@@ -1178,10 +1178,21 @@ pub enum ListMiss {
     RefBeyondList,
     /// `pfn << page_shift` plus the slot offset does not fit a `u64`.
     AddressOverflow,
-    /// The slot's guest address did not read. The only arm that already had its
-    /// own line, `object_list_entry_unreadable`, which stays because it names
-    /// the three inputs the address was built from.
-    Unreadable,
+    /// The slot's guest address did not read, carrying **which** of the walk's
+    /// checks refused.
+    ///
+    /// The payload is the same distinction [`crate::runtime::host::MemError`]
+    /// draws for every other guest read, and the reason it is here is
+    /// [`slot_recheck`]: a slot that read and decoded cleanly at miss time
+    /// cannot later be genuinely unmapped, rooted at a zero PFN and outside the
+    /// address space all at once, so on a re-read the check that refused *is*
+    /// the finding. It was the whole of a driven macos-26 boot's terminal
+    /// verdicts while it was still one bare value.
+    ///
+    /// `object_list_entry_unreadable` stays alongside it, because that line
+    /// names the three inputs the address was built from, which the walk's own
+    /// refusal cannot see.
+    Unreadable(crate::runtime::host::MemError),
     /// The sixteen bytes read and are not an object-list entry.
     Undecodable,
     /// The slot read and is zero: the list is where the guest said and this
@@ -1203,7 +1214,7 @@ impl ListMiss {
         Self::NoObjectList,
         Self::RefBeyondList,
         Self::AddressOverflow,
-        Self::Unreadable,
+        Self::Unreadable(crate::runtime::host::MemError::Unmapped),
         Self::Undecodable,
         Self::SlotEmpty,
     ];
@@ -1215,7 +1226,7 @@ impl ListMiss {
             Self::NoObjectList => "list_miss_no_object_list",
             Self::RefBeyondList => "list_miss_ref_beyond_list",
             Self::AddressOverflow => "list_miss_address_overflow",
-            Self::Unreadable => "list_miss_unreadable",
+            Self::Unreadable(_) => "list_miss_unreadable",
             Self::Undecodable => "list_miss_undecodable",
             Self::SlotEmpty => "list_miss_slot_empty",
         }
@@ -1242,7 +1253,7 @@ impl ListMiss {
             Self::NoObjectList => "slot_recheck_no_object_list",
             Self::RefBeyondList => "slot_recheck_ref_beyond_list",
             Self::AddressOverflow => "slot_recheck_address_overflow",
-            Self::Unreadable => "slot_recheck_unreadable",
+            Self::Unreadable(_) => "slot_recheck_unreadable",
             Self::Undecodable => "slot_recheck_undecodable",
             // Not terminal: the watch survives to be asked again. Named anyway
             // so the table is total and the residue has a spelling if a caller
@@ -1410,11 +1421,11 @@ fn list_entry_or_miss<M: HostMemory>(
             state.page_shift,
         ),
     };
-    if read.is_err() {
+    if let Err(why) = read {
         if lookup == ListLookup::Named {
             note_list_entry_unreadable(task_id, ref_, task, entry_gva);
         }
-        return Err(ListMiss::Unreadable);
+        return Err(ListMiss::Unreadable(why));
     }
     let e = decode_list_object_entry(&raw).map_err(|_| ListMiss::Undecodable)?;
     if e.descriptor_length == 0 || e.descriptor_gva == 0 {

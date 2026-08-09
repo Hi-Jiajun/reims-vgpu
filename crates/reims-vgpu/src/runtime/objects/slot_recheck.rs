@@ -222,6 +222,41 @@ pub(super) fn note_slot_empty(task_id: u32, ref_: u32) {
     }
 }
 
+/// One line per watch that ended, naming the check and the age.
+///
+/// The counted route ranks the ends against each other; this says which
+/// `(task, ref)` and how long it waited, which is what a reader needs to line an
+/// end up against the guest's own `set_object_list` / `define_task` traffic.
+/// [`ListMiss::Unreadable`]'s payload is spelled out because that arm is
+/// fifteen page-table checks wearing one name, and on a re-read the check that
+/// refused is the finding rather than a footnote.
+///
+/// Latched per `(task, ref)` — the sweep can only end a watch once, so this is
+/// belt and braces against a slot re-entering the ledger and ending the same way
+/// every frame the guest re-issues the packet.
+fn note_ended_detail(task_id: u32, ref_: u32, miss: ListMiss, age_us: u64) {
+    if !crate::observe::first_sight(
+        miss.recheck_route(),
+        (u64::from(task_id) << 32) | u64::from(ref_),
+    ) {
+        return;
+    }
+    // The walk's refusal names itself through the same `Decline` vocabulary
+    // every other guest read reports through, so a reader can match this
+    // `check=` against a `gva_read_refused reason=` without a second table.
+    use crate::observe::Decline;
+    let check = match miss {
+        ListMiss::Unreadable(why) => why.slug(),
+        _ => miss.recheck_route(),
+    };
+    crate::observe::off(format!(
+        "slot_recheck_ended task={task_id} ref={ref_} verdict={} check={check} age_us={age_us} \
+         (the slot read and decoded when the guest named it; this is what the same read \
+          found one or more tranches later)",
+        miss.recheck_route(),
+    ));
+}
+
 /// Re-read every watched slot that was recorded before this sweep.
 ///
 /// Runs at the tail of a drain tranche, with the same `state` and host the
@@ -254,6 +289,7 @@ pub fn sweep<M: HostMemory>(state: &DeviceState, host: &M) {
             }
             Verdict::Ended(miss) => {
                 crate::runtime::drain::note_store_route(miss.recheck_route());
+                note_ended_detail(task_id, ref_, miss, age_us);
                 // Beside the verdict and on the same cadence: how long the slot
                 // stayed unpublished before the watch ended is what says whether
                 // the guest had time to publish and chose not to, or whether the
