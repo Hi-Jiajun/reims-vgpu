@@ -438,6 +438,25 @@ do not generalize from one rail to another.
 - x86: `vm/boot-x86.sh --device reims-vgpu-pci --testing`, then
   `scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh -o /tmp/screen.png`
 
+### Run `vm/guest-authorize.sh` after an x86 boot, before any probe
+
+Every probe under `scripts/` reaches the guest as `ssh -o BatchMode=yes macos-vm`, which is key auth
+and nothing else. Only `macos-13` was provisioned with that key; the other rails authenticate by
+password, and `BatchMode=yes` turns that into a silent failure that reads as "the guest is not up
+yet". `vm/guest-authorize.sh` waits for sshd, installs the key into the running clone, and verifies
+`ssh macos-vm` before returning. It is idempotent and needs no password on a rail that already has
+the key, so a harness may call it unconditionally.
+
+It also forgets the host-key pin for `127.0.0.1:2222`, which is a different machine on every rail —
+without that, whichever rail booted first wins and every later rail fails the host-key check.
+
+**Bound every guest-side command with `timeout` on the host side.** An unattended harness cannot
+tell a wedged guest command from a wedged boot. `system_profiler SPDisplaysDataType` has been
+observed hanging indefinitely on a macos-11 guest, and a `sudo` that wedges after authenticating
+holds its timestamp lock, so every later `sudo` — including `sudo true` — queues behind it forever.
+A host-side `timeout` does not kill the remote process, so root steps in particular must be issued
+once and never retried after one times out.
+
 ### A boot on a capable host does not exercise the copying rails
 
 Where the import works, every guest window takes it, and the copying rails run zero times — so a

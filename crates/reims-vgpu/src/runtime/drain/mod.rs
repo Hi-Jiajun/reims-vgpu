@@ -4507,6 +4507,16 @@ fn carrier_word(carried: Option<bool>) -> &'static str {
 /// itself, so a read of it that the host cannot perform is not a reason to
 /// start signalling classes nobody asked for; the ONLINE handshake takes the
 /// same view of the same read.
+///
+/// **The mask is dynamic, so it is re-read per signal rather than latched at
+/// setup.** `enableVBLInterrupt` and `disableVBLInterrupt` are a `lock or 1`
+/// and a `lock and ~1` on this same word, and both x86 rails use them that way:
+/// the guest arms VBL while it is compositing and disarms it when it goes idle.
+/// A driven macos-13 boot read `delivered=3757` and then flat with
+/// `not_enabled` climbing at the grid rate; an undriven macos-11 boot read
+/// `delivered=299` and went the same way. Latching the mask would either starve
+/// a compositing guest or keep signalling an idle one, depending on when the
+/// latch was taken.
 fn display_event_enabled<H: HostMemory>(host: &H, gpa: u64, event_mask: u32) -> bool {
     let mut mask_le = [0u8; 4];
     if host
