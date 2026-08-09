@@ -125,7 +125,13 @@ struct PendingDraw {
 #[derive(Clone, Debug, Default)]
 struct StreamAccum {
     pipeline_ref: u32,
-    /// Pending clears for color attachments (load=clear).
+    /// Every colour attachment whose `load_action` is `Clear`, in stream order.
+    ///
+    /// Membership is the **load** action alone, because this is the pass's
+    /// CLEAR seed and `MTLLoadActionClear` means the attachment starts at the
+    /// record's clear value whatever becomes of it afterwards. Use
+    /// [`StreamAccum::clears_reaching_guest_pages`] — not this — wherever the
+    /// clear colour would be written into the guest's own pages.
     clears: Vec<ColorAttachment>,
     /// Color targets as (pass slot index, attachment). Slot maps to Metal color(i).
     color_slots: Vec<(u32, ColorAttachment)>,
@@ -208,6 +214,26 @@ struct StreamAccum {
 }
 
 impl StreamAccum {
+    /// The subset of [`Self::clears`] whose colour the guest may read back, so
+    /// writing it into the guest's pages is publishing the pass's result rather
+    /// than inventing one.
+    ///
+    /// `MTLStoreActionDontCare` says the pass's result for that attachment is
+    /// dropped. Landing the clear colour in guest memory anyway would be this
+    /// device deciding what the guest sees where the guest said it does not
+    /// care — a content invention, and the exact thing the seed list must not
+    /// be used for.
+    ///
+    /// One method rather than the predicate written at each `apply_clear` loop,
+    /// because there are two of them — the clear-only stream and the draw-failure
+    /// fallback — and they have to agree about what "the guest can read this"
+    /// means.
+    fn clears_reaching_guest_pages(&self) -> impl Iterator<Item = &ColorAttachment> {
+        self.clears
+            .iter()
+            .filter(|att| att.store_action == MTL_STORE_ACTION_STORE)
+    }
+
     /// The stream's bind state as a `PendingDraw`, or what makes it
     /// unrepresentable.
     ///
@@ -1890,23 +1916,25 @@ fn handle_render_record<M: HostMemory + HostOps>(
                             out.type11_mappings.push(att.texture_ref);
                         }
                     }
+                    // The load action decides this, and only the load action.
+                    //
+                    // A `Clear` + non-`Store` attachment used to be dropped from
+                    // this list entirely, which conflated the two jobs the list
+                    // does: it is the pass's CLEAR **seed** for the draws, and
+                    // it is the set whose colour may be **published** to guest
+                    // pages. `MTLStoreAction` governs only the second. Dropping
+                    // it from both meant a drawn pass began on the attachment's
+                    // stale contents — wrong for anything that blends, depth-
+                    // tests, or draws less than the full extent — and the store
+                    // action never licensed that.
+                    //
+                    // macOS 26 asks for the pair 23 times in a 25 s drag and
+                    // macOS 14 twice, against zero on 11/12/13; the branch was
+                    // written as a healthy-zero alarm and those are firings.
+                    // `clears_reaching_guest_pages` is where the store action is
+                    // honoured instead.
                     if att.load_action == MTL_LOAD_ACTION_CLEAR {
-                        if att.store_action == MTL_STORE_ACTION_STORE {
-                            acc.clears.push(att);
-                        } else {
-                            // Metal Clear + non-Store (e.g. DontCare): the clear
-                            // seed is dropped from `acc.clears`, so a drawn pass
-                            // loads stale content (residue) and a clear-only
-                            // stream never reaches guest pages. We do NOT invent
-                            // DontCare semantics (unknown wire stays unknown) —
-                            // just make the drop visible so a boot reveals whether
-                            // any guest emits it. Deduped per target.
-                            note_clear_dropped(
-                                "nonstore_store_action",
-                                att.texture_ref,
-                                &format!("store_action={} load_action=clear", att.store_action),
-                            );
-                        }
+                        acc.clears.push(att);
                     }
                 }
             }
@@ -2931,7 +2959,7 @@ fn finish_stream<M: HostMemory + HostOps>(
     // guest store that would expose intermediate pixels to DisplaySwap.
     let will_draw = acc.saw_draw && !acc.color_slots.is_empty() && !acc.draws.is_empty();
     if !will_draw {
-        for att in &acc.clears {
+        for att in acc.clears_reaching_guest_pages() {
             if apply_clear(state, host, task_id, att) {
                 out.clears_applied += 1;
             }
@@ -3391,7 +3419,7 @@ fn finish_stream<M: HostMemory + HostOps>(
         // class, not only NoMetal: mrt_request fail used to skip this and left
         // mid pages empty → nz_swing thrash on x86 Linux product.
         if out.metal_draws_ok == 0 && !acc.clears.is_empty() {
-            for att in &acc.clears {
+            for att in acc.clears_reaching_guest_pages() {
                 if apply_clear(state, host, task_id, att) {
                     out.clears_applied = out.clears_applied.saturating_add(1);
                 }

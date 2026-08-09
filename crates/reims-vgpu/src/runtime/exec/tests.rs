@@ -4762,3 +4762,84 @@ fn a_render_encoder_fence_reaches_the_render_fence_domain() {
         "a render fence does not touch the blit encoder's domain"
     );
 }
+
+/// `MTLLoadActionClear` seeds the pass whatever the store action says, and only
+/// `MTLStoreActionStore` lets that colour reach the guest's pages.
+///
+/// The two used to be one test of one flag. A `Clear` + `DontCare` attachment
+/// was dropped from `StreamAccum::clears` outright, which took the pass's CLEAR
+/// **seed** with it — so a drawn pass began on the attachment's stale contents.
+/// The store action never said anything about that; it says only that the
+/// result is not preserved afterwards.
+///
+/// macOS 26 sends the pair 23 times in a 25 s Safari drag and macOS 14 twice,
+/// against zero on 11/12/13. The branch that dropped it was written as a
+/// healthy-zero alarm and those are firings of it.
+///
+/// Both halves are asserted here because fixing one without the other is a
+/// plausible half-repair in either direction: seeding but also publishing
+/// invents content the guest said it did not want, and filtering the publish
+/// without restoring the seed leaves the original bug.
+#[test]
+fn a_clear_seeds_the_pass_for_any_store_action_and_publishes_only_for_store() {
+    use crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
+    use crate::runtime::decode::render::{
+        PASS_ATTACH_LOAD_ACTION, PASS_ATTACH_STORE_ACTION, PASS_ATTACH_TEXREF,
+        PASS_COLOR_ATTACH_OFF,
+    };
+
+    let seeded = |store_action: u16| {
+        let mut payload = vec![0u8; 0x400];
+        st32(&mut payload[PASS_COLOR_ATTACH_OFF + PASS_ATTACH_TEXREF..], 7);
+        payload[PASS_COLOR_ATTACH_OFF + PASS_ATTACH_LOAD_ACTION
+            ..PASS_COLOR_ATTACH_OFF + PASS_ATTACH_LOAD_ACTION + 2]
+            .copy_from_slice(&MTL_LOAD_ACTION_CLEAR.to_le_bytes());
+        payload[PASS_COLOR_ATTACH_OFF + PASS_ATTACH_STORE_ACTION
+            ..PASS_COLOR_ATTACH_OFF + PASS_ATTACH_STORE_ACTION + 2]
+            .copy_from_slice(&store_action.to_le_bytes());
+        let mut cmd = vec![0u8; OP_HEADER_LEN + payload.len()];
+        st32(&mut cmd[0..], wire_pass::OPCODE_RENDER_PASS);
+        st32(&mut cmd[4..], (OP_HEADER_LEN + payload.len()) as u32);
+        cmd[OP_HEADER_LEN..].copy_from_slice(&payload);
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        handle_render_record(
+            &mut state,
+            &host,
+            1,
+            wire_pass::OPCODE_RENDER_PASS,
+            &cmd,
+            &mut out,
+            &mut acc,
+        );
+        acc
+    };
+
+    for store_action in [MTL_STORE_ACTION_STORE, MTL_STORE_ACTION_DONT_CARE] {
+        let acc = seeded(store_action);
+        assert!(
+            acc.clears.iter().any(|a| a.texture_ref == 7),
+            "load=Clear store={store_action} must still seed the pass; \
+             a drawn pass would otherwise start on the attachment's stale contents"
+        );
+    }
+
+    // ...and the store action decides only whether that colour is published.
+    assert!(
+        seeded(MTL_STORE_ACTION_STORE)
+            .clears_reaching_guest_pages()
+            .any(|a| a.texture_ref == 7),
+        "a Store result is the guest's to read"
+    );
+    assert_eq!(
+        seeded(MTL_STORE_ACTION_DONT_CARE)
+            .clears_reaching_guest_pages()
+            .count(),
+        0,
+        "DontCare says the result is dropped, so writing the clear colour into \
+         guest pages would be inventing content the guest declined"
+    );
+}
