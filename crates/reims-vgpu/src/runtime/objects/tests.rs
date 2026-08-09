@@ -1908,3 +1908,28 @@ fn a_repoint_of_an_object_this_device_holds_nothing_for_touches_no_neighbour() {
         "the same ref in a different task is a different object"
     );
 }
+
+/// Each way an object-list lookup comes back empty gets its own route.
+///
+/// The whole reason [`super::ListMiss`] exists is that eight causes shared one
+/// `reason=no_list_entry`, so a boot losing draws could not say whether this
+/// device had cleared a task's list under the guest or the guest had not
+/// published the object yet. Two variants sharing a route string — the obvious
+/// copy-paste when a ninth is added — rebuilds exactly that, and rebuilds it
+/// invisibly, because a merged population still reads as a clean count.
+#[test]
+fn every_object_list_miss_names_a_different_check() {
+    let routes: Vec<&'static str> = super::ListMiss::ALL.iter().map(|m| m.route()).collect();
+    let mut unique = routes.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        routes.len(),
+        "two object-list misses share a route, so their counts add up as one: {routes:?}"
+    );
+    assert!(
+        routes.iter().all(|r| r.starts_with("list_miss_")),
+        "the family shares a prefix so a boot can rank it in one grep: {routes:?}"
+    );
+}

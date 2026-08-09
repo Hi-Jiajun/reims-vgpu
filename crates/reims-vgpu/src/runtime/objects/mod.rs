@@ -1147,6 +1147,79 @@ pub enum ListLookup {
     Probe,
 }
 
+/// Which of the eight checks in an object-list lookup came back empty.
+///
+/// They used to be eight `None`s behind one `reason=no_list_entry`, and only the
+/// unreadable arm said anything at all. That is why a macos-26 boot losing ~40
+/// draws to this refusal could not say which of two opposite things had
+/// happened: the device cleared the task's list under the guest
+/// ([`Self::NoObjectList`] — `define_task` resets `object_list_pfn`/`count` and
+/// macOS 26 re-issues `define_task` for a live tid with a new page-table root,
+/// which macOS 13 never does), or the guest had simply not published the object
+/// into a list this device read perfectly well ([`Self::SlotEmpty`]). The first
+/// is a device defect and the second is a wait; they share a reason string and
+/// nothing else.
+///
+/// The routes are counted only for a ref the guest **named** — see
+/// [`ListLookup`], whose `Probe` arm misses by design on every task that does
+/// not own the ref.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ListMiss {
+    /// No task under this id at all.
+    NoTask,
+    /// The task exists and has been torn down or not activated.
+    TaskInactive,
+    /// The task has no object list registered. Either none was ever set, or one
+    /// was set and a later `define_task` for the same id reset it.
+    NoObjectList,
+    /// The ref is past the count the guest declared for the list.
+    RefBeyondList,
+    /// `pfn << page_shift` plus the slot offset does not fit a `u64`.
+    AddressOverflow,
+    /// The slot's guest address did not read. The only arm that already had its
+    /// own line, `object_list_entry_unreadable`, which stays because it names
+    /// the three inputs the address was built from.
+    Unreadable,
+    /// The sixteen bytes read and are not an object-list entry.
+    Undecodable,
+    /// The slot read and is zero: the list is where the guest said and this
+    /// entry has not been written yet. Not a device failure — a race with the
+    /// guest publishing the object.
+    SlotEmpty,
+}
+
+impl ListMiss {
+    /// Every variant, for the distinctness check below.
+    ///
+    /// [`Self::route`]'s match is exhaustive, so a new variant cannot skip
+    /// having a route — but it can skip this list. Add it here too, or the
+    /// distinctness test stops covering the population it names.
+    #[cfg(test)]
+    const ALL: [Self; 8] = [
+        Self::NoTask,
+        Self::TaskInactive,
+        Self::NoObjectList,
+        Self::RefBeyondList,
+        Self::AddressOverflow,
+        Self::Unreadable,
+        Self::Undecodable,
+        Self::SlotEmpty,
+    ];
+
+    pub fn route(self) -> &'static str {
+        match self {
+            Self::NoTask => "list_miss_no_task",
+            Self::TaskInactive => "list_miss_task_inactive",
+            Self::NoObjectList => "list_miss_no_object_list",
+            Self::RefBeyondList => "list_miss_ref_beyond_list",
+            Self::AddressOverflow => "list_miss_address_overflow",
+            Self::Unreadable => "list_miss_unreadable",
+            Self::Undecodable => "list_miss_undecodable",
+            Self::SlotEmpty => "list_miss_slot_empty",
+        }
+    }
+}
+
 /// Lookup one object-list slot for `task_id` / `ref_`, reporting a miss.
 ///
 /// For a ref the guest named. A speculative caller wants [`probe_list_entry`];
@@ -1183,12 +1256,44 @@ fn list_entry<M: HostMemory>(
     ref_: u32,
     lookup: ListLookup,
 ) -> Option<ListObjectEntry> {
-    let task = state.tasks.get(task_id)?;
-    if !task.active || task.object_list_count == 0 {
-        return None;
+    let found = list_entry_or_miss(state, host, task_id, ref_, lookup);
+    match found {
+        Ok(entry) => Some(entry),
+        Err(miss) => {
+            // Only for a ref the guest named. A probe misses on every task that
+            // does not own the ref, which is how it finds the one that does —
+            // counting those would bury the named misses under the search.
+            if lookup == ListLookup::Named {
+                crate::runtime::drain::note_store_route(miss.route());
+            }
+            None
+        }
     }
-    let off = list_object_entry_offset(ref_, task.object_list_count)?;
-    let entry_gva = ((task.object_list_pfn as u64) << state.page_shift).checked_add(off)?;
+}
+
+/// The lookup proper, naming the check that refused.
+///
+/// Split from [`list_entry`] so the eight ways a slot comes back empty are eight
+/// values rather than eight `None`s. See [`ListMiss`] for why that mattered.
+fn list_entry_or_miss<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    ref_: u32,
+    lookup: ListLookup,
+) -> Result<ListObjectEntry, ListMiss> {
+    let task = state.tasks.get(task_id).ok_or(ListMiss::NoTask)?;
+    if !task.active {
+        return Err(ListMiss::TaskInactive);
+    }
+    if task.object_list_count == 0 {
+        return Err(ListMiss::NoObjectList);
+    }
+    let off = list_object_entry_offset(ref_, task.object_list_count)
+        .ok_or(ListMiss::RefBeyondList)?;
+    let entry_gva = ((task.object_list_pfn as u64) << state.page_shift)
+        .checked_add(off)
+        .ok_or(ListMiss::AddressOverflow)?;
     let mut raw = [0u8; OBJECT_LIST_ENTRY_LEN];
     let read = match lookup {
         ListLookup::Named => gva_mem::read_task_gva_by_id(
@@ -1212,13 +1317,13 @@ fn list_entry<M: HostMemory>(
         if lookup == ListLookup::Named {
             note_list_entry_unreadable(task_id, ref_, task, entry_gva);
         }
-        return None;
+        return Err(ListMiss::Unreadable);
     }
-    let e = decode_list_object_entry(&raw).ok()?;
+    let e = decode_list_object_entry(&raw).map_err(|_| ListMiss::Undecodable)?;
     if e.descriptor_length == 0 || e.descriptor_gva == 0 {
-        return None;
+        return Err(ListMiss::SlotEmpty);
     }
-    Some(e)
+    Ok(e)
 }
 
 /// Read the descriptor blob for a list entry.
