@@ -273,6 +273,10 @@ pub(crate) struct ResourcePools {
     /// candidates only; a hit always requires full byte equality.
     sampled_cache: Vec<ResidentSampledSlot>,
     sampled_cache_bytes: usize,
+    /// What [`SAMPLED_CACHE_CAP`] and [`SAMPLED_CACHE_BYTE_CAP`] have thrown
+    /// away, most recently evicted at the front, carrying no images — see
+    /// [`SampledVictim`].
+    sampled_victims: std::collections::VecDeque<SampledVictim>,
     /// Storage-image pool for compute.
     storage_image_free: FreePool<StorageImageKey, StorageImageSlot>,
     storage_image_live: Vec<StorageImageSlot>,
@@ -1711,6 +1715,42 @@ const RECLAIM_HISTORY: usize = 256;
 /// qualifiers, and prefer removing the write to enlarging the cache.
 const SAMPLED_CACHE_CAP: usize = 64;
 const SAMPLED_CACHE_BYTE_CAP: usize = 128 * 1024 * 1024;
+/// How far back the victim ledger remembers what the caps threw away.
+///
+/// Derived from the count cap rather than written down, so the bands in
+/// [`sampled_reach_bands`] keep meaning "twice the cache", "four times" and
+/// "eight times" whatever the cap becomes. Eight times is the whole ledger, so
+/// there is no band past it — a miss the ledger cannot see reports
+/// `sampled_reach_beyond_ledger` and says so.
+const SAMPLED_VICTIM_LEDGER: usize = SAMPLED_CACHE_CAP * 8;
+
+/// One entry [`SAMPLED_CACHE_CAP`] or [`SAMPLED_CACHE_BYTE_CAP`] evicted,
+/// remembered without its image.
+///
+/// The eviction *route* has been banded for a while and it answers a different
+/// question: which cap fired, not how much cache the workload wanted. Nothing
+/// counted the second, and `sampled_evict_route`'s own doc says so in as many
+/// words — "nothing yet counts how many distinct `(key, identity)` windows the
+/// workload wants live at once, and that is the number `AGENTS.md` requires
+/// before a bound moves".
+///
+/// This is that count, taken the only way it can be taken from one run: the LRU
+/// stack distance. A bind that misses and finds its window here would have hit
+/// in a cache `distance + 1` entries larger, and the bytes carried alongside say
+/// what holding it that long would have cost. Reading the two together is the
+/// point — the eviction-route doc warns that a count cap raised without the byte
+/// cap hands every eviction straight to the other route, and a distance series
+/// with no byte series cannot see that coming.
+///
+/// It holds no `SampledSlot` and therefore no Vulkan handle: a ledger of images
+/// would be the cache, at eight times the size, which is the thing being
+/// measured rather than a measurement of it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SampledVictim {
+    key: SampledKey,
+    identity: crate::backend::vulkan::engine::SampledContentIdentity,
+    content_len: usize,
+}
 /// Max recycled sampled slots retained per geometry key in `sampled_free`. A
 /// content-changing input only needs a few live at once (the CB ring is 3-deep
 /// plus the one being acquired); beyond that a recycled slot is destroyed so a

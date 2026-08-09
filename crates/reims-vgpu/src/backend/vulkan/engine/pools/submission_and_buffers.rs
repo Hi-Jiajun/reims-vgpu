@@ -111,6 +111,7 @@ impl ResourcePools {
             sampled_live: Vec::new(),
             sampled_cache: Vec::new(),
             sampled_cache_bytes: 0,
+            sampled_victims: std::collections::VecDeque::new(),
             storage_image_free: FreePool::new(
                 STORAGE_IMAGE_FREE_CAP_PER_KEY,
                 STORAGE_IMAGE_FREE_CAP_TOTAL,
@@ -2633,11 +2634,45 @@ impl ResourcePools {
         identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
         counters: &EngineCounters,
     ) -> Option<SampledSlot> {
-        let handles = self.find_sampled_by_identity(key, identity)?;
+        let Some(handles) = self.find_sampled_by_identity(key, identity) else {
+            // A miss the caps caused is the only kind worth banding, and the
+            // ledger is what tells the two apart: a window it remembers was
+            // here and was evicted, and one it does not is either content this
+            // cache has never held or content evicted longer ago than the
+            // instrument can see. Those are opposite findings and the second
+            // route says which.
+            if let Some(id) = identity {
+                self.note_sampled_reach(key, id);
+            }
+            return None;
+        };
         counters
             .sampled_identity_hits
             .fetch_add(1, Ordering::Relaxed);
         Some(handles)
+    }
+
+    /// Band how much cache would have turned this miss into a hit.
+    ///
+    /// Split out from the lookup so the walk is named: it is the only reason
+    /// this rail touches the ledger, and it is skipped entirely for a bind with
+    /// no identity, which could not have hit at any cache size.
+    fn note_sampled_reach(
+        &self,
+        key: SampledKey,
+        identity: crate::backend::vulkan::engine::SampledContentIdentity,
+    ) {
+        let mut bytes = self.sampled_cache_bytes;
+        for (distance, victim) in self.sampled_victims.iter().enumerate() {
+            bytes = bytes.saturating_add(victim.content_len);
+            if victim.key == key && victim.identity == identity {
+                let (count_route, byte_route) = sampled_reach_bands(distance, bytes);
+                crate::runtime::drain::note_store_route(count_route);
+                crate::runtime::drain::note_store_route(byte_route);
+                return;
+            }
+        }
+        crate::runtime::drain::note_store_route("sampled_reach_beyond_ledger");
     }
 
     pub(crate) fn find_cached_sampled(
@@ -2771,6 +2806,18 @@ impl ResourcePools {
             }
             let evicted = self.sampled_cache.remove(0);
             self.sampled_cache_bytes = self.sampled_cache_bytes.saturating_sub(evicted.content_len);
+            // What the caps threw away, so a later miss can say how much cache
+            // would have kept it. Only an entry with an identity is worth
+            // remembering: the gather rail's lookup is identity-only, so an
+            // entry without one could never be found again anyway.
+            if let Some(identity) = evicted.identity {
+                self.sampled_victims.push_front(SampledVictim {
+                    key: evicted.slot.key(),
+                    identity,
+                    content_len: evicted.content_len,
+                });
+                self.sampled_victims.truncate(SAMPLED_VICTIM_LEDGER);
+            }
             // Recycle rather than destroy: a content-changing sampled input
             // (live tile / video frame) re-uploads into this same-geometry image
             // next frame instead of a fresh vkAllocateMemory. Routed through the
@@ -2897,6 +2944,65 @@ fn sampled_evict_route(len: usize, bytes: usize) -> Option<&'static str> {
     }
 }
 
+/// How much cache a sampled bind that missed would have needed, as two route
+/// names: one in entries and one in bytes.
+///
+/// This is the reach [`sampled_evict_route`]'s doc says nothing counts. It is
+/// the classic LRU stack distance and it is read the same way: a bind at
+/// `distance` d hits in any cache holding more than [`SAMPLED_CACHE_CAP`] + d
+/// entries, so the counters partition the misses by how far each raise would
+/// get. `bytes` is what the cache would have been holding at that moment — its
+/// occupancy now plus every victim at or above `d`.
+///
+/// **Both names, on every miss, deliberately.** A count series alone is the trap
+/// the eviction-route doc names: raising the count cap while the byte cap stays
+/// hands the evictions straight to the other route and buys nothing. The pair
+/// says whether that would happen before the change is made — if the byte band
+/// is already `over_4x` where the count band is `2x`, the count cap is not the
+/// bound.
+///
+/// The bands are multiples of the caps rather than fixed sizes, for the reason
+/// [`target_pool_depth_band`] gives: a change to a cap moves them with it, and a
+/// series taken before the change stays comparable in the only terms that
+/// matter.
+///
+/// # Reading the series
+///
+/// `store_routes` counters are per-window, so sum the samples across the boot.
+/// Two identities hold and are the cheapest way to catch a misreading:
+///
+/// - `bytes_1x + bytes_2x + bytes_4x + bytes_over_4x` equals
+///   `count_2x + count_4x + count_8x`, because a miss found in the ledger emits
+///   exactly one of each ladder.
+/// - Those plus `sampled_reach_beyond_ledger` are every gathered miss that
+///   carried an identity, so the total is bounded above by
+///   `sampled_gather_unretained + sampled_gather_unvouched`.
+///
+/// A large `beyond_ledger` is not a licence to lengthen the ledger. It says the
+/// workload's reuse distance is past eight times the cache, and a cache that
+/// would have to be eight times larger to hit is not a cache this workload
+/// wants — the answer there is upstream, in whatever keeps re-presenting the
+/// window under a new identity.
+fn sampled_reach_bands(distance: usize, bytes: usize) -> (&'static str, &'static str) {
+    let count = if distance < SAMPLED_CACHE_CAP {
+        "sampled_reach_count_2x"
+    } else if distance < SAMPLED_CACHE_CAP * 3 {
+        "sampled_reach_count_4x"
+    } else {
+        "sampled_reach_count_8x"
+    };
+    let bytes = if bytes <= SAMPLED_CACHE_BYTE_CAP {
+        "sampled_reach_bytes_1x"
+    } else if bytes <= SAMPLED_CACHE_BYTE_CAP * 2 {
+        "sampled_reach_bytes_2x"
+    } else if bytes <= SAMPLED_CACHE_BYTE_CAP * 4 {
+        "sampled_reach_bytes_4x"
+    } else {
+        "sampled_reach_bytes_over_4x"
+    };
+    (count, bytes)
+}
+
 /// Which quarter of [`TARGET_POOL_MAX_ENTRIES`] the scratch target pool is
 /// occupying, as a census route name.
 ///
@@ -2916,6 +3022,67 @@ fn target_pool_depth_band(len: usize) -> &'static str {
         "target_pool_depth_q3"
     } else {
         "target_pool_depth_q4"
+    }
+}
+
+#[cfg(test)]
+mod sampled_reach_band_tests {
+    use super::*;
+
+    /// Each distance band at both of its ends. An off-by-one here reads as
+    /// working for as long as the workload stays inside one band, which is the
+    /// case a rail with a healthy cache is always in.
+    #[test]
+    fn each_distance_band_covers_its_multiple_of_the_cap() {
+        let cap = SAMPLED_CACHE_CAP;
+        let count = |d| sampled_reach_bands(d, 0).0;
+        assert_eq!(count(0), "sampled_reach_count_2x");
+        assert_eq!(count(cap - 1), "sampled_reach_count_2x");
+        assert_eq!(count(cap), "sampled_reach_count_4x");
+        assert_eq!(count(cap * 3 - 1), "sampled_reach_count_4x");
+        assert_eq!(count(cap * 3), "sampled_reach_count_8x");
+    }
+
+    /// The furthest a victim can sit in the ledger must still band as the top
+    /// name. The ledger's length and the ladder's top boundary are written apart
+    /// from each other, so a ledger lengthened without the ladder would report
+    /// distances of sixteen times the cap under a name that says eight.
+    #[test]
+    fn the_ledgers_furthest_entry_bands_as_the_top_name() {
+        assert_eq!(
+            sampled_reach_bands(SAMPLED_VICTIM_LEDGER - 1, 0).0,
+            "sampled_reach_count_8x"
+        );
+    }
+
+    /// The byte ladder at both ends of each rung. `<=` at every boundary, so a
+    /// miss needing exactly the cap reports the cap rather than the rung above:
+    /// the question is what the cache would have had to hold, and holding
+    /// exactly the cap is within it.
+    #[test]
+    fn each_byte_band_covers_its_multiple_of_the_byte_cap() {
+        let cap = SAMPLED_CACHE_BYTE_CAP;
+        let bytes = |b| sampled_reach_bands(0, b).1;
+        assert_eq!(bytes(0), "sampled_reach_bytes_1x");
+        assert_eq!(bytes(cap), "sampled_reach_bytes_1x");
+        assert_eq!(bytes(cap + 1), "sampled_reach_bytes_2x");
+        assert_eq!(bytes(cap * 2), "sampled_reach_bytes_2x");
+        assert_eq!(bytes(cap * 2 + 1), "sampled_reach_bytes_4x");
+        assert_eq!(bytes(cap * 4), "sampled_reach_bytes_4x");
+        assert_eq!(bytes(cap * 4 + 1), "sampled_reach_bytes_over_4x");
+    }
+
+    /// The two ladders are independent: a miss can be one entry deep and still
+    /// need four times the byte budget, and that pair is the whole reason both
+    /// are emitted. A reading where the byte band outruns the count band says
+    /// the count cap is not the bound, which is what `sampled_evict_route`'s doc
+    /// warns a count-only series cannot see.
+    #[test]
+    fn a_shallow_miss_can_still_be_byte_bound() {
+        assert_eq!(
+            sampled_reach_bands(0, SAMPLED_CACHE_BYTE_CAP * 4),
+            ("sampled_reach_count_2x", "sampled_reach_bytes_4x")
+        );
     }
 }
 
