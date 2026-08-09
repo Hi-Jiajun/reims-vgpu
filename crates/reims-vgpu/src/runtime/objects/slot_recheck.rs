@@ -249,53 +249,105 @@ pub(super) fn note_slot_empty<M: HostMemory>(
 /// driven macos-26 boot reaches a few dozen times — the misses themselves are
 /// three times that, and repeats of a slot already watched cost nothing.
 fn note_list_population<M: HostMemory>(state: &DeviceState, host: &M, task_id: u32, ref_: u32) {
-    let Some(task) = state.tasks.get(task_id) else {
-        return;
-    };
-    let page_size = 1usize << state.page_shift;
-    let base = (task.object_list_pfn as u64) << state.page_shift;
-    let mut page = vec![0u8; page_size];
-    if gva_mem::try_read_task_gva_by_id(host, &state.tasks, task_id, base, &mut page, state.page_shift)
-        .is_err()
-    {
+    let Some(pop) = first_page_population(state, host, task_id) else {
         // The list's own first page did not read, which the per-slot walk would
         // have reported as `Unreadable` rather than `SlotEmpty` — so reaching
         // here means the two disagree and neither reading is usable.
         crate::runtime::drain::note_store_route("slot_recheck_population_unreadable");
         return;
+    };
+    // The route is what ranks the two shapes against each other across a boot;
+    // the line is what names the task and the reach behind one reading.
+    crate::runtime::drain::note_store_route(if i64::from(ref_) > pop.highest {
+        "slot_empty_ref_above_reach"
+    } else {
+        "slot_empty_ref_within_reach"
+    });
+    crate::observe::off(format!(
+        "slot_empty_population task={task_id} ref={ref_} {pop} \
+         (the first page of this task's own object list, at the moment the ref missed)"
+    ));
+}
+
+/// What one task's object list holds in the first page of it.
+pub(super) struct Population {
+    pub populated: usize,
+    /// The last occupied index, or `-1` for an empty page — so `ref > highest`
+    /// is a total test with no special case for "nothing here at all".
+    pub highest: i64,
+    slots: usize,
+    occupied: Vec<usize>,
+}
+
+impl std::fmt::Display for Population {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "populated={} highest_ref={} slots_read={} occupied={:?}{}",
+            self.populated,
+            self.highest,
+            self.slots,
+            self.occupied,
+            if self.populated > self.occupied.len() {
+                "+"
+            } else {
+                ""
+            }
+        )
     }
+}
+
+/// Count and locate the objects in the first page of `task_id`'s object list.
+///
+/// One guest read of a page, decoded locally: 341 entries at a 4 KiB page and 12
+/// bytes an entry, against 341 page-table walks for the same answer. `None` when
+/// the page does not read.
+///
+/// Shared with the claimant search, which is the point. "Task 1 holds the ref
+/// task 19 missed" means one thing if task 1 holds six objects and the opposite
+/// if it holds three hundred, and a claim measured against an occupancy counted
+/// some other way would not settle it. The two sites count the same way because
+/// there is one count.
+pub(super) fn first_page_population<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+) -> Option<Population> {
+    let task = state.tasks.get(task_id)?;
+    let page_size = 1usize << state.page_shift;
+    let base = (task.object_list_pfn as u64) << state.page_shift;
+    let mut page = vec![0u8; page_size];
+    gva_mem::try_read_task_gva_by_id(
+        host,
+        &state.tasks,
+        task_id,
+        base,
+        &mut page,
+        state.page_shift,
+    )
+    .ok()?;
     // Never past what the guest declared, however many entries the page holds.
     let slots = (page_size / OBJECT_LIST_ENTRY_LEN).min(task.object_list_count as usize);
-    let mut populated = 0usize;
-    let mut highest: Option<usize> = None;
-    let mut occupied: Vec<usize> = Vec::new();
+    let mut pop = Population {
+        populated: 0,
+        highest: -1,
+        slots,
+        occupied: Vec::new(),
+    };
     for i in 0..slots {
         let raw = &page[i * OBJECT_LIST_ENTRY_LEN..(i + 1) * OBJECT_LIST_ENTRY_LEN];
         let Ok(entry) = decode_list_object_entry(raw) else {
             continue;
         };
         if entry.descriptor_length != 0 && entry.descriptor_gva != 0 {
-            populated += 1;
-            highest = Some(i);
-            if occupied.len() < OCCUPIED_SHOWN {
-                occupied.push(i);
+            pop.populated += 1;
+            pop.highest = i as i64;
+            if pop.occupied.len() < OCCUPIED_SHOWN {
+                pop.occupied.push(i);
             }
         }
     }
-    let highest = highest.map_or(-1i64, |h| h as i64);
-    // The route is what ranks the two shapes against each other across a boot;
-    // the line is what names the task and the reach behind one reading.
-    crate::runtime::drain::note_store_route(if i64::from(ref_) > highest {
-        "slot_empty_ref_above_reach"
-    } else {
-        "slot_empty_ref_within_reach"
-    });
-    crate::observe::off(format!(
-        "slot_empty_population task={task_id} ref={ref_} populated={populated} \
-         highest_ref={highest} slots_read={slots} occupied={occupied:?}{} \
-         (the first page of this task's own object list, at the moment the ref missed)",
-        if populated > occupied.len() { "+" } else { "" }
-    ));
+    Some(pop)
 }
 
 /// How many occupied indices the population line prints.

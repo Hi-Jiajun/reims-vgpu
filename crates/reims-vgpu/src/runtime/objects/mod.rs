@@ -1371,9 +1371,25 @@ fn note_slot_empty_claimants<M: HostMemory>(
     ) {
         return;
     }
+    // Each claimant with how many objects it holds at all. This is the whole
+    // discriminator: a task that claims the missing ref while holding six
+    // objects in a 341-slot page owns it, and one that claims it while holding
+    // three hundred claims everything. A driven boot found task 1 claiming
+    // **every** missing ref of 30, which is either the answer or exactly that
+    // second thing, and the id alone cannot say which.
+    let with_reach: Vec<String> = claimants
+        .iter()
+        .map(|&other| {
+            let held = slot_recheck::first_page_population(state, host, other)
+                .map_or(-1i64, |p| p.populated as i64);
+            format!("{other}:holds={held}")
+        })
+        .collect();
     crate::observe::off(format!(
-        "slot_empty_claimants task={task_id} ref={ref_} live={live} claimants={claimants:?} \
-         (which other live tasks hold a real object at this ref, by id)"
+        "slot_empty_claimants task={task_id} ref={ref_} live={live} claimants=[{}] \
+         (which other live tasks hold a real object at this ref, and how many objects \
+          each of them holds in total — a claim is only ownership if the claimant is sparse)",
+        with_reach.join(" ")
     ));
 }
 
