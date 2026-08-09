@@ -1179,6 +1179,9 @@ impl ResourcePools {
         );
         self.slots[self.cur].pending = Some(cleanup);
         self.in_flight += 1;
+        for _ in 0..sampled_twins_in_entry(&admissions) {
+            crate::runtime::drain::note_store_route("sampled_admit_twin_in_entry");
+        }
         for (slot, retain) in admissions {
             self.admit_sampled_slot(device, slot, &retain.content, retain.identity);
         }
@@ -2948,6 +2951,50 @@ impl ResourcePools {
     }
 }
 
+/// Band the duplicate admissions that no publication order could have avoided.
+///
+/// `sampled_admit_duplicate` sums two populations that want opposite fixes, and
+/// nothing else can tell them apart:
+///
+/// - **A twin inside this entry.** Two gathers of one guest window recorded
+///   before either was published — a window bound at two slots of one draw, or
+///   two draws of one batch, since a batch publishes nothing until it flushes.
+///   Both are fixed by publishing earlier, and the batch half needs a rollback
+///   for a submit that fails after its entries are in the cache.
+/// - **A twin from an earlier entry.** The window was already in the cache when
+///   this gather's bind looked, and `find_gathered_sampled` did not find it.
+///   The lookup and the admit ask the same `(key, identity)` question, so that
+///   should be impossible — a reading here is a real defect (a recycled slot
+///   whose key differs from the one requested, or an eviction between the two),
+///   and it is worth more than the whole batch case.
+///
+/// The counter names the first. The second is `sampled_admit_duplicate` minus
+/// it, which is why this is emitted per occurrence rather than per entry.
+///
+/// Returns the count so the selection is testable without a route registry;
+/// emitting is the caller's.
+fn sampled_twins_in_entry(admissions: &[(SampledSlot, SampledRetain)]) -> usize {
+    // Linear over a list that is one entry's worth of textures — a handful,
+    // capped by BATCH_MAX_DRAWS times the bindings of one draw.
+    let mut named: Vec<(SampledKey, crate::backend::vulkan::engine::SampledContentIdentity)> =
+        Vec::new();
+    let mut twins = 0;
+    for (slot, retain) in admissions {
+        // An admission with no identity is never a duplicate: the admit drops
+        // it before the dedup test, because nothing could find it again.
+        let Some(identity) = retain.identity else {
+            continue;
+        };
+        let name = (slot.key(), identity);
+        if named.contains(&name) {
+            twins += 1;
+        } else {
+            named.push(name);
+        }
+    }
+    twins
+}
+
 /// Why a readback allocation is slower than the class asked for.
 ///
 /// `MemoryClass::Readback` ranks `HOST_CACHED` first because the CPU read that
@@ -3307,6 +3354,59 @@ mod recycle_tests {
             ),
             swizzle: Default::default(),
         }
+    }
+
+    /// The twin counter separates the duplicates publication order could have
+    /// avoided from the ones it could not, and each miscount points the next
+    /// session at the wrong bug.
+    ///
+    /// Three things it must get right, and each is a different wrong answer: a
+    /// repeat under one name is a twin (over-count nothing), the *same geometry
+    /// under a different identity* is two different windows and not a twin
+    /// (under-count nothing), and an admission with no identity is never a twin
+    /// because the admit drops it before its dedup test ever runs.
+    #[test]
+    fn only_a_repeated_name_inside_one_entry_counts_as_a_twin() {
+        let id = |k: u64| crate::backend::vulkan::engine::SampledContentIdentity {
+            key: k,
+            generation: 1,
+        };
+        let retain = |identity| SampledRetain {
+            image: vk::Image::null(),
+            content: SampledRetainContent::Gathered { len: 4096 },
+            identity,
+        };
+        let entry = |w, identity| (null_slot(w, 64), retain(identity));
+
+        assert_eq!(
+            sampled_twins_in_entry(&[entry(64, Some(id(1))), entry(64, Some(id(1)))]),
+            1,
+            "one window gathered twice inside one entry is one avoidable gather"
+        );
+        assert_eq!(
+            sampled_twins_in_entry(&[entry(64, Some(id(1))), entry(64, Some(id(2)))]),
+            0,
+            "same geometry, different producer identity: two windows, neither avoidable"
+        );
+        assert_eq!(
+            sampled_twins_in_entry(&[entry(64, Some(id(1))), entry(96, Some(id(1)))]),
+            0,
+            "one identity at two geometries cannot share an image, so neither is a twin"
+        );
+        assert_eq!(
+            sampled_twins_in_entry(&[entry(64, None), entry(64, None)]),
+            0,
+            "an unnamed gather is never admitted, so it can never be a duplicate"
+        );
+        assert_eq!(
+            sampled_twins_in_entry(&[
+                entry(64, Some(id(1))),
+                entry(64, Some(id(1))),
+                entry(64, Some(id(1))),
+            ]),
+            2,
+            "three gathers of one window are two gathers that need not have happened"
+        );
     }
 
     /// A window gathered by a submission still in flight is bindable by the very
