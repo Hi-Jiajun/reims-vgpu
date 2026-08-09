@@ -5597,3 +5597,86 @@ fn a_declined_command_is_latched_in_the_log_and_counted_in_the_census() {
          cannot carry"
     );
 }
+
+/// No display signal path may set a pending bit for a class the guest has not
+/// enabled — swept over every possible enable word.
+///
+/// This is the invariant behind the whole two-word mailbox, and it is the one a
+/// second reader of the enable mask broke: the guest's ISR clears
+/// `pending &= ~enable`, so a bit set outside the mask is not an ignored
+/// notification but a word it will never clear, carried forward by every later
+/// read-modify-write for the life of the boot.
+///
+/// The sweep is over all 16 masks rather than the two the x86 rails happen to
+/// publish, because "which classes a guest arms" is a per-generation decision
+/// and a rail this device has not booted yet is exactly where a missing check
+/// would first cost guest work. Both signal paths run under each mask against a
+/// zeroed pending word, so anything left set outside the mask came from a path
+/// that did not consult it.
+#[test]
+fn no_display_signal_path_sets_a_bit_the_guest_did_not_enable() {
+    use crate::model::DISPLAY_EVENT_MASK_ALL;
+    for mask in 0..=DISPLAY_EVENT_MASK_ALL {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let gpa = 0x7c000000u64;
+        host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+        state.display.shared_gpa = gpa;
+        state.display.display_index = 0;
+        state.display.online_acked = true;
+        host.put_u32(gpa + DISPLAY_SHARED_ENABLE_MASK, mask);
+        host.put_u32(gpa + DISPLAY_SHARED_PENDING, 0);
+
+        let last_us = std::sync::atomic::AtomicU64::new(0);
+        signal_display_vbl_at(&mut state, &mut host, &last_us, 5_000_000);
+        signal_display_present_complete(&mut state, &mut host);
+
+        let mut pending = [0u8; 4];
+        host.read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending)
+            .unwrap();
+        let set = ld32(&pending);
+        assert_eq!(
+            set & !mask,
+            0,
+            "enable=0x{mask:x} left pending=0x{set:x}: bit(s) 0x{:x} are outside \
+             the guest's mask and its ISR will never clear them",
+            set & !mask
+        );
+    }
+}
+
+/// The display-offline class is never signalled, whatever the guest enables.
+///
+/// Bit 3 dispatches to the guest's *offline* event source: signalling it tells a
+/// healthy guest its display went away. This device creates the scanout once and
+/// keeps it for the life of the VM, so the honest state of that bit is always
+/// clear — and a guest arming it is ordinary, not a request. The distinction
+/// matters because an enable word of `0xe` reads as "the guest wants something
+/// we do not send", which is true and harmless, rather than as a missing signal.
+#[test]
+fn display_offline_is_never_signalled_even_when_the_guest_arms_it() {
+    use crate::model::{DISPLAY_EVENT_MASK_ALL, DISPLAY_OFFLINE_EVENT_MASK};
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let gpa = 0x7c000000u64;
+    host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+    state.display.shared_gpa = gpa;
+    state.display.display_index = 0;
+    state.display.online_acked = true;
+    // Everything armed, including offline: the most permissive guest there is.
+    host.put_u32(gpa + DISPLAY_SHARED_ENABLE_MASK, DISPLAY_EVENT_MASK_ALL);
+    host.put_u32(gpa + DISPLAY_SHARED_PENDING, 0);
+
+    let last_us = std::sync::atomic::AtomicU64::new(0);
+    signal_display_vbl_at(&mut state, &mut host, &last_us, 5_000_000);
+    signal_display_present_complete(&mut state, &mut host);
+
+    let mut pending = [0u8; 4];
+    host.read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending)
+        .unwrap();
+    assert_eq!(
+        ld32(&pending) & DISPLAY_OFFLINE_EVENT_MASK,
+        0,
+        "a signalled offline bit tears down a live display pipe"
+    );
+}

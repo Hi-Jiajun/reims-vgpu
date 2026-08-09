@@ -4517,7 +4517,15 @@ fn carrier_word(carried: Option<bool>) -> &'static str {
 /// `delivered=299` and went the same way. Latching the mask would either starve
 /// a compositing guest or keep signalling an idle one, depending on when the
 /// latch was taken.
-fn display_event_enabled<H: HostMemory>(host: &H, gpa: u64, event_mask: u32) -> bool {
+///
+/// **This is the only reader of the enable word, deliberately.** It used to have
+/// a second one: the lock-free VBL pulse in `device::vbl_contended_pulse` wrote
+/// the pending bit without consulting the mask at all, so the same wire form had
+/// two arms and the one a contended poll took was missing the term. That cost
+/// twice over — it manufactured the residue this doc describes, and it counted
+/// those writes as `delivered`, inflating the one census number a stalled rail
+/// is ranked by. Both arms call this now; keep it that way.
+pub(crate) fn display_event_enabled<H: HostMemory>(host: &H, gpa: u64, event_mask: u32) -> bool {
     let mut mask_le = [0u8; 4];
     if host
         .read_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &mut mask_le)
@@ -4525,7 +4533,11 @@ fn display_event_enabled<H: HostMemory>(host: &H, gpa: u64, event_mask: u32) -> 
     {
         return false;
     }
-    ld32(&mask_le) & event_mask != 0
+    let mask = ld32(&mask_le);
+    // Every signal path passes through here, so this is where the guest's own
+    // statement of what it wants is observable without stopping the world.
+    crate::runtime::drain::census::note_display_enable_mask(mask);
+    mask & event_mask != 0
 }
 
 fn signal_display_vbl_at<H: HostMemory + HostOps>(

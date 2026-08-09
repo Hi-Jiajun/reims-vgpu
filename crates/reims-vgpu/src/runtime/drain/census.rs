@@ -122,6 +122,80 @@ pub(crate) fn note_vbl(arm: usize, now_ms: u64) {
     }
 }
 
+/// Sentinel for "no enable word has been read yet".
+///
+/// The mask is four meaningful bits, so any value with a high bit set is
+/// unreachable as a real reading and a first read of `0` still reports.
+const DISPLAY_ENABLE_UNREAD: u32 = u32::MAX;
+
+/// Report the guest's display event-enable word, once per distinct value.
+///
+/// **Which classes a guest arms is a per-generation decision, and it is the
+/// first thing worth knowing about a display pipe that is not advancing.** The
+/// word lives in guest RAM and is never trapped, so the only way to see it used
+/// to be to stop the world and read the page by hand over QMP — which is how it
+/// was read, per rail, one sample at a time. A sample is also the wrong shape:
+/// the guest arms VBL while compositing and disarms when idle, so a single
+/// reading cannot distinguish "never armed" from "not armed just now", and those
+/// are the two answers a stalled rail is being triaged between.
+///
+/// Edge-triggered rather than sampled for that reason: one line per transition
+/// costs nothing on a steady guest and yields the arm/disarm history on a busy
+/// one. `first_sight` cannot serve here — it keys on the formatted line, so a
+/// mask that flips between two values would report each exactly once and then go
+/// quiet, losing the very history this exists to show.
+pub(crate) fn note_display_enable_mask(mask: u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(DISPLAY_ENABLE_UNREAD);
+    let prev = LAST.swap(mask, Relaxed);
+    if prev == mask {
+        return;
+    }
+    // Name every bit the guest's dispatch can claim, and say plainly when it has
+    // armed one this device never signals. A reader looking at `0xe` should not
+    // have to go and find out what bit 3 is; that question cost a session.
+    let names = |m: u32| -> String {
+        use crate::model::{
+            DISPLAY_EVENT_MASK_ALL, DISPLAY_OFFLINE_EVENT_MASK, DISPLAY_ONLINE_EVENT_MASK,
+            DISPLAY_PRESENT_EVENT_MASK, DISPLAY_VBL_EVENT_MASK,
+        };
+        let mut out = Vec::new();
+        for (bit, name) in [
+            (DISPLAY_VBL_EVENT_MASK, "vbl"),
+            (DISPLAY_PRESENT_EVENT_MASK, "transaction"),
+            (DISPLAY_ONLINE_EVENT_MASK, "online"),
+            (DISPLAY_OFFLINE_EVENT_MASK, "offline"),
+        ] {
+            if m & bit != 0 {
+                out.push(name);
+            }
+        }
+        // A bit outside the guest's own dispatch would sit in the pending word
+        // forever, so an unknown one is worth naming loudly rather than dropping.
+        if m & !DISPLAY_EVENT_MASK_ALL != 0 {
+            out.push("unknown");
+        }
+        if out.is_empty() {
+            "none".to_string()
+        } else {
+            out.join("+")
+        }
+    };
+    if prev == DISPLAY_ENABLE_UNREAD {
+        crate::observe::off(format!(
+            "display_enable_mask first mask=0x{mask:x} armed={}",
+            names(mask)
+        ));
+    } else {
+        crate::observe::off(format!(
+            "display_enable_mask 0x{prev:x} -> 0x{mask:x} armed={} was={}",
+            names(mask),
+            names(prev)
+        ));
+    }
+}
+
 /// Report at most this often. One line per second is bounded enough to leave on
 /// for the life of the device and dense enough to see a stall move.
 const DRAIN_DUTY_REPORT_MS: u64 = 1000;

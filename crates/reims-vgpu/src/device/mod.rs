@@ -713,9 +713,21 @@ fn vbl_contended_pulse(slot: &BoundDevice) {
         crate::runtime::drain::note_vbl(crate::runtime::drain::VBL_NOT_CLAIMED, now);
         return;
     }
-    crate::runtime::drain::note_vbl(crate::runtime::drain::VBL_DELIVERED, now);
     let mut scratch = VecDeque::new();
     let mut host = QemuHost::new(&ops, &mut scratch, &slot.prompt_actions);
+    // Same check, same census arm and the same position in the sequence as the
+    // locked path: online, limiter, enable, deliver. This arm used to skip the
+    // enable check entirely, which set a pending bit the guest's ISR would never
+    // clear (it clears `pending & enable`) and counted the write as `delivered`.
+    if !crate::runtime::drain::display_event_enabled(
+        &host,
+        gpa,
+        crate::model::DISPLAY_VBL_EVENT_MASK,
+    ) {
+        crate::runtime::drain::note_vbl(crate::runtime::drain::VBL_NOT_ENABLED, now);
+        return;
+    }
+    crate::runtime::drain::note_vbl(crate::runtime::drain::VBL_DELIVERED, now);
     let mut buf = [0u8; 4];
     if host
         .read_gpa(gpa + crate::model::DISPLAY_SHARED_PENDING, &mut buf)

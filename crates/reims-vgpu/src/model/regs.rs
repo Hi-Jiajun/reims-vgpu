@@ -709,17 +709,84 @@ pub const CHILD_SHARED_STATE_LEN: usize = 8;
 
 pub const DISPLAY_SHARED_PENDING: u64 = 0x100;
 pub const DISPLAY_SHARED_ENABLE_MASK: u64 = 0x104;
-/// VBL pending bit (`signalVBLInterrupt`).:
-/// ~60 Hz vblank = page+0x100 bit0 + 0x1014 + MSI so the compositor keeps
-/// presenting. Without this the guest can stick presenting clear-only flip
-/// buffers while content lands on intermediate mids.
+
+// The display shared page carries a two-word event mailbox: a *pending* word the
+// device ORs bits into, and an *enable* word the guest owns. The guest's display
+// ISR is one atomic read-and-clear followed by a fixed dispatch:
+//
+//     enable  = *(page + 0x104)
+//     old     = atomic { p = *(page + 0x100); *(page + 0x100) = p & ~enable; p }
+//     claimed = old & enable
+//     bit0 -> signalVBLInterrupt          bit2 -> the online  event source
+//     bit1 -> signalTransactionInterrupt  bit3 -> the offline event source
+//
+// Two consequences govern every writer in this crate, and both are load-bearing:
+//
+// 1. **The clear is `pending &= ~enable`, so a bit set for a class the guest has
+//    disabled is never cleared.** It is not inert: every later read-modify-write
+//    of the pending word carries it forward for the life of the boot. A writer
+//    must therefore consult the enable word before setting a bit, not merely
+//    before raising the interrupt — see [`super::super::runtime::drain`]'s
+//    `display_event_enabled`, which is the single reader both arms share.
+// 2. **The guest arms and disarms each class independently and at will.** A
+//    class being disabled at any given sample is normal, not a fault, and the
+//    enable word lives in guest RAM and is never trapped — only polled. Nothing
+//    reconciles the pending word when the guest changes the mask.
+//
+// The four bits below are the complete set: the guest's dispatch has no default
+// arm, so a bit outside 0..=3 is claimed by nobody and would sit in the pending
+// word forever. This device signals bits 0, 1 and 2 and must never signal bit 3.
+
+/// VBL pending bit — the guest's `signalVBLInterrupt`.
+///
+/// Armed by the guest's `enableVBLInterrupt` (`lock or $1` on the enable word)
+/// and disarmed by `disableVBLInterrupt` (`lock and $~1`). VBL is what paces the
+/// compositor: WindowServer produces a frame off its display-link callback, so
+/// the rate delivered here is a ceiling on guest frame rate. Without it the
+/// guest can stick presenting clear-only flip buffers while content lands on
+/// intermediate mids.
 pub const DISPLAY_VBL_EVENT_MASK: u32 = 1 << 0;
-/// Present-complete pending bit (PVG `_presentMappedSurface` completion block:
-/// set bit 1 at `sharedState+0x100`, read `+0x104`, `displayPokePort:` when
-/// the guest asked to be notified). Guest `handleHostInterrupt` read-clears
-/// the pending word; bit index convention matches ONLINE (bit 2).
+/// Display-transaction completion — the guest's `signalTransactionInterrupt`.
+///
+/// Armed by `enableTransactionInterrupt` (`lock or $2`) and disarmed by
+/// `disableTransactionInterrupt`. This is the edge that wakes a display-pipe
+/// transaction waiter so it re-tests its completion event; the wait re-checks on
+/// its own 1 s timeout regardless, so a missed edge costs latency rather than
+/// liveness, and a *wrongly withheld* one costs a second per frame.
+///
+/// The device sets it from the present-completion block — after the presented
+/// surface is retained, not after the host encode — which is the same edge under
+/// its host-side name. The two names describe one event from opposite ends, and
+/// the guest-side one is what a reader chasing a stalled compositor will find in
+/// the guest's own log, so both are recorded here.
+///
+/// Whether a guest arms this class is a per-generation decision, not a constant.
 pub const DISPLAY_PRESENT_EVENT_MASK: u32 = 1 << 1;
+/// Display became available — dispatched to the guest's online event source.
 pub const DISPLAY_ONLINE_EVENT_MASK: u32 = 1 << 2;
+/// Display went away — dispatched to the guest's *offline* event source.
+///
+/// **Nothing in this device may signal this bit, and nothing does.** It is named
+/// because the alternative was worse: an enable word of `0xe` reads as "the
+/// guest enabled a bit we have no name for", which is how bit 3 came to be
+/// suspected of being the thing a wedged display pipe was waiting on. It is the
+/// opposite — a guest that enables it is asking to be told when the display
+/// disappears, which is ordinary, and signalling it would tear down a live
+/// display pipe.
+///
+/// A real hot-unplug would set it. This device has no such event: the scanout is
+/// created once and lives for the VM, so the honest state of this bit is always
+/// clear.
+pub const DISPLAY_OFFLINE_EVENT_MASK: u32 = 1 << 3;
+
+/// The event classes the guest's display ISR dispatches, as one word.
+///
+/// Every bit the guest can claim, and therefore every bit it can *clear*. A bit
+/// outside this mask that reached the pending word would never be consumed.
+pub const DISPLAY_EVENT_MASK_ALL: u32 = DISPLAY_VBL_EVENT_MASK
+    | DISPLAY_PRESENT_EVENT_MASK
+    | DISPLAY_ONLINE_EVENT_MASK
+    | DISPLAY_OFFLINE_EVENT_MASK;
 /// Cursor position / show in the display shared-state page (GPA).
 pub const DISPLAY_SHARED_CURSOR_POS: u64 = 0xe00;
 pub const DISPLAY_SHARED_CURSOR_SHOW: u64 = 0xe04;
