@@ -341,8 +341,7 @@ impl GvaWriteReach {
             Self::Host(HostWriteVerdict::Quiet) => "gvaw_host_quiet",
             Self::Host(HostWriteVerdict::Overlap) => "gvaw_host_overlap",
             Self::Host(HostWriteVerdict::Unnamed) => "gvaw_host_unnamed",
-            Self::Host(HostWriteVerdict::Aged) => "gvaw_host_aged",
-            Self::Host(HostWriteVerdict::Unresolvable) => "gvaw_host_unresolvable",
+            Self::Host(HostWriteVerdict::Forgotten) => "gvaw_host_forgotten",
         }
     }
 
@@ -371,7 +370,7 @@ pub fn reach<H: HostOps>(state: &DeviceState, host: &H, key: GvaTargetKey) -> Gv
     }
     let host_verdict = state
         .host_writes
-        .wrote_any_since(state, e.host_epoch_at_store, &e.gpas);
+        .wrote_any_since(e.host_epoch_at_store, &e.gpas);
     match host_verdict {
         HostWriteVerdict::Quiet => GvaWriteReach::Quiet,
         other => GvaWriteReach::Host(other),

@@ -3032,21 +3032,17 @@ impl DeviceState {
         // it is recorded as an unnamed one rather than as an empty page set.
         match self.mappings.get(&mapping_id) {
             Some(m) if !m.page_entries.is_empty() => {
-                let generation = m.map_generation;
-                // Resolved here, at write time, for the page-keyed shadow only —
-                // the ring resolves the same mapping at read time and that
-                // difference is the thing being measured. `collect` into an
-                // `Option` so one unresolvable entry makes the whole write
-                // unnamed rather than partially named, which is the direction
-                // that cannot lose a frame.
+                // Resolved here, at write time. `collect` into an `Option` so
+                // one unresolvable entry makes the whole write unnamed rather
+                // than partially named, which is the direction that cannot lose
+                // a frame.
                 let shift = self.page_shift;
                 let pages: Option<Vec<u64>> = m
                     .page_entries
                     .iter()
                     .map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, shift))
                     .collect();
-                self.host_writes
-                    .note_mapping(mapping_id, generation, pages.as_deref());
+                self.host_writes.note_mapping(pages.as_deref());
             }
             _ => self.host_writes.note_unknown(),
         }

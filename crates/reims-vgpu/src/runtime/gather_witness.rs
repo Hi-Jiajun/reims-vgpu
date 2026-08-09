@@ -706,7 +706,7 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
         pages_wrote: state
             .gather_witness
             .previous_pages_epoch(&key)
-            .map(|since| state.host_writes.wrote_any_since(state, since, window.gpas)),
+            .map(|since| state.host_writes.wrote_any_since(since, window.gpas)),
     };
     // Report the host-write half's grounds, not just its answer. Three of its
     // four non-quiet values are this device declining to rule a write out rather
