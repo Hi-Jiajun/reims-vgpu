@@ -2016,6 +2016,7 @@ pub(crate) unsafe fn execute_draw_inner(
         vert_module,
         &req.vert_spirv,
         frag_module,
+        &req.frag_spirv,
         pipeline_layout,
         render_pass,
         counters,

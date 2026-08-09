@@ -616,6 +616,12 @@ pub fn device_drain(id: u64) -> bool {
 /// Enqueues HostActions (gfx IRQ / scanout); QEMU must deliver actions after
 /// this call.
 pub fn device_poll(id: u64) -> bool {
+    // Before the lock, and before the `device_slot` miss can return: this is the
+    // only periodic callback that runs on a thread other than the drain worker,
+    // so it is the only place that can report a driver call the drain worker is
+    // still inside. See `observe::driver_watch` for what that failure looks like
+    // from the log (it looks like nothing at all).
+    crate::observe::driver_watch::note_tick();
     let Some(slot) = device_slot(id) else {
         return false;
     };

@@ -588,8 +588,10 @@ impl ObjectCaches {
         // The driver parses SPIR-V here, so this is one of the two calls that
         // can end the process on a module this device assembled. See
         // `driver_breadcrumb` for why the words go to disk across it.
-        let breadcrumb =
-            super::driver_breadcrumb::DriverBreadcrumb::arm("create_shader_module", words);
+        let breadcrumb = super::driver_breadcrumb::DriverBreadcrumb::arm(
+            "create_shader_module",
+            &[("module", words)],
+        );
         let created = ctx
             .device
             .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None);
@@ -1005,6 +1007,10 @@ impl ObjectCaches {
         // that substitutes a vertex format; see the resolution loop below.
         vert_spirv: &[u32],
         frag_module: vk::ShaderModule,
+        // Read only by the driver breadcrumb: a graphics compile consumes both
+        // stages and nothing outside the driver can say which one it choked on,
+        // so both go to disk across the call.
+        frag_spirv: &[u32],
         pipeline_layout: vk::PipelineLayout,
         render_pass: vk::RenderPass,
         counters: &EngineCounters,
@@ -1360,9 +1366,23 @@ impl ObjectCaches {
         if key.pass.depth.is_some() {
             gpci = gpci.depth_stencil_state(&depth_stencil);
         }
+        // The third call that compiles a module this device assembled, and the
+        // only one that compiles two at once. A macOS 15 guest's CoreAnimation
+        // uber fragment shader has been observed keeping NVIDIA's compiler in
+        // here for over ten minutes with the device lock held; see
+        // `crate::observe::driver_watch`, which this arming also starts.
+        let breadcrumb = super::driver_breadcrumb::DriverBreadcrumb::arm(
+            &format!(
+                "create_graphics_pipelines vert_words={} frag_words={}",
+                vert_spirv.len(),
+                frag_spirv.len()
+            ),
+            &[("vert", vert_spirv), ("frag", frag_spirv)],
+        );
         let created = ctx
             .device
             .create_graphics_pipelines(ctx.pipeline_cache, &[gpci], None);
+        breadcrumb.disarm();
         let pipe = created.map_err(|(_, e)| {
             let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateGraphicsPipelines, e));
             self.pipelines.insert_negative(key.clone(), err.clone());
@@ -1418,7 +1438,7 @@ impl ObjectCaches {
         // has been observed dying inside on a macos-14 guest's first dispatch.
         let breadcrumb = super::driver_breadcrumb::DriverBreadcrumb::arm(
             &format!("create_compute_pipelines entry={}", key.entry),
-            shader.spirv,
+            &[("kernel", shader.spirv)],
         );
         let created = ctx
             .device

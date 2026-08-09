@@ -24,9 +24,23 @@
 //!
 //! # What it is not
 //!
-//! It is not a dump facility and it is not an operator switch. There is one
-//! path, it is overwritten by the next arming, and its whole contract is "if
-//! this file exists, the process died in a driver call with this input".
+//! It is not a dump facility and it is not an operator switch. There is one path
+//! per stage the call consumes, they are overwritten by the next arming, and
+//! their whole contract is "if these files exist, the process died in a driver
+//! call with these inputs". A graphics pipeline compiles two modules in one call
+//! and neither can be ruled out from the outside, so both are written and both
+//! are removed together — a single file would have to guess which stage killed
+//! the process, and a guess in an evidence file is worse than no file.
+//!
+//! # The other failure this arming carries: a call that does not return
+//!
+//! Arming also starts [`crate::observe::driver_watch`], because "the driver died
+//! in this call" and "the driver has not come back from this call" are the same
+//! bracket around the same call. A hang is the worse of the two — the process
+//! survives, so nothing is written, and the drain thread holds the device lock
+//! for the whole VM while every census in the crate stays silent because each
+//! one reports at the end of a tranche that will not end. The watch is what puts
+//! a line in the log while it is happening.
 //!
 //! # The other half: a module the validator refused
 //!
@@ -40,60 +54,86 @@
 
 use std::path::PathBuf;
 
-/// The one path. Fixed rather than per-pipeline so a crash leaves exactly one
-/// file to look at, and so a previous boot's leftovers cannot accumulate.
-fn path() -> PathBuf {
-    std::env::temp_dir().join("reims-vgpu-driver-breadcrumb.spv")
+/// One path per stage. Fixed rather than per-pipeline so a crash leaves exactly
+/// one set of files to look at, and so a previous boot's leftovers cannot
+/// accumulate.
+fn path(stage: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("reims-vgpu-driver-breadcrumb-{stage}.spv"))
 }
 
-/// The metadata file beside it, so a reader knows what the module was for
-/// without disassembling it.
+/// The metadata file beside them, so a reader knows what the modules were for
+/// without disassembling anything.
 fn meta_path() -> PathBuf {
     std::env::temp_dir().join("reims-vgpu-driver-breadcrumb.txt")
 }
 
-/// Live for the duration of a driver call that could take the process down.
+/// Live for the duration of a driver call that could take the process down or
+/// fail to return from.
 ///
-/// Dropping it removes the files, so a crash is the only way they survive.
+/// Dropping it removes the files and stops the watch, so a crash is the only way
+/// the files survive and a return is the only way the watch stops.
 pub(crate) struct DriverBreadcrumb {
-    armed: bool,
+    /// The stage tags whose files this guard owns, empty when nothing was
+    /// written.
+    stages: Vec<&'static str>,
+    /// Whether this guard owns [`crate::observe::driver_watch`]'s slot. False
+    /// when an outer call already held it — see that module's `enter`.
+    watching: bool,
 }
 
 impl DriverBreadcrumb {
-    /// Write `spirv` and a one-line description, and hold them until dropped.
+    /// Write every module the call consumes, plus a one-line description, and
+    /// hold them until dropped.
     ///
-    /// A write that fails is reported once and leaves the guard inert: losing
+    /// A write that fails is reported once and costs that stage its file: losing
     /// the breadcrumb is a lost diagnostic, never a reason to skip the work the
-    /// guest asked for.
-    pub(crate) fn arm(what: &str, spirv: &[u32]) -> Self {
-        let mut bytes = Vec::with_capacity(spirv.len() * 4);
-        for word in spirv {
-            bytes.extend_from_slice(&word.to_le_bytes());
-        }
-        if let Err(e) = std::fs::write(path(), &bytes) {
-            crate::observe::fail(format!(
-                "driver_breadcrumb reason=write_failed what={what} err={e}"
+    /// guest asked for. The clock watch is armed regardless, because it needs
+    /// nothing from the filesystem.
+    pub(crate) fn arm(what: &str, modules: &[(&'static str, &[u32])]) -> Self {
+        let watching = crate::observe::driver_watch::enter(what.to_string());
+        let mut stages = Vec::with_capacity(modules.len());
+        let mut meta = String::from(what);
+        meta.push('\n');
+        for (stage, spirv) in modules {
+            let mut bytes = Vec::with_capacity(spirv.len() * 4);
+            for word in *spirv {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+            match std::fs::write(path(stage), &bytes) {
+                Ok(()) => stages.push(*stage),
+                Err(e) => crate::observe::fail(format!(
+                    "driver_breadcrumb reason=write_failed what={what} stage={stage} err={e}"
+                )),
+            }
+            meta.push_str(&format!(
+                "{stage} words={} bytes={}\n",
+                spirv.len(),
+                spirv.len() * 4
             ));
-            return Self { armed: false };
         }
-        let _ = std::fs::write(
-            meta_path(),
-            format!("{what}\nwords={}\nbytes={}\n", spirv.len(), bytes.len()),
-        );
-        Self { armed: true }
+        if !stages.is_empty() {
+            let _ = std::fs::write(meta_path(), meta);
+        }
+        Self { stages, watching }
     }
 
-    /// The call returned, so the input is not the one that kills the process.
+    /// The call returned, so the input is not the one that kills the process and
+    /// the call is not the one holding the device.
     pub(crate) fn disarm(mut self) {
         self.clear();
     }
 
     fn clear(&mut self) {
-        if !self.armed {
+        if self.watching {
+            self.watching = false;
+            crate::observe::driver_watch::leave();
+        }
+        if self.stages.is_empty() {
             return;
         }
-        self.armed = false;
-        let _ = std::fs::remove_file(path());
+        for stage in std::mem::take(&mut self.stages) {
+            let _ = std::fs::remove_file(path(stage));
+        }
         let _ = std::fs::remove_file(meta_path());
     }
 }
@@ -145,6 +185,64 @@ pub(crate) fn keep_rejected_module(digest: &str, spirv: &[u32]) {
 
 #[cfg(test)]
 mod tests {
+    /// A graphics compile consumes two modules and both reach disk under their
+    /// own stage names, then both go away when the call returns.
+    ///
+    /// The `arm`/`disarm` pair is the whole contract — a file left behind after
+    /// a healthy call would accuse the next reader's boot of a crash it did not
+    /// have, and a stage that never reached disk would leave a real crash half
+    /// explained.
+    #[test]
+    fn both_stages_of_a_graphics_compile_reach_disk_and_are_taken_back() {
+        let vert = [0x0723_0203u32, 0x0001_0000, 1];
+        let frag = [0x0723_0203u32, 0x0001_0000, 2, 3];
+        let crumb =
+            super::DriverBreadcrumb::arm("test_graphics", &[("vert", &vert), ("frag", &frag)]);
+
+        let vert_path = super::path("vert");
+        let frag_path = super::path("frag");
+        assert_eq!(
+            std::fs::read(&vert_path).expect("the vertex module is on disk"),
+            vert.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            std::fs::read(&frag_path).expect("the fragment module is on disk"),
+            frag.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>()
+        );
+        let meta = std::fs::read_to_string(super::meta_path()).expect("the meta line is on disk");
+        assert!(meta.contains("vert words=3"), "{meta}");
+        assert!(meta.contains("frag words=4"), "{meta}");
+
+        crumb.disarm();
+        assert!(!vert_path.exists(), "a returned call leaves no vertex file");
+        assert!(!frag_path.exists(), "a returned call leaves no fragment file");
+    }
+
+    /// Arming a breadcrumb also puts the call under the clock watch, and
+    /// disarming takes it back out.
+    ///
+    /// These are two modules coupled by one line, and the coupling is the whole
+    /// reason a hang gets reported at all: the breadcrumb answers "the driver
+    /// died here" and the watch answers "the driver has not come back", and only
+    /// the arming site knows where the call is.
+    #[test]
+    fn an_armed_breadcrumb_puts_the_call_under_the_clock_watch() {
+        crate::observe::driver_watch::leave();
+        let words = [0x0723_0203u32, 0x0001_0000];
+        let crumb = super::DriverBreadcrumb::arm("test_watched", &[("module", &words)]);
+        assert_eq!(
+            crate::observe::driver_watch::watching().as_deref(),
+            Some("test_watched"),
+            "the watch names the call this breadcrumb is bracketing"
+        );
+        crumb.disarm();
+        assert_eq!(
+            crate::observe::driver_watch::watching(),
+            None,
+            "a returned call is no longer outstanding"
+        );
+    }
+
     /// The module reaches disk, little-endian and whole.
     ///
     /// Worth a test rather than trusting the write: the point of the file is to
