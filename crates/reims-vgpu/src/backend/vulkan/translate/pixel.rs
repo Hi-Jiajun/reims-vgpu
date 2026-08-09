@@ -145,6 +145,7 @@ pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {
             srgb(vk::Format::B8G8R8A8_SRGB, vk::Format::B8G8R8A8_UNORM, 4)
         }
         p::MTL_FORMAT_RGB9E5_FLOAT => linear(vk::Format::E5B9G9R9_UFLOAT_PACK32, 4),
+        p::MTL_FORMAT_RGBA16_UNORM => linear(vk::Format::R16G16B16A16_UNORM, 8),
         p::MTL_FORMAT_RGBA16_UINT => linear(vk::Format::R16G16B16A16_UINT, 8),
         p::MTL_FORMAT_RGBA16_FLOAT => linear(vk::Format::R16G16B16A16_SFLOAT, 8),
         p::MTL_FORMAT_RGBA32_UINT => linear(vk::Format::R32G32B32A32_UINT, 16),
@@ -225,6 +226,7 @@ pub fn sampled_pixels(
         // — 99 % of this rail's format declines on a driven macos-26 boot. Both
         // are exact as guest bytes: the Metal and Vulkan spellings are the same
         // little-endian binary16 channels in the same order.
+        vk::Format::R16G16B16A16_UNORM => TexelLayout::Rgba16Unorm,
         vk::Format::R16G16B16A16_SFLOAT => TexelLayout::Rgba16Float,
         vk::Format::R16G16_SFLOAT => TexelLayout::Rg16Float,
         _ => return Err(TranslateReason::NoSampledLayout(mtl)),
@@ -260,6 +262,7 @@ pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
         TexelLayout::R32Float => vk::Format::R32_SFLOAT,
         TexelLayout::R16Unorm => vk::Format::R16_UNORM,
         TexelLayout::Rg16Unorm => vk::Format::R16G16_UNORM,
+        TexelLayout::Rgba16Unorm => vk::Format::R16G16B16A16_UNORM,
         TexelLayout::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
         TexelLayout::Rg16Float => vk::Format::R16G16_SFLOAT,
     }
@@ -635,6 +638,24 @@ mod tests {
             p::MTL_FORMAT_RGB9E5_FLOAT,
             vk::Format::E5B9G9R9_UFLOAT_PACK32,
             4,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_R16_UNORM,
+            vk::Format::R16_UNORM,
+            2,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_RG16_UNORM,
+            vk::Format::R16G16_UNORM,
+            4,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_RGBA16_UNORM,
+            vk::Format::R16G16B16A16_UNORM,
+            8,
             TransferFunction::Linear,
         ),
         (
@@ -1020,6 +1041,32 @@ mod tests {
         }
     }
 
+    /// [`EXPECTED`] names every format [`translate`] accepts.
+    ///
+    /// Every other test here iterates `EXPECTED`, so a format added to
+    /// `translate` and not to `EXPECTED` is simply never swept — its texel
+    /// width, its transfer function, its channel plan and its membership of
+    /// each rail's accepted set all go unchecked, and every test still passes.
+    /// `MTLPixelFormatRGBA16Unorm` was added to `translate` in the same commit
+    /// as this test, and without it nothing would have noticed either way.
+    ///
+    /// Swept over the whole `u16` domain rather than over a list of constants,
+    /// because a list is the thing being checked. This is a derivation, not a
+    /// second spelling: `translate` is the authority on what it accepts and it
+    /// is asked about every value it could be given.
+    #[test]
+    fn expected_names_every_format_the_table_translates() {
+        let listed: std::collections::BTreeSet<u16> =
+            EXPECTED.iter().map(|(mtl, ..)| *mtl).collect();
+        let translated: std::collections::BTreeSet<u16> =
+            (0..=u16::MAX).filter(|mtl| translate(*mtl).is_ok()).collect();
+        assert_eq!(
+            translated, listed,
+            "translate accepts formats EXPECTED does not name (or the reverse), so they are \
+             swept by no test in this module"
+        );
+    }
+
     /// Every rail's accepted set, spelled out. A format silently joining or
     /// leaving one of these changes which draws take the zero-copy path.
     #[test]
@@ -1054,6 +1101,14 @@ mod tests {
                 p::MTL_FORMAT_RGBA8_UNORM_SRGB,
                 p::MTL_FORMAT_BGRA8_UNORM,
                 p::MTL_FORMAT_BGRA8_UNORM_SRGB,
+                // The ten-bit biplanar video planes and the four-channel
+                // sixteen-bit unorm. These three were carried by `translate`
+                // and by the layout table but were absent from `EXPECTED`, so
+                // this list never named them; `expected_names_every_format_
+                // the_table_translates` is what surfaced that.
+                p::MTL_FORMAT_R16_UNORM,
+                p::MTL_FORMAT_RG16_UNORM,
+                p::MTL_FORMAT_RGBA16_UNORM,
                 p::MTL_FORMAT_RGBA16_FLOAT,
             ]
         );

@@ -49,6 +49,12 @@ pub const MTL_FORMAT_BGRA8_UNORM: u16 = 0x50;
 pub const MTL_FORMAT_BGRA8_UNORM_SRGB: u16 = 0x51;
 /// Packed RGB9E5 shared-exponent float. 32-bit texels.
 pub const MTL_FORMAT_RGB9E5_FLOAT: u16 = 0x5d;
+/// `MTLPixelFormatRGBA16Unorm`. Its ordinal sits between two this table
+/// already carries — `RGBA16Uint` at `0x71` and `RGBA16Float` at `0x73` — and
+/// its absence was a decode gap rather than a rail gap: `bytes_per_pixel`
+/// answered `None`, so every path that asks about a texel width refused it, not
+/// just the sampled one.
+pub const MTL_FORMAT_RGBA16_UNORM: u16 = 0x6e;
 pub const MTL_FORMAT_RGBA16_UINT: u16 = 0x71;
 pub const MTL_FORMAT_RGBA16_FLOAT: u16 = 0x73;
 pub const MTL_FORMAT_RGBA32_UINT: u16 = 0x7b;
@@ -171,6 +177,15 @@ pub enum TexelLayout {
     /// with the same exactness argument and the same lossy CPU arm. Four bytes
     /// wide and **not** a colour order.
     Rg16Float,
+    /// 8 bytes/texel, four sixteen-bit normalized channels in R,G,B,A order,
+    /// sampled natively as `R16G16B16A16_UNORM`.
+    ///
+    /// Native for [`Self::R16Unorm`]'s reason one channel count up: narrowing
+    /// sixteen bits of colour to eight would band content graded for them, and
+    /// [`texel_to_rgba8`] carries no arm that could do it anyway. Eight bytes
+    /// wide, so like [`Self::Rgba16Float`] it stays out of the four-byte colour
+    /// rails despite being a colour order.
+    Rgba16Unorm,
 }
 
 impl TexelLayout {
@@ -193,6 +208,7 @@ impl TexelLayout {
         Self::Rg16Unorm,
         Self::Rgba16Float,
         Self::Rg16Float,
+        Self::Rgba16Unorm,
     ];
 
     /// This layout's position in [`Self::ALL`], so a host-side table can be an
@@ -215,6 +231,7 @@ impl TexelLayout {
             Self::Rg16Unorm => 7,
             Self::Rgba16Float => 8,
             Self::Rg16Float => 9,
+            Self::Rgba16Unorm => 10,
         }
     }
 
@@ -230,6 +247,7 @@ impl TexelLayout {
             Self::Rg16Unorm => RG16_BPP,
             Self::Rgba16Float => RGBA16F_BPP,
             Self::Rg16Float => RG16F_BPP,
+            Self::Rgba16Unorm => RGBA16_BPP,
         }
     }
 
@@ -278,7 +296,11 @@ impl TexelLayout {
             // the same reason and a different quantity: `texel_to_rgba8` has no
             // arm for them because an arm would have to narrow ten bits of video
             // luma to eight.
-            Self::R16Float | Self::R32Float | Self::R16Unorm | Self::Rg16Unorm => false,
+            Self::R16Float
+            | Self::R32Float
+            | Self::R16Unorm
+            | Self::Rg16Unorm
+            | Self::Rgba16Unorm => false,
         }
     }
 }
@@ -385,7 +407,7 @@ pub fn bytes_per_pixel(format: u16) -> Option<u32> {
         // Depth32Float_Stencil8 / X32_Stencil8: 64-bit cells on Apple Silicon
         // (40-bit logical DS + pad; Metal allocates 8 B/texel for this family).
         MTL_FORMAT_DEPTH32_FLOAT_STENCIL8 | MTL_FORMAT_X32_STENCIL8 => 8,
-        MTL_FORMAT_RGBA16_UINT | MTL_FORMAT_RGBA16_FLOAT => RGBA16_BPP,
+        MTL_FORMAT_RGBA16_UNORM | MTL_FORMAT_RGBA16_UINT | MTL_FORMAT_RGBA16_FLOAT => RGBA16_BPP,
         MTL_FORMAT_RGBA32_UINT | MTL_FORMAT_RGBA32_FLOAT => RGBA32_BPP,
         _ => return None,
     })
@@ -1764,6 +1786,7 @@ mod tests {
                 TexelLayout::Rg16Unorm => MTL_FORMAT_RG16_UNORM,
                 TexelLayout::Rgba16Float => MTL_FORMAT_RGBA16_FLOAT,
                 TexelLayout::Rg16Float => MTL_FORMAT_RG16_FLOAT,
+                TexelLayout::Rgba16Unorm => MTL_FORMAT_RGBA16_UNORM,
             };
             assert_eq!(
                 Some(layout.bytes_per_texel()),
@@ -1955,8 +1978,10 @@ mod tests {
         // `is_four_byte_color`. The rails that ask reinterpret four bytes as
         // R,G,B,A; handing them an eight-byte texel would read every second
         // pixel and shear the image.
-        assert_eq!(TexelLayout::Rgba16Float.bytes_per_texel(), RGBA16F_BPP);
-        assert!(!TexelLayout::Rgba16Float.is_four_byte_color());
+        for layout in [TexelLayout::Rgba16Float, TexelLayout::Rgba16Unorm] {
+            assert_eq!(layout.bytes_per_texel(), RGBA16_BPP);
+            assert!(!layout.is_four_byte_color(), "{layout:?}");
+        }
         for layout in [
             TexelLayout::R8,
             TexelLayout::Rg8,
