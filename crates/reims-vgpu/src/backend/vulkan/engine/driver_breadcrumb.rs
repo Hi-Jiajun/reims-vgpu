@@ -27,6 +27,16 @@
 //! It is not a dump facility and it is not an operator switch. There is one
 //! path, it is overwritten by the next arming, and its whole contract is "if
 //! this file exists, the process died in a driver call with this input".
+//!
+//! # The other half: a module the validator refused
+//!
+//! [`keep_rejected_module`] lives here because it answers the same question with
+//! the same mechanism, for the failure one step earlier. The breadcrumb catches
+//! a module the *driver* could not survive; that one catches a module this
+//! device assembled and `spirv-val` would not accept — which is a defect in the
+//! translation rather than in the driver, and is equally unreadable from a log
+//! line alone. The difference is that its file is **kept**: the event has
+//! already happened when it is written, so there is nothing to disarm.
 
 use std::path::PathBuf;
 
@@ -91,5 +101,70 @@ impl DriverBreadcrumb {
 impl Drop for DriverBreadcrumb {
     fn drop(&mut self) {
         self.clear();
+    }
+}
+
+/// Keep a module the validator refused, beside the line that refused it.
+///
+/// The same argument as the breadcrumb above and a different failure. A module
+/// this device assembled and `spirv-val` rejected is a **device defect**: the
+/// guest asked for something translatable and the translation came out invalid.
+/// The refusal line carries the validator's one-sentence complaint, and that
+/// sentence names an instruction by result id — `%214 = OpCompositeInsert
+/// %_struct_52 %101 %56 0 0` — which is unreadable without the module those ids
+/// belong to. Reconstructing it means re-running the boot with a probe, which is
+/// two rebuilds and a guest login to recover evidence the device was holding.
+///
+/// Unlike the breadcrumb this file is **kept**, because the event it records has
+/// already happened by the time it is written. Named by content digest so
+/// several distinct bad modules in one boot do not overwrite each other, and so
+/// the name matches nothing else if the same module is refused again — the
+/// validator's verdict is cached per digest, so it is written once per distinct
+/// module per boot regardless of how many pipelines want it.
+///
+/// Disassemble with `spirv-dis`. A failed write costs a diagnostic and nothing
+/// else; the refusal has already been emitted by the caller.
+pub(crate) fn keep_rejected_module(digest: &str, spirv: &[u32]) {
+    let mut bytes = Vec::with_capacity(spirv.len() * 4);
+    for word in spirv {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    let path = std::env::temp_dir().join(format!("reims-vgpu-rejected-{digest}.spv"));
+    match std::fs::write(&path, &bytes) {
+        Ok(()) => crate::observe::off(format!(
+            "spirv_rejected_module_kept path={} words={}",
+            path.display(),
+            spirv.len()
+        )),
+        Err(e) => crate::observe::fail(format!(
+            "spirv_rejected_module reason=write_failed path={} err={e}",
+            path.display()
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The module reaches disk, little-endian and whole.
+    ///
+    /// Worth a test rather than trusting the write: the point of the file is to
+    /// be handed to `spirv-dis`, and a word order or a truncation that made it
+    /// undisassemblable would show up only on the boot where somebody needed it.
+    #[test]
+    fn a_rejected_module_reaches_disk_word_for_word() {
+        // SPIR-V magic first, so the bytes on disk are a plausible module and a
+        // reversed word order is visible rather than merely different.
+        let words = [0x0723_0203u32, 0x0001_0000, 42, 0xdead_beef];
+        let digest = "test0123456789ab";
+        let path = std::env::temp_dir().join(format!("reims-vgpu-rejected-{digest}.spv"));
+        let _ = std::fs::remove_file(&path);
+
+        super::keep_rejected_module(digest, &words);
+
+        let got = std::fs::read(&path).expect("the rejected module is kept");
+        let _ = std::fs::remove_file(&path);
+        let want: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(got, want, "little-endian words, in order, nothing added");
+        assert_eq!(&got[..4], &[0x03, 0x02, 0x23, 0x07], "reads as SPIR-V magic");
     }
 }

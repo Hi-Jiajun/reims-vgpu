@@ -576,6 +576,12 @@ impl ObjectCaches {
                 crate::runtime::spirv_bind::required_image_capabilities(words),
                 crate::runtime::spirv_bind::image_type_census(words),
             ));
+            // The complaint above names instructions by result id, which cannot
+            // be read without the module they belong to. Keep it.
+            super::driver_breadcrumb::keep_rejected_module(
+                &format!("{:016x}{:016x}", key.a, key.b),
+                words,
+            );
             self.shaders.insert_negative(key, err.clone());
             return Err(err);
         }
