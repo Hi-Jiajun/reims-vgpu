@@ -571,6 +571,11 @@ pub fn device_drain(id: u64) -> bool {
     // Same one-second cadence, so the cache trend lines up row-for-row with
     // `store_routes` and `drain_duty`. Measure-only; see `note_cache_levels`.
     crate::runtime::surface_cache::note_cache_levels(&device.state, &host);
+    // Per tranche rather than per census window, unlike the levels above: this
+    // measures how long a slot the guest named takes to appear, so the sampling
+    // interval is the resolution of the answer. Returns immediately when nothing
+    // is watched, which is every tranche on every rail but macos-26.
+    crate::runtime::objects::slot_recheck::sweep(&device.state, &host);
     // The bind registry's own levels, on that same cadence and read against the
     // `bb_retire_*` routes: what the retirements dropped, and what the survivors
     // look like.

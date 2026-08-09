@@ -29,6 +29,8 @@ use crate::runtime::gva_mem;
 use crate::runtime::host::HostMemory;
 use crate::runtime::texture;
 
+pub mod slot_recheck;
+
 /// Fail-visible, de-duplicated per `(task_id, ref)`, for the type-11 resolve
 /// blind spot: an object ref that IS a type-11 IOSurface texture but whose
 /// descriptor cannot be read, cannot register a Metal/Vulkan texture, or carries
@@ -1267,6 +1269,10 @@ fn list_entry<M: HostMemory>(
                 crate::runtime::drain::note_store_route(miss.route());
                 if miss == ListMiss::SlotEmpty {
                     note_slot_empty_claimants(state, host, task_id, ref_);
+                    // The unconfounded half of the same question — see
+                    // `slot_recheck` for why the claimant search above cannot
+                    // settle it and this can.
+                    slot_recheck::note_slot_empty(task_id, ref_);
                 }
             }
             None
