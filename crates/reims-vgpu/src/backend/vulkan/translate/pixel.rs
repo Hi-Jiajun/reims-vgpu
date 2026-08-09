@@ -433,30 +433,35 @@ pub fn resident_color(bgra: bool) -> vk::Format {
 /// An sRGB format has the footprint of its linear sibling, which is what makes
 /// flipping a rail to sRGB a pure colour-space change with no allocation
 /// consequences.
+/// Every [`TexelLayout`] answers from the contract's own width, so a layout
+/// added to [`TexelLayout::ALL`] is covered here the moment it exists. This was
+/// a hand-kept second copy of those widths, and it was missing
+/// `R16G16B16A16_UNORM` for as long as that layout had existed — which cost
+/// macOS 26 a hundred and eight draws a boot, because a width this table did not
+/// know is indistinguishable from a block-compressed one and declines by the
+/// same name. Same argument as [`texel_layout_of`] being a search rather than a
+/// second `match`.
 pub fn bytes_per_texel(format: vk::Format) -> Option<u32> {
+    if let Some(layout) = texel_layout_of(format) {
+        return Some(layout.bytes_per_texel());
+    }
+    // What remains is the formats that are deliberately not `TexelLayout`s:
+    // depth/stencil, the packed shared-exponent float, and the integer and sRGB
+    // spellings of the colour orders. None is a guest linear texel layout, so
+    // none has a contract width to derive from.
     Some(match format {
-        vk::Format::R8_UNORM | vk::Format::S8_UINT => 1,
-        vk::Format::R8G8_UNORM
-        | vk::Format::R16_SFLOAT
-        | vk::Format::R16_UNORM
-        | vk::Format::D16_UNORM => 2,
+        vk::Format::S8_UINT => 1,
+        vk::Format::D16_UNORM => 2,
         vk::Format::R32_UINT
         | vk::Format::R32_SINT
-        | vk::Format::R32_SFLOAT
-        | vk::Format::R16G16_SFLOAT
-        | vk::Format::R16G16_UNORM
-        | vk::Format::R8G8B8A8_UNORM
         | vk::Format::R8G8B8A8_SRGB
         | vk::Format::R8G8B8A8_UINT
         | vk::Format::R8G8B8A8_SINT
-        | vk::Format::B8G8R8A8_UNORM
         | vk::Format::B8G8R8A8_SRGB
         | vk::Format::E5B9G9R9_UFLOAT_PACK32
         | vk::Format::D32_SFLOAT
         | vk::Format::D24_UNORM_S8_UINT => 4,
-        vk::Format::R16G16B16A16_UINT
-        | vk::Format::R16G16B16A16_SFLOAT
-        | vk::Format::D32_SFLOAT_S8_UINT => 8,
+        vk::Format::R16G16B16A16_UINT | vk::Format::D32_SFLOAT_S8_UINT => 8,
         vk::Format::R32G32B32A32_UINT | vk::Format::R32G32B32A32_SFLOAT => 16,
         _ => return None,
     })
@@ -1166,6 +1171,38 @@ mod tests {
                 p::MTL_FORMAT_BGRA8_UNORM_SRGB,
             ]
         );
+    }
+
+    /// Every guest texel layout has a Vulkan-side width, and it is the contract's.
+    ///
+    /// This is the check that was missing. `bytes_per_texel` used to be a second,
+    /// hand-kept copy of `TexelLayout::bytes_per_texel`, and when `Rgba16Unorm`
+    /// was added to the contract nothing made this side learn it. A `None` here
+    /// is not a quiet wrong answer — it is the same verdict a block-compressed
+    /// format gets, so the draw is refused by name
+    /// (`vk_draw_validate_sampled_no_linear_texel_footprint`) and the guest
+    /// silently loses it. macOS 26 lost 108 draws a boot to exactly that.
+    ///
+    /// Asserting equality with the contract rather than a literal is the point:
+    /// a literal table here is what created the drift in the first place.
+    #[test]
+    fn every_texel_layout_has_the_contract_width_on_the_vulkan_side() {
+        for &layout in TexelLayout::ALL {
+            let vk = vk_texel_layout(layout);
+            assert_eq!(
+                bytes_per_texel(vk),
+                Some(layout.bytes_per_texel()),
+                "{layout:?} ({vk:?}) disagrees with the contract width"
+            );
+        }
+    }
+
+    /// A format that is genuinely not one texel-width answers `None`, so the
+    /// derivation above did not turn the decline into a wrong number.
+    #[test]
+    fn a_block_compressed_format_still_has_no_texel_footprint() {
+        assert_eq!(bytes_per_texel(vk::Format::BC1_RGB_UNORM_BLOCK), None);
+        assert_eq!(bytes_per_texel(vk::Format::G8_B8R8_2PLANE_420_UNORM), None);
     }
 
     /// The engine-internal format constants are not a second opinion: each is
