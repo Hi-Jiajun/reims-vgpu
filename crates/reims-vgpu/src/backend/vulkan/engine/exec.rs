@@ -2152,7 +2152,61 @@ pub(crate) unsafe fn execute_draw_inner(
     }
 
     // Target seed staging (CPU import only — not LoadFromTarget).
-    let seed_slot = if let Some(rgba8) = seed_bytes {
+    //
+    // A seed is always eight bits per channel; the attachment need not be. A
+    // buffer→image copy converts nothing and reads the *image's* texel width
+    // per pixel, so staging an RGBA8 seed under a wider attachment would read
+    // past the slot and seed the frame with whatever followed it. The wide arm
+    // below restates the seed as the attachment's texels first; the four-byte
+    // arm is unchanged, which is every attachment this device had until render
+    // targets began following the guest's declared format.
+    let seed_wide = seed_bytes.and_then(|rgba8| {
+        let layout = crate::backend::vulkan::translate::pixel::texel_layout_of(color0_format)?;
+        if layout.bytes_per_texel() == crate::contract::pixel_format::RGBA8_BPP {
+            return None;
+        }
+        Some((rgba8, layout))
+    });
+    let seed_slot = if let Some((rgba8, layout)) = seed_wide {
+        // The seed's own order first, because `expand_rgba8_to_texel` reads
+        // semantic RGBA8 — the same normalization the four-byte arm folds into
+        // its copy, done here as a step because a widening pass cannot also
+        // exchange in place.
+        let mut semantic;
+        let src = if matches!(req.target_seed_order, SeedOrder::Bgra8) {
+            semantic = rgba8.to_vec();
+            for px in semantic.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+            &semantic[..]
+        } else {
+            rgba8
+        };
+        let pixels = req.width.saturating_mul(req.height);
+        let mut wide = vec![0u8; (pixels as usize) * (layout.bytes_per_texel() as usize)];
+        if !crate::contract::pixel_format::expand_rgba8_to_texel(layout, src, pixels, &mut wide) {
+            return Err(DrawError::DrawExecution(
+                DrawExecutionDecline::SeedFormatUnwritable {
+                    format: color0_format,
+                },
+            ));
+        }
+        let slot = {
+            let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
+            pools.acquire_staging(
+                ctx,
+                wide.len() as u64,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                counters,
+            )?
+        };
+        {
+            let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, wide.len() as u64);
+            pools.write_staging(ctx, &slot, &wide)?;
+        }
+        counters.note_seed_upload(wide.len() as u64);
+        Some(slot)
+    } else if let Some(rgba8) = seed_bytes {
         let slot = {
             let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
             pools.acquire_staging(

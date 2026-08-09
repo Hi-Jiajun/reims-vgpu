@@ -50,6 +50,20 @@ pub enum DrawExecutionDecline {
         resident_bgra: bool,
         draw_bgra: bool,
     },
+    /// A CPU `MTLLoadActionLoad` seed was offered for a colour attachment whose
+    /// texel this device cannot write a seed as.
+    ///
+    /// The seed is eight bits per channel and a buffer→image copy converts
+    /// nothing, so it has to be restated as the attachment's own texels before
+    /// it is staged. `pixel_format::expand_rgba8_to_texel` names the layouts
+    /// that can be, and this is the refusal for one that cannot — a wiring
+    /// error rather than a guest condition, since a render target is only ever
+    /// created at a layout that rail covers.
+    ///
+    /// Refused rather than staged short: staging an RGBA8 seed under a wider
+    /// attachment reads past the slot and seeds the frame with whatever the
+    /// pool put after it.
+    SeedFormatUnwritable { format: ash::vk::Format },
     SampledResidentMissing {
         binding: u32,
         identity: TargetIdentity,
@@ -135,6 +149,7 @@ impl Decline for DrawExecutionDecline {
             Self::SeedResidentNotReady { .. } => "vk_draw_exec_seed_resident_not_ready",
             Self::SeedGeometryMismatch { .. } => "vk_draw_exec_seed_geometry_mismatch",
             Self::SeedFormatMismatch { .. } => "vk_draw_exec_seed_format_mismatch",
+            Self::SeedFormatUnwritable { .. } => "vk_draw_exec_seed_format_unwritable",
             Self::SampledResidentMissing { .. } => "vk_draw_exec_sampled_resident_missing",
             Self::SampledResidentNotReady { .. } => "vk_draw_exec_sampled_resident_not_ready",
             Self::SampledResidentGeometryMismatch { .. } => {
@@ -192,6 +207,9 @@ impl Decline for DrawExecutionDecline {
                     ("draw_bgra", draw_bgra.to_string()),
                 ]);
                 fields
+            }
+            Self::SeedFormatUnwritable { format } => {
+                vec![("format", format!("{format:?}"))]
             }
             Self::SampledResidentMissing {
                 binding,

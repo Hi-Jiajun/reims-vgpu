@@ -1078,6 +1078,144 @@ fn unorm8_to_f16_lut() -> &'static [u16; 256] {
     })
 }
 
+/// Restate a semantic-RGBA8 frame as `layout`'s own texels.
+///
+/// The render-target seed's counterpart to [`convert_rgba8_to_row`], keyed on a
+/// [`TexelLayout`] rather than on a guest format because the caller is the
+/// engine and what it holds is the *attachment's* layout.
+///
+/// # Why a colour attachment needs this at all
+///
+/// A CPU `MTLLoadActionLoad` seed is staged into a buffer and copied into the
+/// attachment, and a Vulkan buffer→image copy converts nothing: it reads the
+/// image format's texel width per pixel, straight out of the buffer. While
+/// every render target was eight bits per channel the seed was already those
+/// bytes and the only question was the channel order. A wider attachment reads
+/// twice as many bytes per texel as an RGBA8 seed provides, walks off the end
+/// of the staging slot, and seeds the frame with whatever followed it.
+///
+/// `false` for a layout no colour attachment can be created at, so the caller
+/// declines by name rather than staging a frame of the wrong size. Exhaustive
+/// over [`TexelLayout`] on purpose — a new layout that becomes renderable has
+/// to say here how its seed is written.
+///
+/// The expansion is lossy in the direction that was already lost: the seed
+/// arrives with eight bits per channel whatever this writes it as. What it buys
+/// is that the seed lands as the attachment's texels instead of as a quarter of
+/// them, and the *rendering* on top of it keeps the full range.
+pub fn expand_rgba8_to_texel(
+    layout: TexelLayout,
+    src_rgba: &[u8],
+    pixels: u32,
+    dst: &mut [u8],
+) -> bool {
+    let px = pixels as usize;
+    let Some(dst_len) = px.checked_mul(layout.bytes_per_texel() as usize) else {
+        return false;
+    };
+    let Some(src_len) = px.checked_mul(RGBA8_BPP as usize) else {
+        return false;
+    };
+    if src_rgba.len() < src_len || dst.len() < dst_len {
+        return false;
+    }
+    match layout {
+        TexelLayout::Rgba8 => dst[..src_len].copy_from_slice(&src_rgba[..src_len]),
+        TexelLayout::Bgra8 => {
+            for i in 0..px {
+                let (s, d) = (i * 4, i * 4);
+                dst[d] = src_rgba[s + COMPONENT_B];
+                dst[d + 1] = src_rgba[s + COMPONENT_G];
+                dst[d + 2] = src_rgba[s + COMPONENT_R];
+                dst[d + 3] = src_rgba[s + COMPONENT_A];
+            }
+        }
+        TexelLayout::Rgba16Float => {
+            let lut = unorm8_to_f16_lut();
+            for i in 0..px {
+                let (s, d) = (i * RGBA8_BPP as usize, i * RGBA16F_BPP as usize);
+                for c in 0..4 {
+                    st16(&mut dst[d + c * 2..d + c * 2 + 2], lut[src_rgba[s + c] as usize]);
+                }
+            }
+        }
+        // Not colour-attachment layouts this device creates a render target at,
+        // so a seed for one is a wiring error rather than a conversion.
+        TexelLayout::R8
+        | TexelLayout::Rg8
+        | TexelLayout::R16Float
+        | TexelLayout::R32Float
+        | TexelLayout::R16Unorm
+        | TexelLayout::Rg16Unorm
+        | TexelLayout::Rg16Float
+        | TexelLayout::Rgba16Unorm => return false,
+    }
+    true
+}
+
+/// Read `layout`'s texels back as a semantic-RGBA8 frame — the inverse of
+/// [`expand_rgba8_to_texel`], for the host readback rails.
+///
+/// Those rails hand their bytes to consumers that only speak RGBA8, so a
+/// resident wider than four bytes a texel has to be narrowed on the way out or
+/// refused. Narrowing is the right answer and refusing is not: this is the
+/// *fallback* a Store takes when the GPU could not write the frame into guest
+/// pages directly, and a refusal there loses the frame outright, where before
+/// render targets could be wide the same frame was merely quantized. Quantized
+/// is what this returns, and it is strictly what the eight-bit resident used to
+/// produce.
+///
+/// `false` for a layout with no defined reading, so the caller declines by name.
+/// Exhaustive over [`TexelLayout`] for the same reason as its inverse.
+pub fn narrow_texel_to_rgba8(
+    layout: TexelLayout,
+    src: &[u8],
+    pixels: u32,
+    dst_rgba: &mut [u8],
+) -> bool {
+    let px = pixels as usize;
+    let Some(src_len) = px.checked_mul(layout.bytes_per_texel() as usize) else {
+        return false;
+    };
+    let Some(dst_len) = px.checked_mul(RGBA8_BPP as usize) else {
+        return false;
+    };
+    if src.len() < src_len || dst_rgba.len() < dst_len {
+        return false;
+    }
+    match layout {
+        TexelLayout::Rgba8 => dst_rgba[..dst_len].copy_from_slice(&src[..dst_len]),
+        TexelLayout::Bgra8 => {
+            for i in 0..px {
+                let (s, d) = (i * 4, i * 4);
+                dst_rgba[d] = src[s + COMPONENT_B];
+                dst_rgba[d + 1] = src[s + COMPONENT_G];
+                dst_rgba[d + 2] = src[s + COMPONENT_R];
+                dst_rgba[d + 3] = src[s + COMPONENT_A];
+            }
+        }
+        TexelLayout::Rgba16Float => {
+            let lut = f16_to_unorm8_lut();
+            for i in 0..px {
+                let (s, d) = (i * RGBA16F_BPP as usize, i * RGBA8_BPP as usize);
+                for c in 0..4 {
+                    let h = u16::from_le_bytes([src[s + c * 2], src[s + c * 2 + 1]]);
+                    dst_rgba[d + c] = lut[h as usize];
+                }
+            }
+        }
+        TexelLayout::R8
+        | TexelLayout::Rg8
+        | TexelLayout::R16Float
+        | TexelLayout::R32Float
+        | TexelLayout::R16Unorm
+        | TexelLayout::Rg16Unorm
+        | TexelLayout::Rg16Float
+        | TexelLayout::Rgba16Unorm => return false,
+    }
+    true
+}
+
 pub fn texel_to_rgba8(format: u16, src: &[u8]) -> Option<[u8; 4]> {
     let bpp = bytes_per_pixel(format)? as usize;
     if src.len() < bpp {
@@ -2009,6 +2147,128 @@ mod tests {
             assert!(!layout.is_four_byte_color());
             assert_ne!(layout.bytes_per_texel(), RGBA8_BPP);
         }
+    }
+
+    /// A colour attachment's seed is written as that attachment's texel, and
+    /// the wide arm agrees with the row converter that already knew how.
+    ///
+    /// Derived rather than restated: [`convert_rgba8_to_row`] has expanded
+    /// RGBA8 into `RGBA16_FLOAT` since the sampled half-float work, so this
+    /// asserts the two produce the same bytes instead of hand-writing an f16
+    /// encoding a second time. A divergence between them is the bug — they are
+    /// the same conversion reached from the guest's format and from the
+    /// attachment's layout.
+    #[test]
+    fn a_wide_seed_expands_to_the_same_bytes_the_row_converter_writes() {
+        const PIXELS: u32 = 4;
+        let src: Vec<u8> = (0..PIXELS * RGBA8_BPP).map(|i| (i * 7 % 256) as u8).collect();
+
+        let mut viaraw = vec![0u8; (PIXELS * RGBA16F_BPP) as usize];
+        assert!(convert_rgba8_to_row(
+            MTL_FORMAT_RGBA16_FLOAT,
+            &src,
+            PIXELS,
+            &mut viaraw
+        ));
+        let mut via_layout = vec![0u8; (PIXELS * RGBA16F_BPP) as usize];
+        assert!(expand_rgba8_to_texel(
+            TexelLayout::Rgba16Float,
+            &src,
+            PIXELS,
+            &mut via_layout
+        ));
+        assert_eq!(via_layout, viaraw);
+
+        // The whole point of the arm: eight bytes a texel, not four. A seed
+        // staged at the RGBA8 length under this attachment reads off the end of
+        // its slot.
+        assert_eq!(via_layout.len(), (PIXELS * RGBA8_BPP * 2) as usize);
+    }
+
+    /// Widening a seed and narrowing a readback are inverses, for every layout
+    /// a colour attachment is created at.
+    ///
+    /// The two run on opposite ends of one target's life — the seed goes in as
+    /// the attachment's texel, the fallback readback comes back out as RGBA8 —
+    /// so a disagreement between them shows up as a frame that drifts every
+    /// time it round-trips, which is far harder to read than a wrong colour
+    /// once. Exact and not approximate: `unorm8 -> f16` lands on values the
+    /// reverse LUT maps back to the same byte, so a Store that falls to the CPU
+    /// rail loses the *range* the guest asked for and nothing else.
+    #[test]
+    fn a_seed_widened_and_read_back_is_the_seed_it_started_as() {
+        const PIXELS: u32 = 256;
+        let src: Vec<u8> = (0..PIXELS * RGBA8_BPP).map(|i| (i % 256) as u8).collect();
+        for layout in [
+            TexelLayout::Rgba8,
+            TexelLayout::Bgra8,
+            TexelLayout::Rgba16Float,
+        ] {
+            let mut wide = vec![0u8; (PIXELS * layout.bytes_per_texel()) as usize];
+            assert!(
+                expand_rgba8_to_texel(layout, &src, PIXELS, &mut wide),
+                "{layout:?} must be writable as a seed"
+            );
+            let mut back = vec![0u8; (PIXELS * RGBA8_BPP) as usize];
+            assert!(
+                narrow_texel_to_rgba8(layout, &wide, PIXELS, &mut back),
+                "{layout:?} must be readable back"
+            );
+            assert_eq!(back, src, "{layout:?} did not round-trip");
+        }
+    }
+
+    /// The eight-bit arms stay a copy and an exchange, and a layout no colour
+    /// attachment is created at is refused rather than written short.
+    #[test]
+    fn a_seed_is_refused_for_a_layout_no_colour_attachment_takes() {
+        const PIXELS: u32 = 2;
+        let src = [1u8, 2, 3, 4, 5, 6, 7, 8];
+
+        let mut rgba = [0u8; 8];
+        assert!(expand_rgba8_to_texel(
+            TexelLayout::Rgba8,
+            &src,
+            PIXELS,
+            &mut rgba
+        ));
+        assert_eq!(rgba, src);
+
+        let mut bgra = [0u8; 8];
+        assert!(expand_rgba8_to_texel(
+            TexelLayout::Bgra8,
+            &src,
+            PIXELS,
+            &mut bgra
+        ));
+        assert_eq!(bgra, [3, 2, 1, 4, 7, 6, 5, 8]);
+
+        for layout in [
+            TexelLayout::R8,
+            TexelLayout::Rg8,
+            TexelLayout::R16Float,
+            TexelLayout::R32Float,
+            TexelLayout::R16Unorm,
+            TexelLayout::Rg16Unorm,
+            TexelLayout::Rg16Float,
+            TexelLayout::Rgba16Unorm,
+        ] {
+            let mut dst = [0u8; 64];
+            assert!(
+                !expand_rgba8_to_texel(layout, &src, PIXELS, &mut dst),
+                "{layout:?} is not a colour attachment this device seeds"
+            );
+        }
+
+        // A destination too short for the texels asked for is refused, not
+        // partially written.
+        let mut short = [0u8; 4];
+        assert!(!expand_rgba8_to_texel(
+            TexelLayout::Rgba8,
+            &src,
+            PIXELS,
+            &mut short
+        ));
     }
 
     /// Every format [`store_texel_order`] admits must survive a raw byte copy.

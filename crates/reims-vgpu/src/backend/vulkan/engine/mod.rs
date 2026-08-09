@@ -2207,7 +2207,18 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
     } = &mut *guard;
     let ctx = owner.ensure(counters)?;
     unsafe { pools.ensure_init(ctx, counters)? };
-    let snap = readback_snapshot(pools, identity)?;
+    // The leased rail hands the caller a pointer into the mapped readback slot,
+    // so unlike `read_target_inner` it has nowhere to narrow a wide resident to
+    // — the bytes the caller reads are the slot's. Bounded rather than
+    // converted, and named so a firing says which rail could not serve.
+    let (snap, layout) = readback_snapshot(pools, identity)?;
+    if layout.bytes_per_texel() != RESIDENT_READ_BYTES_PER_TEXEL {
+        return Err(DrawError::TargetRead(
+            reason::TargetReadDecline::TexelNotFourBytes {
+                format: snap.format,
+            },
+        ));
+    }
     let rb_size = (snap.width as u64) * (snap.height as u64) * u64::from(RESIDENT_READ_BYTES_PER_TEXEL);
     unsafe {
         let delivered = copy_image_level0_to_host_delivered(
@@ -3125,34 +3136,28 @@ fn resident_read_snapshot(
     })
 }
 
-/// [`resident_read_snapshot`] plus the constraint the two **host readback**
-/// rails add to it: the bytes must be four per texel.
+/// [`resident_read_snapshot`] plus what the **host readback** rails need on top
+/// of it: how many bytes to ask the GPU for, and how to get RGBA8 out of them.
 ///
-/// Both size their buffer `w * h * RESIDENT_READ_BYTES_PER_TEXEL` and hand the
-/// result to consumers that only speak RGBA8 — `TargetReadback::into_rgba8`
-/// exchanges channels in `chunks_exact_mut(4)`, and the CPU Store rail converts
-/// from RGBA8 a row at a time. A wider resident delivered through either would
-/// be read as the wrong texel out of a buffer half the size it needed.
+/// Both rails hand their bytes to consumers that only speak RGBA8 —
+/// `TargetReadback::into_rgba8` exchanges channels in `chunks_exact_mut(4)`, and
+/// the CPU Store rail converts from RGBA8 a row at a time — so a resident wider
+/// than four bytes a texel has to be read at its own width and then narrowed.
 ///
 /// Separate from the shared snapshot because the third caller —
-/// `copy_target_to_guest_pages` — has no such limit: it copies the resident's
-/// own bytes into guest pages and never interprets them, so bounding it here
-/// would refuse exactly the rail a wide target is supposed to take.
+/// `copy_target_to_guest_pages` — needs neither: it copies the resident's own
+/// bytes into guest pages and never interprets them.
 fn readback_snapshot(
     pools: &pools::ResourcePools,
     identity: &TargetIdentity,
-) -> Result<ResidentReadSnapshot, DrawError> {
+) -> Result<(ResidentReadSnapshot, crate::contract::pixel_format::TexelLayout), DrawError> {
     let snap = resident_read_snapshot(pools, identity)?;
-    if crate::backend::vulkan::translate::pixel::bytes_per_texel(snap.format)
-        != Some(RESIDENT_READ_BYTES_PER_TEXEL)
-    {
-        return Err(DrawError::TargetRead(
-            reason::TargetReadDecline::TexelNotFourBytes {
-                format: snap.format,
-            },
-        ));
-    }
-    Ok(snap)
+    let layout = crate::backend::vulkan::translate::pixel::texel_layout_of(snap.format).ok_or(
+        DrawError::TargetRead(reason::TargetReadDecline::TexelNotFourBytes {
+            format: snap.format,
+        }),
+    )?;
+    Ok((snap, layout))
 }
 
 fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
@@ -3165,8 +3170,12 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
     } = &mut *guard;
     let ctx = owner.ensure(counters)?;
     unsafe { pools.ensure_init(ctx, counters)? };
-    let snap = readback_snapshot(pools, identity)?;
-    let rb_size = (snap.width as u64) * (snap.height as u64) * u64::from(RESIDENT_READ_BYTES_PER_TEXEL);
+    let (snap, layout) = readback_snapshot(pools, identity)?;
+    // Asked for at the resident's own width — the copy is a raw image→buffer
+    // move and reads the image format's texel — and narrowed below if that is
+    // not what the caller can read.
+    let pixels = (snap.width as u64) * (snap.height as u64);
+    let rb_size = pixels * u64::from(layout.bytes_per_texel());
     unsafe {
         let out = copy_image_level0_to_host(
             ctx,
@@ -3182,9 +3191,42 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
         )?;
         pools.registry_note_access(identity, pools::ResidentAccess::TransferRead);
         counters.note_target_read(rb_size);
+        // A wide resident is quantized here rather than refused. This rail is
+        // the fallback a Store takes when the GPU could not land the frame in
+        // guest pages directly, so refusing loses the frame outright — where
+        // before a render target could be wide, the same frame was merely
+        // quantized on its way through an eight-bit resident. Quantized is what
+        // this produces, and it is exactly what that resident used to give.
+        if layout.bytes_per_texel() == RESIDENT_READ_BYTES_PER_TEXEL {
+            return Ok(TargetReadback {
+                pixels: out,
+                bgra: snap.bgra(),
+            });
+        }
+        let count = u32::try_from(pixels).unwrap_or(u32::MAX);
+        let mut narrowed = vec![0u8; (pixels * u64::from(RESIDENT_READ_BYTES_PER_TEXEL)) as usize];
+        if !crate::contract::pixel_format::narrow_texel_to_rgba8(
+            layout,
+            &out,
+            count,
+            &mut narrowed,
+        ) {
+            return Err(DrawError::TargetRead(
+                reason::TargetReadDecline::TexelNotFourBytes {
+                    format: snap.format,
+                },
+            ));
+        }
+        // Visible, because it is a fidelity loss and not just a slow path: the
+        // frame this returns carries eight bits of a channel the guest asked
+        // for sixteen of. A non-zero reading names the population that would be
+        // repaired by teaching this rail's consumers the wider texel.
+        crate::runtime::drain::note_store_route("target_read_narrowed");
         Ok(TargetReadback {
-            pixels: out,
-            bgra: snap.bgra(),
+            pixels: narrowed,
+            // `narrow_texel_to_rgba8` produces semantic RGBA8 whatever the
+            // resident's order was, so the exchange is already done.
+            bgra: false,
         })
     }
 }

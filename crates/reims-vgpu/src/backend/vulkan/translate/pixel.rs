@@ -268,6 +268,22 @@ pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
     }
 }
 
+/// The [`TexelLayout`] a Vulkan format is, or `None` for a format that is not
+/// one of them.
+///
+/// The inverse of [`vk_texel_layout`], for the engine, which holds a resolved
+/// `vk::Format` for an attachment and needs the layout to ask
+/// [`crate::contract::pixel_format`] how to write a texel of it. Written as a
+/// search of `TexelLayout::ALL` rather than as a second `match`, so it cannot
+/// disagree with the forward map and a new layout is covered the moment it is
+/// added to `ALL`.
+pub fn texel_layout_of(format: vk::Format) -> Option<TexelLayout> {
+    TexelLayout::ALL
+        .iter()
+        .copied()
+        .find(|&l| vk_texel_layout(l) == format)
+}
+
 /// Every Vulkan format a colour attachment may take, and the decline for a
 /// format the rail does not render to.
 ///
@@ -544,6 +560,29 @@ mod tests {
     use super::*;
     use crate::observe::Decline;
     use pixel_format as p;
+
+    /// `texel_layout_of` is `vk_texel_layout` read backwards, for every layout
+    /// and for nothing else.
+    ///
+    /// The round trip is the whole property: the engine holds a resolved
+    /// `vk::Format` for an attachment and uses this to ask the contract how to
+    /// write a texel of it, so a layout that does not come back is one whose
+    /// seed would be staged at the wrong width. Driven from `TexelLayout::ALL`
+    /// so a new layout is covered without anyone adding a line.
+    #[test]
+    fn every_texel_layout_survives_the_round_trip_through_its_vulkan_format() {
+        for &layout in TexelLayout::ALL {
+            assert_eq!(
+                texel_layout_of(vk_texel_layout(layout)),
+                Some(layout),
+                "{layout:?} does not come back from its own format"
+            );
+        }
+        // A format that is not a texel layout answers `None` rather than the
+        // nearest one; depth is the case the engine could plausibly present.
+        assert_eq!(texel_layout_of(TRANSIENT_DEPTH_FORMAT), None);
+        assert_eq!(texel_layout_of(vk::Format::UNDEFINED), None);
+    }
 
     /// Every `MTLPixelFormat` the decode contract defines, with the Vulkan
     /// format and texel size it must produce. Written out literally rather than
