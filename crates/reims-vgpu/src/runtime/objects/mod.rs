@@ -1266,13 +1266,7 @@ fn list_entry<M: HostMemory>(
             if lookup == ListLookup::Named {
                 crate::runtime::drain::note_store_route(miss.route());
                 if miss == ListMiss::SlotEmpty {
-                    crate::runtime::drain::note_store_route(
-                        if slot_empty_owned_elsewhere(state, host, task_id, ref_) {
-                            "list_miss_slot_empty_owned_elsewhere"
-                        } else {
-                            "list_miss_slot_empty_owned_nowhere"
-                        },
-                    );
+                    note_slot_empty_claimants(state, host, task_id, ref_);
                 }
             }
             None
@@ -1280,36 +1274,62 @@ fn list_entry<M: HostMemory>(
     }
 }
 
-/// For a named ref whose own task's slot is empty: does any *other* live task
-/// hold a real object at that slot?
+/// For a named ref whose own task's slot is empty: how many *other* live tasks
+/// hold a real object at that slot, against how many there are?
 ///
-/// [`ListMiss::SlotEmpty`] is the only miss a macos-26 boot produces, and it is
-/// the whole of that rail's ~40 lost draws a boot. It has two readings that want
-/// opposite fixes, and this is what separates them:
+/// [`ListMiss::SlotEmpty`] is the only miss a macos-26 boot produces and the
+/// whole of that rail's lost draws. "Does anyone else have it" looked like the
+/// question, and a first boot answered *every* miss with yes — which is when the
+/// confound became obvious. **Every task registers its object list at the same
+/// `pfn = 1`**, and refs are small and dense, so "another task has something at
+/// slot 3" is close to a tautology on a busy guest and says nothing about
+/// ownership.
 ///
-/// - **Owned nowhere.** No task has published the object. The guest referenced
-///   it before writing the slot, and the answer is for the packet to wait rather
-///   than for the draw to be dropped — the machinery already exists for async
-///   shader translation.
-/// - **Owned elsewhere.** Another task has it, so the object exists and this
-///   device looked in the wrong list. Then the question is which task the ref
-///   was meant to resolve against, and it is a decode or ownership defect
-///   rather than a race. `type4_claimant_tasks` already searches this way for
-///   surfaces, so a guest sharing objects across tasks is not a new idea here.
+/// So the reading is the *fraction*, and it is emitted banded against the live
+/// task count rather than as a yes/no:
 ///
-/// Costs one probe read per live task, on a miss only — a few thousand reads a
-/// boot against the 172 misses that trigger it.
-fn slot_empty_owned_elsewhere<M: HostMemory>(
+/// - **nowhere** — nobody has published it. The guest named a ref before writing
+///   the slot, and the answer is for the packet to wait rather than for the draw
+///   to be dropped.
+/// - **one** — exactly one other task has it. That is a real ownership signal:
+///   the object exists in a list this device did not look in.
+/// - **many / all** — the slot index is simply populated across the guest's
+///   tasks, and this search cannot tell ownership from coincidence. Anything
+///   built on it would be built on the confound.
+///
+/// Costs one probe read per live task, on a miss only.
+fn note_slot_empty_claimants<M: HostMemory>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
     ref_: u32,
-) -> bool {
-    state
+) {
+    let live = state.tasks.live_count();
+    let claimants = state
         .tasks
         .live_ids()
         .filter(|&other| other != task_id)
-        .any(|other| probe_list_entry(state, host, other, ref_).is_some())
+        .filter(|&other| probe_list_entry(state, host, other, ref_).is_some())
+        .count();
+    crate::runtime::drain::note_store_route(slot_empty_claim_route(claimants, live));
+}
+
+/// Band a claimant count against the live task count.
+///
+/// Split out from the walk so the banding is testable without a guest: the walk
+/// is a page-table read per task and the band is the only part that can be
+/// wrong in a way that changes what the next session believes.
+fn slot_empty_claim_route(claimants: usize, live_tasks: usize) -> &'static str {
+    // `live_tasks` counts the asking task too, so the most that can claim is
+    // one fewer. Comparing against that rather than against `live_tasks` is what
+    // makes "all" mean all of them.
+    let others = live_tasks.saturating_sub(1);
+    match claimants {
+        0 => "list_miss_slot_empty_claimed_nowhere",
+        1 => "list_miss_slot_empty_claimed_by_one",
+        n if others > 0 && n >= others => "list_miss_slot_empty_claimed_by_all",
+        _ => "list_miss_slot_empty_claimed_by_many",
+    }
 }
 
 /// The lookup proper, naming the check that refused.

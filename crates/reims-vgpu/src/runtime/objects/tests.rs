@@ -1934,63 +1934,45 @@ fn every_object_list_miss_names_a_different_check() {
     );
 }
 
-/// The empty-slot discriminator must not answer "somebody else has it" when
-/// nobody does, nor miss the task that does.
+/// The claimant banding must separate a real ownership signal from the confound
+/// that nearly buried it.
 ///
-/// `ListMiss::SlotEmpty` is every object-list miss a macos-26 boot makes, and
-/// the two readings want opposite fixes: a guest that has not published the
-/// object yet wants the packet to wait, while an object another task already
-/// holds means this device looked in the wrong list. A discriminator that is
-/// wrong in either direction sends the next session at the wrong one.
+/// Every task registers its object list at the same `pfn = 1`, so on a busy
+/// guest "some other task has something at slot 3" is close to a tautology. The
+/// first version of this instrument was a yes/no and answered yes to every miss
+/// on macos-26, which reads as a finding and is not one. The band against the
+/// live task count is what makes the difference visible, so each boundary is
+/// pinned here:
 ///
-/// Same fixture as the probe test above — task 2 owns a readable list at pfn 1
-/// with a real entry at ref 0, and task 5's directory maps nothing.
+/// - nobody has it — the guest has not published it, and the fix is to wait;
+/// - exactly one other task has it — a real ownership signal, the object is in
+///   a list this device did not look in;
+/// - all of the others have it — the slot index is just populated everywhere and
+///   this search cannot tell ownership from coincidence.
+///
+/// The asking task is excluded from the count, so "all" must compare against
+/// `live - 1`. Comparing against `live` would make "all" unreachable and silently
+/// demote every genuine all-claim to "many".
 #[test]
-fn an_empty_slot_says_whether_another_task_holds_the_object() {
-    let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    let dir_gpa = 2u64 << PAGE_SHIFT_X86;
-    let root_gpa = 3u64 << PAGE_SHIFT_X86;
-    let data_gpa = 4u64 << PAGE_SHIFT_X86;
-    host.map_range(dir_gpa, 0x20, 0);
-    host.map_range(root_gpa, 0x1000, 0);
-    host.map_range(data_gpa, 0x1000, 0);
-    let mut d = [0u8; 8];
-    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
-    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-    let _ = host.write_gpa(dir_gpa, &d);
-    let mut pte = [0u8; 4];
-    st32(&mut pte, 4);
-    let _ = host.write_gpa(root_gpa + 4, &pte);
-    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
-    st32(
-        &mut entry[0..],
-        (OBJECT_TYPE_SURFACE as u32) | (0x40u32 << 8),
-    );
-    entry[4..12].copy_from_slice(&0xdead_0000u64.to_le_bytes());
-    let _ = host.write_gpa(data_gpa, &entry);
+fn a_claimant_count_is_banded_against_the_tasks_that_could_have_claimed() {
+    use super::slot_empty_claim_route as band;
 
-    state.define_task(2, 0x1000, 2);
-    assert!(state.set_object_list(2, 1, 4));
-    state.define_task(5, 0x1000, 9);
-    assert!(state.set_object_list(5, 1, 4));
+    assert_eq!(band(0, 8), "list_miss_slot_empty_claimed_nowhere");
+    assert_eq!(band(1, 8), "list_miss_slot_empty_claimed_by_one");
+    assert_eq!(band(4, 8), "list_miss_slot_empty_claimed_by_many");
+    assert_eq!(
+        band(7, 8),
+        "list_miss_slot_empty_claimed_by_all",
+        "seven others out of eight live tasks is every task that could have claimed"
+    );
 
-    // Task 5's slot 0 is empty and task 2's is not — the object exists, this
-    // task does not have it.
-    assert!(
-        super::slot_empty_owned_elsewhere(&state, &host, 5, 0),
-        "task 2 holds ref 0, so a miss on task 5 is a lookup in the wrong list"
-    );
-    // Ref 3 is inside both lists and nobody has written it.
-    assert!(
-        !super::slot_empty_owned_elsewhere(&state, &host, 2, 3),
-        "no task has published ref 3, so this is a guest that has not written \
-         the slot and not a misdirected lookup"
-    );
-    // The owner is never its own elsewhere, or every miss would answer yes as
-    // soon as the guest republished the object under the same task.
-    assert!(
-        !super::slot_empty_owned_elsewhere(&state, &host, 2, 0),
-        "a task holding the object itself must not count as another task holding it"
-    );
+    // Two tasks total: the one asking and one other. That other claiming is
+    // both "one" and "all", and "one" is the reading that matters — it is the
+    // ownership signal, while "all" only ever means the search is uninformative.
+    assert_eq!(band(1, 2), "list_miss_slot_empty_claimed_by_one");
+
+    // A single live task has nobody else to claim, and must not be reported as
+    // a unanimous claim over an empty population.
+    assert_eq!(band(0, 1), "list_miss_slot_empty_claimed_nowhere");
+    assert_eq!(band(0, 0), "list_miss_slot_empty_claimed_nowhere");
 }
