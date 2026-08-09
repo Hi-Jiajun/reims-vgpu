@@ -4237,14 +4237,13 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
     if gpa == 0 {
         return;
     }
-    let mut mask_le = [0u8; 4];
-    if host
-        .read_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &mut mask_le)
-        .is_err()
-    {
+    // The mask gates the pending write and not just the interrupt. It used to
+    // gate only the interrupt, which set a bit for a guest that had declined
+    // the class and could therefore never clear it — see
+    // [`display_event_enabled`] for why that residue is not inert.
+    if !display_event_enabled(host, gpa, DISPLAY_PRESENT_EVENT_MASK) {
         return;
     }
-    let mask = ld32(&mask_le);
     // Pending word is atomic read-and-clear (ldclral) on the guest side; OR
     // the present bit so a not-yet-consumed ONLINE event is preserved.
     let mut pending_le = [0u8; 4];
@@ -4282,14 +4281,12 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
     if stale {
         crate::runtime::census::present_proxy::note_stale_online_pending("present", pending);
     }
-    if mask & DISPLAY_PRESENT_EVENT_MASK != 0 {
-        let bit = 1u32 << (state.display.display_index & 0x1f);
-        state
-            .gfx
-            .interrupt_status_disp
-            .fetch_or(bit, std::sync::atomic::Ordering::AcqRel);
-        host.enqueue(HostAction::irq_gfx());
-    }
+    let bit = 1u32 << (state.display.display_index & 0x1f);
+    state
+        .gfx
+        .interrupt_status_disp
+        .fetch_or(bit, std::sync::atomic::Ordering::AcqRel);
+    host.enqueue(HostAction::irq_gfx());
 }
 
 /// Minimum wall-clock interval shared by both display VBL signal paths, in
@@ -4489,6 +4486,38 @@ fn carrier_word(carried: Option<bool>) -> &'static str {
     }
 }
 
+/// Whether the guest has asked to be told about this class of display event.
+///
+/// `+0x104` is the guest's own statement of which pending bits it will act on,
+/// and its interrupt handler is what makes that binding rather than advisory:
+/// it read-clears `pending & enable_mask` and **leaves every bit outside the
+/// mask exactly where it found it**. So a bit this device sets for a disabled
+/// class is not a notification the guest ignores — it is a word the guest will
+/// never clear, which every later read-modify-write of the pending word then
+/// carries forward for the life of the boot.
+///
+/// Both x86 rails measured here disable classes this device was signalling
+/// anyway, and both showed the litter: with the display idle and the guest
+/// healthy, `+0x100` read `0x1` under a macOS 11 guest whose mask was `0xe`,
+/// and `0x3` under a macOS 13 guest whose mask was `0xc`. In each case the
+/// residue is exactly the set of bits the device set and the guest had not
+/// enabled.
+///
+/// An unreadable mask answers `false`. The guest published this page's address
+/// itself, so a read of it that the host cannot perform is not a reason to
+/// start signalling classes nobody asked for; the ONLINE handshake takes the
+/// same view of the same read.
+fn display_event_enabled<H: HostMemory>(host: &H, gpa: u64, event_mask: u32) -> bool {
+    let mut mask_le = [0u8; 4];
+    if host
+        .read_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &mut mask_le)
+        .is_err()
+    {
+        return false;
+    }
+    ld32(&mask_le) & event_mask != 0
+}
+
 fn signal_display_vbl_at<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -4505,6 +4534,13 @@ fn signal_display_vbl_at<H: HostMemory + HostOps>(
     }
     if !claim_display_vbl(last_us, now_us) {
         note_vbl(VBL_NOT_CLAIMED, now_ms);
+        return;
+    }
+    // Counted after the limiter so the arm is on the same grid as `delivered`
+    // and the two are directly comparable; a guest that never enables VBL then
+    // reports the rate it *would* have been paced at.
+    if !display_event_enabled(host, state.display.shared_gpa, DISPLAY_VBL_EVENT_MASK) {
+        note_vbl(VBL_NOT_ENABLED, now_ms);
         return;
     }
     note_vbl(VBL_DELIVERED, now_ms);

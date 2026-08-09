@@ -26,25 +26,37 @@ use super::DISPLAY_VBL_MIN_INTERVAL_US;
 /// always-on channel, so "are we starving the display link" could not be
 /// answered from a log, only guessed at from the constants.
 ///
-/// The three arms are counted separately because a single "delivered" tally
-/// cannot tell the two silences apart, and they have opposite meanings:
-/// `not_online` is the display never having come up (no VBL is owed at all),
-/// while `not_claimed` is the limiter doing its job at the advertised rate.
-/// Reading a low delivered count without them would license both conclusions.
+/// The arms are counted separately because a single "delivered" tally cannot
+/// tell the silences apart, and they have opposite meanings: `not_online` is
+/// the display never having come up (no VBL is owed at all), `not_claimed` is
+/// the limiter doing its job at the advertised rate, and `not_enabled` is the
+/// guest having declined this class in the shared page's enable mask. Reading a
+/// low delivered count without them would license all three conclusions.
 ///
-/// One line per 1024 deliveries — about 8 s at the grid rate, and it costs three
-/// relaxed increments per poll otherwise.
+/// `not_enabled` is the arm whose absence cost a reader most, and it was
+/// absent: both x86 rails measured here run with VBL disabled in that mask, and
+/// this line reported `delivered=13312 ... window_hz=120.0` for a guest that
+/// had asked for no VBL at all. That reads as "the compositor is being paced at
+/// the grid rate" when nothing is owed and nothing is being consumed.
+///
+/// One line per 1024 deliveries — about 8 s at the grid rate, and it costs one
+/// relaxed increment per poll otherwise.
 /// Which way the VBL path went. Indices into [`VblCensus`].
 pub(crate) const VBL_NOT_ONLINE: usize = 0;
 pub(crate) const VBL_NOT_CLAIMED: usize = 1;
 pub(crate) const VBL_DELIVERED: usize = 2;
+pub(crate) const VBL_NOT_ENABLED: usize = 3;
 
 /// One report per this many deliveries — about 8 s at the grid rate.
 const VBL_REPORT_EVERY: u64 = 1024;
 
+/// Width of [`VblCensus::arms`], derived from the last arm index so a new arm
+/// cannot be added without the array growing with it.
+const VBL_ARMS: usize = VBL_NOT_ENABLED + 1;
+
 #[derive(Default)]
 pub(crate) struct VblCensus {
-    arms: [std::sync::atomic::AtomicU64; 3],
+    arms: [std::sync::atomic::AtomicU64; VBL_ARMS],
     last_report_ms: std::sync::atomic::AtomicU64,
     last_report_n: std::sync::atomic::AtomicU64,
 }
@@ -53,14 +65,27 @@ impl VblCensus {
     /// Count one traversal and return the line to emit when a report is due.
     ///
     /// Returns the line rather than emitting it so the reporting rule is
-    /// testable without a log sink: the interesting properties are "only
-    /// deliveries report", "the rate is measured over the window and not the
-    /// process lifetime", and "the two silent arms stay separable", and all
+    /// testable without a log sink: the interesting properties are "only the
+    /// post-limiter arms report", "the rate is measured over the window and not
+    /// the process lifetime", and "the silent arms stay separable", and all
     /// three are assertions about this return value.
+    ///
+    /// **Two arms report, not one.** `delivered` and `not_enabled` are the two
+    /// outcomes of a tick that got past the online check and the limiter, and
+    /// exactly one of them can be live on a given boot — the guest either has
+    /// the class enabled or it does not. Reporting only on `delivered` is why a
+    /// guest that declines VBL produced no `display_vbl` line at all, which
+    /// reads identically to a device whose VBL path is not running.
+    ///
+    /// `hz` is the reporting arm's own rate over the window, so it stays a rate
+    /// of the thing that triggered the line; `arm=` names which one, because
+    /// 120 Hz of delivery and 120 Hz of declining are the same number and
+    /// opposite facts.
     pub(crate) fn note(&self, arm: usize, now_ms: u64) -> Option<String> {
         use std::sync::atomic::Ordering::Relaxed;
         let n = self.arms[arm].fetch_add(1, Relaxed) + 1;
-        if arm != VBL_DELIVERED || !n.is_multiple_of(VBL_REPORT_EVERY) {
+        let reports = arm == VBL_DELIVERED || arm == VBL_NOT_ENABLED;
+        if !reports || !n.is_multiple_of(VBL_REPORT_EVERY) {
             return None;
         }
         let since_ms = now_ms.saturating_sub(self.last_report_ms.swap(now_ms, Relaxed));
@@ -73,11 +98,18 @@ impl VblCensus {
         } else {
             0.0
         };
+        let name = if arm == VBL_DELIVERED {
+            "delivered"
+        } else {
+            "not_enabled"
+        };
         Some(format!(
-            "display_vbl delivered={n} not_claimed={} not_online={} window_hz={hz:.1} \
-             grid_hz={:.1}",
+            "display_vbl delivered={} not_claimed={} not_online={} not_enabled={} \
+             arm={name} window_hz={hz:.1} grid_hz={:.1}",
+            self.arms[VBL_DELIVERED].load(Relaxed),
             self.arms[VBL_NOT_CLAIMED].load(Relaxed),
             self.arms[VBL_NOT_ONLINE].load(Relaxed),
+            self.arms[VBL_NOT_ENABLED].load(Relaxed),
             1_000_000.0 / DISPLAY_VBL_MIN_INTERVAL_US as f64,
         ))
     }

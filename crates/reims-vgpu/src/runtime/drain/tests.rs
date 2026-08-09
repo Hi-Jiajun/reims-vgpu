@@ -1188,7 +1188,16 @@ fn display_swap_signals_present_complete_on_shared_page() {
         "display IRQ status must name display 0"
     );
 
-    // Enable mask without the present bit: pending still set, no IRQ.
+    // Enable mask without the present bit: NEITHER the pending bit nor the IRQ.
+    //
+    // The pending half of this used to assert the opposite — that the bit is
+    // written whether or not the guest asked for the class. The guest's own
+    // interrupt handler is what makes that wrong: it read-clears
+    // `pending & enable_mask` and leaves every other bit exactly where it found
+    // it, so a bit set for a disabled class is never cleared by anyone. It is
+    // then carried forward by every later read-modify-write of the word, which
+    // is what a live macOS 13 guest showed — `+0x100` reading `0x3` against an
+    // enable mask of `0xc`, both bits set by this device and neither wanted.
     state
         .gfx
         .interrupt_status_disp
@@ -1199,7 +1208,11 @@ fn display_swap_signals_present_complete_on_shared_page() {
     assert!(host
         .read_gpa(shared + DISPLAY_SHARED_PENDING, &mut le)
         .is_ok());
-    assert_ne!(u32::from_le_bytes(le) & DISPLAY_PRESENT_EVENT_MASK, 0);
+    assert_eq!(
+        u32::from_le_bytes(le) & DISPLAY_PRESENT_EVENT_MASK,
+        0,
+        "a present bit the guest disabled is a bit nothing will ever clear"
+    );
     assert_eq!(
         state
             .gfx
@@ -1207,6 +1220,20 @@ fn display_swap_signals_present_complete_on_shared_page() {
             .load(std::sync::atomic::Ordering::Acquire),
         0,
         "no display IRQ when the guest did not ask for present events"
+    );
+
+    // An unreadable enable mask must not be read as permission. The guest
+    // published this page's address itself, so a read of it the host cannot
+    // perform is not a reason to start signalling classes nobody asked for.
+    state.display.shared_gpa = 0xdead_0000_0000;
+    signal_display_present_complete(&mut state, &mut host);
+    assert_eq!(
+        state
+            .gfx
+            .interrupt_status_disp
+            .load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "an unreadable enable mask must not authorise a present event"
     );
 }
 
@@ -2858,6 +2885,11 @@ fn signal_display_vbl_after_online_uses_shared_time_limiter() {
     state.display.shared_gpa = gpa;
     state.display.display_index = 0;
     state.display.online_acked = true;
+    // This test is about the limiter, so it models a guest that asked for VBL.
+    // Without the bit the path declines before the limiter is reached and every
+    // count below reads zero — see
+    // `signal_display_vbl_declines_a_class_the_guest_did_not_enable`.
+    host.put_u32(gpa + DISPLAY_SHARED_ENABLE_MASK, DISPLAY_VBL_EVENT_MASK);
 
     // Microseconds: the base must exceed one grid interval from the zero the
     // limiter starts at, or the very first claim is refused as too early.
@@ -2903,6 +2935,90 @@ fn signal_display_vbl_after_online_uses_shared_time_limiter() {
             & 1,
         0
     );
+}
+
+/// A guest that has not enabled VBL in the shared page's mask gets no VBL:
+/// no pending bit, no interrupt.
+///
+/// The guest's interrupt handler read-clears `pending & enable_mask` and leaves
+/// every other bit exactly where it found it, so a bit this device sets for a
+/// disabled class is one that nothing will ever clear. It is not an ignored
+/// notification; it is a permanent residue in a word this device keeps
+/// read-modify-writing.
+///
+/// Both x86 rails measured here disable VBL: a macOS 11 guest published mask
+/// `0xe` and a macOS 13 guest `0xc`, and each left `+0x100` holding precisely
+/// the bits this device had set and the guest had not asked for — `0x1` and
+/// `0x3`. Meanwhile the census reported `delivered=13312 window_hz=120.0`,
+/// describing a 120 Hz display link to a guest that had asked for none of it.
+///
+/// The mask is re-read per tick rather than latched: `enableVBLInterrupt` and
+/// `disableVBLInterrupt` are a `lock or` and a `lock and` on that same word, so
+/// the guest may turn the class on or off at any moment and expects the next
+/// tick to honour it.
+#[test]
+fn signal_display_vbl_declines_a_class_the_guest_did_not_enable() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let last_ms = std::sync::atomic::AtomicU64::new(0);
+    let gpa = 0x7c000000u64;
+    host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+    state.display.shared_gpa = gpa;
+    state.display.display_index = 0;
+    state.display.online_acked = true;
+
+    // The two masks a real x86 guest was measured publishing. Neither carries
+    // the VBL bit; both carry classes this device does signal, so this is not
+    // "the guest disabled everything".
+    for mask in [0x0eu32, 0x0cu32] {
+        host.put_u32(gpa + DISPLAY_SHARED_ENABLE_MASK, mask);
+        host.put_u32(gpa + DISPLAY_SHARED_PENDING, 0);
+        host.actions.clear();
+        state
+            .gfx
+            .interrupt_status_disp
+            .store(0, std::sync::atomic::Ordering::Release);
+        // Well past one grid interval, so the limiter is not what refuses.
+        last_ms.store(0, std::sync::atomic::Ordering::Release);
+        signal_display_vbl_at(&mut state, &mut host, &last_ms, 5_000_000);
+
+        let mut pending = [0u8; 4];
+        host.read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending)
+            .unwrap();
+        assert_eq!(
+            ld32(&pending) & DISPLAY_VBL_EVENT_MASK,
+            0,
+            "mask {mask:#x} does not carry VBL, so the pending bit must stay clear"
+        );
+        assert!(
+            host.actions.is_empty(),
+            "mask {mask:#x} does not carry VBL, so no interrupt is owed"
+        );
+        assert_eq!(
+            state
+                .gfx
+                .interrupt_status_disp
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "mask {mask:#x} does not carry VBL, so no display IRQ status is owed"
+        );
+    }
+
+    // And the same tick delivers once the guest turns the class on, which is
+    // what says the decline above is the mask and not some other refusal.
+    host.put_u32(gpa + DISPLAY_SHARED_ENABLE_MASK, 0x0e | DISPLAY_VBL_EVENT_MASK);
+    host.actions.clear();
+    last_ms.store(0, std::sync::atomic::Ordering::Release);
+    signal_display_vbl_at(&mut state, &mut host, &last_ms, 5_000_000);
+    let mut pending = [0u8; 4];
+    host.read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending)
+        .unwrap();
+    assert_ne!(
+        ld32(&pending) & DISPLAY_VBL_EVENT_MASK,
+        0,
+        "the guest enabled VBL, so the pending bit is owed"
+    );
+    assert_eq!(host.actions.len(), 1, "the guest enabled VBL, so an IRQ is owed");
 }
 
 /// The VBL limiter is phase-locked to a fixed interval grid so poll jitter
