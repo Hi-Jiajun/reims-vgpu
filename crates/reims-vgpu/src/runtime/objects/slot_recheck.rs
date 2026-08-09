@@ -268,6 +268,7 @@ fn note_list_population<M: HostMemory>(state: &DeviceState, host: &M, task_id: u
     let slots = (page_size / OBJECT_LIST_ENTRY_LEN).min(task.object_list_count as usize);
     let mut populated = 0usize;
     let mut highest: Option<usize> = None;
+    let mut occupied: Vec<usize> = Vec::new();
     for i in 0..slots {
         let raw = &page[i * OBJECT_LIST_ENTRY_LEN..(i + 1) * OBJECT_LIST_ENTRY_LEN];
         let Ok(entry) = decode_list_object_entry(raw) else {
@@ -276,6 +277,9 @@ fn note_list_population<M: HostMemory>(state: &DeviceState, host: &M, task_id: u
         if entry.descriptor_length != 0 && entry.descriptor_gva != 0 {
             populated += 1;
             highest = Some(i);
+            if occupied.len() < OCCUPIED_SHOWN {
+                occupied.push(i);
+            }
         }
     }
     let highest = highest.map_or(-1i64, |h| h as i64);
@@ -288,10 +292,26 @@ fn note_list_population<M: HostMemory>(state: &DeviceState, host: &M, task_id: u
     });
     crate::observe::off(format!(
         "slot_empty_population task={task_id} ref={ref_} populated={populated} \
-         highest_ref={highest} slots_read={slots} \
-         (the first page of this task's own object list, at the moment the ref missed)"
+         highest_ref={highest} slots_read={slots} occupied={occupied:?}{} \
+         (the first page of this task's own object list, at the moment the ref missed)",
+        if populated > occupied.len() { "+" } else { "" }
     ));
 }
+
+/// How many occupied indices the population line prints.
+///
+/// The indices are the reading, not the count: a list occupied at
+/// `{0, 4, 8, 12}` while the guest names 3 and 9 is a stride or base this device
+/// has wrong, and one occupied at `{2, 5, 11, 26}` while the guest names 3 and 9
+/// is not. No count can tell those apart. Truncation is marked with a trailing
+/// `+` on the list rather than left to be inferred from `populated`, because a
+/// silently clipped set reads as a complete one and would answer the stride
+/// question wrongly with no sign that it had.
+///
+/// Measured lists are 4 to 18 entries in a first page; this shows every one of
+/// those whole and clips only something an order of magnitude denser, where the
+/// prefix is still enough to see a stride.
+const OCCUPIED_SHOWN: usize = 24;
 
 /// One line per watch that ended, naming the check and the age.
 ///

@@ -1352,13 +1352,29 @@ fn note_slot_empty_claimants<M: HostMemory>(
     ref_: u32,
 ) {
     let live = state.tasks.live_count();
-    let claimants = state
+    let claimants: Vec<u32> = state
         .tasks
         .live_ids()
         .filter(|&other| other != task_id)
         .filter(|&other| probe_list_entry(state, host, other, ref_).is_some())
-        .count();
-    crate::runtime::drain::note_store_route(slot_empty_claim_route(claimants, live));
+        .collect();
+    crate::runtime::drain::note_store_route(slot_empty_claim_route(claimants.len(), live));
+    // The band was built when these lists were believed dense, where naming the
+    // claimants would have been naming most of the guest. They are not: a driven
+    // boot reads 4 to 18 occupied slots in a 341-entry first page, so a claim is
+    // ~2 % likely by coincidence and *which* tasks claim is now a reading rather
+    // than noise. Latched per `(task, ref)` — the band above is per miss and this
+    // is per slot, which is also why the two counts differ.
+    if !crate::observe::first_sight(
+        "slot_empty_claimants",
+        (u64::from(task_id) << 32) | u64::from(ref_),
+    ) {
+        return;
+    }
+    crate::observe::off(format!(
+        "slot_empty_claimants task={task_id} ref={ref_} live={live} claimants={claimants:?} \
+         (which other live tasks hold a real object at this ref, by id)"
+    ));
 }
 
 /// Band a claimant count against the live task count.
