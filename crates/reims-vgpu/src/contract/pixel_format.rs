@@ -149,9 +149,75 @@ pub enum TexelLayout {
     /// 4 bytes/texel — the chroma half of [`Self::R16Unorm`], sampled natively as
     /// `R16G16_UNORM`. Four bytes wide but **not** a colour order.
     Rg16Unorm,
+    /// 8 bytes/texel, four `float16` channels in R,G,B,A order, sampled
+    /// natively as `R16G16B16A16_SFLOAT`.
+    ///
+    /// This is what a recent macOS window server composites in. It is the only
+    /// layout here **wider** than four bytes, and the only one whose CPU
+    /// alternative is lossy in a way the guest can see rather than merely slow:
+    /// [`texel_to_rgba8`] does carry an arm for it, through
+    /// `f16_to_unorm8_lut`, and that arm quantizes the channel to 256 levels
+    /// and clamps everything above 1.0. A compositor working in extended range
+    /// puts values above 1.0 there on purpose, so the conversion is not a
+    /// rounding difference — it is the highlight range removed.
+    ///
+    /// Sampling the guest's own bytes is exact: `MTLPixelFormatRGBA16Float` and
+    /// `VK_FORMAT_R16G16B16A16_SFLOAT` are both four little-endian IEEE binary16
+    /// channels in that order, so the texel is byte-identical and no conversion
+    /// exists to be lossy.
+    Rgba16Float,
+    /// 4 bytes/texel, two `float16` channels, sampled natively as
+    /// `R16G16_SFLOAT`. The two-channel companion to [`Self::Rgba16Float`],
+    /// with the same exactness argument and the same lossy CPU arm. Four bytes
+    /// wide and **not** a colour order.
+    Rg16Float,
 }
 
 impl TexelLayout {
+    /// Every layout, so a sweep over the vocabulary is derived rather than
+    /// hand-listed.
+    ///
+    /// Held honest by `every_texel_layout_is_in_the_all_list_exactly_once`. The
+    /// tests below used to iterate hand-written arrays whose inner `match` was
+    /// exhaustive, which catches a variant added without an answer but not one
+    /// added without being *swept* — the same half-check `translate::reason`
+    /// found in its own `ALL` list.
+    pub const ALL: &'static [Self] = &[
+        Self::Rgba8,
+        Self::Bgra8,
+        Self::R8,
+        Self::Rg8,
+        Self::R16Float,
+        Self::R32Float,
+        Self::R16Unorm,
+        Self::Rg16Unorm,
+        Self::Rgba16Float,
+        Self::Rg16Float,
+    ];
+
+    /// This layout's position in [`Self::ALL`], so a host-side table can be an
+    /// array sized by `ALL.len()` rather than a map or a hand-widened bitmask.
+    ///
+    /// Exhaustive on purpose: a new variant cannot reach such a table without
+    /// being given a position here, and the array it indexes cannot be too
+    /// narrow for it because its length is `ALL.len()`. That is the shape
+    /// `AGENTS.md` asks for over `mask |= 1 << index`, which bounds a set to 32
+    /// with nothing declared and wraps rather than failing.
+    pub fn index(self) -> usize {
+        match self {
+            Self::Rgba8 => 0,
+            Self::Bgra8 => 1,
+            Self::R8 => 2,
+            Self::Rg8 => 3,
+            Self::R16Float => 4,
+            Self::R32Float => 5,
+            Self::R16Unorm => 6,
+            Self::Rg16Unorm => 7,
+            Self::Rgba16Float => 8,
+            Self::Rg16Float => 9,
+        }
+    }
+
     /// Bytes occupied by one texel in guest linear storage.
     pub fn bytes_per_texel(self) -> u32 {
         match self {
@@ -162,6 +228,8 @@ impl TexelLayout {
             Self::R32Float => R32F_BPP,
             Self::R16Unorm => R16_BPP,
             Self::Rg16Unorm => RG16_BPP,
+            Self::Rgba16Float => RGBA16F_BPP,
+            Self::Rg16Float => RG16F_BPP,
         }
     }
 
@@ -196,6 +264,16 @@ impl TexelLayout {
     pub fn has_cpu_loader_arm(self) -> bool {
         match self {
             Self::Rgba8 | Self::Bgra8 | Self::R8 | Self::Rg8 => true,
+            // The two half-float colour layouts answer `true` because the arm
+            // genuinely exists — `texel_to_rgba8` converts both through
+            // `f16_to_unorm8_lut`. This is a statement about the loader, not an
+            // endorsement: that arm quantizes to 256 levels and clamps above
+            // 1.0, which for an extended-range compositor is lost highlight
+            // range. Answering `false` to force the native rail would be a lie
+            // about the loader and would leave a below-floor window with nothing
+            // to fall to; the native rail earns those binds by being reachable,
+            // not by the floor being unable to turn them away.
+            Self::Rgba16Float | Self::Rg16Float => true,
             // The two sixteen-bit normalized layouts join the floats here for
             // the same reason and a different quantity: `texel_to_rgba8` has no
             // arm for them because an arm would have to narrow ten bits of video
@@ -1640,16 +1718,7 @@ mod tests {
     /// new variant most needs to answer.
     #[test]
     fn a_texel_layout_is_as_wide_as_the_guest_format_it_stands_for() {
-        for layout in [
-            TexelLayout::Rgba8,
-            TexelLayout::Bgra8,
-            TexelLayout::R8,
-            TexelLayout::Rg8,
-            TexelLayout::R16Float,
-            TexelLayout::R32Float,
-            TexelLayout::R16Unorm,
-            TexelLayout::Rg16Unorm,
-        ] {
+        for &layout in TexelLayout::ALL {
             let mtl = match layout {
                 TexelLayout::Rgba8 => MTL_FORMAT_RGBA8_UNORM,
                 TexelLayout::Bgra8 => MTL_FORMAT_BGRA8_UNORM,
@@ -1659,29 +1728,65 @@ mod tests {
                 TexelLayout::R32Float => MTL_FORMAT_R32_FLOAT,
                 TexelLayout::R16Unorm => MTL_FORMAT_R16_UNORM,
                 TexelLayout::Rg16Unorm => MTL_FORMAT_RG16_UNORM,
+                TexelLayout::Rgba16Float => MTL_FORMAT_RGBA16_FLOAT,
+                TexelLayout::Rg16Float => MTL_FORMAT_RG16_FLOAT,
             };
             assert_eq!(
                 Some(layout.bytes_per_texel()),
                 bytes_per_pixel(mtl),
                 "{layout:?} and its guest format {mtl:#x} disagree on texel width"
             );
-            // Exactly the four byte-order layouts have a CPU loader class. The
-            // two float ones deliberately do not — `texel_to_rgba8` has no
-            // float arm, which is why they ride a native sampled rail instead,
-            // and `TexelLayout::R16Float`'s own doc says converting them would
-            // quantize the transfer curve. The two sixteen-bit normalized ones
-            // are the same absence for the same reason: an arm for them would
-            // have to narrow ten bits of video luma to eight. Pinned here
-            // because it is an *absence*, and an absence is what a later "just
-            // add the missing arm" edit removes without noticing what it was
-            // for.
-            let expects_loader = layout.has_cpu_loader_arm();
+            // [`TexelLayout::has_cpu_loader_arm`] is a claim about
+            // [`texel_to_rgba8`], so it is checked against `texel_to_rgba8`.
+            // It used to be checked against `sampled_class(mtl).is_some()`,
+            // which is a different table and already disagreed: `RG16Float` has
+            // a conversion arm and no sampled class. Asking the function the
+            // doc names removes the proxy rather than widening the other table
+            // to match it.
+            //
+            // Both directions matter. A layout answering `false` here is one
+            // that must *not* be handed to a performance floor that would send
+            // it to the CPU, because there is nothing there to serve it — an
+            // absence a later "just add the missing arm" edit removes without
+            // noticing what it was for.
+            // Widest texel any format in the table occupies, so one buffer
+            // satisfies `texel_to_rgba8`'s length check for every layout.
+            let src = [0u8; RGBA32_BPP as usize];
             assert_eq!(
-                sampled_class(mtl).is_some(),
-                expects_loader,
-                "{layout:?} ({mtl:#x}) changed whether the CPU loader claims it"
+                texel_to_rgba8(mtl, &src).is_some(),
+                layout.has_cpu_loader_arm(),
+                "{layout:?} ({mtl:#x}) disagrees with texel_to_rgba8 about having an arm"
             );
         }
+    }
+
+    /// [`TexelLayout::ALL`] really does hold every variant, exactly once, and
+    /// [`TexelLayout::index`] agrees with the position it holds.
+    ///
+    /// Both halves are load-bearing. The host's linear-filter capability table
+    /// is `[bool; ALL.len()]` indexed by `index()`, so a variant missing from
+    /// `ALL` makes that array one short and a variant whose `index()` does not
+    /// match its slot reads another layout's answer — neither of which is a
+    /// compile error, and both of which decide whether a guest texture samples
+    /// or is declined.
+    #[test]
+    fn every_texel_layout_is_in_the_all_list_exactly_once() {
+        for (slot, &layout) in TexelLayout::ALL.iter().enumerate() {
+            assert_eq!(
+                layout.index(),
+                slot,
+                "{layout:?} sits at ALL[{slot}] but indexes {}",
+                layout.index()
+            );
+        }
+        let mut seen: Vec<usize> = TexelLayout::ALL.iter().map(|l| l.index()).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            TexelLayout::ALL.len(),
+            "two layouts share an index, or ALL holds one twice"
+        );
     }
 
     /// Four bytes wide is not the same as a four-byte colour order.
@@ -1698,17 +1803,28 @@ mod tests {
             assert!(layout.is_four_byte_color(), "{layout:?} is a colour order");
             assert_eq!(layout.bytes_per_texel(), RGBA8_BPP);
         }
-        // Two layouts are four bytes wide and are not colour orders: a
-        // single-channel float LUT, and the two-channel sixteen-bit chroma plane
-        // of a ten-bit video. Both would be swizzled as R,G,B,A by a rail that
-        // admitted them on width.
-        for layout in [TexelLayout::R32Float, TexelLayout::Rg16Unorm] {
+        // Three layouts are four bytes wide and are not colour orders: a
+        // single-channel float LUT, the two-channel sixteen-bit chroma plane of
+        // a ten-bit video, and the two-channel half-float. All would be
+        // swizzled as R,G,B,A by a rail that admitted them on width.
+        for layout in [
+            TexelLayout::R32Float,
+            TexelLayout::Rg16Unorm,
+            TexelLayout::Rg16Float,
+        ] {
             assert_eq!(layout.bytes_per_texel(), RGBA8_BPP);
             assert!(
                 !layout.is_four_byte_color(),
                 "{layout:?} is four bytes wide and is not a colour order"
             );
         }
+        // `Rgba16Float` is the one layout *wider* than four bytes, and it is a
+        // colour order — which is exactly why it must not answer
+        // `is_four_byte_color`. The rails that ask reinterpret four bytes as
+        // R,G,B,A; handing them an eight-byte texel would read every second
+        // pixel and shear the image.
+        assert_eq!(TexelLayout::Rgba16Float.bytes_per_texel(), RGBA16F_BPP);
+        assert!(!TexelLayout::Rgba16Float.is_four_byte_color());
         for layout in [
             TexelLayout::R8,
             TexelLayout::Rg8,

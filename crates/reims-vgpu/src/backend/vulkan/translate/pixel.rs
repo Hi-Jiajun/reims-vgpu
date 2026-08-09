@@ -229,6 +229,14 @@ pub fn sampled_pixels(mtl: u16) -> Result<(TexelLayout, Option<TranslateReason>)
         // with mandatory linear filtering, so neither needs a capability gate.
         vk::Format::R16_UNORM => TexelLayout::R16Unorm,
         vk::Format::R16G16_UNORM => TexelLayout::Rg16Unorm,
+        // The half-float colour layouts. A recent macOS window server
+        // composites in `MTLPixelFormatRGBA16Float`, and every such bind used to
+        // land on the CPU re-read rung and be quantized to unorm8 on the way in
+        // — 99 % of this rail's format declines on a driven macos-26 boot. Both
+        // are exact as guest bytes: the Metal and Vulkan spellings are the same
+        // little-endian binary16 channels in the same order.
+        vk::Format::R16G16B16A16_SFLOAT => TexelLayout::Rgba16Float,
+        vk::Format::R16G16_SFLOAT => TexelLayout::Rg16Float,
         _ => return Err(TranslateReason::NoSampledLayout(mtl)),
     };
     Ok((layout, srgb_decline(&f, mtl)))
@@ -250,6 +258,8 @@ pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
         TexelLayout::R32Float => vk::Format::R32_SFLOAT,
         TexelLayout::R16Unorm => vk::Format::R16_UNORM,
         TexelLayout::Rg16Unorm => vk::Format::R16G16_UNORM,
+        TexelLayout::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
+        TexelLayout::Rg16Float => vk::Format::R16G16_SFLOAT,
     }
 }
 
@@ -872,8 +882,20 @@ mod tests {
     #[test]
     fn a_rail_that_carries_no_layout_declines_with_its_own_slug() {
         assert_eq!(
-            sampled_pixels(p::MTL_FORMAT_RGBA16_FLOAT).unwrap_err(),
-            TranslateReason::NoSampledLayout(p::MTL_FORMAT_RGBA16_FLOAT)
+            sampled_pixels(p::MTL_FORMAT_RGBA16_UINT).unwrap_err(),
+            TranslateReason::NoSampledLayout(p::MTL_FORMAT_RGBA16_UINT)
+        );
+        // Its float sibling *is* carried, and at its own width. The two are
+        // asserted together because they are one bit depth apart on the wire
+        // and it is the pair that says the decline above is about the layout
+        // this rail carries rather than about sixteen-bit texels.
+        assert_eq!(
+            sampled_pixels(p::MTL_FORMAT_RGBA16_FLOAT).unwrap().0,
+            TexelLayout::Rgba16Float
+        );
+        assert_eq!(
+            TexelLayout::Rgba16Float.bytes_per_texel(),
+            crate::contract::pixel_format::RGBA16F_BPP
         );
         assert_eq!(
             sampled_pixels(0xffff).unwrap_err(),
@@ -1009,10 +1031,16 @@ mod tests {
                 p::MTL_FORMAT_R16_FLOAT,
                 p::MTL_FORMAT_RG8_UNORM,
                 p::MTL_FORMAT_R32_FLOAT,
+                // The two half-float colour layouts. A recent macOS window
+                // server composites in RGBA16Float; before these were named,
+                // every such bind fell to the CPU rung and was quantized to
+                // unorm8 with everything above 1.0 clamped.
+                p::MTL_FORMAT_RG16_FLOAT,
                 p::MTL_FORMAT_RGBA8_UNORM,
                 p::MTL_FORMAT_RGBA8_UNORM_SRGB,
                 p::MTL_FORMAT_BGRA8_UNORM,
                 p::MTL_FORMAT_BGRA8_UNORM_SRGB,
+                p::MTL_FORMAT_RGBA16_FLOAT,
             ]
         );
         let color: Vec<u16> = EXPECTED

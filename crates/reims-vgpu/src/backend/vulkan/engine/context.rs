@@ -11,6 +11,7 @@ use super::device_lost::DeviceLostDecline;
 use super::init_decline::InitDecline;
 use super::types::DrawError;
 use super::vk_call::{VkCall, VkOp};
+use crate::contract::pixel_format::TexelLayout;
 use crate::backend::vulkan::caps::api_floor;
 use crate::backend::vulkan::caps::device_select::select_physical_device;
 use crate::backend::vulkan::caps::memory_topology::{
@@ -303,9 +304,10 @@ pub(crate) struct DeviceContext {
     pub spirv_storage_write_without_format: bool,
     pub spirv_storage_read_without_format: bool,
     pub spirv_storage_extended_formats: bool,
-    /// `R32_SFLOAT` usable as a linearly-filtered sampled image; gates the
-    /// native float32 color-LUT sampled rail (see [`DeviceFeatures`]).
-    pub sampled_r32f_linear_filter: bool,
+    /// For each [`crate::contract::pixel_format::TexelLayout`], whether this
+    /// host can sample its Vulkan format with linear filtering; gates the
+    /// native sampled rails (see [`DeviceFeatures::sampled_linear_filter`]).
+    pub sampled_linear_filter: [bool; TexelLayout::ALL.len()],
     pub pipeline_cache: vk::PipelineCache,
     pub vertex_divisor: VertexDivisorCapabilities,
     /// Offset alignment a guest-window import must satisfy before a draw may
@@ -559,7 +561,7 @@ impl DeviceContext {
         );
         let storage_image_write_without_format_bgra =
             features.storage_image_write_without_format_bgra();
-        let sampled_r32f_linear_filter = features.sampled_r32f_linear_filter;
+        let sampled_linear_filter = features.sampled_linear_filter;
         let has16 = features.storage16;
         let has8 = features.storage8;
         let has_float16 = features.float16;
@@ -840,7 +842,7 @@ impl DeviceContext {
             spirv_storage_write_without_format: features.storage_image_write_without_format,
             spirv_storage_read_without_format: features.storage_image_read_without_format,
             spirv_storage_extended_formats: features.storage_image_extended_formats,
-            sampled_r32f_linear_filter,
+            sampled_linear_filter,
             pipeline_cache,
             vertex_divisor,
             guest_bind_offset_align: props

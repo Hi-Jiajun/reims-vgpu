@@ -1409,14 +1409,14 @@ pub fn touch_resident_target(identity: Option<&TargetIdentity>, now_ms: u64) {
 #[derive(Clone, Copy, Debug)]
 enum EngineProbe {
     StorageWriteWithoutFormat,
-    SampledR32fLinearFilter,
+    SampledLayoutLinearFilter,
 }
 
 impl EngineProbe {
     fn name(self) -> &'static str {
         match self {
             Self::StorageWriteWithoutFormat => "storage_write_without_format",
-            Self::SampledR32fLinearFilter => "sampled_r32f_linear_filter",
+            Self::SampledLayoutLinearFilter => "sampled_layout_linear_filter",
         }
     }
 
@@ -1425,7 +1425,7 @@ impl EngineProbe {
     fn discriminant(self) -> u64 {
         match self {
             Self::StorageWriteWithoutFormat => 7,
-            Self::SampledR32fLinearFilter => 9,
+            Self::SampledLayoutLinearFilter => 9,
         }
     }
 }
@@ -1537,13 +1537,21 @@ pub fn supports_storage_image_write_without_format() -> bool {
     }
 }
 
-/// Whether the bound device can sample an `R32_SFLOAT` image with **linear**
-/// filtering. Gates the native single-channel float32 sampled rail (color
-/// LUTs): `R16_SFLOAT` linear filtering is spec-mandatory and needs no gate,
-/// but `R32_SFLOAT`'s is optional and absent on Apple/MoltenVK. Returns `false`
-/// (declining the rail, leaving the sample fail-visible) if the engine cannot
-/// initialize.
-pub fn supports_sampled_r32f_linear_filter() -> bool {
+/// Whether the bound device can sample this guest texel layout's Vulkan format
+/// with **linear** filtering.
+///
+/// Gates every native sampled rail — those bind the guest's own bytes and let
+/// the sampler interpolate them, so a layout the host cannot filter must be
+/// declined rather than bound. Asked per layout rather than for the one format
+/// once known to be optional, because the mandatory-format table is an
+/// API-version assumption and does not cover the set: `R32_SFLOAT` is absent on
+/// Apple/MoltenVK and `R16_UNORM`'s linear filtering is optional too.
+///
+/// Returns `false` — declining the rail, leaving the sample fail-visible — if
+/// the engine cannot initialize.
+pub fn supports_sampled_layout_linear_filter(
+    layout: crate::contract::pixel_format::TexelLayout,
+) -> bool {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -1551,10 +1559,10 @@ pub fn supports_sampled_r32f_linear_filter() -> bool {
         ..
     } = &mut *guard;
     match owner.ensure(counters) {
-        Ok(ctx) => ctx.sampled_r32f_linear_filter,
+        Ok(ctx) => ctx.sampled_linear_filter[layout.index()],
         Err(error) => {
-            engine_probe_decline(EngineProbe::SampledR32fLinearFilter, &error)
-                .fail_once(EngineProbe::SampledR32fLinearFilter.discriminant());
+            engine_probe_decline(EngineProbe::SampledLayoutLinearFilter, &error)
+                .fail_once(EngineProbe::SampledLayoutLinearFilter.discriminant());
             false
         }
     }
@@ -3635,7 +3643,7 @@ mod probe_visibility_tests {
         let error = vk_call::exec_submit_device_lost_fixture();
         for probe in [
             EngineProbe::StorageWriteWithoutFormat,
-            EngineProbe::SampledR32fLinearFilter,
+            EngineProbe::SampledLayoutLinearFilter,
         ] {
             let line = engine_probe_decline(probe, &error).render();
             assert!(line.starts_with("vk_engine_probe reason=vk_exec_submit "));

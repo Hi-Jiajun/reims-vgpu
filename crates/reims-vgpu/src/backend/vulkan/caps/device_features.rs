@@ -32,6 +32,8 @@
 
 use ash::vk;
 
+use crate::contract::pixel_format::TexelLayout;
+
 /// How this device can satisfy `MTLSamplerAddressModeMirrorClampToEdge`.
 ///
 /// Three rungs rather than a bool, because *how* it is available decides what
@@ -139,13 +141,25 @@ pub struct DeviceFeatures {
     /// spec-mandatory — only `R8G8B8A8_UNORM` is — so the BGRA composite path
     /// needs this *and* `storage_image_write_without_format`.
     pub bgra8_storage: bool,
-    /// `R32_SFLOAT` usable as a sampled image with **linear** filtering under
-    /// optimal tiling. Single-channel float32 color-management LUTs
-    /// (`UberCompositeFragment` display-profile pass) are sampled with linear
-    /// interpolation; unlike `R16_SFLOAT`, this feature is *not* spec-mandatory
-    /// and is absent on Apple GPUs, so the native float32 sampled rail is gated
-    /// on it and otherwise leaves the sample fail-visible.
-    pub sampled_r32f_linear_filter: bool,
+    /// For each [`TexelLayout`], indexed by [`TexelLayout::index`], whether its
+    /// Vulkan format is usable as a sampled image with **linear** filtering
+    /// under optimal tiling.
+    ///
+    /// The native sampled rails bind a guest texel layout straight to an image
+    /// and let the sampler read it, with interpolation, so a layout the host
+    /// cannot filter is one those rails must decline. This used to be a single
+    /// `bool` for `R32_SFLOAT` — the one layout then known to be optional —
+    /// and every other layout was admitted on the reading that the spec's
+    /// mandatory-format table covered it. That reading is an API-version
+    /// assumption of exactly the kind `AGENTS.md` says to replace with a
+    /// capability, and it does not even hold for the set already here:
+    /// `R16_UNORM`'s linear-filter feature is optional too.
+    ///
+    /// Asking per layout also makes the gate impossible to forget. A new
+    /// [`TexelLayout`] gets an entry because the array is sized by
+    /// `TexelLayout::ALL.len()`, rather than needing someone to remember to add
+    /// a second `bool`.
+    pub sampled_linear_filter: [bool; TexelLayout::ALL.len()],
     pub storage16: bool,
     pub storage8: bool,
     pub float16: bool,
@@ -341,13 +355,17 @@ pub unsafe fn query(
     .optimal_tiling_features
     .contains(vk::FormatFeatureFlags::STORAGE_IMAGE);
 
-    // R32_SFLOAT linear filtering is optional (absent on Apple/MoltenVK); ask
-    // rather than assume, so the native float32 sampled LUT rail can decline
-    // where the host cannot filter it.
-    let sampled_r32f_linear_filter =
-        unsafe { instance.get_physical_device_format_properties(pd, vk::Format::R32_SFLOAT) }
-            .optimal_tiling_features
-            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR);
+    // One probe per sampled texel layout, so the native rails decline a layout
+    // this host cannot filter instead of sampling it wrong. Derived from
+    // `TexelLayout::ALL`, so adding a layout adds its probe.
+    let mut sampled_linear_filter = [false; TexelLayout::ALL.len()];
+    for &layout in TexelLayout::ALL {
+        let format = crate::backend::vulkan::translate::pixel::vk_texel_layout(layout);
+        sampled_linear_filter[layout.index()] =
+            unsafe { instance.get_physical_device_format_properties(pd, format) }
+                .optimal_tiling_features
+                .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR);
+    }
 
     // The guest is handed ONE sample-count answer and uses it for colour
     // attachments, depth attachments and sampled images alike, so the honest
@@ -418,7 +436,7 @@ pub unsafe fn query(
         storage_image_read_without_format: supported.shader_storage_image_read_without_format
             == vk::TRUE,
         bgra8_storage,
-        sampled_r32f_linear_filter,
+        sampled_linear_filter,
         storage16: supported_16.storage_buffer16_bit_access == vk::TRUE,
         storage8: supported_8.storage_buffer8_bit_access == vk::TRUE,
         float16: supported_f16i8.shader_float16 == vk::TRUE,
@@ -451,7 +469,7 @@ mod tests {
             storage_image_write_without_format: true,
             storage_image_read_without_format: true,
             bgra8_storage: true,
-            sampled_r32f_linear_filter: true,
+            sampled_linear_filter: [true; TexelLayout::ALL.len()],
             storage16: true,
             storage8: true,
             float16: true,

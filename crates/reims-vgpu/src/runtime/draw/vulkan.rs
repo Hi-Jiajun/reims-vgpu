@@ -3124,8 +3124,13 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             return None;
         }
         Ok((layout, decline)) => {
-            if layout == TexelLayout::R32Float && !engine::supports_sampled_r32f_linear_filter() {
-                crate::runtime::drain::note_store_route("zc_lin_format_r32f_unfilterable");
+            // Every layout is asked about, not just the one that was known to
+            // be optional. This rail hands the guest's bytes to a sampler that
+            // interpolates them, so "can this host filter this format" is a
+            // question about the layout, and a table indexed by the layout
+            // cannot be missing an entry for one that was added later.
+            if !engine::supports_sampled_layout_linear_filter(layout) {
+                crate::runtime::drain::note_store_route("zc_lin_layout_unfilterable");
                 return None;
             }
             if decline.is_some() {
