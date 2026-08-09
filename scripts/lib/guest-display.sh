@@ -46,6 +46,53 @@ guest_osa() {
   timeout "$secs" ssh -o BatchMode=yes "$guest" "osascript -e '$script'" 2>/dev/null
 }
 
+GUEST_DISPLAY_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# Consent this ssh session to send Apple Events to one named guest application,
+# answering the panel if it comes up. Returns 0 when the app answers.
+#
+# TCC scopes Apple Events per (client, target) pair, so consenting "System
+# Events" says nothing about "Safari": every application a probe scripts needs
+# its own answer. The panel is modal and its default button is Allow, so the
+# answer is one Return through QMP's usb-kbd.
+#
+# The keystroke is sent only after a call has been *seen* to hang, because a
+# hang is the only evidence available that a modal is up — nothing on the host
+# can see the guest's screen from here. A Return pressed blind at a live desktop
+# is not free, and a consented call answers in well under a second, so the
+# timeout is generous enough that a merely busy guest is not mistaken for a
+# blocked one and sent a keystroke it did not ask for.
+#
+# PREFER THIS OVER `System Events` for anything a scriptable application can do
+# itself. Reading or setting `bounds of front window` through an application's
+# own Standard Suite needs only this consent. The same thing through System
+# Events' `process`/`window` objects needs **assistive access**, which has no
+# panel to answer — it is granted by hand in System Preferences, and exactly one
+# rail of six ever had it. A probe written against System Events therefore runs
+# on that one rail and reports every other one as having no windows.
+guest_apple_events_consent() {
+  local guest="$1" app="$2"
+  local probe="tell application \"$app\" to get name"
+  local qmp_sock="${QMP_SOCK:-$GUEST_DISPLAY_REPO_ROOT/vm/disks/run/qmp.sock}"
+  local secs="${GUEST_CONSENT_TIMEOUT:-15}"
+
+  GUEST_OSA_TIMEOUT="$secs" guest_osa "$guest" "$probe" >/dev/null 2>&1 && return 0
+
+  if [ ! -S "$qmp_sock" ]; then
+    echo "guest-display: '$app' has not consented to Apple Events, and there is \
+no QMP socket at $qmp_sock to answer the panel with" >&2
+    return 1
+  fi
+  echo "guest-display: answering the Apple Events consent panel for '$app' ..." >&2
+  QMP_SOCK="$qmp_sock" timeout 30 "$GUEST_DISPLAY_REPO_ROOT/scripts/qmp/qmp.py" \
+    key ret >/dev/null 2>&1 || true
+
+  GUEST_OSA_TIMEOUT="$secs" guest_osa "$guest" "$probe" >/dev/null 2>&1 && return 0
+  echo "guest-display: '$app' still will not answer — the panel may have been for \
+something else, or there is no session to raise one in" >&2
+  return 1
+}
+
 # Print "WIDTH HEIGHT" for $1's desktop, or return 1 having said why on stderr.
 guest_display_size() {
   local guest="$1" out w h
