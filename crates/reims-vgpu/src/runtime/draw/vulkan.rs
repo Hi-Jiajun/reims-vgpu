@@ -93,6 +93,10 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
 
     let mut any_store = false;
     let mut color0_rgba: Option<Vec<u8>> = None;
+    // The engine draw's own refusal slug, kept so the skipped-draw tail can name
+    // why its draws were skipped instead of guessing. `None` means the engine
+    // draw was never attempted — this record carried no pipeline or no vertices.
+    let mut engine_refusal: Option<&'static str> = None;
     // Solid CLEAR seed Stores only when this record owns guest writeback
     // (last of a serialized chain, or unified always-writeback).
     if writeback_guest {
@@ -363,6 +367,12 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 // The guest re-submits every frame, so latch on
                 // (reason, pipeline_ref): a persistent reject cannot flood, but
                 // a new reason on the same pipeline still surfaces.
+                //
+                // Kept for the tail below, because that latch is exactly what
+                // makes the skipped-draw line unreadable on its own: this fires
+                // once per (reason, pipeline) and the tail fires once per
+                // packet, so a hundred skipped draws sit behind one decline.
+                engine_refusal = Some(crate::observe::Decline::slug(&e));
                 linux_m2v_draw_failure(&e, req).fail_once(req.pipeline_ref as u64);
             }
         }
@@ -673,9 +683,26 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
 
     if any_store {
         if req.vertex_count > 0 || req.indexed.is_some() {
+            // This used to end in the literal `(m2v pending)`, which was a
+            // hardcoded guess and was wrong. The tail is reached whenever the
+            // engine draw did not land, for any reason, and a translation still
+            // being in flight is only one of them — on a driven macos-26 boot
+            // the guess accounted for **none** of the 114 lines it printed.
+            // Pipeline 160 alone produced 105 of them, from t=36351 to
+            // t=112002, while its one translation was queued at t=36340 and
+            // reported `done ... ok` at t=36351. The real refusals were a
+            // sampled-texture validation check and the driver quarantine.
+            //
+            // `refused_by` is deliberately not spelled `reason=`: the census
+            // ranks fail-channel lines on that key, and the underlying slug is
+            // already counted once at its own emitter. Naming it twice would
+            // make one refusal read as two.
             crate::observe::fail(format!(
-                "linux_clear_store draws_skipped pipe={} vtx={} (m2v pending)",
-                req.pipeline_ref, req.vertex_count
+                "linux_clear_store draws_skipped reason=draws_skipped_after_engine_refusal \
+                 pipe={} vtx={} refused_by={}",
+                req.pipeline_ref,
+                req.vertex_count,
+                engine_refusal.unwrap_or("engine_draw_not_attempted")
             ));
         }
         (EncodeStatus::Ok, color0_rgba)
