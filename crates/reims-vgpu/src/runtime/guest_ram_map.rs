@@ -429,6 +429,42 @@ pub fn reference_for_pages<H: HostOps + ?Sized>(
 
 /// Ask the host where guest RAM lives and bound every span to the backend's
 /// granularity.
+///
+/// # This runs on the guest's first draw and costs about two seconds
+///
+/// It is lazy — the first `reference_for_pages` triggers it — and importing a
+/// multi-gigabyte RAMBlock through the host-pointer extension is not a cheap
+/// call: the driver has to take the whole range. On a 14 GiB `-m` guest the
+/// first few gathers absorb the entire cost and the ones after them are free,
+/// which is exactly the shape both x86 rails measure on their first frame:
+///
+/// ```text
+///                 draw_stall     stage_us     gather_us  gather_n  gather_b
+/// macos-11 first   2 028 844    2 022 252     2 022 259         6   1 176 768
+/// macos-11 later           —            —            75        61  13 545 376
+/// macos-13 first   1 959 875    1 951 567     1 951 562         4     523 904
+/// macos-13 later           —            —           105       104  15 318 048
+/// ```
+///
+/// Six gathers of 1.1 MB taking two seconds and sixty-one gathers of 13 MB
+/// taking 75 µs is not a gather cost; it is one-time setup charged to whoever
+/// arrives first. The same boots report it as a `sync_exec_lock_hold` of
+/// ~2 000 000 µs over one to three draws.
+///
+/// **The guest has a one-second watchdog behind this.** Its display pipe waits
+/// on a submitted display transaction and gives up after 1000 ms, so a first
+/// frame that takes two seconds blows it on every boot of every rail. Both
+/// rails measured here do blow it; the macos-13 guest recovers and the macos-11
+/// guest does not, and on macos-11 that is the whole visible failure — the
+/// transaction stays pending, WindowServer stops answering, and the session
+/// never starts.
+///
+/// So the laziness is not a performance detail on a slow path. Moving this off
+/// the guest's first draw — the import is taken once for the VM's lifetime, so
+/// device bring-up is where it belongs — is the fix, and it needs a hook that
+/// runs after the backend has published a granularity and before the guest's
+/// display pipe is armed. Timings above are wall clock on a shared host and are
+/// upper bounds; the counts and byte totals are not.
 fn resolve<H: HostOps + ?Sized>(host: &mut H) -> Resolved {
     let Some(align) = granularity() else {
         return Resolved {
