@@ -1750,6 +1750,33 @@ struct SampledVictim {
     key: SampledKey,
     identity: crate::backend::vulkan::engine::SampledContentIdentity,
     content_len: usize,
+    route: SampledVictimRoute,
+}
+
+/// Which of the two things that empty the sampled cache took this entry.
+///
+/// They want opposite fixes and a reach series that folded them together would
+/// point at the wrong one: a window lost to the caps says the cache is too
+/// small for the workload's reuse distance, and a window lost to the idle drain
+/// says `IDLE_TARGET_AGE_MS` is shorter than the interval the guest re-binds at.
+/// The first was the only path the ledger recorded when it was written, so an
+/// aged-out window reported `sampled_reach_beyond_ledger` — the same answer as a
+/// window the cache had genuinely never held.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SampledVictimRoute {
+    /// [`SAMPLED_CACHE_CAP`] or [`SAMPLED_CACHE_BYTE_CAP`] was over budget.
+    Cap,
+    /// The entry went untouched past `IDLE_TARGET_AGE_MS`.
+    Aged,
+}
+
+impl SampledVictimRoute {
+    fn route(self) -> &'static str {
+        match self {
+            Self::Cap => "sampled_reach_lost_to_cap",
+            Self::Aged => "sampled_reach_lost_to_age",
+        }
+    }
 }
 /// Max recycled sampled slots retained per geometry key in `sampled_free`. A
 /// content-changing input only needs a few live at once (the CB ring is 3-deep

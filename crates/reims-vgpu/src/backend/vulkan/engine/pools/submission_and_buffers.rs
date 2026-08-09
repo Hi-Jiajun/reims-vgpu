@@ -369,16 +369,40 @@ impl ResourcePools {
         let mut i = 0;
         while i < self.sampled_cache.len() && taken.len() < max {
             if self.sampled_cache[i].last_touch_ms <= cutoff {
-                let evicted = self.sampled_cache.remove(i);
-                self.sampled_cache_bytes =
-                    self.sampled_cache_bytes.saturating_sub(evicted.content_len);
-                taken.push(evicted.slot);
+                taken.push(self.evict_sampled_entry(i, SampledVictimRoute::Aged));
                 // `remove(i)` shifted the next entry into slot `i`; do not advance.
             } else {
                 i += 1;
             }
         }
         taken
+    }
+
+    /// Take entry `index` out of the sampled cache, charge the byte accounting,
+    /// and remember what was lost.
+    ///
+    /// The only way an entry leaves [`Self::sampled_cache`], which is the point:
+    /// the victim ledger is what separates "the cache never held this" from "the
+    /// cache held it and let it go", and a removal site that forgot to record
+    /// one would move misses into the first class silently. There were two such
+    /// sites and only one recorded; now neither can, because neither removes.
+    ///
+    /// An entry with no identity is not remembered. The gather rail's lookup is
+    /// identity-only, so such a window could never have been found again at any
+    /// cache size and banding its distance would answer a question nobody asked.
+    fn evict_sampled_entry(&mut self, index: usize, route: SampledVictimRoute) -> SampledSlot {
+        let evicted = self.sampled_cache.remove(index);
+        self.sampled_cache_bytes = self.sampled_cache_bytes.saturating_sub(evicted.content_len);
+        if let Some(identity) = evicted.identity {
+            self.sampled_victims.push_front(SampledVictim {
+                key: evicted.slot.key(),
+                identity,
+                content_len: evicted.content_len,
+                route,
+            });
+            self.sampled_victims.truncate(SAMPLED_VICTIM_LEDGER);
+        }
+        evicted.slot
     }
 
     /// Reclaim up to `max` compute-storage residents whose last use is at least
@@ -2669,6 +2693,7 @@ impl ResourcePools {
                 let (count_route, byte_route) = sampled_reach_bands(distance, bytes);
                 crate::runtime::drain::note_store_route(count_route);
                 crate::runtime::drain::note_store_route(byte_route);
+                crate::runtime::drain::note_store_route(victim.route.route());
                 return;
             }
         }
@@ -2804,25 +2829,12 @@ impl ResourcePools {
             {
                 crate::runtime::drain::note_store_route(route);
             }
-            let evicted = self.sampled_cache.remove(0);
-            self.sampled_cache_bytes = self.sampled_cache_bytes.saturating_sub(evicted.content_len);
-            // What the caps threw away, so a later miss can say how much cache
-            // would have kept it. Only an entry with an identity is worth
-            // remembering: the gather rail's lookup is identity-only, so an
-            // entry without one could never be found again anyway.
-            if let Some(identity) = evicted.identity {
-                self.sampled_victims.push_front(SampledVictim {
-                    key: evicted.slot.key(),
-                    identity,
-                    content_len: evicted.content_len,
-                });
-                self.sampled_victims.truncate(SAMPLED_VICTIM_LEDGER);
-            }
+            let evicted = self.evict_sampled_entry(0, SampledVictimRoute::Cap);
             // Recycle rather than destroy: a content-changing sampled input
             // (live tile / video frame) re-uploads into this same-geometry image
             // next frame instead of a fresh vkAllocateMemory. Routed through the
             // in-flight-safe deferral (an in-flight CB may still sample it).
-            self.dispose(device, DeferredHandle::RecycleSampled(evicted.slot));
+            self.dispose(device, DeferredHandle::RecycleSampled(evicted));
         }
     }
 
@@ -2977,6 +2989,11 @@ fn sampled_evict_route(len: usize, bytes: usize) -> Option<&'static str> {
 /// - Those plus `sampled_reach_beyond_ledger` are every gathered miss that
 ///   carried an identity, so the total is bounded above by
 ///   `sampled_gather_unretained + sampled_gather_unvouched`.
+/// - `sampled_reach_lost_to_cap + sampled_reach_lost_to_age` equals the count
+///   ladder's total, and it is the pair that says *which* fix. A miss lost to
+///   the caps is about cache size; a miss lost to the idle drain is about
+///   `IDLE_TARGET_AGE_MS` being shorter than the guest's re-bind interval, and
+///   no amount of extra cache reaches it.
 ///
 /// A large `beyond_ledger` is not a licence to lengthen the ledger. It says the
 /// workload's reuse distance is past eight times the cache, and a cache that
