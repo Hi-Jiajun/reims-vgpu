@@ -294,6 +294,15 @@ success hides a whole family of lost records behind a green run.
 
 ### Reading the fail log
 
+- **A log that stops is a different failure from a log that complains.** Every census here —
+  `drain_duty`, `store_routes`, `engine_delta` — is written at the *end* of a drain tranche, so a
+  drain thread that never returns produces no line at all while `display_vbl` and `host_window_loop`
+  keep ticking from other threads. The boot then reads as healthy. Two lines say otherwise and both
+  come from outside the drain: `driver_call reason=driver_call_outstanding` (a host driver call past
+  its deadline, once at 10 s and then once a minute) and `driver_quarantine` (a call a previous
+  process died inside, refused rather than made again). If the censuses stopped and neither line is
+  there, the stall is somewhere they do not reach — attach a debugger, remembering that
+  `yama/ptrace_scope=1` means gdb has to be an *ancestor* of the QEMU process.
 - **Count the boots before ranking anything.** The device appends and never truncates, so a log you
   did not just create may hold several boots of several builds. `grep -c vk_caps` is the boot count:
   one line per device creation. This is not the check below for "a boot's log and not the test
