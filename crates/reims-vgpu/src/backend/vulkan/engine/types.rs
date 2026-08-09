@@ -1336,6 +1336,24 @@ pub enum TargetIdentity {
         width: u32,
         height: u32,
         generation: u64,
+        /// This target's resident image format, from the pixel format the
+        /// mapping declares for its own plane.
+        ///
+        /// A type-11 mapping is not BGRA8 by its contract, which is what this
+        /// namespace assumed for as long as it held no format: it declares a
+        /// format, `mapping_write` reads that declaration to lay out the
+        /// writeback, and macOS 26 declares `MTLPixelFormatRGBA16Float` for
+        /// some of its compositing surfaces. Rendering those into a BGRA8
+        /// resident quantized the guest's half-float compositing to eight bits
+        /// with nothing to say so — the same loss the `Gva` namespace had, for
+        /// the same reason, found the same way.
+        ///
+        /// [`crate::runtime::present_identity::surface_identity`] is the only
+        /// producer, and it resolves this through
+        /// [`crate::runtime::mapping_write::mapping_store_format`] — the same
+        /// function the writeback lays its rows out from, so the resident and
+        /// its destination cannot disagree about what the guest asked for.
+        format: vk::Format,
     },
     /// Type-2/3 texture ref namespace.
     Texture {
@@ -1477,8 +1495,9 @@ impl TargetIdentity {
     ///
     /// Each namespace answers it from what it knows:
     ///
-    /// * `Surface` backs a type-11 guest IOSurface, whose pages are BGRA8 by
-    ///   that resource's own contract. Always BGRA.
+    /// * `Surface` backs a type-11 guest IOSurface, whose plane carries a
+    ///   declared pixel format exactly as a GVA target does — usually guest
+    ///   scanout order, and not always.
     /// * `Gva` is a render target the guest declared a pixel format for, and
     ///   that declaration is the answer — carried in the key as a whole
     ///   [`vk::Format`], not just its order. Two allocations at one address
@@ -1535,8 +1554,9 @@ impl TargetIdentity {
     ///
     /// [`Self::is_bgra`] is now a question *about* this rather than the thing
     /// the key stores, because a channel order cannot express how wide a
-    /// channel is. Only the `Gva` namespace varies: the other three have no
-    /// guest declaration to follow and answer with the same two constants they
+    /// channel is. The two namespaces the guest declares a format for —
+    /// `Surface` and `Gva` — answer with that declaration; `Texture` and
+    /// `Anonymous` have none to follow and answer with the constant they
     /// always did.
     ///
     /// Whoever reads this to size a buffer must go through
@@ -1544,7 +1564,7 @@ impl TargetIdentity {
     /// assumption is exactly what made a wider format unrepresentable.
     pub fn resident_format(&self) -> vk::Format {
         match self {
-            Self::Surface { .. } => translate::pixel::SCANOUT_FORMAT,
+            Self::Surface { format, .. } => *format,
             Self::Gva { format, .. } => *format,
             Self::Texture { .. } | Self::Anonymous { .. } => {
                 translate::pixel::RESIDENT_RGBA_FORMAT
@@ -1715,6 +1735,7 @@ mod tests {
             width: 1920,
             height: 1080,
             generation: 4,
+            format: translate::pixel::SCANOUT_FORMAT,
         };
         assert_eq!(
             (surface.width(), surface.height(), surface.generation()),
@@ -1789,9 +1810,11 @@ mod tests {
     /// The order is a property of the identity, and the three answers matter for
     /// different reasons.
     ///
-    /// `Surface` must be BGRA whatever else is true: every CPU consumer of a
+    /// `Surface` answers from the format its mapping declared, and one
+    /// constructed at the scanout format reports BGRA: every CPU consumer of a
     /// type-11 composite Store is declared in guest scanout order, so an RGBA
-    /// resident costs a whole-frame exchange per Store.
+    /// resident under a scanout-declared mapping costs a whole-frame exchange
+    /// per Store.
     ///
     /// `Gva` must answer from its own field and from nothing else. That is the
     /// half a future edit is likely to get wrong in either direction — pinning
@@ -1808,6 +1831,7 @@ mod tests {
             width: 8,
             height: 8,
             generation: 0,
+            format: translate::pixel::SCANOUT_FORMAT,
         }
         .is_bgra());
         for (format, bgra) in [
@@ -1922,6 +1946,7 @@ mod tests {
             width: 64,
             height: 64,
             generation: 7,
+            format: translate::pixel::SCANOUT_FORMAT,
         }));
     }
 }

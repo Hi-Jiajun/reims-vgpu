@@ -270,12 +270,18 @@ pub(super) fn identity_fields(identity: &TargetIdentity) -> Vec<(&'static str, S
             width,
             height,
             generation,
+            format,
         } => vec![
             ("identity_kind", "surface".into()),
             ("identity_id", id.to_string()),
             ("identity_width", width.to_string()),
             ("identity_height", height.to_string()),
             ("identity_generation", generation.to_string()),
+            // Part of the key here for the same reason it is in the `Gva` arm
+            // below: one mapping that redeclares its plane's format is two
+            // slots, and a decline naming only the mapping id could not say
+            // which of them refused.
+            ("identity_format", format!("{format:?}")),
         ],
         TargetIdentity::Texture {
             ref_,
@@ -329,6 +335,7 @@ mod tests {
             width: 64,
             height: 32,
             generation: 9,
+            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
         }
     }
 
@@ -437,6 +444,7 @@ mod tests {
                     width: 80,
                     height: 60,
                     generation: 11,
+                    format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
                 },
                 "surface",
                 ("identity_id", "7"),

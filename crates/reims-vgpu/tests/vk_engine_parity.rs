@@ -17,6 +17,15 @@ use reims_vgpu::backend::vulkan::engine::{
     VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
     VisibilityResultMode, MAX_DEVICE_RECREATES,
 };
+/// The resident format every `TargetIdentity::Surface` in this file is built at.
+///
+/// These tests predate the namespace carrying a format, and each was written
+/// against a resident in guest scanout order — several assert on the byte order
+/// of what they read back. Naming the constant once keeps that premise in one
+/// place and makes a test that wants a different format say so.
+const SURFACE_TEST_FORMAT: ash::vk::Format =
+    reims_vgpu::backend::vulkan::translate::pixel::SCANOUT_FORMAT;
+
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -116,8 +125,9 @@ fn near(got: u8, want: u8) -> bool {
 /// read back in.
 ///
 /// The engine picks the attachment format from the resolved target — a
-/// `TargetIdentity::Surface` resident is `B8G8R8A8_UNORM` so a type-11 composite
-/// Store's readback lands in guest scanout order with no CPU pass — and reports
+/// `TargetIdentity::Surface` resident is the format its mapping declared, which
+/// is `SURFACE_TEST_FORMAT` for every identity in this file, so a type-11
+/// composite Store's readback lands in guest scanout order with no CPU pass — and reports
 /// which it used in `DrawOutput::pixels_bgra`. These cases assert *colour*, not
 /// byte layout, so they normalize here from the reported order rather than
 /// assuming one. The physical contract has its own case
@@ -641,6 +651,7 @@ fn depth_test_honored_on_resident_target_path() {
             width: w,
             height: h,
             generation: 1,
+            format: SURFACE_TEST_FORMAT,
         };
         let mut req = engine_req(&vert, &frag, w, h);
         req.vertex_count = 6;
@@ -1096,6 +1107,7 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     let mut make_source = engine_req(&v, &f, 16, 16);
@@ -1161,6 +1173,7 @@ fn resident_sample_alias_uses_gpu_snapshot_without_roundtrip() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut cold = engine_req(&v, &f, 16, 16);
     cold.target_identity = Some(identity.clone());
@@ -1368,6 +1381,7 @@ fn warm_non_store_zero_readback_seed_create_alloc() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     // Cold: seed import + draw with readback so we can verify content, mark ready.
     let mut cold = engine_req(&v, &f, 16, 16);
@@ -1438,6 +1452,7 @@ fn every_admitted_resident_survives_past_the_retired_slot_cap() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     assert!(
         !engine::pin_resident_target(&absent),
@@ -1449,6 +1464,7 @@ fn every_admitted_resident_survives_past_the_retired_slot_cap() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut make = engine_req(&v, &f, 16, 16);
     make.target_identity = Some(pinned.clone());
@@ -1467,6 +1483,7 @@ fn every_admitted_resident_survives_past_the_retired_slot_cap() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut make2 = engine_req(&v, &f, 16, 16);
     make2.target_identity = Some(unpinned.clone());
@@ -1486,6 +1503,7 @@ fn every_admitted_resident_survives_past_the_retired_slot_cap() {
             width: 16,
             height: 16,
             generation: 1,
+            format: SURFACE_TEST_FORMAT,
         });
         engine::execute_draw_request(&filler).expect("filler draw");
     }
@@ -1505,6 +1523,7 @@ fn every_admitted_resident_survives_past_the_retired_slot_cap() {
             width: 16,
             height: 16,
             generation: 1,
+            format: SURFACE_TEST_FORMAT,
         };
         assert!(
             engine::resident_content_ready(&filler),
@@ -1519,8 +1538,9 @@ fn every_admitted_resident_survives_past_the_retired_slot_cap() {
 /// A `output_bgra` + `skip_readback` resident draw leaves content that
 /// [`engine::read_target`] can read back twice with the same answer — asserted
 /// here because nothing else in this suite reads the same resident twice.
-/// A `TargetIdentity::Surface` resident renders and reads back in guest scanout
-/// order **without the caller asking**, and says so; a pooled target does not.
+/// A `TargetIdentity::Surface` resident declared at guest scanout order renders
+/// and reads back in it **without the caller asking**, and says so; a pooled
+/// target does not.
 ///
 /// This is the contract the type-11 composite Store rests on. That Store's
 /// consumers are all defined in BGRA — `mapping_write::write_bgra8`,
@@ -1556,6 +1576,7 @@ fn a_surface_resident_reads_back_in_guest_scanout_order() {
         width: w,
         height: h,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     });
     let out = match engine::execute_draw_request(&resident) {
         Ok(o) => o,
@@ -1617,6 +1638,7 @@ fn a_bgra_resident_draw_reads_back_identically_twice() {
         width: w,
         height: h,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut req = engine_req(&v, &f, w, h);
     req.target_identity = Some(identity.clone());
@@ -1671,6 +1693,7 @@ fn a_skipped_draw_readback_and_a_resident_read_are_counted_apart() {
         width: w,
         height: h,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut req = engine_req(&v, &f, w, h);
     req.target_identity = Some(identity.clone());
@@ -1734,6 +1757,7 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
         width: w,
         height: h,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut req = engine_req(&vert, &frag, w, h);
     req.vertex_count = 6;
@@ -2006,6 +2030,7 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
             width: w,
             height: h,
             generation: 1,
+            format: SURFACE_TEST_FORMAT,
         };
         let mut req = engine_req(&vert, &frag, w, h);
         req.vertex_count = 6;
@@ -2126,6 +2151,7 @@ fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
             width: w,
             height: h,
             generation: 1,
+            format: SURFACE_TEST_FORMAT,
         };
         let mut req = engine_req(&vert, &frag, w, h);
         req.vertex_count = 6;
@@ -2207,6 +2233,7 @@ fn partial_draw_preserves_rgba_seed_on_bgra_target() {
         width: w,
         height: h,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let seed_rgba = [17u8, 91, 203, 255];
     let mut req = engine_req(&vert, &frag, w, h);
@@ -2339,6 +2366,7 @@ fn a_bgra_ordered_seed_lands_the_same_pixels_as_the_rgba_ordered_one() {
             width: w,
             height: h,
             generation: 1,
+            format: SURFACE_TEST_FORMAT,
         };
         let mut req = engine_req(&vert, &frag, w, h);
         req.target_identity = Some(identity.clone());
@@ -2451,6 +2479,7 @@ fn skip_readback_store_then_load_from_target_preserves_content() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     // Pass 1: product zero-copy Store shape — resident path uses skip_readback
     // so no CPU pixels land in host_cache.
@@ -2496,6 +2525,7 @@ fn guest_reset_evicts_resident_targets_without_destroying_context() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut draw = engine_req(&v, &f, 16, 16);
     draw.target_identity = Some(identity.clone());
@@ -2542,6 +2572,7 @@ fn chain_load_from_target_byte_parity_vs_cpu_seed() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut g1 = engine_req(&v, &f, 16, 16);
     g1.target_identity = Some(identity.clone());
@@ -2633,6 +2664,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
         width: w,
         height: h,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut g1 = engine_req(&v, &f, w, h);
     g1.target_identity = Some(identity.clone());
@@ -2888,12 +2920,14 @@ fn ring_overlaps_in_flight_no_readback_draws() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let id_b = TargetIdentity::Surface {
         id: 92,
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     // Cold sync draws mark both targets ready (content verified).
     for (label, identity) in [("ring_cold_a", &id_a), ("ring_cold_b", &id_b)] {
@@ -2968,12 +3002,14 @@ fn seed_from_target_gpu_copies_front_frame() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let back = TargetIdentity::Surface {
         id: 72,
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     // Render known content into the "front frame" resident.
     let mut cold = engine_req(&v, &f, 16, 16);
@@ -3016,6 +3052,7 @@ fn seed_from_target_gpu_copies_front_frame() {
         width: 16,
         height: 16,
         generation: 9,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut missing = engine_req(&v, &f, 16, 16);
     missing.target_identity = Some(back.clone());
@@ -3037,12 +3074,14 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let secondary = TargetIdentity::Surface {
         id: 0x61,
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     let mut mrt = engine_req(&v, &f, 16, 16);
@@ -3082,6 +3121,7 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut consume = engine_req(&v, &f, 16, 16);
     consume.target_identity = Some(consumer_target);
@@ -3122,6 +3162,7 @@ fn mrt_rg16float_secondary_builds_and_renders() {
         width: 32,
         height: 32,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mask = TargetIdentity::Gva {
         gva: 0x3cf5000,
@@ -3188,12 +3229,14 @@ fn depth_and_mrt_secondary_render_in_one_pass() {
             width: w,
             height: h,
             generation: 1,
+            format: SURFACE_TEST_FORMAT,
         };
         let secondary = TargetIdentity::Surface {
             id: surface_id + 1,
             width: w,
             height: h,
             generation: 1,
+            format: SURFACE_TEST_FORMAT,
         };
         let mut req = engine_req(&v, &f, w, h);
         req.target_identity = Some(primary);
@@ -3255,6 +3298,7 @@ fn single_rt_draw_unaffected_by_mrt_path() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut req = engine_req(&v, &f, 16, 16);
     req.target_identity = Some(target.clone());
@@ -3423,6 +3467,7 @@ fn resident_content_state_separates_an_absent_slot_from_an_unstamped_one() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     assert_eq!(
         engine::resident_content_state(&absent),
@@ -3436,6 +3481,7 @@ fn resident_content_state_separates_an_absent_slot_from_an_unstamped_one() {
         width: 16,
         height: 16,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let mut make = engine_req(&v, &f, 16, 16);
     make.target_identity = Some(live.clone());

@@ -4364,6 +4364,7 @@ mod tests {
                 width: 16,
                 height: 16,
                 generation: 1,
+                format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
             },
             width: 16,
             height: 16,

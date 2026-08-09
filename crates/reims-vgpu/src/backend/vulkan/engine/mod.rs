@@ -1608,26 +1608,36 @@ pub fn supports_sampled_layout_linear_filter(
 /// source — `flush_intersecting`, the deferred render-flush rail — reads the same
 /// resident but additionally scatters it into the fragmented guest pages — work
 /// the oracle does not need and which the deferred-writeback rail already
-/// performs on a genuine guest read. Errors (rather than swapping channels) on a
-/// non-BGRA resident: the caller's frame buffer is BGRA8, and an RGBA resident
-/// would hand the proxies channel-swapped pixels.
+/// performs on a genuine guest read.
+///
+/// **Converts rather than refusing.** The caller's frame buffer is BGRA8 and
+/// this is the only source the present capture has left — a refusal here is not
+/// a fallback, it is the host window holding its previous retain until some
+/// later frame happens to be readable. That was survivable while every resident
+/// this could name was created in guest scanout order; it stopped being so once
+/// a type-11 mapping's resident follows the format the mapping declares, because
+/// a scanout plane declared at anything else would have frozen the window
+/// outright. So the readback's own reported order decides, and a resident that
+/// is not already BGRA8 pays one exchange — [`read_target`]'s rail has already
+/// narrowed a wide one to four bytes by then, so the exchange is always over
+/// RGBA8.
 ///
 /// Returns `None` for every *expected* absence — unknown identity, no ready
-/// content, non-BGRA resident, or a short/oversized readback — so the caller can
-/// fall back silently. These are speculative conditions on a normal boot (a cold
-/// mid has no resident yet), not failures worth a fail-log line.
+/// content, or a short/oversized readback — so the caller can fall back
+/// silently. These are speculative conditions on a normal boot (a cold mid has
+/// no resident yet), not failures worth a fail-log line.
 pub fn read_resident_bgra(identity: &TargetIdentity, need: usize) -> Option<Vec<u8>> {
     {
         let guard = lock_engine();
         let slot = guard.pools.registry_get(identity)?;
-        if !slot.content_ready || !slot.scanout_order() {
+        if !slot.content_ready {
             return None;
         }
     }
     let mut px = match read_target_inner(identity) {
-        // The `scanout_order` gate above already established the order, so the
-        // reported one cannot disagree and the bytes pass through untouched.
-        Ok(rb) => rb.pixels,
+        // `into_bgra8` is a no-op for a resident already in scanout order, which
+        // is every one this rail sees on a boot measured so far.
+        Ok(rb) => rb.into_bgra8(),
         Err(e) => {
             let mut emit = crate::observe::Emit::decline("present_capture", &e);
             for (key, value) in draw_execution::identity_fields(identity) {

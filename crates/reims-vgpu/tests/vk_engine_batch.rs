@@ -16,6 +16,15 @@ use reims_vgpu::backend::vulkan::engine::{
     SampledImageResource, SampledSource, SamplerResource, ScissorResource, StorageBufferResource,
     TargetIdentity,
 };
+/// The resident format every `TargetIdentity::Surface` in this file is built at.
+///
+/// These tests predate the namespace carrying a format, and each was written
+/// against a resident in guest scanout order — several assert on the byte order
+/// of what they read back. Naming the constant once keeps that premise in one
+/// place and makes a test that wants a different format say so.
+const SURFACE_TEST_FORMAT: ash::vk::Format =
+    reims_vgpu::backend::vulkan::translate::pixel::SCANOUT_FORMAT;
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -130,6 +139,7 @@ fn batched_draws_compose_and_flush_on_read() {
         width: W,
         height: H,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     let before = engine::counter_snapshot();
@@ -186,12 +196,14 @@ fn cross_target_draw_flushes_open_batch() {
         width: W,
         height: H,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
     let b = TargetIdentity::Surface {
         id: 990_202,
         width: W,
         height: H,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     let before = engine::counter_snapshot();
@@ -245,6 +257,7 @@ fn prefetch_arm_flushes_open_batch() {
         width: W,
         height: H,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     let before = engine::counter_snapshot();
@@ -277,6 +290,7 @@ fn batch_length_cap_flushes_and_reopens() {
         width: W,
         height: H,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     let before = engine::counter_snapshot();
@@ -326,6 +340,7 @@ fn batched_guest_runs_buffer_snapshots_at_record() {
         width: W,
         height: H,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     let before = engine::counter_snapshot();
@@ -416,6 +431,7 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
         width: W,
         height: H,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     // One x86 guest page holding a uniform 2x2 RGBA8 texture, written as two
@@ -577,6 +593,7 @@ fn a_scattered_guest_buffer_window_is_gathered_by_the_gpu_in_one_region_per_stre
         width: W,
         height: H,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     // The device publishes the import granularity when it is created, and it is
@@ -786,6 +803,7 @@ void main() {{
         width: W,
         height: H,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     // The device publishes the import granularity when it is created, so one
@@ -966,6 +984,7 @@ void main() {{
         width: W,
         height: H,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     let (warm_vert, warm_frag) = triangle_spirv();
@@ -1136,6 +1155,7 @@ void main() {{
         width: W,
         height: H,
         generation: 1,
+        format: SURFACE_TEST_FORMAT,
     };
 
     let (warm_vert, warm_frag) = triangle_spirv();
