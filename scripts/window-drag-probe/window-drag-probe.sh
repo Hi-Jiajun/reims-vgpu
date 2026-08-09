@@ -75,7 +75,9 @@ WORK="${KEEP:-$(mktemp -d)}"
 mkdir -p "$WORK"
 [ -n "$KEEP" ] || trap 'rm -rf "$WORK"' EXIT
 say() { echo "window-drag-probe: $*"; }
-osa() { ssh -o BatchMode=yes "$GUEST" "osascript -e '$1'" 2>/dev/null; }
+# shellcheck source=../lib/guest-display.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/guest-display.sh"
+osa() { guest_osa "$GUEST" "$1"; }
 
 ssh -o ConnectTimeout=8 -o BatchMode=yes "$GUEST" true 2>/dev/null || {
   say "no guest at $GUEST" >&2; exit 2; }
