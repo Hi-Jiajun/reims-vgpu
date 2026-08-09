@@ -38,11 +38,22 @@
 //!   have defaulted to 1.0. Refusing is the faithful answer, and the repair is
 //!   not to widen the fallback but to narrow when it applies.
 //!
-//! **None of the second or third class has fired on any archived boot of this
-//! rig** — x86/PCI/Vulkan, driven under the window-drag and web-content probes
-//! as well as idle. For the second, each names a real Metal feature this
-//! workload does not reach, which is the reading that makes leaving them open a
-//! measurement rather than a bet. For the third the zero is structural on this
+//! **`NoSampledLayout` fires in the hundreds of thousands, and the zero that
+//! used to be recorded here was an artifact of where it was sampled.** The
+//! linear sampled zero-copy rung matched `Err(_)` and threw the reason away,
+//! emitting a route name of its own instead, so the slug reached no fail line
+//! however often the check refused — 22 270 declines in one driven macos-26
+//! boot, against 8 975 on macos-13. The reading "this class has never fired"
+//! was taken from the fail log and the fail log could not see it. Any future
+//! claim of that shape has to name the site that would emit, not just the
+//! absence of a grep hit.
+//!
+//! **The rest of the second class, and all of the third, still read zero on
+//! archived boots of this rig** — x86/PCI/Vulkan, driven under the window-drag
+//! and web-content probes as well as idle. For the second, each names a real
+//! Metal feature this workload does not reach, which is the reading that makes
+//! leaving them open a measurement rather than a bet. For the third the zero is
+//! structural on this
 //! rig and says less: no host here declines a three-component vertex format, so
 //! the fallback is never entered and neither variant is reachable. It says
 //! nothing about the arm64 pathway, which this checkout cannot boot, and a
@@ -70,6 +81,16 @@ pub enum TranslateReason {
     /// convert pass. Distinct from [`Self::UnknownPixelFormat`]: the format is
     /// understood, this rail just does not carry it.
     NoSampledLayout(u16),
+    /// The format is defined by the contract and the sampled rail could carry
+    /// its byte layout, but its Metal channels do not sit on their Vulkan
+    /// channels identically, so sampling it needs a component mapping on the
+    /// image view. Distinct from [`Self::NoSampledLayout`] because the two want
+    /// opposite repairs: that one is closed by naming a byte layout, this one
+    /// by teaching a rail to carry a swizzle. `MTLPixelFormatA8Unorm` is the
+    /// standing example — it occupies one byte like `R8_UNORM` does, so a byte
+    /// layout alone would hand the shader `(a,0,0,1)` where Metal gives
+    /// `(0,0,0,a)`.
+    SampledComponentsNotIdentity(u16),
     /// The format is defined by the contract but is not one the engine can use
     /// as a colour attachment. Distinct from [`Self::UnknownPixelFormat`] for
     /// the same reason.
@@ -190,6 +211,7 @@ impl crate::observe::Decline for TranslateReason {
             Self::UnknownStorageSelector(_) => "unknown_storage_selector",
             Self::SrgbDowngraded(_) => "srgb_downgraded",
             Self::NoSampledLayout(_) => "no_sampled_layout",
+            Self::SampledComponentsNotIdentity(_) => "sampled_components_not_identity",
             Self::NoColorAttachmentFormat(_) => "no_color_attachment_format",
             Self::UnknownVertexFormat(_) => "unknown_vertex_format",
             Self::UnknownVertexStepFunction(_) => "unknown_vertex_step_function",
@@ -229,6 +251,7 @@ impl TranslateReason {
             Self::UnknownPixelFormat(v)
             | Self::SrgbDowngraded(v)
             | Self::NoSampledLayout(v)
+            | Self::SampledComponentsNotIdentity(v)
             | Self::NoColorAttachmentFormat(v)
             | Self::NoStorageImageFormat(v) => u32::from(v),
             Self::UnknownVertexFormat(v)
@@ -281,6 +304,7 @@ mod tests {
         TranslateReason::UnknownPixelFormat(0),
         TranslateReason::SrgbDowngraded(0),
         TranslateReason::NoSampledLayout(0),
+        TranslateReason::SampledComponentsNotIdentity(0),
         TranslateReason::NoColorAttachmentFormat(0),
         TranslateReason::NoStorageImageFormat(0),
         TranslateReason::UnknownStorageSelector(0),
@@ -325,30 +349,31 @@ mod tests {
                 TranslateReason::UnknownPixelFormat(_) => 0,
                 TranslateReason::SrgbDowngraded(_) => 1,
                 TranslateReason::NoSampledLayout(_) => 2,
-                TranslateReason::NoColorAttachmentFormat(_) => 3,
-                TranslateReason::NoStorageImageFormat(_) => 4,
-                TranslateReason::UnknownStorageSelector(_) => 5,
-                TranslateReason::UnknownVertexFormat(_) => 6,
-                TranslateReason::UnknownVertexStepFunction(_) => 7,
-                TranslateReason::VertexStepFunctionPerPatch(_) => 8,
-                TranslateReason::UnknownPrimitiveType(_) => 9,
-                TranslateReason::UnknownBlendFactor(_) => 10,
-                TranslateReason::UnknownBlendOperation(_) => 11,
-                TranslateReason::UnknownCompareFunction(_) => 12,
-                TranslateReason::UnknownStencilOperation(_) => 13,
-                TranslateReason::UnknownCullMode(_) => 14,
-                TranslateReason::UnknownWinding(_) => 15,
-                TranslateReason::UnknownFillMode(_) => 16,
-                TranslateReason::UnknownDepthClipMode(_) => 17,
-                TranslateReason::UnknownSamplerFilter(_) => 18,
-                TranslateReason::UnknownSamplerMipFilter(_) => 19,
-                TranslateReason::UnknownSamplerAddressMode(_) => 20,
-                TranslateReason::UnknownSamplerBorderColor(_) => 21,
-                TranslateReason::UnknownSwizzleSelector(_) => 22,
-                TranslateReason::FormatNotVertexBuffer(_) => 23,
-                TranslateReason::VertexFormatWidenReadAsFour(_) => 24,
-                TranslateReason::VertexFormatWidenShaderUnreadable(_) => 25,
-                TranslateReason::UnknownVisibilityResultMode(_) => 26,
+                TranslateReason::SampledComponentsNotIdentity(_) => 3,
+                TranslateReason::NoColorAttachmentFormat(_) => 4,
+                TranslateReason::NoStorageImageFormat(_) => 5,
+                TranslateReason::UnknownStorageSelector(_) => 6,
+                TranslateReason::UnknownVertexFormat(_) => 7,
+                TranslateReason::UnknownVertexStepFunction(_) => 8,
+                TranslateReason::VertexStepFunctionPerPatch(_) => 9,
+                TranslateReason::UnknownPrimitiveType(_) => 10,
+                TranslateReason::UnknownBlendFactor(_) => 11,
+                TranslateReason::UnknownBlendOperation(_) => 12,
+                TranslateReason::UnknownCompareFunction(_) => 13,
+                TranslateReason::UnknownStencilOperation(_) => 14,
+                TranslateReason::UnknownCullMode(_) => 15,
+                TranslateReason::UnknownWinding(_) => 16,
+                TranslateReason::UnknownFillMode(_) => 17,
+                TranslateReason::UnknownDepthClipMode(_) => 18,
+                TranslateReason::UnknownSamplerFilter(_) => 19,
+                TranslateReason::UnknownSamplerMipFilter(_) => 20,
+                TranslateReason::UnknownSamplerAddressMode(_) => 21,
+                TranslateReason::UnknownSamplerBorderColor(_) => 22,
+                TranslateReason::UnknownSwizzleSelector(_) => 23,
+                TranslateReason::FormatNotVertexBuffer(_) => 24,
+                TranslateReason::VertexFormatWidenReadAsFour(_) => 25,
+                TranslateReason::VertexFormatWidenShaderUnreadable(_) => 26,
+                TranslateReason::UnknownVisibilityResultMode(_) => 27,
             }
         }
         let mut seen: Vec<usize> = ALL.iter().map(|r| index(*r)).collect();

@@ -202,8 +202,13 @@ pub fn sampled_pixels(mtl: u16) -> Result<(TexelLayout, Option<TranslateReason>)
     // admitting such a format here would bind, say, `A8Unorm` as plain
     // `R8_UNORM` and hand the shader `(a,0,0,1)` where Metal gives `(0,0,0,a)`.
     // Decline until the rail carries the mapping.
+    //
+    // Its own reason rather than `NoSampledLayout`, because the repair differs:
+    // this one is closed by a rail that can put a swizzle on the view, that one
+    // by naming a byte layout here. Sharing a slug made the two indistinguish-
+    // able in the fail log, which is the failure `reason.rs` exists to prevent.
     if f.components != IDENTITY {
-        return Err(TranslateReason::NoSampledLayout(mtl));
+        return Err(TranslateReason::SampledComponentsNotIdentity(mtl));
     }
     let layout = match f.linear_vk {
         vk::Format::R8G8B8A8_UNORM => TexelLayout::Rgba8,
@@ -875,10 +880,16 @@ mod tests {
             TranslateReason::UnknownPixelFormat(0xffff)
         );
         // Declined for the *mapping*, not the byte size: A8Unorm is one byte
-        // like R8Unorm but does not present its channels the same way.
+        // like R8Unorm but does not present its channels the same way. It gets
+        // its own reason because the repair is a swizzle on the view, where
+        // `NoSampledLayout`'s is a byte layout named here.
         assert_eq!(
             sampled_pixels(p::MTL_FORMAT_A8_UNORM).unwrap_err(),
-            TranslateReason::NoSampledLayout(p::MTL_FORMAT_A8_UNORM)
+            TranslateReason::SampledComponentsNotIdentity(p::MTL_FORMAT_A8_UNORM)
+        );
+        assert_ne!(
+            TranslateReason::SampledComponentsNotIdentity(0).slug(),
+            TranslateReason::NoSampledLayout(0).slug()
         );
         assert!(sampled_pixels(p::MTL_FORMAT_R8_UNORM).is_ok());
         assert_eq!(
@@ -1133,7 +1144,7 @@ mod tests {
         assert!(!has_identity_components(p::MTL_FORMAT_A8_UNORM));
         assert!(matches!(
             sampled_pixels(p::MTL_FORMAT_A8_UNORM),
-            Err(TranslateReason::NoSampledLayout(_))
+            Err(TranslateReason::SampledComponentsNotIdentity(_))
         ));
     }
 

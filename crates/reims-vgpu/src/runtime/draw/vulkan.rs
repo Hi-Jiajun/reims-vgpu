@@ -3029,6 +3029,25 @@ pub(super) fn try_gva_resident_sample<M: HostMemory + HostOps>(
     Some((w, h, SampledSourceRequest::Target(identity)))
 }
 
+/// Which repair would let the linear zero-copy rung carry this format, as a
+/// route name.
+///
+/// The three named arms are the three ways [`translate::pixel::sampled_pixels`]
+/// declines, and each points at different work: teach the decode contract an
+/// ordinal, name a byte layout for a format the contract already defines, or
+/// give the image view a component mapping. `_other` is a healthy zero — a
+/// firing means `sampled_pixels` grew a fourth decline that this split does not
+/// name, not that a format was lost.
+fn zc_lin_no_layout_route(reason: translate::TranslateReason) -> &'static str {
+    use translate::TranslateReason as R;
+    match reason {
+        R::UnknownPixelFormat(_) => "zc_lin_no_layout_undefined_format",
+        R::NoSampledLayout(_) => "zc_lin_no_layout_no_texel_layout",
+        R::SampledComponentsNotIdentity(_) => "zc_lin_no_layout_needs_swizzle",
+        _ => "zc_lin_no_layout_other",
+    }
+}
+
 fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -3084,11 +3103,20 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
         // enumerates in a handful of lines. The number is the guest's own
         // `MTLPixelFormat` ordinal, so it names the format without this device
         // having to hold a second spelling of Apple's table.
-        Err(_) => {
+        // The reason is kept, not discarded. `Err` here has three causes that
+        // want three different repairs — the format is outside the decode
+        // contract, the contract defines it but no rail names a byte layout for
+        // it, or the layout exists but its channels need a swizzle — and a
+        // single count reads the same for all three. The sub-route is the
+        // reason's own slug, so it cannot drift from the taxonomy in
+        // `translate::reason`, and the total is still recorded beside it so the
+        // split adds up.
+        Err(reason) => {
             crate::runtime::drain::note_store_route("zc_lin_format_no_layout");
+            crate::runtime::drain::note_store_route(zc_lin_no_layout_route(reason));
             if crate::observe::first_sight("zc_lin_format_no_layout", u64::from(declared_format)) {
                 crate::observe::off(format!(
-                    "zc_lin_format_no_layout fmt={declared_format:#x} \
+                    "zc_lin_format_no_layout fmt={declared_format:#x} {reason} \
                      (no sampled TexelLayout; the bind falls to the CPU \
                      re-read + memcmp rung)"
                 ));
