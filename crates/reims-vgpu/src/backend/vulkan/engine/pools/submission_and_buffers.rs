@@ -62,6 +62,19 @@ impl ResourcePools {
         unsafe { self.host_ram_imports.bind(ctx, guest_ref) }
     }
 
+    /// Import a RAMBlock ahead of any reference into it.
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must own the device every live import was made against.
+    pub(crate) unsafe fn warm_guest_ram(
+        &mut self,
+        ctx: &DeviceContext,
+        import: &crate::runtime::guest_ram::GuestRamImport,
+    ) -> Result<bool, host_ram::HostRamDecline> {
+        unsafe { self.host_ram_imports.warm(ctx, import) }
+    }
+
     /// How many RAMBlocks are imported, and how many bytes they cover.
     ///
     /// The count is the reading that says whether the model held: one or two

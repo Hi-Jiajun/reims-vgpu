@@ -2861,6 +2861,60 @@ unsafe fn publish_previous_writeback_timestamps(ctx: &context::DeviceContext) {
     }
 }
 
+/// Import every RAMBlock in `imports` now, and report how many that took.
+///
+/// # Why the device does this before the guest asks
+///
+/// `vkAllocateMemory` with a host pointer chained is where a driver that pins
+/// takes its reference on every page of the mapping, and the mapping is the
+/// whole of guest RAM. A driven x86 boot on a discrete NVIDIA host measured
+/// **2 493 029 µs for a 15 032 385 536-byte RAMBlock and 309 796 µs for a
+/// 2 146 435 072-byte one**, with the properties query that precedes both at
+/// 0 µs. Left to the first `gather` that references a block, that is ~2.8 s
+/// charged to the guest's first frame — and the guest's display pipe abandons a
+/// submitted transaction after 1000 ms, so the first frame of every boot missed
+/// its own watchdog by a factor of three.
+///
+/// So the cost is not removed; it is moved to a caller that is not a frame. The
+/// per-page work is the extension's, it is proportional to guest RAM, and
+/// nothing this device does makes it cheaper — importing sub-ranges instead
+/// would be the per-resource import [`host_ram`] exists to avoid.
+///
+/// Returns `(warmed, bytes)`: how many blocks this call actually imported and
+/// how many bytes they covered. Zero blocks means either they were already
+/// imported or the device is not up yet, and neither is a failure — a host with
+/// no import capability never reaches this at all, because the resolution that
+/// produces `imports` refuses first.
+pub fn warm_guest_ram_imports(
+    imports: &[std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>],
+) -> (usize, u64) {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ..
+    } = &mut *guard;
+    let Some(ctx) = owner.ctx.as_ref() else {
+        return (0, 0);
+    };
+    let mut warmed = 0usize;
+    let mut bytes = 0u64;
+    for import in imports {
+        match unsafe { pools.warm_guest_ram(ctx, import) } {
+            Ok(true) => {
+                warmed += 1;
+                bytes = bytes.saturating_add(import.len());
+            }
+            Ok(false) => {}
+            // The draw path asks again and declines there with the same reason,
+            // so this is reported and not propagated: a warm that could not
+            // import must not be the thing that decides the rail is off.
+            Err(inner) => crate::observe::Emit::decline("vk_guest_ram_warm", &inner).fail_once(0),
+        }
+    }
+    (warmed, bytes)
+}
+
 /// Guest memory the device can currently reach through host-pointer imports,
 /// and how many RAMBlocks that is.
 ///

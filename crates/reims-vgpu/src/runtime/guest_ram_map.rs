@@ -237,27 +237,25 @@ pub fn imports() -> Vec<Arc<GuestRamImport>> {
         .unwrap_or_default()
 }
 
-/// Take the import now, so the guest's first draw does not pay for it.
+/// Take the whole guest-RAM import now, so the guest's first draw does not pay
+/// for it.
 ///
-/// Left lazy, [`resolve`] runs inside the first `gather`, inside the first
-/// draw, inside a display transaction the guest abandons after 1000 ms. Called
-/// from the guest driver's protocol-version handshake it runs before the guest
-/// has a display pipe to arm a watchdog on, and every later caller finds the
-/// answer already cached.
+/// # Two steps, and only the second one costs
 ///
-/// **This bought no measured time, and the honest reading is in [`resolve`]'s
-/// doc.** The move is real — `guest_ram_span` emits a second earlier, at the
-/// handshake — but the first frame's `gather_us` did not change, so the two
-/// seconds that blow the guest's watchdog are not this call. It is kept because
-/// asking the host where its RAM is, once, at a handshake, is where that
-/// question belongs whatever else is slow; it is not kept as a fix for the
-/// stall, and it should not be cited as one.
+/// Asking the host where its RAMBlocks are ([`resolve`]) is a handful of shim
+/// calls. Handing each of those mappings to the GPU is `vkAllocateMemory` with
+/// a host pointer chained, which is where a driver that pins takes a reference
+/// on every page of guest RAM — seconds, proportional to the RAM the VM was
+/// given, and measured per block by
+/// [`crate::backend::vulkan::engine::warm_guest_ram_imports`].
 ///
-/// It does not cost the working rail: an undriven macos-13 x86/PCI boot after
-/// the move reaches its desktop in ~25 s with `guest_ram_span` emitted at the
-/// handshake (t=20596, the same millisecond as `protocol_version`) and
-/// `deferred_flush_lost`, `gw_audit_unsound`, `render_flush_over_guest_write`,
-/// `mapping_page_drift` and `present_action_starvation` all zero.
+/// Both were lazy and both landed on the guest's first `gather`, inside its
+/// first draw, inside a display transaction the guest abandons after 1000 ms.
+/// Moving only the first one bought nothing measurable, which is the finding
+/// that located the second: `guest_ram_span` moved a second earlier and
+/// `gather_us` did not move at all. Called from the guest driver's
+/// protocol-version handshake, both now run before the guest has a display pipe
+/// to arm a watchdog on, and every later caller finds the answer already there.
 ///
 /// **It must never cache a negative.** [`resolve`] answers `NoBackendImport`
 /// when no backend has published a granularity yet, and that answer is latched
@@ -266,14 +264,32 @@ pub fn imports() -> Vec<Arc<GuestRamImport>> {
 /// opposite of the intent and would look like a host that lacks the extension.
 /// The guard is the same question `resolve` asks first, and asking it here
 /// leaves the lazy path to handle a backend that is genuinely late.
+///
+/// The device-side half is Vulkan-only because only Vulkan has a device-side
+/// half: the Metal-direct arm builds a `newBufferWithBytesNoCopy` per call
+/// against unified memory and holds no per-RAMBlock import to warm.
 pub fn warm<H: HostOps + ?Sized>(host: &mut H) {
     if granularity().is_none() {
         return;
     }
-    if MAP.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
-        return;
+    let already = MAP.lock().unwrap_or_else(|p| p.into_inner()).is_some();
+    if !already {
+        with_map(host, |_| ());
     }
-    with_map(host, |_| ());
+    #[cfg(feature = "backend-vulkan")]
+    {
+        let imports = imports();
+        if !imports.is_empty() {
+            let (warmed, bytes) =
+                crate::backend::vulkan::engine::warm_guest_ram_imports(&imports);
+            if warmed > 0 {
+                crate::observe::off(format!(
+                    "guest_ram_warm blocks={warmed} bytes={bytes} spans={}",
+                    imports.len()
+                ));
+            }
+        }
+    }
 }
 
 /// Resolve on the first call of a boot, then run `body` against the result.
@@ -473,20 +489,18 @@ pub fn reference_for_pages<H: HostOps + ?Sized>(
 ///
 /// It was lazy — the first `reference_for_pages` triggered it — and it now runs
 /// at the guest driver's protocol handshake instead ([`warm`]). **That move was
-/// measured and it did not shift the stall**, which is the useful half of this
-/// note: the first-frame cost below is not the RAMBlock import, and the next
-/// reader should not spend a boot re-suspecting it.
+/// measured and it did not shift the stall**, which is what located the real
+/// one: asking the host where its RAM is costs nothing, and handing those
+/// mappings to the GPU costs everything. The evidence is one timestamp —
+/// `guest_ram_span`, emitted once per boot by this function, moved from t=56453
+/// to t=55342 while `gather_us` on the first frame stayed at 2 180 583 over the
+/// same six gathers.
 ///
-/// The evidence is one timestamp. `guest_ram_span`, which this function emits
-/// once per boot, moved from t=56453 to t=55342 — the same millisecond as
-/// `protocol_version`, a full second ahead of the draw — and `gather_us` on the
-/// first frame stayed at 2 180 583 over the same six gathers. So resolution is
-/// off the critical path and the two seconds are still there, somewhere else in
-/// the gather path.
-///
-/// What the shape rules in and out. Both x86 rails measure this on their first
-/// frame, and the second row of each pair is what says it is one-time setup
-/// rather than a per-byte cost:
+/// The seconds are `vkAllocateMemory` with the host pointer chained, measured
+/// per RAMBlock at [`crate::backend::vulkan::engine::warm_guest_ram_imports`],
+/// which is now also warmed from [`warm`]. The table below is the state before
+/// that, kept because its second row is what ruled out a per-byte cost and sent
+/// the search to one-time setup:
 ///
 /// ```text
 ///                 draw_stall     stage_us     gather_us  gather_n  gather_b
@@ -509,14 +523,11 @@ pub fn reference_for_pages<H: HostOps + ?Sized>(
 /// transaction stays pending, WindowServer stops answering, and the session
 /// never starts.
 ///
-/// Where the two seconds are NOT: this function, per the timestamp above; the
-/// bytes, per the second row of each pair; and the guest, which is idle behind
-/// its own wait. What is left is one-time backend setup that the first gather
-/// is merely the first caller to touch — the same draw is where
-/// `vk_memory_type_pick class=DeviceLocal` and the first `buffer_slab_device`
-/// allocation appear, and this host is a discrete part whose first submission
-/// after device creation is not free. That is the next place to look, and it
-/// wants a span census inside the gather rather than another guess.
+/// The same driven boot then timed the two halves of the import separately and
+/// read `probe_us=0` beside `alloc_us=2 493 029` for a 15 032 385 536-byte
+/// RAMBlock and `alloc_us=309 796` for a 2 146 435 072-byte one — the whole
+/// stall, in the one call the first gather was the first to reach. That is what
+/// [`warm`] now takes at the handshake.
 ///
 /// Timings above are wall clock on a shared host and are upper bounds; the
 /// counts and byte totals are not.
