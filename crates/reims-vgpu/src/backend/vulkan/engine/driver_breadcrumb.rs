@@ -9,10 +9,12 @@
 //! this process's memory and dies with it. A core dump holds it, and digging a
 //! `Vec<u32>` out of a 2 GiB core is not a workflow.
 //!
-//! So the bytes go to disk *before* the call and are removed *after* it. On a
-//! healthy boot the file exists for the duration of one `vkCreateShaderModule`
-//! plus one `vkCreateComputePipelines` and nothing is left behind. On a crash it
-//! is still there, and it is exactly the module that killed the process.
+//! So the bytes go to disk *before* the call and are removed *after* it. Three
+//! calls compile a module this device assembled — `vkCreateShaderModule`,
+//! `vkCreateComputePipelines` and `vkCreateGraphicsPipelines` — and on a healthy
+//! boot the files exist for the duration of each and nothing is left behind. On
+//! a crash they are still there, and they are exactly the modules that killed
+//! the process.
 //!
 //! # What it costs
 //!
@@ -42,6 +44,33 @@
 //! one reports at the end of a tranche that will not end. The watch is what puts
 //! a line in the log while it is happening.
 //!
+//! # The third use: not doing it again
+//!
+//! A breadcrumb left on disk is a completed experiment — this driver, these
+//! exact inputs, one dead process. [`quarantine`] is what makes the next boot
+//! act on it: the surviving files are folded into a persistent list of driver
+//! calls that killed a process, and a call whose inputs match one is refused by
+//! name instead of made.
+//!
+//! This is evidence, not a heuristic, and the distinction is the whole licence
+//! for it. Nothing here inspects a module to guess whether a driver will like
+//! it — there is no size threshold, no opcode census, no shape rule. The only
+//! input is "the last process that made this exact call did not return from it",
+//! which no amount of reading the module can tell you and which
+//! `AGENTS.md`'s ban on overfitting is not about.
+//!
+//! The cost is that the first crash still happens: this cannot predict a driver
+//! bug, only remember one. The benefit is that a VM stops dying on every boot
+//! for the same reason, and the loss becomes one refused pipeline with a typed
+//! decline naming it — which is the difference between a rail nobody can work on
+//! and a rail with one known gap.
+//!
+//! There is deliberately **no environment switch to turn it off.** A switch that
+//! let a known process-killing module through would widen what the device does
+//! on the strength of an operator's optimism, which `AGENTS.md` forbids for
+//! exactly this reason. Recovery is `rm` on the file, which is a decision with
+//! the evidence in front of you rather than a flag set months earlier.
+//!
 //! # The other half: a module the validator refused
 //!
 //! [`keep_rejected_module`] lives here because it answers the same question with
@@ -54,17 +83,41 @@
 
 use std::path::PathBuf;
 
+pub(crate) mod quarantine;
+
+/// The prefix every file here shares.
+///
+/// Fixed in production, because the whole mechanism turns on the *next* process
+/// finding what this one left — a per-process name would make a crash
+/// unreadable by the boot that follows it.
+///
+/// Under test it carries the test binary's pid, and that is load-bearing rather
+/// than tidy. These paths are global to the machine, so a `cargo test` run
+/// beside a live VM would otherwise delete the boot's breadcrumb out from under
+/// it (observed: a test's `disarm` removed a wedged boot's 1 MB fragment module
+/// mid-wedge) and could write a quarantine entry a real boot would then obey.
+/// The sink's `redirect_logs_for_tests` splits the same way for the same reason.
+#[cfg(not(test))]
+fn prefix() -> String {
+    String::from("reims-vgpu-driver")
+}
+
+#[cfg(test)]
+fn prefix() -> String {
+    format!("reims-vgpu-driver-test-{}", std::process::id())
+}
+
 /// One path per stage. Fixed rather than per-pipeline so a crash leaves exactly
 /// one set of files to look at, and so a previous boot's leftovers cannot
 /// accumulate.
 fn path(stage: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("reims-vgpu-driver-breadcrumb-{stage}.spv"))
+    std::env::temp_dir().join(format!("{}-breadcrumb-{stage}.spv", prefix()))
 }
 
 /// The metadata file beside them, so a reader knows what the modules were for
 /// without disassembling anything.
 fn meta_path() -> PathBuf {
-    std::env::temp_dir().join("reims-vgpu-driver-breadcrumb.txt")
+    std::env::temp_dir().join(format!("{}-breadcrumb.txt", prefix()))
 }
 
 /// Live for the duration of a driver call that could take the process down or
@@ -82,18 +135,29 @@ pub(crate) struct DriverBreadcrumb {
 }
 
 impl DriverBreadcrumb {
-    /// Write every module the call consumes, plus a one-line description, and
-    /// hold them until dropped.
+    /// Clear the quarantine, write every module the call consumes plus a
+    /// description of it, and hold them until dropped.
+    ///
+    /// **This is the only way to enter one of those calls.** The guard the
+    /// caller must hold to make the call is the thing that checks whether the
+    /// last process survived it, so a new driver entry point cannot be added
+    /// without meeting the rule — which is the only enforcement there is, since
+    /// nothing scans for call sites.
     ///
     /// A write that fails is reported once and costs that stage its file: losing
     /// the breadcrumb is a lost diagnostic, never a reason to skip the work the
     /// guest asked for. The clock watch is armed regardless, because it needs
     /// nothing from the filesystem.
-    pub(crate) fn arm(what: &str, modules: &[(&'static str, &[u32])]) -> Self {
+    pub(crate) fn arm(
+        what: &str,
+        modules: &[(&'static str, &[u32])],
+    ) -> Result<Self, quarantine::Quarantined> {
+        if let Some(hit) = quarantine::check(modules) {
+            return Err(hit);
+        }
         let watching = crate::observe::driver_watch::enter(what.to_string());
         let mut stages = Vec::with_capacity(modules.len());
-        let mut meta = String::from(what);
-        meta.push('\n');
+        let mut meta = format!("what={what}\n");
         for (stage, spirv) in modules {
             let mut bytes = Vec::with_capacity(spirv.len() * 4);
             for word in *spirv {
@@ -106,15 +170,17 @@ impl DriverBreadcrumb {
                 )),
             }
             meta.push_str(&format!(
-                "{stage} words={} bytes={}\n",
+                "stage={stage} words={} bytes={}\n",
                 spirv.len(),
                 spirv.len() * 4
             ));
         }
-        if !stages.is_empty() {
-            let _ = std::fs::write(meta_path(), meta);
-        }
-        Self { stages, watching }
+        // Last, and written whether or not a module reached disk: the key is
+        // what the next process needs to recognise this call, and it costs
+        // nothing that a failed `.spv` write should be allowed to take away.
+        meta.push_str(&format!("key={}\n", quarantine::key_of(modules)));
+        let _ = std::fs::write(meta_path(), meta);
+        Ok(Self { stages, watching })
     }
 
     /// The call returned, so the input is not the one that kills the process and
@@ -196,8 +262,8 @@ mod tests {
     fn both_stages_of_a_graphics_compile_reach_disk_and_are_taken_back() {
         let vert = [0x0723_0203u32, 0x0001_0000, 1];
         let frag = [0x0723_0203u32, 0x0001_0000, 2, 3];
-        let crumb =
-            super::DriverBreadcrumb::arm("test_graphics", &[("vert", &vert), ("frag", &frag)]);
+        let crumb = super::DriverBreadcrumb::arm("test_graphics", &[("vert", &vert), ("frag", &frag)])
+            .expect("a module nothing has crashed on is not quarantined");
 
         let vert_path = super::path("vert");
         let frag_path = super::path("frag");
@@ -229,7 +295,8 @@ mod tests {
     fn an_armed_breadcrumb_puts_the_call_under_the_clock_watch() {
         crate::observe::driver_watch::leave();
         let words = [0x0723_0203u32, 0x0001_0000];
-        let crumb = super::DriverBreadcrumb::arm("test_watched", &[("module", &words)]);
+        let crumb = super::DriverBreadcrumb::arm("test_watched", &[("module", &words)])
+            .expect("a module nothing has crashed on is not quarantined");
         assert_eq!(
             crate::observe::driver_watch::watching().as_deref(),
             Some("test_watched"),

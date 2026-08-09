@@ -485,6 +485,31 @@ impl ObjectCaches {
         self.compute_pipelines.clear();
     }
 
+    /// Report a driver call this device refused to repeat, and hand back the
+    /// error every one of the three call sites caches negatively.
+    ///
+    /// One place rather than three so the three cannot drift into three
+    /// different accounts of the same event — and so the line always carries
+    /// both the key (which identifies the call) and what the dead process called
+    /// it (which is the only human-readable thing about it).
+    fn note_quarantined(
+        &self,
+        site: &'static str,
+        hit: &super::driver_breadcrumb::quarantine::Quarantined,
+    ) -> DrawError {
+        let reason = super::reason::DrawReason::DriverCallQuarantined;
+        crate::observe::fail(format!(
+            "driver_quarantine reason={} site={site} key={} previously={} \
+             (a previous process died in this call with these modules; \
+             delete {} to try it again)",
+            <super::reason::DrawReason as crate::observe::Decline>::slug(&reason),
+            hit.key,
+            hit.previously,
+            super::driver_breadcrumb::quarantine::list_path().display(),
+        ));
+        DrawError::Unsupported(reason)
+    }
+
     pub(crate) unsafe fn get_or_create_shader(
         &mut self,
         ctx: &DeviceContext,
@@ -588,10 +613,17 @@ impl ObjectCaches {
         // The driver parses SPIR-V here, so this is one of the two calls that
         // can end the process on a module this device assembled. See
         // `driver_breadcrumb` for why the words go to disk across it.
-        let breadcrumb = super::driver_breadcrumb::DriverBreadcrumb::arm(
+        let breadcrumb = match super::driver_breadcrumb::DriverBreadcrumb::arm(
             "create_shader_module",
             &[("module", words)],
-        );
+        ) {
+            Ok(breadcrumb) => breadcrumb,
+            Err(hit) => {
+                let err = self.note_quarantined("create_shader_module", &hit);
+                self.shaders.insert_negative(key, err.clone());
+                return Err(err);
+            }
+        };
         let created = ctx
             .device
             .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None);
@@ -1371,14 +1403,21 @@ impl ObjectCaches {
         // uber fragment shader has been observed keeping NVIDIA's compiler in
         // here for over ten minutes with the device lock held; see
         // `crate::observe::driver_watch`, which this arming also starts.
-        let breadcrumb = super::driver_breadcrumb::DriverBreadcrumb::arm(
+        let breadcrumb = match super::driver_breadcrumb::DriverBreadcrumb::arm(
             &format!(
                 "create_graphics_pipelines vert_words={} frag_words={}",
                 vert_spirv.len(),
                 frag_spirv.len()
             ),
             &[("vert", vert_spirv), ("frag", frag_spirv)],
-        );
+        ) {
+            Ok(breadcrumb) => breadcrumb,
+            Err(hit) => {
+                let err = self.note_quarantined("create_graphics_pipelines", &hit);
+                self.pipelines.insert_negative(key.clone(), err.clone());
+                return Err(err);
+            }
+        };
         let created = ctx
             .device
             .create_graphics_pipelines(ctx.pipeline_cache, &[gpci], None);
@@ -1436,10 +1475,17 @@ impl ObjectCaches {
             .layout(pipeline_layout);
         // The other call that compiles the module, and the one an NVIDIA driver
         // has been observed dying inside on a macos-14 guest's first dispatch.
-        let breadcrumb = super::driver_breadcrumb::DriverBreadcrumb::arm(
+        let breadcrumb = match super::driver_breadcrumb::DriverBreadcrumb::arm(
             &format!("create_compute_pipelines entry={}", key.entry),
             &[("kernel", shader.spirv)],
-        );
+        ) {
+            Ok(breadcrumb) => breadcrumb,
+            Err(hit) => {
+                let err = self.note_quarantined("create_compute_pipelines", &hit);
+                self.compute_pipelines.insert_negative(key.clone(), err.clone());
+                return Err(err);
+            }
+        };
         let created = ctx
             .device
             .create_compute_pipelines(ctx.pipeline_cache, &[cpci], None);

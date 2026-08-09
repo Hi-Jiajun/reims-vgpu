@@ -37,6 +37,19 @@ pub enum DrawReason {
     /// this device declining to risk the process on undefined behaviour inside
     /// a driver, and it costs the guest the whole dispatch.
     SpirvInvalid,
+    /// A previous process died inside the driver call this request would make,
+    /// with these exact modules, so this device will not make it again.
+    ///
+    /// Distinct from [`Self::SpirvInvalid`] in what it knows: that one is a
+    /// module a validator said was malformed, this one is a module a validator
+    /// accepted and a driver could not survive. Nothing about the module says
+    /// so — the evidence is a breadcrumb the dead process left on disk. See
+    /// `driver_breadcrumb::quarantine` for why that is the only admissible
+    /// input and how to clear it.
+    ///
+    /// Fieldless because the variant is `Copy` and compared by value at every
+    /// negative cache; the key and the call's description ride the fail line.
+    DriverCallQuarantined,
     /// A resident target bound as a sampled image must be a plain 2D image;
     /// arrayed and volume residents have no bind path.
     ResidentSampledNot2d { binding: u32 },
@@ -181,6 +194,7 @@ impl crate::observe::Decline for DrawReason {
     fn slug(&self) -> &'static str {
         match self {
             Self::SpirvInvalid => "spirv_module_invalid",
+            Self::DriverCallQuarantined => "driver_call_quarantined",
             Self::ResidentSampledNot2d { .. } => "resident_sampled_not_2d",
             Self::GuestRunSampledNot2d { .. } => "guest_run_sampled_not_2d",
             Self::SecondaryAttachmentCap { .. } => "secondary_attachment_cap",
