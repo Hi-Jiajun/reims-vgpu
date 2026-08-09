@@ -1933,3 +1933,64 @@ fn every_object_list_miss_names_a_different_check() {
         "the family shares a prefix so a boot can rank it in one grep: {routes:?}"
     );
 }
+
+/// The empty-slot discriminator must not answer "somebody else has it" when
+/// nobody does, nor miss the task that does.
+///
+/// `ListMiss::SlotEmpty` is every object-list miss a macos-26 boot makes, and
+/// the two readings want opposite fixes: a guest that has not published the
+/// object yet wants the packet to wait, while an object another task already
+/// holds means this device looked in the wrong list. A discriminator that is
+/// wrong in either direction sends the next session at the wrong one.
+///
+/// Same fixture as the probe test above — task 2 owns a readable list at pfn 1
+/// with a real entry at ref 0, and task 5's directory maps nothing.
+#[test]
+fn an_empty_slot_says_whether_another_task_holds_the_object() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+    let root_gpa = 3u64 << PAGE_SHIFT_X86;
+    let data_gpa = 4u64 << PAGE_SHIFT_X86;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x1000, 0);
+    host.map_range(data_gpa, 0x1000, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    let mut pte = [0u8; 4];
+    st32(&mut pte, 4);
+    let _ = host.write_gpa(root_gpa + 4, &pte);
+    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut entry[0..],
+        (OBJECT_TYPE_SURFACE as u32) | (0x40u32 << 8),
+    );
+    entry[4..12].copy_from_slice(&0xdead_0000u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa, &entry);
+
+    state.define_task(2, 0x1000, 2);
+    assert!(state.set_object_list(2, 1, 4));
+    state.define_task(5, 0x1000, 9);
+    assert!(state.set_object_list(5, 1, 4));
+
+    // Task 5's slot 0 is empty and task 2's is not — the object exists, this
+    // task does not have it.
+    assert!(
+        super::slot_empty_owned_elsewhere(&state, &host, 5, 0),
+        "task 2 holds ref 0, so a miss on task 5 is a lookup in the wrong list"
+    );
+    // Ref 3 is inside both lists and nobody has written it.
+    assert!(
+        !super::slot_empty_owned_elsewhere(&state, &host, 2, 3),
+        "no task has published ref 3, so this is a guest that has not written \
+         the slot and not a misdirected lookup"
+    );
+    // The owner is never its own elsewhere, or every miss would answer yes as
+    // soon as the guest republished the object under the same task.
+    assert!(
+        !super::slot_empty_owned_elsewhere(&state, &host, 2, 0),
+        "a task holding the object itself must not count as another task holding it"
+    );
+}

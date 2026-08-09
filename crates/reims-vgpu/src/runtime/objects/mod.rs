@@ -1265,10 +1265,51 @@ fn list_entry<M: HostMemory>(
             // counting those would bury the named misses under the search.
             if lookup == ListLookup::Named {
                 crate::runtime::drain::note_store_route(miss.route());
+                if miss == ListMiss::SlotEmpty {
+                    crate::runtime::drain::note_store_route(
+                        if slot_empty_owned_elsewhere(state, host, task_id, ref_) {
+                            "list_miss_slot_empty_owned_elsewhere"
+                        } else {
+                            "list_miss_slot_empty_owned_nowhere"
+                        },
+                    );
+                }
             }
             None
         }
     }
+}
+
+/// For a named ref whose own task's slot is empty: does any *other* live task
+/// hold a real object at that slot?
+///
+/// [`ListMiss::SlotEmpty`] is the only miss a macos-26 boot produces, and it is
+/// the whole of that rail's ~40 lost draws a boot. It has two readings that want
+/// opposite fixes, and this is what separates them:
+///
+/// - **Owned nowhere.** No task has published the object. The guest referenced
+///   it before writing the slot, and the answer is for the packet to wait rather
+///   than for the draw to be dropped — the machinery already exists for async
+///   shader translation.
+/// - **Owned elsewhere.** Another task has it, so the object exists and this
+///   device looked in the wrong list. Then the question is which task the ref
+///   was meant to resolve against, and it is a decode or ownership defect
+///   rather than a race. `type4_claimant_tasks` already searches this way for
+///   surfaces, so a guest sharing objects across tasks is not a new idea here.
+///
+/// Costs one probe read per live task, on a miss only — a few thousand reads a
+/// boot against the 172 misses that trigger it.
+fn slot_empty_owned_elsewhere<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    ref_: u32,
+) -> bool {
+    state
+        .tasks
+        .live_ids()
+        .filter(|&other| other != task_id)
+        .any(|other| probe_list_entry(state, host, other, ref_).is_some())
 }
 
 /// The lookup proper, naming the check that refused.
