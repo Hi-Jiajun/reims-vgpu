@@ -2880,6 +2880,24 @@ unsafe fn publish_previous_writeback_timestamps(ctx: &context::DeviceContext) {
 /// nothing this device does makes it cheaper — importing sub-ranges instead
 /// would be the per-resource import [`host_ram`] exists to avoid.
 ///
+/// # What the move bought, measured
+///
+/// Both x86 rails boot with all four of their RAMBlocks imported inside the
+/// handshake, `guest_ram_warm blocks=4 bytes=17196384256` landing in the same
+/// millisecond as the last `host_ram_import`. The first frame's `gather_us`
+/// then reads **1 088 µs over 67 gathers and 14 722 144 bytes** on macos-11,
+/// against 2 022 259 µs over 6 gathers and 1 176 768 bytes before — three
+/// orders of magnitude less time for twelve times the bytes, which is what says
+/// the gather itself never cost anything.
+///
+/// It does not cost the working rail: a macos-13 x86/PCI boot after the move
+/// reaches its desktop with Dock and Finder running and the console owned by
+/// the login user.
+///
+/// **It did not fix the macos-11 rail**, whose WindowServer still stops after
+/// one composite. That guest does blow its 1000 ms display-transaction watchdog
+/// with or without this, and it is now known not to be why it wedges.
+///
 /// Returns `(warmed, bytes)`: how many blocks this call actually imported and
 /// how many bytes they covered. Zero blocks means either they were already
 /// imported or the device is not up yet, and neither is a failure — a host with
