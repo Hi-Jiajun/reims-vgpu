@@ -1637,6 +1637,15 @@ pub(crate) unsafe fn execute_draw_inner(
     // spelled as a feature. No runtime caller ever set it, and the six parity
     // tests that did were all already rendering into a `Surface` identity.
     let output_bgra = req.target_identity.as_ref().is_some_and(|id| id.is_bgra());
+    // Slot 0's attachment format, decided exactly once.
+    //
+    // Two things have to agree about it — the render pass (and so the pipeline)
+    // this draw is compiled against, and the resident image it renders into —
+    // and they used to agree only because both called `resident_color` on the
+    // same flag. Deciding it here and handing the *format* to both means a
+    // future source for it (the guest's declared attachment format) changes one
+    // line rather than two that must be kept in step.
+    let color0_format = crate::backend::vulkan::translate::pixel::resident_color(output_bgra);
     // A guest-sourced sampled bind used to force the immediate-submit path.
     // Its read of guest RAM happens when the CB *executes*, and this device
     // acked the packet as soon as it was consumed, so deferred submit stretched
@@ -1844,7 +1853,7 @@ pub(crate) unsafe fn execute_draw_inner(
     };
     let mut pass_key = PassKey::single(
         load_uses_gpu_content || seed_bytes.is_some() || req.seed_from_target.is_some(),
-        output_bgra,
+        color0_format,
     );
     for (i, sec) in req.secondary_targets.iter().enumerate() {
         if i >= MAX_SECONDARY_ATTACH {
@@ -2189,7 +2198,7 @@ pub(crate) unsafe fn execute_draw_inner(
     let primary_pass = if ad_hoc_framebuffer {
         caches.get_or_create_pass(
             ctx,
-            PassKey::single(pass_key.load_seed, pass_key.bgra),
+            PassKey::single(pass_key.load_seed, pass_key.color0_format),
             counters,
             pools,
         )?
@@ -2240,7 +2249,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 req.height,
                 primary_pass,
                 gen,
-                output_bgra,
+                color0_format,
                 counters,
             )?;
             if load_uses_gpu_content && !t.content_ready {

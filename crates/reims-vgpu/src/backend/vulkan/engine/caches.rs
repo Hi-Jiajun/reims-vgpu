@@ -119,9 +119,21 @@ pub(crate) struct DepthAttachKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct PassKey {
     pub load_seed: bool, // LOAD vs CLEAR (slot 0)
-    /// Slot-0 attachment format: true = B8G8R8A8_UNORM (guest scanout order for
-    /// zero-copy import-present), false = R8G8B8A8_UNORM.
-    pub bgra: bool,
+    /// Slot-0 attachment format, as a format rather than a channel-order flag.
+    ///
+    /// This used to be `bgra: bool`, meaning `B8G8R8A8_UNORM` or
+    /// `R8G8B8A8_UNORM` and nothing else, which made slot 0 the only attachment
+    /// in this key that could not name a format — [`SecondaryAttachKey`] has
+    /// carried a real [`ash::vk::Format`] since MRT landed. The asymmetry was
+    /// not cosmetic: it is the reason a render target's resident is always
+    /// eight bits per channel whatever the guest declared, because the *only*
+    /// thing downstream could reconstruct from the flag was one of those two.
+    ///
+    /// It must stay part of the key. A render pass and a pipeline are both
+    /// compiled against the attachment's format, so two draws differing only
+    /// here need two of each; a key that omitted it would hand the second draw
+    /// a pipeline built for the first one's format.
+    pub color0_format: ash::vk::Format,
     /// Secondary color attachments (slot 1..). `secondary_count == 0` ⇒ the
     /// classic single-attachment pass, byte-identical to the pre-MRT engine.
     pub secondary: [SecondaryAttachKey; MAX_SECONDARY_ATTACH],
@@ -139,10 +151,10 @@ pub(crate) struct PassKey {
 
 impl PassKey {
     /// Single-color-attachment pass (the pre-MRT constructor).
-    pub(crate) fn single(load_seed: bool, bgra: bool) -> Self {
+    pub(crate) fn single(load_seed: bool, color0_format: ash::vk::Format) -> Self {
         Self {
             load_seed,
-            bgra,
+            color0_format,
             secondary: [SecondaryAttachKey::default(); MAX_SECONDARY_ATTACH],
             secondary_count: 0,
             depth: None,
@@ -731,7 +743,7 @@ impl ObjectCaches {
             return Ok(rp);
         }
         counters.pass_misses.fetch_add(1, Ordering::Relaxed);
-        let target_format = translate::pixel::resident_color(key.bgra);
+        let target_format = key.color0_format;
         let (load_op, initial) = if key.load_seed {
             (
                 vk::AttachmentLoadOp::LOAD,

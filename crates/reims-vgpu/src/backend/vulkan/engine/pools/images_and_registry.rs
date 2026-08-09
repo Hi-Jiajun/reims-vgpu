@@ -928,13 +928,17 @@ impl ResourcePools {
         height: u32,
         render_pass: vk::RenderPass,
         generation: u64,
-        bgra: bool,
+        format: vk::Format,
         counters: &EngineCounters,
     ) -> Result<&ResidentTargetSlot, DrawError> {
+        // The format arrives resolved rather than as a channel-order flag, and
+        // from the same variable that built `render_pass`'s key — an image and
+        // the pass it is attached to must name one format, and deriving it
+        // twice from a shared input is how they drift apart.
+        //
         // Compatible geometry + gen + format: reuse image; rebuild FB if pass
         // changed. A format change must recreate the image, not just the
         // framebuffer — an RGBA image under a BGRA pass is invalid.
-        let format = translate::pixel::resident_color(bgra);
         if let Some(slot) = self.registry.get(&identity) {
             if slot.reusable_for(width, height, generation, format) {
                 if slot.render_pass == render_pass {
