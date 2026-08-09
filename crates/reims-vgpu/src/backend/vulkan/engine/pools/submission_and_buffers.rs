@@ -2976,8 +2976,7 @@ impl ResourcePools {
 fn sampled_twins_in_entry(admissions: &[(SampledSlot, SampledRetain)]) -> usize {
     // Linear over a list that is one entry's worth of textures — a handful,
     // capped by BATCH_MAX_DRAWS times the bindings of one draw.
-    let mut named: Vec<(SampledKey, crate::backend::vulkan::engine::SampledContentIdentity)> =
-        Vec::new();
+    let mut named: Vec<GatheredName> = Vec::new();
     let mut twins = 0;
     for (slot, retain) in admissions {
         // An admission with no identity is never a duplicate: the admit drops
@@ -2985,7 +2984,10 @@ fn sampled_twins_in_entry(admissions: &[(SampledSlot, SampledRetain)]) -> usize 
         let Some(identity) = retain.identity else {
             continue;
         };
-        let name = (slot.key(), identity);
+        let name = GatheredName {
+            key: slot.key(),
+            identity,
+        };
         if named.contains(&name) {
             twins += 1;
         } else {
@@ -3356,15 +3358,22 @@ mod recycle_tests {
         }
     }
 
-    /// The twin counter separates the duplicates publication order could have
-    /// avoided from the ones it could not, and each miscount points the next
-    /// session at the wrong bug.
+    /// [`GatheredName`] decides when two gathers are one window, and this is the
+    /// only test of that equality.
     ///
-    /// Three things it must get right, and each is a different wrong answer: a
-    /// repeat under one name is a twin (over-count nothing), the *same geometry
-    /// under a different identity* is two different windows and not a twin
-    /// (under-count nothing), and an admission with no identity is never a twin
-    /// because the admit drops it before its dedup test ever runs.
+    /// It is worth more than the counter it is written against. The same
+    /// equality is what `exec`'s within-draw reuse binds on, where getting it
+    /// wrong is not a miscount but **one surface's pixels sampled for
+    /// another's** — and a screenshot of a desktop with the wrong window content
+    /// in one layer is exactly the class no assertion in this crate would catch.
+    ///
+    /// Four things it must get right, each a different wrong answer: a repeat
+    /// under one name is one window; the same geometry under a different
+    /// producer identity is two windows and sharing them is the corruption; one
+    /// identity at two geometries cannot share an image either, because the key
+    /// is what picks the image; and an admission with no identity is never a
+    /// duplicate, because the admit drops it before its dedup test ever runs and
+    /// the reuse declines it for the same reason.
     #[test]
     fn only_a_repeated_name_inside_one_entry_counts_as_a_twin() {
         let id = |k: u64| crate::backend::vulkan::engine::SampledContentIdentity {
