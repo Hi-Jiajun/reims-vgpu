@@ -2798,6 +2798,12 @@ impl ResourcePools {
         identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
         counters: &EngineCounters,
     ) -> Option<SampledSlot> {
+        // Before any cache is consulted, so the set is what the workload *asked
+        // for* rather than what this cache happened to keep. That is the whole
+        // distinction from the victim ledger, whose reach is censored at
+        // `SAMPLED_VICTIM_LEDGER` and reads `beyond_ledger` 6 704 times on a
+        // driven macos-26 boot.
+        super::sampled_working_set::note_wanted(key, identity, content.len());
         if let Some(handles) = self.find_sampled_by_identity(key, identity) {
             counters
                 .sampled_identity_hits

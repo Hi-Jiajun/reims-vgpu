@@ -1605,7 +1605,7 @@ pub struct GuestRunSource {
 /// bumps `generation` whenever its authoritative cache entry is rewritten),
 /// so the sampled cache may bind the retained GPU image without re-hashing
 /// or comparing the bytes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SampledContentIdentity {
     /// Stable key of the guest resource (runtime-chosen keyspace).
     pub key: u64,

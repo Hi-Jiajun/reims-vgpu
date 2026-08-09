@@ -32,6 +32,10 @@ pub(crate) mod stamp_completion;
 /// `pools` is private and the census that reports the band lives outside this
 /// module: a peak with no cap beside it is a number, not a reading.
 pub(crate) use pools::IDLE_TARGET_AGE_MS;
+/// The requested sampled working set, re-exported for the same reason and to
+/// the same place: `pools` is private, and this line is only interpretable
+/// beside the eviction routes the census already emits.
+pub use pools::sampled_working_set::census as sampled_working_set_census;
 pub mod reason;
 mod slab;
 pub mod stage_phase;

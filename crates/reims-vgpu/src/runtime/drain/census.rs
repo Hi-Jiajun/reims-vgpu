@@ -1579,6 +1579,13 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         for line in crate::observe::footprint::census_lines(crate::observe::elapsed_ms() as u64) {
             crate::observe::off(line);
         }
+        // Beside the engine counters it has to be read against: the eviction
+        // routes say which cap fired and this says how much the workload wanted,
+        // and neither is interpretable without the other.
+        #[cfg(feature = "backend-vulkan")]
+        if let Some(wanted) = crate::backend::vulkan::engine::sampled_working_set_census() {
+            crate::observe::off(wanted);
+        }
         emit_engine_delta();
         // After `emit_engine_delta`, which emits `draw_phase`: the two divide
         // against each other and reading them in the other order invites
