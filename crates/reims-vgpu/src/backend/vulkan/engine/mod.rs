@@ -3064,6 +3064,65 @@ pub fn guest_import_census() -> (u64, usize) {
 /// than two `4`s that a later widening could move apart.
 const RESIDENT_READ_BYTES_PER_TEXEL: u32 = 4;
 
+/// Bytes an image→buffer copy of one texel of `format` writes.
+///
+/// The single place a readback slot's size is decided, for both rails that size
+/// one. `vkCmdCopyImageToBuffer` names an image extent and reads the *image's*
+/// texel width per pixel, so a slot sized by any other number is either short —
+/// which is a device-side write past the slot, not a truncated read — or larger
+/// than the copy fills. The seed path answers the same question in the other
+/// direction and states the same reason.
+///
+/// The fallback is unreachable for a real resident (an image exists only at a
+/// format these tables know) and is the four this code used to assume rather
+/// than a panic, on the same grounds as [`GuestPageTarget::bytes_per_texel`].
+fn readback_bytes_per_texel(format: ash::vk::Format) -> u32 {
+    crate::backend::vulkan::translate::pixel::bytes_per_texel(format)
+        .unwrap_or(RESIDENT_READ_BYTES_PER_TEXEL)
+}
+
+/// Bring a readback taken at the attachment's own texel width down to the RGBA8
+/// every consumer of drawn pixels speaks.
+///
+/// Both rails that read a colour target back share this: the standalone
+/// [`read_target`] and the tail of a draw that could not defer its Store. They
+/// used to be one narrowing and one four-byte assumption, and the assumption was
+/// the older of the two — which is what made a wide attachment a buffer overrun
+/// on one rail and a quantized frame on the other, for the same resident.
+///
+/// Narrowing rather than refusing, because both callers are the fallback a Store
+/// takes when the GPU could not land the frame in guest pages directly. Refusing
+/// loses the frame outright, where before a render target could be wide the same
+/// frame was merely quantized on its way through an eight-bit resident.
+///
+/// Returns the bytes and the channel order they are in — `narrow_texel_to_rgba8`
+/// produces semantic RGBA8 whatever the resident's order was, so a narrowed
+/// frame owes no exchange and says so.
+fn narrow_readback_to_rgba8(
+    out: Vec<u8>,
+    layout: crate::contract::pixel_format::TexelLayout,
+    format: ash::vk::Format,
+    pixels: u64,
+    bgra: bool,
+) -> Result<(Vec<u8>, bool), DrawError> {
+    if layout.bytes_per_texel() == RESIDENT_READ_BYTES_PER_TEXEL {
+        return Ok((out, bgra));
+    }
+    let count = u32::try_from(pixels).unwrap_or(u32::MAX);
+    let mut narrowed = vec![0u8; (pixels * u64::from(RESIDENT_READ_BYTES_PER_TEXEL)) as usize];
+    if !crate::contract::pixel_format::narrow_texel_to_rgba8(layout, &out, count, &mut narrowed) {
+        return Err(DrawError::TargetRead(
+            reason::TargetReadDecline::TexelNotFourBytes { format },
+        ));
+    }
+    // Visible, because it is a fidelity loss and not just a slow path: the
+    // frame this returns carries eight bits of a channel the guest asked for
+    // sixteen of. A non-zero reading names the population that would be
+    // repaired by teaching this rail's consumers the wider texel.
+    crate::runtime::drain::note_store_route("target_read_narrowed");
+    Ok((narrowed, false))
+}
+
 /// The `srcAccessMask` a resident color target's readback must drain.
 const RESIDENT_READ_SRC_ACCESS: ash::vk::AccessFlags = ash::vk::AccessFlags::from_raw(
     ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE.as_raw()
@@ -3191,43 +3250,11 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
         )?;
         pools.registry_note_access(identity, pools::ResidentAccess::TransferRead);
         counters.note_target_read(rb_size);
-        // A wide resident is quantized here rather than refused. This rail is
-        // the fallback a Store takes when the GPU could not land the frame in
-        // guest pages directly, so refusing loses the frame outright — where
-        // before a render target could be wide, the same frame was merely
-        // quantized on its way through an eight-bit resident. Quantized is what
-        // this produces, and it is exactly what that resident used to give.
-        if layout.bytes_per_texel() == RESIDENT_READ_BYTES_PER_TEXEL {
-            return Ok(TargetReadback {
-                pixels: out,
-                bgra: snap.bgra(),
-            });
-        }
-        let count = u32::try_from(pixels).unwrap_or(u32::MAX);
-        let mut narrowed = vec![0u8; (pixels * u64::from(RESIDENT_READ_BYTES_PER_TEXEL)) as usize];
-        if !crate::contract::pixel_format::narrow_texel_to_rgba8(
-            layout,
-            &out,
-            count,
-            &mut narrowed,
-        ) {
-            return Err(DrawError::TargetRead(
-                reason::TargetReadDecline::TexelNotFourBytes {
-                    format: snap.format,
-                },
-            ));
-        }
-        // Visible, because it is a fidelity loss and not just a slow path: the
-        // frame this returns carries eight bits of a channel the guest asked
-        // for sixteen of. A non-zero reading names the population that would be
-        // repaired by teaching this rail's consumers the wider texel.
-        crate::runtime::drain::note_store_route("target_read_narrowed");
-        Ok(TargetReadback {
-            pixels: narrowed,
-            // `narrow_texel_to_rgba8` produces semantic RGBA8 whatever the
-            // resident's order was, so the exchange is already done.
-            bgra: false,
-        })
+        // A wide resident is quantized here rather than refused; see
+        // `narrow_readback_to_rgba8` for why that direction is the safe one.
+        let (pixels, bgra) =
+            narrow_readback_to_rgba8(out, layout, snap.format, pixels, snap.bgra())?;
+        Ok(TargetReadback { pixels, bgra })
     }
 }
 
@@ -3786,6 +3813,72 @@ mod guest_page_target_tests {
             scatter: vec![(null, vec![ash::vk::BufferCopy::default(); 507])],
         };
         assert_eq!(linear.regions(), 508, "507 stretches plus the detile");
+    }
+}
+
+#[cfg(test)]
+mod readback_width_tests {
+    use super::*;
+    use crate::contract::pixel_format::TexelLayout;
+
+    /// The slot a readback is taken into and the narrowing that consumes it must
+    /// derive their texel width from the same place.
+    ///
+    /// This is the pair that was one function and one literal `4`. A readback
+    /// slot is filled by `vkCmdCopyImageToBuffer`, which names an image extent
+    /// and reads the *image's* texel per pixel, so a slot sized narrower than
+    /// the attachment is a device-side write past it — the failure is a GPU
+    /// overrun, not a truncated frame, and no reading of the pixels can see it.
+    ///
+    /// The property asserted is that **no layout is ever refused for being
+    /// short-sized**. Some layouts have no narrowing to RGBA8 at all — a
+    /// single-channel or two-channel texel is not a frame a `DrawOutput`
+    /// consumer can read — and those refuse whatever they are handed. Telling
+    /// the two apart is the whole test: a refusal that a *larger* buffer would
+    /// have satisfied is the sizer being wrong, and that is the bug. Driving it
+    /// off `TexelLayout::ALL` means a layout added to the contract is swept the
+    /// moment it exists.
+    #[test]
+    fn no_readback_layout_is_refused_for_being_short_sized() {
+        const W: u64 = 7;
+        const H: u64 = 5;
+        const PIXELS: u64 = W * H;
+        for &layout in TexelLayout::ALL {
+            let format = crate::backend::vulkan::translate::pixel::vk_texel_layout(layout);
+            let sized = (PIXELS * u64::from(readback_bytes_per_texel(format))) as usize;
+            match narrow_readback_to_rgba8(vec![0u8; sized], layout, format, PIXELS, true) {
+                Ok((pixels, bgra)) => {
+                    assert_eq!(
+                        pixels.len(),
+                        (PIXELS * u64::from(RESIDENT_READ_BYTES_PER_TEXEL)) as usize,
+                        "{layout:?}: a consumer of drawn pixels reads RGBA8"
+                    );
+                    // A four-byte layout is handed back untouched, so it keeps
+                    // the order it was read in; a narrowed one is semantic RGBA8
+                    // and owes no exchange. Both rails pass this straight on.
+                    assert_eq!(
+                        bgra,
+                        layout.bytes_per_texel() == RESIDENT_READ_BYTES_PER_TEXEL,
+                        "{layout:?}: reported the wrong channel order for its rail"
+                    );
+                }
+                Err(_) => {
+                    // Refused. It must be the layout and not the size, so hand
+                    // the same narrowing a buffer no sizing error could make too
+                    // small and require the same answer.
+                    let mut dst = vec![0u8; (PIXELS * 4) as usize];
+                    assert!(
+                        !crate::contract::pixel_format::narrow_texel_to_rgba8(
+                            layout,
+                            &vec![0u8; sized * 8],
+                            PIXELS as u32,
+                            &mut dst,
+                        ),
+                        "{layout:?}: a bigger buffer was accepted, so the slot was sized short"
+                    );
+                }
+            }
+        }
     }
 }
 

@@ -586,8 +586,30 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
     // teaching the lease to rewrite memory it does not own.
     let bpr = width.saturating_mul(4);
     let write_started = std::time::Instant::now();
-    let (ok, frame_len) = match crate::backend::vulkan::engine::read_target_leased(identity) {
-        Ok(Some(leased)) if leased.bgra => {
+    // A refused lease is a *routing* answer, never a loss. The lease is an
+    // elision of one whole-frame copy and nothing else, so whatever it declines
+    // for, the copying rail below can still serve — and it is strictly the
+    // better place to find out that the frame is unreadable, because it is the
+    // rail that owns the loss report.
+    //
+    // Collapsing the refusal into `None` rather than enumerating which refusals
+    // are recoverable. That enumeration is what would go stale: the lease
+    // refuses a resident wider than four bytes a texel (it hands out a pointer
+    // into the slot and so has nowhere to narrow one), and reading that
+    // particular `Err` as fatal would lose exactly the frames `read_target`
+    // exists to quantize. Any future refusal of a rail that is an optimisation
+    // has the same answer.
+    let leased = match crate::backend::vulkan::engine::read_target_leased(identity) {
+        Ok(leased) => leased,
+        Err(decline) => {
+            crate::observe::off(format!(
+                "render_flush_lease_declined mapping={mapping_id} {width}x{height} err={decline}"
+            ));
+            None
+        }
+    };
+    let (ok, frame_len) = match leased {
+        Some(leased) if leased.bgra => {
             crate::runtime::drain::note_store_route("render_flush_leased");
             let len = leased.bytes().len();
             let ok = crate::runtime::mapping_write::write_bgra8_uncached(
@@ -606,11 +628,11 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
             drop(leased);
             (ok, len)
         }
-        // Either the pool declined the lease (uncached readback memory, where
-        // reading the mapping in place is the slower shape) or the resident is
-        // not in scanout order. Drop any leased frame first so its slot is back
-        // in the pool before the second readback asks for one.
-        Ok(leased) => {
+        // The pool declined the lease (uncached readback memory, where reading
+        // the mapping in place is the slower shape), or it refused outright, or
+        // the resident is not in scanout order. Drop any leased frame first so
+        // its slot is back in the pool before the second readback asks for one.
+        leased => {
             drop(leased);
             crate::runtime::drain::note_store_route("render_flush_copied");
             match crate::backend::vulkan::engine::read_target(identity) {
@@ -634,13 +656,6 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
                     return false;
                 }
             }
-        }
-        Err(e) => {
-            crate::observe::fail(format!(
-                "render_store_lost mapping={mapping_id} {width}x{height} \
-                 reason=resident_read err={e}"
-            ));
-            return false;
         }
     };
     crate::runtime::drain::note_readback_phase(

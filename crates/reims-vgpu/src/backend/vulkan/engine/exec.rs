@@ -2634,7 +2634,15 @@ pub(crate) unsafe fn execute_draw_inner(
     }
 
     phase.enter(super::draw_phase::Phase::AcquireReadback);
-    let rb_size = (req.width as u64) * (req.height as u64) * 4;
+    // Sized by the attachment's own texel, not by a constant four. The copy at
+    // the end of this command buffer names an image extent and no buffer row
+    // length, so the GPU writes `width * height *
+    // bytes_per_texel(color0_format)` bytes into this slot — a wide attachment
+    // over a four-byte slot is a device-side write past the slot, not a short
+    // read. The seed path above answers the same question on the way in, and
+    // states the same reason.
+    let rb_texel = u64::from(super::readback_bytes_per_texel(color0_format));
+    let rb_size = (req.width as u64) * (req.height as u64) * rb_texel;
     let do_readback = !req.skip_readback;
     phase.note_target(req.width, req.height, if do_readback { rb_size } else { 0 });
     let readback = if do_readback {
@@ -3652,9 +3660,26 @@ pub(crate) unsafe fn execute_draw_inner(
     )?;
     counters.note_readback(rb_size);
 
+    // Read at the attachment's width above, narrowed here to the RGBA8 a
+    // `DrawOutput` consumer speaks. Shared with `read_target`'s rail so the two
+    // cannot answer a wide attachment differently — which they did, one
+    // quantizing and one overrunning its slot.
+    let layout = crate::backend::vulkan::translate::pixel::texel_layout_of(color0_format).ok_or(
+        DrawError::TargetRead(super::reason::TargetReadDecline::TexelNotFourBytes {
+            format: color0_format,
+        }),
+    )?;
+    let (pixels, pixels_bgra) = super::narrow_readback_to_rgba8(
+        out,
+        layout,
+        color0_format,
+        (req.width as u64) * (req.height as u64),
+        output_bgra,
+    )?;
+
     Ok(DrawOutput {
-        pixels: out,
-        pixels_bgra: output_bgra,
+        pixels,
+        pixels_bgra,
         occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
     })
 }
