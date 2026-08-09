@@ -46,6 +46,8 @@
 //! driven boot.
 
 use crate::model::DeviceState;
+use crate::runtime::decode::resource::{decode_list_object_entry, OBJECT_LIST_ENTRY_LEN};
+use crate::runtime::gva_mem;
 use crate::runtime::host::HostMemory;
 
 use super::{list_entry_or_miss, ListLookup, ListMiss};
@@ -211,7 +213,12 @@ fn verdict_of(read: Result<(), ListMiss>) -> Verdict {
 /// Called only from the `Named` arm of the lookup — a probe misses on every task
 /// that does not own the ref, which is how it finds the one that does, and
 /// watching those would fill the ledger with the search.
-pub(super) fn note_slot_empty(task_id: u32, ref_: u32) {
+pub(super) fn note_slot_empty<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    ref_: u32,
+) {
     let now = crate::observe::elapsed_us();
     let admitted = ledger()
         .lock()
@@ -219,7 +226,71 @@ pub(super) fn note_slot_empty(task_id: u32, ref_: u32) {
         .admit((task_id, ref_), now);
     if !admitted {
         crate::runtime::drain::note_store_route("slot_recheck_dropped");
+        return;
     }
+    note_list_population(state, host, task_id, ref_);
+}
+
+/// How far the guest has actually populated the list this ref missed in.
+///
+/// The watch says the slot never fills; this says whether the guest's writes
+/// ever reach that far. Two shapes, and they point at different defects:
+///
+/// - **The ref sits above everything populated.** The list is a prefix and this
+///   ref is past its end, so the number the device is treating as an index into
+///   this list is not one — a decode question, not a lifetime one.
+/// - **The ref sits inside a populated region, as a hole.** The list really does
+///   have a gap where the guest named an object, and the object is somewhere
+///   else.
+///
+/// Reads the list's **first page** in one go rather than probing per ref: 341
+/// entries at a 4 KiB page and 12 bytes an entry, against 341 page-table walks
+/// for the same answer. Emitted once per newly-watched `(task, ref)`, which a
+/// driven macos-26 boot reaches a few dozen times — the misses themselves are
+/// three times that, and repeats of a slot already watched cost nothing.
+fn note_list_population<M: HostMemory>(state: &DeviceState, host: &M, task_id: u32, ref_: u32) {
+    let Some(task) = state.tasks.get(task_id) else {
+        return;
+    };
+    let page_size = 1usize << state.page_shift;
+    let base = (task.object_list_pfn as u64) << state.page_shift;
+    let mut page = vec![0u8; page_size];
+    if gva_mem::try_read_task_gva_by_id(host, &state.tasks, task_id, base, &mut page, state.page_shift)
+        .is_err()
+    {
+        // The list's own first page did not read, which the per-slot walk would
+        // have reported as `Unreadable` rather than `SlotEmpty` — so reaching
+        // here means the two disagree and neither reading is usable.
+        crate::runtime::drain::note_store_route("slot_recheck_population_unreadable");
+        return;
+    }
+    // Never past what the guest declared, however many entries the page holds.
+    let slots = (page_size / OBJECT_LIST_ENTRY_LEN).min(task.object_list_count as usize);
+    let mut populated = 0usize;
+    let mut highest: Option<usize> = None;
+    for i in 0..slots {
+        let raw = &page[i * OBJECT_LIST_ENTRY_LEN..(i + 1) * OBJECT_LIST_ENTRY_LEN];
+        let Ok(entry) = decode_list_object_entry(raw) else {
+            continue;
+        };
+        if entry.descriptor_length != 0 && entry.descriptor_gva != 0 {
+            populated += 1;
+            highest = Some(i);
+        }
+    }
+    let highest = highest.map_or(-1i64, |h| h as i64);
+    // The route is what ranks the two shapes against each other across a boot;
+    // the line is what names the task and the reach behind one reading.
+    crate::runtime::drain::note_store_route(if i64::from(ref_) > highest {
+        "slot_empty_ref_above_reach"
+    } else {
+        "slot_empty_ref_within_reach"
+    });
+    crate::observe::off(format!(
+        "slot_empty_population task={task_id} ref={ref_} populated={populated} \
+         highest_ref={highest} slots_read={slots} \
+         (the first page of this task's own object list, at the moment the ref missed)"
+    ));
 }
 
 /// One line per watch that ended, naming the check and the age.

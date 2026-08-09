@@ -1313,7 +1313,7 @@ fn list_entry<M: HostMemory>(
                     // The unconfounded half of the same question — see
                     // `slot_recheck` for why the claimant search above cannot
                     // settle it and this can.
-                    slot_recheck::note_slot_empty(task_id, ref_);
+                    slot_recheck::note_slot_empty(state, host, task_id, ref_);
                 }
             }
             None
