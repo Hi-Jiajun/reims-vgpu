@@ -425,6 +425,14 @@ hardware that lacks the extension.
 
 Pick the pathway your change affects.
 
+Then pick the **rail** — one guest OS line, `macos-11` … `macos-26`, each with its own snapshot
+history under `vm/disks/rails/<rail>/` (x86) or `vm/guest/rails/<rail>/` (arm64). `--rail NAME`
+selects it, `--snapshot LABEL` selects within it, and a boot with neither follows `rails/current`.
+`--list-rails` says what exists. **Name the rail in any result you report**: a macOS 11 guest and a
+macOS 26 guest are two measurements of two guest drivers, and the `rail=` field in the boot's own log
+line is what says which one a reading came from. The same rule as the pathway table above applies —
+do not generalize from one rail to another.
+
 - Arm64: `vm/boot-arm64.sh --device reims-vgpu-mmio --testing`, then
   `scripts/screenshot-when-macos-host/screenshot-when-macos-host.sh /tmp/screen.png`
 - x86: `vm/boot-x86.sh --device reims-vgpu-pci --testing`, then
