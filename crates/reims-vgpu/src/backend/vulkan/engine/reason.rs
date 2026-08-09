@@ -84,10 +84,6 @@ pub enum DrawReason {
     GuestRunSampledNot2d { binding: u32 },
     /// More MRT secondary attachments than the render pass can carry.
     SecondaryAttachmentCap { requested: usize, cap: usize },
-    /// A depth test combined with MRT secondaries — the depth attachment is
-    /// appended after the secondaries and the two paths have not been proven
-    /// together.
-    DepthWithSecondaryAttachments,
     /// The device does not advertise `samplerAnisotropy` and the guest sampler
     /// asked for it.
     SamplerAnisotropyUnsupported,
@@ -200,7 +196,6 @@ impl crate::observe::Decline for DrawReason {
             Self::SecondaryAttachmentCap { .. } => "secondary_attachment_cap",
             Self::ViewportSlotsUnsupported { .. } => "viewport_slots_unsupported",
             Self::VisibilityCountingUnsupported { .. } => "visibility_counting_unsupported",
-            Self::DepthWithSecondaryAttachments => "depth_with_secondary_attachments",
             Self::SamplerAnisotropyUnsupported => "sampler_anisotropy_unsupported",
             Self::SamplerMirrorClampToEdgeUnsupported => "sampler_mirror_clamp_to_edge_unsupported",
             Self::DualSourceBlendUnsupported => "dual_source_blend_unsupported",
@@ -353,7 +348,6 @@ mod tests {
             occlusion_query_precise: false,
         },
         DrawReason::VisibilityResultMode(TranslateReason::UnknownVisibilityResultMode(0)),
-        DrawReason::DepthWithSecondaryAttachments,
         DrawReason::SamplerAnisotropyUnsupported,
         DrawReason::SamplerMirrorClampToEdgeUnsupported,
         DrawReason::ConstantVertexAttribute,

@@ -1863,14 +1863,12 @@ pub(crate) unsafe fn execute_draw_inner(
     pass_key.secondary_count = req.secondary_targets.len() as u8;
     pass_key.color_input = req.color_input;
     // Depth is opt-in per draw (only a non-trivial MTLDepthStencilState reaches
-    // here). Combining it with MRT is not yet supported — the ad-hoc MRT
-    // framebuffer would need the depth view appended and the pass rebuilt; no
-    // known workload does both, so reject rather than silently drop depth.
-    if req.depth.is_some() && is_mrt {
-        return Err(DrawError::Unsupported(
-            super::reason::DrawReason::DepthWithSecondaryAttachments,
-        ));
-    }
+    // here) and composes with MRT: the pass appends its attachment after the
+    // secondaries, `clear_values` appends its clear after theirs, and the ad-hoc
+    // framebuffer below is built from the same order. All three orderings are
+    // written once each and agree by construction; nothing branches on whether
+    // the other feature is present.
+    //
     // The depth attachment is resolved here rather than beside the framebuffer
     // below, because the pass key needs an answer this device can only get from
     // the resident: whether a `MTLLoadActionLoad` can be honoured at all.
@@ -2183,7 +2181,12 @@ pub(crate) unsafe fn execute_draw_inner(
     // and the fetch-carrying `render_pass` is used only for the ad-hoc
     // framebuffer + pipeline, exactly like MRT/depth.
     phase.enter(super::draw_phase::Phase::StagePass);
-    let primary_pass = if is_mrt || req.depth.is_some() || req.color_input {
+    // Whether this draw's pass shape differs from the colour-only one the target
+    // slot's cached framebuffer was built against. One predicate, because the
+    // two answers it feeds have to agree: which pass the slot is ensured under,
+    // and whether the draw builds (and later disposes) a framebuffer of its own.
+    let ad_hoc_framebuffer = is_mrt || req.depth.is_some() || req.color_input;
+    let primary_pass = if ad_hoc_framebuffer {
         caches.get_or_create_pass(
             ctx,
             PassKey::single(pass_key.load_seed, pass_key.bgra),
@@ -2251,29 +2254,16 @@ pub(crate) unsafe fn execute_draw_inner(
             let primary_view = t.view;
             let primary_access = t.access;
             let primary_slot_fb = t.framebuffer;
-            if is_mrt {
-                // Ensure each secondary resident and collect its view for the MRT
-                // framebuffer. Recently-ensured residents sit at the back of the
-                // LRU order, so a later secondary's capacity sweep (front-first)
-                // cannot evict the primary or an earlier secondary in this draw.
-                let mut views = vec![primary_view];
-                for sec in &req.secondary_targets {
-                    let old_access = pools
-                        .registry_get(&sec.identity)
-                        .map(|s| s.access)
-                        .unwrap_or(super::pools::ResidentAccess::Untouched);
-                    let (img, view) = pools.registry_ensure_attachment(
-                        ctx,
-                        sec.identity.clone(),
-                        sec.width,
-                        sec.height,
-                        sec.identity.generation(),
-                        sec.format,
-                        counters,
-                    )?;
-                    views.push(view);
-                    mrt_secondaries.push((sec.identity.clone(), img, old_access));
-                }
+            if ad_hoc_framebuffer {
+                let views = ad_hoc_attachment_views(
+                    ctx,
+                    pools,
+                    counters,
+                    req,
+                    primary_view,
+                    depth_attachment.as_ref().map(|d| d.view),
+                    &mut mrt_secondaries,
+                )?;
                 let fb = pools.create_mrt_framebuffer(
                     ctx,
                     render_pass,
@@ -2282,30 +2272,9 @@ pub(crate) unsafe fn execute_draw_inner(
                     req.height,
                     counters,
                 )?;
-                (primary_image, fb, primary_access, primary_view)
-            } else if let Some(d) = depth_attachment.as_ref() {
-                let fb = pools.create_mrt_framebuffer(
-                    ctx,
-                    render_pass,
-                    &[primary_view, d.view],
-                    req.width,
-                    req.height,
-                    counters,
-                )?;
-                transient_depth = Some((d.owned, fb));
-                (primary_image, fb, primary_access, primary_view)
-            } else if req.color_input {
-                // Fetch pass carries an input reference → the slot's cached
-                // color-only framebuffer is incompatible; build an ad-hoc one
-                // against `render_pass` (disposed deferred after submit).
-                let fb = pools.create_mrt_framebuffer(
-                    ctx,
-                    render_pass,
-                    &[primary_view],
-                    req.width,
-                    req.height,
-                    counters,
-                )?;
+                if let Some(d) = depth_attachment.as_ref() {
+                    transient_depth = Some((d.owned, fb));
+                }
                 (primary_image, fb, primary_access, primary_view)
             } else {
                 (primary_image, primary_slot_fb, primary_access, primary_view)
@@ -2317,30 +2286,31 @@ pub(crate) unsafe fn execute_draw_inner(
                 with_transfer_dst: seed_bytes.is_some(),
             };
             // Acquire the pooled slot under the color-only `primary_pass` (same as
-            // its cached framebuffer). For a depth draw, build a fresh ad-hoc
-            // framebuffer [color, depth] under the depth `render_pass`.
+            // its cached framebuffer), and build the draw's own framebuffer under
+            // `render_pass` whenever the two pass shapes differ.
             let t = pools.acquire_target(ctx, target_key, primary_pass, counters)?;
             let (pool_image, pool_view, pool_fb) = (t.image, t.view, t.framebuffer);
-            if let Some(d) = depth_attachment.as_ref() {
+            if ad_hoc_framebuffer {
+                let views = ad_hoc_attachment_views(
+                    ctx,
+                    pools,
+                    counters,
+                    req,
+                    pool_view,
+                    depth_attachment.as_ref().map(|d| d.view),
+                    &mut mrt_secondaries,
+                )?;
                 let fb = pools.create_mrt_framebuffer(
                     ctx,
                     render_pass,
-                    &[pool_view, d.view],
+                    &views,
                     req.width,
                     req.height,
                     counters,
                 )?;
-                transient_depth = Some((d.owned, fb));
-                (pool_image, fb, super::pools::ResidentAccess::Untouched, pool_view)
-            } else if req.color_input {
-                let fb = pools.create_mrt_framebuffer(
-                    ctx,
-                    render_pass,
-                    &[pool_view],
-                    req.width,
-                    req.height,
-                    counters,
-                )?;
+                if let Some(d) = depth_attachment.as_ref() {
+                    transient_depth = Some((d.owned, fb));
+                }
                 (pool_image, fb, super::pools::ResidentAccess::Untouched, pool_view)
             } else {
                 (pool_image, pool_fb, super::pools::ResidentAccess::Untouched, pool_view)
@@ -3514,7 +3484,12 @@ pub(crate) unsafe fn execute_draw_inner(
     // and are freed once those retire. Disposing BEFORE this point would
     // immediate-free them (this slot is not yet pending, so it is not in the
     // open mask) while the just-submitted CB still references them → GPU fault.
-    if is_mrt || (req.color_input && transient_depth.is_none()) {
+    //
+    // `transient_depth` carries the same handle whenever the draw has depth, so
+    // the two arms below are exclusive by that test rather than by re-deriving
+    // which features are in play — a depth MRT draw has one framebuffer and must
+    // dispose it once.
+    if ad_hoc_framebuffer && transient_depth.is_none() {
         pools.dispose(
             &ctx.device,
             super::pools::DeferredHandle::Framebuffer(target_fb),
@@ -3647,6 +3622,56 @@ fn read_occlusion_samples(
     unsafe { ctx.device.destroy_query_pool(pool, None) };
     read.map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecGetQueryPoolResults, e)))?;
     Ok(Some(samples[0]))
+}
+
+/// The attachment views of a draw's own framebuffer, in the order the render
+/// pass declares them: the primary colour slot, then the secondaries, then
+/// depth.
+///
+/// Three places build a list in this order — the pass's attachment descriptions
+/// in [`ObjectCaches::get_or_create_pass`], the clear vector in [`clear_values`],
+/// and this. Vulkan indexes all three positionally against each other, so a
+/// fourth spelling is a mismatch nothing refuses; there is one call site per
+/// target arm and neither builds its own.
+///
+/// The secondaries are ensured here, after the caller has ensured the primary,
+/// because that order is what protects this draw's own attachments: a resident
+/// just ensured sits at the back of the LRU, so a later secondary's capacity
+/// sweep (which evicts front-first) cannot take the primary or an earlier
+/// secondary out from under the framebuffer being built.
+unsafe fn ad_hoc_attachment_views(
+    ctx: &super::context::DeviceContext,
+    pools: &mut ResourcePools,
+    counters: &EngineCounters,
+    req: &DrawRequest,
+    primary_view: vk::ImageView,
+    depth_view: Option<vk::ImageView>,
+    mrt_secondaries: &mut Vec<(
+        super::types::TargetIdentity,
+        vk::Image,
+        super::pools::ResidentAccess,
+    )>,
+) -> Result<Vec<vk::ImageView>, DrawError> {
+    let mut views = vec![primary_view];
+    for sec in &req.secondary_targets {
+        let old_access = pools
+            .registry_get(&sec.identity)
+            .map(|s| s.access)
+            .unwrap_or(super::pools::ResidentAccess::Untouched);
+        let (img, view) = pools.registry_ensure_attachment(
+            ctx,
+            sec.identity.clone(),
+            sec.width,
+            sec.height,
+            sec.identity.generation(),
+            sec.format,
+            counters,
+        )?;
+        views.push(view);
+        mrt_secondaries.push((sec.identity.clone(), img, old_access));
+    }
+    views.extend(depth_view);
+    Ok(views)
 }
 
 /// One `VkClearValue` per attachment, in framebuffer order: the primary colour

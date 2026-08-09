@@ -3159,6 +3159,91 @@ fn mrt_rg16float_secondary_builds_and_renders() {
     );
 }
 
+/// Depth and MRT in the same pass: a draw carrying both a secondary colour
+/// attachment and a depth attachment renders through one framebuffer holding
+/// all three, in the order the render pass declares them.
+///
+/// The engine used to refuse this shape by name and lose the whole draw. macOS
+/// 26 issues it nine times in a driven boot and macOS 14 once, each refusal
+/// paired with a `draw_vk_nothing_stored` on the same pipe and task.
+///
+/// Depth is the discriminator on purpose, and it separates the two ways the
+/// combination can be wrong. If the depth view were left out of the framebuffer
+/// the pass and the framebuffer would disagree on attachment count and neither
+/// variant would render at all; if the depth *state* were dropped instead, both
+/// variants would cover. Only a pass that carries both attachments and tests
+/// against the depth one gives Never≠Always. The secondary is then asserted to
+/// have survived as a resident, which is what says it was not displaced by the
+/// depth attachment appended after it.
+#[test]
+fn depth_and_mrt_secondary_render_in_one_pass() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let (w, h) = (16u32, 16u32);
+    let mut surface_id = 0x70u32;
+    let mut variant = |compare: SamplerCompareFunction| -> Option<(bool, TargetIdentity)> {
+        surface_id += 2;
+        let primary = TargetIdentity::Surface {
+            id: surface_id,
+            width: w,
+            height: h,
+            generation: 1,
+        };
+        let secondary = TargetIdentity::Surface {
+            id: surface_id + 1,
+            width: w,
+            height: h,
+            generation: 1,
+        };
+        let mut req = engine_req(&v, &f, w, h);
+        req.target_identity = Some(primary);
+        req.secondary_targets.push(SecondaryColorTarget {
+            identity: secondary.clone(),
+            width: w,
+            height: h,
+            format: ash::vk::Format::R8G8B8A8_UNORM,
+            clear: [0.0, 0.0, 1.0, 1.0],
+            load: false,
+            blend: None,
+            color_write_mask: Default::default(),
+        });
+        req.depth = Some(DepthState {
+            // Parity fixtures bind no guest depth texture, so this is the
+            // transient rail — the one that owns its image and so the one whose
+            // dispose order a shared framebuffer would get wrong.
+            identity: None,
+            test_enable: true,
+            write_enable: true,
+            compare,
+            clear_value: 1.0,
+            load: false,
+            stencil: None,
+        });
+        match engine::execute_draw_request(&req) {
+            Ok(o) => Some((triangle_covered(&semantic_rgba(&o), w, h), secondary)),
+            Err(e) if skip_if_no_gpu(&e.to_string()) => {
+                eprintln!("SKIP depth+mrt: {e}");
+                None
+            }
+            Err(e) => panic!("depth + MRT secondary draw: {e}"),
+        }
+    };
+
+    let Some((never, _)) = variant(SamplerCompareFunction::Never) else {
+        return; // no GPU
+    };
+    assert!(
+        !never,
+        "compare=Never must discard every fragment, so the depth attachment is live"
+    );
+    let (always, secondary) = variant(SamplerCompareFunction::Always).unwrap();
+    assert!(always, "compare=Always must keep every fragment");
+    assert!(
+        engine::resident_content_ready(&secondary),
+        "the secondary attachment must still be a ready resident alongside depth"
+    );
+}
+
 /// Firewall: an empty `secondary_targets` leaves the classic single-attachment
 /// path untouched — same fragment color, zero MRT residents created.
 #[test]
