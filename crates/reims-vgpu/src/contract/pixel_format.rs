@@ -802,10 +802,27 @@ pub fn storage_selector(format: u16) -> Option<StorageImageSelector> {
 ///
 /// The match arms *are* the renderable set — the answer to "may a colour
 /// attachment be this format" is `.is_some()`, which is how
-/// `runtime/draw` asks it. There used to be a `RenderTargetClass` enum
-/// returned alongside the width, one variant per arm below; every caller
-/// discarded it, so it named the same six formats a second time and could
-/// disagree with this list without anything noticing.
+/// `runtime/draw` asks it, and since the two arms were made one answer it is
+/// also how `translate::pixel::color_attachment` asks it. There used to be a
+/// `RenderTargetClass` enum returned alongside the width, one variant per arm
+/// below; every caller discarded it, so it named the same six formats a second
+/// time and could disagree with this list without anything noticing.
+///
+/// Adding an arm here is therefore the whole of adding a renderable format, and
+/// it obliges two things of the layout tables: the layout must narrow to RGBA8
+/// (`narrow_texel_to_rgba8`, for the readback rails) and expand from it
+/// (`expand_rgba8_to_texel`, for a CPU `Load` seed). A format admitted here that
+/// those refuse is a render target the guest can create and then lose the frame
+/// of on any host that cannot land it GPU-direct.
+///
+/// `R16_FLOAT` is **not** here and macOS 26 asks for it — a linear GVA target at
+/// `fmt=0x19`, refused three times a driven boot as `rt_resolve
+/// reason=rt_linear_format`. Metal renders to it on every Apple GPU and Vulkan
+/// mandates `R16_SFLOAT` as a colour attachment, so neither side is the blocker.
+/// [`sampled_class`] is: it answers `None` for `R16_FLOAT`, so admitting it here
+/// would give the guest a target it can render into and then cannot sample,
+/// which for a blur pyramid is the whole point of the target. Adding it means
+/// adding the sampled class first.
 ///
 /// sRGB variants share storage bpp with their unorm counterparts (Metal texture
 /// view rules).
@@ -850,9 +867,22 @@ pub fn render_target_bpp(format: u16) -> Option<u32> {
 /// bits still takes the CPU rail. Returning a layout is an admission that the
 /// two **may** match, never a claim that they do.
 ///
-/// The set is deliberately still narrow. A layout belongs here when a guest
-/// render target can declare it and a copy of the resident's bytes is what the
-/// guest should read; it is not [`render_target_bpp`]`.is_some()`.
+/// The rule for membership is the doc's own and not a second list's: a layout
+/// belongs here when a guest render target can declare it and a copy of the
+/// resident's bytes is what the guest should read. That is not mechanically
+/// [`render_target_bpp`]`.is_some()` — a renderable format could in principle
+/// want a conversion on the way out — but every renderable format so far
+/// satisfies it, because a resident is created at the format the guest declared
+/// and the guest reads its own destination back at that same format.
+///
+/// **A renderable format missing from here is a performance bug, not a loss.**
+/// The byte-copy rail declines by name and the caller falls to the CPU
+/// converter, which is [`convert_rgba8_to_row`] — so the obligation a missing
+/// arm creates lands there instead, and that one *is* a loss if unmet.
+/// `RG16_FLOAT` is renderable and absent from here for that reason and no
+/// other: `a_byte_copy_destination_is_the_texel_every_other_table_agrees_it_is`
+/// requires an admitted format to have a [`sampled_class`] naming the same
+/// texel, and `RG16_FLOAT` has none.
 ///
 /// sRGB folds onto its linear sibling for the same reason [`sampled_class`]
 /// folds it: the qualifier describes how a sampler interprets the bytes, not
@@ -1139,15 +1169,32 @@ pub fn expand_rgba8_to_texel(
                 }
             }
         }
+        // The one- and two-channel float attachments. A seed is semantic RGBA8,
+        // so the channels the destination does not have are dropped — which is
+        // what a Metal shader writing `float4` into an `R16Float` attachment
+        // does too, and the inverse of `narrow_texel_to_rgba8` filling the
+        // missing channels with the same zeros and opaque alpha a shader reads
+        // back from them.
+        TexelLayout::R16Float | TexelLayout::Rg16Float => {
+            let lut = unorm8_to_f16_lut();
+            let chans = (layout.bytes_per_texel() / 2) as usize;
+            for i in 0..px {
+                let (s, d) = (i * RGBA8_BPP as usize, i * layout.bytes_per_texel() as usize);
+                for c in 0..chans {
+                    st16(&mut dst[d + c * 2..d + c * 2 + 2], lut[src_rgba[s + c] as usize]);
+                }
+            }
+        }
         // Not colour-attachment layouts this device creates a render target at,
-        // so a seed for one is a wiring error rather than a conversion.
+        // so a seed for one is a wiring error rather than a conversion. What
+        // decides that is `render_target_bpp`, whose doc states the obligation
+        // in the other direction: a format admitted there and refused here is a
+        // render target that loses its seed.
         TexelLayout::R8
         | TexelLayout::Rg8
-        | TexelLayout::R16Float
         | TexelLayout::R32Float
         | TexelLayout::R16Unorm
         | TexelLayout::Rg16Unorm
-        | TexelLayout::Rg16Float
         | TexelLayout::Rgba16Unorm => return false,
     }
     true
@@ -1204,13 +1251,30 @@ pub fn narrow_texel_to_rgba8(
                 }
             }
         }
+        // The one- and two-channel float attachments, filled out to RGBA8 the
+        // way a shader sampling them reads them: the channels the source does
+        // not carry are zero, and alpha is opaque. `expand_rgba8_to_texel` is
+        // the inverse and drops exactly those channels again.
+        TexelLayout::R16Float | TexelLayout::Rg16Float => {
+            let lut = f16_to_unorm8_lut();
+            let chans = (layout.bytes_per_texel() / 2) as usize;
+            for i in 0..px {
+                let (s, d) = (i * layout.bytes_per_texel() as usize, i * RGBA8_BPP as usize);
+                for c in 0..chans {
+                    let h = u16::from_le_bytes([src[s + c * 2], src[s + c * 2 + 1]]);
+                    dst_rgba[d + c] = lut[h as usize];
+                }
+                for c in chans..3 {
+                    dst_rgba[d + c] = 0;
+                }
+                dst_rgba[d + COMPONENT_A] = UNORM8_MAX;
+            }
+        }
         TexelLayout::R8
         | TexelLayout::Rg8
-        | TexelLayout::R16Float
         | TexelLayout::R32Float
         | TexelLayout::R16Unorm
         | TexelLayout::Rg16Unorm
-        | TexelLayout::Rg16Float
         | TexelLayout::Rgba16Unorm => return false,
     }
     true
@@ -2195,15 +2259,33 @@ mod tests {
     /// once. Exact and not approximate: `unorm8 -> f16` lands on values the
     /// reverse LUT maps back to the same byte, so a Store that falls to the CPU
     /// rail loses the *range* the guest asked for and nothing else.
+    /// A layout that carries fewer than four channels is included by giving it a
+    /// seed whose missing channels already hold what the narrowing puts back —
+    /// zero, and opaque alpha, which is what a shader sampling an `R16Float`
+    /// attachment reads out of the channels it does not have. Stating it that
+    /// way keeps one assertion (`back == src`) for every layout, rather than an
+    /// exact case and an approximate one that could both pass while disagreeing
+    /// about which channels are real.
     #[test]
     fn a_seed_widened_and_read_back_is_the_seed_it_started_as() {
         const PIXELS: u32 = 256;
-        let src: Vec<u8> = (0..PIXELS * RGBA8_BPP).map(|i| (i % 256) as u8).collect();
-        for layout in [
-            TexelLayout::Rgba8,
-            TexelLayout::Bgra8,
-            TexelLayout::Rgba16Float,
+        for (layout, channels) in [
+            (TexelLayout::Rgba8, 4usize),
+            (TexelLayout::Bgra8, 4),
+            (TexelLayout::Rgba16Float, 4),
+            (TexelLayout::Rg16Float, 2),
+            (TexelLayout::R16Float, 1),
         ] {
+            let src: Vec<u8> = (0..PIXELS * RGBA8_BPP)
+                .map(|i| {
+                    let c = (i % u32::from(RGBA8_BPP as u16)) as usize;
+                    match () {
+                        _ if c < channels => (i % 256) as u8,
+                        _ if c == COMPONENT_A && channels < 4 => UNORM8_MAX,
+                        _ => 0,
+                    }
+                })
+                .collect();
             let mut wide = vec![0u8; (PIXELS * layout.bytes_per_texel()) as usize];
             assert!(
                 expand_rgba8_to_texel(layout, &src, PIXELS, &mut wide),
@@ -2243,14 +2325,18 @@ mod tests {
         ));
         assert_eq!(bgra, [3, 2, 1, 4, 7, 6, 5, 8]);
 
+        // What this list may hold is not this test's to decide: a layout is
+        // seedable exactly when `render_target_bpp` admits the guest format it
+        // stands for, and
+        // `translate::pixel::…::the_renderable_set_is_one_answer_and_every_member_survives_both_rails`
+        // is what holds the two together. Removing a layout from here without
+        // that test agreeing means the two have drifted again.
         for layout in [
             TexelLayout::R8,
             TexelLayout::Rg8,
-            TexelLayout::R16Float,
             TexelLayout::R32Float,
             TexelLayout::R16Unorm,
             TexelLayout::Rg16Unorm,
-            TexelLayout::Rg16Float,
             TexelLayout::Rgba16Unorm,
         ] {
             let mut dst = [0u8; 64];

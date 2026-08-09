@@ -296,16 +296,26 @@ pub fn texel_layout_of(format: vk::Format) -> Option<TexelLayout> {
 /// unencoded then sampled undecoded cancels out.
 ///
 /// The narrowing is deliberate and stays. Metal renders to far more formats
-/// than these three; admitting one the rest of the pass machinery has never
-/// carried would trade a named decline for a wrong picture.
+/// than this device carries; admitting one the rest of the pass machinery has
+/// never carried would trade a named decline for a wrong picture.
+///
+/// **Which formats those are is the contract's answer, not this function's.**
+/// [`pixel_format::render_target_bpp`] says in its own doc that "the match arms
+/// *are* the renderable set", and this used to hold a second list — of Vulkan
+/// formats rather than Metal ones, so nothing could compare them. They had
+/// already drifted: the contract admitted `RGBA16_FLOAT`, which is what lets a
+/// half-float *primary* attachment be created at the format the guest declared,
+/// while this refused it. One guest format was therefore renderable as slot 0
+/// and declined as a secondary MRT slot, which is not a narrowing anybody chose.
+///
+/// Asking the contract makes the two arms one answer, and makes adding a
+/// renderable format a single edit there rather than a pair of edits that a
+/// commit can half-land.
 pub fn color_attachment(
     mtl: u16,
 ) -> Result<(vk::Format, Option<TranslateReason>), TranslateReason> {
     let f = translate(mtl)?;
-    if !matches!(
-        f.linear_vk,
-        vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM | vk::Format::R16G16_SFLOAT
-    ) {
+    if pixel_format::render_target_bpp(mtl).is_none() {
         return Err(TranslateReason::NoColorAttachmentFormat(mtl));
     }
     Ok((f.linear_vk, srgb_decline(&f, mtl)))
@@ -1169,8 +1179,76 @@ mod tests {
                 p::MTL_FORMAT_RGBA8_UNORM_SRGB,
                 p::MTL_FORMAT_BGRA8_UNORM,
                 p::MTL_FORMAT_BGRA8_UNORM_SRGB,
+                // Admitted since the two arms became one answer. The contract
+                // has said a half-float render target is renderable since one
+                // could be created at that format; only this side still refused
+                // it, so a half-float secondary MRT slot was declined while a
+                // half-float primary was not.
+                p::MTL_FORMAT_RGBA16_FLOAT,
             ]
         );
+    }
+
+    /// The two arms that answer "may a colour attachment be this format" are one
+    /// answer, and every format they admit can survive both readback rails.
+    ///
+    /// They were two hand-kept lists in two vocabularies — `render_target_bpp`
+    /// over `MTLPixelFormat`, this one over `vk::Format` — so nothing could
+    /// compare them, and they had drifted: the contract admitted
+    /// `RGBA16_FLOAT`, which is what lets a half-float *primary* attachment be
+    /// created at the format the guest declared, while `color_attachment`
+    /// refused it. The same guest format was renderable as slot 0 and declined
+    /// as a secondary MRT slot.
+    ///
+    /// The second half is the obligation `render_target_bpp`'s doc states.
+    /// A renderable format whose layout cannot narrow to RGBA8 is a target the
+    /// readback rails lose the frame of, and one that cannot expand from RGBA8
+    /// is a target whose CPU `Load` seed is refused — both silent until a guest
+    /// asks for that format. `Rg16Float` was admitted and could do neither for
+    /// as long as it had been renderable.
+    #[test]
+    fn the_renderable_set_is_one_answer_and_every_member_survives_both_rails() {
+        for &(mtl, ..) in EXPECTED {
+            let admitted = color_attachment(mtl).is_ok();
+            assert_eq!(
+                admitted,
+                p::render_target_bpp(mtl).is_some(),
+                "{mtl:#x}: the two colour-attachment arms disagree"
+            );
+            if !admitted {
+                continue;
+            }
+            let format = color_attachment(mtl).unwrap().0;
+            let layout = texel_layout_of(format).unwrap_or_else(|| {
+                panic!("{mtl:#x}: renderable as {format:?} with no guest texel layout")
+            });
+            // Four pixels of each, through both directions. The functions check
+            // their own lengths, so a `false` here is the layout being unhandled
+            // rather than a short buffer.
+            const PX: u32 = 4;
+            let wide = vec![0u8; PX as usize * layout.bytes_per_texel() as usize];
+            let mut rgba = vec![0u8; PX as usize * p::RGBA8_BPP as usize];
+            assert!(
+                p::narrow_texel_to_rgba8(layout, &wide, PX, &mut rgba),
+                "{mtl:#x}: renderable as {layout:?}, which no readback rail can narrow"
+            );
+            let mut back = wide.clone();
+            assert!(
+                p::expand_rgba8_to_texel(layout, &rgba, PX, &mut back),
+                "{mtl:#x}: renderable as {layout:?}, which no CPU Load seed can expand to"
+            );
+            // The third rail, and the one whose gap is a lost frame rather than
+            // a slow one. When the GPU cannot land a Store in guest pages the
+            // synchronous Store reads the resident back and converts it row by
+            // row into the guest's declared format — so a renderable format this
+            // refuses renders fine and then loses every frame on any host
+            // without a guest-RAM import. `R16_FLOAT` was exactly that gap.
+            let mut row = vec![0u8; PX as usize * p::bytes_per_pixel(mtl).unwrap() as usize];
+            assert!(
+                p::convert_rgba8_to_row(mtl, &rgba, PX, &mut row),
+                "{mtl:#x}: renderable, and the CPU Store converter cannot write it"
+            );
+        }
     }
 
     /// Every guest texel layout has a Vulkan-side width, and it is the contract's.
