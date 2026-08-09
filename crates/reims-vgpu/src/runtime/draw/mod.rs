@@ -3881,7 +3881,7 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
         height: h,
         row_stride: bpr,
         format: fmt,
-    }) = lookup_render_target(state, host, task_id, att.texture_ref)
+    }) = lookup_render_target(state, host, task_id, *att)
     else {
         return lost("render_target_unresolved");
     };
@@ -3965,7 +3965,7 @@ pub fn color_target_request<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
     task_id: u32,
-    color_texture_ref: u32,
+    color: crate::runtime::decode::render::ColorAttachment,
     pipeline_ref: u32,
     vertex_count: u32,
     instance_count: u32,
@@ -3973,7 +3973,8 @@ pub fn color_target_request<M: HostMemory + HostOps>(
     first_vertex: u32,
     base_instance: u32,
 ) -> Option<DrawEncodeRequest> {
-    let rt = lookup_render_target(state, host, task_id, color_texture_ref)?;
+    let color_texture_ref = color.texture_ref;
+    let rt = lookup_render_target(state, host, task_id, color)?;
     let c0 = ColorRtRequest {
         slot: 0,
         texture_ref: color_texture_ref,
@@ -4041,7 +4042,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             height: mh,
             row_stride: bpr,
             format: mfmt,
-        }) = lookup_render_target(state, host, task_id, att.texture_ref)
+        }) = lookup_render_target(state, host, task_id, att)
         else {
             // One unresolvable color attachment drops the whole pass (Metal
             // would not form the encoder with a null RT).

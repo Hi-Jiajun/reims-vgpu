@@ -27,6 +27,7 @@ use crate::runtime::decode::fifo::{
 };
 use crate::runtime::decode::render::{
     self, attachment_subresource_is_bindable, decode_color_attachment, decode_depth_attachment,
+    LevelSupport,
     decode_stencil_attachment, ColorAttachment, DepthAttachment, Kind as RenderKind, ScissorRect,
     Stage, StencilAttachment, PASS_MAX_COLOR_ATTACHMENTS,
 };
@@ -1796,7 +1797,10 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 // guest that wanted none also produces.
                 let depth = decode_depth_attachment(payload);
                 if depth.texture_ref != 0 {
-                    if attachment_subresource_is_bindable(depth.into()) {
+                    if attachment_subresource_is_bindable(
+                        depth.into(),
+                        LevelSupport::LevelZeroOnly,
+                    ) {
                         acc.depth_attach = Some(depth);
                     } else {
                         let drop = note_depth_stencil_unsupported(task_id, "depth", &depth.into());
@@ -1805,7 +1809,10 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 }
                 let stencil = decode_stencil_attachment(payload);
                 if stencil.texture_ref != 0 {
-                    if attachment_subresource_is_bindable(stencil.into()) {
+                    if attachment_subresource_is_bindable(
+                        stencil.into(),
+                        LevelSupport::LevelZeroOnly,
+                    ) {
                         acc.stencil_attach = Some(stencil);
                     } else {
                         let drop =
@@ -1819,35 +1826,35 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         continue;
                     }
                     let slot = i as u32;
-                    // Every consumer of a colour attachment binds the texture
-                    // whole, so a subresource the guest named is rendered past
-                    // rather than into. This used to be reported and then
-                    // rendered anyway, on the argument that dropping the pass
-                    // "would trade wrong pixels for none, which is worse". That
-                    // argument does not survive asking *whose* pixels: the pass
-                    // does not land in the guest's mip 3 and come out blurry, it
-                    // lands in **base level 0 of the same texture**, overwriting
-                    // the image the guest is sampling at LOD 0 and every other
-                    // level's source. A cube face becomes face 0 every time.
-                    // That is wrong content written over right content, which is
-                    // worse than none — and unlike none it also corrupts a
-                    // resource the guest did not name in this pass.
+                    // A slice, a depth plane or a multisample resolve target is
+                    // rendered past rather than into, and the pass is refused
+                    // for it. This used to be reported and then rendered anyway,
+                    // on the argument that dropping the pass "would trade wrong
+                    // pixels for none, which is worse". That argument does not
+                    // survive asking *whose* pixels: the pass does not land in
+                    // the guest's slice 3 and come out wrong, it lands in
+                    // **slice 0 of the same texture**, overwriting the image the
+                    // guest is sampling there. A cube face becomes face 0 every
+                    // time. That is wrong content written over right content,
+                    // which is worse than none — and unlike none it also
+                    // corrupts a resource the guest did not name in this pass.
                     //
-                    // Refusing costs a measured zero: `render_color_subresource_
-                    // unsupported` and the sibling `render_pass_array_length_
-                    // dropped` are absent from every driven boot recorded here,
-                    // while `render_pass_target_extent_unapplied` — decoded from
-                    // the same record — fires in the thousands, so the fields are
-                    // being read and are genuinely zero rather than unreached.
+                    // A **mip level** is the one coordinate that is not in that
+                    // class, which is why this arm passes `AnyLevel`: the linear
+                    // rung of `render_target` resolves the named level's own
+                    // plane out of the guest allocation, so the pass renders
+                    // into it rather than over level 0. macOS 26's compositor
+                    // renders a blur pyramid level by level and every one of
+                    // those passes was being dropped here.
                     //
-                    // Through the shared predicate rather than a fourth term
-                    // written out here, which is what this arm used to carry and
-                    // is how `resolve_texture_ref` went untested: a colour
-                    // attachment with `resolveTexture` set is a multisample
-                    // colour pass, and this device rendered it single-sampled
-                    // into the attachment and never wrote the resolve target the
-                    // guest goes on to read.
-                    if !attachment_subresource_is_bindable(att.into()) {
+                    // Through the shared predicate rather than terms written out
+                    // here, which is what this arm used to carry and is how
+                    // `resolve_texture_ref` went untested: a colour attachment
+                    // with `resolveTexture` set is a multisample colour pass, and
+                    // this device rendered it single-sampled into the attachment
+                    // and never wrote the resolve target the guest goes on to
+                    // read.
+                    if !attachment_subresource_is_bindable(att.into(), LevelSupport::AnyLevel) {
                         let drop = note_color_subresource_unsupported(task_id, slot, &att);
                         acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
                     }
@@ -3862,7 +3869,7 @@ fn apply_clear<M: HostMemory + HostOps>(
     let Some(req) =
         // A clear-only pass: no pipeline and no geometry, so every draw
         // argument including the base instance is zero by construction.
-        draw::color_target_request(state, host, task_id, att.texture_ref, 0, 0, 1, 0, 0, 0)
+        draw::color_target_request(state, host, task_id, *att, 0, 0, 1, 0, 0, 0)
     else {
         // A clear whose color target cannot resolve (mapping unresolved, geometry
         // missing) is dropped here with no other trace — the "background didn't

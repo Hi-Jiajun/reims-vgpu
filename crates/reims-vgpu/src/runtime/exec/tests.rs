@@ -945,7 +945,19 @@ fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_refuses_the_
         "the base subresource is what this device binds; nothing is refused"
     );
 
-    for (level, slice, plane) in [(3u16, 0u16, 0u16), (0, 5, 0), (0, 0, 2)] {
+    // A mip level is the one coordinate this device renders into rather than
+    // past: `render_target`'s linear rung resolves the named level's own plane
+    // out of the guest allocation. Refusing it dropped every pass of macOS 26's
+    // blur pyramid.
+    let acc = run(&pass(3, 0, 0));
+    assert_eq!(acc.color_slots.len(), 1);
+    assert!(
+        acc.bind_snapshot().is_ok(),
+        "a colour attachment naming a mip level must not refuse the stream: \
+         the level resolves to its own plane"
+    );
+
+    for (level, slice, plane) in [(0u16, 5u16, 0u16), (0, 0, 2)] {
         let acc = run(&pass(level, slice, plane));
         // The attachment still reaches the slot list, because the refusal is
         // the stream's and not the attachment's: what is refused is encoding
