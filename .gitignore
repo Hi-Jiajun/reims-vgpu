@@ -30,6 +30,7 @@ __pycache__/
 !/vm/boot-arm64.sh
 !/vm/boot-x86.sh
 !/vm/guest-authorize.sh
+!/vm/rail-debug-posture.sh
 vm/debug/
 vm/logs/
 # OVMF firmware blobs (CODE/VARS .fd) — large binary runtime, never commit
