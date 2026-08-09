@@ -237,6 +237,39 @@ pub fn imports() -> Vec<Arc<GuestRamImport>> {
         .unwrap_or_default()
 }
 
+/// Take the import now, so the guest's first draw does not pay for it.
+///
+/// Left lazy, [`resolve`] runs inside the first `gather`, inside the first
+/// draw, inside a display transaction the guest abandons after 1000 ms. Called
+/// from the guest driver's protocol-version handshake it runs before the guest
+/// has a display pipe to arm a watchdog on, and every later caller finds the
+/// answer already cached.
+///
+/// **This bought no measured time, and the honest reading is in [`resolve`]'s
+/// doc.** The move is real — `guest_ram_span` emits a second earlier, at the
+/// handshake — but the first frame's `gather_us` did not change, so the two
+/// seconds that blow the guest's watchdog are not this call. It is kept because
+/// asking the host where its RAM is, once, at a handshake, is where that
+/// question belongs whatever else is slow; it is not kept as a fix for the
+/// stall, and it should not be cited as one.
+///
+/// **It must never cache a negative.** [`resolve`] answers `NoBackendImport`
+/// when no backend has published a granularity yet, and that answer is latched
+/// in `MAP` for the rest of the boot — so warming before the backend is up
+/// would turn a capable host into one that refuses every window, which is the
+/// opposite of the intent and would look like a host that lacks the extension.
+/// The guard is the same question `resolve` asks first, and asking it here
+/// leaves the lazy path to handle a backend that is genuinely late.
+pub fn warm<H: HostOps + ?Sized>(host: &mut H) {
+    if granularity().is_none() {
+        return;
+    }
+    if MAP.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
+        return;
+    }
+    with_map(host, |_| ());
+}
+
 /// Resolve on the first call of a boot, then run `body` against the result.
 ///
 /// The one place the resolution is built, so no entry point can hold a second
@@ -430,13 +463,24 @@ pub fn reference_for_pages<H: HostOps + ?Sized>(
 /// Ask the host where guest RAM lives and bound every span to the backend's
 /// granularity.
 ///
-/// # This runs on the guest's first draw and costs about two seconds
+/// # This used to run on the guest's first draw, and it is NOT the two seconds
 ///
-/// It is lazy — the first `reference_for_pages` triggers it — and importing a
-/// multi-gigabyte RAMBlock through the host-pointer extension is not a cheap
-/// call: the driver has to take the whole range. On a 14 GiB `-m` guest the
-/// first few gathers absorb the entire cost and the ones after them are free,
-/// which is exactly the shape both x86 rails measure on their first frame:
+/// It was lazy — the first `reference_for_pages` triggered it — and it now runs
+/// at the guest driver's protocol handshake instead ([`warm`]). **That move was
+/// measured and it did not shift the stall**, which is the useful half of this
+/// note: the first-frame cost below is not the RAMBlock import, and the next
+/// reader should not spend a boot re-suspecting it.
+///
+/// The evidence is one timestamp. `guest_ram_span`, which this function emits
+/// once per boot, moved from t=56453 to t=55342 — the same millisecond as
+/// `protocol_version`, a full second ahead of the draw — and `gather_us` on the
+/// first frame stayed at 2 180 583 over the same six gathers. So resolution is
+/// off the critical path and the two seconds are still there, somewhere else in
+/// the gather path.
+///
+/// What the shape rules in and out. Both x86 rails measure this on their first
+/// frame, and the second row of each pair is what says it is one-time setup
+/// rather than a per-byte cost:
 ///
 /// ```text
 ///                 draw_stall     stage_us     gather_us  gather_n  gather_b
@@ -459,12 +503,17 @@ pub fn reference_for_pages<H: HostOps + ?Sized>(
 /// transaction stays pending, WindowServer stops answering, and the session
 /// never starts.
 ///
-/// So the laziness is not a performance detail on a slow path. Moving this off
-/// the guest's first draw — the import is taken once for the VM's lifetime, so
-/// device bring-up is where it belongs — is the fix, and it needs a hook that
-/// runs after the backend has published a granularity and before the guest's
-/// display pipe is armed. Timings above are wall clock on a shared host and are
-/// upper bounds; the counts and byte totals are not.
+/// Where the two seconds are NOT: this function, per the timestamp above; the
+/// bytes, per the second row of each pair; and the guest, which is idle behind
+/// its own wait. What is left is one-time backend setup that the first gather
+/// is merely the first caller to touch — the same draw is where
+/// `vk_memory_type_pick class=DeviceLocal` and the first `buffer_slab_device`
+/// allocation appear, and this host is a discrete part whose first submission
+/// after device creation is not free. That is the next place to look, and it
+/// wants a span census inside the gather rather than another guess.
+///
+/// Timings above are wall clock on a shared host and are upper bounds; the
+/// counts and byte totals are not.
 fn resolve<H: HostOps + ?Sized>(host: &mut H) -> Resolved {
     let Some(align) = granularity() else {
         return Resolved {
@@ -599,6 +648,59 @@ mod tests {
         reset();
         forget_granularity();
         out
+    }
+
+    /// Warming before a backend has published a granularity must leave the
+    /// resolution untaken, so the import a late backend enables is still
+    /// available.
+    ///
+    /// This is the whole hazard in moving the import off the guest's first
+    /// draw. `resolve` answers `NoBackendImport` when there is no granularity
+    /// and that answer is latched in `MAP` for the rest of the boot, so a warm
+    /// taken one instant too early does not merely fail to help — it converts a
+    /// host that can import into one that refuses every window for the life of
+    /// the VM, and reports it as a host lacking the extension.
+    #[test]
+    fn warming_before_the_backend_publishes_a_granularity_latches_nothing() {
+        with_granularity(None, || {
+            let mut host = two_spans();
+            warm(&mut host);
+            assert!(
+                MAP.lock().unwrap_or_else(|p| p.into_inner()).is_none(),
+                "a warm with no granularity must not latch a refusal"
+            );
+
+            // The backend comes up late; the import must still be available.
+            latch_granularity(0x1000);
+            warm(&mut host);
+            assert_eq!(
+                standing_refusal(&mut host),
+                None,
+                "the late backend's import must still resolve"
+            );
+            assert_eq!(imports().len(), 2, "both spans import once warmed");
+        });
+    }
+
+    /// Warming is what the first reference would have done, and doing it twice
+    /// changes nothing — the guest's handshake may be replayed, and every later
+    /// caller has to find the same answer.
+    #[test]
+    fn warming_is_idempotent_and_equals_what_the_lazy_path_would_resolve() {
+        let lazy = with_granularity(Some(0x1000), || {
+            let mut host = two_spans();
+            let refusal = standing_refusal(&mut host);
+            (refusal, imports().len())
+        });
+        let warmed = with_granularity(Some(0x1000), || {
+            let mut host = two_spans();
+            warm(&mut host);
+            warm(&mut host);
+            let refusal = standing_refusal(&mut host);
+            (refusal, imports().len())
+        });
+        assert_eq!(warmed, lazy);
+        assert_eq!(warmed.1, 2);
     }
 
     /// An address in either span resolves, and the offset it resolves to is the
