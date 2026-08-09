@@ -248,15 +248,6 @@ pub(crate) struct ResourcePools {
     readback_live: Option<BufferSlot>,
     /// Extra live readbacks (compute multi-image / multi-buffer).
     readback_multi_live: Vec<BufferSlot>,
-    /// Device-local buffer the guest-page writeback detiles a frame into before
-    /// scattering it into the guest's stretches.
-    ///
-    /// One slot, not a pool keyed by size: this rail writes one frame at a time
-    /// inside a single command buffer, and a boot's frames are all the same
-    /// geometry until the display mode changes. It is grown and never shrunk,
-    /// so a mode change up costs one reallocation and a mode change down costs
-    /// nothing. `None` until the first frame that takes the linear path.
-    guest_scratch: Option<BufferSlot>,
     /// Readback slots handed to a reader that is consuming their mapping with
     /// the engine unlocked; see [`ResourcePools::lease_readback`].
     ///
@@ -2281,19 +2272,21 @@ pub(crate) enum AllocSite {
     Readback,
     ReadbackMulti,
     SlabBlock,
-    /// The guest-page writeback's device-local detiling scratch. One
-    /// allocation per geometry for the life of the device, so a count above a
-    /// handful means the frame size is changing every flush and the grow rule
-    /// is thrashing rather than settling.
-    GuestScratch,
     /// A DEVICE_LOCAL block the draw-time guest gather carves its destinations
     /// from, not one destination. Same relationship to `guest_gather` binds that
     /// [`Self::StagingBlock`] has to staging ones, and read the same way: a
     /// single-digit count for a whole boot is the allocator working.
+    ///
+    /// It also backs the guest-page writeback's detiling buffer, which used to
+    /// have a site of its own (`guest_scratch`) because it had a slot of its
+    /// own. It no longer does: that slot was a singleton reused and grown
+    /// across submissions, and this pool is what makes the buffer fence-ordered.
+    /// So a boot's `guest_gather_block` figure now covers both users, and is
+    /// not comparable with one taken before that merge.
     GuestGatherBlock,
 }
 
-const ALLOC_SITE_N: usize = 10;
+const ALLOC_SITE_N: usize = 9;
 
 impl AllocSite {
     const fn idx(self) -> usize {
@@ -2306,8 +2299,7 @@ impl AllocSite {
             AllocSite::Readback => 5,
             AllocSite::ReadbackMulti => 6,
             AllocSite::SlabBlock => 7,
-            AllocSite::GuestScratch => 8,
-            AllocSite::GuestGatherBlock => 9,
+            AllocSite::GuestGatherBlock => 8,
         }
     }
 }
@@ -2321,7 +2313,6 @@ const ALLOC_SITE_NAMES: [&str; ALLOC_SITE_N] = [
     "readback",
     "readback_multi",
     "slab_block",
-    "guest_scratch",
     "guest_gather_block",
 ];
 

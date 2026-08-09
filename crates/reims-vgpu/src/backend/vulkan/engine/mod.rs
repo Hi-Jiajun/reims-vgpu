@@ -2386,7 +2386,25 @@ pub fn copy_target_to_guest_pages(
         // falls to the rectangle path, which is the only form that can leave
         // the padding unwritten. Both land the same guest bytes.
         let plan = if dst.rows_are_dense() {
-            let scratch = pools.acquire_guest_scratch(ctx, need, counters)?;
+            // The same pool the draw-time gather draws from, and for the same
+            // reason: this buffer is device-local, is written and then read by
+            // transfer commands in one submission, and must not be reused or
+            // freed until that submission's fence retires. A slot from here is
+            // held in `gather_live` and returned by the ring, so both of those
+            // are properties of the pool rather than of a caller's promise.
+            //
+            // Sized by `have` and not `need`. The detile writes `need` bytes
+            // from offset 0, but the scatter below reads one range per run and
+            // those sum to `have` — and the check above only establishes
+            // `need <= have`, so `need` is the smaller of the two. They are in
+            // fact equal wherever this branch is taken, because dense rows make
+            // `extent_end` the same tight frame `references_for_runs` tiled;
+            // that is a coincidence of two separately-derived numbers, not a
+            // stated relation, and sizing by the one the copies actually read
+            // costs nothing and does not depend on it holding.
+            let scratch = pools
+                .acquire_guest_gather(ctx, have, ash::vk::BufferUsageFlags::empty(), counters)?
+                .buffer;
             let scatter = plan_guest_linear_copies(ctx, pools, dst)?;
             counters.guest_write_linear.fetch_add(1, Ordering::Relaxed);
             GuestCopyPlan::Linear {

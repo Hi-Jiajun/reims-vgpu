@@ -72,12 +72,6 @@ impl ResourcePools {
         for s in self.readback_multi_live.drain(..) {
             release_buffer_slot(device, &mut self.slabs, s);
         }
-        // Device-local and never mapped, so nothing can be mid-read through it
-        // the way a leased readback can: the only reader is the GPU, and the
-        // wait above has already retired every submission that named it.
-        if let Some(s) = self.guest_scratch.take() {
-            release_buffer_slot(device, &mut self.slabs, s);
-        }
         // Leased slots are the one class here whose memory a live borrow may
         // still be reading, and freeing it unmaps that borrow's pointer — a
         // read after this line is a fault, not a stale pixel. So wait for the

@@ -64,12 +64,6 @@ pub enum VkOp {
     GuestWriteEndCb,
     /// `vkQueueSubmit` of the guest-page copy.
     GuestWriteSubmit,
-    /// `vkCreateBuffer` of the device-local detiling scratch.
-    GuestScratchCreate,
-    /// `vkAllocateMemory` for the detiling scratch.
-    GuestScratchAlloc,
-    /// `vkBindBufferMemory` of the detiling scratch.
-    GuestScratchBind,
 
     // ---- mod.rs `read_resident_storage` — the pinned deferred-writeback
     //      storage-image flush rail (GPU→host tight copy, then unpin) ----
@@ -366,9 +360,6 @@ impl Decline for VkCall {
             VkOp::GuestWriteBeginCb => "vk_guest_write_begin_cb",
             VkOp::GuestWriteEndCb => "vk_guest_write_end_cb",
             VkOp::GuestWriteSubmit => "vk_guest_write_submit",
-            VkOp::GuestScratchCreate => "vk_guest_scratch_create",
-            VkOp::GuestScratchAlloc => "vk_guest_scratch_alloc",
-            VkOp::GuestScratchBind => "vk_guest_scratch_bind",
 
             VkOp::StorageReadResetCb => "vk_storage_read_reset_cb",
             VkOp::StorageReadBeginCb => "vk_storage_read_begin_cb",
@@ -544,9 +535,6 @@ mod tests {
         VkOp::GuestWriteBeginCb,
         VkOp::GuestWriteEndCb,
         VkOp::GuestWriteSubmit,
-        VkOp::GuestScratchCreate,
-        VkOp::GuestScratchAlloc,
-        VkOp::GuestScratchBind,
         VkOp::StorageReadResetCb,
         VkOp::StorageReadBeginCb,
         VkOp::StorageReadEndCb,

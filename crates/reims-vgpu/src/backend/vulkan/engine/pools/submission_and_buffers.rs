@@ -105,7 +105,6 @@ impl ResourcePools {
             readback_free: HashMap::new(),
             readback_live: None,
             readback_multi_live: Vec::new(),
-            guest_scratch: None,
             readback_leased: Vec::new(),
             sampled_free: FreePool::new(SAMPLED_FREE_CAP_PER_KEY, SAMPLED_FREE_CAP_TOTAL),
             sampled_live: Vec::new(),
@@ -1916,6 +1915,28 @@ impl ResourcePools {
         Ok(slot)
     }
 
+    /// Take a recycled gather slot of exactly `bucket` bytes out of the free
+    /// list and record it live, or `None` when the list has none.
+    ///
+    /// Split out of [`Self::acquire_guest_gather`] because it is the whole of
+    /// the pool's no-aliasing property and it is the half that needs no device,
+    /// so a test can exercise it: a slot **leaves** the free list when it is
+    /// handed out, and only `drain_cleanup` puts it back, which happens after
+    /// the fence of the submission that named it. Two acquires with no fence
+    /// between them therefore cannot resolve to one buffer.
+    ///
+    /// That property is why the guest-page writeback's detiling buffer comes
+    /// from here rather than from a slot of its own. It used to be a singleton
+    /// grown in place, whose safety rested on the writeback rail waiting its
+    /// fence before returning — and that wait was removed when the rail learned
+    /// to record the obligation instead. A grow then freed the buffer while a
+    /// submitted copy was still reading it.
+    fn take_free_gather(&mut self, bucket: u64) -> Option<BufferSlot> {
+        let slot = self.gather_free.get_mut(&bucket)?.pop()?;
+        self.gather_live.push(slot);
+        Some(slot)
+    }
+
     /// A DEVICE_LOCAL buffer of at least `size` bytes for the draw-time guest
     /// gather to assemble a scattered window into.
     ///
@@ -1941,11 +1962,8 @@ impl ResourcePools {
         counters: &EngineCounters,
     ) -> Result<BufferSlot, DrawError> {
         let bucket = Self::bucket(size.max(4));
-        if let Some(list) = self.gather_free.get_mut(&bucket) {
-            if let Some(slot) = list.pop() {
-                self.gather_live.push(slot);
-                return Ok(slot);
-            }
+        if let Some(slot) = self.take_free_gather(bucket) {
+            return Ok(slot);
         }
         let buffer = ctx
             .device
@@ -2275,98 +2293,6 @@ impl ResourcePools {
             coherent: kind.coherent,
             cached: kind.cached,
         })
-    }
-
-    /// The device-local buffer the guest-page writeback detiles a frame into,
-    /// at least `size` bytes, creating or growing it if it is short.
-    ///
-    /// # Why this is one slot and not a pool
-    ///
-    /// The readback pools are keyed by size because many readbacks of many
-    /// geometries are live at once. This buffer has exactly one user, which
-    /// holds the engine lock for the whole of its command buffer, so there is
-    /// never a second live claim on it. Bucketing to a power of two the way
-    /// those pools do would round a 1080p frame's 8.29 MB up to 16 MB of VRAM
-    /// for nothing; the exact requirement is allocated instead, and a smaller
-    /// frame reuses a larger buffer rather than causing a second allocation.
-    ///
-    /// # Safety
-    ///
-    /// The caller must have no submission in flight naming the previous buffer:
-    /// a grow destroys it. The writeback rail waits its fence before returning,
-    /// so its next call cannot overlap its previous one.
-    pub(crate) unsafe fn acquire_guest_scratch(
-        &mut self,
-        ctx: &DeviceContext,
-        size: u64,
-        counters: &EngineCounters,
-    ) -> Result<vk::Buffer, DrawError> {
-        if let Some(slot) = self.guest_scratch {
-            if slot.size >= size {
-                return Ok(slot.buffer);
-            }
-            release_buffer_slot(&ctx.device, &mut self.slabs, slot);
-            self.guest_scratch = None;
-        }
-        let buffer = ctx
-            .device
-            .create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(size)
-                    // Destination of the image copy, source of the scatter.
-                    .usage(vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                None,
-            )
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestScratchCreate, e)))?;
-        counters.note_create();
-        let req = ctx.device.get_buffer_memory_requirements(buffer);
-        // A hard `DeviceLocal` rather than `DeviceLocalPreferred`: the whole
-        // point of this buffer is that the detiling hop stays on the GPU's own
-        // memory so the hop that does cross the bus is a linear read. Placed in
-        // host memory it would be two crossings instead of one and strictly
-        // worse than the rectangle path it replaces — a decline, not a degrade.
-        let mt = ctx
-            .memory_type_for(req.memory_type_bits, MemoryClass::DeviceLocal)
-            .ok_or({
-                DrawError::Unsupported(reason::DrawReason::NoDeviceLocalMemoryForGuestScratch {
-                    memory_type_bits: req.memory_type_bits,
-                })
-            })?;
-        let memory = allocate_memory_timed(
-            ctx,
-            &vk::MemoryAllocateInfo::default()
-                .allocation_size(req.size)
-                .memory_type_index(mt),
-            AllocSite::GuestScratch,
-        )
-        .map_err(|e| {
-            ctx.device.destroy_buffer(buffer, None);
-            DrawError::VkCall(VkCall::new(VkOp::GuestScratchAlloc, e))
-        })?;
-        counters.note_alloc();
-        ctx.device
-            .bind_buffer_memory(buffer, memory, 0)
-            .map_err(|e| {
-                ctx.device.free_memory(memory, None);
-                ctx.device.destroy_buffer(buffer, None);
-                DrawError::VkCall(VkCall::new(VkOp::GuestScratchBind, e))
-            })?;
-        self.guest_scratch = Some(BufferSlot {
-            buffer,
-            memory,
-            // The requirement and not the request: a driver may need more than
-            // was asked for, and recording the smaller number would re-grow a
-            // buffer that is already big enough on the very next frame.
-            size: req.size,
-            // Device-local memory is not host-visible on the topology this
-            // exists for, and nothing here reads it with the CPU.
-            mapped: 0,
-            backing: BufferBacking::Dedicated,
-            coherent: false,
-            cached: false,
-        });
-        Ok(buffer)
     }
 
     pub(crate) unsafe fn acquire_readback(
@@ -4922,5 +4848,93 @@ mod exchange_rb_tests {
         let mut dst = [0u8; 4];
         exchange_rb_into(&src, &mut dst);
         assert_eq!(dst, [3, 2, 1, 4]);
+    }
+}
+
+/// The gather pool's no-aliasing property, which is what the guest-page
+/// writeback's detiling buffer now rests on.
+///
+/// These exercise [`ResourcePools::take_free_gather`] rather than
+/// `acquire_guest_gather`, because the miss path allocates and needs a device
+/// while the property under test does not: a slot is *removed* from the free
+/// list when it is handed out and is recorded live, so nothing can hand the
+/// same buffer to two submissions that have not been separated by a fence.
+///
+/// # What these do not prove
+///
+/// **They would not have caught the bug they were written for**, and saying so
+/// is the point of this paragraph. The fault was in the singleton the writeback
+/// used *instead* of this pool; the pool itself was always correct. What they
+/// pin is the property the writeback now depends on, so a later change that
+/// starts recycling gather slots without a fence — the same mistake one level
+/// down — fails here rather than on a guest's desktop.
+///
+/// Reproducing the original fault needs a GPU, a guest, and a writeback of a
+/// larger window landing before an earlier one's fence retires. Nothing in this
+/// crate reaches that. The evidence for it is an `NVRM: Xid 31` MMU fault on
+/// the copy engine, and the argument is the pair of comments quoted on
+/// [`ResourcePools::take_free_gather`].
+#[cfg(test)]
+mod gather_slots_do_not_alias {
+    use super::*;
+    use ash::vk::Handle;
+
+    fn slot(raw: u64, size: u64) -> BufferSlot {
+        BufferSlot {
+            buffer: vk::Buffer::from_raw(raw),
+            memory: vk::DeviceMemory::from_raw(raw),
+            size,
+            mapped: 0,
+            backing: BufferBacking::Dedicated,
+            coherent: false,
+            cached: false,
+        }
+    }
+
+    /// Two acquires with no fence between them resolve to two different
+    /// buffers.
+    ///
+    /// This is the regression. The writeback rail used to detile through a
+    /// singleton (`guest_scratch`) that answered the second acquire with the
+    /// *same* buffer whenever it was already large enough, so a second frame's
+    /// detile wrote the buffer the first frame's scatter was still reading.
+    #[test]
+    fn a_second_acquire_cannot_name_the_first_ones_buffer() {
+        let mut pools = ResourcePools::new();
+        let bucket = ResourcePools::bucket(4096);
+        pools.gather_free.insert(bucket, vec![slot(1, bucket), slot(2, bucket)]);
+
+        let first = pools.take_free_gather(bucket).expect("a free slot");
+        let second = pools.take_free_gather(bucket).expect("a second free slot");
+
+        assert_ne!(
+            first.buffer, second.buffer,
+            "two live gather slots must not be one buffer"
+        );
+        assert_eq!(pools.gather_live.len(), 2, "both must be recorded live");
+    }
+
+    /// A slot that has been handed out is gone from the free list, so it cannot
+    /// be found again until the ring puts it back after its fence.
+    ///
+    /// The singleton had no such list: it was grown in place and destroyed
+    /// outright on a grow, which is the shape that freed memory underneath a
+    /// submitted copy.
+    #[test]
+    fn an_acquired_slot_is_no_longer_free() {
+        let mut pools = ResourcePools::new();
+        let bucket = ResourcePools::bucket(4096);
+        pools.gather_free.insert(bucket, vec![slot(7, bucket)]);
+
+        let taken = pools.take_free_gather(bucket).expect("a free slot");
+        assert_eq!(taken.buffer, vk::Buffer::from_raw(7));
+        assert!(
+            pools.take_free_gather(bucket).is_none(),
+            "the only slot was handed out; the list must be empty"
+        );
+        assert!(
+            !pools.gather_live.is_empty(),
+            "and the live list is what keeps it alive until its fence retires"
+        );
     }
 }

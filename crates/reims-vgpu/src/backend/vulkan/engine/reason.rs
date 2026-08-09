@@ -167,8 +167,6 @@ pub enum DrawReason {
     NoDeviceLocalMemoryForMrtSecondary { memory_type_bits: u32 },
     /// No device-local memory type for a depth attachment image.
     NoDeviceLocalMemoryForDepth { memory_type_bits: u32 },
-    /// No device-local memory type for the guest writeback's detiling scratch.
-    NoDeviceLocalMemoryForGuestScratch { memory_type_bits: u32 },
     /// No device-local memory type for a draw-time guest gather destination.
     NoDeviceLocalMemoryForGuestGather { memory_type_bits: u32 },
     /// `VK_KHR_swapchain` is not enabled on the engine device.
@@ -220,9 +218,6 @@ impl crate::observe::Decline for DrawReason {
                 "no_device_local_memory_for_mrt_secondary"
             }
             Self::NoDeviceLocalMemoryForDepth { .. } => "no_device_local_memory_for_depth",
-            Self::NoDeviceLocalMemoryForGuestScratch { .. } => {
-                "no_device_local_memory_for_guest_scratch"
-            }
             Self::NoDeviceLocalMemoryForGuestGather { .. } => {
                 "no_device_local_memory_for_guest_gather"
             }
@@ -278,7 +273,6 @@ impl std::fmt::Display for DrawReason {
             | Self::NoDeviceLocalMemoryForSlab { memory_type_bits }
             | Self::NoDeviceLocalMemoryForMrtSecondary { memory_type_bits }
             | Self::NoDeviceLocalMemoryForDepth { memory_type_bits }
-            | Self::NoDeviceLocalMemoryForGuestScratch { memory_type_bits }
             | Self::NoDeviceLocalMemoryForGuestGather { memory_type_bits } => {
                 write!(f, " memory_type_bits={memory_type_bits:#x}")
             }
