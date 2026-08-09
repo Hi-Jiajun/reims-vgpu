@@ -162,6 +162,86 @@ impl Ledger {
     }
 }
 
+/// Which `(task, ref)` pairs have ever resolved to a real object in this boot.
+///
+/// # Why a bitmap and not a set
+///
+/// This is written on the **success** path of every named object-list lookup,
+/// which runs per ref per draw — thousands of times a second under a window
+/// drag. A `Mutex<HashSet>` there would be measuring the instrument. A fixed
+/// bitmap of atomics is one `fetch_or` with no lock and no allocation, and its
+/// bound is the array rather than a number written down somewhere.
+///
+/// # What it is for
+///
+/// Two readings are left for macos-26's lost draws, and this separates them:
+/// the guest names a pipeline ref that **never** existed in this list, or one
+/// that existed and stopped. The second is a device defect with an obvious
+/// mechanism — macOS 26 re-issues `define_task` for a live tid with a new
+/// page-table root, so GVA page 1 afterwards is a different physical page and
+/// everything published into the old one reads as zero.
+struct ResolvedBits {
+    /// `[task][word]`, one bit per ref.
+    words: [[std::sync::atomic::AtomicU64; Self::WORDS]; Self::TASKS],
+    /// Refs or tasks past the array. Counted rather than dropped, because a
+    /// silent miss here would make "never resolved" the answer for everything
+    /// out of range and that is the reading the whole instrument turns on.
+    out_of_range: std::sync::atomic::AtomicU64,
+}
+
+impl ResolvedBits {
+    /// Live task ids observed on this rail run to 21 within a boot and the
+    /// table is indexed directly, so this is headroom rather than a fit.
+    const TASKS: usize = 64;
+    /// One 4 KiB page of a 12-byte-per-entry object list is 341 refs, which is
+    /// the window every other instrument here reads; six words covers it with
+    /// the same rounding.
+    const WORDS: usize = 6;
+    const REFS: u32 = (Self::WORDS * 64) as u32;
+
+    fn new() -> Self {
+        Self {
+            words: std::array::from_fn(|_| std::array::from_fn(|_| Default::default())),
+            out_of_range: Default::default(),
+        }
+    }
+
+    fn locate(task_id: u32, ref_: u32) -> Option<(usize, usize, u64)> {
+        if task_id as usize >= Self::TASKS || ref_ >= Self::REFS {
+            return None;
+        }
+        Some((task_id as usize, (ref_ / 64) as usize, 1u64 << (ref_ % 64)))
+    }
+
+    fn set(&self, task_id: u32, ref_: u32) {
+        use std::sync::atomic::Ordering;
+        let Some((t, w, bit)) = Self::locate(task_id, ref_) else {
+            self.out_of_range.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        self.words[t][w].fetch_or(bit, Ordering::Relaxed);
+    }
+
+    fn get(&self, task_id: u32, ref_: u32) -> Option<bool> {
+        use std::sync::atomic::Ordering;
+        let (t, w, bit) = Self::locate(task_id, ref_)?;
+        Some(self.words[t][w].load(Ordering::Relaxed) & bit != 0)
+    }
+}
+
+fn resolved_bits() -> &'static ResolvedBits {
+    static BITS: std::sync::OnceLock<ResolvedBits> = std::sync::OnceLock::new();
+    BITS.get_or_init(ResolvedBits::new)
+}
+
+/// Remember that `ref_` resolved to a real object under `task_id`.
+///
+/// On the success path of a named lookup. See [`ResolvedBits`] for why this is
+/// an atomic bit and not a set.
+pub(super) fn note_ref_resolved(task_id: u32, ref_: u32) {
+    resolved_bits().set(task_id, ref_);
+}
+
 fn ledger() -> &'static std::sync::Mutex<Ledger> {
     use std::sync::{Mutex, OnceLock};
     static LEDGER: OnceLock<Mutex<Ledger>> = OnceLock::new();
@@ -263,8 +343,24 @@ fn note_list_population<M: HostMemory>(state: &DeviceState, host: &M, task_id: u
     } else {
         "slot_empty_ref_within_reach"
     });
+    // The remaining fork, and the only one both other searches leave open: did
+    // this exact slot ever hold a real object earlier in the boot?
+    let before = match resolved_bits().get(task_id, ref_) {
+        Some(true) => {
+            crate::runtime::drain::note_store_route("slot_empty_ref_was_resolved");
+            "yes"
+        }
+        Some(false) => {
+            crate::runtime::drain::note_store_route("slot_empty_ref_never_resolved");
+            "no"
+        }
+        None => {
+            crate::runtime::drain::note_store_route("slot_empty_ref_untracked");
+            "untracked"
+        }
+    };
     crate::observe::off(format!(
-        "slot_empty_population task={task_id} ref={ref_} {pop} \
+        "slot_empty_population task={task_id} ref={ref_} {pop} resolved_before={before} \
          (the first page of this task's own object list, at the moment the ref missed)"
     ));
 }

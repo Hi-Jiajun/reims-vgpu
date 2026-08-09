@@ -1301,7 +1301,16 @@ fn list_entry<M: HostMemory>(
 ) -> Option<ListObjectEntry> {
     let found = list_entry_or_miss(state, host, task_id, ref_, lookup);
     match found {
-        Ok(entry) => Some(entry),
+        Ok(entry) => {
+            // Only a ref the guest named: a probe's success is the search
+            // finding an owner, which says nothing about what this task's own
+            // list once held. One atomic bit — see `slot_recheck::ResolvedBits`
+            // for why this path cannot take a lock.
+            if lookup == ListLookup::Named {
+                slot_recheck::note_ref_resolved(task_id, ref_);
+            }
+            Some(entry)
+        }
         Err(miss) => {
             // Only for a ref the guest named. A probe misses on every task that
             // does not own the ref, which is how it finds the one that does —

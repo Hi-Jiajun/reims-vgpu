@@ -2549,6 +2549,23 @@ impl DeviceState {
     /// ignore.
     pub fn define_task(&mut self, task_id: u32, length: u64, directory_pfn: u32) {
         self.max_task_id_seen = self.max_task_id_seen.max(task_id);
+        // Redefining a *live* task is the one shape here that can lose published
+        // guest state: the objects below are dropped, and if the new directory
+        // roots a different physical page at the list's own GVA then everything
+        // the guest published into the old one reads back as zero. macOS 13 does
+        // not do this and macOS 26 does, which is why it is counted separately
+        // from a first definition rather than folded into one route.
+        if self.tasks.is_active(task_id) {
+            let same_root = self
+                .tasks
+                .get(task_id)
+                .is_some_and(|t| t.directory_pfn == directory_pfn);
+            crate::runtime::drain::note_store_route(if same_root {
+                "define_task_redefined_live_same_root"
+            } else {
+                "define_task_redefined_live_new_root"
+            });
+        }
         // Drop objects for this task on redefine.
         self.objects.retain(|&(t, _)| t != task_id);
         self.retire_task_linear_residents(task_id);
