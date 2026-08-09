@@ -373,11 +373,27 @@ impl HostWrites {
 
     /// Record a write covering every page of `mapping_id`, as its page list
     /// stands now.
-    pub fn note_mapping(&mut self, mapping_id: u32, map_generation: u32) {
+    ///
+    /// `pages` is that same page list resolved by the caller, which only the
+    /// page-keyed record uses — the ring resolves the mapping again at read
+    /// time, and that difference is the point. `None` means the caller could not
+    /// name every page, which is recorded as an unnamed write rather than as a
+    /// partial one.
+    ///
+    /// **Both records are fed here and there is no way to feed one alone.** The
+    /// two used to be separate calls, and a writer that reached the ring without
+    /// the map would have made the map answer `Quiet` for a page that was
+    /// written — an omission no comparison could catch, because the ring would
+    /// not have known either and the pair would have agreed.
+    pub fn note_mapping(&mut self, mapping_id: u32, map_generation: u32, pages: Option<&[u64]>) {
         self.push(Wrote::Mapping {
             mid: mapping_id,
             map_generation,
         });
+        match pages {
+            Some(p) => self.shadow.note_pages(p, self.epoch),
+            None => self.shadow.note_unknown(self.epoch),
+        }
     }
 
     /// Record a write covering exactly `pages` (page-aligned guest addresses).
@@ -391,23 +407,6 @@ impl HostWrites {
     pub fn note_unknown(&mut self) {
         self.shadow.note_unknown(self.epoch.wrapping_add(1));
         self.push(Wrote::Unknown);
-    }
-
-    /// The page set a mapping-named write landed in, for the shadow only.
-    ///
-    /// Separate from [`Self::note_mapping`] because the ring resolves a mapping
-    /// at *read* time and the shadow must resolve it at *write* time — that is
-    /// the whole difference between them, and the reason the shadow has no
-    /// `Unresolvable` verdict: pages captured when the write happened stay
-    /// correct however the mapping is later re-pointed.
-    ///
-    /// `None` means the caller could not name every page, which is recorded as
-    /// an unnamed write rather than as a partial one.
-    pub fn shadow_mapping_pages(&mut self, pages: Option<&[u64]>) {
-        match pages {
-            Some(p) => self.shadow.note_pages(p, self.epoch),
-            None => self.shadow.note_unknown(self.epoch),
-        }
     }
 
     fn push(&mut self, what: Wrote) {
@@ -462,9 +461,15 @@ impl HostWrites {
         pages: &[u64],
     ) -> HostWriteVerdict {
         crate::runtime::drain::note_store_route(reach_band(self.epoch.saturating_sub(since)));
-        let verdict = self.ring_verdict(state, since, pages);
-        note_shadow(verdict, self.shadow.verdict(since, pages));
-        verdict
+        let ring = self.ring_verdict(state, since, pages);
+        let exact = self.shadow.verdict(since, pages);
+        note_shadow(ring, exact);
+        // The page-keyed record decides. The ring still runs and is still
+        // compared, so `hw_shadow_unsound` remains a live alarm on the answer
+        // being given rather than a retired one — it now reads "this answer
+        // vouched and the ring says the bytes really moved", which is the same
+        // losing direction it always named.
+        exact
     }
 
     /// The ring's own answer — the one that decides, unchanged.
@@ -636,7 +641,13 @@ mod tests {
     }
 
     /// A write that could not name its pages must invalidate everything, and a
-    /// reader older than the ring must be told the ring cannot answer.
+    /// reader older than the ring must be told **the ring** cannot answer.
+    ///
+    /// The horizon half asserts `ring_verdict`, not `wrote_any_since`. The ring
+    /// no longer decides — the page-keyed record does, and it answers this reader
+    /// exactly, which is the whole point of the swap. The ring's own contract is
+    /// still tested because the ring is still computed and still compared, and
+    /// `hw_shadow_unsound` is only a live alarm for as long as that stays true.
     #[test]
     fn what_the_ring_cannot_decide_reads_as_written() {
         let state =
@@ -657,9 +668,14 @@ mod tests {
             w.note_pages(vec![(100 + i) * P]);
         }
         assert_eq!(
-            w.wrote_any_since(&state, stale, &[3 * P]),
+            w.ring_verdict(&state, stale, &[3 * P]),
             HostWriteVerdict::Aged,
             "a mark older than the ring must not be answered from what is left of it"
+        );
+        assert_eq!(
+            w.wrote_any_since(&state, stale, &[3 * P]),
+            HostWriteVerdict::Quiet,
+            "and the record that decides now answers that same reader exactly"
         );
         let fresh = w.epoch();
         assert_eq!(
@@ -754,7 +770,10 @@ mod tests {
         }
         let now = w.epoch();
         for reach in 0..=(RING as u64 + 2) {
-            let aged = w.wrote_any_since(&state, now - reach, &[3 * P]) == HostWriteVerdict::Aged;
+            // `ring_verdict`, because the band it is checked against is the
+            // ring's horizon and the ring no longer decides. `reach_band` still
+            // measures the ring, so the two must keep agreeing with each other.
+            let aged = w.ring_verdict(&state, now - reach, &[3 * P]) == HostWriteVerdict::Aged;
             assert_eq!(
                 reach_band(reach) == "hw_reach_in_ring",
                 !aged,
@@ -767,8 +786,16 @@ mod tests {
 
     /// A mapping-named write is resolved through the mapping's live page list, so
     /// a mapping re-pointed since must not be tested against its new pages.
+    /// This is the one contract the swap to the page-keyed record changed, and
+    /// it changed in the safe direction. The ring resolved a mapping-named write
+    /// at *read* time and had to answer `Unresolvable` once the mapping moved —
+    /// a correct refusal, but a refusal, and each one cost a re-gather. The
+    /// record captures the page set at write time, so re-pointing the mapping
+    /// afterwards cannot make the answer wrong: page 7 was written and still
+    /// reads `Overlap`, page 3 was not and reads `Quiet`, whatever the mapping
+    /// points at now.
     #[test]
-    fn a_mapping_re_pointed_since_the_write_cannot_be_ruled_out() {
+    fn a_mapping_re_pointed_after_the_write_is_still_answered_by_the_pages_it_wrote() {
         use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
         let mut state =
             crate::model::DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
@@ -780,7 +807,7 @@ mod tests {
 
         let mut w = HostWrites::default();
         let mark = w.epoch();
-        w.note_mapping(4, generation);
+        w.note_mapping(4, generation, Some(&[7 * P]));
         assert_eq!(
             w.wrote_any_since(&state, mark, &[7 * P]),
             HostWriteVerdict::Overlap
@@ -790,15 +817,35 @@ mod tests {
             HostWriteVerdict::Quiet
         );
 
-        // Re-point the mapping at a page the write never touched. The write's
-        // page set is no longer reconstructible, so it can rule out nothing.
+        // Re-point the mapping at a page the write never touched. The ring can
+        // no longer reconstruct the write's page set; the record never needed to.
         let m = state.mappings.get_mut(&4).expect("still mapped");
         m.page_entries = vec![(8u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
         m.map_generation = generation.wrapping_add(1);
         assert_eq!(
+            w.wrote_any_since(&state, mark, &[7 * P]),
+            HostWriteVerdict::Overlap,
+            "the page this write landed in is still named by it"
+        );
+        assert_eq!(
             w.wrote_any_since(&state, mark, &[3 * P]),
-            HostWriteVerdict::Unresolvable,
-            "a write named by a mapping that has since moved must not be ruled out"
+            HostWriteVerdict::Quiet,
+            "a page no write ever touched is quiet however the mapping has moved"
+        );
+    }
+
+    /// A writer that cannot name every page of its mapping must not have the
+    /// pages it *could* name mistaken for the whole write.
+    #[test]
+    fn a_mapping_write_that_cannot_name_all_its_pages_invalidates_everything_older() {
+        let state =
+            crate::model::DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        let mut w = HostWrites::default();
+        let mark = w.epoch();
+        w.note_mapping(4, 0, None);
+        assert_eq!(
+            w.wrote_any_since(&state, mark, &[3 * P]),
+            HostWriteVerdict::Unnamed
         );
     }
 }

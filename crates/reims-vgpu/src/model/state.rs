@@ -3045,8 +3045,8 @@ impl DeviceState {
                     .iter()
                     .map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, shift))
                     .collect();
-                self.host_writes.note_mapping(mapping_id, generation);
-                self.host_writes.shadow_mapping_pages(pages.as_deref());
+                self.host_writes
+                    .note_mapping(mapping_id, generation, pages.as_deref());
             }
             _ => self.host_writes.note_unknown(),
         }
