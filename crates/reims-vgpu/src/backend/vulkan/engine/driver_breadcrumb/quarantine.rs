@@ -1,7 +1,21 @@
-//! Driver calls that killed a process, remembered across boots.
+//! Driver calls a process did not return from, remembered across boots.
 //!
 //! The parent module's doc says why this is evidence rather than a heuristic and
 //! why it has no off switch. This one is about the mechanism.
+//!
+//! # "Did not return" includes being killed
+//!
+//! The breadcrumb records that a process **ended while inside** the call, and it
+//! cannot tell a `SIGSEGV` from a `SIGTERM`. Both were observed: macOS 15's
+//! compile segmentation-faults at ~11.5 minutes and macOS 26's was still running
+//! when the boot script's own timeout killed it at 25. Both are "this call does
+//! not come back", so both quarantine.
+//!
+//! The cost is the case at the other end of that scale: killing a boot by hand
+//! during an ordinary healthy compile would quarantine a healthy call. The arm
+//! window is a few hundred microseconds of a boot and the next process says so
+//! loudly, so the answer is `rm` on the list rather than a rule trying to
+//! distinguish the two — which it cannot, because the information is not there.
 //!
 //! # The key is the call, not the module
 //!
@@ -35,7 +49,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 /// A driver call this device will not make again, and the description it had
-/// when it killed a process.
+/// when the process that made it ended inside it.
 #[derive(Debug)]
 pub(crate) struct Quarantined {
     pub(crate) key: String,
@@ -78,7 +92,8 @@ fn entries() -> &'static HashMap<String, String> {
         if !map.is_empty() {
             crate::observe::fail(format!(
                 "driver_quarantine reason=driver_quarantine_loaded calls={} path={} \
-                 (each one killed a process inside the driver; delete the file to try again)",
+                 (each one ended a process that was inside the driver; delete the file to try \
+                 them again)",
                 map.len(),
                 list_path().display()
             ));
@@ -89,7 +104,7 @@ fn entries() -> &'static HashMap<String, String> {
 
 /// A breadcrumb still on disk means the process that armed it never returned
 /// from the call. Fold it into the list and take the files away, so the next
-/// process reads a quarantine rather than a fresh crash.
+/// process reads a quarantine rather than a fresh ending.
 ///
 /// Called from the one-time load, before the file is read, so a crash and the
 /// boot that follows it are separated by nothing the caller has to sequence.
@@ -108,14 +123,15 @@ fn fold_surviving_breadcrumb() {
     if key.is_empty() {
         crate::observe::fail(format!(
             "driver_quarantine reason=driver_quarantine_crash_unkeyed what={what} \
-             (a breadcrumb survived, so the last process died in this call, but its meta \
+             (a breadcrumb survived, so the last process ended inside this call, but its meta \
              carried no key= line and the call cannot be recognised again)"
         ));
         return;
     }
     crate::observe::fail(format!(
-        "driver_quarantine reason=driver_quarantine_crash_recorded what={what} key={key} \
-         (the last process did not return from this driver call; it will be refused from now on)"
+        "driver_quarantine reason=driver_quarantine_ended_in_call what={what} key={key} \
+         (the last process ended while inside this driver call — a crash, or a kill of a call that \
+         was not coming back; it will be refused from now on)"
     ));
     append(key, what);
 }
