@@ -126,8 +126,10 @@ pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {
             ..linear(vk::Format::R8_UNORM, 1)
         },
         p::MTL_FORMAT_R8_UNORM => linear(vk::Format::R8_UNORM, 1),
+        p::MTL_FORMAT_R16_UNORM => linear(vk::Format::R16_UNORM, 2),
         p::MTL_FORMAT_R16_FLOAT => linear(vk::Format::R16_SFLOAT, 2),
         p::MTL_FORMAT_RG8_UNORM => linear(vk::Format::R8G8_UNORM, 2),
+        p::MTL_FORMAT_RG16_UNORM => linear(vk::Format::R16G16_UNORM, 4),
         p::MTL_FORMAT_R32_UINT => linear(vk::Format::R32_UINT, 4),
         p::MTL_FORMAT_R32_SINT => linear(vk::Format::R32_SINT, 4),
         p::MTL_FORMAT_R32_FLOAT => linear(vk::Format::R32_SFLOAT, 4),
@@ -217,6 +219,11 @@ pub fn sampled_pixels(mtl: u16) -> Result<(TexelLayout, Option<TranslateReason>)
         // gate — or the sample stays fail-visible.
         vk::Format::R16_SFLOAT => TexelLayout::R16Float,
         vk::Format::R32_SFLOAT => TexelLayout::R32Float,
+        // The ten-bit biplanar video planes, native for the reason the float
+        // layouts above are native. Both are Vulkan-mandatory sampled formats
+        // with mandatory linear filtering, so neither needs a capability gate.
+        vk::Format::R16_UNORM => TexelLayout::R16Unorm,
+        vk::Format::R16G16_UNORM => TexelLayout::Rg16Unorm,
         _ => return Err(TranslateReason::NoSampledLayout(mtl)),
     };
     Ok((layout, srgb_decline(&f, mtl)))
@@ -236,6 +243,8 @@ pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
         TexelLayout::Rg8 => vk::Format::R8G8_UNORM,
         TexelLayout::R16Float => vk::Format::R16_SFLOAT,
         TexelLayout::R32Float => vk::Format::R32_SFLOAT,
+        TexelLayout::R16Unorm => vk::Format::R16_UNORM,
+        TexelLayout::Rg16Unorm => vk::Format::R16G16_UNORM,
     }
 }
 
@@ -391,11 +400,15 @@ pub fn resident_color(bgra: bool) -> vk::Format {
 pub fn bytes_per_texel(format: vk::Format) -> Option<u32> {
     Some(match format {
         vk::Format::R8_UNORM | vk::Format::S8_UINT => 1,
-        vk::Format::R8G8_UNORM | vk::Format::R16_SFLOAT | vk::Format::D16_UNORM => 2,
+        vk::Format::R8G8_UNORM
+        | vk::Format::R16_SFLOAT
+        | vk::Format::R16_UNORM
+        | vk::Format::D16_UNORM => 2,
         vk::Format::R32_UINT
         | vk::Format::R32_SINT
         | vk::Format::R32_SFLOAT
         | vk::Format::R16G16_SFLOAT
+        | vk::Format::R16G16_UNORM
         | vk::Format::R8G8B8A8_UNORM
         | vk::Format::R8G8B8A8_SRGB
         | vk::Format::R8G8B8A8_UINT
@@ -935,6 +948,8 @@ mod tests {
             (TexelLayout::Rg8, vk::Format::R8G8_UNORM, 2),
             (TexelLayout::R16Float, vk::Format::R16_SFLOAT, 2),
             (TexelLayout::R32Float, vk::Format::R32_SFLOAT, 4),
+            (TexelLayout::R16Unorm, vk::Format::R16_UNORM, 2),
+            (TexelLayout::Rg16Unorm, vk::Format::R16G16_UNORM, 4),
         ] {
             assert_eq!(
                 vk_texel_layout(layout),
@@ -945,6 +960,17 @@ mod tests {
                 layout.bytes_per_texel(),
                 width,
                 "{layout:?} reads rows at a stride its upload format does not have"
+            );
+            // The third holder of this width is `bytes_per_texel`, which sizes
+            // the linear buffer a sampled image is validated against. A format
+            // missing from it is a refused draw rather than a sheared one, and
+            // that is how the ten-bit video planes surfaced: admitting them to
+            // the layout enum moved the refusal here instead of removing it.
+            assert_eq!(
+                bytes_per_texel(format),
+                Some(width),
+                "{format:?} has no linear texel footprint, so a sampled draw \
+                 binding it is refused"
             );
         }
     }

@@ -13,6 +13,10 @@ pub const RG8_BPP: u32 = 2;
 pub const RGBA8_BPP: u32 = 4;
 pub const BGRA8_BPP: u32 = RGBA8_BPP;
 pub const R16F_BPP: u32 = 2;
+/// One sixteen-bit normalized channel — a ten-bit video luma plane.
+pub const R16_BPP: u32 = 2;
+/// Two of them: the matching chroma plane.
+pub const RG16_BPP: u32 = 4;
 pub const R32F_BPP: u32 = 4;
 pub const RG16F_BPP: u32 = 4;
 pub const RGBA16_BPP: u32 = 8;
@@ -24,8 +28,15 @@ pub const R32_BPP: u32 = 4;
 // MTLPixelFormat values (Metal.framework Headers/MTLPixelFormat.h).
 pub const MTL_FORMAT_A8_UNORM: u16 = 0x01;
 pub const MTL_FORMAT_R8_UNORM: u16 = 0x0a;
+/// `MTLPixelFormatR16Unorm`. The luma plane of a ten-bit biplanar video
+/// surface (`'x420'`), where the eight-bit shape uses
+/// [`MTL_FORMAT_R8_UNORM`].
+pub const MTL_FORMAT_R16_UNORM: u16 = 0x14;
 pub const MTL_FORMAT_R16_FLOAT: u16 = 0x19;
 pub const MTL_FORMAT_RG8_UNORM: u16 = 0x1e;
+/// `MTLPixelFormatRG16Unorm`. The chroma half of [`MTL_FORMAT_R16_UNORM`],
+/// as [`MTL_FORMAT_RG8_UNORM`] is of [`MTL_FORMAT_R8_UNORM`].
+pub const MTL_FORMAT_RG16_UNORM: u16 = 0x3c;
 pub const MTL_FORMAT_R32_UINT: u16 = 0x35;
 pub const MTL_FORMAT_R32_SINT: u16 = 0x36;
 pub const MTL_FORMAT_R32_FLOAT: u16 = 0x37;
@@ -121,6 +132,23 @@ pub enum TexelLayout {
     /// Four bytes wide but **not** a colour order, so it stays out of the
     /// RGBA8-shaped loaders and `is_four_byte_color`.
     R32Float,
+    /// 2 bytes/texel — a **ten-bit** biplanar video luma plane, sampled natively
+    /// as `R16_UNORM`.
+    ///
+    /// The same role as [`Self::R8`] one bit depth up. A `'x420'` surface is
+    /// `kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange`, and its planes are
+    /// `MTLPixelFormatR16Unorm` and `MTLPixelFormatRG16Unorm` — not the `R8`/`RG8`
+    /// of the eight-bit `'420v'` shape.
+    ///
+    /// Native rather than converted, for [`Self::R16Float`]'s reason: narrowing
+    /// to unorm8 would drop two bits of luma from content graded for them, and a
+    /// banded frame is a wrong frame this device chose rather than one the guest
+    /// asked for. Two bytes wide and not a colour order, so like the float
+    /// layouts it stays out of the RGBA8-shaped loaders.
+    R16Unorm,
+    /// 4 bytes/texel — the chroma half of [`Self::R16Unorm`], sampled natively as
+    /// `R16G16_UNORM`. Four bytes wide but **not** a colour order.
+    Rg16Unorm,
 }
 
 impl TexelLayout {
@@ -132,6 +160,8 @@ impl TexelLayout {
             Self::Rg8 => RG8_BPP,
             Self::R16Float => R16F_BPP,
             Self::R32Float => R32F_BPP,
+            Self::R16Unorm => R16_BPP,
+            Self::Rg16Unorm => RG16_BPP,
         }
     }
 
@@ -166,7 +196,11 @@ impl TexelLayout {
     pub fn has_cpu_loader_arm(self) -> bool {
         match self {
             Self::Rgba8 | Self::Bgra8 | Self::R8 | Self::Rg8 => true,
-            Self::R16Float | Self::R32Float => false,
+            // The two sixteen-bit normalized layouts join the floats here for
+            // the same reason and a different quantity: `texel_to_rgba8` has no
+            // arm for them because an arm would have to narrow ten bits of video
+            // luma to eight.
+            Self::R16Float | Self::R32Float | Self::R16Unorm | Self::Rg16Unorm => false,
         }
     }
 }
@@ -220,6 +254,8 @@ pub fn bytes_per_pixel(format: u16) -> Option<u32> {
     Some(match format {
         MTL_FORMAT_A8_UNORM | MTL_FORMAT_R8_UNORM | MTL_FORMAT_STENCIL8 => R8_BPP,
         MTL_FORMAT_R16_FLOAT | MTL_FORMAT_RG8_UNORM | MTL_FORMAT_DEPTH16_UNORM => RG8_BPP,
+        MTL_FORMAT_R16_UNORM => R16_BPP,
+        MTL_FORMAT_RG16_UNORM => RG16_BPP,
         MTL_FORMAT_RG16_FLOAT => RG16F_BPP,
         MTL_FORMAT_RGBA8_UNORM
         | MTL_FORMAT_RGBA8_UNORM_SRGB
@@ -1611,6 +1647,8 @@ mod tests {
             TexelLayout::Rg8,
             TexelLayout::R16Float,
             TexelLayout::R32Float,
+            TexelLayout::R16Unorm,
+            TexelLayout::Rg16Unorm,
         ] {
             let mtl = match layout {
                 TexelLayout::Rgba8 => MTL_FORMAT_RGBA8_UNORM,
@@ -1619,6 +1657,8 @@ mod tests {
                 TexelLayout::Rg8 => MTL_FORMAT_RG8_UNORM,
                 TexelLayout::R16Float => MTL_FORMAT_R16_FLOAT,
                 TexelLayout::R32Float => MTL_FORMAT_R32_FLOAT,
+                TexelLayout::R16Unorm => MTL_FORMAT_R16_UNORM,
+                TexelLayout::Rg16Unorm => MTL_FORMAT_RG16_UNORM,
             };
             assert_eq!(
                 Some(layout.bytes_per_texel()),
@@ -1629,10 +1669,13 @@ mod tests {
             // two float ones deliberately do not — `texel_to_rgba8` has no
             // float arm, which is why they ride a native sampled rail instead,
             // and `TexelLayout::R16Float`'s own doc says converting them would
-            // quantize the transfer curve. Pinned here because it is an
-            // *absence*, and an absence is what a later "just add the missing
-            // arm" edit removes without noticing what it was for.
-            let expects_loader = !matches!(layout, TexelLayout::R16Float | TexelLayout::R32Float);
+            // quantize the transfer curve. The two sixteen-bit normalized ones
+            // are the same absence for the same reason: an arm for them would
+            // have to narrow ten bits of video luma to eight. Pinned here
+            // because it is an *absence*, and an absence is what a later "just
+            // add the missing arm" edit removes without noticing what it was
+            // for.
+            let expects_loader = layout.has_cpu_loader_arm();
             assert_eq!(
                 sampled_class(mtl).is_some(),
                 expects_loader,
@@ -1655,12 +1698,23 @@ mod tests {
             assert!(layout.is_four_byte_color(), "{layout:?} is a colour order");
             assert_eq!(layout.bytes_per_texel(), RGBA8_BPP);
         }
-        assert_eq!(TexelLayout::R32Float.bytes_per_texel(), RGBA8_BPP);
-        assert!(
-            !TexelLayout::R32Float.is_four_byte_color(),
-            "a single-channel float is four bytes wide and is not a colour order"
-        );
-        for layout in [TexelLayout::R8, TexelLayout::Rg8, TexelLayout::R16Float] {
+        // Two layouts are four bytes wide and are not colour orders: a
+        // single-channel float LUT, and the two-channel sixteen-bit chroma plane
+        // of a ten-bit video. Both would be swizzled as R,G,B,A by a rail that
+        // admitted them on width.
+        for layout in [TexelLayout::R32Float, TexelLayout::Rg16Unorm] {
+            assert_eq!(layout.bytes_per_texel(), RGBA8_BPP);
+            assert!(
+                !layout.is_four_byte_color(),
+                "{layout:?} is four bytes wide and is not a colour order"
+            );
+        }
+        for layout in [
+            TexelLayout::R8,
+            TexelLayout::Rg8,
+            TexelLayout::R16Float,
+            TexelLayout::R16Unorm,
+        ] {
             assert!(!layout.is_four_byte_color());
             assert_ne!(layout.bytes_per_texel(), RGBA8_BPP);
         }

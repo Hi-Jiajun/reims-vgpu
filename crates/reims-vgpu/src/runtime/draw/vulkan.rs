@@ -2033,9 +2033,15 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     // RG8→(r,g,0,255), which is exactly what an R8_UNORM / R8G8_UNORM Vulkan
     // image samples to (`.r` / `.rg`, zero-filled tail). Skipping the CPU expand
     // and uploading native cuts 4×/2× the staging bytes with byte-exact texels.
+    // The ten-bit pair (`'x420'`, `R16Unorm` / `RG16Unorm`) takes the same
+    // native rail for the same reason and one more: `texel_to_rgba8` has no arm
+    // for them, because an arm would have to narrow ten bits of graded luma to
+    // eight. `TexelLayout::has_cpu_loader_arm` is where that is stated.
     let byte_format = match view.pixel_format {
         pixel_format::MTL_FORMAT_R8_UNORM => TexelLayout::R8,
         pixel_format::MTL_FORMAT_RG8_UNORM => TexelLayout::Rg8,
+        pixel_format::MTL_FORMAT_R16_UNORM => TexelLayout::R16Unorm,
+        pixel_format::MTL_FORMAT_RG16_UNORM => TexelLayout::Rg16Unorm,
         _ => TexelLayout::Rgba8,
     };
     let ok_line = |generation_source: &str, rgba: &[u8]| {
