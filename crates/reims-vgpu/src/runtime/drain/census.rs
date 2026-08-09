@@ -127,10 +127,18 @@ pub(crate) fn note_vbl(arm: usize, now_ms: u64) {
 pub(crate) const DISPLAY_PRESENT_NO_GPA: usize = 0;
 pub(crate) const DISPLAY_PRESENT_NOT_ENABLED: usize = 1;
 pub(crate) const DISPLAY_PRESENT_DELIVERED: usize = 2;
+/// Raised by the refresh tick rather than by a present.
+///
+/// Separate from `DELIVERED` because the two answer different questions and
+/// summing them hides both: `delivered` is "a frame finished", `refresh` is "the
+/// pipe was told its live frame is done with". A guest that drives its display
+/// from this class shows a high `refresh` and a low `delivered`; one that never
+/// arms it shows zero of both, and that is not the same reading.
+pub(crate) const DISPLAY_PRESENT_REFRESH: usize = 3;
 
 /// Width of the counter set, derived from the last arm so a new arm cannot be
 /// added without the array growing with it.
-const DISPLAY_PRESENT_ARMS: usize = DISPLAY_PRESENT_DELIVERED + 1;
+const DISPLAY_PRESENT_ARMS: usize = DISPLAY_PRESENT_REFRESH + 1;
 
 /// One report per this many signals. Presents are far rarer than VBL ticks, so
 /// this is a much smaller stride than [`VBL_REPORT_EVERY`] — a rail that
@@ -167,8 +175,9 @@ pub(crate) fn note_display_present_signal(arm: usize) {
         return;
     }
     crate::observe::off(format!(
-        "display_present_signal delivered={} not_enabled={} no_gpa={}",
+        "display_present_signal delivered={} refresh={} not_enabled={} no_gpa={}",
         ARMS[DISPLAY_PRESENT_DELIVERED].load(Relaxed),
+        ARMS[DISPLAY_PRESENT_REFRESH].load(Relaxed),
         ARMS[DISPLAY_PRESENT_NOT_ENABLED].load(Relaxed),
         ARMS[DISPLAY_PRESENT_NO_GPA].load(Relaxed),
     ));

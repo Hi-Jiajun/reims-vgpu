@@ -4553,6 +4553,128 @@ pub(crate) fn display_event_enabled<H: HostMemory>(host: &H, gpa: u64, event_mas
     mask & event_mask != 0
 }
 
+/// Signal every display-completion class the guest has armed, for one tick of
+/// the refresh grid.
+///
+/// # Why this is one function and not two
+///
+/// A display pipe has to be told when the frame it was showing is done with.
+/// **Which event class carries that news is the guest's choice, published in the
+/// enable word, and the generations do not agree.** Measured on this rig, on
+/// consecutive boots of the same device:
+///
+/// - a macOS 13 guest oscillates its mask `0xc <-> 0xd`, arming and disarming
+///   **VBL** around each compositing burst, and never arms the transaction
+///   class at all;
+/// - a macOS 11 guest sets its mask to `0xe` two seconds after display setup,
+///   arming the **transaction** class, and never arms VBL for the life of the
+///   boot.
+///
+/// They are asking for the same thing by different names. On the guest side the
+/// transaction class runs `transaction_interrupt_gated`, which completes the
+/// *live* transaction — the one on screen — and then consumes the ring. It is a
+/// per-refresh retirement edge, not a per-present notification, and a device
+/// that raises it only when a present happens rings it exactly once and then
+/// stops.
+///
+/// That is a deadlock rather than a slowdown, because the wait it feeds has no
+/// deadline: the guest's window server drains the transaction queue on its
+/// accelerated-access transition, and that drain sleeps until the queue is empty
+/// *and* no transaction is live. With one frame presented, the queue empties,
+/// the frame becomes live, and only a further transaction interrupt would retire
+/// it. None arrives, so the window server never returns — before any user
+/// session exists, and before it could present anything that might unblock it.
+///
+/// So the tick signals whatever the guest armed. This is not a per-generation
+/// branch: nothing here asks which guest is running, it reads the one word the
+/// guest publishes to say what it wants. A guest that arms both gets both; a
+/// guest that arms neither gets a counted refusal and no write.
+///
+/// One mask read, one pending read-modify-write and at most one interrupt per
+/// tick, so arming both classes does not double the doorbell rate.
+///
+/// # Both poll arms call this
+///
+/// The locked poll and the lock-free one taken when the device lock is contended
+/// used to carry their own copies of the read-modify-write below, and the copies
+/// had already diverged once — the lock-free one omitted the enable-mask check
+/// entirely. Sharing the body is what keeps a third divergence from being
+/// possible: there is one place that decides what a refresh tick writes.
+pub(crate) fn signal_display_refresh_classes<H: HostMemory + HostOps>(
+    host: &mut H,
+    gpa: u64,
+    display_index: u32,
+    intr_disp: &std::sync::atomic::AtomicU32,
+    page_size: usize,
+    now_ms: u64,
+) {
+    let mut mask_le = [0u8; 4];
+    if host
+        .read_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &mut mask_le)
+        .is_err()
+    {
+        // The guest published this page's address itself; a read of it the host
+        // cannot perform is not a reason to start signalling classes nobody
+        // asked for. Counted as not-enabled, which is what it is from here.
+        note_vbl(VBL_NOT_ENABLED, now_ms);
+        return;
+    }
+    let mask = ld32(&mask_le);
+    crate::runtime::drain::census::note_display_enable_mask(mask);
+
+    let vbl = mask & DISPLAY_VBL_EVENT_MASK != 0;
+    let transaction = mask & DISPLAY_PRESENT_EVENT_MASK != 0;
+
+    // Counted after the limiter so the arm is on the same grid as `delivered`
+    // and the two are directly comparable; a guest that never enables VBL then
+    // reports the rate it *would* have been paced at.
+    note_vbl(
+        if vbl { VBL_DELIVERED } else { VBL_NOT_ENABLED },
+        now_ms,
+    );
+    if transaction {
+        note_display_present_signal(DISPLAY_PRESENT_REFRESH);
+    }
+    if !vbl && !transaction {
+        return;
+    }
+
+    let mut pending_le = [0u8; 4];
+    let pending = if host
+        .read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending_le)
+        .is_ok()
+    {
+        ld32(&pending_le)
+    } else {
+        0
+    };
+    // Drop a stale (already-acked) ONLINE bit so we don't re-deliver it and make
+    // the guest re-run process_online → connectionChange → overlay rebuild (see
+    // signal_display_present_complete). This tick only runs post-ack, so `stale`
+    // is 0 on healthy boots (bit 2 clears at ack) and this is a no-op there.
+    let stale = pending & DISPLAY_ONLINE_EVENT_MASK != 0;
+    let mut next = if stale {
+        pending & !DISPLAY_ONLINE_EVENT_MASK
+    } else {
+        pending
+    };
+    if vbl {
+        next |= DISPLAY_VBL_EVENT_MASK;
+    }
+    if transaction {
+        next |= DISPLAY_PRESENT_EVENT_MASK;
+    }
+    shared_w32(host, gpa, DISPLAY_SHARED_PENDING, next, page_size);
+    if stale {
+        crate::runtime::census::present_proxy::note_stale_online_pending("vbl", pending);
+    }
+    intr_disp.fetch_or(
+        1u32 << (display_index & 0x1f),
+        std::sync::atomic::Ordering::AcqRel,
+    );
+    host.enqueue(HostAction::irq_gfx());
+}
+
 fn signal_display_vbl_at<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -4571,50 +4693,15 @@ fn signal_display_vbl_at<H: HostMemory + HostOps>(
         note_vbl(VBL_NOT_CLAIMED, now_ms);
         return;
     }
-    // Counted after the limiter so the arm is on the same grid as `delivered`
-    // and the two are directly comparable; a guest that never enables VBL then
-    // reports the rate it *would* have been paced at.
-    if !display_event_enabled(host, state.display.shared_gpa, DISPLAY_VBL_EVENT_MASK) {
-        note_vbl(VBL_NOT_ENABLED, now_ms);
-        return;
-    }
-    note_vbl(VBL_DELIVERED, now_ms);
-    let gpa = state.display.shared_gpa;
-    let mut pending_le = [0u8; 4];
-    let pending = if host
-        .read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending_le)
-        .is_ok()
-    {
-        ld32(&pending_le)
-    } else {
-        0
-    };
-    // Drop a stale (already-acked) ONLINE bit so we don't re-deliver it and make
-    // the guest re-run process_online → connectionChange → overlay rebuild (see
-    // signal_display_present_complete). signal_display_vbl only runs post-ack, so
-    // online_acked is already true here; `stale` is 0 on healthy boots (no-op).
-    let stale = state.display.online_acked && pending & DISPLAY_ONLINE_EVENT_MASK != 0;
-    let base = if stale {
-        pending & !DISPLAY_ONLINE_EVENT_MASK
-    } else {
-        pending
-    };
-    shared_w32(
+    let page_size = state.page_size() as usize;
+    signal_display_refresh_classes(
         host,
-        gpa,
-        DISPLAY_SHARED_PENDING,
-        base | DISPLAY_VBL_EVENT_MASK,
-        state.page_size() as usize,
+        state.display.shared_gpa,
+        state.display.display_index,
+        &state.gfx.interrupt_status_disp,
+        page_size,
+        now_ms,
     );
-    if stale {
-        crate::runtime::census::present_proxy::note_stale_online_pending("vbl", pending);
-    }
-    let bit = 1u32 << (state.display.display_index & 0x1f);
-    state
-        .gfx
-        .interrupt_status_disp
-        .fetch_or(bit, std::sync::atomic::Ordering::AcqRel);
-    host.enqueue(HostAction::irq_gfx());
 }
 
 /// Assert display ONLINE once the guest has published the enable mask.

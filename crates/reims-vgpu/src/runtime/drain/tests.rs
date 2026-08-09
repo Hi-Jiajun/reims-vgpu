@@ -2968,9 +2968,15 @@ fn signal_display_vbl_declines_a_class_the_guest_did_not_enable() {
     state.display.online_acked = true;
 
     // The two masks a real x86 guest was measured publishing. Neither carries
-    // the VBL bit; both carry classes this device does signal, so this is not
-    // "the guest disabled everything".
-    for mask in [0x0eu32, 0x0cu32] {
+    // the VBL bit, so neither is owed a VBL pending bit — but `0x0e` carries the
+    // *transaction* class (macOS 11 arms that instead of VBL), and the tick owes
+    // that guest an interrupt for it. `0x0c` carries only online and offline,
+    // neither of which a refresh tick signals, so nothing at all is owed there.
+    //
+    // `owes_irq` is what separates "this device declined a class" from "this
+    // device went quiet": both masks decline VBL and only one of them means the
+    // guest hears nothing.
+    for (mask, owes_irq) in [(0x0eu32, true), (0x0cu32, false)] {
         host.put_u32(gpa + DISPLAY_SHARED_ENABLE_MASK, mask);
         host.put_u32(gpa + DISPLAY_SHARED_PENDING, 0);
         host.actions.clear();
@@ -2990,17 +2996,19 @@ fn signal_display_vbl_declines_a_class_the_guest_did_not_enable() {
             0,
             "mask {mask:#x} does not carry VBL, so the pending bit must stay clear"
         );
-        assert!(
-            host.actions.is_empty(),
-            "mask {mask:#x} does not carry VBL, so no interrupt is owed"
+        assert_eq!(
+            host.actions.len(),
+            usize::from(owes_irq),
+            "mask {mask:#x}: interrupt owed = {owes_irq}"
         );
         assert_eq!(
             state
                 .gfx
                 .interrupt_status_disp
-                .load(std::sync::atomic::Ordering::Acquire),
-            0,
-            "mask {mask:#x} does not carry VBL, so no display IRQ status is owed"
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0,
+            owes_irq,
+            "mask {mask:#x}: display IRQ status owed = {owes_irq}"
         );
     }
 
@@ -5679,4 +5687,90 @@ fn display_offline_is_never_signalled_even_when_the_guest_arms_it() {
         0,
         "a signalled offline bit tears down a live display pipe"
     );
+}
+
+/// A guest that arms only the transaction class still gets a refresh tick.
+///
+/// The two x86 rails measured here disagree about which event class carries
+/// "the frame you were showing is done with": a macOS 13 guest arms VBL and
+/// never arms the transaction class, a macOS 11 guest does the exact opposite.
+/// The tick has to honour whichever one the guest published, because the guest
+/// side of the transaction class retires the *live* transaction and then
+/// consumes the ring — a per-refresh edge, not a per-present one.
+///
+/// Getting this wrong is a hang and not a slowdown. The wait it feeds (the
+/// window server's transaction-queue drain) sleeps with no deadline, so a device
+/// that raises the class only when a present happens rings it once, the frame
+/// goes live, and nothing ever retires it.
+#[test]
+fn the_refresh_tick_signals_the_transaction_class_when_that_is_what_the_guest_armed() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let gpa = 0x7c000000u64;
+    host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+    state.display.shared_gpa = gpa;
+    state.display.display_index = 0;
+    state.display.online_acked = true;
+    // Exactly what a macOS 11 guest publishes: transaction + online + offline,
+    // and no VBL for the life of the boot.
+    host.put_u32(
+        gpa + DISPLAY_SHARED_ENABLE_MASK,
+        DISPLAY_PRESENT_EVENT_MASK | DISPLAY_ONLINE_EVENT_MASK | 0x8,
+    );
+    host.put_u32(gpa + DISPLAY_SHARED_PENDING, 0);
+
+    let last_us = std::sync::atomic::AtomicU64::new(0);
+    signal_display_vbl_at(&mut state, &mut host, &last_us, 5_000_000);
+
+    let mut pending = [0u8; 4];
+    host.read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending)
+        .unwrap();
+    assert_ne!(
+        ld32(&pending) & DISPLAY_PRESENT_EVENT_MASK,
+        0,
+        "the tick must raise the class the guest armed, or its queue drain never wakes"
+    );
+    assert_eq!(
+        ld32(&pending) & DISPLAY_VBL_EVENT_MASK,
+        0,
+        "VBL was not armed and must not be written"
+    );
+    assert_eq!(
+        host.actions.len(),
+        1,
+        "one tick raises at most one interrupt, whatever it signalled"
+    );
+    assert_eq!(host.actions[0].kind, HostActionKind::IrqGfxPulse);
+}
+
+/// Arming both classes still costs one interrupt and one pending write.
+///
+/// Nothing observed arms both, but the tick reads a guest-owned word and must
+/// not turn a mask it did not expect into a doubled doorbell rate.
+#[test]
+fn a_refresh_tick_that_signals_both_classes_raises_one_interrupt() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let gpa = 0x7c000000u64;
+    host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+    state.display.shared_gpa = gpa;
+    state.display.display_index = 0;
+    state.display.online_acked = true;
+    host.put_u32(
+        gpa + DISPLAY_SHARED_ENABLE_MASK,
+        DISPLAY_VBL_EVENT_MASK | DISPLAY_PRESENT_EVENT_MASK,
+    );
+    host.put_u32(gpa + DISPLAY_SHARED_PENDING, 0);
+
+    let last_us = std::sync::atomic::AtomicU64::new(0);
+    signal_display_vbl_at(&mut state, &mut host, &last_us, 5_000_000);
+
+    let mut pending = [0u8; 4];
+    host.read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending)
+        .unwrap();
+    assert_eq!(
+        ld32(&pending),
+        DISPLAY_VBL_EVENT_MASK | DISPLAY_PRESENT_EVENT_MASK
+    );
+    assert_eq!(host.actions.len(), 1);
 }

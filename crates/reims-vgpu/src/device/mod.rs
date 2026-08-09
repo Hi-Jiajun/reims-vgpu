@@ -120,6 +120,10 @@ struct BoundDevice {
     vbl_shared_gpa: AtomicU64,
     vbl_display_index: AtomicU32,
     vbl_online: AtomicBool,
+    /// Guest page size, published with the rest of the lock-free VBL snapshot.
+    /// The refresh tick's pending write is page-bounded like every other write
+    /// into the shared page, and this arm has no `DeviceState` to ask.
+    vbl_page_size: AtomicU64,
     /// Wall-clock ms of the last VBL claimed by either the locked or contended
     /// poll path. One shared limiter keeps guest pacing independent of which
     /// path happens to win the device lock.
@@ -261,6 +265,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             vbl_shared_gpa: AtomicU64::new(0),
             vbl_display_index: AtomicU32::new(0),
             vbl_online: AtomicBool::new(false),
+            vbl_page_size: AtomicU64::new(0),
             vbl_last_us: AtomicU64::new(0),
             ops,
             #[cfg(feature = "host-window")]
@@ -646,6 +651,8 @@ pub fn device_poll(id: u64) -> bool {
         .store(device.state.display.display_index, Ordering::Release);
     slot.vbl_online
         .store(device.state.display.online_acked, Ordering::Release);
+    slot.vbl_page_size
+        .store(device.state.page_size(), Ordering::Release);
     // Census both source polls and the independently time-gated VBL rate.
     // Drive the resident idle-drain off the poll heartbeat, which ticks even when
     // the guest stops compositing (a static page means no publishes at all).
@@ -696,7 +703,6 @@ pub fn device_poll(id: u64) -> bool {
 /// clear the acked ONLINE bit, so a torn write cannot resurrect it — far better
 /// than dropping ~90% of VBLs, which is the pre-fix behaviour under load.
 fn vbl_contended_pulse(slot: &BoundDevice) {
-    use crate::runtime::host::HostMemory;
     let gpa = slot.vbl_shared_gpa.load(Ordering::Acquire);
     let now = crate::observe::elapsed_ms() as u64;
     if gpa == 0 || !slot.vbl_online.load(Ordering::Acquire) {
@@ -713,46 +719,27 @@ fn vbl_contended_pulse(slot: &BoundDevice) {
         crate::runtime::drain::note_vbl(crate::runtime::drain::VBL_NOT_CLAIMED, now);
         return;
     }
+    let page_size = slot.vbl_page_size.load(Ordering::Acquire);
+    if page_size == 0 {
+        // The locked poll publishes this with the rest of the snapshot, so a
+        // zero means no locked poll has run since bind. Nothing is owed yet.
+        crate::runtime::drain::note_vbl(crate::runtime::drain::VBL_NOT_ONLINE, now);
+        return;
+    }
     let mut scratch = VecDeque::new();
     let mut host = QemuHost::new(&ops, &mut scratch, &slot.prompt_actions);
-    // Same check, same census arm and the same position in the sequence as the
-    // locked path: online, limiter, enable, deliver. This arm used to skip the
-    // enable check entirely, which set a pending bit the guest's ISR would never
-    // clear (it clears `pending & enable`) and counted the write as `delivered`.
-    if !crate::runtime::drain::display_event_enabled(
-        &host,
+    // One body decides what a refresh tick writes, and both poll arms call it.
+    // This arm used to carry its own copy, and the copy had already lost a term:
+    // it never read the enable word at all, so it set a pending bit the guest's
+    // ISR would never clear and counted the write as `delivered`.
+    crate::runtime::drain::signal_display_refresh_classes(
+        &mut host,
         gpa,
-        crate::model::DISPLAY_VBL_EVENT_MASK,
-    ) {
-        crate::runtime::drain::note_vbl(crate::runtime::drain::VBL_NOT_ENABLED, now);
-        return;
-    }
-    crate::runtime::drain::note_vbl(crate::runtime::drain::VBL_DELIVERED, now);
-    let mut buf = [0u8; 4];
-    if host
-        .read_gpa(gpa + crate::model::DISPLAY_SHARED_PENDING, &mut buf)
-        .is_err()
-    {
-        return;
-    }
-    // ONLINE is acked here (vbl_online), so a lingering bit2 is stale — drop it
-    // (mirrors signal_display_vbl's post-ack masking) and OR in the VBL bit.
-    let pending = u32::from_le_bytes(buf);
-    let next =
-        (pending & !crate::model::DISPLAY_ONLINE_EVENT_MASK) | crate::model::DISPLAY_VBL_EVENT_MASK;
-    if host
-        .write_gpa(
-            gpa + crate::model::DISPLAY_SHARED_PENDING,
-            &next.to_le_bytes(),
-        )
-        .is_err()
-    {
-        return;
-    }
-    let idx = slot.vbl_display_index.load(Ordering::Acquire);
-    slot.intr_disp
-        .fetch_or(1u32 << (idx & 0x1f), Ordering::AcqRel);
-    host.enqueue(HostAction::irq_gfx());
+        slot.vbl_display_index.load(Ordering::Acquire),
+        &slot.intr_disp,
+        page_size as usize,
+        now,
+    );
 }
 
 /// Pop one HostAction for the QEMU BH. Returns false if the queue is empty.
