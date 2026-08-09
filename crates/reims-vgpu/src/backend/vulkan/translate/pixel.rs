@@ -194,22 +194,12 @@ pub fn is_srgb(mtl: u16) -> bool {
 /// Callers still choose which layouts they accept: a rail that only handles
 /// four-byte texels asks [`TexelLayout::is_four_byte_color`] rather than a
 /// narrower entry point, so this table stays the single Metal-side rule.
-pub fn sampled_pixels(mtl: u16) -> Result<(TexelLayout, Option<TranslateReason>), TranslateReason> {
+pub fn sampled_pixels(
+    mtl: u16,
+) -> Result<(TexelLayout, Option<TranslateReason>, SwizzlePlan), TranslateReason> {
     let f = translate(mtl)?;
     // A format whose Metal channels do not sit identically on its Vulkan
     // channels needs a component mapping on the view to sample correctly.
-    // `TexelLayout` names a byte layout only and carries no mapping, so
-    // admitting such a format here would bind, say, `A8Unorm` as plain
-    // `R8_UNORM` and hand the shader `(a,0,0,1)` where Metal gives `(0,0,0,a)`.
-    // Decline until the rail carries the mapping.
-    //
-    // Its own reason rather than `NoSampledLayout`, because the repair differs:
-    // this one is closed by a rail that can put a swizzle on the view, that one
-    // by naming a byte layout here. Sharing a slug made the two indistinguish-
-    // able in the fail log, which is the failure `reason.rs` exists to prevent.
-    if f.components != IDENTITY {
-        return Err(TranslateReason::SampledComponentsNotIdentity(mtl));
-    }
     let layout = match f.linear_vk {
         vk::Format::R8G8B8A8_UNORM => TexelLayout::Rgba8,
         vk::Format::B8G8R8A8_UNORM => TexelLayout::Bgra8,
@@ -239,7 +229,19 @@ pub fn sampled_pixels(mtl: u16) -> Result<(TexelLayout, Option<TranslateReason>)
         vk::Format::R16G16_SFLOAT => TexelLayout::Rg16Float,
         _ => return Err(TranslateReason::NoSampledLayout(mtl)),
     };
-    Ok((layout, srgb_decline(&f, mtl)))
+    // The format's own channel plan travels with the layout instead of being a
+    // reason to refuse. A byte layout says how wide a texel is and in what
+    // order its bytes sit; it cannot say that `A8Unorm`'s byte belongs in alpha
+    // rather than red, which is why this used to decline every non-identity
+    // format outright.
+    //
+    // Returning it puts the obligation on the caller and the compiler enforces
+    // it: a rail that can fold this into its image view's component mapping
+    // does so, and one that cannot must decline by name. Deriving it at a call
+    // site instead is not available — the plan is a property of the *Metal*
+    // format, and a rail holding only a `TexelLayout` or a `VkFormat` has
+    // already lost the distinction between `A8Unorm` and `R8Unorm`.
+    Ok((layout, srgb_decline(&f, mtl), f.components))
 }
 
 /// The Vulkan format for a guest [`TexelLayout`].
@@ -478,11 +480,18 @@ fn srgb_decline(f: &PixelFormat, mtl: u16) -> Option<TranslateReason> {
 /// A decoded swizzle plan as the `VkImageView` component mapping that performs
 /// it in hardware.
 ///
-/// The plan passed in is the decoded type-8 view swizzle and nothing else — a
-/// format's own channel remap is not composed into it. That is safe because
-/// [`sampled_pixels`] declines every format whose plan is not identity, which
-/// `every_format_the_sampled_rail_admits_needs_no_mapping_of_its_own` holds it
-/// to; `A8Unorm` is the only such format and it is refused, not reshaped.
+/// The plan passed in is **already folded**: the caller composes the decoded
+/// type-8 view swizzle over the format's own channel remap with
+/// [`crate::contract::pixel_format::SwizzlePlan::after`], because a
+/// `VkComponentMapping` can express one plan and a bind may need both. This
+/// function does no composing of its own and must not start — it would then be
+/// a second place the fold happens, and the two would disagree the first time
+/// only one of them was updated.
+///
+/// It used to be the view swizzle alone, which was safe only because
+/// [`sampled_pixels`] refused every format with a non-identity plan. It no
+/// longer refuses them: it returns the plan, and `A8Unorm` — whose byte rides
+/// in `R8_UNORM` — is sampled rather than sent to the CPU rung.
 ///
 /// This is what makes a swizzled view cost nothing: Vulkan applies the mapping
 /// at sample time, so the texels never have to be rewritten on the CPU (which
@@ -516,10 +525,11 @@ pub fn vk_component_mapping(plan: &SwizzlePlan) -> vk::ComponentMapping {
 /// derive the plan, which is exactly why [`sampled_pixels`] declines a
 /// non-identity format instead of admitting one it could not describe.
 ///
-/// The sampled rail relies on that: its view mapping is the decoded type-8
-/// swizzle alone (see [`vk_component_mapping`]), which is only correct because
-/// nothing with a non-identity plan reaches it. A test holds the two in
-/// agreement.
+/// The sampled rail relies on that: it takes the plan from [`sampled_pixels`]
+/// and folds it under the decoded type-8 swizzle (see [`vk_component_mapping`]),
+/// which it can only do because the plan travels with the layout instead of
+/// being re-derived downstream. This predicate is now a *reader* of the same
+/// fact rather than a gate on it, and a test holds the two in agreement.
 pub fn has_identity_components(mtl: u16) -> bool {
     translate(mtl)
         .map(|f| f.components == IDENTITY)
@@ -801,7 +811,7 @@ mod tests {
             p::MTL_FORMAT_RGBA8_UNORM_SRGB,
             p::MTL_FORMAT_BGRA8_UNORM_SRGB,
         ] {
-            let (_, decline) = sampled_pixels(mtl).unwrap();
+            let (_, decline, _) = sampled_pixels(mtl).unwrap();
             assert_eq!(
                 decline,
                 Some(TranslateReason::SrgbDowngraded(mtl)),
@@ -821,7 +831,7 @@ mod tests {
             if *transfer == TransferFunction::Srgb {
                 continue;
             }
-            if let Ok((_, decline)) = sampled_pixels(*mtl) {
+            if let Ok((_, decline, _)) = sampled_pixels(*mtl) {
                 assert_eq!(decline, None, "MTL {mtl:#x}");
             }
             if let Ok((_, decline)) = color_attachment(*mtl) {
@@ -901,17 +911,18 @@ mod tests {
             sampled_pixels(0xffff).unwrap_err(),
             TranslateReason::UnknownPixelFormat(0xffff)
         );
-        // Declined for the *mapping*, not the byte size: A8Unorm is one byte
-        // like R8Unorm but does not present its channels the same way. It gets
-        // its own reason because the repair is a swizzle on the view, where
-        // `NoSampledLayout`'s is a byte layout named here.
+        // A8Unorm is admitted *with a plan*, not declined. It is one byte like
+        // R8Unorm and rides in the same Vulkan format, and the plan is the only
+        // thing that distinguishes them: without it the shader gets
+        // `(a,0,0,1)` where Metal gives `(0,0,0,a)`.
+        let (a8_layout, _, a8_plan) =
+            sampled_pixels(p::MTL_FORMAT_A8_UNORM).expect("A8Unorm is sampled, with a plan");
+        assert_eq!(a8_layout, TexelLayout::R8);
+        assert_eq!(a8_plan, ALPHA_IN_RED);
         assert_eq!(
-            sampled_pixels(p::MTL_FORMAT_A8_UNORM).unwrap_err(),
-            TranslateReason::SampledComponentsNotIdentity(p::MTL_FORMAT_A8_UNORM)
-        );
-        assert_ne!(
-            TranslateReason::SampledComponentsNotIdentity(0).slug(),
-            TranslateReason::NoSampledLayout(0).slug()
+            sampled_pixels(p::MTL_FORMAT_R8_UNORM).unwrap().2,
+            IDENTITY,
+            "R8Unorm is the same layout and the same Vulkan format as A8Unorm;              only the plan tells them apart"
         );
         assert!(sampled_pixels(p::MTL_FORMAT_R8_UNORM).is_ok());
         assert_eq!(
@@ -937,7 +948,8 @@ mod tests {
     #[test]
     fn single_channel_float_samples_natively_through_its_own_layout() {
         use crate::contract::pixel_format::TexelLayout;
-        let (layout, decline) = sampled_pixels(p::MTL_FORMAT_R16_FLOAT).expect("R16F is sampled");
+        let (layout, decline, _) =
+            sampled_pixels(p::MTL_FORMAT_R16_FLOAT).expect("R16F is sampled");
         assert_eq!(layout, TexelLayout::R16Float);
         assert!(decline.is_none(), "no sRGB transfer function to drop");
         assert_eq!(layout.bytes_per_texel(), 2);
@@ -946,7 +958,7 @@ mod tests {
         // R32F names its layout here (a decode fact); the *runtime* rail gates
         // it on the optional linear-filter capability. Four bytes wide but not a
         // colour order, so it must stay out of `is_four_byte_color`.
-        let (r32, _) = sampled_pixels(p::MTL_FORMAT_R32_FLOAT).expect("R32F is sampled");
+        let (r32, _, _) = sampled_pixels(p::MTL_FORMAT_R32_FLOAT).expect("R32F is sampled");
         assert_eq!(r32, TexelLayout::R32Float);
         assert_eq!(r32.bytes_per_texel(), 4);
         assert!(!r32.is_four_byte_color());
@@ -1020,9 +1032,11 @@ mod tests {
         assert_eq!(
             sampled,
             vec![
-                // A8Unorm is absent on purpose: it needs a component mapping
-                // this rail cannot carry, and binding it as bare R8 would hand
-                // the shader the byte in red instead of alpha.
+                // A8Unorm is present, and it is the one format here admitted
+                // with a non-identity plan: its byte rides in `R8_UNORM` and
+                // the plan puts it back in alpha. Binding it without the plan
+                // would hand the shader the byte in red.
+                p::MTL_FORMAT_A8_UNORM,
                 p::MTL_FORMAT_R8_UNORM,
                 // Single-channel float rides its own native rail (color LUTs).
                 // Both layouts are named here; the runtime gates R32F on the
@@ -1154,26 +1168,35 @@ mod tests {
     /// `R8_UNORM` would hand the shader `(a,0,0,1)` where Metal gives
     /// `(0,0,0,a)`.
     #[test]
-    fn every_format_the_sampled_rail_admits_needs_no_mapping_of_its_own() {
+    fn every_format_the_sampled_rail_admits_reports_its_own_mapping() {
         let mut admitted_any = false;
+        let mut saw_non_identity = false;
         for &(mtl, ..) in EXPECTED {
-            if sampled_pixels(mtl).is_ok() {
-                admitted_any = true;
-                assert!(
-                    has_identity_components(mtl),
-                    "sampled_pixels admits MTLPixelFormat {mtl:#x}, whose channels do not sit \
-                     identically on its Vulkan format; the sampled view binds the type-8 \
-                     swizzle alone and would drop that format's own plan"
-                );
-            }
+            let Ok((_, _, plan)) = sampled_pixels(mtl) else {
+                continue;
+            };
+            admitted_any = true;
+            // The plan handed back must be the format's own, not a default. A
+            // rail that folds it into its view mapping is only correct if this
+            // is the same answer `translate` gives.
+            assert_eq!(
+                plan,
+                translate(mtl).unwrap().components,
+                "sampled_pixels reports a different plan for MTLPixelFormat {mtl:#x} than \
+                 the format table does"
+            );
+            saw_non_identity |= plan != IDENTITY;
+            assert_eq!(has_identity_components(mtl), plan == IDENTITY);
         }
         assert!(admitted_any, "the sampled rail admits nothing at all");
-        // The known non-identity format is declined, not silently reshaped.
-        assert!(!has_identity_components(p::MTL_FORMAT_A8_UNORM));
-        assert!(matches!(
-            sampled_pixels(p::MTL_FORMAT_A8_UNORM),
-            Err(TranslateReason::SampledComponentsNotIdentity(_))
-        ));
+        // This used to assert the opposite — that every admitted format needed
+        // no mapping — which was true only because the one that does was
+        // refused. It is admitted now, and a suite where no admitted format has
+        // a non-identity plan would silently stop testing the fold.
+        assert!(
+            saw_non_identity,
+            "no admitted format carries a mapping, so the composition at the bind site is untested"
+        );
     }
 
     /// The typed reason and the always-on census line must name the class

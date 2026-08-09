@@ -707,11 +707,18 @@ pub(super) enum SampledSourceRequest {
     /// The identity is not optional on this rail: every window that reaches here
     /// went through the witness, and the witness names every window it is asked
     /// about. The vouch beside it is the part that varies.
+    /// The last field is the **format's own** channel plan, not the guest's
+    /// view swizzle: this rail binds guest bytes untouched, so a format whose
+    /// Metal channels do not sit identically on the Vulkan format carrying them
+    /// needs that difference expressed on the image view. It is composed with
+    /// the type-8 view swizzle at the push site. Identity for every format but
+    /// `A8Unorm`.
     GuestRuns(
         crate::backend::vulkan::engine::GuestRunSource,
         TexelLayout,
         LinearSampleIdentity,
         crate::runtime::gather_witness::GatherVouch,
+        pixel_format::SwizzlePlan,
     ),
 }
 
@@ -3043,7 +3050,6 @@ fn zc_lin_no_layout_route(reason: translate::TranslateReason) -> &'static str {
     match reason {
         R::UnknownPixelFormat(_) => "zc_lin_no_layout_undefined_format",
         R::NoSampledLayout(_) => "zc_lin_no_layout_no_texel_layout",
-        R::SampledComponentsNotIdentity(_) => "zc_lin_no_layout_needs_swizzle",
         _ => "zc_lin_no_layout_other",
     }
 }
@@ -3096,9 +3102,13 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // format at all — either it is undefined, or its Metal channels do not sit
     // identically on their Vulkan ones, which is a component mapping this rail
     // does not yet carry. Answering `Ok` with a layout this rail does not admit
-    // now means only the `R32_SFLOAT` filter gate. The first is closed by
-    // teaching the table a format; the second by a host that can filter it.
-    let native = match translate::pixel::sampled_pixels(declared_format) {
+    // now means only the host filter gate below.
+    //
+    // The plan beside the layout is the format's own channel mapping — identity
+    // for all but `A8Unorm`, whose byte rides in `R8_UNORM`. It is composed with
+    // the guest's type-8 view swizzle where the image view is built, so this
+    // rail no longer has to refuse a format for having one.
+    let (native, native_components) = match translate::pixel::sampled_pixels(declared_format) {
         // Deduped per declared format, which is a handful of values a boot
         // enumerates in a handful of lines. The number is the guest's own
         // `MTLPixelFormat` ordinal, so it names the format without this device
@@ -3123,7 +3133,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             }
             return None;
         }
-        Ok((layout, decline)) => {
+        Ok((layout, decline, components)) => {
             // Every layout is asked about, not just the one that was known to
             // be optional. This rail hands the guest's bytes to a sampler that
             // interpolates them, so "can this host filter this format" is a
@@ -3139,7 +3149,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                     declared_format,
                 );
             }
-            layout
+            (layout, components)
         }
     };
     let bpp = native.bytes_per_texel();
@@ -3248,6 +3258,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             native,
             LinearSampleIdentity::from(seen.identity),
             seen.vouch,
+            native_components,
         ),
     ))
 }
@@ -3281,8 +3292,17 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
         } else {
             pixel_format::MTL_FORMAT_BGRA8_UNORM
         };
+        // This rail binds the mapping's raw bytes with the view mapping it was
+        // given, so it carries no format plan. Identity is required rather than
+        // assumed: `is_four_byte_color` happens to exclude the one non-identity
+        // format (`A8Unorm` is a single byte), but that is a coincidence of
+        // widths and not the rule this line depends on.
         let native = match translate::pixel::sampled_pixels(format) {
-            Ok((layout, decline)) if layout.is_four_byte_color() => {
+            Ok((layout, decline, components)) if layout.is_four_byte_color() => {
+                if !pixel_format::swizzle_is_identity(&components) {
+                    crate::runtime::drain::note_store_route("zc_t11_needs_swizzle");
+                    return None;
+                }
                 if decline.is_some() {
                     srgb_census::note_downgrade(srgb_census::site::TYPE11_SAMPLE_ZERO_COPY, format);
                 }
@@ -3325,6 +3345,9 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
         native,
         LinearSampleIdentity::from(seen.identity),
         seen.vouch,
+        // Identity: this rail admitted the format only after checking its plan
+        // was identity, so there is nothing to fold in.
+        pixel_format::swizzle_identity(),
     ))
 }
 
@@ -3363,8 +3386,15 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
         // pass-through/swizzle for exactly these); everything else stays CPU.
         // The texel size comes from the layout the translation chose, so it can
         // never disagree with the image the engine creates.
+        // A multiplanar view's planes are the video luma/chroma formats, all of
+        // which sit identically on their Vulkan spellings. Required rather than
+        // assumed, for the reason the type-11 rail states.
         let (native, bpp) = match translate::pixel::sampled_pixels(view.pixel_format) {
-            Ok((layout, decline)) => {
+            Ok((layout, decline, components)) => {
+                if !pixel_format::swizzle_is_identity(&components) {
+                    crate::runtime::drain::note_store_route("zc_t5_needs_swizzle");
+                    return None;
+                }
                 if decline.is_some() {
                     srgb_census::note_downgrade(
                         srgb_census::site::TYPE5_PLANE_ZERO_COPY,
@@ -3407,6 +3437,9 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
         native,
         LinearSampleIdentity::from(seen.identity),
         seen.vouch,
+        // Identity: this rail admitted the format only after checking its plan
+        // was identity, so there is nothing to fold in.
+        pixel_format::swizzle_identity(),
     ))
 }
 
@@ -5481,6 +5514,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // video plane — and the host spelling is applied once, where the
                 // engine resource is built (`vk_texel_layout` below).
                 let mut sampled_format = TexelLayout::Rgba8;
+                // How the bound texels' channels sit on the host format, from
+                // the rail that produced them. Identity for every CPU-origin
+                // bind, because those loaders have already put the channels
+                // where Metal presents them; non-identity only where a rail
+                // handed the guest's own bytes over untouched.
+                let mut sampled_components = pixel_format::swizzle_identity();
                 let source = match loaded {
                     SampledSourceRequest::Bytes(rgba, identity, byte_format) => {
                         bytes_identity = identity;
@@ -5503,8 +5542,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         }
                         crate::backend::vulkan::engine::SampledSource::Target(identity)
                     }
-                    SampledSourceRequest::GuestRuns(src, native, identity, vouch) => {
+                    SampledSourceRequest::GuestRuns(src, native, identity, vouch, components) => {
                         sampled_format = native;
+                        sampled_components = components;
                         bytes_identity = Some(identity);
                         crate::backend::vulkan::engine::SampledSource::GuestRuns(src, vouch)
                     }
@@ -5587,7 +5627,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             generation: i.generation,
                         }
                     }),
-                    swizzle: view_swizzle.unwrap_or_default(),
+                    // The guest's view swizzle applied *after* the format's own
+                    // channel plan, folded into the one mapping the image view
+                    // can carry. Composed unconditionally rather than behind a
+                    // "does this need it" branch: identity is the unit on both
+                    // sides, so the fold is a no-op for every bind that does not
+                    // need it, and there is no case left to forget.
+                    swizzle: view_swizzle
+                        .unwrap_or_default()
+                        .after(&sampled_components),
                 });
                 Ok(())
             };

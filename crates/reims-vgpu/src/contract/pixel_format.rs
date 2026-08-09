@@ -305,6 +305,40 @@ impl Default for SwizzlePlan {
     }
 }
 
+impl SwizzlePlan {
+    /// This plan applied **after** `inner`, as one plan.
+    ///
+    /// Two remaps stack whenever a texture's own channel layout does not sit
+    /// identically on the host format carrying it *and* the guest asked for a
+    /// view swizzle on top. `A8Unorm` is the standing case: its byte rides in
+    /// `R8_UNORM`, so the format contributes "alpha is in red" and the guest's
+    /// type-8 view contributes whatever it asked for. Binding either alone
+    /// gives the shader the wrong channels.
+    ///
+    /// A hardware component mapping takes one plan, not two, so they have to be
+    /// folded here. The fold is a lookup, because a plan is a function from
+    /// output channel to input channel: this plan names a channel of `inner`'s
+    /// *output*, and `inner` says where that came from. A constant selector has
+    /// no channel to chase and passes through.
+    ///
+    /// Composition is not commutative and the argument order is the one that
+    /// reads: `view.after(&format)`.
+    pub fn after(self, inner: &SwizzlePlan) -> SwizzlePlan {
+        let mut source = self.source;
+        for slot in &mut source {
+            *slot = match *slot {
+                SwizzleSource::Zero => SwizzleSource::Zero,
+                SwizzleSource::One => SwizzleSource::One,
+                SwizzleSource::R => inner.source[COMPONENT_R],
+                SwizzleSource::G => inner.source[COMPONENT_G],
+                SwizzleSource::B => inner.source[COMPONENT_B],
+                SwizzleSource::A => inner.source[COMPONENT_A],
+            };
+        }
+        SwizzlePlan { source }
+    }
+}
+
 const UNORM8_MIN: u8 = 0x00;
 const UNORM8_MAX: u8 = 0xff;
 
@@ -1758,6 +1792,104 @@ mod tests {
                 "{layout:?} ({mtl:#x}) disagrees with texel_to_rgba8 about having an arm"
             );
         }
+    }
+
+    /// Composing two plans is the same as applying them one after the other.
+    ///
+    /// Exhaustive over **every** pair of plans — all six selectors in all four
+    /// slots, both sides, 6^4 x 6^4 = 1 679 616 pairs — checked against
+    /// [`apply_swizzle_rgba8`] on an input whose four channels are distinct, so
+    /// any two channels being confused is visible. This is the derivation
+    /// rather than a restatement: [`SwizzlePlan::after`] is only correct if it
+    /// agrees with actually applying the two, and that is what is asserted.
+    ///
+    /// A hardware component mapping takes one plan, so a bind that needs both a
+    /// format remap and a view swizzle has to fold them. Getting the fold
+    /// backwards produces a plausible image with two channels exchanged, which
+    /// is exactly the class no screenshot catches.
+    #[test]
+    fn composing_two_swizzles_is_applying_them_in_order() {
+        const SELECTORS: [SwizzleSource; 6] = [
+            SwizzleSource::Zero,
+            SwizzleSource::One,
+            SwizzleSource::R,
+            SwizzleSource::G,
+            SwizzleSource::B,
+            SwizzleSource::A,
+        ];
+        // Distinct, and none equal to what `Zero`/`One` produce, so a slot
+        // taking a constant cannot accidentally match a channel.
+        let input = [0x11, 0x22, 0x33, 0x44];
+        let plans = || {
+            SELECTORS.iter().flat_map(move |&r| {
+                SELECTORS.iter().flat_map(move |&g| {
+                    SELECTORS.iter().flat_map(move |&b| {
+                        SELECTORS.iter().map(move |&a| SwizzlePlan {
+                            source: [r, g, b, a],
+                        })
+                    })
+                })
+            })
+        };
+        for inner in plans() {
+            let once = apply_swizzle_rgba8(&inner, input);
+            for outer in plans() {
+                assert_eq!(
+                    apply_swizzle_rgba8(&outer.after(&inner), input),
+                    apply_swizzle_rgba8(&outer, once),
+                    "outer {:?} after inner {:?}",
+                    outer.source,
+                    inner.source
+                );
+            }
+        }
+    }
+
+    /// Identity is the unit on both sides, and composition is not commutative.
+    ///
+    /// The unit law is what lets a caller compose unconditionally instead of
+    /// branching on "did this format need a remap" — a branch that is the
+    /// obvious place to forget one of the two cases. The non-commutativity is
+    /// pinned because the argument order is otherwise easy to swap and the
+    /// result still type-checks.
+    #[test]
+    fn identity_composes_away_and_order_matters() {
+        let identity = swizzle_identity();
+        let alpha_in_red = SwizzlePlan {
+            source: [
+                SwizzleSource::Zero,
+                SwizzleSource::Zero,
+                SwizzleSource::Zero,
+                SwizzleSource::R,
+            ],
+        };
+        assert_eq!(alpha_in_red.after(&identity), alpha_in_red);
+        assert_eq!(identity.after(&alpha_in_red), alpha_in_red);
+
+        // `A8Unorm` sampled through a view asking for alpha in every channel.
+        // The byte is in the host format's red, so the answer names red four
+        // times — and the reverse order does not, which is the point.
+        let alpha_everywhere = SwizzlePlan {
+            source: [
+                SwizzleSource::A,
+                SwizzleSource::A,
+                SwizzleSource::A,
+                SwizzleSource::A,
+            ],
+        };
+        assert_eq!(
+            alpha_everywhere.after(&alpha_in_red).source,
+            [
+                SwizzleSource::R,
+                SwizzleSource::R,
+                SwizzleSource::R,
+                SwizzleSource::R
+            ]
+        );
+        assert_ne!(
+            alpha_everywhere.after(&alpha_in_red),
+            alpha_in_red.after(&alpha_everywhere)
+        );
     }
 
     /// [`TexelLayout::ALL`] really does hold every variant, exactly once, and
