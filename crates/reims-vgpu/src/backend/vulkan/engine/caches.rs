@@ -498,15 +498,15 @@ impl ObjectCaches {
         hit: &super::driver_breadcrumb::quarantine::Quarantined,
     ) -> DrawError {
         let reason = super::reason::DrawReason::DriverCallQuarantined;
-        crate::observe::fail(format!(
-            "driver_quarantine reason={} site={site} key={} previously={} \
-             (a previous process died in this call with these modules; \
-             delete {} to try it again)",
-            <super::reason::DrawReason as crate::observe::Decline>::slug(&reason),
-            hit.key,
-            hit.previously,
-            super::driver_breadcrumb::quarantine::list_path().display(),
-        ));
+        crate::observe::Emit::decline("driver_quarantine", &reason)
+            .field("site", site)
+            .field("key", &hit.key)
+            .field("previously", &hit.previously)
+            .field(
+                "list",
+                super::driver_breadcrumb::quarantine::list_path().display(),
+            )
+            .fail();
         DrawError::Unsupported(reason)
     }
 
@@ -610,8 +610,9 @@ impl ObjectCaches {
             self.shaders.insert_negative(key, err.clone());
             return Err(err);
         }
-        // The driver parses SPIR-V here, so this is one of the two calls that
-        // can end the process on a module this device assembled. See
+        // The driver parses SPIR-V here, so this is one of the three calls that
+        // can end the process on a module this device assembled — the other two
+        // being the compute and graphics pipeline compiles below. See
         // `driver_breadcrumb` for why the words go to disk across it.
         let breadcrumb = match super::driver_breadcrumb::DriverBreadcrumb::arm(
             "create_shader_module",
