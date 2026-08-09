@@ -803,7 +803,29 @@ pub fn validate(words: &[u32]) -> SpirvValidation {
     for word in words {
         bytes.extend_from_slice(&word.to_le_bytes());
     }
-    match metal2vulkan::tools::spirv_val_bytes(&bytes, &std::env::temp_dir()) {
+    // A private directory per call, because `spirv_val_bytes` writes a **fixed**
+    // file name inside whatever directory it is given. Handed the shared
+    // `/tmp`, two concurrent validations — this device's, or one of
+    // `metal2vulkan`'s own async translations — write and delete the same path,
+    // and the loser validates bytes it did not produce or finds no file at all.
+    // Measured: three modules on a working macos-13 boot rejected that way,
+    // which would have cost the guest three shaders to fix a crash on a
+    // different rail.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "reims-vgpu-spirv-val-{}-{seq}",
+        std::process::id()
+    ));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        if crate::observe::first_sight("spirv_val_no_tmp", 0) {
+            crate::observe::fail(format!("spirv_validate reason=validator_unavailable detail={e}"));
+        }
+        return SpirvValidation::Accepted;
+    }
+    let verdict = metal2vulkan::tools::spirv_val_bytes(&bytes, &dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    match verdict {
         Ok(()) => SpirvValidation::Accepted,
         Err(why) => {
             // A missing or unrunnable tool reads as an error from the same call
@@ -819,7 +841,12 @@ pub fn validate(words: &[u32]) -> SpirvValidation {
                 }
                 return SpirvValidation::Accepted;
             }
-            SpirvValidation::Rejected(why.lines().next().unwrap_or(&why).to_string())
+            // The whole message on one line. Its first line is the wrapper's
+            // own "spirv-val failed:" and the validator's diagnosis — the part
+            // that names the instruction — is on the ones after it, so keeping
+            // only the first is how a rejection reads as having no reason.
+            let flattened: Vec<&str> = why.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+            SpirvValidation::Rejected(flattened.join(" | "))
         }
     }
 }
@@ -2776,6 +2803,38 @@ mod tests {
         match validate(&bad) {
             SpirvValidation::Rejected(why) => assert!(!why.is_empty(), "the refusal must say why"),
             SpirvValidation::Accepted => panic!("a type-broken module was accepted"),
+        }
+    }
+
+    /// Concurrent validations do not answer for each other.
+    ///
+    /// The validator wrapper writes a fixed file name inside the directory it
+    /// is handed, so a shared directory makes two callers race over one path
+    /// and the loser gets a verdict about bytes it did not submit. That is not
+    /// hypothetical: it rejected three good modules on a working macos-13 boot,
+    /// where the concurrency comes from this device's drain thread and
+    /// `metal2vulkan`'s own async translations sharing `/tmp`.
+    ///
+    /// Skips where SPIRV-Tools is absent, where every answer is `Accepted` and
+    /// the test could not fail.
+    #[test]
+    fn concurrent_validations_do_not_collide() {
+        let good = minimal_compute_module();
+        if validate(&good) != SpirvValidation::Accepted {
+            eprintln!("skip: no usable spirv-val");
+            return;
+        }
+        let verdicts: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let words = good.clone();
+                    scope.spawn(move || validate(&words))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for verdict in &verdicts {
+            assert_eq!(*verdict, SpirvValidation::Accepted, "{verdicts:?}");
         }
     }
 
