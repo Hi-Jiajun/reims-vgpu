@@ -1566,6 +1566,13 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         if let Some(outstanding) = crate::runtime::objects::type4_backing_outstanding_census() {
             crate::observe::off(outstanding);
         }
+        // The same reason and the same place: `store_routes` counts the watches
+        // that *ended*, and a slot still waiting is skipped by every sweep it
+        // survives, so without this line the misses and the verdicts do not
+        // reconcile and the difference reads as lost records.
+        if let Some(watching) = crate::runtime::objects::slot_recheck::outstanding_census() {
+            crate::observe::off(watching);
+        }
         // Onto the census cadence rather than a timer of its own, so a reader
         // pairing the footprint against `store_routes` is reading one clock.
         // The run dump rate-limits itself; this is the only caller.

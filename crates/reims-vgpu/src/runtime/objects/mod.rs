@@ -1220,6 +1220,36 @@ impl ListMiss {
             Self::SlotEmpty => "list_miss_slot_empty",
         }
     }
+
+    /// The same eight checks, seen a tranche later by
+    /// [`slot_recheck`](self::slot_recheck).
+    ///
+    /// A second table rather than a prefix swap on [`Self::route`], because both
+    /// are matched exhaustively and a new variant therefore cannot be added
+    /// without giving it a name on both cadences. It sits here rather than in
+    /// `slot_recheck` for the same reason the first one does: the two spellings
+    /// of one check belong next to each other, where a divergence is visible.
+    ///
+    /// The recheck's first version collapsed four of these into one
+    /// `slot_recheck_unreadable`, and the first driven boot put **20** readings
+    /// in it — the whole of that boot's terminal verdicts, and unreadable in
+    /// exactly the sense that it could not say which check refused. That is the
+    /// failure [`ListMiss`] itself exists to have fixed once.
+    pub fn recheck_route(self) -> &'static str {
+        match self {
+            Self::NoTask => "slot_recheck_no_task",
+            Self::TaskInactive => "slot_recheck_task_inactive",
+            Self::NoObjectList => "slot_recheck_no_object_list",
+            Self::RefBeyondList => "slot_recheck_ref_beyond_list",
+            Self::AddressOverflow => "slot_recheck_address_overflow",
+            Self::Unreadable => "slot_recheck_unreadable",
+            Self::Undecodable => "slot_recheck_undecodable",
+            // Not terminal: the watch survives to be asked again. Named anyway
+            // so the table is total and the residue has a spelling if a caller
+            // ever wants to report it.
+            Self::SlotEmpty => "slot_recheck_still_empty",
+        }
+    }
 }
 
 /// Lookup one object-list slot for `task_id` / `ref_`, reporting a miss.

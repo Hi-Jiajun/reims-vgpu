@@ -143,6 +143,21 @@ impl Ledger {
             .map(|(k, w)| (*k, *w))
             .collect()
     }
+
+    /// The level line, or `None` when nothing is watched. Takes `now` rather
+    /// than reading the clock so the age it reports is testable.
+    fn outstanding_line(&self, now_us: u64) -> Option<String> {
+        let oldest = self
+            .watches
+            .values()
+            .map(|w| now_us.saturating_sub(w.recorded_us))
+            .max()?;
+        Some(format!(
+            "slot_recheck_watching n={} oldest_us={oldest} capacity={}",
+            self.watches.len(),
+            Self::CAPACITY,
+        ))
+    }
 }
 
 fn ledger() -> &'static std::sync::Mutex<Ledger> {
@@ -153,58 +168,41 @@ fn ledger() -> &'static std::sync::Mutex<Ledger> {
 
 /// How one watch ended.
 ///
-/// Every arm is terminal except [`Self::StillEmpty`], which is the only reason a
-/// watch survives a sweep.
+/// [`Self::StillWaiting`] is the only arm that is not terminal, and the only one
+/// with no route of its own: a slot that is still zero is the ledger's residue,
+/// reported as a level by [`outstanding_census`] rather than counted once per
+/// tranche it survives.
+///
+/// The other seven are [`ListMiss`]'s own variants, carried rather than banded.
+/// The first version of this module folded four of them into one
+/// `slot_recheck_unreadable` and the first driven macos-26 boot put every one of
+/// its 20 terminal verdicts there — a route that says a watch ended and cannot
+/// say why, which is the shape [`ListMiss`] was introduced to retire.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Verdict {
     /// The slot became a real entry. **Reading 1**: the guest published after
     /// naming the ref, and the draw was dropped for a race rather than for a
     /// missing object.
     Filled,
-    /// Still zero, and the task is still alive to publish it.
-    StillEmpty,
-    /// The task went away — deleted, deactivated, or its object list reset by a
-    /// `define_task` — with the slot never published. Its own band, because
-    /// folding it into a "never filled" count would credit the guest's teardown
-    /// as evidence against reading 1.
-    TaskGone,
-    /// The re-read hit one of the other five checks. Should not happen for a
-    /// slot that read cleanly once; a firing here means the list moved under the
-    /// watch and the sample is not comparable.
-    Unreadable,
-}
-
-impl Verdict {
-    fn route(self) -> &'static str {
-        match self {
-            Self::Filled => "slot_recheck_filled",
-            Self::StillEmpty => "slot_recheck_still_empty",
-            Self::TaskGone => "slot_recheck_task_gone",
-            Self::Unreadable => "slot_recheck_unreadable",
-        }
-    }
+    /// Still zero, and still worth asking again.
+    StillWaiting,
+    /// The watch ended without the slot ever being published, and this is the
+    /// check that ended it. `NoTask` / `TaskInactive` / `NoObjectList` are the
+    /// guest tearing the task down; the other four say the list moved under the
+    /// watch, and for a slot that read cleanly once they are a finding in their
+    /// own right rather than a shrug.
+    Ended(ListMiss),
 }
 
 /// Classify one re-read.
 ///
-/// Split from the sweep so the mapping from the eight-way [`ListMiss`] onto the
-/// four verdicts is testable without a guest — it is the only part that can be
-/// wrong in a way that changes what the next session believes, and getting
-/// `NoObjectList` onto the wrong side of it would turn every `define_task`
-/// reissue into evidence that the guest never publishes.
+/// Split from the sweep so the one judgement this module makes is testable
+/// without a guest: which single [`ListMiss`] means "keep asking".
 fn verdict_of(read: Result<(), ListMiss>) -> Verdict {
     match read {
         Ok(()) => Verdict::Filled,
-        Err(ListMiss::SlotEmpty) => Verdict::StillEmpty,
-        Err(ListMiss::NoTask | ListMiss::TaskInactive | ListMiss::NoObjectList) => {
-            Verdict::TaskGone
-        }
-        Err(
-            ListMiss::RefBeyondList
-            | ListMiss::AddressOverflow
-            | ListMiss::Unreadable
-            | ListMiss::Undecodable,
-        ) => Verdict::Unreadable,
+        Err(ListMiss::SlotEmpty) => Verdict::StillWaiting,
+        Err(ended) => Verdict::Ended(ended),
     }
 }
 
@@ -243,20 +241,25 @@ pub fn sweep<M: HostMemory>(state: &DeviceState, host: &M) {
     for (key, watch) in due {
         let (task_id, ref_) = key;
         let read = list_entry_or_miss(state, host, task_id, ref_, ListLookup::Probe).map(|_| ());
-        let verdict = verdict_of(read);
-        if verdict == Verdict::StillEmpty {
-            continue;
-        }
-        crate::runtime::drain::note_store_route(verdict.route());
-        if verdict == Verdict::Filled {
-            // The age at which the fill was *seen*, which is an upper bound on
-            // the age at which it happened — the slot is only sampled once per
-            // tranche. It is quoted against `slot_recheck_filled` from the same
-            // census window, so the mean is `fill_us / filled`.
-            crate::runtime::drain::note_store_route_us(
-                "slot_recheck_fill_us",
-                now.saturating_sub(watch.recorded_us),
-            );
+        let age_us = now.saturating_sub(watch.recorded_us);
+        match verdict_of(read) {
+            Verdict::StillWaiting => continue,
+            Verdict::Filled => {
+                crate::runtime::drain::note_store_route("slot_recheck_filled");
+                // The age at which the fill was *seen*, which is an upper bound
+                // on the age at which it happened — the slot is only sampled
+                // once per tranche. Quoted against `slot_recheck_filled` from
+                // the same census window, so the mean is `fill_us / filled`.
+                crate::runtime::drain::note_store_route_us("slot_recheck_fill_us", age_us);
+            }
+            Verdict::Ended(miss) => {
+                crate::runtime::drain::note_store_route(miss.recheck_route());
+                // Beside the verdict and on the same cadence: how long the slot
+                // stayed unpublished before the watch ended is what says whether
+                // the guest had time to publish and chose not to, or whether the
+                // task was gone before a deferral could have helped.
+                crate::runtime::drain::note_store_route_us("slot_recheck_ended_us", age_us);
+            }
         }
         retired.push(key);
     }
@@ -270,28 +273,70 @@ pub fn sweep<M: HostMemory>(state: &DeviceState, host: &M) {
     }
 }
 
+/// The watches still open, as a **level**, for the census to emit beside the
+/// terminal routes.
+///
+/// The terminal routes are per-window sums and this is not: it is what the
+/// ledger holds at the moment it is read, and the last sample is the answer
+/// rather than the total. It exists because the residue has no other spelling —
+/// a slot that is still zero is skipped by every sweep it survives, so counting
+/// it per tranche would report one long wait as thousands of them, and not
+/// counting it at all leaves "45 misses, 20 verdicts" with no account of the
+/// other 25.
+///
+/// `oldest_us` is the age of the longest-running watch, which is the reading
+/// that says whether the residue is a queue draining or a set of slots the
+/// guest is never going to publish.
+pub fn outstanding_census() -> Option<String> {
+    ledger()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .outstanding_line(crate::observe::elapsed_us())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The four-way collapse of the eight-way miss is the whole judgement this
-    /// module makes; a `NoObjectList` landing on `StillEmpty` would report every
-    /// `define_task` reissue as the guest declining to publish.
+    /// Exactly one miss means "ask again"; every other one ends the watch and
+    /// must arrive at the census carrying which check it was. A second variant
+    /// landing on `StillWaiting` would keep a dead task in the ledger forever,
+    /// and any variant reaching the census banded would rebuild the collapse
+    /// that made this module's first driven boot unreadable.
     #[test]
-    fn a_recheck_verdict_separates_a_live_empty_slot_from_a_torn_down_task() {
+    fn only_an_empty_slot_keeps_a_watch_alive_and_every_other_end_names_its_check() {
         assert_eq!(verdict_of(Ok(())), Verdict::Filled);
-        assert_eq!(verdict_of(Err(ListMiss::SlotEmpty)), Verdict::StillEmpty);
-        for gone in [ListMiss::NoTask, ListMiss::TaskInactive, ListMiss::NoObjectList] {
-            assert_eq!(verdict_of(Err(gone)), Verdict::TaskGone, "{gone:?}");
+        let mut ended = std::collections::HashSet::new();
+        for miss in ListMiss::ALL {
+            match verdict_of(Err(miss)) {
+                Verdict::StillWaiting => assert_eq!(miss, ListMiss::SlotEmpty, "{miss:?}"),
+                Verdict::Ended(seen) => {
+                    assert_eq!(seen, miss);
+                    assert!(
+                        ended.insert(seen.recheck_route()),
+                        "{miss:?} shares a route with another ended verdict"
+                    );
+                }
+                Verdict::Filled => panic!("{miss:?} cannot be a fill"),
+            }
         }
-        for broken in [
-            ListMiss::RefBeyondList,
-            ListMiss::AddressOverflow,
-            ListMiss::Unreadable,
-            ListMiss::Undecodable,
-        ] {
-            assert_eq!(verdict_of(Err(broken)), Verdict::Unreadable, "{broken:?}");
-        }
+        assert_eq!(ended.len(), ListMiss::ALL.len() - 1);
+    }
+
+    /// The residue has no per-tranche route, so the level is the only account of
+    /// it — and an empty ledger must say nothing rather than say zero, or a rail
+    /// that never misses would carry a line claiming it was watching.
+    #[test]
+    fn the_outstanding_level_is_silent_until_something_is_watched() {
+        let mut ledger = Ledger::new();
+        assert_eq!(ledger.outstanding_line(1_000), None);
+        ledger.admit((9, 9), 400);
+        ledger.admit((9, 10), 900);
+        // Two watches, and the age reported is the *oldest* — the youngest would
+        // read as a healthy queue however long the first slot had been stuck.
+        let line = ledger.outstanding_line(1_000).expect("watching");
+        assert!(line.contains(" n=2 "), "{line}");
+        assert!(line.contains("oldest_us=600"), "{line}");
     }
 
     /// A repeat miss on a watched slot must not restart its clock. The guest
