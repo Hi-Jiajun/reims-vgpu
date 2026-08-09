@@ -326,6 +326,17 @@ pub enum ImageFormatSpecializeError {
     MalformedModule,
     MissingBinding(u32),
     AmbiguousBinding(u32),
+    /// An `OpLoad` still declares a type its variable no longer points at, so
+    /// the module this device assembled is not valid SPIR-V.
+    ///
+    /// Only reachable through the clone path — see `specialize_image_formats`
+    /// — and only if something there consumed a repointed variable in a way
+    /// the retype pass does not know how to follow. It is a refusal rather than
+    /// a repair because the alternative is handing the driver a module it may
+    /// not survive: an NVIDIA SPIR-V compiler segmentation-faults inside
+    /// `vkCreateComputePipelines` on exactly this defect, which ends the VM
+    /// process. A guest authors its own kernels, so this must be a decline.
+    LoadTypeMismatch { pointer: u32, declared: u32 },
 }
 
 impl crate::observe::Decline for ImageFormatSpecializeError {
@@ -338,6 +349,7 @@ impl crate::observe::Decline for ImageFormatSpecializeError {
             Self::MalformedModule => "spirv_format_specialize_malformed",
             Self::MissingBinding(_) => "spirv_format_specialize_missing_binding",
             Self::AmbiguousBinding(_) => "spirv_format_specialize_ambiguous_binding",
+            Self::LoadTypeMismatch { .. } => "spirv_format_specialize_load_type_mismatch",
         }
     }
 
@@ -347,6 +359,10 @@ impl crate::observe::Decline for ImageFormatSpecializeError {
             Self::MissingBinding(b) | Self::AmbiguousBinding(b) => {
                 vec![("binding", b.to_string())]
             }
+            Self::LoadTypeMismatch { pointer, declared } => vec![
+                ("pointer", pointer.to_string()),
+                ("declared", declared.to_string()),
+            ],
         }
     }
 }
@@ -914,6 +930,9 @@ pub fn specialize_image_formats(
     let mut changed = 0;
     let mut next_id = bound as u32;
     let mut extra = Vec::new();
+    // Variables whose pointer type was cloned, and the image type they now
+    // name. Their loads are repaired once at the end, after the splice.
+    let mut retyped = std::collections::BTreeMap::<u32, u32>::new();
     for image_type in touched_image_types {
         let at = image_format_word[image_type].expect("validated image type");
         let original = ImageFormat::from_raw(words[at]);
@@ -985,6 +1004,7 @@ pub fn specialize_image_formats(
                 let type_word = variable_type_word[variable]
                     .ok_or(ImageFormatSpecializeError::MalformedModule)?;
                 words[type_word] = pointer_clones[&pointer];
+                retyped.insert(variable as u32, new_image);
             }
         }
     }
@@ -993,12 +1013,100 @@ pub fn specialize_image_formats(
         words.splice(at..at, extra);
         words[3] = next_id;
     }
+    // A variable that moved to a cloned image type takes its loads with it. An
+    // `OpLoad`'s result type must be the pointee of its pointer, so leaving the
+    // loads alone is what makes the module invalid rather than merely
+    // differently typed — and this pass is why the clone path is usable at all.
+    retype_loads(words, &retyped);
+    verify_load_types(words)?;
     for &(binding, format) in requested {
         if image_format(words, binding) != Some(format) {
             return Err(ImageFormatSpecializeError::MissingBinding(binding));
         }
     }
     Ok(changed)
+}
+
+/// Point every `OpLoad` of a retyped variable at that variable's new type.
+///
+/// `retyped` maps a global `OpVariable` id to the `OpTypeImage` its pointer now
+/// names. Nothing else in the module refers to the *variable's* type by id, so
+/// the loads are the whole repair — `OpImageWrite` and `OpImageRead` take the
+/// loaded object and declare no type of their own.
+fn retype_loads(words: &mut [u32], retyped: &std::collections::BTreeMap<u32, u32>) {
+    if retyped.is_empty() {
+        return;
+    }
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let word_count = (words[i] >> 16) as usize;
+        if word_count == 0 || i + word_count > words.len() {
+            return;
+        }
+        if (words[i] & 0xffff) as u16 == OP_LOAD && word_count >= 4 {
+            if let Some(&image) = retyped.get(&words[i + 3]) {
+                words[i + 1] = image;
+            }
+        }
+        i += word_count;
+    }
+}
+
+/// Refuse a module whose loads and pointees disagree.
+///
+/// The SPIR-V rule is that an `OpLoad`'s result type is the type its pointer
+/// points at. Checked here rather than left to the driver because the driver
+/// that finds it may not survive it: an NVIDIA SPIR-V compiler
+/// segmentation-faults inside `vkCreateComputePipelines` on this defect and
+/// takes the VM process with it. Only loads through a global `OpVariable` are
+/// checked, which is every load this function's clone path can have moved.
+fn verify_load_types(words: &[u32]) -> Result<(), ImageFormatSpecializeError> {
+    let bound = *words
+        .get(3)
+        .ok_or(ImageFormatSpecializeError::MalformedModule)? as usize;
+    let mut pointer_pointee = vec![None; bound];
+    let mut variable_type = vec![None; bound];
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let word_count = (words[i] >> 16) as usize;
+        let opcode = (words[i] & 0xffff) as u16;
+        if word_count == 0 || i + word_count > words.len() {
+            return Err(ImageFormatSpecializeError::MalformedModule);
+        }
+        match opcode {
+            OP_TYPE_POINTER if word_count >= 4 => {
+                let id = words[i + 1] as usize;
+                if id < bound {
+                    pointer_pointee[id] = Some(words[i + 3]);
+                }
+            }
+            OP_VARIABLE if word_count >= 4 => {
+                let id = words[i + 2] as usize;
+                if id < bound {
+                    variable_type[id] = Some(words[i + 1] as usize);
+                }
+            }
+            OP_LOAD if word_count >= 4 => {
+                let pointer = words[i + 3] as usize;
+                let pointee = variable_type
+                    .get(pointer)
+                    .copied()
+                    .flatten()
+                    .and_then(|p| pointer_pointee.get(p).copied().flatten());
+                if let Some(pointee) = pointee {
+                    if pointee != words[i + 1] {
+                        return Err(ImageFormatSpecializeError::LoadTypeMismatch {
+                            pointer: words[i + 3],
+                            declared: words[i + 1],
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += word_count;
+    }
+    Ok(())
 }
 
 /// Ensure the module declares `OpCapability StorageImageWriteWithoutFormat`.
@@ -2452,6 +2560,135 @@ mod tests {
             Some(StorageImageAccess::ReadWrite),
             "the variable being decorated and listed as an interface is not an escape"
         );
+    }
+
+    /// Every `OpLoad` in `words` whose pointer is a global `OpVariable` must
+    /// declare the pointee of that variable's pointer type as its result type.
+    ///
+    /// This is a SPIR-V validity rule — "Result Type must be the same as the
+    /// type pointed to by Pointer" — and it is the one that a format
+    /// specialization can break without touching a single instruction inside
+    /// the function: repointing a variable at a cloned image type leaves every
+    /// load of it declaring the type the variable no longer has. Asserted
+    /// structurally rather than by shelling out to `spirv-val`, so it runs on
+    /// every arm and needs nothing installed.
+    fn loads_agree_with_their_pointees(words: &[u32]) -> Result<(), String> {
+        let bound = words[3] as usize;
+        let mut pointer_pointee = vec![None; bound];
+        let mut variable_type = vec![None; bound];
+        let mut i = HEADER_WORDS;
+        while i < words.len() {
+            let count = (words[i] >> 16) as usize;
+            let opcode = (words[i] & 0xffff) as u16;
+            assert!(count > 0 && i + count <= words.len(), "malformed module");
+            match opcode {
+                OP_TYPE_POINTER if count >= 4 => {
+                    pointer_pointee[words[i + 1] as usize] = Some(words[i + 3] as usize)
+                }
+                OP_VARIABLE if count >= 4 => {
+                    variable_type[words[i + 2] as usize] = Some(words[i + 1] as usize)
+                }
+                _ => {}
+            }
+            i += count;
+        }
+        let mut i = HEADER_WORDS;
+        while i < words.len() {
+            let count = (words[i] >> 16) as usize;
+            let opcode = (words[i] & 0xffff) as u16;
+            if opcode == OP_LOAD && count >= 4 {
+                let result_type = words[i + 1] as usize;
+                let pointer = words[i + 3] as usize;
+                let pointee = variable_type
+                    .get(pointer)
+                    .copied()
+                    .flatten()
+                    .and_then(|p| pointer_pointee.get(p).copied().flatten());
+                if let Some(pointee) = pointee {
+                    if pointee != result_type {
+                        return Err(format!(
+                            "OpLoad of %{pointer} declares %{result_type} but the variable now points at %{pointee}"
+                        ));
+                    }
+                }
+            }
+            i += count;
+        }
+        Ok(())
+    }
+
+    /// Two storage images sharing one `OpTypeImage`, only one of them
+    /// specialized, each loaded and written in the function body.
+    ///
+    /// The clone path is the only one that changes a variable's *type*, and it
+    /// is the shape a real kernel takes: `metal2vulkan` emits one `OpTypeImage`
+    /// per (sampled type, dimension, format) tuple, so two
+    /// `texture2d<float, access::write>` parameters share it, and the device
+    /// specializes only the binding the guest bound a surface to.
+    ///
+    /// Left unrepaired, the resulting module is invalid and the NVIDIA driver's
+    /// SPIR-V compiler segmentation-faults inside `vkCreateComputePipelines` —
+    /// taking QEMU with it. That is what the macos-14 rail did on its first
+    /// compute dispatch, and a guest can author any kernel, so a module this
+    /// device assembled must never be one the driver cannot survive.
+    #[test]
+    fn a_cloned_image_type_carries_its_loads_with_it() {
+        // %99 float, %1 OpTypeImage(float, format R32f), %2 pointer to %1,
+        // %3/%4 variables at bindings 34/35, then a function that loads both.
+        let mut words = vec![0x0723_0203, 0x0001_0000, 0, 10, 0];
+        words.extend([(9u32 << 16) | OP_TYPE_IMAGE as u32, 1, 99, 1, 0, 0, 0, 2, 3]);
+        words.extend([(4u32 << 16) | OP_TYPE_POINTER as u32, 2, 0, 1]);
+        words.extend([(4u32 << 16) | OP_VARIABLE as u32, 2, 3, 0]);
+        words.extend([(4u32 << 16) | OP_DECORATE as u32, 3, DECORATION_BINDING, 34]);
+        words.extend([(4u32 << 16) | OP_VARIABLE as u32, 2, 4, 0]);
+        words.extend([(4u32 << 16) | OP_DECORATE as u32, 4, DECORATION_BINDING, 35]);
+        words.extend([(5u32 << 16) | OP_FUNCTION as u32, 98, 5, 0, 97]);
+        words.extend([(4u32 << 16) | OP_LOAD as u32, 1, 6, 3]);
+        words.extend([(4u32 << 16) | OP_LOAD as u32, 1, 7, 4]);
+
+        assert!(loads_agree_with_their_pointees(&words).is_ok(), "premise");
+        assert_eq!(
+            specialize_image_formats(&mut words, &[(34, ImageFormat::Rgba16Float)]),
+            Ok(1)
+        );
+        assert_eq!(image_format(&words, 34), Some(ImageFormat::Rgba16Float));
+        assert_eq!(image_format(&words, 35), Some(ImageFormat::R32Float));
+        if let Err(why) = loads_agree_with_their_pointees(&words) {
+            panic!("specialization left the module invalid: {why}");
+        }
+    }
+
+    /// The guard refuses rather than trusting the repair.
+    ///
+    /// `retype_loads` handles the shape the clone path produces; the check is
+    /// what makes anything it did not handle a decline instead of a module
+    /// handed to a driver that may not survive it. Fed a module broken the way
+    /// an unrepaired clone breaks one, it names the load.
+    #[test]
+    fn a_load_that_disagrees_with_its_pointee_is_refused_by_name() {
+        let mut words = vec![0x0723_0203, 0x0001_0000, 0, 10, 0];
+        words.extend([(9u32 << 16) | OP_TYPE_IMAGE as u32, 1, 99, 1, 0, 0, 0, 2, 3]);
+        words.extend([(9u32 << 16) | OP_TYPE_IMAGE as u32, 8, 99, 1, 0, 0, 0, 2, 2]);
+        words.extend([(4u32 << 16) | OP_TYPE_POINTER as u32, 2, 0, 8]);
+        words.extend([(4u32 << 16) | OP_VARIABLE as u32, 2, 3, 0]);
+        // The variable points at %8 and the load still declares %1.
+        words.extend([(4u32 << 16) | OP_LOAD as u32, 1, 6, 3]);
+
+        assert_eq!(
+            verify_load_types(&words),
+            Err(ImageFormatSpecializeError::LoadTypeMismatch {
+                pointer: 3,
+                declared: 1
+            })
+        );
+        assert_eq!(
+            crate::observe::Decline::slug(&verify_load_types(&words).unwrap_err()),
+            "spirv_format_specialize_load_type_mismatch"
+        );
+        // And it passes once the load names what the variable points at.
+        let at = words.len() - 3;
+        words[at] = 8;
+        assert_eq!(verify_load_types(&words), Ok(()));
     }
 
     #[test]
