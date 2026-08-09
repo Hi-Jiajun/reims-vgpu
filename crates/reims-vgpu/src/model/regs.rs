@@ -1166,6 +1166,26 @@ pub fn device_info_caps(limits: &DeviceInfoLimits, version: u32) -> Vec<(u32, u3
 /// fewer pairs than the count without terminating leaves the walk reading
 /// whatever the page already held.
 ///
+/// # The oldest rail parses the same keys with the same numbering
+///
+/// The macOS 11 guest driver takes the low prefix of this table and nothing
+/// else: it parses keys 1..=6 into six consecutive `u32` fields of one struct in
+/// key order, terminates its walk on key 0, and discards every key above 6. Its
+/// request declares a parse ceiling of 7, so the six keys it understands are
+/// exactly the six this device sends it.
+///
+/// Two things follow, and both are why this paragraph is here rather than in a
+/// session note. First, the key *numbering* is shared across the rails rather
+/// than being a macOS 13 convention — key 1 is the max sample count on both, so
+/// renumbering an entry at or below 6 to suit one guest silently feeds the other
+/// a threadgroup limit where it expects a sample count. Second, the zero
+/// terminator is load-bearing on the oldest rail too, so the paragraph above is
+/// a two-rail statement and not a one-rail one.
+///
+/// A rail between these two has not been checked, and the ceiling each sends is
+/// the only thing that says what it parses — read the `key_table_len` field in
+/// that boot's own `device_info` line rather than assuming this prefix.
+///
 /// # Every key at or below 17 is named, and that is a rule rather than tidiness
 ///
 /// The guest's walker is a jump table with one arm per key, and each arm stores
