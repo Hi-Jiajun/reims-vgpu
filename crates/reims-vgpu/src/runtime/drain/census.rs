@@ -151,12 +151,19 @@ const DISPLAY_PRESENT_REPORT_EVERY: u64 = 64;
 /// fault by itself — a guest that has not armed the class is not owed the
 /// event — but paired with `delivered=0` it says the device never had the
 /// opportunity, which is a different bug from having missed it.
+///
+/// **Every arm reports its first traversal, not just its 64th.** A stride alone
+/// is the wrong instrument for a rail that is *stuck*: the interesting readings
+/// here are single digits, and a wedged guest that took an arm three times would
+/// produce no line at all — indistinguishable in the log from a device on which
+/// this edge never runs, which is the exact confusion this census exists to
+/// remove. The stride bounds a busy rail; the first-sight line bounds a dead one.
 pub(crate) fn note_display_present_signal(arm: usize) {
     use std::sync::atomic::Ordering::Relaxed;
     static ARMS: [std::sync::atomic::AtomicU64; DISPLAY_PRESENT_ARMS] =
         [const { std::sync::atomic::AtomicU64::new(0) }; DISPLAY_PRESENT_ARMS];
     let n = ARMS[arm].fetch_add(1, Relaxed) + 1;
-    if !n.is_multiple_of(DISPLAY_PRESENT_REPORT_EVERY) {
+    if n != 1 && !n.is_multiple_of(DISPLAY_PRESENT_REPORT_EVERY) {
         return;
     }
     crate::observe::off(format!(
