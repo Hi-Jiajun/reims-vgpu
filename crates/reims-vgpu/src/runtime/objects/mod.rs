@@ -1352,11 +1352,11 @@ fn note_slot_empty_claimants<M: HostMemory>(
     ref_: u32,
 ) {
     let live = state.tasks.live_count();
-    let claimants: Vec<u32> = state
+    let claimants: Vec<(u32, ListObjectEntry)> = state
         .tasks
         .live_ids()
         .filter(|&other| other != task_id)
-        .filter(|&other| probe_list_entry(state, host, other, ref_).is_some())
+        .filter_map(|other| probe_list_entry(state, host, other, ref_).map(|e| (other, e)))
         .collect();
     crate::runtime::drain::note_store_route(slot_empty_claim_route(claimants.len(), live));
     // The band was built when these lists were believed dense, where naming the
@@ -1371,25 +1371,29 @@ fn note_slot_empty_claimants<M: HostMemory>(
     ) {
         return;
     }
-    // Each claimant with how many objects it holds at all. This is the whole
-    // discriminator: a task that claims the missing ref while holding six
-    // objects in a 341-slot page owns it, and one that claims it while holding
-    // three hundred claims everything. A driven boot found task 1 claiming
-    // **every** missing ref of 30, which is either the answer or exactly that
-    // second thing, and the id alone cannot say which.
-    let with_reach: Vec<String> = claimants
+    // Occupancy first, because it disqualifies most claims outright: a task
+    // holding 316 of 341 slots claims every ref there is. A driven boot found
+    // task 1 doing exactly that.
+    //
+    // Occupancy alone does not qualify the survivors, though. A sparse list
+    // grows from index 0, so low refs are more likely occupied in *any* task,
+    // and the missing refs here are 3, 4, 9, 10, 14 — the low end. `type=` is
+    // the reading that position cannot fake: if the claimant's slot holds an
+    // object of a kind the guest's command could not have meant, the claim is
+    // coincidence however sparse the claimant is.
+    let detail: Vec<String> = claimants
         .iter()
-        .map(|&other| {
+        .map(|&(other, entry)| {
             let held = slot_recheck::first_page_population(state, host, other)
                 .map_or(-1i64, |p| p.populated as i64);
-            format!("{other}:holds={held}")
+            format!("{other}:holds={held}:type={}", entry.object_type)
         })
         .collect();
     crate::observe::off(format!(
         "slot_empty_claimants task={task_id} ref={ref_} live={live} claimants=[{}] \
-         (which other live tasks hold a real object at this ref, and how many objects \
-          each of them holds in total — a claim is only ownership if the claimant is sparse)",
-        with_reach.join(" ")
+         (other live tasks holding a real object at this ref, each with how many objects \
+          it holds in all and the object type it has here)",
+        detail.join(" ")
     ));
 }
 
