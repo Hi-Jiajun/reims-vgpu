@@ -4221,20 +4221,31 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
     state.pending.iosfc = false;
 }
 
-/// Display-side present completion (PGDisplay `_presentMappedSurface`
-/// completion block, live PVG binary RE in): after
-/// `presentFrame` retains the surface into `+0x188`, the block sets pending
-/// bit 1 on the display shared page, reads the enable mask, and pokes the
-/// display IRQ when the guest asked for present notifications. This is the
-/// guest's frame-done pacing edge — separate from the packet header stamp
-/// (the swap fence). Without it the guest keeps swapping (fence releases)
-/// but never receives the per-present display event.
+/// Display-side present completion: after `presentFrame` retains the surface,
+/// set pending bit 1 on the display shared page, read the enable mask, and poke
+/// the display IRQ when the guest asked for present notifications. This is the
+/// guest's frame-done pacing edge — separate from the packet header stamp (the
+/// swap fence). Without it the guest keeps swapping (fence releases) but never
+/// receives the per-present display event.
+///
+/// **This edge is a wakeup as well as a notification, and one guest wait has no
+/// deadline.** The guest's display pipe drains its transaction queue by sleeping
+/// on its command gate until the consumed and submitted indices meet. The
+/// per-transaction wait is bounded — a second, after which it re-tests and logs
+/// — but the *queue-idle* wait taken on the WSAA defer transition is not: it
+/// sleeps with no deadline and is woken only by the transaction interrupt this
+/// bit raises. A device that finishes the work and never rings this bell
+/// therefore hangs that guest permanently rather than slowly, and the guest is
+/// blocked in the window server, before any frame it could present to unblock
+/// itself. Completion of the underlying event is necessary and not sufficient;
+/// the wakeup is the other half.
 pub fn signal_display_present_complete<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
 ) {
     let gpa = state.display.shared_gpa;
     if gpa == 0 {
+        note_display_present_signal(DISPLAY_PRESENT_NO_GPA);
         return;
     }
     // The mask gates the pending write and not just the interrupt. It used to
@@ -4242,8 +4253,10 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
     // the class and could therefore never clear it — see
     // [`display_event_enabled`] for why that residue is not inert.
     if !display_event_enabled(host, gpa, DISPLAY_PRESENT_EVENT_MASK) {
+        note_display_present_signal(DISPLAY_PRESENT_NOT_ENABLED);
         return;
     }
+    note_display_present_signal(DISPLAY_PRESENT_DELIVERED);
     // Pending word is atomic read-and-clear (ldclral) on the guest side; OR
     // the present bit so a not-yet-consumed ONLINE event is preserved.
     let mut pending_le = [0u8; 4];

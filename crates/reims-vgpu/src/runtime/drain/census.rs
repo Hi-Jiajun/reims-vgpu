@@ -122,6 +122,51 @@ pub(crate) fn note_vbl(arm: usize, now_ms: u64) {
     }
 }
 
+/// Which way the display present/transaction signal went. Indices into the
+/// counter set behind [`note_display_present_signal`].
+pub(crate) const DISPLAY_PRESENT_NO_GPA: usize = 0;
+pub(crate) const DISPLAY_PRESENT_NOT_ENABLED: usize = 1;
+pub(crate) const DISPLAY_PRESENT_DELIVERED: usize = 2;
+
+/// Width of the counter set, derived from the last arm so a new arm cannot be
+/// added without the array growing with it.
+const DISPLAY_PRESENT_ARMS: usize = DISPLAY_PRESENT_DELIVERED + 1;
+
+/// One report per this many signals. Presents are far rarer than VBL ticks, so
+/// this is a much smaller stride than [`VBL_REPORT_EVERY`] — a rail that
+/// presents a handful of times a second should still produce a line.
+const DISPLAY_PRESENT_REPORT_EVERY: u64 = 64;
+
+/// Count one traversal of the display present/transaction signal.
+///
+/// **VBL had a census and this edge had none, and they fail differently.** A
+/// starved VBL costs the compositor its pacing, which reads as slowness. A
+/// withheld transaction interrupt can cost liveness outright: the guest's
+/// queue-idle wait has no deadline, so "how many times did this device raise
+/// bit 1, and how many times did it decline to" is the difference between a
+/// device that is merely behind and one the guest will wait on forever. Neither
+/// question had an answer in any log.
+///
+/// `not_enabled` is the arm to read on a rail that is not advancing. It is not a
+/// fault by itself — a guest that has not armed the class is not owed the
+/// event — but paired with `delivered=0` it says the device never had the
+/// opportunity, which is a different bug from having missed it.
+pub(crate) fn note_display_present_signal(arm: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static ARMS: [std::sync::atomic::AtomicU64; DISPLAY_PRESENT_ARMS] =
+        [const { std::sync::atomic::AtomicU64::new(0) }; DISPLAY_PRESENT_ARMS];
+    let n = ARMS[arm].fetch_add(1, Relaxed) + 1;
+    if !n.is_multiple_of(DISPLAY_PRESENT_REPORT_EVERY) {
+        return;
+    }
+    crate::observe::off(format!(
+        "display_present_signal delivered={} not_enabled={} no_gpa={}",
+        ARMS[DISPLAY_PRESENT_DELIVERED].load(Relaxed),
+        ARMS[DISPLAY_PRESENT_NOT_ENABLED].load(Relaxed),
+        ARMS[DISPLAY_PRESENT_NO_GPA].load(Relaxed),
+    ));
+}
+
 /// Sentinel for "no enable word has been read yet".
 ///
 /// The mask is four meaningful bits, so any value with a high bit set is
