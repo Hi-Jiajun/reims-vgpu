@@ -492,6 +492,61 @@ impl ObjectCaches {
         counters: &EngineCounters,
         pools: &mut ResourcePools,
     ) -> Result<(Digest128, vk::ShaderModule), DrawError> {
+        // Declare the storage-image capabilities this module's own contents
+        // require, before it is keyed or validated.
+        //
+        // This is the only place every module from every path passes through, so
+        // it is the only place the question can be asked once. It used to be
+        // asked at one producer instead, and phrased as provenance — "did *this
+        // device* retarget a binding to `Unknown`?" — which is a claim about how
+        // a module came to need the capability rather than whether it does. The
+        // translator emits `Unknown`-format storage images and extended formats
+        // of its own accord; those modules arrived here undeclared and were
+        // rejected, losing the dispatch. Both x86 rails lose compute work to it.
+        //
+        // A capability whose Vulkan feature was not enabled at device creation
+        // cannot be declared — that is invalid usage, and an invalid module is
+        // undefined behaviour inside a driver rather than an error it returns —
+        // so an unsupported requirement is a named decline instead.
+        let need = crate::runtime::spirv_bind::required_image_capabilities(words);
+        let mut patched;
+        let words: &[u32] = if need.any() {
+            let missing = (need.extended_formats && !ctx.spirv_storage_extended_formats)
+                || (need.write_without_format && !ctx.spirv_storage_write_without_format)
+                || (need.read_without_format && !ctx.spirv_storage_read_without_format);
+            if missing {
+                let err = DrawError::Unsupported(super::reason::DrawReason::SpirvInvalid);
+                crate::observe::fail(format!(
+                    "spirv_capability reason=host_lacks_feature words={} \
+                     need_extended={} need_write={} need_read={} \
+                     have_extended={} have_write={} have_read={}",
+                    words.len(),
+                    need.extended_formats,
+                    need.write_without_format,
+                    need.read_without_format,
+                    ctx.spirv_storage_extended_formats,
+                    ctx.spirv_storage_write_without_format,
+                    ctx.spirv_storage_read_without_format,
+                ));
+                let key = Digest128::of_u32_words(words);
+                self.shaders.insert_negative(key, err.clone());
+                return Err(err);
+            }
+            patched = words.to_vec();
+            let added = crate::runtime::spirv_bind::ensure_image_capabilities(&mut patched, &need);
+            if added.any() {
+                crate::observe::off(format!(
+                    "spirv_capability added extended={} write={} read={} words={}",
+                    added.extended_formats,
+                    added.write_without_format,
+                    added.read_without_format,
+                    patched.len()
+                ));
+            }
+            &patched
+        } else {
+            words
+        };
         let key = Digest128::of_u32_words(words);
         if let Some(err) = self.shaders.get_negative(&key) {
             counters.shader_misses.fetch_add(1, Ordering::Relaxed);
@@ -512,9 +567,14 @@ impl ObjectCaches {
             crate::runtime::spirv_bind::validate(words)
         {
             let err = DrawError::Unsupported(super::reason::DrawReason::SpirvInvalid);
+            // Print what the capability derivation saw alongside the
+            // validator's complaint. When the two disagree the difference is
+            // the whole bug, and neither one alone says which walk is wrong.
             crate::observe::fail(format!(
-                "spirv_validate reason=module_rejected words={} detail={why}",
-                words.len()
+                "spirv_validate reason=module_rejected words={} need={:?} imgs={:?} detail={why}",
+                words.len(),
+                crate::runtime::spirv_bind::required_image_capabilities(words),
+                crate::runtime::spirv_bind::image_type_census(words),
             ));
             self.shaders.insert_negative(key, err.clone());
             return Err(err);

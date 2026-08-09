@@ -289,6 +289,20 @@ pub(crate) struct DeviceContext {
     /// storage surface without an R/B swap (SPIR-V has no `Bgra8` storage
     /// format). Universally present on desktop NVIDIA / Mesa ANV / RADV.
     pub storage_image_write_without_format: bool,
+    /// The raw `shaderStorageImageWriteWithoutFormat` /
+    /// `shaderStorageImageReadWithoutFormat` /
+    /// `shaderStorageImageExtendedFormats` features, unmixed with any surface
+    /// question.
+    ///
+    /// [`Self::storage_image_write_without_format`] above is the *BGRA compositing*
+    /// answer — it also requires a BGRA8 storage surface — so it is the wrong
+    /// gate for "may this module declare the capability". Declaring one whose
+    /// feature was not enabled at device creation is invalid usage, and an
+    /// invalid module is undefined behaviour inside a driver rather than an
+    /// error it returns, so the two questions get two fields.
+    pub spirv_storage_write_without_format: bool,
+    pub spirv_storage_read_without_format: bool,
+    pub spirv_storage_extended_formats: bool,
     /// `R32_SFLOAT` usable as a linearly-filtered sampled image; gates the
     /// native float32 color-LUT sampled rail (see [`DeviceFeatures`]).
     pub sampled_r32f_linear_filter: bool,
@@ -823,6 +837,9 @@ impl DeviceContext {
             gq,
             compute_capable,
             storage_image_write_without_format: storage_image_write_without_format_bgra,
+            spirv_storage_write_without_format: features.storage_image_write_without_format,
+            spirv_storage_read_without_format: features.storage_image_read_without_format,
+            spirv_storage_extended_formats: features.storage_image_extended_formats,
             sampled_r32f_linear_filter,
             pipeline_cache,
             vertex_divisor,

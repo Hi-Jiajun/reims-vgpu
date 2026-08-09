@@ -129,6 +129,12 @@ pub struct DeviceFeatures {
     pub shader_int16: bool,
     pub storage_image_extended_formats: bool,
     pub storage_image_write_without_format: bool,
+    /// `shaderStorageImageReadWithoutFormat`. The read half of the pair above:
+    /// an `OpImageRead` from an `Unknown`-format storage image needs it, and a
+    /// translated kernel may contain one whether or not this device asked for
+    /// the format-less view. Requested so the SPIR-V capability can be declared
+    /// when a module turns out to need it.
+    pub storage_image_read_without_format: bool,
     /// `B8G8R8A8_UNORM` usable as a storage image with optimal tiling. **Not**
     /// spec-mandatory — only `R8G8B8A8_UNORM` is — so the BGRA composite path
     /// needs this *and* `storage_image_write_without_format`.
@@ -242,6 +248,7 @@ impl DeviceFeatures {
             .shader_int16(self.shader_int16)
             .shader_storage_image_extended_formats(self.storage_image_extended_formats)
             .shader_storage_image_write_without_format(self.storage_image_write_without_format)
+            .shader_storage_image_read_without_format(self.storage_image_read_without_format)
             .dual_src_blend(self.dual_src_blend)
             .fill_mode_non_solid(self.fill_mode_non_solid)
             .depth_clamp(self.depth_clamp)
@@ -408,6 +415,8 @@ pub unsafe fn query(
         storage_image_extended_formats: supported.shader_storage_image_extended_formats == vk::TRUE,
         storage_image_write_without_format: supported.shader_storage_image_write_without_format
             == vk::TRUE,
+        storage_image_read_without_format: supported.shader_storage_image_read_without_format
+            == vk::TRUE,
         bgra8_storage,
         sampled_r32f_linear_filter,
         storage16: supported_16.storage_buffer16_bit_access == vk::TRUE,
@@ -440,6 +449,7 @@ mod tests {
             shader_int16: true,
             storage_image_extended_formats: true,
             storage_image_write_without_format: true,
+            storage_image_read_without_format: true,
             bgra8_storage: true,
             sampled_r32f_linear_filter: true,
             storage16: true,

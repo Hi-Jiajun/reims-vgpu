@@ -75,9 +75,49 @@ const OP_RETURN_VALUE: u16 = 254;
 const OP_ATOMIC_FLAG_TEST_AND_SET: u16 = 318;
 const OP_ATOMIC_FLAG_CLEAR: u16 = 319;
 const OP_CAPABILITY: u16 = 17;
+// The three storage-image capability numbers, from SPIR-V's `Capability` enum.
+//
+// **These are the numbers the validator checks, and one of them was wrong for a
+// long time without anything noticing.** `StorageImageWriteWithoutFormat` was
+// spelled `34`, which is `ImageCubeArray` — so the splice that existed to make
+// a format-less write legal declared an unrelated capability, the module was
+// rejected exactly as if nothing had been spliced, and the rejection named the
+// capability that was supposedly just added. Both x86 rails lost compute work to
+// it on every boot.
+//
+// The test over that splice could not see it: it asserted the spliced word
+// equalled `CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT`, which is the
+// constant compared against itself. Only the validator knows these numbers, so
+// the only real check is a module that reaches it — which is what
+// `required_image_capabilities` plus a driven boot now provides.
+//
 /// SPIR-V `Capability StorageImageWriteWithoutFormat` (writes to an `Unknown`
 /// format storage image). Paired with the Vulkan feature of the same name.
-const CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT: u32 = 34;
+const CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT: u32 = 56;
+/// SPIR-V `Capability StorageImageReadWithoutFormat` (reads from an `Unknown`
+/// format storage image). Paired with the Vulkan feature of the same name.
+const CAPABILITY_STORAGE_IMAGE_READ_WITHOUT_FORMAT: u32 = 55;
+/// SPIR-V `Capability StorageImageExtendedFormats`, required by any storage
+/// image whose declared format is outside the core set. Paired with the Vulkan
+/// feature `shaderStorageImageExtendedFormats`.
+const CAPABILITY_STORAGE_IMAGE_EXTENDED_FORMATS: u32 = 49;
+
+// The three are distinct and none is `Shader` (1), which is the one every module
+// already declares. A collision here would make a splice a silent no-op.
+const _: () = assert!(
+    CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT != CAPABILITY_STORAGE_IMAGE_READ_WITHOUT_FORMAT
+        && CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT
+            != CAPABILITY_STORAGE_IMAGE_EXTENDED_FORMATS
+        && CAPABILITY_STORAGE_IMAGE_READ_WITHOUT_FORMAT
+            != CAPABILITY_STORAGE_IMAGE_EXTENDED_FORMATS
+);
+/// `OpTypeImage`'s `Sampled` operand value for "used as a storage image".
+///
+/// Operand 7 of `OpTypeImage`; 1 means sampled, 2 means storage, 0 means either.
+/// Only a storage image's format operand carries a capability requirement, so
+/// this is what keeps a sampled image with an exotic format from being read as
+/// one.
+const IMAGE_SAMPLED_STORAGE: u32 = 2;
 /// SPIR-V `Decoration Binding`.
 const DECORATION_BINDING: u32 = 33;
 const HEADER_WORDS: usize = 5;
@@ -1212,6 +1252,15 @@ fn verify_load_types(words: &[u32]) -> Result<(), ImageFormatSpecializeError> {
 /// 5-word header), so the new instruction is spliced immediately after the last
 /// existing `OpCapability`. Returns `true` if it inserted the capability.
 pub fn ensure_storage_write_without_format_capability(words: &mut Vec<u32>) -> bool {
+    ensure_capability(words, CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT)
+}
+
+/// Splice `OpCapability <cap>` into a module that does not already declare it.
+///
+/// Capabilities occupy the module's first section, immediately after the 5-word
+/// header, so the instruction goes after the last existing `OpCapability`.
+/// Idempotent; returns `true` if it inserted one.
+fn ensure_capability(words: &mut Vec<u32>, cap: u32) -> bool {
     if words.len() < HEADER_WORDS {
         return false;
     }
@@ -1226,18 +1275,206 @@ pub fn ensure_storage_write_without_format_capability(words: &mut Vec<u32>) -> b
         if opcode != OP_CAPABILITY {
             break;
         }
-        if word_count >= 2 && words[i + 1] == CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT {
+        if word_count >= 2 && words[i + 1] == cap {
             return false;
         }
         i += word_count;
         insert_at = i;
     }
-    let instr = [
-        (2u32 << 16) | OP_CAPABILITY as u32,
-        CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT,
-    ];
+    let instr = [(2u32 << 16) | OP_CAPABILITY as u32, cap];
     words.splice(insert_at..insert_at, instr);
     true
+}
+
+/// The storage-image capabilities a finished module's own contents require.
+///
+/// Every field is `true` only if some instruction in the module cannot be
+/// validated without the matching `OpCapability`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RequiredImageCapabilities {
+    /// A storage image declares a format outside SPIR-V's core set.
+    pub extended_formats: bool,
+    /// An `OpImageWrite` targets a storage image whose format is `Unknown`.
+    pub write_without_format: bool,
+    /// An `OpImageRead` targets a storage image whose format is `Unknown`.
+    pub read_without_format: bool,
+}
+
+impl RequiredImageCapabilities {
+    pub fn any(&self) -> bool {
+        self.extended_formats || self.write_without_format || self.read_without_format
+    }
+}
+
+/// Whether a SPIR-V storage-image format needs `StorageImageExtendedFormats`.
+///
+/// The core set — usable with `Shader` alone — is `Unknown`, the four `Rgba*32/16`
+/// and `R32` float/int/uint widths, `Rgba8`/`Rgba8Snorm`, and the 8-bit `Rgba8i`
+/// / `Rgba8ui` forms. Anything narrower than four channels below 32 bits, which
+/// is where `Rg16f`, `R16f`, `Rg8` and `R8` all live, is extended.
+///
+/// Written as an explicit list of the core values rather than a range, because
+/// the core set is not contiguous in the enum and a `<=` test would silently
+/// admit the two-channel formats sitting between the four-channel ones.
+fn storage_format_is_extended(raw: u32) -> bool {
+    !matches!(
+        raw,
+        0     // Unknown
+        | 1   // Rgba32f
+        | 2   // Rgba16f
+        | 3   // R32f
+        | 4   // Rgba8
+        | 5   // Rgba8Snorm
+        | 21  // Rgba32i
+        | 22  // Rgba16i
+        | 23  // Rgba8i
+        | 24  // R32i
+        | 30  // Rgba32ui
+        | 31  // Rgba16ui
+        | 32  // Rgba8ui
+        | 33 // R32ui
+    )
+}
+
+/// Derive which storage-image capabilities a module needs, from the module.
+///
+/// # Why this is derived and not tracked
+///
+/// The device used to add `StorageImageWriteWithoutFormat` when *it* had
+/// retargeted a binding to `Unknown`, on the reasoning that this was the only
+/// way a module could come to need it. That is a claim about provenance, and it
+/// was wrong in the direction that reads as careful: the translator emits
+/// `Unknown`-format storage images of its own accord, and those modules reached
+/// the validator without the capability and were **rejected**, losing the
+/// dispatch. Both x86 rails measured here lose compute work to exactly that —
+/// including the rail that otherwise renders correctly, which is why it went
+/// unnoticed.
+///
+/// Asking the module what it contains cannot go stale that way. A new source of
+/// extended-format or format-less storage images — another translator version, a
+/// new specialization, a guest that simply emits one — is covered without anyone
+/// remembering to add a case, which is the property the provenance test did not
+/// have.
+///
+/// # Why it over-approximates on purpose
+///
+/// The format requirement is exact: a storage image's declared format is right
+/// there in its `OpTypeImage`. The *format-less* requirement is not attributed
+/// to a specific write. This walk asks "does the module declare an
+/// `Unknown`-format storage image, and does it contain any `OpImageWrite`",
+/// rather than proving that some particular write targets that image.
+///
+/// That is deliberate, and the first version of this function did it the other
+/// way. Resolving the write's image operand back through
+/// `OpTypePointer`/`OpVariable`/`OpLoad` attributed most writes correctly and
+/// **missed three modules per boot** — the def-use chain reached them through a
+/// shape the walk did not follow, and the only symptom was the same rejection
+/// the function existed to prevent. Every shape it misses fails closed in the
+/// direction that loses guest work, and there is no bound on how many shapes a
+/// translator can emit.
+///
+/// Over-approximating cannot fail that way, and it costs nothing real:
+/// declaring a capability a module does not use is valid SPIR-V, and the caller
+/// has already established that the device enabled the matching feature. The
+/// exchange is a capability that is occasionally redundant for a class of bug
+/// that is silent and recurring.
+///
+/// The walk is structural throughout and never looks at debug names or guest
+/// object ids.
+pub fn required_image_capabilities(words: &[u32]) -> RequiredImageCapabilities {
+    let mut need = RequiredImageCapabilities::default();
+    if words.len() < HEADER_WORDS {
+        return need;
+    }
+    let mut has_unknown_storage_image = false;
+    let mut has_image_write = false;
+    let mut has_image_read = false;
+
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let word_count = (words[i] >> 16) as usize;
+        let opcode = (words[i] & 0xffff) as u16;
+        if word_count == 0 || i + word_count > words.len() {
+            break;
+        }
+        match opcode {
+            OP_TYPE_IMAGE if word_count >= 9 => {
+                // [7] = Sampled, [8] = Image Format. Sampled 0 means "either",
+                // so it is a possible storage use and counts.
+                let sampled = words[i + 7];
+                let format = words[i + 8];
+                if sampled == IMAGE_SAMPLED_STORAGE || sampled == 0 {
+                    if storage_format_is_extended(format) {
+                        need.extended_formats = true;
+                    }
+                    if format == 0 {
+                        has_unknown_storage_image = true;
+                    }
+                }
+            }
+            OP_IMAGE_WRITE => has_image_write = true,
+            OP_IMAGE_READ => has_image_read = true,
+            _ => {}
+        }
+        i += word_count;
+    }
+    need.write_without_format = has_unknown_storage_image && has_image_write;
+    need.read_without_format = has_unknown_storage_image && has_image_read;
+    need
+}
+
+/// Every `OpTypeImage` in a module, as `(sampled, format)` pairs.
+///
+/// Diagnostic only. When the validator refuses a module for a capability the
+/// derivation above did not ask for, the disagreement is between what
+/// `spirv-val` sees and what this walk sees, and the only way to settle it is to
+/// print what the walk found. Ordered as encountered, deduplicated.
+pub fn image_type_census(words: &[u32]) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    if words.len() < HEADER_WORDS {
+        return out;
+    }
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let word_count = (words[i] >> 16) as usize;
+        let opcode = (words[i] & 0xffff) as u16;
+        if word_count == 0 || i + word_count > words.len() {
+            break;
+        }
+        if opcode == OP_TYPE_IMAGE && word_count >= 9 {
+            let pair = (words[i + 7], words[i + 8]);
+            if !out.contains(&pair) {
+                out.push(pair);
+            }
+        }
+        i += word_count;
+    }
+    out
+}
+
+/// Add every capability [`required_image_capabilities`] found missing.
+///
+/// Returns what it added. Declaring a capability whose Vulkan feature the device
+/// did not enable is invalid usage, so the caller must gate on the features and
+/// decline by name rather than hand the driver a module it may not survive.
+pub fn ensure_image_capabilities(
+    words: &mut Vec<u32>,
+    need: &RequiredImageCapabilities,
+) -> RequiredImageCapabilities {
+    let mut added = RequiredImageCapabilities::default();
+    if need.extended_formats {
+        added.extended_formats =
+            ensure_capability(words, CAPABILITY_STORAGE_IMAGE_EXTENDED_FORMATS);
+    }
+    if need.write_without_format {
+        added.write_without_format =
+            ensure_capability(words, CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT);
+    }
+    if need.read_without_format {
+        added.read_without_format =
+            ensure_capability(words, CAPABILITY_STORAGE_IMAGE_READ_WITHOUT_FORMAT);
+    }
+    added
 }
 
 /// Reflect every set-0 sampler descriptor binding declared by a SPIR-V module.
@@ -1943,7 +2180,13 @@ mod tests {
         // The new capability is spliced after the last OpCapability, before the
         // OpMemoryModel section (capabilities must precede everything else).
         assert_eq!(words[7], (2u32 << 16) | 17);
-        assert_eq!(words[8], CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT);
+        // Spelled literally, not as the constant. `assert_eq!(x, X)` where the
+        // splice wrote `X` proves the splice ran and nothing about *what it
+        // wrote*, and that is precisely how this word sat at 34
+        // (`ImageCubeArray`) through every run of this test. The number is
+        // SPIR-V's, so the literal is the only side of the comparison that
+        // carries information.
+        assert_eq!(words[8], 56, "SPIR-V Capability StorageImageWriteWithoutFormat");
         assert_eq!(
             words[9] & 0xffff,
             14,
@@ -1952,6 +2195,136 @@ mod tests {
         // Idempotent: a second call is a no-op.
         assert!(!ensure_storage_write_without_format_capability(&mut words));
         assert_eq!(words.len(), before + 2);
+    }
+
+    /// Build a minimal module: header, `OpCapability Shader`, `OpMemoryModel`,
+    /// then whatever body words are given.
+    fn module_with(body: &[u32]) -> Vec<u32> {
+        let mut words = vec![
+            0x0723_0203,       // magic
+            0x0001_0600,       // version
+            0,                 // generator
+            64,                // bound
+            0,                 // schema
+            (2u32 << 16) | 17, // OpCapability
+            1,                 // Shader
+            (3u32 << 16) | 14, // OpMemoryModel
+            0,
+            1,
+        ];
+        words.extend_from_slice(body);
+        words
+    }
+
+    /// `OpTypeImage %result %sampled_ty 2D 0 0 0 <sampled> <format>` (9 words).
+    fn op_type_image(result: u32, sampled: u32, format: u32) -> [u32; 9] {
+        [
+            (9u32 << 16) | OP_TYPE_IMAGE as u32,
+            result,
+            2, // sampled type id (unused by the walk)
+            1, // Dim2D
+            0, // depth
+            0, // arrayed
+            0, // MS
+            sampled,
+            format,
+        ]
+    }
+
+    /// A storage image declaring an extended format needs the capability, and
+    /// this is the exact shape a macOS 11 guest's kernel was rejected for:
+    /// `%1138 = OpTypeImage %float 2D 0 0 0 2 Rg16f`.
+    #[test]
+    fn an_extended_storage_format_requires_its_capability() {
+        let words = module_with(&op_type_image(10, IMAGE_SAMPLED_STORAGE, 7));
+        let need = required_image_capabilities(&words);
+        assert!(need.extended_formats, "Rg16f is outside the core set");
+        assert!(!need.write_without_format);
+        assert!(!need.read_without_format);
+    }
+
+    /// Every core storage format is admitted without a capability.
+    ///
+    /// Swept rather than sampled because the core set is **not contiguous** in
+    /// the enum — the two- and one-channel formats sit between the four-channel
+    /// ones — so a `<=` style bound reads as thorough and would quietly demand
+    /// the capability for half of them, or waive it for formats that need it.
+    #[test]
+    fn the_core_storage_formats_need_no_capability() {
+        for raw in [0u32, 1, 2, 3, 4, 5, 21, 22, 23, 24, 30, 31, 32, 33] {
+            assert!(
+                !storage_format_is_extended(raw),
+                "format {raw} is in SPIR-V's core storage set"
+            );
+        }
+        // A representative span of the extended ones, including the neighbours
+        // of core values, which is where an off-by-one would hide.
+        for raw in [6u32, 7, 8, 9, 13, 15, 20, 25, 29, 34, 39] {
+            assert!(
+                storage_format_is_extended(raw),
+                "format {raw} needs StorageImageExtendedFormats"
+            );
+        }
+    }
+
+    /// A *sampled* image is not a storage image, so its format asks for nothing.
+    #[test]
+    fn a_sampled_image_format_does_not_demand_the_storage_capability() {
+        let words = module_with(&op_type_image(10, 1, 7));
+        assert!(!required_image_capabilities(&words).extended_formats);
+    }
+
+    /// An `Unknown`-format storage image plus a write demands
+    /// `StorageImageWriteWithoutFormat`.
+    ///
+    /// The pointer/variable/load words in the body are the shape the translator
+    /// emits around such a write. They are deliberately *not* what the check
+    /// depends on — see `required_image_capabilities` on why attributing the
+    /// write to its image was tried and abandoned — but they belong in the
+    /// fixture so it stays a realistic module rather than two instructions.
+    #[test]
+    fn a_write_to_an_unknown_format_image_requires_its_capability() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&op_type_image(10, IMAGE_SAMPLED_STORAGE, 0));
+        // OpTypePointer %11 UniformConstant %10
+        body.extend_from_slice(&[(4u32 << 16) | OP_TYPE_POINTER as u32, 11, 0, 10]);
+        // OpVariable %11 %12 UniformConstant
+        body.extend_from_slice(&[(4u32 << 16) | OP_VARIABLE as u32, 11, 12, 0]);
+        // OpLoad %10 %13 %12
+        body.extend_from_slice(&[(4u32 << 16) | OP_LOAD as u32, 10, 13, 12]);
+        // OpImageWrite %13 %20 %21
+        body.extend_from_slice(&[(4u32 << 16) | OP_IMAGE_WRITE as u32, 13, 20, 21]);
+        let words = module_with(&body);
+
+        let need = required_image_capabilities(&words);
+        assert!(need.write_without_format, "write to an Unknown-format image");
+        assert!(!need.extended_formats, "Unknown is in the core set");
+
+        // And the splice puts it in, once.
+        let mut patched = words.clone();
+        let added = ensure_image_capabilities(&mut patched, &need);
+        assert!(added.write_without_format);
+        assert_eq!(patched.len(), words.len() + 2);
+        assert!(!ensure_image_capabilities(&mut patched, &need).any());
+        assert_eq!(patched.len(), words.len() + 2);
+        // The splice lands in the capability section, before OpMemoryModel — a
+        // capability declared after it is as invalid as a missing one.
+        assert_eq!(patched[7] & 0xffff, OP_CAPABILITY as u32);
+        assert_eq!(patched[8], 56, "SPIR-V Capability StorageImageWriteWithoutFormat");
+        assert_eq!(patched[9] & 0xffff, 14, "OpMemoryModel follows");
+    }
+
+    /// A write to a *declared*-format image asks for nothing.
+    #[test]
+    fn a_write_to_a_declared_format_image_needs_no_capability() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&op_type_image(10, IMAGE_SAMPLED_STORAGE, 4)); // Rgba8
+        body.extend_from_slice(&[(4u32 << 16) | OP_TYPE_POINTER as u32, 11, 0, 10]);
+        body.extend_from_slice(&[(4u32 << 16) | OP_VARIABLE as u32, 11, 12, 0]);
+        body.extend_from_slice(&[(4u32 << 16) | OP_LOAD as u32, 10, 13, 12]);
+        body.extend_from_slice(&[(4u32 << 16) | OP_IMAGE_WRITE as u32, 13, 20, 21]);
+        let words = module_with(&body);
+        assert!(!required_image_capabilities(&words).any());
     }
 
     #[test]
