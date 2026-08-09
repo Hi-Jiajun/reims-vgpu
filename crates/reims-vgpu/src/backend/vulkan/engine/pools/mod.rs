@@ -532,7 +532,10 @@ pub(crate) struct OpenBatch {
     /// Per-draw descriptor sets paired with the arena block they were allocated
     /// from, so the flush-time free routes each set to its owning pool.
     dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
-    sampled_retains: Vec<SampledRetain>,
+    // No sampled retains: a batch's draws hand their images to the content
+    // cache at `batch_append`, while the batch is still recording, because the
+    // next draw of the same batch looks for them before this CB is submitted.
+    // The absence of the field is what stops one being accumulated again.
 }
 
 /// One in-flight ring slot: a primary CB, its fence (created unsignaled;
@@ -1812,6 +1815,12 @@ enum SampledVictimRoute {
     Cap,
     /// The entry went untouched past `IDLE_TARGET_AGE_MS`.
     Aged,
+    /// The whole cache was discarded because a submission that had already
+    /// published entries into it never reached the queue, so nothing in it could
+    /// be trusted to hold what its name claimed. Not a capacity signal and not
+    /// an age one — a reading here means look at why a submit failed, not at any
+    /// cache bound.
+    Discarded,
 }
 
 impl SampledVictimRoute {
@@ -1819,6 +1828,7 @@ impl SampledVictimRoute {
         match self {
             Self::Cap => "sampled_reach_lost_to_cap",
             Self::Aged => "sampled_reach_lost_to_age",
+            Self::Discarded => "sampled_reach_lost_to_discard",
         }
     }
 }

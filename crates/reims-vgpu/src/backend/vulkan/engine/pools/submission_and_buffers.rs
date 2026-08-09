@@ -1114,16 +1114,7 @@ impl ResourcePools {
         let mut readback: Vec<BufferSlot> = self.readback_live.take().into_iter().collect();
         readback.append(&mut self.readback_multi_live);
         let mut sampled = std::mem::take(&mut self.sampled_live);
-        let mut admissions = Vec::with_capacity(sampled_retains.len());
-        for retain in sampled_retains {
-            // A retain naming an image this entry does not hold is not an
-            // admission — it belongs to a draw whose slots were sealed by an
-            // earlier entry, and the cache already has whatever that entry gave
-            // it.
-            if let Some(index) = sampled.iter().position(|slot| slot.image == retain.image) {
-                admissions.push((sampled.remove(index), retain));
-            }
-        }
+        let admissions = take_retained_slots(&mut sampled, sampled_retains);
         SealedEntry {
             cleanup: PendingGpuCleanup {
                 dsets,
@@ -1179,12 +1170,84 @@ impl ResourcePools {
         );
         self.slots[self.cur].pending = Some(cleanup);
         self.in_flight += 1;
+        self.admit_recorded_sampled(device, admissions);
+    }
+
+    /// Give the content cache the images a recorded command buffer fills.
+    ///
+    /// The one admission point, reached from the two places that can be the
+    /// earliest safe moment for their caller — [`Self::finish_entry_async`] for
+    /// a draw that submits on its own, and [`Self::batch_append`] for one that
+    /// defers into an open batch. Earliest matters: a window not yet in the
+    /// cache is a window the next bind re-imports across PCIe in full.
+    ///
+    /// # The precondition, and why it is not the same instant for both callers
+    ///
+    /// An admission can evict, an eviction disposes, and [`Self::dispose`] frees
+    /// immediately when [`Self::open_slot_mask`] is empty. The command buffer
+    /// that fills these images may also be sampling the one being evicted, so it
+    /// must already be *in* that mask. Read `open_slot_mask`'s own doc: a batch
+    /// puts its slot in the mask the moment `open_batch` is set, while a
+    /// non-batch slot is in it only once its cleanup is parked. That is the
+    /// whole reason the batch may admit while it is still recording and the
+    /// non-batch path may not — and the `debug_assert` is what keeps a third
+    /// caller from being added at the wrong instant.
+    unsafe fn admit_recorded_sampled(
+        &mut self,
+        device: &ash::Device,
+        admissions: Vec<(SampledSlot, SampledRetain)>,
+    ) {
+        debug_assert!(
+            admissions.is_empty() || self.open_slot_mask() & (1 << self.cur) != 0,
+            "admitting while the filling command buffer's slot is invisible to dispose()"
+        );
         for _ in 0..sampled_twins_in_entry(&admissions) {
             crate::runtime::drain::note_store_route("sampled_admit_twin_in_entry");
         }
         for (slot, retain) in admissions {
             self.admit_sampled_slot(device, slot, &retain.content, retain.identity);
         }
+    }
+
+    /// Discard every content-cache entry, in-flight-safely.
+    ///
+    /// The answer to a submission that published entries and then failed to
+    /// reach the queue: those images hold undefined content and the cache would
+    /// hand them to a later bind as if they held a guest window. Nothing records
+    /// which entries came from which submission and nothing should — the cache
+    /// is a pure optimisation, so "some of this is unfilled" has a sound answer
+    /// that needs no bookkeeping at all.
+    ///
+    /// Every removal goes through [`Self::evict_sampled_entry`], so the victim
+    /// ledger stays the single account of how entries leave, and each slot is
+    /// disposed rather than dropped because an *earlier* in-flight CB may still
+    /// be sampling it.
+    pub(crate) unsafe fn discard_sampled_cache(&mut self, device: &ash::Device) {
+        for slot in self.take_whole_sampled_cache() {
+            self.dispose(device, DeferredHandle::RecycleSampled(slot));
+        }
+    }
+
+    /// Device-free half of [`Self::discard_sampled_cache`]: empty the cache
+    /// through the one removal site and return the slots for the caller to
+    /// dispose.
+    ///
+    /// Split out for the same reason [`Self::take_aged_sampled_slots`] is, and
+    /// here the accounting is the part that would break silently. A discard that
+    /// emptied `sampled_cache` without returning `sampled_cache_bytes` to zero
+    /// would leave the byte cap believing it was full for the rest of the boot,
+    /// and every later admission would evict a live entry to make room that was
+    /// already there.
+    fn take_whole_sampled_cache(&mut self) -> Vec<SampledSlot> {
+        if self.sampled_cache.is_empty() {
+            return Vec::new();
+        }
+        crate::runtime::drain::note_store_route("sampled_cache_discarded");
+        let mut taken = Vec::with_capacity(self.sampled_cache.len());
+        while !self.sampled_cache.is_empty() {
+            taken.push(self.evict_sampled_entry(0, SampledVictimRoute::Discarded));
+        }
+        taken
     }
 
     /// The open batch's (CB, fence) when a draw at (identity, geometry, bgra)
@@ -1210,25 +1273,51 @@ impl ResourcePools {
     }
 
     /// Record a batch-deferred draw's completion: open the batch on its ring
-    /// slot (opener) or extend it (joiner), accumulating the per-draw
-    /// descriptor set and sampled-cache admissions for the single flush-time
-    /// seal. The CB stays in recording state; submit happens at
-    /// [`Self::batch_flush`].
-    pub(crate) fn batch_append(
+    /// slot (opener) or extend it (joiner), accumulating the per-draw descriptor
+    /// set for the single flush-time seal. The CB stays in recording state;
+    /// submit happens at [`Self::batch_flush`].
+    ///
+    /// # The sampled images go to the cache here, not at the flush
+    ///
+    /// A batch is several draws to one target sharing one command buffer, and
+    /// the next draw's `find_gathered_sampled` runs before that buffer is
+    /// submitted. Holding the admissions until the flush therefore made every
+    /// draw of a batch miss on every window an earlier draw of the *same* batch
+    /// had already gathered — measured on macos-26 as `sampled_admit_twin_in_entry`
+    /// 3954 of 3956 duplicate admissions, each one a guest window re-imported in
+    /// full across PCIe and then discarded on arrival.
+    ///
+    /// Publishing now is sound because the fill is *recorded* now, into the same
+    /// command buffer and ahead of any consumer, and because setting
+    /// `open_batch` is exactly what puts this slot in [`Self::open_slot_mask`] —
+    /// see [`Self::admit_recorded_sampled`] for why that is the precondition.
+    /// The opener sets it first, below, so the mask is right for its own
+    /// admissions too.
+    ///
+    /// What it costs is a promise: these entries claim content a command buffer
+    /// has not yet delivered. [`Self::batch_flush`] keeps it or, if the submit
+    /// fails, calls [`Self::discard_sampled_cache`].
+    ///
+    /// # Safety
+    ///
+    /// `device` must be the device the retained images belong to.
+    pub(crate) unsafe fn batch_append(
         &mut self,
-        cb: vk::CommandBuffer,
-        fence: vk::Fence,
+        device: &ash::Device,
+        // The pair [`Self::batch_slot`] and [`Self::begin_entry`] both hand
+        // back, passed through as one value because it only ever travels as one.
+        slot: (vk::CommandBuffer, vk::Fence),
         target: BatchTarget,
         dset: Option<(vk::DescriptorSet, vk::DescriptorPool)>,
         sampled_retains: Vec<SampledRetain>,
         counters: &EngineCounters,
     ) {
+        let (cb, fence) = slot;
         match self.open_batch.as_mut() {
             Some(b) => {
                 debug_assert!(b.cb == cb, "joiner recorded into a foreign CB");
                 b.draws += 1;
                 b.dsets.extend(dset);
-                b.sampled_retains.extend(sampled_retains);
                 counters.batch_joins.fetch_add(1, Ordering::Relaxed);
             }
             None => {
@@ -1242,11 +1331,12 @@ impl ResourcePools {
                     target,
                     draws: 1,
                     dsets: dset.into_iter().collect(),
-                    sampled_retains,
                 });
                 counters.batch_opens.fetch_add(1, Ordering::Relaxed);
             }
         }
+        let admissions = take_retained_slots(&mut self.sampled_live, sampled_retains);
+        self.admit_recorded_sampled(device, admissions);
     }
 
     /// Submit the open batch (if any): end its CB, queue it on the batch
@@ -1325,15 +1415,21 @@ impl ResourcePools {
         })();
         match submit {
             Ok(()) => {
-                let sealed = self.seal_entry(
-                    std::mem::take(&mut batch.dsets),
-                    std::mem::take(&mut batch.sampled_retains),
-                );
+                let sealed = self.seal_entry(std::mem::take(&mut batch.dsets), Vec::new());
                 self.finish_entry_async(&ctx.device, sealed);
                 Ok(())
             }
             Err(e) => {
                 self.desc_arena.free(&ctx.device, &batch.dsets);
+                // This batch's draws published sampled images to the content
+                // cache on the promise that this command buffer would fill
+                // them. It never reached the queue, so their contents are
+                // undefined and a later bind would sample them as if they held
+                // a guest window. Nothing tracks which entries were this
+                // batch's, so the whole cache goes — see
+                // `discard_sampled_cache` for why that is the right shape and
+                // not a shortcut.
+                self.discard_sampled_cache(&ctx.device);
                 Err(e)
             }
         }
@@ -2951,6 +3047,30 @@ impl ResourcePools {
     }
 }
 
+/// Lift the images named by `retains` out of `slots`, pairing each with what
+/// names it.
+///
+/// A retained image is not a transient: it is about to become a cache entry, and
+/// leaving it in the list that recycles is how one image ends up both a cache
+/// entry and a free-list slot, handed to a later draw that overwrites content
+/// another draw is sampling.
+///
+/// A retain naming an image the list does not hold is not an admission — the
+/// slot was lifted by an earlier caller, which is the ordinary case for a batch
+/// joiner whose retains were admitted at `batch_append`.
+fn take_retained_slots(
+    slots: &mut Vec<SampledSlot>,
+    retains: Vec<SampledRetain>,
+) -> Vec<(SampledSlot, SampledRetain)> {
+    let mut taken = Vec::with_capacity(retains.len());
+    for retain in retains {
+        if let Some(index) = slots.iter().position(|slot| slot.image == retain.image) {
+            taken.push((slots.remove(index), retain));
+        }
+    }
+    taken
+}
+
 /// Band the duplicate admissions that no publication order could have avoided.
 ///
 /// `sampled_admit_duplicate` sums two populations that want opposite fixes, and
@@ -3415,6 +3535,82 @@ mod recycle_tests {
             ]),
             2,
             "three gathers of one window are two gathers that need not have happened"
+        );
+    }
+
+    /// A cache holding entries a failed submission promised to fill is emptied,
+    /// and emptied completely — the entries, the bytes, and the answers.
+    ///
+    /// Publishing an admission while its command buffer is still recording is
+    /// what lets the next draw of a batch find the window, and the price is that
+    /// an entry can outlive the promise that filled it. This is the whole of the
+    /// undo, so each of the three things it must leave behind is asserted
+    /// separately:
+    ///
+    /// - **No entry answers a bind.** An image the GPU never wrote is undefined
+    ///   content, and binding it is the visual corruption this exists to stop.
+    /// - **The bytes go back to zero.** A discard that forgot the accounting
+    ///   would leave the byte cap believing it was full for the rest of the
+    ///   boot, and every later admission would evict a live entry to make room
+    ///   that was already free — a slow leak of reuse with nothing to see.
+    /// - **The ledger says why.** A discarded window is neither a capacity
+    ///   victim nor an aged one; folding it into either makes the next reading
+    ///   of `sampled_reach_lost_to_cap` argue for a bigger cache when the real
+    ///   answer is that a submit failed.
+    #[test]
+    fn a_discarded_cache_leaves_no_entry_no_bytes_and_a_reason() {
+        let mut pools = ResourcePools::new();
+        let counters = EngineCounters::default();
+        let named = |k: u64| crate::backend::vulkan::engine::SampledContentIdentity {
+            key: k,
+            generation: 1,
+        };
+
+        let mut keys = Vec::new();
+        for i in 0..3u32 {
+            let slot = null_slot(16 + i, 16);
+            keys.push((slot.key(), named(i as u64)));
+            pools.sampled_cache.push(ResidentSampledSlot {
+                slot,
+                fingerprint: SampledFingerprint::Gathered,
+                content: None,
+                content_len: 4096,
+                identity: Some(named(i as u64)),
+                last_touch_ms: 0,
+            });
+            pools.sampled_cache_bytes += 4096;
+        }
+        for (key, id) in &keys {
+            assert!(
+                pools.find_gathered_sampled(*key, Some(*id), &counters).is_some(),
+                "the entries have to be bindable first, or the test proves nothing"
+            );
+        }
+
+        let taken = pools.take_whole_sampled_cache();
+
+        assert_eq!(taken.len(), 3, "every entry is handed back for disposal");
+        assert_eq!(
+            pools.sampled_cache_bytes, 0,
+            "the byte accounting follows the entries out"
+        );
+        for (key, id) in &keys {
+            assert!(
+                pools.find_gathered_sampled(*key, Some(*id), &counters).is_none(),
+                "an image no command buffer filled must not answer a bind"
+            );
+        }
+        assert!(
+            pools
+                .sampled_victims
+                .iter()
+                .all(|v| v.route == SampledVictimRoute::Discarded),
+            "a discarded window is neither a capacity victim nor an aged one"
+        );
+        assert_eq!(
+            pools.take_whole_sampled_cache().len(),
+            0,
+            "discarding an empty cache is a no-op, not a second sweep"
         );
     }
 
@@ -4606,7 +4802,6 @@ mod recycle_tests {
             },
             draws: 1,
             dsets: Vec::new(),
-            sampled_retains: Vec::new(),
         });
         assert_eq!(pools.open_slot_mask(), 1 << 3, "the batch's own slot");
     }

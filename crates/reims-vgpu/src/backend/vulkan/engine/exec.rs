@@ -3441,16 +3441,19 @@ pub(crate) unsafe fn execute_draw_inner(
             pools.registry_note_access(seed_identity, super::pools::ResidentAccess::TransferRead);
         }
     }
-    // Deferred-submit draw: park the per-draw descriptor set and sampled
-    // admissions on the open batch (opening it if this is the first) and
-    // return. The CPU-side bookkeeping above already ran — content_ready and
-    // tracked layouts describe what the recorded CB produces, and every
-    // consumer path flushes the batch before touching the GPU.
+    // Deferred-submit draw: park the per-draw descriptor set on the open batch
+    // (opening it if this is the first), hand the batch this draw's sampled
+    // images for the content cache, and return. The CPU-side bookkeeping above
+    // already ran — content_ready and tracked layouts describe what the recorded
+    // CB produces, and every consumer path flushes the batch before touching the
+    // GPU. The cache admission happens inside `batch_append` rather than at the
+    // flush precisely so the *next* draw of this batch can find these windows;
+    // see its doc.
     if defer_submit {
         let target = batch_target.expect("batch_eligible requires target identity");
         pools.batch_append(
-            cb,
-            fence,
+            &ctx.device,
+            (cb, fence),
             target,
             dset.zip(dset_pool),
             sampled_retains,
