@@ -2436,10 +2436,31 @@ const COMPUTE_PIPELINE_TAGS_BENIGN: [u8; 2] = [
 /// sample count would emit once per distinct count for no extra information.
 /// The refusal itself is outside that latch — the line names a tag once, the
 /// pipeline is refused every time.
+///
+/// # It carries the first value seen, and that is what identifies the property
+///
+/// Naming a tag is the work this line exists to prompt, and a tag number alone
+/// does not do it. A macOS 12 guest sent compute tag `0x03` on every compute
+/// pipeline it built and this device refused all 264 of them; the line said
+/// `tag=0x03 len=4` and a reader could not tell a section offset from a thread
+/// count from a boolean without pulling the guest's own serializer apart. The
+/// value distinguishes them at a glance: an offset lands near the end of the TLV
+/// block, a count is a round number, a `BOOL` is 0 or 1.
+///
+/// **First value seen, not every value**, and the field says `first_value=` so
+/// nobody reads it as the only one. Widening the latch to `(tag, len, value)`
+/// would answer the further question of whether the property varies between
+/// pipelines, and it is deliberately not done: [`crate::observe::first_sight`]
+/// remembers every discriminant it is asked about in an unbounded set, so a
+/// per-value latch on a field that turns out to be a per-pipeline reference
+/// grows without limit on exactly the boot where the field is most unexpected.
+/// A field of more than four bytes has no `first_value=` at all rather than a
+/// truncation.
 struct PipelineFieldDropped {
     kind: &'static str,
     tag: u8,
     len: u8,
+    first_value: Option<u32>,
 }
 
 impl crate::observe::Decline for PipelineFieldDropped {
@@ -2448,11 +2469,15 @@ impl crate::observe::Decline for PipelineFieldDropped {
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
-        vec![
+        let mut out = vec![
             ("kind", self.kind.to_string()),
             ("tag", format!("0x{:02x}", self.tag)),
             ("len", self.len.to_string()),
-        ]
+        ];
+        if let Some(v) = self.first_value {
+            out.push(("first_value", format!("{v:#x}")));
+        }
+        out
     }
 }
 
@@ -2526,7 +2551,9 @@ fn note_pipeline_tlv_fields(
     let unknown = report_tlv_shape(
         kind,
         fields.len(),
-        fields.iter().map(|f| (f.tag, f.length)),
+        fields
+            .iter()
+            .map(|f| (f.tag, f.length, f.has_u32.then_some(f.value_u32))),
         consumed_tags,
         benign_tags,
     );
@@ -2562,7 +2589,7 @@ fn note_entry_tlv_fields(kind: &'static str, bytes: &[u8], entry: usize, consume
     let Some(&field_count) = bytes.get(entry) else {
         return;
     };
-    let mut seen: Vec<(u8, u8)> = Vec::with_capacity(field_count as usize);
+    let mut seen: Vec<(u8, u8, Option<u32>)> = Vec::with_capacity(field_count as usize);
     let mut p = entry + 1;
     for _ in 0..field_count {
         if p + 2 > bytes.len() {
@@ -2572,7 +2599,11 @@ fn note_entry_tlv_fields(kind: &'static str, bytes: &[u8], entry: usize, consume
         if p + 2 + len as usize > bytes.len() {
             return;
         }
-        seen.push((tag, len));
+        // Four bytes exactly, the same width `CompactTlv::has_u32` reports on the
+        // pipeline block's own fields, so the two callers describe a value the
+        // same way or not at all.
+        let value = (len as usize == 4).then(|| ld32(&bytes[p + 2..]));
+        seen.push((tag, len, value));
         p += 2 + len as usize;
     }
     // No benign list: see this function's doc for why it refuses nothing.
@@ -2595,7 +2626,7 @@ fn note_entry_tlv_fields(kind: &'static str, bytes: &[u8], entry: usize, consume
 fn report_tlv_shape(
     kind: &'static str,
     field_count: usize,
-    fields: impl Iterator<Item = (u8, u8)>,
+    fields: impl Iterator<Item = (u8, u8, Option<u32>)>,
     consumed_tags: &[u8],
     benign_tags: &[u8],
 ) -> usize {
@@ -2605,8 +2636,8 @@ fn report_tlv_shape(
     let mut shape = String::new();
     let mut shape_key = kind_key;
     let mut dropped: Vec<(u8, u8)> = Vec::new();
-    let mut unknown: Vec<(u8, u8)> = Vec::new();
-    for (tag, len) in fields {
+    let mut unknown: Vec<(u8, u8, Option<u32>)> = Vec::new();
+    for (tag, len, value) in fields {
         let consumed = consumed_tags.contains(&tag);
         let sep = if shape.is_empty() { "" } else { "," };
         // `*` keeps its old meaning — this decoder does not read the tag — so
@@ -2631,7 +2662,7 @@ fn report_tlv_shape(
         if !consumed {
             dropped.push((tag, len));
             if !benign_tags.contains(&tag) {
-                unknown.push((tag, len));
+                unknown.push((tag, len, value));
             }
         }
     }
@@ -2647,9 +2678,18 @@ fn report_tlv_shape(
     // expected control flow with a written argument behind it, and `AGENTS.md`
     // asks that expected control flow stay quiet; the shape line above is where
     // it stays visible.
-    for &(tag, len) in &unknown {
-        crate::observe::Emit::decline("type7_pipeline", &PipelineFieldDropped { kind, tag, len })
-            .fail_once(kind_key.rotate_left(16) ^ (u64::from(tag) << 8) ^ u64::from(len));
+    for &(tag, len, first_value) in &unknown {
+        crate::observe::Emit::decline(
+            "type7_pipeline",
+            &PipelineFieldDropped {
+                kind,
+                tag,
+                len,
+                first_value,
+            },
+        )
+        // The value is deliberately out of the key — see `PipelineFieldDropped`.
+        .fail_once(kind_key.rotate_left(16) ^ (u64::from(tag) << 8) ^ u64::from(len));
     }
     unknown.len()
 }

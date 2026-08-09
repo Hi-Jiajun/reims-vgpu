@@ -1650,6 +1650,22 @@ fn an_unidentified_pipeline_descriptor_field_refuses_the_pipeline() {
          different tag sets: {}",
         drops[0]
     );
+    // The two fields carry different values, so this cannot pass by reporting
+    // some constant. A tag number alone does not identify a property: a macOS 12
+    // guest refused every compute pipeline it built on one unnamed tag, and the
+    // value is what separates a section offset from a count from a boolean.
+    assert!(
+        drops
+            .iter()
+            .any(|l| l.contains("tag=0x6d") && l.contains("first_value=0x4")),
+        "the decline carries the value of the field it dropped: {drops:?}"
+    );
+    assert!(
+        drops
+            .iter()
+            .any(|l| l.contains("tag=0x6e") && l.contains("first_value=0x1")),
+        "each decline carries its own field's value: {drops:?}"
+    );
 
     // The lines are latched; the refusal is not. `resume`, not `start`: the
     // claim above is what is under test, and `start` would clear the latch and
