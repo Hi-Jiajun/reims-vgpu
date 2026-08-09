@@ -1007,7 +1007,10 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
         height: mh,
         // Checked above: this rail only reaches here for a mapping whose
         // declared format is guest scanout order.
-        bgra: true,
+        // The type-11 mapping rail admits `Bgra8` and nothing else (checked
+        // above), so the destination's format is the scanout one by that
+        // gate rather than by assumption here.
+        format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
     };
     // Both witnesses before the copy rather than after it, matching
     // `contig_for_write`: a refused write costs a spurious bump, which makes a

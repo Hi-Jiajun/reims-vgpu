@@ -7505,20 +7505,35 @@ pub(crate) fn gva_chain_identity(
 /// spelled it differently would render into one identity claiming two formats,
 /// which `registry_ensure` answers by recreating the image every frame.
 ///
-/// Only the two eight-bit orders are produced here. A guest format that is
-/// neither — `RGBA16_FLOAT` is the one a desktop boot names — answers with the
-/// engine's neutral resident colour format, which is what every render target
-/// got when the key held a `bgra: bool` and could express nothing else. That is
-/// a fidelity loss and not a refusal: the draw still runs, and the Store still
-/// lands correctly-shaped bytes for the guest's declared texel, because the CPU
-/// conversion rail expands them from eight bits. Widening this set needs the
-/// host asked whether it can render to the wider format, and every rail that
-/// sizes a buffer from this resident taking its texel width from the format.
+/// The guest's declaration is followed whenever the host can follow it. A
+/// layout this device has no `TexelLayout` for, or one the host cannot render
+/// to and blend into, falls back to the engine's neutral resident colour
+/// format — which is what *every* render target got while the key held a
+/// `bgra: bool` and could express nothing else.
+///
+/// The fallback is a fidelity loss and not a refusal. The draw still runs, and
+/// the Store still lands correctly-shaped bytes for the guest's declared texel,
+/// because [`crate::contract::pixel_format::convert_rgba8_to_row`] expands them
+/// from eight bits — the guest reads a well-formed half-float frame carrying
+/// eight bits of information. What the fallback costs is the range and the
+/// precision the guest asked for: anything above 1.0 in a half-float
+/// compositing target is clamped away before the compositor sees it.
+///
+/// Capability, never an API-version assumption.
+/// `VK_FORMAT_R16G16B16A16_SFLOAT` is in Vulkan's mandatory format table for
+/// both `COLOR_ATTACHMENT` and `COLOR_ATTACHMENT_BLEND`, and it is still asked
+/// for per host: a widening that reads the spec's table instead of the device
+/// is the shape AGENTS.md names, and this one would fail at `vkCreateImage`
+/// rather than decline.
 fn gva_resident_format(format: u16) -> ash::vk::Format {
-    crate::backend::vulkan::translate::pixel::resident_color(matches!(
-        pixel_format::store_texel_order(format),
-        Some(pixel_format::TexelLayout::Bgra8)
-    ))
+    use crate::backend::vulkan::translate::pixel;
+    let Some(layout) = pixel_format::store_texel_order(format) else {
+        return pixel::RESIDENT_RGBA_FORMAT;
+    };
+    if !crate::backend::vulkan::engine::render_target_layout_supported(layout) {
+        return pixel::RESIDENT_RGBA_FORMAT;
+    }
+    pixel::vk_texel_layout(layout)
 }
 
 /// Read a resident render-pass chain back to host memory so the exec loop can

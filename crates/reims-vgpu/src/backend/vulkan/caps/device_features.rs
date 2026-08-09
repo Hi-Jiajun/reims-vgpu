@@ -160,6 +160,26 @@ pub struct DeviceFeatures {
     /// `TexelLayout::ALL.len()`, rather than needing someone to remember to add
     /// a second `bool`.
     pub sampled_linear_filter: [bool; TexelLayout::ALL.len()],
+    /// For each [`TexelLayout`], indexed by [`TexelLayout::index`], whether its
+    /// Vulkan format is usable as a **colour attachment that blends** under
+    /// optimal tiling.
+    ///
+    /// A render target's resident is created at the format the guest declared
+    /// for the attachment, so a layout this host cannot render to — or can
+    /// render to but not blend into — is one that must fall back to the
+    /// engine's eight-bit resident rather than be attempted. Both feature bits
+    /// are required together because a colour attachment that cannot blend is
+    /// not a usable render target for a compositor, and admitting one on the
+    /// strength of the other trades a fidelity loss for a `vkCreateImage` that
+    /// fails or a pipeline the driver refuses.
+    ///
+    /// Asked per layout for the same reason as [`Self::sampled_linear_filter`]
+    /// directly above: the array is sized by `ALL.len()`, so a new
+    /// [`TexelLayout`] cannot reach a render target without getting a probe.
+    /// `R16G16B16A16_SFLOAT` is in Vulkan's mandatory format table for both
+    /// bits, but AGENTS.md is explicit that a capability comes from the device
+    /// and not from a reading of the spec's table.
+    pub color_attachment_blend: [bool; TexelLayout::ALL.len()],
     pub storage16: bool,
     pub storage8: bool,
     pub float16: bool,
@@ -359,12 +379,21 @@ pub unsafe fn query(
     // this host cannot filter instead of sampling it wrong. Derived from
     // `TexelLayout::ALL`, so adding a layout adds its probe.
     let mut sampled_linear_filter = [false; TexelLayout::ALL.len()];
+    // The same derivation for the render-target side: a resident is created at
+    // the guest's declared format, so a layout has to be renderable *and*
+    // blendable before one may be.
+    let mut color_attachment_blend = [false; TexelLayout::ALL.len()];
     for &layout in TexelLayout::ALL {
         let format = crate::backend::vulkan::translate::pixel::vk_texel_layout(layout);
-        sampled_linear_filter[layout.index()] =
+        let features =
             unsafe { instance.get_physical_device_format_properties(pd, format) }
-                .optimal_tiling_features
-                .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR);
+                .optimal_tiling_features;
+        sampled_linear_filter[layout.index()] =
+            features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR);
+        color_attachment_blend[layout.index()] = features.contains(
+            vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND,
+        );
     }
 
     // The guest is handed ONE sample-count answer and uses it for colour
@@ -437,6 +466,7 @@ pub unsafe fn query(
             == vk::TRUE,
         bgra8_storage,
         sampled_linear_filter,
+        color_attachment_blend,
         storage16: supported_16.storage_buffer16_bit_access == vk::TRUE,
         storage8: supported_8.storage_buffer8_bit_access == vk::TRUE,
         float16: supported_f16i8.shader_float16 == vk::TRUE,
@@ -470,6 +500,7 @@ mod tests {
             storage_image_read_without_format: true,
             bgra8_storage: true,
             sampled_linear_filter: [true; TexelLayout::ALL.len()],
+            color_attachment_blend: [true; TexelLayout::ALL.len()],
             storage16: true,
             storage8: true,
             float16: true,

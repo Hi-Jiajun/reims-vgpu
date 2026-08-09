@@ -1290,6 +1290,38 @@ pub fn note_resident_content_copied_out(identity: &TargetIdentity) -> bool {
 /// device recreate drops that registry before guest pages are updated. See
 /// [`crate::backend::vulkan::caps::DriverQuirk`] for what the quirk covers and
 /// how to retire it.
+/// Whether a render target's resident may be created at this texel layout's
+/// format, rather than at the engine's neutral eight-bit one.
+///
+/// The two eight-bit orders answer `true` without asking. They are the engine's
+/// own resident colour formats — every render target this device has ever
+/// created is one of them — so a query could only ever confirm them, and
+/// gating them behind one would make a target's format depend on whether a
+/// device had been resolved when the identity was minted. An identity that
+/// changes format under the same guest allocation is a registry recreate, so
+/// the answer for those two has to be constant.
+///
+/// Anything wider is a real question and is asked of the device:
+/// [`crate::backend::vulkan::caps::device_features::DeviceFeatures::color_attachment_blend`]
+/// holds one probe per [`TexelLayout`] for `COLOR_ATTACHMENT` *and*
+/// `COLOR_ATTACHMENT_BLEND` under optimal tiling. No device yet resolved
+/// answers `false`, which narrows to the format the target would have had
+/// anyway — an override or an unresolved device may never widen what the
+/// device does.
+pub fn render_target_layout_supported(
+    layout: crate::contract::pixel_format::TexelLayout,
+) -> bool {
+    use crate::contract::pixel_format::TexelLayout;
+    if matches!(layout, TexelLayout::Rgba8 | TexelLayout::Bgra8) {
+        return true;
+    }
+    lock_engine()
+        .owner
+        .ctx
+        .as_ref()
+        .is_some_and(|ctx| ctx.features.color_attachment_blend[layout.index()])
+}
+
 pub fn deferred_gpu_only_content_allowed() -> bool {
     lock_engine()
         .owner
@@ -2175,7 +2207,7 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
     } = &mut *guard;
     let ctx = owner.ensure(counters)?;
     unsafe { pools.ensure_init(ctx, counters)? };
-    let snap = resident_read_snapshot(pools, identity)?;
+    let snap = readback_snapshot(pools, identity)?;
     let rb_size = (snap.width as u64) * (snap.height as u64) * u64::from(RESIDENT_READ_BYTES_PER_TEXEL);
     unsafe {
         let delivered = copy_image_level0_to_host_delivered(
@@ -2198,7 +2230,7 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
                 token,
                 ptr,
                 len,
-                bgra: snap.bgra,
+                bgra: snap.bgra(),
             }),
             // The slot had no mapping to lend, so the readback fell back to a
             // copy. Drop it and let the caller take its own copying path rather
@@ -2230,15 +2262,21 @@ pub struct GuestPageTarget {
     pub row_length_texels: u32,
     pub width: u32,
     pub height: u32,
-    /// Channel order the guest reads these bytes back in, from the format it
-    /// declared for this destination.
+    /// The format the guest reads these bytes back as, from what it declared
+    /// for this destination.
     ///
-    /// The copy converts nothing, so this is the order the resident must
+    /// The copy converts nothing, so this is the format the resident must
     /// already hold; the engine checks the pair and refuses by name rather than
     /// assuming either side. It lives here and not on the identity because it
     /// is a property of the *destination* — the runtime is the only side that
     /// knows what the guest declared, exactly as it is for the row pitch above.
-    pub bgra: bool,
+    ///
+    /// A whole format and not a channel order, because it also fixes how wide a
+    /// texel is, and every byte offset below is computed from that. While every
+    /// resident was eight bits per channel that width was a constant `4`
+    /// written into each of them; a destination four bytes per texel wider
+    /// would have had its rows overlap at half their true pitch.
+    pub format: ash::vk::Format,
 }
 
 impl GuestPageTarget {
@@ -2249,9 +2287,23 @@ impl GuestPageTarget {
     /// copying rail does not write them either — a bound that included them
     /// would make the two rails land different guest memory for one frame.
     fn extent_end(&self) -> u64 {
-        let pitch = u64::from(self.row_length_texels.max(self.width)) * 4;
         let rows_before = u64::from(self.height.saturating_sub(1));
-        rows_before * pitch + u64::from(self.width) * 4
+        rows_before * self.pitch_bytes() + u64::from(self.width) * self.bytes_per_texel()
+    }
+
+    /// Bytes one texel of the destination occupies.
+    ///
+    /// `copy_target_to_guest_pages` has already refused a format this cannot
+    /// answer for — it compares the destination's format against the resident's,
+    /// and a resident exists only at a format these tables know — so the
+    /// fallback is unreachable. It is the four this code used to assume rather
+    /// than a panic, because being wrong here costs a mis-planned copy and not a
+    /// lost boot.
+    fn bytes_per_texel(&self) -> u64 {
+        u64::from(
+            crate::backend::vulkan::translate::pixel::bytes_per_texel(self.format)
+                .unwrap_or(RESIDENT_READ_BYTES_PER_TEXEL),
+        )
     }
 
     /// Guest bytes the runs actually name, summed.
@@ -2269,7 +2321,7 @@ impl GuestPageTarget {
 
     /// Guest bytes between the starts of two consecutive rows.
     fn pitch_bytes(&self) -> u64 {
-        u64::from(self.row_length_texels.max(self.width)) * 4
+        u64::from(self.row_length_texels.max(self.width)) * self.bytes_per_texel()
     }
 
     /// The window's byte layout, for planning copy rectangles.
@@ -2294,7 +2346,7 @@ impl GuestPageTarget {
     /// `VkBufferCopy` has no way to skip it — so that window takes the
     /// rectangle path, which does.
     fn rows_are_dense(&self) -> bool {
-        self.pitch_bytes() == u64::from(self.width) * 4
+        self.pitch_bytes() == u64::from(self.width) * self.bytes_per_texel()
     }
 }
 
@@ -2370,11 +2422,17 @@ pub fn copy_target_to_guest_pages(
     }
     unsafe { pools.ensure_init(ctx, counters)? };
     let snap = resident_read_snapshot(pools, identity)?;
-    if snap.bgra != dst.bgra {
-        return Err(DrawError::GuestPageWrite(GuestWriteDecline::OrderMismatch {
-            resident_bgra: snap.bgra,
-            want_bgra: dst.bgra,
-        }));
+    // Whole formats, not channel orders. Two formats sharing an order are four
+    // bytes per texel apart once a render target may be wider than eight bits,
+    // and this copy converts nothing — so an order comparison would admit a
+    // half-float destination over an eight-bit resident.
+    if snap.format != dst.format {
+        return Err(DrawError::GuestPageWrite(
+            GuestWriteDecline::ResidentFormatMismatch {
+                held: snap.format,
+                want: dst.format,
+            },
+        ));
     }
     if snap.width != dst.width || snap.height != dst.height {
         return Err(DrawError::GuestPageWrite(
@@ -3018,19 +3076,34 @@ fn target_readback_ops() -> ReadbackOps {
     }
 }
 
-/// What a resident target's readback copies, and the channel order it is in.
+/// What a resident target's copy moves, and the format it is in.
 struct ResidentReadSnapshot {
     image: ash::vk::Image,
     width: u32,
     height: u32,
     layout: ash::vk::ImageLayout,
-    bgra: bool,
+    /// The resident image's own format. A channel order used to be enough here
+    /// because every resident was eight bits per channel; it is not once a
+    /// render target may be wider, and `copy_target_to_guest_pages` compares
+    /// this against the destination's format to decide whether a byte copy
+    /// lands the right texel.
+    format: ash::vk::Format,
+}
+
+impl ResidentReadSnapshot {
+    /// Whether these texels are already in guest scanout order.
+    fn bgra(&self) -> bool {
+        self.format == crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT
+    }
 }
 
 /// The registry slot's copy geometry, or the typed reason it cannot be read.
 ///
-/// Shared by both readback entry points so that "is this target readable" is
-/// decided once and answered with one vocabulary.
+/// Shared by all three rails that copy out of a resident — the two host
+/// readbacks and the GPU-direct guest-page write — so that "is this target
+/// copyable" is decided once and answered with one vocabulary. It deliberately
+/// does **not** bound the texel width: that is the readbacks' constraint, not
+/// the resident's, and `readback_snapshot` below is where it is applied.
 fn resident_read_snapshot(
     pools: &pools::ResourcePools,
     identity: &TargetIdentity,
@@ -3043,26 +3116,43 @@ fn resident_read_snapshot(
             reason::TargetReadDecline::NoReadyContent,
         ));
     }
-    // Both readback rails size their buffer `w * h * RESIDENT_READ_BYTES_PER_TEXEL`
-    // and hand the bytes to consumers that only speak RGBA8. Asked here rather
-    // than at each of them because this function is what makes "is this target
-    // readable" one question answered in one vocabulary, and how wide its texel
-    // is belongs to that answer.
-    let format = slot.color_format;
-    if crate::backend::vulkan::translate::pixel::bytes_per_texel(format)
-        != Some(RESIDENT_READ_BYTES_PER_TEXEL)
-    {
-        return Err(DrawError::TargetRead(
-            reason::TargetReadDecline::TexelNotFourBytes { format },
-        ));
-    }
     Ok(ResidentReadSnapshot {
         image: slot.image,
         width: slot.width,
         height: slot.height,
         layout: slot.access.layout(),
-        bgra: slot.scanout_order(),
+        format: slot.color_format,
     })
+}
+
+/// [`resident_read_snapshot`] plus the constraint the two **host readback**
+/// rails add to it: the bytes must be four per texel.
+///
+/// Both size their buffer `w * h * RESIDENT_READ_BYTES_PER_TEXEL` and hand the
+/// result to consumers that only speak RGBA8 — `TargetReadback::into_rgba8`
+/// exchanges channels in `chunks_exact_mut(4)`, and the CPU Store rail converts
+/// from RGBA8 a row at a time. A wider resident delivered through either would
+/// be read as the wrong texel out of a buffer half the size it needed.
+///
+/// Separate from the shared snapshot because the third caller —
+/// `copy_target_to_guest_pages` — has no such limit: it copies the resident's
+/// own bytes into guest pages and never interprets them, so bounding it here
+/// would refuse exactly the rail a wide target is supposed to take.
+fn readback_snapshot(
+    pools: &pools::ResourcePools,
+    identity: &TargetIdentity,
+) -> Result<ResidentReadSnapshot, DrawError> {
+    let snap = resident_read_snapshot(pools, identity)?;
+    if crate::backend::vulkan::translate::pixel::bytes_per_texel(snap.format)
+        != Some(RESIDENT_READ_BYTES_PER_TEXEL)
+    {
+        return Err(DrawError::TargetRead(
+            reason::TargetReadDecline::TexelNotFourBytes {
+                format: snap.format,
+            },
+        ));
+    }
+    Ok(snap)
 }
 
 fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
@@ -3075,7 +3165,7 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
     } = &mut *guard;
     let ctx = owner.ensure(counters)?;
     unsafe { pools.ensure_init(ctx, counters)? };
-    let snap = resident_read_snapshot(pools, identity)?;
+    let snap = readback_snapshot(pools, identity)?;
     let rb_size = (snap.width as u64) * (snap.height as u64) * u64::from(RESIDENT_READ_BYTES_PER_TEXEL);
     unsafe {
         let out = copy_image_level0_to_host(
@@ -3094,7 +3184,7 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
         counters.note_target_read(rb_size);
         Ok(TargetReadback {
             pixels: out,
-            bgra: snap.bgra,
+            bgra: snap.bgra(),
         })
     }
 }
@@ -3546,9 +3636,10 @@ mod guest_page_target_tests {
             row_length_texels,
             width,
             height,
-            // Immaterial to these tests: the order is checked against the
-            // resident's, and no fixture here reaches a resident.
-            bgra: true,
+            // The format is checked against the resident's and no fixture here
+            // reaches a resident, so only its texel width matters — these cases
+            // are all four-byte extent arithmetic.
+            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
         }
     }
 

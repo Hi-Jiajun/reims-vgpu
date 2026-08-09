@@ -819,23 +819,40 @@ pub fn render_target_bpp(format: u16) -> Option<u32> {
     })
 }
 
-/// The channel order a render Store's destination stores its texels in, or
-/// `None` for a destination whose texel is not one of the two 8-bit RGBA
-/// permutations.
+/// The texel layout a render Store's destination stores its texels in, or
+/// `None` for a destination whose texel this device cannot name a layout for.
 ///
 /// This is the whole admission rule for landing a resident render target in
 /// guest memory with an image→buffer copy: that copy moves bytes and converts
-/// nothing, so the destination's texel must be four bytes wide and its channel
-/// order must be the order the resident already holds. Say `Some(order)` and
-/// the caller compares it against its resident; say `None` and the only route
-/// left is [`convert_rgba8_to_row`], which is a CPU pass over the frame.
+/// nothing, so the destination's texel and the resident's must be **the same
+/// layout**. Say `Some(layout)` and the caller compares it against its
+/// resident's format; say `None` and the only route left is
+/// [`convert_rgba8_to_row`], which is a CPU pass over the frame.
 ///
 /// Named once because both writeback rails ask it — the type-11 mapping rail
-/// wants `Bgra8` specifically and the GVA rail takes whichever order its
+/// wants `Bgra8` specifically and the GVA rail takes whichever layout its
 /// resident was built in — and a rail that re-lists the formats drifts the
-/// first time one is added. It is deliberately not [`render_target_bpp`]`
-/// .is_some()`: `RGBA16_FLOAT` is renderable and is not a byte-copy
-/// destination.
+/// first time one is added.
+///
+/// # Why `RGBA16_FLOAT` is here now
+///
+/// It used to be excluded, and this doc used to say so: *"`RGBA16_FLOAT` is
+/// renderable and is not a byte-copy destination."* That was true, but of the
+/// **resident** rather than of the contract. Every render target's resident was
+/// eight bits per channel — the identity could hold a channel order and nothing
+/// wider — so a half-float destination could never be the same bytes as the
+/// image, at any order, and the copy was correctly refused.
+///
+/// A resident now carries the format the guest declared, so for a target that
+/// got one the copy is byte-for-byte valid and this says so. The caller is what
+/// makes that safe: it compares this layout against the resident's actual
+/// format, so a half-float destination whose resident *did* fall back to eight
+/// bits still takes the CPU rail. Returning a layout is an admission that the
+/// two **may** match, never a claim that they do.
+///
+/// The set is deliberately still narrow. A layout belongs here when a guest
+/// render target can declare it and a copy of the resident's bytes is what the
+/// guest should read; it is not [`render_target_bpp`]`.is_some()`.
 ///
 /// sRGB folds onto its linear sibling for the same reason [`sampled_class`]
 /// folds it: the qualifier describes how a sampler interprets the bytes, not
@@ -844,6 +861,7 @@ pub fn store_texel_order(format: u16) -> Option<TexelLayout> {
     Some(match format {
         MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => TexelLayout::Rgba8,
         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => TexelLayout::Bgra8,
+        MTL_FORMAT_RGBA16_FLOAT => TexelLayout::Rgba16Float,
         _ => return None,
     })
 }
@@ -1996,20 +2014,23 @@ mod tests {
     /// Every format [`store_texel_order`] admits must survive a raw byte copy.
     ///
     /// Exhaustive over `u16` rather than over a list, because the failure this
-    /// guards is a format being *added* to the admitted set whose texel is not
-    /// four bytes or whose channel order the CPU loaders read differently. Both
-    /// would land a frame in guest memory under the wrong layout, and neither
-    /// is visible at the copy — it converts nothing and cannot notice.
+    /// guards is a format being *added* to the admitted set whose texel this
+    /// crate's other tables describe differently. That would land a frame in
+    /// guest memory under the wrong layout, and it is invisible at the copy —
+    /// which converts nothing and cannot notice.
+    ///
+    /// The rule used to be "four bytes of the order it claims", and it is now
+    /// the agreement itself. Four was never the contract: it was the width of
+    /// the only residents a render target could have, and with that gone what
+    /// has to hold is that the copy's stride, the render-target table and the
+    /// sampled table all name **one** texel for a given format. A width
+    /// assertion would only re-state whichever of them was consulted first.
     #[test]
-    fn a_byte_copy_destination_is_four_bytes_of_the_order_it_claims() {
+    fn a_byte_copy_destination_is_the_texel_every_other_table_agrees_it_is() {
         for fmt in 0u16..=u16::MAX {
             let Some(order) = store_texel_order(fmt) else {
                 continue;
             };
-            assert!(
-                order.is_four_byte_color(),
-                "{fmt:#x} admitted as {order:?}, which is not a four-byte colour order"
-            );
             assert_eq!(
                 bytes_per_pixel(fmt),
                 Some(order.bytes_per_texel()),
@@ -2026,20 +2047,27 @@ mod tests {
                 sampled_class(fmt),
                 Some(match order {
                     TexelLayout::Rgba8 => SampledClass::Rgba8Unorm,
+                    TexelLayout::Rgba16Float => SampledClass::Rgba16Float,
                     _ => SampledClass::Bgra8Unorm,
                 }),
-                "{fmt:#x} is read as one order by the sampler and copied as another"
+                "{fmt:#x} is read as one layout by the sampler and copied as another"
             );
         }
-        // The renderable formats that are not byte-copy destinations, so a
-        // widening of the set above has to delete a line here to pass.
-        for fmt in [MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RG16_FLOAT] {
-            assert!(render_target_bpp(fmt).is_some());
-            assert!(
-                store_texel_order(fmt).is_none(),
-                "{fmt:#x} is wider than four bytes and cannot be handed to a copy"
-            );
-        }
+        // A renderable format that is still not a byte-copy destination, so a
+        // further widening of the set above has to change this line to pass.
+        assert!(render_target_bpp(MTL_FORMAT_RG16_FLOAT).is_some());
+        assert!(
+            store_texel_order(MTL_FORMAT_RG16_FLOAT).is_none(),
+            "RG16_FLOAT renders but is not admitted to a copy"
+        );
+        // The widened one, named so that removing it from the rule is a test
+        // failure rather than a silent narrowing back to eight bits.
+        assert_eq!(
+            store_texel_order(MTL_FORMAT_RGBA16_FLOAT),
+            Some(TexelLayout::Rgba16Float),
+            "a half-float render target must reach the byte-copy rail, or its \
+             frame is quantized to eight bits on the way to the guest"
+        );
     }
 
     #[test]

@@ -383,16 +383,6 @@ unsafe fn import_ramblock(
     bound
 }
 
-/// Channel order as a decline field reads, so the two sides of an
-/// [`GuestWriteDecline::OrderMismatch`] name themselves rather than printing
-/// `true`/`false` a reader has to know the polarity of.
-fn order_name(bgra: bool) -> &'static str {
-    if bgra {
-        "bgra"
-    } else {
-        "rgba"
-    }
-}
 
 /// A check that stopped a resident's frame from being copied straight into the
 /// guest's own pages, so the flush took the CPU route instead.
@@ -418,7 +408,14 @@ pub enum GuestWriteDecline {
     /// are guest scanout order and a GVA render target's are whatever the guest
     /// declared for it. A rail that spelled the rule as one fixed order refused
     /// every RGBA destination it could have served unchanged.
-    OrderMismatch { resident_bgra: bool, want_bgra: bool },
+    /// Two whole formats and not two orders: an order stopped being a complete
+    /// description of a resident once a render target could be wider than eight
+    /// bits per channel, and this copy converts nothing, so a half-float
+    /// destination over an eight-bit resident must be caught here.
+    ResidentFormatMismatch {
+        held: ash::vk::Format,
+        want: ash::vk::Format,
+    },
     /// The resident's geometry is not the geometry the window promised the
     /// guest. Copying anyway would land one extent's pixels under another's row
     /// pitch.
@@ -445,7 +442,7 @@ impl Decline for GuestWriteDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self::Unsupported { .. } => "gpu_writeback_unsupported",
-            Self::OrderMismatch { .. } => "gpu_writeback_order_mismatch",
+            Self::ResidentFormatMismatch { .. } => "gpu_writeback_resident_format_mismatch",
             Self::GeometryMoved { .. } => "gpu_writeback_geometry_moved",
             Self::WindowTooSmall { .. } => "gpu_writeback_window_too_small",
             // The inner decline's own slug, so a driver that refuses the pointer
@@ -458,12 +455,9 @@ impl Decline for GuestWriteDecline {
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::Unsupported { rung } => vec![("rung", rung.slug().to_string())],
-            Self::OrderMismatch {
-                resident_bgra,
-                want_bgra,
-            } => vec![
-                ("resident", order_name(*resident_bgra).to_string()),
-                ("want", order_name(*want_bgra).to_string()),
+            Self::ResidentFormatMismatch { held, want } => vec![
+                ("resident", format!("{held:?}")),
+                ("want", format!("{want:?}")),
             ],
             Self::GeometryMoved {
                 resident_width,

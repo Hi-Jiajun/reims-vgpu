@@ -711,10 +711,20 @@ pub enum GvaWritebackDecline {
     /// target lands here and always will; `convert_rgba8_to_row` is its only
     /// route.
     FormatNeedsConversion { format: u16 },
-    /// The resident's channel order is not the order the destination stores.
-    /// Distinct from the engine's own check of the same pair: this one is asked
-    /// before the walk, so a mismatch costs no page-table work.
-    OrderMismatch { resident_bgra: bool, want_bgra: bool },
+    /// The resident's format is not the format the destination stores, so a
+    /// byte copy would land the wrong texel. Distinct from the engine's own
+    /// check of the same pair: this one is asked before the walk, so a mismatch
+    /// costs no page-table work.
+    ///
+    /// Whole formats and not channel orders. The two differ once a render
+    /// target may be wider than eight bits per channel: `RGBA16_FLOAT` and
+    /// `RGBA8_UNORM` share an order and are four bytes per texel apart, and this
+    /// is the arm that catches a half-float destination whose resident fell back
+    /// to eight bits because the host cannot render to the wider format.
+    ResidentFormatMismatch {
+        held: ash::vk::Format,
+        want: ash::vk::Format,
+    },
     /// The guest's row pitch is not a whole number of texels, or is narrower
     /// than the frame, so there is no `bufferRowLength` that describes it.
     PitchNotTexels { row_stride: u32 },
@@ -750,7 +760,7 @@ impl crate::observe::Decline for GvaWritebackDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self::FormatNeedsConversion { .. } => "gvawb_format_needs_conversion",
-            Self::OrderMismatch { .. } => "gvawb_order_mismatch",
+            Self::ResidentFormatMismatch { .. } => "gvawb_resident_format_mismatch",
             Self::PitchNotTexels { .. } => "gvawb_pitch_not_texels",
             Self::OffsetNotTexelAligned { .. } => "gvawb_offset_not_texel_aligned",
             Self::Unlicensed => "gvawb_unlicensed",
@@ -764,12 +774,9 @@ impl crate::observe::Decline for GvaWritebackDecline {
         match self {
             Self::Unlicensed | Self::SpanIncomplete => Vec::new(),
             Self::FormatNeedsConversion { format } => vec![("fmt", format!("{format:#x}"))],
-            Self::OrderMismatch {
-                resident_bgra,
-                want_bgra,
-            } => vec![
-                ("resident", if *resident_bgra { "bgra" } else { "rgba" }.to_string()),
-                ("want", if *want_bgra { "bgra" } else { "rgba" }.to_string()),
+            Self::ResidentFormatMismatch { held, want } => vec![
+                ("resident", format!("{held:?}")),
+                ("want", format!("{want:?}")),
             ],
             Self::PitchNotTexels { row_stride } => vec![("bpr", row_stride.to_string())],
             Self::OffsetNotTexelAligned { in_page } => vec![("in_page", in_page.to_string())],
@@ -822,26 +829,31 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     texture_ref: u32,
     pages: Option<&crate::runtime::draw::StoreTargetPages>,
 ) -> Result<u64, GvaWritebackDecline> {
-    use crate::contract::pixel_format::{store_texel_order, TexelLayout};
-    // The destination's channel order, and the whole reason this rail can exist
+    use crate::contract::pixel_format::store_texel_order;
+    // The destination's texel layout, and the whole reason this rail can exist
     // at all: a copy converts nothing, so the guest must already read these
-    // bytes in the order the resident holds them.
+    // bytes exactly as the resident holds them.
     let Some(order) = store_texel_order(c0.format) else {
         return Err(GvaWritebackDecline::FormatNeedsConversion { format: c0.format });
     };
-    let want_bgra = order == TexelLayout::Bgra8;
-    let resident_bgra = identity.is_bgra();
+    // Compared as whole formats, not as channel orders.
+    //
+    // While every resident was eight bits per channel an order was a complete
+    // description of one, so `is_bgra() != (order == Bgra8)` decided this. It is
+    // not any more: `RGBA16_FLOAT` and `RGBA8_UNORM` are both RGBA-ordered and
+    // are four bytes per texel apart, so an order comparison would admit a
+    // half-float destination over an eight-bit resident and copy a frame of the
+    // wrong size and the wrong texel into the guest's pages.
+    let want = crate::backend::vulkan::translate::pixel::vk_texel_layout(order);
+    let held = identity.resident_format();
     // A healthy zero on the rail as it stands: `gva_chain_identity` builds the
     // key from this same `c0.format`, so the two agree by construction and this
-    // arm is the alarm for an identity that came from somewhere else. Kept
-    // rather than asserted because the answer it protects — whether the bytes
-    // about to be copied are the bytes the guest reads — is not one to take on
-    // trust from a caller.
-    if resident_bgra != want_bgra {
-        return Err(GvaWritebackDecline::OrderMismatch {
-            resident_bgra,
-            want_bgra,
-        });
+    // arm is the alarm for an identity that came from somewhere else. It is also
+    // the arm that catches the honest disagreement — a guest format whose
+    // resident fell back to eight bits because the host cannot render to it —
+    // and sends that Store down the CPU conversion rail where it belongs.
+    if held != want {
+        return Err(GvaWritebackDecline::ResidentFormatMismatch { held, want });
     }
     let bpt = u64::from(order.bytes_per_texel());
     let row_stride = u64::from(c0.row_stride);
@@ -877,7 +889,7 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
         row_length_texels: (row_stride / bpt) as u32,
         width: c0.width,
         height: c0.height,
-        bgra: want_bgra,
+        format: want,
     };
     // This device is about to write these guest pages, and the hypervisor's
     // dirty bitmap is defined not to see it. Without this record a reader
