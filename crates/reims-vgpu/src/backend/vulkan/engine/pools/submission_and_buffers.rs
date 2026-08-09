@@ -1042,13 +1042,18 @@ impl ResourcePools {
         // the still-recording batch CB).
         self.batch_flush(ctx, counters)?;
         // Reap the oldest contiguous run of already-signaled slots before
-        // claiming one. A slot's cleanup carries the sampled-cache admissions
-        // it owes (`drain_cleanup` -> `admit_sampled_slot`), and the readback
-        // path deliberately waits the fence without retiring (see
-        // `wait_entry_fence`). Retiring only the slot about to be reused
-        // therefore parked every admission until the ring wrapped, so an
-        // unchanged texture re-uploaded and re-allocated for RING_DEPTH - 1
-        // draws before the content cache could serve it.
+        // claiming one, rather than only the slot about to be reused. The
+        // readback path deliberately waits a fence without retiring (see
+        // `wait_entry_fence`), so a signaled slot can sit unreaped for a whole
+        // ring, holding its staging, gather and readback buffers out of the free
+        // lists and its descriptor sets out of the arena — every one of which
+        // the next draw then allocates fresh.
+        //
+        // This used to be load-bearing for the sampled content cache too, whose
+        // admissions travelled in the same cleanup: a texture the guest had not
+        // changed re-uploaded and re-allocated for RING_DEPTH - 1 draws before
+        // the cache could serve it. It no longer is — admission happens at
+        // submit, in `finish_entry_async`, which is the whole of why.
         //
         // `break` on the first unsignaled slot is load-bearing: reaping out of
         // order can drop `in_flight` to 0 while later slots still run, which
@@ -1092,38 +1097,91 @@ impl ResourcePools {
 
     /// Seal the current entry's transient resources: move every live pool slot
     /// (which the just-recorded CB references) out of the shared live lists so
-    /// a concurrent entry cannot recycle them, bundled with the descriptor set
-    /// and deferred sampled-cache admissions.
+    /// a concurrent entry cannot recycle them, bundled with the descriptor set.
+    ///
+    /// The images named by `sampled_retains` are lifted straight back out of the
+    /// cleanup into [`SealedEntry::admissions`]: they are not transient, they
+    /// are about to become cache entries, and leaving them in the bag is what
+    /// made them wait for a fence.
     pub(crate) fn seal_entry(
         &mut self,
         dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
         sampled_retains: Vec<SampledRetain>,
-    ) -> PendingGpuCleanup {
+    ) -> SealedEntry {
         // The slots the map names are about to be handed to the cleanup, so
         // nothing recorded after this may bind one.
         self.forget_cb_bound_buffers("bindmap_clear_seal", "bindmap_clear_seal_entries");
         let mut readback: Vec<BufferSlot> = self.readback_live.take().into_iter().collect();
         readback.append(&mut self.readback_multi_live);
-        PendingGpuCleanup {
-            dsets,
-            staging: std::mem::take(&mut self.staging_live),
-            gather: std::mem::take(&mut self.gather_live),
-            readback,
-            sampled: std::mem::take(&mut self.sampled_live),
-            storage_images: std::mem::take(&mut self.storage_image_live),
-            sampled_retains,
+        let mut sampled = std::mem::take(&mut self.sampled_live);
+        let mut admissions = Vec::with_capacity(sampled_retains.len());
+        for retain in sampled_retains {
+            // A retain naming an image this entry does not hold is not an
+            // admission — it belongs to a draw whose slots were sealed by an
+            // earlier entry, and the cache already has whatever that entry gave
+            // it.
+            if let Some(index) = sampled.iter().position(|slot| slot.image == retain.image) {
+                admissions.push((sampled.remove(index), retain));
+            }
+        }
+        SealedEntry {
+            cleanup: PendingGpuCleanup {
+                dsets,
+                staging: std::mem::take(&mut self.staging_live),
+                gather: std::mem::take(&mut self.gather_live),
+                readback,
+                sampled,
+                storage_images: std::mem::take(&mut self.storage_image_live),
+            },
+            admissions,
         }
     }
 
-    /// Park the sealed cleanup on the current slot: its CB was submitted with
-    /// the slot fence and the entry returns without waiting.
-    pub(crate) fn finish_entry_async(&mut self, cleanup: PendingGpuCleanup) {
+    /// Park the sealed cleanup on the current slot and give the content cache
+    /// the images this entry's CB fills. The CB was submitted with the slot
+    /// fence and the entry returns without waiting.
+    ///
+    /// # Why the cache takes them now and not at retire
+    ///
+    /// A cache entry is a CPU-side name for a GPU image, and the only thing that
+    /// has to have happened before a *consumer* may bind it is that the fill was
+    /// recorded and submitted first. Every consumer is itself a recorded
+    /// command, `begin_entry` flushes the open batch before any path claims a
+    /// slot so queue order is record order, and the fill's own
+    /// `TRANSFER_WRITE → SHADER_READ` barrier (see `upload_buffer_to_sampled_image`)
+    /// has every later-submitted command in its second scope. So the fence adds
+    /// nothing to the consumer's correctness — it only delays the name.
+    ///
+    /// Admitting at retire delayed it by a whole ring: a window bound N times
+    /// while the first bind's slot was still in flight missed N times, gathered
+    /// N times, and threw away N-1 of the images on arrival. Measured on the
+    /// macos-26 rail at `a6ed11b9`: `sampled_admit_duplicate` 5533 against
+    /// `sampled_admit_kept` 3876, and 58.9 GB of guest texels imported in one
+    /// driven boot against 219 MB on macos-13.
+    ///
+    /// The admissions run **after** the slot is marked pending, not before. An
+    /// admission can evict, an eviction disposes, and `dispose` defers against
+    /// the slots open right now — the CB just submitted may sample the image
+    /// being evicted, so this slot has to be in that mask. It is the same
+    /// ordering the ad-hoc framebuffer disposal in `exec` relies on.
+    ///
+    /// # Safety
+    ///
+    /// `device` must be the device every parked handle belongs to.
+    pub(crate) unsafe fn finish_entry_async(&mut self, device: &ash::Device, sealed: SealedEntry) {
+        let SealedEntry {
+            cleanup,
+            admissions,
+        } = sealed;
         debug_assert!(
             self.slots[self.cur].pending.is_none(),
             "current slot already owes cleanup"
         );
         self.slots[self.cur].pending = Some(cleanup);
         self.in_flight += 1;
+        for (slot, retain) in admissions {
+            self.admit_sampled_slot(device, slot, &retain.content, retain.identity);
+        }
     }
 
     /// The open batch's (CB, fence) when a draw at (identity, geometry, bgra)
@@ -1264,11 +1322,11 @@ impl ResourcePools {
         })();
         match submit {
             Ok(()) => {
-                let cleanup = self.seal_entry(
+                let sealed = self.seal_entry(
                     std::mem::take(&mut batch.dsets),
                     std::mem::take(&mut batch.sampled_retains),
                 );
-                self.finish_entry_async(cleanup);
+                self.finish_entry_async(&ctx.device, sealed);
                 Ok(())
             }
             Err(e) => {
@@ -1533,19 +1591,9 @@ impl ResourcePools {
     /// The CB that referenced these resources must have retired.
     unsafe fn drain_cleanup(&mut self, device: &ash::Device, mut pending: PendingGpuCleanup) {
         self.desc_arena.free(device, &pending.dsets);
-        // Cache admissions first (they move slots into the cache and may evict
-        // images — deferred via dispose() while others are in flight), then
-        // recycle what remains.
-        for retain in pending.sampled_retains.drain(..) {
-            if let Some(index) = pending
-                .sampled
-                .iter()
-                .position(|slot| slot.image == retain.image)
-            {
-                let slot = pending.sampled.remove(index);
-                self.admit_sampled_slot(device, slot, &retain.content, retain.identity);
-            }
-        }
+        // No cache admissions here: `seal_entry` lifted them out and
+        // `finish_entry_async` gave them to the cache at submit. What is left in
+        // `pending.sampled` is every slot nothing retained, which recycles.
         for slot in pending.staging.drain(..) {
             let bucket = Self::bucket(slot.size);
             self.staging_free.entry(bucket).or_default().push(slot);
@@ -2782,6 +2830,32 @@ impl ResourcePools {
         content: &SampledRetainContent,
         identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
     ) {
+        for evicted in self.admit_sampled_entry(slot, content, identity) {
+            // Recycle rather than destroy: a content-changing sampled input
+            // (live tile / video frame) re-uploads into this same-geometry image
+            // next frame instead of a fresh vkAllocateMemory. Routed through the
+            // in-flight-safe deferral (an in-flight CB may still sample it).
+            self.dispose(device, DeferredHandle::RecycleSampled(evicted));
+        }
+    }
+
+    /// Device-free half of [`Self::admit_sampled_slot`]: place the entry, charge
+    /// the byte accounting, and return the slots the caps pushed out for the
+    /// caller to dispose. Split out so admission — the rail that decides whether
+    /// a window is gathered twice — is reachable from a test with no GPU, the
+    /// same split [`Self::take_aged_sampled_slots`] carries for the age trim.
+    ///
+    /// The three arms that decline hand the slot back to `sampled_live`, which
+    /// this entry's own [`Self::seal_entry`] has just emptied — so it is swept
+    /// into the *next* entry's cleanup and recycled when that entry's fence
+    /// signals. On one queue that fence is behind this entry's, so a CB still
+    /// reading the image cannot be racing the recycle.
+    fn admit_sampled_entry(
+        &mut self,
+        slot: SampledSlot,
+        content: &SampledRetainContent,
+        identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
+    ) -> Vec<SampledSlot> {
         let (fingerprint, retained, content_len) = match content {
             // The `Arc` is cloned rather than the bytes copied: the retire path
             // already holds one, so recognising this entry by content later
@@ -2798,7 +2872,7 @@ impl ResourcePools {
                 if identity.is_none() {
                     crate::runtime::drain::note_store_route("sampled_admit_no_identity");
                     self.sampled_live.push(slot);
-                    return;
+                    return Vec::new();
                 }
                 (SampledFingerprint::Gathered, None, *len)
             }
@@ -2806,7 +2880,7 @@ impl ResourcePools {
         if content_len > SAMPLED_CACHE_BYTE_CAP {
             crate::runtime::drain::note_store_route("sampled_admit_oversize");
             self.sampled_live.push(slot);
-            return;
+            return Vec::new();
         }
         // Deduplication asks the same question a lookup does, so it has to
         // answer it the same way: a fingerprint match proposes a duplicate and
@@ -2833,7 +2907,7 @@ impl ResourcePools {
                 existing.identity = identity;
             }
             self.sampled_live.push(slot);
-            return;
+            return Vec::new();
         }
         crate::runtime::drain::note_store_route("sampled_admit_kept");
         self.sampled_cache_bytes = self.sampled_cache_bytes.saturating_add(content_len);
@@ -2852,6 +2926,7 @@ impl ResourcePools {
         // absence of a (key, fingerprint) entry, and the two causes look
         // identical from there. Both routes reading zero says every miss is
         // content, and then raising either cap buys nothing.
+        let mut evicted = Vec::new();
         while self.sampled_cache.len() > SAMPLED_CACHE_CAP
             || self.sampled_cache_bytes > SAMPLED_CACHE_BYTE_CAP
         {
@@ -2860,13 +2935,9 @@ impl ResourcePools {
             {
                 crate::runtime::drain::note_store_route(route);
             }
-            let evicted = self.evict_sampled_entry(0, SampledVictimRoute::Cap);
-            // Recycle rather than destroy: a content-changing sampled input
-            // (live tile / video frame) re-uploads into this same-geometry image
-            // next frame instead of a fresh vkAllocateMemory. Routed through the
-            // in-flight-safe deferral (an in-flight CB may still sample it).
-            self.dispose(device, DeferredHandle::RecycleSampled(evicted));
+            evicted.push(self.evict_sampled_entry(0, SampledVictimRoute::Cap));
         }
+        evicted
     }
 
     pub(crate) fn recycle_sampled(&mut self) {
@@ -3236,6 +3307,74 @@ mod recycle_tests {
             ),
             swizzle: Default::default(),
         }
+    }
+
+    /// A window gathered by a submission still in flight is bindable by the very
+    /// next draw, and is bindable exactly once.
+    ///
+    /// Two halves, and each of them is a different defect.
+    ///
+    /// The cache must hold the image **before any fence signals**. A rail that
+    /// waits a millisecond for a ring slot binds one window several times inside
+    /// one slot's life, and every bind that misses re-gathers the whole window:
+    /// measured on the macos-26 rail as 58.9 GB of guest texels in one driven
+    /// boot, 59 % of them thrown away on arrival as `sampled_admit_duplicate`.
+    /// Nothing in this test waits a fence or retires a slot, which is the point.
+    ///
+    /// And the retire bag must **not** still hold it. An image that is both a
+    /// cache entry and a pending recycle is handed to a later `acquire_sampled`
+    /// while the cache still answers binds with it, and that draw overwrites
+    /// content another draw is sampling.
+    #[test]
+    fn a_gathered_window_is_bindable_before_its_fence_and_is_not_also_recycled() {
+        let mut pools = ResourcePools::new();
+        let counters = EngineCounters::default();
+        let identity = crate::backend::vulkan::engine::SampledContentIdentity {
+            key: 0x51,
+            generation: 3,
+        };
+
+        let slot = null_slot(64, 64);
+        let key = slot.key();
+        let image = slot.image;
+        // What `acquire_sampled` leaves behind for a cold guest gather.
+        pools.sampled_live.push(slot);
+        assert!(
+            pools
+                .find_gathered_sampled(key, Some(identity), &counters)
+                .is_none(),
+            "nothing has filled this window yet"
+        );
+
+        let sealed = pools.seal_entry(
+            Vec::new(),
+            vec![SampledRetain {
+                image,
+                content: SampledRetainContent::Gathered { len: 64 * 64 * 4 },
+                identity: Some(identity),
+            }],
+        );
+        assert!(
+            sealed.cleanup.sampled.is_empty(),
+            "an image the cache is about to own must not also be in the recycle bag"
+        );
+        // The device-free half of what `finish_entry_async` does at submit.
+        for (slot, retain) in sealed.admissions {
+            assert!(
+                pools
+                    .admit_sampled_entry(slot, &retain.content, retain.identity)
+                    .is_empty(),
+                "a single entry cannot reach either cap, so nothing is evicted"
+            );
+        }
+
+        assert!(
+            pools
+                .find_gathered_sampled(key, Some(identity), &counters)
+                .is_some(),
+            "the next draw must find the window the in-flight submission gathered, \
+             or it imports every byte of it a second time"
+        );
     }
 
     /// Two different textures filed under one digest stay two textures.
@@ -4052,7 +4191,6 @@ mod recycle_tests {
                 readback: Vec::new(),
                 sampled: Vec::new(),
                 storage_images: Vec::new(),
-                sampled_retains: Vec::new(),
             }),
         }
     }

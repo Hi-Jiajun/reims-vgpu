@@ -658,10 +658,14 @@ impl ResourcePools {
 }
 
 /// Cleanup owed by an entry that skipped its post-submit fence wait: the
-/// descriptor set, every transient pool slot the CB references (moved out of
-/// the live lists at seal time so a concurrent entry cannot recycle them),
-/// and the render path's sampled-content cache admissions — deferred because
-/// admission can EVICT (destroy) cache images the in-flight CB may sample.
+/// descriptor set and every transient pool slot the CB references, moved out of
+/// the live lists at seal time so a concurrent entry cannot recycle them.
+///
+/// **The sampled images this entry filled are not here.** They leave the seal in
+/// [`SealedEntry::admissions`] and enter the content cache at submit, not at
+/// retire — see [`ResourcePools::finish_entry_async`] for why, and note that the
+/// absence of a field is the enforcement: nothing that reaches this struct can
+/// still be owed to the cache.
 pub(crate) struct PendingGpuCleanup {
     dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
     staging: Vec<BufferSlot>,
@@ -669,7 +673,20 @@ pub(crate) struct PendingGpuCleanup {
     readback: Vec<BufferSlot>,
     sampled: Vec<SampledSlot>,
     storage_images: Vec<StorageImageSlot>,
-    sampled_retains: Vec<SampledRetain>,
+}
+
+/// What one sealed entry hands back: the cleanup its ring slot owes once the
+/// fence signals, and the sampled images whose fill the CB about to be parked
+/// carries — which the content cache takes immediately.
+///
+/// The two halves are separated here rather than at retire because they are due
+/// at different times, and putting them in one bag is what made every admission
+/// a fence-length late.
+pub(crate) struct SealedEntry {
+    pub(crate) cleanup: PendingGpuCleanup,
+    /// Each entry pairs the image the CB fills with what names it. Empty for
+    /// every non-render entry (compute, present, sync helpers).
+    admissions: Vec<(SampledSlot, SampledRetain)>,
 }
 
 pub(crate) struct SampledSlot {
@@ -793,7 +810,9 @@ pub(crate) enum SampledFingerprint {
     Gathered,
 }
 
-/// One sampled image a retired submission owes the content cache.
+/// One sampled image a submission owes the content cache — paid at
+/// [`ResourcePools::finish_entry_async`], when the CB that fills it reaches the
+/// queue, and not at the fence.
 pub(crate) struct SampledRetain {
     pub(crate) image: vk::Image,
     /// The bytes to fingerprint, where the source had any. A guest gather has

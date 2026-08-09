@@ -3335,8 +3335,8 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     // CPU-side bookkeeping: the retained target's content is queue-ordered
     // (mark ready), resident sampled layouts advance to the recorded
-    // post-draw layout, and upload-path sampled bytes queue for cache
-    // admission at retire time.
+    // post-draw layout, and the sampled images this CB fills are named for the
+    // cache admission that `finish_entry_async` makes below.
     if let Some(identity) = &req.target_identity {
         // How much of the attachment this draw could have written. Nothing in
         // this device acts on it — it is the standing instrument for whether
@@ -3475,8 +3475,8 @@ pub(crate) unsafe fn execute_draw_inner(
     // admissions) on this ring slot in every mode; whichever entry retires
     // the slot drains it. A failed wait below leaves the slot pending, so no
     // path ever reuses an unretired fence.
-    let cleanup = pools.seal_entry(dset.zip(dset_pool).into_iter().collect(), sampled_retains);
-    pools.finish_entry_async(cleanup);
+    let sealed = pools.seal_entry(dset.zip(dset_pool).into_iter().collect(), sampled_retains);
+    pools.finish_entry_async(&ctx.device, sealed);
 
     // Dispose the ad-hoc per-draw framebuffers (MRT and/or depth) now that
     // `finish_entry_async` has marked this slot pending: the handles park in
