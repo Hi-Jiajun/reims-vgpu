@@ -70,27 +70,47 @@ GUEST_DISPLAY_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # panel to answer — it is granted by hand in System Preferences, and exactly one
 # rail of six ever had it. A probe written against System Events therefore runs
 # on that one rail and reports every other one as having no windows.
-guest_apple_events_consent() {
-  local guest="$1" app="$2"
-  local probe="tell application \"$app\" to get name"
+#
+# The cycle runs `GUEST_CONSENT_ATTEMPTS` times rather than once, because one
+# press is not reliably the press that lands. A cold application can take longer
+# to accept its first event than the probe's timeout, so the first Return goes
+# out before any panel exists; and the desktop raises its own transient furniture
+# — a software-update notification arrived mid-run once — which a keystroke aimed
+# at a modal can meet on the way. Each further round costs nothing on a guest
+# that has already consented, because the call returns at once and no key is
+# pressed at all.
+guest_osa_consenting() {
+  local guest="$1" what="$2" script="$3"
   local qmp_sock="${QMP_SOCK:-$GUEST_DISPLAY_REPO_ROOT/vm/disks/run/qmp.sock}"
   local secs="${GUEST_CONSENT_TIMEOUT:-15}"
+  local attempts="${GUEST_CONSENT_ATTEMPTS:-3}"
+  local i out
 
-  GUEST_OSA_TIMEOUT="$secs" guest_osa "$guest" "$probe" >/dev/null 2>&1 && return 0
-
-  if [ ! -S "$qmp_sock" ]; then
-    echo "guest-display: '$app' has not consented to Apple Events, and there is \
-no QMP socket at $qmp_sock to answer the panel with" >&2
-    return 1
-  fi
-  echo "guest-display: answering the Apple Events consent panel for '$app' ..." >&2
-  QMP_SOCK="$qmp_sock" timeout 30 "$GUEST_DISPLAY_REPO_ROOT/scripts/qmp/qmp.py" \
-    key ret >/dev/null 2>&1 || true
-
-  GUEST_OSA_TIMEOUT="$secs" guest_osa "$guest" "$probe" >/dev/null 2>&1 && return 0
-  echo "guest-display: '$app' still will not answer — the panel may have been for \
-something else, or there is no session to raise one in" >&2
+  for ((i = 1; i <= attempts; i++)); do
+    if out=$(GUEST_OSA_TIMEOUT="$secs" guest_osa "$guest" "$script"); then
+      printf '%s\n' "$out"
+      return 0
+    fi
+    if [ ! -S "$qmp_sock" ]; then
+      echo "guest-display: '$what' did not answer and there is no QMP socket at \
+$qmp_sock to answer a consent panel with" >&2
+      return 1
+    fi
+    echo "guest-display: '$what' did not answer — pressing the default button of \
+whatever modal is up (try $i/$attempts) ..." >&2
+    QMP_SOCK="$qmp_sock" timeout 30 "$GUEST_DISPLAY_REPO_ROOT/scripts/qmp/qmp.py" \
+      key ret >/dev/null 2>&1 || true
+  done
+  echo "guest-display: '$what' still will not answer after $attempts tries — the \
+panel may have been for something else, or there is no session to raise one in" >&2
   return 1
+}
+
+# The smallest call that raises the panel: it names the app and asks it
+# something, which is the whole trigger. Its answer is discarded.
+guest_apple_events_consent() {
+  local guest="$1" app="$2"
+  guest_osa_consenting "$guest" "$app" "tell application \"$app\" to get name" >/dev/null
 }
 
 # Print "WIDTH HEIGHT" for $1's desktop, or return 1 having said why on stderr.

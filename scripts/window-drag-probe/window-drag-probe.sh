@@ -122,7 +122,12 @@ guest_apple_events_consent "$GUEST" "$APP" || {
 # The app's own Standard Suite, not System Events: `bounds of front window` needs
 # only the consent just obtained, while the System Events route needs assistive
 # access that five of six rails do not have. `bounds` is {l,t,r,b}.
-appwin() { osa "tell application \"$APP\" to $1"; }
+#
+# Consent-aware rather than a bare `osa`, because the panel does not always
+# arrive during the consent step above: a cold app can take longer to accept its
+# first event than that step waits, in which case the first call to raise the
+# panel is one of these. Every one of them is a short query, so a retry is cheap.
+appwin() { guest_osa_consenting "$GUEST" "$APP" "tell application \"$APP\" to $1"; }
 
 # Launching is not having a window. Give a cold app on a slow rail room to open
 # one before deciding it never did.
