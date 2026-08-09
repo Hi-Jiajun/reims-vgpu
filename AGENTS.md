@@ -50,9 +50,36 @@ measure them.
 - `crates/reims-vgpu-wire` - derived wire-format views, with their own `AGENTS.md`. Where that file
   is stricter than this one, it wins.
 - `vm/` - snapshot-revert boot scripts for arm64 and x86 guests.
+- `bugs/` - gitignored. One directory per defect that belongs to `metal2vulkan` rather than here.
 
 Start with the owning source modules and nearby tests when changing device, decode, present, or
 backend behavior. Keep durable design facts in code comments close to the behavior they explain.
+
+### A translator defect is packaged, not described
+
+Some of what looks like a device bug is a `metal2vulkan` bug, and the only useful handoff is one the
+translator's own agent can act on without this repository, without a VM, and without asking a
+question. So when a defect is upstream, write it into `bugs/<defect-name>/` before doing anything
+else with it:
+
+| File | Contents |
+|---|---|
+| `README.md` | What the guest loses, the defect, where it lives, what has been ruled out |
+| `input-*.air` | The AIR that reproduces, one file per distinct reproducing blob |
+| `failure.txt` | Verbatim validator output **and the per-tier retry trace** |
+| `repro.sh` | Runs every input and prints the verdict |
+
+Name the directory after the defect, not the symptom and not the shader. Two inputs failing the same
+way are one bug; two failing differently are two, however alike the device-level refusal looks.
+`bugs/README.md` carries the rest — how to recover AIR from a boot's scratch directory, and why the
+tier trace is the part worth capturing.
+
+`bugs/` is gitignored because every payload in it is Apple's AIR, and third-party bytes stay local
+under the rule at the top of `## Commit Guidelines`. Hand a directory over by copying it.
+
+**Check the pin before diagnosing.** `git ls-remote` on the dependency costs a second. Two sessions
+here diagnosed a translator defect down to a function and a line number without running it, and the
+arm that made the repair reachable was already sitting one commit ahead of what we pinned.
 
 ## Operating Principles
 
