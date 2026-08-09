@@ -3841,12 +3841,49 @@ pub(crate) fn publish_surface_store<M: HostMemory + HostOps>(
     );
 }
 
+/// Which of the three chain breaks sent a packet to the recovery rail.
+///
+/// `land_chain_before_abandon`'s doc has always named these three, and each one
+/// emits its own line where it is decided. That was not enough to read a boot:
+/// those lines dedupe per pipeline (`fail_once`) while the recovery does not, so
+/// a driven macOS 26 boot shows 32 recoveries against 10 candidate causes and no
+/// way to pair them. Carrying the cause into the recovery line makes the
+/// expensive event name its own origin, which is the only form of it that
+/// survives `first_sight`.
+///
+/// Ordinal-free on purpose: this is a label, never a wire value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainAbandonCause {
+    /// An intermediate record encoded `Ok` and returned no colour0, so every
+    /// later draw in the packet would composite against a missing seed.
+    NoColor0,
+    /// The `NoMetal` carrier — this build has no host encode path for the
+    /// record. On the Vulkan arm this is where `executeCommandsInBuffer:` and
+    /// the other Metal-only records land.
+    NoMetal,
+    /// A typed terminal refusal from encode, already named by
+    /// `note_draw_encode_fail`.
+    TerminalRefusal,
+}
+
+impl ChainAbandonCause {
+    /// The `cause=` token. Stable text: it is grepped out of boot logs.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::NoColor0 => "no_color0",
+            Self::NoMetal => "no_metal",
+            Self::TerminalRefusal => "terminal_refusal",
+        }
+    }
+}
+
 pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     color_slots: &[(u32, crate::runtime::decode::render::ColorAttachment)],
     rgba: &[u8],
+    cause: ChainAbandonCause,
 ) -> bool {
     // This whole function is the recovery rail for an abandoned chain, so a
     // refusal here is the last frame being lost outright. Every arm names
@@ -3858,8 +3895,9 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
     let lost = |why: &'static str| -> bool {
         crate::runtime::drain::note_store_route("chain_land_refused");
         crate::observe::fail(format!(
-            "writeback_chain_rgba fail reason={why} task={task_id} slots={} bytes={} \
+            "writeback_chain_rgba fail reason={why} cause={} task={task_id} slots={} bytes={} \
              (the abandoned chain's last frame is not landing; guest pages keep stale bytes)",
+            cause.tag(),
             color_slots.len(),
             rgba.len()
         ));
@@ -3919,7 +3957,8 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
     // Store, and keep the degradation fail-visible.
     crate::observe::fail(format!(
         "writeback_chain_rgba reason=resident_chain_abandoned_cpu_recovery \
-         mid={mapping_id} {w}x{h} fmt={fmt:#x}"
+         cause={} mid={mapping_id} {w}x{h} fmt={fmt:#x}",
+        cause.tag()
     ));
     let wrote = mapping_write::write_rgba8_image_changed(state, host, mapping_id, rgba, None, w, h);
     if wrote {
@@ -5226,7 +5265,8 @@ mod memo_scratch_tests {
             &mut host,
             1,
             &[],
-            &[1u8; 4]
+            &[1u8; 4],
+            super::ChainAbandonCause::NoMetal,
         ));
         assert_eq!(
             store_route_count("chain_land_refused"),
@@ -5245,8 +5285,67 @@ mod memo_scratch_tests {
             &mut host,
             1,
             &[(0, att)],
-            &[1u8; 4]
+            &[1u8; 4],
+            super::ChainAbandonCause::TerminalRefusal,
         ));
         assert_eq!(store_route_count("chain_land_refused"), n + 1);
+    }
+
+    /// The refusal carries which break abandoned the chain.
+    ///
+    /// Three call sites reach this rail and each already emits its own line
+    /// where it decides — but those dedupe per pipeline and this one does not,
+    /// so a boot with 32 recoveries and 10 candidate causes cannot pair them.
+    /// Reading the line back is the only way to assert the cause survives the
+    /// hop: the tag is formatted into text, and a caller that passed a constant
+    /// would still typecheck.
+    #[test]
+    fn the_chain_recovery_refusal_says_which_break_abandoned_it() {
+        let mut state =
+            crate::model::DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        let mut host = crate::runtime::host::FakeHost::new();
+
+        let before = std::fs::read_to_string(crate::observe::fail_log_path())
+            .unwrap_or_default()
+            .len();
+        for cause in [
+            super::ChainAbandonCause::NoColor0,
+            super::ChainAbandonCause::NoMetal,
+            super::ChainAbandonCause::TerminalRefusal,
+        ] {
+            assert!(!super::writeback_chain_rgba(
+                &mut state,
+                &mut host,
+                1,
+                &[],
+                &[1u8; 4],
+                cause,
+            ));
+        }
+        let log = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
+        let added = &log[before.min(log.len())..];
+        for cause in [
+            super::ChainAbandonCause::NoColor0,
+            super::ChainAbandonCause::NoMetal,
+            super::ChainAbandonCause::TerminalRefusal,
+        ] {
+            assert!(
+                added.contains(&format!("cause={}", cause.tag())),
+                "the {:?} refusal did not name its cause:\n{added}",
+                cause
+            );
+        }
+        // Three distinct tags, so a boot's recoveries can be banded by origin.
+        let mut tags: Vec<&str> = [
+            super::ChainAbandonCause::NoColor0,
+            super::ChainAbandonCause::NoMetal,
+            super::ChainAbandonCause::TerminalRefusal,
+        ]
+        .iter()
+        .map(|c| c.tag())
+        .collect();
+        tags.sort_unstable();
+        tags.dedup();
+        assert_eq!(tags.len(), 3, "two causes share a tag and cannot be told apart");
     }
 }

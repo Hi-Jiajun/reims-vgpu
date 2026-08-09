@@ -3366,7 +3366,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                                 acc,
                                 &req,
                                 &mut chain_rgba,
-                                resident_chain,
+                                ChainEnd {
+                                    cause: draw::ChainAbandonCause::NoColor0,
+                                    resident: resident_chain,
+                                },
                             );
                             break;
                         }
@@ -3382,7 +3385,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                             acc,
                             &req,
                             &mut chain_rgba,
-                            resident_chain,
+                            ChainEnd {
+                                cause: draw::ChainAbandonCause::NoMetal,
+                                resident: resident_chain,
+                            },
                         );
                         break;
                     }
@@ -3404,7 +3410,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                             acc,
                             &req,
                             &mut chain_rgba,
-                            resident_chain,
+                            ChainEnd {
+                                cause: draw::ChainAbandonCause::TerminalRefusal,
+                                resident: resident_chain,
+                            },
                         );
                         break;
                     }
@@ -3851,6 +3860,17 @@ fn dirty_color_targets<M: HostMemory + HostOps>(
     }
 }
 
+/// How a packet's chain ended: which break stopped it, and whether the last
+/// record left its pixels on the engine-resident target rather than in guest
+/// memory. Both are answers to "what state was the chain in when it broke", and
+/// the recovery rail needs each for a different reason — `resident` decides
+/// whether a readback is owed at all, `cause` is what the refusal reports.
+#[derive(Clone, Copy)]
+struct ChainEnd {
+    cause: draw::ChainAbandonCause,
+    resident: bool,
+}
+
 /// Land the chain image this packet has produced before abandoning it.
 ///
 /// Three records break a multi-draw chain: a typed terminal refusal, the
@@ -3870,16 +3890,17 @@ fn land_chain_before_abandon<M: HostMemory + HostOps>(
     acc: &StreamAccum,
     req: &draw::DrawEncodeRequest,
     chain_rgba: &mut Option<Vec<u8>>,
-    resident_chain: bool,
+    end: ChainEnd,
 ) {
     #[cfg(feature = "backend-vulkan")]
-    if resident_chain && chain_rgba.is_none() {
+    if end.resident && chain_rgba.is_none() {
         *chain_rgba = draw::read_resident_chain(state, req);
     }
     #[cfg(not(feature = "backend-vulkan"))]
-    let _ = (req, resident_chain);
+    let _ = (req, end.resident);
     if let Some(rgba) = chain_rgba.take() {
-        let _ = draw::writeback_chain_rgba(state, host, task_id, &acc.color_slots, &rgba);
+        let _ =
+            draw::writeback_chain_rgba(state, host, task_id, &acc.color_slots, &rgba, end.cause);
     }
     dirty_color_targets(state, host, task_id, &acc.color_targets);
 }
