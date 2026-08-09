@@ -253,6 +253,12 @@ pub fn imports() -> Vec<Arc<GuestRamImport>> {
 /// question belongs whatever else is slow; it is not kept as a fix for the
 /// stall, and it should not be cited as one.
 ///
+/// It does not cost the working rail: an undriven macos-13 x86/PCI boot after
+/// the move reaches its desktop in ~25 s with `guest_ram_span` emitted at the
+/// handshake (t=20596, the same millisecond as `protocol_version`) and
+/// `deferred_flush_lost`, `gw_audit_unsound`, `render_flush_over_guest_write`,
+/// `mapping_page_drift` and `present_action_starvation` all zero.
+///
 /// **It must never cache a negative.** [`resolve`] answers `NoBackendImport`
 /// when no backend has published a granularity yet, and that answer is latched
 /// in `MAP` for the rest of the boot — so warming before the backend is up
