@@ -2687,17 +2687,35 @@ impl ResourcePools {
         identity: crate::backend::vulkan::engine::SampledContentIdentity,
     ) {
         let mut bytes = self.sampled_cache_bytes;
+        // The two halves of a cache entry's name fail for different reasons, so
+        // the walk asks about them separately. A window whose content identity
+        // the ledger remembers under a *different* `SampledKey` did not lose a
+        // race with the cache — it changed geometry, format or swizzle between
+        // the gather that filled the image and the bind that wanted it back, and
+        // no cache keyed on the image can hold both. Folding that into
+        // `beyond_ledger` says "never cached", which is true of the pair and
+        // misleading about the window.
+        let mut identity_elsewhere = false;
         for (distance, victim) in self.sampled_victims.iter().enumerate() {
             bytes = bytes.saturating_add(victim.content_len);
-            if victim.key == key && victim.identity == identity {
-                let (count_route, byte_route) = sampled_reach_bands(distance, bytes);
-                crate::runtime::drain::note_store_route(count_route);
-                crate::runtime::drain::note_store_route(byte_route);
-                crate::runtime::drain::note_store_route(victim.route.route());
-                return;
+            if victim.identity != identity {
+                continue;
             }
+            if victim.key != key {
+                identity_elsewhere = true;
+                continue;
+            }
+            let (count_route, byte_route) = sampled_reach_bands(distance, bytes);
+            crate::runtime::drain::note_store_route(count_route);
+            crate::runtime::drain::note_store_route(byte_route);
+            crate::runtime::drain::note_store_route(victim.route.route());
+            return;
         }
-        crate::runtime::drain::note_store_route("sampled_reach_beyond_ledger");
+        crate::runtime::drain::note_store_route(if identity_elsewhere {
+            "sampled_reach_identity_other_key"
+        } else {
+            "sampled_reach_beyond_ledger"
+        });
     }
 
     pub(crate) fn find_cached_sampled(
@@ -2748,6 +2766,15 @@ impl ResourcePools {
     /// whose content duplicates an existing entry returns to the live list
     /// (recycled later); cap evictions go through dispose() so an image a
     /// concurrent in-flight CB samples is never destroyed under it.
+    ///
+    /// # Every exit is counted, because a cache that never fills looks the same
+    ///
+    /// `sampled_admit_kept`, `_duplicate`, `_no_identity` and `_oversize` sum to
+    /// every call, and their sum against `sampled_guest_imports` is the question
+    /// the reach ledger cannot answer on its own: a miss reported
+    /// `sampled_reach_beyond_ledger` is a window this cache never *evicted*, and
+    /// that has two causes — it was admitted and is still here under a different
+    /// name, or it was never admitted at all. Only these say which.
     unsafe fn admit_sampled_slot(
         &mut self,
         device: &ash::Device,
@@ -2769,6 +2796,7 @@ impl ResourcePools {
             // unreachable dead weight in a capped cache, so it is not admitted.
             SampledRetainContent::Gathered { len } => {
                 if identity.is_none() {
+                    crate::runtime::drain::note_store_route("sampled_admit_no_identity");
                     self.sampled_live.push(slot);
                     return;
                 }
@@ -2776,6 +2804,7 @@ impl ResourcePools {
             }
         };
         if content_len > SAMPLED_CACHE_BYTE_CAP {
+            crate::runtime::drain::note_store_route("sampled_admit_oversize");
             self.sampled_live.push(slot);
             return;
         }
@@ -2799,12 +2828,14 @@ impl ResourcePools {
                 }
         });
         if let Some(existing) = duplicate {
+            crate::runtime::drain::note_store_route("sampled_admit_duplicate");
             if identity.is_some() {
                 existing.identity = identity;
             }
             self.sampled_live.push(slot);
             return;
         }
+        crate::runtime::drain::note_store_route("sampled_admit_kept");
         self.sampled_cache_bytes = self.sampled_cache_bytes.saturating_add(content_len);
         let touch = self.idle_clock_ms;
         self.sampled_cache.push(ResidentSampledSlot {
@@ -2986,8 +3017,9 @@ fn sampled_evict_route(len: usize, bytes: usize) -> Option<&'static str> {
 /// - `bytes_1x + bytes_2x + bytes_4x + bytes_over_4x` equals
 ///   `count_2x + count_4x + count_8x`, because a miss found in the ledger emits
 ///   exactly one of each ladder.
-/// - Those plus `sampled_reach_beyond_ledger` are every gathered miss that
-///   carried an identity, so the total is bounded above by
+/// - Those plus `sampled_reach_identity_other_key` and
+///   `sampled_reach_beyond_ledger` are every gathered miss that carried an
+///   identity, so the total is bounded above by
 ///   `sampled_gather_unretained + sampled_gather_unvouched`.
 /// - `sampled_reach_lost_to_cap + sampled_reach_lost_to_age` equals the count
 ///   ladder's total, and it is the pair that says *which* fix. A miss lost to
