@@ -502,6 +502,23 @@ impl ObjectCaches {
             return Ok((key, m));
         }
         counters.shader_misses.fetch_add(1, Ordering::Relaxed);
+        // Last gate before the driver, and the only place every module from
+        // every path passes through exactly once. An invalid module is
+        // undefined behaviour inside a driver rather than an error it returns,
+        // and one has been observed ending the VM process — so it becomes a
+        // negative cache entry here and the guest's work is declined by name.
+        // See `crate::runtime::spirv_bind::validate`.
+        if let crate::runtime::spirv_bind::SpirvValidation::Rejected(why) =
+            crate::runtime::spirv_bind::validate(words)
+        {
+            let err = DrawError::Unsupported(super::reason::DrawReason::SpirvInvalid);
+            crate::observe::fail(format!(
+                "spirv_validate reason=module_rejected words={} detail={why}",
+                words.len()
+            ));
+            self.shaders.insert_negative(key, err.clone());
+            return Err(err);
+        }
         // The driver parses SPIR-V here, so this is one of the two calls that
         // can end the process on a module this device assembled. See
         // `driver_breadcrumb` for why the words go to disk across it.

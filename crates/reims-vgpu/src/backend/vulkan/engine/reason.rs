@@ -28,6 +28,15 @@ use crate::observe::Decline;
 /// A request the engine understood and declined.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DrawReason {
+    /// A validator rejected the SPIR-V module this device assembled, so it was
+    /// never handed to the driver.
+    ///
+    /// The validator's prose lives in the `spirv_validate` fail line rather
+    /// than in this variant, which is `Copy` and compared by value at every
+    /// cache. Unlike its neighbours this is not a capability refusal — it is
+    /// this device declining to risk the process on undefined behaviour inside
+    /// a driver, and it costs the guest the whole dispatch.
+    SpirvInvalid,
     /// A resident target bound as a sampled image must be a plain 2D image;
     /// arrayed and volume residents have no bind path.
     ResidentSampledNot2d { binding: u32 },
@@ -171,6 +180,7 @@ impl crate::observe::Decline for DrawReason {
     /// check, never shared.
     fn slug(&self) -> &'static str {
         match self {
+            Self::SpirvInvalid => "spirv_module_invalid",
             Self::ResidentSampledNot2d { .. } => "resident_sampled_not_2d",
             Self::GuestRunSampledNot2d { .. } => "guest_run_sampled_not_2d",
             Self::SecondaryAttachmentCap { .. } => "secondary_attachment_cap",

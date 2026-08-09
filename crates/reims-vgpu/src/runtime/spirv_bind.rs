@@ -760,6 +760,70 @@ pub fn storage_image_access(words: &[u32], wanted_binding: u32) -> Option<Storag
     })
 }
 
+/// What a validator said about a module this device was about to hand a driver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpirvValidation {
+    /// The module is valid as far as the validator can tell — including the
+    /// case where no validator is installed, which is not evidence of anything
+    /// and must not become a refusal.
+    Accepted,
+    /// The validator rejected it. Carries its first line, which names the
+    /// instruction.
+    Rejected(String),
+}
+
+/// Ask a validator whether `words` is a module a driver can be given.
+///
+/// # Why this is not the driver's job
+///
+/// It is, and that is the problem. A Vulkan driver is entitled to undefined
+/// behaviour on invalid SPIR-V, and NVIDIA's takes it: a module `metal2vulkan`
+/// produced for a macOS 14 guest's compositor kernel segmentation-faults inside
+/// its SPIR-V compiler and ends the QEMU process — the guest, the device and
+/// every other rail with it. A guest authors its own kernels, so "the module
+/// was invalid" has to be a declined dispatch and can never be a dead VM.
+///
+/// `metal2vulkan`'s library entry point says so itself: it returns assembled
+/// words and states that the caller validates. This device is that caller, and
+/// it validates *after* its own edits — the format specialization and the
+/// capability injection both rewrite the module after the translator has
+/// finished with it, so validating the translator's output would leave this
+/// device's own contribution unchecked.
+///
+/// # When there is no validator
+///
+/// The check is external (`spirv-val`, from SPIRV-Tools, which
+/// `vm/boot-x86.sh` already requires and which `metal2vulkan` spawns during
+/// translation). A host without it gets [`SpirvValidation::Accepted`] and one
+/// fail-log line: an absent instrument is not a verdict, and refusing every
+/// dispatch because a developer tool is missing would be the widening this
+/// device is not allowed to do in either direction.
+pub fn validate(words: &[u32]) -> SpirvValidation {
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for word in words {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    match metal2vulkan::tools::spirv_val_bytes(&bytes, &std::env::temp_dir()) {
+        Ok(()) => SpirvValidation::Accepted,
+        Err(why) => {
+            // A missing or unrunnable tool reads as an error from the same call
+            // as a rejected module, and the two must not be confused: one is a
+            // module that would take the process down, the other is a laptop
+            // without SPIRV-Tools installed.
+            if why.contains("No such file") || why.contains("spawn") || why.contains("not found") {
+                if crate::observe::first_sight("spirv_val_absent", 0) {
+                    crate::observe::fail(format!(
+                        "spirv_validate reason=validator_unavailable detail={}",
+                        why.lines().next().unwrap_or("")
+                    ));
+                }
+                return SpirvValidation::Accepted;
+            }
+            SpirvValidation::Rejected(why.lines().next().unwrap_or(&why).to_string())
+        }
+    }
+}
+
 /// Reflect the explicit texel format for one image descriptor binding.
 ///
 /// The SPIR-V image-format operand is structural shader ABI. It is independent
@@ -2655,6 +2719,63 @@ mod tests {
         assert_eq!(image_format(&words, 35), Some(ImageFormat::R32Float));
         if let Err(why) = loads_agree_with_their_pointees(&words) {
             panic!("specialization left the module invalid: {why}");
+        }
+    }
+
+    /// The smallest module a Vulkan validator accepts: an empty `GLCompute`
+    /// entry point with a declared local size.
+    fn minimal_compute_module() -> Vec<u32> {
+        const OP_CAPABILITY: u32 = 17;
+        const OP_MEMORY_MODEL: u32 = 14;
+        const OP_ENTRY_POINT: u32 = 15;
+        const OP_EXECUTION_MODE: u32 = 16;
+        const OP_TYPE_VOID: u32 = 19;
+        const OP_TYPE_FUNCTION: u32 = 33;
+        const OP_FUNCTION: u32 = 54;
+        const OP_FUNCTION_END: u32 = 56;
+        const OP_LABEL: u32 = 248;
+        const OP_RETURN: u32 = 253;
+        let mut w = vec![0x0723_0203, 0x0001_0000, 0, 5, 0];
+        w.extend([(2 << 16) | OP_CAPABILITY, 1]); // Shader
+        w.extend([(3 << 16) | OP_MEMORY_MODEL, 0, 1]); // Logical GLSL450
+        w.extend([(5 << 16) | OP_ENTRY_POINT, 5, 3, 0x6E69_616D, 0]); // GLCompute %3 "main"
+        w.extend([(6 << 16) | OP_EXECUTION_MODE, 3, 17, 1, 1, 1]); // LocalSize 1 1 1
+        w.extend([(2 << 16) | OP_TYPE_VOID, 1]);
+        w.extend([(3 << 16) | OP_TYPE_FUNCTION, 2, 1]);
+        w.extend([(5 << 16) | OP_FUNCTION, 1, 3, 0, 2]);
+        w.extend([(2 << 16) | OP_LABEL, 4]);
+        w.extend([1 << 16 | OP_RETURN]);
+        w.extend([1 << 16 | OP_FUNCTION_END]);
+        w
+    }
+
+    /// The gate that stands between a guest's shader and undefined behaviour
+    /// inside a driver.
+    ///
+    /// A valid module passes and an invalid one is named, which is the whole
+    /// contract — the device declines the dispatch rather than handing the
+    /// driver something it is entitled to crash on, and one driver does.
+    ///
+    /// Skips where SPIRV-Tools is not installed, because there the function is
+    /// specified to accept: an absent instrument is not a verdict.
+    #[test]
+    fn a_module_a_validator_rejects_never_reaches_a_driver() {
+        let good = minimal_compute_module();
+        if validate(&good) != SpirvValidation::Accepted {
+            eprintln!("skip: no usable spirv-val, or it rejects the minimal module");
+            return;
+        }
+        // Point the function's return type at the function id instead of at
+        // %void, which is a type error no driver has to survive.
+        let mut bad = good.clone();
+        let at = bad
+            .iter()
+            .position(|w| *w == (5 << 16) | 54)
+            .expect("OpFunction");
+        bad[at + 1] = 3;
+        match validate(&bad) {
+            SpirvValidation::Rejected(why) => assert!(!why.is_empty(), "the refusal must say why"),
+            SpirvValidation::Accepted => panic!("a type-broken module was accepted"),
         }
     }
 
