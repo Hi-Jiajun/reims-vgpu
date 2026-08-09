@@ -236,6 +236,17 @@ pub(crate) struct ComputePipelineKey {
     pub layout: LayoutKey,
 }
 
+/// A shader module and the words the driver compiles from it.
+///
+/// They travel together because a pipeline create needs the handle and the
+/// crash breadcrumb needs the source, and two parameters is how a caller ends
+/// up passing one shader's handle beside another's words.
+#[derive(Clone, Copy)]
+pub(crate) struct ShaderModuleSource<'a> {
+    pub module: vk::ShaderModule,
+    pub spirv: &'a [u32],
+}
+
 /// How many distinct never-creatable keys a cache remembers the refusal for.
 ///
 /// This bounds the **negative** map only, and it is the one bound in this file
@@ -491,9 +502,15 @@ impl ObjectCaches {
             return Ok((key, m));
         }
         counters.shader_misses.fetch_add(1, Ordering::Relaxed);
+        // The driver parses SPIR-V here, so this is one of the two calls that
+        // can end the process on a module this device assembled. See
+        // `driver_breadcrumb` for why the words go to disk across it.
+        let breadcrumb =
+            super::driver_breadcrumb::DriverBreadcrumb::arm("create_shader_module", words);
         let created = ctx
             .device
             .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None);
+        breadcrumb.disarm();
         let module = created.map_err(|e| {
             let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateShaderModule, e));
             self.shaders.insert_negative(key, err.clone());
@@ -1282,7 +1299,7 @@ impl ObjectCaches {
         &mut self,
         ctx: &DeviceContext,
         key: &ComputePipelineKey,
-        module: vk::ShaderModule,
+        shader: ShaderModuleSource<'_>,
         pipeline_layout: vk::PipelineLayout,
         counters: &EngineCounters,
         pools: &mut ResourcePools,
@@ -1309,20 +1326,27 @@ impl ObjectCaches {
         })?;
         let stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(module)
+            .module(shader.module)
             .name(&entry_c);
         let cpci = vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(pipeline_layout);
-        let pipe = ctx
+        // The other call that compiles the module, and the one an NVIDIA driver
+        // has been observed dying inside on a macos-14 guest's first dispatch.
+        let breadcrumb = super::driver_breadcrumb::DriverBreadcrumb::arm(
+            &format!("create_compute_pipelines entry={}", key.entry),
+            shader.spirv,
+        );
+        let created = ctx
             .device
-            .create_compute_pipelines(ctx.pipeline_cache, &[cpci], None)
-            .map_err(|(_, e)| {
-                let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateComputePipelines, e));
-                self.compute_pipelines
-                    .insert_negative(key.clone(), err.clone());
-                err
-            })?[0];
+            .create_compute_pipelines(ctx.pipeline_cache, &[cpci], None);
+        breadcrumb.disarm();
+        let pipe = created.map_err(|(_, e)| {
+            let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateComputePipelines, e));
+            self.compute_pipelines
+                .insert_negative(key.clone(), err.clone());
+            err
+        })?[0];
         counters.note_create();
         // Same warm-start persistence as the graphics path.
         ctx.persist_pipeline_cache();

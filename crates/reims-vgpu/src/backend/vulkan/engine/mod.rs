@@ -20,6 +20,7 @@ mod draw_execution;
 mod draw_phase;
 mod draw_preparation;
 pub(crate) mod draw_validation;
+mod driver_breadcrumb;
 mod exec;
 mod exec_compute;
 mod facade_decline;

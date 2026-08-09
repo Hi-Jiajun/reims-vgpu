@@ -279,7 +279,10 @@ pub(crate) unsafe fn execute_compute_inner(
     let pipeline = caches.get_or_create_compute_pipeline(
         ctx,
         &cpipe_key,
-        module,
+        super::caches::ShaderModuleSource {
+            module,
+            spirv: &req.spirv,
+        },
         pipeline_layout,
         counters,
         pools,
