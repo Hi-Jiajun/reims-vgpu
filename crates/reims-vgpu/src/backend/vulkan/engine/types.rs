@@ -1362,14 +1362,24 @@ pub enum TargetIdentity {
         width: u32,
         height: u32,
         generation: u64,
-        /// Channel order of this target's resident, from the pixel format the
-        /// guest declared for the attachment. See [`TargetIdentity::is_bgra`]
-        /// for why an order has to be part of the key rather than a per-draw
-        /// argument, and why this namespace is the one that carries it: a
-        /// surface is BGRA by its own contract and a pooled target has no
-        /// declaration to follow, but a GVA render target's declaration is the
-        /// whole answer.
-        bgra: bool,
+        /// This target's resident image format, from the pixel format the guest
+        /// declared for the attachment.
+        ///
+        /// See [`TargetIdentity::is_bgra`] for why it has to be part of the key
+        /// rather than a per-draw argument, and why this namespace is the one
+        /// that carries it: a surface is BGRA by its own contract and a pooled
+        /// target has no declaration to follow, but a GVA render target's
+        /// declaration is the whole answer.
+        ///
+        /// It is a format and not a `bgra: bool` because the guest declares
+        /// more than a channel order. A flag can only ever reconstruct
+        /// `B8G8R8A8_UNORM` or `R8G8B8A8_UNORM`, so every render target was
+        /// eight bits per channel whatever was asked for — the twin, on the
+        /// Store side, of the sampled-half-float bug. It also made this key
+        /// disagree with the image for a secondary MRT attachment, whose
+        /// resident is created from the guest's real format while its identity
+        /// claimed `bgra = false`.
+        format: vk::Format,
     },
     /// Anonymous / no protocol identity (oracle / one-shot draws).
     Anonymous { slot: u64 },
@@ -1470,8 +1480,8 @@ impl TargetIdentity {
     /// * `Surface` backs a type-11 guest IOSurface, whose pages are BGRA8 by
     ///   that resource's own contract. Always BGRA.
     /// * `Gva` is a render target the guest declared a pixel format for, and
-    ///   that declaration is the answer — carried in the key, from
-    ///   `pixel_format::store_texel_order`. Two allocations at one address
+    ///   that declaration is the answer — carried in the key as a whole
+    ///   [`vk::Format`], not just its order. Two allocations at one address
     ///   declaring different formats are two keys and therefore two slots,
     ///   which is what stops them recreating one image between them.
     /// * `Texture` and `Anonymous` have no destination to follow — nothing
@@ -1493,10 +1503,52 @@ impl TargetIdentity {
     /// disagree, and every readback reports the order it copied. The identity
     /// is the only place the answer was pinned to a namespace.
     pub fn is_bgra(&self) -> bool {
+        self.resident_format() == translate::pixel::SCANOUT_FORMAT
+    }
+
+    /// Whether these two identities name the same destination, whatever format
+    /// each declares for it.
+    ///
+    /// Not `==`. Equality is the *registry* question — do these share one image
+    /// — and the format belongs in it, because two formats at one address are
+    /// two images. This is the *conflict* question, asked of two attachments of
+    /// one render pass, and there the answer must ignore the format: a pass with
+    /// two colour attachments over one guest span writes that span twice, and
+    /// which of the two lands is whichever Store runs last.
+    ///
+    /// The distinction only appeared once the key could hold a format. While it
+    /// held a `bgra: bool`, `==` answered this by accident for every pair that
+    /// shared an order, and the two questions were indistinguishable.
+    pub fn aliases(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Surface { id: a, .. }, Self::Surface { id: b, .. }) => a == b,
+            (Self::Gva { gva: a, .. }, Self::Gva { gva: b, .. }) => a == b,
+            (Self::Texture { ref_: a, .. }, Self::Texture { ref_: b, .. }) => a == b,
+            (Self::Anonymous { slot: a }, Self::Anonymous { slot: b }) => a == b,
+            _ => false,
+        }
+    }
+
+    /// The format of the resident image behind this identity — the answer
+    /// `registry_ensure` creates the image with and the render pass is built
+    /// against.
+    ///
+    /// [`Self::is_bgra`] is now a question *about* this rather than the thing
+    /// the key stores, because a channel order cannot express how wide a
+    /// channel is. Only the `Gva` namespace varies: the other three have no
+    /// guest declaration to follow and answer with the same two constants they
+    /// always did.
+    ///
+    /// Whoever reads this to size a buffer must go through
+    /// [`translate::pixel::bytes_per_texel`] rather than assuming four. That
+    /// assumption is exactly what made a wider format unrepresentable.
+    pub fn resident_format(&self) -> vk::Format {
         match self {
-            Self::Surface { .. } => true,
-            Self::Gva { bgra, .. } => *bgra,
-            Self::Texture { .. } | Self::Anonymous { .. } => false,
+            Self::Surface { .. } => translate::pixel::SCANOUT_FORMAT,
+            Self::Gva { format, .. } => *format,
+            Self::Texture { .. } | Self::Anonymous { .. } => {
+                translate::pixel::RESIDENT_RGBA_FORMAT
+            }
         }
     }
 }
@@ -1758,14 +1810,18 @@ mod tests {
             generation: 0,
         }
         .is_bgra());
-        for bgra in [false, true] {
+        for (format, bgra) in [
+            (translate::pixel::RESIDENT_RGBA_FORMAT, false),
+            (translate::pixel::SCANOUT_FORMAT, true),
+        ] {
             let gva = TargetIdentity::Gva {
                 gva: 0x1000,
                 width: 8,
                 height: 8,
                 generation: 0,
-                bgra,
+                format,
             };
+            assert_eq!(gva.resident_format(), format, "{gva:?} must answer its key");
             assert_eq!(gva.is_bgra(), bgra, "{gva:?} must answer from its key");
         }
         for other in [
@@ -1784,26 +1840,88 @@ mod tests {
 
     /// Two allocations at one address declaring different formats are two keys.
     ///
-    /// The order has to be *in* the key, not beside it. If it were not, both
+    /// The format has to be *in* the key, not beside it. If it were not, both
     /// would hash to one registry slot whose image can only be built one way,
-    /// and `registry_ensure` answers a requested order that disagrees with the
+    /// and `registry_ensure` answers a requested format that disagrees with the
     /// slot's by destroying and recreating the image — every frame, for as long
     /// as both keep drawing.
+    ///
+    /// The third format here is the point. `R16G16B16A16_SFLOAT` and
+    /// `R8G8B8A8_UNORM` are the **same channel order** and different images, so
+    /// while this key held a `bgra: bool` they were one entry — and the wider
+    /// one could not be asked for at all, which is why nothing noticed. A key
+    /// that separates the two orders but not those two formats passes the first
+    /// assertion here and fails the second.
     #[test]
-    fn a_gva_targets_order_separates_it_from_the_same_address_in_the_other_order() {
-        let at = |bgra| TargetIdentity::Gva {
+    fn a_gva_targets_format_separates_it_from_the_same_address_in_another_format() {
+        let at = |format| TargetIdentity::Gva {
             gva: 0x4000,
             width: 64,
             height: 64,
             generation: 7,
-            bgra,
+            format,
         };
-        assert_ne!(at(true), at(false));
-        let mut seen = std::collections::HashSet::new();
-        assert!(seen.insert(at(true)));
-        assert!(
-            seen.insert(at(false)),
-            "the two orders must not collide in the registry's key space"
+        let rgba8 = at(translate::pixel::RESIDENT_RGBA_FORMAT);
+        let bgra8 = at(translate::pixel::SCANOUT_FORMAT);
+        let rgba16f = at(vk::Format::R16G16B16A16_SFLOAT);
+        assert_ne!(rgba8, bgra8);
+        assert_ne!(
+            rgba8, rgba16f,
+            "two widths of one channel order are two residents"
         );
+        let mut seen = std::collections::HashSet::new();
+        for (id, what) in [(bgra8, "bgra8"), (rgba8, "rgba8"), (rgba16f, "rgba16f")] {
+            assert!(
+                seen.insert(id),
+                "{what} must not collide in the registry's key space"
+            );
+        }
+    }
+
+    /// The registry question and the conflict question must answer differently,
+    /// and only one of them may look at the format.
+    ///
+    /// Two colour attachments of one pass over one guest span write that span
+    /// twice whatever format each declares, so the MRT alias check has to refuse
+    /// the pair — while the registry has to keep them apart, because they are
+    /// two images. `==` cannot serve both: it either has the format and misses
+    /// the conflict, or lacks it and merges two images into one slot.
+    ///
+    /// This is the pair the old `bgra: bool` key could not express. Both of
+    /// these are RGBA-ordered, so it answered `==` for them and the alias check
+    /// fired by accident.
+    #[test]
+    fn one_span_at_two_formats_is_two_registry_keys_and_still_one_conflict() {
+        let at = |format| TargetIdentity::Gva {
+            gva: 0x4000,
+            width: 64,
+            height: 64,
+            generation: 7,
+            format,
+        };
+        let rgba8 = at(translate::pixel::RESIDENT_RGBA_FORMAT);
+        let rgba16f = at(vk::Format::R16G16B16A16_SFLOAT);
+        assert_ne!(rgba8, rgba16f, "two images, so two registry slots");
+        assert!(
+            rgba8.aliases(&rgba16f),
+            "one guest span, so one destination and a refused pass"
+        );
+
+        // A different span is neither, and the two namespaces never alias each
+        // other however their numbers line up.
+        let elsewhere = TargetIdentity::Gva {
+            gva: 0x5000,
+            width: 64,
+            height: 64,
+            generation: 7,
+            format: translate::pixel::RESIDENT_RGBA_FORMAT,
+        };
+        assert!(!rgba8.aliases(&elsewhere));
+        assert!(!rgba8.aliases(&TargetIdentity::Surface {
+            id: 0x4000,
+            width: 64,
+            height: 64,
+            generation: 7,
+        }));
     }
 }

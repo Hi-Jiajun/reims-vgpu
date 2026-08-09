@@ -92,6 +92,16 @@ pub struct GvaTargetKey {
     pub generation: u64,
     pub width: u32,
     pub height: u32,
+    /// Channel order of the resident this key was taken from.
+    ///
+    /// It is an order and not the resident's whole format because this key
+    /// names a **guest span**, and every format the identity can hold today
+    /// maps onto one of the two orders one-for-one. That stops being true the
+    /// moment a render target may be wider than eight bits per channel: RGBA8
+    /// and half-float RGBA are one order and two residents, and they would
+    /// share a key here. Whoever widens
+    /// [`crate::backend::vulkan::engine::TargetIdentity::resident_format`]'s
+    /// range widens this with it.
     pub bgra: bool,
 }
 
@@ -111,13 +121,13 @@ impl GvaTargetKey {
                 width,
                 height,
                 generation,
-                bgra,
+                format,
             } if generation != 0 && gva != 0 => Some(Self {
                 gva,
                 generation,
                 width,
                 height,
-                bgra,
+                bgra: format == crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
             }),
             _ => None,
         }

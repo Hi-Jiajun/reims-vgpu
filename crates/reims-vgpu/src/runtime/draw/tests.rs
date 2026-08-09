@@ -965,7 +965,7 @@ fn gva_chain_identity_rules() {
             width: 16,
             height: 16,
             generation: 0,
-            bgra: false,
+            format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
         }),
         "color0 declares the extent"
     );
@@ -1022,7 +1022,7 @@ fn render_chain_identity_covers_type11_and_gva_targets() {
             width: 64,
             height: 32,
             generation: 0,
-            bgra: false,
+            format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
         })
     );
 }
@@ -4298,7 +4298,7 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
         width: 64,
         height: 64,
         generation: 0,
-        bgra: false,
+        format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
     };
 
     let mut host = crate::runtime::host::FakeHost::new();
@@ -4382,7 +4382,7 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
         width: 64,
         height: 64,
         generation: 0,
-        bgra: false,
+        format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
     };
     let slot0 = ColorRtRequest {
         slot: 0,

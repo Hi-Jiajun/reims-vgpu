@@ -278,7 +278,7 @@ pub(super) fn identity_fields(identity: &TargetIdentity) -> Vec<(&'static str, S
             width,
             height,
             generation,
-            bgra,
+            format,
         } => vec![
             ("identity_kind", "gva".into()),
             ("identity_gva", format!("{gva:#x}")),
@@ -286,8 +286,11 @@ pub(super) fn identity_fields(identity: &TargetIdentity) -> Vec<(&'static str, S
             ("identity_height", height.to_string()),
             ("identity_generation", generation.to_string()),
             // Part of the key, so two slots at one address differ by it and a
-            // decline naming only the address would not say which.
-            ("identity_order", if *bgra { "bgra" } else { "rgba" }.into()),
+            // decline naming only the address would not say which. Named as the
+            // format rather than as a channel order, because two formats
+            // sharing an order — eight-bit RGBA and half-float RGBA — are two
+            // slots an order alone would print identically.
+            ("identity_format", format!("{format:?}")),
         ],
         TargetIdentity::Anonymous { slot } => vec![
             ("identity_kind", "anonymous".into()),
@@ -437,7 +440,7 @@ mod tests {
                     width: 80,
                     height: 60,
                     generation: 11,
-                    bgra: false,
+                    format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
                 },
                 "gva",
                 ("identity_gva", "0x1234"),

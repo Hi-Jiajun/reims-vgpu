@@ -1637,15 +1637,20 @@ pub(crate) unsafe fn execute_draw_inner(
     // spelled as a feature. No runtime caller ever set it, and the six parity
     // tests that did were all already rendering into a `Surface` identity.
     let output_bgra = req.target_identity.as_ref().is_some_and(|id| id.is_bgra());
-    // Slot 0's attachment format, decided exactly once.
+    // Slot 0's attachment format, read from the identity that owns it.
     //
     // Two things have to agree about it — the render pass (and so the pipeline)
     // this draw is compiled against, and the resident image it renders into —
     // and they used to agree only because both called `resident_color` on the
-    // same flag. Deciding it here and handing the *format* to both means a
-    // future source for it (the guest's declared attachment format) changes one
-    // line rather than two that must be kept in step.
-    let color0_format = crate::backend::vulkan::translate::pixel::resident_color(output_bgra);
+    // same flag. Now the identity answers, once, and both take it from here.
+    //
+    // A draw with no target identity renders into a pooled target, which
+    // `acquire_target` creates at the engine's neutral resident colour format.
+    let color0_format = req
+        .target_identity
+        .as_ref()
+        .map(|id| id.resident_format())
+        .unwrap_or(crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT);
     // A guest-sourced sampled bind used to force the immediate-submit path.
     // Its read of guest RAM happens when the CB *executes*, and this device
     // acked the packet as soon as it was consumed, so deferred submit stretched

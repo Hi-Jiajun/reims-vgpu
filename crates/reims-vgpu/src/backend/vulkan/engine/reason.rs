@@ -305,6 +305,20 @@ pub enum TargetReadDecline {
     UnknownIdentity,
     /// The readback's resident has never had content written.
     NoReadyContent,
+    /// The readback's resident does not hold four-byte texels.
+    ///
+    /// Every consumer of a [`super::TargetReadback`] speaks RGBA8 —
+    /// `into_rgba8` exchanges channels in `chunks_exact_mut(4)`, and the CPU
+    /// Store rail converts from RGBA8 a row at a time — and the readback buffer
+    /// is sized `w * h * 4` for the same reason. A wider resident delivered
+    /// through here would be read as the wrong texel with nothing to say so.
+    ///
+    /// A refusal rather than a conversion, because these rails are the
+    /// *fallback* for a target whose frame the GPU could not write into guest
+    /// pages directly. A resident wide enough to trip this is one the direct
+    /// rail handles, so the honest answer is to name the gap rather than to
+    /// narrow the frame on the way through it.
+    TexelNotFourBytes { format: ash::vk::Format },
 }
 
 impl Decline for TargetReadDecline {
@@ -312,6 +326,14 @@ impl Decline for TargetReadDecline {
         match self {
             Self::UnknownIdentity => "read_target_unknown_identity",
             Self::NoReadyContent => "read_target_no_ready_content",
+            Self::TexelNotFourBytes { .. } => "read_target_texel_not_four_bytes",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::UnknownIdentity | Self::NoReadyContent => Vec::new(),
+            Self::TexelNotFourBytes { format } => vec![("format", format!("{format:?}"))],
         }
     }
 }

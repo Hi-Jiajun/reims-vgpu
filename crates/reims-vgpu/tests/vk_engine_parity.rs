@@ -2698,7 +2698,7 @@ fn gva_chain_resident_single_readback_matches_cpu_seed_chain() {
         width: 16,
         height: 16,
         generation: 0,
-        bgra: false,
+        format: reims_vgpu::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
     };
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
@@ -2760,7 +2760,7 @@ fn gva_deferred_store_flush_read_matches_sync_store() {
         width: 16,
         height: 16,
         generation: 0,
-        bgra: false,
+        format: reims_vgpu::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
     };
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
@@ -3128,7 +3128,7 @@ fn mrt_rg16float_secondary_builds_and_renders() {
         width: 32,
         height: 32,
         generation: 0,
-        bgra: false,
+        format: reims_vgpu::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
     };
     let mut mrt = engine_req(&v, &f, 32, 32);
     mrt.target_identity = Some(primary.clone());
@@ -3273,7 +3273,7 @@ fn single_rt_draw_unaffected_by_mrt_path() {
         width: 16,
         height: 16,
         generation: 0,
-        bgra: false,
+        format: reims_vgpu::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
     };
     assert!(!engine::resident_content_ready(&never));
 }

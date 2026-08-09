@@ -2827,7 +2827,7 @@ pub(super) struct GvaSpan {
     pub width: u32,
     pub height: u32,
     /// The guest's declared pixel format, not a host one:
-    /// [`gva_resident_bgra`] turns it into the `bgra` half of the key.
+    /// [`gva_resident_format`] turns it into the `format` half of the key.
     pub format: u16,
 }
 
@@ -2886,7 +2886,7 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
     if generation == 0 {
         return Err(GvaResidentRefusal::NoGeneration);
     }
-    let bgra = gva_resident_bgra(format);
+    let resident_format = gva_resident_format(format);
     let verdict = reach(
         state,
         host,
@@ -2895,7 +2895,7 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
             generation,
             width: w,
             height: h,
-            bgra,
+            bgra: resident_format == crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
         },
     );
     if !verdict.is_quiet() {
@@ -2906,7 +2906,7 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
         width: w,
         height: h,
         generation,
-        bgra,
+        format: resident_format,
     };
     if !crate::backend::vulkan::engine::resident_content_ready(&identity) {
         return Err(GvaResidentRefusal::NoResident);
@@ -4738,7 +4738,14 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
                     c.row_stride,
                     c.height,
                 ),
-                bgra: gva_resident_bgra(c.format),
+                // The format this attachment's image is actually created with,
+                // not a re-derivation of it. `registry_ensure_attachment` takes
+                // `format` — resolved just above by `color_attachment` — so
+                // answering the key from anything else lets the identity claim
+                // one format while the image holds another. It did: a
+                // `R16G16_SFLOAT` secondary is admitted by `color_attachment`
+                // and got an identity saying eight-bit RGBA.
+                format,
             }
         } else if c.mapping_id != 0 {
             crate::runtime::present_identity::surface_identity(
@@ -4762,7 +4769,11 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
         // the engine rejects, and a pass that reads and writes one image through
         // two attachments has no correct rendering — so the draw is refused
         // rather than run with the alias quietly removed.
-        if identity == *primary {
+        //
+        // `aliases` and not `==`: the destination is the conflict, not the
+        // registry slot. Two attachments over one guest span at two formats are
+        // two images, so `==` says no and the span is still written twice.
+        if identity.aliases(primary) {
             crate::runtime::census::present_proxy::note_secondary_mrt_drop(
                 crate::runtime::census::present_proxy::MrtDrop::AliasesPrimary,
                 c.width,
@@ -7480,31 +7491,34 @@ pub(crate) fn gva_chain_identity(
         width: w,
         height: h,
         generation: req.gva_alloc_gen,
-        bgra: gva_resident_bgra(c0.format),
+        format: gva_resident_format(c0.format),
     })
 }
 
-/// Channel order the resident behind a GVA render target must hold: the one the
+/// The format the resident behind a GVA render target must hold: the one the
 /// guest declared for that attachment.
 ///
-/// This is `is_bgra`'s rule, on
-/// [`crate::backend::vulkan::engine::TargetIdentity`], applied to the one
-/// namespace that
-/// has a declaration to follow, and it is a function rather than an expression
-/// at each producer because the two producers key *the same registry slot*. A
-/// primary and a secondary attachment that spelled it differently would render
-/// into one identity claiming two orders, which `registry_ensure` answers by
-/// recreating the image every frame.
+/// This is [`crate::backend::vulkan::engine::TargetIdentity::resident_format`]'s
+/// rule applied to the one namespace that has a declaration to follow, and it is
+/// a function rather than an expression at each producer because the producers
+/// key *the same registry slot*. A primary and a secondary attachment that
+/// spelled it differently would render into one identity claiming two formats,
+/// which `registry_ensure` answers by recreating the image every frame.
 ///
-/// A format with no four-byte channel order — an `RGBA16_FLOAT` render target
-/// is the one a desktop boot names — answers RGBA. Its resident cannot be the
-/// destination's bytes at any order, so the Store converts on the CPU and the
-/// order is simply the engine's neutral one.
-fn gva_resident_bgra(format: u16) -> bool {
-    matches!(
+/// Only the two eight-bit orders are produced here. A guest format that is
+/// neither — `RGBA16_FLOAT` is the one a desktop boot names — answers with the
+/// engine's neutral resident colour format, which is what every render target
+/// got when the key held a `bgra: bool` and could express nothing else. That is
+/// a fidelity loss and not a refusal: the draw still runs, and the Store still
+/// lands correctly-shaped bytes for the guest's declared texel, because the CPU
+/// conversion rail expands them from eight bits. Widening this set needs the
+/// host asked whether it can render to the wider format, and every rail that
+/// sizes a buffer from this resident taking its texel width from the format.
+fn gva_resident_format(format: u16) -> ash::vk::Format {
+    crate::backend::vulkan::translate::pixel::resident_color(matches!(
         pixel_format::store_texel_order(format),
         Some(pixel_format::TexelLayout::Bgra8)
-    )
+    ))
 }
 
 /// Read a resident render-pass chain back to host memory so the exec loop can
@@ -8140,7 +8154,7 @@ mod vulkan_split_tests {
             width: 64,
             height: 64,
             generation,
-            bgra: false,
+            format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
         };
 
         assert_eq!(
@@ -8869,7 +8883,7 @@ mod vulkan_split_tests {
             width: 8,
             height: 8,
             generation: 0,
-            bgra: false,
+            format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
         };
 
         let gen_of = |host: &mut FakeHost| {

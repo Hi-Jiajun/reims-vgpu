@@ -2176,7 +2176,7 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
     let ctx = owner.ensure(counters)?;
     unsafe { pools.ensure_init(ctx, counters)? };
     let snap = resident_read_snapshot(pools, identity)?;
-    let rb_size = (snap.width as u64) * (snap.height as u64) * 4;
+    let rb_size = (snap.width as u64) * (snap.height as u64) * u64::from(RESIDENT_READ_BYTES_PER_TEXEL);
     unsafe {
         let delivered = copy_image_level0_to_host_delivered(
             ctx,
@@ -2986,6 +2986,15 @@ pub fn guest_import_census() -> (u64, usize) {
     (bytes, count)
 }
 
+/// Bytes per texel a resident target readback delivers.
+///
+/// Not a property of the resident — of the *readback*. Its buffer is sized from
+/// this and every consumer of the bytes reads them as RGBA8, so it is the one
+/// number `resident_read_snapshot` admits a resident's format against. Naming
+/// it once is what keeps the check and the buffer size the same number, rather
+/// than two `4`s that a later widening could move apart.
+const RESIDENT_READ_BYTES_PER_TEXEL: u32 = 4;
+
 /// The `srcAccessMask` a resident color target's readback must drain.
 const RESIDENT_READ_SRC_ACCESS: ash::vk::AccessFlags = ash::vk::AccessFlags::from_raw(
     ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE.as_raw()
@@ -3034,6 +3043,19 @@ fn resident_read_snapshot(
             reason::TargetReadDecline::NoReadyContent,
         ));
     }
+    // Both readback rails size their buffer `w * h * RESIDENT_READ_BYTES_PER_TEXEL`
+    // and hand the bytes to consumers that only speak RGBA8. Asked here rather
+    // than at each of them because this function is what makes "is this target
+    // readable" one question answered in one vocabulary, and how wide its texel
+    // is belongs to that answer.
+    let format = slot.color_format;
+    if crate::backend::vulkan::translate::pixel::bytes_per_texel(format)
+        != Some(RESIDENT_READ_BYTES_PER_TEXEL)
+    {
+        return Err(DrawError::TargetRead(
+            reason::TargetReadDecline::TexelNotFourBytes { format },
+        ));
+    }
     Ok(ResidentReadSnapshot {
         image: slot.image,
         width: slot.width,
@@ -3054,7 +3076,7 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
     let ctx = owner.ensure(counters)?;
     unsafe { pools.ensure_init(ctx, counters)? };
     let snap = resident_read_snapshot(pools, identity)?;
-    let rb_size = (snap.width as u64) * (snap.height as u64) * 4;
+    let rb_size = (snap.width as u64) * (snap.height as u64) * u64::from(RESIDENT_READ_BYTES_PER_TEXEL);
     unsafe {
         let out = copy_image_level0_to_host(
             ctx,
