@@ -599,6 +599,16 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
     // particular `Err` as fatal would lose exactly the frames `read_target`
     // exists to quantize. Any future refusal of a rail that is an optimisation
     // has the same answer.
+    //
+    // Measured, and only reachable one way. On a host that can import guest RAM
+    // every Store lands GPU-direct and this whole tail runs zero times — six
+    // driven rails, `render_flush_copied` and `render_flush_leased` exactly zero
+    // on all of them. With `REIMS_VGPU_GUEST_IMPORT=off`, macos-26 produces
+    // **34 lease refusals and 34 copies, one to one, and zero
+    // `render_store_lost`**: every one a Surface resident too wide for the lease
+    // to lend. Reading the `Err` as fatal cost 34 frames a boot on exactly the
+    // host class that has no second rail, and no boot of a capable host could
+    // have shown it.
     let leased = match crate::backend::vulkan::engine::read_target_leased(identity) {
         Ok(leased) => leased,
         Err(decline) => {
