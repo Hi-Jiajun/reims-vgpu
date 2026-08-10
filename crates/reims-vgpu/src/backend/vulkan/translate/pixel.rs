@@ -130,6 +130,7 @@ pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {
         p::MTL_FORMAT_R16_UNORM => linear(vk::Format::R16_UNORM, 2),
         p::MTL_FORMAT_R16_FLOAT => linear(vk::Format::R16_SFLOAT, 2),
         p::MTL_FORMAT_RG8_UNORM => linear(vk::Format::R8G8_UNORM, 2),
+        p::MTL_FORMAT_RG8_UINT => linear(vk::Format::R8G8_UINT, 2),
         p::MTL_FORMAT_RG16_UNORM => linear(vk::Format::R16G16_UNORM, 4),
         p::MTL_FORMAT_R32_UINT => linear(vk::Format::R32_UINT, 4),
         p::MTL_FORMAT_R32_SINT => linear(vk::Format::R32_SINT, 4),
@@ -780,6 +781,12 @@ mod tests {
             TransferFunction::Linear,
         ),
         (
+            p::MTL_FORMAT_RG8_UINT,
+            vk::Format::R8G8_UINT,
+            2,
+            TransferFunction::Linear,
+        ),
+        (
             p::MTL_FORMAT_R32_UINT,
             vk::Format::R32_UINT,
             4,
@@ -1376,29 +1383,35 @@ mod tests {
     /// error. Now each rail that cannot take it says so about itself.
     #[test]
     fn an_integer_texel_is_declared_but_has_no_sampled_rail() {
-        // Declared: it has a width and a Vulkan spelling.
-        assert_eq!(
-            p::bytes_per_pixel(p::MTL_FORMAT_R8_UINT),
-            Some(p::R8_BPP),
-            "R8Uint is one byte wide"
-        );
-        assert_eq!(
-            translate(p::MTL_FORMAT_R8_UINT).unwrap().vk,
-            vk::Format::R8_UINT
-        );
+        // Both members macOS 26 stages, and the second was found only by
+        // admitting the first: one dispatch binds both, so the refusal moved
+        // from `0x0d` to `0x21` at an unchanged count.
+        let integers: &[(u16, vk::Format, u32)] = &[
+            (p::MTL_FORMAT_R8_UINT, vk::Format::R8_UINT, p::R8_BPP),
+            (p::MTL_FORMAT_RG8_UINT, vk::Format::R8G8_UINT, p::RG8_BPP),
+        ];
+        for &(mtl, vk_format, bpp) in integers {
+            // Declared: it has a width and a Vulkan spelling.
+            assert_eq!(p::bytes_per_pixel(mtl), Some(bpp), "{mtl:#x} texel width");
+            assert_eq!(translate(mtl).unwrap().vk, vk_format);
 
-        // Refused, and each by its own name rather than by a shared slug.
-        assert!(matches!(
-            sampled_pixels(p::MTL_FORMAT_R8_UINT),
-            Err(TranslateReason::NoSampledLayout(p::MTL_FORMAT_R8_UINT))
-        ));
-        assert!(color_attachment(p::MTL_FORMAT_R8_UINT).is_err());
-        assert_eq!(p::render_target_bpp(p::MTL_FORMAT_R8_UINT), None);
-        assert_eq!(p::storage_selector(p::MTL_FORMAT_R8_UINT), None);
+            // Refused, and each by its own name rather than by a shared slug.
+            assert!(
+                matches!(sampled_pixels(mtl), Err(TranslateReason::NoSampledLayout(f)) if f == mtl),
+                "{mtl:#x} must decline the sampled rail by name"
+            );
+            assert!(color_attachment(mtl).is_err());
+            assert_eq!(p::render_target_bpp(mtl), None);
+            assert_eq!(p::storage_selector(mtl), None);
 
-        // And it never reaches a unorm converter: no texel layout means no
-        // conversion arm can silently claim it.
-        assert_eq!(texel_layout_of(vk::Format::R8_UINT), None);
+            // And it never reaches a unorm converter: no texel layout means no
+            // conversion arm can silently claim it.
+            assert_eq!(
+                texel_layout_of(vk_format),
+                None,
+                "{mtl:#x} must have no guest texel layout"
+            );
+        }
     }
 
     /// The two arms that answer "may a colour attachment be this format" are one

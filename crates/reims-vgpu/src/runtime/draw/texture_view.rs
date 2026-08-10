@@ -400,18 +400,79 @@ pub(super) fn resolve_texture_view<M: HostMemory + HostOps>(
     resolve_texture_view_reasoned(state, host, task_id, texture_ref).ok()
 }
 
+/// Which term of [`effective_view_sample_format`] refused.
+///
+/// Three different bugs, and only one of them is this crate's:
+///
+/// * `BaseUndeclared` — a format the guest's own texture is in that
+///   `contract::pixel_format` has no row for. **Ours.** Nothing about the bind
+///   is wrong; this table is short.
+/// * `ViewUndeclared` — the guest named an override this table has no row for.
+///   Also ours, one argument over.
+/// * `WidthMismatch` — the guest asked to view N bytes of storage as M, which
+///   Metal itself forbids. **The guest's**, and the only one of the three the
+///   old single slug actually described.
+///
+/// They were one `None`, printed as `format_incompatible` — a name that asserts
+/// the third. Two readings of a macos-26 log spent their time in the guest's
+/// descriptor over `MTLPixelFormatR8Uint`, which was the first case: a row this
+/// table was simply missing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewSampleRefusal {
+    BaseUndeclared { base: u16 },
+    ViewUndeclared { view: u16 },
+    WidthMismatch { base_bpp: u32, view_bpp: u32 },
+}
+
+impl std::fmt::Display for ViewSampleRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BaseUndeclared { base } => {
+                write!(f, "base_undeclared_here base={base:#x}")
+            }
+            Self::ViewUndeclared { view } => {
+                write!(f, "view_undeclared_here view={view:#x}")
+            }
+            Self::WidthMismatch { base_bpp, view_bpp } => {
+                write!(
+                    f,
+                    "view_width_mismatch base_bpp={base_bpp} view_bpp={view_bpp}"
+                )
+            }
+        }
+    }
+}
+
 /// Pick the sample format for a type-8 view over base storage.
 ///
 /// Metal texture views require the view format to be bpp-compatible with the base.
 /// Unknown formats (no `bytes_per_pixel`) fail visibly. `None` override inherits base.
+///
+/// Almost every caller only needs "may I", which is what this answers. A caller
+/// that has to *print* a refusal wants [`effective_view_sample_format_reasoned`]
+/// instead — same rule, one implementation, following the
+/// [`resolve_texture_view`] / [`resolve_texture_view_reasoned`] pair above.
 pub(crate) fn effective_view_sample_format(base_fmt: u16, view_fmt: Option<u16>) -> Option<u16> {
+    effective_view_sample_format_reasoned(base_fmt, view_fmt).ok()
+}
+
+/// [`effective_view_sample_format`], naming the term that refused.
+pub(crate) fn effective_view_sample_format_reasoned(
+    base_fmt: u16,
+    view_fmt: Option<u16>,
+) -> Result<u16, ViewSampleRefusal> {
     let sample = view_fmt.unwrap_or(base_fmt);
-    let base_bpp = pixel_format::bytes_per_pixel(base_fmt)?;
-    let sample_bpp = pixel_format::bytes_per_pixel(sample)?;
+    let base_bpp = pixel_format::bytes_per_pixel(base_fmt)
+        .ok_or(ViewSampleRefusal::BaseUndeclared { base: base_fmt })?;
+    let sample_bpp = pixel_format::bytes_per_pixel(sample)
+        .ok_or(ViewSampleRefusal::ViewUndeclared { view: sample })?;
     if base_bpp != sample_bpp {
-        return None;
+        return Err(ViewSampleRefusal::WidthMismatch {
+            base_bpp,
+            view_bpp: sample_bpp,
+        });
     }
-    Some(sample)
+    Ok(sample)
 }
 
 /// Apply a type-8 view swizzle by rewriting tight RGBA8 texels. Identity plans
@@ -901,6 +962,76 @@ mod texture_view_split_tests {
         assert!(
             effective_view_sample_format(MTL_FORMAT_R8_UINT, Some(MTL_FORMAT_RGBA8_UNORM))
                 .is_none()
+        );
+    }
+
+    /// The three ways this gate can refuse are three different bugs, and only
+    /// the third is the guest's. They shared one slug, and that slug asserted
+    /// the third.
+    ///
+    /// The `is_none()`/`is_err()` agreement is what keeps this from becoming a
+    /// second implementation of the rule: the plain gate is written in terms of
+    /// the reasoned one, and this walks a table across all three outcomes plus
+    /// the success case to say so.
+    #[test]
+    fn the_view_gate_names_which_of_its_three_terms_refused() {
+        use crate::contract::pixel_format::{
+            MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RGBA8_UNORM,
+        };
+        // A value Metal does not define and this table therefore has no row for.
+        const UNDECLARED: u16 = 0xfff0;
+
+        let cases: &[(u16, Option<u16>, Result<u16, ViewSampleRefusal>)] = &[
+            (
+                MTL_FORMAT_BGRA8_UNORM,
+                Some(MTL_FORMAT_RGBA8_UNORM),
+                Ok(MTL_FORMAT_RGBA8_UNORM),
+            ),
+            (
+                UNDECLARED,
+                None,
+                Err(ViewSampleRefusal::BaseUndeclared { base: UNDECLARED }),
+            ),
+            (
+                MTL_FORMAT_BGRA8_UNORM,
+                Some(UNDECLARED),
+                Err(ViewSampleRefusal::ViewUndeclared { view: UNDECLARED }),
+            ),
+            (
+                MTL_FORMAT_BGRA8_UNORM,
+                Some(MTL_FORMAT_R8_UNORM),
+                Err(ViewSampleRefusal::WidthMismatch {
+                    base_bpp: 4,
+                    view_bpp: 1,
+                }),
+            ),
+        ];
+
+        for &(base, view, ref want) in cases {
+            let got = effective_view_sample_format_reasoned(base, view);
+            assert_eq!(&got, want, "base={base:#x} view={view:?}");
+            // The `Option` gate is this one with the reason dropped, and every
+            // caller that only asks "may I" must keep agreeing with it.
+            assert_eq!(
+                effective_view_sample_format(base, view),
+                got.ok(),
+                "base={base:#x} view={view:?}: the two gates disagree"
+            );
+        }
+
+        // Each refusal prints its own text, so the fail log can be ranked on it.
+        let printed: Vec<String> = cases
+            .iter()
+            .filter_map(|(b, v, _)| effective_view_sample_format_reasoned(*b, *v).err())
+            .map(|r| r.to_string())
+            .collect();
+        assert_eq!(printed.len(), 3);
+        let distinct: std::collections::HashSet<&str> =
+            printed.iter().map(String::as_str).collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "two refusals share a spelling: {printed:?}"
         );
     }
 

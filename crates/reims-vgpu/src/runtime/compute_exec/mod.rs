@@ -1973,13 +1973,28 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             return Err(ComputeStatus::MissingTexture("compute_stage_tex_zero_geom"));
         }
         // sRGB color-renderable surfaces stage as unorm storage (same bpp).
-        let Some(view_format) =
-            crate::runtime::draw::effective_view_sample_format(format, view_pixel_format)
-        else {
-            crate::observe::fail(format!(
-                "compute_stage_tex view_fail reason=format_incompatible ref={texture_ref} base={stage_ref} base_fmt={format:#x} view_fmt={view_pixel_format:?} mapping={mapping_id}"
-            ));
-            return Err(ComputeStatus::Unsupported("compute_view_format"));
+        let view_format = match crate::runtime::draw::effective_view_sample_format_reasoned(
+            format,
+            view_pixel_format,
+        ) {
+            Ok(view_format) => view_format,
+            Err(refusal) => {
+                // `term=` is what says whether this is a gap in this crate's
+                // format table or the guest asking for something Metal forbids,
+                // and `role=` says which rail would have had to take it — the
+                // two questions the next reader has, and the two the old
+                // `format_incompatible` could not answer. The bind dies here,
+                // before the storage check, so without `role=` the log cannot
+                // say whether the missing rail is a sampled layout or a storage
+                // selector.
+                crate::observe::fail(format!(
+                    "compute_stage_tex view_fail reason=format_incompatible term={refusal} \
+                     role={} ref={texture_ref} base={stage_ref} base_fmt={format:#x} \
+                     view_fmt={view_pixel_format:?} {width}x{height} mapping={mapping_id}",
+                    if is_storage { "storage" } else { "sampled" }
+                ));
+                return Err(ComputeStatus::Unsupported("compute_view_format"));
+            }
         };
         let stage_fmt = match view_format {
             pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB => pixel_format::MTL_FORMAT_BGRA8_UNORM,

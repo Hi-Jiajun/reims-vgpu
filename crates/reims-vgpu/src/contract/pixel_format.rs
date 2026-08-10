@@ -51,6 +51,23 @@ pub const MTL_FORMAT_R8_UINT: u16 = 0x0d;
 pub const MTL_FORMAT_R16_UNORM: u16 = 0x14;
 pub const MTL_FORMAT_R16_FLOAT: u16 = 0x19;
 pub const MTL_FORMAT_RG8_UNORM: u16 = 0x1e;
+/// `MTLPixelFormatRG8Uint`. The RG8 family runs from `RG8Unorm` at 30 the same
+/// way the R8 family runs from `R8Unorm` at 10, so the unsigned-integer member
+/// is 33.
+///
+/// Declared for the reason [`MTL_FORMAT_R8_UINT`] was, and *found* by declaring
+/// it: with `R8Uint` admitted to the width gate, the same macOS 26 compute
+/// dispatches came back refusing `0x21` instead, at an identical count. One
+/// dispatch binds both, so neither alone recovers it — which is why the count
+/// did not move and reading it as "the fix did nothing" would have been wrong.
+///
+/// Whether that pairing is the integer twin of the [`MTL_FORMAT_R8_UNORM`] /
+/// [`MTL_FORMAT_RG8_UNORM`] biplanar shape this table already carries is a
+/// guess, and is deliberately not written into the code.
+///
+/// Integer texels, so the same restriction as [`MTL_FORMAT_R8_UINT`]: declared,
+/// and refused by name by every rail that would have to give them a meaning.
+pub const MTL_FORMAT_RG8_UINT: u16 = 0x21;
 /// `MTLPixelFormatRG16Unorm`. The chroma half of [`MTL_FORMAT_R16_UNORM`],
 /// as [`MTL_FORMAT_RG8_UNORM`] is of [`MTL_FORMAT_R8_UNORM`].
 pub const MTL_FORMAT_RG16_UNORM: u16 = 0x3c;
@@ -447,7 +464,10 @@ pub fn bytes_per_pixel(format: u16) -> Option<u32> {
         MTL_FORMAT_A8_UNORM | MTL_FORMAT_R8_UNORM | MTL_FORMAT_R8_UINT | MTL_FORMAT_STENCIL8 => {
             R8_BPP
         }
-        MTL_FORMAT_R16_FLOAT | MTL_FORMAT_RG8_UNORM | MTL_FORMAT_DEPTH16_UNORM => RG8_BPP,
+        MTL_FORMAT_R16_FLOAT
+        | MTL_FORMAT_RG8_UNORM
+        | MTL_FORMAT_RG8_UINT
+        | MTL_FORMAT_DEPTH16_UNORM => RG8_BPP,
         MTL_FORMAT_R16_UNORM => R16_BPP,
         MTL_FORMAT_RG16_UNORM => RG16_BPP,
         MTL_FORMAT_RG16_FLOAT => RG16F_BPP,
@@ -1799,6 +1819,7 @@ mod tests {
             (MTL_FORMAT_A8_UNORM, 1),
             (MTL_FORMAT_R8_UNORM, 1),
             (MTL_FORMAT_R8_UINT, 1),
+            (MTL_FORMAT_RG8_UINT, 2),
             (MTL_FORMAT_R16_FLOAT, 2),
             (MTL_FORMAT_RG8_UNORM, 2),
             (MTL_FORMAT_R32_UINT, 4),
