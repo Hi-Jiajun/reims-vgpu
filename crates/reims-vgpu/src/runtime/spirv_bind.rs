@@ -2037,6 +2037,39 @@ fn is_texture_kind(kind: ResourceKind) -> bool {
     )
 }
 
+/// Whether [`crate::env::BUFFER_EXTENT`] is switched off, read once per process.
+///
+/// Latched because this sits on the per-bind path and `std::env::var_os` is a
+/// lock and an allocation; the variable is read at the first bind of the boot
+/// and cannot change under a running device. The refusal is named once, on the
+/// off channel, so a boot whose gather volume is being compared says in its own
+/// log which arm it ran rather than relying on the operator's shell history.
+fn buffer_extent_disabled() -> bool {
+    use std::sync::OnceLock;
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| {
+        let (state, value) = crate::env::read(crate::env::BUFFER_EXTENT);
+        match state {
+            crate::env::Switch::Off => {
+                crate::observe::off("buffer_extent reason=buffer_extent_disabled_by_env");
+                true
+            }
+            // An unrecognized spelling is named rather than silently read as the
+            // default, which is the one way an operator concludes a switch does
+            // not work. It still takes the default arm: this switch may only
+            // turn a rail off, and a value nobody can parse is not that.
+            crate::env::Switch::Unrecognized => {
+                crate::observe::fail(format!(
+                    "buffer_extent reason=buffer_extent_env_unrecognized value={}",
+                    value.unwrap_or_default()
+                ));
+                false
+            }
+            crate::env::Switch::On | crate::env::Switch::Unset => false,
+        }
+    })
+}
+
 /// The byte extent reflection proves a `[[buffer(n)]]` bind cannot be read past,
 /// or `None` when the bind must keep the whole window the guest declared.
 ///
@@ -2063,6 +2096,9 @@ fn is_texture_kind(kind: ResourceKind) -> bool {
 /// report `metal_index` 2 — and because a threadgroup `[[buffer(n)]]` consumes no
 /// descriptor and binds no guest memory to narrow.
 pub fn reflected_buffer_extent(reflection: &ShaderReflection, metal_index: u32) -> Option<u64> {
+    if buffer_extent_disabled() {
+        return None;
+    }
     let extent = reflection.bindings.iter().find_map(|b| {
         (b.kind == ResourceKind::Buffer && b.metal_index == metal_index)
             .then_some(b.extent)

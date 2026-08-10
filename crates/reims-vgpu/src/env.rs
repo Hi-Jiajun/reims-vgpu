@@ -103,6 +103,24 @@ pub const PAGE_GUARDS: &str = "REIMS_VGPU_PAGE_GUARDS";
 /// the probe is trying to measure.
 pub const RANGE_COVERAGE: &str = "REIMS_VGPU_RANGE_COVERAGE";
 
+/// `off` stops narrowing a guest buffer bind to the extent the shader's
+/// reflection proved it can read, so the bind walks the rest of the allocation
+/// exactly as it did before that rail existed.
+///
+/// This is the A/B instrument for the rail, and it is why the rail can be
+/// measured at all: the two arms differ by one branch in one process, so a
+/// driven boot of each on one build and one rail attributes a change in gathered
+/// bytes to the narrowing rather than to a rebuild. Without it the comparison is
+/// a boot of `HEAD` against a boot of `HEAD~1`, which also moves every other
+/// difference between the two binaries into the result.
+///
+/// It only ever *widens the window this device reads*, never what the guest may
+/// see, so it obeys the rule the module doc states: it turns a rail off, and
+/// there is no spelling of it that turns one on. `on` and unset are the same
+/// arm — the default — because a capability that is not measured is not a
+/// capability this switch may grant.
+pub const BUFFER_EXTENT: &str = "REIMS_VGPU_BUFFER_EXTENT";
+
 /// What one variable says, including the two ways it says nothing usable.
 ///
 /// Four states rather than a `bool` because "unset", "explicitly on" and
@@ -176,12 +194,13 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 5] = [
+pub const ALL: [&str; 6] = [
     GUEST_IMPORT,
     DRAW_LOG,
     GPU_STAMP,
     PAGE_GUARDS,
     RANGE_COVERAGE,
+    BUFFER_EXTENT,
 ];
 
 /// The state of every variable in [`ALL`], for the one-shot boot line.
