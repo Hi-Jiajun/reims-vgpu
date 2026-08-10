@@ -405,6 +405,26 @@ const F32_INF_BITS: u32 = 0x7f80_0000;
 const F16_F32_MANT_SHIFT: u32 = 13;
 const F32_TO_F16_ROUND_BIT: u32 = 0x1000;
 
+/// Bytes one texel of `format` occupies in guest linear storage, or `None` for
+/// a format this contract does not define.
+///
+/// # The `X*_Stencil8` arms are the parent cell, deliberately
+///
+/// `X32_Stencil8` and `X24_Stencil8` are **stencil-aspect views of a combined
+/// depth-stencil texture**, not formats with storage of their own. This answers
+/// the size of the cell they view — 8 and 4 — because that is what every caller
+/// of this function needs: [`crate::backend::vulkan::translate::pixel`] binds
+/// them to `D32_SFLOAT_S8_UINT` and `D24_UNORM_S8_UINT`, whose texels are
+/// exactly those widths, and a resource sized at anything else is a short
+/// allocation.
+///
+/// An external per-format table will say **1** for both, and it is not wrong —
+/// it is describing the stencil plane alone, which is a different question. This
+/// crate answers that one too, as [`depth_stencil_packing`]'s
+/// `stencil_plane_bpp`, and it is 1 there. **Do not reconcile the two.** They are
+/// two numbers for two purposes and we hold both on purpose; moving this arm to
+/// 1 to agree with a vendor table would under-allocate every stencil-aspect
+/// parent.
 pub fn bytes_per_pixel(format: u16) -> Option<u32> {
     Some(match format {
         MTL_FORMAT_A8_UNORM | MTL_FORMAT_R8_UNORM | MTL_FORMAT_STENCIL8 => R8_BPP,
@@ -1788,6 +1808,44 @@ mod tests {
             assert_eq!(bytes_per_pixel(fmt), Some(bpp));
         }
         assert_eq!(bytes_per_pixel(0xffff), None);
+    }
+
+    /// A packed depth-stencil format's texel width is one number, held by two
+    /// tables, so they are required to agree.
+    ///
+    /// [`depth_stencil_packing`] declares `full_bpp` for the cell it describes
+    /// the interior of, and [`bytes_per_pixel`] declares the same width for the
+    /// same format; a copy sized by one and laid out by the other is a short
+    /// read the moment they differ. Swept over every `u16` rather than listed,
+    /// so a format added to either table is covered without anyone adding a line.
+    ///
+    /// This is also what pins the `X*_Stencil8` arms against being "corrected"
+    /// to the stencil plane's own width — that number is `stencil_plane_bpp`,
+    /// which this checks is a *field within* the cell rather than the cell.
+    #[test]
+    fn the_two_tables_agree_on_a_packed_depth_stencil_texel() {
+        let mut seen = 0;
+        for fmt in 0..=u16::MAX {
+            let Some(packing) = depth_stencil_packing(fmt) else {
+                continue;
+            };
+            seen += 1;
+            assert_eq!(
+                bytes_per_pixel(fmt),
+                Some(packing.full_bpp),
+                "{fmt:#x}: the pixel table and the packing disagree on the texel width"
+            );
+            // Every plane named must fit inside the cell it is a plane of.
+            assert!(
+                packing.stencil_offset + packing.stencil_plane_bpp <= packing.full_bpp,
+                "{fmt:#x}: the stencil field runs past the texel"
+            );
+            assert!(
+                packing.depth_offset + packing.depth_plane_bpp <= packing.full_bpp,
+                "{fmt:#x}: the depth field runs past the texel"
+            );
+        }
+        assert_eq!(seen, 4, "the packed depth-stencil family is four formats");
     }
 
     #[test]
