@@ -2657,17 +2657,12 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
         None => span,
     };
     if span < ZERO_COPY_BUFFER_MIN_BYTES {
-        // A narrowed bind lands here by design: most declared objects are a few
-        // hundred bytes and the floor is what says the GPU gather is not worth
-        // arranging for them. The caller's CPU read takes the same cap, so this
-        // is a route change and not a loss — which is exactly what it was not
-        // before that read was capped, when it turned a whole-window gather into
-        // a whole-window CPU read.
-        crate::runtime::drain::note_store_route(if span < full {
-            "zc_buffer_below_floor_narrowed"
-        } else {
-            "zc_buffer_below_floor"
-        });
+        // Narrowing cannot be what put a bind here: the caller only hands this
+        // function a cap that already clears the floor, so a sub-floor span means
+        // the allocation itself is sub-floor and the cap never bound anything.
+        // That is why this stayed one route — a `_narrowed` sibling would have
+        // been a counter that cannot count.
+        crate::runtime::drain::note_store_route("zc_buffer_below_floor");
         return None;
     }
     // Counted only once the rail has actually taken the bind. Counting at the
@@ -2766,6 +2761,31 @@ fn bound_buffer_content(
 /// keeps the whole-allocation window this function has always bound. It is part
 /// of the registry key rather than of the resolution, because it describes the
 /// shader and not the bind — see [`crate::runtime::bound_buffers`].
+///
+/// # The cap reaches the two rails differently, and it is measured why
+///
+/// The gather rail takes it **only when the capped span still clears
+/// [`ZERO_COPY_BUFFER_MIN_BYTES`]**; the CPU read takes it always.
+///
+/// The asymmetry is not tidiness. A bind whose cap drops it under the floor
+/// leaves the gather rail, and leaving the gather rail means leaving the
+/// **registry** with it — a below-floor bind is never held, so it re-resolves its
+/// backing and re-reads guest memory on *every draw*, where the same bind above
+/// the floor was one hashmap hit. Applying the cap regardless traded a cached
+/// whole-window gather for an uncached narrow read, and three driven macos-13
+/// Maps boots per arm measured that trade as a loss on every boot:
+/// `binds_us/chain` 6.14 / 6.33 / 4.01 us with the rail off against
+/// 9.19 / 10.65 / 8.84 us with it on, with `zc_buffer_held` falling 30 835 ->
+/// 16 360. Total `draw_us/draw` was indistinguishable (370 / 364 / 310 against
+/// 378 / 372 / 307), so the 2.2 GB a run the cap saved bought no time at all:
+/// these binds are not bus-bound, they are per-bind-cost-bound.
+///
+/// So the rail narrows only where narrowing does not change which rail a bind is
+/// on. Today's shaders declare objects of at most 512 bytes
+/// (`bugs/buffer-binding-extent-and-access` measured 60 blobs: median 64, max
+/// 512), so that condition is rarely met and the rail is close to inert — which
+/// is the honest outcome, not a bug to tune around. On the CPU read the cap is
+/// free: that bind was reading the whole window uncached either way.
 fn load_buffer_content<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2775,6 +2795,11 @@ fn load_buffer_content<M: HostMemory + HostOps>(
     allow_zero_copy: bool,
     extent_cap: Option<u64>,
 ) -> Option<crate::backend::vulkan::engine::BufferContent> {
+    // Below the floor the cap would cost the bind its registry entry, so the
+    // gather rail and the registry key both ignore it there. Keyed on the same
+    // value the walk used, or a lookup would answer with a span it did not ask
+    // for.
+    let gather_cap = extent_cap.filter(|&cap| cap >= ZERO_COPY_BUFFER_MIN_BYTES);
     // A held resolution answers before anything is resolved at all: the walk
     // below produces the same runs until the guest moves the addresses, and it
     // announces every such move. This is the whole point of the registry — see
@@ -2782,7 +2807,7 @@ fn load_buffer_content<M: HostMemory + HostOps>(
     if allow_zero_copy {
         if let Some(bound) = state
             .bound_buffers
-            .get(task_id, buffer_ref, offset, extent_cap)
+            .get(task_id, buffer_ref, offset, gather_cap)
         {
             let content = bound_buffer_content(bound);
             crate::runtime::drain::note_store_route("zc_buffer_held");
@@ -2796,12 +2821,12 @@ fn load_buffer_content<M: HostMemory + HostOps>(
     let backing = resolve_buffer_backing(state, host, task_id, buffer_ref)?;
     if allow_zero_copy {
         if let Some(bound) =
-            try_buffer_zero_copy_resolved(state, host, task_id, &backing, offset, extent_cap)
+            try_buffer_zero_copy_resolved(state, host, task_id, &backing, offset, gather_cap)
         {
             let content = bound_buffer_content(&bound);
             state
                 .bound_buffers
-                .insert(task_id, buffer_ref, offset, extent_cap, bound);
+                .insert(task_id, buffer_ref, offset, gather_cap, bound);
             return Some(content);
         }
     }

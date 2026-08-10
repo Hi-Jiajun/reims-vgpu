@@ -145,6 +145,35 @@ fn sampled_zero_copy_floor_separates_video_from_small_binds() {
     assert!(ZERO_COPY_BUFFER_MIN_BYTES < ZERO_COPY_SAMPLED_MIN_BYTES);
 }
 
+/// A shader extent may narrow the gather rail only while the bind stays on it.
+///
+/// This is the rule that keeps the extent rail from costing what it saves, and
+/// the arithmetic is the whole of it: `load_buffer_content` drops any cap below
+/// [`ZERO_COPY_BUFFER_MIN_BYTES`], because a cap under the floor moves the bind
+/// off the gather rail and therefore out of the held-resolution registry, which
+/// three driven macos-13 Maps boots measured as a ~50 % rise in `binds_us/chain`
+/// against no change in `draw_us/draw`.
+///
+/// The filter is asserted here rather than through a draw because a draw cannot
+/// reach it without a live device, and the property is arithmetic on one
+/// constant. What a boot measures is the *consequence*; what this pins is that
+/// the gate is on the floor and not on some other number.
+#[test]
+fn an_extent_cap_below_the_gather_floor_is_not_applied_to_the_gather_rail() {
+    let keeps = |cap: u64| Some(cap).filter(|&c| c >= ZERO_COPY_BUFFER_MIN_BYTES);
+
+    // The population today's shaders actually declare: 60 captured AIR blobs
+    // ran median 64 bytes, max 512. None of these may reach the gather rail.
+    for cap in [4u64, 64, 288, 512, ZERO_COPY_BUFFER_MIN_BYTES - 1] {
+        assert_eq!(keeps(cap), None, "cap {cap} must not narrow the gather");
+    }
+    // A declared object at or above the floor still narrows: the bind stays on
+    // the rail, keeps its registry entry, and gathers less.
+    for cap in [ZERO_COPY_BUFFER_MIN_BYTES, ZERO_COPY_BUFFER_MIN_BYTES + 1] {
+        assert_eq!(keeps(cap), Some(cap), "cap {cap} should still narrow");
+    }
+}
+
 /// The window math the three sampled zero-copy rails now share.
 ///
 /// Each rail used to carry its own copy, so each could have drifted alone. The
