@@ -4929,6 +4929,96 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
     );
 }
 
+/// A draw the engine never attempted is counted, with the vertices it cost.
+///
+/// `encode_draw_chain`'s skipped-draw tail spends one `linux_clear_store
+/// draws_skipped` line per `(pipeline, slug)`, so a pipeline refused every frame
+/// reports one line for however many draws it lost. The two census counters do
+/// not dedupe, and they are therefore the only readings that can be summed into
+/// "what did this refusal cost the guest". A bare zero from them has to mean no
+/// draw was skipped, never that nobody was counting.
+///
+/// Both are asserted because they fail differently. Dropping the draw count
+/// loses the rate; wiring the vertex count to a neighbouring field of
+/// `DrawEncodeRequest` — `instance_count` and `first_vertex` sit beside
+/// `vertex_count` and every one of them is a `u32` — still moves a counter, and
+/// only a magnitude check separates a skipped six-vertex quad from a skipped
+/// fifty-four-vertex pass. The delta form is deliberate: the census map is
+/// process-global and the rest of the suite shares it.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_draw_skipped_after_an_engine_refusal_is_counted_with_the_vertices_it_cost() {
+    use crate::runtime::drain::store_route_count;
+
+    const DRAWS: &str = "draws_skipped_after_engine_refusal";
+    const VERTICES: &str = "draws_skipped_after_engine_refusal_vertices";
+    /// Not 1, 3 or 6: a count that could be confused with an instance count, a
+    /// triangle or a full-screen quad cannot show the vertex counter reading
+    /// the wrong field.
+    const VERTEX_COUNT: u32 = 54;
+
+    let rig = StoreRig::new(8);
+    let (mut host, mut state) = (rig.host, rig.state);
+
+    let mut req = DrawEncodeRequest {
+        task_id: 1,
+        // No pipeline, so the engine draw is never attempted at all — the
+        // cheapest way to the tail, and the arm whose refusal the emitter has
+        // to name itself because there is no engine slug to borrow.
+        pipeline_ref: 0,
+        vertex_count: VERTEX_COUNT,
+        instance_count: 1,
+        primitive_type: 3,
+        first_vertex: 0,
+        colors: vec![ColorRtRequest {
+            slot: 0,
+            texture_ref: 7,
+            // 64x64 BGRA8 at a tight stride is exactly one 16 KiB page of the
+            // rig's walkable task, so the CLEAR seed Store lands and the tail's
+            // `any_store` precondition is met.
+            target_gva: StoreRig::gva(1),
+            row_stride: 64 * 4,
+            width: 64,
+            height: 64,
+            format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            store_action: MTL_STORE_ACTION_STORE,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let draws_before = store_route_count(DRAWS);
+    let vertices_before = store_route_count(VERTICES);
+
+    let cap = crate::observe::FailCapture::start();
+    let st = encode_draw_chain(&mut state, &mut host, &mut req, true, false).0;
+    let lines = cap.lines();
+    drop(cap);
+
+    assert!(
+        matches!(st, EncodeStatus::Ok),
+        "the CLEAR seed Store landed, so the record stored: {st:?}"
+    );
+    assert!(
+        lines.iter().any(|l| {
+            l.contains("reason=draws_skipped_after_engine_refusal")
+                && l.contains("refused_by=engine_draw_not_attempted")
+        }),
+        "the counted skip is the one the tail names: {lines:?}"
+    );
+    assert_eq!(
+        store_route_count(DRAWS),
+        draws_before + 1,
+        "one skipped draw is one count, whatever the line dedup did with it"
+    );
+    assert_eq!(
+        store_route_count(VERTICES),
+        vertices_before + u64::from(VERTEX_COUNT),
+        "the vertices banded beside the draw are the draw's own vertex count"
+    );
+}
+
 /// A scissored Store carries the same bound as a full-image one, on both of its
 /// rails.
 ///

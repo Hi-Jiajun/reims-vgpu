@@ -704,6 +704,31 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 req.vertex_count,
                 engine_refusal.unwrap_or("engine_draw_not_attempted")
             ));
+            // The line above dedupes on `(pipeline, slug)` and the count does
+            // not, so the two answer different questions and only this one can
+            // be added up. Reading the line count as the draw count understates
+            // it by however many times one pipeline was refused — which on a
+            // rail that composites the same layer every frame is the entire
+            // magnitude. Nothing else in the census counts a draw the engine
+            // refused, so "what did this refusal cost the guest" had no
+            // instrument at all; a bare zero here now means no draw was
+            // skipped, rather than meaning nobody was counting.
+            //
+            // The vertices are banded beside the draws because a skipped
+            // six-vertex full-screen quad and a skipped fifty-four-vertex pass
+            // are the same 1 in a draw count and are not the same loss.
+            //
+            // Deliberately **not** split by `engine_refusal` here. That slug is
+            // already this crate's vocabulary and is counted at its own
+            // emitter, so keying a census entry on it would merge two
+            // populations under one name and make one refusal read as two —
+            // the same reason `refused_by=` above is not spelled `reason=`.
+            // The split lives on the fail line; the magnitude lives here.
+            crate::runtime::drain::note_store_route("draws_skipped_after_engine_refusal");
+            crate::runtime::drain::note_store_route_n(
+                "draws_skipped_after_engine_refusal_vertices",
+                u64::from(req.vertex_count),
+            );
         }
         (EncodeStatus::Ok, color0_rgba)
     } else {
