@@ -482,6 +482,50 @@ impl DeviceContext {
                 (props.api_version, props.device_type, p)
             })
             .collect();
+        // One line per enumerated device, emitted **before** the selection so the
+        // list survives a boot where nothing clears the floor and there is no
+        // winner to hang it off.
+        //
+        // A hybrid laptop enumerates two GPUs and this device silently binds one
+        // of them; until this line existed, a report from such a host could not
+        // say which, nor that the other existed, nor why it lost. The rank is on
+        // the line because the rank *is* the policy — a reader who disagrees with
+        // the choice can see the number that made it — and the driver identity is
+        // there because `DriverQuirk` is the one place driver identity may change
+        // behavior and a quirk report needs the driver's own name for itself
+        // rather than the marketing name of the silicon.
+        //
+        // `VkPhysicalDeviceDriverProperties` is Vulkan 1.2 core and 1.2 is the
+        // baseline, so it is answerable on every device that could be selected.
+        // A device *below* the floor may not answer it; the struct is
+        // zero-initialised, so such a device reports empty strings next to
+        // `above_floor=false`, which reads correctly.
+        for (index, (api, device_type, candidate)) in candidates.iter().enumerate() {
+            let props = instance.get_physical_device_properties(*candidate);
+            let name = CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy();
+            let mut driver = vk::PhysicalDeviceDriverProperties::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut driver);
+            instance.get_physical_device_properties2(*candidate, &mut props2);
+            let driver_name = CStr::from_ptr(driver.driver_name.as_ptr()).to_string_lossy();
+            let driver_info = CStr::from_ptr(driver.driver_info.as_ptr()).to_string_lossy();
+            let profile =
+                classify_memory(&instance.get_physical_device_memory_properties(*candidate));
+            crate::observe::off(format!(
+                "vk_device_candidate index={index} of={} name={name:?} type={device_type:?} \
+                 api={} above_floor={} rank={} driver_id={:?} driver={driver_name:?} \
+                 driver_info={driver_info:?} memory={} device_local_mb={} \
+                 vendor_id={:#06x} device_id={:#06x}",
+                candidates.len(),
+                api_floor::version_str(*api),
+                api_floor::meets_floor(*api),
+                crate::backend::vulkan::caps::device_select::rank_physical_device(*device_type),
+                driver.driver_id,
+                profile.topology.slug(),
+                profile.device_local_bytes >> 20,
+                props.vendor_id,
+                props.device_id,
+            ));
+        }
         let (pd, _chosen_api_version) = select_physical_device(&candidates).map_err(|found| {
             let decline = if found.is_empty() {
                 InitDecline::NoPhysicalDevice
@@ -786,6 +830,17 @@ impl DeviceContext {
             caps.quirks.no_deferred_draw_batching,
             caps.quirks.guest_pages_stay_authoritative,
         ));
+        // Every optional feature and limit this backend resolved, on one line.
+        // `vk_device_select` above names the handful a draw's *expressiveness*
+        // turns on; this names the whole resolved set, including the ones that
+        // came back false. The two are not redundant: a rail declining by name
+        // and a rail never asked for look identical in a log that only reports
+        // what was enabled.
+        crate::observe::off(features.report_line());
+        // What the operator set. A boot whose rails were narrowed from outside
+        // the process reads as a slow device unless the narrowing is on the
+        // same page as the capabilities.
+        crate::observe::off(crate::env::report_line());
         // Warm-start the pipeline cache from the previous boot's blob. Cold
         // pipeline compiles are the remaining pre-convergence stall class
         // (~256 ms first use per pipeline); the blob is keyed by the device's

@@ -165,6 +165,48 @@ pub fn switch(name: &str) -> Switch {
     read(name).0
 }
 
+/// Every variable this device reads.
+///
+/// The one place the set is enumerable. A boot line built from this reports what
+/// an operator actually set, which is the difference between a bug report that
+/// says "it is slow" and one that says "it is slow with a rail switched off" —
+/// and an operator who mistyped a value learns it from the same line, because
+/// [`Switch::Unrecognized`] has its own spelling here.
+///
+/// Nothing enforces that a new `pub const` above is added to this list; the rule
+/// is stated and honestly unenforced. What keeps it small is that the list is
+/// next to the constants, and [`report_line`] is the only consumer.
+pub const ALL: [&str; 5] = [
+    GUEST_IMPORT,
+    DRAW_LOG,
+    GPU_STAMP,
+    PAGE_GUARDS,
+    RANGE_COVERAGE,
+];
+
+/// The state of every variable in [`ALL`], for the one-shot boot line.
+///
+/// Unset variables are on the line too, and deliberately: the reading a report
+/// needs is "these five are the whole set and four of them are default", not a
+/// line that goes empty and leaves a reader unsure whether it ran.
+pub fn report_line() -> String {
+    let mut out = String::from("vgpu_env");
+    for name in ALL {
+        let (state, value) = read(name);
+        let short = name.strip_prefix("REIMS_VGPU_").unwrap_or(name);
+        let state = match state {
+            Switch::Unset => "unset".to_owned(),
+            Switch::On => "on".to_owned(),
+            Switch::Off => "off".to_owned(),
+            // The raw value, because an operator who typed `REIMS_VGPU_GPU_STAMP=disabled`
+            // needs to see what the parse rejected, not just that it did.
+            Switch::Unrecognized => format!("unrecognized({})", value.unwrap_or_default()),
+        };
+        out.push_str(&format!(" {}={state}", short.to_ascii_lowercase()));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,13 +299,9 @@ mod tests {
     /// by grepping their own environment.
     #[test]
     fn every_name_carries_the_crate_prefix() {
-        let names = [
-            DRAW_LOG,
-            GUEST_IMPORT,
-            GPU_STAMP,
-            PAGE_GUARDS,
-            RANGE_COVERAGE,
-        ];
+        // `ALL` rather than a second list: a list written twice is the thing
+        // this module exists to stop, and the boot line reads the same one.
+        let names = ALL;
         for name in names {
             assert!(name.starts_with("REIMS_VGPU_"), "{name}");
             assert!(
@@ -277,5 +315,38 @@ mod tests {
                 assert_ne!(a, b, "two variables share a name");
             }
         }
+    }
+
+    /// The boot line names every variable, including the ones nobody set.
+    ///
+    /// A line that only reported what was set would go empty on a default boot,
+    /// and an empty line cannot be told from an absent one — so a report from a
+    /// machine with a rail switched off would look exactly like a report from a
+    /// machine with a build that never emitted it.
+    #[test]
+    fn the_boot_line_names_every_variable_set_or_not() {
+        let line = report_line();
+        assert!(line.starts_with("vgpu_env "), "{line}");
+        for name in ALL {
+            let short = name
+                .strip_prefix("REIMS_VGPU_")
+                .expect("the prefix is asserted above")
+                .to_ascii_lowercase();
+            assert!(line.contains(&format!(" {short}=")), "{short} in {line}");
+        }
+    }
+
+    /// A value the parse rejects reaches the line verbatim. An operator who
+    /// wrote `disabled` instead of `off` otherwise reads `unset` and concludes
+    /// the switch does not work.
+    #[test]
+    fn an_unrecognized_value_reaches_the_boot_line() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the lock serializes every mutation of this variable in this
+        // process; `report_line` below is the only reader.
+        unsafe { std::env::set_var(GUEST_IMPORT, "disabled") };
+        let line = report_line();
+        unsafe { std::env::remove_var(GUEST_IMPORT) };
+        assert!(line.contains("guest_import=unrecognized(disabled)"), "{line}");
     }
 }

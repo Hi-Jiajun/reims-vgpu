@@ -321,6 +321,91 @@ impl DeviceFeatures {
             .shader_int8(self.int8)
     }
 
+    /// One line naming every feature and limit this backend resolved against the
+    /// bound device, so a boot says what it turned on and what it did without.
+    ///
+    /// # Why this destructures instead of reading fields
+    ///
+    /// A report built from field accesses goes stale the moment a field is
+    /// added: the new capability is queried, gates a rail, and is invisible in
+    /// every log — which is the same silence `device_features` was created to
+    /// end, one level up. A `let Self { .. }` pattern with no rest binding makes
+    /// the compiler refuse to build until the new field is named here, so the
+    /// line cannot fall behind the struct. Do not add `..` to it.
+    ///
+    /// The two per-layout arrays are reported as the layouts that came back
+    /// **false**, because that is the actionable set and it is usually empty; a
+    /// bitfield per layout would be denser and unreadable in a bug report.
+    pub fn report_line(&self) -> String {
+        let Self {
+            robust_buffer_access,
+            sampler_anisotropy,
+            max_sampler_anisotropy,
+            max_image_dimension_2d,
+            max_compute_workgroup_invocations,
+            subgroup_size,
+            max_compute_workgroup_size,
+            max_compute_shared_memory_bytes,
+            max_sample_count,
+            d24_unorm_s8_attachment,
+            shader_int16,
+            storage_image_extended_formats,
+            storage_image_write_without_format,
+            storage_image_read_without_format,
+            bgra8_storage,
+            sampled_linear_filter,
+            color_attachment_blend,
+            storage16,
+            storage8,
+            float16,
+            int8,
+            shader_output_viewport_index,
+            timeline_semaphore,
+            mirror_clamp_to_edge,
+            dual_src_blend,
+            fill_mode_non_solid,
+            depth_clamp,
+            multi_viewport,
+            max_viewports,
+            occlusion_query_precise,
+        } = self;
+        let missing = |probes: &[bool; TexelLayout::ALL.len()]| {
+            let names: Vec<String> = TexelLayout::ALL
+                .iter()
+                .filter(|l| !probes[l.index()])
+                .map(|l| format!("{l:?}"))
+                .collect();
+            if names.is_empty() {
+                "none".to_owned()
+            } else {
+                names.join(",")
+            }
+        };
+        format!(
+            "vk_features robust_buffer_access={robust_buffer_access} \
+             sampler_anisotropy={sampler_anisotropy} max_sampler_anisotropy={max_sampler_anisotropy} \
+             max_image_dimension_2d={max_image_dimension_2d} \
+             max_compute_workgroup_invocations={max_compute_workgroup_invocations} \
+             subgroup_size={subgroup_size} \
+             max_compute_workgroup_size={max_compute_workgroup_size:?} \
+             max_compute_shared_memory_bytes={max_compute_shared_memory_bytes} \
+             max_sample_count={max_sample_count} d24_unorm_s8_attachment={d24_unorm_s8_attachment} \
+             shader_int16={shader_int16} \
+             storage_image_extended_formats={storage_image_extended_formats} \
+             storage_image_write_without_format={storage_image_write_without_format} \
+             storage_image_read_without_format={storage_image_read_without_format} \
+             bgra8_storage={bgra8_storage} no_linear_filter={} no_blendable_attachment={} \
+             storage16={storage16} storage8={storage8} float16={float16} int8={int8} \
+             shader_output_viewport_index={shader_output_viewport_index} \
+             timeline_semaphore={timeline_semaphore} mirror_clamp_to_edge={mirror_clamp_to_edge:?} \
+             dual_src_blend={dual_src_blend} fill_mode_non_solid={fill_mode_non_solid} \
+             depth_clamp={depth_clamp} multi_viewport={multi_viewport} max_viewports={max_viewports} \
+             occlusion_query_precise={occlusion_query_precise}",
+            missing(sampled_linear_filter),
+            missing(color_attachment_blend),
+        )
+    }
+
     /// Device extension names this feature set requires, beyond the ones the
     /// interop rails ask for.
     pub fn required_extensions(&self) -> Vec<*const std::os::raw::c_char> {
@@ -724,6 +809,48 @@ mod tests {
             2,
             "the second viewport must reach the pipeline's slot count"
         );
+    }
+
+    /// The boot line reports a feature that came back **false** as false rather
+    /// than omitting it.
+    ///
+    /// This is the whole reason the line exists beside `vk_device_select`: a rail
+    /// that declines by name and a rail that was never asked for read the same in
+    /// a log that only prints what was enabled, and they are different bug
+    /// reports. Both directions are asserted, because a line that printed only
+    /// the false ones would have the same defect mirrored.
+    #[test]
+    fn the_feature_line_reports_both_directions() {
+        let on = all_supported().report_line();
+        assert!(on.starts_with("vk_features "), "{on}");
+        assert!(on.contains("depth_clamp=true"), "{on}");
+        assert!(on.contains("timeline_semaphore=true"), "{on}");
+        assert!(on.contains("subgroup_size=64"), "{on}");
+        // The layout probes report the *missing* set, which is empty here.
+        assert!(on.contains("no_linear_filter=none"), "{on}");
+        assert!(on.contains("no_blendable_attachment=none"), "{on}");
+
+        let off = DeviceFeatures::default().report_line();
+        assert!(off.contains("depth_clamp=false"), "{off}");
+        assert!(off.contains("timeline_semaphore=false"), "{off}");
+        assert!(
+            off.contains("mirror_clamp_to_edge=Unsupported"),
+            "the rung, not a bool: which spelling a device has decides what is \
+             requested at create time — {off}"
+        );
+    }
+
+    /// A layout the host cannot filter is named on the line, so "the sampled rail
+    /// declined" is answerable from one boot's log rather than from a second run
+    /// with a probe.
+    #[test]
+    fn the_feature_line_names_the_layouts_a_host_cannot_serve() {
+        let mut f = all_supported();
+        f.sampled_linear_filter[TexelLayout::R32Float.index()] = false;
+        let line = f.report_line();
+        assert!(line.contains("no_linear_filter=R32Float"), "{line}");
+        // The other array is independent and must not be dragged along.
+        assert!(line.contains("no_blendable_attachment=none"), "{line}");
     }
 
     /// A device that advertises no `multiViewport` reports a limit of one, and
