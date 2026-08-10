@@ -3170,6 +3170,65 @@ fn note_released_or_remapped<H: HostMemory + HostOps>(
     }
 }
 
+/// Say whether the range this unmap names still has an entry for every page,
+/// which is the question the guest's own teardown is about to ask.
+///
+/// Stands before the packet is applied, and only on an unmap, because that is
+/// the last moment the tree holds what the guest will find: it submits the
+/// packet, blocks on this device's reply, and edits the tree afterwards. See
+/// [`crate::runtime::unmap_coverage`] for what the two findings mean.
+fn observe_unmap_coverage<H: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &H,
+    task_id: u32,
+    gva: u64,
+    length: u64,
+) {
+    use crate::runtime::unmap_coverage::{self, Coverage};
+
+    if !unmap_coverage::enabled() {
+        return;
+    }
+    let (spanned, scanned) = unmap_coverage::pages_of(length, state.page_shift);
+    if scanned == 0 {
+        return;
+    }
+    if scanned < spanned {
+        note_store_route("unmap_coverage_truncated");
+    }
+    let Some(geometry) = reims_vgpu_paging::resolve::geometry_for_page_shift(state.page_shift)
+    else {
+        return;
+    };
+    let Some(entry) = state.tasks.get(task_id) else {
+        return;
+    };
+    let task = reims_vgpu_paging::resolve::Task {
+        active: entry.active,
+        directory_pfn: entry.directory_pfn,
+    };
+    let counts = reims_vgpu_paging::resolve::range_coverage(
+        &crate::runtime::gva_mem::HostPhys(host),
+        geometry,
+        &task,
+        gva,
+        scanned,
+    );
+    let verdict = counts.as_ref().map_or(Coverage::Unwalkable, Coverage::of);
+    note_store_route(verdict.route());
+    if verdict.is_finding() && crate::observe::first_sight(verdict.route(), u64::from(task_id)) {
+        let leaf = verdict.is_leaf_level().unwrap_or(false);
+        crate::observe::fail(format!(
+            "unmap_coverage reason={} task={task_id} gva={gva:#x} len={length:#x} \
+             pages={spanned} scanned={scanned} leaf_level={leaf} detail={verdict:?} \
+             (the guest tears this exact range down after this device replies, and refuses \
+             per page to clear an entry that is already zero — a page without one is a page \
+             its own assertion ends the guest on)",
+            verdict.route()
+        ));
+    }
+}
+
 /// The shared body of the six lifecycle commands named by [`MapFamily`].
 fn apply_map_family<H: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -3190,12 +3249,17 @@ fn apply_map_family<H: HostMemory + HostOps>(
         let task_id = crate::contract::endian::ld32(&packet.payload[0..]);
         let gva = crate::contract::endian::ld64(&packet.payload[4..]);
         let length = crate::contract::endian::ld64(&packet.payload[12..]);
-        // Audit the interval against what this task already has live. The guest
-        // applies these exact intervals to its own page table — the wire length
-        // and its `allocate`/`deallocate` argument are the same call on the same
-        // object — so a pairing disagreement here is a disagreement its teardown
-        // assertion will eventually find. Observation only; nothing below reads
-        // the verdict. See `runtime::map_audit`.
+        // Audit the interval against what this task already has live: a range
+        // mapped twice or unmapped without a map is a disagreement the guest's
+        // own teardown assertion will eventually find.
+        //
+        // The GVA here is the one the guest's `allocate`/`deallocate` receive.
+        // **The length is not** — the packet's length field and the argument
+        // those take come off two different objects, so an interval built from
+        // this length pairs correctly against itself and is not the page-table
+        // range. That is why `observe_unmap_coverage` below reads the tree
+        // rather than trusting this. Observation only; nothing reads the
+        // verdict. See `runtime::map_audit`.
         {
             let page_size = 1u64 << state.page_shift;
             let intervals = state.map_audit.entry(task_id).or_default();
@@ -3227,6 +3291,13 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // here, ahead of the unmap being applied, because this is the last
         // moment those addresses translate. See `runtime::released_pages`.
         note_released_or_remapped(state, host, task_id, gva, length, family);
+        // And the question none of the three above asks, because none of them
+        // needs a host write to be true: does the range the guest is about to
+        // tear down still have an entry for every page? Its teardown asserts
+        // that it does, one page at a time. See `runtime::unmap_coverage`.
+        if matches!(family, MapFamily::UnmapMemory) {
+            observe_unmap_coverage(state, host, task_id, gva, length);
+        }
         // Verbose-gated walk probe at map/unmap time. This runs a full
         // guest page-table walk (`diagnose_gva_walk`) purely to build the
         // log string, and fired ~9k times/boot on the drain path — a flood

@@ -86,6 +86,7 @@ pub mod mapping_write;
 pub mod mipmap;
 pub mod node_guard;
 pub mod released_pages;
+pub mod unmap_coverage;
 pub mod mmio;
 /// MTLB container → wrapped-AIR carve for metal2vulkan.
 pub mod mtlb;
