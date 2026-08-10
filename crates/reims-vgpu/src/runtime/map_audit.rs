@@ -20,10 +20,20 @@
 //! never mapped, unmapped twice, mapped over itself, or unmapped at a different
 //! length reaches that assertion directly.
 //!
-//! # What it has answered, and the one thing it cannot see
+//! # What it has answered, and the two things it cannot see
 //!
 //! Clean on every boot it has been read on, including a dozen that panicked. So
 //! no *drained* teardown has ever been a double.
+//!
+//! **Read that only as far as the census lets you.** Every verdict is counted
+//! into `store_routes` under [`MapAudit::slug`], `map_audit_consistent`
+//! included, and that counter is the whole basis for the sentence above. The
+//! fail line fires only on a finding and is deduped per `(task, channel)` on top
+//! of that, so its absence on its own says nothing about whether a single packet
+//! was ever audited. A boot whose log carries no `map_audit_consistent` audited
+//! nothing, and its silence is not a clean reading. Check for the counter before
+//! quoting a zero: the readings taken before the counter existed were quoted
+//! that way, and could not tell the two apart.
 //!
 //! **The fatal one is not drained.** The guest submits an unmap and unwires
 //! immediately afterwards — measured, it beats this device to the range about
@@ -92,7 +102,13 @@ impl MapAudit {
         !matches!(self, Self::Consistent)
     }
 
-    /// A stable slug for the fail channel.
+    /// A stable name for this verdict, used both as the fail-channel reason and
+    /// as the `store_routes` counter.
+    ///
+    /// One spelling on purpose. The fail line is emitted only for a finding and
+    /// deduped on top of that, while the counter is bumped for every verdict —
+    /// so the two say different things about the same reading and a second
+    /// spelling would let them drift apart silently.
     pub fn slug(self) -> &'static str {
         match self {
             Self::Consistent => "map_audit_consistent",

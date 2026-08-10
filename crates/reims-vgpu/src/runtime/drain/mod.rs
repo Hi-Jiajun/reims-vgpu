@@ -3269,6 +3269,13 @@ fn apply_map_family<H: HostMemory + HostOps>(
             } else {
                 intervals.unmap(gva, length)
             };
+            // Counted on every verdict, including `Consistent`. The fail line
+            // below is emitted only on a finding and deduped on top of that, so
+            // without this the audit's silence would be indistinguishable from
+            // the audit never having run — which is what "clean on a dozen
+            // panicking boots" actually rested on. The census is the only
+            // never-fired signal there is.
+            note_store_route(verdict.slug());
             if verdict.is_finding()
                 && crate::observe::first_sight(verdict.slug(), u64::from(task_id) << 32 | u64::from(channel_id))
             {

@@ -5774,3 +5774,74 @@ fn a_refresh_tick_that_signals_both_classes_raises_one_interrupt() {
     );
     assert_eq!(host.actions.len(), 1);
 }
+
+/// The interval audit is counted on every verdict, not only on a finding.
+///
+/// This is the difference between "the audit ran and found nothing" and "the
+/// audit never ran", and a dozen panicking macos-26 boots were read as the
+/// first when the log could only support the second: the fail line fires for a
+/// finding and is deduped on top of that, so silence was the expected output of
+/// both. Only the census can say a clean pairing was actually observed.
+#[test]
+fn the_map_interval_audit_counts_a_clean_pairing_and_not_only_a_finding() {
+    use crate::runtime::drain::store_route_count;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+
+    // task@0 u32, gva@4 u64, length@12 u64 — the layout `apply_map_family`
+    // decodes and the one the guest's own allocator receives.
+    let payload = |task: u32, gva: u64, len: u64| {
+        let mut p = vec![0u8; 20];
+        p[0..4].copy_from_slice(&task.to_le_bytes());
+        p[4..12].copy_from_slice(&gva.to_le_bytes());
+        p[12..20].copy_from_slice(&len.to_le_bytes());
+        p
+    };
+    let packet = |opcode: u16, payload: Vec<u8>| Packet {
+        opcode,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN + payload.len() as u32,
+        completion_stamp: 0,
+        payload,
+        next_head: 0,
+    };
+
+    let clean = store_route_count("map_audit_consistent");
+    let bad = store_route_count("map_audit_unmap_of_unmapped");
+
+    let gva = 0x4000_0000u64;
+    let len = 4u64 << PAGE_SHIFT_X86;
+    process_child_packet(
+        &mut state,
+        &mut host,
+        7,
+        &packet(CHILD_OP_MAP_MEMORY2, payload(3, gva, len)),
+    );
+    process_child_packet(
+        &mut state,
+        &mut host,
+        7,
+        &packet(CHILD_OP_UNMAP_MEMORY, payload(3, gva, len)),
+    );
+    assert_eq!(
+        store_route_count("map_audit_consistent"),
+        clean + 2,
+        "a matched map and unmap must leave a positive reading; without one, an \
+         audit that never ran reads exactly like an audit that found nothing"
+    );
+
+    // The second release of the same range is the shape the guest asserts on,
+    // and it must be counted under its own name rather than absorbed.
+    process_child_packet(
+        &mut state,
+        &mut host,
+        7,
+        &packet(CHILD_OP_UNMAP_MEMORY, payload(3, gva, len)),
+    );
+    assert_eq!(store_route_count("map_audit_unmap_of_unmapped"), bad + 1);
+    assert_eq!(
+        store_route_count("map_audit_consistent"),
+        clean + 2,
+        "a finding must not also be counted as a clean pairing"
+    );
+}
