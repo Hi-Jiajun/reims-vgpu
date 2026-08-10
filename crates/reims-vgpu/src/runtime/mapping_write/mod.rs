@@ -1045,27 +1045,8 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
         ReadbackPhase::Resolve,
         resolve_started.elapsed().as_micros() as u64,
     );
-    // Hold the resolved copy rather than recording it, when the rail is on. The
-    // bytes above — the runs, the footprint witnesses, the geometry — are all
-    // resolved either way; what defers is only the recording and the bus
-    // traffic, which is the part a driven boot spends its time on and the part
-    // no reader of these pages consumes at anything like this rate.
-    //
-    // A refusal hands the target back and falls through to the copy, so this can
-    // only ever cost the deferral, never the frame.
-    let target = if crate::runtime::render_park_enabled() {
-        crate::backend::vulkan::engine::park_target_copy(mapping_id, identity, target, &gpas).err()
-    } else {
-        Some(target)
-    };
-    if let Some(target) = target {
-        crate::backend::vulkan::engine::copy_target_to_guest_pages(identity, &target, &gpas)
-            .map_err(|inner| GpuWritebackDecline::Engine { inner })?;
-    }
-    // `render_writeback::finish` hands this image to reclaim on the caller's way
-    // out, on both arms. That is safe for a parked plan only because the park
-    // took an LRU pin over the same identity, which is what actually holds the
-    // image until the copy has been recorded — see `park_target_copy`.
+    crate::backend::vulkan::engine::copy_target_to_guest_pages(identity, &target, &gpas)
+        .map_err(|inner| GpuWritebackDecline::Engine { inner })?;
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
     // Nothing here leaves a host copy of the frame, so the surface cache must

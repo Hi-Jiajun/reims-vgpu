@@ -1,30 +1,10 @@
-//! Resolve a render Store's frame against the guest's pages, and land it when
-//! something is about to read them.
+//! Land a render Store's frame in the guest's pages, at the Store.
 //!
 //! A type-11 render Store names a mapping and a resident image the draw just
-//! rendered into. This module resolves the copy — geometry, runs, witnesses —
-//! and then **parks** it: [`crate::backend::vulkan::engine::park_target_copy`]
-//! holds the resolved plan under an LRU pin, keyed by mapping, and a second
-//! Store into that mapping replaces it. Every settle site that is about to let a
-//! host reader touch guest bytes lands everything parked first; the three
-//! completion-stamp sites deliberately do not, which is where the win comes from
-//! (see [`SettleSite::lands_parked_plans`]).
+//! rendered into. This module copies the one into the other and returns. There
+//! is no window, no pin held across the call, and nothing to land later.
 //!
-//! The GVA Store (`store_gva_frame`) is **not** parked and still copies where it
-//! stands. The two rails are separable and this one is the larger cost of the
-//! two, so it moved first; that boundary is a scoping decision, not a statement
-//! that the GVA rail cannot be parked.
-//!
-//! `REIMS_VGPU_RENDER_PARK=off` restores the eager shape the rest of this doc
-//! describes, and is both the A/B instrument and the falsifier for the one bug
-//! class a deferral has that an eager copy does not — a reader served pre-Store
-//! bytes, which is stale pixels and which no counter can see.
-//!
-//! # Why the frame was written at the Store, and what changed
-//!
-//! The sections below are the investigation that led here, kept because they are
-//! what says *where* the land point belongs. They describe the eager rail, which
-//! is still what runs with the switch off.
+//! # Why the frame is written here rather than deferred
 //!
 //! It used to be deferred. A Store armed a window naming the pinned resident,
 //! and the window was landed either by the next completion stamp or by a host
@@ -360,44 +340,6 @@ macro_rules! settle_sites {
             pub fn route_unnamed(self) -> &'static str {
                 match self { $(Self::$variant => concat!($slug, "_unnamed"),)* }
             }
-
-            /// Whether a settle here must first submit the Stores this device
-            /// has parked.
-            ///
-            /// **This is a contract statement, and it is where the whole of the
-            /// deferral's win comes from.** A completion stamp says a submission
-            /// finished; it does not say the guest may read the resource. What
-            /// says that is the host-valid flag the guest itself owns and the
-            /// synchronize it issues before a CPU read. The three stamp sites
-            /// fire at a cadence far above any reader — landing at their rate is
-            /// what made the old deferred window's coalescing unreachable — so
-            /// they answer `false`. Every other variant is a host toucher of
-            /// guest bytes and must land everything parked before it reads.
-            ///
-            /// Spelled as an exhaustive match on each variant rather than a
-            /// `matches!` over the three, so a site added later cannot silently
-            /// inherit either answer: the compiler stops until someone decides
-            /// which kind it is.
-            pub fn lands_parked_plans(self) -> bool {
-                match self {
-                    Self::CompletionStamp | Self::RootStamp | Self::ChildStamp => false,
-                    Self::LinearTextureLoad
-                    | Self::LinearTextureSeed
-                    | Self::LinearTextureSampled
-                    | Self::LinearMemoRead
-                    | Self::BufferGuestRead
-                    | Self::ComputeStageTexture
-                    | Self::ScanoutPaint
-                    | Self::MappingBgra8Write
-                    | Self::MappingRgba8Write
-                    | Self::MappingRawRowsWrite
-                    | Self::MappingRawRowsRead
-                    | Self::MappingRectRead
-                    | Self::MappingRectWrite
-                    | Self::MappingBytesWrite
-                    | Self::MappingBytesRead => true,
-                }
-            }
         }
     };
 }
@@ -487,13 +429,6 @@ settle_sites! {
 pub fn settle_guest_writes(site: SettleSite) {
     #[cfg(feature = "backend-vulkan")]
     {
-        // Before the outstanding-check below, not after it: a parked Store has
-        // not been recorded, so it is exactly the case where the debt flag alone
-        // would say "nothing outstanding" and let this return without landing
-        // the frame this caller is about to read over.
-        if site.lands_parked_plans() {
-            crate::backend::vulkan::engine::land_parked_copies();
-        }
         // The flag read is one relaxed-acquire load and clear is the common
         // answer, so the census below runs only on the calls that cost
         // something. It can race a writeback armed on another thread between
@@ -541,13 +476,6 @@ pub fn settle_guest_writes_unless_disjoint(
 ) {
     #[cfg(feature = "backend-vulkan")]
     {
-        // Same ordering as [`settle_guest_writes`], and for the same reason.
-        // `guest_writes_reaching` answers `Unnamed` while anything is parked, so
-        // this caller would take the wait regardless — landing first is what
-        // makes that wait cover the frame rather than block on nothing.
-        if site.lands_parked_plans() {
-            crate::backend::vulkan::engine::land_parked_copies();
-        }
         if !crate::backend::vulkan::engine::guest_writes_outstanding() {
             return;
         }
@@ -1075,44 +1003,5 @@ mod tests {
             );
         }
         assert_eq!(seen.len(), SettleSite::ALL.len());
-    }
-
-    /// The three stamp sites do not land parked Stores, and every other site
-    /// does.
-    ///
-    /// This is the whole of the deferral's win expressed as a property, so it is
-    /// asserted over `SettleSite::ALL` rather than against a hand-written list:
-    /// a site added later shows up here as an unclassified variant instead of
-    /// quietly inheriting whichever answer its neighbour had. The count is
-    /// pinned too, because a partition that silently became "all false" would
-    /// still satisfy an exhaustiveness check while turning the rail off.
-    #[test]
-    fn only_the_three_stamp_sites_withhold_parked_plans() {
-        let withheld: Vec<SettleSite> = SettleSite::ALL
-            .iter()
-            .copied()
-            .filter(|s| !s.lands_parked_plans())
-            .collect();
-        assert_eq!(
-            withheld,
-            vec![
-                SettleSite::CompletionStamp,
-                SettleSite::RootStamp,
-                SettleSite::ChildStamp
-            ],
-            "a completion stamp says a submission finished, not that the guest \
-             may read the resource; every other site is a host toucher of guest \
-             bytes and must land first"
-        );
-        let lands = SettleSite::ALL
-            .iter()
-            .filter(|s| s.lands_parked_plans())
-            .count();
-        assert_eq!(
-            lands,
-            SettleSite::ALL.len() - 3,
-            "every site that is not one of the three stamps must land"
-        );
-        assert!(lands > 0, "a partition where nothing lands is the rail off");
     }
 }
