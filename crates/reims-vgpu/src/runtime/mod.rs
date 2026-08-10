@@ -85,8 +85,10 @@ pub mod mapping_write;
 /// generateMipmaps for multi-mip type-2/3 linear textures.
 pub mod mipmap;
 pub mod node_guard;
+/// Whether a range's page-table entries are in the state the guest's own next
+/// edit of them requires — the direction that is ordered is the map.
+pub mod range_coverage;
 pub mod released_pages;
-pub mod unmap_coverage;
 pub mod mmio;
 /// MTLB container → wrapped-AIR carve for metal2vulkan.
 pub mod mtlb;

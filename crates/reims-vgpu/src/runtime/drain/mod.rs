@@ -3178,21 +3178,21 @@ fn note_released_or_remapped<H: HostMemory + HostOps>(
 /// submits an unmap *before* unwiring, so that direction is a race and is
 /// counted rather than judged; keeping it is what proves the walk works, since a
 /// broken walk would read absent on both sides. See
-/// [`crate::runtime::unmap_coverage`].
+/// [`crate::runtime::range_coverage`].
 fn observe_range_coverage<H: HostMemory + HostOps>(
     state: &DeviceState,
     host: &H,
     task_id: u32,
     gva: u64,
     length: u64,
-    op: crate::runtime::unmap_coverage::Op,
+    op: crate::runtime::range_coverage::Op,
 ) {
-    use crate::runtime::unmap_coverage::{self, Coverage};
+    use crate::runtime::range_coverage::{self, Coverage};
 
-    if !unmap_coverage::enabled() {
+    if !range_coverage::enabled() {
         return;
     }
-    let (spanned, scanned) = unmap_coverage::pages_of(length, state.page_shift);
+    let (spanned, scanned) = range_coverage::pages_of(length, state.page_shift);
     if scanned == 0 {
         return;
     }
@@ -3297,7 +3297,7 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // the guest's own next step requires? It asserts per page that an unmap
         // finds one and a map does not. Both directions are read, and the one
         // that cannot end a boot is what makes the other's reading evidence —
-        // see `runtime::unmap_coverage`.
+        // see `runtime::range_coverage`.
         observe_range_coverage(
             state,
             host,
@@ -3305,9 +3305,9 @@ fn apply_map_family<H: HostMemory + HostOps>(
             gva,
             length,
             if matches!(family, MapFamily::UnmapMemory) {
-                crate::runtime::unmap_coverage::Op::Unmap
+                crate::runtime::range_coverage::Op::Unmap
             } else {
-                crate::runtime::unmap_coverage::Op::Map
+                crate::runtime::range_coverage::Op::Map
             },
         );
         // Verbose-gated walk probe at map/unmap time. This runs a full
