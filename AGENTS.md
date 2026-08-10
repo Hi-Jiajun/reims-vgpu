@@ -429,8 +429,12 @@ capability at `caps::host_pointer`, and the reference at `runtime/guest_ram_map.
 by name when no backend published a granularity.
 
 **Page recycling is unchanged and still load-bearing.** The guest reassigning a GPA to a different
-allocation while we hold a reference over it is the PTE-corruption class
-`runtime/storage_flush/guards.rs` exists for. It applied to the dma-buf and it applies here.
+allocation while we hold a reference over it is the PTE-corruption class. It applied to the dma-buf
+and it applies here. Three modules carry it now: `runtime/guest_ram.rs` for the surface
+page-ownership guards, `runtime/render_writeback.rs`, whose doc walks the four hazards the retired
+deferred-flush window carried and says why each cannot arise in the direct path, and
+`runtime/node_guard.rs`, the alarm for the worst end of it — a host write landing on a page that
+holds the guest's own page-table entries.
 
 **The pinning difference is real; do not gloss it.** A udmabuf fd made the pages it named
 unswappable and unmigratable, and closing it revoked the GPU's access. `VK_EXT_external_memory_host`
@@ -444,14 +448,17 @@ Guest RAM is not **fd-backed**: the import is over an ordinary mapping, so `vm/b
 plain `-m` allocation. `memory-backend-memfd,share=on` outlived the dma-buf rail it was for, on the
 grounds that a shared memfd is what makes uffd minor-fault mode applicable; it is gone, because uffd
 needs a privilege QEMU does not have on the dev host anyway. Restoring the backing is a
-prerequisite for ever wanting uffd here — `storage_flush/fence.rs` keeps what changes — but it buys
-nothing alone.
+prerequisite for ever wanting uffd here, but it buys nothing alone.
 
-So the deferred-flush rail — the device's largest cost — is retired by writing into guest pages
-directly, which is what `storage_flush` always said would retire it. Read that module's own
-qualifier and the routes that are *not* blocked before assuming a window is safe to skip. Note that
-`runtime/gva_view.rs::ensure_gva_view` hands back a host pointer but is not a window resolver — it
-requires the span to be one contiguous page run and returns `None` otherwise.
+So the deferred-flush rail — the device's largest cost — is retired, by writing into guest pages
+directly. **`runtime/storage_flush/` went with it and no longer exists**; do not go looking for it,
+and do not read a reference to it in an older commit body or `kb/` entry as a live path. Its two
+halves are now `runtime/render_writeback.rs`, whose module doc lists the four hazards the deferred
+window carried and why each cannot arise in the direct path, and `runtime/host_writes.rs`, the
+per-page record of which guest pages this device has written. Read `render_writeback`'s doc before
+assuming a landing is safe to skip. Note that `runtime/gva_view.rs::ensure_gva_view` hands back a
+host pointer but is not a window resolver — it requires the span to be one contiguous page run and
+returns `None` otherwise.
 
 ### Environment overrides
 
@@ -673,8 +680,9 @@ with `scripts/wire-oracle/wire-oracle.sh` on an Apple host, and set `REIMS_WIRE_
 there so their absence fails the build.
 
 **The `backend-metal` `--lib` arm is expected to be green.** It used to carry six standing failures
-in `runtime::storage_flush::tests`, and this file used to tell you to expect them; they were
-Vulkan-rail tests compiled unconditionally, and they now carry the gate. A red there is a real
+in a module that has since been deleted outright, and this file used to tell you to expect them;
+they were Vulkan-rail tests compiled unconditionally, and they carried the gate before the module
+went. A red there is a real
 result again — do not restore the exception, and do not silence a new one by weakening what it
 asserts.
 
