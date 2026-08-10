@@ -1250,6 +1250,19 @@ impl crate::observe::Decline for IndexLoadReason {
 /// same boot. So this is a rail that succeeds, not one that was failing quietly,
 /// and a line from it is worth reading. See `runtime::mtlb` for the same
 /// measurement on the loader one level down.
+///
+/// **That zero is per-guest-line, and macOS 26 is not on it.** Every driven
+/// macos-26 boot measured so far emits 36-40 fail lines from here, all of them
+/// `no_list_entry`, while a driven macos-15 boot of the same binary emits none.
+/// The macOS 26 population has a measured mechanism and is not a regression to
+/// re-derive: the guest clears the object-list slot it named while the packet
+/// that named it is still undrained, so the slot reads zero when this device
+/// gets to it. The deduped counters behind those lines run several times higher
+/// than the lines themselves, so the two are not interchangeable.
+///
+/// Read a count here against the same rail's previous boot. Read it against the
+/// paragraph above instead and macOS 26's standing behaviour arrives looking
+/// like a fresh defect, which is a mistake this doc has already cost once.
 fn load_render_pipeline<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
