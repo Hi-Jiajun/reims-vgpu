@@ -158,6 +158,10 @@ fn sampled_zero_copy_floor_separates_video_from_small_binds() {
 /// reach it without a live device, and the property is arithmetic on one
 /// constant. What a boot measures is the *consequence*; what this pins is that
 /// the gate is on the floor and not on some other number.
+///
+/// Vulkan-arm only: the floor it reads is a `backend-vulkan` constant, and the
+/// gather rail it gates does not exist on the Metal-direct arm.
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn an_extent_cap_below_the_gather_floor_is_not_applied_to_the_gather_rail() {
     let keeps = |cap: u64| Some(cap).filter(|&c| c >= ZERO_COPY_BUFFER_MIN_BYTES);
