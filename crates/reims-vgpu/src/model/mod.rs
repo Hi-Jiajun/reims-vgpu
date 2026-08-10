@@ -403,6 +403,73 @@ mod tests {
         );
     }
 
+    /// The AIR version the guest actually receives sits inside the window the
+    /// guest honours, read out of the reply page rather than out of the table.
+    ///
+    /// The `const` assertion beside [`DEVICE_INFO_AIR_VERSION`] already binds
+    /// the table entry. This binds the other end: key 18 is served through the
+    /// same reduction every other key goes through, so a future change that
+    /// routes it through a host-dependent floor — as the GPU-dependent keys are
+    /// — could deliver a value the constant never sees. The guest's driver
+    /// rewrites an out-of-window value silently in both directions (undefined
+    /// becomes 2.2, at-or-above 2.8 clamps to 2.7), so a wrong value here does
+    /// not fail, it just stops being what this table says it is.
+    ///
+    /// Driven at macOS 26's declared ceiling of 45, which is the rail that has a
+    /// consumer for this key.
+    #[test]
+    fn the_air_version_the_guest_receives_is_inside_the_window_the_guest_honours() {
+        let mut d = dev();
+        let mut h = FakeHost::new();
+        setup_boot_regs(&mut d, &mut h);
+        let reply_pfn = 0x20u32;
+        h.map_range(
+            pfn_to_gpa(reply_pfn, PAGE_SHIFT_ARM64E),
+            PAGE_SIZE_ARM64E as usize,
+            0xee,
+        );
+        let mut payload = vec![0u8; 12];
+        st32(&mut payload[DEVICE_INFO_TAHOE_KEY_TABLE_LEN..], 45);
+        st32(
+            &mut payload[DEVICE_INFO_TAHOE_COUNT..],
+            (PAGE_SIZE_ARM64E as usize / DEVICE_INFO_REPLY_PAIR_LEN) as u32,
+        );
+        st32(&mut payload[DEVICE_INFO_TAHOE_REPLY_PFN..], reply_pfn);
+        write_main_packet(&mut h, 0, ROOT_OP_DEVICE_INFO_TAHOE, 3, &payload);
+        d.state
+            .gfx
+            .fifo_read
+            .store(0, std::sync::atomic::Ordering::Release);
+        d.state.gfx.fifo_written = PACKET_HEADER_LEN + 12;
+        d.state.pending.main_drain = true;
+        d.drain(&mut h);
+
+        // Walk the reply the way the guest does: pairs until the zero
+        // terminator. Reading a fixed slot instead would pin the key's position
+        // in the table, which is not what is under test here.
+        let base = pfn_to_gpa(reply_pfn, PAGE_SHIFT_ARM64E);
+        let mut served = None;
+        for slot in 0..(PAGE_SIZE_ARM64E as usize / DEVICE_INFO_REPLY_PAIR_LEN) {
+            let at = base + (slot * DEVICE_INFO_REPLY_PAIR_LEN) as u64;
+            let key = h.get_u32(at);
+            if key == 0 {
+                break;
+            }
+            if key == DEVICE_INFO_KEY_MAX_MSL_VERSION {
+                served = Some(h.get_u32(at + 4));
+                break;
+            }
+        }
+
+        let served = served.expect("key 18 is inside macOS 26's ceiling, so the reply carries it");
+        assert!(
+            (DEVICE_INFO_AIR_VERSION_MIN..=DEVICE_INFO_AIR_VERSION_MAX).contains(&served),
+            "the guest was told AIR {served:#x}, outside the window \
+             {DEVICE_INFO_AIR_VERSION_MIN:#x}..={DEVICE_INFO_AIR_VERSION_MAX:#x} it honours — \
+             it will rewrite the value and hold something this table does not describe"
+        );
+    }
+
     /// A key the guest parses and this device never answers is counted, and the
     /// two ways that happens are counted apart.
     ///

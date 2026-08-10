@@ -1316,7 +1316,7 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
     (DEVICE_INFO_KEY_HEAP_BUFFER_GRANULARITY, 32),
     (DEVICE_INFO_KEY_HEAP_TEXTURES, 1),
     (DEVICE_INFO_KEY_BUFFER_WITH_IOSURFACE, 1),
-    (DEVICE_INFO_KEY_MAX_MSL_VERSION, 131079),
+    (DEVICE_INFO_KEY_MAX_MSL_VERSION, DEVICE_INFO_AIR_VERSION),
     (DEVICE_INFO_KEY_SHARED_TEXTURES, 1),
     (DEVICE_INFO_KEY_PROGRAMMABLE_SAMPLE_POSITIONS, 1),
     (DEVICE_INFO_KEY_TILE_SHADERS, 1),
@@ -1376,6 +1376,21 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
 /// Narrowing it would take a real capability away — an AIR version is what the
 /// guest's compiler *emits against* — to satisfy an invariant that does not
 /// exist.
+///
+/// # The guest's own window, which is why [`DEVICE_INFO_AIR_VERSION`] is bounded
+///
+/// The value does not reach the plugin as sent. The guest kernel driver's
+/// device-info parser post-processes this key alone, before any plugin sees it:
+/// an **undefined** key 18 becomes `0x20002`, and a value **at or above
+/// `0x20008` is clamped down to `0x20007`**. No floor is applied — anything
+/// below `0x20001` passes through unchanged. It then splits the packed word
+/// into the two `u32` halves the capability struct carries.
+///
+/// So `0x20007` is the ceiling of what any guest on this pathway can be told,
+/// and this device already sends exactly that. Raising it is not a way to offer
+/// a newer AIR; it is a way to send a number the guest silently rewrites.
+/// [`DEVICE_INFO_AIR_VERSION`] carries a `const` assertion for the window so a
+/// future edit fails the build instead of being quietly clamped.
 pub const DEVICE_INFO_KEY_MAX_MSL_VERSION: u32 = 18;
 pub const DEVICE_INFO_KEY_SHARED_TEXTURES: u32 = 19;
 pub const DEVICE_INFO_KEY_MAX_VERTEX_AMPLIFICATION: u32 = 20;
@@ -1425,6 +1440,37 @@ pub const MTL_GPU_FAMILY_APPLE1: u32 = 1001;
 ///
 /// Apple9. It is the value key 37 has always carried; naming it is what lets the
 /// family *set* below be derived from it instead of written beside it.
+/// The value served for [`DEVICE_INFO_KEY_MAX_MSL_VERSION`]: AIR 2.7, packed
+/// `(major << 16) | minor`.
+///
+/// Named rather than left as `131079` in the table because the guest treats it
+/// as a bounded quantity and this device sits at the top of that bound. See the
+/// key's own doc for what the guest driver does to an out-of-window value; the
+/// assertions below are the enforceable half of it.
+pub const DEVICE_INFO_AIR_VERSION: u32 = 0x0002_0007;
+
+/// The lowest packed AIR version the guest accepts without falling back.
+///
+/// Below this the guest driver applies no correction, so the value reaches the
+/// Metal plugin as sent and lands on the plugin's out-of-range arm, which
+/// substitutes a fixed device type and driver version rather than deriving them
+/// from the AIR version. That is a silent downgrade, not a refusal.
+pub const DEVICE_INFO_AIR_VERSION_MIN: u32 = 0x0002_0001;
+
+/// The highest packed AIR version the guest honours.
+///
+/// At or above `0x20008` the guest driver clamps to this value, so sending more
+/// changes nothing the guest can observe while making this table disagree with
+/// what the guest actually holds.
+pub const DEVICE_INFO_AIR_VERSION_MAX: u32 = 0x0002_0007;
+
+const _: () = assert!(
+    DEVICE_INFO_AIR_VERSION >= DEVICE_INFO_AIR_VERSION_MIN
+        && DEVICE_INFO_AIR_VERSION <= DEVICE_INFO_AIR_VERSION_MAX,
+    "the served AIR version must sit inside the window the guest honours, or the guest \
+     silently rewrites it and this table stops describing what the guest holds"
+);
+
 pub const DEVICE_INFO_GPU_FAMILY: u32 = 1009;
 
 /// The `supportsFamily` set implied by [`DEVICE_INFO_GPU_FAMILY`].
