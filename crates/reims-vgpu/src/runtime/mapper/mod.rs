@@ -2330,9 +2330,28 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
     }
     // Deferred-writeback flush-on-access: this read must observe the resident
     // content, not the stale pre-dispatch guest bytes.
-    crate::runtime::render_writeback::settle_guest_writes(
-        crate::runtime::render_writeback::SettleSite::MappingBytesRead,
-    );
+    //
+    // Narrowed to this mapping's own pages. Unnarrowed, this wait silently
+    // defeated the narrowing its callers had already done: `scanout::paint_mapping`
+    // rules the outstanding writeback disjoint from the very same mapping and
+    // skips its `ScanoutPaint` settle, then reaches here and waits for that same
+    // writeback anyway. An inner gate that is wider than the outer one makes the
+    // outer one decorative, and on a driven macos-13 Maps drag this site was 31
+    // waits costing 153 ms — 4.9 ms each, a fifth of the boot's whole draw budget
+    // in thirty-one events.
+    //
+    // Correctness is unchanged in the direction that matters: the skip needs the
+    // engine to *prove* the pending writeback lands nowhere in the page set, and
+    // an unnameable set (`None`) settles exactly as before. The page set comes
+    // from the same `mapping_reach_pages` the writeback's own destination is
+    // named with, so both ends of the comparison are one rule.
+    {
+        let s = &*state;
+        crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
+            crate::runtime::render_writeback::SettleSite::MappingBytesRead,
+            || s.mapping_reach_pages(mapping_id),
+        );
+    }
     copy_mapping_runs(
         state,
         host,

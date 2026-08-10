@@ -890,19 +890,13 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
     // Narrowed on this mapping's own pages, which unlike every other narrowed
     // site here costs no walk at all: `page_entries` already *is* the page list,
     // and the writeback rail that lands in them built its own destination from
-    // the same field. A mapping with no page list, or one holding an entry that
-    // names no backing, cannot be ruled out and settles.
-    let (mappings, shift) = (&state.mappings, state.page_shift);
+    // the same field — literally, via `DeviceState::mapping_reach_pages`, which
+    // is also what names the write. A mapping with no page list, or one holding
+    // an entry that names no backing, cannot be ruled out and settles.
+    let s = &*state;
     crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
         crate::runtime::render_writeback::SettleSite::ScanoutPaint,
-        || {
-            let m = mappings.get(&mapping_id)?;
-            (!m.page_entries.is_empty()).then_some(())?;
-            m.page_entries
-                .iter()
-                .map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, shift))
-                .collect::<Option<Vec<u64>>>()
-        },
+        || s.mapping_reach_pages(mapping_id),
     );
 
     let Some(m) = state.mappings.get(&mapping_id) else {

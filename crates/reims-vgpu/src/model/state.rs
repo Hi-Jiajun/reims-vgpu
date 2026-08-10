@@ -3073,25 +3073,52 @@ impl DeviceState {
         self.host_writes.note_pages(pages);
     }
 
+    /// Every guest page a mapping covers, or `None` when the set cannot be
+    /// named exactly.
+    ///
+    /// This is the page set the guest-write **reach** test is decided on, from
+    /// both ends: [`Self::note_host_wrote_mapping`] names a writeback's
+    /// destination with it, and the readers that ask
+    /// `render_writeback::settle_guest_writes_unless_disjoint` whether they may
+    /// skip the wait name their source with it. Those two answers are compared
+    /// against each other, so they must come from one rule — a writer that
+    /// named pages by a slightly different rule than the reader would make a
+    /// genuine overlap read as disjoint, and skipping *that* wait is a stale
+    /// frame. Hence one function rather than the three hand-written copies this
+    /// replaced.
+    ///
+    /// All-or-nothing on purpose: `collect` into an `Option` so a single
+    /// unresolvable entry makes the whole set unnamed rather than partially
+    /// named. A short list is the one wrong answer that costs a frame, because
+    /// it licenses skipping a wait for a page it silently omitted. `None` always
+    /// settles.
+    ///
+    /// Cheap by construction — no revalidation, no host round trip, no
+    /// `map_pages`. `page_entries` already *is* the list. That matters because
+    /// the settle closure runs on the hot path whenever a writeback is
+    /// outstanding. The revalidating cousin is
+    /// [`crate::runtime::mapper::mapping_page_gpas`], which needs a `&mut host`
+    /// and is for callers about to *map* the pages, not merely name them.
+    pub fn mapping_reach_pages(&self, mapping_id: u32) -> Option<Vec<u64>> {
+        let m = self.mappings.get(&mapping_id)?;
+        if m.page_entries.is_empty() {
+            return None;
+        }
+        let shift = self.page_shift;
+        m.page_entries
+            .iter()
+            .map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, shift))
+            .collect()
+    }
+
     /// The same, for a writer that knows which mapping's pages it is landing in.
     pub fn note_host_wrote_mapping(&mut self, mapping_id: u32) {
-        // A mapping with no page list cannot have its write ruled out later, so
-        // it is recorded as an unnamed one rather than as an empty page set.
-        match self.mappings.get(&mapping_id) {
-            Some(m) if !m.page_entries.is_empty() => {
-                // Resolved here, at write time. `collect` into an `Option` so
-                // one unresolvable entry makes the whole write unnamed rather
-                // than partially named, which is the direction that cannot lose
-                // a frame.
-                let shift = self.page_shift;
-                let pages: Option<Vec<u64>> = m
-                    .page_entries
-                    .iter()
-                    .map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, shift))
-                    .collect();
-                self.host_writes.note_mapping(pages.as_deref());
-            }
-            _ => self.host_writes.note_unknown(),
+        // A mapping whose pages cannot be named exactly cannot have its write
+        // ruled out later, so it is recorded as an unnamed one rather than as an
+        // empty (or short) page set.
+        match self.mapping_reach_pages(mapping_id) {
+            Some(pages) => self.host_writes.note_mapping(Some(&pages)),
+            None => self.host_writes.note_unknown(),
         }
     }
 
@@ -3553,6 +3580,51 @@ mod fail_vocabulary_tests {
         assert!(!state.set_mapping_geom(1, 0, 64, 0x50));
         assert!(!state.set_mapping_geom(1, 64, 0, 0x50));
         assert!(!state.mappings.contains_key(&1));
+    }
+
+    /// The reach set is every page or no pages, never a short list.
+    ///
+    /// This is the one property the disjoint-settle skip rests on. Both ends of
+    /// that comparison — the writeback naming its destination, and a reader
+    /// asking whether it may skip the wait — come from
+    /// [`DeviceState::mapping_reach_pages`], so a set that silently dropped an
+    /// unresolvable entry would let a reader skip a settle for a page the
+    /// writeback is about to land in. That is a stale frame with no error
+    /// anywhere, which is why the failure direction is asserted and not just the
+    /// success one.
+    #[test]
+    fn a_mapping_reach_set_is_every_page_or_none() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        let shift = crate::model::PAGE_SHIFT_X86;
+        let mut state = DeviceState::new(DeviceId(1), shift);
+        assert!(state.set_mapping_geom(3, 64, 64, 0x50));
+
+        assert_eq!(
+            state.mapping_reach_pages(3),
+            None,
+            "a mapping with no page list can rule nothing out"
+        );
+        assert_eq!(
+            state.mapping_reach_pages(99),
+            None,
+            "a mapping that does not exist can rule nothing out"
+        );
+
+        let valid = |pfn: u32| (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+        state.mappings.get_mut(&3).unwrap().page_entries = vec![valid(4), valid(5), valid(6)];
+        assert_eq!(
+            state.mapping_reach_pages(3),
+            Some(vec![4u64 << shift, 5u64 << shift, 6u64 << shift]),
+            "every entry resolves, so the whole set is named"
+        );
+
+        // The middle entry carries no VALID bit, so it names no backing.
+        state.mappings.get_mut(&3).unwrap().page_entries = vec![valid(4), 0, valid(6)];
+        assert_eq!(
+            state.mapping_reach_pages(3),
+            None,
+            "one unresolvable entry must unname the set, not shorten it"
+        );
     }
 
     /// Every one of the three entry points must reach the record, whatever it can
