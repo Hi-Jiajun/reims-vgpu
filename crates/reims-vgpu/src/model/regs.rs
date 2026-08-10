@@ -1264,9 +1264,25 @@ pub fn device_info_caps(limits: &DeviceInfoLimits, version: u32) -> Vec<(u32, u3
 /// authorised four primitive types both backends refuse, and nothing said so
 /// because the entry was a pair of integers.
 ///
-/// A new entry at or below 17 therefore gets a `DEVICE_INFO_KEY_*` constant
-/// whose doc says what the guest does with it. Above 17 the guest discards the
-/// pair, so a bare number there promises nothing.
+/// A new entry therefore gets a `DEVICE_INFO_KEY_*` constant whose doc says what
+/// the guest does with it.
+///
+/// **That rule used to stop at 17, on the grounds that "above 17 the guest
+/// discards the pair, so a bare number there promises nothing". That is false on
+/// any rail newer than macOS 13, and it is why keys 18..44 sat here as bare
+/// integers.** macOS 13 declares a parse ceiling of 7 and does discard the rest;
+/// macOS 15 declares 42 and macOS 26 declares 45, and every key below their
+/// ceiling has its own dispatch arm storing into its own capability field. So
+/// the entries above 17 are instructions to those guests in exactly the sense
+/// the paragraph above describes, and they are the *only* instructions macOS 26
+/// gets that macOS 15 does not — the sender filters on the ceiling, so keys 42
+/// and 44 reach Tahoe alone.
+///
+/// The names below are decoded from the guests' own walkers and cross-checked
+/// against six values in this table that are self-describing under that reading
+/// (key 18 `0x20007` a packed 2.7, key 28 `7` exactly three declared bits, key
+/// 33 `4095` exactly twelve, key 37 `1009` an `MTLGPUFamily`, key 40 `256` an
+/// alignment, key 41 `7` three rounding modes).
 ///
 /// **Key 0 is not a key.** It terminates the walk and discards every remaining
 /// pair, so an entry keyed 0 would silently truncate this table at its position.
@@ -1300,28 +1316,111 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
     (DEVICE_INFO_KEY_HEAP_BUFFER_GRANULARITY, 32),
     (DEVICE_INFO_KEY_HEAP_TEXTURES, 1),
     (DEVICE_INFO_KEY_BUFFER_WITH_IOSURFACE, 1),
-    (18, 131079),
-    (19, 1),
-    (21, 1),
-    (23, 1),
-    (24, 1),
-    (25, 1),
-    (26, 1),
-    (27, 1),
-    (28, 7),
-    (29, 1024),
-    (30, 32768),
-    (31, 32768),
-    (32, 16),
-    (33, 4095),
-    (34, 8),
-    (35, 2048),
-    (36, 16),
-    (37, 1009),
-    (40, 256),
-    (41, 7),
-    (42, 2),
-    (44, 127),
+    (DEVICE_INFO_KEY_MAX_MSL_VERSION, 131079),
+    (DEVICE_INFO_KEY_SHARED_TEXTURES, 1),
+    (DEVICE_INFO_KEY_PROGRAMMABLE_SAMPLE_POSITIONS, 1),
+    (DEVICE_INFO_KEY_TILE_SHADERS, 1),
+    (DEVICE_INFO_KEY_IMAGEBLOCKS, 1),
+    (DEVICE_INFO_KEY_RASTER_ORDER_GROUPS, 1),
+    (DEVICE_INFO_KEY_MEMORY_ORDER_ATOMICS, 1),
+    (DEVICE_INFO_KEY_LARGE_MRT, 1),
+    (DEVICE_INFO_KEY_SUPPORT_FLAGS_2023, 7),
+    (DEVICE_INFO_KEY_MAX_COMPUTE_THREADS, 1024),
+    (DEVICE_INFO_KEY_MAX_COMPUTE_LOCAL_MEMORY, 32768),
+    (DEVICE_INFO_KEY_MAX_COMPUTE_TG_MEMORY, 32768),
+    (DEVICE_INFO_KEY_COMPUTE_TG_MEMORY_ALIGN, 16),
+    (DEVICE_INFO_KEY_SUPPORT_FLAGS_2024, 4095),
+    (DEVICE_INFO_KEY_GPU_CORE_COUNT, 8),
+    (DEVICE_INFO_KEY_MAX_TEXTURE_LAYERS, 2048),
+    (DEVICE_INFO_KEY_MAX_PREDICATED_NESTING, 16),
+    (DEVICE_INFO_KEY_GPU_FAMILY_CLAMPED, 1009),
+    (DEVICE_INFO_KEY_MIN_LINEAR_TEXTURE_ALIGN, 256),
+    (DEVICE_INFO_KEY_TEXTURE_WRITE_ROUNDING, 7),
+    (DEVICE_INFO_KEY_SUPPORT_FLAGS_2025, 2),
+    (DEVICE_INFO_KEY_HOST_GPU_FAMILIES, 127),
+];
+
+pub const DEVICE_INFO_KEY_MAX_MSL_VERSION: u32 = 18;
+pub const DEVICE_INFO_KEY_SHARED_TEXTURES: u32 = 19;
+pub const DEVICE_INFO_KEY_MAX_VERTEX_AMPLIFICATION: u32 = 20;
+pub const DEVICE_INFO_KEY_PROGRAMMABLE_SAMPLE_POSITIONS: u32 = 21;
+pub const DEVICE_INFO_KEY_RASTERIZATION_RATE_LAYERS: u32 = 22;
+pub const DEVICE_INFO_KEY_TILE_SHADERS: u32 = 23;
+pub const DEVICE_INFO_KEY_IMAGEBLOCKS: u32 = 24;
+pub const DEVICE_INFO_KEY_RASTER_ORDER_GROUPS: u32 = 25;
+pub const DEVICE_INFO_KEY_MEMORY_ORDER_ATOMICS: u32 = 26;
+pub const DEVICE_INFO_KEY_LARGE_MRT: u32 = 27;
+/// Bit 0 `Apple5`, bit 1 `DynamicAttributeStride`, bit 2 `Texture2DMultisampleArray`.
+pub const DEVICE_INFO_KEY_SUPPORT_FLAGS_2023: u32 = 28;
+pub const DEVICE_INFO_KEY_MAX_COMPUTE_THREADS: u32 = 29;
+pub const DEVICE_INFO_KEY_MAX_COMPUTE_LOCAL_MEMORY: u32 = 30;
+pub const DEVICE_INFO_KEY_MAX_COMPUTE_TG_MEMORY: u32 = 31;
+pub const DEVICE_INFO_KEY_COMPUTE_TG_MEMORY_ALIGN: u32 = 32;
+/// Twelve bits: `LargeUserTasks`, `LargeKernelTasks`, `CommandBufferJump`,
+/// `RangeBuffer`, `SharedMemoryHeap`, `ArgumentBuffers`, `SIMDReduction`,
+/// `Float16BCubicFiltering`, `SIMDShuffleAndFill`, `ConditionalLoadStore`,
+/// `ComputeCompressedTextureWrite`, `SharedTexturePlacement`.
+pub const DEVICE_INFO_KEY_SUPPORT_FLAGS_2024: u32 = 33;
+pub const DEVICE_INFO_KEY_GPU_CORE_COUNT: u32 = 34;
+pub const DEVICE_INFO_KEY_MAX_TEXTURE_LAYERS: u32 = 35;
+pub const DEVICE_INFO_KEY_MAX_PREDICATED_NESTING: u32 = 36;
+/// A single raw `MTLGPUFamily` ordinal — the family the guest reports as *the*
+/// one this device is. Must not disagree with
+/// [`DEVICE_INFO_KEY_HOST_GPU_FAMILIES`], which is a set containing it.
+pub const DEVICE_INFO_KEY_GPU_FAMILY_CLAMPED: u32 = 37;
+pub const DEVICE_INFO_KEY_ARGUMENT_BUFFERS_TIER: u32 = 38;
+pub const DEVICE_INFO_KEY_ARGUMENT_BUFFERS_MAX_SAMPLERS: u32 = 39;
+pub const DEVICE_INFO_KEY_MIN_LINEAR_TEXTURE_ALIGN: u32 = 40;
+pub const DEVICE_INFO_KEY_TEXTURE_WRITE_ROUNDING: u32 = 41;
+/// Bit 0 `IndirectCommandBuffers`, bit 1 `ArgumentBuffers2025`, bit 2
+/// `EnhancedRenderICBs`. Reaches macOS 26 and no older rail.
+pub const DEVICE_INFO_KEY_SUPPORT_FLAGS_2025: u32 = 42;
+/// Bits 0..7 are `supportsFamily` for Apple 5, 6, 7, 8, 9, 9b, 10, 11 — a *set*,
+/// where [`DEVICE_INFO_KEY_GPU_FAMILY_CLAMPED`] is a single member of it.
+/// Reaches macOS 26 and no older rail.
+pub const DEVICE_INFO_KEY_HOST_GPU_FAMILIES: u32 = 44;
+
+/// Keys inside a guest's parse ceiling that its walker has **no arm for**.
+///
+/// Key 43 is a gap in Apple's own numbering: macOS 26 declares a ceiling of 45
+/// and its 45-entry jump table sends key 43 straight to the loop increment, so
+/// the pair is read and discarded. The capability struct has 43 keyed fields —
+/// keys 1..42 and 44 — and no forty-fourth.
+///
+/// This exists so the hole report does not name it. A hole is meant to read as
+/// "the guest has a field here and this device never fills it"; a key with no
+/// arm is not that, and reporting one sends the next reader looking for a value
+/// to send that the guest would throw away. It cost this investigation a boot.
+pub const DEVICE_INFO_DEAD_KEYS: &[u32] = &[43];
+
+/// Keys the guest has a real arm for that this device deliberately does not
+/// answer, and what each one's absence tells the guest.
+///
+/// These are the true holes — the ones the report should keep naming. Every
+/// entry leaves its field zero with its `Defined` byte clear, and the guest's
+/// accessors turn that into a specific refusal rather than into a zero:
+///
+/// * 20 `MaxVertexAmplificationCount` — `supportsVertexAmplificationCount:`
+///   then answers yes only for 1, so the guest builds no amplified passes.
+///   Correct: no rail here amplifies.
+/// * 22 `RasterizationRateLayerCount` —
+///   `supportsRasterizationRateMapWithLayerCount:` answers no, so the guest
+///   builds no variable-rate maps. Correct for the same reason.
+/// * 38 `ArgumentBuffersTier` and 39 `ArgumentBuffersMaxSamplerCount` — no
+///   consumer was found in either guest Metal plugin or the guest kernel
+///   driver; the plugin derives the tier from
+///   [`DEVICE_INFO_KEY_SUPPORT_FLAGS_2024`] instead. Answering them is believed
+///   inert, which is why they are listed rather than filled in.
+///
+/// All four are holes on macOS 15 as well as macOS 26, and macOS 15 renders a
+/// correct dock — so **none of them can explain a Tahoe-only defect.** That is
+/// the reasoning this constant exists to hold, because it is the reasoning a
+/// future session is most likely to redo from the hole report alone.
+pub const DEVICE_INFO_UNANSWERED_KEYS: &[u32] = &[
+    DEVICE_INFO_KEY_MAX_VERTEX_AMPLIFICATION,
+    DEVICE_INFO_KEY_RASTERIZATION_RATE_LAYERS,
+    DEVICE_INFO_KEY_ARGUMENT_BUFFERS_TIER,
+    DEVICE_INFO_KEY_ARGUMENT_BUFFERS_MAX_SAMPLERS,
 ];
 
 #[inline]

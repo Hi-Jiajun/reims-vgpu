@@ -465,6 +465,30 @@ mod tests {
             .max()
             .expect("the table is not empty");
 
+        // The three sets partition the guest's parse range, and the partition is
+        // derived here rather than written down twice. Adding a key to the table
+        // without dropping it from the unanswered list — or the reverse — fails
+        // this, which is the only thing stopping that list from decaying into a
+        // comment that used to be true.
+        let answered: std::collections::BTreeSet<u32> =
+            DEVICE_INFO_CAPS.iter().map(|&(key, _)| key).collect();
+        let derived_unanswered: Vec<u32> = (1..=table_top)
+            .filter(|k| !answered.contains(k))
+            .filter(|k| !DEVICE_INFO_DEAD_KEYS.contains(k))
+            .collect();
+        assert_eq!(
+            derived_unanswered, DEVICE_INFO_UNANSWERED_KEYS,
+            "DEVICE_INFO_UNANSWERED_KEYS must be exactly the keys below the \
+             table top that this device neither answers nor knows to be dead"
+        );
+        for dead in DEVICE_INFO_DEAD_KEYS {
+            assert!(
+                !answered.contains(dead),
+                "key {dead} is sent and also declared dead — the guest would \
+                 discard it, so one of the two is wrong"
+            );
+        }
+
         // A guest that parses nothing has no unanswered key of either kind:
         // key 0 terminates the walk and is not a key, so a ceiling of 1 admits
         // none. This is what catches an off-by-one that counts key 0 as a hole
@@ -490,6 +514,7 @@ mod tests {
         let gaps_below = |ceiling: u32| -> u64 {
             (1..ceiling.min(table_top + 1))
                 .filter(|key| !DEVICE_INFO_CAPS.iter().any(|&(k, _)| k == *key))
+                .filter(|key| !DEVICE_INFO_DEAD_KEYS.contains(key))
                 .count() as u64
         };
         let macos_15 = ask(42).0;
@@ -497,12 +522,26 @@ mod tests {
         assert_eq!(macos_15, gaps_below(42), "macOS 15 parses keys 1..=41");
         assert_eq!(macos_26, gaps_below(45), "macOS 26 parses keys 1..=44");
 
-        // The assertion a constant — or a computation that ignored the guest's
-        // ceiling — cannot satisfy: parsing further must find strictly more.
-        assert!(
-            macos_26 > macos_15,
-            "macOS 26 parses three keys further than macOS 15 and the table has \
-             a gap in that span, so it must report more holes: {macos_26} vs {macos_15}"
+        // **The two rails have the same holes, and that is the finding.** The
+        // only key macOS 26 parses that macOS 15 does not and this device does
+        // not answer is 43, which the guest's own walker has no arm for. Once it
+        // stops being counted, the hole sets are identical — so no hole can
+        // explain a defect that appears on macOS 26 and not on macOS 15. This
+        // assertion used to read `macos_26 > macos_15` and passed for exactly
+        // the wrong reason: it was counting the dead key.
+        assert_eq!(
+            macos_26, macos_15,
+            "the extra keys macOS 26 parses are answered (42, 44) or dead (43), \
+             so parsing further must find no additional hole"
+        );
+
+        // Ceiling sensitivity still has to hold, or the report could be a
+        // constant. Key 22 is a real hole, so a ceiling above it must find one
+        // more than a ceiling at it.
+        assert_eq!(
+            ask(23).0,
+            ask(22).0 + 1,
+            "raising the ceiling past the hole at key 22 must report it"
         );
     }
 

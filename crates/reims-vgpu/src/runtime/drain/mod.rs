@@ -1587,11 +1587,26 @@ fn reply_device_info<H: HostMemory + HostOps>(
     let table_top = served.iter().map(|&(key, _)| key).max().unwrap_or(0);
     // Key 0 terminates the walk and is not a key, so the parseable set starts
     // at 1.
+    // A key the guest's walker has no arm for is not a hole: nothing would ever
+    // consume a value sent for it. Reporting one sends the next reader hunting
+    // for a value to fill a field that does not exist, which is a boot this
+    // investigation actually spent — see
+    // [`crate::model::DEVICE_INFO_DEAD_KEYS`].
     let holes: Vec<u32> = (1..key_table_len.min(table_top.saturating_add(1)))
         .filter(|key| !answered.contains(key))
+        .filter(|key| !crate::model::DEVICE_INFO_DEAD_KEYS.contains(key))
         .collect();
     let tail = key_table_len.saturating_sub(table_top.saturating_add(1));
+    // A hole this device has characterized is a decision; a hole it has not is a
+    // guest capability field nobody here has ever looked at. Only the second is
+    // a finding, and they are counted apart because the first set is expected to
+    // be non-empty forever — a combined count can never read as an alarm.
+    let unknown_holes = holes
+        .iter()
+        .filter(|key| !crate::model::DEVICE_INFO_UNANSWERED_KEYS.contains(key))
+        .count();
     note_store_route_n("device_info_key_holes", holes.len() as u64);
+    note_store_route_n("device_info_key_holes_unknown", unknown_holes as u64);
     note_store_route_n("device_info_key_tail", u64::from(tail));
     // Printed on every reply, not only when something changed. A host that
     // already meets the table reduces nothing, and then silence would be
