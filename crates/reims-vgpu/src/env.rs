@@ -71,6 +71,38 @@ pub const GPU_STAMP: &str = "REIMS_VGPU_GPU_STAMP";
 /// the drain thread is exactly the kind that could perturb its own subject.
 pub const PAGE_GUARDS: &str = "REIMS_VGPU_PAGE_GUARDS";
 
+/// Setting this **on** makes [`crate::runtime::range_coverage`] walk the guest's
+/// page table across every page of every map and unmap range. Default off, and
+/// it is the only variable here whose default is the quiet one.
+///
+/// # Why it defaults off, which is a measurement and not a preference
+///
+/// Always-on, this walk costs the drain enough to lose the guest a race it
+/// otherwise wins. One undriven macos-15 boot went from **0** `no_list_entry` to
+/// **47**, and from 0 `list_miss_slot_empty` to 182, purely by adding it — and
+/// back to 0 with the guards switched off on the same binary. The other guards
+/// descend a single path per packet; this one walks a whole range, sixteen
+/// thousand pages for one 64 MiB mapping, on the drain thread while it holds the
+/// device lock.
+///
+/// So it is a probe rather than a guard, under the rule its own module states:
+/// an instrument that watches a race must not be the reason the race moves.
+///
+/// # Why it is not the widening this module forbids
+///
+/// The rule above is about **capability** — a switch may not turn on a rail the
+/// host reported it cannot run, because binding an unadvertised extension is a
+/// crash and importing an undeclared handle is undefined behavior in a driver.
+/// There is no host that cannot walk a page table it is already reading, and
+/// nothing this gates changes what the guest observes. What it changes is how
+/// much work the drain does, and the default is the side that does less.
+///
+/// It gets its own name rather than riding on [`DRAW_LOG`] for the same reason
+/// it exists: that variable turns on a per-draw log flood that is itself a drain
+/// cost, so gating a latency probe behind it would guarantee the perturbation
+/// the probe is trying to measure.
+pub const RANGE_COVERAGE: &str = "REIMS_VGPU_RANGE_COVERAGE";
+
 /// What one variable says, including the two ways it says nothing usable.
 ///
 /// Four states rather than a `bool` because "unset", "explicitly on" and
@@ -225,13 +257,25 @@ mod tests {
     /// by grepping their own environment.
     #[test]
     fn every_name_carries_the_crate_prefix() {
-        for name in [DRAW_LOG, GUEST_IMPORT, GPU_STAMP, PAGE_GUARDS] {
+        let names = [
+            DRAW_LOG,
+            GUEST_IMPORT,
+            GPU_STAMP,
+            PAGE_GUARDS,
+            RANGE_COVERAGE,
+        ];
+        for name in names {
             assert!(name.starts_with("REIMS_VGPU_"), "{name}");
             assert!(
                 name.bytes()
                     .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'),
                 "{name}"
             );
+        }
+        for (i, a) in names.iter().enumerate() {
+            for b in &names[i + 1..] {
+                assert_ne!(a, b, "two variables share a name");
+            }
         }
     }
 }

@@ -80,8 +80,32 @@
 //! of those pages unconditionally, so the reach asked for is never more than the
 //! reach the guest has already committed to.
 //!
-//! It is gated with the other two guards on [`crate::env::PAGE_GUARDS`], so one
-//! switch takes all three out of a boot that is measuring the race they watch.
+//! # And it is still too expensive to leave on, which was measured the hard way
+//!
+//! Always-on for four commits, this walk **changed the thing it was watching**.
+//! One undriven macos-15 boot:
+//!
+//! | build | this probe | `no_list_entry` | `list_miss_slot_empty` |
+//! |---|---|---|---|
+//! | previous tip | absent | **0** | **0** |
+//! | with it, guards on | walking | **47** | **182** |
+//! | same binary, guards off | silent | **0** | **0** |
+//!
+//! A rail that had never lost a draw to an empty object-list slot started losing
+//! forty-seven of them, and switching the probe off on the same binary gave them
+//! back. The walk is on the drain thread while it holds the device lock, and the
+//! guest clears those slots by writing its own memory — which nothing orders
+//! against the ring except how fast this device reads it. Slowing the drain lost
+//! the race.
+//!
+//! So this is a **probe, not a guard**, and it is off unless
+//! [`crate::env::RANGE_COVERAGE`] asks for it. Turn it on to ask its question and
+//! off before quoting any other counter from the same boot.
+//!
+//! That accident is also the most useful thing this module has produced. It is a
+//! *manipulated variable*: drain latency was raised deliberately and lost draws
+//! followed, on a rail with none. Every earlier attempt on `no_list_entry` was a
+//! correlation. See `kb/macos-26-the-guest-runs-ahead-of-the-drain.md`.
 
 use reims_vgpu_paging::resolve::RangeCoverage;
 
@@ -101,12 +125,36 @@ use reims_vgpu_paging::resolve::RangeCoverage;
 /// a population it could not see.
 pub const MAX_SCAN_PAGES: u64 = 1 << 20;
 
-/// Whether the guest guards are observing this boot.
+/// Whether this probe runs at all, which by default it does not.
 ///
-/// Shared with [`crate::runtime::node_guard`] deliberately: all three page
-/// guards watch the same guest teardown, and an A/B that silences one of them
-/// while the others keep running measures neither arm.
-pub use crate::runtime::node_guard::enabled;
+/// **The only instrument here that is off unless asked for, and the reason is a
+/// measurement rather than caution.** See the module doc's cost section and
+/// [`crate::env::RANGE_COVERAGE`].
+///
+/// Read once and cached: the alternative is an environment lookup on the drain
+/// thread for every map and unmap packet, which is the kind of cost this gate
+/// exists to avoid.
+///
+/// [`crate::runtime::node_guard::enabled`] still silences it, so the one switch
+/// that takes every page instrument out of a boot keeps doing that.
+pub fn enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        enabled_from(
+            crate::env::switch(crate::env::RANGE_COVERAGE),
+            crate::runtime::node_guard::enabled(),
+        )
+    })
+}
+
+/// The decision [`enabled`] caches, split out so it can be tested.
+///
+/// [`enabled`] latches in a `OnceLock` and the environment is process-global, so
+/// a test of the real function could assert one arm per process at best. This is
+/// the whole rule and it is total over both inputs.
+fn enabled_from(asked: crate::env::Switch, guards_on: bool) -> bool {
+    asked == crate::env::Switch::On && guards_on
+}
 
 /// Which way the guest is about to edit the range.
 ///
@@ -260,6 +308,29 @@ pub fn pages_of(length: u64, page_shift: u32) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The probe runs only when an operator asked for it by name, and the page
+    /// guards' own switch still silences it.
+    ///
+    /// Off-by-default is the load-bearing half and it is not a preference: this
+    /// walk was measured changing the counters of the rail it ran on, so an
+    /// unset environment — which is every boot nobody configured — must not
+    /// walk. A `Switch::Unrecognized` counts as not asked, so a typo leaves the
+    /// quiet default rather than silently costing a boot its readings.
+    #[test]
+    fn the_probe_is_off_unless_asked_for_by_name_and_the_guards_agree() {
+        use crate::env::Switch;
+        assert!(enabled_from(Switch::On, true));
+        for asked in [Switch::Unset, Switch::Off, Switch::Unrecognized] {
+            assert!(!enabled_from(asked, true), "{asked:?} started the probe");
+        }
+        for asked in [Switch::On, Switch::Unset, Switch::Off, Switch::Unrecognized] {
+            assert!(
+                !enabled_from(asked, false),
+                "{asked:?} outran the page-guard switch"
+            );
+        }
+    }
 
     fn counts(present: u64, absent: u64, undecidable: u64) -> RangeCoverage {
         RangeCoverage {
