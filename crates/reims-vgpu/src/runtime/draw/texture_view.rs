@@ -868,6 +868,42 @@ mod texture_view_split_tests {
         assert!(effective_view_sample_format(0, Some(MTL_FORMAT_RGBA8_UNORM)).is_none());
     }
 
+    /// A format this crate has never declared and one the guest may not
+    /// reinterpret are different refusals, and this gate could only say the
+    /// second.
+    ///
+    /// It answers `None` the moment either side has no known texel width, so an
+    /// undeclared format arrives at the compute and draw binds as
+    /// `format_incompatible` — which reads as "the guest asked for an illegal
+    /// view" and sends the next reader to the guest's descriptor rather than to
+    /// this crate's own table. `R8Uint` is the worked example: a macOS 26 guest
+    /// stages one into compute dispatches, `bytes_per_pixel` had no arm for it,
+    /// and 51 dispatches a boot were refused under the wrong name.
+    ///
+    /// Declaring the width is all this asserts. Whether an *integer* texel may
+    /// then be sampled is a separate question, answered separately and by name —
+    /// see `an_integer_texel_is_declared_but_has_no_sampled_rail`.
+    #[test]
+    fn a_declared_format_clears_the_width_gate_whether_or_not_a_rail_takes_it() {
+        use crate::contract::pixel_format::{
+            MTL_FORMAT_R8_UINT, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RGBA8_UNORM,
+        };
+        assert_eq!(
+            effective_view_sample_format(MTL_FORMAT_R8_UINT, None),
+            Some(MTL_FORMAT_R8_UINT)
+        );
+        // One byte wide, so it views as the other one-byte formats and not as
+        // anything wider. The mismatch arm is what stays load-bearing here.
+        assert_eq!(
+            effective_view_sample_format(MTL_FORMAT_R8_UINT, Some(MTL_FORMAT_R8_UNORM)),
+            Some(MTL_FORMAT_R8_UNORM)
+        );
+        assert!(
+            effective_view_sample_format(MTL_FORMAT_R8_UINT, Some(MTL_FORMAT_RGBA8_UNORM))
+                .is_none()
+        );
+    }
+
     /// The point of typing this refusal is that the sink can tell the fifteen
     /// checks apart. Two sharing a slug would put them back behind one label —
     /// which is the state this replaced, where all fifteen printed

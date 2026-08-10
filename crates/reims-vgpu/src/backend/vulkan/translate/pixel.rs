@@ -126,6 +126,7 @@ pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {
             ..linear(vk::Format::R8_UNORM, 1)
         },
         p::MTL_FORMAT_R8_UNORM => linear(vk::Format::R8_UNORM, 1),
+        p::MTL_FORMAT_R8_UINT => linear(vk::Format::R8_UINT, 1),
         p::MTL_FORMAT_R16_UNORM => linear(vk::Format::R16_UNORM, 2),
         p::MTL_FORMAT_R16_FLOAT => linear(vk::Format::R16_SFLOAT, 2),
         p::MTL_FORMAT_RG8_UNORM => linear(vk::Format::R8G8_UNORM, 2),
@@ -761,6 +762,12 @@ mod tests {
             TransferFunction::Linear,
         ),
         (
+            p::MTL_FORMAT_R8_UINT,
+            vk::Format::R8_UINT,
+            1,
+            TransferFunction::Linear,
+        ),
+        (
             p::MTL_FORMAT_R16_FLOAT,
             vk::Format::R16_SFLOAT,
             2,
@@ -1351,6 +1358,47 @@ mod tests {
                 p::MTL_FORMAT_RGBA16_FLOAT,
             ]
         );
+    }
+
+    /// An integer texel is declared, translates, and is refused by every rail
+    /// that would have to give it a meaning — each by its own name.
+    ///
+    /// The refusal is the point. `R8Uint` holds an eight-bit *integer*, and every
+    /// converter in `pixel_format` reads a one-byte texel as a unorm: run through
+    /// them, a stored 200 comes back as 0.784 and the shader is handed a number
+    /// the guest never wrote. So the correct rail for an integer format is the
+    /// native one or none, and until a guest is measured needing the native one,
+    /// none is the honest answer.
+    ///
+    /// What the declaration bought is a *precise* refusal rather than a
+    /// misleading one: before it, `bytes_per_pixel` answered `None` and the bind
+    /// died at the width gate as `format_incompatible`, which names a guest
+    /// error. Now each rail that cannot take it says so about itself.
+    #[test]
+    fn an_integer_texel_is_declared_but_has_no_sampled_rail() {
+        // Declared: it has a width and a Vulkan spelling.
+        assert_eq!(
+            p::bytes_per_pixel(p::MTL_FORMAT_R8_UINT),
+            Some(p::R8_BPP),
+            "R8Uint is one byte wide"
+        );
+        assert_eq!(
+            translate(p::MTL_FORMAT_R8_UINT).unwrap().vk,
+            vk::Format::R8_UINT
+        );
+
+        // Refused, and each by its own name rather than by a shared slug.
+        assert!(matches!(
+            sampled_pixels(p::MTL_FORMAT_R8_UINT),
+            Err(TranslateReason::NoSampledLayout(p::MTL_FORMAT_R8_UINT))
+        ));
+        assert!(color_attachment(p::MTL_FORMAT_R8_UINT).is_err());
+        assert_eq!(p::render_target_bpp(p::MTL_FORMAT_R8_UINT), None);
+        assert_eq!(p::storage_selector(p::MTL_FORMAT_R8_UINT), None);
+
+        // And it never reaches a unorm converter: no texel layout means no
+        // conversion arm can silently claim it.
+        assert_eq!(texel_layout_of(vk::Format::R8_UINT), None);
     }
 
     /// The two arms that answer "may a colour attachment be this format" are one

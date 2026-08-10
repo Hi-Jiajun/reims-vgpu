@@ -28,6 +28,23 @@ pub const R32_BPP: u32 = 4;
 // MTLPixelFormat values (Metal.framework Headers/MTLPixelFormat.h).
 pub const MTL_FORMAT_A8_UNORM: u16 = 0x01;
 pub const MTL_FORMAT_R8_UNORM: u16 = 0x0a;
+/// `MTLPixelFormatR8Uint`. Metal numbers the R8 family consecutively from
+/// `R8Unorm` at 10 — `R8Unorm_sRGB`, `R8Snorm`, `R8Uint`, `R8Sint` — so the
+/// unsigned-integer member is 13.
+///
+/// Declared for the same reason as [`MTL_FORMAT_RGBA16_UNORM`] below: its
+/// absence was a *decode* gap, not a rail gap. `bytes_per_pixel` answered `None`
+/// for it, and since [`crate::runtime::draw::effective_view_sample_format`] asks
+/// that question about both the base and the view before anything else looks at
+/// the bind, every path refused it as `format_incompatible` — a slug that reads
+/// as "the guest asked for an illegal reinterpretation" when what happened is
+/// that this crate had never heard of the format. A macOS 26 guest stages one
+/// into compute dispatches, which is what surfaced it.
+///
+/// Being *declared* is not being *sampled*: an integer texel must not be run
+/// through the unorm converters, so it has no [`crate::backend::vulkan`] texel
+/// layout and no storage selector, and both of those decline it by name.
+pub const MTL_FORMAT_R8_UINT: u16 = 0x0d;
 /// `MTLPixelFormatR16Unorm`. The luma plane of a ten-bit biplanar video
 /// surface (`'x420'`), where the eight-bit shape uses
 /// [`MTL_FORMAT_R8_UNORM`].
@@ -427,7 +444,9 @@ const F32_TO_F16_ROUND_BIT: u32 = 0x1000;
 /// parent.
 pub fn bytes_per_pixel(format: u16) -> Option<u32> {
     Some(match format {
-        MTL_FORMAT_A8_UNORM | MTL_FORMAT_R8_UNORM | MTL_FORMAT_STENCIL8 => R8_BPP,
+        MTL_FORMAT_A8_UNORM | MTL_FORMAT_R8_UNORM | MTL_FORMAT_R8_UINT | MTL_FORMAT_STENCIL8 => {
+            R8_BPP
+        }
         MTL_FORMAT_R16_FLOAT | MTL_FORMAT_RG8_UNORM | MTL_FORMAT_DEPTH16_UNORM => RG8_BPP,
         MTL_FORMAT_R16_UNORM => R16_BPP,
         MTL_FORMAT_RG16_UNORM => RG16_BPP,
@@ -1779,6 +1798,7 @@ mod tests {
         let cases = [
             (MTL_FORMAT_A8_UNORM, 1),
             (MTL_FORMAT_R8_UNORM, 1),
+            (MTL_FORMAT_R8_UINT, 1),
             (MTL_FORMAT_R16_FLOAT, 2),
             (MTL_FORMAT_RG8_UNORM, 2),
             (MTL_FORMAT_R32_UINT, 4),
