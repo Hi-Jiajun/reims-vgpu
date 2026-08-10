@@ -2336,9 +2336,20 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
     // rules the outstanding writeback disjoint from the very same mapping and
     // skips its `ScanoutPaint` settle, then reaches here and waits for that same
     // writeback anyway. An inner gate that is wider than the outer one makes the
-    // outer one decorative, and on a driven macos-13 Maps drag this site was 31
-    // waits costing 153 ms — 4.9 ms each, a fifth of the boot's whole draw budget
-    // in thirty-one events.
+    // outer one decorative.
+    //
+    // Measured on driven macos-13 Apple Maps drags, three boots per arm,
+    // alternating pinned binaries on a quiesced host. The site was 31-34 waits a
+    // boot costing 153-287 ms, ~5 ms each; after narrowing it is **zero**, and the
+    // outcome counters say every one of those waits was `_disjoint` with no
+    // `_overlap` and no `_unnamed` — not one was owed. `fence_us/fence` and
+    // `sampled_us` both fall ~3x with clean separation between the arms.
+    //
+    // **No throughput claim.** End-to-end per-chain time does not separate at
+    // n=3: the `seed_us` and `engine_us` controls, which this cannot touch,
+    // drifted upward by more than the total moved down. ~34 waits of ~5 ms in a
+    // 25 s window is 0.7 % of wall clock concentrated in ~34 of ~1000 chains, so
+    // this is a tail effect and a median is the wrong instrument for it.
     //
     // Correctness is unchanged in the direction that matters: the skip needs the
     // engine to *prove* the pending writeback lands nowhere in the page set, and
