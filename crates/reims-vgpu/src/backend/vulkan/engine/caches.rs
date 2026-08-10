@@ -545,6 +545,12 @@ impl ObjectCaches {
         // cannot be declared — that is invalid usage, and an invalid module is
         // undefined behaviour inside a driver rather than an error it returns —
         // so an unsupported requirement is a named decline instead.
+        // Both passes below walk the whole module, and so does the digest, so the
+        // charge is levied once here on the words the caller handed over rather
+        // than at each walk.
+        counters
+            .shader_hash_words
+            .fetch_add(words.len() as u64, Ordering::Relaxed);
         let need = crate::runtime::spirv_bind::required_image_capabilities(words);
         let mut patched;
         let words: &[u32] = if need.any() {

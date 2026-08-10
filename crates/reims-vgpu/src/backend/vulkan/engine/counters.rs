@@ -152,6 +152,22 @@ engine_counters! {
         allocs,
         shader_hits,
         shader_misses,
+        /// SPIR-V words walked by [`super::caches::Caches::get_or_create_shader`]
+        /// before it can look anything up, summed over every call including the
+        /// hits.
+        ///
+        /// Keying a module by its contents means the key costs a pass over the
+        /// contents, and this device asks for two of them — the storage-image
+        /// capability derivation and the digest — on every draw, for both stages,
+        /// whether or not the module is already cached. `shader_hits` alone reads
+        /// as a working cache and says nothing about that, the same way
+        /// `sampled_cache_hits` read as working until `sampled_cache_hit_bytes`
+        /// priced it: a hit over a 2 KiB module and a hit over an 88 KiB one are
+        /// the same count and forty times the work.
+        ///
+        /// Divided by the census window this is a bandwidth, which is the form
+        /// that can be compared against what a hashing pass over memory costs.
+        shader_hash_words,
         layout_hits,
         layout_misses,
         pass_hits,
