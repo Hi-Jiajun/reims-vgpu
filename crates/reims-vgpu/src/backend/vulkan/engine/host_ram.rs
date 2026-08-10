@@ -304,6 +304,16 @@ unsafe fn import_ramblock(
     // exactly what that preference describes. On a discrete host the selector
     // will land on a host-visible type, and the copy into VRAM is a separate
     // decision made by the caller, not by this import.
+    //
+    // The RAMBlock's whole length goes with the request, and for this call site
+    // that is the load-bearing argument rather than a detail. An imported host
+    // pointer's pages do not move — the memory type cannot relocate a mapping
+    // this process already holds — so the only thing the pick decides is which
+    // heap the driver charges a multi-gigabyte allocation to. `Upload` on a
+    // `Unified` classification prefers `DEVICE_LOCAL`, and on a part whose
+    // device-local heap is a carve-out smaller than the guest (an APU with 2 GiB
+    // against a 16 GiB guest) that preference asks the driver to keep the entire
+    // guest resident in a pool with no room for it.
     let req = ctx
         .caps
         .memory_request(crate::backend::vulkan::caps::MemoryClass::Upload);
@@ -314,10 +324,17 @@ unsafe fn import_ramblock(
             &ctx.memory_properties,
             host_base as *const std::ffi::c_void,
             &req,
+            size,
         )
     };
     let probe_us = probe_started.elapsed().as_micros() as u64;
-    let memory_type_index = picked.ok_or(HostRamDecline::NoImportableMemoryType { host_base })?;
+    let pick = picked.ok_or(HostRamDecline::NoImportableMemoryType { host_base })?;
+    ctx.report_oversized_allocation(
+        crate::backend::vulkan::caps::MemoryClass::Upload,
+        size,
+        pick,
+    );
+    let memory_type_index = pick.index;
     let alloc_started = Instant::now();
 
     let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(HANDLE_TYPE);
@@ -374,9 +391,17 @@ unsafe fn import_ramblock(
     if bound.is_err() {
         unsafe { ctx.device.destroy_buffer(buffer, None) };
     }
+    // The heap is on this line and not just the type index, because "which type"
+    // is not answerable from the index alone on an unfamiliar device and the
+    // heap is what a report of a slow host turns on. `fits=0` here is the whole
+    // diagnosis for a guest larger than the pool its import was charged to.
     crate::observe::off(format!(
-        "host_ram_import id={} bytes={size} mtype={memory_type_index} probe_us={probe_us} alloc_us={} ok={}",
+        "host_ram_import id={} bytes={size} mtype={memory_type_index} heap={} heap_mb={} \
+         fits={} probe_us={probe_us} alloc_us={} ok={}",
         import.id().get(),
+        pick.heap_index,
+        pick.heap_bytes >> 20,
+        pick.fits,
         alloc_started.elapsed().as_micros() as u64,
         bound.is_ok(),
     ));

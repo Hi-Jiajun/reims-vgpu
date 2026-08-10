@@ -206,7 +206,7 @@ impl ResourcePools {
         counters.note_create();
         let req = ctx.device.get_image_memory_requirements(image);
         let mt = ctx
-            .memory_type_for(req.memory_type_bits, MemoryClass::DeviceLocal)
+            .memory_type_for(req.memory_type_bits, req.size, MemoryClass::DeviceLocal)
             .ok_or({
                 DrawError::Unsupported(reason::DrawReason::NoDeviceLocalMemoryForStorageImage {
                     memory_type_bits: req.memory_type_bits,
@@ -1217,7 +1217,7 @@ impl ResourcePools {
             counters.note_create();
             let ireq = ctx.device.get_image_memory_requirements(image);
             let imt = ctx
-                .memory_type_for(ireq.memory_type_bits, MemoryClass::DeviceLocal)
+                .memory_type_for(ireq.memory_type_bits, ireq.size, MemoryClass::DeviceLocal)
                 .ok_or_else(|| {
                     ctx.device.destroy_image(image, None);
                     DrawError::Unsupported(reason::DrawReason::NoDeviceLocalMemoryForMrtSecondary {
@@ -1425,7 +1425,7 @@ impl ResourcePools {
         counters.note_create();
         let ireq = ctx.device.get_image_memory_requirements(image);
         let imt = ctx
-            .memory_type_for(ireq.memory_type_bits, MemoryClass::DeviceLocal)
+            .memory_type_for(ireq.memory_type_bits, ireq.size, MemoryClass::DeviceLocal)
             .ok_or_else(|| {
                 ctx.device.destroy_image(image, None);
                 DrawError::Unsupported(reason::DrawReason::NoDeviceLocalMemoryForDepth {

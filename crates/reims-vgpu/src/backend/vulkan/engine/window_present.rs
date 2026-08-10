@@ -1265,6 +1265,7 @@ impl WindowPresenter {
         let req = ctx.device.get_image_memory_requirements(image);
         let Some(mem_type) = ctx.memory_type_for(
             req.memory_type_bits,
+            req.size,
             crate::backend::vulkan::caps::MemoryClass::Upload,
         ) else {
             ctx.device.destroy_image(image, None);

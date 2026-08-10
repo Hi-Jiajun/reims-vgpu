@@ -1866,7 +1866,7 @@ impl ResourcePools {
         counters.note_create();
         let req = ctx.device.get_buffer_memory_requirements(buffer);
         let mt = ctx
-            .memory_type_for(req.memory_type_bits, MemoryClass::Upload)
+            .memory_type_for(req.memory_type_bits, req.size, MemoryClass::Upload)
             .ok_or({
                 DrawError::Unsupported(reason::DrawReason::NoHostVisibleMemoryForStaging {
                     memory_type_bits: req.memory_type_bits,
@@ -2229,7 +2229,7 @@ impl ResourcePools {
         counters.note_create();
         let req = ctx.device.get_buffer_memory_requirements(buffer);
         let mt = ctx
-            .memory_type_for(req.memory_type_bits, MemoryClass::Readback)
+            .memory_type_for(req.memory_type_bits, req.size, MemoryClass::Readback)
             .ok_or({
                 DrawError::Unsupported(reason::DrawReason::NoHostVisibleMemoryForReadback {
                     memory_type_bits: req.memory_type_bits,

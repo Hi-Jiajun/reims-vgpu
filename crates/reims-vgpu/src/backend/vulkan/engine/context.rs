@@ -957,8 +957,18 @@ impl DeviceContext {
     ///
     /// Returns `None` only when no type in `type_bits` carries the class's
     /// *required* flags — the caller must then decline with a named reason.
-    pub(crate) fn memory_type_for(&self, type_bits: u32, class: MemoryClass) -> Option<u32> {
-        let picked = self.memory_type_with(type_bits, &self.caps.memory_request(class));
+    ///
+    /// `bytes` is the allocation this pick is for, and every caller has it in the
+    /// `VkMemoryRequirements` it just queried. It is what keeps a large
+    /// allocation out of a heap that could not hold it — see
+    /// [`select_memory_type`].
+    pub(crate) fn memory_type_for(
+        &self,
+        type_bits: u32,
+        bytes: u64,
+        class: MemoryClass,
+    ) -> Option<u32> {
+        let picked = self.memory_type_with(type_bits, bytes, &self.caps.memory_request(class));
         // Once per class per boot. What a class *asks* for is in
         // `MemoryTopology::request` and readable from source; what it *gets* is
         // not, because it depends on this device's memory-type table, and the
@@ -968,30 +978,72 @@ impl DeviceContext {
         // size is a difference in which heap the pick landed in. Naming the
         // index and its flags is what turns that from an inference into a
         // reading.
-        if let Some(i) = picked {
+        if let Some(pick) = picked {
             // Keyed on the class and the index together, so a device whose
             // table makes the pick differ between call sites says so instead of
             // latching the first answer for the boot.
-            let key = ((class as u64) << 32) | i as u64;
+            let key = ((class as u64) << 32) | pick.index as u64;
             if crate::observe::first_sight("vk_memory_type_pick", key) {
-                let t = self.memory_properties.memory_types[i as usize];
+                let t = self.memory_properties.memory_types[pick.index as usize];
                 crate::observe::off(format!(
-                    "vk_memory_type_pick class={class:?} index={i} heap={} flags={:?} \
-                     heap_bytes={}",
-                    t.heap_index,
-                    t.property_flags,
-                    self.memory_properties.memory_heaps[t.heap_index as usize].size,
+                    "vk_memory_type_pick class={class:?} index={} heap={} flags={:?} \
+                     heap_bytes={} bytes={bytes} fits={}",
+                    pick.index, pick.heap_index, t.property_flags, pick.heap_bytes, pick.fits,
                 ));
             }
+            self.report_oversized_allocation(class, bytes, pick);
         }
-        picked
+        picked.map(|p| p.index)
     }
 
     /// Escape hatch for a caller that has already built a [`MemoryRequest`]
     /// (the host-pointer import path, which must intersect what
     /// `vkGetMemoryHostPointerPropertiesEXT` named for the pointer).
-    pub(crate) fn memory_type_with(&self, type_bits: u32, req: &MemoryRequest) -> Option<u32> {
-        select_memory_type(&self.memory_properties, type_bits, req)
+    pub(crate) fn memory_type_with(
+        &self,
+        type_bits: u32,
+        bytes: u64,
+        req: &MemoryRequest,
+    ) -> Option<crate::backend::vulkan::caps::memory_topology::MemoryTypePick> {
+        select_memory_type(&self.memory_properties, type_bits, req, bytes)
+    }
+
+    /// Report, once per (class, heap), an allocation charged to a heap that could
+    /// not hold it even empty.
+    ///
+    /// Fail-visible rather than off-channel, and it is not a loss of guest work:
+    /// the allocation is still attempted and usually succeeds. What it says is
+    /// that this device has asked its driver to keep something resident in a pool
+    /// with no room for it, which is the condition under which a driver's
+    /// residency manager evicts the rest of the working set on every submission.
+    /// That reads from the outside as "the whole machine got slow", and until
+    /// this line existed there was nothing in a boot's log that named it.
+    ///
+    /// [`MemoryTypePick::fits`] is a heap-capacity test and not a residency one,
+    /// so this is a lower bound: a heap large enough to hold the allocation can
+    /// still be too full to. The direction it does catch is unambiguous.
+    pub(crate) fn report_oversized_allocation(
+        &self,
+        class: MemoryClass,
+        bytes: u64,
+        pick: crate::backend::vulkan::caps::memory_topology::MemoryTypePick,
+    ) {
+        if pick.fits {
+            return;
+        }
+        let key = ((class as u64) << 32) | pick.heap_index as u64;
+        if !crate::observe::first_sight("vk_memory_heap_too_small", key) {
+            return;
+        }
+        crate::observe::fail(format!(
+            "vk_memory_heap_too_small reason=vk_memory_heap_too_small class={class:?} \
+             index={} heap={} heap_mb={} bytes_mb={} (the allocation is charged to a heap that \
+             could not hold it empty; expect driver-side eviction of the working set)",
+            pick.index,
+            pick.heap_index,
+            pick.heap_bytes >> 20,
+            bytes >> 20,
+        ));
     }
 
     /// Whether a selected memory type is host-cached and whether it is coherent.

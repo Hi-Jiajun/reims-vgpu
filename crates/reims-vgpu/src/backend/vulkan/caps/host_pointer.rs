@@ -268,8 +268,8 @@ pub unsafe fn query(
     }
 }
 
-/// Which memory type an import of `host_ptr` must use, or `None` when the
-/// device accepts none that also meet `req`.
+/// Which memory type an import of `bytes` at `host_ptr` must use, or `None` when
+/// the device accepts none that also meet `req`.
 ///
 /// `vkGetMemoryHostPointerPropertiesEXT` answers with a `memoryTypeBits` mask
 /// that is a property of the *pointer*, not of the device, so it cannot be
@@ -277,6 +277,11 @@ pub unsafe fn query(
 /// [`super::memory_topology::select_memory_type`] rather than being ranked here:
 /// a second selection site is a second policy, and the two would diverge on the
 /// first host where the ranking mattered.
+///
+/// `bytes` is the whole RAMBlock, and it is the parameter that keeps a
+/// multi-gigabyte import out of a small device-local carve-out — see
+/// [`super::memory_topology::select_memory_type`] for why an imported pointer's
+/// memory type is an accounting choice rather than a placement one.
 ///
 /// # Safety
 ///
@@ -289,7 +294,8 @@ pub unsafe fn import_memory_type(
     memory_props: &vk::PhysicalDeviceMemoryProperties,
     host_ptr: *const std::ffi::c_void,
     req: &super::memory_topology::MemoryRequest,
-) -> Option<u32> {
+    bytes: u64,
+) -> Option<super::memory_topology::MemoryTypePick> {
     let mut ptr_props = vk::MemoryHostPointerPropertiesEXT::default();
     // `ash` 0.38 wraps this extension as raw function pointers only, so the
     // call goes through `fp()` rather than a checked method.
@@ -308,7 +314,7 @@ pub unsafe fn import_memory_type(
     if rc != vk::Result::SUCCESS {
         return None;
     }
-    super::memory_topology::select_memory_type(memory_props, ptr_props.memory_type_bits, req)
+    super::memory_topology::select_memory_type(memory_props, ptr_props.memory_type_bits, req, bytes)
 }
 
 #[cfg(test)]
