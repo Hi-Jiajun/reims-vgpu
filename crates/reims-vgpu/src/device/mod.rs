@@ -580,6 +580,7 @@ pub fn device_drain(id: u64) -> bool {
     // against the write census, which only moves when this device writes. Also
     // returns immediately when nothing is watched.
     crate::runtime::released_pages::sweep(&mut device.state);
+    crate::runtime::released_pages::note_levels(&device.state);
     // The bind registry's own levels, on that same cadence and read against the
     // `bb_retire_*` routes: what the retirements dropped, and what the survivors
     // look like.

@@ -29,12 +29,16 @@
 //!
 //! # Terminals, not a horizon
 //!
-//! A watched page stops being watched when the guest maps it again — at which
+//! A watched page stops being watched when **any** task maps it again — at which
 //! point writing to it is legitimate, and keeping it would report ordinary work
-//! as a defect — or when the task dies. Neither is a duration chosen in
-//! advance. That matters here for the same reason it did for
+//! as a defect — or when it reports. Neither is a duration chosen in advance.
+//! That matters here for the same reason it did for
 //! [`crate::runtime::objects::slot_recheck`]: a horizon would have to come from
 //! somewhere, and the number would end up deciding the answer.
+//!
+//! Note "any task", not "the task that released it". See [`ReleasedPages`] for
+//! why the watch is not keyed by task, which is the difference between a finding
+//! worth acting on and one that is just a shared surface.
 //!
 //! # What it costs
 //!
@@ -58,7 +62,7 @@ use std::collections::BTreeMap;
 
 use crate::runtime::host_writes::{HostWriteVerdict, HostWrites};
 
-/// How many released pages one task's watch will hold.
+/// How many released pages the watch will hold.
 ///
 /// A single release can cover tens of megabytes, so this is a bound on the
 /// watch and not on the guest. A page that does not fit is **refused and
@@ -94,7 +98,7 @@ impl ReleasedVerdict {
     }
 }
 
-/// When a page was released.
+/// When a page was released, and by which task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Released {
     /// The [`HostWrites`] epoch current at the release. Any write carrying a
@@ -102,9 +106,28 @@ struct Released {
     epoch: u64,
     /// `crate::observe::elapsed_us` at the release.
     at_us: u64,
+    /// The task whose unmap armed it, carried for the finding's own line rather
+    /// than for keying — see why the watch is not per task.
+    task_id: u32,
 }
 
-/// One task's released pages.
+/// The released pages, across every task.
+///
+/// **Global on purpose, and this is the correction that makes a finding
+/// trustworthy.** A guest page is guest-physical and more than one task can map
+/// it — a shared IOSurface is exactly that — so a per-task watch arms a page
+/// when task A unmaps it and then reports the perfectly legitimate write that
+/// arrives through task B's live mapping. Keyed globally, any task mapping the
+/// page disarms it, and that whole class of false finding cannot arise.
+///
+/// The residue, which no keying fixes: if A and B both map a page and only A
+/// unmaps, the page is armed while B still holds it, and a write through B reads
+/// as a finding. Counting live mappings per page would answer it, and it is not
+/// done here because the count would have to be complete to be worth anything —
+/// a page mapped by a route this watch does not see would make every later
+/// answer for it wrong in the quiet direction. So the residue is stated, and the
+/// discriminator for a specific finding is whether the page is still reachable
+/// by any task at the time it fires.
 #[derive(Default, Debug)]
 pub struct ReleasedPages {
     pages: BTreeMap<u64, Released>,
@@ -118,7 +141,7 @@ impl ReleasedPages {
     /// release epoch: the question is whether anything was written since the
     /// guest stopped wanting us there, and re-stamping it would forgive a write
     /// that had already happened.
-    pub fn release(&mut self, writes: &HostWrites, gpa: u64, now_us: u64) {
+    pub fn release(&mut self, writes: &HostWrites, task_id: u32, gpa: u64, now_us: u64) {
         if self.pages.contains_key(&gpa) {
             return;
         }
@@ -131,6 +154,7 @@ impl ReleasedPages {
             Released {
                 epoch: writes.epoch(),
                 at_us: now_us,
+                task_id,
             },
         );
     }
@@ -140,23 +164,33 @@ impl ReleasedPages {
         self.pages.remove(&gpa);
     }
 
-    /// Judge every watched page, dropping the ones that answer.
+    /// Judge every watched page and report only the ones that answered.
     ///
     /// A page that reports is removed so that one late write is one finding
     /// rather than one per sweep for the rest of the boot. A `Quiet` page stays,
-    /// because the write it is waiting for has not happened *yet*.
-    pub fn sweep(&mut self, writes: &HostWrites, now_us: u64) -> Vec<(u64, ReleasedVerdict)> {
+    /// because the write it is waiting for has not happened *yet* — and it is
+    /// **not** reported: a quiet page is the normal state of every watched page
+    /// on every sweep, so returning them makes the output the product of the
+    /// watch size and the tranche count. That is not a hypothetical. Returning
+    /// them cost one boot **104 million** counter increments, each taking the
+    /// census mutex, from an instrument whose entire job is to not perturb a
+    /// race. The watch size is reported as a level instead.
+    pub fn sweep(
+        &mut self,
+        writes: &HostWrites,
+        now_us: u64,
+    ) -> Vec<(u64, u32, ReleasedVerdict)> {
         let mut out = Vec::new();
         self.pages.retain(|&gpa, rel| {
             let verdict = match writes.wrote_any_since(rel.epoch, &[gpa]) {
-                HostWriteVerdict::Quiet => ReleasedVerdict::Quiet,
+                HostWriteVerdict::Quiet => return true,
                 HostWriteVerdict::Overlap => ReleasedVerdict::Wrote {
                     since_us: now_us.saturating_sub(rel.at_us),
                 },
                 _ => ReleasedVerdict::Undecidable,
             };
-            out.push((gpa, verdict));
-            matches!(verdict, ReleasedVerdict::Quiet)
+            out.push((gpa, rel.task_id, verdict));
+            false
         });
         out
     }
@@ -183,30 +217,46 @@ pub fn sweep(state: &mut crate::model::DeviceState) {
     let now_us = crate::observe::elapsed_us();
     let crate::model::DeviceState {
         host_writes,
-        released_pages: watches,
+        released_pages: watch,
         ..
     } = state;
-    for (&task_id, watch) in watches.iter_mut() {
-        if watch.watched() == 0 {
-            continue;
-        }
-        for (gpa, verdict) in watch.sweep(host_writes, now_us) {
-            crate::runtime::drain::note_store_route(verdict.route());
-            if let ReleasedVerdict::Wrote { since_us } = verdict {
-                if crate::observe::first_sight("released_write_after_release", gpa) {
-                    crate::observe::fail(format!(
-                        "released_pages reason={} task={task_id} gpa={gpa:#x} \
-                         since_us={since_us} watched={} refused={} (this device wrote to a guest \
-                         page after the guest released it; the guest is entitled to have given \
-                         that page to something else, including its own page table)",
-                        verdict.route(),
-                        watch.watched(),
-                        watch.refused(),
-                    ));
-                }
+    if watch.watched() == 0 {
+        return;
+    }
+    for (gpa, task_id, verdict) in watch.sweep(host_writes, now_us) {
+        crate::runtime::drain::note_store_route(verdict.route());
+        if let ReleasedVerdict::Wrote { since_us } = verdict {
+            if crate::observe::first_sight("released_write_after_release", gpa) {
+                crate::observe::fail(format!(
+                    "released_pages reason={} task={task_id} gpa={gpa:#x} \
+                     since_us={since_us} watched={} refused={} (this device wrote to a guest \
+                     page after the guest released it; the guest is entitled to have given \
+                     that page to something else, including its own page table)",
+                    verdict.route(),
+                    watch.watched(),
+                    watch.refused(),
+                ));
             }
         }
     }
+}
+
+/// The watch's own size, on the census cadence.
+///
+/// A level rather than a per-page count, because the population is the thing
+/// worth knowing and counting each quiet page every sweep is what made this
+/// instrument expensive. `refused` non-zero means the readings describe a
+/// smaller set than the guest released.
+pub fn note_levels(state: &crate::model::DeviceState) {
+    let watch = &state.released_pages;
+    if watch.watched() == 0 && watch.refused() == 0 {
+        return;
+    }
+    crate::observe::off(format!(
+        "released_pages_levels watching={} refused={} capacity={WATCH_CAP}",
+        watch.watched(),
+        watch.refused(),
+    ));
 }
 
 #[cfg(test)]
@@ -221,11 +271,13 @@ mod tests {
     fn a_released_page_nobody_wrote_to_stays_quiet_and_stays_watched() {
         let mut r = ReleasedPages::default();
         let writes = HostWrites::default();
-        r.release(&writes, 9 * P, 0);
+        r.release(&writes, 7, 9 * P, 0);
         for t in 1..4 {
-            let found = r.sweep(&writes, t);
-            assert_eq!(found, vec![(9 * P, ReleasedVerdict::Quiet)]);
-            assert_eq!(r.watched(), 1);
+            assert!(
+                r.sweep(&writes, t).is_empty(),
+                "a quiet page is not reported — it is the normal state of every watched page"
+            );
+            assert_eq!(r.watched(), 1, "and it stays watched");
         }
     }
 
@@ -235,12 +287,12 @@ mod tests {
     fn a_write_after_the_release_is_reported_once() {
         let mut r = ReleasedPages::default();
         let mut writes = HostWrites::default();
-        r.release(&writes, 9 * P, 100);
+        r.release(&writes, 7, 9 * P, 100);
         writes.note_pages(vec![9 * P]);
 
         let found = r.sweep(&writes, 700);
-        assert_eq!(found, vec![(9 * P, ReleasedVerdict::Wrote { since_us: 600 })]);
-        assert!(found[0].1.is_finding());
+        assert_eq!(found, vec![(9 * P, 7, ReleasedVerdict::Wrote { since_us: 600 })]);
+        assert!(found[0].2.is_finding());
         assert_eq!(r.watched(), 0, "a page that reported is not watched again");
         assert!(r.sweep(&writes, 800).is_empty());
     }
@@ -252,8 +304,9 @@ mod tests {
         let mut r = ReleasedPages::default();
         let mut writes = HostWrites::default();
         writes.note_pages(vec![9 * P]);
-        r.release(&writes, 9 * P, 0);
-        assert_eq!(r.sweep(&writes, 1), vec![(9 * P, ReleasedVerdict::Quiet)]);
+        r.release(&writes, 7, 9 * P, 0);
+        assert!(r.sweep(&writes, 1).is_empty());
+        assert_eq!(r.watched(), 1, "still watched, still waiting");
     }
 
     /// A page the guest maps again leaves the watch, so the writes that follow
@@ -263,7 +316,7 @@ mod tests {
     fn a_remapped_page_leaves_the_watch() {
         let mut r = ReleasedPages::default();
         let mut writes = HostWrites::default();
-        r.release(&writes, 9 * P, 0);
+        r.release(&writes, 7, 9 * P, 0);
         r.remapped(9 * P);
         assert_eq!(r.watched(), 0);
         writes.note_pages(vec![9 * P]);
@@ -276,12 +329,12 @@ mod tests {
     fn a_second_release_does_not_forgive_a_write_that_already_landed() {
         let mut r = ReleasedPages::default();
         let mut writes = HostWrites::default();
-        r.release(&writes, 9 * P, 0);
+        r.release(&writes, 7, 9 * P, 0);
         writes.note_pages(vec![9 * P]);
-        r.release(&writes, 9 * P, 10);
+        r.release(&writes, 7, 9 * P, 10);
         assert_eq!(
             r.sweep(&writes, 20),
-            vec![(9 * P, ReleasedVerdict::Wrote { since_us: 20 })],
+            vec![(9 * P, 7, ReleasedVerdict::Wrote { since_us: 20 })],
             "the gap is measured from the first release, not the second"
         );
     }
@@ -291,11 +344,11 @@ mod tests {
     fn an_unnamed_write_is_undecidable() {
         let mut r = ReleasedPages::default();
         let mut writes = HostWrites::default();
-        r.release(&writes, 9 * P, 0);
+        r.release(&writes, 7, 9 * P, 0);
         writes.note_unknown();
         let found = r.sweep(&writes, 1);
-        assert_eq!(found, vec![(9 * P, ReleasedVerdict::Undecidable)]);
-        assert!(!found[0].1.is_finding());
+        assert_eq!(found, vec![(9 * P, 7, ReleasedVerdict::Undecidable)]);
+        assert!(!found[0].2.is_finding());
     }
 
     /// The watch stops at its capacity and counts what it turned away.
@@ -304,14 +357,50 @@ mod tests {
         let mut r = ReleasedPages::default();
         let writes = HostWrites::default();
         for i in 0..WATCH_CAP as u64 {
-            r.release(&writes, i * P, 0);
+            r.release(&writes, 7, i * P, 0);
         }
         assert_eq!(r.watched(), WATCH_CAP);
         for i in 0..5u64 {
-            r.release(&writes, (WATCH_CAP as u64 + i) * P, 0);
+            r.release(&writes, 7, (WATCH_CAP as u64 + i) * P, 0);
         }
         assert_eq!(r.refused(), 5);
         assert_eq!(r.watched(), WATCH_CAP, "a refusal does not evict");
+    }
+
+    /// A page released by one task and mapped by **another** is disarmed.
+    ///
+    /// This is the whole reason the watch is not keyed by task. A shared surface
+    /// is mapped by more than one task, so keying by task would arm the page on
+    /// the first unmap and then report every legitimate write arriving through
+    /// the other task's live mapping — a finding per shared page per boot, all
+    /// of them wrong, in an instrument whose only value is that a hit is a
+    /// proof.
+    #[test]
+    fn a_page_mapped_again_by_a_different_task_is_disarmed() {
+        let mut r = ReleasedPages::default();
+        let mut writes = HostWrites::default();
+        r.release(&writes, 3, 9 * P, 0);
+        // Task 8, not task 3, maps it.
+        r.remapped(9 * P);
+        assert_eq!(r.watched(), 0);
+        writes.note_pages(vec![9 * P]);
+        assert!(
+            r.sweep(&writes, 1).is_empty(),
+            "a write through the other task's live mapping is ordinary work"
+        );
+    }
+
+    /// The finding carries the task whose unmap armed the page, so a reading
+    /// names something even though the watch is global.
+    #[test]
+    fn a_finding_names_the_task_that_released_the_page() {
+        let mut r = ReleasedPages::default();
+        let mut writes = HostWrites::default();
+        r.release(&writes, 21, 4 * P, 0);
+        writes.note_pages(vec![4 * P]);
+        let found = r.sweep(&writes, 5);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, 21);
     }
 
     /// Every verdict names itself, and exactly one of them is the finding.

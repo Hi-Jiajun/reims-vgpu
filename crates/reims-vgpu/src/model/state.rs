@@ -1828,15 +1828,19 @@ pub struct DeviceState {
     /// belong to the task's address space, so a reused id inheriting them would
     /// be watching memory that is now somebody else's.
     pub node_guard: std::collections::BTreeMap<u32, crate::runtime::node_guard::NodeWatch>,
-    /// Per-task guest pages the guest has released, for the post-release write
-    /// guard.
+    /// Guest pages the guest has released, for the post-release write guard.
     ///
     /// Observation only — see [`crate::runtime::released_pages`], which exists
     /// because [`Self::node_guard`] cannot see a write that lands on a page
-    /// *before* that page becomes part of a page table. Same lifetime as the
-    /// other two ledgers here.
-    pub released_pages:
-        std::collections::BTreeMap<u32, crate::runtime::released_pages::ReleasedPages>,
+    /// *before* that page becomes part of a page table.
+    ///
+    /// **Not keyed by task, unlike the two ledgers above it, and that is the
+    /// point.** A guest page is guest-physical and more than one task can map
+    /// it, so a per-task watch reports the legitimate write that arrives through
+    /// another task's live mapping. Keyed globally, any task mapping the page
+    /// disarms it. For the same reason it is not dropped on task teardown: the
+    /// page stays released whatever happens to the task that let it go.
+    pub released_pages: crate::runtime::released_pages::ReleasedPages,
     /// Live object refs per task, as `(task_id, ref)`.
     ///
     /// Membership only — deliberately carries no descriptor payload. Every
@@ -2167,7 +2171,7 @@ impl DeviceState {
             map_family_events: 0,
             map_audit: std::collections::BTreeMap::new(),
             node_guard: std::collections::BTreeMap::new(),
-            released_pages: std::collections::BTreeMap::new(),
+            released_pages: crate::runtime::released_pages::ReleasedPages::default(),
             objects: std::collections::BTreeSet::new(),
             texture_to_mapping: BTreeMap::new(),
             mappings: BTreeMap::new(),
@@ -2602,7 +2606,6 @@ impl DeviceState {
         // this id is losing, and after a redefine they describe whatever the
         // guest has since done with them.
         self.node_guard.remove(&task_id);
-        self.released_pages.remove(&task_id);
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         // New directory ⇒ old GVA HostOps views alias the wrong PT — retire.
@@ -2670,7 +2673,6 @@ impl DeviceState {
         // holding a page set that describes memory it has given back.
         self.map_audit.remove(&task_id);
         self.node_guard.remove(&task_id);
-        self.released_pages.remove(&task_id);
         self.tasks.remove(task_id);
         true
     }
