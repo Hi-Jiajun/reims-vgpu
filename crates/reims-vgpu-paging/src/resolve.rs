@@ -159,6 +159,49 @@ pub fn read_task_root(
     })
 }
 
+/// The most interior nodes one descent can read, which is the tree's depth.
+pub const MAX_TREE_NODES: usize = wire_page_table::MAX_DEPTH as usize;
+
+/// The guest-physical pages holding page-table entries that `gva` descends
+/// through under `task`, written into `out`, returning how many were read.
+///
+/// **Interior pages only.** The page the walk resolves *to* is data and is
+/// deliberately absent, so a caller may read this as "these pages must not be
+/// written" without that claim swallowing every page the tree maps.
+///
+/// Short, or empty, whenever the walk refused early — a task with no directory
+/// reads zero, and an address that stops being mapped mid-teardown reads only
+/// the levels above where it stopped. Those levels were really read and really
+/// are nodes, so they are reported rather than discarded; a caller must not read
+/// a short answer as "the tree has no more nodes than this".
+pub fn task_node_gpas(
+    mem: &dyn GuestMemory,
+    geometry: Geometry,
+    task: &Task,
+    gva: u64,
+    out: &mut [u64; MAX_TREE_NODES],
+) -> usize {
+    let Ok(root) = read_task_root(mem, task, geometry) else {
+        return 0;
+    };
+    let mut nodes = wire_page_table::NodePath::default();
+    // The walk's own verdict is discarded on purpose: an unresolvable address
+    // still descended through real nodes, and those are the answer here.
+    let _ = wire_page_table::walk_recording_nodes(
+        &mem,
+        geometry,
+        root.root_pfn,
+        root.depth,
+        gva,
+        &mut nodes,
+    );
+    let pfns = nodes.pfns();
+    for (slot, &pfn) in out.iter_mut().zip(pfns) {
+        *slot = geometry.pfn_to_addr(pfn);
+    }
+    pfns.len()
+}
+
 pub fn translate_root(
     mem: &dyn GuestMemory,
     geometry: Geometry,
@@ -330,6 +373,93 @@ mod tests {
         assert_eq!(root.directory_pfn, 2);
         assert_eq!(root.root_pfn, 1);
         assert_eq!(root.depth, 1);
+    }
+
+    /// The node GPAs are the pages the descent read entries out of, and the
+    /// page the address resolves to is not one of them.
+    ///
+    /// Written against a two-level tree so "interior" and "root" are not the
+    /// same page: at depth 1 a walker that reported the leaf instead of the root
+    /// would still return one address and could pass by accident.
+    #[test]
+    fn the_node_gpas_are_the_tables_and_not_the_page_they_map() {
+        let mut r = MapReader::new();
+        // depth 2, root pfn 1: root[0] -> pfn 3, and pfn 3's entry 0 -> pfn 9.
+        let dir_gpa = 2u64 << PAGE_SHIFT_ARM64E;
+        r.put_u32(dir_gpa + DIRECTORY_ROOT_PFN, 1);
+        r.put_u32(dir_gpa + DIRECTORY_DEPTH, 2);
+        r.put_u32(1u64 << PAGE_SHIFT_ARM64E, 3);
+        r.put_u32(3u64 << PAGE_SHIFT_ARM64E, 9);
+        let task = Task {
+            active: true,
+            directory_pfn: 2,
+        };
+
+        let mut out = [0u64; MAX_TREE_NODES];
+        let n = task_node_gpas(&r, ARM64E, &task, 0x40, &mut out);
+        assert_eq!(n, 2, "one node per level walked");
+        assert_eq!(
+            &out[..n],
+            &[1u64 << PAGE_SHIFT_ARM64E, 3u64 << PAGE_SHIFT_ARM64E]
+        );
+
+        // The address really does resolve into pfn 9, and pfn 9 is not a node.
+        let t = translate_root(&r, ARM64E, 1, 2, 0x40);
+        assert_eq!(t.status, ResolveStatus::Ok);
+        assert_eq!(t.leaf_pfn, 9);
+        assert!(!out[..n].contains(&(9u64 << PAGE_SHIFT_ARM64E)));
+    }
+
+    /// A task the walk cannot even start on reports no nodes rather than a
+    /// stale or invented one.
+    #[test]
+    fn a_task_with_no_directory_reports_no_nodes() {
+        let r = MapReader::new();
+        let mut out = [0u64; MAX_TREE_NODES];
+        for task in [
+            Task {
+                active: false,
+                directory_pfn: 2,
+            },
+            Task {
+                active: true,
+                directory_pfn: 0,
+            },
+        ] {
+            assert_eq!(task_node_gpas(&r, ARM64E, &task, 0x40, &mut out), 0);
+        }
+    }
+
+    /// An address that stops resolving still reports the levels above where it
+    /// stopped — which is the case the guard exists for, because a guest tearing
+    /// a task down unmaps from the bottom.
+    #[test]
+    fn an_unresolvable_address_still_reports_the_nodes_above_it() {
+        let mut r = MapReader::new();
+        let dir_gpa = 2u64 << PAGE_SHIFT_ARM64E;
+        r.put_u32(dir_gpa + DIRECTORY_ROOT_PFN, 1);
+        r.put_u32(dir_gpa + DIRECTORY_DEPTH, 2);
+        // The root's entry names pfn 3, and pfn 3's own entry is written as the
+        // format's not-present encoding — a real zero rather than a hole in the
+        // reader, so the walk refuses on the guest's table and not on the test.
+        r.put_u32(1u64 << PAGE_SHIFT_ARM64E, 3);
+        r.put_u32(3u64 << PAGE_SHIFT_ARM64E, 0);
+        let task = Task {
+            active: true,
+            directory_pfn: 2,
+        };
+
+        assert_eq!(
+            translate_root(&r, ARM64E, 1, 2, 0x40).status,
+            ResolveStatus::ErrZeroPfn
+        );
+        let mut out = [0u64; MAX_TREE_NODES];
+        let n = task_node_gpas(&r, ARM64E, &task, 0x40, &mut out);
+        assert_eq!(
+            &out[..n],
+            &[1u64 << PAGE_SHIFT_ARM64E, 3u64 << PAGE_SHIFT_ARM64E],
+            "both levels were read before the walk refused"
+        );
     }
 
     #[test]
