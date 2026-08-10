@@ -1312,6 +1312,26 @@ pub enum StorageImageFormat {
     /// [`translate::pixel::sampled_image`] and not through
     /// `translate::pixel::storage_image`.
     R16Unorm,
+    /// Two-channel sixteen-bit normalized; **sampled-image only**, and
+    /// [`Self::R16Unorm`]'s other half.
+    ///
+    /// A ten-bit biplanar video texture is two planes, and this is the chroma
+    /// one (`MTLPixelFormatRG16Unorm`) to that one's luma. A shader sampling such
+    /// a frame binds both planes, so admitting only the luma one still loses the
+    /// whole dispatch — the refusal moves to the other binding rather than going
+    /// away.
+    ///
+    /// `STORAGE_IMAGE` is no more mandatory for `R16G16_UNORM` than for
+    /// `R16_UNORM`, so it is reachable by the same single route for the same
+    /// reason.
+    Rg16Unorm,
+    /// Four-channel sixteen-bit normalized; **sampled-image only**, the widest
+    /// member of the same family.
+    ///
+    /// `SAMPLED_IMAGE` with `SAMPLED_IMAGE_FILTER_LINEAR` is mandatory for
+    /// `R16G16B16A16_UNORM` and `STORAGE_IMAGE` is not, which is the whole of why
+    /// it sits here rather than in the storage selector.
+    Rgba16Unorm,
 }
 
 impl StorageImageFormat {
@@ -1324,6 +1344,8 @@ impl StorageImageFormat {
             Self::Rgba32Float | Self::Rgba32Uint => 16,
             Self::Rgba16Float | Self::Rgba16Uint => 8,
             Self::Rg16Float => 4,
+            Self::Rgba16Unorm => 8,
+            Self::Rg16Unorm => 4,
             Self::R16Float | Self::Rg8Unorm | Self::R16Unorm => 2,
             Self::R8Unorm => 1,
             Self::Rgba8Uint

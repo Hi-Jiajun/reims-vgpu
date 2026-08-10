@@ -4052,7 +4052,9 @@ fn guest_numeric_class(guest: crate::backend::vulkan::engine::StorageImageFormat
         | V::Rg8Unorm
         | V::R32Float
         | V::Rgb9e5Ufloat
-        | V::R16Unorm => 0,
+        | V::R16Unorm
+        | V::Rg16Unorm
+        | V::Rgba16Unorm => 0,
         V::Rgba16Uint | V::Rgba8Uint | V::Rgba32Uint | V::R32Uint => 1,
         V::Rgba8Sint | V::R32Sint => 2,
     }
@@ -4162,7 +4164,7 @@ fn specialized_storage_image_format(
         // R32 sint/float and the packed Rgb9e5 stay sampled-only until a live
         // capture justifies enabling their storage path.
         V::R32Uint => (1, S::R32ui),
-        V::R32Sint | V::R32Float | V::Rgb9e5Ufloat | V::R16Unorm => {
+        V::R32Sint | V::R32Float | V::Rgb9e5Ufloat | V::R16Unorm | V::Rg16Unorm | V::Rgba16Unorm => {
             return Err("spirv_sampled_only_format_as_storage");
         }
         V::Rgba32Float => (0, S::Rgba32Float),

@@ -421,17 +421,34 @@ pub fn storage_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
 /// [`TexelLayout`] and is wider still. The two are not merged because the
 /// compute request carries a `StorageImageFormat` — see that type's doc for the
 /// end state that would let them be.
+///
+/// # The two rails are held to each other by a test
+///
+/// Admitting `R16_UNORM` alone left the *chroma* half of the same biplanar video
+/// texture refused, so the dispatch a shader makes of both planes was still lost
+/// — the refusal moved to the other binding. That is the failure mode of fixing
+/// a divergence one format at a time, so it is now a relation rather than a list:
+/// `a_texture_the_graphics_rail_samples_is_not_refused_by_the_compute_one` sweeps
+/// every `u16` and requires everything [`sampled_pixels`] admits to be admitted
+/// here, against a named exception set that the test states the reason for.
+///
+/// The converse does not hold and must not: this rail carries the integer and
+/// packed formats a compute shader reads and [`sampled_pixels`] has no
+/// [`TexelLayout`] for, because that one answers a CPU-upload byte order.
 pub fn sampled_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
     use crate::contract::pixel_format as pf;
     // Sampled-only members first, then everything a storage image may be. The
     // `translate` call keeps an entirely unknown value declining as
     // `unknown_pixel_format` rather than as a missing layout, exactly as
     // `storage_image` does for the same reason.
-    if mtl == pf::MTL_FORMAT_R16_UNORM {
-        translate(mtl)?;
-        return Ok(StorageImageFormat::R16Unorm);
-    }
-    storage_image(mtl)
+    let sampled_only = match mtl {
+        pf::MTL_FORMAT_R16_UNORM => StorageImageFormat::R16Unorm,
+        pf::MTL_FORMAT_RG16_UNORM => StorageImageFormat::Rg16Unorm,
+        pf::MTL_FORMAT_RGBA16_UNORM => StorageImageFormat::Rgba16Unorm,
+        _ => return storage_image(mtl),
+    };
+    translate(mtl)?;
+    Ok(sampled_only)
 }
 
 /// The guest's scanout byte order, in Vulkan terms.
@@ -531,6 +548,8 @@ pub fn vk_storage_image(format: StorageImageFormat) -> vk::Format {
         StorageImageFormat::R32Float => vk::Format::R32_SFLOAT,
         StorageImageFormat::Rgb9e5Ufloat => vk::Format::E5B9G9R9_UFLOAT_PACK32,
         StorageImageFormat::R16Unorm => vk::Format::R16_UNORM,
+        StorageImageFormat::Rg16Unorm => vk::Format::R16G16_UNORM,
+        StorageImageFormat::Rgba16Unorm => vk::Format::R16G16B16A16_UNORM,
     }
 }
 
@@ -610,6 +629,92 @@ mod tests {
     use super::*;
     use crate::observe::Decline;
     use pixel_format as p;
+
+    /// A guest texture the graphics rail will sample is one the compute rail
+    /// will sample, for every `MTLPixelFormat` value there is.
+    ///
+    /// This is the relation two separate bugs were instances of. The same guest
+    /// texture, sampleable in a draw and refused in a dispatch, costs the whole
+    /// `DispatchThreadgroups` — and finding those one format at a time does not
+    /// converge: admitting `R16_UNORM` left the chroma half of the very same
+    /// biplanar video texture refused, so the loss simply moved to the shader's
+    /// other binding. Sweeping every `u16` is what makes the next one a failure
+    /// here rather than a lost frame on a rail nobody booted.
+    ///
+    /// The exceptions are listed rather than tolerated, because each is a real
+    /// decision this rail cannot yet express:
+    ///
+    /// - `A8Unorm` needs its channel plan. [`sampled_pixels`] hands back a
+    ///   [`SwizzlePlan`] that puts the single byte in alpha; a
+    ///   [`StorageImageFormat`] carries no component mapping, so admitting it
+    ///   here would sample the byte as **red**. A wrong sample is worse than a
+    ///   named refusal, so it stays refused until the compute request can carry
+    ///   a plan.
+    /// - The two `*_SRGB` orders would have to bind their linear sibling, which
+    ///   is the [`TranslateReason::SrgbDowngraded`] loss [`srgb_decline`]
+    ///   documents. This rail's `Result` has nowhere to record it, and
+    ///   [`storage_image`] refuses sRGB for the same reason with its own test
+    ///   pinning that. Admitting it silently here would break the symmetry the
+    ///   crate relies on, so it waits for the rail to gain a warning channel.
+    ///
+    /// The converse is deliberately not asserted: this rail carries the integer
+    /// and packed formats a compute shader reads and [`sampled_pixels`] has no
+    /// [`TexelLayout`] for, because that one answers a CPU-upload byte order and
+    /// not a sampling capability.
+    #[test]
+    fn a_texture_the_graphics_rail_samples_is_not_refused_by_the_compute_one() {
+        const EXCEPTIONS: &[(u16, &str)] = &[
+            (p::MTL_FORMAT_A8_UNORM, "needs a component mapping"),
+            (p::MTL_FORMAT_RGBA8_UNORM_SRGB, "would downgrade unrecorded"),
+            (p::MTL_FORMAT_BGRA8_UNORM_SRGB, "would downgrade unrecorded"),
+        ];
+
+        let mut refused = Vec::new();
+        for mtl in 0..=u16::MAX {
+            if sampled_pixels(mtl).is_ok() && sampled_image(mtl).is_err() {
+                refused.push(mtl);
+            }
+        }
+        let expected: Vec<u16> = EXCEPTIONS.iter().map(|&(mtl, _)| mtl).collect();
+        assert_eq!(
+            refused, expected,
+            "a format the graphics rail samples must be sampleable in a dispatch \
+             or be one of the exceptions this test names"
+        );
+
+        // Each exception is refused for the reason claimed and not because the
+        // contract does not define it — an undefined value would satisfy the
+        // sweep above for the wrong reason.
+        for &(mtl, why) in EXCEPTIONS {
+            assert!(translate(mtl).is_ok(), "{mtl:#x} is a defined format ({why})");
+        }
+
+        // The ten-bit biplanar video planes travel together: a shader samples
+        // luma and chroma from one frame, so one admitted without the other is
+        // the whole dispatch lost anyway.
+        assert_eq!(
+            sampled_image(p::MTL_FORMAT_R16_UNORM),
+            Ok(StorageImageFormat::R16Unorm)
+        );
+        assert_eq!(
+            sampled_image(p::MTL_FORMAT_RG16_UNORM),
+            Ok(StorageImageFormat::Rg16Unorm)
+        );
+
+        // Sampled-only means sampled-only: none of the members this rail adds
+        // over the storage one may be reached as a storage image, because Vulkan
+        // mandates none of them for `STORAGE_IMAGE`.
+        for mtl in [
+            p::MTL_FORMAT_R16_UNORM,
+            p::MTL_FORMAT_RG16_UNORM,
+            p::MTL_FORMAT_RGBA16_UNORM,
+        ] {
+            assert!(
+                storage_image(mtl).is_err(),
+                "{mtl:#x} is sampled-only and must not be admitted as a storage image"
+            );
+        }
+    }
 
     /// `texel_layout_of` is `vk_texel_layout` read backwards, for every layout
     /// and for nothing else.
