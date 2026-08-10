@@ -1,20 +1,48 @@
-//! Whether the range the guest is about to tear down still has an entry for
-//! every page of it.
+//! Whether a range's page-table entries are in the state the guest's own next
+//! step requires of them.
 //!
 //! # The invariant, and whose it is
 //!
-//! One guest line's GPU page-table teardown walks the `[gva, gva+len)` range it
-//! was given one page at a time and refuses, per page, to clear a leaf entry
-//! that is **already zero**. The refusal is an assertion: it panics the guest.
-//! The same walk refuses to descend through an interior entry that is zero,
-//! which is a second assertion at a different site and the same outcome.
+//! One guest line's GPU page table asserts in both directions, one page at a
+//! time, and each assertion panics the guest:
 //!
-//! That teardown runs *after* this device replies to the unmap the guest sent —
-//! the guest submits the packet, blocks, and only then edits its own tree. So at
-//! the moment the packet arrives, the tree still holds whatever the teardown is
-//! about to find, and this device is already entitled to read it. Walking the
-//! range here answers whether the guest is about to assert, **before it does**,
-//! and names the page it will die on.
+//! - **tearing a range down**, it refuses to clear a leaf entry that is
+//!   **already zero**, and refuses to descend through an interior entry that is
+//!   zero — two sites, one outcome;
+//! - **building a range up**, it refuses to write an entry that is **already
+//!   non-zero**.
+//!
+//! So the requirement is exactly opposite per direction, over the same walk:
+//! every page of an unmap's range must have an entry, and every page of a map's
+//! range must not.
+//!
+//! # Only one direction is ordered, and it is the map
+//!
+//! Both edits sit on the same side of their packet: the guest wires the range
+//! and **then** submits the map, and it submits the unmap and **then** unwires.
+//! So the two readings are not symmetric at all.
+//!
+//! - **Map — ordered.** The wiring is complete before the packet exists, so the
+//!   range must be fully covered when this device sees it. [`Coverage::Absent`]
+//!   and [`Coverage::Partial`] are findings: the guest published a mapping its
+//!   own tree does not hold, and the eventual teardown walks the hole.
+//! - **Unmap — a race, and nothing here is a finding.** The unwiring is only
+//!   *started* by the time the packet is readable, so what this device finds
+//!   depends on whether the drain or the guest got there first. Measured on
+//!   macos-26 the guest wins about nineteen times in twenty, and a boot's
+//!   `unmap_coverage_absent` is that race and not a defect.
+//!
+//! The unmap side is still counted, for two reasons. The ratio measures the race
+//! itself, which is a real property of this device's drain latency; and its
+//! disagreeing with the map side is what proves the walk works at all. A walk
+//! that had a stale root, resolved the wrong task, or was off by a page shift
+//! would report absence on **both** sides, and the map side reading covered is
+//! the only thing that separates a working instrument from that.
+//!
+//! **Do not restore a finding on the unmap side.** It was one for exactly one
+//! boot, on the premise that the guest blocks on this device's reply before
+//! unwiring. It does not; the submit and the unwire are adjacent, with the reply
+//! not between them.
 //!
 //! # Why this is not the same question as the two guards next door
 //!
@@ -25,20 +53,24 @@
 //! write anywhere in the story. Both guards read clean on boots that panicked,
 //! and this is the reading that explains how they could.
 //!
-//! # What the two findings mean
+//! # What the readings mean
 //!
-//! - [`Coverage::Absent`] — **no** page of the range has an entry. The range was
-//!   already torn down, or was never wired. `level` separates those further: a
-//!   zero at the deepest level is a leaf entry that was cleared, and a zero
-//!   above it is a subtree that is not there at all.
+//! [`Coverage`] describes the tree and nothing else; [`Op`] decides which
+//! reading is the alarm.
+//!
+//! - [`Coverage::Absent`] — **no** page of the range has an entry. `level`
+//!   separates two shapes: a zero at the deepest level is a leaf entry that was
+//!   never written or has been cleared, and a zero above it is a subtree that is
+//!   not there at all.
 //! - [`Coverage::Partial`] — some pages have entries and some do not, and
-//!   `first_absent` is the page the guest's own walk reaches first and dies on.
-//!   A mapping that was only partly wired, or partly torn down.
+//!   `first_absent` is the page an in-order walk reaches first, which is the page
+//!   the guest's own walk would die on.
+//! - [`Coverage::Covered`] — every page has one. On a map that is the healthy
+//!   reading and the whole population.
 //!
-//! Everything else is counted and silent. [`Coverage::Undecidable`] in
-//! particular is **not** a finding: a table page that would not read says
-//! nothing about what the guest will find there, and reporting it as absence is
-//! how an alarm costs a session for being wrong.
+//! [`Coverage::Undecidable`] is **not** a finding: a table page that would not
+//! read says nothing about what the guest will find there, and reporting it as
+//! absence is how an alarm costs a session for being wrong.
 //!
 //! # What it costs
 //!
@@ -53,7 +85,7 @@
 
 use reims_vgpu_paging::resolve::RangeCoverage;
 
-/// The most pages one unmap will be walked for.
+/// The most pages one packet will be walked for.
 ///
 /// **Not a fidelity bound.** The guest walks every page of its own range, so
 /// there is no reach this can be too small for in the sense of missing something
@@ -75,6 +107,34 @@ pub const MAX_SCAN_PAGES: u64 = 1 << 20;
 /// guards watch the same guest teardown, and an A/B that silences one of them
 /// while the others keep running measures neither arm.
 pub use crate::runtime::node_guard::enabled;
+
+/// Which way the guest is about to edit the range.
+///
+/// Carried as a type rather than a bool so the two requirements are named where
+/// they are read, and so a third direction cannot be added without every
+/// consumer being told about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Op {
+    /// The guest has **already** written an entry per page, and then submitted.
+    /// The range must be fully covered; a hole is the guest publishing a mapping
+    /// its own tree does not hold.
+    Map,
+    /// The guest submitted, and unwires afterwards. What the tree holds when the
+    /// packet is read is a race between the drain and the guest, so nothing on
+    /// this side is a finding.
+    Unmap,
+}
+
+impl Op {
+    /// The counter for a range longer than [`MAX_SCAN_PAGES`], so a bound that
+    /// trims a reading says so rather than shrinking the population silently.
+    pub fn truncated_route(self) -> &'static str {
+        match self {
+            Self::Map => "map_coverage_truncated",
+            Self::Unmap => "unmap_coverage_truncated",
+        }
+    }
+}
 
 /// What the range looked like, as a verdict rather than counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,20 +193,35 @@ impl Coverage {
         }
     }
 
-    /// Whether this is a reading the module exists to find.
-    pub fn is_finding(self) -> bool {
+    /// Whether this reading is a defect for `op`.
+    ///
+    /// Only the map direction has any, because only it is ordered: the guest
+    /// finishes wiring before the packet exists, so a range that is not covered
+    /// is a mapping its own tree does not hold. The unmap direction is a race
+    /// with the guest's own unwiring and every reading of it is expected — see
+    /// this module's docs before making one of them an alarm.
+    pub fn is_finding(self, op: Op) -> bool {
+        if op == Op::Unmap {
+            return false;
+        }
         matches!(self, Self::Absent { .. } | Self::Partial { .. })
     }
 
-    /// The counter name, one per variant and exhaustive, so a new verdict
-    /// cannot reach a census under a borrowed name.
-    pub fn route(self) -> &'static str {
-        match self {
-            Self::Covered => "unmap_coverage_covered",
-            Self::Absent { .. } => "unmap_coverage_absent",
-            Self::Partial { .. } => "unmap_coverage_partial",
-            Self::Undecidable => "unmap_coverage_undecidable",
-            Self::Unwalkable => "unmap_coverage_unwalkable",
+    /// The counter name, one per direction per variant and exhaustive, so a new
+    /// verdict cannot reach a census under a borrowed name and the two
+    /// directions can never be summed into one.
+    pub fn route(self, op: Op) -> &'static str {
+        match (op, self) {
+            (Op::Map, Self::Covered) => "map_coverage_covered",
+            (Op::Map, Self::Absent { .. }) => "map_coverage_absent",
+            (Op::Map, Self::Partial { .. }) => "map_coverage_partial",
+            (Op::Map, Self::Undecidable) => "map_coverage_undecidable",
+            (Op::Map, Self::Unwalkable) => "map_coverage_unwalkable",
+            (Op::Unmap, Self::Covered) => "unmap_coverage_covered",
+            (Op::Unmap, Self::Absent { .. }) => "unmap_coverage_absent",
+            (Op::Unmap, Self::Partial { .. }) => "unmap_coverage_partial",
+            (Op::Unmap, Self::Undecidable) => "unmap_coverage_undecidable",
+            (Op::Unmap, Self::Unwalkable) => "unmap_coverage_unwalkable",
         }
     }
 
@@ -218,24 +293,39 @@ mod tests {
         );
         assert_eq!(Coverage::of(&counts(0, 0, 4)), Coverage::Undecidable);
 
-        let routes = [
-            Coverage::Covered.route(),
-            Coverage::Absent { level: 2, depth: 3 }.route(),
-            Coverage::Partial {
-                first_absent: 0,
-                absent: 1,
-                level: 2,
-                depth: 3,
+        let mut routes = Vec::new();
+        for (op, prefix) in [(Op::Map, "map_coverage_"), (Op::Unmap, "unmap_coverage_")] {
+            assert!(op.truncated_route().starts_with(prefix));
+            routes.push(op.truncated_route());
+            for v in every_verdict() {
+                let route = v.route(op);
+                assert!(
+                    route.starts_with(prefix),
+                    "{route} does not name its direction"
+                );
+                routes.push(route);
             }
-            .route(),
-            Coverage::Undecidable.route(),
-            Coverage::Unwalkable.route(),
-        ];
+        }
         for (i, a) in routes.iter().enumerate() {
             for b in &routes[i + 1..] {
                 assert_ne!(a, b, "two verdicts share a counter name");
             }
         }
+    }
+
+    fn every_verdict() -> [Coverage; 5] {
+        [
+            Coverage::Covered,
+            Coverage::Absent { level: 2, depth: 3 },
+            Coverage::Partial {
+                first_absent: 0,
+                absent: 1,
+                level: 2,
+                depth: 3,
+            },
+            Coverage::Undecidable,
+            Coverage::Unwalkable,
+        ]
     }
 
     /// A range that is entirely absent except for tables that would not read is
@@ -252,20 +342,35 @@ mod tests {
         ));
     }
 
-    /// Only the two shapes that predict a guest assertion are findings.
+    /// Nothing on the unmap side is ever a finding, whatever the tree held.
+    ///
+    /// This is the property a measured boot bought: the guest submits the unmap
+    /// and unwires afterwards, so an absent range there is the drain losing a
+    /// race — 124 of them against 7 covered on one macos-26 boot. An alarm on
+    /// that reads as a boot full of proof and is worth none of it.
     #[test]
-    fn only_the_two_predictive_shapes_are_findings() {
-        assert!(!Coverage::Covered.is_finding());
-        assert!(!Coverage::Undecidable.is_finding());
-        assert!(!Coverage::Unwalkable.is_finding());
-        assert!(Coverage::Absent { level: 2, depth: 3 }.is_finding());
+    fn the_unmap_direction_has_no_findings_at_all() {
+        for v in every_verdict() {
+            assert!(!v.is_finding(Op::Unmap), "{v:?} became an unmap finding");
+        }
+    }
+
+    /// On the map side the guest has finished wiring before the packet exists,
+    /// so anything short of full coverage is a defect and full coverage is the
+    /// healthy reading.
+    #[test]
+    fn a_map_is_a_finding_exactly_when_its_range_is_not_fully_covered() {
+        assert!(Coverage::Absent { level: 2, depth: 3 }.is_finding(Op::Map));
         assert!(Coverage::Partial {
             first_absent: 0,
             absent: 1,
             level: 0,
             depth: 3,
         }
-        .is_finding());
+        .is_finding(Op::Map));
+        assert!(!Coverage::Covered.is_finding(Op::Map));
+        assert!(!Coverage::Undecidable.is_finding(Op::Map));
+        assert!(!Coverage::Unwalkable.is_finding(Op::Map));
     }
 
     /// The leaf-level question is answered only where there is a zero to ask it

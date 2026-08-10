@@ -3170,19 +3170,22 @@ fn note_released_or_remapped<H: HostMemory + HostOps>(
     }
 }
 
-/// Say whether the range this unmap names still has an entry for every page,
-/// which is the question the guest's own teardown is about to ask.
+/// Say whether this range's entries are there, and on a map — the one direction
+/// the guest orders — treat their absence as the defect it is.
 ///
-/// Stands before the packet is applied, and only on an unmap, because that is
-/// the last moment the tree holds what the guest will find: it submits the
-/// packet, blocks on this device's reply, and edits the tree afterwards. See
-/// [`crate::runtime::unmap_coverage`] for what the two findings mean.
-fn observe_unmap_coverage<H: HostMemory + HostOps>(
+/// The guest finishes wiring a range before it submits the map for it, so a map
+/// whose range is not fully covered is a mapping its own tree does not hold. It
+/// submits an unmap *before* unwiring, so that direction is a race and is
+/// counted rather than judged; keeping it is what proves the walk works, since a
+/// broken walk would read absent on both sides. See
+/// [`crate::runtime::unmap_coverage`].
+fn observe_range_coverage<H: HostMemory + HostOps>(
     state: &DeviceState,
     host: &H,
     task_id: u32,
     gva: u64,
     length: u64,
+    op: crate::runtime::unmap_coverage::Op,
 ) {
     use crate::runtime::unmap_coverage::{self, Coverage};
 
@@ -3194,7 +3197,7 @@ fn observe_unmap_coverage<H: HostMemory + HostOps>(
         return;
     }
     if scanned < spanned {
-        note_store_route("unmap_coverage_truncated");
+        note_store_route(op.truncated_route());
     }
     let Some(geometry) = reims_vgpu_paging::resolve::geometry_for_page_shift(state.page_shift)
     else {
@@ -3215,16 +3218,15 @@ fn observe_unmap_coverage<H: HostMemory + HostOps>(
         scanned,
     );
     let verdict = counts.as_ref().map_or(Coverage::Unwalkable, Coverage::of);
-    note_store_route(verdict.route());
-    if verdict.is_finding() && crate::observe::first_sight(verdict.route(), u64::from(task_id)) {
+    let route = verdict.route(op);
+    note_store_route(route);
+    if verdict.is_finding(op) && crate::observe::first_sight(route, u64::from(task_id)) {
         let leaf = verdict.is_leaf_level().unwrap_or(false);
         crate::observe::fail(format!(
-            "unmap_coverage reason={} task={task_id} gva={gva:#x} len={length:#x} \
+            "range_coverage reason={route} task={task_id} gva={gva:#x} len={length:#x} \
              pages={spanned} scanned={scanned} leaf_level={leaf} detail={verdict:?} \
-             (the guest tears this exact range down after this device replies, and refuses \
-             per page to clear an entry that is already zero — a page without one is a page \
-             its own assertion ends the guest on)",
-            verdict.route()
+             (the guest wires a range fully before publishing the map for it, so a page \
+             without an entry here is a page its own teardown will later assert on)"
         ));
     }
 }
@@ -3292,12 +3294,23 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // moment those addresses translate. See `runtime::released_pages`.
         note_released_or_remapped(state, host, task_id, gva, length, family);
         // And the question none of the three above asks, because none of them
-        // needs a host write to be true: does the range the guest is about to
-        // tear down still have an entry for every page? Its teardown asserts
-        // that it does, one page at a time. See `runtime::unmap_coverage`.
-        if matches!(family, MapFamily::UnmapMemory) {
-            observe_unmap_coverage(state, host, task_id, gva, length);
-        }
+        // needs a host write to be true: are this range's entries in the state
+        // the guest's own next step requires? It asserts per page that an unmap
+        // finds one and a map does not. Both directions are read, and the one
+        // that cannot end a boot is what makes the other's reading evidence —
+        // see `runtime::unmap_coverage`.
+        observe_range_coverage(
+            state,
+            host,
+            task_id,
+            gva,
+            length,
+            if matches!(family, MapFamily::UnmapMemory) {
+                crate::runtime::unmap_coverage::Op::Unmap
+            } else {
+                crate::runtime::unmap_coverage::Op::Map
+            },
+        );
         // Verbose-gated walk probe at map/unmap time. This runs a full
         // guest page-table walk (`diagnose_gva_walk`) purely to build the
         // log string, and fired ~9k times/boot on the drain path — a flood
