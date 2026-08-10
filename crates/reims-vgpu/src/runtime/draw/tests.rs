@@ -92,6 +92,7 @@ fn rb(
         param_index: None,
         address_space: None,
         declared_size: None,
+        extent: None,
         type_layout: None,
         type_name: None,
         texture_shape: None,
@@ -833,8 +834,8 @@ fn metal_icb_inheritance_line_keeps_pipeline_and_sanitized_driver_detail() {
 #[cfg(feature = "backend-vulkan")]
 fn shader_pull_reflection(bindings: &[u32]) -> metal2vulkan::reflect::ShaderReflection {
     use metal2vulkan::reflect::{
-        DescriptorLocation, ResourceBinding, ResourceKind, ShaderReflection, ShaderStage,
-        VertexBuiltins, REFLECTION_VERSION,
+        BufferExtent, DescriptorLocation, ResourceBinding, ResourceKind, ShaderReflection,
+        ShaderStage, VertexBuiltins, REFLECTION_VERSION,
     };
     ShaderReflection {
         reflection_version: REFLECTION_VERSION,
@@ -849,6 +850,9 @@ fn shader_pull_reflection(bindings: &[u32]) -> metal2vulkan::reflect::ShaderRefl
                 param_index: None,
                 address_space: None,
                 declared_size: None,
+                // What the translator emits for a buffer carrying neither an
+                // object size nor a type name: the class that forbids narrowing.
+                extent: Some(BufferExtent::Unknown),
                 type_layout: None,
                 type_name: None,
                 texture_shape: None,
