@@ -121,6 +121,24 @@ pub const RANGE_COVERAGE: &str = "REIMS_VGPU_RANGE_COVERAGE";
 /// capability this switch may grant.
 pub const BUFFER_EXTENT: &str = "REIMS_VGPU_BUFFER_EXTENT";
 
+/// `off` narrows the draw batch back to one render target, so a draw whose
+/// target differs from the open batch's stops joining it and submits its own
+/// command buffer.
+///
+/// The wider arm — the default — is that the target does not key the batch at
+/// all: every batched draw begins and ends its own render pass inside the
+/// command buffer, and nothing between `batch_append` and `batch_flush` reads
+/// which image those passes wrote. A run alternating between two surfaces
+/// therefore costs one submission per draw under the narrow arm and one per
+/// `BATCH_MAX_DRAWS` draws under the wide one.
+///
+/// It exists as a switch for the same reason [`BUFFER_EXTENT`] does: the two
+/// arms differ by one comparison in one process, so a driven boot of each on one
+/// build and one guest rail attributes a change in submissions, ring blocking
+/// and gathered bytes to the batching rule rather than to a rebuild. Off is a
+/// refusal (`nojoin_target_switch`) and never a permission.
+pub const BATCH_MIXED_TARGETS: &str = "REIMS_VGPU_BATCH_MIXED_TARGETS";
+
 /// What one variable says, including the two ways it says nothing usable.
 ///
 /// Four states rather than a `bool` because "unset", "explicitly on" and
@@ -194,13 +212,14 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 6] = [
+pub const ALL: [&str; 7] = [
     GUEST_IMPORT,
     DRAW_LOG,
     GPU_STAMP,
     PAGE_GUARDS,
     RANGE_COVERAGE,
     BUFFER_EXTENT,
+    BATCH_MIXED_TARGETS,
 ];
 
 /// The state of every variable in [`ALL`], for the one-shot boot line.

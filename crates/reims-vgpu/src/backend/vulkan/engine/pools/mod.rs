@@ -499,14 +499,16 @@ pub(crate) struct ResourcePools {
 ///
 /// One value rather than four parameters, because these four decide two
 /// different things in two places — whether a draw may join the open batch
-/// (`batch_slot`) and what the batch records when one opens (`batch_append`) —
+/// (`batch_fit`) and what the batch records when one opens (`batch_append`) —
 /// and they were spelled out at both. Two of them are adjacent `u32`s, so a
 /// `width`/`height` transposition between the question and the answer compiles
 /// and produces a batch that admits draws of the wrong shape.
 ///
-/// Derived `PartialEq` is the join test, so the fields it turns on cannot drift
-/// from the fields the batch carries: adding one here makes it decide joins
-/// without a second edit.
+/// Derived `PartialEq` is the *narrowed* join test — the arm
+/// [`crate::env::BATCH_MIXED_TARGETS`]`=off` selects — so the fields it turns on
+/// cannot drift from the fields the batch carries: adding one here makes it
+/// decide joins without a second edit. The default arm does not compare it at
+/// all; see [`BatchFit`].
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct BatchTarget {
     pub identity: TargetIdentity,
@@ -515,9 +517,33 @@ pub(crate) struct BatchTarget {
     pub bgra: bool,
 }
 
+/// Whether a draw can append to the open batch, and when it cannot, why.
+///
+/// Total rather than an `Option`, because the three refusals want three
+/// different next moves and the census cannot rank them if they share a name:
+/// [`None`](Self::None) is a batch that has already been submitted and is the
+/// floor a workload cannot go below, [`Full`](Self::Full) says
+/// `BATCH_MAX_DRAWS` is the binding constraint, and
+/// [`OtherTarget`](Self::OtherTarget) can only appear on the narrowed arm and is
+/// what that arm costs.
+#[derive(Clone, Copy)]
+pub(crate) enum BatchFit {
+    /// Nothing is recording.
+    None,
+    /// A batch is recording and already holds `BATCH_MAX_DRAWS` draws.
+    Full,
+    /// A batch is recording on a different [`BatchTarget`], and
+    /// [`crate::env::BATCH_MIXED_TARGETS`] is off.
+    OtherTarget,
+    /// Room in the recording batch: its command buffer and the fence its flush
+    /// will submit with.
+    Open(vk::CommandBuffer, vk::Fence),
+}
+
 pub(crate) struct OpenBatch {
     cb: vk::CommandBuffer,
     fence: vk::Fence,
+    /// Only the narrowed arm reads this; see [`BatchFit::OtherTarget`].
     target: BatchTarget,
     draws: u64,
     /// Per-draw descriptor sets paired with the arena block they were allocated

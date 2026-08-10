@@ -2906,13 +2906,20 @@ fn device_loss_named_and_recreate_bounded() {
     }
 }
 
-/// In-flight ring lock (3-deep): consecutive no-readback resident draws land
-/// on separate ring slots without retiring each other; only the entry that
-/// wraps onto a still-pending slot pays the retire (ring_retire_blocks). A
-/// boundary read then retires everything and sees the exact final content.
-/// If RING_DEPTH changes, the wrap arithmetic below must follow.
+/// Consecutive no-readback resident draws stay in flight: none of them waits on
+/// its own submission, and a boundary read retires everything and sees the
+/// exact final content of both targets.
+///
+/// It used to assert the ring *wrap* as well — "the first three occupy every
+/// slot, the fourth wraps onto the first and pays the retire" — and that
+/// arithmetic has been unreachable from four draws since `RING_DEPTH` went to
+/// 8. It is doubly unreachable now that the four alternating draws share one
+/// command buffer: they are one submission, not four. Driving a real wrap would
+/// take `RING_DEPTH * BATCH_MAX_DRAWS` draws and would then assert
+/// `ring_retire_blocks`, which is a race against how fast the host GPU retires
+/// a 16x16 draw. What is left here is not that, and the name says so.
 #[test]
-fn ring_overlaps_in_flight_no_readback_draws() {
+fn alternating_target_no_readback_draws_stay_in_flight_and_read_back_exact() {
     let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let id_a = TargetIdentity::Surface {
@@ -2953,8 +2960,7 @@ fn ring_overlaps_in_flight_no_readback_draws() {
     engine::read_target(&id_a).expect("ring quiesce");
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
-    // Four async draws: the first three occupy every slot in flight; the
-    // fourth wraps onto the first slot and must retire it.
+    // Four async draws alternating between two targets.
     for (n, identity) in [&id_a, &id_b, &id_a, &id_b].into_iter().enumerate() {
         let mut warm = engine_req(&v, &f, 16, 16);
         warm.target_identity = Some((*identity).clone());
@@ -2967,16 +2973,15 @@ fn ring_overlaps_in_flight_no_readback_draws() {
         d.render_post_wait_skips, 4,
         "all four draws must skip the post-submit wait: {d:?}"
     );
-    // Deferred submit: each alternating-target draw opens its own batch; the
-    // next draw's begin_entry flushes it (submit), so three flushes land in
-    // the window and the fourth batch is still open (flushed by the boundary
-    // read below). Same-target runs sharing one CB are covered by
-    // vk_engine_batch.rs.
-    assert_eq!(d.batch_opens, 4, "each draw opens a batch: {d:?}");
-    assert_eq!(d.batch_joins, 0, "alternating targets never join: {d:?}");
+    // Deferred submit: the target does not key the batch, so all four land in
+    // one command buffer and nothing has submitted it yet — the boundary read
+    // below is what flushes it. Under `REIMS_VGPU_BATCH_MIXED_TARGETS=off` this
+    // reads 4/0/3 instead, which is what it read before that key was dropped.
+    assert_eq!(d.batch_opens, 1, "one batch carries all four draws: {d:?}");
+    assert_eq!(d.batch_joins, 3, "three of them joined it: {d:?}");
     assert_eq!(
-        d.batch_flushes, 3,
-        "each subsequent draw flushes its predecessor's batch: {d:?}"
+        d.batch_flushes, 0,
+        "nothing consumed either target inside the window: {d:?}"
     );
     // Boundary reads retire the in-flight work and see the final content.
     let px = engine::read_target(&id_a)

@@ -185,10 +185,20 @@ fn batched_draws_compose_and_flush_on_read() {
     }
 }
 
-/// A draw to a DIFFERENT target must not join; claiming its slot flushes the
-/// open batch first, so the first target's content is complete when read.
+/// A draw to a DIFFERENT target joins the open batch, and both targets still
+/// receive exactly their own draw's pixels.
+///
+/// This is the whole of what dropping the target from the join key has to be
+/// true for. Every batched draw begins and ends its own render pass, so the two
+/// passes recorded here name two different attachments and neither may write
+/// the other — but nothing in Vulkan says so on its own, and a batch that
+/// carried the target for a reason nobody had written down would fail here as a
+/// wrong half of a wrong image rather than as a counter.
+///
+/// It read `batch_opens=2, batch_joins=0, batch_flushes=1` while the key
+/// existed, on a rail where that refusal alone was 26 % of all draws.
 #[test]
-fn cross_target_draw_flushes_open_batch() {
+fn cross_target_draws_share_one_command_buffer_and_land_in_their_own_images() {
     let _guard = engine_test_lock().lock().unwrap();
     let (vert, frag) = triangle_spirv();
     let a = TargetIdentity::Surface {
@@ -219,17 +229,17 @@ fn cross_target_draw_flushes_open_batch() {
             panic!("opener draw: {msg}");
         }
     }
-    // Different identity: not joinable — begin_entry flushes A's batch, and
-    // this draw opens a batch of its own.
+    // Different identity, and the *opposite* half of the frame: if the two
+    // passes were not independent, whichever image lost would read as its own
+    // half cleared and the other half painted.
     let other = batch_req(&vert, &frag, &b, false, half_scissor(false));
     engine::execute_draw_request(&other).expect("cross-target draw");
     let mid = engine::counter_snapshot().delta_since(&before);
-    assert_eq!(mid.batch_opens, 2, "each target opened its own batch");
-    assert_eq!(mid.batch_joins, 0, "cross-target draws never join");
-    assert_eq!(mid.batch_flushes, 1, "claiming B's slot flushed A's batch");
+    assert_eq!(mid.batch_opens, 1, "one batch carries both targets");
+    assert_eq!(mid.batch_joins, 1, "the second target joined it");
+    assert_eq!(mid.batch_flushes, 0, "and nothing has consumed either yet");
 
-    // A: left half colored, right half untouched clear — single-draw batch
-    // content is exact after its flush.
+    // A drew the left half; the read is what flushes the shared batch.
     let px = engine::read_target(&a).expect("read A").into_rgba8();
     let left = ((10 * W + 8) * 4) as usize;
     let right = ((10 * W + W / 2 + 8) * 4) as usize;
@@ -241,6 +251,19 @@ fn cross_target_draw_flushes_open_batch() {
     assert!(
         is_zero(&px[right..right + 4]),
         "A right half = {:?}",
+        &px[right..right + 4]
+    );
+
+    // B drew the right half, out of the same command buffer.
+    let px = engine::read_target(&b).expect("read B").into_rgba8();
+    assert!(
+        is_zero(&px[left..left + 4]),
+        "B left half = {:?}",
+        &px[left..left + 4]
+    );
+    assert!(
+        is_frag_color(&px[right..right + 4]),
+        "B right half = {:?}",
         &px[right..right + 4]
     );
 }

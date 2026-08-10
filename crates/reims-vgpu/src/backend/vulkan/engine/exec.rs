@@ -14,7 +14,9 @@ use super::counters::EngineCounters;
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::draw_execution::DrawExecutionDecline;
 use super::draw_validation::DrawValidationDecline;
-use super::pools::{BatchTarget, BufferSlot, ResourcePools, SampledKey, SampledSlot, TargetKey};
+use super::pools::{
+    BatchFit, BatchTarget, BufferSlot, ResourcePools, SampledKey, SampledSlot, TargetKey,
+};
 use super::stage_phase;
 use super::types::{
     BufferContent, ColorWriteMask, DrawError, DrawOutput, DrawRequest, SampledSource,
@@ -1394,6 +1396,41 @@ struct JoinTerms {
     cpu_seed: bool,
     gpu_seed: bool,
     no_open_batch: bool,
+    batch_full: bool,
+    target_switch: bool,
+}
+
+/// Whether [`crate::env::BATCH_MIXED_TARGETS`] is switched off, read once per
+/// process.
+///
+/// Latched for the same reason [`crate::runtime::spirv_bind`]'s extent switch
+/// is: this sits on the per-draw path and `std::env::var_os` is a lock and an
+/// allocation, and the variable cannot change under a running device. The
+/// refusal is named once, on the off channel, so a boot whose submission count
+/// is being compared says in its own log which arm it ran.
+fn batch_mixed_targets_disabled() -> bool {
+    use std::sync::OnceLock;
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| {
+        let (state, value) = crate::env::read(crate::env::BATCH_MIXED_TARGETS);
+        match state {
+            crate::env::Switch::Off => {
+                crate::observe::off("batch_mixed reason=batch_mixed_targets_disabled_by_env");
+                true
+            }
+            // An unrecognized spelling is named rather than silently read as the
+            // default. It still takes the default arm: this switch may only turn
+            // a rail off, and a value nobody can parse is not that.
+            crate::env::Switch::Unrecognized => {
+                crate::observe::fail(format!(
+                    "batch_mixed reason=batch_mixed_targets_env_unrecognized value={}",
+                    value.unwrap_or_default()
+                ));
+                false
+            }
+            crate::env::Switch::On | crate::env::Switch::Unset => false,
+        }
+    })
 }
 
 /// What a [`JoinTerms`] rung is a statement about.
@@ -1420,7 +1457,7 @@ impl JoinTerms {
     /// one question and miss the other, and cannot be mis-scoped by landing at
     /// the wrong index — its scope is written beside it, not inferred from
     /// where it sits.
-    const LADDER: [JoinRefusal; 10] = [
+    const LADDER: [JoinRefusal; 12] = [
         (|t| t.force_loss, JoinScope::Draw, "nojoin_force_loss"),
         (|t| t.quirk, JoinScope::Draw, "nojoin_quirk"),
         (|t| t.is_mrt, JoinScope::Draw, "nojoin_mrt"),
@@ -1431,6 +1468,8 @@ impl JoinTerms {
         (|t| t.cpu_seed, JoinScope::Fit, "nojoin_cpu_seed"),
         (|t| t.gpu_seed, JoinScope::Fit, "nojoin_gpu_seed"),
         (|t| t.no_open_batch, JoinScope::Fit, "nojoin_no_open_batch"),
+        (|t| t.batch_full, JoinScope::Fit, "nojoin_batch_full"),
+        (|t| t.target_switch, JoinScope::Fit, "nojoin_target_switch"),
     ];
 
     /// Whether this draw may defer its submit and leave its command buffer
@@ -1718,12 +1757,36 @@ pub(crate) unsafe fn execute_draw_inner(
     // stop at its own term now walks to the end of the ladder and is counted
     // there when the open batch is on another target.
     //
-    // What that leaves is `nojoin_no_open_batch` as the largest refusal, and
-    // it is a statement about `BatchTarget` rather than about the draw — the
-    // batch is keyed by target identity and geometry, so a run alternating
-    // between two surfaces cannot batch at all even though each draw opens
-    // and ends its own render pass inside the command buffer. Nothing read so
-    // far says that key is load-bearing.
+    // What that left was `nojoin_no_open_batch` as the largest refusal, and it
+    // was a statement about `BatchTarget` rather than about the draw — the batch
+    // was keyed by target identity and geometry, so a run alternating between
+    // two surfaces could not batch at all even though each draw opens and ends
+    // its own render pass inside the command buffer.
+    //
+    // # And that key was not load-bearing either
+    //
+    // Driven macos-13 hammer boot, 22 200 draws through the ladder, before:
+    //
+    //   join_appended_self_alias      9 364   42.2 %
+    //   join_appended                 6 786   30.6 %
+    //   nojoin_no_open_batch          5 787   26.1 %
+    //   nojoin_cpu_seed                 263    1.2 %
+    //
+    // So on this rail one refusal was 96 % of all of them, and it named a batch
+    // that was recording and had room. The target now decides nothing: a draw
+    // appends to whatever batch is open, and `BatchTarget` is compared only on
+    // the arm `REIMS_VGPU_BATCH_MIXED_TARGETS=off` selects. What makes that
+    // sound is that no consumer of an open batch reads which image its passes
+    // wrote — `batch_flush` takes the CB, the fence and the accumulated
+    // descriptor sets — and the readback rail has always appended a copy of one
+    // target's image to whatever batch happened to be recording (see
+    // `read_target_leased`'s `batch_readback_joins`).
+    //
+    // The refusal that stood for two conditions is split with it:
+    // `nojoin_no_open_batch` now means only that nothing is recording, and
+    // `nojoin_batch_full` means `BATCH_MAX_DRAWS` is the binding constraint —
+    // which is the next lever if it becomes the largest reading, and was
+    // unreadable while one name covered both.
     //
     // So the batching ceiling was one term: a draw sampling the target it
     // renders into, which the GVA resident sampled rung made common. That term
@@ -1750,6 +1813,15 @@ pub(crate) unsafe fn execute_draw_inner(
     // shared prefix a `debug_assert` had to police. `batch_eligible` is now
     // derived from the same fields the ladder reads, so an added term cannot
     // reach one and miss the other.
+    // Last because it is the only thing here that looks anything up. Evaluated
+    // eagerly, which costs one enum match on a draw an earlier term already
+    // refused. A draw with no identity has no `BatchTarget` to ask about and is
+    // refused by `no_identity` above this in the ladder, so its fit is `None`
+    // and never reaches a name of its own.
+    let fit = batch_target
+        .as_ref()
+        .map(|t| pools.batch_fit(t, batch_mixed_targets_disabled()))
+        .unwrap_or(BatchFit::None);
     let terms = JoinTerms {
         force_loss,
         quirk: ctx.caps.quirks.no_deferred_draw_batching,
@@ -1760,13 +1832,9 @@ pub(crate) unsafe fn execute_draw_inner(
         no_identity: req.target_identity.is_none(),
         cpu_seed: req.target_rgba8.is_some(),
         gpu_seed: req.seed_from_target.is_some(),
-        // Last because it is the only term that looks anything up. Evaluated
-        // eagerly, which costs one `Option` compare on a draw an earlier term
-        // already refused.
-        no_open_batch: batch_target
-            .as_ref()
-            .and_then(|t| pools.batch_slot(t))
-            .is_none(),
+        no_open_batch: matches!(fit, BatchFit::None),
+        batch_full: matches!(fit, BatchFit::Full),
+        target_switch: matches!(fit, BatchFit::OtherTarget),
     };
     let batch_eligible = terms.batch_eligible();
     let no_join = terms.refusal();
@@ -1790,16 +1858,17 @@ pub(crate) unsafe fn execute_draw_inner(
     // so a boot can tell "the CPU is ahead of the ring" from "preparing a draw
     // got slower", which `prep_us` alone cannot.
     phase.enter(super::draw_phase::Phase::Slot);
-    let (cb, fence) = if joins {
-        let target = batch_target.as_ref().expect("joins requires identity");
-        pools.batch_slot(target).expect("joins checked batch_slot")
-    } else {
+    // `joins` is `refusal().is_none()`, and each of the other three `BatchFit`
+    // arms has its own rung, so a join *is* a `BatchFit::Open` and the pair
+    // cannot be any other combination.
+    let (cb, fence) = match fit {
+        BatchFit::Open(cb, fence) if joins => (cb, fence),
         // A fresh command buffer, so the guest-window imports the previous one
         // pinned against eviction may be displaced again. A *joiner*
         // deliberately does not bump: it records into the open batch's CB, which
         // still names every import the draws before it were handed and has not
         // been submitted, so nothing may free one out from under it.
-        pools.begin_entry(ctx, counters)?
+        _ => pools.begin_entry(ctx, counters)?,
     };
     phase.enter(super::draw_phase::Phase::Pipeline);
 
@@ -3966,6 +4035,8 @@ mod tests {
             cpu_seed: b(7),
             gpu_seed: b(8),
             no_open_batch: b(9),
+            batch_full: b(10),
+            target_switch: b(11),
         }
     }
 

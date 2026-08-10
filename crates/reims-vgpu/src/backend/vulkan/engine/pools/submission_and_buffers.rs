@@ -1249,26 +1249,39 @@ impl ResourcePools {
         taken
     }
 
-    /// The open batch's (CB, fence) when a draw at (identity, geometry, bgra)
-    /// can append to it. `None` means the caller must claim its own slot (and
+    /// Whether a draw at `target` can append to the open batch, and when it
+    /// cannot, which of the three reasons it is. Anything but
+    /// [`BatchFit::Open`] means the caller must claim its own slot (and
     /// `begin_entry` will flush the batch first).
     ///
-    /// A full batch (BATCH_MAX_DRAWS) also answers `None`, turning the next
-    /// same-target draw into a flush-then-reopen. Unbounded batches destroyed
-    /// the pipeline (live A/B 2026-07-19): the GPU idled while the CPU
-    /// recorded the whole run — the present then blocked behind the entire
-    /// batch executing from scratch (presents 38.7 -> 27/s) — and every
-    /// draw's staging slots stayed hoarded in ONE pending ring entry until
-    /// its fence retired, starving the free lists into per-bind
-    /// vkCreateBuffer/vkAllocateMemory churn (setup_bufs 50 -> 108 us/draw).
-    /// The cap keeps the GPU fed every ~N draws while still amortizing the
-    /// per-draw submit+fence cost N-fold.
-    pub(crate) fn batch_slot(
-        &self,
-        target: &BatchTarget,
-    ) -> Option<(vk::CommandBuffer, vk::Fence)> {
-        let b = self.open_batch.as_ref()?;
-        (b.draws < BATCH_MAX_DRAWS && b.target == *target).then_some((b.cb, b.fence))
+    /// A full batch (BATCH_MAX_DRAWS) refuses, turning the next draw into a
+    /// flush-then-reopen. Unbounded batches destroyed the pipeline (live A/B
+    /// 2026-07-19): the GPU idled while the CPU recorded the whole run — the
+    /// present then blocked behind the entire batch executing from scratch
+    /// (presents 38.7 -> 27/s) — and every draw's staging slots stayed hoarded
+    /// in ONE pending ring entry until its fence retired, starving the free
+    /// lists into per-bind vkCreateBuffer/vkAllocateMemory churn (setup_bufs 50
+    /// -> 108 us/draw). The cap keeps the GPU fed every ~N draws while still
+    /// amortizing the per-draw submit+fence cost N-fold.
+    ///
+    /// `narrow_to_target` is [`crate::env::BATCH_MIXED_TARGETS`] switched off.
+    /// The default is that the batch's own target does not decide this: every
+    /// batched draw begins and ends its own render pass, the flush reads only
+    /// the CB, the fence and the accumulated descriptor sets, and the readback
+    /// rail already appends a copy of *some other* target's image to whatever
+    /// batch happens to be recording. Passing the parameter rather than reading
+    /// the environment here keeps this function pure and testable.
+    pub(crate) fn batch_fit(&self, target: &BatchTarget, narrow_to_target: bool) -> BatchFit {
+        let Some(b) = self.open_batch.as_ref() else {
+            return BatchFit::None;
+        };
+        if b.draws >= BATCH_MAX_DRAWS {
+            return BatchFit::Full;
+        }
+        if narrow_to_target && b.target != *target {
+            return BatchFit::OtherTarget;
+        }
+        BatchFit::Open(b.cb, b.fence)
     }
 
     /// Record a batch-deferred draw's completion: open the batch on its ring
@@ -1278,8 +1291,8 @@ impl ResourcePools {
     ///
     /// # The sampled images go to the cache here, not at the flush
     ///
-    /// A batch is several draws to one target sharing one command buffer, and
-    /// the next draw's `find_gathered_sampled` runs before that buffer is
+    /// A batch is several draws sharing one command buffer, and the next draw's
+    /// `find_gathered_sampled` runs before that buffer is
     /// submitted. Holding the admissions until the flush therefore made every
     /// draw of a batch miss on every window an earlier draw of the *same* batch
     /// had already gathered — measured on macos-26 as `sampled_admit_twin_in_entry`
@@ -4741,6 +4754,61 @@ mod recycle_tests {
             dsets: Vec::new(),
         });
         assert_eq!(pools.open_slot_mask(), 1 << 3, "the batch's own slot");
+    }
+
+    /// The target decides a join only on the narrowed arm, and each of the three
+    /// refusals answers with its own name.
+    ///
+    /// The wide arm is the one a workload lives on: a driven macos-13 hammer
+    /// boot refused 26.1 % of all draws for a target switch alone, against a
+    /// batch that was recording and had room. Without this the two arms are
+    /// indistinguishable except by a live boot, and `BatchFit::OtherTarget`
+    /// would be reachable only through the environment.
+    #[test]
+    fn only_the_narrowed_arm_asks_what_the_open_batch_was_drawing_into() {
+        let target = |slot: u64| BatchTarget {
+            identity: TargetIdentity::Anonymous { slot },
+            width: 16,
+            height: 16,
+            bgra: false,
+        };
+        let mut pools = ResourcePools::new();
+        pools.slots = (0..4).map(|_| idle_slot()).collect();
+
+        assert!(
+            matches!(pools.batch_fit(&target(0), false), BatchFit::None),
+            "nothing recording"
+        );
+
+        pools.open_batch = Some(OpenBatch {
+            cb: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            target: target(0),
+            draws: 1,
+            dsets: Vec::new(),
+        });
+        assert!(
+            matches!(pools.batch_fit(&target(0), true), BatchFit::Open(..)),
+            "its own target fits on either arm"
+        );
+        assert!(
+            matches!(pools.batch_fit(&target(1), true), BatchFit::OtherTarget),
+            "the narrowed arm refuses a second surface"
+        );
+        assert!(
+            matches!(pools.batch_fit(&target(1), false), BatchFit::Open(..)),
+            "the default arm admits it — every draw opens and ends its own pass"
+        );
+
+        // Fullness outranks the target on both arms: the cap is what keeps the
+        // GPU fed, and a full batch has to be flushed whoever asks.
+        pools.open_batch.as_mut().expect("open").draws = BATCH_MAX_DRAWS;
+        for narrow in [false, true] {
+            assert!(
+                matches!(pools.batch_fit(&target(0), narrow), BatchFit::Full),
+                "narrow={narrow}"
+            );
+        }
     }
 
     /// What `GRAVEYARD_FORCE_DRAIN` used to backstop: a pure-async streak never
