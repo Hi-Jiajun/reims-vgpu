@@ -121,6 +121,24 @@ pub const RANGE_COVERAGE: &str = "REIMS_VGPU_RANGE_COVERAGE";
 /// capability this switch may grant.
 pub const BUFFER_EXTENT: &str = "REIMS_VGPU_BUFFER_EXTENT";
 
+/// `off` makes a type-11 render Store copy the frame into the guest's pages
+/// where it stands, instead of resolving the copy and holding it until a reader
+/// needs it.
+///
+/// This is the forced-eager mode `runtime::render_writeback`'s module doc asks
+/// for by name, and it exists for two jobs rather than one. It is the A/B
+/// instrument — the two arms differ by one branch in one process, so a driven
+/// boot of each on one build attributes a change to the deferral rather than to
+/// a rebuild. And it is the falsifier for the class of bug a deferral has that an
+/// eager copy cannot: a reader served pre-Store bytes shows up as stale pixels,
+/// which no counter can see, so "same screenshot under both arms" is the check
+/// that the parked frames are reaching the pages that need them.
+///
+/// It only ever narrows. `off` removes a rail and performs strictly more copies
+/// than the default; there is no spelling of it that makes this device skip a
+/// copy it would otherwise have made.
+pub const RENDER_PARK: &str = "REIMS_VGPU_RENDER_PARK";
+
 /// What one variable says, including the two ways it says nothing usable.
 ///
 /// Four states rather than a `bool` because "unset", "explicitly on" and
@@ -194,13 +212,14 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 6] = [
+pub const ALL: [&str; 7] = [
     GUEST_IMPORT,
     DRAW_LOG,
     GPU_STAMP,
     PAGE_GUARDS,
     RANGE_COVERAGE,
     BUFFER_EXTENT,
+    RENDER_PARK,
 ];
 
 /// The state of every variable in [`ALL`], for the one-shot boot line.

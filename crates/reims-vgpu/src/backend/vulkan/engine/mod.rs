@@ -859,6 +859,21 @@ fn clear_guest_write_pages() {
 /// `pages` need not be sorted; it is the reader's window and is usually a
 /// handful of entries against a whole frame's worth here.
 pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
+    // A parked Store is a write this device owes to guest pages that the
+    // submitted-write ledger below does not name — it has not been recorded, so
+    // nothing has armed its footprint there. Answering `Disjoint` from that
+    // ledger alone would licence a reader to skip the settle that is the only
+    // thing that lands the parked plan, and it would then read the pre-Store
+    // bytes. So while anything is parked this says only "cannot rule it out",
+    // which costs the disjoint shortcut and keeps every reader correct.
+    //
+    // Narrowing this to the parked plans' own pages is possible and is left
+    // undone deliberately: parked plans number about six, every settle site that
+    // matters lands them all anyway, and a page-level answer here would be a
+    // second copy of the reach rule that could disagree with the ledger's.
+    if parked_copies_outstanding() {
+        return GuestWriteReach::Unnamed;
+    }
     let Ok(f) = GUEST_WRITE_PAGES.lock() else {
         return GuestWriteReach::Unnamed;
     };
@@ -938,7 +953,144 @@ pub fn quiesce_guest_writes() {
 /// can ask whether there is anything to order behind *before* deciding how to
 /// order it. Reading it is one relaxed-acquire load.
 pub fn guest_writes_outstanding() -> bool {
-    GUEST_WRITE_DEBT.load(std::sync::atomic::Ordering::Acquire)
+    GUEST_WRITE_DEBT.load(std::sync::atomic::Ordering::Acquire) || parked_copies_outstanding()
+}
+
+/// A render Store's copy, resolved against the guest's page tables but not yet
+/// recorded into the GPU's command stream.
+///
+/// See `crate::runtime::render_writeback`'s module doc for why this exists: the
+/// contract asks for no host-to-guest copy at a Store, and a driven boot
+/// performs one per Store anyway while the readers that consume those bytes
+/// number about six a second. Parking is what turns "copy at every Store" into
+/// "copy when something is about to read".
+///
+/// It holds the three arguments [`copy_target_to_guest_pages`] takes and nothing
+/// else, deliberately. The seam could have been cut inside that function —
+/// everything up to `references_for_runs` needs the guest's page tables and the
+/// rest needs only the engine — but it does not have to be: re-invoking the
+/// whole function at land time re-runs only its geometry validation, which is
+/// pure and cheap, and leaves one copy path in the tree instead of two halves
+/// that can disagree.
+struct ParkedCopy {
+    identity: TargetIdentity,
+    target: GuestPageTarget,
+    pages: Vec<u64>,
+}
+
+/// Resolved Stores waiting for a reader, one per mapping.
+///
+/// Keyed by mapping id so a second Store into one surface **replaces** the first
+/// rather than queueing behind it. That replacement is the coalescing the
+/// deferred window this rail used to have could never reach: it landed at the
+/// next completion stamp, which arrives so much more often than a repeat Store
+/// that no second Store ever found a live window.
+///
+/// A `Mutex` of its own rather than a field on `EngineState`, because landing
+/// takes the engine lock and a parked plan must be removed from here *before*
+/// that happens or the two lock orders cross.
+static PARKED_COPIES: Lazy<Mutex<std::collections::BTreeMap<u32, ParkedCopy>>> =
+    Lazy::new(|| Mutex::new(std::collections::BTreeMap::new()));
+
+/// Whether any Store is resolved and not yet recorded.
+fn parked_copies_outstanding() -> bool {
+    !PARKED_COPIES.lock().is_empty()
+}
+
+/// Hold a resolved Store instead of recording it, and return.
+///
+/// `Err` means the caller must perform the copy itself — this refuses rather
+/// than silently dropping a frame. The one refusal is a resident that cannot be
+/// pinned: between park and land the reclaim paths would otherwise be free to
+/// take the image the parked plan reads from, and an unpinnable identity is one
+/// this rail cannot make that promise about.
+///
+/// The pin is released by exactly two places, [`land_parked_copies`] and
+/// [`drop_parked_copy`], which are the only two ways an entry leaves the map. A
+/// pin that leaked would strand a framebuffer for the guest's lifetime, which is
+/// why replacement below unpins the plan it displaces rather than overwriting it.
+pub fn park_target_copy(
+    mapping_id: u32,
+    identity: &TargetIdentity,
+    target: GuestPageTarget,
+    pages: &[u64],
+) -> Result<(), GuestPageTarget> {
+    if !pin_resident_target(identity) {
+        crate::runtime::drain::note_store_route("render_park_unpinnable");
+        return Err(target);
+    }
+    let parked = ParkedCopy {
+        identity: identity.clone(),
+        target,
+        pages: pages.to_vec(),
+    };
+    let mut map = PARKED_COPIES.lock();
+    if let Some(displaced) = map.insert(mapping_id, parked) {
+        // The later frame is the fresher answer for these pages, so the one it
+        // displaces is not lost work — it is a copy this rail correctly never
+        // made. Its pin is this thread's to release.
+        drop(map);
+        unpin_resident_target(&displaced.identity);
+        crate::runtime::drain::note_store_route("render_park_replaced");
+    }
+    crate::runtime::drain::note_store_route("render_park_armed");
+    Ok(())
+}
+
+/// Record and submit every parked Store, then return.
+///
+/// Called by every settle site that is about to let a host reader touch guest
+/// bytes. It does not wait — `quiesce_guest_writes` does that, and runs straight
+/// after this at every caller, so the copies this submits are inside the wait
+/// that follows.
+///
+/// The map is drained under its own lock and released before any copy is
+/// recorded, because recording takes the engine lock.
+pub fn land_parked_copies() {
+    let drained: Vec<ParkedCopy> = {
+        let mut map = PARKED_COPIES.lock();
+        std::mem::take(&mut *map).into_values().collect()
+    };
+    if drained.is_empty() {
+        return;
+    }
+    for plan in drained {
+        match copy_target_to_guest_pages(&plan.identity, &plan.target, &plan.pages) {
+            Ok(()) => {
+                crate::runtime::drain::note_store_route("render_park_landed");
+                // Only now has this image stopped being the only place these
+                // pixels exist. The eager rail says this at the Store; under
+                // parking that statement is false until here, and saying it
+                // early would license reclaim to take an image a parked plan
+                // still has to read.
+                note_resident_content_copied_out(&plan.identity);
+            }
+            Err(e) => {
+                // A parked plan that cannot be recorded is a frame the guest
+                // asked for and will not get, which is exactly what the
+                // always-on failure path is for.
+                crate::observe::Emit::decline("render_park_land_failed", &e).fail_once(0);
+                crate::runtime::drain::note_store_route("render_park_land_failed");
+            }
+        }
+        unpin_resident_target(&plan.identity);
+    }
+}
+
+/// Discard the parked Store for one mapping without landing it.
+///
+/// The guest wrote these bytes itself, or the mapping is going away. Landing
+/// here would clobber the guest's own write with pixels rendered before it —
+/// the write-ordering hazard the deferred window used to carry — so the frame is
+/// dropped and the drop is counted under `reason`.
+pub fn drop_parked_copy(mapping_id: u32, reason: &'static str) {
+    let mut map = PARKED_COPIES.lock();
+    let Some(plan) = map.remove(&mapping_id) else {
+        return;
+    };
+    drop(map);
+    unpin_resident_target(&plan.identity);
+    crate::runtime::drain::note_store_route(reason);
 }
 
 /// Record the completion stamp's word into the GPU queue behind the writebacks

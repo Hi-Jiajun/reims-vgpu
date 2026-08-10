@@ -110,6 +110,15 @@ pub fn apply(
             // The guest wrote these pages after our last render into them, so
             // our copy is stale by the guest's own statement and the next read
             // must re-take the guest pages.
+            //
+            // A Store this device resolved but has not yet recorded holds pixels
+            // rendered *before* that guest write, so landing it now would
+            // overwrite the guest's own bytes with older ones. Dropped rather
+            // than landed — this is the write-ordering hazard the retired
+            // deferred window carried, and `clear_host_valid` is the decoded
+            // signal that answers it.
+            #[cfg(feature = "backend-vulkan")]
+            crate::backend::vulkan::engine::drop_parked_copy(id, "render_park_dropped_guest_wrote");
             let seq = state.next_validity_seq();
             if let Some(m) = state.mappings.get_mut(&id) {
                 m.content_generation = m.content_generation.saturating_add(1);
