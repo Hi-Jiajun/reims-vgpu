@@ -15,10 +15,15 @@
 //!
 //! `node_guard` first sees `P` as a node at step 3 or later, so the write at
 //! step 4 is before its first sighting and reads as `FirstSight` rather than as
-//! a finding. The window is exactly the one the guest's ordering rail is
-//! supposed to close: it submits the unmap, blocks on the event, and only then
-//! runs its own `deallocate` — so **our stamp is what releases that block**, and
-//! a stamp written before our work has quiesced is what opens step 4.
+//! a finding.
+//!
+//! **The ordering claim this paragraph used to make is wrong and is worth not
+//! repeating.** It said the guest submits the unmap, blocks on this device's
+//! reply, and only then unwires — so that our stamp opened step 4. It does not
+//! block: the submit and the unwire are adjacent, and measured, the guest
+//! finishes unwiring before this device even reads the packet about nineteen
+//! times in twenty. Nothing this device replies opens that window; the guest
+//! opens it itself.
 //!
 //! So this watches the other end. A page released by the guest is a page this
 //! device has been told to stop writing, whatever it later becomes, and a write

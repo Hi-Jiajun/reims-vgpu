@@ -5,23 +5,38 @@
 //!
 //! One guest line keeps a three-level GPU page table whose interior nodes carry
 //! both a C++ child-pointer array, in its kernel heap, and a 32-bit PTE word per
-//! slot, in a guest page. Its teardown asserts the two agree — a slot with a
-//! live child pointer must have a non-zero PTE — and on that line the assertion
-//! fires on roughly two boots in five and takes the whole guest with it. The
-//! divergence is one-sided: the child pointers are unreachable from here, and
-//! the PTE page is ordinary guest RAM that this device reads on every
-//! translation and could, if it resolved an address wrongly, write.
+//! slot in a guest page. The PTE page is ordinary guest RAM that this device
+//! reads on every translation and could, if it resolved an address wrongly,
+//! write — and a zero word appearing in one is the PTE-corruption class this
+//! repository has already been bitten by once, in the map-notify guest flush
+//! `apply_map_family` still carries a comment about.
 //!
-//! The interval audit in [`crate::runtime::map_audit`] answered the first
-//! question — the guest's map and unmap ranges pair cleanly, including on a boot
-//! that panicked — so a pairing bug is not what violates the invariant. This
-//! answers the second: does a host write ever land on a node page?
+//! **A hit is a proof**, and none has ever been seen: zero findings across
+//! twelve boots that panicked in that guest's own page-table teardown, with
+//! `node_guard_undecidable` and `node_guard_not_watched` both zero, so the
+//! answer rests on writes that named their pages and on a watch the cap never
+//! truncated.
 //!
-//! **A hit is a proof.** A zero word appearing in a node page is exactly what
-//! the guest's assertion reads as a missing entry, and this device writing a
-//! page-sized clear or a zero-filled writeback into a recycled page is the
-//! PTE-corruption class this repository has already been bitten by once — the
-//! map-notify guest flush that `apply_map_family` still carries a comment about.
+//! # It was built for a panic it does not explain, and that is now settled
+//!
+//! This was written to catch the child-pointer/PTE divergence that a macOS 26
+//! kernel panic was believed to be. It is not that. The frame the belief rested
+//! on was a symbolizer naming the *next* cold block, and the guest's assertion
+//! is the flat one — `deallocate` refusing to clear a leaf entry that is already
+//! zero, with no interior node involved. See
+//! `kb/macos-26-panic-is-a-zero-pte-not-a-child-divergence.md`.
+//!
+//! That panic is now understood and is upstream: the guest's own
+//! `release_pte` has no re-entry guard, so a map released twice deallocates one
+//! range twice and asserts on the first entry it finds already cleared. No host
+//! write, ordering or reply participates.
+//!
+//! **This module is kept anyway, and not out of sentiment.** The corruption
+//! class it watches is real, is this device's to cause, and has cost this
+//! repository a boot before. What changed is only that it is a standing guard
+//! against a hazard rather than the instrument for one open bug — so read a
+//! firing as the PTE-corruption alarm it is, and do not read its zeros as
+//! evidence about any guest assertion.
 //!
 //! # What it costs, and why it can be always on
 //!

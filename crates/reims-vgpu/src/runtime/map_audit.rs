@@ -3,24 +3,34 @@
 //!
 //! # Why this exists
 //!
-//! The guest keeps a three-level page table whose interior nodes hold both a C++
-//! child-pointer array, in its kernel heap, and a 32-bit PTE word per slot, in a
-//! guest page this device reads on every translation. Its teardown asserts that
-//! the two agree: a slot with a live child pointer must have a non-zero PTE. On
-//! one guest line that assertion fires on roughly two boots in five and takes
-//! the whole guest with it.
+//! The guest keeps a three-level page table in guest pages this device reads on
+//! every translation. Its teardown walks the range it is given one page at a
+//! time and **refuses to clear a leaf entry that is already zero** — an
+//! assertion that panics the guest. On one guest line it fires on about half of
+//! undriven boots.
 //!
-//! This device never writes those node pages, so it cannot violate that
-//! invariant directly. What it *can* do is drive the guest into violating it,
-//! and the wire gives us the means to check the most reachable way:
+//! This device never writes those pages, so it cannot violate that invariant
+//! directly. What it *can* do is drive the guest into violating it, and the wire
+//! gives us the means to check the most reachable way:
 //!
 //! **The guest's own `allocate` and `deallocate` take their length from the same
-//! call whose value the map packet carries.** So the intervals in the FIFO are
-//! exactly the intervals the guest applies to its tree. If a range is unmapped
-//! that was never mapped, unmapped twice, mapped over itself, or unmapped at a
-//! different length than it was mapped at, the guest's leaf `entriesSet` reaches
-//! zero at the wrong moment and it detaches a node whose PTE is already clear —
-//! which is the assertion, exactly.
+//! call whose value the map packet carries**, and their address from the getter
+//! the packet's address field is built from. So the intervals in the FIFO are
+//! exactly the intervals the guest applies to its tree. A range unmapped that was
+//! never mapped, unmapped twice, mapped over itself, or unmapped at a different
+//! length reaches that assertion directly.
+//!
+//! # What it has answered, and the one thing it cannot see
+//!
+//! Clean on every boot it has been read on, including a dozen that panicked. So
+//! no *drained* teardown has ever been a double.
+//!
+//! **The fatal one is not drained.** The guest submits an unmap and unwires
+//! immediately afterwards — measured, it beats this device to the range about
+//! nineteen times in twenty — so a release that panics the guest does so inside
+//! the window between its submit and this device's read. That packet is never
+//! decoded, never audited and never counted. Read this instrument's zero as
+//! covering every teardown that did not end the boot, and nothing more.
 //!
 //! # This is an instrument, not a repair
 //!

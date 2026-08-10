@@ -3105,8 +3105,8 @@ fn observe_page_table_nodes<H: HostMemory + HostOps>(
                 crate::observe::fail(format!(
                     "node_guard reason={} task={task_id} node_gpa={gpa:#x} gva={gva:#x} \
                      gap_us={gap_us} watched={} refused={} (this device wrote into a guest page \
-                     holding page-table entries; the guest's own teardown asserts that a slot \
-                     with a live child has a non-zero entry)",
+                     holding page-table entries; a zero word landing there is what the guest's \
+                     own teardown reads as an entry it has already cleared, and it panics on one)",
                     verdict.route(),
                     watch.watched(),
                     watch.refused(),
