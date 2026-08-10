@@ -6,65 +6,88 @@
 # untextured polygon with no icon highlight, and the dock's own background comes
 # out mottled rather than blurred. That was reported from a hand-taken
 # screenshot, which is not a regression gate — `AGENTS.md` asks for a log- or
-# test-level proxy for the bug class before a visual fix lands, and there was no
+# test-level proxy for a bug class before a visual fix lands, and there was no
 # way to ask for the effect on demand at all.
 #
-# So this does two things a screenshot cannot. It *asks for* the hover
-# reproducibly, by gliding the pointer onto a dock slot and resting it there
-# (see `hover.c` — a hover is an arrival followed by rest, not a coordinate).
-# And it brackets each hover with the device's own fail log, so the lines the
-# device emitted while that effect was being composited are separated from the
-# whole boot's noise.
+# # Why this drives the pointer from the host
+#
+# The first version of this probe compiled a Quartz pointer poster on the guest,
+# the way `window-drag-probe`'s `drag.c` does. That cannot work on the rail with
+# the bug: **macOS 26 has no command line developer tools**, so `clang` is absent
+# and the build step requests an installer dialog instead. The other guest-side
+# routes are no better — `screencapture` fails outright there ("could not create
+# image from display", so `guest_display_size` cannot answer), and the
+# `osascript` desktop-bounds queries need Apple Events consent a fresh ssh
+# session does not have.
+#
+# QMP's `input-send-event` reaches the machine's usb-tablet from outside the
+# guest, so it needs no guest tooling, no consent and no permission, and it works
+# identically on all six rails. It is the same transport `vibrancy-latch-probe`
+# already drives its gestures over. The consequence worth noting is that this
+# probe **does not use ssh at all** — a guest whose sshd never came up can still
+# be photographed.
+#
+# A hover is an *arrival followed by rest*, not a coordinate: the window server
+# starts its tooltip timer when the pointer stops, so the probe glides in over
+# several sub-moves and then stops sending events entirely. Re-asserting the
+# position on a timer would restart that timer forever and the tooltip would
+# never appear.
 #
 # It does not judge the picture. It produces a screenshot per slot and a fail-log
 # slice per slot; comparing those against a known-good rail is the reading.
 #
 # Usage:
 #   scripts/dock-hover-probe/dock-hover-probe.sh [--slots N] [--rest SECONDS]
-#                                                [--keep DIR] [--guest HOST]
+#                                                [--keep DIR] [--qmp SOCK]
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-# shellcheck source=../lib/guest-display.sh
-. "$SCRIPT_DIR/../lib/guest-display.sh"
 
-GUEST=macos-vm
 SLOTS=5
 REST=2.5
 KEEP=""
-FAILLOG=/tmp/reims-vgpu-fail.log
+FAILLOG="${REIMS_FAIL_LOG:-/tmp/reims-vgpu-fail.log}"
+# The x86 boot's stable per-boot symlink. qmp.py defaults to the arm64 path, so
+# this must be passed explicitly here — the same override vibrancy-latch-probe
+# makes, for the same reason.
+QMP_SOCK="${QMP_SOCK:-$REPO_ROOT/vm/disks/run/qmp.sock}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --slots) SLOTS="$2"; shift 2 ;;
     --rest) REST="$2"; shift 2 ;;
     --keep) KEEP="$2"; shift 2 ;;
-    --guest) GUEST="$2"; shift 2 ;;
+    --qmp) QMP_SOCK="$2"; shift 2 ;;
+    -h|--help) sed -n '2,38p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
     *) echo "dock-hover-probe: unknown option $1" >&2; exit 2 ;;
   esac
 done
 
 say() { echo "dock-hover-probe: $*"; }
 
-# The screenshot is taken two seconds into each hover's rest, so a shorter rest
-# would photograph a pointer that has already left. Refused rather than clamped:
-# a run that silently ignored `--rest` would produce dock shots with no hover in
-# them and nothing would say why.
-if ! awk -v r="$REST" 'BEGIN { exit !(r > 2.2) }'; then
-  say "--rest must be greater than 2.2 s (the shot lands 2 s into the rest)" >&2
+# The screenshot is taken partway into each hover's rest, so a shorter rest would
+# photograph a pointer that has already left. Refused rather than clamped: a run
+# that silently ignored `--rest` would produce dock shots with no hover in them
+# and nothing would say why.
+if ! awk -v r="$REST" 'BEGIN { exit !(r > 1.5) }'; then
+  say "--rest must be greater than 1.5 s (the shot lands 1.2 s into the rest)" >&2
   exit 2
 fi
 
 WORK="${KEEP:-$(mktemp -d)}"
 mkdir -p "$WORK"
 
-ssh -o ConnectTimeout=8 -o BatchMode=yes "$GUEST" true 2>/dev/null || {
-  say "no guest at $GUEST — run vm/guest-authorize.sh first" >&2; exit 2; }
+QMP="$REPO_ROOT/scripts/qmp/qmp.py"
+[ -S "$QMP_SOCK" ] || { say "no QMP socket at $QMP_SOCK — is a boot running?" >&2; exit 2; }
 [ -f "$FAILLOG" ] || { say "no fail log at $FAILLOG — is a boot running?" >&2; exit 2; }
 
-read -r SW SH < <(guest_display_size "$GUEST") || exit 2
-say "guest desktop ${SW}x${SH}"
+read -r SW SH < <(QMP_SOCK="$QMP_SOCK" "$QMP" size 2>"$WORK/size.err")
+case "${SW:-}" in
+  [0-9]*) ;;
+  *) say "QMP did not report a display size — see $WORK/size.err" >&2; exit 2 ;;
+esac
+say "guest display ${SW}x${SH}"
 
 # The dock's own geometry is not queryable without assistive access, which five
 # of six rails do not have. It does not need to be: the probe hovers a band of
@@ -79,18 +102,8 @@ HOVER_Y=$(( SH - 44 ))
 APPROACH_Y=$(( SH - 260 ))
 [ "$APPROACH_Y" -lt 0 ] && APPROACH_Y=0
 
-scp -q "$SCRIPT_DIR/hover.c" "$GUEST:/tmp/reims-hover.c" || {
-  say "could not copy the hover poster to the guest" >&2; exit 2; }
-ssh -o BatchMode=yes "$GUEST" \
-  'clang -O2 -o /tmp/reims-hover /tmp/reims-hover.c -framework ApplicationServices -lm' \
-  2>"$WORK/build.err" || {
-  say "could not build the hover poster on the guest:" >&2
-  sed 's/^/  /' "$WORK/build.err" >&2; exit 2; }
-
 SHOT="$REPO_ROOT/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh"
 
-# Slots across the middle half of the screen, which is where a default dock's
-# icons fall whatever its item count.
 span=$(( SW / 2 ))
 left=$(( SW / 4 ))
 captured=0
@@ -102,33 +115,24 @@ for i in $(seq 1 "$SLOTS"); do
   fi
 
   before=$(wc -c < "$FAILLOG")
-  # The hover runs in the background and the screenshot is taken *during* its
-  # rest, because the effect exists only while the pointer is resting. Waiting
-  # for the poster to return and then shooting photographs a dock that is still
-  # hovered but has had its tooltip up for the whole rest — which works, but
-  # gives no control over when in the effect's life the shot lands.
-  #
-  # Bounded host-side: an unattended harness cannot tell a wedged guest command
-  # from a wedged boot, and a hover that never returns must not hang a sweep.
-  timeout 90 ssh -o BatchMode=yes "$GUEST" \
-    "/tmp/reims-hover $x $HOVER_Y $APPROACH_Y $REST" \
-    > "$WORK/hover-$i.json" 2>"$WORK/hover-$i.err" &
-  HOLD=$!
 
-  # Let the approach finish (~200 ms) and the tooltip timer elapse before
-  # shooting. The poster rests for $REST after arriving, so this must land
-  # inside that window.
-  sleep 2
+  # The approach: a handful of sub-moves so the window server sees a pointer
+  # entering the target rather than teleporting into it. Then nothing, so the
+  # tooltip timer can run.
+  for step in 1 2 3 4 5 6; do
+    y=$(( APPROACH_Y + (HOVER_Y - APPROACH_Y) * step / 6 ))
+    QMP_SOCK="$QMP_SOCK" "$QMP" move "$x" "$y" >/dev/null 2>>"$WORK/move-$i.err"
+  done
+
+  sleep 1.2
   "$SHOT" -o "$WORK/dock-slot-$i.png" > "$WORK/shot-$i.log" 2>&1 \
     && captured=$(( captured + 1 )) \
     || say "slot $i at x=$x: host screenshot failed — see $WORK/shot-$i.log"
 
-  wait $HOLD 2>/dev/null
-  if [ ! -s "$WORK/hover-$i.json" ]; then
-    say "slot $i at x=$x: hover poster produced no record — see hover-$i.err"
-  fi
+  # Let the rest finish before cutting the log slice, so the slice covers the
+  # whole time the effect was on screen rather than only up to the shot.
+  sleep "$(awk -v r="$REST" 'BEGIN { d = r - 1.2; print (d > 0 ? d : 0) }')"
 
-  # The device's own account of that interval, and nothing else's.
   after=$(wc -c < "$FAILLOG")
   if [ "$after" -gt "$before" ]; then
     tail -c "$(( after - before ))" "$FAILLOG" > "$WORK/faillog-slot-$i.txt"
