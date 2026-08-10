@@ -1308,6 +1308,13 @@ fn list_entry<M: HostMemory>(
             // for why this path cannot take a lock.
             if lookup == ListLookup::Named {
                 slot_recheck::note_ref_resolved(task_id, ref_);
+                // The control for the banding below, and the reason it is worth
+                // reading: a miss skewing late says nothing unless the hits do
+                // not. See `census::note_list_lookup_age`.
+                crate::runtime::drain::note_list_lookup_age(
+                    true,
+                    crate::runtime::drain::tranche_elapsed_us(),
+                );
             }
             Some(entry)
         }
@@ -1317,6 +1324,14 @@ fn list_entry<M: HostMemory>(
             // counting those would bury the named misses under the search.
             if lookup == ListLookup::Named {
                 crate::runtime::drain::note_store_route(miss.route());
+                // How late in its tranche this lookup happened. The guest clears
+                // a slot by writing its own memory, so a slot found cleared
+                // should be one read late — if these band like the hits do, that
+                // story is wrong however good the totals look.
+                crate::runtime::drain::note_list_lookup_age(
+                    false,
+                    crate::runtime::drain::tranche_elapsed_us(),
+                );
                 if miss == ListMiss::SlotEmpty {
                     note_slot_empty_claimants(state, host, task_id, ref_);
                     // The unconfounded half of the same question — see

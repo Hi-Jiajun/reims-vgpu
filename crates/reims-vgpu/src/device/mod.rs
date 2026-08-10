@@ -551,6 +551,10 @@ pub fn device_drain(id: u64) -> bool {
     // Both hold the device lock, and which one owns the worker's wall clock is
     // the question `drain_duty` exists to answer.
     let tranche_started = std::time::Instant::now();
+    // The same instant on the crate's own clock, so a lookup inside the drain
+    // can say how late in this tranche it happened without threading a start
+    // time through every call. See `census::tranche_elapsed_us`.
+    crate::runtime::drain::note_tranche_started(crate::observe::elapsed_us());
     device.drain(&mut host);
     // Submit any deferred draw batch before the worker sleeps: consumers
     // inside the tranche flush on their own (engine begin_entry), this bounds

@@ -1525,6 +1525,63 @@ pub fn note_resident_window_flushed() {
     RESIDENT_ARM.note_flush(crate::observe::elapsed_us());
 }
 
+/// When the drain tranche now running started, in [`crate::observe::elapsed_us`].
+///
+/// One word, written once per tranche by the worker that owns it. A device runs
+/// one drain worker, so there is no interleaving to lose; a second device would
+/// share this and the two would blend, which is why nothing here claims to be
+/// per device.
+static TRANCHE_START_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Mark the start of a drain tranche, for [`tranche_elapsed_us`].
+pub fn note_tranche_started(now_us: u64) {
+    TRANCHE_START_US.store(now_us, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How long the tranche now running has been running.
+///
+/// The question this exists for: a guest clears an object-list slot by writing
+/// its own memory, which nothing orders against the ring except how fast this
+/// device reads it — so a lookup that finds a cleared slot should be one that
+/// happened *late* in a long tranche. Reading zero before the first tranche is
+/// harmless; nothing consults it outside one.
+pub fn tranche_elapsed_us() -> u64 {
+    crate::observe::elapsed_us()
+        .saturating_sub(TRANCHE_START_US.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Band one object-list lookup by how late in its tranche it happened.
+///
+/// Bands rather than a mean, because the claim being tested is about a **tail**:
+/// "the losing lookups sit behind the long tranches" is false if they are spread
+/// like every other lookup, and two means that differ by a little cannot tell
+/// those apart.
+///
+/// `hit` picks the family, and the hit family is the point. A miss banding that
+/// skewed late would prove nothing on its own if *every* lookup skews late — the
+/// control is the whole reason this is worth recording, and the session that
+/// added it had already been caught once reading an instrument without one.
+pub fn note_list_lookup_age(hit: bool, us: u64) {
+    note_store_route(list_lookup_age_route(hit, us));
+}
+
+/// The counter name for one banded lookup, total over both families and every
+/// age.
+fn list_lookup_age_route(hit: bool, us: u64) -> &'static str {
+    match (hit, us) {
+        (true, 0..=99) => "list_hit_age_under_100us",
+        (true, 100..=999) => "list_hit_age_under_1ms",
+        (true, 1_000..=9_999) => "list_hit_age_under_10ms",
+        (true, 10_000..=99_999) => "list_hit_age_under_100ms",
+        (true, _) => "list_hit_age_over_100ms",
+        (false, 0..=99) => "list_miss_age_under_100us",
+        (false, 100..=999) => "list_miss_age_under_1ms",
+        (false, 1_000..=9_999) => "list_miss_age_under_10ms",
+        (false, 10_000..=99_999) => "list_miss_age_under_100ms",
+        (false, _) => "list_miss_age_over_100ms",
+    }
+}
+
 /// Accumulate one completed drain tranche; emits at most once per second.
 pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
     if let Some(line) = DRAIN_DUTY.note(drain_us, publish_us, crate::observe::elapsed_ms() as u64) {
@@ -2244,4 +2301,49 @@ fn take_store_routes() -> Option<String> {
     }
     routes.clear();
     Some(out)
+}
+
+#[cfg(test)]
+mod lookup_age_tests {
+    use super::list_lookup_age_route;
+
+    /// Every decade boundary lands in the band below it, and the two families
+    /// never share a counter.
+    ///
+    /// The boundaries are the whole content of this function, and an off-by-one
+    /// at one of them would move a population between decades without any
+    /// reading looking wrong — which is exactly the shape of error a banding is
+    /// built to avoid making.
+    #[test]
+    fn the_bands_are_decades_and_the_two_families_are_disjoint() {
+        const EDGES: [(u64, &str, &str); 6] = [
+            (0, "list_hit_age_under_100us", "list_miss_age_under_100us"),
+            (99, "list_hit_age_under_100us", "list_miss_age_under_100us"),
+            (100, "list_hit_age_under_1ms", "list_miss_age_under_1ms"),
+            (999, "list_hit_age_under_1ms", "list_miss_age_under_1ms"),
+            (1_000, "list_hit_age_under_10ms", "list_miss_age_under_10ms"),
+            (10_000, "list_hit_age_under_100ms", "list_miss_age_under_100ms"),
+        ];
+        for (us, hit, miss) in EDGES {
+            assert_eq!(list_lookup_age_route(true, us), hit, "hit at {us}");
+            assert_eq!(list_lookup_age_route(false, us), miss, "miss at {us}");
+        }
+        for us in [100_000u64, 264_000, u64::MAX] {
+            assert_eq!(list_lookup_age_route(true, us), "list_hit_age_over_100ms");
+            assert_eq!(list_lookup_age_route(false, us), "list_miss_age_over_100ms");
+        }
+    }
+
+    /// No age reaches the same counter from both families, so a hit can never be
+    /// summed into the miss banding it is the control for.
+    #[test]
+    fn a_hit_and_a_miss_never_share_a_counter() {
+        for us in [0u64, 50, 100, 500, 1_000, 5_000, 10_000, 99_999, 100_000] {
+            assert_ne!(
+                list_lookup_age_route(true, us),
+                list_lookup_age_route(false, us),
+                "at {us}"
+            );
+        }
+    }
 }
