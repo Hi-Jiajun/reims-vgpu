@@ -1174,6 +1174,14 @@ mod tests {
         assert_eq!(
             color,
             vec![
+                // macOS 26 renders into a single-channel half-float linear GVA
+                // target — a blur/backdrop intermediate — and it was refused as
+                // `rt_resolve reason=rt_linear_format` three times a driven
+                // boot until `rgba8_to_texel` gained the arm its CPU Store
+                // needed. It has been in the sampled list above throughout,
+                // which is what made the target renderable-and-readable rather
+                // than write-only.
+                p::MTL_FORMAT_R16_FLOAT,
                 p::MTL_FORMAT_RG16_FLOAT,
                 p::MTL_FORMAT_RGBA8_UNORM,
                 p::MTL_FORMAT_RGBA8_UNORM_SRGB,

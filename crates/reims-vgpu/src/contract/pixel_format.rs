@@ -756,6 +756,37 @@ pub fn is_srgb(format: u16) -> bool {
     )
 }
 
+/// Which **CPU-upload fast path** a sampled format's guest bytes qualify for, or
+/// `None` for one that has to go through a per-texel convert.
+///
+/// # This is not the sampling admission rule
+///
+/// The name reads like one and it is not, which has cost a session: a `None`
+/// here was once written up as "this device cannot sample that format", and a
+/// plan was built on adding a variant to unblock a render target.
+///
+/// Nothing in this crate can *refuse* a bind because of this function. It has
+/// two non-test callers, both in `runtime/draw/texture_view.rs`
+/// (`linear_native_upload_format` and the tight-linear-load fast path), and both
+/// treat a `None` — or any variant that is not `Rgba8Unorm`/`Bgra8Unorm` — as
+/// "take the ordinary convert path". The convert path is not a decline.
+///
+/// What actually admits a sampled format is `translate::pixel::sampled_pixels`,
+/// which answers a [`TexelLayout`] and declines by name with
+/// `TranslateReason::NoSampledLayout`. That table is strictly wider than this
+/// one: it carries the half-float and sixteen-bit-normalized layouts natively.
+/// **Ask it, not this, when the question is whether a format can be sampled.**
+///
+/// So the members here are the layouts a loader can hand the uploader with no
+/// conversion — which is why they are almost all eight-bit channel orders. A
+/// format belongs here when its guest bytes are already in a final upload order,
+/// and nowhere else does membership mean anything.
+///
+/// `Rgba16Float` is the one member no upload fast path reads. It is here as the
+/// independent statement of a byte layout that
+/// `a_byte_copy_destination_is_the_texel_every_other_table_agrees_it_is` checks
+/// [`store_texel_order`] against — a consistency cross-check between two tables,
+/// again not a capability claim.
 pub fn sampled_class(format: u16) -> Option<SampledClass> {
     Some(match format {
         MTL_FORMAT_A8_UNORM => SampledClass::A8Unorm,
@@ -815,14 +846,26 @@ pub fn storage_selector(format: u16) -> Option<StorageImageSelector> {
 /// those refuse is a render target the guest can create and then lose the frame
 /// of on any host that cannot land it GPU-direct.
 ///
-/// `R16_FLOAT` is **not** here and macOS 26 asks for it — a linear GVA target at
-/// `fmt=0x19`, refused three times a driven boot as `rt_resolve
+/// `R16_FLOAT` is here because macOS 26 asks for it — a linear GVA target at
+/// `fmt=0x19`, previously refused three times a driven boot as `rt_resolve
 /// reason=rt_linear_format`. Metal renders to it on every Apple GPU and Vulkan
-/// mandates `R16_SFLOAT` as a colour attachment, so neither side is the blocker.
-/// [`sampled_class`] is: it answers `None` for `R16_FLOAT`, so admitting it here
-/// would give the guest a target it can render into and then cannot sample,
-/// which for a blur pyramid is the whole point of the target. Adding it means
-/// adding the sampled class first.
+/// mandates `R16_SFLOAT` for both `COLOR_ATTACHMENT_BIT` and
+/// `COLOR_ATTACHMENT_BLEND_BIT` in optimal tiling, so no capability gate is owed
+/// and no host can decline it.
+///
+/// The gap that had to close first was the third rail, not the sampler: the CPU
+/// Store converter reaches [`rgba8_to_texel`], which carried no `R16_FLOAT` arm,
+/// so the format would have rendered fine and then lost every frame on any host
+/// without a guest-RAM import. [`sampled_class`] answering `None` for it is
+/// **not** a blocker and was once recorded as one — read that function's doc
+/// before believing otherwise; it selects a CPU-upload fast path and cannot
+/// refuse a bind. What admits a sampled `R16_FLOAT` is
+/// `translate::pixel::sampled_pixels`, which has carried it as a native
+/// [`TexelLayout::R16Float`] rail throughout.
+///
+/// It is absent from [`store_texel_order`] for the reason `RG16_FLOAT` is, which
+/// that function's doc states: a missing arm there is a performance bug, not a
+/// loss, and the byte-copy rail declines by name to the CPU converter above.
 ///
 /// sRGB variants share storage bpp with their unorm counterparts (Metal texture
 /// view rules).
@@ -832,6 +875,7 @@ pub fn render_target_bpp(format: u16) -> Option<u32> {
         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => BGRA8_BPP,
         MTL_FORMAT_RGBA16_FLOAT => RGBA16F_BPP,
         MTL_FORMAT_RG16_FLOAT => RG16F_BPP,
+        MTL_FORMAT_R16_FLOAT => R16F_BPP,
         _ => return None,
     })
 }
@@ -1359,6 +1403,20 @@ pub fn rgba8_to_texel(format: u16, rgba: [u8; 4], dst: &mut [u8]) -> bool {
             st16(&mut dst[0..2], lut[rgba[COMPONENT_R] as usize]);
             st16(&mut dst[2..4], lut[rgba[COMPONENT_G] as usize]);
         }
+        MTL_FORMAT_R16_FLOAT => {
+            // R → one float16 channel; G,B,A have no destination (R16 is
+            // 2 bytes). One channel count below the RG16Float arm above, and
+            // the same LUT.
+            //
+            // There is deliberately no `texel_to_rgba8` arm in the other
+            // direction: this one exists so a renderable format's Store can be
+            // written, while [`TexelLayout::has_cpu_loader_arm`] answers `false`
+            // for `R16Float` so a sampled bind of one keeps its native rail
+            // instead of being quantized to 256 levels on the way in. The two
+            // directions are governed separately and nothing here couples them.
+            let lut = unorm8_to_f16_lut();
+            st16(&mut dst[0..2], lut[rgba[COMPONENT_R] as usize]);
+        }
         _ => return false,
     }
     true
@@ -1820,6 +1878,79 @@ mod tests {
         assert_eq!(back[1], 90);
         assert_eq!(back[2], 0);
         assert_eq!(back[3], 255);
+    }
+
+    /// A single-channel half-float render target survives the two rails a
+    /// render target actually uses, in both directions.
+    ///
+    /// macOS 26 renders into one — a linear GVA blur/backdrop intermediate at
+    /// `fmt=0x19` — and this device refused it three times a driven boot as
+    /// `rt_resolve reason=rt_linear_format`. The refusal was recorded for a
+    /// while as a missing [`sampled_class`], which it was not: `sampled_pixels`
+    /// has carried `R16_FLOAT` as a native sampled layout throughout. The
+    /// missing piece was the CPU Store converter's [`rgba8_to_texel`] arm, so
+    /// the format would have rendered and then lost every frame on a host with
+    /// no guest-RAM import.
+    ///
+    /// The round trip is deliberately *not* `convert_row_to_rgba8`: there is no
+    /// [`texel_to_rgba8`] arm for `R16_FLOAT` and there should not be, because
+    /// [`TexelLayout::has_cpu_loader_arm`] answers `false` for it so a sampled
+    /// bind keeps the native rail. The readback direction a render target uses
+    /// is the layout-level [`narrow_texel_to_rgba8`], which is what this asks.
+    #[test]
+    fn an_r16float_render_target_survives_the_store_and_readback_rails() {
+        assert_eq!(render_target_bpp(MTL_FORMAT_R16_FLOAT), Some(R16F_BPP));
+        // The claim the fail-log reading rests on: the sampler was never the
+        // blocker, so admitting the target does not create a write-only one.
+        assert!(
+            TexelLayout::R16Float.bytes_per_texel() == R16F_BPP,
+            "the render-target width and the sampled layout must be one texel"
+        );
+
+        let w = 16u32;
+        let mut rgba = vec![0u8; (w as usize) * RGBA8_BPP as usize];
+        for i in 0..(w as usize) {
+            rgba[i * 4] = 40; // R — the only channel R16Float carries
+            rgba[i * 4 + 1] = 90; // G, dropped
+            rgba[i * 4 + 2] = 200; // B, dropped
+            rgba[i * 4 + 3] = 128; // A, dropped
+        }
+
+        // Rail one: the synchronous Store's row converter, which is the arm
+        // that was missing. Without it this returns false and the guest loses
+        // the frame.
+        let tight = tight_row_bytes(w, MTL_FORMAT_R16_FLOAT).unwrap();
+        assert_eq!(tight, w * R16F_BPP);
+        let mut native = vec![0u8; tight as usize];
+        assert!(
+            convert_rgba8_to_row(MTL_FORMAT_R16_FLOAT, &rgba, w, &mut native),
+            "the CPU Store converter cannot write an admitted render target"
+        );
+
+        // Rail two: the readback rails' narrow, over the same bytes.
+        let mut back = vec![0u8; (w as usize) * RGBA8_BPP as usize];
+        assert!(narrow_texel_to_rgba8(
+            TexelLayout::R16Float,
+            &native,
+            w,
+            &mut back
+        ));
+        // R round-trips through the u8→f16→u8 LUT; G and B have no source, and
+        // alpha is opaque — the way a shader sampling one channel reads it.
+        assert_eq!(back[0], 40);
+        assert_eq!(back[1], 0);
+        assert_eq!(back[2], 0);
+        assert_eq!(back[3], UNORM8_MAX);
+
+        // The CPU `Load` seed, the third obligation a renderable format owes.
+        let mut seed = vec![0u8; tight as usize];
+        assert!(expand_rgba8_to_texel(
+            TexelLayout::R16Float,
+            &rgba,
+            w,
+            &mut seed
+        ));
+        assert_eq!(seed, native, "the seed and the Store must write one texel");
     }
 
     /// Metal color-renderable 8-bit + f16 set used as Reims VGPU pass attachments.
