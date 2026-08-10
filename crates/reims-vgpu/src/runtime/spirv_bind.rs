@@ -553,6 +553,32 @@ fn descriptor_root(
     })
 }
 
+/// Whether the module actually declares a descriptor variable at `binding`.
+///
+/// The reflection is derived from the AIR entry point's signature, not from the
+/// translated module, so a Metal function that names `[[texture(n)]]` and never
+/// samples it produces a reflection entry for a descriptor the SPIR-V may not
+/// declare at all. The render path's declared-but-unprovided scan reported those
+/// as gaps, which is a false alarm: nothing references the binding, so nothing
+/// is unbound.
+///
+/// This is the question that separates the two, asked of the module rather than
+/// of the signature. `false` means the reflection named a resource the shader
+/// does not carry, and there is nothing to bind. `true` means the module has a
+/// variable on that binding and a draw that leaves it out of the descriptor
+/// layout is building a pipeline whose module references a binding its layout
+/// does not contain.
+///
+/// Deliberately narrower than "is it sampled": a declared-and-unused variable
+/// still participates in layout consistency, so declaration is the right bar for
+/// the question the caller is asking.
+pub fn declares_descriptor(words: &[u32], binding: u32) -> bool {
+    let Some(instrs) = instructions(words) else {
+        return false;
+    };
+    descriptor_root(words, &instrs, binding, STORAGE_CLASS_UNIFORM_CONSTANT).is_some()
+}
+
 /// Mark every id whose value derives from an already-marked id, to a fixpoint.
 ///
 /// Both provenance questions here have the same shape — seed a set of ids, then

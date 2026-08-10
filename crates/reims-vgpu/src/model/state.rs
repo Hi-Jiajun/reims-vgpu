@@ -1813,6 +1813,14 @@ pub struct DeviceState {
     pub max_mapping_id_seen: u32,
     /// Count of MapMemory2/UnmapMemory packets (measure census).
     pub map_family_events: u64,
+    /// Per-task live guest-VA mappings, for the map/unmap pairing audit.
+    ///
+    /// Observation only — see [`crate::runtime::map_audit`] for what it watches
+    /// and why the wire is entitled to answer it. Keyed separately from
+    /// [`Self::tasks`] because a map packet may name a task id this device has
+    /// no entry for, and that case is itself worth counting rather than
+    /// dropping.
+    pub map_audit: std::collections::BTreeMap<u32, crate::runtime::map_audit::MapIntervals>,
     /// Live object refs per task, as `(task_id, ref)`.
     ///
     /// Membership only — deliberately carries no descriptor payload. Every
@@ -2141,6 +2149,7 @@ impl DeviceState {
             max_mapping_id_seen: 0,
             tasks: TaskTable::new(),
             map_family_events: 0,
+            map_audit: std::collections::BTreeMap::new(),
             objects: std::collections::BTreeSet::new(),
             texture_to_mapping: BTreeMap::new(),
             mappings: BTreeMap::new(),
@@ -2568,6 +2577,9 @@ impl DeviceState {
         }
         // Drop objects for this task on redefine.
         self.objects.retain(|&(t, _)| t != task_id);
+        // A deleted task's whole address space goes with it, so its live
+        // mappings are not leaks and a reused id must not inherit them.
+        self.map_audit.remove(&task_id);
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         // New directory ⇒ old GVA HostOps views alias the wrong PT — retire.

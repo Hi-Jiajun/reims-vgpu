@@ -5347,6 +5347,19 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         .iter()
                         .any(|s| s.index == i && s.sampler_ref != 0)
                 },
+                // Same relocation the bind path applies, so the question is
+                // asked of the binding the module would actually carry.
+                |i| {
+                    let base_off = if separate_sampled {
+                        FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+                    } else {
+                        0
+                    };
+                    crate::runtime::spirv_bind::declares_descriptor(
+                        &f_words,
+                        TEXTURE_BINDING_BASE + i + base_off,
+                    )
+                },
             );
             if !unbound.is_empty() {
                 // Cold path only: build the provided-index sets for the log detail.

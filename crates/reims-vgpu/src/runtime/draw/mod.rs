@@ -484,6 +484,7 @@ fn frag_unbound_scan(
     has_buf: impl Fn(u32) -> bool,
     has_tex: impl Fn(u32) -> bool,
     has_smp: impl Fn(u32) -> bool,
+    tex_declared_in_module: impl Fn(u32) -> bool,
 ) -> (Vec<String>, Vec<u32>) {
     use metal2vulkan::reflect::ResourceKind;
     let mut unbound: Vec<String> = Vec::new();
@@ -499,9 +500,24 @@ fn frag_unbound_scan(
             }
             _ => continue,
         };
-        if !provided {
-            unbound.push(format!("{cls}{}", rb.metal_index));
+        if provided {
+            continue;
         }
+        // A texture the reflection names but the module never declares is not a
+        // gap. The reflection comes from the AIR entry point's signature, so a
+        // Metal function that lists `[[texture(n)]]` and never samples it
+        // produces an entry for a descriptor the translated SPIR-V does not
+        // carry — nothing references the binding, so nothing is unbound.
+        //
+        // Asked of textures only, because that is the class observed firing and
+        // the binding relocation for it is the one this caller can compute. A
+        // buffer or sampler reported here is still worth reading as before.
+        if matches!(rb.kind, ResourceKind::Texture | ResourceKind::TextureArray)
+            && !tex_declared_in_module(rb.metal_index)
+        {
+            continue;
+        }
+        unbound.push(format!("{cls}{}", rb.metal_index));
     }
     (unbound, embedded)
 }

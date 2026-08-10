@@ -3060,6 +3060,32 @@ fn apply_map_family<H: HostMemory + HostOps>(
         let task_id = crate::contract::endian::ld32(&packet.payload[0..]);
         let gva = crate::contract::endian::ld64(&packet.payload[4..]);
         let length = crate::contract::endian::ld64(&packet.payload[12..]);
+        // Audit the interval against what this task already has live. The guest
+        // applies these exact intervals to its own page table — the wire length
+        // and its `allocate`/`deallocate` argument are the same call on the same
+        // object — so a pairing disagreement here is a disagreement its teardown
+        // assertion will eventually find. Observation only; nothing below reads
+        // the verdict. See `runtime::map_audit`.
+        {
+            let page_size = 1u64 << state.page_shift;
+            let intervals = state.map_audit.entry(task_id).or_default();
+            let verdict = if matches!(family, MapFamily::MapMemory2) {
+                intervals.map(gva, length, page_size)
+            } else {
+                intervals.unmap(gva, length)
+            };
+            if verdict.is_finding()
+                && crate::observe::first_sight(verdict.slug(), u64::from(task_id) << 32 | u64::from(channel_id))
+            {
+                let live = intervals.live_count();
+                crate::observe::fail(format!(
+                    "map_audit op={name} reason={} task={task_id} gva={gva:#x} len={length:#x} \
+                     live={live} detail={verdict:?} (the guest applies this exact interval to its \
+                     own page table; a disagreement here is one its teardown will assert on)",
+                    verdict.slug()
+                ));
+            }
+        }
         // Verbose-gated walk probe at map/unmap time. This runs a full
         // guest page-table walk (`diagnose_gva_walk`) purely to build the
         // log string, and fired ~9k times/boot on the drain path — a flood

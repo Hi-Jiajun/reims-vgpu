@@ -78,6 +78,7 @@ pub mod input;
 /// Process-global metal2vulkan SPIR-V cache (AIR content hash → SPIR-V).
 pub mod m2v_cache;
 /// IOSurface mapper capture + page-table resolve.
+pub mod map_audit;
 pub mod mapper;
 /// Write host BGRA into guest mapping pages (render writeback).
 pub mod mapping_write;

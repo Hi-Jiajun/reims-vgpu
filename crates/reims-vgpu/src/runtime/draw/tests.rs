@@ -268,22 +268,43 @@ fn frag_unbound_scan_reports_missing_standard_kinds_and_embedded_textures() {
     // All standard resources bound → `unbound` empty; the embedded texture is
     // always reported (render path cannot source it) regardless of binding.
     let (unbound, embedded) =
-        frag_unbound_scan(&bindings, |i| [1, 2].contains(&i), |i| i == 3, |i| i == 0);
+        frag_unbound_scan(&bindings, |i| [1, 2].contains(&i), |i| i == 3, |i| i == 0, |_| true);
     assert!(unbound.is_empty());
     assert_eq!(embedded, vec![9]);
 
     // Drop the texture bind → exactly tex3 reported (synthetics stay silent).
-    let (unbound, _) = frag_unbound_scan(&bindings, |i| [1, 2].contains(&i), |_| false, |i| i == 0);
+    let (unbound, _) = frag_unbound_scan(&bindings, |i| [1, 2].contains(&i), |_| false, |i| i == 0, |_| true);
     assert_eq!(unbound, vec!["tex3".to_string()]);
 
     // Drop buffer 2 + sampler 0 → both reported, ordered by declaration.
-    let (unbound, _) = frag_unbound_scan(&bindings, |i| i == 1, |i| i == 3, |_| false);
+    let (unbound, _) = frag_unbound_scan(&bindings, |i| i == 1, |i| i == 3, |_| false, |_| true);
     assert_eq!(unbound, vec!["buf2".to_string(), "smp0".to_string()]);
 
     // A reflection with no embedded texture returns an empty embedded list.
     let standard_only = [rb(K::Buffer, 1), rb(K::Texture, 3), rb(K::Sampler, 0)];
-    let (_, embedded) = frag_unbound_scan(&standard_only, |_| true, |_| true, |_| true);
+    let (_, embedded) = frag_unbound_scan(&standard_only, |_| true, |_| true, |_| true, |_| true);
     assert!(embedded.is_empty());
+
+    // An unprovided texture the translated module never declares is NOT a gap:
+    // the reflection comes from the AIR signature, so a `[[texture(n)]]` the
+    // shader never samples produces an entry for a descriptor the SPIR-V does
+    // not carry. Reporting it was a false alarm on three rails.
+    let (unbound, _) = frag_unbound_scan(
+        &bindings,
+        |i| [1, 2].contains(&i),
+        |_| false,
+        |i| i == 0,
+        |_| false,
+    );
+    assert!(
+        unbound.is_empty(),
+        "an undeclared texture is not an unbound descriptor: {unbound:?}"
+    );
+
+    // ...but a buffer and a sampler are still reported, because the module
+    // predicate is asked of textures only.
+    let (unbound, _) = frag_unbound_scan(&bindings, |i| i == 1, |i| i == 3, |_| false, |_| false);
+    assert_eq!(unbound, vec!["buf2".to_string(), "smp0".to_string()]);
 }
 
 #[cfg(feature = "backend-vulkan")]
