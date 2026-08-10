@@ -1436,12 +1436,23 @@ fn resolve_buffer_backing<M: HostMemory>(
 /// Narrowed on the buffer's own span, so the vertex and index reads that reach
 /// here — none of which a render Store ever writes — do not start paying for a
 /// wait they never owed.
+///
+/// `extent_cap` is the shader's proven reach, exactly as
+/// `try_buffer_zero_copy_resolved` takes it, and it is not optional polish here.
+/// This is where a narrowed bind *lands*: capping the span drops it under the
+/// zero-copy floor, so the rail declines and the bind falls through to this
+/// read. A cap applied only on the rail above therefore converts a whole-window
+/// GPU gather into a whole-window CPU read, which a driven macos-13 boot
+/// measured at 11x the bind cost — `binds_us/chain` 2.79 us -> 31.33 us — for a
+/// rail whose point was to move fewer bytes. Both arms take the cap or neither
+/// does.
 fn read_buffer_bytes_resolved<M: HostMemory>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
     backing: &BufferBacking,
     offset: u64,
+    extent_cap: Option<u64>,
 ) -> Option<Vec<u8>> {
     let (gva, size) = (backing.gva, backing.size);
     if offset >= size {
@@ -1450,7 +1461,18 @@ fn read_buffer_bytes_resolved<M: HostMemory>(
         ));
         return None;
     }
-    let avail = size - offset;
+    // The allocation still bounds the read when the two disagree: a declared
+    // object larger than what is left of the allocation is the shader and the
+    // guest contradicting each other, and only one of them owns these pages.
+    let full = size - offset;
+    let avail = match extent_cap {
+        Some(cap) => full.min(cap),
+        None => full,
+    };
+    if avail < full {
+        crate::runtime::drain::note_store_route("cpu_buffer_extent_narrowed");
+        crate::runtime::drain::note_store_route_n("cpu_buffer_extent_saved_bytes", full - avail);
+    }
     let want = host_alloc_len(avail).filter(|&n| n > 0)?;
     let (read_gva, read_span) = (gva + offset, want as u64);
     let (tasks, page_shift, page_size) = (&state.tasks, state.page_shift, state.page_size());
@@ -1493,7 +1515,10 @@ fn load_buffer_bytes<M: HostMemory>(
     offset: u64,
 ) -> Option<Vec<u8>> {
     let backing = resolve_buffer_backing(state, host, task_id, buffer_ref)?;
-    read_buffer_bytes_resolved(state, host, task_id, &backing, offset)
+    // No shader in scope here — these callers read a buffer outside a draw's
+    // bind set, so there is no reflection to bound them and the whole span is
+    // the only answer.
+    read_buffer_bytes_resolved(state, host, task_id, &backing, offset, None)
 }
 
 /// If `texture_ref` is a type-8 object whose descriptor is a buffer-backed

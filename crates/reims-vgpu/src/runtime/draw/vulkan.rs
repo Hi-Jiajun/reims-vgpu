@@ -2650,20 +2650,32 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     // The shader's proven reach, when it has one. `min` and not the cap alone:
     // a declared object larger than what is left of the allocation is the guest
     // and the shader disagreeing, and the allocation is the side that bounds
-    // what this device may read. Narrowing is counted rather than silent — the
-    // rail's whole cost is bytes, so a change in how many it moves has to be
-    // readable without a boot-to-boot diff.
+    // what this device may read.
+    let full = span;
     let span = match extent_cap {
-        Some(cap) if cap < span => {
-            crate::runtime::drain::note_store_route("zc_buffer_extent_narrowed");
-            crate::runtime::drain::note_store_route_n("zc_buffer_extent_saved_bytes", span - cap);
-            cap
-        }
-        _ => span,
+        Some(cap) => span.min(cap),
+        None => span,
     };
     if span < ZERO_COPY_BUFFER_MIN_BYTES {
-        crate::runtime::drain::note_store_route("zc_buffer_below_floor");
+        // A narrowed bind lands here by design: most declared objects are a few
+        // hundred bytes and the floor is what says the GPU gather is not worth
+        // arranging for them. The caller's CPU read takes the same cap, so this
+        // is a route change and not a loss — which is exactly what it was not
+        // before that read was capped, when it turned a whole-window gather into
+        // a whole-window CPU read.
+        crate::runtime::drain::note_store_route(if span < full {
+            "zc_buffer_below_floor_narrowed"
+        } else {
+            "zc_buffer_below_floor"
+        });
         return None;
+    }
+    // Counted only once the rail has actually taken the bind. Counting at the
+    // narrowing instead credited this rail with bytes the bind then went and
+    // read on the CPU path anyway, which is a saving that did not happen.
+    if span < full {
+        crate::runtime::drain::note_store_route("zc_buffer_extent_narrowed");
+        crate::runtime::drain::note_store_route_n("zc_buffer_extent_saved_bytes", full - span);
     }
     // No settle here, for the reason `try_linear_sample_zero_copy` states at
     // length: this rail hands the engine guest-RAM runs and the *GPU* reads them
@@ -2793,7 +2805,7 @@ fn load_buffer_content<M: HostMemory + HostOps>(
             return Some(content);
         }
     }
-    let bytes = read_buffer_bytes_resolved(state, host, task_id, &backing, offset)?;
+    let bytes = read_buffer_bytes_resolved(state, host, task_id, &backing, offset, extent_cap)?;
     Some(crate::backend::vulkan::engine::BufferContent::from(bytes))
 }
 
