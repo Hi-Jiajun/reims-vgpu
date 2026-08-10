@@ -1000,9 +1000,14 @@ mod tests {
             "R8Unorm is the same layout and the same Vulkan format as A8Unorm;              only the plan tells them apart"
         );
         assert!(sampled_pixels(p::MTL_FORMAT_R8_UNORM).is_ok());
+        // `R8_UNORM` is renderable as of the macos-26 coverage-layer reading, so
+        // the "sampled but not a colour attachment" case is carried by a format
+        // that still is one. `R32_FLOAT` has a sampled layout (the colour-LUT
+        // rail) and no render-target width, which is the pair this asserts:
+        // having a layout is not being a colour attachment.
         assert_eq!(
-            color_attachment(p::MTL_FORMAT_R8_UNORM).unwrap_err(),
-            TranslateReason::NoColorAttachmentFormat(p::MTL_FORMAT_R8_UNORM)
+            color_attachment(p::MTL_FORMAT_R32_FLOAT).unwrap_err(),
+            TranslateReason::NoColorAttachmentFormat(p::MTL_FORMAT_R32_FLOAT)
         );
         assert_eq!(
             color_attachment(0xffff).unwrap_err(),
@@ -1181,6 +1186,13 @@ mod tests {
                 // needed. It has been in the sampled list above throughout,
                 // which is what made the target renderable-and-readable rather
                 // than write-only.
+                //
+                // `R8_UNORM` is the same reading one format over — a
+                // single-channel *eight-bit* linear GVA target, a coverage or
+                // mask layer, refused once a driven boot as `fmt=0xa`. It
+                // needed three conversion arms rather than one because a
+                // one-byte texel had never been a render target here.
+                p::MTL_FORMAT_R8_UNORM,
                 p::MTL_FORMAT_R16_FLOAT,
                 p::MTL_FORMAT_RG16_FLOAT,
                 p::MTL_FORMAT_RGBA8_UNORM,

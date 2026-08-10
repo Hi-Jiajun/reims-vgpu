@@ -863,6 +863,19 @@ pub fn storage_selector(format: u16) -> Option<StorageImageSelector> {
 /// `translate::pixel::sampled_pixels`, which has carried it as a native
 /// [`TexelLayout::R16Float`] rail throughout.
 ///
+/// `R8_UNORM` is here for the same kind of reading one rail over: macOS 26 also
+/// renders into a single-channel *eight-bit* linear GVA target — a coverage,
+/// mask or shadow layer — refused once a driven boot as `rt_resolve
+/// reason=rt_linear_format fmt=0xa`. Vulkan mandates `R8_UNORM` as a colour
+/// attachment, so again no capability is owed. It needed three arms rather than
+/// one, because a one-byte texel had never been a render target: the readback
+/// narrow, the CPU `Load` seed expansion and the CPU Store converter.
+///
+/// `RG8_UNORM` is deliberately *not* here. No guest has been observed declaring
+/// a two-channel eight-bit render target, and admitting a format costs three
+/// conversions plus a census line, so members are added on measurement rather
+/// than by family resemblance.
+///
 /// It is absent from [`store_texel_order`] for the reason `RG16_FLOAT` is, which
 /// that function's doc states: a missing arm there is a performance bug, not a
 /// loss, and the byte-copy rail declines by name to the CPU converter above.
@@ -876,6 +889,7 @@ pub fn render_target_bpp(format: u16) -> Option<u32> {
         MTL_FORMAT_RGBA16_FLOAT => RGBA16F_BPP,
         MTL_FORMAT_RG16_FLOAT => RG16F_BPP,
         MTL_FORMAT_R16_FLOAT => R16F_BPP,
+        MTL_FORMAT_R8_UNORM => R8_BPP,
         _ => return None,
     })
 }
@@ -1229,13 +1243,26 @@ pub fn expand_rgba8_to_texel(
                 }
             }
         }
+        // The single-channel eight-bit attachment — a coverage, mask or shadow
+        // layer, which is what a one-channel unorm target almost always is.
+        // Drops G, B and A for the same reason the float arms above do: a seed
+        // is semantic RGBA8 and the destination has one channel to put it in.
+        TexelLayout::R8 => {
+            for (i, d) in dst[..px].iter_mut().enumerate() {
+                *d = src_rgba[i * RGBA8_BPP as usize + COMPONENT_R];
+            }
+        }
         // Not colour-attachment layouts this device creates a render target at,
         // so a seed for one is a wiring error rather than a conversion. What
         // decides that is `render_target_bpp`, whose doc states the obligation
         // in the other direction: a format admitted there and refused here is a
         // render target that loses its seed.
-        TexelLayout::R8
-        | TexelLayout::Rg8
+        //
+        // `Rg8` sits here rather than beside `R8` above deliberately: no guest
+        // has been observed declaring a two-channel eight-bit render target, and
+        // the arm is trivial to add when one is. Admitting a layout costs three
+        // conversions and a census line, so they are added on measurement.
+        TexelLayout::Rg8
         | TexelLayout::R32Float
         | TexelLayout::R16Unorm
         | TexelLayout::Rg16Unorm
@@ -1314,8 +1341,20 @@ pub fn narrow_texel_to_rgba8(
                 dst_rgba[d + COMPONENT_A] = UNORM8_MAX;
             }
         }
-        TexelLayout::R8
-        | TexelLayout::Rg8
+        // The single-channel eight-bit attachment, filled out the way a shader
+        // sampling it reads it and the way `texel_to_rgba8`'s `R8_UNORM` arm
+        // already does: the channels it does not carry are zero and alpha is
+        // opaque. `expand_rgba8_to_texel` is the inverse and drops exactly those.
+        TexelLayout::R8 => {
+            for (i, &s) in src[..px].iter().enumerate() {
+                let d = i * RGBA8_BPP as usize;
+                dst_rgba[d + COMPONENT_R] = s;
+                dst_rgba[d + COMPONENT_G] = 0;
+                dst_rgba[d + COMPONENT_B] = 0;
+                dst_rgba[d + COMPONENT_A] = UNORM8_MAX;
+            }
+        }
+        TexelLayout::Rg8
         | TexelLayout::R32Float
         | TexelLayout::R16Unorm
         | TexelLayout::Rg16Unorm
@@ -1402,6 +1441,12 @@ pub fn rgba8_to_texel(format: u16, rgba: [u8; 4], dst: &mut [u8]) -> bool {
             let lut = unorm8_to_f16_lut();
             st16(&mut dst[0..2], lut[rgba[COMPONENT_R] as usize]);
             st16(&mut dst[2..4], lut[rgba[COMPONENT_G] as usize]);
+        }
+        MTL_FORMAT_R8_UNORM => {
+            // R → the single byte; G,B,A have no destination. The inverse of
+            // `texel_to_rgba8`'s `R8_UNORM` arm, which is where the round trip
+            // for this format is checked.
+            dst[0] = rgba[COMPONENT_R];
         }
         MTL_FORMAT_R16_FLOAT => {
             // R → one float16 channel; G,B,A have no destination (R16 is
@@ -1838,9 +1883,19 @@ mod tests {
         assert_eq!(render_target_bpp(MTL_FORMAT_BGRA8_UNORM_SRGB), Some(4));
         assert_eq!(render_target_bpp(MTL_FORMAT_RGBA16_FLOAT), Some(8));
         assert_eq!(render_target_bpp(MTL_FORMAT_RG16_FLOAT), Some(4));
+        // The two single-channel members, both added on a macos-26 reading of
+        // `rt_resolve reason=rt_linear_format`: a half-float blur/backdrop
+        // intermediate and an eight-bit coverage/mask layer.
+        assert_eq!(render_target_bpp(MTL_FORMAT_R16_FLOAT), Some(R16F_BPP));
+        assert_eq!(render_target_bpp(MTL_FORMAT_R8_UNORM), Some(R8_BPP));
         // Integer / non-color formats stay fail-closed.
         assert_eq!(render_target_bpp(MTL_FORMAT_RGBA8_UINT), None);
-        assert_eq!(render_target_bpp(MTL_FORMAT_R8_UNORM), None);
+        assert_eq!(render_target_bpp(MTL_FORMAT_A8_UNORM), None);
+        // Sampled but not renderable, so "has a layout" is not "is a colour
+        // attachment" — the distinction `sampled_pixels` and this table each own
+        // one half of.
+        assert_eq!(render_target_bpp(MTL_FORMAT_R32_FLOAT), None);
+        assert_eq!(render_target_bpp(MTL_FORMAT_RG8_UNORM), None);
     }
 
     /// RG16Float MRT slots (vibrancy UI tile masks) must admit as color RTs so
@@ -1951,6 +2006,66 @@ mod tests {
             &mut seed
         ));
         assert_eq!(seed, native, "the seed and the Store must write one texel");
+    }
+
+    /// A single-channel eight-bit render target survives all three CPU rails.
+    ///
+    /// macOS 26 renders into one — a linear GVA coverage/mask layer at
+    /// `fmt=0xa` — and this device refused it once a driven boot as `rt_resolve
+    /// reason=rt_linear_format`, alongside the `R16_FLOAT` refusals the test
+    /// above covers.
+    ///
+    /// This one needed three arms rather than one, and that is the point of
+    /// testing it separately: a one-byte texel had never been a render target,
+    /// so `narrow_texel_to_rgba8`, `expand_rgba8_to_texel` and the CPU Store's
+    /// `rgba8_to_texel` all refused it, each in a different function. Unlike
+    /// `R16_FLOAT` this format does have a [`texel_to_rgba8`] arm already
+    /// (`has_cpu_loader_arm` is true for `R8`), so the round trip can be closed
+    /// through the Metal-format converters as well as the layout ones.
+    #[test]
+    fn an_r8unorm_render_target_survives_all_three_cpu_rails() {
+        assert_eq!(render_target_bpp(MTL_FORMAT_R8_UNORM), Some(R8_BPP));
+
+        let w = 16u32;
+        let mut rgba = vec![0u8; (w as usize) * RGBA8_BPP as usize];
+        for i in 0..(w as usize) {
+            rgba[i * 4] = 77; // R — the only channel R8Unorm carries
+            rgba[i * 4 + 1] = 90; // G, dropped
+            rgba[i * 4 + 2] = 200; // B, dropped
+            rgba[i * 4 + 3] = 128; // A, dropped
+        }
+
+        // Rail one: the synchronous Store's row converter.
+        let tight = tight_row_bytes(w, MTL_FORMAT_R8_UNORM).unwrap();
+        assert_eq!(tight, w * R8_BPP);
+        let mut native = vec![0u8; tight as usize];
+        assert!(
+            convert_rgba8_to_row(MTL_FORMAT_R8_UNORM, &rgba, w, &mut native),
+            "the CPU Store converter cannot write an admitted render target"
+        );
+        assert!(native.iter().all(|&b| b == 77));
+
+        // Rail two: the readback narrow. One channel out, the rest filled the
+        // way a shader sampling it reads them.
+        let mut back = vec![0u8; (w as usize) * RGBA8_BPP as usize];
+        assert!(narrow_texel_to_rgba8(TexelLayout::R8, &native, w, &mut back));
+        assert_eq!(back[0], 77);
+        assert_eq!(back[1], 0);
+        assert_eq!(back[2], 0);
+        assert_eq!(back[3], UNORM8_MAX);
+
+        // Rail three: the CPU `Load` seed, which must write the same texel the
+        // Store does or a seeded pass and a stored one disagree.
+        let mut seed = vec![0u8; tight as usize];
+        assert!(expand_rgba8_to_texel(TexelLayout::R8, &rgba, w, &mut seed));
+        assert_eq!(seed, native, "the seed and the Store must write one texel");
+
+        // And the Metal-format loader agrees with the layout narrow, which is
+        // available for this format and was not for `R16_FLOAT`.
+        assert_eq!(
+            texel_to_rgba8(MTL_FORMAT_R8_UNORM, &native[..1]),
+            Some([77, 0, 0, UNORM8_MAX])
+        );
     }
 
     /// Metal color-renderable 8-bit + f16 set used as Reims VGPU pass attachments.
@@ -2463,7 +2578,6 @@ mod tests {
         // is what holds the two together. Removing a layout from here without
         // that test agreeing means the two have drifted again.
         for layout in [
-            TexelLayout::R8,
             TexelLayout::Rg8,
             TexelLayout::R32Float,
             TexelLayout::R16Unorm,
