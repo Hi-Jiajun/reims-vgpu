@@ -234,11 +234,35 @@ static ENGINE: Lazy<Mutex<EngineState>> = Lazy::new(|| Mutex::new(EngineState::n
 /// throughput it can make up, while a window delayed by the worker drops the
 /// frame it was about to show. `engine_lock` cannot say which side paid without
 /// the two being named apart, so every acquire declares itself.
+///
+/// # Why there are three and not two
+///
+/// [`Self::Worker`] used to mean "the drain worker **and** every entry point
+/// QEMU reaches that is not the window", which is three populations on one
+/// counter and the one reading nobody could take from it. The drain worker owns
+/// the lock for a whole tranche — 28-45 ms on a driven x86 boot, 117 ms at the
+/// tail — and the threads that queue behind it are not peers of each other:
+///
+/// * The **drain worker** blocking is throughput it makes up on the next
+///   tranche.
+/// * A **vCPU** blocking is the guest stopped dead inside an MMIO store, and
+///   every other emulated device's timing goes with it. That is the population
+///   an audio underrun or a late timer is a symptom of.
+/// * QEMU's **main loop** blocking inside the action BH stalls every device in
+///   the process, not just this one.
+///
+/// The last two are both [`Self::Device`]: this crate cannot tell a vCPU thread
+/// from the main loop without QEMU telling it, and the actionable split is
+/// "the render tranche" against "everything QEMU needed while it ran".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EngineLockSite {
-    /// The drain worker executing guest commands, and every entry point QEMU
-    /// reaches that is not the window's own event loop.
+    /// The drain worker executing guest commands. Recognised by the thread
+    /// having entered [`crate::qemu::abi::reims_vgpu_qemu_device_drain`] at
+    /// least once, which is a property no other thread has.
     Worker,
+    /// Every other entry point QEMU reaches: a vCPU inside an MMIO store, the
+    /// main loop inside the action BH, poll, reset, teardown.
+    Device,
     /// The host window's event loop: present, attach, resize, detach.
     Window,
 }
@@ -247,18 +271,46 @@ impl EngineLockSite {
     fn index(self) -> usize {
         match self {
             Self::Worker => 0,
-            Self::Window => 1,
+            Self::Device => 1,
+            Self::Window => 2,
         }
     }
 
     fn label(self) -> &'static str {
         match self {
             Self::Worker => "worker",
+            Self::Device => "device",
             Self::Window => "window",
         }
     }
 
-    const ALL: [Self; 2] = [Self::Worker, Self::Window];
+    const ALL: [Self; 3] = [Self::Worker, Self::Device, Self::Window];
+}
+
+thread_local! {
+    /// Whether this thread has ever run a drain.
+    ///
+    /// Latched rather than scoped: a thread that has drained once is the drain
+    /// worker for the process's life on both shims, and a scoped marker would
+    /// have to be restored on every early return out of a `?`-heavy call tree.
+    /// A test process that drains from its own thread labels that thread the
+    /// worker, which is what it is for the duration.
+    static IS_DRAIN_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark the calling thread as the drain worker. Called by the drain entry point
+/// before it takes the lock, so the first tranche is attributed correctly.
+pub(crate) fn mark_drain_thread() {
+    IS_DRAIN_THREAD.with(|c| c.set(true));
+}
+
+/// Which site a `lock_engine()` acquire belongs to, from the calling thread.
+fn calling_site() -> EngineLockSite {
+    if IS_DRAIN_THREAD.with(std::cell::Cell::get) {
+        EngineLockSite::Worker
+    } else {
+        EngineLockSite::Device
+    }
 }
 
 /// Wait-to-acquire and hold time on `ENGINE`, split by [`EngineLockSite`].
@@ -272,15 +324,15 @@ impl EngineLockSite {
 #[derive(Default)]
 struct EngineLockCensus {
     /// Acquires that took the mutex with no wait, per site.
-    uncontended: [std::sync::atomic::AtomicU64; 2],
+    uncontended: [std::sync::atomic::AtomicU64; EngineLockSite::ALL.len()],
     /// Acquires that found it held and had to block, per site.
-    contended: [std::sync::atomic::AtomicU64; 2],
+    contended: [std::sync::atomic::AtomicU64; EngineLockSite::ALL.len()],
     /// Wall clock blocked on the mutex, summed over `contended`.
-    wait_us: [std::sync::atomic::AtomicU64; 2],
-    wait_max_us: [std::sync::atomic::AtomicU64; 2],
+    wait_us: [std::sync::atomic::AtomicU64; EngineLockSite::ALL.len()],
+    wait_max_us: [std::sync::atomic::AtomicU64; EngineLockSite::ALL.len()],
     /// Wall clock from acquire to release, over every acquire.
-    hold_us: [std::sync::atomic::AtomicU64; 2],
-    hold_max_us: [std::sync::atomic::AtomicU64; 2],
+    hold_us: [std::sync::atomic::AtomicU64; EngineLockSite::ALL.len()],
+    hold_max_us: [std::sync::atomic::AtomicU64; EngineLockSite::ALL.len()],
 }
 
 static ENGINE_LOCK: EngineLockCensus = EngineLockCensus::new();
@@ -291,12 +343,12 @@ impl EngineLockCensus {
 
     const fn new() -> Self {
         Self {
-            uncontended: [Self::ZERO; 2],
-            contended: [Self::ZERO; 2],
-            wait_us: [Self::ZERO; 2],
-            wait_max_us: [Self::ZERO; 2],
-            hold_us: [Self::ZERO; 2],
-            hold_max_us: [Self::ZERO; 2],
+            uncontended: [Self::ZERO; EngineLockSite::ALL.len()],
+            contended: [Self::ZERO; EngineLockSite::ALL.len()],
+            wait_us: [Self::ZERO; EngineLockSite::ALL.len()],
+            wait_max_us: [Self::ZERO; EngineLockSite::ALL.len()],
+            hold_us: [Self::ZERO; EngineLockSite::ALL.len()],
+            hold_max_us: [Self::ZERO; EngineLockSite::ALL.len()],
         }
     }
 
@@ -414,9 +466,14 @@ fn lock_engine_at(site: EngineLockSite) -> EngineGuard {
 
 /// [`lock_engine_at`] for the drain worker and the QEMU entry points, which is
 /// every caller but the host window's event loop.
+///
+/// Which of the two it is comes from the calling thread rather than from the
+/// call site: the same functions are reached from a drain tranche and from a
+/// vCPU's MMIO store, so no fixed site could name both correctly. See
+/// [`EngineLockSite`] for why telling them apart is the whole point.
 #[inline]
 fn lock_engine() -> EngineGuard {
-    lock_engine_at(EngineLockSite::Worker)
+    lock_engine_at(calling_site())
 }
 
 /// Device-reset proxy: guest-derived Vulkan objects evicted at the lifetime boundary.
@@ -3413,6 +3470,56 @@ pub fn test_poison_and_flush() {
     g.counters.device_lost.fetch_add(1, Ordering::Relaxed);
     g.owner.mark_device_lost();
     g.flush_device_derived();
+}
+
+#[cfg(test)]
+mod engine_lock_site_tests {
+    use super::*;
+
+    /// A thread that has not run a drain is not the drain worker, and one that
+    /// has is.
+    ///
+    /// The whole value of the split is that a vCPU stalled inside an MMIO store
+    /// is countable apart from the tranche that stalled it, and the only thing
+    /// separating those two threads is this latch. Asserted on a fresh thread
+    /// because the marker is thread-local: running it on the test's own thread
+    /// would pass whatever the latch did, since the test would be both.
+    #[test]
+    fn a_thread_is_the_worker_only_after_it_has_drained() {
+        let seen = std::thread::spawn(|| {
+            let before = calling_site();
+            mark_drain_thread();
+            (before, calling_site())
+        })
+        .join()
+        .expect("probe thread");
+        assert_eq!(seen.0, EngineLockSite::Device, "before any drain");
+        assert_eq!(seen.1, EngineLockSite::Worker, "after one drain");
+
+        // And the latch does not leak across threads: a second thread that has
+        // not drained still reports `Device`, however many have.
+        let other = std::thread::spawn(calling_site).join().expect("probe two");
+        assert_eq!(other, EngineLockSite::Device);
+    }
+
+    /// Every site has its own label and its own census slot. Two sharing either
+    /// would put a stalled vCPU and the tranche that stalled it on one counter,
+    /// which is the state this split exists to leave.
+    #[test]
+    fn every_site_has_its_own_slot_and_label() {
+        let mut labels: Vec<_> = EngineLockSite::ALL.iter().map(|s| s.label()).collect();
+        let count = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), count, "two sites share a label");
+        let mut indices: Vec<_> = EngineLockSite::ALL.iter().map(|s| s.index()).collect();
+        indices.sort_unstable();
+        assert_eq!(
+            indices,
+            (0..count).collect::<Vec<_>>(),
+            "indices must tile the census arrays exactly"
+        );
+    }
 }
 
 #[cfg(test)]
