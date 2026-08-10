@@ -1316,7 +1316,7 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
     (DEVICE_INFO_KEY_HEAP_BUFFER_GRANULARITY, 32),
     (DEVICE_INFO_KEY_HEAP_TEXTURES, 1),
     (DEVICE_INFO_KEY_BUFFER_WITH_IOSURFACE, 1),
-    (DEVICE_INFO_KEY_MAX_MSL_VERSION, 131079),
+    (DEVICE_INFO_KEY_MAX_MSL_VERSION, DEVICE_INFO_COMPILER_TARGET),
     (DEVICE_INFO_KEY_SHARED_TEXTURES, 1),
     (DEVICE_INFO_KEY_PROGRAMMABLE_SAMPLE_POSITIONS, 1),
     (DEVICE_INFO_KEY_TILE_SHADERS, 1),
@@ -1340,6 +1340,8 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
     (DEVICE_INFO_KEY_HOST_GPU_FAMILIES, DEVICE_INFO_GPU_FAMILY_SET),
 ];
 
+/// Wire key 18 — the packed compiler target, whose value and whose misleading
+/// name are both explained at [`DEVICE_INFO_COMPILER_TARGET`].
 pub const DEVICE_INFO_KEY_MAX_MSL_VERSION: u32 = 18;
 pub const DEVICE_INFO_KEY_SHARED_TEXTURES: u32 = 19;
 pub const DEVICE_INFO_KEY_MAX_VERTEX_AMPLIFICATION: u32 = 20;
@@ -1425,6 +1427,95 @@ const _: () = assert!(
 const _: () = assert!(
     DEVICE_INFO_GPU_FAMILY_SET >> (DEVICE_INFO_GPU_FAMILY - MTL_GPU_FAMILY_APPLE1 - 3) == 0,
     "the family set must not claim a family above the one this device says it is"
+);
+
+/// The `Apple`*n* generation [`DEVICE_INFO_GPU_FAMILY`] names.
+///
+/// `MTLGPUFamily.Apple`*n* is `1000 + n`, so this is `n`. Both derivations below
+/// are expressed against it rather than against the raw ordinal, because
+/// "Apple9" is the thing they are both about and the ordinal is an encoding of
+/// it.
+const fn apple_generation(family: u32) -> u32 {
+    family - MTL_GPU_FAMILY_APPLE1 + 1
+}
+
+/// The major half of this device's compiler target. See
+/// [`DEVICE_INFO_COMPILER_TARGET`].
+///
+/// The guest refuses to construct a compiler at all when this is below 2, so it
+/// is a floor and not a preference.
+pub const DEVICE_INFO_TARGET_MAJOR: u32 = 2;
+
+/// The generation the minor half of a compiler target counts from: minor 1 is
+/// `Apple5`, so a minor is its generation less four.
+const DEVICE_INFO_TARGET_MINOR_BASE: u32 = 4;
+
+/// The compiler target this device publishes, packed into key 18.
+///
+/// # The key's name is Apple's and describes the field, not the contents
+///
+/// The guest's capability struct calls this field `MaxMetalShaderVersion` and
+/// stores it as two `u32` halves, a major and a minor. **The guest does not read
+/// it as a shading-language version.** Its Metal plugin takes the two halves
+/// verbatim, as eight bytes, and hands them to the Metal compiler as the target
+/// data that identifies this device. That identity is what every compiled
+/// artefact for the device is keyed on — including the slice lookup a
+/// precompiled binary archive performs when it is opened, which **asserts**
+/// rather than returning the error its caller is prepared for when no slice
+/// matches.
+///
+/// The reading is also self-checking: there is no Metal Shading Language 2.5 or
+/// 2.7, so neither this value nor the one it replaces can be a language version.
+///
+/// # So this is a third spelling of the GPU family and must agree with the other two
+///
+/// The minor half selects the GPU generation, offset so that minor `n` is
+/// `Apple(n + 4)`. It is therefore the same fact as
+/// [`DEVICE_INFO_KEY_GPU_FAMILY_CLAMPED`] (key 37) and
+/// [`DEVICE_INFO_KEY_HOST_GPU_FAMILIES`] (key 44), and it is derived from
+/// [`DEVICE_INFO_GPU_FAMILY`] for exactly the reason
+/// [`DEVICE_INFO_GPU_FAMILY_SET`] is.
+///
+/// The table used to carry a bare `131079` here. That is minor 7, i.e.
+/// **`Apple11`**, sent in the same reply as `1009` (Apple9) at key 37 and an
+/// `Apple5..=Apple9` set at key 44 — one reply, three answers, two of them
+/// wrong. Narrowing to the family this device actually claims is the same safe
+/// direction key 44 was narrowed in: a generation is an instruction about what
+/// the guest may build, and no backend here implements anything above Apple9.
+pub const DEVICE_INFO_COMPILER_TARGET: u32 = {
+    let minor = apple_generation(DEVICE_INFO_GPU_FAMILY) - DEVICE_INFO_TARGET_MINOR_BASE;
+    (DEVICE_INFO_TARGET_MAJOR << 16) | minor
+};
+
+// The guest decodes a minor of 1..=7 and falls back to a generic target for
+// anything else, so a family bump that walks off either end must fail the build
+// rather than silently publish a target no archive can match.
+const _: () = assert!(
+    DEVICE_INFO_COMPILER_TARGET & 0xffff >= 1,
+    "the compiler target's minor half must name a generation the guest decodes"
+);
+const _: () = assert!(
+    DEVICE_INFO_COMPILER_TARGET & 0xffff <= 7,
+    "the compiler target's minor half must name a generation the guest decodes"
+);
+const _: () = assert!(
+    DEVICE_INFO_TARGET_MAJOR >= 2,
+    "the guest builds no compiler for a target whose major half is below 2"
+);
+// The relation this whole constant exists to hold: the generation the target
+// names and the family key 37 names are one fact, and the set at key 44 must
+// contain it. Three independently-derived values, so the agreement is asserted
+// rather than assumed.
+const _: () = assert!(
+    (DEVICE_INFO_COMPILER_TARGET & 0xffff) + DEVICE_INFO_TARGET_MINOR_BASE
+        == apple_generation(DEVICE_INFO_GPU_FAMILY),
+    "the compiler target must name the generation this device says it is"
+);
+const _: () = assert!(
+    DEVICE_INFO_GPU_FAMILY_SET
+        & (1 << (DEVICE_INFO_COMPILER_TARGET & 0xffff).saturating_sub(1))
+        != 0,
+    "the family set must contain the generation the compiler target names"
 );
 
 /// Keys inside a guest's parse ceiling that its walker has **no arm for**.

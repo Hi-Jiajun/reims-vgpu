@@ -403,6 +403,74 @@ mod tests {
         );
     }
 
+    /// The three keys that each spell the GPU family agree, read out of the
+    /// reply table rather than out of the constants that build it.
+    ///
+    /// Keys 18, 37 and 44 are one fact in three encodings — a packed compiler
+    /// target whose minor half is the generation less four, a raw `MTLGPUFamily`
+    /// ordinal, and a cumulative `supportsFamily` bit set. Each is derived from
+    /// `DEVICE_INFO_GPU_FAMILY` and each has `const` assertions at its
+    /// declaration, but those check a value against the expression that just
+    /// produced it. This asserts the property that actually matters: that the
+    /// three numbers **the guest receives** describe one device.
+    ///
+    /// It is worth a test rather than a fourth `const` assertion because it
+    /// reads `DEVICE_INFO_CAPS`, so it also fails if a key is dropped from the
+    /// table, sent twice, or wired to the wrong constant — none of which a
+    /// declaration-site assertion can see.
+    #[test]
+    fn the_three_keys_that_spell_the_gpu_family_agree() {
+        use crate::model::regs::{
+            DEVICE_INFO_KEY_GPU_FAMILY_CLAMPED, DEVICE_INFO_KEY_HOST_GPU_FAMILIES,
+            DEVICE_INFO_KEY_MAX_MSL_VERSION, MTL_GPU_FAMILY_APPLE1,
+        };
+
+        let served = |key: u32| -> u32 {
+            let mut hits = DEVICE_INFO_CAPS.iter().filter(|&&(k, _)| k == key);
+            let (_, value) = *hits.next().unwrap_or_else(|| panic!("key {key} is served"));
+            assert!(hits.next().is_none(), "key {key} is served exactly once");
+            value
+        };
+
+        let target = served(DEVICE_INFO_KEY_MAX_MSL_VERSION);
+        let clamped = served(DEVICE_INFO_KEY_GPU_FAMILY_CLAMPED);
+        let set = served(DEVICE_INFO_KEY_HOST_GPU_FAMILIES);
+
+        // Key 37 is `1000 + n`, so this is the generation every other key is
+        // checked against.
+        let generation = clamped - MTL_GPU_FAMILY_APPLE1 + 1;
+
+        // Key 18: minor half plus four is the generation. The major half is a
+        // floor the guest enforces, not a family term.
+        assert!(
+            target >> 16 >= 2,
+            "the guest builds no compiler for a target major below 2, got {}",
+            target >> 16
+        );
+        assert_eq!(
+            (target & 0xffff) + 4,
+            generation,
+            "key 18's compiler target names Apple{} but key 37 says Apple{generation}",
+            (target & 0xffff) + 4
+        );
+
+        // Key 44: cumulative, bit 0 is Apple5, so the top set bit is the
+        // generation and nothing above it may be claimed.
+        let top_bit = u32::BITS - 1 - set.leading_zeros();
+        assert_ne!(set, 0, "key 44 must claim at least the family key 37 names");
+        assert_eq!(
+            top_bit + 5,
+            generation,
+            "key 44's highest claimed family is Apple{} but key 37 says Apple{generation}",
+            top_bit + 5
+        );
+        assert_eq!(
+            set,
+            (1u32 << (top_bit + 1)) - 1,
+            "key 44 is cumulative: every family below the top one is claimed too"
+        );
+    }
+
     /// A key the guest parses and this device never answers is counted, and the
     /// two ways that happens are counted apart.
     ///
