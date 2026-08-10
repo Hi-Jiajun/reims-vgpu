@@ -31,6 +31,25 @@
 //! A later call reusing one of the modules with a different partner is a
 //! different experiment and is allowed to run.
 //!
+//! # Keying on the content makes the list self-invalidating, which is a reading
+//!
+//! The key is computed from the modules the caller is holding *now* and matched
+//! against the file; it is never stored alongside them. So when the thing that
+//! produced those modules changes — a translator bump is the case that arises —
+//! the emitted bytes change, the digest changes, and the entry simply stops
+//! matching. The call is re-attempted with no list surgery and no rev field.
+//!
+//! That has a consequence worth stating, because it saves a boot. **A firing is
+//! evidence about the present, not about when the line was written.** If a
+//! quarantine recorded before a translator bump still fires after it, the module
+//! being handed to the driver is byte-identical to the one that killed a
+//! process, and every count recorded on that line — word counts included —
+//! describes what is being produced today.
+//!
+//! The converse is where the list goes quiet rather than wrong: a line nothing
+//! matches any more is indistinguishable from a defect somebody fixed. Do not
+//! read stale entries as a census of live defects; read the ones that *fire*.
+//!
 //! # The file
 //!
 //! One text file, one line per quarantined call:
