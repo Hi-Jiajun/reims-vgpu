@@ -24,8 +24,8 @@ use ash::vk;
 use super::reason::TranslateReason;
 use crate::backend::vulkan::engine::StorageImageFormat;
 use crate::contract::pixel_format::{
-    self, SwizzlePlan, SwizzleSource, TexelLayout, COMPONENT_A, COMPONENT_B, COMPONENT_G,
-    COMPONENT_R,
+    self, StorageImageSelector, SwizzlePlan, SwizzleSource, TexelLayout, COMPONENT_A, COMPONENT_B,
+    COMPONENT_G, COMPONENT_R,
 };
 
 /// Whether a format's stored values carry the sRGB electro-optical transfer
@@ -321,34 +321,38 @@ pub fn color_attachment(
     Ok((f.linear_vk, srgb_decline(&f, mtl)))
 }
 
-/// The engine's storage-image format for a contract [`StorageImageSelector`]
-/// ordinal.
+/// The engine's storage-image format for a contract [`StorageImageSelector`].
 ///
 /// The selector is the compute rail's own narrowing of `MTLPixelFormat`, so
 /// this is a vocabulary-to-vocabulary step rather than a Metal decision — but
 /// it lives here for the same reason everything else does: it was previously
 /// spelled in `runtime/compute_exec/mod.rs`, where nothing could see that the two
-/// enums had to stay in step. A selector with no engine format means the
-/// vocabularies have drifted, which is a different failure from a format the
-/// rail does not support, so it declines by its own name.
-pub fn storage_image_from_selector(selector: u32) -> Result<StorageImageFormat, TranslateReason> {
+/// enums had to stay in step.
+///
+/// It is **total**, and that is the point. It used to take the selector's `u32`
+/// ordinal and match it with thirteen `s if s == S::X as u32` guard arms, which
+/// the compiler cannot check for coverage — so a new selector variant compiled
+/// fine here and declined at run time as a drift between two vocabularies that
+/// had not actually drifted. Taking the enum makes the arms exhaustive and the
+/// decline unnecessary: every selector the contract can produce has an engine
+/// format, and a new one cannot be added without this answering for it.
+pub fn storage_image_from_selector(selector: StorageImageSelector) -> StorageImageFormat {
     use crate::contract::pixel_format::StorageImageSelector as S;
-    Ok(match selector {
-        s if s == S::Rgba8Uint as u32 => StorageImageFormat::Rgba8Uint,
-        s if s == S::Rgba8Sint as u32 => StorageImageFormat::Rgba8Sint,
-        s if s == S::Rgba16Uint as u32 => StorageImageFormat::Rgba16Uint,
-        s if s == S::Rgba16Float as u32 => StorageImageFormat::Rgba16Float,
-        s if s == S::Rgba32Float as u32 => StorageImageFormat::Rgba32Float,
-        s if s == S::Rgba8Unorm as u32 => StorageImageFormat::Rgba8Unorm,
-        s if s == S::Bgra8Unorm as u32 => StorageImageFormat::Bgra8Unorm,
-        s if s == S::R16Float as u32 => StorageImageFormat::R16Float,
-        s if s == S::Rg16Float as u32 => StorageImageFormat::Rg16Float,
-        s if s == S::R8Unorm as u32 => StorageImageFormat::R8Unorm,
-        s if s == S::Rg8Unorm as u32 => StorageImageFormat::Rg8Unorm,
-        s if s == S::Rgba32Uint as u32 => StorageImageFormat::Rgba32Uint,
-        s if s == S::R32Uint as u32 => StorageImageFormat::R32Uint,
-        other => return Err(TranslateReason::UnknownStorageSelector(other)),
-    })
+    match selector {
+        S::Rgba8Uint => StorageImageFormat::Rgba8Uint,
+        S::Rgba8Sint => StorageImageFormat::Rgba8Sint,
+        S::Rgba16Uint => StorageImageFormat::Rgba16Uint,
+        S::Rgba16Float => StorageImageFormat::Rgba16Float,
+        S::Rgba32Float => StorageImageFormat::Rgba32Float,
+        S::Rgba8Unorm => StorageImageFormat::Rgba8Unorm,
+        S::Bgra8Unorm => StorageImageFormat::Bgra8Unorm,
+        S::R16Float => StorageImageFormat::R16Float,
+        S::Rg16Float => StorageImageFormat::Rg16Float,
+        S::R8Unorm => StorageImageFormat::R8Unorm,
+        S::Rg8Unorm => StorageImageFormat::Rg8Unorm,
+        S::Rgba32Uint => StorageImageFormat::Rgba32Uint,
+        S::R32Uint => StorageImageFormat::R32Uint,
+    }
 }
 
 /// The engine's storage-image format for a Metal pixel format.
@@ -397,7 +401,7 @@ pub fn storage_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
         _ => {}
     }
     let selector = pf::storage_selector(mtl).ok_or(TranslateReason::NoStorageImageFormat(mtl))?;
-    storage_image_from_selector(selector as u32)
+    Ok(storage_image_from_selector(selector))
 }
 
 /// The compute path's admission for a **sampled** image bind.

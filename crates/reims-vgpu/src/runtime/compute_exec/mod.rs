@@ -1214,7 +1214,15 @@ pub(crate) struct StagedTexture {
     pub pixel_format: u16,
     /// Product storage-selector ABI when this Metal format is storage-capable.
     /// Sample-only formats such as RGB9E5Float intentionally have no selector.
-    pub storage_selector: Option<u32>,
+    /// The contract's storage-image selector for this texture's format, or
+    /// `None` for a format that is not a storage image.
+    ///
+    /// Carried as the enum rather than as its `u32` ordinal. It used to be
+    /// narrowed to `u32` the moment `pixel_format::storage_selector` produced
+    /// it, at three staging sites, which pushed the coverage question past every
+    /// compiler that could have answered it: both backends then matched raw
+    /// integers, and the Metal one had silently been missing a member.
+    pub storage_selector: Option<pixel_format::StorageImageSelector>,
     pub width: u32,
     pub height: u32,
     pub bytes: Vec<u8>,
@@ -1261,7 +1269,7 @@ impl StagedTexture {
         &self,
         task_id: u32,
         pipeline_ref: u32,
-    ) -> Result<u32, ComputeStatus> {
+    ) -> Result<pixel_format::StorageImageSelector, ComputeStatus> {
         self.storage_selector.ok_or_else(|| {
             crate::observe::fail(format!(
                 "compute_texture_format fail reason=no_backend_selector task={task_id} \
@@ -1698,7 +1706,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ));
             return Err(ComputeStatus::Unsupported("compute_heap_fmt_bytes"));
         };
-        let storage_selector = pixel_format::storage_selector(format).map(|s| s as u32);
+        let storage_selector = pixel_format::storage_selector(format);
         if is_storage && storage_selector.is_none() {
             crate::observe::fail(format!(
                 "compute_stage_tex heap_fail reason=fmt_storage ref={texture_ref} heap={heap_ref} fmt={format:#x} {width}x{height}"
@@ -1987,7 +1995,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 return Err(ComputeStatus::Unsupported("stage_tex_fmt_bytes"));
             }
         };
-        let storage_selector = pixel_format::storage_selector(stage_fmt).map(|s| s as u32);
+        let storage_selector = pixel_format::storage_selector(stage_fmt);
         if is_storage && storage_selector.is_none() {
             crate::observe::fail(format!(
                 "compute_stage_tex type11_fail reason=fmt_storage mapping={mapping_id} {width}x{height} fmt={format:#x}"
@@ -2266,7 +2274,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             format!("fmt={stage_format:#x}"),
         );
     };
-    let storage_selector = pixel_format::storage_selector(stage_format).map(|s| s as u32);
+    let storage_selector = pixel_format::storage_selector(stage_format);
     if is_storage && storage_selector.is_none() {
         return linear_fail(
             ComputeStatus::Unsupported("linear_tex_fmt_storage"),
@@ -3563,17 +3571,11 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             ));
             return ComputeStatus::Unsupported("storage_no_selector_specialize");
         };
-        let Some(guest_fmt) = simg_u32_to_engine_storage(selector) else {
-            crate::observe::fail(format!(
-                "compute_linux unsupported storage_format reason=selector_unknown pipe={} bind={} simg={selector} fmt={:#x}",
-                acc.pipeline_ref, t.binding, t.pixel_format
-            ));
-            return ComputeStatus::Unsupported("storage_selector_unknown_specialize");
-        };
+        let guest_fmt = selector_to_engine_storage(selector);
         let Some(shader_decl) = crate::runtime::spirv_bind::image_format(&spirv, t.binding) else {
             crate::observe::fail(format!(
                 "compute_linux storage_format fail reason=spirv_format_missing pipe={} bind={} guest={guest_fmt:?} simg={}",
-                acc.pipeline_ref, t.binding, selector
+                acc.pipeline_ref, t.binding, selector as u32
             ));
             return ComputeStatus::Unsupported("storage_spirv_format_missing");
         };
@@ -3588,7 +3590,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                         "compute_linux storage_format fail reason={reason} pipe={} bind={} spirv={shader_decl:?} guest={guest_fmt:?} simg={} guest_bpp={} shader_bpp={}",
                         acc.pipeline_ref,
                         t.binding,
-                        selector,
+                        selector as u32,
                         guest_fmt.bytes_per_texel(),
                         spirv_image_format_to_engine_storage(shader_decl)
                             .map(|format| format.bytes_per_texel())
@@ -3640,20 +3642,14 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 ));
                 return ComputeStatus::Unsupported("storage_no_selector_writeback");
             };
-            let Some(guest_fmt) = simg_u32_to_engine_storage(selector) else {
-                crate::observe::fail(format!(
-                    "compute_linux unsupported storage_format reason=selector_unknown pipe={} bind={} simg={selector} fmt={:#x}",
-                    acc.pipeline_ref, t.binding, t.pixel_format
-                ));
-                return ComputeStatus::Unsupported("storage_selector_unknown_writeback");
-            };
+            let guest_fmt = selector_to_engine_storage(selector);
             let Some((_, _, shader_decl, specialized)) = storage_formats
                 .iter()
                 .find(|(binding, _, _, _)| *binding == t.binding)
             else {
                 crate::observe::fail(format!(
                     "compute_linux storage_format fail reason=spirv_format_specialize_internal pipe={} bind={} simg={}",
-                    acc.pipeline_ref, t.binding, selector
+                    acc.pipeline_ref, t.binding, selector as u32
                 ));
                 return ComputeStatus::Unsupported("storage_format_specialize_internal");
             };
@@ -3679,7 +3675,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 let Some(fmt) = spirv_image_format_to_engine_storage(*specialized) else {
                     crate::observe::fail(format!(
                         "compute_linux storage_format fail reason=spirv_storage_format_unsupported pipe={} bind={} spirv={specialized:?} guest={guest_fmt:?} simg={}",
-                        acc.pipeline_ref, t.binding, selector
+                        acc.pipeline_ref, t.binding, selector as u32
                     ));
                     return ComputeStatus::Unsupported("storage_spirv_format_unsupported");
                 };
@@ -3706,7 +3702,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     "compute_linux storage_format_specialize pipe={} bind={} spirv={shader_decl:?} specialized={specialized:?} engine={shader_fmt:?} guest={guest_fmt:?} simg={} guest_bpp={} shader_bpp={}",
                     acc.pipeline_ref,
                     t.binding,
-                    selector,
+                    selector as u32,
                     guest_fmt.bytes_per_texel(),
                     spirv_image_format_to_engine_storage(*shader_decl)
                         .map(|format| format.bytes_per_texel())
@@ -3989,10 +3985,18 @@ fn spirv_words_le(bytes: &[u8]) -> Result<Vec<u32>, ComputeSpirvDecline> {
 /// `if let Some(..)` / `let Some(..) else`, so the adapters keep that shape; the
 /// decision itself now happens in exactly one place.
 #[cfg(feature = "backend-vulkan")]
-fn simg_u32_to_engine_storage(
-    simg: u32,
-) -> Option<crate::backend::vulkan::engine::StorageImageFormat> {
-    crate::backend::vulkan::translate::pixel::storage_image_from_selector(simg).ok()
+/// The engine's storage format for a contract selector.
+///
+/// Total, because the translate layer's map is. It used to take the selector's
+/// `u32` ordinal and hand back an `Option`, and both of its call sites carried a
+/// `reason=selector_unknown` refusal for the `None` — a decline that could only
+/// have fired if two enums in this crate had drifted, which is not a thing the
+/// guest can cause and not a thing a run-time check should be watching for.
+/// Those two refusals are gone with the `Option`.
+fn selector_to_engine_storage(
+    selector: pixel_format::StorageImageSelector,
+) -> crate::backend::vulkan::engine::StorageImageFormat {
+    crate::backend::vulkan::translate::pixel::storage_image_from_selector(selector)
 }
 
 #[cfg(feature = "backend-vulkan")]

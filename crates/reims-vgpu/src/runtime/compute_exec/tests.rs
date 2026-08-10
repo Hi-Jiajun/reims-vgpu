@@ -886,7 +886,7 @@ fn a_format_with_no_storage_selector_refuses_the_same_way_from_every_rail() {
 
     // And a format that does have a selector goes through.
     let mut ok = StagedTexture {
-        storage_selector: Some(5),
+        storage_selector: Some(pixel_format::StorageImageSelector::Rgba8Unorm),
         ..no_selector
     };
     let (storage, sampled) =
@@ -1137,7 +1137,7 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
     assert_eq!((staged.width, staged.height), (1, 4));
     assert_eq!(
         staged.storage_selector,
-        Some(StorageImageSelector::Rgba32Uint as u32)
+        Some(StorageImageSelector::Rgba32Uint)
     );
     assert_eq!(staged.bytes.len(), 4 * 16);
     assert!(staged.bytes.iter().all(|&b| b == 0x5a));
@@ -1173,7 +1173,7 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
     assert_eq!(sampled.pixel_format, MTL_FORMAT_R32_UINT);
     assert_eq!(
         sampled.storage_selector,
-        Some(StorageImageSelector::R32Uint as u32)
+        Some(StorageImageSelector::R32Uint)
     );
     assert_eq!(sampled.bytes.len(), 4 * 4 * 4);
     assert!(matches!(sampled.writeback, TextureWriteback::None));
@@ -1261,7 +1261,7 @@ fn stage_texture_type5_record_stages_biplanar_y_plane() {
     assert_eq!((staged.width, staged.height), (16, 8));
     assert_eq!(
         staged.storage_selector,
-        Some(crate::contract::pixel_format::StorageImageSelector::R8Unorm as u32)
+        Some(crate::contract::pixel_format::StorageImageSelector::R8Unorm)
     );
     assert_eq!(staged.bytes.len(), 16 * 8);
     assert!(staged.bytes.iter().all(|&b| b == 0x77));
@@ -1447,7 +1447,7 @@ fn stage_heap_texture_uses_host_only_residency_identity() {
     assert_eq!(staged.pixel_format, MTL_FORMAT_RGBA32_FLOAT);
     assert_eq!(
         staged.storage_selector,
-        Some(StorageImageSelector::Rgba32Float as u32)
+        Some(StorageImageSelector::Rgba32Float)
     );
     assert_eq!(staged.bytes.len(), 180 * 135 * 16);
     assert!(matches!(staged.writeback, TextureWriteback::None));
@@ -1480,7 +1480,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
         #[cfg(all(feature = "backend-metal", target_os = "macos"))]
         texture_ref: 44,
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
-        storage_selector: Some(5),
+        storage_selector: Some(pixel_format::StorageImageSelector::Rgba8Unorm),
         width: 2,
         height: 2,
         bytes: rgba.clone(),
@@ -1772,8 +1772,8 @@ fn storage_format_specialization_preserves_raw_views_and_runtime_shape() {
         Some(pixel_format::StorageImageSelector::R32Uint)
     );
     assert_eq!(
-        simg_u32_to_engine_storage(pixel_format::StorageImageSelector::R32Uint as u32),
-        Some(V::R32Uint)
+        selector_to_engine_storage(pixel_format::StorageImageSelector::R32Uint),
+        V::R32Uint
     );
     assert_eq!(
         spirv_image_format_to_engine_storage(S::R32ui),
@@ -2353,7 +2353,7 @@ fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
         #[cfg(all(feature = "backend-metal", target_os = "macos"))]
         texture_ref: key.texture_ref,
         pixel_format: key.pixel_format,
-        storage_selector: Some(0),
+        storage_selector: Some(pixel_format::StorageImageSelector::Rgba8Uint),
         width: key.width,
         height: key.height,
         bytes: Vec::new(),
