@@ -324,7 +324,38 @@ pub(crate) enum Phase {
     /// worker that holds the engine lock 671 ms of every second. Look there
     /// before shortening this span again.
     Slot = 1,
+    /// What is left of the pipeline span once the five below are taken out of
+    /// it: building the layout, pass and attribute keys, and resolving the load
+    /// action. See [`Phase::PipelineShader`] for why the split exists.
     Pipeline = 2,
+    /// `acquire_depth_view` — the one span in the pipeline group that can touch
+    /// the image registry rather than a cache.
+    PipelineDepth = 14,
+    /// Both `get_or_create_shader` calls.
+    ///
+    /// # Why the pipeline span is split at all
+    ///
+    /// It is the second-largest phase this device has — 22 % of all draw work on
+    /// a driven macos-13 hammer boot — and it is spent almost entirely on cache
+    /// **hits**: `pipeline_misses` was 215 of 29 300 draws. A hit is a lookup, so
+    /// 37-41 µs of it is a lookup costing what a compile should, and no field
+    /// named which of the six lookups in the span it was.
+    ///
+    /// `shader_hash_words` priced this one first, because keying a module by its
+    /// contents means every hit re-walks the contents, and it came back too small
+    /// to be the answer: 3 KiB modules, 6 271 bytes a draw, single-digit
+    /// microseconds of SipHash. That left ~25 µs a draw unattributed across the
+    /// other five, which is what these bars divide.
+    PipelineShader = 15,
+    /// `get_or_create_layout` and `get_or_create_pass`, the two keyed by a
+    /// freshly built key rather than by a handle.
+    PipelineLayoutPass = 16,
+    /// `get_or_create_pipeline` — the only lookup here whose miss is a driver
+    /// compile, so a large bar with `pipeline_misses` near zero is a lookup cost
+    /// and a large bar tracking the misses is not.
+    PipelineCompile = 17,
+    /// The per-sampler `get_or_create_sampler` loop.
+    PipelineSampler = 18,
     Stage = 3,
     StagePass = 4,
     Acquire = 5,
@@ -341,7 +372,11 @@ pub(crate) enum Phase {
 impl Phase {
     /// Highest ordinal, so [`PHASES`] is derived from the enum rather than
     /// hand-counted beside it.
-    const LAST: Phase = Phase::Readback;
+    ///
+    /// The pipeline sub-phases were appended after `Readback` rather than
+    /// inserted next to `Pipeline`, so that every existing ordinal kept its
+    /// value and this stayed the only place the count is written.
+    const LAST: Phase = Phase::PipelineSampler;
 }
 
 const PHASES: usize = Phase::LAST as usize + 1;
@@ -386,7 +421,14 @@ pub struct DrawPhaseWindow {
     pub prep_us: u64,
     /// Blocked claiming a ring slot. See [`Phase::Slot`].
     pub slot_us: u64,
+    /// The residue of the pipeline span; the five below are carved out of it and
+    /// the six together are what `pipeline_us` used to be alone.
     pub pipeline_us: u64,
+    pub pipeline_depth_us: u64,
+    pub pipeline_shader_us: u64,
+    pub pipeline_layout_pass_us: u64,
+    pub pipeline_compile_us: u64,
+    pub pipeline_sampler_us: u64,
     pub stage_us: u64,
     pub stage_pass_us: u64,
     pub acquire_us: u64,
@@ -411,6 +453,13 @@ pub fn take_window() -> Option<DrawPhaseWindow> {
         prep_us: to_us(ACC[Phase::Prep as usize].swap(0, Ordering::Relaxed)),
         slot_us: to_us(ACC[Phase::Slot as usize].swap(0, Ordering::Relaxed)),
         pipeline_us: to_us(ACC[Phase::Pipeline as usize].swap(0, Ordering::Relaxed)),
+        pipeline_depth_us: to_us(ACC[Phase::PipelineDepth as usize].swap(0, Ordering::Relaxed)),
+        pipeline_shader_us: to_us(ACC[Phase::PipelineShader as usize].swap(0, Ordering::Relaxed)),
+        pipeline_layout_pass_us: to_us(
+            ACC[Phase::PipelineLayoutPass as usize].swap(0, Ordering::Relaxed),
+        ),
+        pipeline_compile_us: to_us(ACC[Phase::PipelineCompile as usize].swap(0, Ordering::Relaxed)),
+        pipeline_sampler_us: to_us(ACC[Phase::PipelineSampler as usize].swap(0, Ordering::Relaxed)),
         stage_us: to_us(ACC[Phase::Stage as usize].swap(0, Ordering::Relaxed)),
         stage_pass_us: to_us(ACC[Phase::StagePass as usize].swap(0, Ordering::Relaxed)),
         acquire_us: to_us(ACC[Phase::Acquire as usize].swap(0, Ordering::Relaxed)),
@@ -590,6 +639,15 @@ mod tests {
             Phase::Submit,
             Phase::Wait,
             Phase::Readback,
+            // Appended after `Readback` rather than placed next to `Pipeline`,
+            // so the ordinals above kept their values when the pipeline span was
+            // divided. Declaration order here is ordinal order, not reading
+            // order.
+            Phase::PipelineDepth,
+            Phase::PipelineShader,
+            Phase::PipelineLayoutPass,
+            Phase::PipelineCompile,
+            Phase::PipelineSampler,
         ];
         assert_eq!(all.len(), PHASES);
         for (want, phase) in all.iter().enumerate() {

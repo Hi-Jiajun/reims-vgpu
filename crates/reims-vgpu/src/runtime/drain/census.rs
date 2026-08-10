@@ -1646,7 +1646,7 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         emit_engine_delta();
         // After `emit_engine_delta`, which emits `draw_phase`: the two divide
         // against each other and reading them in the other order invites
-        // treating the engine's twelve phases as the whole draw, which is the
+        // treating the engine's phases as the whole draw, which is the
         // misreading this line exists to correct. Not gated on the backend —
         // the timer is runtime-side and the Metal arm can adopt it without a
         // second census.
@@ -1932,7 +1932,7 @@ fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot)
 ///
 /// `draw_phase` divides the engine and `chain_phase` divides everything around
 /// it, so this line is emitted immediately after that one and the two are read
-/// together: `chain_phase`'s `engine_us` must equal `draw_phase`'s twelve
+/// together: `chain_phase`'s `engine_us` must equal `draw_phase`'s phases
 /// summed, and `chain_phase`'s eight must equal `drain_duty`'s `draw_us`.
 /// Whatever `draw_phase` does not account for is the other seven bars here, and
 /// on the boot that motivated this line that was 82% of the draw.
@@ -2012,7 +2012,9 @@ fn emit_draw_phase() {
         return;
     };
     crate::observe::off(format!(
-        "draw_phase draws={} prep_us={} slot_us={} pipeline_us={} stage_us={} stage_pass_us={} \
+        "draw_phase draws={} prep_us={} slot_us={} pipeline_us={} \
+         pl_depth_us={} pl_shader_us={} pl_layoutpass_us={} pl_compile_us={} pl_sampler_us={} \
+         stage_us={} stage_pass_us={} \
          acquire_us={} acquire_sampled_us={} sampled_upload_us={} acquire_readback_us={} \
          descriptors_us={} \
          record_us={} submit_us={} wait_us={} readback_us={} max_us={} stalls={}",
@@ -2020,6 +2022,11 @@ fn emit_draw_phase() {
         w.prep_us,
         w.slot_us,
         w.pipeline_us,
+        w.pipeline_depth_us,
+        w.pipeline_shader_us,
+        w.pipeline_layout_pass_us,
+        w.pipeline_compile_us,
+        w.pipeline_sampler_us,
         w.stage_us,
         w.stage_pass_us,
         w.acquire_us,

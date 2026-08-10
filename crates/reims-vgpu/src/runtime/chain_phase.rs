@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! drain_duty  draw_us=499184 draws=275              1.82 ms per draw
-//! draw_phase  draws=275  (twelve phases summed)     0.34 ms per draw
+//! draw_phase  draws=275  (its phases summed)        0.34 ms per draw
 //! ```
 //!
 //! So **82% of draw time — 407 ms of that second, 41% of the wall clock — is
@@ -54,7 +54,9 @@
 //! - The eight sum to `drain_duty`'s `draw_us`, and `chain_phase draws` equals
 //!   its `draws`. A shortfall means a draw path that does not pass through
 //!   [`ChainTimer`] at all.
-//! - `engine_us` equals `draw_phase`'s twelve phases summed. A shortfall there
+//! - `engine_us` equals `draw_phase`'s phases summed — all of them, including
+//!   the five the pipeline span is divided into, which are carved out of
+//!   `pipeline_us` rather than added beside it. A shortfall there
 //!   means the engine is being entered by some route this bracket does not see.
 //!
 //! Neither identity is asserted in code, because a census that panics on its own

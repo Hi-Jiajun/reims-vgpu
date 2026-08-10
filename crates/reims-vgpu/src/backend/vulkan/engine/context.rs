@@ -42,6 +42,43 @@ pub const FENCE_TIMEOUT_NS: u64 = 5_000_000_000; // 5s
 /// u8[16] pipelineCacheUUID — all integers little-endian.
 const PIPELINE_CACHE_HEADER_ONE_LEN: usize = 32;
 
+/// Largest warm-start blob worth handing the driver, and largest worth writing
+/// back.
+///
+/// A `VkPipelineCache` has no eviction: `vkGetPipelineCacheData` returns every
+/// entry it ever accumulated, and this device saves that snapshot to disk and
+/// reloads it next boot. Across many boots of many builds the blob therefore
+/// only grows, and the save policy below orders snapshots by length on the
+/// explicit assumption that a longer one is a better one.
+///
+/// That assumption is false past a few megabytes, and the cost is not small.
+/// Four driven macos-13 hammer boots, identical snapshot and probe, host
+/// quiesced, differing only in the blob on disk:
+///
+/// ```text
+/// loaded      pipeline_misses   pl_compile_us   per compile
+///  30.82 MB        229              0.946 s       4.13 ms
+///  30.82 MB        236              0.932 s       3.95 ms
+///   0.00 MB        220              0.309 s       1.41 ms
+///   3.85 MB        220              0.161 s       0.73 ms
+/// ```
+///
+/// The miss count barely moves — the in-memory `ObjectCache` is empty at boot
+/// either way, so the same ~220 `vkCreateGraphicsPipelines` calls happen. What
+/// changes is what each one costs, and an oversized blob makes it **5.7x** what
+/// a right-sized one costs and **2.9x** what no blob at all costs. A warm cache
+/// is worth having; an unbounded one is worse than none.
+///
+/// Why a large blob costs more per compile is the driver's business and is not
+/// measured here. Size is the observable, so size is what this bounds.
+///
+/// 16 MiB is four times the ~3.9 MB a boot of this workload settles at, so a
+/// workload several times richer still warms fully, and it is half the 30.8 MB
+/// at which the penalty was measured. Growth at steady state is ~0.1 MB a boot
+/// (3.85 -> 3.95 across two boots), so this is ~120 boots of headroom before the
+/// bound is reached and the blob is rebuilt from one boot.
+const PIPELINE_CACHE_MAX_WARM_BYTES: usize = 16 * 1024 * 1024;
+
 /// On-disk pipeline-cache blob location for a device, keyed by its
 /// pipelineCacheUUID (hex) so blobs from other GPUs/driver versions land in
 /// distinct files and never collide.
@@ -75,6 +112,15 @@ enum PipelineCacheDecline {
     },
     Incompatible {
         bytes: usize,
+    },
+    /// The blob is well-formed and this device's, but larger than
+    /// [`PIPELINE_CACHE_MAX_WARM_BYTES`], so warming from it would cost more per
+    /// compile than starting cold. Declined by name rather than silently
+    /// ignored: this boot pays real cold-start compiles, and the next boot sees
+    /// a rebuilt blob, so a reader has to be able to tell that from a first boot.
+    TooLarge {
+        bytes: usize,
+        cap: usize,
     },
     WarmCreate {
         result: vk::Result,
@@ -117,6 +163,7 @@ impl crate::observe::Decline for PipelineCacheDecline {
         match self {
             Self::Read { .. } => "vk_pipeline_cache_read",
             Self::Incompatible { .. } => "vk_pipeline_cache_incompatible",
+            Self::TooLarge { .. } => "vk_pipeline_cache_too_large",
             Self::WarmCreate { .. } => "vk_pipeline_cache_warm_create",
             Self::Write { .. } => "vk_pipeline_cache_write",
             Self::Rename { .. } => "vk_pipeline_cache_rename",
@@ -135,6 +182,9 @@ impl crate::observe::Decline for PipelineCacheDecline {
                 ("io_kind", format!("{kind:?}")),
             ],
             Self::Incompatible { bytes } => vec![("bytes", bytes.to_string())],
+            Self::TooLarge { bytes, cap } => {
+                vec![("bytes", bytes.to_string()), ("cap", cap.to_string())]
+            }
             Self::WarmCreate { result } => vec![(
                 "vk_result",
                 result.to_string().replace(char::is_whitespace, "_"),
@@ -197,6 +247,14 @@ fn read_pipeline_cache_blob(
     props: &vk::PhysicalDeviceProperties,
 ) -> Result<Option<Vec<u8>>, PipelineCacheDecline> {
     match std::fs::read(path) {
+        // Size is checked before compatibility only so the larger, cheaper-to-
+        // decide refusal wins the report; both are cold starts either way.
+        Ok(blob) if blob.len() > PIPELINE_CACHE_MAX_WARM_BYTES => {
+            Err(PipelineCacheDecline::TooLarge {
+                bytes: blob.len(),
+                cap: PIPELINE_CACHE_MAX_WARM_BYTES,
+            })
+        }
         Ok(blob) if pipeline_cache_blob_compatible(&blob, props) => Ok(Some(blob)),
         Ok(blob) => Err(PipelineCacheDecline::Incompatible { bytes: blob.len() }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -939,6 +997,21 @@ impl DeviceContext {
                 return;
             }
         };
+        // Never write back a blob the next boot would refuse to load. Without
+        // this the bound above still self-heals — one cold boot rebuilds a small
+        // blob — but every boot in between pays a 30 MB write to produce a file
+        // whose only use is to be declined.
+        if data.len() > PIPELINE_CACHE_MAX_WARM_BYTES {
+            crate::observe::Emit::decline(
+                "vk_pipeline_cache_save",
+                &PipelineCacheDecline::TooLarge {
+                    bytes: data.len(),
+                    cap: PIPELINE_CACHE_MAX_WARM_BYTES,
+                },
+            )
+            .fail_once(0);
+            return;
+        }
         // Growth debounce: byte length is the proxy for "a new pipeline
         // landed" (equal-length different-content saves are lost, which only
         // costs a warm-start miss on that one pipeline next boot).
@@ -1545,6 +1618,62 @@ mod pipeline_cache_blob_tests {
         };
         assert_eq!(warm.slug(), "vk_pipeline_cache_warm_create");
         assert_eq!(warm.fields()[0].0, "vk_result");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A blob past [`PIPELINE_CACHE_MAX_WARM_BYTES`] is refused as a cold start,
+    /// and refused for being oversized rather than for being malformed — the two
+    /// have opposite meanings for whoever reads the boot, because an oversized
+    /// blob is this device's own well-formed output and a rebuilt one is the
+    /// expected next state.
+    ///
+    /// Written against a blob that is otherwise perfectly loadable, so it fails
+    /// if the size gate is ever moved after the compatibility gate.
+    #[test]
+    fn an_oversized_pipeline_cache_blob_is_declined_by_size_not_by_shape() {
+        use crate::observe::Decline as _;
+        let root = std::env::temp_dir().join(format!(
+            "reims-vgpu-pcap-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let props = vk::PhysicalDeviceProperties::default();
+
+        // A header this device would otherwise accept, padded past the cap.
+        let mut blob = Vec::with_capacity(PIPELINE_CACHE_MAX_WARM_BYTES + 1);
+        blob.extend_from_slice(&(PIPELINE_CACHE_HEADER_ONE_LEN as u32).to_le_bytes());
+        blob.extend_from_slice(&(vk::PipelineCacheHeaderVersion::ONE.as_raw() as u32).to_le_bytes());
+        blob.extend_from_slice(&props.vendor_id.to_le_bytes());
+        blob.extend_from_slice(&props.device_id.to_le_bytes());
+        blob.extend_from_slice(&props.pipeline_cache_uuid);
+        assert!(
+            pipeline_cache_blob_compatible(&blob, &props),
+            "the fixture must be loadable before it is padded, or this proves nothing"
+        );
+        blob.resize(PIPELINE_CACHE_MAX_WARM_BYTES + 1, 0);
+
+        let path = root.join("oversized.bin");
+        std::fs::write(&path, &blob).unwrap();
+        let decline = read_pipeline_cache_blob(&path, &props).unwrap_err();
+        assert_eq!(decline.slug(), "vk_pipeline_cache_too_large");
+        assert_eq!(
+            decline.fields(),
+            vec![
+                ("bytes", (PIPELINE_CACHE_MAX_WARM_BYTES + 1).to_string()),
+                ("cap", PIPELINE_CACHE_MAX_WARM_BYTES.to_string()),
+            ]
+        );
+
+        // One byte under the cap is still a warm start, so the bound is a bound
+        // and not a ban on warming.
+        blob.truncate(PIPELINE_CACHE_MAX_WARM_BYTES);
+        std::fs::write(&path, &blob).unwrap();
+        assert_eq!(
+            read_pipeline_cache_blob(&path, &props).unwrap(),
+            Some(blob),
+            "a blob at exactly the cap warms"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

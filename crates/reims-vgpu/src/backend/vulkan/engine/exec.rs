@@ -1892,11 +1892,13 @@ pub(crate) unsafe fn execute_draw_inner(
     // an image is not in is undefined behaviour rather than a stale read — so
     // "the guest asked to load" and "there is something to load" are two
     // questions and only the second one is about this device.
+    phase.enter(super::draw_phase::Phase::PipelineDepth);
     let depth_attachment = req
         .depth
         .as_ref()
         .map(|_| acquire_depth_view(ctx, pools, req, counters))
         .transpose()?;
+    phase.enter(super::draw_phase::Phase::Pipeline);
     if let Some(d) = &req.depth {
         let load = depth_attachment
             .as_ref()
@@ -1923,12 +1925,15 @@ pub(crate) unsafe fn execute_draw_inner(
         })
         .collect();
 
+    phase.enter(super::draw_phase::Phase::PipelineShader);
     let (vert_digest, vert_module) =
         caches.get_or_create_shader(ctx, &req.vert_spirv, counters, pools)?;
     let (frag_digest, frag_module) =
         caches.get_or_create_shader(ctx, &req.frag_spirv, counters, pools)?;
+    phase.enter(super::draw_phase::Phase::PipelineLayoutPass);
     let (dsl, pipeline_layout) = caches.get_or_create_layout(ctx, &layout_key, counters, pools)?;
     let render_pass = caches.get_or_create_pass(ctx, pass_key, counters, pools)?;
+    phase.enter(super::draw_phase::Phase::Pipeline);
     // How many viewport slots this draw rasterizes into, checked against the
     // host before it is baked into a pipeline. Refused rather than clamped:
     // clamping would silently drop the viewports past the host's limit, which
@@ -2022,6 +2027,7 @@ pub(crate) unsafe fn execute_draw_inner(
     };
     // One cache, consulted once. `get_or_create_pipeline` already counts the hit
     // and already checks the negative entry for a key that failed to compile.
+    phase.enter(super::draw_phase::Phase::PipelineCompile);
     let pipeline = caches.get_or_create_pipeline(
         ctx,
         &pipeline_key,
@@ -2036,6 +2042,7 @@ pub(crate) unsafe fn execute_draw_inner(
     )?;
 
     // Samplers
+    phase.enter(super::draw_phase::Phase::PipelineSampler);
     let mut sampler_handles = Vec::new();
     for s in &req.samplers {
         let h = caches.get_or_create_sampler(ctx, &s.state_key(), counters, pools)?;
