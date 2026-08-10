@@ -84,6 +84,7 @@ pub mod mapper;
 pub mod mapping_write;
 /// generateMipmaps for multi-mip type-2/3 linear textures.
 pub mod mipmap;
+pub mod node_guard;
 pub mod mmio;
 /// MTLB container → wrapped-AIR carve for metal2vulkan.
 pub mod mtlb;

@@ -3040,6 +3040,79 @@ impl MapFamily {
     }
 }
 
+/// Record the page-table nodes `gva` descends through under `task_id`, and say
+/// whether this device wrote to any of them since it last saw them as nodes.
+///
+/// Stands here, on the map/unmap packet, for two reasons: the tree is being
+/// edited at exactly this moment, so the nodes read are the live ones; and the
+/// device is already holding the task and the address, so the whole cost is one
+/// descent of at most [`node_guard::MAX_TREE_NODES`] guest reads.
+///
+/// A finding is emitted on the fail channel because it is one — a host write
+/// into a page of page-table entries is the corruption class that ends a guest,
+/// and the zero-word shape of this device's clears is what the guest's own
+/// teardown assertion reads as a missing entry. Everything else is counted and
+/// silent.
+fn observe_page_table_nodes<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &H,
+    task_id: u32,
+    gva: u64,
+) {
+    use crate::runtime::node_guard::{self, NodeVerdict};
+
+    let Some(geometry) =
+        reims_vgpu_paging::resolve::geometry_for_page_shift(state.page_shift)
+    else {
+        return;
+    };
+    let Some(entry) = state.tasks.get(task_id) else {
+        return;
+    };
+    let task = reims_vgpu_paging::resolve::Task {
+        active: entry.active,
+        directory_pfn: entry.directory_pfn,
+    };
+    let mut nodes = [0u64; node_guard::MAX_TREE_NODES];
+    let found = reims_vgpu_paging::resolve::task_node_gpas(
+        &crate::runtime::gva_mem::HostPhys(host),
+        geometry,
+        &task,
+        gva,
+        &mut nodes,
+    );
+    if found == 0 {
+        return;
+    }
+
+    let now_us = crate::observe::elapsed_us();
+    // The write census is read while the watch is mutated, so it is split off
+    // first: both live on `DeviceState` and only one of them is being written.
+    let DeviceState {
+        host_writes,
+        node_guard: watches,
+        ..
+    } = state;
+    let watch = watches.entry(task_id).or_default();
+    for &gpa in &nodes[..found] {
+        let verdict = watch.observe(host_writes, gpa, now_us);
+        note_store_route(verdict.route());
+        if let NodeVerdict::Wrote { gap_us } = verdict {
+            if crate::observe::first_sight("node_guard_wrote_node_page", gpa) {
+                crate::observe::fail(format!(
+                    "node_guard reason={} task={task_id} node_gpa={gpa:#x} gva={gva:#x} \
+                     gap_us={gap_us} watched={} refused={} (this device wrote into a guest page \
+                     holding page-table entries; the guest's own teardown asserts that a slot \
+                     with a live child has a non-zero entry)",
+                    verdict.route(),
+                    watch.watched(),
+                    watch.refused(),
+                ));
+            }
+        }
+    }
+}
+
 /// The shared body of the six lifecycle commands named by [`MapFamily`].
 fn apply_map_family<H: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -3086,6 +3159,12 @@ fn apply_map_family<H: HostMemory + HostOps>(
                 ));
             }
         }
+        // The other half of the same question, and the one the interval audit
+        // reading clean moves the weight onto: has this device *written* into a
+        // page that holds the guest's page-table entries? The descent below is
+        // the only work done for it — the write census it asks is already kept
+        // for the sampled cache. See `runtime::node_guard`.
+        observe_page_table_nodes(state, host, task_id, gva);
         // Verbose-gated walk probe at map/unmap time. This runs a full
         // guest page-table walk (`diagnose_gva_walk`) purely to build the
         // log string, and fired ~9k times/boot on the drain path — a flood
