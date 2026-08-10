@@ -246,15 +246,35 @@ pub fn sweep(state: &mut crate::model::DeviceState) {
     }
 }
 
-/// The watch's own size, on the census cadence.
+/// The watch's own size, at most once per census interval.
 ///
 /// A level rather than a per-page count, because the population is the thing
 /// worth knowing and counting each quiet page every sweep is what made this
 /// instrument expensive. `refused` non-zero means the readings describe a
 /// smaller set than the guest released.
+///
+/// **The cadence is enforced here and cannot be left to the call site.** This is
+/// called from the drain tranche, beside [`sweep`], which genuinely wants to run
+/// every tranche — so a levels line with no gate of its own inherits the tranche
+/// rate. It did: a driven macos-13 window ran 363 tranches a second and this
+/// emitted 8 297 lines over 25 s, **62 % of every line in the log**, while its
+/// own doc said "on the census cadence". A level that is sampled 363 times a
+/// second says nothing a once-a-second sample does not, and it is a `format!`
+/// and a sink write per tranche on the drain worker's critical path.
+///
+/// The gate is [`crate::runtime::surface_cache::note_cache_levels`]'s, deliberately:
+/// sharing the one-second interval is what lets a boot read this row-for-row
+/// against `store_routes` and `drain_duty`. Unlike that one, the values here are
+/// two loads rather than a cache walk, so the gate goes *before* them and the
+/// quiet tranche costs one clock read.
 pub fn note_levels(state: &crate::model::DeviceState) {
+    static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     let watch = &state.released_pages;
     if watch.watched() == 0 && watch.refused() == 0 {
+        return;
+    }
+    if !claim_census_interval(&LAST_MS, crate::observe::elapsed_ms() as u64) {
         return;
     }
     crate::observe::off(format!(
@@ -262,6 +282,37 @@ pub fn note_levels(state: &crate::model::DeviceState) {
         watch.watched(),
         watch.refused(),
     ));
+}
+
+/// The census interval every levels line in this device shares.
+///
+/// One second, so `released_pages_levels`, `cache_levels`, `store_routes` and
+/// `drain_duty` all describe the same window and can be read as one row.
+const CENSUS_INTERVAL_MS: u64 = 1_000;
+
+/// Atomically claim the next census interval, or refuse.
+///
+/// Split out and given the clock as an argument for the same reason
+/// `drain::claim_display_vbl` is: a rate gate written inline against
+/// `elapsed_ms()` can only be checked by a boot, and this one was wrong for as
+/// long as it was inline. Here it is a pure function of `(last, now)` and the
+/// tests below pin both edges.
+///
+/// The claimed timestamp is set to `now` rather than advanced by one interval —
+/// the opposite of the VBL grid, and deliberately. A VBL is a cadence the guest
+/// latches onto, so its phase must not drift; this is a sample of a level, where
+/// landing exactly on a grid buys nothing and back-dating would let a burst of
+/// tranches after a long stall each emit a line.
+fn claim_census_interval(last_ms: &std::sync::atomic::AtomicU64, now_ms: u64) -> bool {
+    use std::sync::atomic::Ordering;
+    let last = last_ms.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last) < CENSUS_INTERVAL_MS {
+        return false;
+    }
+    // Losing the race only costs a skipped interval, never a double line.
+    last_ms
+        .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -422,5 +473,50 @@ mod tests {
         names.dedup();
         assert_eq!(names.len(), before, "two verdicts share a route name");
         assert_eq!(all.iter().filter(|v| v.is_finding()).count(), 1);
+    }
+
+    /// The gate that makes this a census line and not a per-tranche one.
+    ///
+    /// A driven macos-13 window runs ~363 drain tranches a second and
+    /// `note_levels` is called from every one of them, so without a claim here
+    /// the level is emitted 363 times a second. This asserts the tranche rate
+    /// cannot get through: 363 calls spread across one second yield one line.
+    #[test]
+    fn a_seconds_worth_of_tranches_claims_one_census_interval() {
+        let last = std::sync::atomic::AtomicU64::new(0);
+        // Start at a nonzero clock so the first call is not a special case of
+        // the zero initialiser.
+        let base = 5_000;
+        assert!(claim_census_interval(&last, base), "the first sample emits");
+
+        // Up to 362, not 363: the 363rd tranche lands exactly on `base + 1000`,
+        // which is a full interval later and is *supposed* to claim. It is the
+        // next assertion, not part of this one.
+        let claims = (1..363)
+            .filter(|i| claim_census_interval(&last, base + (1000 * i) / 363))
+            .count();
+        assert_eq!(claims, 0, "a tranche inside the interval must not emit");
+
+        assert!(
+            claim_census_interval(&last, base + CENSUS_INTERVAL_MS),
+            "the tranche that reaches the next interval emits"
+        );
+    }
+
+    /// A stall does not bank intervals it slept through.
+    ///
+    /// The claim moves to `now`, not forward by one interval, so the tranches
+    /// that arrive in a burst after a long drain stall produce one line between
+    /// them rather than one per interval the stall covered.
+    #[test]
+    fn a_long_stall_does_not_release_a_burst_of_lines() {
+        let last = std::sync::atomic::AtomicU64::new(0);
+        assert!(claim_census_interval(&last, 1_000));
+        // Ten intervals pass inside one tranche, then the burst arrives.
+        assert!(claim_census_interval(&last, 11_000));
+        let banked = (1..=10)
+            .filter(|i| claim_census_interval(&last, 11_000 + i))
+            .count();
+        assert_eq!(banked, 0, "the stall must not bank a line per interval");
     }
 }
