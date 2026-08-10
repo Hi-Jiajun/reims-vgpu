@@ -2631,6 +2631,7 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     task_id: u32,
     backing: &BufferBacking,
     offset: u64,
+    extent_cap: Option<u64>,
 ) -> Option<crate::runtime::bound_buffers::BoundBuffer> {
     let (gva, size) = (backing.gva, backing.size);
     if offset >= size {
@@ -2645,6 +2646,20 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
         // makes the `n > 0` arm unreachable, so this is the width check alone.
         crate::runtime::drain::note_store_route("zc_buffer_span_unusable");
         return None;
+    };
+    // The shader's proven reach, when it has one. `min` and not the cap alone:
+    // a declared object larger than what is left of the allocation is the guest
+    // and the shader disagreeing, and the allocation is the side that bounds
+    // what this device may read. Narrowing is counted rather than silent — the
+    // rail's whole cost is bytes, so a change in how many it moves has to be
+    // readable without a boot-to-boot diff.
+    let span = match extent_cap {
+        Some(cap) if cap < span => {
+            crate::runtime::drain::note_store_route("zc_buffer_extent_narrowed");
+            crate::runtime::drain::note_store_route_n("zc_buffer_extent_saved_bytes", span - cap);
+            cap
+        }
+        _ => span,
     };
     if span < ZERO_COPY_BUFFER_MIN_BYTES {
         crate::runtime::drain::note_store_route("zc_buffer_below_floor");
@@ -2733,6 +2748,12 @@ fn bound_buffer_content(
 /// walking. `untileable` walked successfully and still could not bind, so
 /// nothing upstream of the walk would have saved it — which is why the two are
 /// counted apart rather than as one "the window failed".
+///
+/// `extent_cap` is the byte extent the shader on this draw proved it cannot read
+/// past, from [`crate::runtime::spirv_bind::reflected_buffer_extent`]. `None`
+/// keeps the whole-allocation window this function has always bound. It is part
+/// of the registry key rather than of the resolution, because it describes the
+/// shader and not the bind — see [`crate::runtime::bound_buffers`].
 fn load_buffer_content<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2740,13 +2761,17 @@ fn load_buffer_content<M: HostMemory + HostOps>(
     buffer_ref: u32,
     offset: u64,
     allow_zero_copy: bool,
+    extent_cap: Option<u64>,
 ) -> Option<crate::backend::vulkan::engine::BufferContent> {
     // A held resolution answers before anything is resolved at all: the walk
     // below produces the same runs until the guest moves the addresses, and it
     // announces every such move. This is the whole point of the registry — see
     // `crate::runtime::bound_buffers`.
     if allow_zero_copy {
-        if let Some(bound) = state.bound_buffers.get(task_id, buffer_ref, offset) {
+        if let Some(bound) = state
+            .bound_buffers
+            .get(task_id, buffer_ref, offset, extent_cap)
+        {
             let content = bound_buffer_content(bound);
             crate::runtime::drain::note_store_route("zc_buffer_held");
             return Some(content);
@@ -2758,9 +2783,13 @@ fn load_buffer_content<M: HostMemory + HostOps>(
     // CPU read.
     let backing = resolve_buffer_backing(state, host, task_id, buffer_ref)?;
     if allow_zero_copy {
-        if let Some(bound) = try_buffer_zero_copy_resolved(state, host, task_id, &backing, offset) {
+        if let Some(bound) =
+            try_buffer_zero_copy_resolved(state, host, task_id, &backing, offset, extent_cap)
+        {
             let content = bound_buffer_content(&bound);
-            state.bound_buffers.insert(task_id, buffer_ref, offset, bound);
+            state
+                .bound_buffers
+                .insert(task_id, buffer_ref, offset, extent_cap, bound);
             return Some(content);
         }
     }
@@ -5185,9 +5214,25 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 continue;
             }
             let allow_zc = !constant_step_bufs.contains(&b.index);
-            let Some(content) =
-                load_buffer_content(state, host, req.task_id, b.buffer_ref, b.offset, allow_zc)
-            else {
+            // The vertex shader's own reflection bounds its own `[[buffer(n)]]`
+            // binds. A buffer feeding `[[stage_in]]` is a vertex *attribute*
+            // rather than a declared argument, so reflection lists no Buffer at
+            // its index and the lookup declines to narrow it — which is correct
+            // twice over, because the vertex descriptor's stride is what would
+            // bound one of those and it is a different number.
+            let cap = crate::runtime::spirv_bind::reflected_buffer_extent(
+                &v_shader.reflection,
+                b.index,
+            );
+            let Some(content) = load_buffer_content(
+                state,
+                host,
+                req.task_id,
+                b.buffer_ref,
+                b.offset,
+                allow_zc,
+                cap,
+            ) else {
                 return Err(DrawError::DrawPreparation(
                     DrawPreparationDecline::VertexBufferMissing {
                         index: b.index,
@@ -5207,9 +5252,23 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             if b.buffer_ref == 0 {
                 continue;
             }
-            let Some(content) =
-                load_buffer_content(state, host, req.task_id, b.buffer_ref, b.offset, true)
-            else {
+            // The fragment shader's reflection, for the same reason. The two
+            // stages are looked up separately because one Metal buffer index
+            // names a different argument in each, and a cap taken from the
+            // wrong stage would bound a bind the other stage never declared.
+            let cap = crate::runtime::spirv_bind::reflected_buffer_extent(
+                &f_shader.reflection,
+                b.index,
+            );
+            let Some(content) = load_buffer_content(
+                state,
+                host,
+                req.task_id,
+                b.buffer_ref,
+                b.offset,
+                true,
+                cap,
+            ) else {
                 return Err(DrawError::DrawPreparation(
                     DrawPreparationDecline::FragmentBufferMissing {
                         index: b.index,

@@ -1987,7 +1987,7 @@ pub fn offset_fragment_sampled_resource_bindings(words: &mut [u32]) -> usize {
 
 use metal2vulkan::meta::{TextureDimension, TextureShape};
 use metal2vulkan::reflect::{
-    ResourceAccess, ResourceKind, ShaderReflection, ShaderStage, REFLECTION_VERSION,
+    BufferExtent, ResourceAccess, ResourceKind, ShaderReflection, ShaderStage, REFLECTION_VERSION,
     RESOURCE_DESCRIPTOR_SET,
 };
 
@@ -2035,6 +2035,43 @@ fn is_texture_kind(kind: ResourceKind) -> bool {
             | ResourceKind::StorageImage
             | ResourceKind::EmbeddedArgBufferTexture
     )
+}
+
+/// The byte extent reflection proves a `[[buffer(n)]]` bind cannot be read past,
+/// or `None` when the bind must keep the whole window the guest declared.
+///
+/// A guest buffer bind names an allocation and an offset, never a length, so the
+/// widest safe answer — and until this existed, the only answer — is "the rest of
+/// the allocation". `try_buffer_zero_copy_resolved`'s doc records what that cost:
+/// 67.5 % of a driven boot's gathered bytes are vertex-stage constant buffers no
+/// vertex descriptor bounds, and narrowing them on `declared_size` alone was
+/// closed because a `constant T&` (whose declared size *is* the bound) could not
+/// be told from a `device T*` (whose declared size is one element the shader may
+/// index far past). [`BufferExtent`] is the translator answering exactly that
+/// question, so this is the reopening of that rail.
+///
+/// **Only [`BufferExtent::Object`] may narrow.** `Unbounded` says AIR carries an
+/// element size but no length, `Unknown` says the metadata cannot separate the
+/// two, and a binding this shader does not declare at all gets no answer here —
+/// all three return `None` and keep the full window. The asymmetry is the whole
+/// safety argument: an over-wide window costs bus bytes, and an under-wide one
+/// hands the GPU a short buffer, which is a silent wrong-pixels bug with no error
+/// anywhere. The translator states the same rule on `BufferExtent` itself.
+///
+/// The kind is checked as well as the index because `metal_index` is only unique
+/// within a resource family — a `[[texture(2)]]` and a `[[buffer(2)]]` both
+/// report `metal_index` 2 — and because a threadgroup `[[buffer(n)]]` consumes no
+/// descriptor and binds no guest memory to narrow.
+pub fn reflected_buffer_extent(reflection: &ShaderReflection, metal_index: u32) -> Option<u64> {
+    let extent = reflection.bindings.iter().find_map(|b| {
+        (b.kind == ResourceKind::Buffer && b.metal_index == metal_index)
+            .then_some(b.extent)
+            .flatten()
+    })?;
+    match extent {
+        BufferExtent::Object { bytes } => Some(u64::from(bytes)),
+        BufferExtent::Unbounded | BufferExtent::Unknown => None,
+    }
 }
 
 /// How reflection describes descriptor `binding` for the sampled render path.
@@ -2620,6 +2657,70 @@ mod tests {
             datalayout: None,
             function_constants: vec![],
         }
+    }
+
+    fn buffer_binding(metal_index: u32, extent: Option<BufferExtent>) -> ResourceBinding {
+        ResourceBinding {
+            kind: ResourceKind::Buffer,
+            metal_index,
+            descriptor: Some(DescriptorLocation {
+                set: RESOURCE_DESCRIPTOR_SET,
+                binding: metal_index,
+            }),
+            param_index: None,
+            address_space: None,
+            declared_size: None,
+            extent,
+            type_layout: None,
+            type_name: None,
+            texture_shape: None,
+            embedded_source: None,
+            access: None,
+            static_sampler: None,
+        }
+    }
+
+    /// Only `Object` narrows a bind; every other answer keeps the whole window.
+    ///
+    /// The asymmetry is the safety argument for the whole narrowing rail, and it
+    /// is the direction with no alarm behind it: too wide a window costs bus
+    /// bytes and nothing else, too narrow a one hands the GPU a short buffer and
+    /// draws whatever follows it. So each of the four ways to *not* know an
+    /// extent is asserted separately rather than as one "not Object" case —
+    /// `Unbounded`, `Unknown`, a binding this shader does not declare, and a
+    /// binding present but carrying no extent at all.
+    #[test]
+    fn only_a_bounded_object_extent_narrows_a_buffer_bind() {
+        let mut r = empty_reflection(ShaderStage::Vertex);
+        r.bindings = vec![
+            buffer_binding(0, Some(BufferExtent::Object { bytes: 288 })),
+            buffer_binding(1, Some(BufferExtent::Unbounded)),
+            buffer_binding(2, Some(BufferExtent::Unknown)),
+            buffer_binding(3, None),
+        ];
+
+        assert_eq!(reflected_buffer_extent(&r, 0), Some(288), "a bounded object");
+        assert_eq!(reflected_buffer_extent(&r, 1), None, "an unbounded pointer");
+        assert_eq!(reflected_buffer_extent(&r, 2), None, "an undecided extent");
+        assert_eq!(reflected_buffer_extent(&r, 3), None, "no extent carried");
+        assert_eq!(reflected_buffer_extent(&r, 9), None, "not declared at all");
+    }
+
+    /// A `metal_index` is unique only within a resource family, so the lookup
+    /// must not read a texture's or a threadgroup buffer's slot as a bind it may
+    /// narrow. A `[[texture(0)]]` and a `[[buffer(0)]]` both report index 0, and
+    /// a threadgroup `[[buffer(n)]]` binds no guest memory at all.
+    #[test]
+    fn a_buffer_extent_is_not_read_off_another_resource_family() {
+        let mut r = empty_reflection(ShaderStage::Fragment);
+        let mut threadgroup = buffer_binding(0, Some(BufferExtent::Object { bytes: 16 }));
+        threadgroup.kind = ResourceKind::ThreadgroupBuffer;
+        let mut texture = buffer_binding(1, Some(BufferExtent::Object { bytes: 32 }));
+        texture.kind = ResourceKind::Texture;
+        r.bindings = vec![threadgroup, texture];
+
+        assert_eq!(reflected_buffer_extent(&r, 0), None, "threadgroup buffer");
+        assert_eq!(reflected_buffer_extent(&r, 1), None, "texture");
     }
 
     fn texture_binding(binding: u32, shape: TextureShape) -> ResourceBinding {
