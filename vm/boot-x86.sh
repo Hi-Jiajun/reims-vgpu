@@ -58,6 +58,25 @@
 # without `audiodev=` then refuses to realize ("no default audio driver
 # available"), which kills the boot before OVMF.
 #
+# WHICH audiodev is chosen at run time, native-host-backend first, because the
+# backends are not interchangeable under load. QEMU refills the backend from
+# `audio_run_out` on its main loop at `timer-period` (10 ms), so every backend
+# is exposed to main-loop jitter; what differs is what happens when the refill
+# is late:
+#
+#   - `sdl` holds `4 * 11610 us` and its callback fills the shortfall with
+#     zeroes. Zeroes in the middle of a waveform is what a click is, and it
+#     neither logs nor counts them, so the symptom reaches the user and nothing
+#     else. It is last in the preference order for that reason, not for quality.
+#   - `pipewire` and `pa` each run their own thread with their own ring
+#     (PipeWire's is a fixed 1 MiB) and default to 46440 us; PipeWire reports an
+#     underrun when it does happen.
+#   - `alsa` has an xrun trace (`alsa_xrun_out`).
+#
+# `AUDIODEV=` forces one. `AUDIO_BUFFER_US` and `AUDIO_USB_BUFFER` set the two
+# buffers explicitly so the jitter budget is stated rather than inherited.
+# `scripts/audio-crackle-probe` is what turns "it crackles" into a number.
+#
 # Launch configuration is CLI flags / env here (this is the boot script, not
 # device/backend code) — never an env sniff inside the device.
 #
@@ -118,6 +137,25 @@ GUEST_MAC="${GUEST_MAC:-52:54:00:c9:18:27}"
 
 CPU_MODEL="${CPU_MODEL:-Skylake-Client}"
 CPU_OPTIONS="${CPU_OPTIONS:-+ssse3,+sse4.2,+popcnt,+avx,+avx2,+aes,+xsave,+xsaveopt,check}"
+
+# Audio backend. `AUDIODEV` names a QEMU audiodev driver explicitly; unset picks
+# the first one this build has that is native to the host — see the AUDIO note
+# in the header for why SDL is the last resort rather than the default, and
+# scripts/audio-crackle-probe for the measurement.
+AUDIODEV="${AUDIODEV:-}"
+# How much audio QEMU's backend holds, in microseconds. The mixer that refills
+# it runs on QEMU's main loop at `timer-period`, so this is the jitter the host
+# may show before the guest's sound has a hole in it. 46440 us is what the
+# PipeWire and PulseAudio backends default to on their own; it is stated here so
+# the number is the same on every backend rather than 11610 on one of them.
+AUDIO_BUFFER_US="${AUDIO_BUFFER_US:-46440}"
+# Bytes of guest-supplied audio the `usb-audio` device rings before the backend
+# takes it. QEMU's default is 32 packets — 6144 bytes, about 32 ms at 48 kHz
+# stereo — and `streambuf_put` drops a whole packet, silently, whenever the ring
+# is full when an isochronous transfer lands. 64 KiB is ~340 ms, which is the
+# other half of the same jitter budget and costs only latency nobody in a VM
+# notices.
+AUDIO_USB_BUFFER="${AUDIO_USB_BUFFER:-65536}"
 
 BOOT_CLASS="testing"          # testing | interactive | capture
 RAIL_LABEL="${RAIL:-}"        # empty = follow rails/current; else a rail name
@@ -448,6 +486,28 @@ if [ "$GFX_DEVICE" = "reims-vgpu-pci" ]; then
   fi
 fi
 
+# --- Pick the audio backend -----------------------------------------------------
+# Preference order, first that this build has. Native host backends come first
+# because each runs its own thread with its own ring, so a late QEMU main loop
+# costs latency there instead of silence; SDL is last because its callback fills
+# the gap with zeroes and says nothing. See the AUDIO note in the header.
+if [ -z "$AUDIODEV" ]; then
+  case "$(uname -s)" in
+    Darwin) AUDIO_PREFERENCE="coreaudio sdl none" ;;
+    *)      AUDIO_PREFERENCE="pipewire pa alsa sdl none" ;;
+  esac
+  AUDIO_AVAILABLE="$("$QEMU_BIN" -audiodev help 2>/dev/null)"
+  for candidate in $AUDIO_PREFERENCE; do
+    if printf '%s\n' "$AUDIO_AVAILABLE" | grep -qx "  *$candidate" \
+       || printf '%s\n' "$AUDIO_AVAILABLE" | grep -qx "$candidate"; then
+      AUDIODEV="$candidate"
+      break
+    fi
+  done
+  # `none` is always compiled in, so this only fires if the query itself failed.
+  AUDIODEV="${AUDIODEV:-none}"
+fi
+
 # --- Build the QEMU command line ------------------------------------------------
 # q35 + OVMF + AppleSMC + SATA OpenCore/HDD. Display is attached below.
 QEMU_ARGS=(
@@ -464,8 +524,8 @@ QEMU_ARGS=(
   -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
   -drive "if=pflash,format=raw,file=$OVMF_VARS"
   -smbios type=2
-  -audiodev sdl,id=audio0
-  -device usb-audio,bus=xhci.0,audiodev=audio0
+  -audiodev "$AUDIODEV,id=audio0,out.buffer-length=$AUDIO_BUFFER_US"
+  -device "usb-audio,bus=xhci.0,audiodev=audio0,buffer=$AUDIO_USB_BUFFER"
   -device ich9-ahci,id=sata
   -drive "id=OpenCoreBoot,if=none,format=qcow2,file=$OPENCORE"
   -device ide-hd,bus=sata.2,drive=OpenCoreBoot
@@ -541,6 +601,7 @@ else
 fi
 
 echo "boot-x86.sh: device=$GFX_DEVICE class=$BOOT_CLASS rail=$RAIL_NAME snapshot=$SNAPSHOT_NAME cpu=$CPU_MODEL smp=${CPU_THREADS},cores=${CPU_CORES} mem=$RAM reboot=${QEMU_REBOOT_ACTION}"
+echo "boot-x86.sh: audiodev=$AUDIODEV out.buffer-length=${AUDIO_BUFFER_US}us usb-audio buffer=${AUDIO_USB_BUFFER}"
 echo "boot-x86.sh: ssh → localhost:$SSH_PORT   serial → $SERIAL_LOG   qmp → $QMP_SOCK"
 [ -n "$TRACE_LOG" ] && echo "boot-x86.sh: trace → $TRACE_LOG ($TRACE_SPEC)"
 
