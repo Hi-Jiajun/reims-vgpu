@@ -493,6 +493,25 @@ holds its timestamp lock, so every later `sudo` — including `sudo true` — qu
 A host-side `timeout` does not kill the remote process, so root steps in particular must be issued
 once and never retried after one times out.
 
+### `probe exit=0` is not a clean boot — grep the boot's own stdout for a panic
+
+A guest kernel panic can land **after** the probe has finished and reported success, so the two
+signals every sweep here has been judged on — `probe exit=0` and `dev=1` — both read green on a boot
+whose guest died. That is not hypothetical: on macos-26 it is roughly one driven boot in three, and
+it went unrecorded for as long as rails were judged that way.
+
+`vm/boot-x86.sh` already prints `capture-then-revert (guest kernel panic)` and keeps the serial log,
+so the check is one grep of the boot's own stdout and it is the verdict that outranks the probe's:
+
+```sh
+grep -q 'guest kernel panic' "$OUT/boot-stdout.log" && echo PANIC || echo ok
+```
+
+Report it per rail alongside `dev=` and the probe's exit. A rail that panics on a third of its boots
+is not a rail that passes, and one clean boot of it is not evidence — **band a suspected panic over
+at least six boots before believing a rate**, in both directions. A single green run says nothing,
+and so does a single red one.
+
 ### A boot on a capable host does not exercise the copying rails
 
 Where the import works, every guest window takes it, and the copying rails run zero times — so a
