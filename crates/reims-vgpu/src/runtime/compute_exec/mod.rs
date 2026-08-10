@@ -3999,7 +3999,11 @@ fn simg_u32_to_engine_storage(
 fn mtl_to_engine_sampled(
     format: u16,
 ) -> Option<crate::backend::vulkan::engine::StorageImageFormat> {
-    crate::backend::vulkan::translate::pixel::storage_image(format).ok()
+    // The *sampled* admission, not the storage one. Asking `storage_image` here
+    // cost macOS 14 and macOS 15 a whole `DispatchThreadgroups` a boot on
+    // `MTLPixelFormatR16Unorm`, which is sampleable everywhere and is not a
+    // storage format — see `translate::pixel::sampled_image`.
+    crate::backend::vulkan::translate::pixel::sampled_image(format).ok()
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -4047,7 +4051,8 @@ fn guest_numeric_class(guest: crate::backend::vulkan::engine::StorageImageFormat
         | V::R8Unorm
         | V::Rg8Unorm
         | V::R32Float
-        | V::Rgb9e5Ufloat => 0,
+        | V::Rgb9e5Ufloat
+        | V::R16Unorm => 0,
         V::Rgba16Uint | V::Rgba8Uint | V::Rgba32Uint | V::R32Uint => 1,
         V::Rgba8Sint | V::R32Sint => 2,
     }
@@ -4157,7 +4162,7 @@ fn specialized_storage_image_format(
         // R32 sint/float and the packed Rgb9e5 stay sampled-only until a live
         // capture justifies enabling their storage path.
         V::R32Uint => (1, S::R32ui),
-        V::R32Sint | V::R32Float | V::Rgb9e5Ufloat => {
+        V::R32Sint | V::R32Float | V::Rgb9e5Ufloat | V::R16Unorm => {
             return Err("spirv_sampled_only_format_as_storage");
         }
         V::Rgba32Float => (0, S::Rgba32Float),

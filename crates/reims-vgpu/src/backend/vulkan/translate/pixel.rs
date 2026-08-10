@@ -400,6 +400,40 @@ pub fn storage_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
     storage_image_from_selector(selector as u32)
 }
 
+/// The compute path's admission for a **sampled** image bind.
+///
+/// [`storage_image`] answers the storage question, and the compute rail used to
+/// ask it for both roles — `mtl_to_engine_sampled` was a one-line wrapper over
+/// it. That is why macOS 14 and macOS 15 each lost a whole
+/// `DispatchThreadgroups` a boot to `sampled_format_unsupported` on
+/// `MTLPixelFormatR16Unorm`: the ten-bit biplanar video luma plane is
+/// sampleable everywhere and is not a storage format, so the storage table
+/// correctly refused a question it was never being asked.
+///
+/// The two questions are genuinely different and Vulkan says so. `R16_UNORM` is
+/// mandatory for `SAMPLED_IMAGE` with `SAMPLED_IMAGE_FILTER_LINEAR` and carries
+/// no mandatory `STORAGE_IMAGE` support; `E5B9G9R9_UFLOAT_PACK32` has no storage
+/// support at all. So this is a superset of [`storage_image`] rather than a copy
+/// of it, and the members it adds are exactly the ones marked sampled-only on
+/// [`StorageImageFormat`].
+///
+/// The graphics rail asks [`sampled_pixels`] instead, which answers a
+/// [`TexelLayout`] and is wider still. The two are not merged because the
+/// compute request carries a `StorageImageFormat` — see that type's doc for the
+/// end state that would let them be.
+pub fn sampled_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
+    use crate::contract::pixel_format as pf;
+    // Sampled-only members first, then everything a storage image may be. The
+    // `translate` call keeps an entirely unknown value declining as
+    // `unknown_pixel_format` rather than as a missing layout, exactly as
+    // `storage_image` does for the same reason.
+    if mtl == pf::MTL_FORMAT_R16_UNORM {
+        translate(mtl)?;
+        return Ok(StorageImageFormat::R16Unorm);
+    }
+    storage_image(mtl)
+}
+
 /// The guest's scanout byte order, in Vulkan terms.
 ///
 /// The compositor's framebuffers are `MTLPixelFormatBGRA8Unorm`, so a resident
@@ -496,6 +530,7 @@ pub fn vk_storage_image(format: StorageImageFormat) -> vk::Format {
         StorageImageFormat::R32Sint => vk::Format::R32_SINT,
         StorageImageFormat::R32Float => vk::Format::R32_SFLOAT,
         StorageImageFormat::Rgb9e5Ufloat => vk::Format::E5B9G9R9_UFLOAT_PACK32,
+        StorageImageFormat::R16Unorm => vk::Format::R16_UNORM,
     }
 }
 

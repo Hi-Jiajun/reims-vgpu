@@ -1297,6 +1297,21 @@ pub enum StorageImageFormat {
     /// Packed three-channel shared-exponent float; sampled-image only on the
     /// product path (`MTLPixelFormatRGB9E5Float`).
     Rgb9e5Ufloat,
+    /// Single-channel sixteen-bit normalized; **sampled-image only**, for
+    /// `Rgb9e5Ufloat`'s reason and one more.
+    ///
+    /// This is the ten-bit biplanar video luma plane
+    /// (`MTLPixelFormatR16Unorm`). macOS 14 and macOS 15 each bind one to a
+    /// `DispatchThreadgroups` and lost the whole dispatch to
+    /// `sampled_format_unsupported` until it was named here.
+    ///
+    /// It must **not** reach a storage bind. Vulkan mandates `R16_UNORM` for
+    /// `SAMPLED_IMAGE` and `SAMPLED_IMAGE_FILTER_LINEAR` and does *not* mandate
+    /// it for `STORAGE_IMAGE`, so admitting it to a storage image would claim a
+    /// capability the host may not have — which is why it is reachable through
+    /// [`translate::pixel::sampled_image`] and not through
+    /// `translate::pixel::storage_image`.
+    R16Unorm,
 }
 
 impl StorageImageFormat {
@@ -1309,7 +1324,7 @@ impl StorageImageFormat {
             Self::Rgba32Float | Self::Rgba32Uint => 16,
             Self::Rgba16Float | Self::Rgba16Uint => 8,
             Self::Rg16Float => 4,
-            Self::R16Float | Self::Rg8Unorm => 2,
+            Self::R16Float | Self::Rg8Unorm | Self::R16Unorm => 2,
             Self::R8Unorm => 1,
             Self::Rgba8Uint
             | Self::Rgba8Sint
