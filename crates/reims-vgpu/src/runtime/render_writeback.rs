@@ -731,10 +731,22 @@ fn finish(
 #[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GvaWritebackDecline {
-    /// The guest declared a destination format whose texel is not four bytes of
-    /// colour, so no image→buffer copy can produce it. A `RGBA16_FLOAT` render
-    /// target lands here and always will; `convert_rgba8_to_row` is its only
-    /// route.
+    /// The guest declared a destination format that [`crate::contract::pixel_format::store_texel_order`] does
+    /// not admit as a byte-copy destination, so no image→buffer copy can produce
+    /// it and `convert_rgba8_to_row` is the only route.
+    ///
+    /// This used to say "not four bytes of colour", and to name `RGBA16_FLOAT`
+    /// as landing here *always*. Both went stale together: a resident now
+    /// carries the format the guest declared rather than always being eight bits
+    /// per channel, so a half-float destination can be the same bytes as the
+    /// image, and `RGBA16_FLOAT` is an admitted eight-byte member of that table.
+    /// The rule was never a width — it is whether the destination's texel and
+    /// the resident's are one layout, which is [`crate::contract::pixel_format::store_texel_order`]'s question
+    /// and not this doc's to restate.
+    ///
+    /// `R16_FLOAT` is what lands here now, twice on a driven macos-26 boot: it
+    /// is renderable but deliberately not a byte-copy destination, for the
+    /// reason `store_texel_order`'s own doc gives for `RG16_FLOAT`.
     FormatNeedsConversion { format: u16 },
     /// The resident's format is not the format the destination stores, so a
     /// byte copy would land the wrong texel. Distinct from the engine's own
