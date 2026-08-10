@@ -1559,6 +1559,40 @@ fn reply_device_info<H: HostMemory + HostOps>(
         .filter(|&(key, _)| key < key_table_len)
         .collect();
     let above_ceiling = served.len() - caps.len();
+    // The mirror of `above_ceiling`, and the direction that can cost guest work.
+    //
+    // `above_ceiling` counts keys this device answers that the guest discards —
+    // harmless, and until now it was the only direction reported. The other
+    // direction is a key the guest has a parse arm for and this device never
+    // sends: the guest's walker stores nothing into that field, so its Metal
+    // plugin answers from whatever the capability struct was initialised to.
+    // Per [`DEVICE_INFO_CAPS`]'s own doc a value here is an *instruction to the
+    // guest about what it may build*, so a key left out is a silent
+    // instruction rather than a silent omission, and nothing said how many
+    // there were.
+    //
+    // Split in two, because the halves mean different things and only one of
+    // them is a decision this repository made. A **hole** is a key inside the
+    // range the table already covers that the table skips — either nobody
+    // answered it or the capture it came from never saw it. A **tail** key is
+    // past everything this device has ever been asked for, so it is a newer
+    // guest asking a newer question. One combined number would make a guest
+    // that merely parses further look identical to a table with gaps in it,
+    // and those want opposite work.
+    //
+    // Bounded by construction: the hole list cannot be longer than the table's
+    // own highest key, and the tail is a count rather than a list, so a guest
+    // declaring an absurd ceiling cannot turn this into a log flood.
+    let answered: std::collections::BTreeSet<u32> = caps.iter().map(|&(key, _)| key).collect();
+    let table_top = served.iter().map(|&(key, _)| key).max().unwrap_or(0);
+    // Key 0 terminates the walk and is not a key, so the parseable set starts
+    // at 1.
+    let holes: Vec<u32> = (1..key_table_len.min(table_top.saturating_add(1)))
+        .filter(|key| !answered.contains(key))
+        .collect();
+    let tail = key_table_len.saturating_sub(table_top.saturating_add(1));
+    note_store_route_n("device_info_key_holes", holes.len() as u64);
+    note_store_route_n("device_info_key_tail", u64::from(tail));
     // Printed on every reply, not only when something changed. A host that
     // already meets the table reduces nothing, and then silence would be
     // indistinguishable from the derivation never having run — which is exactly
@@ -1578,10 +1612,16 @@ fn reply_device_info<H: HostMemory + HostOps>(
         .map(|((key, answer), (_, table))| format!("key{key}={answer}(was {table})"))
         .collect();
     crate::observe::off(format!(
-        "device_info version={} key_table_len={} above_ceiling={} dual_plane={} host_samples={} host_d24s8={} host_threads={}x{}x{} host_tg_mem={} host_fp16={} derived=[{}]",
+        "device_info version={} key_table_len={} above_ceiling={} holes=[{}] tail={} dual_plane={} host_samples={} host_d24s8={} host_threads={}x{}x{} host_tg_mem={} host_fp16={} derived=[{}]",
         version,
         key_table_len,
         above_ceiling,
+        holes
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        tail,
         u8::from(crate::model::protocol_dual_plane_textures(version)),
         limits.max_sample_count,
         u8::from(limits.d24_stencil8),

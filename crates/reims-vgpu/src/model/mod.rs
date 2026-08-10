@@ -403,6 +403,109 @@ mod tests {
         );
     }
 
+    /// A key the guest parses and this device never answers is counted, and the
+    /// two ways that happens are counted apart.
+    ///
+    /// The reply already reported `above_ceiling` — keys this device sends that
+    /// the guest discards, which costs nothing. The opposite direction was
+    /// silent, and it is the one that can cost guest work: the guest's walker
+    /// has an arm per key, so a key that never arrives leaves that field at
+    /// whatever the capability struct was initialised to, and
+    /// [`DEVICE_INFO_CAPS`]'s doc is explicit that a value here is an
+    /// instruction to the guest about what it may build.
+    ///
+    /// Driven at the two ceilings real rails declare, measured on driven boots:
+    /// macOS 26 sends 45 and macOS 15 sends 42. The rails disagreeing is the
+    /// point — a guest that parses further must report more holes, which is
+    /// what fails if the ceiling stops feeding the computation.
+    #[test]
+    fn the_keys_a_guest_parses_and_this_device_never_answers_are_counted() {
+        use crate::runtime::drain::store_route_count;
+
+        /// Drive one device-info request at `key_table_len` and return the
+        /// `(holes, tail)` this reply contributed.
+        fn ask(key_table_len: u32) -> (u64, u64) {
+            let mut d = dev();
+            let mut h = FakeHost::new();
+            setup_boot_regs(&mut d, &mut h);
+            let reply_pfn = 0x20u32;
+            h.map_range(
+                pfn_to_gpa(reply_pfn, PAGE_SHIFT_ARM64E),
+                PAGE_SIZE_ARM64E as usize,
+                0xee,
+            );
+            let mut payload = vec![0u8; 12];
+            st32(&mut payload[DEVICE_INFO_TAHOE_KEY_TABLE_LEN..], key_table_len);
+            st32(
+                &mut payload[DEVICE_INFO_TAHOE_COUNT..],
+                (PAGE_SIZE_ARM64E as usize / DEVICE_INFO_REPLY_PAIR_LEN) as u32,
+            );
+            st32(&mut payload[DEVICE_INFO_TAHOE_REPLY_PFN..], reply_pfn);
+            write_main_packet(&mut h, 0, ROOT_OP_DEVICE_INFO_TAHOE, 3, &payload);
+            d.state
+                .gfx
+                .fifo_read
+                .store(0, std::sync::atomic::Ordering::Release);
+            d.state.gfx.fifo_written = PACKET_HEADER_LEN + 12;
+            d.state.pending.main_drain = true;
+            let before = (
+                store_route_count("device_info_key_holes"),
+                store_route_count("device_info_key_tail"),
+            );
+            d.drain(&mut h);
+            (
+                store_route_count("device_info_key_holes") - before.0,
+                store_route_count("device_info_key_tail") - before.1,
+            )
+        }
+
+        let table_top = DEVICE_INFO_CAPS
+            .iter()
+            .map(|&(key, _)| key)
+            .max()
+            .expect("the table is not empty");
+
+        // A guest that parses nothing has no unanswered key of either kind:
+        // key 0 terminates the walk and is not a key, so a ceiling of 1 admits
+        // none. This is what catches an off-by-one that counts key 0 as a hole
+        // on every boot of every rail.
+        assert_eq!(ask(1), (0, 0), "a ceiling of 1 admits no key at all");
+
+        // Tail is pure arithmetic and independently checkable: keys beyond
+        // anything this device has ever been asked for.
+        assert_eq!(
+            ask(table_top + 1).1,
+            0,
+            "a guest that stops at the table's top asks nothing new"
+        );
+        assert_eq!(
+            ask(table_top + 9).1,
+            8,
+            "eight keys past the table's top are eight tail keys"
+        );
+
+        // The two real rails. The holes are the keys below each ceiling that
+        // the table skips; deriving the expectation from `DEVICE_INFO_CAPS`
+        // rather than writing the numbers keeps this from pinning today's gaps.
+        let gaps_below = |ceiling: u32| -> u64 {
+            (1..ceiling.min(table_top + 1))
+                .filter(|key| !DEVICE_INFO_CAPS.iter().any(|&(k, _)| k == *key))
+                .count() as u64
+        };
+        let macos_15 = ask(42).0;
+        let macos_26 = ask(45).0;
+        assert_eq!(macos_15, gaps_below(42), "macOS 15 parses keys 1..=41");
+        assert_eq!(macos_26, gaps_below(45), "macOS 26 parses keys 1..=44");
+
+        // The assertion a constant — or a computation that ignored the guest's
+        // ceiling — cannot satisfy: parsing further must find strictly more.
+        assert!(
+            macos_26 > macos_15,
+            "macOS 26 parses three keys further than macOS 15 and the table has \
+             a gap in that span, so it must report more holes: {macos_26} vs {macos_15}"
+        );
+    }
+
     #[test]
     fn reset_clears_state() {
         let mut d = dev();
