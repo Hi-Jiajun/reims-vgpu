@@ -3061,6 +3061,9 @@ fn observe_page_table_nodes<H: HostMemory + HostOps>(
 ) {
     use crate::runtime::node_guard::{self, NodeVerdict};
 
+    if !node_guard::enabled() {
+        return;
+    }
     let Some(geometry) =
         reims_vgpu_paging::resolve::geometry_for_page_shift(state.page_shift)
     else {
@@ -3108,6 +3111,61 @@ fn observe_page_table_nodes<H: HostMemory + HostOps>(
                     watch.watched(),
                     watch.refused(),
                 ));
+            }
+        }
+    }
+}
+
+/// Record the guest-physical pages of `[gva, gva+length)` as released, on an
+/// unmap, or as handed back, on a map.
+///
+/// Both directions matter and the map one is not an afterthought: a page the
+/// guest maps again is a page this device is entitled to write, so leaving it
+/// watched would report every recycled page as a defect. See
+/// [`crate::runtime::released_pages`].
+///
+/// The resolve runs against the live page table, which on an unmap means it has
+/// to happen before the packet is applied. A range that no longer translates
+/// resolves to fewer pages than it spans, and that is not an error here — those
+/// pages are already gone and there is nothing left to watch.
+fn note_released_or_remapped<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &H,
+    task_id: u32,
+    gva: u64,
+    length: u64,
+    family: MapFamily,
+) {
+    if !crate::runtime::node_guard::enabled() {
+        return;
+    }
+    let pages = crate::runtime::gva_mem::task_gva_page_gpa_set(
+        host,
+        &state.tasks,
+        task_id,
+        gva,
+        length,
+        state.page_shift,
+    );
+    if pages.is_empty() {
+        return;
+    }
+    let now_us = crate::observe::elapsed_us();
+    let DeviceState {
+        host_writes,
+        released_pages: watches,
+        ..
+    } = state;
+    let watch = watches.entry(task_id).or_default();
+    match family {
+        MapFamily::UnmapMemory => {
+            for gpa in pages {
+                watch.release(host_writes, gpa, now_us);
+            }
+        }
+        _ => {
+            for gpa in pages {
+                watch.remapped(gpa);
             }
         }
     }
@@ -3165,6 +3223,11 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // the only work done for it — the write census it asks is already kept
         // for the sampled cache. See `runtime::node_guard`.
         observe_page_table_nodes(state, host, task_id, gva);
+        // And the half `node_guard` structurally cannot see: a write landing on
+        // a page *before* it becomes a node. The page list has to be resolved
+        // here, ahead of the unmap being applied, because this is the last
+        // moment those addresses translate. See `runtime::released_pages`.
+        note_released_or_remapped(state, host, task_id, gva, length, family);
         // Verbose-gated walk probe at map/unmap time. This runs a full
         // guest page-table walk (`diagnose_gva_walk`) purely to build the
         // log string, and fired ~9k times/boot on the drain path — a flood

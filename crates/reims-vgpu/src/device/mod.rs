@@ -576,6 +576,10 @@ pub fn device_drain(id: u64) -> bool {
     // interval is the resolution of the answer. Returns immediately when nothing
     // is watched, which is every tranche on every rail but macos-26.
     crate::runtime::objects::slot_recheck::sweep(&device.state, &host);
+    // Beside it and on the same cadence: a page the guest released is judged
+    // against the write census, which only moves when this device writes. Also
+    // returns immediately when nothing is watched.
+    crate::runtime::released_pages::sweep(&mut device.state);
     // The bind registry's own levels, on that same cadence and read against the
     // `bb_retire_*` routes: what the retirements dropped, and what the survivors
     // look like.

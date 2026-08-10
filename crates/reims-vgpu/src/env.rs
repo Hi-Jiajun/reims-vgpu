@@ -54,6 +54,23 @@ pub const DRAW_LOG: &str = "REIMS_VGPU_DRAW_LOG";
 /// one of them without rebuilding.
 pub const GPU_STAMP: &str = "REIMS_VGPU_GPU_STAMP";
 
+/// Setting this off stops the two guest-page write guards —
+/// [`crate::runtime::node_guard`] and [`crate::runtime::released_pages`] — from
+/// observing anything. They decide nothing, so this changes no guest-visible
+/// behavior; what it removes is the page-table descent and the page-list resolve
+/// that each map and unmap packet pays for them, on the drain thread, while it
+/// holds the device lock.
+///
+/// A narrowing, like every switch here: it turns an observation off and can
+/// never turn one on.
+///
+/// It exists because these guards watch an intermittent guest kernel panic that
+/// is a **race**, so the honest question "does watching it change the rate?" has
+/// to be answerable without rebuilding. A measurement that cannot be controlled
+/// is the failure this whole instrument was built to avoid, and an instrument on
+/// the drain thread is exactly the kind that could perturb its own subject.
+pub const PAGE_GUARDS: &str = "REIMS_VGPU_PAGE_GUARDS";
+
 /// What one variable says, including the two ways it says nothing usable.
 ///
 /// Four states rather than a `bool` because "unset", "explicitly on" and
@@ -208,7 +225,7 @@ mod tests {
     /// by grepping their own environment.
     #[test]
     fn every_name_carries_the_crate_prefix() {
-        for name in [DRAW_LOG, GUEST_IMPORT, GPU_STAMP] {
+        for name in [DRAW_LOG, GUEST_IMPORT, GPU_STAMP, PAGE_GUARDS] {
             assert!(name.starts_with("REIMS_VGPU_"), "{name}");
             assert!(
                 name.bytes()

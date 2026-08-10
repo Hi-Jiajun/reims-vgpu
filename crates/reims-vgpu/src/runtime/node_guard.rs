@@ -63,6 +63,19 @@ use crate::runtime::host_writes::{HostWriteVerdict, HostWrites};
 
 pub use reims_vgpu_paging::resolve::MAX_TREE_NODES;
 
+/// Whether the two guest-page write guards observe anything this boot.
+///
+/// Read once and cached, because the alternative is an environment lookup on the
+/// drain thread for every map and unmap packet — and an instrument that watches
+/// a race must not be the reason the race moves.
+///
+/// Off is the only value that changes anything, per [`crate::env`]'s rule that a
+/// switch may narrow and never widen.
+pub fn enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::env::switch(crate::env::PAGE_GUARDS) != crate::env::Switch::Off)
+}
+
 /// How many distinct node pages one task's watch will hold.
 ///
 /// The guest's tree is depth 3 with a 1024 fanout, so a task mapping a few
