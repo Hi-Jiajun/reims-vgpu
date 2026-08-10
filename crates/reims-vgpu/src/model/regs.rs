@@ -1333,11 +1333,11 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
     (DEVICE_INFO_KEY_GPU_CORE_COUNT, 8),
     (DEVICE_INFO_KEY_MAX_TEXTURE_LAYERS, 2048),
     (DEVICE_INFO_KEY_MAX_PREDICATED_NESTING, 16),
-    (DEVICE_INFO_KEY_GPU_FAMILY_CLAMPED, 1009),
+    (DEVICE_INFO_KEY_GPU_FAMILY_CLAMPED, DEVICE_INFO_GPU_FAMILY),
     (DEVICE_INFO_KEY_MIN_LINEAR_TEXTURE_ALIGN, 256),
     (DEVICE_INFO_KEY_TEXTURE_WRITE_ROUNDING, 7),
     (DEVICE_INFO_KEY_SUPPORT_FLAGS_2025, 2),
-    (DEVICE_INFO_KEY_HOST_GPU_FAMILIES, 127),
+    (DEVICE_INFO_KEY_HOST_GPU_FAMILIES, DEVICE_INFO_GPU_FAMILY_SET),
 ];
 
 pub const DEVICE_INFO_KEY_MAX_MSL_VERSION: u32 = 18;
@@ -1379,6 +1379,53 @@ pub const DEVICE_INFO_KEY_SUPPORT_FLAGS_2025: u32 = 42;
 /// where [`DEVICE_INFO_KEY_GPU_FAMILY_CLAMPED`] is a single member of it.
 /// Reaches macOS 26 and no older rail.
 pub const DEVICE_INFO_KEY_HOST_GPU_FAMILIES: u32 = 44;
+
+/// `MTLGPUFamily.Apple1`. The Apple family ordinals are `1000 + n`, so this is
+/// the base every family value in this file is expressed against rather than a
+/// number chosen to fit one of them.
+pub const MTL_GPU_FAMILY_APPLE1: u32 = 1001;
+
+/// The single `MTLGPUFamily` this device presents itself as.
+///
+/// Apple9. It is the value key 37 has always carried; naming it is what lets the
+/// family *set* below be derived from it instead of written beside it.
+pub const DEVICE_INFO_GPU_FAMILY: u32 = 1009;
+
+/// The `supportsFamily` set implied by [`DEVICE_INFO_GPU_FAMILY`].
+///
+/// Metal's Apple families are cumulative — a device that is Apple9 answers yes
+/// to Apple5 through Apple9 — so the set is exactly the bits at or below the
+/// family this device claims to be, and it is *computed* from it. Two spellings
+/// of one fact is what this avoids: the table used to carry `127` here beside
+/// `1009` at key 37, which claims Apple9 as the device and Apple10 as a
+/// supported family in the same reply.
+///
+/// That mattered because these two keys reach **macOS 26 and no older rail**, so
+/// a contradiction between them is invisible on every rail that renders
+/// correctly. Narrowing rather than widening is also the only safe direction:
+/// each bit is an instruction about what the guest may build, and Apple10 and
+/// Apple9b name feature sets no backend here implements.
+///
+/// Bit `n` is family `Apple(5 + n)`, so Apple9 is bit 4 and the set is bits
+/// 0..=4.
+pub const DEVICE_INFO_GPU_FAMILY_SET: u32 = {
+    let family_index = DEVICE_INFO_GPU_FAMILY - MTL_GPU_FAMILY_APPLE1; // 8 for Apple9
+    let bit = family_index - 4; // Apple5 is bit 0
+    (1u32 << (bit + 1)) - 1
+};
+
+// The set must contain the family it was derived from, and must not claim any
+// family above it. Both directions are asserted because the shift arithmetic
+// above is the only thing keeping them true, and a future family bump edits one
+// constant.
+const _: () = assert!(
+    DEVICE_INFO_GPU_FAMILY_SET & (1 << (DEVICE_INFO_GPU_FAMILY - MTL_GPU_FAMILY_APPLE1 - 4)) != 0,
+    "the family set must contain the family this device says it is"
+);
+const _: () = assert!(
+    DEVICE_INFO_GPU_FAMILY_SET >> (DEVICE_INFO_GPU_FAMILY - MTL_GPU_FAMILY_APPLE1 - 3) == 0,
+    "the family set must not claim a family above the one this device says it is"
+);
 
 /// Keys inside a guest's parse ceiling that its walker has **no arm for**.
 ///
