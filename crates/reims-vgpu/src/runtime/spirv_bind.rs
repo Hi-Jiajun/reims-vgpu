@@ -24,6 +24,17 @@
 
 /// SPIR-V `OpDecorate` opcode.
 const OP_DECORATE: u16 = 71;
+/// The declarations that name a variable id without referencing it, which
+/// [`descriptor_static_use`] must skip. `OpEntryPoint` is the one that matters:
+/// from SPIR-V 1.4 its interface list carries every global variable in the
+/// module, so counting it would make every declared descriptor read as used.
+const OP_NAME: u16 = 5;
+const OP_MEMBER_NAME: u16 = 6;
+const OP_ENTRY_POINT: u16 = 15;
+const OP_MEMBER_DECORATE: u16 = 72;
+const OP_DECORATE_ID: u16 = 332;
+const OP_DECORATE_STRING: u16 = 5632;
+const OP_MEMBER_DECORATE_STRING: u16 = 5633;
 const OP_TYPE_IMAGE: u16 = 25;
 const OP_TYPE_SAMPLER: u16 = 26;
 const OP_TYPE_SAMPLED_IMAGE: u16 = 27;
@@ -577,6 +588,113 @@ pub fn declares_descriptor(words: &[u32], binding: u32) -> bool {
         return false;
     };
     descriptor_root(words, &instrs, binding, STORAGE_CLASS_UNIFORM_CONSTANT).is_some()
+}
+
+/// Whether a declared descriptor is *statically used*, which is the bar Vulkan
+/// actually sets.
+///
+/// [`declares_descriptor`] answers the weaker question, and the two are not the
+/// same rule. Vulkan requires the pipeline layout to contain a descriptor for
+/// every resource the shader **statically uses**; a variable that is declared
+/// and never referenced is legal to omit. So a draw whose module declares a
+/// binding its layout does not contain is a specification violation only if this
+/// says [`DescriptorUse::Used`], and a fail line that does not separate the two
+/// is reporting a population it cannot tell apart.
+///
+/// "Statically used" here is the spec's own wording — the variable is referenced
+/// by an instruction — and the test is the direct one: does the root id appear as
+/// an operand anywhere outside the declarations that necessarily name it?
+///
+/// The exclusion list is the whole subtlety. `OpVariable` declares the id,
+/// `OpDecorate`/`OpMemberDecorate` and their `Id`/`String` forms carry its
+/// binding, `OpName`/`OpMemberName` carry its debug name, and from SPIR-V 1.4
+/// **`OpEntryPoint` lists every global variable in its interface** whether or not
+/// the body touches it. Counting any of those as a reference would make every
+/// declared descriptor read as used, which is the failure that looks like
+/// thoroughness. Everything else counts, including an `OpAccessChain` or an
+/// `OpImageTexelPointer` that never gets loaded, because those reference the
+/// variable and the spec asks about references rather than about loads.
+pub fn descriptor_static_use(words: &[u32], binding: u32) -> DescriptorUse {
+    let Some(instrs) = instructions(words) else {
+        return DescriptorUse::NotDeclared;
+    };
+    let root = match descriptor_root(words, &instrs, binding, STORAGE_CLASS_UNIFORM_CONSTANT) {
+        None => return DescriptorUse::NotDeclared,
+        Some(Root::Ambiguous) => return DescriptorUse::Ambiguous,
+        Some(Root::One { id, .. }) => id as u32,
+    };
+    for &Instruction {
+        opcode,
+        word_count,
+        at: i,
+    } in &instrs
+    {
+        if matches!(
+            opcode,
+            OP_VARIABLE
+                | OP_DECORATE
+                | OP_MEMBER_DECORATE
+                | OP_DECORATE_ID
+                | OP_DECORATE_STRING
+                | OP_MEMBER_DECORATE_STRING
+                | OP_NAME
+                | OP_MEMBER_NAME
+                | OP_ENTRY_POINT
+        ) {
+            continue;
+        }
+        // Word 0 is the opcode/length header; every operand after it is a
+        // candidate reference. A result id cannot collide with the root, because
+        // the root's own result id belongs to the `OpVariable` skipped above.
+        if words[i + 1..i + word_count].contains(&root) {
+            return DescriptorUse::Used;
+        }
+    }
+    DescriptorUse::DeclaredUnused
+}
+
+/// What [`descriptor_static_use`] found for one binding.
+///
+/// Four states rather than a `bool` because three of them mean "do not report a
+/// violation" for three different reasons, and a caller that collapses them
+/// cannot say which population it is looking at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DescriptorUse {
+    /// No variable in the module carries this binding. The reflection named a
+    /// resource the translated shader does not have.
+    NotDeclared,
+    /// The module declares the variable and no instruction references it. Legal
+    /// to leave out of the pipeline layout.
+    DeclaredUnused,
+    /// An instruction references the variable, so the layout must contain it.
+    Used,
+    /// More than one variable carries this binding, so "the" root is not a
+    /// single id. Fails closed: treated as a reason not to claim either answer.
+    Ambiguous,
+}
+
+impl DescriptorUse {
+    /// A stable name for the fail channel and the `store_routes` counter.
+    ///
+    /// One spelling for both, so the reason and the census cannot drift.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::NotDeclared => "frag_unbound_not_declared",
+            Self::DeclaredUnused => "frag_unbound_declared_unused",
+            Self::Used => "frag_declared_descriptor_unbound",
+            Self::Ambiguous => "frag_unbound_ambiguous_binding",
+        }
+    }
+
+    /// Whether omitting this binding from the pipeline layout violates the
+    /// specification.
+    ///
+    /// Only [`Self::Used`]. [`Self::Ambiguous`] deliberately does **not** count:
+    /// it means the module has two variables on one binding, which is its own
+    /// defect and must not be reported under a name that says something else.
+    pub fn is_violation(self) -> bool {
+        matches!(self, Self::Used)
+    }
 }
 
 /// Mark every id whose value derives from an already-marked id, to a fixpoint.
@@ -2221,6 +2339,124 @@ mod tests {
         // Idempotent: a second call is a no-op.
         assert!(!ensure_storage_write_without_format_capability(&mut words));
         assert_eq!(words.len(), before + 2);
+    }
+
+    /// A fragment module declaring one `UniformConstant` variable on `binding`,
+    /// named by `OpEntryPoint`'s interface list the way SPIR-V 1.4 requires, and
+    /// referenced by an `OpLoad` only when `loaded`.
+    ///
+    /// The entry point is not decoration: from 1.4 its interface list carries
+    /// every global variable whether the body touches it or not, so a module
+    /// without it would not exercise the one exclusion that decides this
+    /// function's answer.
+    fn module_with_descriptor(binding: u32, loaded: bool) -> Vec<u32> {
+        const VAR: u32 = 10;
+        const FN: u32 = 11;
+        let mut body = vec![
+            // OpEntryPoint Fragment %FN "m" %VAR
+            (5u32 << 16) | OP_ENTRY_POINT as u32,
+            4,
+            FN,
+            u32::from_le_bytes([b'm', 0, 0, 0]),
+            VAR,
+            // OpName %VAR "t"
+            (3u32 << 16) | OP_NAME as u32,
+            VAR,
+            u32::from_le_bytes([b't', 0, 0, 0]),
+            // OpDecorate %VAR Binding <binding>
+            (4u32 << 16) | OP_DECORATE as u32,
+            VAR,
+            DECORATION_BINDING,
+            binding,
+            // %VAR = OpVariable %2 UniformConstant
+            (4u32 << 16) | OP_VARIABLE as u32,
+            2,
+            VAR,
+            STORAGE_CLASS_UNIFORM_CONSTANT,
+        ];
+        if loaded {
+            // %12 = OpLoad %2 %VAR
+            body.extend_from_slice(&[(4u32 << 16) | OP_LOAD as u32, 2, 12, VAR]);
+        }
+        module_with(&body)
+    }
+
+    /// Declaration and static use are different questions, and only the second
+    /// one is what Vulkan requires of a pipeline layout.
+    ///
+    /// This is the discriminator the `frag_declared_descriptor_unbound` firings
+    /// on macos-14, macos-15 and macos-26 were missing: the guard proved the
+    /// module declares the binding, which is not the bar, and the fail line read
+    /// identically for a real violation and for a variable nothing references.
+    #[test]
+    fn a_descriptor_is_used_only_when_something_references_it() {
+        let unused = module_with_descriptor(96, false);
+        let used = module_with_descriptor(96, true);
+
+        assert!(declares_descriptor(&unused, 96));
+        assert!(declares_descriptor(&used, 96));
+
+        assert_eq!(
+            descriptor_static_use(&unused, 96),
+            DescriptorUse::DeclaredUnused,
+            "OpEntryPoint's interface list and OpDecorate/OpName name the variable \
+             without referencing it; counting them makes every descriptor read as used"
+        );
+        assert!(!descriptor_static_use(&unused, 96).is_violation());
+
+        assert_eq!(descriptor_static_use(&used, 96), DescriptorUse::Used);
+        assert!(descriptor_static_use(&used, 96).is_violation());
+
+        assert_eq!(
+            descriptor_static_use(&used, 97),
+            DescriptorUse::NotDeclared,
+            "a binding no variable carries is not a use of anything"
+        );
+    }
+
+    /// Two variables on one binding is its own defect and must not be reported
+    /// as a layout violation, which would name the wrong thing.
+    #[test]
+    fn two_variables_on_one_binding_fail_closed_rather_than_pick_one() {
+        let mut body = vec![
+            (4u32 << 16) | OP_DECORATE as u32,
+            20,
+            DECORATION_BINDING,
+            5,
+            (4u32 << 16) | OP_VARIABLE as u32,
+            2,
+            20,
+            STORAGE_CLASS_UNIFORM_CONSTANT,
+            (4u32 << 16) | OP_DECORATE as u32,
+            21,
+            DECORATION_BINDING,
+            5,
+        ];
+        body.extend_from_slice(&[
+            (4u32 << 16) | OP_VARIABLE as u32,
+            2,
+            21,
+            STORAGE_CLASS_UNIFORM_CONSTANT,
+        ]);
+        let words = module_with(&body);
+        assert_eq!(descriptor_static_use(&words, 5), DescriptorUse::Ambiguous);
+        assert!(
+            !descriptor_static_use(&words, 5).is_violation(),
+            "an ambiguous binding is not evidence that the layout is missing a descriptor"
+        );
+    }
+
+    /// Every verdict carries its own name, so a census cannot collapse two.
+    #[test]
+    fn every_descriptor_use_has_its_own_slug() {
+        let all = [
+            DescriptorUse::NotDeclared,
+            DescriptorUse::DeclaredUnused,
+            DescriptorUse::Used,
+            DescriptorUse::Ambiguous,
+        ];
+        let slugs: std::collections::BTreeSet<&str> = all.iter().map(|u| u.slug()).collect();
+        assert_eq!(slugs.len(), all.len());
     }
 
     /// Build a minimal module: header, `OpCapability Shader`, `OpMemoryModel`,

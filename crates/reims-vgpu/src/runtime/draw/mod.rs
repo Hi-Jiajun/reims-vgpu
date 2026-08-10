@@ -461,14 +461,56 @@ fn vertex_buffer_needs_storage_binding(v_words: &[u32], idx: u32, is_stage_in: b
     !is_stage_in || crate::runtime::spirv_bind::buffer_access(v_words, idx).is_some()
 }
 
+/// Which directly-bound Metal resource class a [`FragUnbound`] names.
+///
+/// Carried as a type rather than as the `buf`/`tex`/`smp` prefix this used to be
+/// formatted into, because the class decides the SPIR-V binding relocation and a
+/// consumer that wants it back out of a string has to parse one. `Display` is the
+/// only place the prefix exists now.
+#[cfg(feature = "backend-vulkan")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FragUnboundClass {
+    Buffer,
+    Texture,
+    Sampler,
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl std::fmt::Display for FragUnboundClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Buffer => "buf",
+            Self::Texture => "tex",
+            Self::Sampler => "smp",
+        })
+    }
+}
+
+/// One directly-bound fragment resource the shader declares and the draw did not
+/// provide.
+#[cfg(feature = "backend-vulkan")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FragUnbound {
+    pub class: FragUnboundClass,
+    /// The Metal argument index, before any SPIR-V binding relocation.
+    pub metal_index: u32,
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl std::fmt::Display for FragUnbound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.class, self.metal_index)
+    }
+}
+
 /// One pass over the fragment reflection classifying the two bind gaps the render
 /// path cannot recover from. Returns `(unbound, embedded)`:
 /// - **`unbound`** — standard directly-bound kinds (`[[buffer(n)]]` /
 ///   `[[texture(n)]]` / `[[sampler(n)]]`) the shader DECLARES but the draw never
 ///   provided (per the caller's membership predicates). Each names a descriptor the
 ///   translated SPIR-V references yet the Vulkan engine leaves unbound — an
-///   undefined read that paints garbage. Entries are prefixed `buf`/`tex`/`smp` +
-///   index. `ColorInput` / `ThreadgroupBuffer` / `StorageImage` reach the shader by
+///   undefined read that paints garbage. `ColorInput` / `ThreadgroupBuffer` /
+///   `StorageImage` reach the shader by
 ///   other paths (validated by `census_reflection_wellformed`) and are skipped.
 /// - **`embedded`** — `EmbeddedArgBufferTexture` synthetic indices: textures
 ///   metal2vulkan flattened out of an `air.indirect_buffer` argument. The compute
@@ -485,15 +527,17 @@ fn frag_unbound_scan(
     has_tex: impl Fn(u32) -> bool,
     has_smp: impl Fn(u32) -> bool,
     tex_declared_in_module: impl Fn(u32) -> bool,
-) -> (Vec<String>, Vec<u32>) {
+) -> (Vec<FragUnbound>, Vec<u32>) {
     use metal2vulkan::reflect::ResourceKind;
-    let mut unbound: Vec<String> = Vec::new();
+    let mut unbound: Vec<FragUnbound> = Vec::new();
     let mut embedded: Vec<u32> = Vec::new();
     for rb in bindings {
         let (cls, provided) = match rb.kind {
-            ResourceKind::Buffer => ("buf", has_buf(rb.metal_index)),
-            ResourceKind::Texture | ResourceKind::TextureArray => ("tex", has_tex(rb.metal_index)),
-            ResourceKind::Sampler => ("smp", has_smp(rb.metal_index)),
+            ResourceKind::Buffer => (FragUnboundClass::Buffer, has_buf(rb.metal_index)),
+            ResourceKind::Texture | ResourceKind::TextureArray => {
+                (FragUnboundClass::Texture, has_tex(rb.metal_index))
+            }
+            ResourceKind::Sampler => (FragUnboundClass::Sampler, has_smp(rb.metal_index)),
             ResourceKind::EmbeddedArgBufferTexture => {
                 embedded.push(rb.metal_index);
                 continue;
@@ -517,9 +561,49 @@ fn frag_unbound_scan(
         {
             continue;
         }
-        unbound.push(format!("{cls}{}", rb.metal_index));
+        unbound.push(FragUnbound {
+            class: cls,
+            metal_index: rb.metal_index,
+        });
     }
     (unbound, embedded)
+}
+
+/// Ask the specification's own question of one reported gap: does the module
+/// *statically use* the descriptor its layout does not contain?
+///
+/// The scan above stops at declaration because that is what it can answer per
+/// draw for the price of a decoration walk. Declaration is not the bar: Vulkan
+/// requires the pipeline layout to contain a descriptor for every resource the
+/// shader references, and a declared-and-never-referenced variable is legal to
+/// omit. So this is the difference between a specification violation and a
+/// harmless reflection artefact, and until it is asked the fail line is naming a
+/// population it cannot tell apart.
+///
+/// Textures only, and the reason is the same one the declaration check gives:
+/// the caller can compute the SPIR-V binding for a texture, and the relocation
+/// for the other two classes is not this function's to guess. A buffer or a
+/// sampler gap answers [`spirv_bind::DescriptorUse::Used`] unexamined, which
+/// keeps them reported exactly as loudly as before rather than quietly
+/// downgrading a class nobody has measured.
+#[cfg(feature = "backend-vulkan")]
+fn frag_unbound_static_use(
+    gap: &FragUnbound,
+    f_words: &[u32],
+    separate_sampled: bool,
+) -> crate::runtime::spirv_bind::DescriptorUse {
+    use crate::runtime::spirv_bind::{
+        self, DescriptorUse, FRAG_SAMPLED_RESOURCE_BINDING_OFFSET, TEXTURE_BINDING_BASE,
+    };
+    if gap.class != FragUnboundClass::Texture {
+        return DescriptorUse::Used;
+    }
+    let base_off = if separate_sampled {
+        FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+    } else {
+        0
+    };
+    spirv_bind::descriptor_static_use(f_words, TEXTURE_BINDING_BASE + gap.metal_index + base_off)
 }
 
 #[cfg(feature = "backend-vulkan")]

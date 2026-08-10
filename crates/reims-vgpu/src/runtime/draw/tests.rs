@@ -249,7 +249,12 @@ fn cpu_portability_store_publishes_composite() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn frag_unbound_scan_reports_missing_standard_kinds_and_embedded_textures() {
+    use crate::runtime::draw::{FragUnbound, FragUnboundClass};
     use metal2vulkan::reflect::ResourceKind as K;
+    let gap = |class, metal_index| FragUnbound { class, metal_index };
+    let tex = |i| gap(FragUnboundClass::Texture, i);
+    let buf = |i| gap(FragUnboundClass::Buffer, i);
+    let smp = |i| gap(FragUnboundClass::Sampler, i);
     // Shader declares buffer 1+2, texture 3, sampler 0, an embedded arg-buffer
     // texture (index 9), plus other synthetic kinds (color input, threadgroup
     // buffer, storage image, constexpr sampler) that reach the shader by other
@@ -274,11 +279,11 @@ fn frag_unbound_scan_reports_missing_standard_kinds_and_embedded_textures() {
 
     // Drop the texture bind → exactly tex3 reported (synthetics stay silent).
     let (unbound, _) = frag_unbound_scan(&bindings, |i| [1, 2].contains(&i), |_| false, |i| i == 0, |_| true);
-    assert_eq!(unbound, vec!["tex3".to_string()]);
+    assert_eq!(unbound, vec![tex(3)]);
 
     // Drop buffer 2 + sampler 0 → both reported, ordered by declaration.
     let (unbound, _) = frag_unbound_scan(&bindings, |i| i == 1, |i| i == 3, |_| false, |_| true);
-    assert_eq!(unbound, vec!["buf2".to_string(), "smp0".to_string()]);
+    assert_eq!(unbound, vec![buf(2), smp(0)]);
 
     // A reflection with no embedded texture returns an empty embedded list.
     let standard_only = [rb(K::Buffer, 1), rb(K::Texture, 3), rb(K::Sampler, 0)];
@@ -304,7 +309,14 @@ fn frag_unbound_scan_reports_missing_standard_kinds_and_embedded_textures() {
     // ...but a buffer and a sampler are still reported, because the module
     // predicate is asked of textures only.
     let (unbound, _) = frag_unbound_scan(&bindings, |i| i == 1, |i| i == 3, |_| false, |_| false);
-    assert_eq!(unbound, vec!["buf2".to_string(), "smp0".to_string()]);
+    assert_eq!(unbound, vec![buf(2), smp(0)]);
+
+    // The class survives the scan as a type, so a consumer that needs the SPIR-V
+    // binding relocation does not have to parse it back out of a formatted
+    // string. `Display` is the only place the prefix exists.
+    assert_eq!(tex(3).to_string(), "tex3");
+    assert_eq!(buf(2).to_string(), "buf2");
+    assert_eq!(smp(0).to_string(), "smp0");
 }
 
 #[cfg(feature = "backend-vulkan")]

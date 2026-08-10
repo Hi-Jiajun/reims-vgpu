@@ -5361,6 +5361,20 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     )
                 },
             );
+            // Declaration is not the bar the specification sets — a layout must
+            // contain a descriptor for every resource the shader *statically
+            // uses*, and a declared-and-never-referenced variable is legal to
+            // omit. The scan above asks the weaker question because it is the
+            // cheap one and it runs per draw; this asks the real one, only for
+            // the handful the scan already flagged, and counts each answer so a
+            // boot says which population these firings belong to.
+            let uses: Vec<_> = unbound
+                .iter()
+                .map(|gap| (*gap, frag_unbound_static_use(gap, &f_words, separate_sampled)))
+                .collect();
+            for (_, use_) in &uses {
+                crate::runtime::drain::note_store_route(use_.slug());
+            }
             if !unbound.is_empty() {
                 // Cold path only: build the provided-index sets for the log detail.
                 let bufs: std::collections::BTreeSet<u32> =
@@ -5377,12 +5391,23 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     .filter(|s| s.sampler_ref != 0)
                     .map(|s| s.index)
                     .collect();
+                // Each gap carries its own verdict, because a line that says
+                // only "unbound=[tex0]" cannot be ranked: the same text is
+                // written for a specification violation and for a variable the
+                // module declares and never references.
+                let detail = uses
+                    .iter()
+                    .map(|(gap, use_)| format!("{gap}:{}", use_.slug()))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let violations = uses.iter().filter(|(_, u)| u.is_violation()).count();
                 crate::observe::fail(format!(
                     "shader_resource_declared_unbound reason=frag_declared_descriptor_unbound \
-                     pipe={} unbound=[{}] provided_buf={bufs:?} provided_tex={texs:?} \
+                     pipe={} unbound=[{detail}] violations={violations}/{} \
+                     provided_buf={bufs:?} provided_tex={texs:?} \
                      provided_smp={smps:?} {}x{}",
                     req.pipeline_ref,
-                    unbound.join(","),
+                    uses.len(),
                     w,
                     h
                 ));
