@@ -36,9 +36,37 @@
 # It does not judge the picture. It produces a screenshot per slot and a fail-log
 # slice per slot; comparing those against a known-good rail is the reading.
 #
+# # The crash census, and why a screenshot needed one
+#
+# On macos-26 the picture is only half the defect. Three guest processes —
+# `com.apple.dock.extra`, `Spotlight` and `iconservicesagent` — abort in a loop
+# every few seconds, all three on a byte-identical stack: Metal's
+# `+[MTLLoader sliceIDForDevice:legacyDriverVersion:airntDriverVersion:]`
+# asserting while RenderBox loads a precompiled binary archive for an icon.
+# A process that dies mid-composite leaves exactly the reported picture, so
+# "how many aborted, and on what" is the reading the screenshot cannot give.
+#
+# So this harvests the guest's own crash reports and ranks them by faulting
+# symbol. That is a *count*, which survives host contention, unlike anything
+# timed.
+#
+# **The path is the whole trick, and four earlier sessions concluded these
+# reports do not exist because of it.** `scp macos-vm:~/Library/...` does not
+# expand the `~` in a remote glob, so it matches nothing and fails exactly as a
+# missing file does; `/Library/Logs/DiagnosticReports` is the *system*
+# directory and holds only some of them. A remote path with no leading `/` is
+# already relative to the home directory, so `Library/Logs/...` is the spelling
+# that works, and both directories are polled.
+#
+# The census needs ssh, which the hover half deliberately does not — a guest
+# whose sshd never came up can still be photographed. So it is best-effort and
+# never fails the run: no ssh means the census says so and the screenshots still
+# stand. `--no-crash-census` skips it outright.
+#
 # Usage:
 #   scripts/dock-hover-probe/dock-hover-probe.sh [--slots N] [--rest SECONDS]
 #                                                [--keep DIR] [--qmp SOCK]
+#                                                [--no-crash-census] [--ssh HOST]
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -47,6 +75,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SLOTS=5
 REST=2.5
 KEEP=""
+CRASH_CENSUS=1
+SSH_HOST="${REIMS_GUEST_SSH:-macos-vm}"
 FAILLOG="${REIMS_FAIL_LOG:-/tmp/reims-vgpu-fail.log}"
 # The x86 boot's stable per-boot symlink. qmp.py defaults to the arm64 path, so
 # this must be passed explicitly here — the same override vibrancy-latch-probe
@@ -59,7 +89,9 @@ while [ $# -gt 0 ]; do
     --rest) REST="$2"; shift 2 ;;
     --keep) KEEP="$2"; shift 2 ;;
     --qmp) QMP_SOCK="$2"; shift 2 ;;
-    -h|--help) sed -n '2,38p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
+    --no-crash-census) CRASH_CENSUS=0; shift ;;
+    --ssh) SSH_HOST="$2"; shift 2 ;;
+    -h|--help) sed -n '2,65p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
     *) echo "dock-hover-probe: unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -163,4 +195,71 @@ if [ -s "$WORK/reasons.txt" ]; then
   sed 's/^/  /' "$WORK/reasons.txt"
 else
   say "no fail-channel refusal was emitted during any hover"
+fi
+
+# --- guest crash census -----------------------------------------------------
+# Best-effort by construction: this half needs ssh and the hover half does not,
+# so every failure below reports and returns rather than failing the run.
+if [ "$CRASH_CENSUS" -eq 1 ]; then
+  IPS="$WORK/ips"
+  mkdir -p "$IPS"
+  if ! timeout 20 ssh -o BatchMode=yes "$SSH_HOST" true >/dev/null 2>&1; then
+    say "crash census skipped: no ssh to $SSH_HOST (the screenshots above still stand)"
+  else
+    # Both directories: the per-user one holds the icon-renderer aborts, the
+    # system one holds a different subset. Neither alone is the population.
+    timeout 90 scp -o BatchMode=yes \
+      "$SSH_HOST:Library/Logs/DiagnosticReports/*.ips" "$IPS/" >/dev/null 2>&1
+    timeout 90 scp -o BatchMode=yes \
+      "$SSH_HOST:/Library/Logs/DiagnosticReports/*.ips" "$IPS/" >/dev/null 2>&1
+    n=$(find "$IPS" -name '*.ips' 2>/dev/null | wc -l)
+    if [ "$n" -eq 0 ]; then
+      say "crash census: no .ips on the guest — no process aborted this boot"
+    else
+      # An .ips is a one-line JSON header followed by a JSON body. Rank by
+      # (process, faulting symbol): the symbol is what says whether several
+      # crashing processes are one defect or several.
+      python3 - "$IPS" > "$WORK/crashes.txt" 2>/dev/null <<'PY'
+import json, pathlib, sys, collections
+tally = collections.Counter()
+for p in sorted(pathlib.Path(sys.argv[1]).glob("*.ips")):
+    try:
+        body = json.loads(p.read_text().split("\n", 1)[1])
+        thread = body["threads"][body["faultingThread"]]
+        images = body["usedImages"]
+        top = "?"
+        # The first frame below the *whole* raise path is the one that names the
+        # defect. That path is two layers, and stopping after the first leaves
+        # every abort in the tree reading as the same `MTLReportFailure`: libc
+        # raises it (`abort`/`__assert_rtn`) and the framework that failed
+        # reports it (`MTLReportFailure`). Both are identical for every assert
+        # and neither says which check refused.
+        raise_images = (
+            "libsystem_kernel.dylib", "libsystem_pthread.dylib", "libsystem_c.dylib",
+        )
+        raise_symbols = ("MTLReportFailure", "_MTLMessageContextEnd", "__assert_rtn")
+        for f in thread["frames"]:
+            sym = f.get("symbol", "")
+            image = images[f["imageIndex"]].get("name") or "?"
+            if not sym or image in raise_images:
+                continue
+            if any(sym.startswith(p) for p in raise_symbols):
+                continue
+            top = f"{image} {sym}"
+            break
+        tally[(body.get("procName", "?"), body.get("termination", {}).get("indicator", "?"), top)] += 1
+    except Exception:
+        tally[(p.name, "unparsed", "?")] += 1
+for (proc, how, top), n in tally.most_common():
+    print(f"{n:4d}  {proc}  [{how}]  {top}")
+PY
+      say "crash census: $n report(s) on the guest, by (process, faulting symbol):"
+      if [ -s "$WORK/crashes.txt" ]; then
+        sed 's/^/  /' "$WORK/crashes.txt"
+      else
+        say "  (reports present but none parsed — see $IPS)"
+      fi
+      say "reports kept in $IPS — Apple's data, never commit them"
+    fi
+  fi
 fi
