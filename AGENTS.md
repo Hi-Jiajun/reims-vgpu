@@ -271,13 +271,24 @@ guest work in four ways — an entry evicted, an entry never recorded, a run rea
 **bitmask standing in for a set**, where `mask |= 1u32 << index` bounds the membership to 32 with
 nothing declared anywhere and a shift past the width *wraps* in release rather than failing. A fifth
 has no number at all: **a slot holding one decoded record**, where `acc.x = Some(rec)` in a decode
-arm is a capacity of one and the second record the guest sends drops the first.
+arm is a capacity of one and the second record the guest sends drops the first. A sixth is **an enum
+narrowed to its ordinal at the producer**: write `selector as u32` and every consumer downstream must
+match integers, which `rustc` cannot check for coverage, so a table that is silently one member short
+compiles and reads as complete. That is not hypothetical — it cost the arm64 pathway every `R32Uint`
+storage bind, against a selector the contract declared and the x86 pathway ran.
 
 None of these is found reliably by looking for them, which is why the scanners that used to be
 listed here are gone. Make them unrepresentable instead: put the bound in the type that carries the
 collection, give the mask a width pinned by a `const` assertion against the table it indexes, and
 where a latch must not be overwritten, make the second write a typed refusal rather than an
 assignment. Then a new site cannot be added without meeting the rule, and nothing has to go hunting.
+
+**Where a selector, opcode or class tag is this crate's own vocabulary rather than a guest value,
+carry the type and not the integer.** A guest value is arbitrary and must be parsed once, at the
+boundary, into something total; after that boundary the ordinal has no job left. Keeping it costs the
+exhaustiveness check on every consumer, and buys nothing a `Display` impl or an `as u32` at the one
+log site would not. This is the same rule as "derive, don't duplicate and compare", one step earlier:
+the second spelling you avoid is the integer.
 
 Prefer an instrument over a reading, where an instrument that is not a source grep exists. Reading
 an audit against itself cannot see an opcode that is simply the wrong number, a length four bytes
