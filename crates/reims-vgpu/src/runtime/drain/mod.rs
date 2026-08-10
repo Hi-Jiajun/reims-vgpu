@@ -3255,12 +3255,11 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // mapped twice or unmapped without a map is a disagreement the guest's
         // own teardown assertion will eventually find.
         //
-        // The GVA here is the one the guest's `allocate`/`deallocate` receive.
-        // **The length is not** — the packet's length field and the argument
-        // those take come off two different objects, so an interval built from
-        // this length pairs correctly against itself and is not the page-table
-        // range. That is why `observe_unmap_coverage` below reads the tree
-        // rather than trusting this. Observation only; nothing reads the
+        // Both fields are the values the guest's own `allocate`/`deallocate`
+        // receive: its length getter forwards to the same call this packet's
+        // length field is built from, and the address is one getter used by
+        // both. So these intervals are the page-table ranges and not merely
+        // consistent with themselves. Observation only; nothing reads the
         // verdict. See `runtime::map_audit`.
         {
             let page_size = 1u64 << state.page_shift;
