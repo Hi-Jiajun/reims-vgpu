@@ -493,6 +493,40 @@ holds its timestamp lock, so every later `sudo` — including `sudo true` — qu
 A host-side `timeout` does not kill the remote process, so root steps in particular must be issued
 once and never retried after one times out.
 
+### Drive a probe from the host, not from inside the guest
+
+**macOS 26 has no command line developer tools and no working `screencapture`.** A probe that
+compiles C on the guest (`window-drag-probe`'s `drag.c`) cannot build there at all, and
+`scripts/lib/guest-display.sh`'s `guest_display_size` returns nothing because `screencapture` fails
+with "could not create image from display". Both `osascript` desktop-bounds routes are empty too — a
+fresh ssh session holds no Apple Events consent. So a guest-side probe does not silently degrade on
+that rail; it does not run, and it reports a *build* or *permission* failure that reads like noise.
+
+Reach for the host side first. It works identically on all six rails and needs no guest tooling, no
+consent and no permission — and no ssh, which matters on a rail that panics during a third of driven
+boots:
+
+| want | use |
+|---|---|
+| pointer / keyboard | `scripts/qmp/qmp.py` — `move`, `click`, `drag`, `key`, `type`, `wheel` (QMP `input-send-event` to the machine's usb-tablet/usb-kbd) |
+| guest display size | `scripts/qmp/qmp.py size` |
+| a screenshot | the host helper (`screenshot-when-kde-plasma-host`), **never** QMP `shot` |
+
+QMP `shot`/`screendump` stays disabled on purpose: with the host-owned window and QEMU at
+`-display none` the frame never crosses into QEMU's address space, so a screendump shows something
+other than what the window shows. Sizing is exempt because the DisplaySurface still carries the right
+dimensions, which is all the input helpers ever used it for.
+
+Do not add a guest-side fallback "for the rails that have clang". A second path that works on five of
+six rails rots, and the rail it skips is the one with the open defects. `dock-hover-probe`'s
+`hover.c` was deleted rather than kept for exactly this reason. Where a probe genuinely needs guest
+state — a process list, a log — ssh remains the only route, but bound it with `timeout` and never
+read its absence as a device result.
+
+**sshd answers well before the desktop composites.** A probe started when port 2222 opens
+photographs the Apple logo and the boot progress bar. Wait for `pgrep -x Dock` over ssh, then give
+the dock and wallpaper a few seconds to settle.
+
 ### `probe exit=0` is not a clean boot — grep the boot's own stdout for a panic
 
 A guest kernel panic can land **after** the probe has finished and reported success, so the two
