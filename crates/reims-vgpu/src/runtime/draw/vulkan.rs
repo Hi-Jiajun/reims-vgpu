@@ -3743,7 +3743,19 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     // The reads below walk raw task GVAs and cannot name a mapping, so every
     // surface still owed a frame is paid first — see
     // `runtime::writeback_debt::pay_all` for why the disjointness closure below
-    // cannot narrow this.
+    // cannot narrow this, and `note_unnamed_reach` for the sampled census that
+    // says how much of that payment is owed. The census runs first, while the
+    // ledger still holds what the payment is about to clear, and it is handed the
+    // same walk the disjointness test below uses so both are one rule.
+    {
+        let (tasks, page_shift) = (&state.tasks, state.page_shift);
+        let page_size = state.page_size();
+        crate::runtime::writeback_debt::note_unnamed_reach(state, || {
+            let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
+            let gpas = gva_mem::task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift);
+            (gpas.len() as u64 == want).then_some(gpas)
+        });
+    }
     crate::runtime::writeback_debt::pay_all(state, host);
     let (tasks, page_shift) = (&state.tasks, state.page_shift);
     let page_size = state.page_size();

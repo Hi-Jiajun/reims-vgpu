@@ -268,9 +268,8 @@ pub fn pay_for_mapping<M: HostMemory + HostOps>(
 ///
 /// Narrowing this would need a page-extent hint held per debt, and a hint is the
 /// beginning of holding resolved memory — which is what the module doc says this
-/// rail must not do. `wbdebt_paid_all` is the counter that says whether it is
-/// worth revisiting: it is the number of times an unnameable reader paid for
-/// every surface, and it is per-window like every other `store_routes` counter.
+/// rail must not do. [`note_unnamed_reach`] is the instrument that says whether
+/// it would be worth it; read its doc before building one.
 pub fn pay_all<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
     if state.pending_writebacks.is_empty() {
         return;
@@ -280,6 +279,74 @@ pub fn pay_all<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
             continue;
         };
         pay(state, host, mapping_id, debt, "wbdebt_paid_all");
+    }
+}
+
+/// One call in [`REACH_SAMPLE`] does the walk; the rest cost one modulo.
+///
+/// The walk is ~2 000 page-table descents for a 1080p span and the site that
+/// dominates [`pay_all`] runs about 1 700 times a second, so measuring every call
+/// would cost more than the rail saves and would be measuring the instrument.
+/// A census wants a rate and not a total, and a rate converges on a 1-in-64
+/// sample of a population this size: ~26 walks a second against ~1 700 calls.
+const REACH_SAMPLE: u64 = 64;
+
+/// Calls to [`note_unnamed_reach`], for the sample.
+static REACH_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Does an unnameable reader that pays every debt actually read the pages it is
+/// paying for?
+///
+/// # The question, and why it decides the rail's ceiling
+///
+/// The premise the lazy rail was built on read the settle census wrong. Those
+/// counters count settles that **waited**, and on a driven macos-13
+/// sustained-animation boot they total six a second — which is what "840 writes
+/// consumed six times" was derived from. The *calls* are a different population:
+/// `draw::vulkan::load_linear_guest_memoized` alone reaches its settle about
+/// 1 700 times a second, reads the guest pages every one of them, and cannot name
+/// a mapping, so it pays every owed frame. That is why the first driven on-arm
+/// boot coalesced 130 Stores of 577 rather than the ~95 % the premise predicted.
+///
+/// But paying is only *owed* where the read and the surface share pages. A
+/// compositor sampling a glyph atlas while three windows owe frames pays three
+/// copies it will not look at. This counts which it is:
+///
+/// * `wbdebt_reach_overlap` — the sampled read touched a page some debt's
+///   mapping holds. The payment was owed and no narrowing can remove it.
+/// * `wbdebt_reach_disjoint` — it did not. The payment was pure waste, and the
+///   ratio of these two is the prize a page-extent hint per debt would collect.
+/// * `wbdebt_reach_unnamed` — the reader's own walk came back short, so nothing
+///   could be ruled out. A narrowing must treat this as overlap.
+///
+/// `pages` is the reader's own closure, the same one it hands the disjointness
+/// test, so both ends of the comparison stay one rule. It runs only on a sampled
+/// call and only while something is owed.
+pub fn note_unnamed_reach(state: &DeviceState, pages: impl FnOnce() -> Option<Vec<u64>>) {
+    if state.pending_writebacks.is_empty() {
+        return;
+    }
+    let n = REACH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !n.is_multiple_of(REACH_SAMPLE) {
+        return;
+    }
+    let Some(read) = pages() else {
+        crate::runtime::drain::note_store_route("wbdebt_reach_unnamed");
+        return;
+    };
+    let read: std::collections::BTreeSet<u64> = read.into_iter().collect();
+    let overlap = state
+        .pending_writebacks
+        .mappings_by_age()
+        .into_iter()
+        .any(|mapping_id| {
+            state
+                .mapping_reach_pages(mapping_id)
+                .is_some_and(|owed| owed.iter().any(|page| read.contains(page)))
+        });
+    match overlap {
+        true => crate::runtime::drain::note_store_route("wbdebt_reach_overlap"),
+        false => crate::runtime::drain::note_store_route("wbdebt_reach_disjoint"),
     }
 }
 
