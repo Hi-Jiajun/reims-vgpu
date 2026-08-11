@@ -667,9 +667,23 @@ and a change can help one and hurt the other.
 **Classify the boot before comparing two of them.** A macos-13 boot presents either ~60 frames a
 second or ~95-117 for its whole life, tightly, with nothing in between, and the guest picks per boot.
 `present_hz`, `draws/s` and `fresh` are all halved on a slow boot, so none of them is comparable
-across the two; `us/draw` and anything else normalised per draw is. Mixing boots from both
-populations is how a real 17 % effect ends up buried under a 2x artifact. `present_hz` alone is the
-discriminator — the gap between 61 and 94 is empty on every boot on record.
+across the two. Mixing boots from both populations is how a real 17 % effect ends up buried under a
+2x artifact. `present_hz` alone is the discriminator — the gap between 61 and 94 is empty on every
+boot on record.
+
+**`us/draw` is not comparable across the populations either, and it reads like it should be.** A slow
+boot asks the GPU for half the work, the governor clocks down, and every GPU microsecond gets more
+expensive: over 16 boots with `nvidia-smi` sampled alongside, slow boots read **10.3 % higher
+`us/draw`** than fast ones on one binary (15.68 against 14.22), and `us/draw` against the driven-window
+clock correlates at r=-0.89. So an arm that happens to draw more slow boots reads slower per draw for
+a reason that has nothing to do with the change. Score per-draw numbers within the fast population
+only.
+
+Within that population `us/draw` has a **coefficient of variation of 3.4 %** and a 12 % max-to-min
+spread over twelve boots, so a per-draw change under ~5 % needs several boots an arm and a single
+pair proves nothing. Do not try to correct for the clock arithmetically: dividing by the SM clock
+makes the spread *worse* (12 % to 22 %), because the gather is bandwidth-bound and the memory clock
+swings 405-14001 MHz independently.
 
 **A run's slow rate is a Bernoulli draw, and its base rate drifts.** Over 40 interleaved boots it was
 12 slow in 40; two runs later the same binary read 7 in 12, twice. So a slow rate is comparable only
