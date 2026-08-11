@@ -5239,6 +5239,27 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             })
             .map(|a| a.buffer_index)
             .collect();
+        // Every buffer index the pipeline's attribute list names, gathered once
+        // rather than rescanned per bind.
+        //
+        // Not to be confused with `stage_in_bufs` further down, which is a
+        // different set built for a different job: that one is filled during the
+        // attribute walk and holds only the indices that actually carried bytes,
+        // and it decides storage binding. This one is every index the list
+        // mentions, and it only ever *refuses* a neutral substitution.
+        //
+        // Unfiltered on purpose. An attribute with `format == 0` or a zero
+        // stride is skipped by the walk below and reads no bytes, but excluding
+        // those here would make this set depend on the same two fields the walk
+        // re-derives through `bind_attribute_stride`, and the two would drift
+        // apart the first time that derivation changed. Listing an index the
+        // walk turns out to skip costs one gather and never correctness, which
+        // is the direction this set is allowed to be wrong in.
+        let attribute_bufs: std::collections::BTreeSet<u32> = pd
+            .vertex_attributes
+            .iter()
+            .map(|a| a.buffer_index)
+            .collect();
         let mut vtx_storage: Vec<(u32, crate::backend::vulkan::engine::BufferContent)> = Vec::new();
         // The three `bind_phase` spans below divide `chain_phase`'s `binds_us`,
         // which is this draw path's largest column and covered three costs with
@@ -5272,10 +5293,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // first is what `Unused` is about, so an index the pipeline's
             // attribute list names keeps its guest bytes whatever reflection
             // says about the argument.
-            let feeds_stage_in = pd
-                .vertex_attributes
-                .iter()
-                .any(|a| a.buffer_index == b.index);
+            let feeds_stage_in = attribute_bufs.contains(&b.index);
             let content = if crate::runtime::spirv_bind::may_serve_neutral(access, feeds_stage_in) {
                 crate::runtime::bind_phase::note_neutral_served();
                 crate::backend::vulkan::engine::BufferContent::Bytes(
