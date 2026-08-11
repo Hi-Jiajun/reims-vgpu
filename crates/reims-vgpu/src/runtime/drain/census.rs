@@ -50,6 +50,35 @@ pub(crate) const VBL_NOT_ENABLED: usize = 3;
 /// One report per this many deliveries — about 8 s at the grid rate.
 const VBL_REPORT_EVERY: u64 = 1024;
 
+/// One report per this many deliveries, for an arm's first
+/// [`VBL_EARLY_UNTIL`] — about half a second at the grid rate.
+///
+/// # The window this exists to make visible
+///
+/// A macOS 13 guest latches its display link at either ~60 Hz or ~120 Hz within
+/// the first seconds of the display coming up, and then holds it for the life of
+/// the boot. Which one it picks varies boot to boot on a byte-identical device,
+/// and it is worth a **factor of two** in presented frames, draws and every
+/// per-second reading taken off them — far more than any rail this device has
+/// been tuned on.
+///
+/// At [`VBL_REPORT_EVERY`] the first line of a boot lands after about eleven
+/// seconds, which is long after the guest has decided. So the cadence during the
+/// window that decides it was simply not observable, and no amount of reading
+/// later lines could recover it. Sixteen finer lines at the head of each arm cost
+/// nothing and cover the first ~9 s.
+///
+/// This is an instrument, not a rail: nothing branches on it.
+const VBL_REPORT_EARLY: u64 = 64;
+
+/// How far into an arm's count the finer [`VBL_REPORT_EARLY`] cadence runs.
+///
+/// Equal to [`VBL_REPORT_EVERY`] so the two cadences meet exactly at the
+/// boundary: the last early report and the first ordinary one are the same
+/// event, and no window is ever measured across a change of step.
+const VBL_EARLY_UNTIL: u64 = VBL_REPORT_EVERY;
+const _: () = assert!(VBL_EARLY_UNTIL.is_multiple_of(VBL_REPORT_EARLY));
+
 /// Width of [`VblCensus::arms`], derived from the last arm index so a new arm
 /// cannot be added without the array growing with it.
 const VBL_ARMS: usize = VBL_NOT_ENABLED + 1;
@@ -104,17 +133,26 @@ impl VblCensus {
         use std::sync::atomic::Ordering::Relaxed;
         let n = self.arms[arm].fetch_add(1, Relaxed) + 1;
         let reports = arm == VBL_DELIVERED || arm == VBL_NOT_ENABLED;
-        if !reports || !n.is_multiple_of(VBL_REPORT_EVERY) {
+        // The head of each arm reports finely, because that is the window in
+        // which the guest picks the display-link rate it then keeps; see
+        // `VBL_REPORT_EARLY`. The two cadences meet at `VBL_EARLY_UNTIL`, so
+        // `step` is also exactly how many events this window covers.
+        let step = if n <= VBL_EARLY_UNTIL {
+            VBL_REPORT_EARLY
+        } else {
+            VBL_REPORT_EVERY
+        };
+        if !reports || !n.is_multiple_of(step) {
             return None;
         }
         let since_ms = now_ms.saturating_sub(self.last_report_ms[arm].swap(now_ms, Relaxed));
         // Window rate, not a lifetime average: the lifetime figure carries the
         // pre-online stretch forever and would read low long after the display
-        // came up. The count in the window is `VBL_REPORT_EVERY` by construction
-        // — this line exists because this arm's own count just reached a
-        // multiple of it — so the only variable is how long that took.
+        // came up. The count in the window is `step` by construction — this line
+        // exists because this arm's own count just reached a multiple of it — so
+        // the only variable is how long that took.
         let hz = if since_ms > 0 {
-            (VBL_REPORT_EVERY * 1000) as f64 / since_ms as f64
+            (step * 1000) as f64 / since_ms as f64
         } else {
             0.0
         };
