@@ -58,8 +58,15 @@ while [ $SECONDS -lt $end ]; do
   for q in $QUERIES; do
     [ $SECONDS -lt $end ] || break
     round=$(( round + 1 ))
-    # cmd+space. `meta_l` is Command in QEMU's qcode names, which is not free
-    # choice — see `scripts/qmp/qmp.py`'s table.
+    # cmd+space *toggles*, so a round that starts with the window already open
+    # closes it instead and types into whatever has focus. Escaping first makes
+    # the starting state the same every round whatever the last one left behind
+    # — without it, one round in three photographed a bare desktop.
+    #
+    # `meta_l` is Command in QEMU's qcode names, which is not free choice — see
+    # `scripts/qmp/qmp.py`'s table.
+    "$Q" key esc >/dev/null 2>&1
+    sleep 1
     "$Q" key meta_l+spc >/dev/null 2>&1
     sleep 2
     # Typed a character at a time by the helper, which is what makes the window
