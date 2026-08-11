@@ -169,6 +169,79 @@ use crate::runtime::objects;
 /// bounds pointers rather than shader bytes.
 pub const MEMO_CAPACITY: usize = 1024;
 
+/// The two buffer-index sets every draw of one pipeline used to rebuild from
+/// that pipeline's attribute list.
+///
+/// Both are functions of `RenderPipelineDescriptor::vertex_attributes` alone —
+/// no field of the draw request reaches either — so they belong to the
+/// resolution and not to the draw, and building them per draw was two heap
+/// allocations and two tree builds on the path `chain_phase` reports as
+/// `binds_us`, this draw path's largest column.
+///
+/// Sorted slices rather than `BTreeSet`s. The population is the attribute list's
+/// distinct buffer indices, which a real pipeline runs in the single digits, and
+/// at that size a sorted `binary_search` is a cache line and a compare where a
+/// tree is a pointer chase per level. The sort also makes the two sets
+/// canonical, so an equality between two resolutions means what it reads as.
+pub struct VertexBindPlan {
+    /// Buffer indices feeding at least one Constant-step attribute. A bind of
+    /// one of these may not take the zero-copy rail: the engine prepends a CPU
+    /// base-instance prefix to those bytes at prepare time.
+    constant_step: Box<[u32]>,
+    /// Every buffer index the attribute list names, whatever the attribute's
+    /// format or stride turns out to be.
+    ///
+    /// Unfiltered on purpose, and this is the one place that reasoning now
+    /// lives. An attribute with `format == 0` or a zero stride is skipped by the
+    /// draw's attribute walk and reads no bytes, but excluding those here would
+    /// make this set depend on the same two fields the walk re-derives through
+    /// `bind_attribute_stride`, and the two would drift apart the first time
+    /// that derivation changed. Listing an index the walk turns out to skip
+    /// costs one gather and never correctness, which is the direction this set
+    /// is allowed to be wrong in.
+    attribute: Box<[u32]>,
+}
+
+impl VertexBindPlan {
+    fn build(desc: &RenderPipelineDescriptor) -> Self {
+        let mut constant_step: Vec<u32> = desc
+            .vertex_attributes
+            .iter()
+            .filter(|a| {
+                a.format != 0
+                    && a.stride != 0
+                    && crate::backend::vulkan::translate::vertex::step_function(a.declared_step_function)
+                        == Ok(crate::backend::vulkan::engine::VertexStepFunction::Constant)
+            })
+            .map(|a| a.buffer_index)
+            .collect();
+        constant_step.sort_unstable();
+        constant_step.dedup();
+        let mut attribute: Vec<u32> = desc
+            .vertex_attributes
+            .iter()
+            .map(|a| a.buffer_index)
+            .collect();
+        attribute.sort_unstable();
+        attribute.dedup();
+        Self {
+            constant_step: constant_step.into_boxed_slice(),
+            attribute: attribute.into_boxed_slice(),
+        }
+    }
+
+    /// Whether a bind of this buffer index feeds a Constant-step attribute, and
+    /// so must stay on the CPU staging read.
+    pub fn is_constant_step(&self, buffer_index: u32) -> bool {
+        self.constant_step.binary_search(&buffer_index).is_ok()
+    }
+
+    /// Whether the pipeline's attribute list names this buffer index at all.
+    pub fn feeds_stage_in(&self, buffer_index: u32) -> bool {
+        self.attribute.binary_search(&buffer_index).is_ok()
+    }
+}
+
 /// Everything a draw chain needs from its pipeline ref, resolved once.
 ///
 /// Every field is an `Arc` because the whole point is that a hit copies nothing:
@@ -180,6 +253,8 @@ pub struct ResolvedRenderPipeline {
     pub desc: Arc<RenderPipelineDescriptor>,
     pub vertex: Arc<CachedShader>,
     pub fragment: Arc<CachedShader>,
+    /// Derived from `desc` and memoized with it — see [`VertexBindPlan`].
+    pub bind_plan: Arc<VertexBindPlan>,
 }
 
 /// The three object-list entries a resolution depends on, in the order they are
@@ -574,16 +649,19 @@ fn resolve_uncached<M: HostMemory + HostOps>(
         pipeline_ref,
         reason,
     })?;
+    let bind_plan = Arc::new(VertexBindPlan::build(&desc));
     Ok(ResolvedRenderPipeline {
         desc: Arc::new(desc),
         vertex,
         fragment,
+        bind_plan,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::decode::resource::VertexAttribute;
 
     fn entry(gva: u64, len: u32, ot: u8) -> ListObjectEntry {
         ListObjectEntry {
@@ -667,5 +745,67 @@ mod tests {
             ot[slot].object_type += 1;
             assert_ne!(base, ot, "slot {slot} object_type");
         }
+    }
+
+    /// The two sets [`VertexBindPlan`] carries used to be rebuilt inside the
+    /// draw path from the same attribute list, and this pins the classification
+    /// they replaced rather than the shape of the code that does it.
+    ///
+    /// The interesting rows are the ones the old inline filter got right by
+    /// construction and a rewrite can get wrong: a Constant-step attribute whose
+    /// `format` is zero, and one whose `stride` is zero, are **not** constant
+    /// step for this purpose — the draw's attribute walk skips them, so a bind
+    /// of their buffer must stay eligible for the zero-copy rail — while both
+    /// still count as named by the attribute list, because that set is
+    /// deliberately unfiltered.
+    #[test]
+    fn the_bind_plan_separates_constant_step_from_merely_named() {
+        const CONSTANT: Option<u32> = Some(0);
+        const PER_INSTANCE: Option<u32> = Some(2);
+        let attr = |buffer_index, format, stride, declared_step_function| VertexAttribute {
+            location: 0,
+            format,
+            offset: 0,
+            buffer_index,
+            stride,
+            declared_step_function,
+            declared_step_rate: None,
+        };
+        let desc = RenderPipelineDescriptor {
+            vertex_attributes: vec![
+                attr(1, 0x21, 16, CONSTANT),      // constant, and it counts
+                attr(2, 0x21, 16, PER_INSTANCE),  // named, not constant
+                attr(3, 0, 16, CONSTANT),         // format 0: the walk skips it
+                attr(4, 0x21, 0, CONSTANT),       // stride 0: the walk skips it
+                attr(1, 0x21, 32, PER_INSTANCE),  // a second attribute on buffer 1
+                attr(5, 0x21, 16, None),          // undeclared step is per-vertex
+            ],
+            ..Default::default()
+        };
+        let plan = VertexBindPlan::build(&desc);
+
+        assert!(plan.is_constant_step(1), "declared Constant with real bytes");
+        for index in [2, 3, 4, 5] {
+            assert!(
+                !plan.is_constant_step(index),
+                "buffer {index} must keep the zero-copy rail"
+            );
+        }
+        // Unfiltered: every index the list mentions, skipped by the walk or not.
+        for index in 1..=5 {
+            assert!(plan.feeds_stage_in(index), "buffer {index} is named");
+        }
+        assert!(!plan.feeds_stage_in(0), "an index the list never names");
+        assert!(!plan.feeds_stage_in(6));
+    }
+
+    /// A pipeline with no vertex block answers "no" to both questions rather
+    /// than panicking on an empty search, which is the shape every fullscreen
+    /// pass that builds its vertices in the shader takes.
+    #[test]
+    fn an_empty_attribute_list_names_nothing() {
+        let plan = VertexBindPlan::build(&RenderPipelineDescriptor::default());
+        assert!(!plan.is_constant_step(0));
+        assert!(!plan.feeds_stage_in(0));
     }
 }

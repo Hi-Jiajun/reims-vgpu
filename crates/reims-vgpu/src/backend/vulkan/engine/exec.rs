@@ -3779,9 +3779,17 @@ pub(crate) unsafe fn execute_draw_inner(
     // submitted in one `vkQueueSubmit` with a single compute→vertex barrier at
     // the end of `pre` standing in for the ~1.3 per-draw barriers this device
     // records today. That needs no lookahead — the two are recorded in parallel,
-    // not in order — which is what makes it reachable at all. It is a large
-    // change to the ring, and what the pass pair it removes is worth is priced
-    // first by [`crate::env::PASS_CHURN`].
+    // not in order — which is what makes it reachable at all.
+    //
+    // **It is not worth building on this host, and that is measured rather than
+    // guessed.** [`crate::env::PASS_CHURN`] priced the pass pair over twenty
+    // interleaved boots at 0.42 us of a ~13.3 us draw, disjoint on the per-draw
+    // column and invisible on the frame rate. 82 % of 0.42 us is ~2.6 % of
+    // per-draw CPU and ~1.5 % of frames, against a rewrite of the ring's
+    // submission and a deferred pass end whose failure mode is a render-pass
+    // scope violation on a host with no validation layer. Read that switch's doc
+    // before reopening this; the arithmetic is all there, and so is the reason
+    // the answer is different on a tiler.
     //
     // The three obstacles that would remain cannot follow the gathers into
     // `pre`: a snapshot copies the target an earlier draw of this same batch
