@@ -860,6 +860,32 @@ impl StampWait {
 /// 14.90; the guest paces this rail and four CPU wins in a row have moved it by
 /// nothing.
 ///
+/// # It holds on all six guest drivers
+///
+/// The measurement above is macos-13 alone, and *when a completion becomes
+/// visible* is exactly the class that can be fine on one guest driver and stall
+/// another — failing as a frozen desktop rather than as a decline, which no
+/// counter reports. So all six x86 rails were swept:
+///
+/// ```text
+/// macos-11  dev=1 ssh=1 dock=1 sd=184 panic=0
+/// macos-12  dev=1 ssh=1 dock=1 sd=147 panic=0
+/// macos-13  dev=1 ssh=1 dock=1 sd=131 panic=0
+/// macos-14  dev=1 ssh=1 dock=1 sd=215 panic=0
+/// macos-15  dev=1 ssh=1 dock=1 sd=281 panic=0
+/// macos-26  dev=1 ssh=1 dock=1 sd=126 panic=0
+/// ```
+///
+/// `sd` is the field that answers the question — host-window standard deviation,
+/// ~38 for the boot screen and >100 for a composited desktop. Every rail cleared
+/// 126, so every one of them put a picture up rather than sitting on a stamp it
+/// was still waiting for. `stamp_write_forward` runs 345-1815 a boot across the
+/// six, so the coalesced write is landing everywhere and not only where it was
+/// tuned.
+///
+/// These are undriven boots: they prove the desktop composites on each driver,
+/// not that the saving reproduces there. Only macos-13 has been driven.
+///
 /// **One thing this was expected to do and does not.** `batch_flushes` is
 /// unchanged (0.987, 1.90 draws a flush against 1.85). The reasoning was that
 /// `engine::write_stamp_after_guest_writes` appends to the open batch and then
