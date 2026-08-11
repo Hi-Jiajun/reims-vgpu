@@ -359,8 +359,33 @@ fn read_identity<M: HostMemory + HostOps>(
 ///
 /// `preflight_memo_stale` being **0** across 1.4 million asks is the reading
 /// that matters for the identity check: on a steady desktop the three entries
-/// never move, which is what the module doc's argument predicts and what makes a
-/// non-zero reading worth investigating rather than shrugging at.
+/// never move, which is what the module doc's argument predicts.
+///
+/// # And on the other five drivers, where it is *not* zero
+///
+/// One undriven boot of each x86 rail, which catches the cold memo and the
+/// pipeline churn of app launch rather than a settled desktop:
+///
+/// ```text
+/// macos-11  ready=2353  absent= 617  stale= 0     79 % hit
+/// macos-12  ready=1613  absent= 951  stale= 0     63 %
+/// macos-13  ready= 930  absent= 919  stale= 0     50 %
+/// macos-14  ready= 906  absent=1137  stale=19     44 %
+/// macos-15  ready= 838  absent=1610  stale= 0     34 %
+/// macos-26  ready=5415  absent=2146  stale=23     72 %
+/// ```
+///
+/// Two things worth keeping. First, **the 99.83 % above is a steady-state
+/// number, not a universal one** — a cold memo during boot hits 34-79 %, which
+/// is the population this optimisation does not serve and does not need to.
+///
+/// Second, and more useful: **`stale` is not always zero.** macos-14 and
+/// macos-26 replace pipelines during boot and the identity check catches it,
+/// falling back to the full preflight exactly as designed. That is the reading
+/// that says the check is **not vacuous** — a comparison that returned zero on
+/// every rail under every condition would be indistinguishable from one that
+/// could never fire, and this one demonstrably fires on real guest behaviour and
+/// then declines the entry.
 ///
 /// One artifact to know: `sum vs preflight_us` drops to ~0.41, because the three
 /// timed sub-spans now cover almost nothing while this check — which is inside
