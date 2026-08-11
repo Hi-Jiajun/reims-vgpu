@@ -35,6 +35,34 @@
 /// every guest window takes it and the copying rails run zero times, so a green
 /// boot says nothing about them — and they are the only rails on a host without
 /// the extension, and the rails a discrete GPU takes regardless.
+///
+/// # What the copying rails cost, driven macos-13, two boots each arm
+///
+/// One binary, interleaved, same probe. The gate held: `disabled_by_env` once
+/// per boot, `guest_ram_map_no_backend_import` ~1 000 times, and
+/// `sampled_guest_imports`/`buffer_guest_imports` **zero in every one of 77 and
+/// 75 windows** — against non-zero on the import-on arm, which is what says the
+/// counter would have caught a bind running past a closed gate. No panics; the
+/// desktop renders correctly.
+///
+/// ```text
+///                    import on    import off
+/// present_hz            14.80     6.80 / 6.85
+/// duty                   0.81     0.91 / 0.92
+/// draw_us per draw      41.4 us   126.3 / 127.8 us
+/// exec_phase finish    639.6 ms/s  810.9 / 821.1 ms/s
+/// ```
+///
+/// **Less than half the frame rate and 3x the per-draw cost**, with the whole
+/// difference landing in `ExecPhase::Finish` — the writeback copies. That is the
+/// rail working, not a regression: the copy is the point on a host that cannot
+/// import, and the guest observes the same pixels. It stays a *performance*
+/// difference, which is what the support matrix requires of it.
+///
+/// **This measures the no-import column, not an iGPU.** A unified-memory host
+/// *with* the extension binds a `GuestSlice` directly and is the fastest cell of
+/// that matrix, not this one. Nothing in this reading was taken on Intel or AMD
+/// hardware.
 pub const GUEST_IMPORT: &str = "REIMS_VGPU_GUEST_IMPORT";
 
 /// Verbose per-draw logging on top of the always-on fail sink.

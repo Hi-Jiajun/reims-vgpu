@@ -503,6 +503,33 @@ impl ReadbackPhase {
 /// [`Self::Header`] is deliberately the leftover: it is timed as the function's
 /// total minus the other four, so a cost in a corner nobody listed still lands
 /// somewhere and the sum still equals `op0x37_us`.
+///
+/// # What it measured, driven macos-13, 74 windows
+///
+/// `sum` against `op0x37_us` is **0.999**, so the tiling closes and the split is
+/// arithmetic:
+///
+/// ```text
+/// finish     639.6 ms/s   (contains draw_us)
+/// preflight   74.6 ms/s   <- the largest span outside the encode
+/// walk        45.7 ms/s
+/// header       6.7 ms/s
+/// load         3.7 ms/s
+/// finish - draw  ~26 ms/s
+/// ```
+///
+/// **The largest non-draw cost in this device is the speculative preflight**, at
+/// ~10 % of the whole drain worker. `Load` is 2 % — a structural read had
+/// nominated the per-command-buffer allocation and GVA copy as the likely
+/// dominant cost, and it is not, which is the third nomination this tiling has
+/// retired. `Header` being small is the reassuring reading: the cost is in spans
+/// that were named rather than in a corner nobody listed.
+///
+/// On a host with no host-pointer import (`REIMS_VGPU_GUEST_IMPORT=off`, two
+/// boots) the shape changes and only in the expected place: `finish` rises to
+/// 811-821 ms/s while `preflight` *falls* to 39-40, because that arm runs at
+/// less than half the packet rate. The whole difference is the writeback copies,
+/// which is the copying rail working rather than a regression.
 #[derive(Clone, Copy)]
 pub enum ExecPhase {
     /// The command-buffer load loop: one `vec![0u8; len]` and one
