@@ -350,6 +350,68 @@ pub fn note_unnamed_reach(state: &DeviceState, pages: impl FnOnce() -> Option<Ve
     }
 }
 
+/// Pay whatever a *texture* reference names, for a reader that reaches guest
+/// bytes through a task GVA but knows which resource it is reading.
+///
+/// # Why a GVA reader is nameable after all, and what that measured
+///
+/// The three linear readers walk raw task GVAs, so the first cut of this rail
+/// had them pay every owed frame. [`note_unnamed_reach`] priced that: **173
+/// sampled payments over one driven macos-13 sustained-animation boot, 173
+/// disjoint from every owed surface and not one overlap**, at a 1-in-64 sample
+/// of ~11 000 payments. Meanwhile `wbdebt_paid_all` was 20 391 against
+/// `wbdebt_paid_named` 755, so 96 % of all payments were the ones that read
+/// nothing they paid for, and they cost `sampled_us` 1.64 → 8.49 us a chain.
+///
+/// They are nameable because the guest names them. A debt is keyed by mapping
+/// id, and this device holds two ways from a texture reference to one:
+/// `DeviceState::texture_to_mapping` for the per-task registration, and the id
+/// itself where the guest uses one namespace for both —
+/// [`crate::runtime::resource_validity::apply`] resolves a validity statement
+/// through exactly this pair, and this is the same question asked of the same
+/// two tables.
+///
+/// A reference that resolves to neither names no mapping this device holds, so
+/// no debt can be about it. That is a statement about the registries and not
+/// about a workload — but it is not a statement about raw *page* aliasing, where
+/// a surface's pages are re-used as some other resource's backing with no
+/// mapping entry. [`note_unnamed_reach`] stays wired at these sites as the
+/// standing alarm for exactly that: it samples the read's own page walk against
+/// every owed surface's pages, and `wbdebt_reach_overlap` above zero is a
+/// payment this naming skipped and should not have.
+pub fn pay_for_texture<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+) {
+    if state.pending_writebacks.is_empty() {
+        return;
+    }
+    // Both spellings, in the order `resource_validity::apply` uses: a reference
+    // that is itself a mapping id, and the per-task registration. Paying one
+    // leaves the ledger holding the other, so asking twice costs a map lookup
+    // and cannot pay the wrong surface.
+    let mapped = state
+        .texture_to_mapping
+        .get(&(task_id, texture_ref))
+        .copied();
+    let mut named = false;
+    if state.pending_writebacks.get(texture_ref).is_some() {
+        named = true;
+        pay_for_mapping(state, host, texture_ref);
+    }
+    if let Some(mapping_id) = mapped.filter(|&id| id != texture_ref) {
+        if state.pending_writebacks.get(mapping_id).is_some() {
+            named = true;
+            pay_for_mapping(state, host, mapping_id);
+        }
+    }
+    if !named {
+        crate::runtime::drain::note_store_route("wbdebt_texture_owes_nothing");
+    }
+}
+
 /// Pay `mapping_id`'s owed frame and then wait for every guest-page write this
 /// device has submitted — the whole obligation of a host-side reader or writer
 /// of one named mapping's bytes, in one call.

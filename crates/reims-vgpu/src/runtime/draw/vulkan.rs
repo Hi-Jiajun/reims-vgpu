@@ -3692,6 +3692,7 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
+    texture_ref: u32,
     tex: &TextureDescriptor,
     gva: u64,
     w: u32,
@@ -3740,11 +3741,11 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     // A short walk is `None` and settles. `pages_spanned` is the count the
     // resolver would have produced with nothing dropped, and a dropped page is
     // one this reader cannot rule out.
-    // The reads below walk raw task GVAs and cannot name a mapping, so every
-    // surface still owed a frame is paid first — see
-    // `runtime::writeback_debt::pay_all` for why the disjointness closure below
-    // cannot narrow this, and `note_unnamed_reach` for the sampled census that
-    // says how much of that payment is owed. The census runs first, while the
+    // The reads below walk a raw task GVA, but the reference names a resource,
+    // and a debt is keyed by mapping id — so only what this reference resolves
+    // to is paid. `note_unnamed_reach` stays as the standing alarm for the one
+    // thing the naming cannot see, raw page aliasing; it samples this read's own
+    // walk against every owed surface and must stay at zero overlap. The census runs first, while the
     // ledger still holds what the payment is about to clear, and it is handed the
     // same walk the disjointness test below uses so both are one rule.
     {
@@ -3756,7 +3757,7 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
             (gpas.len() as u64 == want).then_some(gpas)
         });
     }
-    crate::runtime::writeback_debt::pay_all(state, host);
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
     let (tasks, page_shift) = (&state.tasks, state.page_shift);
     let page_size = state.page_size();
     crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
@@ -4067,7 +4068,7 @@ pub(super) fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     // against the memo: unchanged content reuses the retained swizzled Arc
     // and carries a generation identity so the engine skips hash+memcmp too.
     if let Some((rgba, identity, byte_format)) =
-        load_linear_guest_memoized(state, host, task_id, tex, gva, w, h)
+        load_linear_guest_memoized(state, host, task_id, texture_ref, tex, gva, w, h)
     {
         note_guest_rung_blank(
             state,

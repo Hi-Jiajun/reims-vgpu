@@ -2416,9 +2416,8 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     } else {
         // The bulk/row reads below walk raw task GVAs; a Store's
         // guest-page write is submitted and not waited on.
-        crate::runtime::writeback_debt::settle_unnamed(
-            state,
-            host,
+        crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
+        crate::runtime::render_writeback::settle_guest_writes(
             crate::runtime::render_writeback::SettleSite::ComputeStageTexture,
         );
         if read_linear_texture_bulk(

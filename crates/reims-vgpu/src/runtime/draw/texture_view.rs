@@ -745,11 +745,11 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // walk runs only when something is outstanding, and the pages read are the
     // ones `read_span` names — not `bpr * h`, so a padded source does not claim
     // the trailing padding it never touches.
-    // The reads below walk raw task GVAs and cannot name a mapping, so every
-    // surface still owed a frame is paid first — see
-    // `runtime::writeback_debt::pay_all` for why the disjointness closure below
-    // cannot narrow this, and `note_unnamed_reach` for the sampled census that
-    // says how much of that payment is owed.
+    // The reads below walk a raw task GVA, but the reference names a resource,
+    // and a debt is keyed by mapping id — so only what this reference resolves
+    // to is paid. `note_unnamed_reach` stays as the standing alarm for the one
+    // thing the naming cannot see, raw page aliasing; it samples this read's own
+    // walk against every owed surface and must stay at zero overlap.
     {
         let (tasks, page_shift) = (&state.tasks, state.page_shift);
         let page_size = state.page_size();
@@ -759,7 +759,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
             (gpas.len() as u64 == want).then_some(gpas)
         });
     }
-    crate::runtime::writeback_debt::pay_all(state, host);
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
     let (tasks, page_shift, page_size) = (&state.tasks, state.page_shift, state.page_size());
     crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
         site,
