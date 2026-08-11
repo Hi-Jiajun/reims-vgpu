@@ -174,6 +174,36 @@
 //! more regions is measured to cost, fewer regions is expected to pay and could
 //! still meet a floor this experiment cannot see.
 //!
+//! ## What it is worth, as a two-point model
+//!
+//! Fitting `frame_time = fixed + k * regions` through the two arms — 203 regions
+//! at 49.95 Hz and 806 at 24.37 Hz — gives **~35 us of frame time per region**
+//! and a region-free floor of 12.94 ms, i.e. **~77 Hz against today's 50**. On
+//! that model the region count is **35 % of frame time** at the shipping ~200,
+//! and most of it is recoverable well before reaching one region: 50 regions
+//! already predicts 68 Hz.
+//!
+//! Two straight lines through two points is the weakest kind of model and it is
+//! quoted as an expected value, not a result. What makes it worth writing down is
+//! that it agrees with an independent measurement made another way: the ablation
+//! in `backend::vulkan::engine::context` that removed this rail's GPU work
+//! *entirely* — regions, detile and bytes — reached 104 Hz. A model that put the
+//! region-free point above that would be refuted on its face; 77 Hz sits below
+//! it, and the remainder is the detile and the traffic the compute path still has
+//! to do.
+//!
+//! ## The two gates a compute scatter needs, both already open
+//!
+//! * The imported guest buffer must be bindable as a storage buffer. It already
+//!   is: `caps::host_pointer::GUEST_IMPORT_USAGE` includes `STORAGE_BUFFER`, and
+//!   that is the exact usage set the capability query asks the driver about — so
+//!   a host that admits the import admits this.
+//! * The offsets must be addressable in 4-byte units. Run offsets and lengths are
+//!   texel-aligned, which is 4 bytes for the eight-bit-per-channel formats this
+//!   rail serves, but it is *not* guaranteed for a narrower texel. That is a
+//!   check, not an assumption: a run that fails it falls back to the transfer
+//!   regions, which stay as the path for it and for any host that declines.
+//!
 //! # The contract does not ask for this copy at all
 //!
 //! Nothing in a render Store carries a region, and the search for one is over:
