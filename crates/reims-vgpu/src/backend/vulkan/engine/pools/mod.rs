@@ -2223,7 +2223,58 @@ const STAGING_MISS_EMIT_EVERY: u64 = 512;
 ///
 /// Before changing this constant, read `batch_flush_draws / batch_flushes`
 /// against it — while the ratio sits far below, the ceiling is not the bound.
-const BATCH_MAX_DRAWS: u64 = 8;
+/// # The bursty probe could not see this constant, and a sustained one can
+///
+/// Everything above was measured on a window-server probe that sleeps between
+/// its phases, and on that workload the paragraph above is right: batches end at
+/// a readback and the ceiling never binds. Under a *sustained* full-rate
+/// animation (`scripts/sustained-animation-probe`) the same build reads
+/// `batch_readback_joins` at 34 % of flushes rather than 91 %, the ratio this
+/// doc says to check sits at 6.24 against a ceiling of 8, and
+/// `nojoin_batch_full` — the refusal that had no name of its own until the
+/// target key was dropped — is the **largest** refusal in the ladder at 10.7 %
+/// of all draws. The precondition stated above is met on that workload, so the
+/// constant was swept against it.
+///
+/// Ten driven macos-13 boots, one pinned binary, the cap read from a temporary
+/// environment probe so no arm is a rebuild, host quiesced, stock GPU clocks.
+/// The guest turns out to have two compositing regimes across boots — 418-429
+/// draws per presented frame, or 268 — and they are not comparable to each
+/// other, so this is the six boots that landed in the first (n=3 at 8, n=3 at
+/// 32, n=1 at 24 and at 64), medianed:
+///
+/// ```text
+/// cap   gather KiB/draw   slot us/draw   record us/draw   draws/CB   ring blocks   present Hz
+///   8            262.74          12.91             2.83       6.24        38 649        40.70
+///  24            223.13          11.56             2.44      11.42        19 554        39.65
+///  32            217.80          11.33             2.21      12.86        17 478        40.60
+///  64            210.95          10.39             2.33      15.63        12 548        35.10
+/// ```
+///
+/// Within one regime these are near-deterministic: the three boots at 8 read
+/// 262.65/263.28/262.74 KiB per draw and the three at 32 read
+/// 217.80/217.80/217.70. `present_hz` is the one noisy column (±3 % boot to
+/// boot) and it is flat.
+///
+/// So 32 buys **17 % fewer guest bytes copied per draw**, 55 % fewer ring
+/// blocks, 12 % less blocking in [`Phase::Slot`] and 22 % less command
+/// recording, and the device serves **10 % more guest draws** in the same forty
+/// seconds at three points lower duty (0.91 -> 0.88). The frame rate does not
+/// move, and saying it does would be reading noise: what moved is headroom.
+///
+/// The gain is reuse, not batching for its own sake. `cb_bound_buffers` is
+/// scoped to one command buffer, so doubling the draws in one doubles the span
+/// over which a guest window gathered once can be bound again — with no change
+/// in what any draw observes, because a command buffer executes as one unit and
+/// two draws in it have always read guest RAM at the same instant.
+///
+/// **64 is past the cliff** the paragraph above describes, and it fails exactly
+/// as predicted: it keeps saving bytes and loses 14 % of the frames. 32 is
+/// chosen over 24 for the byte saving and over 64 for that. `desc_pool_grow`
+/// stayed 0 and creates-per-frame stayed flat (39.40 -> 39.16) at 32, so
+/// neither the descriptor arena nor the staging free lists is the next thing to
+/// give.
+pub(crate) const BATCH_MAX_DRAWS: u64 = 32;
 
 /// 128-bit content fingerprint for the sampled cache.
 ///

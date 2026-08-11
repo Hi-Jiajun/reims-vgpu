@@ -3359,6 +3359,17 @@ pub fn object_cache_levels() -> [usize; 6] {
     lock_engine().caches.levels()
 }
 
+/// How many draws one deferred-submit command buffer accepts before it refuses
+/// joiners — [`pools::BATCH_MAX_DRAWS`], for the integration test that drives
+/// past it.
+///
+/// Exported rather than restated in the test: the number is chosen by a live
+/// sweep and has already moved once, and a test carrying its own copy asserts
+/// the sweep's old answer against the new one and fails as if the device broke.
+pub fn batch_max_draws() -> u64 {
+    pools::BATCH_MAX_DRAWS
+}
+
 pub fn counter_snapshot() -> CounterSnapshot {
     let eng = lock_engine();
     let mut snap = eng.counters.snapshot();

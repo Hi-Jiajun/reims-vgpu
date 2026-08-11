@@ -301,9 +301,15 @@ fn prefetch_arm_flushes_open_batch() {
     assert_eq!(mid.batch_flushes, 0, "batch still open before the arm");
 }
 
-/// A batch refuses joiners at BATCH_MAX_DRAWS (8): draw 9 flushes + reopens,
-/// draw 10 joins the second batch. Keeps the GPU fed and the staging pool
-/// recycling instead of hoarding a whole run in one pending ring entry.
+/// A batch refuses joiners at `BATCH_MAX_DRAWS`: the draw after a full batch
+/// flushes and reopens, and the one after that joins the second batch. Keeps
+/// the GPU fed and the staging pool recycling instead of hoarding a whole run
+/// in one pending ring entry.
+///
+/// The cap is read from the engine rather than written here. It is chosen by a
+/// live sweep and has moved once already (8 -> 32); a test carrying its own
+/// copy asserts the sweep's old answer against its new one and fails as though
+/// the device had broken.
 #[test]
 fn batch_length_cap_flushes_and_reopens() {
     let _guard = engine_test_lock().lock().unwrap();
@@ -329,19 +335,26 @@ fn batch_length_cap_flushes_and_reopens() {
             panic!("opener draw: {msg}");
         }
     }
-    for n in 1..10 {
+    // `cap + 1` joiners after the opener is `cap + 2` draws: the first `cap`
+    // fill batch one, the next opens batch two and the last joins it — so the
+    // reopen is not the last thing that happened.
+    let cap = engine::batch_max_draws();
+    for n in 1..=cap + 1 {
         let joiner = batch_req(&vert, &frag, &identity, true, half_scissor(n % 2 == 0));
         engine::execute_draw_request(&joiner).unwrap_or_else(|e| panic!("draw #{n}: {e}"));
     }
     let d = engine::counter_snapshot().delta_since(&before);
-    assert_eq!(d.batch_opens, 2, "cap at 8 forces a second batch: {d:?}");
     assert_eq!(
-        d.batch_joins, 8,
-        "7 join the first batch, 1 the second: {d:?}"
+        d.batch_opens, 2,
+        "the cap forces a second batch at {cap}: {d:?}"
+    );
+    assert_eq!(
+        d.batch_joins, cap,
+        "cap-1 join the first batch, 1 the second: {d:?}"
     );
     assert_eq!(d.batch_flushes, 1, "the cap flushed exactly once: {d:?}");
     assert_eq!(
-        d.batch_flush_draws, 8,
+        d.batch_flush_draws, cap,
         "the full first batch flushed: {d:?}"
     );
     engine::test_quiesce_ring();
