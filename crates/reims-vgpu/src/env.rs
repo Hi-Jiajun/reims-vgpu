@@ -250,22 +250,31 @@ pub const SCATTER_SPLIT: &str = "REIMS_VGPU_SCATTER_SPLIT";
 /// ways in one binary.
 pub const COMPUTE_SCATTER: &str = "REIMS_VGPU_COMPUTE_SCATTER";
 
-/// `on` holds a type-11 surface Store's frame in the engine resident and copies
-/// it into the guest's pages when something reads them, instead of at the Store.
+/// `off` narrows a type-11 surface Store back to copying its frame into the
+/// guest's pages at the Store, instead of holding it in the engine resident and
+/// copying when something reads those pages.
 ///
-/// **This one is a permission and not a refusal, and unlike [`COMPUTE_GATHER`]
-/// its two arms are not byte-identical.** They land the same bytes in the same
-/// pages; what differs is *when*, and therefore what a reader this device did
-/// not account for would see. That is the whole risk of the rail and the reason
-/// it is a switch: the arm that has to be believed is the one where a reader
-/// exists that [`crate::runtime::writeback_debt`] does not pay, and the only way
-/// to hold the two against each other on a given guest is a binary that runs
-/// both. The failure mode is a stale frame, which is why the A/B harness
-/// photographs both arms.
+/// **The two arms are not byte-identical, and this switch is the only reason
+/// that is acceptable.** They land the same bytes in the same pages; what
+/// differs is *when*, and therefore what a reader this device failed to account
+/// for would see. The failure mode is a stale frame — which no counter can
+/// report, because a copy correctly skipped and a copy wrongly skipped are the
+/// same absence — so the arm that has to be believed is the one where such a
+/// reader exists, and the only way to hold the two against each other on a given
+/// guest is a binary that runs both. The A/B harness photographs both arms for
+/// this and nothing else.
 ///
-/// The bytes are ~840 whole frames a second into pages that six reads a second
-/// consume; [`crate::runtime::writeback_debt`] carries that census and the
-/// reasoning.
+/// It narrows in the sense this module requires: the eager Store is what the
+/// lazy one defers, `writeback_debt::pay` calls the identical
+/// `render_writeback::store_render_frame`, and switching this off cannot reach a
+/// copy the lazy rail would not eventually have made.
+///
+/// Default on, because it is the measured winner and by a margin no other rail
+/// here has produced. Twelve interleaved driven macos-13 boots: 90 % of type-11
+/// Stores superseded before anything read their pages, `draw_us` 14.62 against
+/// 26.52 a draw, and five of six on-arm boots presenting at 105.8-109.2 Hz
+/// against a 77.2-78.6 Hz baseline. `crate::runtime::writeback_debt` carries the
+/// census, the reader argument and the standing alarm.
 pub const LAZY_WRITEBACK: &str = "REIMS_VGPU_LAZY_WRITEBACK";
 
 /// `off` narrows a draw chain's pipeline resolution back to the full walk —
