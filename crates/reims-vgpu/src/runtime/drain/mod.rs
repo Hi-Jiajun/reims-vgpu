@@ -917,13 +917,37 @@ impl PendingStamp {
     /// stamp, so a held packet's retry finds the word — but it is ~2 800
     /// avoidable round trips a boot behind a guard that reads as working.
     ///
-    /// The suspicion is the index: this compares `stamp_slot_index(wait.index)`
-    /// against the same masking of `CHILD_REG_STAMP_INDEX`, and if a wait names
-    /// its slot in a different encoding than that register does, the equality can
-    /// never hold. **Measure which slots each side names before changing the
-    /// comparison.** Three sessions were spent on this residue by nominating a
-    /// cause and fixing it unmeasured; a fourth guess written into this line
-    /// would be the same mistake.
+    /// # Why, measured rather than guessed
+    ///
+    /// It is **not** an encoding mismatch, which was the first suspicion. The
+    /// boot's own `packet_stamp_wait_unmet` lines name both sides, and they
+    /// disagree about the *channel*, not the spelling:
+    ///
+    /// ```text
+    /// packet_stamp_wait_unmet opcode=0x37 ch1 index=2 awaited=0xe  current=0xa
+    /// packet_stamp_wait_unmet opcode=0x6  ch5 index=1 awaited=0x5  current=0x3
+    /// packet_stamp_wait_unmet opcode=0x22 ch2 index=4 awaited=0x1  current=0x0
+    /// ```
+    ///
+    /// Channel 1 waits on slot 2, channel 5 on slot 1, channel 2 on slot 4.
+    /// **Every one of them is waiting on a slot some other channel writes**, and
+    /// this guard answers only the drain's own slot — by construction, as its
+    /// last line above says. So it is not broken; it covers a case this workload
+    /// does not produce, while the case the workload does produce is the one it
+    /// declines.
+    ///
+    /// The mechanism is nesting: `process_child_packet` can reach `drain_other`,
+    /// so channel B's drain runs inside channel A's, and A's latched stamps are
+    /// sitting in A's stack frame where B cannot see them. Answering from them
+    /// would be correct for the same reason it is correct here — the drain
+    /// thread is single-threaded, so a latched stamp is work that finished
+    /// before the waiting packet was decoded — but it needs the latch to live in
+    /// `DeviceState` keyed by channel rather than in a local.
+    ///
+    /// **That is worth ~0.2 ms/s and no more**: 2 836 extra holds over a 45 s
+    /// boot, each costing a re-drain, against a change that bought 88 ms/s. It
+    /// is recorded because a guard that fires zero times should say why, not
+    /// because it is the next thing to fix.
     fn discharges(self, slot: u32, wait: StampWait) -> bool {
         stamp_slot_index(wait.index) == slot && self.value.is_some_and(|v| wait.satisfied_by(v))
     }
