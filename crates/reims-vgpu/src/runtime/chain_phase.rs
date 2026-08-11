@@ -139,12 +139,28 @@ pub enum Phase {
     /// content key, and the global cache mutex. The translate itself is a miss
     /// path and this boot has none.
     PipelineXlate = 12,
+    /// The CLEAR-seed Store loop at the head of `draw_vk`: one full-surface
+    /// solid buffer per colour attachment, a channel swap for a type-11 target,
+    /// and the write of it into the guest's pages.
+    ///
+    /// # Why the prep span is split at all
+    ///
+    /// `prep_us` is 0.16 µs a chain on a compositing load and **9.27 µs** on the
+    /// `blur=40` load that runs the drain worker at duty 0.90 — 22.8 % of that
+    /// chain, second only to the engine. A bar that moves by a factor of 58
+    /// between two workloads is measuring something one of them does and the
+    /// other does not, and the span holds exactly two candidates.
+    PrepSeed = 13,
+    /// `sync_store_allowed_pages` — the page-table walk that bounds the
+    /// synchronous GVA Store, taken before any GPU work so the set predates the
+    /// submit.
+    PrepPages = 14,
 }
 
 impl Phase {
     /// Highest ordinal, so [`PHASES`] is derived from the enum rather than
     /// hand-counted beside it.
-    const LAST: Phase = Phase::PipelineXlate;
+    const LAST: Phase = Phase::PrepPages;
 }
 
 const PHASES: usize = Phase::LAST as usize + 1;
@@ -182,6 +198,10 @@ pub struct ChainPhaseWindow {
     pub assemble_us: u64,
     pub engine_us: u64,
     pub store_us: u64,
+    /// The two spans carved out of `prep_us`; the three together are what
+    /// `prep_us` used to be alone.
+    pub prep_seed_us: u64,
+    pub prep_pages_us: u64,
     pub chains: u64,
     pub max_us: u64,
 }
@@ -204,6 +224,8 @@ pub fn take_window() -> Option<ChainPhaseWindow> {
         assemble_us: to_us(ACC[Phase::Assemble as usize].swap(0, Ordering::Relaxed)),
         engine_us: to_us(ACC[Phase::Engine as usize].swap(0, Ordering::Relaxed)),
         store_us: to_us(ACC[Phase::Store as usize].swap(0, Ordering::Relaxed)),
+        prep_seed_us: to_us(ACC[Phase::PrepSeed as usize].swap(0, Ordering::Relaxed)),
+        prep_pages_us: to_us(ACC[Phase::PrepPages as usize].swap(0, Ordering::Relaxed)),
         chains,
         max_us: to_us(MAX_NS.swap(0, Ordering::Relaxed)),
     };

@@ -99,6 +99,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     let mut engine_refusal: Option<&'static str> = None;
     // Solid CLEAR seed Stores only when this record owns guest writeback
     // (last of a serialized chain, or unified always-writeback).
+    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::PrepSeed);
     if writeback_guest {
         for (i, c) in colors.iter().enumerate() {
             // Reports an out-of-contract value; the gate below is unchanged, and
@@ -180,8 +181,12 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // Resolved here rather than at the write so the set predates the submit.
     // `None` when there is no GVA target, no writeback, or the walk cannot name
     // the span — an unresolvable span is not an authorisation to write anywhere.
+    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::PrepPages);
     let sync_store_pages =
         sync_store_allowed_pages(state, host, req.task_id, colors.first(), writeback_guest);
+    // Back to `Prep`, which is now the residue: everything in this function
+    // before the metal2vulkan call that is neither of the two spans above.
+    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Prep);
     // metal2vulkan path: load MTLB → AIR → SPIR-V → internal Vulkan engine offscreen.
     let mut draw_rgba: Option<Vec<u8>> = None;
     // Physical order of `draw_rgba`. A type-11 composite Store renders into a

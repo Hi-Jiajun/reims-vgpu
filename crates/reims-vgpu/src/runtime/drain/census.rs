@@ -1997,7 +1997,8 @@ fn emit_chain_phase() {
     crate::observe::off(format!(
         "chain_phase chains={} prep_us={} pipeline_us={} pl_gen_us={} pl_desc_us={} \
          pl_mtlb_us={} pl_air_us={} pl_xlate_us={} binds_us={} sampled_us={} \
-         seed_us={} assemble_us={} engine_us={} store_us={} max_us={}",
+         seed_us={} assemble_us={} engine_us={} store_us={} prep_seed_us={} \
+         prep_pages_us={} max_us={}",
         w.chains,
         w.prep_us,
         w.pipeline_us,
@@ -2012,6 +2013,8 @@ fn emit_chain_phase() {
         w.assemble_us,
         w.engine_us,
         w.store_us,
+        w.prep_seed_us,
+        w.prep_pages_us,
         w.max_us,
     ));
     // Under `chain_phase`, dividing its largest column the same way
