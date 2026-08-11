@@ -835,11 +835,38 @@ impl StampWait {
 ///
 /// That matters because a stamp is not a word write. On the Vulkan arm
 /// `write_stamp` submits a command buffer, measured at **12.3 us a packet**
-/// against 59 ns for the tail read beside it, and a driven macos-13 boot
-/// averages **11.6 packets per drain call** — so collapsing the run removes
-/// roughly ten submissions in eleven. `engine_delta` said the same thing from
-/// the other side: `batch_flushes` equalled `batch_opens` at 1.58 draws a
-/// flush, because each packet's stamp flushed whatever draws had gathered.
+/// against 59 ns for the tail read beside it.
+///
+/// # What it bought, six driven macos-13 boots, one binary, both arms
+///
+/// All six in one compositing regime (995-999 draws a frame), no panics, same
+/// desktop. `gpu_stamps` fell to **1.9 %** of the per-packet arm and the span
+/// with it:
+///
+/// ```text
+///                   coalesced    per packet
+/// stamp ms/s         5.9-6.8     77.1-97.2
+/// unnamed in drain   224-231      314-317
+/// duty              0.80-0.81    0.89-0.90
+/// slot_us              29 049        37 874
+/// ```
+///
+/// **The arithmetic closes**: the stamp span fell 90.3 ms/s and the whole drain
+/// residue fell 88.6 ms/s, so the time was removed rather than relocated — and
+/// `proc - draw - compute` is 197 against 201 ms/s, unchanged, which says the
+/// same from the other side.
+///
+/// It buys **headroom, not frames**. `present_hz`/`offered_hz` are 15.05 against
+/// 14.90; the guest paces this rail and four CPU wins in a row have moved it by
+/// nothing.
+///
+/// **One thing this was expected to do and does not.** `batch_flushes` is
+/// unchanged (0.987, 1.90 draws a flush against 1.85). The reasoning was that
+/// `engine::write_stamp_after_guest_writes` appends to the open batch and then
+/// flushes it, so removing the stamps should let the batch accumulate. It does
+/// not, so the batch is flushed by something else and the stamp rode along with
+/// a flush that was already going to happen. Do not repeat the claim that the
+/// stamp was what flushed the draw batch.
 ///
 /// [`Self::latch`] takes the **maximum in wrapping-signed order** rather than
 /// the last value seen. For a well-formed guest those are the same, and taking
@@ -876,6 +903,27 @@ impl PendingStamp {
     /// [`StampVerdict::Hold`], and park the channel against a stamp this device
     /// is itself holding. `slot` is the drain's own stamp index; a wait naming
     /// any other slot is not ours to answer.
+    ///
+    /// # It fires zero times, and the hazard it guards is real
+    ///
+    /// The A/B above is the same six boots. `packet_stamp_wait_met_pending` is
+    /// **0** on the coalesced arm while `packet_stamp_wait_held` **more than
+    /// doubled**, 5 073 against 2 237, taking `setup_calls` up 47 % with it in
+    /// re-drains. Those two readings together say this comparison never matches:
+    /// the packets that should have been answered here fall through to the stale
+    /// word instead.
+    ///
+    /// It is not a correctness failure — every `break` flushes the pending
+    /// stamp, so a held packet's retry finds the word — but it is ~2 800
+    /// avoidable round trips a boot behind a guard that reads as working.
+    ///
+    /// The suspicion is the index: this compares `stamp_slot_index(wait.index)`
+    /// against the same masking of `CHILD_REG_STAMP_INDEX`, and if a wait names
+    /// its slot in a different encoding than that register does, the equality can
+    /// never hold. **Measure which slots each side names before changing the
+    /// comparison.** Three sessions were spent on this residue by nominating a
+    /// cause and fixing it unmeasured; a fourth guess written into this line
+    /// would be the same mistake.
     fn discharges(self, slot: u32, wait: StampWait) -> bool {
         stamp_slot_index(wait.index) == slot && self.value.is_some_and(|v| wait.satisfied_by(v))
     }
