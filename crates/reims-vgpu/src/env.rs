@@ -160,6 +160,25 @@ pub const BATCH_MIXED_TARGETS: &str = "REIMS_VGPU_BATCH_MIXED_TARGETS";
 /// Off is a refusal and never a permission: it makes this device read *more* of
 /// the guest's memory, never less, and there is no spelling that grants a
 /// capability.
+///
+/// # It buys frames now, and did not when it was written
+///
+/// The twelve-boot A/B that landed this rail established the saving —
+/// `kib_per_draw` −6.27 %, disjoint at 45x — and explicitly established **no
+/// frame gain**, correctly, because the host window presenter was then a hard
+/// ~41 Hz ceiling and no device-side saving could appear past it.
+///
+/// Re-run on the multi-flight presenter, eight driven macos-13 boots, n=3 vs
+/// n=2 after regime exclusion: `kib_per_draw` **−6.31 %** — the same number to
+/// within a twentieth of a percent, disjoint at 44x, which is what says the two
+/// runs measured one rail — and now `frames_s` **+3.73 %, disjoint**, with
+/// `draws_s` +2.93 % also disjoint.
+///
+/// So the saving was real all along and was being spent into a ceiling. Two
+/// readings follow, and the second is the one worth carrying: a per-draw saving
+/// measured before that presenter fix is owed a re-run rather than believed
+/// worthless, and `frames_s` is the metric that reports it — not `presents_s`,
+/// which still overlapped here at this sample size.
 pub const UNUSED_BINDS: &str = "REIMS_VGPU_UNUSED_BINDS";
 
 /// `off` returns the host window presenter to one present in flight at a time.

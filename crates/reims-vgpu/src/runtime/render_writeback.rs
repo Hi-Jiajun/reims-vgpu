@@ -181,6 +181,54 @@
 //! the same thing from the other side: 3 796 disjointness checks a second, of
 //! which **six** found a read overlapping an outstanding write.
 //!
+//! # The deferral below was built, and it corrupts the guest's page tables
+//!
+//! **Read this before building what the next four sections describe.** They are
+//! kept because their reasoning about the seam and the land point is sound and
+//! was confirmed; what they underestimate is one hazard and overestimate is the
+//! prize.
+//!
+//! It was implemented as specified — the plan resolved and parked at the Store,
+//! landed at every settle site except the three completion stamps, replaced on a
+//! second Store into the same pages, dropped on `clear_host_valid`, pinned and
+//! page-armed at the arm rather than at the record. It ran, and the mechanism
+//! worked: one boot armed 2 951 plans, replaced 865, landed 2 782 and lost none.
+//!
+//! Four driven macos-13 boots, and a fifth on the **same binary** with the rail
+//! switched off:
+//!
+//! ```text
+//! rail on    PANIC  "hitting assertion" @AppleParavirtPageTable.cpp:200
+//! rail on    PANIC  PTE Corruption detected: ptep ...
+//! rail on    PANIC  Possible memory corruption: pmap_pv_remove(...)
+//! rail on    PANIC  "hitting assertion" @AppleParavirtPageTable.cpp:200
+//! rail off   ok
+//! ```
+//!
+//! Four for four, against eighteen clean macos-13 boots of the same probe that
+//! day, and the off arm of the same binary clean. This is the **page recycling**
+//! hazard, which the list below names third and treats as one of four: the guest
+//! reassigns a surface's backing inside the park-to-land window — its own
+//! `MappingEntry::page_entries` doc measures id recycling at ~20 ms under scroll,
+//! and that window is ~55 ms — and the landed copy writes a full surface into
+//! whatever now owns those pages. Here that was the guest's page tables.
+//! `gpuwb_pages_not_ours` fires on the same boot, which is this device saying so
+//! from the other side.
+//!
+//! Landing at the Store is what makes that hazard *not exist*: the pages cannot
+//! move inside one call, which is the fourth bullet under "What the window cost
+//! that this cannot" and is load-bearing rather than incidental. Any future
+//! attempt needs a page-ownership guard held **across** the window — the
+//! re-validation at the land has to be that the pages still belong to the
+//! mapping, and neither `arm_guest_write_pages` nor the registry pin is that.
+//!
+//! **And the prize is not the one computed below.** That estimate divides the
+//! Stores by the settles that *waited* (~6 a second) and gets ~36 copies a second
+//! against 1 556. The land has to run on every settle **call** at a landing site,
+//! not on the ones that block, and those are far more frequent. Measured over the
+//! four boots, copies actually removed were **27 %, 65 %, 66 %, 65 %** — a factor
+//! of about 2.9 at best, not 43. Worth having, and not worth what it cost here.
+//!
 //! # What a deferral has to answer, and where the seam is
 //!
 //! Arming instead of writing is the easy half, and a second Store into one
