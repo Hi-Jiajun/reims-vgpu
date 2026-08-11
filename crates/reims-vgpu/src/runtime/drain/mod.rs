@@ -5225,13 +5225,20 @@ pub(crate) fn display_event_enabled<H: HostMemory>(host: &H, gpa: u64, event_mas
 /// an 8.47 ms grid, so its turnaround lands past the grid point often, and it is
 /// precisely those ticks the old ordering spent.
 ///
-/// **It does not explain the boot-to-boot regime split, and the first version of
-/// this doc claimed it did.** The guest latches either a ~60 Hz or a ~120 Hz
-/// display link early in the boot and holds it, and the split came out 2 fast to
-/// 1 slow on *both* arms — unchanged. The slow arm is not a delivery shortfall
-/// this ordering can repair: B3 received 54 % more VBL than A2 and presented the
-/// same 59 frames a second, so a guest in that state is not asking for more.
-/// Whatever picks the latch is upstream of everything here and is still open.
+/// **It does not by itself explain the boot-to-boot regime split, and the first
+/// version of this doc claimed it did.** The split came out 2 fast to 1 slow on
+/// *both* arms at n=3. The slow arm is not a steady-state delivery shortfall this
+/// ordering repairs: B3 received 54 % more VBL than A2 and presented the same 59
+/// frames a second.
+///
+/// What the split is, is settled — see `VBL_REPORT_EARLY` beside
+/// [`census::VblCensus`]. The guest
+/// measures the rate it is served across **one early window**, latches 60 Hz or
+/// 120 Hz from it, and never revisits the answer however fast it is served
+/// afterwards. So this ordering can only matter to the extent it changes what
+/// that one window reads, which is a probability over boots and not a rate, and
+/// n=3 an arm cannot measure one. Ranking this change on steady-state
+/// `present_hz` was the wrong instrument.
 ///
 /// Reading the mask first cannot deliver faster than the advertised rate —
 /// [`claim_display_vbl`] still gates every delivery on a full interval having

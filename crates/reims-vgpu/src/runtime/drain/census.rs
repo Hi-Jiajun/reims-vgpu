@@ -68,6 +68,38 @@ const VBL_REPORT_EVERY: u64 = 1024;
 /// later lines could recover it. Sixteen finer lines at the head of each arm cost
 /// nothing and cover the first ~9 s.
 ///
+/// # What it found: one window decides the whole boot
+///
+/// Eight driven macos-13 boots of one binary, quiesced host. The **first
+/// sustained `arm=delivered` window** — the guest's first stretch of holding VBL
+/// armed continuously, which lands around `delivered=128` — predicts the rate
+/// the guest keeps, 8 times out of 8:
+///
+/// ```text
+/// boot   first sustained window   presented frames/s
+/// b1            60.5 Hz                  59
+/// b2-b8    119.2 - 120.5 Hz           99 - 108
+/// ```
+///
+/// The guest measures the rate it is being served, once, and holds the answer.
+///
+/// **It does not revisit it.** b1 went on to receive 103-116 Hz of VBL for the
+/// rest of the boot, from `t=38 s` onward, and still presented 59 frames a
+/// second throughout. So this is not "the compositor runs as fast as it is
+/// paced": a guest that measured 60 Hz early keeps a 60 Hz compositor no matter
+/// what it is offered afterwards, and the only opportunity to influence it has
+/// closed by about nine seconds after the display comes up.
+///
+/// That is why the early lines matter more than every later line put together,
+/// and why a change to this device's steady-state pacing can be real and still
+/// move nothing: by the time the probe drives the guest, the factor of two has
+/// already been chosen.
+///
+/// What made b1's window read 60.5: across it the device delivered 64 VBL and
+/// declined 128, so the guest was found armed on about a third of ticks. Its
+/// re-arm turnaround, not the limiter, is what missed the grid — the limiter
+/// held its usual ~118 Hz in that boot as in every other.
+///
 /// This is an instrument, not a rail: nothing branches on it.
 const VBL_REPORT_EARLY: u64 = 64;
 
