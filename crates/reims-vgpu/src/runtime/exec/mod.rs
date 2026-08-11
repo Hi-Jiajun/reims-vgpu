@@ -855,15 +855,22 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
     task_id: u32,
     stream: &[u8],
 ) -> bool {
+    use crate::runtime::drain::{note_preflight_part, note_preflight_pipe, PreflightPart};
+    let refs_started = std::time::Instant::now();
     let pipelines = render_pipeline_refs(stream);
+    note_preflight_part(PreflightPart::Refs, refs_started.elapsed().as_nanos() as u64);
     let mut pending = false;
     for pipeline_ref in pipelines {
-        let Ok((v_air, f_air)) = draw::load_render_air_pair(state, host, task_id, pipeline_ref)
-        else {
+        note_preflight_pipe();
+        let air_started = std::time::Instant::now();
+        let pair = draw::load_render_air_pair(state, host, task_id, pipeline_ref);
+        note_preflight_part(PreflightPart::Air, air_started.elapsed().as_nanos() as u64);
+        let Ok((v_air, f_air)) = pair else {
             // Normal execution emits the precise pipeline/MTLB failure. A
             // missing plan input is deterministic, not asynchronous work.
             continue;
         };
+        let cache_started = std::time::Instant::now();
         if !crate::runtime::m2v_cache::ensure_cached_async(
             &v_air,
             metal2vulkan::passes::Stage::Vertex,
@@ -878,6 +885,7 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
         ) {
             pending = true;
         }
+        note_preflight_part(PreflightPart::Cache, cache_started.elapsed().as_nanos() as u64);
     }
     pending
 }
@@ -924,26 +932,36 @@ fn preflight_compute_translations<M: HostMemory + HostOps>(
     task_id: u32,
     stream: &[u8],
 ) -> bool {
+    use crate::runtime::drain::{note_preflight_part, note_preflight_pipe, PreflightPart};
+    let refs_started = std::time::Instant::now();
+    let inputs = compute_translation_inputs(stream);
+    note_preflight_part(PreflightPart::Refs, refs_started.elapsed().as_nanos() as u64);
     let mut pending = false;
-    for (pipeline_ref, local_size) in compute_translation_inputs(stream) {
-        let Some(pipeline) =
-            compute_exec::load_compute_pipeline(state, host, task_id, pipeline_ref)
-        else {
-            continue;
-        };
-        let Some(mtlb) = crate::runtime::mtlb::load_mtlb(
-            state,
-            host,
-            task_id,
-            pipeline.kernel_func_ref,
-            crate::runtime::mtlb::AirLoadRail::Compute,
-        ) else {
+    for (pipeline_ref, local_size) in inputs {
+        note_preflight_pipe();
+        let air_started = std::time::Instant::now();
+        let loaded = compute_exec::load_compute_pipeline(state, host, task_id, pipeline_ref)
+            .and_then(|pipeline| {
+                crate::runtime::mtlb::load_mtlb(
+                    state,
+                    host,
+                    task_id,
+                    pipeline.kernel_func_ref,
+                    crate::runtime::mtlb::AirLoadRail::Compute,
+                )
+            });
+        note_preflight_part(PreflightPart::Air, air_started.elapsed().as_nanos() as u64);
+        let Some(mtlb) = loaded else {
             continue;
         };
         let Ok(air) = crate::runtime::mtlb::extract_air(&mtlb) else {
             continue;
         };
-        if !crate::runtime::m2v_cache::ensure_cached_kernel_async(air, local_size, pipeline_ref) {
+        let cache_started = std::time::Instant::now();
+        let cached =
+            crate::runtime::m2v_cache::ensure_cached_kernel_async(air, local_size, pipeline_ref);
+        note_preflight_part(PreflightPart::Cache, cache_started.elapsed().as_nanos() as u64);
+        if !cached {
             pending = true;
         }
     }

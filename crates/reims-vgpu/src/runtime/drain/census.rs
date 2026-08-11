@@ -591,6 +591,61 @@ impl ExecPhase {
     }
 }
 
+/// Which part of the translation preflight a span was spent in.
+///
+/// [`ExecPhase::Preflight`] is **74.6 ms/s, the largest cost in this device
+/// outside the draw encode**, and it is speculative work: it re-derives, per
+/// exec packet, whether metal2vulkan already holds every pipeline the streams
+/// reference. Three unlike things happen in there and the aggregate cannot say
+/// which one costs, which is exactly the shape `RegsOp` was added for after the
+/// same mistake.
+///
+/// The three sum to `preflight_us`, so the identity is checkable on the line.
+#[derive(Clone, Copy)]
+pub enum PreflightPart {
+    /// Collecting the distinct pipeline refs: `iter_segments` and a full
+    /// `render::decode` / `compute::decode` of every record in the stream — the
+    /// *same* walk `walk_stream` is about to make, done a second time because
+    /// the answer has to be complete before any record runs.
+    Refs,
+    /// `load_render_air_pair` and its compute counterpart: resolving each
+    /// pipeline's AIR out of guest memory.
+    Air,
+    /// `m2v_cache::ensure_cached_async`, which digests the whole AIR blob to
+    /// build the key and then takes the cache's global lock. Twice per render
+    /// pipeline, once per kernel.
+    Cache,
+}
+
+impl PreflightPart {
+    /// How many parts there are. The census arrays are sized from this, so a new
+    /// variant that forgets to bump it fails to build [`Self::ALL`] rather than
+    /// overflowing an array at report time.
+    pub(crate) const COUNT: usize = 3;
+
+    const ALL: [PreflightPart; Self::COUNT] = [
+        PreflightPart::Refs,
+        PreflightPart::Air,
+        PreflightPart::Cache,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            PreflightPart::Refs => 0,
+            PreflightPart::Air => 1,
+            PreflightPart::Cache => 2,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            PreflightPart::Refs => "refs",
+            PreflightPart::Air => "air",
+            PreflightPart::Cache => "cache",
+        }
+    }
+}
+
 /// The per-opcode split of `proc_ns`, indexed by the opcode itself.
 ///
 /// Sized from the contract rather than from a count of the arms
@@ -1163,6 +1218,13 @@ pub(crate) struct DrainDutyCensus {
     /// Sums to that opcode's own `op0x37_us` on the `drain_ops` line.
     exec_ns: [std::sync::atomic::AtomicU64; ExecPhase::COUNT],
     exec_count: [std::sync::atomic::AtomicU64; ExecPhase::COUNT],
+    /// The inside of [`ExecPhase::Preflight`], indexed by
+    /// [`PreflightPart::index`]. Sums to `preflight_us` on the `exec_phase`
+    /// line. `pre_pipes` is the distinct pipeline refs the scan resolved, which
+    /// is the denominator every per-pipeline figure needs.
+    pre_ns: [std::sync::atomic::AtomicU64; PreflightPart::COUNT],
+    pre_count: [std::sync::atomic::AtomicU64; PreflightPart::COUNT],
+    pre_pipes: std::sync::atomic::AtomicU64,
     max_tranche_us: std::sync::atomic::AtomicU64,
     /// Longest single Flush in the window. `flush_us/flushes` is a mean, and a
     /// mean cannot tell "every flush costs 7.7 ms" from "most are free and one
@@ -1387,6 +1449,43 @@ impl DrainDutyCensus {
         }
         let above = self.proc_ops.above_max.swap(0, Relaxed);
         any.then(|| format!("drain_ops win_ms={win_ms} above_max={above}{body}"))
+    }
+
+    /// One span inside the translation preflight, in nanoseconds.
+    pub(crate) fn note_preflight(&self, part: PreflightPart, ns: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let i = part.index();
+        self.pre_ns[i].fetch_add(ns, Relaxed);
+        self.pre_count[i].fetch_add(1, Relaxed);
+    }
+
+    /// One distinct pipeline ref the preflight scan resolved.
+    pub(crate) fn note_preflight_pipe(&self) {
+        self.pre_pipes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The inside of the preflight over the window [`Self::note`] just reported.
+    ///
+    /// Read against `exec_phase`: these three sum to its `preflight_us`.
+    /// `pipes` is the distinct pipeline refs resolved, so `air_us / pipes` is
+    /// what one AIR resolve costs and `pipes / preflight_n` is how many the
+    /// average packet re-derives.
+    pub(crate) fn take_preflight_parts(&self) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let win_ms = self.last_win_ms.load(Relaxed);
+        let mut body = String::new();
+        let mut any = false;
+        for part in PreflightPart::ALL {
+            let i = part.index();
+            let us = self.pre_ns[i].swap(0, Relaxed) / 1000;
+            let n = self.pre_count[i].swap(0, Relaxed);
+            any |= n != 0;
+            let label = part.label();
+            body.push_str(&format!(" {label}_us={us} {label}_n={n}"));
+        }
+        let pipes = self.pre_pipes.swap(0, Relaxed);
+        any.then(|| format!("preflight_split win_ms={win_ms} pipes={pipes}{body}"))
     }
 
     /// One span inside `process_exec_indirect2`, in nanoseconds.
@@ -2022,6 +2121,16 @@ pub fn note_exec_phase(phase: ExecPhase, ns: u64) {
     DRAIN_DUTY.note_exec(phase, ns);
 }
 
+/// Attribute one span inside the translation preflight, in nanoseconds.
+pub fn note_preflight_part(part: PreflightPart, ns: u64) {
+    DRAIN_DUTY.note_preflight(part, ns);
+}
+
+/// Count one distinct pipeline ref the preflight scan resolved.
+pub fn note_preflight_pipe() {
+    DRAIN_DUTY.note_preflight_pipe();
+}
+
 /// Attribute one access around a packet, in nanoseconds, by which one it was.
 pub fn note_drain_regs(op: RegsOp, ns: u64) {
     DRAIN_DUTY.note_regs(op, ns);
@@ -2051,6 +2160,10 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         // divides `draw_us`.
         if let Some(exec) = DRAIN_DUTY.take_exec_phases() {
             crate::observe::off(exec);
+        }
+        // Under `exec_phase`, dividing its `preflight_us`.
+        if let Some(pre) = DRAIN_DUTY.take_preflight_parts() {
+            crate::observe::off(pre);
         }
         // Under `flush_rails`, dividing its `render_us`.
         if let Some(split) = DRAIN_DUTY.take_readback_split() {
