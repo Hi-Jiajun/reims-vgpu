@@ -2976,6 +2976,11 @@ pub(crate) unsafe fn execute_draw_inner(
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecBeginCb, e)))?;
+        // Only on the arm that opens a command buffer. A joiner appends to one
+        // already armed, and re-arming would move its top stamp past draws the
+        // batch has already recorded — which would read as a fast submission
+        // rather than as a broken one.
+        unsafe { pools.gpu_span_arm(ctx, cb) };
     }
 
     // Metal permits a pass to sample the same texture it renders into. Vulkan
@@ -3652,6 +3657,10 @@ pub(crate) unsafe fn execute_draw_inner(
     let defer_submit = batch_eligible;
     phase.enter(super::draw_phase::Phase::Submit);
     if !defer_submit {
+        // Last command before the CB ends, so the stamp bounds every draw and
+        // copy this submission recorded. A deferred draw is sealed by
+        // `batch_flush` instead, on the same slot.
+        unsafe { pools.gpu_span_seal_current(ctx, cb) };
         ctx.device
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecEndCb, e)))?;

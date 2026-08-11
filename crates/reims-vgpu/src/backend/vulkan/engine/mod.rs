@@ -43,6 +43,7 @@ pub use pools::sampled_working_set::census as sampled_working_set_census;
 /// module: a peak with no cap beside it is a number, not a reading.
 pub(crate) use pools::IDLE_TARGET_AGE_MS;
 pub mod gather_phase;
+pub mod gpu_span;
 pub mod reason;
 mod slab;
 pub mod stage_phase;

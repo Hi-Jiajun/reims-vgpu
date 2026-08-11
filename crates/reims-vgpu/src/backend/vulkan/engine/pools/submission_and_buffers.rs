@@ -659,6 +659,7 @@ impl ResourcePools {
                         cmd_buf,
                         fence,
                         pending: None,
+                        span: super::gpu_span::SlotSpan::Idle,
                     });
                 }
                 Err(e) => {
@@ -1093,6 +1094,115 @@ impl ResourcePools {
         }
     }
 
+    /// Reset the current slot's timestamp pair and write the top one, so the
+    /// submission about to be recorded reports its own GPU execution time.
+    ///
+    /// Called once per command buffer that a draw *opens* — a batch joiner
+    /// appends to a CB that is already armed, and arming again would move the top
+    /// stamp forward past work the batch has already recorded. Both
+    /// `vkCmdResetQueryPool` and the write must be outside a render pass instance,
+    /// which the call site satisfies by sitting immediately after
+    /// `vkBeginCommandBuffer`.
+    ///
+    /// # Safety
+    ///
+    /// `cb` must be the current slot's command buffer, recording, and outside any
+    /// render pass.
+    pub(crate) unsafe fn gpu_span_arm(&mut self, ctx: &DeviceContext, cb: vk::CommandBuffer) {
+        let Some(probe) = ctx.draw_spans.as_ref() else {
+            return;
+        };
+        let slot = self.cur;
+        // A slot armed twice without a read between means the ring reused it
+        // without retiring it, which would also mean its cleanup was never
+        // drained. Report rather than silently overwrite: the sample is lost
+        // either way and only the counter says so.
+        if self.slots[slot].span != gpu_span::SlotSpan::Idle {
+            gpu_span::note_unread();
+        }
+        let base = DrawSpanProbe::base(slot);
+        ctx.device
+            .cmd_reset_query_pool(cb, probe.pool, base, DrawSpanProbe::PER_SLOT);
+        ctx.device
+            .cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, probe.pool, base);
+        self.slots[slot].span = gpu_span::SlotSpan::Armed;
+        gpu_span::note_armed();
+    }
+
+    /// Write the bottom timestamp of the slot's command buffer, immediately
+    /// before it ends.
+    ///
+    /// `slot` is passed rather than read from `self.cur` because the batch flush
+    /// path seals the slot the batch was opened on, and a caller that guessed
+    /// would attribute one submission's span to another slot's queries.
+    ///
+    /// # Safety
+    ///
+    /// `cb` must be `slot`'s command buffer, still recording, and outside any
+    /// render pass.
+    unsafe fn gpu_span_seal(&mut self, ctx: &DeviceContext, cb: vk::CommandBuffer, slot: usize) {
+        let Some(probe) = ctx.draw_spans.as_ref() else {
+            return;
+        };
+        if self.slots[slot].span != gpu_span::SlotSpan::Armed {
+            return;
+        }
+        ctx.device.cmd_write_timestamp(
+            cb,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            probe.pool,
+            DrawSpanProbe::base(slot) + 1,
+        );
+        self.slots[slot].span = gpu_span::SlotSpan::Sealed;
+        gpu_span::note_sealed();
+    }
+
+    /// [`Self::gpu_span_seal`] for the slot the caller is about to submit on its
+    /// own, which is always the current one.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::gpu_span_seal`].
+    pub(crate) unsafe fn gpu_span_seal_current(
+        &mut self,
+        ctx: &DeviceContext,
+        cb: vk::CommandBuffer,
+    ) {
+        unsafe { self.gpu_span_seal(ctx, cb, self.cur) };
+    }
+
+    /// Read a retiring slot's timestamp pair and charge the delta.
+    ///
+    /// Only ever called with the slot's fence already signaled, which is what
+    /// makes both queries available — so `vkGetQueryPoolResults` is asked without
+    /// `WAIT` and a `NOT_READY` is a real defect in that ordering rather than
+    /// something to spin on. It is dropped rather than retried: a lost sample is
+    /// visible as `armed - read` and retrying inside the retire path would put an
+    /// unbounded wait on the drain worker to fix an instrument.
+    unsafe fn gpu_span_read(&mut self, ctx: &DeviceContext, slot: usize) {
+        let Some(probe) = ctx.draw_spans.as_ref() else {
+            return;
+        };
+        let sealed = self.slots[slot].span == gpu_span::SlotSpan::Sealed;
+        self.slots[slot].span = gpu_span::SlotSpan::Idle;
+        if !sealed {
+            return;
+        }
+        let mut ticks = [0u64; DrawSpanProbe::PER_SLOT as usize];
+        if ctx
+            .device
+            .get_query_pool_results(
+                probe.pool,
+                DrawSpanProbe::base(slot),
+                &mut ticks,
+                vk::QueryResultFlags::TYPE_64,
+            )
+            .is_ok()
+        {
+            gpu_span::note_busy_ns(probe.elapsed_ns(ticks[0], ticks[1]));
+        }
+    }
+
     /// Retire one slot: wait its fence, reset it, and drain the cleanup it
     /// owes. No-op for a slot with nothing pending.
     unsafe fn retire_slot(
@@ -1111,6 +1221,11 @@ impl ResourcePools {
         ctx.device
             .reset_fences(&[fence])
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsResetFencesRetire, e)))?;
+        // After the wait and before anything else: the fence signalling is
+        // precisely what makes this slot's two queries available, and the read is
+        // the only thing that returns the slot's span state to `Idle` so the next
+        // arming of it is not reported as a lost sample.
+        unsafe { self.gpu_span_read(ctx, index) };
         let pending = self.slots[index].pending.take().expect("checked above");
         self.in_flight = self.in_flight.saturating_sub(1);
         self.drain_cleanup(&ctx.device, pending);
@@ -1511,6 +1626,13 @@ impl ResourcePools {
         counters
             .batch_flush_draws
             .fetch_add(batch.draws, Ordering::Relaxed);
+        // `self.cur` is still the slot the batch was opened on: `begin_entry`
+        // flushes the open batch *before* it advances, and every other flush
+        // caller reaches here without claiming a slot of its own. Sealing against
+        // any other index would charge this submission's GPU span to a slot whose
+        // queries a different command buffer wrote.
+        let slot = self.cur;
+        unsafe { self.gpu_span_seal(ctx, batch.cb, slot) };
         let submit = (|| -> Result<(), DrawError> {
             ctx.device
                 .end_command_buffer(batch.cb)
@@ -4566,6 +4688,7 @@ mod recycle_tests {
                 sampled: Vec::new(),
                 storage_images: Vec::new(),
             }),
+            span: super::gpu_span::SlotSpan::Idle,
         }
     }
 
@@ -4574,6 +4697,7 @@ mod recycle_tests {
             cmd_buf: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
             pending: None,
+            span: super::gpu_span::SlotSpan::Idle,
         }
     }
 

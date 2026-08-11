@@ -2696,6 +2696,31 @@ fn emit_draw_phase() {
     ));
     emit_stage_phase();
     emit_gather_phase();
+    emit_gpu_span();
+}
+
+/// Beside `draw_phase`, because it is the one column in it the GPU wrote.
+///
+/// `slot_us` above is the drain worker blocked on a ring fence, and every session
+/// before this one read that as "the GPU is busy" without a GPU-side number
+/// existing. `busy_us` is that number: GPU microseconds summed over the
+/// submissions retired this window, from timestamps each command buffer wrote
+/// into itself.
+///
+/// Read the pair and never `busy_us` alone. Against a census second it is
+/// utilisation; against `slot_us` it is how much of the worker's wait was this
+/// device's own recorded work rather than queue latency, and those are two
+/// different questions with two different fixes. `armed`/`sealed`/`read` say
+/// whether a low reading is a quiet GPU or a probe that did not close.
+#[cfg(feature = "backend-vulkan")]
+fn emit_gpu_span() {
+    let Some(w) = crate::backend::vulkan::engine::gpu_span::take_window() else {
+        return;
+    };
+    crate::observe::off(format!(
+        "gpu_span busy_us={} busy_max_us={} read={} armed={} sealed={} unread={}",
+        w.busy_us, w.busy_max_us, w.read, w.armed, w.sealed, w.unread,
+    ));
 }
 
 /// Where a compute-gather dispatch's CPU cost goes, four ways.
@@ -3004,7 +3029,11 @@ mod lookup_age_tests {
             (100, "list_hit_age_under_1ms", "list_miss_age_under_1ms"),
             (999, "list_hit_age_under_1ms", "list_miss_age_under_1ms"),
             (1_000, "list_hit_age_under_10ms", "list_miss_age_under_10ms"),
-            (10_000, "list_hit_age_under_100ms", "list_miss_age_under_100ms"),
+            (
+                10_000,
+                "list_hit_age_under_100ms",
+                "list_miss_age_under_100ms",
+            ),
         ];
         for (us, hit, miss) in EDGES {
             assert_eq!(list_lookup_age_route(true, us), hit, "hit at {us}");

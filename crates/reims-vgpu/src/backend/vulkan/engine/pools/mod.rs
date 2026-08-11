@@ -11,13 +11,13 @@ use std::time::Instant;
 
 use super::buffer_slab::{BufferSlabToken, BUFFER_SLAB_IDLE_KEEP_EMPTY};
 use super::compute_execution::ComputeExecutionDecline;
-use super::context::{DeviceContext, FENCE_TIMEOUT_NS};
+use super::context::{DeviceContext, DrawSpanProbe, FENCE_TIMEOUT_NS};
 use super::counters::EngineCounters;
 use super::desc_arena::{DescriptorArena, DESC_BLOCK_MAX_SETS};
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::types::{DrawError, ResidentReclaim, StorageImageFormat, TargetIdentity};
 use super::vk_call::{VkCall, VkOp};
-use super::{buffer_slab, color_subresource_range, host_ram, reason, slab, types};
+use super::{buffer_slab, color_subresource_range, gpu_span, host_ram, reason, slab, types};
 use crate::backend::vulkan::caps::{MappedMemoryKind, MemoryClass};
 use crate::backend::vulkan::translate;
 use crate::model::ComputeStorageResidencyKey;
@@ -608,6 +608,10 @@ struct CmdSlot {
     cmd_buf: vk::CommandBuffer,
     fence: vk::Fence,
     pending: Option<PendingGpuCleanup>,
+    /// Whether this slot's GPU timestamp pair has been written, and how far.
+    /// Read and cleared when the slot retires, which is the first moment the
+    /// fence makes the queries readable. See [`super::gpu_span`].
+    span: gpu_span::SlotSpan,
 }
 
 /// In-flight ring depth: the next draw/dispatch records + submits while
