@@ -170,27 +170,46 @@
 //! The lever it points at carries none of the deferral's hazards: **issue the
 //! scatter as one compute dispatch over a run table instead of ~200 transfer
 //! regions.** Same bytes, same destination, byte-identical result, nothing held
-//! across any window. Note the inference has one direction proven and one not —
-//! more regions is measured to cost, fewer regions is expected to pay and could
-//! still meet a floor this experiment cannot see.
+//! across any window. That is what `backend::vulkan::engine::guest_scatter` now
+//! does — a private module, so this names it rather than links it — and the
+//! paragraphs below are its measurement rather than the expected value they used
+//! to be.
 //!
-//! ## What it is worth, as a two-point model
+//! ## What it was worth: +48 % frames, measured
 //!
-//! Fitting `frame_time = fixed + k * regions` through the two arms — 203 regions
-//! at 49.95 Hz and 806 at 24.37 Hz — gives **~35 us of frame time per region**
-//! and a region-free floor of 12.94 ms, i.e. **~77 Hz against today's 50**. On
-//! that model the region count is **35 % of frame time** at the shipping ~200,
-//! and most of it is recoverable well before reaching one region: 50 regions
-//! already predicts 68 Hz.
+//! Eight driven macos-13 sustained-animation boots, interleaved arms of
+//! `REIMS_VGPU_COMPUTE_SCATTER`, three excluded by the standing regime rule.
+//! Exact Mann-Whitney over the survivors (on n=3, off n=2):
 //!
-//! Two straight lines through two points is the weakest kind of model and it is
-//! quoted as an expected value, not a result. What makes it worth writing down is
-//! that it agrees with an independent measurement made another way: the ablation
-//! in `backend::vulkan::engine::context` that removed this rail's GPU work
-//! *entirely* — regions, detile and bytes — reached 104 Hz. A model that put the
-//! region-free point above that would be refuted on its face; 77 Hz sits below
-//! it, and the remainder is the detile and the traffic the compute path still has
-//! to do.
+//! ```text
+//!                        on        off      delta   separation
+//! frames/s            74.92      50.51    +48.3 %       7.1x  disjoint
+//! presents/s          76.08      51.74    +47.1 %      10.8x  disjoint
+//! draws/s          26 655.9   21 123.0    +26.2 %      15.3x  disjoint
+//! regions/writeback     1.0      187                    (the mechanism)
+//! ```
+//!
+//! `p` floors at 0.20 for n=3 vs n=2 and reads that way; the separations are
+//! what carry it. Three independent things say the reading is not an artifact:
+//! the off arm reproduces the 49.95 Hz baseline recorded above from a different
+//! session and a different probe, `present_hz` equals `offered_hz` on both arms
+//! so the presenter is not the thing that moved, and the on arm lands between
+//! the prediction below and the ablation ceiling above it.
+//!
+//! The prediction it replaces is kept because it was *right*, which is the part
+//! worth trusting next time. Fitting `frame_time = fixed + k * regions` through
+//! the two ablation arms — 203 regions at 49.95 Hz and 806 at 24.37 Hz — gave
+//! ~35 us of frame time per region, a region-free floor of 12.94 ms, and **~77
+//! Hz against 50**: the region count was 35 % of frame time at the shipping
+//! ~200. Measured 74.9. Two straight lines through two points is the weakest
+//! kind of model and this one landed within 3 %.
+//!
+//! It was bracketed above as well as below. The ablation in
+//! `backend::vulkan::engine::context` that removed this rail's GPU work
+//! *entirely* — regions, detile and bytes — reached 104 Hz, so a model putting
+//! the region-free point above that would have been refuted on its face. The
+//! 74.9 to 104 Hz that remains is the detile and the traffic the compute path
+//! still has to do, and is where the next reading of this rail starts.
 //!
 //! ## The two gates a compute scatter needs, both already open
 //!
