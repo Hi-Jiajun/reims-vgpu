@@ -74,6 +74,44 @@
 //! `stage` at 0.150 is the shared run-table arena, already amortised over a
 //! draw's 1.4 dispatches, and there is nothing left in it to remove.
 //!
+//! # And then the two repairs it pointed at moved `plan` and not the total
+//!
+//! Hoisting `vkCmdBindPipeline` out of the dispatch loop and building the run
+//! table at its exact capacity, measured the same way on two more driven boots,
+//! all four in the collapsed regime (draws/frame 256.8-257.5) so they are one
+//! population:
+//!
+//! ```text
+//!             plan   stage    dset  record   total   dispatches/s
+//! before     0.350   0.150   0.082   0.376   0.959      21 949
+//! before     0.333   0.145   0.082   0.368   0.928      20 120
+//! after      0.223   0.128   0.140   0.404   0.895      24 606
+//! after      0.225   0.142   0.146   0.419   0.932      23 085
+//! ```
+//!
+//! **`plan` fell 34 % with the arms disjoint, and the total did not move.** The
+//! ~0.12 µs the reallocations were costing reappeared in `dset` and `record` —
+//! `dset` by 74 %, in a path neither change touched at all. That is the signal
+//! this split cannot resolve: at 80-150 ns a part, two `Instant::now()` calls
+//! are a large share of what is being timed, and an untouched column moving 74 %
+//! between two runs is the instrument's own floor rather than a mechanism.
+//!
+//! Do not read the `after` rows as a regression, and do not read the `plan`
+//! column as a win in frames. What they jointly say is that **the dispatch's
+//! cost is not reachable by shaving this crate's own work**: what is left is
+//! four driver calls, at a release build with `lto = "fat"`, and the only lever
+//! on four driver calls is issuing fewer of them.
+//!
+//! # Which is why the next change is not in this file
+//!
+//! Fewer dispatches has a floor of one per draw (the destination arena, ~35 %
+//! of `record`), and a ceiling of **none at all**:
+//! [`super::pools::buffer_gather_working_set`] measured 91 % of this rail's
+//! gathers as repeats of a window it already assembled. A content cache removes
+//! the dispatch, the run table, the descriptor set and the GPU copy together,
+//! and it makes every column above moot rather than smaller. Build that before
+//! anything else here.
+//!
 //! # This measures the planning, not the copy
 //!
 //! Every part here is CPU time spent *arranging* a copy the GPU makes later, in
