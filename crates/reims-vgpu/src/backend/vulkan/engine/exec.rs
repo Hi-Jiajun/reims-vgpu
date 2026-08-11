@@ -3319,6 +3319,10 @@ pub(crate) unsafe fn execute_draw_inner(
             Some(groups) => {
                 let pipeline = unsafe { pools.scatter_pipeline(ctx) }
                     .expect("planned only after the pipeline was created");
+                // Bound once for the run: `record` is 39 % of a dispatch's
+                // cost and this was one of its four driver calls, repeated for
+                // a handle that never changes.
+                unsafe { pipeline.bind(&ctx.device, cb) };
                 for g in &groups {
                     let _r = super::gather_phase::Span::open(super::gather_phase::Part::Record);
                     unsafe { pipeline.dispatch(&ctx.device, cb, g.set, g.run_count) };

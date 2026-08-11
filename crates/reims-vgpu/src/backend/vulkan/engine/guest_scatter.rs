@@ -243,8 +243,17 @@ pub(crate) fn build_run_tables(
     order.sort_unstable_by_key(|r| r.dst);
 
     let align = bind_align.max(1);
-    let mut tables: Vec<RunTable> = Vec::new();
+    // One window is the overwhelmingly common case — the partition below only
+    // splits at a `max_range` boundary, which a driven boot met on 6 % of its
+    // writebacks — so this reserves for that and grows on the rare split.
+    let mut tables: Vec<RunTable> = Vec::with_capacity(1);
     let mut open: Option<(u64, Vec<u32>, u64)> = None;
+    // Every run contributes exactly [`WORDS_PER_RUN`] words and a window holds
+    // at most all of them, so this is the exact upper bound and the push loop
+    // below cannot reallocate. It was reallocating six times per table on a
+    // ~13-run gather, growing a `Vec::new()` to fifty words, and this rail plans
+    // ~21 000 tables a second — see [`super::gather_phase`].
+    let words_cap = runs.len() * WORDS_PER_RUN;
     for run in order {
         let end = run.dst.saturating_add(run.len);
         // `align` is at least 16 and always a power of two, so the rounded-down
@@ -270,7 +279,7 @@ pub(crate) fn build_run_tables(
             }
             None => fresh_base,
         };
-        let (_, words, hi) = open.get_or_insert_with(|| (base, Vec::new(), 0));
+        let (_, words, hi) = open.get_or_insert_with(|| (base, Vec::with_capacity(words_cap), 0));
         // Every one of these divisions is exact and every result is bounded by
         // the `max_range` check above, so the truncating casts cannot lose a bit.
         words.push((run.src / SCATTER_WORD) as u32);
@@ -534,12 +543,31 @@ impl ScatterPipeline {
         unsafe { device.update_descriptor_sets(&writes, &[]) };
     }
 
-    /// Bind, push the run count and dispatch one workgroup per run.
+    /// Bind the kernel, once, ahead of a run of [`Self::dispatch`]es.
+    ///
+    /// Split out because the handle is the same on every dispatch and this rail
+    /// issues ~21 000 of them a second: `record` is 39 % of a dispatch's CPU
+    /// cost and this is one of its four driver calls, so a draw's 1.4 dispatches
+    /// paid for 1.4 binds of one pipeline. Whoever binds is also responsible for
+    /// there being no *other* pipeline bound to
+    /// [`vk::PipelineBindPoint::COMPUTE`] between the bind and the last
+    /// dispatch — which holds at both call sites, because each records its
+    /// dispatches in one uninterrupted loop.
     ///
     /// # Safety
     ///
-    /// `cb` must be recording, and `set` must name buffers live for the whole
-    /// of the submission `cb` belongs to.
+    /// `cb` must be recording.
+    pub(crate) unsafe fn bind(&self, device: &ash::Device, cb: vk::CommandBuffer) {
+        unsafe { device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.pipeline) };
+    }
+
+    /// Bind the set, push the run count and dispatch one workgroup per run.
+    ///
+    /// # Safety
+    ///
+    /// `cb` must be recording with this pipeline bound by [`Self::bind`], and
+    /// `set` must name buffers live for the whole of the submission `cb`
+    /// belongs to.
     pub(crate) unsafe fn dispatch(
         &self,
         device: &ash::Device,
@@ -548,7 +576,6 @@ impl ScatterPipeline {
         run_count: u32,
     ) {
         unsafe {
-            device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.pipeline);
             device.cmd_bind_descriptor_sets(
                 cb,
                 vk::PipelineBindPoint::COMPUTE,

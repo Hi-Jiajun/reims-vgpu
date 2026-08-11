@@ -3274,6 +3274,8 @@ unsafe fn copy_image_level0_to_buffer(
                     // pipeline is a fixture of the device. It is already built —
                     // the plan could not have been made otherwise.
                     if let Some(pipeline) = pools.scatter_pipeline(ctx) {
+                        // One bind for the whole run; the handle never changes.
+                        pipeline.bind(&ctx.device, cb);
                         for group in groups {
                             pipeline.dispatch(&ctx.device, cb, group.set, group.run_count);
                         }
