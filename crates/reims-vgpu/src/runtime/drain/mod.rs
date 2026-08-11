@@ -5236,9 +5236,28 @@ pub(crate) fn display_event_enabled<H: HostMemory>(host: &H, gpa: u64, event_mas
 /// measures the rate it is served across **one early window**, latches 60 Hz or
 /// 120 Hz from it, and never revisits the answer however fast it is served
 /// afterwards. So this ordering can only matter to the extent it changes what
-/// that one window reads, which is a probability over boots and not a rate, and
-/// n=3 an arm cannot measure one. Ranking this change on steady-state
-/// `present_hz` was the wrong instrument.
+/// that one window reads, which is a probability over boots and not a rate.
+///
+/// **It does not change it.** Forty interleaved driven macos-13 boots, twenty an
+/// arm, no guest panic and no boot lost:
+///
+/// ```text
+///          latched fast   latched slow   rate
+/// old            13             7        0.65
+/// new            15             5        0.75
+/// ```
+///
+/// That is p≈0.7 — nothing. The 9-in-11 against 4-in-9 that earlier runs hinted
+/// at was the non-interleaving showing through, which is exactly what the run
+/// was set up to falsify. So this ordering is kept on its own merits: it is what
+/// the contract says (a tick that delivers nothing has no business spending the
+/// interval), it is unit-tested, and it raises the delivered rate within a boot.
+/// It is not a frame-rate fix and must not be quoted as one.
+///
+/// The same forty boots put the base rate at **28 fast to 12 slow**, so about
+/// three boots in ten lose half their frame rate on this rail, and they are
+/// sharply bimodal — every slow boot presented 59.8-60.5 Hz and every fast one
+/// 94.8-117.0, with nothing in between.
 ///
 /// Reading the mask first cannot deliver faster than the advertised rate —
 /// [`claim_display_vbl`] still gates every delivery on a full interval having
