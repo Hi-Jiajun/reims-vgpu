@@ -200,6 +200,22 @@ pub const UNUSED_BINDS: &str = "REIMS_VGPU_UNUSED_BINDS";
 /// less concurrency than several, never more.
 pub const PRESENT_DEPTH: &str = "REIMS_VGPU_PRESENT_DEPTH";
 
+/// **Default on.** Setting this off restores one completion-stamp write per
+/// packet, which is what `drain_child_fifo` did before the stamps in a single
+/// drain of one channel were collapsed into a single write at its end.
+///
+/// Off is a refusal and never a permission: one write per packet is strictly
+/// more work than one per drain, never less, and the coalesced arm needs no
+/// capability the per-packet arm does not.
+///
+/// It exists because the stamp is **12.3 us a packet** on the Vulkan arm —
+/// `write_stamp` submits a command buffer rather than writing a word — and
+/// because a change to when a completion becomes visible to the guest is the
+/// kind whose failure is a stall or a stutter rather than a decline. The
+/// previous behavior has to stay reachable without a rebuild so the two can be
+/// A/B'd on one binary.
+pub const STAMP_COALESCE: &str = "REIMS_VGPU_STAMP_COALESCE";
+
 /// **Probe, default off.** Setting this *on* cuts every guest-page scatter run
 /// into four contiguous sub-ranges that tile it exactly.
 ///
@@ -503,7 +519,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 14] = [
+pub const ALL: [&str; 15] = [
     LAZY_WRITEBACK,
     SLAB_RETAIN,
     CLEAR_SEED,
@@ -516,6 +532,7 @@ pub const ALL: [&str; 14] = [
     BATCH_MIXED_TARGETS,
     UNUSED_BINDS,
     PRESENT_DEPTH,
+    STAMP_COALESCE,
     SCATTER_SPLIT,
     COMPUTE_SCATTER,
 ];

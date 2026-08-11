@@ -824,6 +824,63 @@ impl StampWait {
     }
 }
 
+/// The completion stamp one drain of one channel owes, coalesced.
+///
+/// Every packet in a `drain_child_fifo` call stamps **the same slot** — the
+/// index is read once from the channel's register block before the loop — and a
+/// stamp wait is satisfied by any value at or past the one awaited
+/// ([`StampWait::satisfied_by`]). So a run of stamps to one slot is observable
+/// only through its greatest value unless the guest samples between the writes,
+/// and writing only that value discharges every wait the run would have.
+///
+/// That matters because a stamp is not a word write. On the Vulkan arm
+/// `write_stamp` submits a command buffer, measured at **12.3 us a packet**
+/// against 59 ns for the tail read beside it, and a driven macos-13 boot
+/// averages **11.6 packets per drain call** — so collapsing the run removes
+/// roughly ten submissions in eleven. `engine_delta` said the same thing from
+/// the other side: `batch_flushes` equalled `batch_opens` at 1.58 draws a
+/// flush, because each packet's stamp flushed whatever draws had gathered.
+///
+/// [`Self::latch`] takes the **maximum in wrapping-signed order** rather than
+/// the last value seen. For a well-formed guest those are the same, and taking
+/// the maximum means this device cannot introduce a regressing stamp even if a
+/// regressing one arrives — a slot going backwards would unsatisfy a wait the
+/// guest had already been told was met.
+#[derive(Clone, Copy, Default)]
+pub struct PendingStamp {
+    /// `None` until a packet in this drain has completed. A drain that stamps
+    /// nothing owes nothing and must submit nothing.
+    value: Option<u32>,
+}
+
+impl PendingStamp {
+    /// Fold one packet's completion stamp in, keeping the later of the two in
+    /// the same wrapping-signed order [`StampWait::satisfied_by`] compares in.
+    pub fn latch(&mut self, stamp: u32) {
+        self.value = Some(match self.value {
+            Some(held) if stamp.wrapping_sub(held) as i32 <= 0 => held,
+            _ => stamp,
+        });
+    }
+
+    /// The value owed, or `None` when this drain stamped nothing.
+    pub fn owed(self) -> Option<u32> {
+        self.value
+    }
+
+    /// Whether `wait` is already discharged by what this drain has latched but
+    /// not yet written.
+    ///
+    /// Without this a packet waiting on the slot an earlier packet in the same
+    /// drain stamped would read the stale word out of guest RAM, return
+    /// [`StampVerdict::Hold`], and park the channel against a stamp this device
+    /// is itself holding. `slot` is the drain's own stamp index; a wait naming
+    /// any other slot is not ours to answer.
+    fn discharges(self, slot: u32, wait: StampWait) -> bool {
+        stamp_slot_index(wait.index) == slot && self.value.is_some_and(|v| wait.satisfied_by(v))
+    }
+}
+
 /// Parsed FIFO packet (main + child share framing).
 ///
 /// `stamp_waits` is the record array between header and payload, decoded. The
@@ -1147,6 +1204,7 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
     host: &H,
     channel: Option<u32>,
     packet: &Packet,
+    pending: Option<(u32, PendingStamp)>,
 ) -> StampVerdict {
     if packet.stamp_waits.is_empty() {
         return StampVerdict::Ready;
@@ -1154,6 +1212,15 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
     let mut verdict = StampVerdict::Ready;
     for wait in &packet.stamp_waits {
         let index = stamp_slot_index(wait.index);
+        // Answered from the drain's own latch before guest RAM, because the word
+        // in guest RAM is stale by exactly the stamps this drain is holding. The
+        // ordering the wait asks about already holds: packets are processed in
+        // order on this thread, so a stamp latched here is work that finished
+        // before the packet doing the waiting was decoded.
+        if pending.is_some_and(|(slot, held)| held.discharges(slot, *wait)) {
+            note_store_route("packet_stamp_wait_met_pending");
+            continue;
+        }
         let unresolvable = |reason: &'static str, detail: String| {
             note_store_route("packet_stamp_wait_unresolvable");
             if crate::observe::first_sight("packet_stamp_wait_unresolvable", u64::from(index)) {
@@ -2200,7 +2267,11 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
             ring_size,
         ) {
             Ok(packet) => {
-                if note_packet_stamp_waits(state, host, None, &packet) == StampVerdict::Hold {
+                // The main FIFO stamps per packet and latches nothing, so there is
+                // no pending value here for a wait to be answered from.
+                if note_packet_stamp_waits(state, host, None, &packet, None)
+                    == StampVerdict::Hold
+                {
                     // Same hold as the child drain, and this is the timeline
                     // where it matters most: the measured root wait is a
                     // `DELETE_TASK` ordered behind a child FIFO's stamp, so
@@ -4336,6 +4407,17 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     // See `drain_main_fifo`'s copy for what a sticky bit would cost.
     state.stamp_deferred_mask &= !bit;
 
+    // Every packet below stamps `stamp_index`, which was read once above, so the
+    // whole drain owes one slot one value. See [`PendingStamp`] for why that is
+    // collapsed rather than written per packet, and `env::STAMP_COALESCE` for
+    // the switch that restores the per-packet arm.
+    let coalesce = crate::env::switch(crate::env::STAMP_COALESCE) != crate::env::Switch::Off;
+    let mut pending = PendingStamp::default();
+    // The slot the latch is about, resolved the same way `write_stamp` resolves
+    // it, so a wait naming that slot is compared against the same index the
+    // pending value will be written to.
+    let stamp_index_slot = stamp_slot_index(stamp_index);
+
     loop {
         let regs_started = std::time::Instant::now();
         let tail_read = crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_TAIL);
@@ -4423,8 +4505,13 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
         }
         match decode_packet(&snap, head, available, ring_length) {
             Ok(packet) => {
-                if note_packet_stamp_waits(state, host, Some(channel_id), &packet)
-                    == StampVerdict::Hold
+                if note_packet_stamp_waits(
+                    state,
+                    host,
+                    Some(channel_id),
+                    &packet,
+                    Some((stamp_index_slot, pending)),
+                ) == StampVerdict::Hold
                 {
                     // The guest ordered this packet behind work that has not
                     // reached its stamp. Hold it: head and completion stamp stay
@@ -4483,12 +4570,19 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 // an async execution path, that ordering has to come back with
                 // it — and be written against the async model that then exists,
                 // not inherited from an empty queue.
-                let stamp_started = std::time::Instant::now();
-                write_stamp(state, host, stamp_index, packet.completion_stamp);
-                census::note_drain_regs(
-                    census::RegsOp::Stamp,
-                    stamp_started.elapsed().as_nanos() as u64,
-                );
+                if coalesce {
+                    // Deliberately untimed: the cost this span was measuring is
+                    // the submit, and folding a value into a latch is not one.
+                    // The submit it defers to is timed where it happens, below.
+                    pending.latch(packet.completion_stamp);
+                } else {
+                    let stamp_started = std::time::Instant::now();
+                    write_stamp(state, host, stamp_index, packet.completion_stamp);
+                    census::note_drain_regs(
+                        census::RegsOp::Stamp,
+                        stamp_started.elapsed().as_nanos() as u64,
+                    );
+                }
                 if state.pending.host_action_yield {
                     if head != tail {
                         state.pending.child_mask |= bit;
@@ -4507,6 +4601,20 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 break;
             }
         }
+    }
+
+    // Every `break` above lands here, which is what makes one site enough: a
+    // drain that stops on a held stamp, a deferred translation, a decode fault
+    // or a host-action yield owes the stamps it already latched exactly as a
+    // drain that ran the ring dry does. Leaving one unwritten is a guest waiting
+    // on a word that never arrives.
+    if let Some(value) = pending.owed() {
+        let stamp_started = std::time::Instant::now();
+        write_stamp(state, host, stamp_index, value);
+        census::note_drain_regs(
+            census::RegsOp::Stamp,
+            stamp_started.elapsed().as_nanos() as u64,
+        );
     }
 
     state.draining_mask &= !bit;
