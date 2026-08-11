@@ -2359,7 +2359,29 @@ fn ensure_child_ring<M: HostMemory>(
     length
 }
 
+/// The child FIFO's own ring reader, and **the hot one**.
+///
+/// There are two readers over one wire form. [`read_ring_bytes`] serves the
+/// root FIFO and `ring_reads` for it measured **zero** across a driven
+/// `blur=40` boot while the child FIFO decoded ~8 000 packets a second — so
+/// timing only that one reports a rail that never runs and reads exactly like a
+/// span that is free. Both are counted into the same pair now; a split by FIFO
+/// would be the next refinement if the total turns out to matter.
 fn read_child_ring_bytes<M: HostMemory>(
+    mem: &M,
+    page_gpas: &[u64],
+    ring_length: u32,
+    absolute: u32,
+    len: u32,
+    page_shift: u32,
+) -> Result<Vec<u8>, MemError> {
+    let started = std::time::Instant::now();
+    let out = read_child_ring_bytes_inner(mem, page_gpas, ring_length, absolute, len, page_shift);
+    census::note_drain_ring(started.elapsed().as_nanos() as u64);
+    out
+}
+
+fn read_child_ring_bytes_inner<M: HostMemory>(
     mem: &M,
     page_gpas: &[u64],
     ring_length: u32,
