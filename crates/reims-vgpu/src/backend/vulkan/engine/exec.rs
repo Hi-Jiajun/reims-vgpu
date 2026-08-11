@@ -2140,9 +2140,9 @@ pub(crate) unsafe fn execute_draw_inner(
 
     phase.enter(super::draw_phase::Phase::PipelineShader);
     let (vert_digest, vert_module) =
-        caches.get_or_create_shader(ctx, &req.vert_spirv, counters, pools)?;
+        caches.get_or_create_shader_memoized(ctx, &req.vert_spirv, counters, pools)?;
     let (frag_digest, frag_module) =
-        caches.get_or_create_shader(ctx, &req.frag_spirv, counters, pools)?;
+        caches.get_or_create_shader_memoized(ctx, &req.frag_spirv, counters, pools)?;
     phase.enter(super::draw_phase::Phase::PipelineLayoutPass);
     let (dsl, pipeline_layout) = caches.get_or_create_layout(ctx, &layout_key, counters, pools)?;
     let render_pass = caches.get_or_create_pass(ctx, pass_key, counters, pools)?;

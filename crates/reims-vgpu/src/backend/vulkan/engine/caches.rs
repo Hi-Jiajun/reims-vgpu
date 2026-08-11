@@ -422,6 +422,85 @@ impl<K: Clone + Eq + std::hash::Hash, V> ObjectCache<K, V> {
     }
 }
 
+/// Entries the front index holds before it starts over.
+///
+/// Each entry is an address, a `Digest128` and an `Arc` clone — tens of bytes,
+/// plus the words the `Arc` keeps alive, which the runtime owns for the
+/// shader's lifetime anyway. A driven macos-13 boot binds a few hundred
+/// distinct modules, so this is a ceiling with an order of magnitude of
+/// headroom and `shader_digest_reset` firing is the boot saying the guest's
+/// module set is not what that assumed.
+const SHADER_DIGEST_ENTRIES: usize = 4096;
+
+/// `Arc<Vec<u32>>` allocation address → the digest that module finally hashes
+/// to, so a repeat bind can skip three whole-module walks.
+///
+/// # Why an address is a sound key
+///
+/// Only because the entry holds the `Arc`. While it does, the allocation cannot
+/// be freed, so nothing else can be given that address and the key cannot come
+/// to mean a different module. Drop the `Arc` from the entry and this becomes a
+/// use-after-free dressed as a cache hit.
+///
+/// `usize` rather than `*const Vec<u32>` because a raw pointer is not `Send` and
+/// `Caches` is held behind the engine lock and moved between threads. The
+/// address is never dereferenced — it is compared, and the `Arc` beside it is
+/// what keeps it meaningful.
+///
+/// # What it skips, and why that is safe
+///
+/// [`ObjectCaches::get_or_create_shader`] walks the module three times before it
+/// can look anything up: `required_image_capabilities`, the digest, and (on the
+/// patch path) a rebuild. All three are pure functions of the words, and the
+/// words behind an `Arc<Vec<u32>>` cannot change. So the digest recorded here is
+/// the *final* one — after any capability patch — and a hit is the same answer
+/// those three walks would have produced.
+///
+/// A hit still consults [`ObjectCaches::shaders`], positive and negative. That
+/// keeps this index from depending on `ObjectCache` never evicting, which is a
+/// property it happens to have and does not promise: a miss there simply falls
+/// through to the full path, which recomputes and re-inserts.
+#[derive(Default)]
+struct ShaderDigestIndex {
+    map: std::collections::HashMap<usize, (std::sync::Arc<Vec<u32>>, Digest128)>,
+}
+
+impl ShaderDigestIndex {
+    /// The digest this allocation's module hashes to, if it has been walked
+    /// before.
+    fn get(&self, words: &std::sync::Arc<Vec<u32>>) -> Option<Digest128> {
+        self.map
+            .get(&(std::sync::Arc::as_ptr(words) as usize))
+            .map(|(_, digest)| *digest)
+    }
+
+    /// Record what a full walk of this allocation produced.
+    ///
+    /// The bound is enforced here because this is the only way in: past
+    /// [`SHADER_DIGEST_ENTRIES`] the whole index is dropped rather than evicting
+    /// one entry, because there is no recency to evict *by* — every entry is
+    /// equally cheap to rebuild, and a boot that reaches the bound is reporting
+    /// something rather than asking for a policy.
+    fn insert(&mut self, words: &std::sync::Arc<Vec<u32>>, digest: Digest128) {
+        if self.map.len() >= SHADER_DIGEST_ENTRIES {
+            crate::observe::off(format!(
+                "shader_digest_reset entries={} words={}",
+                self.map.len(),
+                words.len()
+            ));
+            self.map.clear();
+        }
+        self.map.insert(
+            std::sync::Arc::as_ptr(words) as usize,
+            (std::sync::Arc::clone(words), digest),
+        );
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+    }
+}
+
 pub(crate) struct ObjectCaches {
     shaders: ObjectCache<Digest128, vk::ShaderModule>,
     layouts: ObjectCache<LayoutKey, (vk::DescriptorSetLayout, vk::PipelineLayout)>,
@@ -430,6 +509,10 @@ pub(crate) struct ObjectCaches {
     samplers: ObjectCache<SamplerStateKey, vk::Sampler>,
     /// Lc: compute pipelines (content digest + entry + layout).
     compute_pipelines: ObjectCache<ComputePipelineKey, vk::Pipeline>,
+    /// The allocation a shader's words live in → the digest its module hashes
+    /// to, so a repeat bind of the same module does not walk it three times to
+    /// find that out.
+    shader_digests: ShaderDigestIndex,
 }
 
 impl ObjectCaches {
@@ -441,6 +524,7 @@ impl ObjectCaches {
             pipelines: ObjectCache::new(),
             samplers: ObjectCache::new(),
             compute_pipelines: ObjectCache::new(),
+            shader_digests: ShaderDigestIndex::default(),
         }
     }
 
@@ -489,6 +573,9 @@ impl ObjectCaches {
     }
 
     pub(crate) fn clear_logical(&mut self) {
+        // Before the modules it indexes, so no window exists where a front-index
+        // hit names a digest whose module has already gone.
+        self.shader_digests.clear();
         self.shaders.clear();
         self.layouts.clear();
         self.passes.clear();
@@ -520,6 +607,48 @@ impl ObjectCaches {
             )
             .fail();
         DrawError::Unsupported(reason)
+    }
+
+    /// [`Self::get_or_create_shader`] with the three whole-module walks skipped
+    /// for an allocation that has been through it before.
+    ///
+    /// The draw path is the caller that needs this: it binds two modules a draw
+    /// at ~30 000 draws a second, from `Arc`s the runtime holds for each
+    /// shader's lifetime, into a cache that on a driven macos-13 boot reports
+    /// `shader_misses=0`. `pl_shader_us` was **63 ms of every second** — the
+    /// largest single item inside `engine_us` — spent deriving a key for a
+    /// module already in hand.
+    ///
+    /// The compute path calls the walking form directly and deliberately: its
+    /// `spirv` is an owned `Vec` with no stable allocation to key on, and a
+    /// dispatch is three orders rarer than a draw.
+    pub(crate) unsafe fn get_or_create_shader_memoized(
+        &mut self,
+        ctx: &DeviceContext,
+        words: &std::sync::Arc<Vec<u32>>,
+        counters: &EngineCounters,
+        pools: &mut ResourcePools,
+    ) -> Result<(Digest128, vk::ShaderModule), DrawError> {
+        if let Some(key) = self.shader_digests.get(words) {
+            // Negative before positive, in the order the walking form asks them:
+            // a module this device refused is refused again without being
+            // rebuilt, and without the front index quietly promoting it.
+            if let Some(err) = self.shaders.get_negative(&key) {
+                counters.shader_misses.fetch_add(1, Ordering::Relaxed);
+                return Err(err);
+            }
+            if let Some(&module) = self.shaders.get(&key) {
+                counters.shader_hits.fetch_add(1, Ordering::Relaxed);
+                counters.shader_digest_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok((key, module));
+            }
+            // The module was evicted or destroyed under a digest this index
+            // still names. Falling through re-walks and re-creates it, which is
+            // why the index may hold a digest the cache does not.
+        }
+        let (key, module) = self.get_or_create_shader(ctx, words, counters, pools)?;
+        self.shader_digests.insert(words, key);
+        Ok((key, module))
     }
 
     pub(crate) unsafe fn get_or_create_shader(
@@ -1738,5 +1867,83 @@ mod object_cache_tests {
         // The memory came back, so this time the create succeeds.
         c.insert(key, 0x5EED);
         assert_eq!(c.get(&key), Some(&0x5EED));
+    }
+
+    /// The index is keyed on the *allocation*, not on the contents, and that is
+    /// the whole of its soundness argument: it holds the `Arc`, so the address
+    /// cannot be reused while the entry lives.
+    ///
+    /// Two `Arc`s over identical words are two allocations and therefore two
+    /// entries. That is not a miss to fix — a content key is what the digest
+    /// already is, and rederiving it is what this index exists to avoid.
+    #[test]
+    fn the_shader_digest_index_keys_the_allocation_and_not_the_contents() {
+        let mut index = ShaderDigestIndex::default();
+        let words = std::sync::Arc::new(vec![0x0723_0203u32, 0x0001_0000, 0x000d_000b]);
+        let twin = std::sync::Arc::new((*words).clone());
+        let digest = Digest128 { a: 0xA1, b: 0xB2, len: 3 };
+
+        assert_eq!(index.get(&words), None, "nothing walked yet");
+        index.insert(&words, digest);
+
+        assert_eq!(index.get(&words), Some(digest));
+        assert_eq!(
+            index.get(&twin),
+            None,
+            "identical words in a second allocation are a second entry"
+        );
+        let alias = std::sync::Arc::clone(&words);
+        assert_eq!(
+            index.get(&alias),
+            Some(digest),
+            "a clone of the same Arc is the same allocation and the same entry"
+        );
+    }
+
+    /// A dropped module's address may be handed to the next allocation, and the
+    /// index must not answer for it. It cannot: the entry holds an `Arc`, so
+    /// while it lives the allocation is not freed and the address is not
+    /// available to hand out.
+    ///
+    /// This asserts the mechanism rather than the hazard — a test that freed an
+    /// allocation and hoped for the address back would be testing the allocator.
+    #[test]
+    fn a_shader_digest_entry_keeps_its_words_alive() {
+        let mut index = ShaderDigestIndex::default();
+        let words = std::sync::Arc::new(vec![1u32, 2, 3]);
+        index.insert(&words, Digest128 { a: 1, b: 2, len: 3 });
+        assert_eq!(
+            std::sync::Arc::strong_count(&words),
+            2,
+            "the index holds one, which is what makes its key an address"
+        );
+        index.clear();
+        assert_eq!(std::sync::Arc::strong_count(&words), 1, "and releases it");
+    }
+
+    /// The bound is the container's and it starts over rather than evicting,
+    /// because every entry is equally cheap to rebuild and there is no recency
+    /// to evict by.
+    #[test]
+    fn the_shader_digest_index_starts_over_at_its_bound() {
+        let mut index = ShaderDigestIndex::default();
+        let held: Vec<std::sync::Arc<Vec<u32>>> = (0..SHADER_DIGEST_ENTRIES)
+            .map(|i| std::sync::Arc::new(vec![i as u32]))
+            .collect();
+        for (i, words) in held.iter().enumerate() {
+            index.insert(words, Digest128 { a: i as u64, b: 0, len: 1 });
+        }
+        assert_eq!(index.map.len(), SHADER_DIGEST_ENTRIES);
+        assert!(index.get(&held[0]).is_some());
+
+        let one_more = std::sync::Arc::new(vec![0xFFFF_FFFFu32]);
+        index.insert(&one_more, Digest128 { a: 9, b: 9, len: 1 });
+
+        assert_eq!(index.map.len(), 1, "the bound holds by starting over");
+        assert_eq!(index.get(&one_more), Some(Digest128 { a: 9, b: 9, len: 1 }));
+        assert!(
+            index.get(&held[0]).is_none(),
+            "and the reset is total, so nothing survives to be answered stale"
+        );
     }
 }

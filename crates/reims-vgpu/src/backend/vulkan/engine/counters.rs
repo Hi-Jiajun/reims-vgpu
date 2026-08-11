@@ -168,6 +168,17 @@ engine_counters! {
         /// Divided by the census window this is a bandwidth, which is the form
         /// that can be compared against what a hashing pass over memory costs.
         shader_hash_words,
+        /// `shader_hits` that never walked the module at all, because
+        /// `get_or_create_shader_memoized` recognised the allocation its words
+        /// live in and already knew the digest.
+        ///
+        /// Read as a *fraction of* `shader_hits`, which is the only form that
+        /// says anything: the two together are the front index's hit rate, and
+        /// `shader_hash_words` beside them is what the walks that remain cost.
+        /// A boot where this sits well below `shader_hits` has a draw path
+        /// handing the walking form an allocation it does not hold — which is a
+        /// correctness-neutral regression that nothing else would report.
+        shader_digest_hits,
         layout_hits,
         layout_misses,
         pass_hits,
