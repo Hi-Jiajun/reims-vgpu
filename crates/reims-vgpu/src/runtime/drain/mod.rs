@@ -4281,6 +4281,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     let Some(regs_off) = child_reg_block_offset(channel_id) else {
         return;
     };
+    let setup_started = std::time::Instant::now();
     let regs_gpa = state.pfn_gpa(state.gfx.root_page) + regs_off;
 
     let mut head = match crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_HEAD) {
@@ -4322,6 +4323,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
         return;
     }
     let page_gpas = state.child_rings[channel_id as usize].page_gpas.clone();
+    census::note_drain_setup(setup_started.elapsed().as_nanos() as u64);
 
     // Nested drain_other must skip this channel (no re-enter head).
     // Use a bit mask so nested drains skip the full stack, not only the leaf.
@@ -4335,7 +4337,10 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     state.stamp_deferred_mask &= !bit;
 
     loop {
-        let tail = match crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_TAIL) {
+        let regs_started = std::time::Instant::now();
+        let tail_read = crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_TAIL);
+        census::note_drain_regs(regs_started.elapsed().as_nanos() as u64);
+        let tail = match tail_read {
             Ok(v) => v,
             Err(_) => {
                 state.record_fail(FailEvent::MalformedChildPacket {
@@ -4430,9 +4435,10 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     state.pending.child_mask |= bit;
                     break;
                 }
-                if process_child_packet(state, host, channel_id, &packet)
-                    == ChildPacketDisposition::Deferred
-                {
+                let proc_started = std::time::Instant::now();
+                let disposition = process_child_packet(state, host, channel_id, &packet);
+                census::note_drain_proc(proc_started.elapsed().as_nanos() as u64);
+                if disposition == ChildPacketDisposition::Deferred {
                     // Translation owns only immutable AIR bytes. Keep head and
                     // stamp untouched so retry cannot duplicate any packet
                     // side effect; continue with sibling channels in the
@@ -4440,14 +4446,15 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     break;
                 }
                 head = packet.next_head;
-                if gpa_map::write_u32(
+                let head_started = std::time::Instant::now();
+                let head_write = gpa_map::write_u32(
                     host,
                     regs_gpa + CHILD_REG_HEAD,
                     head,
                     state.page_size() as usize,
-                )
-                .is_err()
-                {
+                );
+                census::note_drain_regs(head_started.elapsed().as_nanos() as u64);
+                if head_write.is_err() {
                     // The packet was processed + stamped, but the consumer
                     // pointer never advanced: the next drain re-reads the stale
                     // head and RE-EXECUTES the same packets. Fail-visible so
@@ -4470,7 +4477,9 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 // an async execution path, that ordering has to come back with
                 // it — and be written against the async model that then exists,
                 // not inherited from an empty queue.
+                let stamp_started = std::time::Instant::now();
                 write_stamp(state, host, stamp_index, packet.completion_stamp);
+                census::note_drain_regs(stamp_started.elapsed().as_nanos() as u64);
                 if state.pending.host_action_yield {
                     if head != tail {
                         state.pending.child_mask |= bit;

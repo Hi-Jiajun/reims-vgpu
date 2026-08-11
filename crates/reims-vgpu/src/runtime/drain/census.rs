@@ -916,6 +916,28 @@ pub(crate) struct DrainDutyCensus {
     ring_reads: std::sync::atomic::AtomicU64,
     decode_ns: std::sync::atomic::AtomicU64,
     packets: std::sync::atomic::AtomicU64,
+    /// The rest of `drain_child_fifo`, so that the loop is covered end to end
+    /// rather than sampled at two points.
+    ///
+    /// Two instruments in a row named a candidate from reading the code and
+    /// were worth 0.3 % between them, so this does not name a third: `proc_ns`
+    /// spans the whole opcode dispatch, `regs_ns` the guest register traffic
+    /// every packet pays around it, and `setup_ns` the per-call prologue. With
+    /// `ring_ns` and `decode_ns` those five tile one iteration of the loop, so
+    /// whatever is left after subtracting them from the residue is *outside*
+    /// the child FIFO entirely and the search moves rather than guesses again.
+    ///
+    /// `proc_ns` contains `draw_us` and `compute_us`, which name themselves on
+    /// the same line — subtract them and what remains is the dispatch's own
+    /// per-opcode cost. The other two contain nothing that names itself.
+    ///
+    /// Nanoseconds for the same reason as the pair above: `regs_ns` fires three
+    /// times a packet and each one is a handful of guest word accesses.
+    proc_ns: std::sync::atomic::AtomicU64,
+    regs_ns: std::sync::atomic::AtomicU64,
+    regs_ops: std::sync::atomic::AtomicU64,
+    setup_ns: std::sync::atomic::AtomicU64,
+    setup_calls: std::sync::atomic::AtomicU64,
     max_tranche_us: std::sync::atomic::AtomicU64,
     /// Longest single Flush in the window. `flush_us/flushes` is a mean, and a
     /// mean cannot tell "every flush costs 7.7 ms" from "most are free and one
@@ -1103,6 +1125,29 @@ impl DrainDutyCensus {
         self.packets.fetch_add(1, Relaxed);
     }
 
+    /// One `process_child_packet` dispatch, in nanoseconds. Contains the draw
+    /// and compute phases, which name themselves on the same line.
+    pub(crate) fn note_proc(&self, ns: u64) {
+        self.proc_ns
+            .fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// One guest register access around a packet — the tail read, the head
+    /// writeback, or the completion stamp — in nanoseconds.
+    pub(crate) fn note_regs(&self, ns: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.regs_ns.fetch_add(ns, Relaxed);
+        self.regs_ops.fetch_add(1, Relaxed);
+    }
+
+    /// One `drain_child_fifo` prologue, in nanoseconds: the three register
+    /// reads, the ring resolve, and the page-GPA copy the loop reads from.
+    pub(crate) fn note_setup(&self, ns: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.setup_ns.fetch_add(ns, Relaxed);
+        self.setup_calls.fetch_add(1, Relaxed);
+    }
+
     /// Accumulate one completed tranche and return the line when a report is
     /// due. Returns the line rather than emitting it so the reporting rule is
     /// testable without a log sink: that the window resets on report (so the
@@ -1151,6 +1196,11 @@ impl DrainDutyCensus {
         let ring_reads = self.ring_reads.swap(0, Relaxed);
         let decode = self.decode_ns.swap(0, Relaxed) / 1000;
         let packets = self.packets.swap(0, Relaxed);
+        let proc_us = self.proc_ns.swap(0, Relaxed) / 1000;
+        let regs = self.regs_ns.swap(0, Relaxed) / 1000;
+        let regs_ops = self.regs_ops.swap(0, Relaxed);
+        let setup = self.setup_ns.swap(0, Relaxed) / 1000;
+        let setup_calls = self.setup_calls.swap(0, Relaxed);
         let slow = self.slow_tranches.swap(0, Relaxed);
         let busy = drain.saturating_add(publish);
         let duty = busy as f64 / (win_ms as f64 * 1000.0);
@@ -1161,6 +1211,8 @@ impl DrainDutyCensus {
              flush_us={flush} flushes={flushes} max_flush_us={max_flush} \
              tail_us={tail} boundary_us={boundary} \
              ring_us={ring} ring_reads={ring_reads} decode_us={decode} packets={packets} \
+             proc_us={proc_us} regs_us={regs} regs_ops={regs_ops} \
+             setup_us={setup} setup_calls={setup_calls} \
              slow_tranches={slow}/{tranches} slow_us={DRAIN_TRANCHE_SLOW_US}"
         ))
     }
@@ -1657,6 +1709,21 @@ pub fn note_drain_ring(ns: u64) {
 /// Attribute one packet decode, in nanoseconds.
 pub fn note_drain_decode(ns: u64) {
     DRAIN_DUTY.note_decode(ns);
+}
+
+/// Attribute one `process_child_packet` dispatch, in nanoseconds.
+pub fn note_drain_proc(ns: u64) {
+    DRAIN_DUTY.note_proc(ns);
+}
+
+/// Attribute one guest register access around a packet, in nanoseconds.
+pub fn note_drain_regs(ns: u64) {
+    DRAIN_DUTY.note_regs(ns);
+}
+
+/// Attribute one `drain_child_fifo` prologue, in nanoseconds.
+pub fn note_drain_setup(ns: u64) {
+    DRAIN_DUTY.note_setup(ns);
 }
 
 /// Accumulate one completed drain tranche; emits at most once per second.
