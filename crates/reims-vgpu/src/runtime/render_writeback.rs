@@ -44,6 +44,40 @@
 //! the wrong denominator for a per-surface-rail ratio by about 2.4x. Use the
 //! route counter for the rail being reasoned about.
 //!
+//! # And the redundancy is supersession, never identical bytes
+//!
+//! There is a cheaper repair than any deferral — refuse the copy when the guest's
+//! pages already hold these exact pixels — and the witness for it is already
+//! built and already maintained from both ends. `finish` stamps the resident
+//! with the mapping's `surface_content_epoch` after every Store, and
+//! `registry_mark_ready` clears that stamp on every draw that renders into the
+//! resident, so `resident_content_epoch(identity) == m.surface_content_epoch` at
+//! the top of a Store means nothing has changed the pixels since the last one.
+//! It is the same comparison the type-11 attachment LOAD already elides its CPU
+//! seed on, read from the writing side.
+//!
+//! **It is zero, and not nearly zero.** A census partitioning every
+//! `surface_flush` four ways over two driven macos-13 sustained-animation boots:
+//!
+//! ```text
+//! boot 1   surface_flush 30 239   current 0   stale 0   unstamped 30 239   absent 0
+//! boot 2   surface_flush 29 164   current 0   stale 0   unstamped 29 164   absent 0
+//! ```
+//!
+//! 59 403 Stores and not one of them found a resident still stamped. That is
+//! structural rather than a property of this workload: a Store is what a draw
+//! chain ends in, so a draw has always just rendered into the resident and
+//! always just cleared the stamp. The `absent` column reading zero says the
+//! sampling is sound — every Store did find its slot to ask.
+//!
+//! So do not build the identity elision, and do not read the ~5 GB/s as
+//! containing duplicate frames. What the traffic contains is **superseded**
+//! frames: this rail writes ~414 full surfaces a second into guest pages that
+//! only ~18 non-stamp settles a second ever read, and of those only ~7 overlap
+//! the pages they are settling for. Every frame written between two reads of a
+//! surface is replaced before anything looks at it. That is what a deferral
+//! collapses and what an identity check cannot see.
+//!
 //! So there is no burst of redundant Stores to collapse *inside* this rail, and
 //! the deferred window would still have nothing to coalesce. What is left is the
 //! rail's own cost at the rate the guest asks for it, and that cost is this
