@@ -3740,6 +3740,11 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     // A short walk is `None` and settles. `pages_spanned` is the count the
     // resolver would have produced with nothing dropped, and a dropped page is
     // one this reader cannot rule out.
+    // The reads below walk raw task GVAs and cannot name a mapping, so every
+    // surface still owed a frame is paid first — see
+    // `runtime::writeback_debt::pay_all` for why the disjointness closure below
+    // cannot narrow this.
+    crate::runtime::writeback_debt::pay_all(state, host);
     let (tasks, page_shift) = (&state.tasks, state.page_shift);
     let page_size = state.page_size();
     crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
@@ -7837,6 +7842,18 @@ fn store_surface_resident<M: HostMemory + HostOps>(
     let Some(identity) = type11_store_identity(state, req, true) else {
         return false;
     };
+    // Owe the frame rather than write it, when the rail is on. The resident this
+    // draw just filled is the only place these pixels exist and the engine
+    // already refuses to reclaim such a slot, so nothing has to be pinned and
+    // nothing resolved is held — see `runtime::writeback_debt` for why that
+    // distinction is the whole difference from the rail that corrupted the
+    // guest's page tables.
+    if crate::runtime::writeback_debt::lazy_writeback_enabled()
+        && arm_surface_writeback_debt(state, host, mapping_id, &identity, width, height)
+    {
+        crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+        return true;
+    }
     if !crate::runtime::render_writeback::store_render_frame(
         state, host, mapping_id, &identity, width, height,
     ) {
@@ -7850,8 +7867,60 @@ fn store_surface_resident<M: HostMemory + HostOps>(
     true
 }
 
-
-
+/// Record that `mapping_id` is owed this frame, and hand the currency witness to
+/// the resident holding it.
+///
+/// `true` when the debt is armed and the caller owes the guest nothing further
+/// this Store. `false` sends the caller down the ordinary eager Store, which is
+/// what a mapping this device holds no entry for gets.
+///
+/// # Why the resident is stamped here, where no copy has happened
+///
+/// The stamp says the resident holds the mapping's content, and it is what
+/// licenses the type-11 attachment LOAD to seed from that image instead of
+/// reading a whole frame back out of guest memory — 802 elided against 36
+/// uploaded on a driven boot. `registry_mark_ready` clears it on every draw that
+/// renders into the resident, so a Store that did not re-stamp would hand the
+/// next LOAD a refusal, the LOAD would read the guest's pages, and reading them
+/// is exactly what pays the debt. The rail would collapse to the eager one with
+/// extra bookkeeping.
+///
+/// It is sound for that consumer and it is the *only* consumer: the resident
+/// holds this surface's newest pixels, which is what a LOAD asks for. It would
+/// not be sound for a writeback that read the stamp to decide it could skip the
+/// copy — with a debt outstanding the pages hold something older, not something
+/// equal. `render_writeback`'s doc measures that elision as never once firing
+/// and says not to build it; whoever revisits that has to read this first.
+fn arm_surface_writeback_debt<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    width: u32,
+    height: u32,
+) -> bool {
+    let Some(map_generation) = state.mappings.get(&mapping_id).map(|m| m.map_generation) else {
+        return false;
+    };
+    // The one call that says "these pixels changed and the guest's pages do not
+    // hold them yet". It advances the surface's content epoch, which is what the
+    // stamp below records, and `ResourceValidity::host_published_seq`, which is
+    // what orders this frame against the guest's own later claim to have written
+    // the same pages — `writeback_debt::pay` reads that ordering back through
+    // `resource_validity::licence_of` and abandons a frame the guest superseded.
+    let epoch = state.note_surface_content_published(mapping_id);
+    crate::backend::vulkan::engine::stamp_resident_content_epoch(identity, epoch);
+    // Armed before the eviction is paid, so the ledger never holds two debts for
+    // one mapping and the payment below cannot be the one just armed.
+    let evicted = state
+        .pending_writebacks
+        .arm(mapping_id, width, height, map_generation);
+    if let Some(evicted) = evicted {
+        crate::runtime::drain::note_store_route("wbdebt_evicted");
+        crate::runtime::writeback_debt::pay_for_mapping(state, host, evicted);
+    }
+    true
+}
 
 
 

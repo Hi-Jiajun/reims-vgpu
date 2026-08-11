@@ -127,6 +127,8 @@ pub mod surface_cache;
 pub mod task_slot;
 /// Texture / type-11 geometry registration.
 pub mod texture;
+/// Owe a type-11 surface's guest pages a frame, and pay when something reads.
+pub mod writeback_debt;
 
 /// The unit-test host double, gated with its definition. An ungated re-export
 /// would keep it reachable and so keep it in the staticlib.

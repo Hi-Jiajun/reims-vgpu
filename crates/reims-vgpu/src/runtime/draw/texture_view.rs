@@ -745,6 +745,11 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // walk runs only when something is outstanding, and the pages read are the
     // ones `read_span` names — not `bpr * h`, so a padded source does not claim
     // the trailing padding it never touches.
+    // The reads below walk raw task GVAs and cannot name a mapping, so every
+    // surface still owed a frame is paid first — see
+    // `runtime::writeback_debt::pay_all` for why the disjointness closure below
+    // cannot narrow this.
+    crate::runtime::writeback_debt::pay_all(state, host);
     let (tasks, page_shift, page_size) = (&state.tasks, state.page_shift, state.page_size());
     crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
         site,

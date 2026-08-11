@@ -1488,6 +1488,11 @@ fn read_buffer_bytes_resolved<M: HostMemory>(
     }
     let want = host_alloc_len(avail).filter(|&n| n > 0)?;
     let (read_gva, read_span) = (gva + offset, want as u64);
+    // The one reader that holds `DeviceState` shared and so cannot pay an owed
+    // frame. It reads a *buffer*, which is a different guest allocation from a
+    // type-11 surface — counted rather than argued away; see
+    // `runtime::writeback_debt::note_unpaid_buffer_read`.
+    crate::runtime::writeback_debt::note_unpaid_buffer_read(state);
     let (tasks, page_shift, page_size) = (&state.tasks, state.page_shift, state.page_size());
     crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
         crate::runtime::render_writeback::SettleSite::BufferGuestRead,

@@ -893,10 +893,11 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
     // the same field — literally, via `DeviceState::mapping_reach_pages`, which
     // is also what names the write. A mapping with no page list, or one holding
     // an entry that names no backing, cannot be ruled out and settles.
-    let s = &*state;
-    crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
+    crate::runtime::writeback_debt::settle_for_mapping_unless_disjoint(
+        state,
+        host,
+        mapping_id,
         crate::runtime::render_writeback::SettleSite::ScanoutPaint,
-        || s.mapping_reach_pages(mapping_id),
     );
 
     let Some(m) = state.mappings.get(&mapping_id) else {

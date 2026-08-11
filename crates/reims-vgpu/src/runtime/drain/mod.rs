@@ -3604,7 +3604,14 @@ fn apply_map_family<H: HostMemory + HostOps>(
         use crate::runtime::decode::fifo::decode_synchronize_resources;
         match decode_synchronize_resources(&packet.payload) {
             Ok(cmd) => {
-                crate::runtime::render_writeback::settle_guest_writes(
+                // The guest asking for a resource synchronize is the one
+                // host-to-guest copy the contract actually names, so it is the
+                // land point every owed frame is owed to. A driven boot issues
+                // zero of these; a boot where this arm fires is a boot where the
+                // lazy rail is being asked for exactly what it defers.
+                crate::runtime::writeback_debt::settle_unnamed(
+                    state,
+                    host,
                     crate::runtime::render_writeback::SettleSite::ChildStamp,
                 );
                 let oid = cmd.object_ids.first().copied().unwrap_or(0);

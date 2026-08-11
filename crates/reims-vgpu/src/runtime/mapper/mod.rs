@@ -2283,7 +2283,10 @@ pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
     }
     // Deferred-writeback flush-on-access: land any pending resident content
     // in these pages first so this write applies on top of it, not under it.
-    crate::runtime::render_writeback::settle_guest_writes(
+    crate::runtime::writeback_debt::settle_for_mapping(
+        state,
+        host,
+        mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingBytesWrite,
     );
     // Exact-window residency invalidation: guest pages in this range no
@@ -2356,13 +2359,12 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
     // an unnameable set (`None`) settles exactly as before. The page set comes
     // from the same `mapping_reach_pages` the writeback's own destination is
     // named with, so both ends of the comparison are one rule.
-    {
-        let s = &*state;
-        crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
-            crate::runtime::render_writeback::SettleSite::MappingBytesRead,
-            || s.mapping_reach_pages(mapping_id),
-        );
-    }
+    crate::runtime::writeback_debt::settle_for_mapping_unless_disjoint(
+        state,
+        host,
+        mapping_id,
+        crate::runtime::render_writeback::SettleSite::MappingBytesRead,
+    );
     copy_mapping_runs(
         state,
         host,

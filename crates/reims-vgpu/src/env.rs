@@ -250,6 +250,24 @@ pub const SCATTER_SPLIT: &str = "REIMS_VGPU_SCATTER_SPLIT";
 /// ways in one binary.
 pub const COMPUTE_SCATTER: &str = "REIMS_VGPU_COMPUTE_SCATTER";
 
+/// `on` holds a type-11 surface Store's frame in the engine resident and copies
+/// it into the guest's pages when something reads them, instead of at the Store.
+///
+/// **This one is a permission and not a refusal, and unlike [`COMPUTE_GATHER`]
+/// its two arms are not byte-identical.** They land the same bytes in the same
+/// pages; what differs is *when*, and therefore what a reader this device did
+/// not account for would see. That is the whole risk of the rail and the reason
+/// it is a switch: the arm that has to be believed is the one where a reader
+/// exists that [`crate::runtime::writeback_debt`] does not pay, and the only way
+/// to hold the two against each other on a given guest is a binary that runs
+/// both. The failure mode is a stale frame, which is why the A/B harness
+/// photographs both arms.
+///
+/// The bytes are ~840 whole frames a second into pages that six reads a second
+/// consume; [`crate::runtime::writeback_debt`] carries that census and the
+/// reasoning.
+pub const LAZY_WRITEBACK: &str = "REIMS_VGPU_LAZY_WRITEBACK";
+
 /// `off` narrows a draw chain's pipeline resolution back to the full walk —
 /// object list, descriptor, decode, MTLB read, AIR carve and content hash, for
 /// the pipeline and both of its functions, on every draw.
@@ -445,7 +463,8 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 11] = [
+pub const ALL: [&str; 12] = [
+    LAZY_WRITEBACK,
     GUEST_IMPORT,
     DRAW_LOG,
     GPU_STAMP,
