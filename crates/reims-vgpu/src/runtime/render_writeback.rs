@@ -105,6 +105,33 @@
 //! has to look across the rails and across frames, not at the spacing of Stores
 //! inside one.
 //!
+//! ## But "traffic" is regions, not bytes, and that is a different lever
+//!
+//! The host GPU runs **86-91 % busy at 3-4 % memory utilization** under this
+//! load. A rail that were bandwidth bound could not produce those two numbers
+//! together; this one is bound by the *number of copy operations* it issues.
+//!
+//! The count comes from the guest's own allocator. It backs a surface in 16 KiB
+//! physically-contiguous granules, so a 1920x1080 window is 2 025 pages in **507
+//! runs** (see [`crate::runtime::guest_ram_map::references_for_runs`]), and the
+//! `Linear` plan's scatter is one `VkBufferCopy` region per run. At ~414 Stores a
+//! second that is ~210 000 regions a second from this rail alone. The runs cannot
+//! be merged — non-adjacent in GPA means non-adjacent in the import — so the
+//! count is a property of guest memory layout and not of anything this device
+//! chooses.
+//!
+//! Which is what makes the two ablations in
+//! `backend::vulkan::engine::context`'s `dedicated_transfer_family` read the way
+//! they do: removing the copies entirely was worth ~30 Hz, and skipping only the
+//! image *read* while the bytes still crossed was worth 4 Hz of it. The 26 Hz is
+//! in the scatter, and the scatter is where the regions are.
+//!
+//! So there is a lever here that is not deferral and carries none of its hazards:
+//! **issue the scatter as one compute dispatch over a run table instead of 507
+//! transfer regions.** Same bytes, same destination, byte-identical result, no
+//! stale plan held across any window. Untested — recorded as the shape the
+//! measurements point at, not as a result.
+//!
 //! # The contract does not ask for this copy at all
 //!
 //! Nothing in a render Store carries a region, and the search for one is over:
@@ -228,6 +255,24 @@
 //! not on the ones that block, and those are far more frequent. Measured over the
 //! four boots, copies actually removed were **27 %, 65 %, 66 %, 65 %** — a factor
 //! of about 2.9 at best, not 43. Worth having, and not worth what it cost here.
+//!
+//! ## Defer the decision, not the plan
+//!
+//! The hazard is not deferral as such — it is that a *parked plan* holds guest
+//! page references resolved at a moment that has passed. A shape that keeps the
+//! saving and cannot have the bug: skip the copy at the Store, and at the settle
+//! do a **fresh** Store — re-walk the mapping's page tables *then*, resolve runs
+//! *then*, copy from the resident *then*. Nothing stale is held across the
+//! window, so a surface whose backing the guest recycled is either gone (skip) or
+//! re-resolves to the pages it now owns, which is what a Store landing at that
+//! moment would have written anyway.
+//!
+//! What that costs is the thing the seam analysis below already identifies as
+//! hard, and it is now the *only* hard part: the land needs `DeviceState` and
+//! `HostMemory`, and [`settle_guest_writes`] takes a [`SettleSite`] and nothing
+//! else. Threading both through its call sites is the work. It is untested — no
+//! boot has run it — and it is recorded here because it is the one variant the
+//! four panics above do not rule out.
 //!
 //! # What a deferral has to answer, and where the seam is
 //!
