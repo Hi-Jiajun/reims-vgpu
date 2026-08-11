@@ -19,12 +19,23 @@
 <title>reims-vgpu sustained animation</title>
 <style>
   html, body { margin: 0; padding: 0; background: #101014; overflow: hidden; }
-  /* Full-viewport bands, each a separately composited layer: `will-change`
-     promotes them so the window server composites N surfaces per frame rather
-     than repainting one. That is the shape this device serves. */
+  /* Full-viewport bands, each a separately composited layer, so the window
+     server composites N surfaces per frame rather than repainting one. That is
+     the shape this device serves.
+
+     Promotion is forced, not hinted. `will-change: transform` alone is advisory
+     and the compositor may decline it: ten boots of one binary split into two
+     tight clusters, ~420 draws per presented frame and ~268, with a 24 %
+     `present_hz` gap between them and nothing in between — larger than any
+     device effect measured against this probe. The collapsed cluster is bands
+     repainted into their parent instead of composited. `backface-visibility`
+     here plus the 3D transform in `tick()` take the promotion out of the
+     compositor's discretion. Both halves are required: this rule cannot carry a
+     `transform`, because `tick()` overwrites the inline one every frame. */
   .band {
     position: absolute; left: 0; width: 100%; height: 11%;
     will-change: transform;
+    backface-visibility: hidden;
   }
   .box {
     position: absolute; top: 8%; height: 84%; width: 12vh;
@@ -82,7 +93,9 @@ function tick() {
     // band count so the layers never line up into one repeating composite.
     const dir = b % 2 === 0 ? 1 : -1;
     const x = dir * ((phase * (b + 3)) % 1) * 100;
-    bands[b].style.transform = `translateX(${x}%)`;
+    // `translate3d` and not `translateX`: the 3D form is what keeps the band on
+    // the composited path every frame. See the `.band` rule above.
+    bands[b].style.transform = `translate3d(${x}%, 0, 0)`;
   }
 
   const w = ctx.canvas.width, h = ctx.canvas.height;

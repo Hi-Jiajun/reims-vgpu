@@ -55,9 +55,36 @@ and the guest rails have no reason to have working DNS. Override the port with
 Everything the page draws steps per *frame*, never per wall-clock millisecond,
 so a slow boot and a fast boot draw identical content per frame number and
 differ only in how many frames they complete. It loads both rails that matter:
-eight `will-change` layers the window server composites separately, and a canvas
-repainted every frame so texture content is uploaded rather than only
-re-composited.
+eight layers the window server composites separately, and a canvas repainted
+every frame so texture content is uploaded rather than only re-composited.
+
+## Layer promotion is forced, because a hint made the probe bimodal
+
+`will-change: transform` is advisory. Ten boots of one pinned binary — same
+snapshot, same probe, same quiesced host — split into two tight clusters with
+nothing in between:
+
+| | promoted | collapsed |
+|---|---|---|
+| draws per presented frame | 417.9 – 429.0 | 267.7 – 268.5 |
+| `present_hz` median | 39.1 – 41.7 | 49.0 – 50.6 |
+
+Eight of ten landed in the first. Which cluster a boot drew was uncorrelated
+with anything under test. The **24 %** `present_hz` gap is larger than any
+device effect yet measured against this probe, so a sweep that mixes clusters
+cannot see a real 17 % change and will credit the cluster to whichever arm drew
+it. Within a cluster the counters reproduce to a fraction of a percent, which is
+what makes three boots per arm enough.
+
+So the page no longer hints. `.band` carries `backface-visibility: hidden` and
+`tick()` writes a `translate3d`, which together take the decision out of the
+compositor's hands. **Both halves are load-bearing**: the CSS rule cannot carry
+the 3D transform, because `tick()` overwrites the inline `transform` every
+frame, and a CSS-only fix would be silently discarded.
+
+`drain_duty draws` over `window_publish fresh` is still the discriminator, and
+checking it stays worthwhile — it is how you find out this stopped working.
+Boots taken before this change are not comparable to boots taken after it.
 
 ## What it does not do
 
