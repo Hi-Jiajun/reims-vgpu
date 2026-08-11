@@ -664,12 +664,28 @@ So a throughput, caching or cadence change needs
 Name which probe a number came from, the same way a rail is named: they are two populations of draws
 and a change can help one and hurt the other.
 
-**Classify the boot before comparing two of them.** The guest itself has more than one compositing
-regime and picks between them per boot — the sustained probe reads either ~420 or ~268 draws per
-presented frame, tightly, with nothing in between. `present_hz` is not comparable across the two, and
-mixing boots from both is how a real 17 % effect ends up buried under a 24 % artifact. Everything
-else reproduces to a fraction of a percent *within* a regime, which is what makes three boots per arm
-enough to separate one. `drain_duty draws` over `window_publish fresh` is the discriminator.
+**Classify the boot before comparing two of them.** A macos-13 boot presents either ~60 frames a
+second or ~95-117 for its whole life, tightly, with nothing in between, and the guest picks per boot.
+`present_hz`, `draws/s` and `fresh` are all halved on a slow boot, so none of them is comparable
+across the two; `us/draw` and anything else normalised per draw is. Mixing boots from both
+populations is how a real 17 % effect ends up buried under a 2x artifact. `present_hz` alone is the
+discriminator — the gap between 61 and 94 is empty on every boot on record.
+
+**A run's slow rate is a Bernoulli draw, and its base rate drifts.** Over 40 interleaved boots it was
+12 slow in 40; two runs later the same binary read 7 in 12, twice. So a slow rate is comparable only
+**within one interleaved run**, never against a number from an earlier one, and a change claiming to
+move it needs about twenty boots an arm — twelve cannot separate 0.4 from 0.7. This is a different
+rule from classifying a boot: that one is about which population a reading came from, this one is
+about the population *rate* being unstable across time on one host.
+
+What the split is **not**: not the display mode (both populations report `1920 x 1080 @ 120.00Hz`),
+not the VBL limiter (~118 Hz on fast and slow boots alike), not the claim ordering (40 interleaved
+boots, p≈0.7), not anything visible in the guest's first sustained VBL window, and not this device
+sitting on a frame-time cliff — making it ~20 % slower with `REIMS_VGPU_COMPUTE_GATHER=off` did not
+raise the slow rate. The cause is open. Read `VBL_REPORT_EARLY` beside
+`runtime::drain::census::VblCensus` before spending boots on a new theory: a run of eight holds one
+or two slow boots and so cannot tell a cause from a coincidence, which has already produced one
+confident wrong answer here.
 
 **Bracket one character of every `pkill -f` pattern**, as `x86_6[4]` does above and as
 `reims_vgp[u]-` does further down. `pkill -f` matches against whole command lines, and the shell

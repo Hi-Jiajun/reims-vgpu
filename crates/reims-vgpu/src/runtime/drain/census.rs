@@ -106,11 +106,43 @@ const VBL_REPORT_EVERY: u64 = 1024;
 /// A slow boot is not being starved of VBL when it settles: it receives ~85 a
 /// second and presents 60.
 ///
+/// # It is not a frame-time cliff either
+///
+/// A guest holding a 120 Hz link that presents either ~120 or exactly ~60 is the
+/// signature of vsync-locked halving: miss the 8.33 ms budget and you fall to
+/// every other vblank. If that were it, this device would be sitting on the edge
+/// of the threshold, and every microsecond saved anywhere would buy a
+/// *probability* of doubling the frame rate — which would be the most important
+/// fact in this crate.
+///
+/// It is not it. Twenty-four interleaved boots, with the device deliberately
+/// pushed the wrong way by `REIMS_VGPU_COMPUTE_GATHER=off` (about 20 % more GPU
+/// work per draw, and the arm's positive control confirmed
+/// `buffer_gather_dispatches=0`):
+///
+/// ```text
+/// arm                       fast   slow
+/// ~20 % slower device         10      2
+/// shipping default             5      7
+/// ```
+///
+/// Making the device slower did not push boots over a cliff; the slower arm
+/// latched fast *more* often. Whatever direction that effect is (p≈0.09, and one
+/// interleaved run of twelve an arm is not enough to claim it), it rules out the
+/// cliff, which predicted the opposite and predicted it strongly.
+///
 /// So the cause of the split is **open**. What is closed is that it is not the
 /// limiter (which holds ~118 Hz on every boot, fast or slow), not the claim
 /// ordering (40 interleaved boots, p≈0.7, see
-/// [`super::signal_display_refresh_classes`]), and not anything visible in the
-/// deciding window this instrument was built to expose.
+/// [`super::signal_display_refresh_classes`]), not the display mode (see
+/// [`super::fill_display_descriptor`]), not anything visible in the deciding
+/// window this instrument was built to expose, and not a frame-time threshold
+/// this device sits near.
+///
+/// One methodological result came with it and belongs to anyone testing the next
+/// theory: the base rate **drifts**. It was 12 slow in 40 early in a session and
+/// 7 in 12 twice, hours later, on the same binary. Compare arms only within one
+/// interleaved run.
 ///
 /// This is an instrument, not a rail: nothing branches on it.
 const VBL_REPORT_EARLY: u64 = 64;
