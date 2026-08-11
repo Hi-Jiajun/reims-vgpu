@@ -555,6 +555,35 @@ struct PresentFrame {
 /// unable to acquire. That is safe and self-limiting — it refuses as
 /// `busy_acquire`, which is exactly the counter that says so — and it is why
 /// this is a ceiling on ambition rather than a promise about the surface.
+///
+/// # It is transparent on every x86 rail, at every rate they offer
+///
+/// The depth was measured on macos-13 and shipped for all of them, so the other
+/// rails were owed a boot each. One driven boot per rail, same binary:
+///
+/// ```text
+/// rail       present_hz  offered_hz  busy_fence  busy_acquire  panic
+/// macos-11        45.20       45.20           0             0  no
+/// macos-12        47.20       47.20           0             0  no
+/// macos-14        45.60       45.60           0             0  no
+/// macos-15        14.45       14.45           0             0  no
+/// macos-26        40.00       40.00           0             0  no
+/// macos-26        21.05       21.05           0             0  no
+/// macos-26        36.20       36.20           0             0  no
+/// ```
+///
+/// `presents == offered` exactly on all seven boots, with both refusal counters
+/// at zero. Two readings carry it. macos-15 offers **14 Hz**, a third of what
+/// macos-13 does, and is equally transparent; and macos-26 was booted three
+/// times, landing at 40, 21 and 36 Hz, and tracked its own offer each time. So
+/// this is not a clamp that happens to sit above what these guests ask for — a
+/// clamp shows as the two columns diverging at the top of the range, and nothing
+/// here diverges at any rate between 14 and 47 Hz.
+///
+/// The macos-26 boots did not panic, which is worth stating precisely: that rail
+/// panics on roughly a third of driven boots for reasons of its own, three clean
+/// boots is an unremarkable draw from that rate, and this says nothing about
+/// whether the rate moved. It is the presenter that was being measured.
 const PRESENT_IN_FLIGHT: usize = MAILBOX_MIN_IMAGES as usize;
 
 /// At least as deep as the single-flight presenter this replaced, so indexing
