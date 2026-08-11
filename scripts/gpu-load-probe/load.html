@@ -234,6 +234,25 @@ if (gl) {
   gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
   glTint = gl.getUniformLocation(prog, 'tint');
   gl.viewport(0, 0, 1024, 768);
+  // Report which renderer the guest bound this context to, the same way the
+  // scan reports a leg boundary: a fetch the host's server has no file for, so
+  // the answer lands in its log with a host timestamp. There is no other way to
+  // learn it — the guest has no developer tools, and a device-side counter
+  // cannot see a decision the guest made before it ever reached this device.
+  //
+  // It is the question this dial's collapse turns on. `verts=60000` produces six
+  // presented frames a second while the guest burns ~1.1 cores across its vCPUs
+  // and this device is idle seven eighths of the time, and a renderer string
+  // naming a software rasteriser and one naming the paravirtualised GPU are two
+  // completely different bugs.
+  const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+  const q = (e) => { try { return String(gl.getParameter(e)); } catch (_) { return '?'; } };
+  fetch('webgl-renderer' +
+        `?vendor=${encodeURIComponent(q(gl.VENDOR))}` +
+        `&renderer=${encodeURIComponent(q(gl.RENDERER))}` +
+        `&unmasked=${encodeURIComponent(dbg ? q(dbg.UNMASKED_RENDERER_WEBGL) : 'no-ext')}` +
+        `&version=${encodeURIComponent(q(gl.VERSION))}` +
+        `&maxtex=${q(gl.MAX_TEXTURE_SIZE)}`).catch(() => {});
 } else {
   const c = document.getElementById('gl');
   if (c) c.style.display = 'none';
