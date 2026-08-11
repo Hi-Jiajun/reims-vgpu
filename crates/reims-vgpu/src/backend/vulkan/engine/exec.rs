@@ -97,6 +97,22 @@ struct GatherDispatch {
 /// `off` restores the ~13 `VkBufferCopy` regions per gathered window. See
 /// [`crate::env::COMPUTE_GATHER`] for both sets of boots and for why the earlier
 /// rejection was right at the time.
+/// Whether the layout-churn probe is on. **Default off**, and never anything but
+/// a probe: it adds two image barriers per draw and removes nothing.
+///
+/// See its one call site for what it prices and why the answer is not otherwise
+/// obtainable. It is a switch and not a `#[cfg]` because the question it answers
+/// is about the host, so it has to be askable on a host somebody else has.
+fn layout_churn_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::env::read(crate::env::LAYOUT_CHURN).0,
+            crate::env::Switch::On
+        )
+    })
+}
+
 fn compute_gather_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -3630,6 +3646,61 @@ pub(crate) unsafe fn execute_draw_inner(
         ctx.device.cmd_end_query(cb, pool, 0);
     }
     ctx.device.cmd_end_render_pass(cb);
+    if layout_churn_probe_enabled() {
+        // PROBE — `REIMS_VGPU_LAYOUT_CHURN=on`. One extra round trip of the
+        // colour attachment's layout, out of `TRANSFER_SRC_OPTIMAL` and back
+        // into it, recorded where the pass has just left it there.
+        //
+        // It exists to price what this device already pays twice a draw and has
+        // never measured. Every draw that loads its target barriers it from
+        // `TRANSFER_SRC_OPTIMAL` to `COLOR_ATTACHMENT_OPTIMAL` on the way in, and
+        // every render pass puts it back through `final_layout` on the way out —
+        // so a run of draws into one target transitions a full-size image twice
+        // per draw for no reader. On hardware that keeps colour compression
+        // metadata, moving an image to a transfer layout is a resolve over the
+        // whole attachment; on hardware that does not, it is free. Which of those
+        // this is decides whether that pair is worth removing, and no counter in
+        // this device can tell them apart.
+        //
+        // A positive control rather than a change: the pixels are identical
+        // because both layouts preserve contents and nothing is recorded between
+        // the two barriers, so `us/draw` moving is the cost of two transitions
+        // and nothing else. If it does not move, the pair costs nothing here and
+        // the reading is that this host does not compress what it is asked to
+        // transfer.
+        let out = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .image(target_image)
+            .subresource_range(super::color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &out,
+        );
+        let back = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .image(target_image)
+            .subresource_range(super::color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &back,
+        );
+    }
 
     if let Some(ref rb) = readback {
         // The pass resolved the colour attachment to TRANSFER_SRC_OPTIMAL, so

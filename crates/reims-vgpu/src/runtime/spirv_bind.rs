@@ -2284,14 +2284,77 @@ pub fn reflected_buffer_extent(reflection: &ShaderReflection, metal_index: u32) 
     if buffer_extent_disabled() {
         return None;
     }
-    let extent = reflection.bindings.iter().find_map(|b| {
+    // Which answer this bind got, counted at the one place the field is read.
+    //
+    // # Why a census and not a comment
+    //
+    // Both narrowing counters — `zc_buffer_extent_narrowed` on the gather rail
+    // and `cpu_buffer_extent_narrowed` on the staging one — read **zero for a
+    // whole driven macos-13 boot**, across 2.57 million buffer binds. A rail
+    // built to reopen 67.5 % of this device's gathered bytes is firing no times,
+    // and nothing else in the boot says so: a narrowing counter at zero is the
+    // same reading whether every bind is genuinely unbounded, the translator
+    // reports nothing, or the lookup never finds the binding at all.
+    //
+    // These four separate those, and only the first is a workload fact:
+    //
+    // * `bext_unbounded` — AIR carries an element size and no length. Nothing to
+    //   do; a `device T*` may be indexed anywhere.
+    // * `bext_unknown` — the metadata cannot separate a bounded reference from a
+    //   pointer. A translator gap, and the one that would be worth packaging.
+    // * `bext_absent` — no `Buffer` binding at this index. Expected for a
+    //   `[[stage_in]]` attribute source, which is bounded by the vertex
+    //   descriptor's stride rather than by a declared argument.
+    // * `bext_object` — the answer that may narrow, with the bytes it declares
+    //   banded so a reader can tell "narrowable and tiny" from "narrowable and
+    //   already the whole allocation".
+    //
+    // `bext_object` firing while both `*_narrowed` counters stay at zero would
+    // mean the caps are being dropped between here and the rails, which is a
+    // different bug from the translator not answering and would otherwise look
+    // identical.
+    let found = reflection.bindings.iter().find_map(|b| {
         (b.kind == ResourceKind::Buffer && b.metal_index == metal_index)
             .then_some(b.extent)
             .flatten()
-    })?;
+    });
+    let Some(extent) = found else {
+        crate::runtime::drain::note_store_route("bext_absent");
+        return None;
+    };
     match extent {
-        BufferExtent::Object { bytes } => Some(u64::from(bytes)),
-        BufferExtent::Unbounded | BufferExtent::Unknown => None,
+        BufferExtent::Object { bytes } => {
+            crate::runtime::drain::note_store_route("bext_object");
+            crate::runtime::drain::note_store_route(band_declared_object(bytes));
+            Some(u64::from(bytes))
+        }
+        BufferExtent::Unbounded => {
+            crate::runtime::drain::note_store_route("bext_unbounded");
+            None
+        }
+        BufferExtent::Unknown => {
+            crate::runtime::drain::note_store_route("bext_unknown");
+            None
+        }
+    }
+}
+
+/// Band a declared object size, because what decides whether narrowing is worth
+/// anything is the order of magnitude and not the byte.
+///
+/// The floor matters: a cap that does not clear `ZERO_COPY_BUFFER_MIN_BYTES` is
+/// dropped by the gather rail and applied by the staging one, so a population
+/// sitting entirely in the smallest band says the narrowing lands on the CPU
+/// path and never on the rail that moves the bytes. A survey of 60 captured AIR
+/// blobs ran a median declared size of 64 bytes and a maximum of 512, so the
+/// bands are placed around that rather than spread evenly.
+fn band_declared_object(bytes: u32) -> &'static str {
+    match bytes {
+        0..=64 => "bext_object_le64",
+        65..=512 => "bext_object_le512",
+        513..=4096 => "bext_object_le4k",
+        4097..=65536 => "bext_object_le64k",
+        _ => "bext_object_gt64k",
     }
 }
 

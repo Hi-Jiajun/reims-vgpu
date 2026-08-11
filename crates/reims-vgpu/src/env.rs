@@ -63,6 +63,41 @@
 /// *with* the extension binds a `GuestSlice` directly and is the fastest cell of
 /// that matrix, not this one. Nothing in this reading was taken on Intel or AMD
 /// hardware.
+///
+/// # What the GPU-side clock says, and it inverts the reading above
+///
+/// Everything above is CPU wall clock. `gpu_span` times the submission on the
+/// GPU's own clock, and on that clock the copying rails are the **cheaper** arm.
+/// One regime-matched pair, driven macos-13, same pin:
+///
+/// ```text
+///                        import off    import on    import on
+/// draws per frame           249.6        252.4        253.5
+/// window_publish fresh       59.5         59.0         59.0
+/// GPU us per draw            6.04        15.26        16.03
+/// draw us per submission    78.42       226.66       230.92
+/// drain duty                 0.66         0.37         0.36
+/// gather regions/draw         0.0         15.4         13.4
+/// ```
+///
+/// **Same frames, 61 % less GPU work per draw, and nearly twice the drain duty.**
+/// The gather is what moves: with the import on, every scattered guest window is
+/// assembled by the GPU out of guest RAM, which on a discrete host is a PCIe copy
+/// — 4.46 GB/s of it, running at ~18 GB/s effective, and about 55 % of all the
+/// GPU time this device spends. With the import off there is no gather at all;
+/// the CPU packs the same bytes into staging and the drain worker pays for it.
+///
+/// So the two arms are not "fast" and "slow", they are **which engine does the
+/// copy**. On this host, with the GPU at 45 % occupancy and the worker at 0.37
+/// duty, moving it to the GPU is free and the import wins on the unmatched
+/// regimes. On a host where the GPU is the constraint and the CPU is not — which
+/// is the iGPU column of the support matrix — the trade plausibly inverts, and
+/// `=off` is already the switch that takes it. That is a hypothesis this host
+/// cannot test and it is written here so an operator on an iGPU knows there is a
+/// second arm worth two boots.
+///
+/// One matched pair, one rail, one regime. The unmatched boots are not quoted
+/// because `fresh` is not comparable across compositing regimes.
 pub const GUEST_IMPORT: &str = "REIMS_VGPU_GUEST_IMPORT";
 
 /// Verbose per-draw logging on top of the always-on fail sink.
@@ -560,6 +595,66 @@ pub const COMPUTE_GATHER: &str = "REIMS_VGPU_COMPUTE_GATHER";
 /// the two caveats that belong to the reading rather than to the code.
 pub const GPU_SPANS: &str = "REIMS_VGPU_GPU_SPANS";
 
+/// **Default off, and a probe rather than a rail.** `on` makes every draw send
+/// its colour attachment out of `TRANSFER_SRC_OPTIMAL` and straight back into it
+/// after the render pass has ended.
+///
+/// It prices a pair this device already pays on every loading draw and has never
+/// measured. A draw that loads its target barriers the image to
+/// `COLOR_ATTACHMENT_OPTIMAL` on the way in, and the render pass's `final_layout`
+/// returns it to `TRANSFER_SRC_OPTIMAL` on the way out — so a run of draws into
+/// one target moves a full-size image between two layouts twice per draw, for a
+/// transfer reader that on this workload arrives a few times a second against
+/// tens of thousands of draws. Whether that is free or a whole-attachment resolve
+/// is a property of the host's colour compression, and nothing else in this
+/// device can distinguish the two.
+///
+/// The arm is byte-identical in what the guest observes: both layouts preserve
+/// contents, and nothing is recorded between the two barriers. So it may only add
+/// GPU time, and `gpu_span`'s `us/draw` moving is that time.
+///
+/// It never widens anything — `on` records *more* work — which is why it is safe
+/// as an on-switch where every other variable here is an off-switch.
+///
+/// # What it read: the pair is free on this host
+///
+/// Six driven macos-13 sustained-animation boots on one pin, interleaved
+/// on/off/on/off/on/off. The `on` arm records **four** full-attachment layout
+/// transitions a draw where the `off` arm records two:
+///
+/// ```text
+///                       on     on     on      off    off    off
+/// draws per frame     284.5  252.4  271.8    299.9  269.4  253.5
+/// GPU us per draw     14.90  15.26  13.84    15.85  13.94  16.03
+/// ```
+///
+/// The arms interleave completely, and in each of the three regime-matched pairs
+/// the arm doing **more** work reads **lower** — which is the sign an effect
+/// cannot have, so it is boot-to-boot noise. Doubling this device's per-draw
+/// layout transitions costs less than the ~5 % spread between two boots of one
+/// binary.
+///
+/// The reading is that this host does not compress what it is asked to transfer:
+/// the colour attachment is created with `TRANSFER_SRC` usage, so the driver has
+/// no compression to resolve when the layout moves. **So do not remove the
+/// existing pair on this evidence.** Every loading draw barriers its target into
+/// `COLOR_ATTACHMENT_OPTIMAL` and the pass's `final_layout` puts it back, for a
+/// transfer reader that arrives a few times a second against tens of thousands of
+/// draws — it looks wasteful and it measures free, and the barrier family it sits
+/// in has had five live dependency bugs, so the refactor is all risk and no
+/// measured gain *here*.
+///
+/// # Why it stays
+///
+/// "Here" is the whole caveat, and it is why this is a kept probe rather than a
+/// deleted one. AMD and Intel parts keep colour compression metadata that a
+/// transfer layout can force a whole-attachment resolve of, and this project has
+/// no such host to boot. Anyone who has one can answer the question in two boots
+/// without writing any code: if `us/draw` rises on the `on` arm there, the pair
+/// is worth removing and this doc is wrong about their machine, not about this
+/// one.
+pub const LAYOUT_CHURN: &str = "REIMS_VGPU_LAYOUT_CHURN";
+
 /// What one variable says, including the two ways it says nothing usable.
 ///
 /// Four states rather than a `bool` because "unset", "explicitly on" and
@@ -633,7 +728,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 17] = [
+pub const ALL: [&str; 18] = [
     LAZY_WRITEBACK,
     SLAB_RETAIN,
     CLEAR_SEED,
@@ -656,6 +751,7 @@ pub const ALL: [&str; 17] = [
     // pins" trap with the evidence removed.
     COMPUTE_GATHER,
     GPU_SPANS,
+    LAYOUT_CHURN,
 ];
 
 /// The state of every variable in [`ALL`], for the one-shot boot line.

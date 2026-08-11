@@ -89,6 +89,26 @@ pub enum MapRefusal {
     /// This is a heap-*capacity* test and not a residency one, so it is a lower
     /// bound: a host that passes it can still be too full to import. It catches
     /// the direction that has been seen to kill a guest.
+    ///
+    /// # What would give such a host the fast rail back
+    ///
+    /// Not this refusal, which only makes the host work. The import is one
+    /// `VkDeviceMemory` per RAMBlock because that is the coarsest thing a bound
+    /// can be sized to, and nothing about the rail requires it: a window already
+    /// resolves against whichever import backs its GPA, and one straddling two of
+    /// them already groups into two `VkBuffer` sources. So a RAMBlock could be
+    /// imported in granularity-aligned chunks instead, imported on the first
+    /// reference into each, and then only the chunks a submission names have to
+    /// be resident — which is the guest's working set rather than its RAM.
+    ///
+    /// Two things make that more than a `flat_map` in [`resolve`], and both have
+    /// to be answered before it is worth building. The lookup is a linear
+    /// `find` over the imports, which is right for two and is not right for a
+    /// hundred. And a chunk imported and never released is only a *slower* way
+    /// to reach this same refusal, so a small-heap host needs the chunks to be
+    /// evictable — against this module's own standing advice, which is sound
+    /// only while every import fits. Neither can be measured on a host whose
+    /// roomiest heap is four times its guest.
     ImportExceedsHeap { needed: u64, budget: u64 },
     /// The address is not inside any imported span. Guest RAM the GPU can reach
     /// exists, and this address is not in it — a device MMIO address, a hole,
