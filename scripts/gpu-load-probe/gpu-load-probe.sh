@@ -30,6 +30,51 @@
 # Name the dials in any result. Two boots at different `GPU_LOAD_ARGS` are two
 # workloads, not two readings, exactly as two rails are two guest drivers.
 #
+# # Turning a dial up can make the measurement worse, and the reading that says
+# # so is `drain_duty`
+#
+# The failure this probe exists to fix has a mirror image: a load heavy enough
+# to starve the *guest* measures Safari's JavaScript engine instead of the
+# device, and looks like a very slow device while doing it. The first run of
+# this probe at `layers=16&boxes=8&verts=90000&tex=1024` reported a worst second
+# of 11.3 Hz — and produced **1 329 draws a second at drain duty 0.12**, against
+# 26 800 at 0.83 on the far lighter CSS-only probe. The device was idle seven
+# eighths of the time.
+#
+# So read `drain_duty`'s `duty` and `draws` before believing any frame rate off
+# this probe, and choose dials that push `duty` toward 1.0 with `draws` at or
+# above what the sustained-animation probe produces.
+#
+# # What each dial is worth, measured — and the one that does not work
+#
+# Four driven macos-13 boots, one binary, quiesced host. `verts` builds its
+# array once and only re-uploads it, so none of this is the JavaScript fill:
+#
+#   dials                                     duty   draws/s  gather regions/s
+#   (sustained-animation probe, for scale)    0.83    26 800           427 000
+#   layers=24&boxes=6                         0.68    11 525           270 807
+#   layers=16&boxes=6&verts=30000&tex=512     0.14     1 390            34 976
+#   layers=8&boxes=6&verts=60000              0.11     1 017            26 592
+#
+# **The `verts` axis does not work on this rail.** Any WebGL at all collapses
+# the guest to ~1 000 draws a second at duty 0.11 — the device is then idle
+# seven eighths of the time and the boot measures Safari's WebGL path, not this
+# device. That is a property of the guest, not of the dial: the array is static
+# and the shader is two lines. Do not use `verts` to rank a device change until
+# something explains the collapse; the dial stays because the collapse is itself
+# worth reproducing in one command.
+#
+# `layers` is the axis that works, and it is worth using for what it does to the
+# *shape* rather than the size of the load: at 24 layers it drives **23.5 gather
+# regions per draw against the sustained probe's 15.8**, so it is the heavier arm
+# for anything about the guest buffer gather even though its absolute draw rate
+# is lower. `tex` has not been measured alone.
+#
+# Nothing here beats the sustained-animation probe for total device load. That
+# probe reaches duty 0.83 and this one does not, so it remains the arm for
+# ranking a change; this one is for loading a *particular rail* harder than a
+# compositing page does.
+#
 # The page is served by the host over QEMU's user-net gateway (10.0.2.2), not
 # fetched from the internet: a probe whose workload can change under it cannot
 # be A/B'd, and the rails have no reason to have working DNS.

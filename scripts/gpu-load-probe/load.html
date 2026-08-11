@@ -122,7 +122,13 @@ if (gl) {
   gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog);
   gl.useProgram(prog);
   glCount = VERTS - (VERTS % 3);      // whole triangles only
+  // Built once. The per-frame cost has to be the upload and not the fill —
+  // see the tick, which explains what rebuilding it cost.
   glData = new Float32Array(glCount * 2);
+  for (let i = 0; i < glCount; i++) {
+    glData[i * 2]     = (((i * 7) % 2048) / 1024) - 1;
+    glData[i * 2 + 1] = (((i * 13) % 2048) / 1024) - 1;
+  }
   glBuf = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, glBuf);
   const loc = gl.getAttribLocation(prog, 'p');
@@ -157,13 +163,22 @@ function tick() {
   }
 
   if (gl) {
-    // Rewrite every vertex each frame — a buffer the guest must hand over
-    // again, which is the whole point of this axis. Integer-stepped, so the
-    // content of frame N is the same on every boot.
-    for (let i = 0; i < glCount; i++) {
-      const t = (i * 7 + frame * 3) % 2048;
-      glData[i * 2]     = (t / 1024) - 1;
-      glData[i * 2 + 1] = (((i * 13 + frame * 5) % 2048) / 1024) - 1;
+    // Hand the whole buffer over again every frame — that is this axis — but
+    // do **not** rebuild it in JavaScript first.
+    //
+    // The first version of this page rewrote all `glCount * 2` floats per
+    // frame. At verts=90000 that made the *guest* the bottleneck rather than
+    // the device: a driven boot fell to 1 329 draws a second at drain duty
+    // 0.12, against 26 800 at 0.83 on the far lighter CSS-only probe. A probe
+    // that starves the device measures the guest's JavaScript engine, which is
+    // the exact failure it was written to fix, one layer further out.
+    //
+    // Mutating a few entries is enough: `bufferData` re-uploads the whole array
+    // regardless, so the device sees the same traffic, and the touched entries
+    // stop a browser from proving the contents constant and eliding the call.
+    for (let k = 0; k < 8; k++) {
+      const i = (frame * 7 + k * 251) % glCount;
+      glData[i * 2] = (((i * 13 + frame) % 2048) / 1024) - 1;
     }
     gl.bufferData(gl.ARRAY_BUFFER, glData, gl.DYNAMIC_DRAW);
     gl.clear(gl.COLOR_BUFFER_BIT);
@@ -171,16 +186,15 @@ function tick() {
   }
 
   if (tctx) {
-    // A full repaint, so the whole surface is fresh content rather than a
-    // damaged strip the guest could upload partially.
+    // Two fills rather than the twenty-five the first version drew, for the
+    // reason above: the *upload* is the load on this axis and it is `TEX * TEX`
+    // either way, so anything more elaborate is guest paint time bought at the
+    // device's expense.
     const s = TEX;
     tctx.fillStyle = `hsl(${frame % 360} 60% 30%)`;
     tctx.fillRect(0, 0, s, s);
-    for (let i = 0; i < 24; i++) {
-      tctx.fillStyle = `hsl(${(frame * 3 + i * 15) % 360} 80% 55%)`;
-      const q = ((frame * (i + 1)) % s);
-      tctx.fillRect(q, (i * s / 24) | 0, s / 6, s / 24);
-    }
+    tctx.fillStyle = `hsl(${(frame * 5) % 360} 85% 60%)`;
+    tctx.fillRect((frame * 3) % s, 0, s / 4, s);
   }
 
   if ((frame & 63) === 0) {
