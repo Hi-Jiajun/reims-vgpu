@@ -1556,6 +1556,19 @@ impl ResourcePools {
         BatchFit::Open(b.cb, b.fence)
     }
 
+    /// Whether the open batch is rendering into the same target this draw wants,
+    /// or `None` when nothing is recording.
+    ///
+    /// **This decides nothing.** It exists because every batched draw begins and
+    /// ends its own render pass — see [`Self::batch_fit`]'s doc — and a pass can
+    /// only ever be shared between draws whose target agrees, so this is the
+    /// ceiling on merging them and there was no number for it. Separate from
+    /// `batch_fit` because that function is deliberately pure and testable
+    /// without a device, and a counter in it would not be.
+    pub(crate) fn batch_target_is(&self, target: &BatchTarget) -> Option<bool> {
+        self.open_batch.as_ref().map(|b| b.target == *target)
+    }
+
     /// Record a batch-deferred draw's completion: open the batch on its ring
     /// slot (opener) or extend it (joiner), accumulating the per-draw descriptor
     /// set for the single flush-time seal. The CB stays in recording state;

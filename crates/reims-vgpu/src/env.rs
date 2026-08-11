@@ -464,14 +464,60 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 /// regime discriminator that works on the sustained probe is flat here, so
 /// nothing separates a fast boot from a slow one before the fact.
 ///
-/// Until then the switch is a permission rather than a refusal, which is the
-/// one place this module's own rule is bent. It is bent knowingly: that rule is
-/// about **host capability** — binding an unadvertised extension crashes and
-/// importing an undeclared handle is undefined behaviour — and neither arm here
-/// asks the host for anything the other does not. What differs is only which of
-/// two byte-identical copies runs, and the default is the one that has not been
-/// beaten — which is not the same claim as "the one that measured faster", and
-/// the difference is the whole of the reading above.
+/// # 2026-08-11: this is now default ON, and the switch is an ordinary refusal
+///
+/// Everything above is the case for leaving it off, and it was sound on the tree
+/// that measured it. Two things changed.
+///
+/// **The GPU cost is now measured directly rather than inferred from a wall-clock
+/// wait.** Every reading above reaches for `slot_us`, which is the drain worker
+/// blocked on a ring fence. [`crate::backend::vulkan::engine::gpu_span`] times the
+/// submission on the GPU's own clock instead. Driven macos-13 sustained boots,
+/// same pin, matched compositing regime, with the *planned* region count carried
+/// as the control so "byte-identical output" is checkable rather than asserted:
+///
+/// ```text
+///                        off      off      on       on
+/// draws per frame       280.2    276.4    269.5    256.1
+/// gather regions/draw    15.7     15.5     15.9     16.8   <- control, flat
+/// GPU us per draw        18.33    18.40    13.88    14.32   -24 %
+/// draw us per submission 266.4    264.1    195.0    203.8   -25 %
+/// drain duty              0.56     0.58     0.55     0.37
+/// window_publish fresh  105.0/s  104.5/s  110.0/s   59.0/s
+/// ```
+///
+/// The arms are disjoint with no overlap, and the control says both arms planned
+/// the same ~16 regions a draw — so this is one workload done for a quarter less
+/// GPU, which is exactly what a dispatch replacing ~13 transfer regions should
+/// buy.
+///
+/// **The CPU cost it was rejected for is now affordable.** +31.6 ms/s of
+/// `record_us` mattered because the drain worker was saturated at duty 0.90; the
+/// stamp coalescing and the preflight memo have since taken ~148 ms/s off that
+/// thread, and duty is 0.55-0.58 here and does not move between the arms. The
+/// earlier rejection was not wrong, it was conditional on a premise that two
+/// commits removed.
+///
+/// **Why this matters more than the frames say.** `fresh` moves +4.8 % on the one
+/// boot where it could, and on this rail frames are set by the guest — 54 % GPU
+/// occupancy beside duty 0.56 means neither side of the device is the pacer. The
+/// quantity that matters is GPU work per unit of guest work, because the support
+/// matrix's other column is an iGPU, where the same recorded commands cost roughly
+/// an order of magnitude more and this workload is hard GPU-bound. A 24 % cut
+/// there is a 24 % cut in the thing that binds it. This host cannot boot an iGPU,
+/// so `us/draw` is the closest available measurement and it is the one quoted.
+///
+/// So `off` is now an ordinary refusal — strictly ~13 transfer regions where the
+/// wider arm issues one dispatch — and the paragraph below about the switch being
+/// a "permission" no longer applies. The arms remain byte-identical in what the
+/// guest observes, which is why either may be the default at all: the kernel
+/// copies `uint`s and carries no format, row or texel semantics.
+///
+/// The narrowing arm stays because the answer is a property of the **host**. A
+/// discrete GPU crossing PCIe per region and a unified-memory host writing into
+/// the same physical pages have no reason to agree, and only the first has been
+/// measured. On a host where the dispatch loses, `=off` is the one command that
+/// says so.
 pub const COMPUTE_GATHER: &str = "REIMS_VGPU_COMPUTE_GATHER";
 
 /// **Default on.** `off` stops the device writing the two GPU timestamps that

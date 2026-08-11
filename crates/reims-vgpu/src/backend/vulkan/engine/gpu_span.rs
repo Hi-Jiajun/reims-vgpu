@@ -101,6 +101,55 @@
 //!   the workload — 48 % lower, in the table above, for a rail that got *more*
 //!   expensive. Always normalise: per `draws`, or per the kind's own `*_n`.
 //!
+//! # What the tiling says, once all five kinds carry stamps
+//!
+//! One driven macos-13 sustained boot in the ~280-draws-a-frame regime, all five
+//! kinds stamped, `unattributed=0`:
+//!
+//! ```text
+//! kind        us/sub   subs/s    ms/s   share
+//! draw        266.39     1961   522.4   96.9 %
+//! store       267.26       72    19.2    3.6 %
+//! stamp         5.45      211     1.2    0.2 %
+//! readback      0.00        0     0.0    0    %
+//! compute       0.00        0     0.0    0    %
+//! ```
+//!
+//! **A draw submission is 96.9 % of this device's GPU time**, and the guest-page
+//! writeback — the rail several sessions treated as the largest GPU cost — is
+//! 3.6 %. That is not a refutation of those sessions: it is what
+//! [`crate::runtime::writeback_debt`] *did*, by eliding 90 % of type-11 Stores.
+//! The remaining Store submissions are 72 a second against 1 961 draw ones.
+//!
+//! `readback` and `compute` at exactly zero are healthy zeros on this workload,
+//! not missing coverage: a compositing guest issues no compute and this probe's
+//! Safari page reads nothing back. A boot of a guest that does either must show
+//! them non-zero, and their appearing is how you know the workload changed.
+//!
+//! ## The control, re-run on this build, lands in `draw` and not in `store`
+//!
+//! `SCATTER_SPLIT=on` at matched regime (293.8 draws a frame against 280.2):
+//!
+//! ```text
+//!                    base      split      delta
+//! draw us/sub      266.39     287.38     +7.9 %
+//! store us/sub     267.26     270.70     +1.3 %
+//! us/draw           18.33      19.61     +7.0 %
+//! window_publish   105.0/s     96.0/s    -8.6 %
+//! ```
+//!
+//! Four times the writeback's copy regions costs **+7.9 % on the draw submission
+//! and nothing measurable on the store one** — because the scatter is recorded
+//! into whatever command buffer is open, and at 1 961 draw submissions against 72
+//! store ones that is nearly always a draw's. So `Kind` is "what this submission
+//! executed", which is the honest thing for a timestamp pair to mean, and it is
+//! *not* a per-rail attribution. A rail that rides in another kind's command
+//! buffer is charged to that kind.
+//!
+//! Do not read `store` at 3.6 % as "the writeback is 3.6 % of GPU time". Read it
+//! as "the writeback's own submissions are 3.6 %", and reach for an ablation when
+//! the question is a rail rather than a submission.
+//!
 //! # Which makes `busy_us` the number to optimise, not frames
 //!
 //! 17.7 µs of GPU for one window-server compositing draw is a great deal of work

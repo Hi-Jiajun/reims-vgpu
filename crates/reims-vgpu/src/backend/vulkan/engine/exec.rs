@@ -89,16 +89,20 @@ struct GatherDispatch {
     run_count: u32,
 }
 
-/// Whether the compute gather is on. **Default off** — it halves this rail's
-/// GPU cost and spends more than that on the CPU getting there. See
-/// [`crate::env::COMPUTE_GATHER`] for the boots that put it there and for the
-/// one change that would flip it.
+/// Whether the compute gather is on. **Default on since 2026-08-11** — it takes
+/// 24 % off this device's GPU work per draw for byte-identical guest output, and
+/// the CPU cost that kept it off for two sessions is now paid out of drain-worker
+/// headroom that did not exist when it was measured.
+///
+/// `off` restores the ~13 `VkBufferCopy` regions per gathered window. See
+/// [`crate::env::COMPUTE_GATHER`] for both sets of boots and for why the earlier
+/// rejection was right at the time.
 fn compute_gather_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
+        !matches!(
             crate::env::read(crate::env::COMPUTE_GATHER).0,
-            crate::env::Switch::On
+            crate::env::Switch::Off
         )
     })
 }
@@ -1993,6 +1997,27 @@ pub(crate) unsafe fn execute_draw_inner(
         "join_appended"
     }));
     let joins = no_join.is_none();
+    // Observation only, and the ceiling on the largest GPU-side saving this device
+    // has not taken. Every batched draw begins and ends its own render pass, so at
+    // ~27 draws a command buffer this rail issues ~27 `vkCmdBeginRenderPass` /
+    // `vkCmdEndRenderPass` pairs per submission over full-size attachments. Only a
+    // draw whose target agrees with the batch's could ever share one, so this
+    // split is how much merging could reach — and on a tiled or unified-memory
+    // host, where each pass loads and stores the whole attachment, that is the
+    // difference between a workload that fits in the memory bandwidth and one that
+    // does not.
+    if joins {
+        crate::runtime::drain::note_store_route(
+            match batch_target.as_ref().and_then(|t| pools.batch_target_is(t)) {
+                Some(true) => "join_same_target",
+                Some(false) => "join_other_target",
+                // A joiner with no `BatchTarget` of its own: refused by
+                // `no_identity` above unless something upstream changes, so this
+                // is a healthy zero rather than a third population.
+                None => "join_target_absent",
+            },
+        );
+    }
     // Claim the next ring slot — BEFORE any pool acquire, so a recycled slot
     // can never alias a still-in-flight CB. Blocks (retire) only when every
     // slot is still in flight; the wait lands in retire_wait_us. A batch
