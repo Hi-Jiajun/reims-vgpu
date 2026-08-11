@@ -735,6 +735,14 @@ the pattern text without changing what it matches. The failure is easy to misrea
 worked": the shell dies with status 144 and the surviving QEMU then holds `localhost:2222`, so the
 *next* boot dies on the `hostfwd` rule for the reason described below. Two symptoms, one cause.
 
+**The bracket protects only the shell that issues the `pkill`. Every ancestor is still a match**, so
+a pinned QEMU path must cross as an **exported variable and never as argv**. Any command line that
+names `.../reims-vgpu/…/qemu-system-x86_64-pin-whatever` matches `qemu-system-x86_6[4].*reims-vgpu`,
+and a chain runner that takes two pins as arguments is killed by the first boot it starts. That
+failure reads as success twice over: the runner prints its first "round 1 arm A" line and then
+simply stops, and the harness it launched under reports the unit as finished. An environment
+variable never appears in `/proc/pid/cmdline`, which is the whole fix.
+
 **Wait on the fail log, not on SSH alone.** The previous boot's QEMU outlives its script by long
 enough to still hold `localhost:2222`, and a new boot that loses that race dies on the `hostfwd` rule
 alone — the script prints one line about it and every other line looks like a normal start. `ssh
