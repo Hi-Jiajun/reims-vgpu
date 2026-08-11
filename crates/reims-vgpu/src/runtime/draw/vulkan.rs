@@ -2730,16 +2730,23 @@ fn note_gather_freshness(
     buffer_ref: u32,
     offset: u64,
     extent_cap: Option<u64>,
-    span: u64,
+    bound: &crate::runtime::bound_buffers::BoundBuffer,
 ) {
-    crate::runtime::buffer_gather_freshness::note_bind(
-        task_id,
-        buffer_ref,
-        offset,
-        extent_cap,
-        state.buffer_write_gen.stamp(task_id, buffer_ref),
-        span,
-    );
+    // SAFETY: `bound.runs` is the resolution the CPU gather itself walks, whose
+    // `host_ptr`s are stable aliases of at least `len` bytes into this process's
+    // guest-RAM import. This reads them at the same point in the draw the gather
+    // does, under the same borrow of `state`.
+    unsafe {
+        crate::runtime::buffer_gather_freshness::note_bind(
+            task_id,
+            buffer_ref,
+            offset,
+            extent_cap,
+            state.buffer_write_gen.stamp(task_id, buffer_ref),
+            bound.span,
+            &bound.runs,
+        );
+    }
 }
 
 /// The engine's view of a held resolution.
@@ -2844,9 +2851,8 @@ fn load_buffer_content<M: HostMemory + HostOps>(
             .get(task_id, buffer_ref, offset, gather_cap)
         {
             let content = bound_buffer_content(bound);
-            let span = bound.span;
             crate::runtime::drain::note_store_route("zc_buffer_held");
-            note_gather_freshness(state, task_id, buffer_ref, offset, gather_cap, span);
+            note_gather_freshness(state, task_id, buffer_ref, offset, gather_cap, bound);
             return Some(content);
         }
     }
@@ -2860,11 +2866,11 @@ fn load_buffer_content<M: HostMemory + HostOps>(
             try_buffer_zero_copy_resolved(state, host, task_id, &backing, offset, gather_cap)
         {
             let content = bound_buffer_content(&bound);
-            let span = bound.span;
+            // Before the insert, which takes `state` mutably and moves `bound`.
+            note_gather_freshness(state, task_id, buffer_ref, offset, gather_cap, &bound);
             state
                 .bound_buffers
                 .insert(task_id, buffer_ref, offset, gather_cap, bound);
-            note_gather_freshness(state, task_id, buffer_ref, offset, gather_cap, span);
             return Some(content);
         }
     }

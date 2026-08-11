@@ -1652,6 +1652,7 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         }
         // Beside it, because the two answer one question between them: that one
         // says the same window comes back and this says whether its bytes moved.
+        #[cfg(feature = "backend-vulkan")]
         if let Some(fresh) = crate::runtime::buffer_gather_freshness::census() {
             crate::observe::off(fresh);
         }

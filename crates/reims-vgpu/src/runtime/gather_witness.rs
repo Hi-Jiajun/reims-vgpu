@@ -453,11 +453,17 @@ impl GatherWitness {
 /// permutation of a window unchanged, and a scrolled tile atlas is exactly a
 /// permutation of itself.
 ///
+/// Shared with [`super::buffer_gather_freshness`], which audits the buffer rail
+/// against the guest's declarations rather than against this witness. One fold
+/// and not two: a second implementation would be a second place for "the bytes
+/// did not move" to mean something slightly different, in the one direction
+/// where being wrong serves a stale frame.
+///
 /// # Safety
 /// Every run's `host_ptr` must be a live mapping of at least `len` bytes — the
 /// same precondition the gather itself relies on, read at the same point in the
 /// draw.
-unsafe fn fold_runs(runs: &[crate::backend::vulkan::engine::GuestRun], span: u64) -> u128 {
+pub(crate) unsafe fn fold_runs(runs: &[crate::backend::vulkan::engine::GuestRun], span: u64) -> u128 {
     let mut a: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut b: u64 = 0xc2b2_ae3d_27d4_eb4f;
     let mut remaining = span;
