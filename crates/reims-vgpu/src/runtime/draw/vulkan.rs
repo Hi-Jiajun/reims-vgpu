@@ -5332,11 +5332,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Binds);
     crate::runtime::bind_phase::note_bind();
 
-    // SPIR-V words for the engine, shared from the translation cache (Arc — no
-    // per-draw materialization; fragment reloc variants are cached per shader).
-    let v_words = v_shader.words.clone();
+    // The two modules in the numbering this draw will use, from the translation
+    // cache. Each carries the walks of its own numbering beside it — see
+    // `m2v_cache::ShaderVariant` — so nothing here re-walks a module per draw.
+    // A vertex module never relocates, so it is always the base variant.
+    let v_variant = v_shader.variant(false, false);
+    let v_words = v_variant.words.clone();
     #[allow(unused_mut)]
-    let mut f_words = f_shader.words.clone();
+    let mut f_variant = f_shader.variant(false, false);
 
     {
         use crate::runtime::spirv_bind::{
@@ -5551,8 +5554,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // sampled-with-buffer coupling is kept so the engine's image/sampler
         // binding base mirrors one flag pair, not a third variant.
         if separate_sampled || buf_collide {
-            f_words = f_shader.fragment_words(separate_sampled, buf_collide);
+            f_variant = f_shader.variant(separate_sampled, buf_collide);
         }
+        let f_words = f_variant.words.clone();
 
         // Non-stage-in vertex buffers + fragment buffers as storage buffers.
         //
@@ -6199,9 +6203,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
             // Reflect the residual shader interface and provision defaults only
             // where explicit guest or constexpr state did not already win.
-            for binding in crate::runtime::spirv_bind::sampler_bindings(&v_words)
-                .into_iter()
-                .chain(crate::runtime::spirv_bind::sampler_bindings(&f_words))
+            for &binding in v_variant
+                .sampler_bindings
+                .iter()
+                .chain(f_variant.sampler_bindings.iter())
             {
                 if sampler_binds.insert(binding) {
                     samplers.push(

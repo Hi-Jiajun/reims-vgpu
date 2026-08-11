@@ -1748,6 +1748,59 @@ pub(crate) fn test_module_with_two_sampled_images(used: u32, declared_unused: u3
     w
 }
 
+/// A module carrying one set-0 `OpTypeSampler` variable at each of `bindings`.
+///
+/// Beside [`test_module_with_two_sampled_images`] and for the same reason: the
+/// opcode numbers are constants in this file, so a copy in another module's test
+/// would be those numbers spelled a second time.
+///
+/// A *sampler*, not a sampled image — [`sampler_bindings`] partitions set 0 by
+/// the pointee type, so a fixture built out of images answers its question with
+/// an empty vector and would make any test over it vacuous.
+#[cfg(test)]
+pub(crate) fn test_module_with_samplers(bindings: &[u32]) -> Vec<u32> {
+    const SAMPLER_TY: u32 = 10;
+    const POINTER_TY: u32 = 11;
+    const FIRST_VAR: u32 = 12;
+
+    let mut w = vec![
+        0x0723_0203,       // magic
+        0x0001_0600,       // version
+        0,                 // generator
+        64,                // bound
+        0,                 // schema
+        (2u32 << 16) | 17, // OpCapability
+        1,                 // Shader
+        (3u32 << 16) | 14, // OpMemoryModel
+        0,                 // Logical
+        1,                 // GLSL450
+    ];
+    for (i, binding) in bindings.iter().enumerate() {
+        w.extend_from_slice(&[
+            (4u32 << 16) | OP_DECORATE as u32,
+            FIRST_VAR + i as u32,
+            DECORATION_BINDING,
+            *binding,
+        ]);
+    }
+    w.extend_from_slice(&[(2u32 << 16) | OP_TYPE_SAMPLER as u32, SAMPLER_TY]);
+    w.extend_from_slice(&[
+        (4u32 << 16) | OP_TYPE_POINTER as u32,
+        POINTER_TY,
+        STORAGE_CLASS_UNIFORM_CONSTANT,
+        SAMPLER_TY,
+    ]);
+    for i in 0..bindings.len() as u32 {
+        w.extend_from_slice(&[
+            (4u32 << 16) | OP_VARIABLE as u32,
+            POINTER_TY,
+            FIRST_VAR + i,
+            STORAGE_CLASS_UNIFORM_CONSTANT,
+        ]);
+    }
+    w
+}
+
 /// Every distinct `Binding` decoration in the module, whatever it decorates.
 ///
 /// Deliberately class-blind and deliberately cheap: this is the candidate list
@@ -2045,7 +2098,7 @@ fn relocate_by_class(
 ///
 /// # Neither relocation ran on a driven x86/PCI boot
 ///
-/// `m2v_cache::fragment_words` returns the unrelocated words when both
+/// `m2v_cache::CachedShader::variant` returns the unrelocated words when both
 /// `separate_sampled` and `buf_collide` are false, and on a driven boot
 /// (web-content probe, 10 captures, 494 draws in a census window) that was every
 /// shader: 160 `linux_m2v_async` lines and **zero** `frag_sampled_reloc` or
