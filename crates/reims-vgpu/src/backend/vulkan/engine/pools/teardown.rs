@@ -16,6 +16,7 @@ impl ResourcePools {
         // to cmd_pool (destroyed below) and its dsets to desc_pool; the
         // accumulated transients are already in the live lists.
         self.open_batch = None;
+        self.forget_pass_echo();
         // Best-effort quiesce: wait every in-flight fence so no CB references
         // what we are about to destroy. On device loss the waits fail — the
         // teardown proceeds regardless, matching the recreate path.

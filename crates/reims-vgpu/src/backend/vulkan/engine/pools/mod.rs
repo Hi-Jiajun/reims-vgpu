@@ -469,6 +469,12 @@ pub(crate) struct ResourcePools {
     /// treat it as in flight; every path that claims a slot or quiesces the
     /// ring flushes it first ([`Self::batch_flush`]).
     open_batch: Option<OpenBatch>,
+    /// The render pass the last recorded draw opened — see [`PassEcho`].
+    ///
+    /// Observation only: nothing branches on it. It exists because "could this
+    /// draw have continued the previous one's pass" is not answerable from any
+    /// counter this device had, and the answer is the size of the merge.
+    last_pass: Option<PassEcho>,
     /// Offset suballocator for DEVICE_LOCAL optimal images (targets, sampled,
     /// storage, resident registry). Sub-allocates many image binds from a few
     /// large `VkDeviceMemory` blocks to collapse the per-image
@@ -584,6 +590,29 @@ pub(crate) enum BatchFit {
     /// Room in the recording batch: its command buffer and the fence its flush
     /// will submit with.
     Open(vk::CommandBuffer, vk::Fence),
+}
+
+/// The render pass instance the previously recorded draw opened, and the
+/// command buffer it opened it in.
+///
+/// Instrument for the merge this device has not taken: every batched draw
+/// begins and ends its own render pass, so a joiner whose pass is identical to
+/// its predecessor's *and* which records nothing between the two could have
+/// stayed inside the open one. `pass` and `fb` are what make two passes the same
+/// instance — a `CLEAR` joiner gets a different `pass` from a `LOAD` one, which
+/// is why the handle is compared rather than the target identity that decides
+/// batching. `area` is the render area, which must agree for the same reason.
+///
+/// `cb` is carried because a command buffer handle is recycled: an echo left
+/// behind by the previous user of this handle names a pass that was ended and
+/// submitted. Every path that resets or submits a CB clears the echo, and the
+/// handle comparison is the second lock on the same door.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PassEcho {
+    pub(crate) cb: vk::CommandBuffer,
+    pub(crate) pass: vk::RenderPass,
+    pub(crate) fb: vk::Framebuffer,
+    pub(crate) area: (u32, u32),
 }
 
 pub(crate) struct OpenBatch {

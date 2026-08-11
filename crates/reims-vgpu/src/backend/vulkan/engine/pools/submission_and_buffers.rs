@@ -144,6 +144,7 @@ impl ResourcePools {
             graveyard: Vec::new(),
             target_free: FreePool::new(TARGET_FREE_CAP_PER_KEY, TARGET_FREE_CAP_TOTAL),
             open_batch: None,
+            last_pass: None,
             slab: slab::SlabPool::new(),
             slabs: buffer_slab::BufferSlabs::new(),
             host_ram_imports: host_ram::HostRamImports::default(),
@@ -1307,6 +1308,11 @@ impl ResourcePools {
         // reader/compute/prefetch path (and prevents ring wrap from resetting
         // the still-recording batch CB).
         self.batch_flush(ctx, counters)?;
+        // Whatever pass was standing, the caller is about to record into a
+        // different command buffer than the one that opened it. Unconditional
+        // and above the early exits below, because every claim of a slot ends
+        // the echoed pass's recording session whether a batch was open or not.
+        self.forget_pass_echo();
         // Reap the oldest contiguous run of already-signaled slots before
         // claiming one, rather than only the slot about to be reused. The
         // readback path deliberately waits a fence without retiring (see
@@ -1569,6 +1575,33 @@ impl ResourcePools {
         self.open_batch.as_ref().map(|b| b.target == *target)
     }
 
+    /// Whether the pass a draw is about to open is the one already standing in
+    /// the same command buffer — see [`PassEcho`].
+    ///
+    /// False whenever nothing is echoed, so the first draw of a command buffer
+    /// answers "no" without a special case, which is correct: it has no
+    /// predecessor to continue.
+    pub(crate) fn pass_echoes(&self, echo: &PassEcho) -> bool {
+        self.last_pass.as_ref() == Some(echo)
+    }
+
+    /// Record the pass a draw just opened. Called at the `vkCmdBeginRenderPass`
+    /// and nowhere else, so the echo always names a pass that is standing.
+    pub(crate) fn note_pass_opened(&mut self, echo: PassEcho) {
+        self.last_pass = Some(echo);
+    }
+
+    /// Forget the echoed pass.
+    ///
+    /// Called wherever the command buffer holding it stops being the one a draw
+    /// would record into — a reset at `begin_entry`, a submit at the batch
+    /// flush, and teardown. Missing one would let a joiner believe a pass ended
+    /// in a previous submission is still open, which is why this is a method
+    /// rather than an assignment at each site.
+    pub(crate) fn forget_pass_echo(&mut self) {
+        self.last_pass = None;
+    }
+
     /// Record a batch-deferred draw's completion: open the batch on its ring
     /// slot (opener) or extend it (joiner), accumulating the per-draw descriptor
     /// set for the single flush-time seal. The CB stays in recording state;
@@ -1682,6 +1715,9 @@ impl ResourcePools {
         let Some(mut batch) = self.open_batch.take() else {
             return Ok(());
         };
+        // The CB is about to be ended and submitted, so no pass inside it is
+        // still open to continue.
+        self.forget_pass_echo();
         counters.batch_flushes.fetch_add(1, Ordering::Relaxed);
         counters
             .batch_flush_draws

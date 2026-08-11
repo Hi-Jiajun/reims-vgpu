@@ -3018,6 +3018,25 @@ pub(crate) unsafe fn execute_draw_inner(
         };
     }
 
+    // The `passmerge_outside_*` route naming the first thing this draw records
+    // that a render pass instance cannot contain, or `None` if it records
+    // nothing outside one.
+    //
+    // The route name itself rather than a tag translated later: a second
+    // spelling is a table that can go one arm short, and the only consumer is
+    // the emission below.
+    //
+    // Every site below that emits a barrier, a copy or a dispatch names itself
+    // here, *after* whatever `continue` decides the site is a no-op for this
+    // draw — a loop that skips every element records nothing and must not claim
+    // it did. The first name wins, because the question is whether the pass
+    // standing from the previous draw survived to here, and the first thing
+    // recorded is what ended it.
+    //
+    // This decides nothing. It is read once, at the `vkCmdBeginRenderPass`
+    // below, to charge this draw to one bucket of `passmerge_*`.
+    let mut outside_pass: Option<&'static str> = None;
+
     // Metal permits a pass to sample the same texture it renders into. Vulkan
     // does not permit that attachment feedback loop on this path, so capture
     // the prior resident content into a same-format GPU image before changing
@@ -3037,6 +3056,7 @@ pub(crate) unsafe fn execute_draw_inner(
             continue;
         };
         target_snapshotted = true;
+        outside_pass.get_or_insert("passmerge_outside_snapshot");
         // Once per distinct source: duplicate bindings of one target share the
         // image, so a second barrier for it would order nothing new. The
         // *first* is unconditional — the source is a registry resident this
@@ -3097,6 +3117,7 @@ pub(crate) unsafe fn execute_draw_inner(
 
     // Seed upload (CPU import).
     if let Some(seed) = &seed_slot {
+        outside_pass.get_or_insert("passmerge_outside_seed");
         let (src_stage, src_access) =
             target_prior_access(target_snapshotted, target_access).source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
@@ -3148,6 +3169,7 @@ pub(crate) unsafe fn execute_draw_inner(
             &barrier,
         );
     } else if let Some((seed_image, seed_access)) = seed_from_resolved {
+        outside_pass.get_or_insert("passmerge_outside_seed");
         // GPU present-boundary seed: resident front frame → draw target copy,
         // then the pass runs with LOAD.
         //
@@ -3215,6 +3237,7 @@ pub(crate) unsafe fn execute_draw_inner(
             std::sync::atomic::Ordering::Relaxed,
         );
     } else if load_uses_gpu_content {
+        outside_pass.get_or_insert("passmerge_outside_target_layout");
         // A prior direct sample may have left this target shader-readable;
         // transition from the registry's tracked layout back to attachment use.
         let prior = target_prior_access(target_snapshotted, target_access);
@@ -3238,6 +3261,7 @@ pub(crate) unsafe fn execute_draw_inner(
             &barrier,
         );
     } else if target_snapshotted || target_access != super::pools::ResidentAccess::Untouched {
+        outside_pass.get_or_insert("passmerge_outside_clear_wait");
         // The Clear render pass discards prior content via initialLayout
         // UNDEFINED, so nothing here preserves pixels — but its colour writes
         // still have to wait for whoever last read them, and on this path the
@@ -3295,6 +3319,7 @@ pub(crate) unsafe fn execute_draw_inner(
         {
             continue;
         }
+        outside_pass.get_or_insert("passmerge_outside_resident_layout");
         let (src_stage, src_access) = access.source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
@@ -3326,6 +3351,7 @@ pub(crate) unsafe fn execute_draw_inner(
         else {
             continue;
         };
+        outside_pass.get_or_insert("passmerge_outside_sampled_upload");
         upload_buffer_to_sampled_image(
             ctx,
             cb,
@@ -3352,6 +3378,9 @@ pub(crate) unsafe fn execute_draw_inner(
     //
     // Either form lands byte-identical bytes; which one ran decides only this
     // barrier's source scope, and `buffer_gather_dispatches` says which it was.
+    if !guest_gathers.is_empty() {
+        outside_pass.get_or_insert("passmerge_outside_gather");
+    }
     let gather_dispatched = if guest_gathers.is_empty() || !compute_gather_enabled() {
         false
     } else {
@@ -3450,6 +3479,7 @@ pub(crate) unsafe fn execute_draw_inner(
         else {
             continue;
         };
+        outside_pass.get_or_insert("passmerge_outside_sampled_upload");
         upload_buffer_to_sampled_image(
             ctx,
             cb,
@@ -3472,6 +3502,7 @@ pub(crate) unsafe fn execute_draw_inner(
         if *access == super::pools::ResidentAccess::Untouched {
             continue;
         }
+        outside_pass.get_or_insert("passmerge_outside_mrt_layout");
         let (src_stage, src_access) = access.source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
@@ -3528,12 +3559,44 @@ pub(crate) unsafe fn execute_draw_inner(
                 .device
                 .create_query_pool(&ci, None)
                 .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecCreateQueryPool, e)))?;
+            outside_pass.get_or_insert("passmerge_outside_query_reset");
             ctx.device.cmd_reset_query_pool(cb, pool, 0, 1);
             Some((pool, flags))
         }
     };
+    // What this draw would have needed to continue the pass its predecessor
+    // left standing, charged to exactly one bucket. `join_same_target` already
+    // says how many draws render into the batch's own target; this says how many
+    // of those could have shared the pass, which is the number the merge is
+    // worth. The ladder is ordered so each rung names the *nearest* obstacle: a
+    // draw that never joined has no pass to continue whatever else is true of
+    // it, and a draw whose pass instance differs would need a new one even if it
+    // recorded nothing.
+    //
+    // Observation only — the pass is begun below either way.
+    //
+    // The buckets are exhaustive over draws that reach here, which is the
+    // cheapest way to catch a mis-placed `get_or_insert`: summed over a census
+    // window they equal `chain_phase chains`, and `passmerge_no_join` alone
+    // equals that count less `engine_delta batch_joins`. A total that falls
+    // short means a draw took a path that skips this line; a `no_join` that
+    // disagrees means `joins` and the batch counters have come apart.
+    let echo = super::pools::PassEcho {
+        cb,
+        pass: render_pass,
+        fb: target_fb,
+        area: (req.width, req.height),
+    };
+    crate::runtime::drain::note_store_route(if !joins {
+        "passmerge_no_join"
+    } else if !pools.pass_echoes(&echo) {
+        "passmerge_pass_differs"
+    } else {
+        outside_pass.unwrap_or("passmerge_reachable")
+    });
     ctx.device
         .cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
+    pools.note_pass_opened(echo);
     ctx.device
         .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
     if let Some((pool, flags)) = occlusion {
