@@ -8,6 +8,7 @@
 //! parent's imports, which this half shares.
 
 use super::*;
+use crate::contract::pixel_format::solid_bgra8;
 
 /// Vulkan image shape for a reflected Metal sampled-image dimensionality.
 ///
@@ -117,8 +118,14 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             if c.width == 0 || c.height == 0 {
                 continue;
             }
-            let rgba = solid_rgba8(c.width, c.height, &c.clear_color);
+            // Only the first attachment's RGBA copy is ever read again — it is
+            // this chain's `color0_rgba` — so the other attachments' seeds are
+            // built straight into the order their destination wants and never
+            // exist in any other one.
+            let want_rgba = i == 0 || c.target_gva != 0;
+            let rgba = want_rgba.then(|| solid_rgba8(c.width, c.height, &c.clear_color));
             let ok = if c.target_gva != 0 {
+                let rgba = rgba.as_ref().expect("built for every GVA target above");
                 write_gva_rgba8(
                     state,
                     host,
@@ -128,7 +135,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     c.height,
                     c.row_stride,
                     c.format,
-                    &rgba,
+                    rgba,
                 )
                 .is_ok()
             } else if c.mapping_id != 0 {
@@ -137,7 +144,13 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 // fragmented mapping too, staging native rows and landing them
                 // through `mapper::write_mapping_bytes`. (A comment here used to
                 // call it contig-only, which it has not been.)
-                let bgra = swap_rb_channels(&rgba);
+                //
+                // Built from the swapped *pixel* rather than by exchanging the
+                // channels of the RGBA image: a solid image is one repeated
+                // word, so the exchange belongs to the word and doing it per
+                // texel cost an allocation and two passes over the whole
+                // surface. See `contract::pixel_format::solid_bgra8`.
+                let bgra = solid_bgra8(c.width, c.height, &c.clear_color);
                 let stride = c.width.saturating_mul(RGBA8_BPP);
                 mapping_write::write_bgra8(
                     state,
@@ -154,7 +167,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             if ok {
                 any_store = true;
                 if i == 0 {
-                    color0_rgba = Some(rgba);
+                    color0_rgba = rgba;
                 }
                 crate::observe::line(format!(
                     "linux_clear_store mid={} gva={:#x} {}x{} pipe={} load={}",

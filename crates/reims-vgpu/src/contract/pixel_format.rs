@@ -1138,18 +1138,63 @@ pub fn f64_to_unorm8(value: f64) -> u8 {
 /// and neither owns, and because `contract` is the tree that gets tested on
 /// every arm.
 pub fn solid_rgba8(w: u32, h: u32, clear: &[f64; 4]) -> Vec<u8> {
-    let px = [
+    solid_image8(w, h, unorm8_rgba(clear))
+}
+
+/// [`solid_rgba8`] with the red and blue channels exchanged — the same image a
+/// caller used to obtain by building the RGBA one and swapping every texel of
+/// it, which is what a type-11 mapping's native order needs.
+///
+/// Building it directly is the point. A CLEAR seed that lands in a mapping used
+/// to cost two allocations and four passes over the image — zero the RGBA
+/// buffer, fill it, zero the BGRA buffer, read the first while writing the
+/// second — for a result that is one repeated word. On the load probe's
+/// `blur=40` dial the seed loop moved 140 MB a second this way and `prep_seed_us`
+/// was **8.6 µs of a 41 µs chain, 21 % of it and second only to the engine**.
+///
+/// The channel exchange belongs to the *pixel*, not to the image, so the whole
+/// of it is the argument this function computes.
+pub fn solid_bgra8(w: u32, h: u32, clear: &[f64; 4]) -> Vec<u8> {
+    let [r, g, b, a] = unorm8_rgba(clear);
+    solid_image8(w, h, [b, g, r, a])
+}
+
+/// The clear colour as one unorm8 RGBA texel.
+fn unorm8_rgba(clear: &[f64; 4]) -> [u8; 4] {
+    [
         f64_to_unorm8(clear[COMPONENT_R]),
         f64_to_unorm8(clear[COMPONENT_G]),
         f64_to_unorm8(clear[COMPONENT_B]),
         f64_to_unorm8(clear[COMPONENT_A]),
-    ];
+    ]
+}
+
+/// `w * h` copies of `px`, tightly packed, each byte written exactly once.
+///
+/// The fill doubles what it has already written rather than walking texels, so
+/// the buffer is filled by `memcpy` at growing sizes instead of by a four-byte
+/// store per texel, and it is never zeroed first — `vec![0u8; n]` followed by a
+/// fill writes every byte twice.
+///
+/// The length is still driven by the buffer rather than by a texel count, which
+/// is the property [`solid_rgba8`]'s doc above requires: `extend_from_within`
+/// can only copy bytes this buffer already holds, and the final truncation is to
+/// the same `n` the capacity was reserved for, so no arithmetic here can
+/// describe a different image from the one that was allocated.
+fn solid_image8(w: u32, h: u32, px: [u8; 4]) -> Vec<u8> {
     let n = (w as usize)
         .saturating_mul(h as usize)
         .saturating_mul(px.len());
-    let mut img = vec![0u8; n];
-    for texel in img.chunks_exact_mut(px.len()) {
-        texel.copy_from_slice(&px);
+    if n < px.len() {
+        // A zero-texel image, or one whose geometry saturated. Either way there
+        // is no first texel to double from.
+        return Vec::new();
+    }
+    let mut img = Vec::with_capacity(n);
+    img.extend_from_slice(&px);
+    while img.len() < n {
+        let take = (n - img.len()).min(img.len());
+        img.extend_from_within(..take);
     }
     img
 }
@@ -2982,6 +3027,84 @@ mod tests {
                 &mut back
             ));
             assert_eq!(&back[..], *p);
+        }
+    }
+}
+
+#[cfg(test)]
+mod solid_fill_tests {
+    use super::{solid_bgra8, solid_rgba8};
+
+    /// The one-pass fill produces exactly what walking texels produced.
+    ///
+    /// The doubling fill writes a growing `memcpy` rather than a texel at a
+    /// time, so the arithmetic it can get wrong is a length: a short image, a
+    /// tail that is not a whole doubling, and the zero-texel case are the three
+    /// places it could differ from the idiom it replaced. Every geometry below
+    /// is checked against that idiom rather than against a hand-written
+    /// expectation, so the test states equivalence and not a second spelling.
+    #[test]
+    fn the_doubling_fill_matches_a_texel_walk_at_every_geometry() {
+        fn walk(w: u32, h: u32, px: [u8; 4]) -> Vec<u8> {
+            let n = (w as usize) * (h as usize) * px.len();
+            let mut img = vec![0u8; n];
+            for texel in img.chunks_exact_mut(px.len()) {
+                texel.copy_from_slice(&px);
+            }
+            img
+        }
+        let clear = [0.25_f64, 0.5, 0.75, 1.0];
+        let px = [
+            super::f64_to_unorm8(clear[0]),
+            super::f64_to_unorm8(clear[1]),
+            super::f64_to_unorm8(clear[2]),
+            super::f64_to_unorm8(clear[3]),
+        ];
+        for (w, h) in [
+            (0, 0),
+            (0, 8),
+            (8, 0),
+            (1, 1),
+            (1, 3),
+            (3, 1),
+            (5, 7),
+            (17, 13),
+            (64, 64),
+            (129, 3),
+        ] {
+            assert_eq!(
+                solid_rgba8(w, h, &clear),
+                walk(w, h, px),
+                "rgba {w}x{h} must match the texel walk"
+            );
+        }
+    }
+
+    /// The BGRA builder equals swapping the RGBA one, which is how its only
+    /// caller used to obtain it.
+    ///
+    /// Fails if the exchange is applied to the wrong pair — the alpha channel
+    /// and the green channel both stay put, so a transposition that moved one
+    /// of them would pass a test that only checked the length.
+    #[test]
+    fn the_bgra_seed_equals_the_rgba_seed_with_red_and_blue_exchanged() {
+        for clear in [
+            [0.0_f64, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 0.5],
+            [0.1, 0.2, 0.3, 0.4],
+        ] {
+            for (w, h) in [(1, 1), (4, 4), (13, 5)] {
+                let mut swapped = solid_rgba8(w, h, &clear);
+                for px in swapped.chunks_exact_mut(4) {
+                    px.swap(0, 2);
+                }
+                assert_eq!(
+                    solid_bgra8(w, h, &clear),
+                    swapped,
+                    "bgra {w}x{h} clear={clear:?}"
+                );
+            }
         }
     }
 }
