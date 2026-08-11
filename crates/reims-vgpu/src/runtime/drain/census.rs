@@ -131,13 +131,42 @@ const VBL_REPORT_EVERY: u64 = 1024;
 /// interleaved run of twelve an arm is not enough to claim it), it rules out the
 /// cliff, which predicted the opposite and predicted it strongly.
 ///
+/// # Nor is it the host GPU's clock
+///
+/// The direction above pointed at the governor: this part idles at 180 MHz
+/// against a 3090 MHz cap, so "more GPU work" plausibly means "higher clock"
+/// means "lower latency for everything the guest waits on". Sixteen boots with
+/// `nvidia-smi` sampled at 2 Hz throughout, split at the 25 s mark so the window
+/// *before* the guest has latched is read separately from the driven one:
+///
+/// ```text
+///        early (0-25 s)          driven (25 s-end)
+///        med MHz   p90   util    med MHz   util
+/// fast     1040   1590    24 %     1547    31 %
+/// slow     1044   1594    26 %     1266    24 %
+/// ```
+///
+/// The early window is **identical**. The driven window differs, and that is the
+/// causality running backwards rather than a cause: a guest presenting 60 frames
+/// a second asks for half the work and so clocks lower by construction. Reading
+/// the driven column alone would have produced a confident wrong answer, which
+/// is why the run split the windows before scoring.
+///
 /// So the cause of the split is **open**. What is closed is that it is not the
 /// limiter (which holds ~118 Hz on every boot, fast or slow), not the claim
 /// ordering (40 interleaved boots, p≈0.7, see
 /// [`super::signal_display_refresh_classes`]), not the display mode (see
 /// [`super::fill_display_descriptor`]), not anything visible in the deciding
-/// window this instrument was built to expose, and not a frame-time threshold
-/// this device sits near.
+/// window this instrument was built to expose, not a frame-time threshold this
+/// device sits near, and not the host GPU clock.
+///
+/// Every device-side cause anyone here has been able to name is now excluded,
+/// which makes a guest-internal race — the order its own daemons and window
+/// server happen to start in, from one snapshot revert to the next — the
+/// hypothesis left standing. Nothing in this device can observe that, and a
+/// device change aimed at it would be aimed at nothing. Before spending another
+/// twenty boots, find a reading that would *distinguish* a guest-internal race
+/// from a device cause; a further exclusion is worth less than that.
 ///
 /// One methodological result came with it and belongs to anyone testing the next
 /// theory: the base rate **drifts**. It was 12 slow in 40 early in a session and

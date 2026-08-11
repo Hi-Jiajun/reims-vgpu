@@ -682,7 +682,9 @@ What the split is **not**: not the display mode (both populations report `1920 x
 not the VBL limiter (~118 Hz on fast and slow boots alike), not the claim ordering (40 interleaved
 boots, p≈0.7), not anything visible in the guest's first sustained VBL window, and not this device
 sitting on a frame-time cliff — making it ~20 % slower with `REIMS_VGPU_COMPUTE_GATHER=off` did not
-raise the slow rate. The cause is open. Read `VBL_REPORT_EARLY` beside
+raise the slow rate — and not the host GPU clock, which is identical across both populations in the
+window before the guest latches. The cause is open, and every device-side cause anyone has named is
+now excluded. Read `VBL_REPORT_EARLY` beside
 `runtime::drain::census::VblCensus` before spending boots on a new theory: a run of eight holds one
 or two slow boots and so cannot tell a cause from a coincidence, which has already produced one
 confident wrong answer here.
