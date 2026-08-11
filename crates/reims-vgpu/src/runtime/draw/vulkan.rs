@@ -2700,12 +2700,17 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
         Some(cap) => span.min(cap),
         None => span,
     };
-    if span < ZERO_COPY_BUFFER_MIN_BYTES {
-        // Narrowing cannot be what put a bind here: the caller only hands this
-        // function a cap that already clears the floor, so a sub-floor span means
-        // the allocation itself is sub-floor and the cap never bound anything.
-        // That is why this stayed one route — a `_narrowed` sibling would have
-        // been a counter that cannot count.
+    if full < ZERO_COPY_BUFFER_MIN_BYTES {
+        // `full` and not the narrowed `span`, because the floor asks whether this
+        // *window* is worth the zero-copy rail and that is a property of what the
+        // guest bound, not of how much of it one shader reads. Comparing the
+        // narrowed span instead is what made a 64-byte declared object cost the
+        // bind its registry entry and fall to a CPU read.
+        //
+        // On the default arm the two are the same number: the caller only hands
+        // this function a cap that already clears the floor, so `span == full`
+        // whenever `full >= FLOOR`. The distinction only bites with
+        // `REIMS_VGPU_EXTENT_NARROW=on`.
         crate::runtime::drain::note_store_route("zc_buffer_below_floor");
         return None;
     }
@@ -2897,6 +2902,47 @@ fn bound_buffer_content(
 /// wall clock, before this device could time the GPU. The gather is a PCIe copy
 /// and about 55 % of all GPU time here, and no CPU counter was ever going to
 /// see it.
+/// Whether a declared object size may narrow the bytes the gather rail moves.
+///
+/// **Default off** — see [`crate::env::EXTENT_NARROW`] for the bytes at stake,
+/// for what separates this from the earlier attempt that applied the cap to the
+/// rail *decision*, and for why an arm that reads fewer guest bytes has to earn
+/// its default with a screenshot as well as a number.
+/// Which cap the gather rail and the held-resolution registry key carry.
+///
+/// A function rather than two lines at the call site because it is the whole of
+/// the difference between the two arms, and because a test can then assert the
+/// rule instead of restating it — the test that used to cover this re-implemented
+/// the filter and so could only ever agree with itself.
+///
+/// `narrow` false is the default: a cap below [`ZERO_COPY_BUFFER_MIN_BYTES`] is
+/// dropped, because the floor is compared against the narrowed span and a
+/// 64-byte object would move the bind off the rail and out of the registry. Every
+/// object this workload declares is 512 bytes or under, so that drops all of
+/// them.
+///
+/// `narrow` true keeps every cap, and
+/// [`try_buffer_zero_copy_resolved`] then compares the floor against the *full*
+/// span instead, so the bind stays on the rail it was on and only the extent
+/// walked and copied moves.
+pub(super) fn gather_cap_for(extent_cap: Option<u64>, narrow: bool) -> Option<u64> {
+    if narrow {
+        extent_cap
+    } else {
+        extent_cap.filter(|&cap| cap >= ZERO_COPY_BUFFER_MIN_BYTES)
+    }
+}
+
+fn extent_narrow_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::env::read(crate::env::EXTENT_NARROW).0,
+            crate::env::Switch::On
+        )
+    })
+}
+
 fn note_extent_headroom(extent_cap: Option<u64>, span: u64) {
     let Some(cap) = extent_cap else {
         crate::runtime::drain::note_store_route_n("bext_uncapped_span_bytes", span);
@@ -2917,11 +2963,20 @@ fn load_buffer_content<M: HostMemory + HostOps>(
     allow_zero_copy: bool,
     extent_cap: Option<u64>,
 ) -> Option<crate::backend::vulkan::engine::BufferContent> {
-    // Below the floor the cap would cost the bind its registry entry, so the
-    // gather rail and the registry key both ignore it there. Keyed on the same
-    // value the walk used, or a lookup would answer with a span it did not ask
-    // for.
-    let gather_cap = extent_cap.filter(|&cap| cap >= ZERO_COPY_BUFFER_MIN_BYTES);
+    // Which cap the rail and the registry key carry. Keyed on the same value the
+    // walk used, or a lookup would answer with a span it did not ask for.
+    //
+    // Default: below the floor the cap is dropped, because it would cost the bind
+    // its registry entry — the floor was compared against the *narrowed* span, so
+    // a 64-byte object turned a registry hit into a CPU read. Since every object
+    // this workload declares is 512 bytes or less, that drops all of them and the
+    // rail is inert.
+    //
+    // `REIMS_VGPU_EXTENT_NARROW=on` keeps the cap and moves the floor comparison
+    // onto the full span instead (`try_buffer_zero_copy_resolved`), so the bind
+    // stays on exactly the rail it was on and only the extent walked and copied
+    // narrows.
+    let gather_cap = gather_cap_for(extent_cap, extent_narrow_enabled());
     // A held resolution answers before anything is resolved at all: the walk
     // below produces the same runs until the guest moves the addresses, and it
     // announces every such move. This is the whole point of the registry — see

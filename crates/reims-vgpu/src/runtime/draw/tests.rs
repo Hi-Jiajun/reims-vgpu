@@ -164,17 +164,55 @@ fn sampled_zero_copy_floor_separates_video_from_small_binds() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn an_extent_cap_below_the_gather_floor_is_not_applied_to_the_gather_rail() {
-    let keeps = |cap: u64| Some(cap).filter(|&c| c >= ZERO_COPY_BUFFER_MIN_BYTES);
+    use super::vulkan::gather_cap_for;
 
-    // The population today's shaders actually declare: 60 captured AIR blobs
-    // ran median 64 bytes, max 512. None of these may reach the gather rail.
+    // The population today's shaders actually declare: 60 captured AIR blobs ran
+    // median 64 bytes, max 512, and a driven boot reads 1.03 million `Object`
+    // verdicts a boot between 65 and 512 bytes against 79 above 64 KiB. None of
+    // these may reach the gather rail on the default arm.
     for cap in [4u64, 64, 288, 512, ZERO_COPY_BUFFER_MIN_BYTES - 1] {
-        assert_eq!(keeps(cap), None, "cap {cap} must not narrow the gather");
+        assert_eq!(
+            gather_cap_for(Some(cap), false),
+            None,
+            "cap {cap} must not narrow the gather by default"
+        );
     }
     // A declared object at or above the floor still narrows: the bind stays on
     // the rail, keeps its registry entry, and gathers less.
     for cap in [ZERO_COPY_BUFFER_MIN_BYTES, ZERO_COPY_BUFFER_MIN_BYTES + 1] {
-        assert_eq!(keeps(cap), Some(cap), "cap {cap} should still narrow");
+        assert_eq!(gather_cap_for(Some(cap), false), Some(cap), "cap {cap}");
+    }
+    // A bind with no declared object has nothing to narrow by on either arm.
+    assert_eq!(gather_cap_for(None, false), None);
+    assert_eq!(gather_cap_for(None, true), None);
+}
+
+/// `REIMS_VGPU_EXTENT_NARROW=on` keeps the caps the floor drops, which is the
+/// whole of the arm.
+///
+/// The one that matters is the population above: 512 bytes and under is where
+/// essentially every declared object sits, so an arm that kept only the caps
+/// already above 16 KiB would be the default arm with extra steps and would
+/// measure as no change — which is exactly how a switch gets called neutral.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn the_narrowing_arm_keeps_the_caps_the_floor_drops() {
+    use super::vulkan::gather_cap_for;
+
+    for cap in [4u64, 64, 288, 512, ZERO_COPY_BUFFER_MIN_BYTES - 1] {
+        assert_eq!(
+            gather_cap_for(Some(cap), true),
+            Some(cap),
+            "cap {cap} is the population this arm exists for"
+        );
+    }
+    // And it changes nothing about the caps that already cleared the floor.
+    for cap in [ZERO_COPY_BUFFER_MIN_BYTES, 1 << 20] {
+        assert_eq!(
+            gather_cap_for(Some(cap), true),
+            gather_cap_for(Some(cap), false),
+            "cap {cap} must not depend on the arm"
+        );
     }
 }
 
