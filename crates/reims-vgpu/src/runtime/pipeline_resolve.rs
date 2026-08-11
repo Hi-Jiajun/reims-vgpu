@@ -29,6 +29,49 @@
 //! already been. A hit that costs what a compile costs is the thing this module
 //! deletes.
 //!
+//! # What it removed, and why that is only worth 1.7 % of the frames
+//!
+//! Ten driven macos-13 sustained-animation boots, interleaved arms of
+//! `REIMS_VGPU_PIPELINE_MEMO`. The span it targets collapses, and the four bars
+//! are disjoint across every pair of boots:
+//!
+//! ```text
+//!                 on (n=4)     off (n=4)
+//! pl_desc_us        20 000        52 400     the three-entry identity check
+//! pl_mtlb_us             0        34 900     gone
+//! pl_air_us              0         5 300     gone
+//! pl_xlate_us            0        33 100     gone
+//! span per chain   0.89 us       4.86 us     -3.97 us, 15 % of a 26.5 us chain
+//! ```
+//!
+//! **And the frames barely moved: +1.70 %, disjoint but at sep 0.9x.** What the
+//! same boots say about why is not ambiguous, because it is also disjoint —
+//! every on boot blocked longer than every off boot:
+//!
+//! ```text
+//! slot_us     on  129 484  132 023  121 964  121 124     (min 121 124)
+//!            off   90 427   78 494   68 489   83 515     (max  90 427)
+//! ```
+//!
+//! `slot_us` is the drain worker blocked waiting for a ring slot, which is
+//! waiting for the GPU. It rose 1.74 us a chain of the 3.97 us this saved, and
+//! `drain_duty`'s `busy_us` is unchanged at ~840 ms a second across both arms.
+//! So the worker did not go idle and did not draw more; it spent what it saved
+//! waiting.
+//!
+//! **This rail is GPU-bound on this host, and that is the finding, not this
+//! memo.** A CPU saving here converts at roughly the residual rate until the GPU
+//! work comes down — the largest piece of which is the guest buffer gather, at
+//! 5.8 GB/s over 427 000 transfer regions a second.
+//!
+//! The memo stays anyway, and not out of sunk cost. It is a strict reduction in
+//! work with no measured regression on any metric; the balance it is measured
+//! against is one host's (a discrete NVIDIA GPU with a fast CPU beside it) and
+//! the unified-memory cells of the support matrix have the opposite one, where
+//! guest page-table walks contend with the GPU for the same memory; and a probe
+//! heavy enough to make the drain worker the bottleneck again would convert it.
+//! What may **not** be said is that it bought 15 % of anything.
+//!
 //! # The identity a memo entry is checked against
 //!
 //! A guest object's identity is its **object-list entry**, and this module's
