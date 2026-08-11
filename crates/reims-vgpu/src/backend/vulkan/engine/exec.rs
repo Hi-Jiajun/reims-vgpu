@@ -3581,6 +3581,39 @@ pub(crate) unsafe fn execute_draw_inner(
     // equals that count less `engine_delta batch_joins`. A total that falls
     // short means a draw took a path that skips this line; a `no_join` that
     // disagrees means `joins` and the batch counters have come apart.
+    //
+    // # What it read, and why the gather was the wrong suspect
+    //
+    // Two driven macos-13 sustained-animation boots, quiesced, both fast
+    // (`present_hz` 115.0 and 114.0), sum identity exact on both:
+    //
+    // ```text
+    // bucket                          b1              b2
+    // outside_target_layout    850 698  82.4%  871 180  82.3%
+    // outside_snapshot          75 010   7.3%   77 740   7.3%
+    // no_join                   64 295   6.2%    66 396   6.3%
+    // pass_differs              41 904   4.1%    43 262   4.1%
+    // reachable                      0      0         0      0
+    // ```
+    //
+    // Nothing lands in `outside_gather`. The obstacle is a layout transition
+    // this device creates for itself: [`super::caches::ObjectCaches::get_or_create_pass`]
+    // ends every pass with `final_layout = TRANSFER_SRC_OPTIMAL` so a present
+    // blit or a readback can read the target without transitioning it, and the
+    // `LOAD` pass then names `initial_layout = COLOR_ATTACHMENT_OPTIMAL`, so the
+    // next draw into that target barriers the image all the way back.
+    //
+    // The trade is badly priced: `target_reads` is 1 199 a second — the present
+    // capture and the deferred-window flush, the only consumers that ending
+    // exists for — against ~24 000 draws a second that immediately undo it. On
+    // this discrete host that is a barrier and probably little else; on anything
+    // with framebuffer compression (every iGPU, every tiler, AMD DCC, Intel CCS)
+    // it is a decompress and recompress of the attachment per draw.
+    //
+    // **The ladder charges the nearest obstacle, so `outside_gather=0` does not
+    // mean gathers are rare.** `buffer_guest_gathers` is 34 564/s and they sit
+    // behind the layout barrier, which precedes them in record order. What the
+    // merge is actually worth cannot be read until that barrier moves.
     let echo = super::pools::PassEcho {
         cb,
         pass: render_pass,
