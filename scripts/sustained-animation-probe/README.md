@@ -82,19 +82,25 @@ compositor's hands. **Both halves are load-bearing**: the CSS rule cannot carry
 the 3D transform, because `tick()` overwrites the inline `transform` every
 frame, and a CSS-only fix would be silently discarded.
 
-Three driven macos-13 boots after the change read 424.8, 427.7 and 427.6 draws
-per presented frame — all inside the promoted band — with `present_hz` medians
-of 40.95, 41.55 and 41.30, a spread of **1.5 %** against the 24 % the two
-clusters sat apart.
+**It did not work, and the first three boots said it had.** The first three
+boots after the change read 424.8, 427.7 and 427.6 draws per presented frame,
+all promoted, `present_hz` spanning 1.5 %. The seventh collapsed: **265.8**.
+Running tally since the change is 6 promoted, 1 collapsed — about 14 %, against
+2 in 10 before. There is no evidence the change reduced anything.
 
-Read that as consistent-with rather than proven: at the old one-in-five collapse
-rate, three boots miss the collapsed cluster by chance about half the time, so
-the three boots alone are weak. The argument is the mechanism plus the tight
-band, and the band is the part that would have been wide either way if the
-clusters were still there.
+The promotion edit stays. It is correct, costs nothing, and rules out one real
+possibility. But the split is still here, so:
 
-`drain_duty draws` over `window_publish fresh` is still the discriminator, and
-checking it stays worthwhile — it is how you find out this stopped working.
+**Classify every boot before comparing two.** `drain_duty draws` over
+`window_publish fresh`; the clusters are ~420 and ~268 with nothing in between,
+so no threshold tuning is needed. Expect to discard roughly one boot in seven,
+and plan a sweep with that headroom rather than assuming three boots per arm
+will all land together.
+
+The methodological lesson is worth more than the fix: a three-boot green run
+against a one-in-five failure is not evidence — it comes up about half the time.
+Write the probability down beside the reading, not the verdict.
+
 Boots taken before this change are not comparable to boots taken after it.
 
 ## What it does not do
