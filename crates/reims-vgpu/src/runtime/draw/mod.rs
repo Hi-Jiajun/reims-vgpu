@@ -503,6 +503,38 @@ impl std::fmt::Display for FragUnbound {
     }
 }
 
+/// The fragment textures a draw must substitute a neutral image for: the gaps
+/// the scan flagged that are textures and that the module *statically uses*.
+///
+/// Vulkan requires the pipeline layout to contain a descriptor for every
+/// statically-used resource, and `engine/exec.rs` builds that layout from
+/// provided resources alone — so one of these left alone is not an unwritten
+/// descriptor, it is a binding the layout does not mention. Mesa's Intel driver
+/// scores each used binding as `(use_count << 7) / array_size` over an array it
+/// sized to `max_binding + 1` and zero-filled, so the omission divides by zero
+/// and kills the host process inside pipeline creation rather than returning an
+/// error. That is why this population has to be filled rather than only counted.
+///
+/// Three narrowings, each load-bearing:
+///
+/// - **Textures only.** The sampler class provisions its own default where it
+///   binds, and a storage buffer has no neutral this device can invent; both are
+///   still reported by the caller.
+/// - **[`DescriptorUse::Used`] only.** A declared-and-never-referenced variable
+///   is legal to omit and must stay omitted, or the census that separated those
+///   two populations cannot tell them apart any more.
+/// - **Not `Ambiguous`.** Two variables on one binding is its own defect and is
+///   not repaired by picking one of them; `is_violation` already excludes it.
+#[cfg(feature = "backend-vulkan")]
+fn frag_unbound_textures_to_neutralize(
+    uses: &[(FragUnbound, crate::runtime::spirv_bind::DescriptorUse)],
+) -> Vec<u32> {
+    uses.iter()
+        .filter(|(gap, use_)| use_.is_violation() && gap.class == FragUnboundClass::Texture)
+        .map(|(gap, _)| gap.metal_index)
+        .collect()
+}
+
 /// One pass over the fragment reflection classifying the two bind gaps the render
 /// path cannot recover from. Returns `(unbound, embedded)`:
 /// - **`unbound`** — standard directly-bound kinds (`[[buffer(n)]]` /

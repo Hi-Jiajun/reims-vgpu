@@ -5525,7 +5525,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Verified non-flooding: 0 fires across a full x86 boot (desktop convergence
         // + Safari + CSS gradients + a 23-binding compositor shader), so any fire is
         // a genuine bind gap, not expected control flow.
-        {
+        // The guard below reports; its value is the population the repair after
+        // the texture loop acts on. Empty on every draw that binds what it
+        // samples, which is the hot path.
+        let frag_unbound_used_textures: Vec<u32> = {
             // Membership predicates over the (tiny) provided-resource slices — the
             // scan allocates nothing on the all-bound hot path (both result Vecs
             // stay empty). The `frag_embedded_*` reason names a DIFFERENT silent
@@ -5618,7 +5621,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     req.pipeline_ref, w, h
                 ));
             }
-        }
+            // Textures only, and violations only. A buffer or sampler gap is
+            // reported above and not repaired here: the sampler class already
+            // provisions its own default further down, and a storage buffer gap
+            // has no neutral this device can invent. `DeclaredUnused` is legal
+            // to omit and must stay omitted, or the census this block exists to
+            // keep cannot tell the two populations apart.
+            frag_unbound_textures_to_neutralize(&uses)
+        };
 
         // Framebuffer fetch (`air.render_target` INPUT param `dest_N` →
         // reflection `ColorInput` at binding 96+N): the engine supports the
@@ -5919,6 +5929,89 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             for t in &req.fragment_textures {
                 push_tex(t.index, t.texture_ref, true)?;
             }
+        }
+        // Repair the gaps the guard found. A fragment texture the module
+        // statically uses and this draw did not bind is absent from the
+        // descriptor set layout *entirely* — `engine/exec.rs` builds the layout
+        // from provided resources alone, so it is not an unwritten slot in a
+        // layout that has the binding. Vulkan requires a descriptor for every
+        // statically-used resource, and on Mesa's Intel driver the omission is
+        // fatal rather than undefined: it sizes its binding array to
+        // `max_binding + 1`, zero-fills every number nothing declared, and
+        // scores each *used* binding as `(use_count << 7) / array_size`, so the
+        // hole divides by zero and the host process dies of `SIGFPE` inside
+        // pipeline creation with nothing returned for this device to decline on.
+        //
+        // Cold path: the vector is empty on every draw that binds what it
+        // samples, so this costs one `is_empty` on the hot path.
+        for &index in &frag_unbound_used_textures {
+            use crate::runtime::spirv_bind::{ReflectedSampledKind, SampledImageKind};
+            let base_off = if separate_sampled {
+                FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+            } else {
+                0
+            };
+            let img_bind = TEXTURE_BINDING_BASE + index + base_off;
+            if images.iter().any(|img| img.binding == img_bind) {
+                continue;
+            }
+            // The shape has to be the one the module declared: a plain 2D view
+            // bound where the shader samples an array is a different violation,
+            // not a repair. The reflection is asked in the translator's
+            // numbering, which is what `reflected_sampled_kind` takes — the
+            // relocation above applies to the SPIR-V, not to the signature.
+            let kind = match crate::runtime::spirv_bind::reflected_sampled_kind(
+                &f_shader.reflection,
+                TEXTURE_BINDING_BASE + index,
+            ) {
+                ReflectedSampledKind::Kind(k) => k,
+                ReflectedSampledKind::Absent | ReflectedSampledKind::Unsupported => {
+                    SampledImageKind::D2
+                }
+            };
+            let Some(shape) = sampled_image_shape(kind) else {
+                // Cube and cube-array need six faces, and this engine declines
+                // them where they are bound too. The hole stays and is named,
+                // rather than papered over with a shape the shader did not
+                // declare — which would be a second violation wearing the
+                // repair's clothes.
+                crate::observe::fail(format!(
+                    "shader_resource_declared_unbound \
+                     reason=frag_neutral_texture_shape_unsupported \
+                     pipe={} idx={index} binding={img_bind} kind={kind:?}",
+                    req.pipeline_ref
+                ));
+                continue;
+            };
+            // A repair that succeeded, not a success: the shader samples a
+            // texture whose contents this device invented, so it stays on the
+            // fail channel and the reliance stays measurable.
+            crate::observe::fail(format!(
+                "shader_resource_declared_unbound \
+                 reason=frag_neutral_texture_substituted \
+                 pipe={} idx={index} binding={img_bind} kind={kind:?} 1x1",
+                req.pipeline_ref
+            ));
+            images.push(crate::backend::vulkan::engine::SampledImageResource {
+                binding: img_bind,
+                width: 1,
+                height: 1,
+                layers: shape.layers,
+                arrayed: shape.arrayed,
+                volume: shape.volume,
+                cube: shape.cube,
+                one_dim: shape.one_dim,
+                source: crate::backend::vulkan::engine::SampledSource::Bytes(
+                    std::sync::Arc::new(crate::contract::pixel_format::solid_rgba8(
+                        1,
+                        1,
+                        &[0.0; 4],
+                    )),
+                ),
+                format: ash::vk::Format::R8G8B8A8_UNORM,
+                identity: None,
+                swizzle: Default::default(),
+            });
         }
         {
             let mut push_smp = |index: u32,

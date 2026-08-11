@@ -5876,3 +5876,40 @@ fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
         "and neither does a pass with no depth attachment at all"
     );
 }
+
+/// Only a texture gap the fragment module statically uses is substituted for.
+///
+/// The three narrowings are the whole content of the rule and each one fails in
+/// a different direction. Filling a `DeclaredUnused` gap pays a descriptor for a
+/// variable nothing references and destroys the census that separated it from a
+/// real violation; filling an `Ambiguous` one picks between two variables on a
+/// binding, which is a guess; filling a buffer or sampler gap invents a resource
+/// where the caller either has its own default or has no neutral at all. Leaving
+/// a `Used` texture gap alone is the one that kills the host process, because
+/// Mesa's Intel driver divides `(use_count << 7)` by the array size its own
+/// zero-fill gave the binding the layout never declared.
+#[test]
+#[cfg(feature = "backend-vulkan")]
+fn only_a_statically_used_texture_gap_is_given_a_neutral_image() {
+    use crate::runtime::spirv_bind::DescriptorUse;
+
+    let gap = |class, metal_index| FragUnbound { class, metal_index };
+    let uses = vec![
+        (gap(FragUnboundClass::Texture, 3), DescriptorUse::Used),
+        (
+            gap(FragUnboundClass::Texture, 4),
+            DescriptorUse::DeclaredUnused,
+        ),
+        (gap(FragUnboundClass::Texture, 5), DescriptorUse::Ambiguous),
+        (gap(FragUnboundClass::Texture, 6), DescriptorUse::NotDeclared),
+        // Both other classes answer `Used` unconditionally from
+        // `frag_unbound_static_use`, so they are exactly the case that would slip
+        // through a filter written on the verdict alone.
+        (gap(FragUnboundClass::Buffer, 7), DescriptorUse::Used),
+        (gap(FragUnboundClass::Sampler, 8), DescriptorUse::Used),
+    ];
+
+    assert_eq!(frag_unbound_textures_to_neutralize(&uses), vec![3]);
+    // Nothing flagged, nothing substituted — the hot path.
+    assert!(frag_unbound_textures_to_neutralize(&[]).is_empty());
+}
