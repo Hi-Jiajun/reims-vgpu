@@ -335,6 +335,37 @@ fn read_identity<M: HostMemory + HostOps>(
 /// Returns `false` whenever the memo is switched off, so
 /// `REIMS_VGPU_PIPELINE_MEMO=off` takes the preflight back down its full path
 /// along with everything else this module short-circuits.
+///
+/// # What it measured, two driven macos-13 boots
+///
+/// ```text
+/// preflight_memo_ready    716 427 / 708 872
+/// preflight_memo_absent     1 207 /   1 428      99.83 % hit
+/// preflight_memo_stale          0 /       0
+///
+///                    before        after
+/// preflight ms/s     ~76           15.19 / 14.99      -80 %
+/// air ms/s           53.90/54.23    0.00 /  0.00
+/// cache ms/s         16.30/16.60    0.00 /  0.00
+/// refs ms/s           6.24/6.23     6.21 /  6.10      control, held
+/// refs_us/call        0.41/0.42     0.39 /  0.40      control, held
+/// op0x37 us/packet  101.2          94.34 / 94.43
+/// ```
+///
+/// **~60 ms/s off the drain worker.** `cache` falling is not a second win and
+/// not a regression — it only ever ran on a miss, so it tracks the hit rate by
+/// construction. `refs` still runs for every packet and is the control that says
+/// the two boots are comparable.
+///
+/// `preflight_memo_stale` being **0** across 1.4 million asks is the reading
+/// that matters for the identity check: on a steady desktop the three entries
+/// never move, which is what the module doc's argument predicts and what makes a
+/// non-zero reading worth investigating rather than shrugging at.
+///
+/// One artifact to know: `sum vs preflight_us` drops to ~0.41, because the three
+/// timed sub-spans now cover almost nothing while this check — which is inside
+/// `preflight_us` and outside all three — covers the rest. That is the
+/// instrument no longer tiling its subject, not time going missing.
 pub fn translations_ready<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
