@@ -34,6 +34,28 @@
     ?tex=W        A 2D canvas of W x W repainted every frame, so the guest
                   uploads fresh texture content — the sampled-image rail.
 
+    ?gldraws=N    Split the WebGL canvas's frame into N `drawArrays` calls,
+                  each preceded by a uniform write. This is the **command
+                  stream** axis: what a paravirtualized GPU costs is per draw
+                  — decode, bind resolution, descriptor build, recording — and
+                  every other dial here raises bytes or fragments instead.
+                  Needs `verts`; the vertex range is divided between the calls,
+                  so `gldraws` alone changes the shape of a frame and not its
+                  size. No JavaScript per call beyond the uniform.
+
+    ?fragcost=K   K loop iterations in the WebGL fragment shader. Pure GPU
+                  intensity with no guest cost at all, so it moves `slot_us`
+                  (ring backpressure) and nothing else. Use it to ask whether a
+                  reading is bounded by this device's CPU or by the GPU behind
+                  it: a dial that raises frame time here and nowhere else says
+                  the device had headroom.
+
+    ?blur=R       R-pixel `backdrop-filter` blur on every band. The window
+                  server, not the page, pays it, and it pays on the GPU — so
+                  this drives heavy compositor fragment work through the same
+                  surfaces the `layers` dial creates, without adding a single
+                  JavaScript operation per frame.
+
   Defaults are the *light* end of each, so a caller always states the load it
   asked for and a boot's URL is the record of what it measured.
 
@@ -64,6 +86,13 @@
     position: absolute; right: 10px; bottom: 6px; z-index: 20;
     font: 14px -apple-system, Helvetica, sans-serif; color: #9f9;
   }
+  #backdrop {
+    position: absolute; inset: 0; z-index: -1;
+    background:
+      repeating-linear-gradient(45deg, #123 0 24px, #7ad 24px 48px),
+      repeating-linear-gradient(-45deg, #431 0 31px, #fa7 31px 62px);
+    background-blend-mode: difference;
+  }
   #gl, #tex { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
   #tex { opacity: 0.35; }
 </style>
@@ -73,15 +102,63 @@
 <div id="hud">warming up</div>
 <script>
 const P = new URLSearchParams(location.search);
+
+// ------------------------------------------------------------------ scan ----
+// `?scan=a=1,b=2;c=3&legsecs=S` walks a list of dial sets, one document each,
+// `S` seconds apart. A boot costs minutes and a leg costs seconds, so a
+// question about the *shape* of a load — which dial moves which rail — is
+// answered far more cheaply by one boot than by one boot per dial set.
+//
+// It navigates rather than opening tabs or iframes, so exactly one document is
+// ever live and no earlier leg is still animating behind the current one. Each
+// leg announces itself by fetching a URL the host's server has no file for; the
+// 404 in the server's own log is the leg boundary, timestamped by the host
+// clock, which is the clock the device's census is on. `;` and `,` stand in for
+// `&` because the whole list has to survive being one query parameter.
+const SCAN = (P.get('scan') || '').split(';').filter(s => s.length > 0);
+const LEGSECS = Math.max(1, parseInt(P.get('legsecs') ?? '25', 10) || 25);
+const LEGNO = parseInt(P.get('leg') ?? '0', 10) || 0;
+function gotoLeg(rest, n) {
+  const dials = rest[0].split(',').join('&');
+  const tail = rest.slice(1).join(';');
+  location.replace(`load.html?${dials}&scan=${encodeURIComponent(tail)}` +
+                   `&legsecs=${LEGSECS}&leg=${n}&legstarted=1`);
+}
+if (SCAN.length > 0 && !P.has('legstarted')) {
+  // The first document of a scan carries only the list, so it hands straight
+  // over to leg 0 rather than drawing a leg of its own with default dials.
+  fetch(`leg-begin-${LEGNO}?dials=${encodeURIComponent(SCAN[0])}`)
+    .catch(() => {}).finally(() => gotoLeg(SCAN, LEGNO));
+} else if (SCAN.length > 0) {
+  // The last leg's document carries an empty list and so falls out of both
+  // arms: it runs until the probe's own window ends, which is what makes the
+  // scan's total time the caller's to choose rather than the list's.
+  setTimeout(() => {
+    fetch(`leg-end-${LEGNO}`).catch(() => {}).finally(() => gotoLeg(SCAN, LEGNO + 1));
+  }, LEGSECS * 1000);
+}
+
 const num = (k, d) => Math.max(0, parseInt(P.get(k) ?? d, 10) || 0);
 const LAYERS = num('layers', 8);
 const BOXES  = num('boxes', 6);
 const VERTS  = num('verts', 0);
 const TEX    = num('tex', 0);
+const GLDRAWS  = Math.max(1, num('gldraws', 1));
+const FRAGCOST = num('fragcost', 0);
+const BLUR     = num('blur', 0);
 
 // ---------------------------------------------------------------- layers ----
 // Each band is its own composited surface moving at its own rate, so no two
 // frames repeat an earlier pair and the compositor cannot elide one.
+// A blurred backdrop has to have something to blur: over a flat body the
+// compositor can satisfy the filter with a constant and the pass costs nothing.
+// This is the pattern the boxes are read through, and it never moves, so no
+// part of its cost is per frame except the blur itself.
+if (BLUR > 0) {
+  const bg = document.createElement('div');
+  bg.id = 'backdrop';
+  document.body.appendChild(bg);
+}
 const bands = [];
 for (let b = 0; b < LAYERS; b++) {
   const el = document.createElement('div');
@@ -93,7 +170,16 @@ for (let b = 0; b < LAYERS; b++) {
     box.className = 'box';
     box.style.left = (i * 100 / Math.max(BOXES, 1)) + '%';
     box.style.width = (80 / Math.max(BOXES, 1)) + '%';
-    box.style.background = `hsl(${(b * 37 + i * 11) % 360} 80% 55%)`;
+    if (BLUR > 0) {
+      // Translucent, or the filter has no visible consequence and is a
+      // candidate for elision by a compositor that can prove the element
+      // opaque.
+      box.style.background = `hsla(${(b * 37 + i * 11) % 360} 80% 55% / 0.35)`;
+      box.style.backdropFilter = `blur(${BLUR}px)`;
+      box.style.webkitBackdropFilter = `blur(${BLUR}px)`;
+    } else {
+      box.style.background = `hsl(${(b * 37 + i * 11) % 360} 80% 55%)`;
+    }
     el.appendChild(box);
   }
   document.body.appendChild(el);
@@ -105,7 +191,7 @@ for (let b = 0; b < LAYERS; b++) {
 // `bufferData` every frame is what makes the guest hand this device a large
 // buffer window it has to gather into device-local memory. The shader is
 // deliberately trivial so the cost lands on the gather and not on fragments.
-let gl = null, glBuf = null, glData = null, glCount = 0;
+let gl = null, glBuf = null, glData = null, glCount = 0, glTint = null;
 if (VERTS > 0) {
   const c = document.getElementById('gl');
   c.width = 1024; c.height = 768;
@@ -116,7 +202,19 @@ if (gl) {
   gl.shaderSource(vs, 'attribute vec2 p;varying vec3 v;void main(){v=vec3(p*0.5+0.5,0.6);gl_Position=vec4(p,0.0,1.0);}');
   gl.compileShader(vs);
   const fs = gl.createShader(gl.FRAGMENT_SHADER);
-  gl.shaderSource(fs, 'precision mediump float;varying vec3 v;void main(){gl_FragColor=vec4(v,1.0);}');
+  // `fragcost` is a literal in the source rather than a uniform because a WebGL
+  // 1 loop bound must be constant, and because a shader whose cost is a uniform
+  // is one pipeline the guest keeps while a shader whose cost is a literal is a
+  // different program per dial — which is what a caller comparing two dials
+  // wants, since each is then its own compiled pipeline exactly as two real
+  // programs would be.
+  gl.shaderSource(fs,
+    'precision highp float;varying vec3 v;uniform vec4 tint;void main(){' +
+    'vec3 c=v;' +
+    (FRAGCOST > 0
+      ? `for(int i=0;i<${FRAGCOST};i++){c=fract(c*1.11+vec3(0.013,0.017,0.019))+c*0.0001;}`
+      : '') +
+    'gl_FragColor=vec4(c*0.5+tint.rgb*0.5,1.0);}');
   gl.compileShader(fs);
   const prog = gl.createProgram();
   gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog);
@@ -134,6 +232,7 @@ if (gl) {
   const loc = gl.getAttribLocation(prog, 'p');
   gl.enableVertexAttribArray(loc);
   gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  glTint = gl.getUniformLocation(prog, 'tint');
   gl.viewport(0, 0, 1024, 768);
 } else {
   const c = document.getElementById('gl');
@@ -182,7 +281,20 @@ function tick() {
     }
     gl.bufferData(gl.ARRAY_BUFFER, glData, gl.DYNAMIC_DRAW);
     gl.clear(gl.COLOR_BUFFER_BIT);
-    gl.drawArrays(gl.TRIANGLES, 0, glCount);
+    // One call, or `gldraws` of them over the same vertices. The uniform write
+    // between calls is what stops the guest's driver from merging them, and it
+    // is also the smallest state change a real frame carries, so a draw here
+    // costs this device what a draw costs anywhere.
+    const per = Math.max(3, Math.floor(glCount / GLDRAWS / 3) * 3);
+    let first = 0;
+    for (let d = 0; d < GLDRAWS && first < glCount; d++) {
+      if (glTint) {
+        const h = (d * 0.137 + frame * 0.01) % 1;
+        gl.uniform4f(glTint, h, 1 - h, (h * 3) % 1, 1);
+      }
+      gl.drawArrays(gl.TRIANGLES, first, Math.min(per, glCount - first));
+      first += per;
+    }
   }
 
   if (tctx) {
@@ -199,7 +311,8 @@ function tick() {
 
   if ((frame & 63) === 0) {
     document.getElementById('hud').textContent =
-      `f=${frame} layers=${LAYERS}x${BOXES} verts=${glCount} tex=${TEX}`;
+      `f=${frame} layers=${LAYERS}x${BOXES} verts=${glCount}x${GLDRAWS} ` +
+      `frag=${FRAGCOST} tex=${TEX} blur=${BLUR}`;
   }
   requestAnimationFrame(tick);
 }

@@ -132,14 +132,52 @@ sleep 2
 
 # Mark the log so only the driven window is measured.
 OFFSET=$(stat -c %s "$FAILLOG")
-# Nothing to drive: the page animates itself. That is the point — no host input
-# lands during the window, so nothing in the measurement is the probe's own cost.
-sleep "$SECS"
-
-tail -c "+$(( OFFSET + 1 ))" "$FAILLOG" >"$OUT/window.log"
-# Reading a captured window is not specific to this probe, so the analysis is
-# not carried here. `ANIM_ANALYZE` names it — the same variable the sustained
-# probe uses, because the window format is the device's and not the probe's.
 ANALYZE="${ANIM_ANALYZE:-}"
-[ -n "$ANALYZE" ] && [ -f "$ANALYZE" ] && python3 "$ANALYZE" "$OUT/window.log"
+
+case "$ARGS" in
+*scan=*)
+  # A scanned load walks a list of dial sets in one boot, and each leg's window
+  # has to be cut at the moment the page changed rather than at a time computed
+  # from it. The page announces each boundary by fetching a path this server has
+  # no file for, so the 404 landing in `httpd.log` is the signal — and cutting
+  # the fail log by *byte offset* when it lands needs no mapping between the
+  # host's clock and the device's `t=`, which is a different clock.
+  #
+  # A leg's file is written when the next boundary arrives, so the last leg is
+  # cut by the probe's own deadline instead.
+  leg=0
+  deadline=$(( SECONDS + SECS ))
+  seen=0
+  while [ $SECONDS -lt $deadline ]; do
+    n=$(grep -c 'leg-end-' "$OUT/httpd.log" 2>/dev/null); n=${n:-0}
+    if [ "$n" -gt "$seen" ]; then
+      tail -c "+$(( OFFSET + 1 ))" "$FAILLOG" >"$OUT/leg${leg}.log"
+      OFFSET=$(stat -c %s "$FAILLOG")
+      seen=$n
+      leg=$(( leg + 1 ))
+    fi
+    sleep 1
+  done
+  tail -c "+$(( OFFSET + 1 ))" "$FAILLOG" >"$OUT/leg${leg}.log"
+  cp -f "$OUT/leg${leg}.log" "$OUT/window.log"
+  # The dial set of each leg is in the URL the page asked for when it entered
+  # that leg, so the server's log is also the record of what was measured.
+  echo "===== legs the page walked ====="
+  grep -o 'GET /load.html?[^ ]*' "$OUT/httpd.log" || true
+  for f in "$OUT"/leg*.log; do
+    echo "===== $(basename "$f") ====="
+    [ -n "$ANALYZE" ] && [ -f "$ANALYZE" ] && python3 "$ANALYZE" "$f"
+  done
+  ;;
+*)
+  # Nothing to drive: the page animates itself. That is the point — no host input
+  # lands during the window, so nothing in the measurement is the probe's own cost.
+  sleep "$SECS"
+  tail -c "+$(( OFFSET + 1 ))" "$FAILLOG" >"$OUT/window.log"
+  # Reading a captured window is not specific to this probe, so the analysis is
+  # not carried here. `ANIM_ANALYZE` names it — the same variable the sustained
+  # probe uses, because the window format is the device's and not the probe's.
+  [ -n "$ANALYZE" ] && [ -f "$ANALYZE" ] && python3 "$ANALYZE" "$OUT/window.log"
+  ;;
+esac
 exit 0
