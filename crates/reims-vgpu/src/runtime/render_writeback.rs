@@ -1,8 +1,44 @@
-//! Land a render Store's frame in the guest's pages, at the Store.
+//! Land a render Store's frame in the guest's pages.
 //!
 //! A type-11 render Store names a mapping and a resident image the draw just
 //! rendered into. This module copies the one into the other and returns. There
 //! is no window, no pin held across the call, and nothing to land later.
+//!
+//! # The type-11 rail can now be asked to owe the copy instead
+//!
+//! [`crate::runtime::writeback_debt`] is the rail this doc spent four sections
+//! designing and one section burying, built in the one shape the four guest
+//! panics do not rule out: nothing resolved is held, and a payment re-derives
+//! the identity and re-walks the page tables at the moment it runs. Read that
+//! module's doc first if you are here about deferral; what follows is the
+//! measurement it stands on, and three of its numbers are now known to be wrong
+//! in the ways below.
+//!
+//! Twelve driven macos-13 sustained-animation boots, six an arm: **90 % of
+//! type-11 Stores are superseded before anything reads their pages**, `store_us`
+//! falls 0.89 against 9.56 us a chain, `draw_us` 14.62 against 26.52, and five
+//! of six on-arm boots present at 105.8-109.2 Hz against a 77.2-78.6 Hz
+//! baseline. `store_gva_frame` below is **not** deferred and still writes its
+//! ~850 frames a second eagerly.
+//!
+//! ## What that rail corrected here
+//!
+//! * **"Six reads a second" is the wrong denominator, the same way
+//!   `target_reads` was.** Every `settle_*` counter quoted below counts settles
+//!   that *waited*; the settle *calls* are three orders larger.
+//!   `draw::vulkan::load_linear_guest_memoized` alone reaches its settle ~1 700
+//!   times a second and reads the guest pages every one of them. The prize was
+//!   never 1 556-to-6.
+//! * **Those readers are nameable, so the deferral does not need the seam this
+//!   doc calls hard.** They walk raw task GVAs, but they hold a texture
+//!   reference and a debt is keyed by a mapping id, so
+//!   `writeback_debt::pay_for_texture` resolves one to the other through the two
+//!   tables `resource_validity::apply` already uses. `settle_guest_writes`'s
+//!   signature never had to change.
+//! * **The redundancy is not "supersession across rails and frames" in the sense
+//!   below.** It is supersession within *one* rail across frames — which the two
+//!   censuses further down could not see, because both measured the spacing of
+//!   Stores rather than the spacing of reads.
 //!
 //! # Why the frame is written here rather than deferred
 //!
@@ -422,6 +458,13 @@
 //! distinct surfaces and landing at a settle is therefore of order **36 copies a
 //! second instead of 1 556** — the same territory the ablation measured at 86 Hz,
 //! reached without losing a frame the guest asked for.
+//!
+//! **That last arithmetic is wrong and the rail that was built measured it.**
+//! `settle_linear_memo_read` reading 6 is six settles that *waited*; the site is
+//! called ~1 700 times a second and reads the guest's pages every time. The
+//! delivered figure is ~3 300 copies a second against ~21 000, not 36 against
+//! 1 556 — a factor of six rather than forty-three, and still worth 45 % of the
+//! per-draw cost. See [`crate::runtime::writeback_debt`].
 //!
 //! **That factor is only available if the three stamp sites do not land parked
 //! plans**, and it is a contract statement rather than a shortcut. A completion
