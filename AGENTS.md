@@ -574,6 +574,38 @@ change touching guest-memory upload, writeback or bind needs the boot a second t
 appears once. Nothing may then report a bound import — a non-zero import count means a bind ran past
 a closed gate.
 
+### `present_hz` is clamped by the presenter, so it cannot rank a device change
+
+The host window presenter puts out **~41 frames a second and does not care what
+is offered to it**. Twelve driven macos-13 boots across three builds and both
+arms of an A/B read `presents` of 1599-1696 — a 5 % spread — while `offered`
+ranged 1760-2015 and per-draw gathered bytes differed 6 % between the arms.
+`busy_acquire` was 0 on every one; the ceiling is `WindowPresenter`'s single
+in-flight blit fence.
+
+So a device-side change that removes real work will show **nothing** here, and
+that is not evidence the work was not removed. Rank device changes on unclamped
+numbers instead, in this order:
+
+- `drain_duty draws` — draws served, a count.
+- `window_publish fresh` — frames the device published (~49/s while presents sit
+  at 41).
+- anything normalized per draw. Raw totals scale with the draw count, so a boot
+  that served more draws gathered more and the ratio is what carries meaning.
+
+**Quote the presents, never the drop percentage.** The drop reads 4.9 % on one
+boot and 17.3 % on another with the *same* presenter, because all the variation
+is in the denominator: a guest offering 44 loses 5 % and one offering 50 loses
+17 %, and both presented 41. A session quoted 4.9-5.7 % from three consecutive
+boots, concluded the presenter was worth "at most ~5 %, not the lever it looked
+like", and was wrong — those three boots were ones where the guest asked for
+little.
+
+This also retires a standing puzzle. Several CPU wins here "bought microseconds
+and zero frames" — a bounded pipeline cache, −39 % submissions, −20x `stage_us`.
+None of them could have bought frames through a presenter already at its
+ceiling.
+
 ### An undriven boot measures an idle device
 
 A `--testing` boot reaches the desktop and then sits there. Reading its counters as this device's
