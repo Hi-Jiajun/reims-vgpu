@@ -90,7 +90,7 @@ struct GatherDispatch {
 }
 
 /// Whether the compute gather is on. **Default on since 2026-08-11** — it takes
-/// 24 % off this device's GPU work per draw for byte-identical guest output, and
+/// 21 % off this device's GPU work per draw for byte-identical guest output, and
 /// the CPU cost that kept it off for two sessions is now paid out of drain-worker
 /// headroom that did not exist when it was measured.
 ///

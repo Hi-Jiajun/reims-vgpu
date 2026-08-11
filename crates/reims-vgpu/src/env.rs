@@ -491,6 +491,25 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 /// GPU, which is exactly what a dispatch replacing ~13 transfer regions should
 /// buy.
 ///
+/// Those four boots were taken in blocks, two per arm, which cannot separate the
+/// change from anything that drifted between the blocks. Six more, **interleaved**
+/// on/off/on/off/on/off on one pin, hold it:
+///
+/// ```text
+///                          on     on     on     off    off    off
+/// draws per frame        291.2  299.3  249.4   254.5  301.4  192.6
+/// gather regions/draw     15.6   15.4   16.1    16.4   15.0   13.4  <- control
+/// GPU us per draw        15.64  15.55  14.56   20.51  19.59  17.50
+/// drain duty              0.63   0.63   0.39    0.39   0.64   0.35
+/// ```
+///
+/// Still disjoint — the worst `on` boot beats the best `off` boot — for **-20.6 %**
+/// on the arm means, against the -24 % the block-ordered four read. The control
+/// overlaps between the arms and duty does not rise on the dispatch arm, which are
+/// the two readings that would void the comparison. Take the -20.6 % as the
+/// figure: it is the one measured under interleaving, and it spans three
+/// compositing regimes rather than one.
+///
 /// **The CPU cost it was rejected for is now affordable.** +31.6 ms/s of
 /// `record_us` mattered because the drain worker was saturated at duty 0.90; the
 /// stamp coalescing and the preflight memo have since taken ~148 ms/s off that
