@@ -2146,17 +2146,65 @@ const IDLE_RECYCLE_TRIM_PER_PASS: usize = 8;
 /// climbs and the buffers drain to zero within a few hundred ms of settling.
 const SETTLED_PASSES_FOR_BUFFER_TRIM: u32 = 3;
 
-/// Empty slab blocks retained at idle. `slab::SLAB_KEEP_EMPTY` (2) is the churn
-/// buffer the hot release path keeps mid-burst; at *settled* idle the drain
-/// trims all the way to zero so no empty `SLAB_SIZE` block sits resident for a
-/// long idle desktop. The hot-path buffer still absorbs active churn (blocks
-/// full of live content are never empty, so this never frees a working block);
-/// only a block that has genuinely gone empty and stayed empty across the drain
-/// interval is returned. Re-allocating on the next burst is measured hitch-free
-/// (block allocation during a quad-4K load never moved the per-frame hitch
-/// proxy), and at true idle no burst reuses a spare — so a retained spare is
-/// pure waste. Minimising idle VRAM is the explicit goal.
+/// Empty image-slab blocks retained once idle has **settled**.
+/// `slab::SLAB_KEEP_EMPTY` (2) is the churn buffer the hot release path keeps
+/// mid-burst; at settled idle the drain trims all the way to zero so no empty
+/// `SLAB_SIZE` block sits resident for a long idle desktop. At true idle no
+/// burst reuses a spare, so a retained spare is pure waste, and minimising idle
+/// VRAM is the explicit goal.
+///
+/// **The settled gate is what makes zero safe, and it was missing.** The drain
+/// fires every `IDLE_DRAIN_INTERVAL_MS` (100 ms) whenever the poll heartbeat
+/// ticks, which is *most of the time* on any workload that does not saturate the
+/// drain worker — and it used to trim to zero on every one of those passes,
+/// overriding the hot path's budget between two frames of a live animation. A
+/// driven macos-13 boot of the load probe's WebGL dial read 257 block
+/// allocations and 162 idle trims of a 64 MiB block in 25 seconds, alternating
+/// one for one about eight times a second, against 39 in the same window of a
+/// compositing load the drain could not keep up with. The trims were not
+/// reclaiming an idle desktop's VRAM; they were handing back the block the next
+/// frame re-allocated, at `vk_alloc_sites slab_block` ~1.2 ms each plus the free.
+///
+/// So the trim now runs under the same `trim_buffers` gate as the HOST_VISIBLE
+/// buffer pools, whose own doc reached this conclusion first
+/// ([`SETTLED_PASSES_FOR_BUFFER_TRIM`]): a pass that saw a staging acquire or
+/// drained a resident is not idle, whatever the drain worker's duty says, and
+/// only a run of genuinely quiet passes returns the blocks.
 const IDLE_SLAB_KEEP_EMPTY: usize = 0;
+
+/// Whether the settled gate applies to the image slab, for this process.
+///
+/// Read once: the arms differ in how many `vkAllocateMemory` calls a workload
+/// makes, so a boot that flipped it midway would be two devices in one log.
+fn slab_retain_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let (state, value) = crate::env::read(crate::env::SLAB_RETAIN);
+        let on = !matches!(state, crate::env::Switch::Off);
+        crate::observe::off(format!(
+            "slab_retain on={on} switch={state:?} value={}",
+            value.unwrap_or_else(|| "<unset>".into())
+        ));
+        on
+    })
+}
+
+/// How many empty image-slab blocks per size class this idle pass may leave
+/// behind, or `None` when the pass must not touch them at all.
+///
+/// `None` is what stops the 100 ms drain interval from overriding the hot
+/// release path's own churn budget between two frames of a live animation. The
+/// pass has nothing to do in that case: the hot path already returns every block
+/// past [`slab::SLAB_KEEP_EMPTY`] as it empties, so an unsettled pass can only
+/// trim *below* a budget that was chosen to absorb exactly this churn.
+fn idle_slab_trim_keep(settled: bool) -> Option<usize> {
+    if settled || !slab_retain_enabled() {
+        Some(IDLE_SLAB_KEEP_EMPTY)
+    } else {
+        None
+    }
+}
 
 /// Pop one entry from the LARGEST non-empty bucket of a size-keyed recycle pool.
 ///
@@ -3376,6 +3424,42 @@ mod resident_reuse_tests {
         assert!(
             !s.reusable_for(64, 32, 7, translate::pixel::resident_color(true)),
             "format still separates the two bgra orders"
+        );
+    }
+}
+
+#[cfg(test)]
+mod idle_slab_trim_tests {
+    use super::{idle_slab_trim_keep, IDLE_SLAB_KEEP_EMPTY};
+
+    /// An idle pass that is not settled must leave the image slab alone.
+    ///
+    /// This is the whole of the policy, and the case it protects is not idle at
+    /// all: the drain fires every `IDLE_DRAIN_INTERVAL_MS` whenever the poll
+    /// heartbeat ticks, so a workload with 100 ms gaps between frames reaches it
+    /// between every pair of them. Trimming there returns the block the next
+    /// frame re-allocates — measured at 257 allocations against 162 trims of a
+    /// 64 MiB block in one 25 s driven window.
+    ///
+    /// Fails without the gate: the trim ran on every fired pass, so this would
+    /// read `Some(0)` for both arguments.
+    ///
+    /// It cannot reach the `off` arm of [`crate::env::SLAB_RETAIN`], which
+    /// reads the environment through a `OnceLock` shared with every other test
+    /// in this binary. That arm is the A/B's, verified on a boot.
+    #[test]
+    fn an_unsettled_idle_pass_does_not_trim_the_image_slab() {
+        // The environment this test suite runs in leaves the switch unset, which
+        // is the retaining arm.
+        assert_eq!(
+            idle_slab_trim_keep(true),
+            Some(IDLE_SLAB_KEEP_EMPTY),
+            "a settled pass returns the blocks, which is what the drain is for"
+        );
+        assert_eq!(
+            idle_slab_trim_keep(false),
+            None,
+            "an unsettled pass leaves the hot path's churn budget in place"
         );
     }
 }

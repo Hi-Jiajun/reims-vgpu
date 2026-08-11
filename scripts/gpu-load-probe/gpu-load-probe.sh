@@ -142,7 +142,28 @@ ANALYZE="${ANIM_ANALYZE:-}"
 "$REPO/scripts/qemu-thread-census/qemu-thread-census.sh" \
   "$OUT/threads.log" "$(( SECS + 5 ))" >"$OUT/threads.err" 2>&1 &
 THREADS=$!
-trap 'kill $HTTPD $THREADS 2>/dev/null' EXIT
+
+# The guest's display sleeps, and a probe that only animates does not stop it.
+# This page drives itself, so a window longer than the guest's display-sleep
+# timeout receives no input at all — and when the display sleeps, `WindowServer`
+# stops compositing and disables the vblank class, so the device goes to zero
+# while the page's `setTimeout` chain keeps running and the boot looks alive.
+# That is not a slow device and it is not a slow guest: a 145 s window read
+# `delivered=1607` frozen across two vblank censuses, every QEMU thread under
+# 20 % of one core, and the leg boundaries arriving exactly on schedule.
+#
+# One pointer move a screen-sleep timeout cannot ignore, alternating between two
+# adjacent corner pixels so the cursor never rests over a moving layer.
+(
+  while :; do
+    sleep 20
+    "$Q" move 4 4 >/dev/null 2>&1
+    sleep 20
+    "$Q" move 5 5 >/dev/null 2>&1
+  done
+) &
+AWAKE=$!
+trap 'kill $HTTPD $THREADS $AWAKE 2>/dev/null' EXIT
 
 case "$ARGS" in
 *scan=*)

@@ -277,6 +277,21 @@ pub const COMPUTE_SCATTER: &str = "REIMS_VGPU_COMPUTE_SCATTER";
 /// census, the reader argument and the standing alarm.
 pub const LAZY_WRITEBACK: &str = "REIMS_VGPU_LAZY_WRITEBACK";
 
+/// `off` narrows the idle drain back to returning every empty image-slab block
+/// to the driver on each fired pass, instead of only once idle has settled.
+///
+/// It narrows in the sense this module requires: `off` retains strictly less
+/// device memory, never more, and reaches no allocation the settled arm would
+/// not also reach — a block trimmed early is re-allocated on the next carve, and
+/// the arms differ only in how many `vkAllocateMemory` calls one workload makes.
+///
+/// It exists because the size of the churn it removes is a property of the
+/// *workload's duty cycle*, not of the device: a load that saturates the drain
+/// worker never lets a pass fire, and one that leaves 100 ms gaps between frames
+/// pays a block allocation in every one of them. Ranking that needs both arms in
+/// one binary on one guest.
+pub const SLAB_RETAIN: &str = "REIMS_VGPU_SLAB_RETAIN";
+
 /// `off` narrows a draw chain's pipeline resolution back to the full walk —
 /// object list, descriptor, decode, MTLB read, AIR carve and content hash, for
 /// the pipeline and both of its functions, on every draw.
@@ -472,8 +487,9 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 12] = [
+pub const ALL: [&str; 13] = [
     LAZY_WRITEBACK,
+    SLAB_RETAIN,
     GUEST_IMPORT,
     DRAW_LOG,
     GPU_STAMP,

@@ -322,6 +322,21 @@ impl ResourcePools {
             }
             buf_trimmed += storage_trimmed;
         }
+        // The DEVICE_LOCAL image slab, under the same settled state as the
+        // pools above rather than at the caller — which is how it came to run on
+        // *every* fired pass instead. The pass fires every
+        // `IDLE_DRAIN_INTERVAL_MS` whenever the poll heartbeat ticks, which is
+        // most of the time on any workload that does not saturate the drain
+        // worker, so trimming to zero there handed back the block the next frame
+        // re-allocated. [`IDLE_SLAB_KEEP_EMPTY`] carries the boot that read 257
+        // allocations against 162 trims of a 64 MiB block in 25 seconds.
+        //
+        // Not inside the `if` above, because the switch that restores the old
+        // behaviour has to be able to reach this on an unsettled pass; the
+        // policy is [`idle_slab_trim_keep`] and this is its only caller.
+        if let Some(keep) = idle_slab_trim_keep(trim_buffers) {
+            self.slab.trim_empty_blocks(device, keep);
+        }
         trimmed + buf_trimmed
     }
 
@@ -580,11 +595,9 @@ impl ResourcePools {
         // LRU eviction that never comes on a static desktop; the same age cutoff
         // frees them once idle without touching an actively-dispatched resident.
         self.trim_aged_compute_storage(&ctx.device, sampled_cutoff, IDLE_RECYCLE_TRIM_PER_PASS);
-        // …and releases the empty slab blocks the hot release path retains as a
-        // churn buffer, which otherwise sit resident forever at idle (no image
-        // release fires to trigger their free). Down to one spare.
-        self.slab
-            .trim_empty_blocks(&ctx.device, IDLE_SLAB_KEEP_EMPTY);
+        // The image slab's empty blocks are released by `trim_recycle_pools`
+        // above, next to the buffer slab's and under the same settled gate —
+        // one policy, one call site, so the two cannot drift apart again.
     }
 
     /// Cumulative sampled-cache pool recycle diagnostics:
