@@ -11,6 +11,8 @@ pub mod blit_exec;
 /// guest moves the addresses under them.
 #[cfg(feature = "backend-vulkan")]
 pub mod bound_buffers;
+pub mod buffer_gather_freshness;
+pub mod buffer_write_gen;
 /// Always-on proxies and censuses, one per measured bug class.
 pub mod census;
 /// Where a draw chain's wall clock goes on the runtime side of the engine

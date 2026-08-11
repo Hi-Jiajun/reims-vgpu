@@ -1650,6 +1650,11 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         if let Some(wanted) = crate::backend::vulkan::engine::buffer_gather_working_set_census() {
             crate::observe::off(wanted);
         }
+        // Beside it, because the two answer one question between them: that one
+        // says the same window comes back and this says whether its bytes moved.
+        if let Some(fresh) = crate::runtime::buffer_gather_freshness::census() {
+            crate::observe::off(fresh);
+        }
         emit_engine_delta();
         // After `emit_engine_delta`, which emits `draw_phase`: the two divide
         // against each other and reading them in the other order invites

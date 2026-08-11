@@ -1935,6 +1935,14 @@ pub struct DeviceState {
     /// See [`crate::runtime::bound_buffers`].
     #[cfg(feature = "backend-vulkan")]
     pub bound_buffers: crate::runtime::bound_buffers::BoundBuffers,
+    /// When the guest last declared a write to each **buffer** object.
+    ///
+    /// The half of the validity quad `resource_validity::apply` has nowhere to
+    /// put: a buffer has no mapping, so its `content_generation` does not exist
+    /// and the statement was being decoded and dropped. Ungated, because the
+    /// producer is the decoder rather than a backend. See
+    /// [`crate::runtime::buffer_write_gen`].
+    pub buffer_write_gen: crate::runtime::buffer_write_gen::BufferWriteGens,
     /// Monotonic source for every sampled-content generation this device
     /// hands the engine. Read only through
     /// [`DeviceState::next_sampled_content_generation`].
@@ -2210,6 +2218,7 @@ impl DeviceState {
             gather_witness: crate::runtime::gather_witness::GatherWitness::default(),
             #[cfg(feature = "backend-vulkan")]
             bound_buffers: crate::runtime::bound_buffers::BoundBuffers::default(),
+            buffer_write_gen: crate::runtime::buffer_write_gen::BufferWriteGens::default(),
             sampled_content_gen: 0,
             host_writes: crate::runtime::host_writes::HostWrites::default(),
             guest_linear_scratch: Vec::new(),
@@ -2442,6 +2451,10 @@ impl DeviceState {
     /// retires forty entries and one that retires none read identically as
     /// events, and it is the entries that become the re-walks.
     pub fn retire_bound_buffers_for_task(&mut self, task_id: u32) -> usize {
+        // Ungated and unconditional: a task's object ids stop naming its objects
+        // whatever backend is compiled in, and a stamp that outlived its task
+        // would read as quiet for whatever the next task puts at that id.
+        self.buffer_write_gen.retire_task(task_id);
         #[cfg(feature = "backend-vulkan")]
         {
             self.bound_buffers.retire_task(task_id)

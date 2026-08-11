@@ -2711,6 +2711,37 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     })
 }
 
+/// Charge one zero-copy buffer bind to the freshness split.
+///
+/// Called from **both** rails that take the bind — the held resolution and the
+/// fresh walk — because they are one population: a cache would serve a window
+/// whether or not this device had to re-walk its addresses, and counting only
+/// the fresh walks would report the rate over the 0.8 % of binds that miss the
+/// registry. See [`crate::runtime::buffer_gather_freshness`].
+///
+/// Charged where the *bind* is taken and not where the engine gathers, because
+/// the engine has neither the task nor the reference — it sees an `Arc` address.
+/// A window the engine binds in place rather than gathering is therefore counted
+/// here and would not have needed a cache, which makes this reading a slight
+/// under-statement of the achievable rate rather than an over-statement.
+fn note_gather_freshness(
+    state: &crate::model::DeviceState,
+    task_id: u32,
+    buffer_ref: u32,
+    offset: u64,
+    extent_cap: Option<u64>,
+    span: u64,
+) {
+    crate::runtime::buffer_gather_freshness::note_bind(
+        task_id,
+        buffer_ref,
+        offset,
+        extent_cap,
+        state.buffer_write_gen.stamp(task_id, buffer_ref),
+        span,
+    );
+}
+
 /// The engine's view of a held resolution.
 ///
 /// One spelling for the fresh walk and the lookup, so a resolution cannot mean
@@ -2813,7 +2844,9 @@ fn load_buffer_content<M: HostMemory + HostOps>(
             .get(task_id, buffer_ref, offset, gather_cap)
         {
             let content = bound_buffer_content(bound);
+            let span = bound.span;
             crate::runtime::drain::note_store_route("zc_buffer_held");
+            note_gather_freshness(state, task_id, buffer_ref, offset, gather_cap, span);
             return Some(content);
         }
     }
@@ -2827,9 +2860,11 @@ fn load_buffer_content<M: HostMemory + HostOps>(
             try_buffer_zero_copy_resolved(state, host, task_id, &backing, offset, gather_cap)
         {
             let content = bound_buffer_content(&bound);
+            let span = bound.span;
             state
                 .bound_buffers
                 .insert(task_id, buffer_ref, offset, gather_cap, bound);
+            note_gather_freshness(state, task_id, buffer_ref, offset, gather_cap, span);
             return Some(content);
         }
     }
