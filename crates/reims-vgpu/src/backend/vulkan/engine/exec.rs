@@ -82,6 +82,139 @@ impl PendingGuestGather {
     }
 }
 
+/// One gather turned into a compute dispatch: the descriptor set naming its
+/// three buffers, and how many runs the kernel has to walk.
+struct GatherDispatch {
+    set: vk::DescriptorSet,
+    run_count: u32,
+}
+
+/// Whether the compute gather is on. See [`crate::env::COMPUTE_GATHER`].
+fn compute_gather_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            crate::env::read(crate::env::COMPUTE_GATHER).0,
+            crate::env::Switch::Off
+        )
+    })
+}
+
+/// Turn every pending gather into dispatches, or `None` to leave the whole
+/// batch on the transfer regions.
+///
+/// # Why the whole batch and not a gather at a time
+///
+/// The two forms need different barriers — one is a `TRANSFER_WRITE` and the
+/// other a `SHADER_WRITE` — and the loop that follows this emits exactly one
+/// barrier for all of them. Mixing forms inside a batch would mean either two
+/// barriers or one over-wide source scope, and this rail is not where an
+/// all-or-nothing costs anything: a decline is a property of the *host* (no
+/// pipeline, no import) or of the arithmetic (an unaligned run), and both are
+/// stable across a command buffer rather than varying gather to gather.
+///
+/// This is the gather direction of the same repair `plan_guest_scatter_dispatches`
+/// made to the writeback, where replacing ~200 transfer regions with one
+/// dispatch was measured at +48 % frames on a driven macos-13 boot. Here it
+/// replaces the 427 000 regions a second the buffer gather issues — the largest
+/// remaining GPU cost on that rail — with one dispatch per gathered window.
+///
+/// # Safety
+///
+/// `gathers` must name buffers live for the whole submission being recorded.
+unsafe fn plan_buffer_gather_dispatches(
+    ctx: &super::context::DeviceContext,
+    pools: &mut ResourcePools,
+    counters: &EngineCounters,
+    gathers: &[PendingGuestGather],
+) -> Result<Option<Vec<GatherDispatch>>, DrawError> {
+    use super::guest_scatter::{build_gather_run_tables, ScatterRun};
+    let Some(pipeline) = (unsafe { pools.scatter_pipeline(ctx) }) else {
+        return Ok(None);
+    };
+    // Planned for every gather before anything is allocated, so a refusal in the
+    // last one does not leave the first one's staging slot and descriptor set on
+    // the pools for a dispatch that will not be recorded — the same ordering
+    // `plan_guest_scatter_dispatches` states.
+    let mut planned: Vec<(vk::Buffer, vk::Buffer, u64, super::guest_scatter::RunTable)> =
+        Vec::new();
+    for gather in gathers {
+        // The window's own byte count, from the regions themselves rather than
+        // from the slot: `acquire_guest_gather` rounds up to a power-of-two
+        // bucket, and the tighter bound is the one that catches a run reaching
+        // past what this window actually covers.
+        let dst_have: u64 = gather
+            .sources
+            .iter()
+            .flat_map(|(_, copies)| copies.iter())
+            .map(|c| c.dst_offset.saturating_add(c.size))
+            .max()
+            .unwrap_or(0);
+        for (source, copies) in &gather.sources {
+            let runs: Vec<ScatterRun> = copies
+                .iter()
+                .map(|c| ScatterRun {
+                    // The guest import is the source here, so the copy's
+                    // `src_offset` is the guest side and its `dst_offset` the
+                    // device-local slot — the exact opposite of the writeback,
+                    // and the whole of what `build_gather_run_tables` exchanges.
+                    src: c.src_offset,
+                    dst: c.dst_offset,
+                    len: c.size,
+                })
+                .collect();
+            match build_gather_run_tables(
+                &runs,
+                ctx.guest_bind_offset_align,
+                ctx.max_storage_buffer_range,
+                dst_have,
+            ) {
+                Ok(built) => planned.extend(
+                    built
+                        .into_iter()
+                        .map(|t| (*source, gather.dst, dst_have, t)),
+                ),
+                Err(decline) => {
+                    counters
+                        .buffer_gather_declined
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::observe::Emit::decline("buffer_gather_plan", &decline).fail_once(0);
+                    return Ok(None);
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(planned.len());
+    for (source, dst, dst_have, table) in &planned {
+        let bytes = super::run_table_bytes(&table.words);
+        let runs_slot = unsafe {
+            pools.acquire_staging(
+                ctx,
+                bytes.len() as u64,
+                vk::BufferUsageFlags::empty(),
+                counters,
+            )
+        }?;
+        unsafe { pools.write_staging(ctx, &runs_slot, bytes) }?;
+        let set =
+            unsafe { pools.alloc_scatter_descriptor_set(&ctx.device, pipeline.dsl, counters) }?;
+        unsafe {
+            super::guest_scatter::ScatterPipeline::write_set(
+                &ctx.device,
+                set,
+                (*source, table.bind_offset, table.bind_range),
+                (*dst, 0, *dst_have),
+                (runs_slot.buffer, bytes.len() as u64),
+            );
+        }
+        out.push(GatherDispatch {
+            set,
+            run_count: table.run_count,
+        });
+    }
+    Ok(Some(out))
+}
+
 /// The one bind range a window's stretches amount to, when they amount to one.
 ///
 /// A single run starting at window byte zero *is* the whole window:
@@ -699,10 +832,9 @@ impl crate::observe::Decline for SampledImportDecline {
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::CopyOffsetAlignment { offset } => vec![("offset", offset.to_string())],
-            Self::GatherShort { covered, want } => vec![
-                ("covered", covered.to_string()),
-                ("want", want.to_string()),
-            ],
+            Self::GatherShort { covered, want } => {
+                vec![("covered", covered.to_string()), ("want", want.to_string())]
+            }
         }
     }
 }
@@ -2040,60 +2172,59 @@ pub(crate) unsafe fn execute_draw_inner(
         }
         Some(mode) => Some(crate::backend::vulkan::translate::raster::vk_query_control_flags(mode)),
     };
-    let pipeline_key = PipelineKey {
-        vert: vert_digest,
-        frag: frag_digest,
-        attrs: attr_keys,
-        topology: req.primitive_topology,
-        blend: req.blend.map(|b| b.key()),
-        secondary_blend: {
-            let mut per_slot = [None; MAX_SECONDARY_ATTACH];
-            for (slot, target) in req
-                .secondary_targets
-                .iter()
-                .take(MAX_SECONDARY_ATTACH)
-                .enumerate()
-            {
-                per_slot[slot] = target.blend.map(|b| b.key());
-            }
-            per_slot
-        },
-        color_write_mask: {
-            let mut per_slot = [ColorWriteMask::default(); 1 + MAX_SECONDARY_ATTACH];
-            per_slot[0] = req.color_write_mask;
-            for (slot, target) in req
-                .secondary_targets
-                .iter()
-                .take(MAX_SECONDARY_ATTACH)
-                .enumerate()
-            {
-                per_slot[slot + 1] = target.color_write_mask;
-            }
-            per_slot
-        },
-        pass: pass_key,
-        cull_mode: req.cull_mode,
-        front_face_ccw: req.front_face_ccw,
-        fill_mode: req.fill_mode,
-        depth_clip: req.depth_clip,
-        depth_test: req.depth.as_ref().map(|d| d.test_enable).unwrap_or(false),
-        depth_write: req.depth.as_ref().map(|d| d.write_enable).unwrap_or(false),
-        depth_compare: req
-            .depth
-            .as_ref()
-            .map(|d| d.compare)
-            .unwrap_or(super::types::SamplerCompareFunction::Always),
-        stencil: req
-            .depth
-            .as_ref()
-            .and_then(|d| d.stencil)
-            .map(|s| super::caches::StencilKey {
-                front: s.front,
-                back: s.back,
+    let pipeline_key =
+        PipelineKey {
+            vert: vert_digest,
+            frag: frag_digest,
+            attrs: attr_keys,
+            topology: req.primitive_topology,
+            blend: req.blend.map(|b| b.key()),
+            secondary_blend: {
+                let mut per_slot = [None; MAX_SECONDARY_ATTACH];
+                for (slot, target) in req
+                    .secondary_targets
+                    .iter()
+                    .take(MAX_SECONDARY_ATTACH)
+                    .enumerate()
+                {
+                    per_slot[slot] = target.blend.map(|b| b.key());
+                }
+                per_slot
+            },
+            color_write_mask: {
+                let mut per_slot = [ColorWriteMask::default(); 1 + MAX_SECONDARY_ATTACH];
+                per_slot[0] = req.color_write_mask;
+                for (slot, target) in req
+                    .secondary_targets
+                    .iter()
+                    .take(MAX_SECONDARY_ATTACH)
+                    .enumerate()
+                {
+                    per_slot[slot + 1] = target.color_write_mask;
+                }
+                per_slot
+            },
+            pass: pass_key,
+            cull_mode: req.cull_mode,
+            front_face_ccw: req.front_face_ccw,
+            fill_mode: req.fill_mode,
+            depth_clip: req.depth_clip,
+            depth_test: req.depth.as_ref().map(|d| d.test_enable).unwrap_or(false),
+            depth_write: req.depth.as_ref().map(|d| d.write_enable).unwrap_or(false),
+            depth_compare: req
+                .depth
+                .as_ref()
+                .map(|d| d.compare)
+                .unwrap_or(super::types::SamplerCompareFunction::Always),
+            stencil: req.depth.as_ref().and_then(|d| d.stencil).map(|s| {
+                super::caches::StencilKey {
+                    front: s.front,
+                    back: s.back,
+                }
             }),
-        viewport_slots: slot_count_u32,
-        layout: layout_key.clone(),
-    };
+            viewport_slots: slot_count_u32,
+            layout: layout_key.clone(),
+        };
     // One cache, consulted once. `get_or_create_pipeline` already counts the hit
     // and already checks the negative entry for a key that failed to compile.
     phase.enter(super::draw_phase::Phase::PipelineCompile);
@@ -2347,8 +2478,7 @@ pub(crate) unsafe fn execute_draw_inner(
         super::types::TargetIdentity,
         vk::Image,
         super::pools::ResidentAccess,
-    )> =
-        Vec::new();
+    )> = Vec::new();
     // This draw's depth attachment, when it has one. The framebuffer is always
     // this draw's own and is always disposed after submit; the image behind it
     // is only owned here when the pass named no guest depth texture to key a
@@ -2455,9 +2585,19 @@ pub(crate) unsafe fn execute_draw_inner(
                 if let Some(d) = depth_attachment.as_ref() {
                     transient_depth = Some((d.owned, fb));
                 }
-                (pool_image, fb, super::pools::ResidentAccess::Untouched, pool_view)
+                (
+                    pool_image,
+                    fb,
+                    super::pools::ResidentAccess::Untouched,
+                    pool_view,
+                )
             } else {
-                (pool_image, pool_fb, super::pools::ResidentAccess::Untouched, pool_view)
+                (
+                    pool_image,
+                    pool_fb,
+                    super::pools::ResidentAccess::Untouched,
+                    pool_view,
+                )
             }
         };
     // GPU seed source: resolved after registry_ensure (which protects it from
@@ -2905,7 +3045,8 @@ pub(crate) unsafe fn execute_draw_inner(
 
     // Seed upload (CPU import).
     if let Some(seed) = &seed_slot {
-        let (src_stage, src_access) = target_prior_access(target_snapshotted, target_access).source_scope();
+        let (src_stage, src_access) =
+            target_prior_access(target_snapshotted, target_access).source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -3062,7 +3203,8 @@ pub(crate) unsafe fn execute_draw_inner(
         // A pooled or freshly created target tracks `UNDEFINED` — nothing has
         // touched it, so it is excluded rather than barriered, which keeps this
         // off the pooled path entirely.
-        let (src_stage, src_access) = target_prior_access(target_snapshotted, target_access).source_scope();
+        let (src_stage, src_access) =
+            target_prior_access(target_snapshotted, target_access).source_scope();
         let barrier = [vk::MemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
@@ -3155,9 +3297,32 @@ pub(crate) unsafe fn execute_draw_inner(
     // a barrier before the draw reads them, which follows the loop — one for
     // all of them, because a per-buffer barrier would submit N of them to
     // express the same dependency.
-    for gather in &guest_gathers {
-        for (source, copies) in &gather.sources {
-            ctx.device.cmd_copy_buffer(cb, *source, gather.dst, copies);
+    //
+    // Either form lands byte-identical bytes; which one ran decides only this
+    // barrier's source scope, and `buffer_gather_dispatches` says which it was.
+    let gather_dispatched = if guest_gathers.is_empty() || !compute_gather_enabled() {
+        false
+    } else {
+        match unsafe { plan_buffer_gather_dispatches(ctx, pools, counters, &guest_gathers) }? {
+            Some(groups) => {
+                let pipeline = unsafe { pools.scatter_pipeline(ctx) }
+                    .expect("planned only after the pipeline was created");
+                for g in &groups {
+                    unsafe { pipeline.dispatch(&ctx.device, cb, g.set, g.run_count) };
+                }
+                counters
+                    .buffer_gather_dispatches
+                    .fetch_add(groups.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    };
+    if !gather_dispatched {
+        for gather in &guest_gathers {
+            for (source, copies) in &gather.sources {
+                ctx.device.cmd_copy_buffer(cb, *source, gather.dst, copies);
+            }
         }
     }
     if !guest_gathers.is_empty() {
@@ -3172,8 +3337,24 @@ pub(crate) unsafe fn execute_draw_inner(
         // sampled window gathers into one of these slots and is then read by the
         // buffer→image copy below, which is a transfer and not a graphics stage.
         // Without it that copy races the gather that fills it.
+        //
+        // The source scope follows whichever form ran, and only that form: a
+        // barrier naming both would be correct but would say the copies might
+        // have been a compute write on a boot where they were not, which is a
+        // dependency the driver then has to honour for nothing.
+        let (src_stage, src_access) = if gather_dispatched {
+            (
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::AccessFlags::SHADER_WRITE,
+            )
+        } else {
+            (
+                vk::PipelineStageFlags::TRANSFER,
+                vk::AccessFlags::TRANSFER_WRITE,
+            )
+        };
         let barrier = [vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .src_access_mask(src_access)
             .dst_access_mask(
                 vk::AccessFlags::VERTEX_ATTRIBUTE_READ
                     | vk::AccessFlags::INDEX_READ
@@ -3183,7 +3364,7 @@ pub(crate) unsafe fn execute_draw_inner(
             )];
         ctx.device.cmd_pipeline_barrier(
             cb,
-            vk::PipelineStageFlags::TRANSFER,
+            src_stage,
             vk::PipelineStageFlags::ALL_GRAPHICS | vk::PipelineStageFlags::TRANSFER,
             vk::DependencyFlags::empty(),
             &barrier,
@@ -4325,20 +4506,21 @@ mod tests {
                 volume: false,
                 cube: false,
                 one_dim: false,
-                source: SampledSource::GuestRuns(GuestRunSource {
-                    runs: std::sync::Arc::new(vec![GuestRun {
-                        host_ptr: 0x1000,
-                        len: total_len,
-                    }]),
-                    total_len,
-                    row_length_texels,
-                    // A fixture over a dummy host address names no guest
-                    // RAM, so there is no reference an import could bind.
-                    pages: None,
-                },
-                // No witness ran for a synthetic source, so nothing vouches:
-                // the gather is the only disposition this fixture can take.
-                crate::runtime::gather_witness::GatherVouch::Fresh,
+                source: SampledSource::GuestRuns(
+                    GuestRunSource {
+                        runs: std::sync::Arc::new(vec![GuestRun {
+                            host_ptr: 0x1000,
+                            len: total_len,
+                        }]),
+                        total_len,
+                        row_length_texels,
+                        // A fixture over a dummy host address names no guest
+                        // RAM, so there is no reference an import could bind.
+                        pages: None,
+                    },
+                    // No witness ran for a synthetic source, so nothing vouches:
+                    // the gather is the only disposition this fixture can take.
+                    crate::runtime::gather_witness::GatherVouch::Fresh,
                 ),
                 format: crate::backend::vulkan::translate::pixel::vk_texel_layout(
                     crate::contract::pixel_format::TexelLayout::Bgra8,
@@ -4428,7 +4610,10 @@ mod tests {
                     vk::PipelineStageFlags::TOP_OF_PIPE,
                     "{access:?} names a prior access, so skipping its barrier drops a dependency"
                 );
-                assert!(!flags.is_empty(), "{access:?} has an access to make available");
+                assert!(
+                    !flags.is_empty(),
+                    "{access:?} has an access to make available"
+                );
             }
         }
     }
@@ -4879,7 +5064,11 @@ mod depth_load_tests {
     fn the_transient_depth_rail_never_honours_a_load() {
         let transient = AcquiredDepth {
             view: vk::ImageView::null(),
-            owned: Some((vk::Image::null(), vk::DeviceMemory::null(), vk::ImageView::null())),
+            owned: Some((
+                vk::Image::null(),
+                vk::DeviceMemory::null(),
+                vk::ImageView::null(),
+            )),
             identity: None,
             content_ready: false,
         };

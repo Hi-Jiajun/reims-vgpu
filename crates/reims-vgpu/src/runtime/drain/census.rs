@@ -1793,6 +1793,7 @@ fn emit_engine_delta() {
          buffer_guest_imports={} buffer_guest_import_bytes={} \
          buffer_guest_gathers={} buffer_guest_gather_bytes={} \
          buffer_guest_gather_regions={} \
+         buffer_gather_dispatches={} buffer_gather_declined={} \
          buffer_bind_reuses={} \
          buffer_snapshot_binds={} \
          guest_write_linear={} guest_write_rects={} guest_write_regions={} \
@@ -1841,6 +1842,8 @@ fn emit_engine_delta() {
         d.buffer_guest_gathers,
         d.buffer_guest_gather_bytes,
         d.buffer_guest_gather_regions,
+        d.buffer_gather_dispatches,
+        d.buffer_gather_declined,
         d.buffer_bind_reuses,
         d.buffer_snapshot_binds,
         d.guest_write_linear,

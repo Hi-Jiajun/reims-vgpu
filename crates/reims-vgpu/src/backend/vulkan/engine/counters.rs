@@ -412,6 +412,17 @@ engine_counters! {
         buffer_guest_gathers,
         buffer_guest_gather_bytes,
         buffer_guest_gather_regions,
+        /// Compute dispatches the buffer gather issued in place of those
+        /// regions, and the plans that could not become one.
+        ///
+        /// Read as a pair with `buffer_guest_gather_regions`, which keeps
+        /// counting the regions a *declined* window still costs: a boot on the
+        /// dispatch path reads a handful of regions and one dispatch per
+        /// gathered window, and a boot that silently fell back reads the region
+        /// count it always did. Neither alone says which form a boot took, which
+        /// is the mistake the writeback's own census made first.
+        buffer_gather_dispatches,
+        buffer_gather_declined,
         /// Buffer binds served from a copy the command buffer being recorded
         /// already holds — see `ResourcePools::cb_bound_buffers`.
         ///

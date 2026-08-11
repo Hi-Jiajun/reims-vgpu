@@ -264,6 +264,24 @@ pub const COMPUTE_SCATTER: &str = "REIMS_VGPU_COMPUTE_SCATTER";
 /// binary that can be run both ways against that guest.
 pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 
+/// `off` narrows the draw-time guest buffer gather back to one transfer region
+/// per guest run, from the compute dispatch that replaces them.
+///
+/// The gather direction of what [`COMPUTE_SCATTER`] does for the writeback, and
+/// it narrows for the same reasons. The dispatch moves the same bytes into the
+/// same device-local slot — the kernel copies `uint`s and carries no format,
+/// row or direction semantics at all — so this switch chooses between two
+/// byte-identical implementations of one copy and can never change what the
+/// guest observes. The transfer form is the only form on a host without the
+/// guest-RAM import, and it stays the form for a window whose runs the dispatch
+/// cannot express.
+///
+/// It exists because it is the A/B. The buffer gather issues ~427 000 transfer
+/// regions a second on a driven macos-13 boot, against the ~200 per writeback
+/// the scatter removed for +48 % frames, and the only way to hold that against
+/// this repair on a given host is to run the host both ways in one binary.
+pub const COMPUTE_GATHER: &str = "REIMS_VGPU_COMPUTE_GATHER";
+
 /// What one variable says, including the two ways it says nothing usable.
 ///
 /// Four states rather than a `bool` because "unset", "explicitly on" and

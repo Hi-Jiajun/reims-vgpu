@@ -1,5 +1,28 @@
-//! Scatter a detiled frame into the guest's pages with one compute dispatch
-//! instead of one transfer region per run.
+//! Move bytes between a device-local buffer and the guest's
+//! physically-discontiguous pages with one compute dispatch instead of one
+//! transfer region per run — in **either** direction.
+//!
+//! # One kernel, two rails
+//!
+//! The kernel carries no direction at all. It reads `src[run.x + i]` and writes
+//! `dst[run.y + i]`, and nothing in it knows which side is guest memory. Two
+//! callers use it:
+//!
+//! | rail | `Src` | `Dst` | planner |
+//! |---|---|---|---|
+//! | render writeback | detiled scratch | guest pages | [`build_run_tables`] |
+//! | draw buffer gather | guest pages | pooled gather slot | [`build_gather_run_tables`] |
+//!
+//! What differs is only which binding has to be a *window*, and that is forced
+//! rather than chosen: the imported RAMBlock is wider than
+//! `maxStorageBufferRange` and the pooled slot is not, so the guest side is
+//! always the windowed one. [`build_gather_run_tables`] is therefore a swap over
+//! [`build_run_tables`] and not a second planner — see its doc for why that
+//! matters more than tidiness.
+//!
+//! The writeback shipped first and its measurement is the one below; the gather
+//! is the same repair against a larger population, ~427 000 transfer regions a
+//! second against the writeback's ~200 per frame.
 //!
 //! # Why this rail exists
 //!
@@ -262,6 +285,51 @@ pub(crate) fn build_run_tables(
     Ok(tables)
 }
 
+/// [`build_run_tables`] for the other direction: guest RAM is the **source**
+/// and the device-local slot is the destination.
+///
+/// # Why this is a swap and not a second planner
+///
+/// The kernel carries no direction at all — it reads `src[run.x + i]` and writes
+/// `dst[run.y + i]`, and nothing in it knows which side is guest memory. What
+/// differs between a writeback and a gather is only *which binding has to be a
+/// window*, and that is forced: the imported RAMBlock is wider than
+/// `maxStorageBufferRange` and the pooled slot is not, so the guest side is
+/// always the windowed one. [`build_run_tables`] windows `dst`, so a gather
+/// hands it the runs with the two sides exchanged and exchanges the two index
+/// words back afterwards.
+///
+/// Doing it this way rather than by copying the planner is not tidiness. That
+/// function carries the partitioning that fixes a measured bug — 6 % of one
+/// boot's writebacks straddled a 4 GiB boundary — and a second copy of the
+/// sweep is a second place for that to be got wrong, in a direction no test on
+/// the other one would catch.
+///
+/// `dst_have` bounds the device-local slot the runs write into, taking the place
+/// of `src_have`'s bound on the scratch.
+pub(crate) fn build_gather_run_tables(
+    runs: &[ScatterRun],
+    bind_align: u64,
+    max_range: u64,
+    dst_have: u64,
+) -> Result<Vec<RunTable>, ScatterDecline> {
+    let exchanged: Vec<ScatterRun> = runs
+        .iter()
+        .map(|r| ScatterRun {
+            src: r.dst,
+            dst: r.src,
+            len: r.len,
+        })
+        .collect();
+    let mut tables = build_run_tables(&exchanged, bind_align, max_range, dst_have)?;
+    for table in &mut tables {
+        for run in table.words.chunks_exact_mut(WORDS_PER_RUN) {
+            run.swap(0, 1);
+        }
+    }
+    Ok(tables)
+}
+
 /// Close one window into a table, once no further run will join it.
 fn finish_table(bind_offset: u64, words: Vec<u32>, hi: u64) -> Result<RunTable, ScatterDecline> {
     let run_count =
@@ -409,6 +477,12 @@ impl ScatterPipeline {
 
     /// Write one dispatch's three bindings into an allocated set.
     ///
+    /// Both `src` and `dst` are `(buffer, offset, range)` because either of them
+    /// can be the imported guest RAM, and that one has to be a window: a
+    /// RAMBlock is routinely wider than `maxStorageBufferRange`. The writeback
+    /// windows `dst` and the gather windows `src`, and which side is which is
+    /// the only difference between the two — see [`build_gather_run_tables`].
+    ///
     /// # Safety
     ///
     /// `set` must have been allocated from [`Self::dsl`], and every buffer must
@@ -416,15 +490,15 @@ impl ScatterPipeline {
     pub(crate) unsafe fn write_set(
         device: &ash::Device,
         set: vk::DescriptorSet,
-        src: (vk::Buffer, u64),
+        src: (vk::Buffer, u64, u64),
         dst: (vk::Buffer, u64, u64),
         runs: (vk::Buffer, u64),
     ) {
         let infos = [
             vk::DescriptorBufferInfo::default()
                 .buffer(src.0)
-                .offset(0)
-                .range(src.1),
+                .offset(src.1)
+                .range(src.2),
             vk::DescriptorBufferInfo::default()
                 .buffer(dst.0)
                 .offset(dst.1)
@@ -500,6 +574,79 @@ mod tests {
     fn one(mut tables: Vec<RunTable>) -> RunTable {
         assert_eq!(tables.len(), 1, "these runs fit one bound window");
         tables.remove(0)
+    }
+
+    /// A gather is the writeback with the two sides exchanged, so the window it
+    /// binds must land on the **guest** offsets and the device-local indices
+    /// must stay absolute. Getting the swap backwards reads the guest's RAM at
+    /// a slot-sized offset and writes the slot at a RAMBlock-sized one, which is
+    /// wrong bytes rather than a crash — so it is asserted against the planner
+    /// it delegates to rather than against a hand-written expectation.
+    #[test]
+    fn a_gather_windows_the_guest_side_and_leaves_the_slot_absolute() {
+        let high = 8 * 1024 * 1024 * 1024u64;
+        // Guest source high in the RAMBlock, device-local destination low.
+        let g = one(build_gather_run_tables(
+            &[run(high, 0, 4096), run(high + 65536, 4096, 4096)],
+            ALIGN,
+            MAX,
+            1 << 20,
+        )
+        .expect("aligned runs plan"));
+        assert_eq!(g.bind_offset, high, "the window is on the guest side");
+        assert_eq!(g.bind_range, 65536 + 4096);
+        assert_eq!(g.run_count, 2);
+        // src index relative to the guest window, dst index absolute in the slot.
+        assert_eq!(&g.words[0..3], &[0, 0, 1024]);
+        assert_eq!(&g.words[4..7], &[65536 / 4, 4096 / 4, 1024]);
+    }
+
+    /// The same runs planned both ways must agree on everything but which two
+    /// words hold which index — that identity is what makes the delegation safe,
+    /// and it is the thing a future edit to either function could break.
+    #[test]
+    fn a_gather_table_is_the_writeback_table_with_its_indices_exchanged() {
+        let rs = [run(0x4000_0000, 0, 8192), run(0x4001_0000, 8192, 8192)];
+        let flipped: Vec<ScatterRun> = rs
+            .iter()
+            .map(|r| ScatterRun {
+                src: r.dst,
+                dst: r.src,
+                len: r.len,
+            })
+            .collect();
+        let g = one(build_gather_run_tables(&rs, ALIGN, MAX, 1 << 20).expect("gather plans"));
+        let w = one(build_run_tables(&flipped, ALIGN, MAX, 1 << 20).expect("writeback plans"));
+        assert_eq!(g.bind_offset, w.bind_offset);
+        assert_eq!(g.bind_range, w.bind_range);
+        assert_eq!(g.run_count, w.run_count);
+        for (gr, wr) in g
+            .words
+            .chunks_exact(WORDS_PER_RUN)
+            .zip(w.words.chunks_exact(WORDS_PER_RUN))
+        {
+            assert_eq!(gr[0], wr[1], "src index is the writeback's dst index");
+            assert_eq!(gr[1], wr[0], "and the other way round");
+            assert_eq!(gr[2], wr[2], "length is a length either way");
+        }
+    }
+
+    /// A gather straddling the 4 GiB `maxStorageBufferRange` wall has to
+    /// partition on the guest side, exactly as a writeback does — the bug that
+    /// cost 6 % of one boot's writebacks ~200 transfer regions each, reached
+    /// through the delegation rather than reimplemented behind it.
+    #[test]
+    fn a_gather_spanning_the_storage_range_wall_splits_into_two_windows() {
+        let max = 4 * 1024 * 1024 * 1024u64;
+        let tables = build_gather_run_tables(
+            &[run(0, 0, 4096), run(max + 4096, 4096, 4096)],
+            ALIGN,
+            max,
+            1 << 20,
+        )
+        .expect("aligned runs plan");
+        assert_eq!(tables.len(), 2, "no one window can bind both guest offsets");
+        assert_eq!(tables.iter().map(|t| t.run_count).sum::<u32>(), 2);
     }
 
     /// The whole point of the offset bind: a destination at the top of a 16 GiB
@@ -680,15 +827,13 @@ mod tests {
     /// arrive in window order, which is not destination order.
     #[test]
     fn the_bound_window_covers_runs_arriving_out_of_destination_order() {
-        let t = one(
-            build_run_tables(
-                &[run(0, 8192, 16), run(16, 128, 16), run(32, 4096, 16)],
-                ALIGN,
-                MAX,
-                1 << 20,
-            )
-            .expect("plan"),
-        );
+        let t = one(build_run_tables(
+            &[run(0, 8192, 16), run(16, 128, 16), run(32, 4096, 16)],
+            ALIGN,
+            MAX,
+            1 << 20,
+        )
+        .expect("plan"));
         assert_eq!(t.bind_offset, 128, "the lowest destination, aligned down");
         assert_eq!(t.bind_range, 8192 + 16 - 128, "up to the highest end");
         for i in 0..3 {

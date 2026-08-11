@@ -2888,7 +2888,7 @@ unsafe fn plan_guest_scatter_dispatches(
     }
     let mut groups = Vec::with_capacity(tables.len());
     for (buffer, table) in &tables {
-        let bytes: &[u8] = bytemuck_words(&table.words);
+        let bytes: &[u8] = run_table_bytes(&table.words);
         let runs_slot = unsafe {
             pools.acquire_staging(
                 ctx,
@@ -2904,7 +2904,9 @@ unsafe fn plan_guest_scatter_dispatches(
             guest_scatter::ScatterPipeline::write_set(
                 &ctx.device,
                 set,
-                (scratch.buffer, scratch.size),
+                // The scratch is bound whole; the guest import is the windowed
+                // side, because a RAMBlock is wider than `maxStorageBufferRange`.
+                (scratch.buffer, 0, scratch.size),
                 (*buffer, table.bind_offset, table.bind_range),
                 (runs_slot.buffer, bytes.len() as u64),
             );
@@ -2917,14 +2919,17 @@ unsafe fn plan_guest_scatter_dispatches(
     Ok(Some(groups))
 }
 
-/// The run table's `u32`s as the bytes a staging write takes.
+/// A run table's `u32`s as the bytes a staging write takes.
+///
+/// Shared by both directions — the writeback's scatter and the buffer gather —
+/// because it is the same table and the same staging write either way.
 ///
 /// A local reinterpret rather than a dependency: `u32` has no padding and no
 /// invalid bit patterns, and the destination is a `*mut u8` memcpy either way.
 /// The endianness is the host's, which is the guest's, which is what the shader
 /// reads — the same reasoning `write_stamp_after_guest_writes` states for its
 /// one word, one layer up.
-fn bytemuck_words(words: &[u32]) -> &[u8] {
+pub(crate) fn run_table_bytes(words: &[u32]) -> &[u8] {
     // SAFETY: `u32` is `Copy` with no padding, so any `[u32]` is a valid `[u8]`
     // of four times the length, and the borrow keeps the source alive.
     unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), std::mem::size_of_val(words)) }
