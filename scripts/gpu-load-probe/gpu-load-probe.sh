@@ -134,6 +134,16 @@ sleep 2
 OFFSET=$(stat -c %s "$FAILLOG")
 ANALYZE="${ANIM_ANALYZE:-}"
 
+# Every counter this device emits measures this device, so a window where the
+# drain worker is idle seven eighths of the time says nothing about who held the
+# other seven eighths. QEMU names its threads, so a per-thread CPU census does —
+# and it is the only reading here that can tell a computing guest from a guest
+# waiting on a round trip.
+"$REPO/scripts/qemu-thread-census/qemu-thread-census.sh" \
+  "$OUT/threads.log" "$(( SECS + 5 ))" >"$OUT/threads.err" 2>&1 &
+THREADS=$!
+trap 'kill $HTTPD $THREADS 2>/dev/null' EXIT
+
 case "$ARGS" in
 *scan=*)
   # A scanned load walks a list of dial sets in one boot, and each leg's window
