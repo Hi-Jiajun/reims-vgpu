@@ -24,18 +24,20 @@ mod driver_breadcrumb;
 mod exec;
 mod exec_compute;
 mod facade_decline;
+mod guest_scatter;
 mod host_ram;
 pub mod init_decline;
 mod pools;
+mod scatter_shader;
 pub(crate) mod stamp_completion;
-/// The ceiling `registry_non_pinned_peak` is read against. Re-exported because
-/// `pools` is private and the census that reports the band lives outside this
-/// module: a peak with no cap beside it is a number, not a reading.
-pub(crate) use pools::IDLE_TARGET_AGE_MS;
 /// The requested sampled working set, re-exported for the same reason and to
 /// the same place: `pools` is private, and this line is only interpretable
 /// beside the eviction routes the census already emits.
 pub use pools::sampled_working_set::census as sampled_working_set_census;
+/// The ceiling `registry_non_pinned_peak` is read against. Re-exported because
+/// `pools` is private and the census that reports the band lives outside this
+/// module: a peak with no cap beside it is a number, not a reading.
+pub(crate) use pools::IDLE_TARGET_AGE_MS;
 pub mod reason;
 mod slab;
 pub mod stage_phase;
@@ -1365,9 +1367,7 @@ pub fn note_resident_content_copied_out(identity: &TargetIdentity) -> bool {
 /// answers `false`, which narrows to the format the target would have had
 /// anyway — an override or an unresolved device may never widen what the
 /// device does.
-pub fn render_target_layout_supported(
-    layout: crate::contract::pixel_format::TexelLayout,
-) -> bool {
+pub fn render_target_layout_supported(layout: crate::contract::pixel_format::TexelLayout) -> bool {
     use crate::contract::pixel_format::TexelLayout;
     if matches!(layout, TexelLayout::Rgba8 | TexelLayout::Bgra8) {
         return true;
@@ -2286,7 +2286,8 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
             },
         ));
     }
-    let rb_size = (snap.width as u64) * (snap.height as u64) * u64::from(RESIDENT_READ_BYTES_PER_TEXEL);
+    let rb_size =
+        (snap.width as u64) * (snap.height as u64) * u64::from(RESIDENT_READ_BYTES_PER_TEXEL);
     unsafe {
         let delivered = copy_image_level0_to_host_delivered(
             ctx,
@@ -2550,13 +2551,27 @@ pub fn copy_target_to_guest_pages(
             // that is a coincidence of two separately-derived numbers, not a
             // stated relation, and sizing by the one the copies actually read
             // costs nothing and does not depend on it holding.
-            let scratch = pools
-                .acquire_guest_gather(ctx, have, ash::vk::BufferUsageFlags::empty(), counters)?
-                .buffer;
-            let scatter = plan_guest_linear_copies(ctx, pools, dst)?;
+            let scratch = pools.acquire_guest_gather(
+                ctx,
+                have,
+                ash::vk::BufferUsageFlags::empty(),
+                counters,
+            )?;
+            // The dispatch first, falling back to the regions it replaces —
+            // which is the only ordering that keeps the transfer form reachable
+            // on every host and for every run shape it still has to serve.
+            let scatter = match compute_scatter_enabled() {
+                true => plan_guest_scatter_dispatches(ctx, pools, counters, dst, &scratch)?
+                    .map(ScatterForm::Dispatches),
+                false => None,
+            };
+            let scatter = match scatter {
+                Some(form) => form,
+                None => ScatterForm::Regions(plan_guest_linear_copies(ctx, pools, dst)?),
+            };
             counters.guest_write_linear.fetch_add(1, Ordering::Relaxed);
             GuestCopyPlan::Linear {
-                scratch,
+                scratch: scratch.buffer,
                 // `buffer_row_length(0)` is Vulkan's "tightly packed", which is
                 // exactly what dense means. Passing `row_length_texels` would
                 // be the same number whenever it is set and an invalid one
@@ -2582,6 +2597,9 @@ pub fn copy_target_to_guest_pages(
         counters
             .guest_write_regions
             .fetch_add(plan.regions(), Ordering::Relaxed);
+        counters
+            .guest_write_dispatches
+            .fetch_add(plan.dispatches(), Ordering::Relaxed);
         copy_image_level0_to_buffer(ctx, pools, counters, &snap, &plan)?;
         pools.registry_note_access(identity, pools::ResidentAccess::TransferRead);
         counters.note_target_read(u64::from(dst.width) * u64::from(dst.height) * 4);
@@ -2635,9 +2653,35 @@ enum GuestCopyPlan {
         scratch: ash::vk::Buffer,
         /// The one rectangle that fills the scratch, tightly packed.
         detile: ash::vk::BufferImageCopy,
-        /// One byte range per guest stretch, grouped by the buffer it lands in.
-        scatter: Vec<(ash::vk::Buffer, Vec<ash::vk::BufferCopy>)>,
+        /// How the scratch reaches the guest's stretches.
+        scatter: ScatterForm,
     },
+}
+
+/// The two ways a detiled frame gets from the scratch into the guest's pages.
+///
+/// They write the same bytes to the same addresses — the kernel copies `uint`s
+/// and carries no format, row or texel semantics — so which one runs is a cost
+/// decision and never a visible one, exactly as the choice above it is.
+enum ScatterForm {
+    /// One `VkBufferCopy` per guest stretch, grouped by the buffer it lands in.
+    ///
+    /// The only form on a host without the guest-RAM import, the form for a run
+    /// the dispatch cannot express, and the A/B baseline. See
+    /// [`crate::env::COMPUTE_SCATTER`].
+    Regions(Vec<(ash::vk::Buffer, Vec<ash::vk::BufferCopy>)>),
+    /// One compute dispatch per destination buffer, over a run table.
+    ///
+    /// This rail is bound by the number of copy regions it issues rather than by
+    /// the bytes in them, which is what makes replacing ~200 regions with one
+    /// dispatch the repair — see [`guest_scatter`].
+    Dispatches(Vec<ScatterGroup>),
+}
+
+/// One dispatch: every run of this writeback that lands in one guest buffer.
+struct ScatterGroup {
+    set: ash::vk::DescriptorSet,
+    run_count: u32,
 }
 
 impl GuestCopyPlan {
@@ -2646,12 +2690,31 @@ impl GuestCopyPlan {
     /// The detiling rectangle counts: it is a region the driver consumes, and
     /// leaving it out would make the linear path's total read as exactly the
     /// stretch count when it is one more than that.
+    /// A dispatch contributes none: it is a grid, not a region list, and
+    /// counting one as a region would hide the very thing this counter exists to
+    /// show. A linear plan that dispatched therefore reads as exactly 1 — the
+    /// detile — which is the reading that says the scatter left the copy engine.
     fn regions(&self) -> u64 {
         match self {
             Self::Rectangles(groups) => groups.iter().map(|(_, r)| r.len() as u64).sum(),
-            Self::Linear { scatter, .. } => {
-                1 + scatter.iter().map(|(_, r)| r.len() as u64).sum::<u64>()
-            }
+            Self::Linear { scatter, .. } => match scatter {
+                ScatterForm::Regions(groups) => {
+                    1 + groups.iter().map(|(_, r)| r.len() as u64).sum::<u64>()
+                }
+                ScatterForm::Dispatches(_) => 1,
+            },
+        }
+    }
+
+    /// Dispatches this plan will submit, for the census. Zero on every other
+    /// form, which is what makes the pair a share rather than two counts.
+    fn dispatches(&self) -> u64 {
+        match self {
+            Self::Rectangles(_) => 0,
+            Self::Linear { scatter, .. } => match scatter {
+                ScatterForm::Regions(_) => 0,
+                ScatterForm::Dispatches(groups) => groups.len() as u64,
+            },
         }
     }
 }
@@ -2741,6 +2804,130 @@ unsafe fn plan_guest_linear_copies(
         group_by_buffer(&mut grouped, bound.buffer, copy);
     }
     Ok(grouped)
+}
+
+/// Whether the compute scatter is on. See [`crate::env::COMPUTE_SCATTER`].
+fn compute_scatter_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            crate::env::read(crate::env::COMPUTE_SCATTER).0,
+            crate::env::Switch::Off
+        )
+    })
+}
+
+/// Bind every run and turn the set into one compute dispatch per destination
+/// buffer, or `Ok(None)` when this writeback has to take the transfer regions.
+///
+/// `Ok(None)` is a routing answer and never a loss: the caller falls back to
+/// [`plan_guest_linear_copies`], which lands the identical bytes. Every reason
+/// for one is named through [`guest_scatter::ScatterDecline`] so a boot quietly
+/// running on the expensive path is visible rather than inferred from a frame
+/// rate.
+///
+/// # Why the run table is host memory the shader reads in place
+///
+/// It is ~200 `uvec4`s — 3.2 KiB, past every push-constant limit and far below
+/// anything worth a staging copy. A staging slot is host-visible, coherent and
+/// already carries `STORAGE_BUFFER` usage, so writing it and binding it costs
+/// this rail no copy region at all, which is the resource the whole change is
+/// about.
+unsafe fn plan_guest_scatter_dispatches(
+    ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
+    counters: &counters::EngineCounters,
+    dst: &GuestPageTarget,
+    scratch: &pools::BufferSlot,
+) -> Result<Option<Vec<ScatterGroup>>, DrawError> {
+    use guest_scatter::{build_run_table, ScatterRun};
+    use host_ram::GuestWriteDecline;
+    let Some(pipeline) = (unsafe { pools.scatter_pipeline(ctx) }) else {
+        return Ok(None);
+    };
+    let mut grouped: Vec<(ash::vk::Buffer, Vec<ScatterRun>)> = Vec::new();
+    for run in &dst.runs {
+        let bound = unsafe { pools.bind_guest_ram(ctx, &run.guest) }
+            .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
+        group_by_buffer(
+            &mut grouped,
+            bound.buffer,
+            ScatterRun {
+                src: run.window_offset,
+                // The same re-basing every planner here does: `head` is what the
+                // granularity rounding put in front of the byte asked for.
+                dst: bound.offset + bound.head,
+                len: run.guest.requested(),
+            },
+        );
+    }
+    // Planned for every group before anything is allocated, so a refusal in the
+    // last group does not leave the first one's staging slot and descriptor set
+    // sitting on the pools for a dispatch that will not be recorded.
+    let mut tables = Vec::with_capacity(grouped.len());
+    for (buffer, runs) in &grouped {
+        match build_run_table(
+            runs,
+            ctx.guest_bind_offset_align,
+            ctx.max_storage_buffer_range,
+            // The window's own byte count and not the slot's, which is rounded
+            // up to a power-of-two bucket. Both bound the memory soundly; this
+            // is the tighter, and it is the one that catches a run reaching past
+            // what the detile actually wrote rather than merely past the slot.
+            dst.window_bytes(),
+        ) {
+            Ok(table) => tables.push((*buffer, table)),
+            Err(decline) => {
+                counters
+                    .guest_write_scatter_declined
+                    .fetch_add(1, Ordering::Relaxed);
+                crate::observe::Emit::decline("scatter_plan", &decline).fail_once(0);
+                return Ok(None);
+            }
+        }
+    }
+    let mut groups = Vec::with_capacity(tables.len());
+    for (buffer, table) in &tables {
+        let bytes: &[u8] = bytemuck_words(&table.words);
+        let runs_slot = unsafe {
+            pools.acquire_staging(
+                ctx,
+                bytes.len() as u64,
+                ash::vk::BufferUsageFlags::empty(),
+                counters,
+            )
+        }?;
+        unsafe { pools.write_staging(ctx, &runs_slot, bytes) }?;
+        let set =
+            unsafe { pools.alloc_scatter_descriptor_set(&ctx.device, pipeline.dsl, counters) }?;
+        unsafe {
+            guest_scatter::ScatterPipeline::write_set(
+                &ctx.device,
+                set,
+                (scratch.buffer, scratch.size),
+                (*buffer, table.bind_offset, table.bind_range),
+                (runs_slot.buffer, bytes.len() as u64),
+            );
+        }
+        groups.push(ScatterGroup {
+            set,
+            run_count: table.run_count,
+        });
+    }
+    Ok(Some(groups))
+}
+
+/// The run table's `u32`s as the bytes a staging write takes.
+///
+/// A local reinterpret rather than a dependency: `u32` has no padding and no
+/// invalid bit patterns, and the destination is a `*mut u8` memcpy either way.
+/// The endianness is the host's, which is the guest's, which is what the shader
+/// reads — the same reasoning `write_stamp_after_guest_writes` states for its
+/// one word, one layer up.
+fn bytemuck_words(words: &[u32]) -> &[u8] {
+    // SAFETY: `u32` is `Copy` with no padding, so any `[u32]` is a valid `[u8]`
+    // of four times the length, and the borrow keeps the source alive.
+    unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), std::mem::size_of_val(words)) }
 }
 
 /// Add one stretch's copy to the group for `buffer`, opening a group if this is
@@ -2941,25 +3128,57 @@ unsafe fn copy_image_level0_to_buffer(
                 *scratch,
                 &one,
             );
-            // The scatter reads what the detile just wrote, and both are
-            // transfer-stage work in one command buffer, where nothing orders
-            // them by itself. A global memory barrier rather than a buffer one
-            // because there is exactly one buffer in flight between the two
-            // and no other access to exclude.
-            let detiled = [ash::vk::MemoryBarrier::default()
-                .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)];
-            ctx.device.cmd_pipeline_barrier(
-                cb,
-                ash::vk::PipelineStageFlags::TRANSFER,
-                ash::vk::PipelineStageFlags::TRANSFER,
-                ash::vk::DependencyFlags::empty(),
-                &detiled,
-                &[],
-                &[],
-            );
-            for (buffer, regions) in scatter {
-                ctx.device.cmd_copy_buffer(cb, *scratch, *buffer, regions);
+            // The scatter reads what the detile just wrote, and nothing in one
+            // command buffer orders the two by itself. A global memory barrier
+            // rather than a buffer one because there is exactly one buffer in
+            // flight between them and no other access to exclude.
+            match scatter {
+                ScatterForm::Regions(groups) => {
+                    let detiled = [ash::vk::MemoryBarrier::default()
+                        .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)];
+                    ctx.device.cmd_pipeline_barrier(
+                        cb,
+                        ash::vk::PipelineStageFlags::TRANSFER,
+                        ash::vk::PipelineStageFlags::TRANSFER,
+                        ash::vk::DependencyFlags::empty(),
+                        &detiled,
+                        &[],
+                        &[],
+                    );
+                    for (buffer, regions) in groups {
+                        ctx.device.cmd_copy_buffer(cb, *scratch, *buffer, regions);
+                    }
+                }
+                ScatterForm::Dispatches(groups) => {
+                    // Two dependencies in one barrier because they have the same
+                    // destination: the detile's write to the scratch, and the
+                    // host's write of the run tables, which happened before this
+                    // submission and so needs `HOST` named on the source side.
+                    let ready = [ash::vk::MemoryBarrier::default()
+                        .src_access_mask(
+                            ash::vk::AccessFlags::TRANSFER_WRITE | ash::vk::AccessFlags::HOST_WRITE,
+                        )
+                        .dst_access_mask(ash::vk::AccessFlags::SHADER_READ)];
+                    ctx.device.cmd_pipeline_barrier(
+                        cb,
+                        ash::vk::PipelineStageFlags::TRANSFER | ash::vk::PipelineStageFlags::HOST,
+                        ash::vk::PipelineStageFlags::COMPUTE_SHADER,
+                        ash::vk::DependencyFlags::empty(),
+                        &ready,
+                        &[],
+                        &[],
+                    );
+                    // Looked up rather than carried in the plan: the plan holds
+                    // only what a dispatch needs that is per-writeback, and the
+                    // pipeline is a fixture of the device. It is already built —
+                    // the plan could not have been made otherwise.
+                    if let Some(pipeline) = pools.scatter_pipeline(ctx) {
+                        for group in groups {
+                            pipeline.dispatch(&ctx.device, cb, group.set, group.run_count);
+                        }
+                    }
+                }
             }
         }
     }
@@ -2981,12 +3200,31 @@ unsafe fn copy_image_level0_to_buffer(
     // names ordinary system pages this process already has mapped, and a PCIe
     // write to system memory is snooped, so there is no invalidate for this
     // side to issue.
+    //
+    // The source scope is the stage that actually wrote the guest's pages, which
+    // is the dispatch on the compute scatter and the copy on every other form.
+    // Naming `TRANSFER` alone against a dispatch would release the detile and
+    // leave the writes the guest is about to read unordered — the one place in
+    // this rail where the two forms are not interchangeable.
+    let (wrote_stage, wrote_access) = match plan {
+        GuestCopyPlan::Linear {
+            scatter: ScatterForm::Dispatches(_),
+            ..
+        } => (
+            ash::vk::PipelineStageFlags::COMPUTE_SHADER,
+            ash::vk::AccessFlags::SHADER_WRITE,
+        ),
+        _ => (
+            ash::vk::PipelineStageFlags::TRANSFER,
+            ash::vk::AccessFlags::TRANSFER_WRITE,
+        ),
+    };
     let host_visible = [ash::vk::MemoryBarrier::default()
-        .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+        .src_access_mask(wrote_access)
         .dst_access_mask(ash::vk::AccessFlags::HOST_READ)];
     ctx.device.cmd_pipeline_barrier(
         cb,
-        ash::vk::PipelineStageFlags::TRANSFER,
+        wrote_stage,
         ash::vk::PipelineStageFlags::HOST,
         ash::vk::DependencyFlags::empty(),
         &host_visible,
@@ -3052,12 +3290,14 @@ unsafe fn publish_previous_writeback_timestamps(ctx: &context::DeviceContext) {
         return;
     };
     let mut ticks = [0u64; context::TimestampProbe::SLOTS as usize];
-    match unsafe { ctx.device.get_query_pool_results(
-        probe.pool,
-        0,
-        &mut ticks,
-        ash::vk::QueryResultFlags::TYPE_64,
-    ) } {
+    match unsafe {
+        ctx.device.get_query_pool_results(
+            probe.pool,
+            0,
+            &mut ticks,
+            ash::vk::QueryResultFlags::TYPE_64,
+        )
+    } {
         // In f64, not integer ticks-times-period: `timestampPeriod` is a
         // float and drivers do report values below 1 ns, which an integer
         // multiply would truncate to zero and report as "the GPU did nothing".
@@ -3327,7 +3567,13 @@ fn resident_read_snapshot(
 fn readback_snapshot(
     pools: &pools::ResourcePools,
     identity: &TargetIdentity,
-) -> Result<(ResidentReadSnapshot, crate::contract::pixel_format::TexelLayout), DrawError> {
+) -> Result<
+    (
+        ResidentReadSnapshot,
+        crate::contract::pixel_format::TexelLayout,
+    ),
+    DrawError,
+> {
     let snap = resident_read_snapshot(pools, identity)?;
     let layout = crate::backend::vulkan::translate::pixel::texel_layout_of(snap.format).ok_or(
         DrawError::TargetRead(reason::TargetReadDecline::TexelNotFourBytes {
@@ -3989,9 +4235,30 @@ mod guest_page_target_tests {
         let linear = GuestCopyPlan::Linear {
             scratch: null,
             detile: ash::vk::BufferImageCopy::default(),
-            scatter: vec![(null, vec![ash::vk::BufferCopy::default(); 507])],
+            scatter: ScatterForm::Regions(vec![(null, vec![ash::vk::BufferCopy::default(); 507])]),
         };
         assert_eq!(linear.regions(), 508, "507 stretches plus the detile");
+        assert_eq!(linear.dispatches(), 0, "the transfer form dispatches none");
+    }
+
+    /// The same 507 stretches as a dispatch must read as one region and one
+    /// dispatch, because the pair is the only account of which form a boot took.
+    ///
+    /// Counting the dispatch as a region would make the two forms
+    /// indistinguishable in the census — 508 either way — which is the reading
+    /// the whole change exists to move.
+    #[test]
+    fn a_dispatched_scatter_reads_as_one_region_and_one_dispatch() {
+        let dispatched = GuestCopyPlan::Linear {
+            scratch: ash::vk::Buffer::null(),
+            detile: ash::vk::BufferImageCopy::default(),
+            scatter: ScatterForm::Dispatches(vec![ScatterGroup {
+                set: ash::vk::DescriptorSet::null(),
+                run_count: 507,
+            }]),
+        };
+        assert_eq!(dispatched.regions(), 1, "the detile, and nothing else");
+        assert_eq!(dispatched.dispatches(), 1, "one destination buffer");
     }
 }
 

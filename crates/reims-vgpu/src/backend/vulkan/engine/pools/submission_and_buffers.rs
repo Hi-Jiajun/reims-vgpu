@@ -134,6 +134,9 @@ impl ResourcePools {
             settled_drain_passes: 0,
             cmd_pool: vk::CommandPool::null(),
             desc_arena: DescriptorArena::empty(),
+            scatter: None,
+            scatter_refused: false,
+            scatter_dsets: Vec::new(),
             slots: Vec::new(),
             cur: 0,
             in_flight: 0,
@@ -685,6 +688,58 @@ impl ResourcePools {
         Ok((set, pool))
     }
 
+    /// The device's guest-scatter pipeline, built on the first writeback that
+    /// wants it and `None` on a device whose driver refused to build it.
+    ///
+    /// The refusal latches: a host that cannot compile our kernel is not going
+    /// to compile it on the next frame either, and retrying would put a pipeline
+    /// creation on the hot path several hundred times a second. It is emitted
+    /// once, on the fail channel, because the fallback it selects is the
+    /// expensive path this rail exists to leave.
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must be the device these pools belong to.
+    pub(crate) unsafe fn scatter_pipeline(
+        &mut self,
+        ctx: &DeviceContext,
+    ) -> Option<super::super::guest_scatter::ScatterPipeline> {
+        if let Some(p) = self.scatter {
+            return Some(p);
+        }
+        if self.scatter_refused {
+            return None;
+        }
+        match unsafe { super::super::guest_scatter::ScatterPipeline::create(ctx) } {
+            Ok(p) => {
+                self.scatter = Some(p);
+                Some(p)
+            }
+            Err(e) => {
+                self.scatter_refused = true;
+                crate::observe::Emit::decline("scatter_pipeline", &e).fail();
+                None
+            }
+        }
+    }
+
+    /// Allocate a descriptor set for the guest-scatter kernel and park it on the
+    /// list [`Self::seal_entry`] drains, so the caller owes it nothing.
+    ///
+    /// # Safety
+    ///
+    /// `device` must be the device these pools belong to.
+    pub(crate) unsafe fn alloc_scatter_descriptor_set(
+        &mut self,
+        device: &ash::Device,
+        dsl: vk::DescriptorSetLayout,
+        counters: &EngineCounters,
+    ) -> Result<vk::DescriptorSet, DrawError> {
+        let (set, pool) = unsafe { self.alloc_descriptor_set(device, dsl, counters) }?;
+        self.scatter_dsets.push((set, pool));
+        Ok(set)
+    }
+
     /// Free `(set, owning_pool)` pairs back to their allocating blocks.
     pub(crate) unsafe fn free_descriptor_sets(
         &self,
@@ -1114,6 +1169,10 @@ impl ResourcePools {
         readback.append(&mut self.readback_multi_live);
         let mut sampled = std::mem::take(&mut self.sampled_live);
         let admissions = take_retained_slots(&mut sampled, sampled_retains);
+        // Both seal points reach here, which is the whole reason the scatter's
+        // sets are parked on `self` instead of travelling with its plan.
+        let mut dsets = dsets;
+        dsets.append(&mut self.scatter_dsets);
         SealedEntry {
             cleanup: PendingGpuCleanup {
                 dsets,
@@ -1479,7 +1538,10 @@ impl ResourcePools {
 
     /// The buffer this command buffer already staged or gathered for `key`, if
     /// it still holds one. See `ResourcePools::cb_bound_buffers`.
-    pub(crate) fn cb_bound_buffer(&self, key: (usize, u64)) -> Option<super::super::exec::BoundBuffer> {
+    pub(crate) fn cb_bound_buffer(
+        &self,
+        key: (usize, u64),
+    ) -> Option<super::super::exec::BoundBuffer> {
         self.cb_bound_buffers.get(&key).copied()
     }
 
@@ -1585,7 +1647,10 @@ impl ResourcePools {
     pub(crate) fn note_guest_write_recorded(&mut self, identity: &TargetIdentity) {
         // A bind recorded after this must not reuse a copy taken before it: the
         // Store lands in guest pages a later bind may name.
-        self.forget_cb_bound_buffers("bindmap_clear_guestwrite", "bindmap_clear_guestwrite_entries");
+        self.forget_cb_bound_buffers(
+            "bindmap_clear_guestwrite",
+            "bindmap_clear_guestwrite_entries",
+        );
         self.guest_writes_in_flight = true;
         if self.pin_resident_target(identity, true) {
             self.unpin_on_settle.push(identity.clone());
@@ -3527,7 +3592,9 @@ mod recycle_tests {
         }
         for (key, id) in &keys {
             assert!(
-                pools.find_gathered_sampled(*key, Some(*id), &counters).is_some(),
+                pools
+                    .find_gathered_sampled(*key, Some(*id), &counters)
+                    .is_some(),
                 "the entries have to be bindable first, or the test proves nothing"
             );
         }
@@ -3541,7 +3608,9 @@ mod recycle_tests {
         );
         for (key, id) in &keys {
             assert!(
-                pools.find_gathered_sampled(*key, Some(*id), &counters).is_none(),
+                pools
+                    .find_gathered_sampled(*key, Some(*id), &counters)
+                    .is_none(),
                 "an image no command buffer filled must not answer a bind"
             );
         }
@@ -4592,12 +4661,11 @@ mod recycle_tests {
             generation: 3,
             format: translate::pixel::SCANOUT_FORMAT,
         };
-        pools
-            .registry
-            .insert(
-                identity.clone(),
-                crate::backend::vulkan::engine::pools::images_and_registry::pin_count_tests::ready_slot(),
-            );
+        pools.registry.insert(
+            identity.clone(),
+            crate::backend::vulkan::engine::pools::images_and_registry::pin_count_tests::ready_slot(
+            ),
+        );
         assert_eq!(pools.registry[&identity].pin_count, 0, "nobody has pinned");
 
         // Recording the copy is what pins: the caller holds nothing.
@@ -4644,14 +4712,16 @@ mod recycle_tests {
             generation: 1,
             format: translate::pixel::SCANOUT_FORMAT,
         };
-        pools
-            .registry
-            .insert(
-                identity.clone(),
-                crate::backend::vulkan::engine::pools::images_and_registry::pin_count_tests::ready_slot(),
-            );
+        pools.registry.insert(
+            identity.clone(),
+            crate::backend::vulkan::engine::pools::images_and_registry::pin_count_tests::ready_slot(
+            ),
+        );
         // The window pins for its present blit and still holds it.
-        assert!(pools.pin_resident_target(&identity, true), "the window's pin");
+        assert!(
+            pools.pin_resident_target(&identity, true),
+            "the window's pin"
+        );
 
         pools.note_guest_write_recorded(&identity);
         assert_eq!(pools.registry[&identity].pin_count, 2);
@@ -4981,7 +5051,9 @@ mod gather_slots_do_not_alias {
     fn a_second_acquire_cannot_name_the_first_ones_buffer() {
         let mut pools = ResourcePools::new();
         let bucket = ResourcePools::bucket(4096);
-        pools.gather_free.insert(bucket, vec![slot(1, bucket), slot(2, bucket)]);
+        pools
+            .gather_free
+            .insert(bucket, vec![slot(1, bucket), slot(2, bucket)]);
 
         let first = pools.take_free_gather(bucket).expect("a free slot");
         let second = pools.take_free_gather(bucket).expect("a second free slot");

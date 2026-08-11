@@ -98,6 +98,20 @@ pub enum VkOp {
     /// `vkCreateComputePipelines` for a dispatch pipeline.
     CachesCreateComputePipelines,
 
+    /// `vkCreateShaderModule` for the device's own guest-scatter kernel.
+    ///
+    /// Separate from the `Caches*` family because that one names a guest shader
+    /// and this one names a fixture of the device — a failure here is our own
+    /// SPIR-V being refused, which is a different diagnosis entirely.
+    ScatterCreateShaderModule,
+    /// `vkCreateDescriptorSetLayout` for the guest-scatter kernel's three
+    /// storage buffers.
+    ScatterCreateSetLayout,
+    /// `vkCreatePipelineLayout` for the guest-scatter kernel.
+    ScatterCreatePipelineLayout,
+    /// `vkCreateComputePipelines` for the guest-scatter kernel.
+    ScatterCreatePipeline,
+
     /// `vkGetPipelineCacheData` before persisting a grown pipeline cache.
     ContextPipelineCacheGetData,
     /// `vkCreateQueryPool` for the readback's two-slot timestamp probe.
@@ -376,6 +390,11 @@ impl Decline for VkCall {
             VkOp::CachesCreateGraphicsPipelines => "vk_caches_create_graphics_pipelines",
             VkOp::CachesCreateComputePipelines => "vk_caches_create_compute_pipelines",
 
+            VkOp::ScatterCreateShaderModule => "vk_scatter_create_shader_module",
+            VkOp::ScatterCreateSetLayout => "vk_scatter_create_set_layout",
+            VkOp::ScatterCreatePipelineLayout => "vk_scatter_create_pipeline_layout",
+            VkOp::ScatterCreatePipeline => "vk_scatter_create_pipeline",
+
             VkOp::ContextPipelineCacheGetData => "vk_context_pipeline_cache_get_data",
             VkOp::ContextCreateQueryPool => "vk_context_create_query_pool",
             VkOp::ContextCreateSemaphore => "vk_context_create_semaphore",
@@ -548,6 +567,10 @@ mod tests {
         VkOp::CachesCreateSampler,
         VkOp::CachesCreateGraphicsPipelines,
         VkOp::CachesCreateComputePipelines,
+        VkOp::ScatterCreateShaderModule,
+        VkOp::ScatterCreateSetLayout,
+        VkOp::ScatterCreatePipelineLayout,
+        VkOp::ScatterCreatePipeline,
         VkOp::ContextPipelineCacheGetData,
         VkOp::ContextCreateQueryPool,
         VkOp::ContextCreateSemaphore,

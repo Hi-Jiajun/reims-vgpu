@@ -502,6 +502,24 @@ engine_counters! {
         /// window is ~507 stretches, so ~507 here means every frame took the
         /// linear path and ~1500 means none did.
         guest_write_regions,
+        /// Compute dispatches submitted by the linear path's scatter, one per
+        /// destination buffer.
+        ///
+        /// Read against `guest_write_linear`, which it equals on an ordinary
+        /// one-RAMBlock machine where every linear writeback dispatched. The
+        /// pair with `guest_write_regions` is the whole reading: a boot on the
+        /// dispatch reads ~1 region per linear writeback (the detile) and ~1
+        /// dispatch, where one on the transfer scatter reads ~507 regions and
+        /// zero.
+        guest_write_dispatches,
+        /// Linear writebacks that planned a dispatch, could not, and took the
+        /// transfer regions.
+        ///
+        /// A healthy zero. Any firing is a run whose geometry the kernel cannot
+        /// express or a window wider than the driver binds, and each one is a
+        /// whole frame on the expensive path — the fail-channel record names
+        /// which check refused.
+        guest_write_scatter_declined,
     }
 
     cumulative {

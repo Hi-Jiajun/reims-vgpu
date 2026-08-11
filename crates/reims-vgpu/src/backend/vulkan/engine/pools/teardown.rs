@@ -166,6 +166,16 @@ impl ResourcePools {
             device.destroy_fence(slot.fence, None);
         }
         self.cur = 0;
+        // After the fences above, so nothing submitted can still name it, and
+        // before the arena because its sets were allocated against this layout.
+        // Freed before the arena that owns their blocks. Anything still here was
+        // never submitted, or its fence has already retired above.
+        let owed = std::mem::take(&mut self.scatter_dsets);
+        self.desc_arena.free(device, &owed);
+        if let Some(scatter) = self.scatter.take() {
+            scatter.destroy(device);
+        }
+        self.scatter_refused = false;
         self.desc_arena.destroy(device);
         if self.cmd_pool != vk::CommandPool::null() {
             device.destroy_command_pool(self.cmd_pool, None);

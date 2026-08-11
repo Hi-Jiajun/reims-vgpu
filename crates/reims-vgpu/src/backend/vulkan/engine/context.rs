@@ -11,13 +11,13 @@ use super::device_lost::DeviceLostDecline;
 use super::init_decline::InitDecline;
 use super::types::DrawError;
 use super::vk_call::{VkCall, VkOp};
-use crate::contract::pixel_format::TexelLayout;
 use crate::backend::vulkan::caps::api_floor;
 use crate::backend::vulkan::caps::device_select::select_physical_device;
 use crate::backend::vulkan::caps::memory_topology::{
     classify_memory, select_memory_type, MappedMemoryKind, MemoryClass, MemoryRequest,
 };
 use crate::backend::vulkan::caps::{DriverQuirk, HostGpuCaps};
+use crate::contract::pixel_format::TexelLayout;
 
 /// Max device recreates **that produce no guest work between them**.
 ///
@@ -381,6 +381,15 @@ pub(crate) struct DeviceContext {
     /// which implementations may require to be component-aligned — 16 bytes is
     /// the largest component-size any vertex format has.
     pub guest_bind_offset_align: u64,
+    /// The widest span this device will bind as one storage buffer, from
+    /// `VkPhysicalDeviceLimits::maxStorageBufferRange`.
+    ///
+    /// Read rather than assumed because a guest RAMBlock is routinely wider than
+    /// it — a 16 GiB guest against a limit that is a `uint32_t` — so the
+    /// guest-scatter kernel binds a window over the block rather than the block,
+    /// and this is the bound that window is checked against. See
+    /// [`super::guest_scatter::build_run_table`].
+    pub max_storage_buffer_range: u64,
     /// Which vertex attribute formats this device accepts in a vertex buffer,
     /// probed once. Vulkan makes the three-component 8/16-bit formats optional,
     /// so a pipeline resolves each attribute through this rather than assuming
@@ -826,7 +835,8 @@ impl DeviceContext {
         // so a device that declines it is out of spec — which is exactly why the
         // answer is read from `features` rather than assumed: an assumption here
         // is a `vkWaitSemaphores` into a driver that never implemented it.
-        let stamp_completion = features.timeline_semaphore
+        let stamp_completion = features
+            .timeline_semaphore
             .then(|| super::stamp_completion::StampCompletion::start(&device))
             .transpose()
             .map_err(|e| {
@@ -963,6 +973,7 @@ impl DeviceContext {
                 .min_storage_buffer_offset_alignment
                 .max(props.limits.min_uniform_buffer_offset_alignment)
                 .max(16),
+            max_storage_buffer_range: u64::from(props.limits.max_storage_buffer_range),
             vertex_formats,
             max_sampler_anisotropy: features.max_sampler_anisotropy,
             sampler_anisotropy: features.sampler_anisotropy,
@@ -1186,7 +1197,6 @@ impl DeviceContext {
     pub(crate) fn queue(&self) -> vk::Queue {
         unsafe { self.device.get_device_queue(self.gq, 0) }
     }
-
 }
 
 /// The index of a queue family that transfers and does nothing else — a copy
@@ -1643,7 +1653,9 @@ mod pipeline_cache_blob_tests {
         // A header this device would otherwise accept, padded past the cap.
         let mut blob = Vec::with_capacity(PIPELINE_CACHE_MAX_WARM_BYTES + 1);
         blob.extend_from_slice(&(PIPELINE_CACHE_HEADER_ONE_LEN as u32).to_le_bytes());
-        blob.extend_from_slice(&(vk::PipelineCacheHeaderVersion::ONE.as_raw() as u32).to_le_bytes());
+        blob.extend_from_slice(
+            &(vk::PipelineCacheHeaderVersion::ONE.as_raw() as u32).to_le_bytes(),
+        );
         blob.extend_from_slice(&props.vendor_id.to_le_bytes());
         blob.extend_from_slice(&props.device_id.to_le_bytes());
         blob.extend_from_slice(&props.pipeline_cache_uuid);

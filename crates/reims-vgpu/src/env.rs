@@ -234,6 +234,22 @@ pub const PRESENT_DEPTH: &str = "REIMS_VGPU_PRESENT_DEPTH";
 /// rebuilding the experiment from the module doc.
 pub const SCATTER_SPLIT: &str = "REIMS_VGPU_SCATTER_SPLIT";
 
+/// `off` narrows the guest-page writeback's scatter back to one transfer region
+/// per guest run, from the compute dispatch that replaces them.
+///
+/// The dispatch writes the same guest bytes — the kernel copies `uint`s and
+/// carries no format, row or texel semantics at all — so this switch chooses
+/// between two byte-identical implementations of one copy and can never change
+/// what the guest observes. It narrows in the sense the module doc requires:
+/// the transfer form is the only form on a host without the guest-RAM import,
+/// and it stays the form for a run whose geometry the dispatch cannot express.
+///
+/// It exists because it is the A/B. The region count is measured to be ~35 % of
+/// frame time (see [`crate::runtime::render_writeback`]), and the only way to
+/// hold that number against this repair on a given host is to run the host both
+/// ways in one binary.
+pub const COMPUTE_SCATTER: &str = "REIMS_VGPU_COMPUTE_SCATTER";
+
 /// What one variable says, including the two ways it says nothing usable.
 ///
 /// Four states rather than a `bool` because "unset", "explicitly on" and
@@ -307,7 +323,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 10] = [
+pub const ALL: [&str; 11] = [
     GUEST_IMPORT,
     DRAW_LOG,
     GPU_STAMP,
@@ -318,6 +334,7 @@ pub const ALL: [&str; 10] = [
     UNUSED_BINDS,
     PRESENT_DEPTH,
     SCATTER_SPLIT,
+    COMPUTE_SCATTER,
 ];
 
 /// The state of every variable in [`ALL`], for the one-shot boot line.
@@ -483,6 +500,9 @@ mod tests {
         unsafe { std::env::set_var(GUEST_IMPORT, "disabled") };
         let line = report_line();
         unsafe { std::env::remove_var(GUEST_IMPORT) };
-        assert!(line.contains("guest_import=unrecognized(disabled)"), "{line}");
+        assert!(
+            line.contains("guest_import=unrecognized(disabled)"),
+            "{line}"
+        );
     }
 }

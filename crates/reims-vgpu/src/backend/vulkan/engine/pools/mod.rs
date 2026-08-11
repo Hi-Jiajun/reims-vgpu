@@ -392,6 +392,29 @@ pub(crate) struct ResourcePools {
     /// block on exhaustion instead of hard-failing the draw; sets are freed
     /// per entry, paired with their owning block. See [`DescriptorArena`].
     desc_arena: DescriptorArena,
+    /// The device's own guest-scatter pipeline, built on first use.
+    ///
+    /// Lazy rather than part of [`ResourcePools::ensure_init`] so a driver that
+    /// refuses our SPIR-V costs this rail its dispatch and nothing else: the
+    /// writeback falls back to the transfer regions and every other rail on the
+    /// device is untouched. See [`crate::backend::vulkan::engine::guest_scatter`].
+    scatter: Option<crate::backend::vulkan::engine::guest_scatter::ScatterPipeline>,
+    /// Whether a `scatter` build has already been tried and failed, so the
+    /// fallback costs one flag rather than a `vkCreateComputePipelines` per
+    /// writeback on a host that will never serve one.
+    scatter_refused: bool,
+    /// Descriptor sets a guest-scatter dispatch has allocated and not yet
+    /// handed to a fence.
+    ///
+    /// Held here rather than returned to the writeback because the writeback has
+    /// two seal points — its own [`ResourcePools::seal_entry`] and the
+    /// [`ResourcePools::batch_flush`] it takes when it joined an open batch —
+    /// and threading the sets through both is how one of them ends up double
+    /// -freeing or leaking. [`ResourcePools::seal_entry`] drains this, and both
+    /// paths reach it. A writeback that allocated a set and then failed before
+    /// submitting anything leaves it here for the next seal, which is correct:
+    /// no submitted command buffer ever named it, so any later fence will do.
+    scatter_dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
     /// N-deep in-flight ring: each slot is one CB + fence + the cleanup it
     /// owes. Entries rotate through slots; a slot is reused only after its
     /// fence retires (begin_entry blocks on the oldest when the ring is full).
