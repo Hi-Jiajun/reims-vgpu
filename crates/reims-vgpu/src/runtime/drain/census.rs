@@ -889,6 +889,18 @@ pub(crate) struct DrainDutyCensus {
     computes: std::sync::atomic::AtomicU64,
     flush_us: std::sync::atomic::AtomicU64,
     flushes: std::sync::atomic::AtomicU64,
+    /// The two things a tranche does after `Device::drain` returns and before
+    /// `drain_us` is taken: submit the deferred draw batch, and publish the
+    /// present boundary.
+    ///
+    /// They are inside `drain_us` and outside every `DrainPhase`, which is the
+    /// gap this pair closes. On a driven `blur=40` boot `drain_us` was 933 ms a
+    /// second against `draw_us` 604 ms — **a third of the drain worker's wall
+    /// clock named by nothing**, on the one thread every guest packet is
+    /// serialized through. The same gap is 37 % on the sustained-animation
+    /// probe, so it is not a property of one workload.
+    tail_us: std::sync::atomic::AtomicU64,
+    boundary_us: std::sync::atomic::AtomicU64,
     max_tranche_us: std::sync::atomic::AtomicU64,
     /// Longest single Flush in the window. `flush_us/flushes` is a mean, and a
     /// mean cannot tell "every flush costs 7.7 ms" from "most are free and one
@@ -1052,6 +1064,14 @@ impl DrainDutyCensus {
         self.rb_max_us[i].fetch_max(us, Relaxed);
     }
 
+    /// Attribute the tranche tail — the deferred-batch submit and the present
+    /// boundary — which sit inside `drain_us` and inside no [`DrainPhase`].
+    pub(crate) fn note_tail(&self, tail_us: u64, boundary_us: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.tail_us.fetch_add(tail_us, Relaxed);
+        self.boundary_us.fetch_add(boundary_us, Relaxed);
+    }
+
     /// Accumulate one completed tranche and return the line when a report is
     /// due. Returns the line rather than emitting it so the reporting rule is
     /// testable without a log sink: that the window resets on report (so the
@@ -1092,6 +1112,8 @@ impl DrainDutyCensus {
         let flush = self.flush_us.swap(0, Relaxed);
         let flushes = self.flushes.swap(0, Relaxed);
         let max_flush = self.max_flush_us.swap(0, Relaxed);
+        let tail = self.tail_us.swap(0, Relaxed);
+        let boundary = self.boundary_us.swap(0, Relaxed);
         let slow = self.slow_tranches.swap(0, Relaxed);
         let busy = drain.saturating_add(publish);
         let duty = busy as f64 / (win_ms as f64 * 1000.0);
@@ -1100,6 +1122,7 @@ impl DrainDutyCensus {
              duty={duty:.3} drain_us={drain} publish_us={publish} max_tranche_us={max} \
              draw_us={draw} draws={draws} compute_us={compute} computes={computes} \
              flush_us={flush} flushes={flushes} max_flush_us={max_flush} \
+             tail_us={tail} boundary_us={boundary} \
              slow_tranches={slow}/{tranches} slow_us={DRAIN_TRANCHE_SLOW_US}"
         ))
     }
@@ -1580,6 +1603,12 @@ fn list_lookup_age_route(hit: bool, us: u64) -> &'static str {
         (false, 10_000..=99_999) => "list_miss_age_under_100ms",
         (false, _) => "list_miss_age_over_100ms",
     }
+}
+
+/// Attribute the tranche tail: the deferred-batch submit and the present
+/// boundary, both inside `drain_us` and inside no [`DrainPhase`].
+pub fn note_drain_tail(tail_us: u64, boundary_us: u64) {
+    DRAIN_DUTY.note_tail(tail_us, boundary_us);
 }
 
 /// Accumulate one completed drain tranche; emits at most once per second.

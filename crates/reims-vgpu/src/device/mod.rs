@@ -567,12 +567,25 @@ pub fn device_drain(id: u64) -> bool {
     // time through every call. See `census::tranche_elapsed_us`.
     crate::runtime::drain::note_tranche_started(crate::observe::elapsed_us());
     device.drain(&mut host);
+    // The tail is timed apart from `Device::drain` because it is inside
+    // `drain_us` and inside no `DrainPhase`, and that residue is a third of the
+    // drain worker's wall clock on every workload measured — 933 ms a second of
+    // `drain_us` against 604 of `draw_us` on a driven `blur=40` boot. A gap that
+    // size on the one thread every guest packet serializes through cannot be
+    // left to inference.
+    let tail_started = std::time::Instant::now();
     // Submit any deferred draw batch before the worker sleeps: consumers
     // inside the tranche flush on their own (engine begin_entry), this bounds
     // only the idle-tail latency of the last same-target run.
     #[cfg(feature = "backend-vulkan")]
     crate::backend::vulkan::engine::flush_batched_draws();
+    let tail_us = tail_started.elapsed().as_micros() as u64;
+    let boundary_started = std::time::Instant::now();
     publish_present_boundary(&slot, device.state.present.frame_flush_seen);
+    crate::runtime::drain::note_drain_tail(
+        tail_us,
+        boundary_started.elapsed().as_micros() as u64,
+    );
     let drain_us = tranche_started.elapsed().as_micros() as u64;
     let publish_started = std::time::Instant::now();
     // Push the finished present frame to the host-owned window (if running).
