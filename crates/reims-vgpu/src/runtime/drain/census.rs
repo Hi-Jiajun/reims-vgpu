@@ -1796,6 +1796,7 @@ fn emit_engine_delta() {
          buffer_bind_reuses={} \
          buffer_snapshot_binds={} \
          guest_write_linear={} guest_write_rects={} guest_write_regions={} \
+         guest_write_dispatches={} guest_write_scatter_declined={} \
          seed_uploads={} seed_upload_bytes={} \
          ring_retire_blocks={} target_evicts={} desc_pool_grow={} gen_mismatch={}",
         d.creates,
@@ -1845,6 +1846,8 @@ fn emit_engine_delta() {
         d.guest_write_linear,
         d.guest_write_rects,
         d.guest_write_regions,
+        d.guest_write_dispatches,
+        d.guest_write_scatter_declined,
         d.seed_uploads,
         d.seed_upload_bytes,
         d.ring_retire_blocks,

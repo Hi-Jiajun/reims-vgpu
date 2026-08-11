@@ -2840,7 +2840,7 @@ unsafe fn plan_guest_scatter_dispatches(
     dst: &GuestPageTarget,
     scratch: &pools::BufferSlot,
 ) -> Result<Option<Vec<ScatterGroup>>, DrawError> {
-    use guest_scatter::{build_run_table, ScatterRun};
+    use guest_scatter::{build_run_tables, ScatterRun};
     use host_ram::GuestWriteDecline;
     let Some(pipeline) = (unsafe { pools.scatter_pipeline(ctx) }) else {
         return Ok(None);
@@ -2866,7 +2866,7 @@ unsafe fn plan_guest_scatter_dispatches(
     // sitting on the pools for a dispatch that will not be recorded.
     let mut tables = Vec::with_capacity(grouped.len());
     for (buffer, runs) in &grouped {
-        match build_run_table(
+        match build_run_tables(
             runs,
             ctx.guest_bind_offset_align,
             ctx.max_storage_buffer_range,
@@ -2876,7 +2876,7 @@ unsafe fn plan_guest_scatter_dispatches(
             // what the detile actually wrote rather than merely past the slot.
             dst.window_bytes(),
         ) {
-            Ok(table) => tables.push((*buffer, table)),
+            Ok(built) => tables.extend(built.into_iter().map(|t| (*buffer, t))),
             Err(decline) => {
                 counters
                     .guest_write_scatter_declined

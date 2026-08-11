@@ -31,7 +31,7 @@
 //!
 //! `Dst` is bound at an **offset**, never at zero. A word index into a whole
 //! RAMBlock does not fit a `uint`: a 16 GiB guest is exactly 2^32 words, and
-//! `vm/boot-x86.sh` runs `-m 16G`. [`build_run_table`] binds the smallest
+//! `vm/boot-x86.sh` runs `-m 16G`. [`build_run_tables`] binds the smallest
 //! alignment-respecting window covering the writeback's own destinations and
 //! makes every index relative to that base, which is single-digit MiB wide.
 //!
@@ -161,8 +161,8 @@ pub(crate) struct RunTable {
     pub run_count: u32,
 }
 
-/// Turn one destination buffer's runs into a word-indexed table and the window
-/// to bind it against.
+/// Turn one destination buffer's runs into word-indexed tables and the windows
+/// to bind them against — one table per dispatch.
 ///
 /// Pure, so it is testable on every arm including the one with no GPU — which
 /// matters more here than usual, because every failure mode of this arithmetic
@@ -170,20 +170,31 @@ pub(crate) struct RunTable {
 ///
 /// `bind_align` is the device's storage-buffer offset alignment
 /// ([`DeviceContext::guest_bind_offset_align`]) and `max_range` its
-/// `maxStorageBufferRange`. `src_have` is the detiled scratch's size.
-pub(crate) fn build_run_table(
+/// `maxStorageBufferRange`. `src_have` is what the detile actually wrote.
+///
+/// # Why this returns a list and not one table
+///
+/// One writeback's runs routinely span more than `maxStorageBufferRange`, which
+/// is a `uint32_t` and so at most 4 GiB, against the 16 GiB `vm/boot-x86.sh`
+/// gives the guest. The guest's allocator hands out 16 KiB granules from
+/// wherever it has them, so a single 1080p surface's pages can sit either side
+/// of a 4 GiB boundary — a **driven macos-13 boot measured this on 6 % of its
+/// writebacks**, each of which then fell back to ~200 transfer regions.
+///
+/// So the span is partitioned rather than refused: the runs are swept in
+/// destination order and closed into a new window whenever the next one would
+/// not fit. The cost is one extra dispatch and one extra descriptor set at each
+/// boundary, against the ~200 regions the fallback cost. A single run wider than
+/// `max_range` still refuses, because no partition can help it.
+pub(crate) fn build_run_tables(
     runs: &[ScatterRun],
     bind_align: u64,
     max_range: u64,
     src_have: u64,
-) -> Result<RunTable, ScatterDecline> {
-    let Some(first) = runs.first() else {
+) -> Result<Vec<RunTable>, ScatterDecline> {
+    if runs.is_empty() {
         return Err(ScatterDecline::Empty);
-    };
-    // Two passes rather than one, because the bind offset is a property of the
-    // whole set and every index is relative to it.
-    let mut lo = first.dst;
-    let mut hi = 0u64;
+    }
     for run in runs {
         if run.src % SCATTER_WORD != 0 || run.dst % SCATTER_WORD != 0 || run.len % SCATTER_WORD != 0
         {
@@ -200,39 +211,67 @@ pub(crate) fn build_run_table(
                 have: src_have,
             });
         }
-        lo = lo.min(run.dst);
-        hi = hi.max(run.dst.saturating_add(run.len));
     }
-    // `bind_align` is at least 16 and always a power of two, so the rounded-down
-    // base stays a whole number of words and every relative index stays exact.
-    let bind_offset = lo - lo % bind_align.max(1);
-    let bind_range = hi - bind_offset;
-    // Checked here and not at the descriptor write, because a range the driver
-    // refuses and a range whose word index does not fit a `uint` are the same
-    // bound: `maxStorageBufferRange` is a `uint32_t`, so a range that passes
-    // this cannot produce an index above `u32::MAX / 4`.
-    if bind_range > max_range {
-        return Err(ScatterDecline::RangeTooWide {
-            range: bind_range,
-            max: max_range,
-        });
-    }
-    let mut words = Vec::with_capacity(runs.len() * WORDS_PER_RUN);
-    for run in runs {
-        // Every one of these divisions is exact and every result is bounded by a
-        // check above, so the truncating casts cannot lose a bit.
+    // Destination order, which is not the order the guest's page plan hands them
+    // over — that is window order. The sweep below needs the former and the
+    // dispatch does not care about either, because every run carries its own two
+    // indices.
+    let mut order: Vec<&ScatterRun> = runs.iter().collect();
+    order.sort_unstable_by_key(|r| r.dst);
+
+    let align = bind_align.max(1);
+    let mut tables: Vec<RunTable> = Vec::new();
+    let mut open: Option<(u64, Vec<u32>, u64)> = None;
+    for run in order {
+        let end = run.dst.saturating_add(run.len);
+        // `align` is at least 16 and always a power of two, so the rounded-down
+        // base stays a whole number of words and every relative index is exact.
+        let fresh_base = run.dst - run.dst % align;
+        if end - fresh_base > max_range {
+            // Not a partitioning problem: no base this run can be indexed from
+            // brings its own end inside the bound.
+            return Err(ScatterDecline::RangeTooWide {
+                range: end - fresh_base,
+                max: max_range,
+            });
+        }
+        let base = match &open {
+            Some((base, _, _)) if end - *base <= max_range => *base,
+            Some(_) => {
+                // Closing here and not at the top of the next iteration, so a
+                // window is emitted exactly once and the `open` slot never holds
+                // two.
+                let (base, words, hi) = open.take().expect("just matched Some");
+                tables.push(finish_table(base, words, hi)?);
+                fresh_base
+            }
+            None => fresh_base,
+        };
+        let (_, words, hi) = open.get_or_insert_with(|| (base, Vec::new(), 0));
+        // Every one of these divisions is exact and every result is bounded by
+        // the `max_range` check above, so the truncating casts cannot lose a bit.
         words.push((run.src / SCATTER_WORD) as u32);
-        words.push(((run.dst - bind_offset) / SCATTER_WORD) as u32);
+        words.push(((run.dst - base) / SCATTER_WORD) as u32);
         words.push((run.len / SCATTER_WORD) as u32);
         words.push(0);
+        *hi = (*hi).max(end);
     }
-    let run_count = u32::try_from(runs.len()).map_err(|_| ScatterDecline::RangeTooWide {
-        range: runs.len() as u64,
-        max: u64::from(u32::MAX),
-    })?;
+    if let Some((base, words, hi)) = open.take() {
+        tables.push(finish_table(base, words, hi)?);
+    }
+    Ok(tables)
+}
+
+/// Close one window into a table, once no further run will join it.
+fn finish_table(bind_offset: u64, words: Vec<u32>, hi: u64) -> Result<RunTable, ScatterDecline> {
+    let run_count =
+        u32::try_from(words.len() / WORDS_PER_RUN).map_err(|_| ScatterDecline::RangeTooWide {
+            range: (words.len() / WORDS_PER_RUN) as u64,
+            max: u64::from(u32::MAX),
+        })?;
     Ok(RunTable {
         bind_offset,
-        bind_range,
+        bind_range: hi - bind_offset,
         words,
         run_count,
     })
@@ -457,6 +496,12 @@ mod tests {
         ScatterRun { src, dst, len }
     }
 
+    /// The single table a set of runs that fits one window must produce.
+    fn one(mut tables: Vec<RunTable>) -> RunTable {
+        assert_eq!(tables.len(), 1, "these runs fit one bound window");
+        tables.remove(0)
+    }
+
     /// The whole point of the offset bind: a destination at the top of a 16 GiB
     /// RAMBlock still produces small indices, where an index from zero would
     /// have overflowed a `uint`.
@@ -468,13 +513,15 @@ mod tests {
     #[test]
     fn indices_are_relative_to_the_bound_window_not_to_the_buffer() {
         let high = 16 * 1024 * 1024 * 1024u64;
-        let t = build_run_table(
+        let mut t = build_run_tables(
             &[run(0, high, 16384), run(16384, high + 65536, 16384)],
             ALIGN,
             MAX,
             1 << 20,
         )
         .expect("aligned runs plan");
+        assert_eq!(t.len(), 1, "one window covers both");
+        let t = t.remove(0);
         assert_eq!(t.bind_offset, high, "already aligned, so bound where it is");
         assert_eq!(t.bind_range, 65536 + 16384);
         assert_eq!(t.run_count, 2);
@@ -486,7 +533,7 @@ mod tests {
 
     /// The bound the driver states is a `uint32_t`, so a range that passes it
     /// can never produce a word index that does not fit a `uint` — which is why
-    /// [`build_run_table`] carries one check and not two.
+    /// [`build_run_tables`] carries one check and not two.
     #[test]
     fn a_range_the_driver_admits_always_has_a_word_index_that_fits() {
         assert!(u64::from(u32::MAX) / SCATTER_WORD <= u64::from(u32::MAX));
@@ -494,7 +541,7 @@ mod tests {
 
     #[test]
     fn the_bind_offset_rounds_down_to_the_alignment_and_indices_absorb_it() {
-        let t = build_run_table(&[run(0, 1000, 8)], 16, MAX, 1 << 20).expect("plan");
+        let t = one(build_run_tables(&[run(0, 1000, 8)], 16, MAX, 1 << 20).expect("plan"));
         assert_eq!(t.bind_offset, 992, "1000 rounded down to a multiple of 16");
         assert_eq!(t.bind_range, 1008 - 992);
         // The 8 bytes the rounding put in front become 2 words of index.
@@ -506,24 +553,76 @@ mod tests {
     #[test]
     fn a_run_that_is_not_a_whole_number_of_words_is_refused() {
         for bad in [run(1, 64, 16), run(0, 65, 16), run(0, 64, 15)] {
-            let err = build_run_table(&[bad], ALIGN, MAX, 1 << 20)
+            let err = build_run_tables(&[bad], ALIGN, MAX, 1 << 20)
                 .expect_err("a sub-word run must not plan");
             assert!(matches!(err, ScatterDecline::Unaligned { .. }), "{err:?}");
         }
     }
 
+    /// A span wider than the driver binds splits into two dispatches rather than
+    /// falling back to ~200 transfer regions.
+    ///
+    /// This is not a corner: `maxStorageBufferRange` is a `uint32_t` and the
+    /// guest gets 16 GiB, and a driven macos-13 boot straddled the boundary on
+    /// 6 % of its writebacks.
     #[test]
-    fn a_window_wider_than_the_driver_binds_is_refused() {
-        // Word-aligned, so the refusal is the range and not the alignment: two
-        // runs 4 GiB apart in one RAMBlock, which is what a guest larger than
-        // `maxStorageBufferRange` produces the moment its window straddles.
+    fn a_span_wider_than_the_driver_binds_splits_into_two_windows() {
         let far = 4 * 1024 * 1024 * 1024u64;
-        let err = build_run_table(&[run(0, 0, 16), run(0, far, 16)], ALIGN, MAX, 1 << 20)
-            .expect_err("a range past maxStorageBufferRange must not plan");
+        let tables = build_run_tables(&[run(0, 0, 16), run(16, far, 16)], ALIGN, MAX, 1 << 20)
+            .expect("a straddling span partitions rather than refusing");
+        assert_eq!(tables.len(), 2, "one window either side of the bound");
+        assert_eq!(tables[0].bind_offset, 0);
+        assert_eq!(tables[1].bind_offset, far);
+        for t in &tables {
+            assert_eq!(t.run_count, 1);
+            assert!(t.bind_range <= MAX, "each window is inside the bound");
+            // Index zero in its own window, which is the whole point of a base.
+            assert_eq!(t.words[1], 0);
+        }
+        // The source words are preserved across the split, so no run lost its
+        // half of the copy.
+        assert_eq!(tables[0].words[0], 0);
+        assert_eq!(tables[1].words[0], 4);
+    }
+
+    /// A single run no base can bring inside the bound is a refusal, because no
+    /// partition can help it.
+    #[test]
+    fn one_run_wider_than_the_driver_binds_is_refused() {
+        // Word-aligned, so the refusal is the range and not the alignment.
+        let err = build_run_tables(&[run(0, 0, MAX + 1 + 16)], ALIGN, MAX, u64::MAX)
+            .expect_err("a run past maxStorageBufferRange must not plan");
         assert!(
             matches!(err, ScatterDecline::RangeTooWide { .. }),
             "{err:?}"
         );
+    }
+
+    /// Every run must land in exactly one window, and the windows must tile the
+    /// runs — a sweep that dropped the last open window, or emitted one twice,
+    /// loses or duplicates guest bytes and nothing downstream could tell.
+    #[test]
+    fn a_partitioned_sweep_places_every_run_exactly_once() {
+        let step = 3 * 1024 * 1024 * 1024u64;
+        let runs: Vec<_> = (0..5u64).map(|i| run(i * 16, i * step, 16)).collect();
+        let tables = build_run_tables(&runs, ALIGN, MAX, 1 << 20).expect("plan");
+        assert!(tables.len() > 1, "5 runs 3 GiB apart cannot be one window");
+        let placed: u32 = tables.iter().map(|t| t.run_count).sum();
+        assert_eq!(placed as usize, runs.len(), "every run placed once");
+        // Reconstruct each run's absolute destination from its window and check
+        // the set matches, which catches a run rebased against the wrong base.
+        let mut seen: Vec<u64> = tables
+            .iter()
+            .flat_map(|t| {
+                t.words
+                    .chunks_exact(WORDS_PER_RUN)
+                    .map(move |w| t.bind_offset + u64::from(w[1]) * SCATTER_WORD)
+            })
+            .collect();
+        seen.sort_unstable();
+        let mut want: Vec<u64> = runs.iter().map(|r| r.dst).collect();
+        want.sort_unstable();
+        assert_eq!(seen, want);
     }
 
     /// The scratch bound is checked from this side because the descriptor's own
@@ -531,7 +630,7 @@ mod tests {
     /// defined-but-wrong words and scatters them into the guest.
     #[test]
     fn a_run_reading_past_the_scratch_is_refused() {
-        let err = build_run_table(&[run(4096, 0, 4096)], ALIGN, MAX, 4096)
+        let err = build_run_tables(&[run(4096, 0, 4096)], ALIGN, MAX, 4096)
             .expect_err("a run past the scratch must not plan");
         assert!(
             matches!(err, ScatterDecline::SourceOverrun { .. }),
@@ -542,7 +641,7 @@ mod tests {
     #[test]
     fn no_runs_is_refused_rather_than_dispatched_empty() {
         assert_eq!(
-            build_run_table(&[], ALIGN, MAX, 1 << 20),
+            build_run_tables(&[], ALIGN, MAX, 1 << 20),
             Err(ScatterDecline::Empty)
         );
     }
@@ -550,18 +649,30 @@ mod tests {
     /// The table's words are what the guest's pages end up holding, so the
     /// mapping from run to `uvec4` is asserted directly rather than through the
     /// two properties above.
+    ///
+    /// The table is in **destination** order, which is not the order the runs
+    /// arrive in — the sweep that partitions wide spans needs that ordering, and
+    /// the dispatch does not care because every run carries both its indices.
     #[test]
-    fn every_run_becomes_four_words_in_order() {
+    fn every_run_becomes_four_words_carrying_its_own_two_indices() {
         let runs = [run(0, 4096, 64), run(64, 8192, 128), run(192, 100, 32)];
-        let t = build_run_table(&runs, ALIGN, MAX, 1 << 20).expect("plan");
+        let t = one(build_run_tables(&runs, ALIGN, MAX, 1 << 20).expect("plan"));
         assert_eq!(t.words.len(), runs.len() * WORDS_PER_RUN);
         assert_eq!(t.run_count as usize, runs.len());
-        for (i, r) in runs.iter().enumerate() {
-            let w = &t.words[i * WORDS_PER_RUN..][..WORDS_PER_RUN];
-            assert_eq!(u64::from(w[0]) * SCATTER_WORD, r.src);
-            assert_eq!(u64::from(w[1]) * SCATTER_WORD + t.bind_offset, r.dst);
-            assert_eq!(u64::from(w[2]) * SCATTER_WORD, r.len);
-        }
+        let mut want: Vec<_> = runs.iter().map(|r| (r.dst, r.src, r.len)).collect();
+        want.sort_unstable();
+        let got: Vec<_> = t
+            .words
+            .chunks_exact(WORDS_PER_RUN)
+            .map(|w| {
+                (
+                    t.bind_offset + u64::from(w[1]) * SCATTER_WORD,
+                    u64::from(w[0]) * SCATTER_WORD,
+                    u64::from(w[2]) * SCATTER_WORD,
+                )
+            })
+            .collect();
+        assert_eq!(got, want, "each run's own (dst, src, len), in dst order");
     }
 
     /// The bound window has to cover every run, including one whose destination
@@ -569,13 +680,15 @@ mod tests {
     /// arrive in window order, which is not destination order.
     #[test]
     fn the_bound_window_covers_runs_arriving_out_of_destination_order() {
-        let t = build_run_table(
-            &[run(0, 8192, 16), run(16, 128, 16), run(32, 4096, 16)],
-            ALIGN,
-            MAX,
-            1 << 20,
-        )
-        .expect("plan");
+        let t = one(
+            build_run_tables(
+                &[run(0, 8192, 16), run(16, 128, 16), run(32, 4096, 16)],
+                ALIGN,
+                MAX,
+                1 << 20,
+            )
+            .expect("plan"),
+        );
         assert_eq!(t.bind_offset, 128, "the lowest destination, aligned down");
         assert_eq!(t.bind_range, 8192 + 16 - 128, "up to the highest end");
         for i in 0..3 {
