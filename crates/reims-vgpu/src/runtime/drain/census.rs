@@ -199,6 +199,34 @@ const VBL_REPORT_EVERY: u64 = 1024;
 /// one this device owns through an offline/online cycle — would set
 /// `fRefreshPeriod` on every boot and take the good 70 % down to 60 Hz.
 ///
+/// # "Work-limited" is measured, and it makes the frame rate this device's score
+///
+/// The free-running branch above is the useful one to optimise against, because
+/// *work-limited* there is a measured claim rather than a reading of the code.
+/// The twenty-four-boot run whose latch result appears above also moved this
+/// device's per-draw cost by a known amount, so scoring its **fast boots only**
+/// says what a per-draw saving is worth in frames:
+///
+/// ```text
+/// arm                          n fast   present_hz mean (range)   us/draw mean (range)
+/// shipping                          5   113.2  (109.8-116.3)      13.21  (12.66-14.02)
+/// 20.6 % more GPU work per draw     9   105.5  (101.4-107.7)      15.07  (13.92-16.16)
+/// ```
+///
+/// The frame rates are **disjoint** — the slowest shipping boot beats the fastest
+/// slowed one — while `us/draw` overlaps across the same fourteen boots. Two
+/// things follow, and the second is the one that changes what to do:
+///
+/// - a free-running guest converts device work into frames at roughly **0.35
+///   frames per unit of per-draw GPU work**, so a candidate worth under ~5 % per
+///   draw is not worth a boot chain here;
+/// - `present_hz` over the fast population is a *sharper* instrument than
+///   `us/draw`, not a noisier one, and it is the number to rank a change by.
+///
+/// That also settles the standing puzzle of per-draw wins that "bought no
+/// frames": they were measured through a presenter that clamped at ~41 Hz. It
+/// does not clamp now, and the frames are there.
+///
 /// # What this closes
 ///
 /// Not the limiter (~118 Hz on every boot, fast or slow), not the claim ordering

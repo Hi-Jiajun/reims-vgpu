@@ -607,8 +607,29 @@ frames raises *both*. Always quote them together:
   again. Check `busy_fence` and `busy_acquire`; on the shipping depth they are 0.
 - neither moved — the change bought no frames, whatever else it bought.
 
-`drain_duty draws` and anything normalized per draw stay the right way to rank a
-change that is about per-draw cost rather than about frames.
+**In the fast population `present_hz` is the score, and it is sharper than
+`us/draw`.** A fast-latching macos-13 guest free-runs on a zero frame period, so
+its rate is *work-limited*: whatever this device stops doing per draw, the guest
+spends on more frames. Twenty-four interleaved boots pushed the device 20.6 %
+the wrong way (`REIMS_VGPU_COMPUTE_GATHER=off`), scored over their fast boots
+only:
+
+| arm | n fast | `present_hz` mean (range) | `us/draw` mean (range) |
+|---|---|---|---|
+| shipping | 5 | **113.2** (109.8-116.3) | 13.21 (12.66-14.02) |
+| 20.6 % more GPU work/draw | 9 | **105.5** (101.4-107.7) | 15.07 (13.92-16.16) |
+
+The `present_hz` arms are **disjoint** — the slowest shipping boot beats the
+fastest slowed one — while `us/draw` *overlaps* on the same fourteen boots. So
+the frame rate is the more sensitive instrument of the two, not the noisier one,
+and a per-draw saving that cannot be seen in `present_hz` over five fast boots an
+arm is smaller than it looks. Elasticity for sizing a candidate: about **0.35
+frames per unit of per-draw GPU work**, so a 10 % per-draw saving is worth
+looking for and a 2 % one is not measurable here.
+
+`drain_duty draws` and anything normalized per draw stay the right way to
+*attribute* a change — which phase paid — but they are no longer the way to rank
+one.
 
 **Quote the presents, never the drop percentage.** This survives the fix and is
 the trap that cost a session a wrong call. With a *clamped* presenter the drop
