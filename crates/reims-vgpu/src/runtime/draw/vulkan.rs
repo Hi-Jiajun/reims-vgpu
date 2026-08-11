@@ -2868,6 +2868,46 @@ fn bound_buffer_content(
 /// 512), so that condition is rarely met and the rail is close to inert — which
 /// is the honest outcome, not a bug to tune around. On the CPU read the cap is
 /// free: that bind was reading the whole window uncached either way.
+/// Charge one bind that took the gather rail to the extent-headroom split: how
+/// many of the bytes this rail is about to move a declared object size would
+/// have removed.
+///
+/// # The question two prior measurements leave open
+///
+/// `try_buffer_zero_copy_resolved`'s doc puts 67.5 % of a boot's gathered bytes
+/// on vertex-stage constant buffers that no vertex descriptor bounds, and says
+/// the way to reopen them is for the translator to answer whether the bind is a
+/// bounded reference or an indexable pointer. **It now answers.** A driven
+/// macos-13 boot at the current pin reads `bext_unknown=0` against
+/// `bext_object=1 179 068` — and every one of those objects is small, 601 826 at
+/// 64 bytes or under and 577 143 between 65 and 512.
+///
+/// `load_buffer_content`'s own doc measured the other side: applying the cap
+/// everywhere saved **2.2 GB a run** and cost half the held resolutions, for no
+/// change in `draw_us/draw`. Both cannot be true of one workload. 2.2 GB a run
+/// is ~2 % of what this rail moves, and 67.5 % of the bytes sitting behind caps
+/// of 512 bytes or less would be nearly all of it.
+///
+/// So this counts the bytes rather than arguing about them, without changing
+/// what any bind does. `bext_would_save_bytes` against `gather_bytes` is the
+/// whole answer, and `bext_capped_span_bytes` beside `bext_uncapped_span_bytes`
+/// says how much of the traffic even has a cap to apply.
+///
+/// The other reason to re-ask: that 2.2 GB was ranked on `draw_us/draw`, a CPU
+/// wall clock, before this device could time the GPU. The gather is a PCIe copy
+/// and about 55 % of all GPU time here, and no CPU counter was ever going to
+/// see it.
+fn note_extent_headroom(extent_cap: Option<u64>, span: u64) {
+    let Some(cap) = extent_cap else {
+        crate::runtime::drain::note_store_route_n("bext_uncapped_span_bytes", span);
+        return;
+    };
+    crate::runtime::drain::note_store_route_n("bext_capped_span_bytes", span);
+    if cap < span {
+        crate::runtime::drain::note_store_route_n("bext_would_save_bytes", span - cap);
+    }
+}
+
 fn load_buffer_content<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2893,6 +2933,7 @@ fn load_buffer_content<M: HostMemory + HostOps>(
         {
             let content = bound_buffer_content(bound);
             crate::runtime::drain::note_store_route("zc_buffer_held");
+            note_extent_headroom(extent_cap, bound.span);
             note_gather_freshness(state, task_id, buffer_ref, offset, gather_cap, bound);
             return Some(content);
         }
@@ -2908,6 +2949,7 @@ fn load_buffer_content<M: HostMemory + HostOps>(
         {
             let content = bound_buffer_content(&bound);
             // Before the insert, which takes `state` mutably and moves `bound`.
+            note_extent_headroom(extent_cap, bound.span);
             note_gather_freshness(state, task_id, buffer_ref, offset, gather_cap, &bound);
             state
                 .bound_buffers

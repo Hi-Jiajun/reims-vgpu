@@ -96,8 +96,21 @@
 /// cannot test and it is written here so an operator on an iGPU knows there is a
 /// second arm worth two boots.
 ///
-/// One matched pair, one rail, one regime. The unmatched boots are not quoted
-/// because `fresh` is not comparable across compositing regimes.
+/// One matched pair for the frame rate; the per-draw GPU cost has since
+/// replicated across **four boots an arm and three compositing regimes**, and the
+/// arms do not come close to touching:
+///
+/// ```text
+/// import off   6.89  6.04  6.61  6.60
+/// import on   15.37 13.72 13.84 16.03  (and 14.90, 15.26, 15.85, 13.94)
+/// ```
+///
+/// Drain duty runs 0.66-0.82 on the copying arm against 0.36-0.64 on the import
+/// arm, which is the same trade seen from the other side: the worker pays what
+/// the GPU does not.
+///
+/// The frame-rate half stays a single matched pair, because `fresh` is not
+/// comparable across compositing regimes and only one pair matched.
 pub const GUEST_IMPORT: &str = "REIMS_VGPU_GUEST_IMPORT";
 
 /// Verbose per-draw logging on top of the always-on fail sink.
