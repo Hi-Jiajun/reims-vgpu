@@ -264,22 +264,58 @@ pub const COMPUTE_SCATTER: &str = "REIMS_VGPU_COMPUTE_SCATTER";
 /// binary that can be run both ways against that guest.
 pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 
-/// `off` narrows the draw-time guest buffer gather back to one transfer region
-/// per guest run, from the compute dispatch that replaces them.
+/// `on` issues the draw-time guest buffer gather as one compute dispatch per
+/// gathered window instead of one transfer region per guest run.
 ///
 /// The gather direction of what [`COMPUTE_SCATTER`] does for the writeback, and
-/// it narrows for the same reasons. The dispatch moves the same bytes into the
-/// same device-local slot — the kernel copies `uint`s and carries no format,
-/// row or direction semantics at all — so this switch chooses between two
-/// byte-identical implementations of one copy and can never change what the
-/// guest observes. The transfer form is the only form on a host without the
-/// guest-RAM import, and it stays the form for a window whose runs the dispatch
-/// cannot express.
+/// byte-identical for the same reason: the kernel copies `uint`s and carries no
+/// format, row or direction semantics at all, and the run table is built from
+/// the very `VkBufferCopy` regions the transfer form would have issued. So this
+/// chooses between two implementations of one copy and can never change what
+/// the guest observes.
 ///
-/// It exists because it is the A/B. The buffer gather issues ~427 000 transfer
-/// regions a second on a driven macos-13 boot, against the ~200 per writeback
-/// the scatter removed for +48 % frames, and the only way to hold that against
-/// this repair on a given host is to run the host both ways in one binary.
+/// # It is default **off**, and this is the measurement that says so
+///
+/// Ten driven macos-13 sustained-animation boots. Comparing only the four that
+/// landed in the same compositing sub-regime (draws/frame ~351, so like for
+/// like), the dispatch does exactly what it was built to do to the GPU and more
+/// than that to the CPU:
+///
+/// ```text
+///                     on (n=2)        off (n=2)
+/// slot_us          48 838 / 62 875  124 703 / 130 423   -56 %  GPU blocking
+/// ring_retire_blocks          260              502      -48 %
+/// record_us        91 961 / 93 106   49 458 /  50 562   +85 %  CPU recording
+/// descriptors_us   10 387 /  9 109    6 796 /   6 757   +45 %
+/// frames/s          74.68 /  75.64    76.04 /   76.12    -1.4 %
+/// ```
+///
+/// So the mechanism works — halving the blocking on a rail this device is
+/// **GPU-bound** on is exactly the lever — and the implementation gives it all
+/// back. The reason is the count: ~40 000 dispatches a second, one per gathered
+/// window, each paying an `acquire_staging` for its run table, a
+/// `write_staging`, a descriptor-set allocation and an `update_descriptor_sets`.
+/// The writeback's scatter issues ~1 900 a second and does not notice any of
+/// that.
+///
+/// # The one change that would flip it
+///
+/// Give a command buffer's gather destinations one arena buffer instead of one
+/// pooled slot each. Then a single dispatch covers every gather in the command
+/// buffer — `batch_flushes` is ~2 200/s against ~34 000 gathers — with `Dst`
+/// bound over the arena and each run's destination index absolute in it. That
+/// takes the dispatch count, the staging acquisitions and the descriptor sets
+/// all down by the same ~18x, against a GPU saving already measured at 56 %.
+/// It needs `BoundBuffer` to carry a suballocation offset, which is why it is
+/// not in the same change as this.
+///
+/// Until then the switch is a permission rather than a refusal, which is the
+/// one place this module's own rule is bent. It is bent knowingly: that rule is
+/// about **host capability** — binding an unadvertised extension crashes and
+/// importing an undeclared handle is undefined behaviour — and neither arm here
+/// asks the host for anything the other does not. What differs is only which of
+/// two byte-identical copies runs, and the default is the one that measured
+/// faster.
 pub const COMPUTE_GATHER: &str = "REIMS_VGPU_COMPUTE_GATHER";
 
 /// What one variable says, including the two ways it says nothing usable.

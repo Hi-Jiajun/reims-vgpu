@@ -89,13 +89,16 @@ struct GatherDispatch {
     run_count: u32,
 }
 
-/// Whether the compute gather is on. See [`crate::env::COMPUTE_GATHER`].
+/// Whether the compute gather is on. **Default off** — it halves this rail's
+/// GPU cost and spends more than that on the CPU getting there. See
+/// [`crate::env::COMPUTE_GATHER`] for the boots that put it there and for the
+/// one change that would flip it.
 fn compute_gather_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        !matches!(
+        matches!(
             crate::env::read(crate::env::COMPUTE_GATHER).0,
-            crate::env::Switch::Off
+            crate::env::Switch::On
         )
     })
 }
