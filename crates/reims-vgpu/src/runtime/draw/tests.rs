@@ -2904,6 +2904,92 @@ fn view_format_reinterprets_bgra_storage_as_rgba() {
     assert_eq!(out, [10, 20, 30, 40]);
 }
 
+/// A solid landing puts the same bytes in the guest's pages as the full-image
+/// one it replaced.
+///
+/// The repeated-row writer converts once and copies that conversion to every
+/// destination row, where the full-image writer converted each of its identical
+/// rows. Those are two spellings of one result and this asserts they agree, over
+/// a destination whose row stride is wider than its tight row — the case where a
+/// stride mistake in the repeated path would write the right bytes to the wrong
+/// offsets and a tight-stride test would not see it.
+///
+/// Fails without the change only in the direction that matters: it is the
+/// equivalence, not the speed, that a future edit to `SourceRows` could break.
+#[test]
+fn a_solid_gva_landing_matches_the_full_image_landing_it_replaced() {
+    use crate::contract::endian::st32;
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::contract::pixel_format::{solid_rgba8, MTL_FORMAT_BGRA8_UNORM};
+    use crate::runtime::host::FakeHost;
+
+    // Two identical guests, so the two writers land into two byte-for-byte
+    // equal address spaces and the comparison is of the writes alone.
+    fn guest(page_shift: u32) -> (FakeHost, DeviceState) {
+        let mut host = FakeHost::new();
+        let dir_gpa = 2u64 << page_shift;
+        let root_gpa = 3u64 << page_shift;
+        host.map_range(dir_gpa, 0x20, 0);
+        host.map_range(root_gpa, 1 << page_shift, 0);
+        // Eight data pages, contiguous, so the destination span resolves whole.
+        for p in 0..8u64 {
+            host.map_range((5 + p) << page_shift, 1 << page_shift, 0);
+        }
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        let _ = host.write_gpa(dir_gpa, &d);
+        for p in 0..8u64 {
+            st32(&mut d[..4], (5 + p) as u32);
+            let _ = host.write_gpa(root_gpa + (1 + p) * 4, &d[..4]);
+        }
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        state.page_shift = page_shift;
+        state.define_task(1, 0x1000, 2);
+        (host, state)
+    }
+
+    let page_shift = PAGE_SHIFT_X86;
+    let gva = 1u64 << page_shift;
+    let (w, h) = (7u32, 5u32);
+    let bpr = 64u32; // wider than the 28-byte tight row, on purpose
+    let clear = [0.2_f64, 0.4, 0.6, 1.0];
+
+    let (mut h1, mut s1) = guest(page_shift);
+    assert!(
+        write_gva_solid8(&mut s1, &mut h1, 1, gva, w, h, bpr, MTL_FORMAT_BGRA8_UNORM, &clear)
+            .is_ok(),
+        "the solid landing must succeed"
+    );
+
+    let (mut h2, mut s2) = guest(page_shift);
+    let full = solid_rgba8(w, h, &clear);
+    assert!(
+        write_gva_rgba8(
+            &mut s2,
+            &mut h2,
+            1,
+            gva,
+            w,
+            h,
+            bpr,
+            MTL_FORMAT_BGRA8_UNORM,
+            &full
+        )
+        .is_ok(),
+        "the full-image landing must succeed"
+    );
+
+    let span = (h as usize) * (bpr as usize);
+    let mut a = vec![0u8; span];
+    let mut b = vec![0u8; span];
+    assert!(gva_mem::read_task_gva(&h1, &s1.tasks[1], gva, &mut a, page_shift).is_ok());
+    assert!(gva_mem::read_task_gva(&h2, &s2.tasks[1], gva, &mut b, page_shift).is_ok());
+    assert_eq!(a, b, "the two landings must be byte-identical");
+    // …and not both empty, which would make the assertion above vacuous.
+    assert!(a.iter().any(|&x| x != 0), "the landing wrote something");
+}
+
 /// Regression: type-2/3 GVA Stores must walk with device page_shift (x86=12).
 /// Using the arm64e-default fallback made every `linux_m2v_store gva=… ok=0`
 /// on Ventura/Tahoe x86 product boots.

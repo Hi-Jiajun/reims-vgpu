@@ -118,12 +118,11 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             if c.width == 0 || c.height == 0 {
                 continue;
             }
-            // Only the first attachment's RGBA copy is ever read again — it is
-            // this chain's `color0_rgba` — so the other attachments' seeds are
-            // built straight into the order their destination wants and never
-            // exist in any other one.
-            let want_rgba = i == 0 || c.target_gva != 0;
-            let rgba = want_rgba.then(|| solid_rgba8(c.width, c.height, &c.clear_color));
+            // The only reader of a full-surface RGBA copy is this chain's
+            // `color0_rgba`. Neither writer below takes one — the GVA landing
+            // repeats a single row and the type-11 landing builds its own image
+            // in the mapping's order — so no other attachment materialises one.
+            let rgba = (i == 0).then(|| solid_rgba8(c.width, c.height, &c.clear_color));
             // Which branch this loop actually takes, how many bytes it lands and
             // what the landing costs. `prep_seed_us` is 8.6 µs of a 41 µs chain
             // on the `blur=40` dial and rebuilding the images without their two
@@ -137,8 +136,11 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 let _span = StoreCostSpan::new("clear_seed_gva_us");
                 crate::runtime::drain::note_store_route("clear_seed_gva");
                 crate::runtime::drain::note_store_route_n("clear_seed_gva_kb", seed_kb);
-                let rgba = rgba.as_ref().expect("built for every GVA target above");
-                write_gva_rgba8(
+                // A solid landing, so the writer converts one row rather than
+                // this surface's thousand identical ones. The full RGBA image
+                // above is built for `color0_rgba` and is not this write's
+                // source.
+                write_gva_solid8(
                     state,
                     host,
                     req.task_id,
@@ -147,7 +149,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     c.height,
                     c.row_stride,
                     c.format,
-                    rgba,
+                    &c.clear_color,
                 )
                 .is_ok()
             } else if c.mapping_id != 0 {
