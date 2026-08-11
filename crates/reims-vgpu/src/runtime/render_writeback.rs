@@ -126,11 +126,38 @@
 //! image *read* while the bytes still crossed was worth 4 Hz of it. The 26 Hz is
 //! in the scatter, and the scatter is where the regions are.
 //!
-//! So there is a lever here that is not deferral and carries none of its hazards:
-//! **issue the scatter as one compute dispatch over a run table instead of 507
-//! transfer regions.** Same bytes, same destination, byte-identical result, no
-//! stale plan held across any window. Untested — recorded as the shape the
-//! measurements point at, not as a result.
+//! ## Measured, by making it worse on purpose
+//!
+//! That reading was tested directly, and the controlled form is the useful one:
+//! [`crate::env::SCATTER_SPLIT`] cuts every scatter run into four contiguous
+//! sub-ranges that tile it exactly. The guest bytes written are byte-for-byte
+//! identical; only the region count changes. Eight driven macos-13 boots, four
+//! per arm, one binary:
+//!
+//! ```text
+//! regions/writeback   present_hz per boot        draw_us   duty   slot_us
+//! 203 (shipping)      49.15 49.45 56.45 56.40    34-42     0.76-0.88   143-244 ms/s
+//! 806 (4x)            26.90 23.80 23.00 23.70    50-63     0.93        365-489 ms/s
+//! ```
+//!
+//! **Four times the regions for the same bytes halves the frame rate** — 49.95
+//! to 24.37 median `frames_s`, disjoint at 7x the arms' own spread, eight boots
+//! for eight with no overlap. `draws_s` falls 46 %. And it lands exactly where
+//! the mechanism predicts: `slot_us` roughly doubles, which is the drain worker
+//! blocking longer on a ring fence the GPU takes longer to signal.
+//!
+//! So this rail is bound by the **number of copy regions it issues**, and the
+//! bytes are close to free. That is the opposite of what the ~5.0 GB/s figure
+//! above suggests on its face, and it is why every attempt aimed at the bytes —
+//! a second queue, damage rects, the parked deferral — either measured nothing
+//! or cost more than it saved.
+//!
+//! The lever it points at carries none of the deferral's hazards: **issue the
+//! scatter as one compute dispatch over a run table instead of ~200 transfer
+//! regions.** Same bytes, same destination, byte-identical result, nothing held
+//! across any window. Note the inference has one direction proven and one not —
+//! more regions is measured to cost, fewer regions is expected to pay and could
+//! still meet a floor this experiment cannot see.
 //!
 //! # The contract does not ask for this copy at all
 //!

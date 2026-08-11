@@ -200,6 +200,40 @@ pub const UNUSED_BINDS: &str = "REIMS_VGPU_UNUSED_BINDS";
 /// less concurrency than several, never more.
 pub const PRESENT_DEPTH: &str = "REIMS_VGPU_PRESENT_DEPTH";
 
+/// **Probe, default off.** Setting this *on* cuts every guest-page scatter run
+/// into four contiguous sub-ranges that tile it exactly.
+///
+/// The guest bytes written are byte-for-byte identical either way — only the
+/// number of `VkBufferCopy` regions changes, by 4x. It is the controlled form of
+/// the question the writeback rail's cost turns on: whether that rail is bound
+/// by the bytes it moves or by the number of copy regions it issues. The two
+/// predict opposite things about replacing the scatter with a compute dispatch,
+/// and a host GPU at 86-91 % busy on 3-4 % memory utilization says it is not the
+/// bytes.
+///
+/// It is a probe and not a rail, in the sense [`RANGE_COVERAGE`] is: it changes
+/// nothing the guest observes, and its default is the side that does less work.
+/// It does not widen anything — there is no host that can issue one copy region
+/// and not four.
+///
+/// # What it measured, and why it is kept rather than deleted
+///
+/// Eight driven macos-13 boots, four per arm, one binary: 203 regions per
+/// writeback against 806, and `present_hz` **49.15/49.45/56.45/56.40 against
+/// 26.90/23.80/23.00/23.70**. Eight boots for eight with no overlap — four times
+/// the regions for byte-identical output **halves the frame rate**, and
+/// `slot_us` roughly doubles, which is the drain worker blocking longer on a ring
+/// fence the GPU takes longer to signal.
+///
+/// That answers the question for this host class and it is written up where the
+/// rail is, in [`crate::runtime::render_writeback`]. The probe stays because the
+/// answer is a property of the **host**, not of this device: a discrete GPU
+/// crossing PCIe per region and a unified-memory host writing into the same
+/// physical pages have no reason to agree, and only one of the two has been
+/// measured. A future unified-memory boot re-runs this in one command instead of
+/// rebuilding the experiment from the module doc.
+pub const SCATTER_SPLIT: &str = "REIMS_VGPU_SCATTER_SPLIT";
+
 /// What one variable says, including the two ways it says nothing usable.
 ///
 /// Four states rather than a `bool` because "unset", "explicitly on" and
@@ -273,7 +307,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 9] = [
+pub const ALL: [&str; 10] = [
     GUEST_IMPORT,
     DRAW_LOG,
     GPU_STAMP,
@@ -283,6 +317,7 @@ pub const ALL: [&str; 9] = [
     BATCH_MIXED_TARGETS,
     UNUSED_BINDS,
     PRESENT_DEPTH,
+    SCATTER_SPLIT,
 ];
 
 /// The state of every variable in [`ALL`], for the one-shot boot line.

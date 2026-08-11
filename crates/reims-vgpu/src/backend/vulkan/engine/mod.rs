@@ -2656,6 +2656,24 @@ impl GuestCopyPlan {
     }
 }
 
+/// How many contiguous sub-ranges the scatter probe cuts each run into.
+///
+/// Four rather than two so the effect is well clear of boot-to-boot spread, and
+/// not more because the sub-ranges have to stay large enough that the answer is
+/// about region count rather than about having made every copy tiny.
+const SCATTER_SPLIT_PARTS: u64 = 4;
+
+/// Whether the scatter probe is on. See its use site.
+fn scatter_split_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::env::read(crate::env::SCATTER_SPLIT).0,
+            crate::env::Switch::On
+        )
+    })
+}
+
 /// Bind every run and turn it into one byte range each, grouped by the buffer
 /// it lands in.
 ///
@@ -2687,6 +2705,39 @@ unsafe fn plan_guest_linear_copies(
             // import's granularity, and copying it would write guest bytes
             // either side of the window that this frame was never given.
             .size(run.guest.requested());
+        // PROBE — `REIMS_VGPU_SCATTER_SPLIT=on`. Cuts each run into
+        // `SCATTER_SPLIT_PARTS` contiguous sub-ranges that tile it exactly, so
+        // the guest bytes written are identical and only the region *count*
+        // changes. It exists to separate "this rail is bound by the bytes it
+        // moves" from "it is bound by the number of copy regions it issues" —
+        // the two predict opposite things about a compute scatter, and the host
+        // GPU sitting at 86-91 % busy on 3-4 % memory utilization says it is not
+        // the bytes. Default off; delete once the question is answered.
+        if scatter_split_enabled() {
+            let total = copy.size;
+            let part = total / SCATTER_SPLIT_PARTS;
+            if part != 0 {
+                for i in 0..SCATTER_SPLIT_PARTS {
+                    // The last part takes the remainder, so the sub-ranges tile
+                    // the run exactly rather than losing `total % PARTS` bytes.
+                    let len = if i == SCATTER_SPLIT_PARTS - 1 {
+                        total - part * (SCATTER_SPLIT_PARTS - 1)
+                    } else {
+                        part
+                    };
+                    let off = part * i;
+                    group_by_buffer(
+                        &mut grouped,
+                        bound.buffer,
+                        ash::vk::BufferCopy::default()
+                            .dst_offset(copy.dst_offset + off)
+                            .src_offset(copy.src_offset + off)
+                            .size(len),
+                    );
+                }
+                continue;
+            }
+        }
         group_by_buffer(&mut grouped, bound.buffer, copy);
     }
     Ok(grouped)
