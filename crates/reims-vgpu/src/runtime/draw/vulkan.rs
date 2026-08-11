@@ -2623,8 +2623,11 @@ fn mapping_window_guest_runs<M: HostMemory + HostOps>(
 ///   not touch these bytes.
 ///
 /// The rail's real cost is not its width. 99.2 % of gathers re-copy a span this
-/// device already copied — see `note_gather_key_recurrence` in
-/// `backend::vulkan::engine::exec`.
+/// device already copied. The census that measured that is gone; what counts the
+/// same population now is
+/// [`crate::backend::vulkan::engine::buffer_gather_working_set_census`], which
+/// reports the recurrence beside the *distinct* window count a cache would have
+/// to hold to serve it — the half the recurrence rate alone does not give.
 fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,

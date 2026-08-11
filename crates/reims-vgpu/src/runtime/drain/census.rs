@@ -1643,6 +1643,13 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         if let Some(wanted) = crate::backend::vulkan::engine::sampled_working_set_census() {
             crate::observe::off(wanted);
         }
+        // The same question one rail over, and the one with no cache behind it
+        // yet: `buffer_guest_gathers` says how many gathers ran and this says
+        // how few distinct windows they were.
+        #[cfg(feature = "backend-vulkan")]
+        if let Some(wanted) = crate::backend::vulkan::engine::buffer_gather_working_set_census() {
+            crate::observe::off(wanted);
+        }
         emit_engine_delta();
         // After `emit_engine_delta`, which emits `draw_phase`: the two divide
         // against each other and reading them in the other order invites
@@ -2069,6 +2076,25 @@ fn emit_draw_phase() {
         w.stalls,
     ));
     emit_stage_phase();
+    emit_gather_phase();
+}
+
+/// Where a compute-gather dispatch's CPU cost goes, four ways.
+///
+/// Emitted only when a gather dispatched, so the line's presence is itself the
+/// statement that this boot ran the dispatch arm — see
+/// [`crate::backend::vulkan::engine::gather_phase`] for what each part is and
+/// what would remove it.
+#[cfg(feature = "backend-vulkan")]
+fn emit_gather_phase() {
+    let Some(w) = crate::backend::vulkan::engine::gather_phase::take_window() else {
+        return;
+    };
+    crate::observe::off(format!(
+        "gather_phase plan_us={} plan_n={} stage_us={} stage_n={} \
+         dset_us={} dset_n={} record_us={} record_n={}",
+        w.plan_us, w.plan_n, w.stage_us, w.stage_n, w.dset_us, w.dset_n, w.record_us, w.record_n,
+    ));
 }
 
 /// Under `draw_phase`, dividing its largest column — `stage_us` is 83 % of that

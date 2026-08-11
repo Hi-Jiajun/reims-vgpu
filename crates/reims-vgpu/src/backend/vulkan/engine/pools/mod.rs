@@ -2565,6 +2565,7 @@ impl Drop for SlowStagingWrite {
     }
 }
 
+pub mod buffer_gather_working_set;
 mod images_and_registry;
 pub mod sampled_working_set;
 mod submission_and_buffers;

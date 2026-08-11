@@ -276,60 +276,63 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 ///
 /// # It is default **off**, and this is the measurement that says so
 ///
-/// Ten driven macos-13 sustained-animation boots. Comparing only the four that
-/// landed in the same compositing sub-regime (draws/frame ~351, so like for
-/// like), the dispatch does exactly what it was built to do to the GPU and more
-/// than that to the CPU:
+/// Ten driven macos-13 sustained-animation boots, interleaved, on the tree that
+/// gave a dispatch a shared run-table arena and a recycled descriptor set. The
+/// mechanism columns are per draw, so they are comparable across boots that drew
+/// different amounts, and they are disjoint in every one of the four compositing
+/// regimes the ten boots landed in:
 ///
 /// ```text
-///                     on (n=2)        off (n=2)
-/// slot_us          48 838 / 62 875  124 703 / 130 423   -56 %  GPU blocking
-/// ring_retire_blocks          260              502      -48 %
-/// record_us        91 961 / 93 106   49 458 /  50 562   +85 %  CPU recording
-/// descriptors_us   10 387 /  9 109    6 796 /   6 757   +45 %
-/// frames/s          74.68 /  75.64    76.04 /   76.12    -1.4 %
+///                        on            off
+/// slot_us/draw          1.94          4.06     -52 %   GPU blocking
+/// record_us/draw        3.10          2.01     +54 %   CPU recording
+/// dispatches/draw       1.44          0.00
 /// ```
 ///
-/// So the mechanism works — halving the blocking on a rail this device is
-/// **GPU-bound** on is exactly the lever — and the implementation gives it all
-/// back. The reason is the count: ~40 000 dispatches a second, one per gathered
-/// window, each paying an `acquire_staging` for its run table, a
-/// `write_staging`, a descriptor-set allocation and an `update_descriptor_sets`.
-/// The writeback's scatter issues ~1 900 a second and does not notice any of
-/// that.
+/// **Frames did not move, and the honest statement is that they could not be
+/// read.** The rank test put `frames_s` at +9.0 % — and that number is an
+/// artifact of the band mix, which is worth stating because it is the trap this
+/// project keeps walking into. The ten boots sort by draws per frame as
+///
+/// ```text
+/// 257.0 257.2 | 335.9 340.4 341.4 344.0 | 361.6 362.2 363.9 367.5
+/// ```
+///
+/// — a **fourth** regime the harness's band edges did not yet separate, running
+/// at ~79 frames a second against the next one's ~72. The on arm drew three
+/// boots from the fast side and the off arm one. Matched by draws per frame the
+/// two arms are level, and with the edges re-derived no band holds two boots of
+/// both arms, so the frame question is *unresolved* rather than answered either
+/// way.
+///
+/// So the arena and the recycle took the recording penalty from +85 % to +54 %,
+/// the GPU saving held at ~-52 %, and it is still not enough. What is left is
+/// +31.6 ms a second of `record_us` over ~36 700 dispatches — **0.86 us each**,
+/// against the ~1.05 us this started at.
 ///
 /// # What would flip it, and what would not
 ///
 /// **Not fewer dispatches.** The obvious move is to batch a command buffer's
 /// gathers into one, and the arithmetic refuses it: ~40 000 dispatches against
-/// ~26 500 draws is **1.5 per draw**, not 18 per command buffer. A gather is
-/// recorded ahead of its own draw's render pass and cannot be hoisted to the
-/// front of the command buffer, because a Store earlier in that same command
-/// buffer may have landed in the pages it reads — which is exactly why
-/// `ResourcePools::note_guest_write_recorded` invalidates the bind map. So
-/// batching buys at most 1.5x on the count.
+/// ~26 500 draws is **1.5 per draw**, not 18 per command buffer. `guest_gathers`
+/// is a local of `execute_draw_inner`, so a plan covers one draw's windows and
+/// there is no command-buffer-wide batch to make. Merging within a draw is real
+/// but it is 1.4x on the count, not 18x.
 ///
-/// **The per-dispatch cost, which is ~1.05 us of the 1.6 us a draw this
-/// regressed by.** Three things are paid per dispatch and all three are
-/// avoidable:
+/// **The per-dispatch cost, and the next reading is an instrument and not a
+/// guess.** [`crate::backend::vulkan::engine::gather_phase`] splits the 0.86 us
+/// four ways — the run-table planning, the shared staging arena, the descriptor
+/// set, and the command-buffer calls — because guessing which of them is the
+/// next 0.8 us is how a session spends a day on `vkCmdBindPipeline` and finds it
+/// was never the cost. Read `gather_phase` from a driven boot before touching
+/// any of them.
 ///
-/// - an `acquire_staging` and a `write_staging` for a ~200-byte run table.
-///   One command-buffer-scoped arena for run tables, with each dispatch reading
-///   at its own offset, makes that ~2 200 acquisitions a second instead of
-///   40 000.
-/// - a descriptor-set allocation and an `update_descriptor_sets`. Two of the
-///   three bindings — the guest import and the run-table arena — are the *same
-///   buffer* for every dispatch in a command buffer. Only `Dst` differs, and
-///   only because each gathered window takes its own pooled slot. Suballocate
-///   those from one command-buffer arena instead and all three bindings become
-///   constant, so the whole command buffer needs **one** descriptor set.
-///   `BoundBuffer` already carries an offset, so the bind side of that is free.
-/// - the bind and push. With one set per command buffer, a dispatch is a push
-///   constant carrying its run-table base index and `vkCmdDispatch`.
-///
-/// Together that is ~0.05 us a dispatch against today's ~1.05, holding a GPU
-/// saving already measured at 56 %. That is the change worth making; a first
-/// pass at only the count is measurably not.
+/// The candidate that survives the arithmetic without a reading is the
+/// **destination arena**: each gathered window takes its own pooled slot, so
+/// `Dst` is the only binding that still varies within a draw. Suballocating a
+/// draw's destinations from one buffer makes all three constant, which is one
+/// descriptor set and one dispatch per draw rather than 1.4 of each.
+/// `BoundBuffer` already carries an offset, so the bind side of that is free.
 ///
 /// # A region-count threshold is not the shortcut it looks like
 ///
@@ -364,8 +367,9 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 /// about **host capability** — binding an unadvertised extension crashes and
 /// importing an undeclared handle is undefined behaviour — and neither arm here
 /// asks the host for anything the other does not. What differs is only which of
-/// two byte-identical copies runs, and the default is the one that measured
-/// faster.
+/// two byte-identical copies runs, and the default is the one that has not been
+/// beaten — which is not the same claim as "the one that measured faster", and
+/// the difference is the whole of the reading above.
 pub const COMPUTE_GATHER: &str = "REIMS_VGPU_COMPUTE_GATHER";
 
 /// What one variable says, including the two ways it says nothing usable.

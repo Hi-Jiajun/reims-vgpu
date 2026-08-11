@@ -154,6 +154,7 @@ unsafe fn plan_buffer_gather_dispatches(
             .max()
             .unwrap_or(0);
         for (source, copies) in &gather.sources {
+            let _p = super::gather_phase::Span::open(super::gather_phase::Part::Plan);
             let runs: Vec<ScatterRun> = copies
                 .iter()
                 .map(|c| ScatterRun {
@@ -192,10 +193,14 @@ unsafe fn plan_buffer_gather_dispatches(
     // ~40 000 of them a second against ~2 200 command buffers, so the acquire
     // and the write were being paid eighteen times over for bytes that fit in a
     // single slot.
-    let words: Vec<&[u32]> = planned.iter().map(|(_, _, _, t)| &t.words[..]).collect();
-    let (runs_slot, places) = unsafe { super::stage_run_tables(ctx, pools, counters, &words) }?;
+    let (runs_slot, places) = {
+        let _s = super::gather_phase::Span::open(super::gather_phase::Part::Stage);
+        let words: Vec<&[u32]> = planned.iter().map(|(_, _, _, t)| &t.words[..]).collect();
+        unsafe { super::stage_run_tables(ctx, pools, counters, &words) }?
+    };
     let mut out = Vec::with_capacity(planned.len());
     for ((source, dst, dst_have, table), place) in planned.iter().zip(&places) {
+        let _d = super::gather_phase::Span::open(super::gather_phase::Part::Dset);
         let set =
             unsafe { pools.alloc_scatter_descriptor_set(&ctx.device, pipeline.dsl, counters) }?;
         unsafe {
@@ -317,6 +322,13 @@ unsafe fn stage_buffer_content(
                 // direct bind does, so this owes the same quiesce.
                 pools.note_guest_read_recorded();
                 counters.note_buffer_guest_gather(src.total_len, pending.regions());
+                // Counted here and not at the top of this arm, because only a
+                // window that actually gathers is a window a content cache would
+                // have to hold. `key.0` is the `runs` allocation's address,
+                // already computed above as this draw's dedup key — the same
+                // identity one scope wider. See
+                // [`super::pools::buffer_gather_working_set`].
+                super::pools::buffer_gather_working_set::note_gathered(key.0, key.1);
                 gathers.push(pending);
                 bound
             } else {
@@ -3308,6 +3320,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 let pipeline = unsafe { pools.scatter_pipeline(ctx) }
                     .expect("planned only after the pipeline was created");
                 for g in &groups {
+                    let _r = super::gather_phase::Span::open(super::gather_phase::Part::Record);
                     unsafe { pipeline.dispatch(&ctx.device, cb, g.set, g.run_count) };
                 }
                 counters
