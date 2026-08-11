@@ -489,6 +489,81 @@ impl ReadbackPhase {
     }
 }
 
+/// Which part of `process_exec_indirect2` a span was spent in.
+///
+/// One opcode carries the whole dispatch: the per-opcode split of `proc_us` puts
+/// `CHILD_OP_EXEC_INDIRECT2` at **754-775 ms/s** against **under 3.3 ms/s for
+/// the eleven other opcodes combined**. `draw_us` names 585 ms/s of that, and it
+/// names it narrowly — `DrainPhase::Draw` wraps `encode_draw_chain` alone,
+/// inside the per-draw loop. **The remaining ~197 ms/s is the whole of the drain
+/// residue that is left**, and no span reaches it.
+///
+/// These five tile the function rather than nominate a part of it, which is the
+/// method that worked on the child-FIFO loop after nominating one twice did not.
+/// [`Self::Header`] is deliberately the leftover: it is timed as the function's
+/// total minus the other four, so a cost in a corner nobody listed still lands
+/// somewhere and the sum still equals `op0x37_us`.
+#[derive(Clone, Copy)]
+pub enum ExecPhase {
+    /// The command-buffer load loop: one `vec![0u8; len]` and one
+    /// `read_task_gva_by_id` per command buffer, each a GVA resolve and a copy
+    /// out of guest memory. Sized by the guest, so a multi-MiB stream is a
+    /// multi-MiB allocation and copy on the drain thread.
+    Load,
+    /// The speculative translation preflight: scans each stream for RENDER and
+    /// COMPUTE pipeline refs and asks whether metal2vulkan has them, so a packet
+    /// can be deferred whole rather than half-executed.
+    Preflight,
+    /// `walk_stream`: decoding every record of every segment and applying the
+    /// bind bookkeeping, which is where `render::decode` and `apply_binds` run.
+    /// The inner loop of the whole device.
+    Walk,
+    /// `finish_stream`: clears, ICB executes, the draw list, and the per-draw
+    /// loop. **Contains `draw_us`**, which names itself, so `Finish` minus
+    /// `draw_us` is the per-draw setup and result handling around the encode.
+    Finish,
+    /// Everything else the function does — header and payload validation, the
+    /// resource-table decode, `consume_resource_table`, and any path that
+    /// returns early. Derived rather than measured directly, so the five sum to
+    /// the function's own total by construction.
+    Header,
+}
+
+impl ExecPhase {
+    /// How many phases there are. The census arrays are sized from this, so a
+    /// new variant that forgets to bump it fails to build [`Self::ALL`] rather
+    /// than overflowing an array at report time.
+    pub(crate) const COUNT: usize = 5;
+
+    const ALL: [ExecPhase; Self::COUNT] = [
+        ExecPhase::Load,
+        ExecPhase::Preflight,
+        ExecPhase::Walk,
+        ExecPhase::Finish,
+        ExecPhase::Header,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            ExecPhase::Load => 0,
+            ExecPhase::Preflight => 1,
+            ExecPhase::Walk => 2,
+            ExecPhase::Finish => 3,
+            ExecPhase::Header => 4,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            ExecPhase::Load => "load",
+            ExecPhase::Preflight => "preflight",
+            ExecPhase::Walk => "walk",
+            ExecPhase::Finish => "finish",
+            ExecPhase::Header => "header",
+        }
+    }
+}
+
 /// The per-opcode split of `proc_ns`, indexed by the opcode itself.
 ///
 /// Sized from the contract rather than from a count of the arms
@@ -1057,6 +1132,10 @@ pub(crate) struct DrainDutyCensus {
     /// See [`ProcOpTable`] for why this is indexed by the opcode rather than
     /// keyed by a class this device would have had to invent.
     proc_ops: ProcOpTable,
+    /// The inside of `CHILD_OP_EXEC_INDIRECT2`, indexed by [`ExecPhase::index`].
+    /// Sums to that opcode's own `op0x37_us` on the `drain_ops` line.
+    exec_ns: [std::sync::atomic::AtomicU64; ExecPhase::COUNT],
+    exec_count: [std::sync::atomic::AtomicU64; ExecPhase::COUNT],
     max_tranche_us: std::sync::atomic::AtomicU64,
     /// Longest single Flush in the window. `flush_us/flushes` is a mean, and a
     /// mean cannot tell "every flush costs 7.7 ms" from "most are free and one
@@ -1281,6 +1360,37 @@ impl DrainDutyCensus {
         }
         let above = self.proc_ops.above_max.swap(0, Relaxed);
         any.then(|| format!("drain_ops win_ms={win_ms} above_max={above}{body}"))
+    }
+
+    /// One span inside `process_exec_indirect2`, in nanoseconds.
+    pub(crate) fn note_exec(&self, phase: ExecPhase, ns: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let i = phase.index();
+        self.exec_ns[i].fetch_add(ns, Relaxed);
+        self.exec_count[i].fetch_add(1, Relaxed);
+    }
+
+    /// The inside of `CHILD_OP_EXEC_INDIRECT2` over the window [`Self::note`]
+    /// just reported, or `None` when no exec packet ran in it.
+    ///
+    /// Read against `drain_ops`: these five sum to its `op0x37_us`. `finish_us`
+    /// contains `drain_duty`'s `draw_us`, so `finish_us - draw_us` is the
+    /// per-draw setup and result handling that sits around the encode and is
+    /// named by nothing else.
+    pub(crate) fn take_exec_phases(&self) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let win_ms = self.last_win_ms.load(Relaxed);
+        let mut body = String::new();
+        let mut any = false;
+        for phase in ExecPhase::ALL {
+            let i = phase.index();
+            let us = self.exec_ns[i].swap(0, Relaxed) / 1000;
+            let n = self.exec_count[i].swap(0, Relaxed);
+            any |= n != 0;
+            let label = phase.label();
+            body.push_str(&format!(" {label}_us={us} {label}_n={n}"));
+        }
+        any.then(|| format!("exec_phase win_ms={win_ms}{body}"))
     }
 
     /// One access around a packet, in nanoseconds, into both the total and the
@@ -1880,6 +1990,11 @@ pub fn note_drain_proc(opcode: u16, ns: u64) {
     DRAIN_DUTY.note_proc(opcode, ns);
 }
 
+/// Attribute one span inside `process_exec_indirect2`, in nanoseconds.
+pub fn note_exec_phase(phase: ExecPhase, ns: u64) {
+    DRAIN_DUTY.note_exec(phase, ns);
+}
+
 /// Attribute one access around a packet, in nanoseconds, by which one it was.
 pub fn note_drain_regs(op: RegsOp, ns: u64) {
     DRAIN_DUTY.note_regs(op, ns);
@@ -1904,6 +2019,11 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         // its `packets`, less `op_overflow`.
         if let Some(ops) = DRAIN_DUTY.take_proc_ops() {
             crate::observe::off(ops);
+        }
+        // Under `drain_ops`, dividing its `op0x37_us` the way `chain_phase`
+        // divides `draw_us`.
+        if let Some(exec) = DRAIN_DUTY.take_exec_phases() {
+            crate::observe::off(exec);
         }
         // Under `flush_rails`, dividing its `render_us`.
         if let Some(split) = DRAIN_DUTY.take_readback_split() {

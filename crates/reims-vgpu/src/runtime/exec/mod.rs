@@ -616,6 +616,10 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     let n_cb = cmdbuf_count as usize;
     let page_shift = state.page_shift;
     let mut streams = Vec::with_capacity(n_cb);
+    // This call's measured spans, summed, so `Header` can be the leftover. The
+    // census's own totals cover the whole window and cannot answer for one call.
+    let mut measured_ns = 0u64;
+    let load_started = std::time::Instant::now();
     for i in 0..n_cb {
         // `need` already pinned the whole table: i < n_cb <= cmdbuf_count, so
         // off + DESC_LEN = cbufs_off + (i + 1) * DESC_LEN <= need <=
@@ -653,21 +657,35 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         out.streams_loaded += 1;
         streams.push(stream);
     }
+    let load_ns = load_started.elapsed().as_nanos() as u64;
+    measured_ns += load_ns;
+    crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Load, load_ns);
 
     // Plan before execute: cold AIR translation is immutable CPU work and can
     // run without protocol ownership. Keep the packet unconsumed until every
     // referenced render stage is ready, so replay cannot duplicate clears,
     // fences, compute dispatches, or guest writeback.
     #[cfg(feature = "backend-vulkan")]
-    let translation_pending = streams.iter().fold(false, |pending, stream| {
-        let render_pending = preflight_render_translations(state, host, task_id, stream);
-        let compute_pending = preflight_compute_translations(state, host, task_id, stream);
-        render_pending || compute_pending || pending
-    });
+    let translation_pending = {
+        let preflight_started = std::time::Instant::now();
+        let pending = streams.iter().fold(false, |pending, stream| {
+            let render_pending = preflight_render_translations(state, host, task_id, stream);
+            let compute_pending = preflight_compute_translations(state, host, task_id, stream);
+            render_pending || compute_pending || pending
+        });
+        let preflight_ns = preflight_started.elapsed().as_nanos() as u64;
+        measured_ns += preflight_ns;
+        crate::runtime::drain::note_exec_phase(
+            crate::runtime::drain::ExecPhase::Preflight,
+            preflight_ns,
+        );
+        pending
+    };
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     let translation_pending = false;
     if translation_pending {
         out.deferred = true;
+        note_exec_header(exec_started, measured_ns);
         return out;
     }
 
@@ -680,11 +698,43 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
 
     for stream in streams {
         let mut acc = StreamAccum::default();
+        let walk_started = std::time::Instant::now();
         walk_stream(state, host, task_id, &stream, &mut out, &mut acc);
+        let walk_ns = walk_started.elapsed().as_nanos() as u64;
+        measured_ns += walk_ns;
+        crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Walk, walk_ns);
+        let finish_started = std::time::Instant::now();
         finish_stream(state, host, task_id, &mut out, &acc);
+        let finish_ns = finish_started.elapsed().as_nanos() as u64;
+        measured_ns += finish_ns;
+        crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Finish, finish_ns);
     }
+    note_exec_header(exec_started, measured_ns);
     out.total_us = elapsed_us(exec_started);
     out
+}
+
+/// Close the [`ExecPhase`] tiling of `process_exec_indirect2` at one of its
+/// return points.
+///
+/// [`ExecPhase::Header`] is the **leftover**, not a span: it is the function's
+/// own elapsed time minus the four that measured themselves, so the five sum to
+/// the opcode's `op0x37_us` whatever path the call took. Deriving it rather than
+/// wrapping the header parse is what makes the tiling closed — a cost in a
+/// corner nobody thought to list still lands here instead of vanishing, which is
+/// the property that made the child-FIFO tiling answer on one boot.
+///
+/// `measured_ns` is **this call's** four spans summed, not the census's running
+/// totals: the census accumulates across every packet in the window, so
+/// subtracting it from one call's clock would be subtracting the whole second.
+/// The subtraction is saturating anyway, because an underflow would print as a
+/// colossal `header_us` rather than as the zero it means.
+fn note_exec_header(exec_started: std::time::Instant, measured_ns: u64) {
+    let total = exec_started.elapsed().as_nanos() as u64;
+    crate::runtime::drain::note_exec_phase(
+        crate::runtime::drain::ExecPhase::Header,
+        total.saturating_sub(measured_ns),
+    );
 }
 
 /// Apply every record of one submission's resource table.
