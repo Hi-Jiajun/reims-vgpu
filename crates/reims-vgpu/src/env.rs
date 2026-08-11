@@ -139,6 +139,29 @@ pub const BUFFER_EXTENT: &str = "REIMS_VGPU_BUFFER_EXTENT";
 /// refusal (`nojoin_target_switch`) and never a permission.
 pub const BATCH_MIXED_TARGETS: &str = "REIMS_VGPU_BATCH_MIXED_TARGETS";
 
+/// `off` stages the guest bytes of a `[[buffer(n)]]` bind even when the stage's
+/// own reflection says the shader never dereferences it.
+///
+/// The wider arm — the default — binds a neutral page for such a bind instead of
+/// gathering the guest's, because
+/// [`crate::runtime::spirv_bind::ReflectedBufferAccess::Unused`] means no shader
+/// invocation reads through the descriptor. The descriptor is still written, so
+/// the pipeline layout is byte-for-byte what it was; only the contents change,
+/// and only for binds nothing reads.
+///
+/// It exists as a switch for the same reason [`BUFFER_EXTENT`] does, and with
+/// more at stake. This is the one rail here whose failure mode is **silent wrong
+/// pixels**: if the translator ever says `Unused` about a buffer a shader does
+/// dereference, the shader reads the neutral page and nothing anywhere reports
+/// it. So the arm that copies has to stay reachable in one process, both to A/B
+/// the saving and to answer "is this rail why that surface is wrong" without a
+/// rebuild.
+///
+/// Off is a refusal and never a permission: it makes this device read *more* of
+/// the guest's memory, never less, and there is no spelling that grants a
+/// capability.
+pub const UNUSED_BINDS: &str = "REIMS_VGPU_UNUSED_BINDS";
+
 /// What one variable says, including the two ways it says nothing usable.
 ///
 /// Four states rather than a `bool` because "unset", "explicitly on" and
@@ -212,7 +235,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 7] = [
+pub const ALL: [&str; 8] = [
     GUEST_IMPORT,
     DRAW_LOG,
     GPU_STAMP,
@@ -220,6 +243,7 @@ pub const ALL: [&str; 7] = [
     RANGE_COVERAGE,
     BUFFER_EXTENT,
     BATCH_MIXED_TARGETS,
+    UNUSED_BINDS,
 ];
 
 /// The state of every variable in [`ALL`], for the one-shot boot line.

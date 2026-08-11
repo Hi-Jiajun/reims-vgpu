@@ -2130,6 +2130,93 @@ pub enum ReflectedBufferAccess {
     Undeclared = 2,
 }
 
+/// Bytes in the neutral page a [`ReflectedBufferAccess::Unused`] bind is given
+/// in place of the guest's.
+///
+/// Nothing reads it — that is the entire premise of the rail — so the only
+/// requirements on the size are that it be non-zero, so the bind is a valid
+/// descriptor and does not trip the empty-content check the stage-in path uses
+/// as a "stream bound nothing" signal, and that it be *one* size, so every
+/// neutral bind in a command buffer shares one allocation and the engine's
+/// `cb_bound_buffer` reuse collapses them into a single upload.
+///
+/// One 4 KiB page is comfortably above the largest bounded buffer object any
+/// shader observed here declares: a survey of 60 captured AIR blobs ran a median
+/// of 64 bytes and a maximum of 512. Sizing it above that costs one page of host
+/// memory for the life of the process and means a driver that does look at the
+/// descriptor's range sees one wider than any declared block, rather than
+/// narrower.
+const NEUTRAL_BIND_BYTES: usize = 4096;
+
+/// The one neutral page, shared by every bind that gets one.
+///
+/// Shared deliberately rather than allocated per bind. The engine keys its
+/// per-command-buffer bind reuse on `(Arc::as_ptr, len)`, so one `Arc` means the
+/// first neutral bind in a command buffer uploads 4 KiB and every later one is a
+/// `buffer_bind_reuses` hit costing nothing. Allocating per bind would defeat
+/// the rail by replacing a guest gather with a fresh staging upload.
+static NEUTRAL_BIND: std::sync::OnceLock<std::sync::Arc<Vec<u8>>> = std::sync::OnceLock::new();
+
+/// The neutral page to bind for a buffer the shader does not dereference.
+///
+/// Zeroed, and that is not a "safe default" so much as the only value with no
+/// meaning: the premise is that no invocation loads through this descriptor, so
+/// any contents would do, and zeros are what a reader who does not believe the
+/// premise will find easiest to recognise in a capture.
+pub fn neutral_bind_bytes() -> std::sync::Arc<Vec<u8>> {
+    NEUTRAL_BIND
+        .get_or_init(|| std::sync::Arc::new(vec![0u8; NEUTRAL_BIND_BYTES]))
+        .clone()
+}
+
+/// Whether [`crate::env::UNUSED_BINDS`] is switched off, read once per process.
+///
+/// Same shape as [`buffer_extent_disabled`], and read once for the same reason:
+/// this sits in the per-draw path at tens of thousands of binds a second, and an
+/// environment read there would cost more than the rail saves.
+fn unused_binds_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        let (state, value) = crate::env::read(crate::env::UNUSED_BINDS);
+        match state {
+            crate::env::Switch::Off => {
+                crate::observe::off("unused_binds reason=unused_binds_disabled_by_env");
+                true
+            }
+            crate::env::Switch::Unrecognized => {
+                crate::observe::fail(format!(
+                    "unused_binds reason=unused_binds_env_unrecognized value={}",
+                    value.unwrap_or_default()
+                ));
+                false
+            }
+            crate::env::Switch::Unset | crate::env::Switch::On => false,
+        }
+    })
+}
+
+/// Whether this bind may be served the neutral page instead of the guest's bytes.
+///
+/// Two conditions, and the second is not redundant. Reflection must say
+/// [`ReflectedBufferAccess::Unused`] — nothing weaker, per that type's doc — and
+/// the caller must confirm the index is not also feeding `[[stage_in]]`.
+///
+/// The stage-in condition is the one that would cost geometry. A vertex buffer
+/// bound at index *n* is read twice on this path: once as a declared argument,
+/// which is what reflection is describing, and once as the byte source for every
+/// vertex attribute naming buffer *n*, which reflection is not describing at all.
+/// The translator lists no `Buffer` at a pure stage-in index, so in principle
+/// such a bind classifies `Undeclared` and never reaches here — but "in
+/// principle" is the wrong strength of argument for a substitution that would
+/// hand the vertex shader a page of zeros as its vertex stream and draw nothing
+/// visible while declining nothing. The caller checks the attribute list it
+/// already has.
+pub fn may_serve_neutral(access: ReflectedBufferAccess, feeds_stage_in: bool) -> bool {
+    matches!(access, ReflectedBufferAccess::Unused)
+        && !feeds_stage_in
+        && !unused_binds_disabled()
+}
+
 /// How reflection describes a `[[buffer(n)]]` bind's use by this stage.
 ///
 /// The asymmetry is the same one [`reflected_buffer_extent`] states, and for a
@@ -2902,6 +2989,55 @@ mod tests {
             ReflectedBufferAccess::Undeclared,
             "texture"
         );
+    }
+
+    /// Only an unused bind that feeds no stage-in attribute may be substituted.
+    ///
+    /// Both terms are asserted, because both failures are silent and one of them
+    /// is catastrophic: substituting a stage-in buffer hands the vertex shader a
+    /// page of zeros as its vertex stream, which draws nothing and declines
+    /// nothing. The other two classes must never be substituted at all.
+    #[test]
+    fn only_an_unused_bind_that_feeds_no_stage_in_may_be_neutralized() {
+        assert!(
+            may_serve_neutral(ReflectedBufferAccess::Unused, false),
+            "unused and not a vertex stream"
+        );
+        assert!(
+            !may_serve_neutral(ReflectedBufferAccess::Unused, true),
+            "an index the attribute list names keeps its guest bytes"
+        );
+        for class in [
+            ReflectedBufferAccess::Dereferenced,
+            ReflectedBufferAccess::Undeclared,
+        ] {
+            for feeds_stage_in in [false, true] {
+                assert!(
+                    !may_serve_neutral(class, feeds_stage_in),
+                    "{class:?} is never substituted (stage_in={feeds_stage_in})"
+                );
+            }
+        }
+    }
+
+    /// The neutral page is one shared, non-empty allocation.
+    ///
+    /// Non-empty because the stage-in path reads empty content as "the stream
+    /// bound nothing" and declines on it, and shared because the engine keys its
+    /// per-command-buffer bind reuse on the pointer — a fresh allocation per
+    /// bind would replace a guest gather with a staging upload and defeat the
+    /// rail.
+    #[test]
+    fn the_neutral_page_is_one_shared_non_empty_allocation() {
+        let a = neutral_bind_bytes();
+        let b = neutral_bind_bytes();
+        assert!(!a.is_empty(), "an empty bind reads as 'nothing was bound'");
+        assert_eq!(a.len(), NEUTRAL_BIND_BYTES);
+        assert!(
+            std::sync::Arc::ptr_eq(&a, &b),
+            "every neutral bind shares one allocation, so the engine reuses it"
+        );
+        assert!(a.iter().all(|&byte| byte == 0), "zeroed");
     }
 
     /// The classification must not answer differently because the *extent* rail

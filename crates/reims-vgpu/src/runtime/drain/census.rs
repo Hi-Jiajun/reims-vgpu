@@ -1951,7 +1951,7 @@ fn emit_bind_phase() {
     };
     crate::observe::off(format!(
         "bind_phase binds={} vertex_us={} fragment_us={} attrs_us={} \
-         acc_unused={} acc_deref={} acc_undecl={} acc_n={} acc_unused_staged={}",
+         acc_unused={} acc_deref={} acc_undecl={} acc_n={} acc_unused_staged={} neutral={}",
         w.binds,
         w.vertex_us,
         w.fragment_us,
@@ -1963,7 +1963,10 @@ fn emit_bind_phase() {
         // so this is their sum and not a separately-counted total: a reader who
         // divides gets an identity that holds or a bug that shows.
         w.access_total(),
+        // These two partition `acc_unused` in turn, so the second identity on
+        // the line is `acc_unused_staged + neutral == acc_unused`.
         w.access_unused_staged,
+        w.neutral_served,
     ));
 }
 

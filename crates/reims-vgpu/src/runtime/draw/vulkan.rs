@@ -5261,28 +5261,46 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 &v_shader.reflection,
                 b.index,
             );
-            // Measurement only: nothing below branches on this yet. It sizes
-            // the population a skip could serve, from the same reflection the
-            // cap above is read from and under the same stage rule.
-            crate::runtime::bind_phase::note_access(
-                crate::runtime::spirv_bind::reflected_buffer_access(&v_shader.reflection, b.index),
+            let access = crate::runtime::spirv_bind::reflected_buffer_access(
+                &v_shader.reflection,
+                b.index,
             );
-            let Some(content) = load_buffer_content(
-                state,
-                host,
-                req.task_id,
-                b.buffer_ref,
-                b.offset,
-                allow_zc,
-                cap,
-            ) else {
-                return Err(DrawError::DrawPreparation(
-                    DrawPreparationDecline::VertexBufferMissing {
-                        index: b.index,
-                        buffer_ref: b.buffer_ref,
-                        offset: b.offset,
-                    },
-                ));
+            crate::runtime::bind_phase::note_access(access);
+            // A vertex buffer is read twice on this path — as the declared
+            // argument reflection describes, and as the byte source for every
+            // stage-in attribute naming this index, which it does not. Only the
+            // first is what `Unused` is about, so an index the pipeline's
+            // attribute list names keeps its guest bytes whatever reflection
+            // says about the argument.
+            let feeds_stage_in = pd
+                .vertex_attributes
+                .iter()
+                .any(|a| a.buffer_index == b.index);
+            let content = if crate::runtime::spirv_bind::may_serve_neutral(access, feeds_stage_in) {
+                crate::runtime::bind_phase::note_neutral_served();
+                crate::backend::vulkan::engine::BufferContent::Bytes(
+                    crate::runtime::spirv_bind::neutral_bind_bytes(),
+                )
+            } else {
+                crate::runtime::bind_phase::note_unused_staged(access);
+                let Some(content) = load_buffer_content(
+                    state,
+                    host,
+                    req.task_id,
+                    b.buffer_ref,
+                    b.offset,
+                    allow_zc,
+                    cap,
+                ) else {
+                    return Err(DrawError::DrawPreparation(
+                        DrawPreparationDecline::VertexBufferMissing {
+                            index: b.index,
+                            buffer_ref: b.buffer_ref,
+                            offset: b.offset,
+                        },
+                    ));
+                };
+                content
             };
             vtx_storage.push((b.index, content));
         }
@@ -5303,26 +5321,39 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 &f_shader.reflection,
                 b.index,
             );
-            // Same measurement, against the fragment stage's own reflection.
-            crate::runtime::bind_phase::note_access(
-                crate::runtime::spirv_bind::reflected_buffer_access(&f_shader.reflection, b.index),
+            let access = crate::runtime::spirv_bind::reflected_buffer_access(
+                &f_shader.reflection,
+                b.index,
             );
-            let Some(content) = load_buffer_content(
-                state,
-                host,
-                req.task_id,
-                b.buffer_ref,
-                b.offset,
-                true,
-                cap,
-            ) else {
-                return Err(DrawError::DrawPreparation(
-                    DrawPreparationDecline::FragmentBufferMissing {
-                        index: b.index,
-                        buffer_ref: b.buffer_ref,
-                        offset: b.offset,
-                    },
-                ));
+            crate::runtime::bind_phase::note_access(access);
+            // No stage-in exclusion here: `[[stage_in]]` is a vertex-stage
+            // concept and `pd.vertex_attributes` names vertex buffer indices,
+            // which are a different index space from the fragment stage's.
+            let content = if crate::runtime::spirv_bind::may_serve_neutral(access, false) {
+                crate::runtime::bind_phase::note_neutral_served();
+                crate::backend::vulkan::engine::BufferContent::Bytes(
+                    crate::runtime::spirv_bind::neutral_bind_bytes(),
+                )
+            } else {
+                crate::runtime::bind_phase::note_unused_staged(access);
+                let Some(content) = load_buffer_content(
+                    state,
+                    host,
+                    req.task_id,
+                    b.buffer_ref,
+                    b.offset,
+                    true,
+                    cap,
+                ) else {
+                    return Err(DrawError::DrawPreparation(
+                        DrawPreparationDecline::FragmentBufferMissing {
+                            index: b.index,
+                            buffer_ref: b.buffer_ref,
+                            offset: b.offset,
+                        },
+                    ));
+                };
+                content
             };
             frag_storage.push((b.index, content));
         }
