@@ -82,6 +82,17 @@ compositor's hands. **Both halves are load-bearing**: the CSS rule cannot carry
 the 3D transform, because `tick()` overwrites the inline `transform` every
 frame, and a CSS-only fix would be silently discarded.
 
+Three driven macos-13 boots after the change read 424.8, 427.7 and 427.6 draws
+per presented frame — all inside the promoted band — with `present_hz` medians
+of 40.95, 41.55 and 41.30, a spread of **1.5 %** against the 24 % the two
+clusters sat apart.
+
+Read that as consistent-with rather than proven: at the old one-in-five collapse
+rate, three boots miss the collapsed cluster by chance about half the time, so
+the three boots alone are weak. The argument is the mechanism plus the tight
+band, and the band is the part that would have been wide either way if the
+clusters were still there.
+
 `drain_duty draws` over `window_publish fresh` is still the discriminator, and
 checking it stays worthwhile — it is how you find out this stopped working.
 Boots taken before this change are not comparable to boots taken after it.
