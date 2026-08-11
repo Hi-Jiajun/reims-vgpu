@@ -415,6 +415,29 @@ pub(crate) struct ResourcePools {
     /// submitting anything leaves it here for the next seal, which is correct:
     /// no submitted command buffer ever named it, so any later fence will do.
     scatter_dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
+    /// Guest-scatter descriptor sets whose fence has retired, ready to be
+    /// rewritten and handed out again.
+    ///
+    /// Every set here was allocated against the one [`guest_scatter`] layout, so
+    /// unlike a draw's — which are keyed by a per-pipeline binding signature —
+    /// they are interchangeable, and a `vkAllocateDescriptorSets` per use buys
+    /// nothing. The draw-time gather issues ~40 000 dispatches a second on a
+    /// driven macos-13 boot and an allocate plus its matching free is two driver
+    /// calls apiece, which is the larger half of the per-dispatch cost that kept
+    /// the compute gather switched off. Recycling makes the steady state zero of
+    /// both.
+    ///
+    /// A set returns here only from `drain_cleanup`, which runs after the fence
+    /// of the submission that named it — the same rule the staging and gather
+    /// free lists keep, and the reason a rewrite cannot race a dispatch still
+    /// reading the old bindings.
+    ///
+    /// Bounded by construction rather than by a cap: nothing enters that was not
+    /// already allocated and retired, so the high-water is the peak number of
+    /// dispatches in flight at once and never more.
+    ///
+    /// [`guest_scatter`]: crate::backend::vulkan::engine::guest_scatter
+    scatter_dset_free: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
     /// N-deep in-flight ring: each slot is one CB + fence + the cleanup it
     /// owes. Entries rotate through slots; a slot is reused only after its
     /// fence retires (begin_entry blocks on the oldest when the ring is full).
@@ -711,6 +734,9 @@ impl ResourcePools {
 /// still be owed to the cache.
 pub(crate) struct PendingGpuCleanup {
     dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
+    /// The guest-scatter sets, kept apart from `dsets` because they recycle
+    /// rather than free — see [`ResourcePools::scatter_dset_free`].
+    scatter_dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
     staging: Vec<BufferSlot>,
     gather: Vec<BufferSlot>,
     readback: Vec<BufferSlot>,

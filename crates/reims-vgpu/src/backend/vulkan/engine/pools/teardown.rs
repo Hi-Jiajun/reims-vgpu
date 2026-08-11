@@ -170,7 +170,10 @@ impl ResourcePools {
         // before the arena because its sets were allocated against this layout.
         // Freed before the arena that owns their blocks. Anything still here was
         // never submitted, or its fence has already retired above.
-        let owed = std::mem::take(&mut self.scatter_dsets);
+        let mut owed = std::mem::take(&mut self.scatter_dsets);
+        // The recycle list holds only sets from entries whose fence retired,
+        // which is the same "nothing can still name it" state this relies on.
+        owed.append(&mut self.scatter_dset_free);
         self.desc_arena.free(device, &owed);
         if let Some(scatter) = self.scatter.take() {
             scatter.destroy(device);

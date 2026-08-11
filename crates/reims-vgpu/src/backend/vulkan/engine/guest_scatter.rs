@@ -483,16 +483,23 @@ impl ScatterPipeline {
     /// windows `dst` and the gather windows `src`, and which side is which is
     /// the only difference between the two — see [`build_gather_run_tables`].
     ///
+    /// `runs` is `(buffer, offset, range)` for a different reason: a whole
+    /// submission's tables share one staging slot, so a dispatch's own table
+    /// starts wherever [`super::stage_run_tables`] placed it. The kernel indexes
+    /// from zero of its *bound range*, which is what makes the offset the only
+    /// thing that has to say which of them this dispatch reads.
+    ///
     /// # Safety
     ///
     /// `set` must have been allocated from [`Self::dsl`], and every buffer must
-    /// be live and cover the offset/range pair given for it.
+    /// be live and cover the offset/range pair given for it. Every offset must
+    /// be a multiple of the device's `minStorageBufferOffsetAlignment`.
     pub(crate) unsafe fn write_set(
         device: &ash::Device,
         set: vk::DescriptorSet,
         src: (vk::Buffer, u64, u64),
         dst: (vk::Buffer, u64, u64),
-        runs: (vk::Buffer, u64),
+        runs: (vk::Buffer, u64, u64),
     ) {
         let infos = [
             vk::DescriptorBufferInfo::default()
@@ -505,20 +512,25 @@ impl ScatterPipeline {
                 .range(dst.2),
             vk::DescriptorBufferInfo::default()
                 .buffer(runs.0)
-                .offset(0)
-                .range(runs.1),
+                .offset(runs.1)
+                .range(runs.2),
         ];
-        let writes: Vec<_> = [BINDING_SRC, BINDING_DST, BINDING_RUNS]
-            .iter()
-            .enumerate()
-            .map(|(i, binding)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(*binding)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(std::slice::from_ref(&infos[i]))
-            })
-            .collect();
+        // An array and not a collected `Vec`: this runs once per dispatch and
+        // the draw-time gather issues ~40 000 of those a second, so a heap
+        // allocation here is 40 000 a second for three elements whose count is
+        // fixed by the layout.
+        let writes = [
+            (BINDING_SRC, &infos[0]),
+            (BINDING_DST, &infos[1]),
+            (BINDING_RUNS, &infos[2]),
+        ]
+        .map(|(binding, info)| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(binding)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(info))
+        });
         unsafe { device.update_descriptor_sets(&writes, &[]) };
     }
 

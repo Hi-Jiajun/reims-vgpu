@@ -2886,18 +2886,15 @@ unsafe fn plan_guest_scatter_dispatches(
             }
         }
     }
+    // One staging slot for every table this writeback needs; see
+    // [`stage_run_tables`]. This rail issues far fewer dispatches than the draw
+    // -time gather does, so the saving is small here — it shares the arena
+    // because a second copy of the placement arithmetic is a second place to
+    // name a descriptor offset the driver will not accept.
+    let words: Vec<&[u32]> = tables.iter().map(|(_, t)| &t.words[..]).collect();
+    let (runs_slot, places) = unsafe { stage_run_tables(ctx, pools, counters, &words) }?;
     let mut groups = Vec::with_capacity(tables.len());
-    for (buffer, table) in &tables {
-        let bytes: &[u8] = run_table_bytes(&table.words);
-        let runs_slot = unsafe {
-            pools.acquire_staging(
-                ctx,
-                bytes.len() as u64,
-                ash::vk::BufferUsageFlags::empty(),
-                counters,
-            )
-        }?;
-        unsafe { pools.write_staging(ctx, &runs_slot, bytes) }?;
+    for ((buffer, table), place) in tables.iter().zip(&places) {
         let set =
             unsafe { pools.alloc_scatter_descriptor_set(&ctx.device, pipeline.dsl, counters) }?;
         unsafe {
@@ -2908,7 +2905,7 @@ unsafe fn plan_guest_scatter_dispatches(
                 // side, because a RAMBlock is wider than `maxStorageBufferRange`.
                 (scratch.buffer, 0, scratch.size),
                 (*buffer, table.bind_offset, table.bind_range),
-                (runs_slot.buffer, bytes.len() as u64),
+                (runs_slot.buffer, place.bind_offset, place.bind_range),
             );
         }
         groups.push(ScatterGroup {
@@ -2933,6 +2930,99 @@ pub(crate) fn run_table_bytes(words: &[u32]) -> &[u8] {
     // SAFETY: `u32` is `Copy` with no padding, so any `[u32]` is a valid `[u8]`
     // of four times the length, and the borrow keeps the source alive.
     unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), std::mem::size_of_val(words)) }
+}
+
+/// Where each of a submission's run tables sits inside the one staging slot they
+/// share: byte offset and byte length, in the order they were given.
+///
+/// `bind_offset` is a multiple of `minStorageBufferOffsetAlignment` by
+/// construction, which is what makes it legal as a `VkDescriptorBufferInfo`
+/// offset; `bind_range` is the table's own length and not the padded stride, so
+/// the shader's bound range never covers a neighbour's words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RunTablePlace {
+    bind_offset: u64,
+    bind_range: u64,
+}
+
+/// Lay `tables` end to end at `align` and produce the arena's bytes, along with
+/// each table's place inside them.
+///
+/// Split out from [`stage_run_tables`] because it is the whole of the layout —
+/// the arithmetic *and* which bytes land where — and it needs no device, so a
+/// test can walk both. What is left in the caller is an acquire and a write.
+fn pack_run_tables(tables: &[&[u32]], align: u64) -> (Vec<u8>, Vec<RunTablePlace>) {
+    let align = align.max(1);
+    let mut cursor = 0u64;
+    let places: Vec<RunTablePlace> = tables
+        .iter()
+        .map(|words| {
+            // `max(4)` because a zero-length table would give a descriptor a
+            // zero range, which Vulkan refuses. It cannot arise — every planner
+            // declines an empty table before it gets here — but the bound
+            // belongs where the range is chosen rather than in a comment on the
+            // planners.
+            let len = (std::mem::size_of_val(*words) as u64).max(4);
+            let place = RunTablePlace {
+                bind_offset: cursor,
+                bind_range: len,
+            };
+            // Pad to the next legal descriptor offset. `align` is a power of two
+            // (Vulkan requires it of `minStorageBufferOffsetAlignment`), so this
+            // is the round-up and not an approximation of one.
+            cursor += len.div_ceil(align) * align;
+            place
+        })
+        .collect();
+    let mut packed = vec![0u8; cursor.max(4) as usize];
+    for (place, words) in places.iter().zip(tables) {
+        let at = place.bind_offset as usize;
+        let bytes = run_table_bytes(words);
+        packed[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+    (packed, places)
+}
+
+/// Write a whole submission's run tables into **one** staging slot, each at an
+/// offset a storage-buffer descriptor may name.
+///
+/// This is the arena that made the draw-time compute gather affordable. Each
+/// dispatch used to take a staging slot of its own for a ~200-byte table, which
+/// is an `acquire_staging` and a `write_staging` apiece — ~40 000 of each a
+/// second on a driven macos-13 boot, against ~2 200 command buffers. Sharing one
+/// slot makes it one of each per command buffer, and the descriptor's own
+/// `offset` field is what tells a dispatch which table is its own, so nothing in
+/// the kernel changes.
+///
+/// The writeback's scatter shares it for the same reason it shares
+/// [`run_table_bytes`]: it is the same table and the same staging write, and a
+/// second copy of the padding arithmetic is a second place to get a descriptor
+/// offset wrong.
+///
+/// # Safety
+///
+/// `ctx` must be the device `pools` belongs to.
+unsafe fn stage_run_tables(
+    ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
+    counters: &counters::EngineCounters,
+    tables: &[&[u32]],
+) -> Result<(pools::BufferSlot, Vec<RunTablePlace>), types::DrawError> {
+    // One host-side buffer laid out exactly as the slot wants it, so the slot
+    // takes one `write_staging`. A whole command buffer's tables come to a few
+    // kilobytes, which is why this is cheaper than the per-table slots it
+    // replaces even with the extra copy.
+    let (packed, places) = pack_run_tables(tables, ctx.guest_bind_offset_align);
+    let slot = unsafe {
+        pools.acquire_staging(
+            ctx,
+            packed.len() as u64,
+            ash::vk::BufferUsageFlags::empty(),
+            counters,
+        )
+    }?;
+    unsafe { pools.write_staging(ctx, &slot, &packed) }?;
+    Ok((slot, places))
 }
 
 /// Add one stretch's copy to the group for `buffer`, opening a group if this is
@@ -4348,5 +4438,108 @@ mod probe_visibility_tests {
             assert!(line.starts_with("vk_engine_probe reason=vk_exec_submit "));
             assert!(line.ends_with(&format!(" probe={}", probe.name())));
         }
+    }
+}
+
+#[cfg(test)]
+mod run_table_arena_tests {
+    use super::*;
+
+    /// `minStorageBufferOffsetAlignment` on the three hosts this rail runs:
+    /// 16 on Apple/MoltenVK, 32 on the NVIDIA proprietary driver, 256 on the
+    /// several drivers that report the Vulkan maximum-permitted value.
+    const ALIGNS: [u64; 3] = [16, 32, 256];
+
+    fn table(runs: usize, seed: u32) -> Vec<u32> {
+        (0..runs as u32 * 4).map(|w| w ^ seed).collect()
+    }
+
+    /// A descriptor offset the driver refuses is the whole failure mode this
+    /// arena introduced, so it is the first thing asserted.
+    #[test]
+    fn every_place_starts_at_a_legal_descriptor_offset() {
+        for align in ALIGNS {
+            let words: Vec<Vec<u32>> = (1..=9).map(|n| table(n, n as u32)).collect();
+            let borrowed: Vec<&[u32]> = words.iter().map(|w| &w[..]).collect();
+            let (_, places) = pack_run_tables(&borrowed, align);
+            for place in &places {
+                assert_eq!(
+                    place.bind_offset % align,
+                    0,
+                    "align {align}: offset {} is not a multiple",
+                    place.bind_offset
+                );
+            }
+        }
+    }
+
+    /// A range reaching into the next table would let a dispatch read runs that
+    /// belong to another gather — a wrong window, not a slow one.
+    #[test]
+    fn no_places_bound_range_reaches_its_neighbour() {
+        for align in ALIGNS {
+            let words: Vec<Vec<u32>> = (1..=9).map(|n| table(n, n as u32)).collect();
+            let borrowed: Vec<&[u32]> = words.iter().map(|w| &w[..]).collect();
+            let (packed, places) = pack_run_tables(&borrowed, align);
+            for pair in places.windows(2) {
+                assert!(
+                    pair[0].bind_offset + pair[0].bind_range <= pair[1].bind_offset,
+                    "align {align}: {:?} overlaps {:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+            let last = places.last().expect("nine tables");
+            assert!(
+                last.bind_offset + last.bind_range <= packed.len() as u64,
+                "align {align}: last place reaches past the arena"
+            );
+        }
+    }
+
+    /// The bytes a dispatch reads at its own place must be its own table's, in
+    /// order. This is the property the per-table staging slots gave for free and
+    /// the arena has to earn.
+    #[test]
+    fn each_table_reads_back_its_own_words_at_its_own_place() {
+        for align in ALIGNS {
+            let words: Vec<Vec<u32>> = (1..=9)
+                .map(|n| table(n * 3, 0xa5a5_0000 + n as u32))
+                .collect();
+            let borrowed: Vec<&[u32]> = words.iter().map(|w| &w[..]).collect();
+            let (packed, places) = pack_run_tables(&borrowed, align);
+            for (place, want) in places.iter().zip(&words) {
+                let at = place.bind_offset as usize;
+                let bytes = &packed[at..at + std::mem::size_of_val(&want[..])];
+                assert_eq!(bytes, run_table_bytes(want), "align {align}");
+                assert_eq!(
+                    place.bind_range,
+                    std::mem::size_of_val(&want[..]) as u64,
+                    "align {align}: a range wider than the table would bind padding"
+                );
+            }
+        }
+    }
+
+    /// One table is the writeback's ordinary case and it must not pay for the
+    /// arena: its place is the buffer's own start, exactly as the per-table slot
+    /// it replaces was.
+    #[test]
+    fn a_lone_table_sits_at_offset_zero() {
+        let words = table(7, 1);
+        let (packed, places) = pack_run_tables(&[&words[..]], 256);
+        assert_eq!(places.len(), 1);
+        assert_eq!(places[0].bind_offset, 0);
+        assert_eq!(places[0].bind_range, 7 * 4 * 4);
+        assert_eq!(packed.len(), 256, "rounded up to the alignment stride");
+    }
+
+    /// `acquire_staging` and `VkDescriptorBufferInfo` both refuse a zero size,
+    /// and a caller with nothing to stage would otherwise reach both with one.
+    #[test]
+    fn no_tables_still_asks_for_a_buffer_a_descriptor_could_name() {
+        let (packed, places) = pack_run_tables(&[], 256);
+        assert!(places.is_empty());
+        assert_eq!(packed.len(), 4);
     }
 }

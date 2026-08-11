@@ -187,18 +187,15 @@ unsafe fn plan_buffer_gather_dispatches(
             }
         }
     }
+    // One staging slot for every table this command buffer's gathers need, not
+    // one apiece. A gathered window's table is ~200 bytes and this rail issues
+    // ~40 000 of them a second against ~2 200 command buffers, so the acquire
+    // and the write were being paid eighteen times over for bytes that fit in a
+    // single slot.
+    let words: Vec<&[u32]> = planned.iter().map(|(_, _, _, t)| &t.words[..]).collect();
+    let (runs_slot, places) = unsafe { super::stage_run_tables(ctx, pools, counters, &words) }?;
     let mut out = Vec::with_capacity(planned.len());
-    for (source, dst, dst_have, table) in &planned {
-        let bytes = super::run_table_bytes(&table.words);
-        let runs_slot = unsafe {
-            pools.acquire_staging(
-                ctx,
-                bytes.len() as u64,
-                vk::BufferUsageFlags::empty(),
-                counters,
-            )
-        }?;
-        unsafe { pools.write_staging(ctx, &runs_slot, bytes) }?;
+    for ((source, dst, dst_have, table), place) in planned.iter().zip(&places) {
         let set =
             unsafe { pools.alloc_scatter_descriptor_set(&ctx.device, pipeline.dsl, counters) }?;
         unsafe {
@@ -207,7 +204,7 @@ unsafe fn plan_buffer_gather_dispatches(
                 set,
                 (*source, table.bind_offset, table.bind_range),
                 (*dst, 0, *dst_have),
-                (runs_slot.buffer, bytes.len() as u64),
+                (runs_slot.buffer, place.bind_offset, place.bind_range),
             );
         }
         out.push(GatherDispatch {

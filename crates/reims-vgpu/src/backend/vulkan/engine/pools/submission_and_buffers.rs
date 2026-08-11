@@ -137,6 +137,7 @@ impl ResourcePools {
             scatter: None,
             scatter_refused: false,
             scatter_dsets: Vec::new(),
+            scatter_dset_free: Vec::new(),
             slots: Vec::new(),
             cur: 0,
             in_flight: 0,
@@ -723,21 +724,57 @@ impl ResourcePools {
         }
     }
 
-    /// Allocate a descriptor set for the guest-scatter kernel and park it on the
-    /// list [`Self::seal_entry`] drains, so the caller owes it nothing.
+    /// A descriptor set for the guest-scatter kernel, recycled if one has
+    /// retired and allocated if not, parked on the list [`Self::seal_entry`]
+    /// drains so the caller owes it nothing.
+    ///
+    /// The caller must write it before dispatching: a recycled set still names
+    /// the previous dispatch's three buffers, and `ScatterPipeline::write_set`
+    /// is the only writer. Every caller does, because writing is how it names
+    /// its own buffers at all — there is no path that binds a set it did not
+    /// just write.
     ///
     /// # Safety
     ///
-    /// `device` must be the device these pools belong to.
+    /// `device` must be the device these pools belong to, and `dsl` must be the
+    /// guest-scatter layout every set on the free list was allocated against.
     pub(crate) unsafe fn alloc_scatter_descriptor_set(
         &mut self,
         device: &ash::Device,
         dsl: vk::DescriptorSetLayout,
         counters: &EngineCounters,
     ) -> Result<vk::DescriptorSet, DrawError> {
-        let (set, pool) = unsafe { self.alloc_descriptor_set(device, dsl, counters) }?;
+        let (set, pool) = match self.take_free_scatter_dset() {
+            Some(recycled) => recycled,
+            None => unsafe { self.alloc_descriptor_set(device, dsl, counters) }?,
+        };
         self.scatter_dsets.push((set, pool));
         Ok(set)
+    }
+
+    /// Take a retired guest-scatter set off the free list, or `None` when there
+    /// is none.
+    ///
+    /// Split out of [`Self::alloc_scatter_descriptor_set`] for the same reason
+    /// [`Self::take_free_gather`] is split out of `acquire_guest_gather`: it is
+    /// the whole of the no-aliasing property and it is the half that needs no
+    /// device, so a test can exercise it. A set **leaves** the free list when it
+    /// is handed out and only `drain_cleanup` puts it back, which runs after the
+    /// fence of the submission that named it — so two dispatches inside one
+    /// command buffer cannot be handed one set and have the second's
+    /// `write_set` overwrite the first's bindings.
+    fn take_free_scatter_dset(&mut self) -> Option<(vk::DescriptorSet, vk::DescriptorPool)> {
+        self.scatter_dset_free.pop()
+    }
+
+    /// Return a retired entry's guest-scatter sets to the free list.
+    ///
+    /// The other half of [`Self::take_free_scatter_dset`], named for the same
+    /// reason: the fence is what makes a rewrite safe, and this is the only
+    /// caller that has one. `drain_cleanup` is the only call site and it runs
+    /// after the wait.
+    fn recycle_scatter_dsets(&mut self, sets: &mut Vec<(vk::DescriptorSet, vk::DescriptorPool)>) {
+        self.scatter_dset_free.append(sets);
     }
 
     /// Free `(set, owning_pool)` pairs back to their allocating blocks.
@@ -1170,12 +1207,13 @@ impl ResourcePools {
         let mut sampled = std::mem::take(&mut self.sampled_live);
         let admissions = take_retained_slots(&mut sampled, sampled_retains);
         // Both seal points reach here, which is the whole reason the scatter's
-        // sets are parked on `self` instead of travelling with its plan.
-        let mut dsets = dsets;
-        dsets.append(&mut self.scatter_dsets);
+        // sets are parked on `self` instead of travelling with its plan. They
+        // travel in their own field rather than joining `dsets`, because they
+        // recycle at retire and a draw's do not.
         SealedEntry {
             cleanup: PendingGpuCleanup {
                 dsets,
+                scatter_dsets: std::mem::take(&mut self.scatter_dsets),
                 staging: std::mem::take(&mut self.staging_live),
                 gather: std::mem::take(&mut self.gather_live),
                 readback,
@@ -1767,6 +1805,9 @@ impl ResourcePools {
     /// The CB that referenced these resources must have retired.
     unsafe fn drain_cleanup(&mut self, device: &ash::Device, mut pending: PendingGpuCleanup) {
         self.desc_arena.free(device, &pending.dsets);
+        // The fence this entry waited on is exactly what makes a rewrite of
+        // these safe, so the free list is fed from here and nowhere else.
+        self.recycle_scatter_dsets(&mut pending.scatter_dsets);
         // No cache admissions here: `seal_entry` lifted them out and
         // `finish_entry_async` gave them to the cache at submit. What is left in
         // `pending.sampled` is every slot nothing retained, which recycles.
@@ -4505,6 +4546,7 @@ mod recycle_tests {
             fence: vk::Fence::null(),
             pending: Some(PendingGpuCleanup {
                 dsets: Vec::new(),
+                scatter_dsets: Vec::new(),
                 staging: Vec::new(),
                 gather: Vec::new(),
                 readback: Vec::new(),
@@ -5087,5 +5129,89 @@ mod gather_slots_do_not_alias {
             !pools.gather_live.is_empty(),
             "and the live list is what keeps it alive until its fence retires"
         );
+    }
+}
+
+/// The guest-scatter descriptor pool's no-aliasing property, which is what makes
+/// recycling a set cheaper than allocating one *and* correct.
+///
+/// These exercise [`ResourcePools::take_free_scatter_dset`] and
+/// [`ResourcePools::recycle_scatter_dsets`] rather than
+/// `alloc_scatter_descriptor_set`, because the miss path allocates and needs a
+/// device while the property under test does not — the same split, for the same
+/// reason, as [`gather_slots_do_not_alias`].
+///
+/// The property: a set is *removed* from the free list when it is handed out,
+/// and only a retired entry puts it back. A dispatch's bindings are written into
+/// its set immediately before it is recorded, so two dispatches handed one set
+/// would have the second's `write_set` silently retarget the first — a gather
+/// reading another window's runs, which is wrong pixels rather than slow ones.
+#[cfg(test)]
+mod scatter_descriptor_sets_do_not_alias {
+    use super::*;
+    use ash::vk::Handle;
+
+    fn pair(raw: u64) -> (vk::DescriptorSet, vk::DescriptorPool) {
+        (
+            vk::DescriptorSet::from_raw(raw),
+            vk::DescriptorPool::from_raw(1),
+        )
+    }
+
+    /// Two takes with no retire between them cannot resolve to one set.
+    #[test]
+    fn two_takes_with_no_retire_between_them_give_two_sets() {
+        let mut pools = ResourcePools::new();
+        pools.recycle_scatter_dsets(&mut vec![pair(1), pair(2)]);
+        let first = pools.take_free_scatter_dset().expect("two were recycled");
+        let second = pools.take_free_scatter_dset().expect("two were recycled");
+        assert_ne!(first.0, second.0);
+        assert!(
+            pools.take_free_scatter_dset().is_none(),
+            "the list held exactly what was recycled into it"
+        );
+    }
+
+    /// A retired set comes back, which is the whole point: the steady state must
+    /// stop calling `vkAllocateDescriptorSets`.
+    #[test]
+    fn a_retired_set_is_handed_out_again() {
+        let mut pools = ResourcePools::new();
+        pools.recycle_scatter_dsets(&mut vec![pair(7)]);
+        let taken = pools.take_free_scatter_dset().expect("one was recycled");
+        assert_eq!(taken.0.as_raw(), 7);
+        assert!(pools.take_free_scatter_dset().is_none());
+        pools.recycle_scatter_dsets(&mut vec![taken]);
+        assert_eq!(
+            pools
+                .take_free_scatter_dset()
+                .expect("it was recycled again")
+                .0
+                .as_raw(),
+            7
+        );
+    }
+
+    /// A fresh device has nothing to recycle, so the first dispatch of a boot
+    /// allocates rather than reading an empty `pop` as a usable handle.
+    #[test]
+    fn a_fresh_pool_has_nothing_to_hand_out() {
+        let mut pools = ResourcePools::new();
+        assert!(pools.take_free_scatter_dset().is_none());
+    }
+
+    /// Recycling drains the caller's vector, so a `PendingGpuCleanup` cannot be
+    /// drained twice into the free list and hand the same set to two live
+    /// dispatches.
+    #[test]
+    fn recycling_takes_the_sets_out_of_the_entry_that_owed_them() {
+        let mut pools = ResourcePools::new();
+        let mut owed = vec![pair(3), pair(4)];
+        pools.recycle_scatter_dsets(&mut owed);
+        assert!(owed.is_empty());
+        pools.recycle_scatter_dsets(&mut owed);
+        assert!(pools.take_free_scatter_dset().is_some());
+        assert!(pools.take_free_scatter_dset().is_some());
+        assert!(pools.take_free_scatter_dset().is_none());
     }
 }
