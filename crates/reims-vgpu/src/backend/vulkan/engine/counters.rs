@@ -415,12 +415,21 @@ engine_counters! {
         /// Compute dispatches the buffer gather issued in place of those
         /// regions, and the plans that could not become one.
         ///
-        /// Read as a pair with `buffer_guest_gather_regions`, which keeps
-        /// counting the regions a *declined* window still costs: a boot on the
-        /// dispatch path reads a handful of regions and one dispatch per
-        /// gathered window, and a boot that silently fell back reads the region
-        /// count it always did. Neither alone says which form a boot took, which
-        /// is the mistake the writeback's own census made first.
+        /// **`buffer_guest_gather_regions` above counts regions *planned*, not
+        /// issued**, because it is charged where the window is planned and
+        /// before either form is chosen. A dispatch boot therefore still reports
+        /// ~245 000 of them while issuing none — do not read that column as
+        /// transfer traffic. It is a property of the workload (how scattered the
+        /// guest's buffers are) and stays comparable across the two arms and
+        /// across builds, which is what makes it useful; it is simply not the
+        /// column that says which form ran.
+        ///
+        /// **This one is.** `dispatches > 0` means the dispatch path ran for the
+        /// whole batch; `declined > 0` means a window's arithmetic was refused
+        /// and every gather in that command buffer took the transfer regions,
+        /// which is all-or-nothing because the two forms need different
+        /// barriers. Both zero on a boot with gathers means the switch is off or
+        /// the host cannot import.
         buffer_gather_dispatches,
         buffer_gather_declined,
         /// Buffer binds served from a copy the command buffer being recorded
