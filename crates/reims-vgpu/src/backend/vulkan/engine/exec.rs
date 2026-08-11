@@ -123,6 +123,118 @@ fn compute_gather_enabled() -> bool {
     })
 }
 
+/// One thing a draw records that a render pass instance cannot contain.
+///
+/// The variants are the recording sites in [`execute_draw_inner`], one each, and
+/// they exist as a type rather than as the route string each used to carry so
+/// that the two ladders below cannot come apart: a new obstacle fails to compile
+/// until both spellings exist, where a second `get_or_insert` of a hand-written
+/// name would simply be missing from one of them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PassObstacle {
+    /// A target sampled by its own draw, captured before the attachment changes.
+    Snapshot,
+    /// The seed copy that gives a `LOAD` pass its prior content.
+    Seed,
+    /// The colour target transitioned back into attachment use.
+    TargetLayout,
+    /// A `CLEAR` pass's colour writes waiting for whoever last read the target.
+    ClearWait,
+    /// A sampled resident transitioned to shader-read.
+    ResidentLayout,
+    /// A CPU-origin or guest-origin upload into a sampled image.
+    SampledUpload,
+    /// The compute dispatches (or transfer copies) that assemble scattered guest
+    /// buffer windows.
+    Gather,
+    /// An MRT secondary attachment transitioned back into attachment use.
+    MrtLayout,
+    /// `vkCmdResetQueryPool` for an occlusion query.
+    QueryReset,
+}
+
+impl PassObstacle {
+    /// Whether this obstacle exists **only because the previous draw's pass was
+    /// closed**.
+    ///
+    /// [`super::caches::ObjectCaches::get_or_create_pass`] ends every pass with
+    /// `final_layout = TRANSFER_SRC_OPTIMAL`, so the next draw into that target
+    /// has to barrier its colour attachments back to
+    /// `COLOR_ATTACHMENT_OPTIMAL`. A pass that was never ended never moved them,
+    /// so those two transitions have nothing to undo and are not recorded at
+    /// all. Every other variant is work the draw owes whatever the pass did — a
+    /// sampled resident still has to become shader-readable, a gather still has
+    /// to run — so holding the pass open does not remove it, it only means the
+    /// pass has to be closed to record it.
+    fn is_pass_end_artifact(self) -> bool {
+        matches!(self, Self::TargetLayout | Self::MrtLayout)
+    }
+
+    /// The `passmerge_*` route for the ladder that charges the nearest obstacle
+    /// as this device records today.
+    fn route(self) -> &'static str {
+        match self {
+            Self::Snapshot => "passmerge_outside_snapshot",
+            Self::Seed => "passmerge_outside_seed",
+            Self::TargetLayout => "passmerge_outside_target_layout",
+            Self::ClearWait => "passmerge_outside_clear_wait",
+            Self::ResidentLayout => "passmerge_outside_resident_layout",
+            Self::SampledUpload => "passmerge_outside_sampled_upload",
+            Self::Gather => "passmerge_outside_gather",
+            Self::MrtLayout => "passmerge_outside_mrt_layout",
+            Self::QueryReset => "passmerge_outside_query_reset",
+        }
+    }
+
+    /// The `passheld_*` route for the ladder that charges the nearest obstacle a
+    /// held-open pass would still meet.
+    fn held_route(self) -> &'static str {
+        match self {
+            Self::Snapshot => "passheld_outside_snapshot",
+            Self::Seed => "passheld_outside_seed",
+            Self::TargetLayout | Self::MrtLayout => unreachable!(
+                "an attachment-layout obstacle is not recorded on the held ladder"
+            ),
+            Self::ClearWait => "passheld_outside_clear_wait",
+            Self::ResidentLayout => "passheld_outside_resident_layout",
+            Self::SampledUpload => "passheld_outside_sampled_upload",
+            Self::Gather => "passheld_outside_gather",
+            Self::QueryReset => "passheld_outside_query_reset",
+        }
+    }
+}
+
+/// The nearest obstacle a draw records, read twice: once as this device records
+/// today, and once as it would record if a pass were never closed between two
+/// draws of one command buffer.
+///
+/// Both are needed because the first answered its own question and hid the next
+/// one. `passmerge_outside_target_layout` took 82.4 % of draws, which says the
+/// attachment transition is the nearest obstacle and says **nothing** about what
+/// stands behind it — and that is the number that decides whether holding the
+/// pass open is worth building, because the transition is the one obstacle that
+/// holding the pass open removes by construction.
+///
+/// Observation only. Nothing here changes what is recorded.
+#[derive(Default)]
+struct PassObstacles {
+    first: Option<PassObstacle>,
+    first_held: Option<PassObstacle>,
+}
+
+impl PassObstacles {
+    /// Charge one obstacle, at the site that records it and after whatever
+    /// `continue` decides the site is a no-op for this draw. The first wins on
+    /// each ladder, because the question is what ended the pass that was
+    /// standing.
+    fn note(&mut self, obstacle: PassObstacle) {
+        self.first.get_or_insert(obstacle);
+        if !obstacle.is_pass_end_artifact() {
+            self.first_held.get_or_insert(obstacle);
+        }
+    }
+}
+
 /// Turn every pending gather into dispatches, or `None` to leave the whole
 /// batch on the transfer regions.
 ///
@@ -3018,24 +3130,20 @@ pub(crate) unsafe fn execute_draw_inner(
         };
     }
 
-    // The `passmerge_outside_*` route naming the first thing this draw records
-    // that a render pass instance cannot contain, or `None` if it records
-    // nothing outside one.
-    //
-    // The route name itself rather than a tag translated later: a second
-    // spelling is a table that can go one arm short, and the only consumer is
-    // the emission below.
+    // What this draw records that a render pass instance cannot contain, on the
+    // two ladders [`PassObstacles`] keeps.
     //
     // Every site below that emits a barrier, a copy or a dispatch names itself
     // here, *after* whatever `continue` decides the site is a no-op for this
     // draw — a loop that skips every element records nothing and must not claim
-    // it did. The first name wins, because the question is whether the pass
-    // standing from the previous draw survived to here, and the first thing
-    // recorded is what ended it.
+    // it did. The first obstacle wins on each ladder, because the question is
+    // whether the pass standing from the previous draw survived to here, and the
+    // first thing recorded is what ended it.
     //
     // This decides nothing. It is read once, at the `vkCmdBeginRenderPass`
-    // below, to charge this draw to one bucket of `passmerge_*`.
-    let mut outside_pass: Option<&'static str> = None;
+    // below, to charge this draw to one bucket of `passmerge_*` and one of
+    // `passheld_*`.
+    let mut outside_pass = PassObstacles::default();
 
     // Metal permits a pass to sample the same texture it renders into. Vulkan
     // does not permit that attachment feedback loop on this path, so capture
@@ -3056,7 +3164,7 @@ pub(crate) unsafe fn execute_draw_inner(
             continue;
         };
         target_snapshotted = true;
-        outside_pass.get_or_insert("passmerge_outside_snapshot");
+        outside_pass.note(PassObstacle::Snapshot);
         // Once per distinct source: duplicate bindings of one target share the
         // image, so a second barrier for it would order nothing new. The
         // *first* is unconditional — the source is a registry resident this
@@ -3117,7 +3225,7 @@ pub(crate) unsafe fn execute_draw_inner(
 
     // Seed upload (CPU import).
     if let Some(seed) = &seed_slot {
-        outside_pass.get_or_insert("passmerge_outside_seed");
+        outside_pass.note(PassObstacle::Seed);
         let (src_stage, src_access) =
             target_prior_access(target_snapshotted, target_access).source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
@@ -3169,7 +3277,7 @@ pub(crate) unsafe fn execute_draw_inner(
             &barrier,
         );
     } else if let Some((seed_image, seed_access)) = seed_from_resolved {
-        outside_pass.get_or_insert("passmerge_outside_seed");
+        outside_pass.note(PassObstacle::Seed);
         // GPU present-boundary seed: resident front frame → draw target copy,
         // then the pass runs with LOAD.
         //
@@ -3237,7 +3345,7 @@ pub(crate) unsafe fn execute_draw_inner(
             std::sync::atomic::Ordering::Relaxed,
         );
     } else if load_uses_gpu_content {
-        outside_pass.get_or_insert("passmerge_outside_target_layout");
+        outside_pass.note(PassObstacle::TargetLayout);
         // A prior direct sample may have left this target shader-readable;
         // transition from the registry's tracked layout back to attachment use.
         let prior = target_prior_access(target_snapshotted, target_access);
@@ -3261,7 +3369,7 @@ pub(crate) unsafe fn execute_draw_inner(
             &barrier,
         );
     } else if target_snapshotted || target_access != super::pools::ResidentAccess::Untouched {
-        outside_pass.get_or_insert("passmerge_outside_clear_wait");
+        outside_pass.note(PassObstacle::ClearWait);
         // The Clear render pass discards prior content via initialLayout
         // UNDEFINED, so nothing here preserves pixels — but its colour writes
         // still have to wait for whoever last read them, and on this path the
@@ -3319,7 +3427,7 @@ pub(crate) unsafe fn execute_draw_inner(
         {
             continue;
         }
-        outside_pass.get_or_insert("passmerge_outside_resident_layout");
+        outside_pass.note(PassObstacle::ResidentLayout);
         let (src_stage, src_access) = access.source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
@@ -3351,7 +3459,7 @@ pub(crate) unsafe fn execute_draw_inner(
         else {
             continue;
         };
-        outside_pass.get_or_insert("passmerge_outside_sampled_upload");
+        outside_pass.note(PassObstacle::SampledUpload);
         upload_buffer_to_sampled_image(
             ctx,
             cb,
@@ -3379,7 +3487,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // Either form lands byte-identical bytes; which one ran decides only this
     // barrier's source scope, and `buffer_gather_dispatches` says which it was.
     if !guest_gathers.is_empty() {
-        outside_pass.get_or_insert("passmerge_outside_gather");
+        outside_pass.note(PassObstacle::Gather);
     }
     let gather_dispatched = if guest_gathers.is_empty() || !compute_gather_enabled() {
         false
@@ -3479,7 +3587,7 @@ pub(crate) unsafe fn execute_draw_inner(
         else {
             continue;
         };
-        outside_pass.get_or_insert("passmerge_outside_sampled_upload");
+        outside_pass.note(PassObstacle::SampledUpload);
         upload_buffer_to_sampled_image(
             ctx,
             cb,
@@ -3502,7 +3610,7 @@ pub(crate) unsafe fn execute_draw_inner(
         if *access == super::pools::ResidentAccess::Untouched {
             continue;
         }
-        outside_pass.get_or_insert("passmerge_outside_mrt_layout");
+        outside_pass.note(PassObstacle::MrtLayout);
         let (src_stage, src_access) = access.source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
@@ -3559,7 +3667,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 .device
                 .create_query_pool(&ci, None)
                 .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecCreateQueryPool, e)))?;
-            outside_pass.get_or_insert("passmerge_outside_query_reset");
+            outside_pass.note(PassObstacle::QueryReset);
             ctx.device.cmd_reset_query_pool(cb, pool, 0, 1);
             Some((pool, flags))
         }
@@ -3575,14 +3683,14 @@ pub(crate) unsafe fn execute_draw_inner(
     //
     // Observation only — the pass is begun below either way.
     //
-    // The buckets are exhaustive over draws that reach here, which is the
-    // cheapest way to catch a mis-placed `get_or_insert`: summed over a census
-    // window they equal `chain_phase chains`, and `passmerge_no_join` alone
+    // Each family's buckets are exhaustive over draws that reach here, which is
+    // the cheapest way to catch a mis-placed `note`: summed over a census window
+    // each family equals `chain_phase chains`, and `passmerge_no_join` alone
     // equals that count less `engine_delta batch_joins`. A total that falls
     // short means a draw took a path that skips this line; a `no_join` that
     // disagrees means `joins` and the batch counters have come apart.
     //
-    // # What it read, and why the gather was the wrong suspect
+    // # Why there are two families, and why the first one answered nothing
     //
     // Two driven macos-13 sustained-animation boots, quiesced, both fast
     // (`present_hz` 115.0 and 114.0), sum identity exact on both:
@@ -3610,22 +3718,41 @@ pub(crate) unsafe fn execute_draw_inner(
     // with framebuffer compression (every iGPU, every tiler, AMD DCC, Intel CCS)
     // it is a decompress and recompress of the attachment per draw.
     //
-    // **The ladder charges the nearest obstacle, so `outside_gather=0` does not
+    // **A ladder charges the nearest obstacle, so `outside_gather=0` does not
     // mean gathers are rare.** `buffer_guest_gathers` is 34 564/s and they sit
-    // behind the layout barrier, which precedes them in record order. What the
-    // merge is actually worth cannot be read until that barrier moves.
+    // behind the layout barrier, which precedes them in record order — so the
+    // reading above says which obstacle is nearest and nothing whatever about
+    // what the merge is worth, because the nearest one is the single obstacle
+    // that holding the pass open removes by construction.
+    //
+    // `passheld_*` is the same ladder with those two transitions taken out — see
+    // [`PassObstacle::is_pass_end_artifact`] for why exactly those two and no
+    // others. It is the reading that decides whether a deferred pass end is
+    // worth building: `passheld_reachable` is how many draws a *local* merge
+    // could take with no lookahead at all, and whatever bucket holds the rest
+    // names the obstacle that would have to be hoisted to take them too.
     let echo = super::pools::PassEcho {
         cb,
         pass: render_pass,
         fb: target_fb,
         area: (req.width, req.height),
     };
+    let continues = joins && pools.pass_echoes(&echo);
     crate::runtime::drain::note_store_route(if !joins {
         "passmerge_no_join"
-    } else if !pools.pass_echoes(&echo) {
+    } else if !continues {
         "passmerge_pass_differs"
     } else {
-        outside_pass.unwrap_or("passmerge_reachable")
+        outside_pass.first.map_or("passmerge_reachable", PassObstacle::route)
+    });
+    crate::runtime::drain::note_store_route(if !joins {
+        "passheld_no_join"
+    } else if !continues {
+        "passheld_pass_differs"
+    } else {
+        outside_pass
+            .first_held
+            .map_or("passheld_reachable", PassObstacle::held_route)
     });
     ctx.device
         .cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
