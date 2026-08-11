@@ -1950,8 +1950,20 @@ fn emit_bind_phase() {
         return;
     };
     crate::observe::off(format!(
-        "bind_phase binds={} vertex_us={} fragment_us={} attrs_us={}",
-        w.binds, w.vertex_us, w.fragment_us, w.attrs_us,
+        "bind_phase binds={} vertex_us={} fragment_us={} attrs_us={} \
+         acc_unused={} acc_deref={} acc_undecl={} acc_n={} acc_unused_staged={}",
+        w.binds,
+        w.vertex_us,
+        w.fragment_us,
+        w.attrs_us,
+        w.access_unused,
+        w.access_dereferenced,
+        w.access_undeclared,
+        // The three classes partition the buffer binds resolved in the window,
+        // so this is their sum and not a separately-counted total: a reader who
+        // divides gets an identity that holds or a bug that shows.
+        w.access_total(),
+        w.access_unused_staged,
     ));
 }
 

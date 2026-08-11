@@ -2110,6 +2110,71 @@ pub fn reflected_buffer_extent(reflection: &ShaderReflection, metal_index: u32) 
     }
 }
 
+/// What reflection says a `[[buffer(n)]]` bind is *for*, as a total answer.
+///
+/// The translator's [`ResourceAccess`] is parsed here, at the one boundary that
+/// reads it, so no consumer downstream matches on an `Option` of a foreign enum
+/// and silently gains a fourth case when the translator declares one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReflectedBufferAccess {
+    /// The specialized entry point does not dereference this buffer. Its
+    /// descriptor may still have to be bound, but no guest bytes are read
+    /// through it, so nothing needs staging for this draw.
+    Unused = 0,
+    /// Reflection declares the bind and says the shader touches it —
+    /// `ReadOnly`, `WriteOnly`, `ReadWrite`, or an image class at this index.
+    Dereferenced = 1,
+    /// Reflection carries no `Buffer` at this index, or carries one with no
+    /// access recorded. Both mean *no answer*, which is not the same as
+    /// [`Self::Unused`] and must never be treated as one.
+    Undeclared = 2,
+}
+
+/// How reflection describes a `[[buffer(n)]]` bind's use by this stage.
+///
+/// The asymmetry is the same one [`reflected_buffer_extent`] states, and for a
+/// sharper reason. Reading `Unused` where the shader does dereference the buffer
+/// hands the GPU stale or absent bytes — silent wrong pixels, no error anywhere
+/// — so only an explicit [`ResourceAccess::Unused`] may answer
+/// [`ReflectedBufferAccess::Unused`]. A bind reflection never mentions, and one
+/// it mentions without an access, are both [`ReflectedBufferAccess::Undeclared`].
+///
+/// Deliberately not gated on [`crate::env::BUFFER_EXTENT`]. That switch governs
+/// narrowing a bind's byte window, which is a different question from whether
+/// the bind is read at all, and folding the two would make one switch silently
+/// answer for two rails.
+///
+/// The kind is checked as well as the index for the reason
+/// [`reflected_buffer_extent`] gives: `metal_index` is unique only within a
+/// resource family, so a `[[texture(2)]]` would otherwise answer for
+/// `[[buffer(2)]]`.
+pub fn reflected_buffer_access(
+    reflection: &ShaderReflection,
+    metal_index: u32,
+) -> ReflectedBufferAccess {
+    // `find_map` here yields `Option<Option<ResourceAccess>>` on purpose: the
+    // outer level says whether reflection declares a Buffer at this index at
+    // all, the inner says whether that declaration carries an access. Flattening
+    // them would merge "not declared" into "declared, access unrecorded", and
+    // this function exists to keep those apart.
+    let Some(access) = reflection.bindings.iter().find_map(|b| {
+        (b.kind == ResourceKind::Buffer && b.metal_index == metal_index).then_some(b.access)
+    }) else {
+        return ReflectedBufferAccess::Undeclared;
+    };
+    match access {
+        Some(ResourceAccess::Unused) => ReflectedBufferAccess::Unused,
+        Some(
+            ResourceAccess::ReadOnly
+            | ResourceAccess::WriteOnly
+            | ResourceAccess::ReadWrite
+            | ResourceAccess::Sampled
+            | ResourceAccess::Storage,
+        ) => ReflectedBufferAccess::Dereferenced,
+        None => ReflectedBufferAccess::Undeclared,
+    }
+}
+
 /// How reflection describes descriptor `binding` for the sampled render path.
 /// Lets the call site log a genuine gap fail-visibly while staying silent on the
 /// expected "bound but not sampled by this shader" case.
@@ -2757,6 +2822,107 @@ mod tests {
 
         assert_eq!(reflected_buffer_extent(&r, 0), None, "threadgroup buffer");
         assert_eq!(reflected_buffer_extent(&r, 1), None, "texture");
+    }
+
+    /// Only an explicit `Unused` answers `Unused`, and every other way of not
+    /// knowing answers `Undeclared`.
+    ///
+    /// Asserted case by case rather than as one "not Unused" arm, for the reason
+    /// `only_a_bounded_object_extent_narrows_a_buffer_bind` gives about the
+    /// extent: this is the direction with no alarm behind it. A bind wrongly
+    /// read as unused would have its guest bytes withheld, and the shader would
+    /// read whatever the descriptor happened to point at — wrong pixels, no
+    /// error anywhere. Reading a genuinely unused bind as `Dereferenced` only
+    /// costs the copy we already pay.
+    #[test]
+    fn only_an_explicit_unused_access_answers_unused() {
+        use metal2vulkan::reflect::ResourceAccess;
+
+        let mut r = empty_reflection(ShaderStage::Fragment);
+        let with = |index: u32, access: Option<ResourceAccess>| {
+            let mut b = buffer_binding(index, None);
+            b.access = access;
+            b
+        };
+        r.bindings = vec![
+            with(0, Some(ResourceAccess::Unused)),
+            with(1, Some(ResourceAccess::ReadOnly)),
+            with(2, Some(ResourceAccess::WriteOnly)),
+            with(3, Some(ResourceAccess::ReadWrite)),
+            with(4, None),
+        ];
+
+        assert_eq!(
+            reflected_buffer_access(&r, 0),
+            ReflectedBufferAccess::Unused,
+            "the one class that may withhold bytes"
+        );
+        for index in 1..=3 {
+            assert_eq!(
+                reflected_buffer_access(&r, index),
+                ReflectedBufferAccess::Dereferenced,
+                "index {index} is touched by the shader"
+            );
+        }
+        assert_eq!(
+            reflected_buffer_access(&r, 4),
+            ReflectedBufferAccess::Undeclared,
+            "declared, but carrying no access"
+        );
+        assert_eq!(
+            reflected_buffer_access(&r, 9),
+            ReflectedBufferAccess::Undeclared,
+            "not declared at all — not a synonym for unused"
+        );
+    }
+
+    /// The same family rule the extent lookup obeys. A `[[texture(0)]]` marked
+    /// unused must not answer for `[[buffer(0)]]`, or a bind the shader does
+    /// read would have its bytes withheld on a texture's say-so.
+    #[test]
+    fn a_buffer_access_is_not_read_off_another_resource_family() {
+        use metal2vulkan::reflect::ResourceAccess;
+
+        let mut r = empty_reflection(ShaderStage::Fragment);
+        let mut threadgroup = buffer_binding(0, None);
+        threadgroup.kind = ResourceKind::ThreadgroupBuffer;
+        threadgroup.access = Some(ResourceAccess::Unused);
+        let mut texture = buffer_binding(1, None);
+        texture.kind = ResourceKind::Texture;
+        texture.access = Some(ResourceAccess::Unused);
+        r.bindings = vec![threadgroup, texture];
+
+        assert_eq!(
+            reflected_buffer_access(&r, 0),
+            ReflectedBufferAccess::Undeclared,
+            "threadgroup buffer"
+        );
+        assert_eq!(
+            reflected_buffer_access(&r, 1),
+            ReflectedBufferAccess::Undeclared,
+            "texture"
+        );
+    }
+
+    /// The classification must not answer differently because the *extent* rail
+    /// was switched off. They are two questions about one binding and one switch
+    /// must not silently answer for both.
+    #[test]
+    fn the_access_class_does_not_follow_the_extent_switch() {
+        use metal2vulkan::reflect::ResourceAccess;
+
+        let mut r = empty_reflection(ShaderStage::Vertex);
+        let mut b = buffer_binding(0, Some(BufferExtent::Object { bytes: 288 }));
+        b.access = Some(ResourceAccess::Unused);
+        r.bindings = vec![b];
+
+        // Whatever `buffer_extent_disabled()` reads from the environment on this
+        // host, the access answer is the same one.
+        assert_eq!(
+            reflected_buffer_access(&r, 0),
+            ReflectedBufferAccess::Unused,
+            "access is not gated on the extent switch"
+        );
     }
 
     fn texture_binding(binding: u32, shape: TextureShape) -> ResourceBinding {

@@ -5261,6 +5261,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 &v_shader.reflection,
                 b.index,
             );
+            // Measurement only: nothing below branches on this yet. It sizes
+            // the population a skip could serve, from the same reflection the
+            // cap above is read from and under the same stage rule.
+            crate::runtime::bind_phase::note_access(
+                crate::runtime::spirv_bind::reflected_buffer_access(&v_shader.reflection, b.index),
+            );
             let Some(content) = load_buffer_content(
                 state,
                 host,
@@ -5296,6 +5302,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             let cap = crate::runtime::spirv_bind::reflected_buffer_extent(
                 &f_shader.reflection,
                 b.index,
+            );
+            // Same measurement, against the fragment stage's own reflection.
+            crate::runtime::bind_phase::note_access(
+                crate::runtime::spirv_bind::reflected_buffer_access(&f_shader.reflection, b.index),
             );
             let Some(content) = load_buffer_content(
                 state,

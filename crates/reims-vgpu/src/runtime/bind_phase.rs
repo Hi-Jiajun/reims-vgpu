@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::observe::phase_clock::{charge_ns, to_us};
+use crate::runtime::spirv_bind::ReflectedBufferAccess;
 
 /// The parts of the bind phase that are worth telling apart.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,6 +51,16 @@ const PARTS: usize = 3;
 static ACC: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
 static BINDS: AtomicU64 = AtomicU64::new(0);
 
+/// One slot per [`ReflectedBufferAccess`], indexed by its ordinal.
+const ACCESS_CLASSES: usize = ReflectedBufferAccess::Undeclared as usize + 1;
+
+/// The table is wide enough for every class the parse can return. Derived from
+/// the highest ordinal rather than hand-counted, so a new class fails the build
+/// here instead of wrapping into another class's tally at runtime.
+const _: () = assert!(ACCESS_CLASSES == 3);
+
+static ACCESS: [AtomicU64; ACCESS_CLASSES] = [const { AtomicU64::new(0) }; ACCESS_CLASSES];
+
 /// One window of the split, as taken by the per-second census.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BindPhaseWindow {
@@ -58,6 +69,30 @@ pub struct BindPhaseWindow {
     pub attrs_us: u64,
     /// Bind phases entered in the window — the denominator the three share.
     pub binds: u64,
+    /// Buffer binds whose stage's reflection says the shader never dereferences
+    /// them. These are the ones whose guest bytes need not be staged at all.
+    pub access_unused: u64,
+    /// Buffer binds reflection says the shader does touch.
+    pub access_dereferenced: u64,
+    /// Buffer binds reflection gives no answer for. Not a synonym for
+    /// [`Self::access_unused`] — see [`ReflectedBufferAccess::Undeclared`].
+    pub access_undeclared: u64,
+    /// Of [`Self::access_unused`], those whose bytes were gathered anyway.
+    ///
+    /// This is the *reliance* reading, and it is what makes the tally worth
+    /// keeping rather than a probe to delete. While nothing acts on the
+    /// classification the two are equal by construction; once something does,
+    /// the gap between them is the saving, measured rather than assumed.
+    pub access_unused_staged: u64,
+}
+
+impl BindPhaseWindow {
+    /// The three access classes partition the buffer binds resolved in the
+    /// window, so they sum to that count. Stated as a method rather than a
+    /// field so no emitter can publish a total that disagrees with its parts.
+    pub fn access_total(&self) -> u64 {
+        self.access_unused + self.access_dereferenced + self.access_undeclared
+    }
 }
 
 /// Take and clear the window. `None` when no bind phase ran, so an idle second
@@ -69,9 +104,33 @@ pub fn take_window() -> Option<BindPhaseWindow> {
         fragment_us: to_us(ACC[Part::FragmentLoad as usize].swap(0, Ordering::Relaxed)),
         attrs_us: to_us(ACC[Part::Attrs as usize].swap(0, Ordering::Relaxed)),
         binds,
+        access_unused: ACCESS[ReflectedBufferAccess::Unused as usize].swap(0, Ordering::Relaxed),
+        access_dereferenced: ACCESS[ReflectedBufferAccess::Dereferenced as usize]
+            .swap(0, Ordering::Relaxed),
+        access_undeclared: ACCESS[ReflectedBufferAccess::Undeclared as usize]
+            .swap(0, Ordering::Relaxed),
+        access_unused_staged: UNUSED_STAGED.swap(0, Ordering::Relaxed),
     };
     (binds > 0).then_some(w)
 }
+
+/// Count one buffer bind against what its stage's reflection said about it.
+///
+/// Called once per resolved `[[buffer(n)]]` bind on the render path, in both the
+/// vertex and the fragment loop, so the three classes partition that population
+/// — see [`BindPhaseWindow::access_total`].
+pub fn note_access(class: ReflectedBufferAccess) {
+    ACCESS[class as usize].fetch_add(1, Ordering::Relaxed);
+    if matches!(class, ReflectedBufferAccess::Unused) {
+        // While nothing skips on the classification these two rise together.
+        // The counter is here, and not derived from `access_unused` at the
+        // emitter, so that the day something does skip, the line reports the
+        // saving instead of continuing to report the classification twice.
+        UNUSED_STAGED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+static UNUSED_STAGED: AtomicU64 = AtomicU64::new(0);
 
 /// Count one entry into the bind phase, so the parts have a denominator that
 /// is theirs rather than `chain_phase`'s `chains`.
@@ -177,6 +236,75 @@ mod tests {
         }
         let w = take_window().expect("binds were noted");
         assert!(w.attrs_us > 100, "{w:?}");
+    }
+
+    /// The three access classes partition the binds counted, so they sum to the
+    /// total the line publishes. That identity is what makes the line
+    /// self-checking: a reader who divides gets an answer that holds or a bug
+    /// that shows.
+    #[test]
+    fn the_access_classes_sum_to_the_total() {
+        let _ = take_window();
+        note_bind();
+        for _ in 0..5 {
+            note_access(ReflectedBufferAccess::Unused);
+        }
+        for _ in 0..11 {
+            note_access(ReflectedBufferAccess::Dereferenced);
+        }
+        for _ in 0..2 {
+            note_access(ReflectedBufferAccess::Undeclared);
+        }
+
+        let w = take_window().expect("a bind was noted");
+        assert_eq!(w.access_unused, 5, "{w:?}");
+        assert_eq!(w.access_dereferenced, 11, "{w:?}");
+        assert_eq!(w.access_undeclared, 2, "{w:?}");
+        assert_eq!(w.access_total(), 18, "{w:?}");
+    }
+
+    /// Each class lands in its own slot. Indexing the table by the enum's
+    /// ordinal is only safe while the ordinals are distinct and in range, and a
+    /// class quietly tallying into another's slot would read as a real
+    /// population rather than as a bug.
+    #[test]
+    fn each_access_class_lands_in_its_own_slot() {
+        for class in [
+            ReflectedBufferAccess::Unused,
+            ReflectedBufferAccess::Dereferenced,
+            ReflectedBufferAccess::Undeclared,
+        ] {
+            let _ = take_window();
+            note_bind();
+            note_access(class);
+            let w = take_window().expect("a bind was noted");
+            assert_eq!(w.access_total(), 1, "{class:?} counted once: {w:?}");
+            let landed = match class {
+                ReflectedBufferAccess::Unused => w.access_unused,
+                ReflectedBufferAccess::Dereferenced => w.access_dereferenced,
+                ReflectedBufferAccess::Undeclared => w.access_undeclared,
+            };
+            assert_eq!(landed, 1, "{class:?} landed in its own slot: {w:?}");
+        }
+    }
+
+    /// While nothing skips on the classification, every unused bind is still
+    /// staged. The day a skip lands this assertion is what has to change, and
+    /// the gap between the two numbers is the saving it bought.
+    #[test]
+    fn every_unused_bind_is_still_staged() {
+        let _ = take_window();
+        note_bind();
+        note_access(ReflectedBufferAccess::Unused);
+        note_access(ReflectedBufferAccess::Unused);
+        note_access(ReflectedBufferAccess::Dereferenced);
+
+        let w = take_window().expect("a bind was noted");
+        assert_eq!(w.access_unused, 2, "{w:?}");
+        assert_eq!(
+            w.access_unused_staged, w.access_unused,
+            "nothing acts on the classification yet: {w:?}"
+        );
     }
 
     /// Taking the window resets it, so the line is a rate and not a running
