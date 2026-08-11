@@ -5,17 +5,37 @@
 #
 #   gpu-load-probe.sh <outdir> <seconds>
 #
-# Why it exists. The sustained-animation probe has **saturated** on macos-13:
-# the guest produces ~26 800 draws and ~76 presented frames a second whatever
-# the device does, the drain worker sits at duty 0.83, and a measured
-# 3.9 us/chain CPU saving moved `draws_s` by less than 0.1 % because the worker
-# spent what it saved waiting for guest work. A probe the device cannot fall
-# behind cannot rank a device change, in either direction — it reports "no
-# effect" for a real win and for a real regression alike.
+# Why it exists — and read the correction below before believing it. The
+# sustained-animation probe was once **saturated** on macos-13: the guest
+# produced ~26 800 draws and ~76 presented frames a second whatever the device
+# did, the drain worker sat at duty 0.83, and a measured 3.9 us/chain CPU saving
+# moved `draws_s` by less than 0.1 % because the worker spent what it saved
+# waiting for guest work. A probe the device cannot fall behind cannot rank a
+# device change, in either direction — it reports "no effect" for a real win and
+# for a real regression alike.
 #
 # So this probe makes each guest frame heavier instead of asking for more
 # frames, which is also the only thing a page *can* do: the guest's frame rate
 # is its own display cadence and no content raises it.
+#
+# # That saturation is gone, and the sustained probe ranks changes again
+#
+# The reading above was taken on a slower device and through a presenter that
+# clamped at ~41 frames a second. Neither holds now: the drain worker sits at
+# duty 0.55-0.58 and a fast-latching boot presents 109-119 Hz. Twenty-four
+# interleaved boots with the device pushed 20.6 % the wrong way
+# (`REIMS_VGPU_COMPUTE_GATHER=off`), scored over their fast boots only, separate
+# **disjointly** on this probe — 113.2 Hz mean against 105.5, slowest shipping
+# boot above fastest slowed one — while `us/draw` overlaps across the same
+# fourteen boots.
+#
+# So the sustained probe is the sharpest instrument in this harness, not a
+# saturated one, and `present_hz` over the fast population is what to rank by.
+# See `runtime::drain::census`'s `VBL_REPORT_EARLY` for the run and the
+# elasticity it puts on a candidate.
+#
+# This probe keeps its own job, which was always the second half of the sentence
+# below: loading one *particular rail* harder than a compositing page does.
 #
 # The load is three independent dials, set through `GPU_LOAD_ARGS`, because they
 # land on three different rails:
@@ -70,10 +90,10 @@
 # for anything about the guest buffer gather even though its absolute draw rate
 # is lower. `tex` has not been measured alone.
 #
-# Nothing here beats the sustained-animation probe for total device load. That
-# probe reaches duty 0.83 and this one does not, so it remains the arm for
-# ranking a change; this one is for loading a *particular rail* harder than a
-# compositing page does.
+# Nothing here beats the sustained-animation probe for total device load, and
+# that probe is also the one shown to separate arms disjointly, so it remains the
+# arm for ranking a change; this one is for loading a *particular rail* harder
+# than a compositing page does.
 #
 # The page is served by the host over QEMU's user-net gateway (10.0.2.2), not
 # fetched from the internet: a probe whose workload can change under it cannot
