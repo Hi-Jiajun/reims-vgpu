@@ -146,6 +146,21 @@
 //! the mechanism predicts: `slot_us` roughly doubles, which is the drain worker
 //! blocking longer on a ring fence the GPU takes longer to signal.
 //!
+//! **The cost is on the GPU, not in the driver's recording of it**, and that is
+//! the part which decides what can fix it. Per draw, across the same boots:
+//!
+//! ```text
+//!               slot_us        record_us
+//! shipping      10.40  11.54   2.12  2.07
+//! 4x regions    24.69  29.07   2.72  2.10
+//! ```
+//!
+//! `record_us` — building the region arrays and calling `vkCmdCopyBuffer` — does
+//! not move, while the wait for the GPU nearly triples. Four times the
+//! `VkBufferCopy` structs cost almost nothing to write down and a great deal to
+//! execute. So a fix has to remove GPU-side per-region work; batching the same
+//! regions into fewer calls would not touch this.
+//!
 //! So this rail is bound by the **number of copy regions it issues**, and the
 //! bytes are close to free. That is the opposite of what the ~5.0 GB/s figure
 //! above suggests on its face, and it is why every attempt aimed at the bytes —
