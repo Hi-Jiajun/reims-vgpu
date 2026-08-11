@@ -489,6 +489,90 @@ impl ReadbackPhase {
     }
 }
 
+/// The per-opcode split of `proc_ns`, indexed by the opcode itself.
+///
+/// Sized from the contract rather than from a count of the arms
+/// `process_child_packet` happens to have: [`CHILD_OP_MAX`] is the largest
+/// opcode the child FIFO defines, so a table one wider than it can hold every
+/// opcode the guest can legally send and there is no bound left to overflow.
+/// That is the whole reason this is direct-indexed rather than an associative
+/// table with a probe and a dropped-entry counter — a capacity derived from the
+/// wire format cannot be one short the way a hand-picked slot count can.
+///
+/// An opcode above the maximum is counted in `above_max` rather than indexed;
+/// decode is expected to have refused it long before here, so a non-zero reading
+/// is a decoder result, not a table result.
+///
+/// Its own type because `#[derive(Default)]` stops at 32-element arrays and
+/// this is 65 wide. The manual impl is the whole cost of getting the bound from
+/// the contract.
+struct ProcOpTable {
+    ns: [std::sync::atomic::AtomicU64; PROC_OP_SLOTS],
+    count: [std::sync::atomic::AtomicU64; PROC_OP_SLOTS],
+    above_max: std::sync::atomic::AtomicU64,
+}
+
+/// One slot per legal child opcode, `0..=CHILD_OP_MAX`. Derived from the
+/// contract's own maximum, so a new opcode widens the table by widening that.
+const PROC_OP_SLOTS: usize = crate::model::CHILD_OP_MAX as usize + 1;
+
+impl Default for ProcOpTable {
+    fn default() -> Self {
+        Self {
+            ns: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            count: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            above_max: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+/// Which of the three accesses `drain_child_fifo` makes around a packet.
+///
+/// They were one counter first, and the aggregate misled: it read 5055 ns an
+/// access, which is not a plausible cost for four bytes and is only explicable
+/// if the three are not alike. They are not — see the `regs_op_ns` field doc.
+#[derive(Clone, Copy)]
+pub enum RegsOp {
+    /// The `CHILD_REG_TAIL` read at the top of each loop iteration. A four-byte
+    /// `address_space_read`, and the one op here that really is one.
+    TailRead,
+    /// The `CHILD_REG_HEAD` writeback after a packet is processed. Four bytes
+    /// again, but through `gpa_map::write_u32` rather than the raw callback, so
+    /// it carries whatever page bookkeeping that path does.
+    HeadWrite,
+    /// The completion stamp. **Not a word write**: on the Vulkan arm this tries
+    /// the GPU rail first — resolving a guest RAM reference and submitting a
+    /// command buffer — and falls through to a blocking settle when that
+    /// declines. If the 97 ms/s is anywhere, the prior is that it is here, which
+    /// is exactly why it is measured rather than assumed.
+    Stamp,
+}
+
+impl RegsOp {
+    /// How many accesses there are. The census arrays are sized from this, so a
+    /// new variant that forgets to bump it fails to build [`Self::ALL`] rather
+    /// than overflowing an array at report time.
+    pub(crate) const COUNT: usize = 3;
+
+    const ALL: [RegsOp; Self::COUNT] = [RegsOp::TailRead, RegsOp::HeadWrite, RegsOp::Stamp];
+
+    const fn index(self) -> usize {
+        match self {
+            RegsOp::TailRead => 0,
+            RegsOp::HeadWrite => 1,
+            RegsOp::Stamp => 2,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            RegsOp::TailRead => "tailrd",
+            RegsOp::HeadWrite => "headwr",
+            RegsOp::Stamp => "stamp",
+        }
+    }
+}
+
 impl FlushRail {
     const ALL: [FlushRail; 4] = [
         FlushRail::Render,
@@ -938,6 +1022,41 @@ pub(crate) struct DrainDutyCensus {
     regs_ops: std::sync::atomic::AtomicU64,
     setup_ns: std::sync::atomic::AtomicU64,
     setup_calls: std::sync::atomic::AtomicU64,
+    /// `regs_ns` split by which of the three accesses it was, because the
+    /// aggregate turned out to be averaging three unlike things.
+    ///
+    /// The span was added expecting three cheap guest word accesses a packet and
+    /// measured **5055 ns each**, 25x what an `address_space_read` of four bytes
+    /// costs. `write_stamp` is why it cannot be read as register traffic: on the
+    /// Vulkan arm it tries `stamp_word_ordered_on_gpu` first, which resolves a
+    /// guest RAM reference and *submits a GPU command buffer*, and falls through
+    /// to a blocking settle when that declines. So one of the three is a
+    /// submission or a quiesce and the other two are word accesses, and a single
+    /// bucket cannot say which carries the 97 ms/s.
+    ///
+    /// Indexed by [`RegsOp::index`]. The three **must** sum to `regs_ns` and the
+    /// counts to `regs_ops`; that identity is the cheapest way to catch a
+    /// mis-attributed site, so both the total and the split are emitted.
+    regs_op_ns: [std::sync::atomic::AtomicU64; RegsOp::COUNT],
+    regs_op_count: [std::sync::atomic::AtomicU64; RegsOp::COUNT],
+    /// `proc_ns` split by the opcode that was dispatched, as an associative
+    /// table keyed by the guest opcode itself.
+    ///
+    /// `proc - draw - compute` is 155-165 ms/s over two driven boots — the
+    /// larger half of the residue, and 24 us a packet against a decode that
+    /// costs 117 ns. `process_child_packet` is a match over ~24 arms and only
+    /// one of them has ever been timed, so nothing says whether that 155 ms is
+    /// one arm or spread across all of them.
+    ///
+    /// Keyed by opcode rather than by a hand-written class enum because the
+    /// point is to find out which arms cost, and a class enum written now would
+    /// encode the guess this instrument exists to avoid. Slots are claimed on
+    /// first sight and never released, so the key scan is over the handful of
+    /// opcodes a boot actually issues.
+    ///
+    /// See [`ProcOpTable`] for why this is indexed by the opcode rather than
+    /// keyed by a class this device would have had to invent.
+    proc_ops: ProcOpTable,
     max_tranche_us: std::sync::atomic::AtomicU64,
     /// Longest single Flush in the window. `flush_us/flushes` is a mean, and a
     /// mean cannot tell "every flush costs 7.7 ms" from "most are free and one
@@ -1125,19 +1244,54 @@ impl DrainDutyCensus {
         self.packets.fetch_add(1, Relaxed);
     }
 
-    /// One `process_child_packet` dispatch, in nanoseconds. Contains the draw
-    /// and compute phases, which name themselves on the same line.
-    pub(crate) fn note_proc(&self, ns: u64) {
-        self.proc_ns
-            .fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    /// One `process_child_packet` dispatch, in nanoseconds, into the total and
+    /// into the slot for its opcode. Contains the draw and compute phases, which
+    /// name themselves on the same line.
+    pub(crate) fn note_proc(&self, opcode: u16, ns: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.proc_ns.fetch_add(ns, Relaxed);
+        let Some(slot) = self.proc_ops.ns.get(opcode as usize) else {
+            self.proc_ops.above_max.fetch_add(1, Relaxed);
+            return;
+        };
+        slot.fetch_add(ns, Relaxed);
+        self.proc_ops.count[opcode as usize].fetch_add(1, Relaxed);
     }
 
-    /// One guest register access around a packet — the tail read, the head
-    /// writeback, or the completion stamp — in nanoseconds.
-    pub(crate) fn note_regs(&self, ns: u64) {
+    /// The per-opcode split of the window [`Self::note`] just reported, or
+    /// `None` when no packet was dispatched in it.
+    ///
+    /// Sits under `drain_duty`'s `proc_us` and divides it: the `_us` fields sum
+    /// to `proc_us` and the `_n` fields to `packets`. Only opcodes the window
+    /// actually saw are printed, so a line names the arms this workload takes
+    /// rather than all 65 the contract allows.
+    pub(crate) fn take_proc_ops(&self) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let win_ms = self.last_win_ms.load(Relaxed);
+        let mut body = String::new();
+        let mut any = false;
+        for opcode in 0..PROC_OP_SLOTS {
+            let n = self.proc_ops.count[opcode].swap(0, Relaxed);
+            let us = self.proc_ops.ns[opcode].swap(0, Relaxed) / 1000;
+            if n == 0 {
+                continue;
+            }
+            any = true;
+            body.push_str(&format!(" op{opcode:#04x}_us={us} op{opcode:#04x}_n={n}"));
+        }
+        let above = self.proc_ops.above_max.swap(0, Relaxed);
+        any.then(|| format!("drain_ops win_ms={win_ms} above_max={above}{body}"))
+    }
+
+    /// One access around a packet, in nanoseconds, into both the total and the
+    /// per-op split. Recording both is what makes the sum identity checkable.
+    pub(crate) fn note_regs(&self, op: RegsOp, ns: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         self.regs_ns.fetch_add(ns, Relaxed);
         self.regs_ops.fetch_add(1, Relaxed);
+        let i = op.index();
+        self.regs_op_ns[i].fetch_add(ns, Relaxed);
+        self.regs_op_count[i].fetch_add(1, Relaxed);
     }
 
     /// One `drain_child_fifo` prologue, in nanoseconds: the three register
@@ -1201,6 +1355,16 @@ impl DrainDutyCensus {
         let regs_ops = self.regs_ops.swap(0, Relaxed);
         let setup = self.setup_ns.swap(0, Relaxed) / 1000;
         let setup_calls = self.setup_calls.swap(0, Relaxed);
+        // Emitted beside the total it divides, so `tailrd_us + headwr_us +
+        // stamp_us == regs_us` is checkable on the line itself.
+        let mut regs_split = String::new();
+        for op in RegsOp::ALL {
+            let i = op.index();
+            let us = self.regs_op_ns[i].swap(0, Relaxed) / 1000;
+            let n = self.regs_op_count[i].swap(0, Relaxed);
+            let label = op.label();
+            regs_split.push_str(&format!(" {label}_us={us} {label}_n={n}"));
+        }
         let slow = self.slow_tranches.swap(0, Relaxed);
         let busy = drain.saturating_add(publish);
         let duty = busy as f64 / (win_ms as f64 * 1000.0);
@@ -1211,7 +1375,7 @@ impl DrainDutyCensus {
              flush_us={flush} flushes={flushes} max_flush_us={max_flush} \
              tail_us={tail} boundary_us={boundary} \
              ring_us={ring} ring_reads={ring_reads} decode_us={decode} packets={packets} \
-             proc_us={proc_us} regs_us={regs} regs_ops={regs_ops} \
+             proc_us={proc_us} regs_us={regs} regs_ops={regs_ops}{regs_split} \
              setup_us={setup} setup_calls={setup_calls} \
              slow_tranches={slow}/{tranches} slow_us={DRAIN_TRANCHE_SLOW_US}"
         ))
@@ -1711,14 +1875,14 @@ pub fn note_drain_decode(ns: u64) {
     DRAIN_DUTY.note_decode(ns);
 }
 
-/// Attribute one `process_child_packet` dispatch, in nanoseconds.
-pub fn note_drain_proc(ns: u64) {
-    DRAIN_DUTY.note_proc(ns);
+/// Attribute one `process_child_packet` dispatch, in nanoseconds, by opcode.
+pub fn note_drain_proc(opcode: u16, ns: u64) {
+    DRAIN_DUTY.note_proc(opcode, ns);
 }
 
-/// Attribute one guest register access around a packet, in nanoseconds.
-pub fn note_drain_regs(ns: u64) {
-    DRAIN_DUTY.note_regs(ns);
+/// Attribute one access around a packet, in nanoseconds, by which one it was.
+pub fn note_drain_regs(op: RegsOp, ns: u64) {
+    DRAIN_DUTY.note_regs(op, ns);
 }
 
 /// Attribute one `drain_child_fifo` prologue, in nanoseconds.
@@ -1734,6 +1898,12 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         // rails must sum to its `flush_us` and their counts to its `flushes`.
         if let Some(rails) = DRAIN_DUTY.take_flush_rails() {
             crate::observe::off(rails);
+        }
+        // Also immediately after `drain_duty`, and read the same way: the
+        // per-opcode `_us` fields sum to its `proc_us` and the `_n` fields to
+        // its `packets`, less `op_overflow`.
+        if let Some(ops) = DRAIN_DUTY.take_proc_ops() {
+            crate::observe::off(ops);
         }
         // Under `flush_rails`, dividing its `render_us`.
         if let Some(split) = DRAIN_DUTY.take_readback_split() {

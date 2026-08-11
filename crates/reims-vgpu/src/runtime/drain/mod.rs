@@ -4339,7 +4339,10 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     loop {
         let regs_started = std::time::Instant::now();
         let tail_read = crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_TAIL);
-        census::note_drain_regs(regs_started.elapsed().as_nanos() as u64);
+        census::note_drain_regs(
+            census::RegsOp::TailRead,
+            regs_started.elapsed().as_nanos() as u64,
+        );
         let tail = match tail_read {
             Ok(v) => v,
             Err(_) => {
@@ -4437,7 +4440,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 }
                 let proc_started = std::time::Instant::now();
                 let disposition = process_child_packet(state, host, channel_id, &packet);
-                census::note_drain_proc(proc_started.elapsed().as_nanos() as u64);
+                census::note_drain_proc(packet.opcode, proc_started.elapsed().as_nanos() as u64);
                 if disposition == ChildPacketDisposition::Deferred {
                     // Translation owns only immutable AIR bytes. Keep head and
                     // stamp untouched so retry cannot duplicate any packet
@@ -4453,7 +4456,10 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     head,
                     state.page_size() as usize,
                 );
-                census::note_drain_regs(head_started.elapsed().as_nanos() as u64);
+                census::note_drain_regs(
+                    census::RegsOp::HeadWrite,
+                    head_started.elapsed().as_nanos() as u64,
+                );
                 if head_write.is_err() {
                     // The packet was processed + stamped, but the consumer
                     // pointer never advanced: the next drain re-reads the stale
@@ -4479,7 +4485,10 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 // not inherited from an empty queue.
                 let stamp_started = std::time::Instant::now();
                 write_stamp(state, host, stamp_index, packet.completion_stamp);
-                census::note_drain_regs(stamp_started.elapsed().as_nanos() as u64);
+                census::note_drain_regs(
+                    census::RegsOp::Stamp,
+                    stamp_started.elapsed().as_nanos() as u64,
+                );
                 if state.pending.host_action_yield {
                     if head != tail {
                         state.pending.child_mask |= bit;
