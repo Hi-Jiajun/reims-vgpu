@@ -323,6 +323,32 @@ pub(crate) enum Phase {
     /// guest pages — 8.8 GB/s across the bus on a discrete host, against a
     /// worker that holds the engine lock 671 ms of every second. Look there
     /// before shortening this span again.
+    ///
+    /// # This span is no longer large, and the reading above is retired
+    ///
+    /// Everything above is a 2026-07 reading. Two driven macos-13
+    /// sustained-animation boots on 2026-08-11, quiesced host, agreeing to 1 %:
+    ///
+    /// ```text
+    ///                 anim1     anim2
+    /// slot_us        32.7 ms/s  17.9 ms/s
+    /// gpu_span busy  516.9      512.3
+    /// draws          29 180/s   28 958/s
+    /// drain duty     0.56       0.58
+    /// ```
+    ///
+    /// **`slot_us` is 18-33 ms a second, not 314**, and the GPU is busy 512-517
+    /// ms of that second — so the worker's wait is a *twentieth* of the GPU's own
+    /// occupancy and the ring is not the constraint on this rail. Whatever the
+    /// 314 ms/s was, the join-rule change above and everything since removed it.
+    ///
+    /// Do not read a large `slot_us` into this device from the numbers above it.
+    /// The GPU-side figure they were all inferring is measured directly now, by
+    /// [`super::gpu_span`], and it says something different from all of them: at
+    /// 51 % occupancy and duty 0.56 **neither the GPU nor the worker is the
+    /// pacer**, and the five CPU wins that bought no frames were not absorbed by
+    /// `slot_us` — there was nothing to absorb them, because the guest sets the
+    /// rate.
     Slot = 1,
     /// What is left of the pipeline span once the five below are taken out of
     /// it: building the layout, pass and attribute keys, and resolving the load
@@ -620,7 +646,10 @@ mod tests {
         }
         let w = take_window().expect("a dropped timer counts a draw");
         assert!(w.slot_us >= 2_000, "{w:?}");
-        assert_eq!(w.prep_us, 0, "the claim's wait may not read as prepare time");
+        assert_eq!(
+            w.prep_us, 0,
+            "the claim's wait may not read as prepare time"
+        );
 
         // Every ordinal distinct and contiguous from zero, so `PHASES` covers
         // them and no two share an accumulator.

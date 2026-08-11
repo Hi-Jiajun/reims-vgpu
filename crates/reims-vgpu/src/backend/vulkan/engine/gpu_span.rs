@@ -31,6 +31,55 @@
 //! it without correlating two clocks: the delta is GPU ticks between two points
 //! on the GPU's own timeline.
 //!
+//! # What it said the first time, and what that retires
+//!
+//! Two driven macos-13 sustained-animation boots, quiesced host, 42 driven census
+//! windows each, agreeing to about 1 %:
+//!
+//! ```text
+//!                        anim1      anim2
+//! gpu_span busy_us      516.9 ms/s  512.3 ms/s      -> 51 % of a second
+//! submissions read       1 945/s     1 914/s
+//! GPU us per submission    265.8       267.6
+//! draws                 29 180/s    28 958/s
+//! GPU us per draw           17.71       17.69
+//! draw_phase slot_us     32.7 ms/s   17.9 ms/s
+//! drain duty                0.56        0.58
+//! ```
+//!
+//! Three things fall out, and the third is the one that changes what to work on.
+//!
+//! * **`slot_us` is 18-33 ms a second, not the 314 that
+//!   [`super::draw_phase::Phase::Slot`]'s doc measured in 2026-07.** The ring
+//!   blocks a twentieth as much as the GPU is busy. Every conclusion drawn from
+//!   that column being large is drawn from a number that no longer reproduces.
+//! * **`read` equals `batch_flushes` exactly** — 1 990 against 1 990 on the
+//!   window checked — which is the cross-check that the probe counts submissions
+//!   and not something else. Two independently maintained counters, one identity.
+//! * **Neither the GPU nor the drain worker is the pacer.** 51 % GPU occupancy
+//!   beside drain duty 0.56 leaves both roughly half idle, and the guest sets the
+//!   rate. That is a better explanation of the five CPU wins that bought no
+//!   frames than "the rail is GPU-bound" ever was: nothing was bound, so nothing
+//!   could convert. It also says a frame count cannot rank a device change on this
+//!   rail at all, whatever the change does.
+//!
+//! # Which makes `busy_us` the number to optimise, not frames
+//!
+//! 17.7 µs of GPU for one window-server compositing draw is a great deal of work
+//! for a textured quad, and this host is an RTX 5080. The support matrix's other
+//! column is an iGPU, where the same recorded commands cost roughly an order of
+//! magnitude more — so a workload this host runs at 51 % occupancy is one an iGPU
+//! is *hard* GPU-bound on by a wide margin, and the per-draw GPU figure is exactly
+//! the quantity that binds it.
+//!
+//! This device has no iGPU to boot on (the dev host has a discrete GPU only), so
+//! `busy_us` is the closest thing to an iGPU measurement that exists here: a
+//! change that lowers it at identical output — same `draws`, same
+//! `buffer_guest_gather_regions`, same bytes — is an iGPU win whether or not this
+//! host's frame rate notices. Prefer it to `present_hz` for anything about GPU
+//! work, and quote the controls beside it so "identical output" is checkable
+//! rather than asserted.
+//!
 //! # It is a tiling, not a sample
 //!
 //! `busy_us` and the derived leftover `slot_us - busy_us` sum to the wait, which
