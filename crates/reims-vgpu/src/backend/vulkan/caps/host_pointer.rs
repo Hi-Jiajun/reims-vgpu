@@ -168,6 +168,23 @@ pub struct HostPointerCaps {
     /// assumed to be 4096: MoltenVK reports Apple's page size, and a Linux
     /// driver may report more than either.
     pub min_alignment: u64,
+    /// The largest `VkMemoryHeap::size` this device reports, which is the
+    /// ceiling on any single import it could hold.
+    ///
+    /// An import is a `VkDeviceMemory` and every `VkDeviceMemory` is charged to
+    /// one heap, so an import longer than the roomiest heap on the device cannot
+    /// be resident in any of them — whatever memory type the pointer turns out
+    /// to accept. That is a statement about the device alone, which is why it is
+    /// answerable here with no pointer in hand.
+    ///
+    /// The roomiest heap and not the one an import would land on: the memory
+    /// type is a property of the *pointer* and is resolved per RAMBlock at
+    /// import time. Taking the maximum makes this the widest true bound, so it
+    /// refuses only what no heap could have held.
+    ///
+    /// Zero on every rung but [`HostPointerImport::Supported`], where no import
+    /// may be made at all.
+    pub heap_budget: u64,
 }
 
 impl HostPointerCaps {
@@ -176,6 +193,7 @@ impl HostPointerCaps {
         Self {
             rung,
             min_alignment: 0,
+            heap_budget: 0,
         }
     }
 
@@ -262,9 +280,22 @@ pub unsafe fn query(
         return HostPointerCaps::refused(HostPointerImport::AlignmentUnsatisfiable);
     }
 
+    // Core since Vulkan 1.0 and needs no extension, which is why the bound is
+    // taken from heap sizes rather than from `VK_EXT_memory_budget`: a heap's
+    // size is what no allocation charged to it can exceed on any host, and a
+    // budget is a second, optional answer that would leave hosts without the
+    // extension unbounded.
+    let props = unsafe { instance.get_physical_device_memory_properties(pd) };
+    let heap_budget = props.memory_heaps[..props.memory_heap_count as usize]
+        .iter()
+        .map(|h| h.size)
+        .max()
+        .unwrap_or(0);
+
     HostPointerCaps {
         rung: HostPointerImport::Supported,
         min_alignment,
+        heap_budget,
     }
 }
 

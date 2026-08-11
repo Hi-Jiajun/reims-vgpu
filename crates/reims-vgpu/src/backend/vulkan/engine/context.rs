@@ -749,15 +749,18 @@ impl DeviceContext {
         let host_pointer =
             crate::backend::vulkan::caps::host_pointer::query(&instance, pd, &has_device_extension);
         // Published for `runtime::guest_ram_map`, which builds the imports and
-        // has no device context to read the granularity from. A negative rung
-        // withdraws it rather than publishing zero, so the absence of a number
-        // is itself the gate and no site can act on a granularity from a device
-        // that declined the handle type.
+        // has no device context to read the granularity or the heap sizes from.
+        // A negative rung withdraws them rather than publishing zeroes, so the
+        // absence of a number is itself the gate and no site can act on a
+        // granularity from a device that declined the handle type.
         match host_pointer.rung {
             crate::backend::vulkan::caps::HostPointerImport::Supported => {
-                crate::runtime::guest_ram::latch_granularity(host_pointer.min_alignment);
+                crate::runtime::guest_ram::latch_import_limits(
+                    host_pointer.min_alignment,
+                    host_pointer.heap_budget,
+                );
             }
-            _ => crate::runtime::guest_ram::forget_granularity(),
+            _ => crate::runtime::guest_ram::forget_import_limits(),
         }
         // Every import this process holds names a `VkDeviceMemory` that dies
         // with the device below. Dropping them here, before the new one exists,

@@ -2458,6 +2458,12 @@ fn guest_page_window<M: HostOps>(
                 MapRefusal::NoBackendImport => "zc_buf_no_import",
                 MapRefusal::HostRefused(_) => "zc_buf_host_refused",
                 MapRefusal::NoUsableRegion { .. } => "zc_buf_no_region",
+                // Its own band and not folded into `zc_buf_no_import`: this
+                // host has the extension and would import, and what refused is
+                // the size of the guest against the size of its heaps. A boot
+                // reading this is one where raising the heap or lowering `-m`
+                // would restore the rail, which is not true of any other band.
+                MapRefusal::ImportExceedsHeap { .. } => "zc_buf_over_heap",
                 MapRefusal::GpaNotInAnyImport { .. } => "zc_buf_gpa_unbacked",
                 MapRefusal::OutsideImport(_) => "zc_buf_outside_import",
                 // `references_for_runs` reaches this only for a window it could

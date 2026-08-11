@@ -21,7 +21,8 @@
 //! Neither side has both, and the device context deliberately does not take a
 //! host — see the module doc on [`crate::qemu::host_ops`] for why the runtime
 //! keeps it. So the granularity is published by the backend through
-//! [`crate::runtime::guest_ram::latch_granularity`] and the spans are fetched
+//! [`crate::runtime::guest_ram::latch_import_limits`] — together with the
+//! largest import that backend's heaps could hold — and the spans are fetched
 //! here, on the first guest-memory reference of a boot.
 //!
 //! Building lazily rather than eagerly also gets the ordering right for free:
@@ -38,7 +39,9 @@
 //! statement about the host rather than a loss, so it is reported once on the
 //! off channel rather than as a failure per reference.
 
-use crate::runtime::guest_ram::{granularity, GuestRamError, GuestRamImport, GuestRef};
+use crate::runtime::guest_ram::{
+    granularity, import_budget, GuestRamError, GuestRamImport, GuestRef,
+};
 use crate::runtime::host::{GuestRamRegionsError, HostOps};
 use std::sync::Arc;
 
@@ -57,6 +60,36 @@ pub enum MapRefusal {
     /// granule. Distinct from [`Self::HostRefused`] because the host answered
     /// fine and it is our own bound that rejected every span.
     NoUsableRegion { spans: usize },
+    /// The spans are importable and this guest is larger than the roomiest heap
+    /// on the host's GPU, so nothing may import any of them.
+    ///
+    /// # Why the whole map refuses rather than the block that does not fit
+    ///
+    /// An import is a `VkDeviceMemory` charged to one heap, and a submission
+    /// that names it makes the driver keep all of it resident. On a part whose
+    /// heaps are a fraction of the guest — an APU with a few gigabytes of
+    /// carve-out against a `-m 16G` guest — the kernel refuses to validate the
+    /// allocation and the submission fails, which arrives as a **lost device**
+    /// and a dead guest rather than as a slow rail. That has been reported from
+    /// the field on `radv`/`amdgpu` (`Not enough memory for command submission`,
+    /// then a lost context), and the reporter's own fix was to set
+    /// [`crate::env::GUEST_IMPORT`] off by hand. This makes the device reach the
+    /// same state without being told to.
+    ///
+    /// Refusing the whole map rather than the oversized block is what makes it
+    /// safe: the copying rails are selected by a page having no [`GuestRef`], and
+    /// a *partial* import would leave the writeback paths holding references
+    /// into one RAMBlock and none into another, which is a hard error at those
+    /// sites and not a fallback. All or nothing keeps the boot on the one arm
+    /// that is tested end to end.
+    ///
+    /// The comparison is against the sum, because every import is live at once
+    /// for the VM's lifetime and a submission may name any of them.
+    ///
+    /// This is a heap-*capacity* test and not a residency one, so it is a lower
+    /// bound: a host that passes it can still be too full to import. It catches
+    /// the direction that has been seen to kill a guest.
+    ImportExceedsHeap { needed: u64, budget: u64 },
     /// The address is not inside any imported span. Guest RAM the GPU can reach
     /// exists, and this address is not in it — a device MMIO address, a hole,
     /// or a page the guest named that this machine does not back.
@@ -113,6 +146,7 @@ impl crate::observe::Decline for MapRefusal {
             Self::NoBackendImport => "guest_ram_map_no_backend_import",
             Self::HostRefused(_) => "guest_ram_map_host_refused",
             Self::NoUsableRegion { .. } => "guest_ram_map_no_usable_region",
+            Self::ImportExceedsHeap { .. } => "guest_ram_map_import_exceeds_heap",
             Self::GpaNotInAnyImport { .. } => "guest_ram_map_gpa_not_in_any_import",
             Self::Scattered { .. } => "guest_ram_map_scattered",
             // The inner reason is the diagnosis; this wrapper only says where
@@ -130,6 +164,10 @@ impl crate::observe::Decline for MapRefusal {
                 f
             }
             Self::NoUsableRegion { spans } => vec![("spans", spans.to_string())],
+            Self::ImportExceedsHeap { needed, budget } => vec![
+                ("needed_mb", (needed >> 20).to_string()),
+                ("budget_mb", (budget >> 20).to_string()),
+            ],
             Self::GpaNotInAnyImport { gpa } => vec![("gpa", format!("{gpa:#x}"))],
             Self::Scattered { pages, runs, first } => vec![
                 ("pages", pages.to_string()),
@@ -556,6 +594,19 @@ fn resolve<H: HostOps + ?Sized>(host: &mut H) -> Resolved {
         .into_iter()
         .filter_map(|span| GuestRamImport::new(span, align).ok().map(Arc::new))
         .collect();
+    // Every import is live for the VM's lifetime and any submission may name any
+    // of them, so what has to fit is the sum and not the largest block. A guest
+    // that does not fit takes the copying rails whole rather than in part — see
+    // [`MapRefusal::ImportExceedsHeap`] for why a partial import is the one
+    // outcome that is worse than either.
+    let needed: u64 = imports.iter().map(|i| i.len()).sum();
+    let over_budget = import_budget().filter(|budget| needed > *budget);
+    if let Some(budget) = over_budget {
+        return Resolved {
+            imports: Vec::new(),
+            refusal: Some(MapRefusal::ImportExceedsHeap { needed, budget }),
+        };
+    }
     let refusal = imports
         .is_empty()
         .then_some(MapRefusal::NoUsableRegion { spans: count });
@@ -604,7 +655,20 @@ fn report_once(refusal: MapRefusal) -> MapRefusal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::guest_ram::{forget_granularity, latch_granularity, GuestRamRegion};
+    use crate::runtime::guest_ram::{forget_import_limits, latch_import_limits, GuestRamRegion};
+
+    /// A budget no test span can exceed, so a test about the granularity is not
+    /// also a test about the heap. The budget tests name their own.
+    const UNBOUNDED: u64 = u64::MAX;
+
+    /// Latch a granularity with a budget that admits everything.
+    fn latch_granularity(align: u64) {
+        latch_import_limits(align, UNBOUNDED);
+    }
+
+    fn forget_granularity() {
+        forget_import_limits();
+    }
 
     /// The whole module is process-global, and so is the granularity latch.
     /// Every test here takes this and restores both.
@@ -665,6 +729,82 @@ mod tests {
         reset();
         forget_granularity();
         out
+    }
+
+    /// Run `body` with a granularity and an explicit heap budget latched.
+    fn with_budget<R>(align: u64, budget: u64, body: impl FnOnce() -> R) -> R {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        reset();
+        latch_import_limits(align, budget);
+        let out = body();
+        reset();
+        forget_import_limits();
+        out
+    }
+
+    /// The bytes [`two_spans`] asks this device to keep resident. Derived from
+    /// the spans rather than written out, so a change to either stays one number.
+    fn two_spans_bytes() -> u64 {
+        two_spans().0.iter().map(|r| r.len).sum()
+    }
+
+    /// A guest larger than the roomiest heap on the host's GPU must not import
+    /// at all.
+    ///
+    /// This is the reported `radv`/`amdgpu` failure: the import succeeds, and
+    /// every submission that names it then fails validation in the kernel with
+    /// `Not enough memory for command submission`, which arrives as a lost
+    /// device. The copying rails are the working configuration on such a host and
+    /// this is how the device reaches them without an operator setting a variable.
+    #[test]
+    fn a_guest_larger_than_every_heap_takes_the_copying_rails() {
+        let needed = two_spans_bytes();
+        with_budget(0x1000, needed - 1, || {
+            let mut host = two_spans();
+            assert_eq!(
+                standing_refusal(&mut host),
+                Some(MapRefusal::ImportExceedsHeap {
+                    needed,
+                    budget: needed - 1,
+                }),
+                "a guest past the budget must refuse by name"
+            );
+            assert_eq!(
+                imports().len(),
+                0,
+                "and must not leave a partial import behind"
+            );
+        });
+    }
+
+    /// The bound is `>`, not `>=`: a guest that exactly fills the roomiest heap
+    /// is admitted, because nothing in the contract says an allocation the size
+    /// of its heap cannot be made. Pinned because an off-by-one in the safe
+    /// direction here silently costs every host whose heap equals its guest.
+    #[test]
+    fn a_guest_that_exactly_fills_the_roomiest_heap_still_imports() {
+        let needed = two_spans_bytes();
+        with_budget(0x1000, needed, || {
+            let mut host = two_spans();
+            assert_eq!(standing_refusal(&mut host), None);
+            assert_eq!(imports().len(), 2);
+        });
+    }
+
+    /// A backend that publishes a granularity beside a zero budget has published
+    /// nothing: the pair is withdrawn, and the map reads it as a host that cannot
+    /// import. Without this, a zero budget would refuse every guest by name and
+    /// blame the guest's size for a backend that answered badly.
+    #[test]
+    fn a_zero_budget_withdraws_the_granularity_rather_than_refusing_every_guest() {
+        with_budget(0x1000, 0, || {
+            let mut host = two_spans();
+            assert_eq!(
+                standing_refusal(&mut host),
+                Some(MapRefusal::NoBackendImport),
+                "a zero budget is a backend that cannot import, not a guest that is too big"
+            );
+        });
     }
 
     /// Warming before a backend has published a granularity must leave the
