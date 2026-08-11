@@ -863,23 +863,35 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
     for pipeline_ref in pipelines {
         note_preflight_pipe();
         let air_started = std::time::Instant::now();
-        let pair = draw::load_render_air_pair(state, host, task_id, pipeline_ref);
+        // The MTLB containers, not owned copies of the AIR inside them: the two
+        // `ensure_cached_async` calls below borrow, digest and drop, so copying
+        // first would allocate twice per pipeline ref for bytes nothing keeps.
+        let pair = draw::load_render_mtlb_pair(state, host, task_id, pipeline_ref);
         note_preflight_part(PreflightPart::Air, air_started.elapsed().as_nanos() as u64);
-        let Ok((v_air, f_air)) = pair else {
+        let Ok((v_mtlb, f_mtlb)) = pair else {
             // Normal execution emits the precise pipeline/MTLB failure. A
             // missing plan input is deterministic, not asynchronous work.
             continue;
         };
+        // A container whose AIR will not extract is the same "deterministic
+        // missing plan input" as one that would not load: normal execution
+        // reports it precisely, and there is no asynchronous work to await.
+        let (Ok(v_air), Ok(f_air)) = (
+            crate::runtime::mtlb::extract_air(&v_mtlb),
+            crate::runtime::mtlb::extract_air(&f_mtlb),
+        ) else {
+            continue;
+        };
         let cache_started = std::time::Instant::now();
         if !crate::runtime::m2v_cache::ensure_cached_async(
-            &v_air,
+            v_air,
             metal2vulkan::passes::Stage::Vertex,
             pipeline_ref,
         ) {
             pending = true;
         }
         if !crate::runtime::m2v_cache::ensure_cached_async(
-            &f_air,
+            f_air,
             metal2vulkan::passes::Stage::Fragment,
             pipeline_ref,
         ) {

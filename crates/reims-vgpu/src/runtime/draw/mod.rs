@@ -1338,11 +1338,24 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
     Some(p)
 }
 
-/// Resolve immutable AIR inputs for a render pipeline before executing its
-/// packet. The Linux scheduler uses this read-only plan step to translate on a
-/// background thread while unrelated child FIFOs continue draining.
+/// The two MTLB containers a render pipeline's stages live in, without
+/// extracting or copying the AIR out of them.
+///
+/// [`load_render_air_pair`] wraps this and then copies both AIR blobs into fresh
+/// `Vec`s. The preflight does not need owned bytes — it hands them to
+/// `m2v_cache::ensure_cached_async`, which takes `&[u8]`, digests it, and only
+/// retains anything on a miss. On a boot where every shader is already
+/// translated that copy is pure waste, and it is not a small population:
+/// **12 650-12 786 pipeline refs a second**, so two allocations and two memcpys
+/// each, ~25 400 a second, to produce bytes that are hashed and dropped.
+///
+/// This replaced a `load_render_air_pair` that did the same three resolves and
+/// then `to_vec`'d both blobs. The preflight was its **only** caller, so there
+/// was no second consumer needing owned bytes and nothing to keep it for: the
+/// draw path reaches its AIR by another route. Returning the containers and
+/// letting the caller borrow is the whole function.
 #[cfg(feature = "backend-vulkan")]
-pub(crate) fn load_render_air_pair<M: HostMemory + HostOps>(
+pub(crate) fn load_render_mtlb_pair<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
@@ -1371,19 +1384,7 @@ pub(crate) fn load_render_air_pair<M: HostMemory + HostOps>(
         task_id,
         function_ref: pd.fragment_func_ref,
     })?;
-    let v_air = crate::runtime::mtlb::extract_air(&v_mtlb)
-        .map_err(|reason| DrawPreparationDecline::VertexAirExtract {
-            function_ref: pd.vertex_func_ref,
-            reason,
-        })?
-        .to_vec();
-    let f_air = crate::runtime::mtlb::extract_air(&f_mtlb)
-        .map_err(|reason| DrawPreparationDecline::FragmentAirExtract {
-            function_ref: pd.fragment_func_ref,
-            reason,
-        })?
-        .to_vec();
-    Ok((v_air, f_air))
+    Ok((v_mtlb, f_mtlb))
 }
 
 /// Resolve type-1 buffer object → guest bytes starting at `offset`.
