@@ -691,9 +691,54 @@ pub const LAYOUT_CHURN: &str = "REIMS_VGPU_LAYOUT_CHURN";
 /// bext_uncapped_span_bytes   287.3 GB    283.7 GB
 /// ```
 ///
-/// **49 % of every byte this rail moves sits behind a cap that would remove
-/// 99.97 % of it**, and the gather is ~55 % of all the GPU time this device
-/// spends (see [`GUEST_IMPORT`]).
+/// That reads as "49 % of every byte this rail moves sits behind a cap that
+/// would remove 99.97 % of it", and the gather is ~55 % of all the GPU time this
+/// device spends (see [`GUEST_IMPORT`]). **Both halves of that sentence are
+/// true and the conclusion drawn from it was still wrong**; the six boots below
+/// say why.
+///
+/// # What it is actually worth: bytes yes, time no
+///
+/// Six interleaved driven macos-13 boots, one binary, quiesced host,
+/// `sustained-animation-probe`. The byte columns are the mechanism's own
+/// control and they are **fully disjoint**:
+///
+/// ```text
+/// arm   gather KB/draw    gathers/draw   zc_buffer_held   narrowed
+/// on         95.5             0.578         2 671 242       7 054
+/// on         98.4             0.585         1 521 450       6 868
+/// on         98.4             0.584         1 496 094       6 679
+/// off       112.6             0.652         1 538 409           0
+/// off       111.2             0.645         1 121 638           0
+/// off       109.4             0.643         2 711 284           0
+/// ```
+///
+/// So the rail moves **12.3 % fewer bytes** in **10 % fewer gathers**, the gate
+/// holds at zero on the `off` arm, and `zc_buffer_held` does *not* fall — the
+/// registry churn that sank the earlier attempt is genuinely avoided, and both
+/// arms' screenshots show a correct desktop.
+///
+/// `us/draw` does not move. Banded within regime, because the guest picks its
+/// own draw rate per boot and the two populations are not comparable:
+///
+/// ```text
+/// regime ~245-255 draws/frame (GPU 23 % busy)   on 15.45, 15.55 | off 15.24, 15.54
+/// regime ~272-274 draws/frame (GPU 41-43 % busy) on 13.77       | off 14.53
+/// ```
+///
+/// At the idle regime the arms interleave, at n=2 against n=2. The one loaded
+/// pair reads −5.2 % for `on`, which is close to the ~6.8 % a 12.3 % byte cut
+/// off a 55 %-of-GPU-time rail predicts — but it is one pair against one pair,
+/// and the same table shows `us/draw` varying by more than that between two
+/// boots of the *same* arm. It is a lead, not a result.
+///
+/// **The 49 % headroom figure is an over-count, and this is the trap to avoid
+/// repeating.** `note_extent_headroom` charges every bind that reaches the
+/// gather rail — about 2.6 M of them — while the GPU only gathers ~640 k times
+/// a boot, because `buffer_bind_reuses` collapses repeats inside one command
+/// buffer before any copy happens. `bext_would_save_bytes` is therefore an upper
+/// bound over *binds*, not over *gathers*, and the honest reduction is the 12.3 %
+/// measured above. Do not flip a default on it.
 ///
 /// # What `on` changes, and what it deliberately does not
 ///
@@ -720,6 +765,17 @@ pub const LAYOUT_CHURN: &str = "REIMS_VGPU_LAYOUT_CHURN";
 /// than leaving it undefined, so the failure mode is visibly wrong rather than
 /// unsound — but visibly wrong is still wrong, and this stays off until an A/B
 /// has both the `gpu_span` reading and a screenshot.
+///
+/// It now has both, and the screenshot passed while the number did not: the six
+/// boots above bought no time on the host that can be measured here. Reading
+/// fewer guest bytes than the guest declared is a correctness risk taken on the
+/// translator's word, and a risk with no measured return is not a default.
+///
+/// What would overturn this is a host where the gather is the constraint rather
+/// than 55 % of a device that is idle three-quarters of the second — which is
+/// exactly the iGPU column of the support matrix, and see [`GUEST_IMPORT`] for
+/// why that host wants a different answer on this whole family. Two boots there
+/// settle it, and the arm and its `bext_*` census stay so that they can.
 pub const EXTENT_NARROW: &str = "REIMS_VGPU_EXTENT_NARROW";
 
 /// What one variable says, including the two ways it says nothing usable.
