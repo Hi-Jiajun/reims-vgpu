@@ -331,6 +331,34 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 /// saving already measured at 56 %. That is the change worth making; a first
 /// pass at only the count is measurably not.
 ///
+/// # A region-count threshold is not the shortcut it looks like
+///
+/// The dispatch's value scales with how many regions each one replaces, so the
+/// obvious cheap interim is to dispatch only for windows above some run count.
+/// Six driven boots of `gpu-load-probe` at `layers=24&boxes=6`, which runs
+/// **23.5 gather regions per draw** against the sustained probe's 15.8, say the
+/// ceiling on that is low. Comparing the boots that reached the same drain duty
+/// (~0.8):
+///
+/// ```text
+///            frames/s   slot_us   record_us
+/// on               86.96    13 007      64 357
+/// off              84.76    95 715      42 487
+/// off              83.72   107 146      42 279
+/// ```
+///
+/// The sign does flip — `slot_us` falls **86 %** here against 56 % on the
+/// lighter load, exactly as amortising a fixed cost over more regions predicts
+/// — and it is still only ~+3 % of the frames, because the per-dispatch cost is
+/// unchanged and the recording penalty is the same +52 %. A threshold buys the
+/// tail of a distribution whose mean is the problem.
+///
+/// That load is also a poor A/B vehicle and should not be used as one: the same
+/// six boots ranged over drain duty 0.25 to 0.80 and 24.7 to 87.0 frames a
+/// second, while `draws/frame` sat at 132.7-133.0 on every one of them. The
+/// regime discriminator that works on the sustained probe is flat here, so
+/// nothing separates a fast boot from a slow one before the fact.
+///
 /// Until then the switch is a permission rather than a refusal, which is the
 /// one place this module's own rule is bent. It is bent knowingly: that rule is
 /// about **host capability** — binding an unadvertised extension crashes and
