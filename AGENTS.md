@@ -574,37 +574,55 @@ change touching guest-memory upload, writeback or bind needs the boot a second t
 appears once. Nothing may then report a bound import — a non-zero import count means a bind ran past
 a closed gate.
 
-### `present_hz` is clamped by the presenter, so it cannot rank a device change
+### `present_hz` tracks `offered_hz` exactly, so read the pair and never one alone
 
-The host window presenter puts out **~41 frames a second and does not care what
-is offered to it**. Twelve driven macos-13 boots across three builds and both
-arms of an A/B read `presents` of 1599-1696 — a 5 % spread — while `offered`
-ranged 1760-2015 and per-draw gathered bytes differed 6 % between the arms.
-`busy_acquire` was 0 on every one; the ceiling is `WindowPresenter`'s single
-in-flight blit fence.
+The x86/Vulkan host window presenter used to clamp at **~41 frames a second
+whatever it was offered**, because `WindowPresenter` allowed one present in
+flight. It now runs `PRESENT_IN_FLIGHT` of them and the clamp is gone. Eight
+driven macos-13 sustained-animation boots across the two arms of
+`REIMS_VGPU_PRESENT_DEPTH`:
 
-So a device-side change that removes real work will show **nothing** here, and
-that is not evidence the work was not removed. Rank device changes on unclamped
-numbers instead, in this order:
+| arm | `presents`/`offered` per boot | `busy_fence` per boot |
+|---|---|---|
+| depth 3 (shipping) | **1.000** on all five | 0, 0, 0, 0, 0 |
+| depth 1 (`=off`) | 0.828, 0.822, 0.853 | 411, 421, 372 |
 
-- `drain_duty draws` — draws served, a count.
-- `window_publish fresh` — frames the device published (~49/s while presents sit
-  at 41).
-- anything normalized per draw. Raw totals scale with the draw count, so a boot
-  that served more draws gathered more and the ratio is what carries meaning.
+Every shipping boot presented **exactly** what it was offered, including two
+whose offered rate was ~56 Hz rather than ~49 — so this is not a new clamp
+sitting a little higher, and it holds across both compositing regimes.
 
-**Quote the presents, never the drop percentage.** The drop reads 4.9 % on one
-boot and 17.3 % on another with the *same* presenter, because all the variation
-is in the denominator: a guest offering 44 loses 5 % and one offering 50 loses
-17 %, and both presented 41. A session quoted 4.9-5.7 % from three consecutive
-boots, concluded the presenter was worth "at most ~5 %, not the lever it looked
-like", and was wrong — those three boots were ones where the guest asked for
-little.
+At n=3 vs n=3 after regime exclusion, `presents_s` rose **16.2 %** with the arms
+disjoint at 3.6x their own spread, while `offered_hz`, `draws_s` and
+`kib_per_draw` all *overlapped* — the device did identical work and only the
+presenter changed. So `present_hz` is now a real reading, and the old advice to
+ignore it is retired.
 
-This also retires a standing puzzle. Several CPU wins here "bought microseconds
+**But it is a reading of two things, and the pair is what says which.** The
+presenter now passes everything, so `present_hz` equals `offered_hz`, and
+`offered_hz` is the device's own publish rate. A device change that raises
+frames raises *both*. Always quote them together:
+
+- both rose — the device published more, which is the win.
+- `offered` rose and `present` did not — the presenter has become a ceiling
+  again. Check `busy_fence` and `busy_acquire`; on the shipping depth they are 0.
+- neither moved — the change bought no frames, whatever else it bought.
+
+`drain_duty draws` and anything normalized per draw stay the right way to rank a
+change that is about per-draw cost rather than about frames.
+
+**Quote the presents, never the drop percentage.** This survives the fix and is
+the trap that cost a session a wrong call. With a *clamped* presenter the drop
+read 4.9 % on one boot and 17.3 % on another because all the variation was in
+the denominator: a guest offering 44 loses 5 % and one offering 50 loses 17 %,
+and both presented 41. That session quoted 4.9-5.7 % from three consecutive
+low-offering boots and concluded the presenter was "worth at most ~5 %, not the
+lever it looked like". It was worth 17.8 %.
+
+This also retired a standing puzzle. Several CPU wins here "bought microseconds
 and zero frames" — a bounded pipeline cache, −39 % submissions, −20x `stage_us`.
 None of them could have bought frames through a presenter already at its
-ceiling.
+ceiling, and a per-draw saving measured before this fix is **owed a re-run**
+rather than believed to have been worthless.
 
 ### An undriven boot measures an idle device
 
