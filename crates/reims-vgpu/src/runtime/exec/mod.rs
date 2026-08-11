@@ -862,6 +862,19 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
     let mut pending = false;
     for pipeline_ref in pipelines {
         note_preflight_pipe();
+        // The draw path's own memo already knows whether these two shaders are
+        // translated, and answers for ~0.6 us against the 4.3 us of guest
+        // resolves below. `translations_ready` states why that is not a weaker
+        // answer — chiefly that the translate cache never evicts, so a shader
+        // this memo saw translated is still translated.
+        if crate::runtime::pipeline_resolve::translations_ready(
+            state,
+            host,
+            task_id,
+            pipeline_ref,
+        ) {
+            continue;
+        }
         let air_started = std::time::Instant::now();
         // The MTLB containers, not owned copies of the AIR inside them: the two
         // `ensure_cached_async` calls below borrow, digest and drop, so copying

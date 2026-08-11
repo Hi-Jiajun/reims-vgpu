@@ -124,6 +124,16 @@
 //! | `pipe_memo_evict` | [`MEMO_CAPACITY`] pushed a resolution out |
 //! | `pipe_memo_forget_all` | a device reset invalidated every key at once |
 //! | `pipe_memo_off` | the memo is switched off; one per chain |
+//! | `preflight_memo_ready` | [`translations_ready`] served the exec preflight |
+//! | `preflight_memo_absent` | no entry; the preflight loaded the AIR itself |
+//! | `preflight_memo_stale` | an entry existed and the identity had changed |
+//!
+//! The three `preflight_*` routes are the same memo asked a **different
+//! question** by a different caller — "are these shaders already translated?"
+//! rather than "give me the resolution" — so they are counted apart from the
+//! `pipe_memo_*` set. Summing the two would double-count a pipeline that both
+//! the preflight and the draw asked about, which is every pipeline on a healthy
+//! packet.
 //!
 //! `pipe_memo_stale` is the one to read. It is the population the paragraph
 //! above says should be near zero on a steady desktop and non-zero only when a
@@ -288,6 +298,74 @@ fn read_identity<M: HostMemory + HostOps>(
         objects::lookup_list_entry(state, host, task_id, vertex_ref)?,
         objects::lookup_list_entry(state, host, task_id, fragment_ref)?,
     ])
+}
+
+/// Whether `pipeline_ref`'s two shaders are **already translated**, answered
+/// from this memo alone and without resolving, translating or reading any AIR.
+///
+/// # Why the exec preflight can ask this instead of loading the AIR
+///
+/// `ExecPhase::Preflight` exists to answer one question before any record of a
+/// packet runs: will executing this stream have to wait for a translation? It
+/// answered it by resolving each pipeline's AIR out of guest memory and offering
+/// it to `m2v_cache::ensure_cached_async` — three guest resolves at **4.3 us a
+/// pipeline ref, 12 700 refs a second, ~54 ms of every second**.
+///
+/// A memo hit answers the same question for ~0.6 us, and it is not a weaker
+/// answer:
+///
+/// - an entry is only ever filed after a successful [`resolve_uncached`], and it
+///   holds the two `Arc<CachedShader>` that resolution produced — so **an entry
+///   existing means those shaders were translated**;
+/// - the m2v translate cache is **unbounded and nothing evicts it** (its only
+///   removal is `forget_if_transient`, dropping a transient failure so it can be
+///   retried), so a shader translated once is translated for the life of the
+///   process;
+/// - therefore even if this memo's own [`MEMO_CAPACITY`] evicts the entry before
+///   the draw reaches it, the draw's `translate_cached_reflected` finds the
+///   shader ready and does not translate synchronously. The eviction costs the
+///   resolve, never the translation.
+///
+/// The identity check is the same three object-list entry reads [`resolve`]
+/// makes, with the same coverage and the same two documented gaps — a
+/// descriptor or an MTLB rewritten in place. Those gaps are not widened by
+/// asking here: the draw that follows performs the identical check, so a guest
+/// that could fool this one already fools that one.
+///
+/// Returns `false` whenever the memo is switched off, so
+/// `REIMS_VGPU_PIPELINE_MEMO=off` takes the preflight back down its full path
+/// along with everything else this module short-circuits.
+pub fn translations_ready<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    pipeline_ref: u32,
+) -> bool {
+    if !memo_enabled() {
+        return false;
+    }
+    let cached = {
+        let m = memo().lock().unwrap_or_else(|e| e.into_inner());
+        m.get(&(task_id, pipeline_ref)).map(|e| {
+            (
+                e.identity,
+                e.resolved.desc.vertex_func_ref,
+                e.resolved.desc.fragment_func_ref,
+            )
+        })
+    };
+    let Some((identity, vertex_ref, fragment_ref)) = cached else {
+        note_store_route("preflight_memo_absent");
+        return false;
+    };
+    if read_identity(state, host, task_id, pipeline_ref, vertex_ref, fragment_ref)
+        == Some(identity)
+    {
+        note_store_route("preflight_memo_ready");
+        return true;
+    }
+    note_store_route("preflight_memo_stale");
+    false
 }
 
 /// Resolve `pipeline_ref` to its descriptor and both translated shaders.
@@ -457,6 +535,30 @@ mod tests {
             descriptor_length: len,
             descriptor_gva: gva,
         }
+    }
+
+    /// An empty memo must answer **not ready**, and that direction is the whole
+    /// safety of asking it.
+    ///
+    /// `translations_ready` gates whether the exec preflight skips loading a
+    /// pipeline's AIR. A wrong `false` costs the resolve it was trying to save;
+    /// a wrong `true` tells the packet its shaders are translated when nothing
+    /// has translated them, and the draw then meets an untranslated pipeline
+    /// with the packet already committed. So the absent case is pinned
+    /// explicitly rather than left to follow from the `Option` being `None`.
+    #[test]
+    fn an_absent_memo_entry_is_never_reported_ready() {
+        use crate::model::DeviceId;
+        use crate::runtime::host::FakeHost;
+
+        forget_all();
+        let state = DeviceState::new(DeviceId(1), 12);
+        let host = FakeHost::new();
+        assert!(
+            !translations_ready(&state, &host, 7, 9),
+            "a pipeline this memo has never resolved must send the preflight \
+             down its own path, not be waved through as translated"
+        );
     }
 
     /// The cap has to evict, or a guest that cycles pipeline refs grows this map
