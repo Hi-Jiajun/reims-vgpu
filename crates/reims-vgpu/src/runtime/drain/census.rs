@@ -1793,7 +1793,7 @@ fn emit_engine_delta() {
         "engine_delta creates={} allocs={} batch_opens={} batch_joins={} batch_flushes={} \
          batch_flush_draws={} batch_readback_joins={} readbacks={} readback_bytes={} render_post_wait_skips={} \
          target_reads={} target_read_bytes={} gpu_stamps={} pipeline_misses={} \
-         shader_misses={} shader_hits={} shader_hash_words={} \
+         shader_misses={} shader_hits={} shader_digest_hits={} shader_hash_words={} \
          pass_misses={} layout_misses={} sampler_misses={} \
          sampled_cache_hits={} sampled_identity_hits={} sampled_cache_hit_bytes={} \
          sampled_cache_misses={} sampled_reuploads={} \
@@ -1829,6 +1829,7 @@ fn emit_engine_delta() {
         d.pipeline_misses,
         d.shader_misses,
         d.shader_hits,
+        d.shader_digest_hits,
         d.shader_hash_words,
         d.pass_misses,
         d.layout_misses,
