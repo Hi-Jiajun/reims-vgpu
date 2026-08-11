@@ -601,6 +601,41 @@ impl ExecPhase {
 /// same mistake.
 ///
 /// The three sum to `preflight_us`, so the identity is checkable on the line.
+/// It reads ~0.95 rather than 1.00 because the `extract_air` calls that sit
+/// between the `Air` and `Cache` spans are outside both.
+///
+/// # What it measured, two driven macos-13 boots
+///
+/// ```text
+/// air      53.90 / 54.23 ms/s    4.34 / 4.30 us per pipeline ref   <- 71 %
+/// cache    16.30 / 16.60 ms/s    1.30 / 1.31 us per pipeline ref
+/// refs      6.24 / 6.23 ms/s     0.41 / 0.40 us per call
+/// pipes/s  12 650 / 12 786
+/// ```
+///
+/// `Refs` — the second full decode of the stream, the part most obviously
+/// redundant since `walk_stream` decodes the same records straight afterwards —
+/// is **8 %**. The cost is `Air`, and *within* `Air` it is the three
+/// guest-memory resolves rather than the AIR copies: removing both copies moved
+/// `air_us/pipe` by only 4.7 %.
+///
+/// # The lever that is left, and why it is soundable
+///
+/// The remaining ~50 ms/s comes off only by **not resolving at all** — a memo of
+/// `(task_id, pipeline_ref)` already confirmed translated.
+///
+/// What makes that keepable-sound is that **the m2v cache is unbounded and
+/// nothing evicts it**: its sole removal is `forget_if_transient`, which drops a
+/// transient *failure* so it can be retried. An `Entry::Ready` stays Ready for
+/// the life of the process, so the only staleness is the guest repointing a ref
+/// at different AIR — which the object-deletion paths already hook.
+///
+/// The failure mode is bounded but **not free**, which is why it has not been
+/// rushed in: `translate_cached_reflected` falls through to a *synchronous*
+/// translate on a miss, so a stale memo does not lose guest work — it runs an
+/// AIR-to-SPIR-V translation inline on the drain thread while the device lock is
+/// held, which is exactly what the asynchronous preflight exists to avoid.
+/// Design the invalidation against the deletion paths before taking the memo.
 #[derive(Clone, Copy)]
 pub enum PreflightPart {
     /// Collecting the distinct pipeline refs: `iter_segments` and a full
