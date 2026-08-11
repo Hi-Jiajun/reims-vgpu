@@ -41,6 +41,40 @@
 //! one. Both are on the same line for that reason, and `gathers` beside them is
 //! what makes the recurrence rate readable as `1 - distinct / gathers` for this
 //! window rather than quoted from a boot nobody can re-run.
+//!
+//! # What it said
+//!
+//! Two driven macos-13 sustained-animation boots, a census second each:
+//!
+//! ```text
+//! distinct=1897  mib=287.7  gathers=20771  mib_moved=3520.5  recur=0.909  dropped=0
+//! distinct=1781  mib=271.7  gathers=19452  mib_moved=3307.5  recur=0.908  dropped=0
+//! ```
+//!
+//! Three things follow and they do not all point the same way.
+//!
+//! * **A cache of unbounded size would serve 91 % of the gathers**, which is
+//!   ~3.2 GB/s of GPU copy and ~90 % of this rail's ~427 000 transfer regions a
+//!   second. That is the largest single removable item this device has, on the
+//!   arithmetic that `render_writeback`'s own ablation established — region
+//!   count, not bytes, is what the rail is bound by.
+//! * **It is 91 % and not the 99.2 % the buffer rail is usually argued from.**
+//!   The older figure came off a window-drag probe and a census that no longer
+//!   exists; this is the sustained-animation population. Quote the one whose
+//!   probe is named, per `AGENTS.md`: they are two workloads and both are real.
+//! * **Unbounded means 288 MiB of device-local memory**, held across
+//!   submissions, on a host whose whole gather pool is transient today. That is
+//!   the number a cap has to be argued against, and it is large enough that the
+//!   cap will bind — so the eviction policy is part of the design and not a
+//!   detail to add later. `dropped=0` says the 1 897 is a count and not a floor.
+//!
+//! Recurrence is about **keys**, not bytes: it says the same window comes back,
+//! not that its contents are unchanged. What would make a hit sound is
+//! [`crate::runtime::gather_witness`], which already carries exactly this
+//! argument for the sampled rails — the hypervisor dirty bitmap for guest CPU
+//! stores and [`crate::runtime::host_writes`] for this device's own. Its
+//! `MAX_TRACKED_WINDOWS` is 256 against the 1 897 here, so adopting it is a
+//! resize as well as a wiring.
 
 use std::collections::HashMap;
 

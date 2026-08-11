@@ -34,6 +34,46 @@
 //! factor and a reader comparing one to `record_us` per draw would conclude the
 //! parts do not sum.
 //!
+//! # What it said, and why it was worth building
+//!
+//! Two driven macos-13 sustained-animation boots, ~21 000 dispatches a census
+//! second each, agreeing to a hundredth of a microsecond:
+//!
+//! ```text
+//!            us/dispatch    share
+//! record        0.376        39 %
+//! plan          0.350        37 %
+//! stage         0.150        16 %
+//! dset          0.082         9 %
+//!               0.959
+//! ```
+//!
+//! **The descriptor set is already nearly free, and the fix this crate had
+//! written down was aimed at it.** `env::COMPUTE_GATHER` named the destination
+//! arena — the change that makes all three bindings constant so a draw needs one
+//! set instead of 1.4 — as "the candidate that survives the arithmetic without a
+//! reading". It attacks the 9 % column. Recycling the sets, which cost four
+//! lines, had already taken `vkAllocateDescriptorSets` and its matching free out
+//! of the steady state, and what is left of `dset` is one
+//! `vkUpdateDescriptorSets` of three buffers.
+//!
+//! The two that matter are:
+//!
+//! * **`plan`, and it is entirely this crate's own code.** No driver call is in
+//!   it: a `Vec<ScatterRun>` built from the copy regions, a second `Vec` inside
+//!   [`super::guest_scatter::build_gather_run_tables`] holding those runs with
+//!   their two indices exchanged, and the table's own `Vec<u32>` — three heap
+//!   allocations and three passes over ~13 runs, to produce ~200 bytes.
+//! * **`record`, which is four driver calls** — bind pipeline, bind set, push,
+//!   dispatch. The pipeline bind is the same handle every time and only the
+//!   first of a draw's dispatches needs it. Beyond that this column falls only
+//!   with the dispatch *count*, which is what the destination arena would buy
+//!   after all — 1.4 down to 1.0, so ~30 % of it, and not the 9 % column it was
+//!   proposed for.
+//!
+//! `stage` at 0.150 is the shared run-table arena, already amortised over a
+//! draw's 1.4 dispatches, and there is nothing left in it to remove.
+//!
 //! # This measures the planning, not the copy
 //!
 //! Every part here is CPU time spent *arranging* a copy the GPU makes later, in
