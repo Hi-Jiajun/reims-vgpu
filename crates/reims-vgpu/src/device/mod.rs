@@ -351,6 +351,17 @@ pub fn device_reset(id: u64) -> bool {
         slot.present_action_pending.store(false, Ordering::Release);
         slot.present_boundary_seen.store(false, Ordering::Release);
         crate::runtime::census::present_proxy::reset_for_device();
+        // The pipeline memo is keyed by `(task_id, pipeline_ref)`, which are the
+        // *guest's* names and mean nothing across a reset: the next guest to
+        // boot names its own task 1 and its own pipeline 9, and an entry left
+        // over from the last one would be checked against object-list entries
+        // read out of the new guest's memory. Those could match by coincidence
+        // — the entry is 12 bytes and a fresh guest lays its object list out the
+        // same way — and a coincidence there serves the previous boot's shader.
+        // Unlike the translate cache underneath it, this map is not
+        // content-keyed and so cannot survive the identity of its keys changing.
+        #[cfg(feature = "backend-vulkan")]
+        crate::runtime::pipeline_resolve::forget_all();
         true
     } else {
         false

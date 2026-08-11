@@ -95,6 +95,9 @@ pub mod mtlb;
 /// Object-list lookup and type-11 registration.
 pub mod objects;
 pub mod plan;
+/// A draw's pipeline and both its shaders, resolved once per pipeline object.
+#[cfg(feature = "backend-vulkan")]
+pub mod pipeline_resolve;
 /// The resident identity a type-11 guest surface renders into.
 #[cfg(feature = "backend-vulkan")]
 pub mod present_identity;

@@ -5091,107 +5091,28 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             },
         ));
     }
-    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Pipeline);
+    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::PipelineGen);
     // Name the color0 GVA target's allocation before anything can render into
     // it, and once: the pinned Store identity, the cross-pass Load identity and
     // the deferred window's stored copy are all keyed on this value, and two
     // walks of one address across a submit are two answers.
     req.gva_alloc_gen = gva_alloc_generation(state, host, req);
-    let pd = load_render_pipeline(state, host, req.task_id, req.pipeline_ref).ok_or({
-        DrawError::DrawPreparation(
-            crate::backend::vulkan::engine::DrawPreparationDecline::PipelineMissing {
-                task_id: req.task_id,
-                pipeline_ref: req.pipeline_ref,
-            },
-        )
-    })?;
-    let v_mtlb = load_mtlb(
-        state,
-        host,
-        req.task_id,
-        pd.vertex_func_ref,
-        AirLoadRail::Draw,
-    )
-    .ok_or({
-        DrawError::DrawPreparation(
-            crate::backend::vulkan::engine::DrawPreparationDecline::VertexMtlbMissing {
-                task_id: req.task_id,
-                function_ref: pd.vertex_func_ref,
-            },
-        )
-    })?;
-    let f_mtlb = load_mtlb(
-        state,
-        host,
-        req.task_id,
-        pd.fragment_func_ref,
-        AirLoadRail::Draw,
-    )
-    .ok_or({
-        DrawError::DrawPreparation(
-            crate::backend::vulkan::engine::DrawPreparationDecline::FragmentMtlbMissing {
-                task_id: req.task_id,
-                function_ref: pd.fragment_func_ref,
-            },
-        )
-    })?;
-    // Borrowed from the `*_mtlb` locals above, which outlive every use below.
-    // These were `.to_vec()`, which allocated and copied both AIR blobs on
-    // every chain — `drain_duty` measures ~1142 chains/s, so that is ~2300
-    // allocations a second on the drain worker for bytes that are only ever
-    // read (`translate_cached_reflected` takes `&[u8]`, and its cache is keyed
-    // by hashing them).
-    let v_air = crate::runtime::mtlb::extract_air(&v_mtlb).map_err(|reason| {
-        DrawError::DrawPreparation(
-            crate::backend::vulkan::engine::DrawPreparationDecline::VertexAirExtract {
-                function_ref: pd.vertex_func_ref,
-                reason,
-            },
-        )
-    })?;
-    let f_air = crate::runtime::mtlb::extract_air(&f_mtlb).map_err(|reason| {
-        DrawError::DrawPreparation(
-            crate::backend::vulkan::engine::DrawPreparationDecline::FragmentAirExtract {
-                function_ref: pd.fragment_func_ref,
-                reason,
-            },
-        )
-    })?;
+    // One call for the pipeline descriptor and both translated shaders. It is
+    // memoized on the three objects' list entries — see
+    // `crate::runtime::pipeline_resolve` for what that identity is and what it
+    // does not cover — so the object-list walks, descriptor reads, MTLB reads,
+    // AIR carves and content hashes behind it happen once per pipeline object
+    // rather than once per draw. The sub-phases below still bracket the parts,
+    // so a boot's `chain_phase` line says how much of the span survived.
+    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::PipelineDesc);
+    let resolved =
+        crate::runtime::pipeline_resolve::resolve(state, host, req.task_id, req.pipeline_ref)
+            .map_err(DrawError::DrawPreparation)?;
+    let pd = &resolved.desc;
+    let v_shader = resolved.vertex.clone();
+    let f_shader = resolved.fragment.clone();
 
-    // AIR→SPIR-V is content-cached: live boots re-translated the same pipelines
-    // dozens of times on the doorbell vCPU and tripped IPI timeout panics.
-    // Reflected translate: the cached shader carries the metal2vulkan reflection
-    // facade so per-draw texture provisioning reads dimensionality straight from
-    // the AIR-derived metadata (single source of truth) rather than re-walking the
-    // emitted SPIR-V. `_shader.reflection` is used at the sampled-image binding
-    // loop below; the SPIR-V walk stays as a cold fallback.
-    let v_shader = crate::runtime::m2v_cache::translate_cached_reflected(
-        v_air,
-        metal2vulkan::passes::Stage::Vertex,
-        req.pipeline_ref,
-    )
-    .map_err(|reason| {
-        DrawError::DrawPreparation(
-            crate::backend::vulkan::engine::DrawPreparationDecline::VertexTranslate {
-                pipeline_ref: req.pipeline_ref,
-                reason,
-            },
-        )
-    })?;
-    let f_shader = crate::runtime::m2v_cache::translate_cached_reflected(
-        f_air,
-        metal2vulkan::passes::Stage::Fragment,
-        req.pipeline_ref,
-    )
-    .map_err(|reason| {
-        DrawError::DrawPreparation(
-            crate::backend::vulkan::engine::DrawPreparationDecline::FragmentTranslate {
-                pipeline_ref: req.pipeline_ref,
-                reason,
-            },
-        )
-    })?;
-
+    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Pipeline);
     let Some((w, h)) = req.colors.first().map(|c0| (c0.width, c0.height)) else {
         return Ok(M2vDrawSpan::None);
     };
@@ -6904,7 +6825,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 host,
                 req.task_id,
                 &req.colors,
-                &pd,
+                pd,
                 &primary_id,
                 w,
                 h,

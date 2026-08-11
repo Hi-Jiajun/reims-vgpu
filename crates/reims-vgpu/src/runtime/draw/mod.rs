@@ -1263,7 +1263,7 @@ impl crate::observe::Decline for IndexLoadReason {
 /// Read a count here against the same rail's previous boot. Read it against the
 /// paragraph above instead and macOS 26's standing behaviour arrives looking
 /// like a fresh defect, which is a mistake this doc has already cost once.
-fn load_render_pipeline<M: HostMemory + HostOps>(
+pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,

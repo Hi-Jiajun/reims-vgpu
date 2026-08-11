@@ -36,7 +36,7 @@
 //! | phase | from | to | what would fix it |
 //! |---|---|---|---|
 //! | `prep` | `encode_draw_chain` entry | the metal2vulkan call | the CLEAR-only fast path, which never leaves this phase |
-//! | `pipeline` | there | both shaders translated | the AIR→SPIR-V content cache |
+//! | `pipeline` | there | both shaders translated | `runtime::pipeline_resolve` (backend-vulkan only, so named not linked), which is what the five bars below it were measured to justify |
 //! | `binds` | there | vertex/fragment buffer content materialized | zero-copy buffer binds |
 //! | `sampled` | there | every sampled image and sampler resolved | the gather witness and the sampled cache |
 //! | `seed` | there | the colour Load seed resolved | resident Load elision |
@@ -58,6 +58,11 @@
 //!   the five the pipeline span is divided into, which are carved out of
 //!   `pipeline_us` rather than added beside it. A shortfall there
 //!   means the engine is being entered by some route this bracket does not see.
+//!
+//! This line's own `pipeline_us` is divided the same way, by the five
+//! `pipeline_*_us` bars — see [`Phase::PipelineMtlb`] for why. They are carved
+//! out of it, so it is the six that sum to the chain and not `pipeline_us`
+//! alone.
 //!
 //! Neither identity is asserted in code, because a census that panics on its own
 //! arithmetic is worse than one a reader can divide. They are stated here so the
@@ -84,9 +89,16 @@ use std::time::Instant;
 use crate::observe::phase_clock::{charge_ns, to_us};
 
 /// Phase slots, in the order a draw chain passes through them.
+///
+/// The five `Pipeline*` sub-phases are appended after `Store` rather than
+/// inserted next to `Pipeline`, so every existing ordinal keeps its value and
+/// [`PHASES`] stays derived from [`Phase::LAST`] rather than hand-counted. Same
+/// arrangement, and the same reason, as `draw_phase`'s pipeline split.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase {
     Prep = 0,
+    /// What is left of the pipeline span once the five below are taken out of
+    /// it: the render-target extent check and the phase's own bookkeeping.
     Pipeline = 1,
     Binds = 2,
     Sampled = 3,
@@ -94,9 +106,48 @@ pub enum Phase {
     Assemble = 5,
     Engine = 6,
     Store = 7,
+    /// `gva_alloc_generation` — the colour0 target's allocation walk, taken once
+    /// per chain because two walks of one address across a submit are two
+    /// answers.
+    PipelineGen = 8,
+    /// `load_render_pipeline`: one object-list lookup, one descriptor read out
+    /// of guest memory, and the decode of the bytes it read.
+    PipelineDesc = 9,
+    /// Both `load_mtlb` calls.
+    ///
+    /// # Why the pipeline span is split at all
+    ///
+    /// It is the third-largest column on the line — 17.8 % of a chain on a
+    /// driven macos-13 sustained-animation boot, 4.66 us of 26.2 — and the whole
+    /// of it is spent arriving at a shader this device already holds:
+    /// `shader_misses` and `pipeline_misses` are both **zero** over a boot that
+    /// runs 27 000 chains a second.
+    ///
+    /// A hit that costs that much is a lookup priced like a compile, and six
+    /// candidates share the span. This bar is the one with a structural reason to
+    /// be large: each `load_mtlb` resolves an object descriptor (an object-list
+    /// read plus a descriptor read) and then reads the whole MTLB container out
+    /// of guest memory into a fresh `Vec`, so the pair is six guest-memory walks
+    /// and three allocations per chain for bytes that have not changed since the
+    /// guest compiled them.
+    PipelineMtlb = 10,
+    /// Both `extract_air` calls — a linear scan of each MTLB container for the
+    /// wrapper magic, so it is charged separately from the read that produced
+    /// the container and from the hash that consumes the blob.
+    PipelineAir = 11,
+    /// Both `translate_cached_reflected` calls: hashing each AIR blob for its
+    /// content key, and the global cache mutex. The translate itself is a miss
+    /// path and this boot has none.
+    PipelineXlate = 12,
 }
 
-const PHASES: usize = 8;
+impl Phase {
+    /// Highest ordinal, so [`PHASES`] is derived from the enum rather than
+    /// hand-counted beside it.
+    const LAST: Phase = Phase::PipelineXlate;
+}
+
+const PHASES: usize = Phase::LAST as usize + 1;
 
 /// Nanoseconds, per [`crate::observe::phase_clock`]. `prep_us` and
 /// `pipeline_us` are a couple of microseconds across a whole chain, so their
@@ -117,7 +168,14 @@ thread_local! {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ChainPhaseWindow {
     pub prep_us: u64,
+    /// The residue of the pipeline span; the five below are carved out of it and
+    /// the six together are what `pipeline_us` used to be alone.
     pub pipeline_us: u64,
+    pub pipeline_gen_us: u64,
+    pub pipeline_desc_us: u64,
+    pub pipeline_mtlb_us: u64,
+    pub pipeline_air_us: u64,
+    pub pipeline_xlate_us: u64,
     pub binds_us: u64,
     pub sampled_us: u64,
     pub seed_us: u64,
@@ -135,6 +193,11 @@ pub fn take_window() -> Option<ChainPhaseWindow> {
     let w = ChainPhaseWindow {
         prep_us: to_us(ACC[Phase::Prep as usize].swap(0, Ordering::Relaxed)),
         pipeline_us: to_us(ACC[Phase::Pipeline as usize].swap(0, Ordering::Relaxed)),
+        pipeline_gen_us: to_us(ACC[Phase::PipelineGen as usize].swap(0, Ordering::Relaxed)),
+        pipeline_desc_us: to_us(ACC[Phase::PipelineDesc as usize].swap(0, Ordering::Relaxed)),
+        pipeline_mtlb_us: to_us(ACC[Phase::PipelineMtlb as usize].swap(0, Ordering::Relaxed)),
+        pipeline_air_us: to_us(ACC[Phase::PipelineAir as usize].swap(0, Ordering::Relaxed)),
+        pipeline_xlate_us: to_us(ACC[Phase::PipelineXlate as usize].swap(0, Ordering::Relaxed)),
         binds_us: to_us(ACC[Phase::Binds as usize].swap(0, Ordering::Relaxed)),
         sampled_us: to_us(ACC[Phase::Sampled as usize].swap(0, Ordering::Relaxed)),
         seed_us: to_us(ACC[Phase::Seed as usize].swap(0, Ordering::Relaxed)),
@@ -228,6 +291,11 @@ mod tests {
         assert_eq!(w.chains, 1);
         let sum = w.prep_us
             + w.pipeline_us
+            + w.pipeline_gen_us
+            + w.pipeline_desc_us
+            + w.pipeline_mtlb_us
+            + w.pipeline_air_us
+            + w.pipeline_xlate_us
             + w.binds_us
             + w.sampled_us
             + w.seed_us
@@ -245,6 +313,27 @@ mod tests {
         assert!(w.prep_us >= 1_000, "prep held the first sleep: {w:?}");
         assert!(w.engine_us >= 1_000, "engine held the second sleep: {w:?}");
         assert!(w.store_us >= 1_000, "store held the third sleep: {w:?}");
+    }
+
+    /// The pipeline sub-phases are **carved out of** `pipeline_us`, not added
+    /// beside it. A reader who sums the six against the chain has to get the
+    /// chain, so a sub-phase that also charged the residue would double its own
+    /// time and read as the largest bar on the line.
+    #[test]
+    fn a_pipeline_sub_phase_is_carved_out_of_the_residue() {
+        let _ = take_window();
+        {
+            let _t = ChainTimer::start();
+            enter(Phase::PipelineMtlb);
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            enter(Phase::Store);
+        }
+        let w = take_window().expect("one chain ran");
+        assert!(
+            w.pipeline_mtlb_us >= 2_000,
+            "the sleep charged the sub-phase: {w:?}"
+        );
+        assert!(w.pipeline_us < 1_000, "and not the residue as well: {w:?}");
     }
 
     /// A phase change with no timer live must not charge anything, or a stray

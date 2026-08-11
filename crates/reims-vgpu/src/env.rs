@@ -250,6 +250,20 @@ pub const SCATTER_SPLIT: &str = "REIMS_VGPU_SCATTER_SPLIT";
 /// ways in one binary.
 pub const COMPUTE_SCATTER: &str = "REIMS_VGPU_COMPUTE_SCATTER";
 
+/// `off` narrows a draw chain's pipeline resolution back to the full walk —
+/// object list, descriptor, decode, MTLB read, AIR carve and content hash, for
+/// the pipeline and both of its functions, on every draw.
+///
+/// It narrows in the sense this module requires: the full walk is what the memo
+/// is a cache in front of, and every resolution the memo serves came out of it.
+/// Switching it off cannot reach a resolution the walk would not have produced.
+///
+/// It exists because the memo's correctness rests on a stated claim about what a
+/// guest does to a live pipeline object — see
+/// [`crate::runtime::pipeline_resolve`] — and a claim about a guest is worth a
+/// binary that can be run both ways against that guest.
+pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
+
 /// What one variable says, including the two ways it says nothing usable.
 ///
 /// Four states rather than a `bool` because "unset", "explicitly on" and

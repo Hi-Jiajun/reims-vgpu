@@ -1978,11 +1978,17 @@ fn emit_chain_phase() {
         return;
     };
     crate::observe::off(format!(
-        "chain_phase chains={} prep_us={} pipeline_us={} binds_us={} sampled_us={} \
+        "chain_phase chains={} prep_us={} pipeline_us={} pl_gen_us={} pl_desc_us={} \
+         pl_mtlb_us={} pl_air_us={} pl_xlate_us={} binds_us={} sampled_us={} \
          seed_us={} assemble_us={} engine_us={} store_us={} max_us={}",
         w.chains,
         w.prep_us,
         w.pipeline_us,
+        w.pipeline_gen_us,
+        w.pipeline_desc_us,
+        w.pipeline_mtlb_us,
+        w.pipeline_air_us,
+        w.pipeline_xlate_us,
         w.binds_us,
         w.sampled_us,
         w.seed_us,
