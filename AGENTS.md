@@ -594,6 +594,33 @@ scripts/window-drag-probe/window-drag-probe.sh --seconds 25 --app Safari
 That produces real window-server compositing, against 0 draws/s idle. The probe refuses a verdict if
 the window never moved, so a run that produced no motion cannot be mistaken for a slow device.
 
+### A bursty driven boot measures the gaps between its bursts
+
+Driving is not enough. A probe built out of discrete interactions — a Mission Control round, a
+Launchpad round, a drag — spends most of its wall clock waiting for guest animations, and whole
+seconds of it have **zero** draws. Nothing in the capture says so: the counters are self-consistent
+and the log is well-formed. One such probe put `present_hz` at a median of 2.8 Hz on a device
+sustaining 78.8 Hz minutes later in the same VM.
+
+The damage is not a scale factor, it is a different **ranking**. On one build, one rail and one
+quiesced host, the bursty probe put `chain_phase`'s `engine` at 49 % and `store` at 10 %; the
+sustained one puts `store` at 35 % and `engine` at 28 %. Decisively, the drain worker's duty is 0.00
+median on the bursty probe and 0.91 on the sustained one — so **only the sustained arm can turn a
+per-draw CPU saving into frames**, and three separate CPU wins measured against the bursty one each
+bought real microseconds and no frames at all.
+
+So a throughput, caching or cadence change needs
+`scripts/sustained-animation-probe/sustained-animation-probe.sh` as well as an interaction probe.
+Name which probe a number came from, the same way a rail is named: they are two populations of draws
+and a change can help one and hurt the other.
+
+**Classify the boot before comparing two of them.** The guest itself has more than one compositing
+regime and picks between them per boot — the sustained probe reads either ~420 or ~268 draws per
+presented frame, tightly, with nothing in between. `present_hz` is not comparable across the two, and
+mixing boots from both is how a real 17 % effect ends up buried under a 24 % artifact. Everything
+else reproduces to a fraction of a percent *within* a regime, which is what makes three boots per arm
+enough to separate one. `drain_duty draws` over `window_publish fresh` is the discriminator.
+
 **Bracket one character of every `pkill -f` pattern**, as `x86_6[4]` does above and as
 `reims_vgp[u]-` does further down. `pkill -f` matches against whole command lines, and the shell
 running the `pkill` has the pattern in *its* command line, so an unbracketed pattern matches the
