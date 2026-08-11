@@ -101,7 +101,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // Solid CLEAR seed Stores only when this record owns guest writeback
     // (last of a serialized chain, or unified always-writeback).
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::PrepSeed);
-    if writeback_guest {
+    if writeback_guest && clear_seed_enabled() {
         for (i, c) in colors.iter().enumerate() {
             // Reports an out-of-contract value; the gate below is unchanged, and
             // it is the site that disagrees with this module's writeback loop
@@ -124,7 +124,19 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             // exist in any other one.
             let want_rgba = i == 0 || c.target_gva != 0;
             let rgba = want_rgba.then(|| solid_rgba8(c.width, c.height, &c.clear_color));
+            // Which branch this loop actually takes, how many bytes it lands and
+            // what the landing costs. `prep_seed_us` is 8.6 µs of a 41 µs chain
+            // on the `blur=40` dial and rebuilding the images without their two
+            // redundant passes did not move it by a hundredth, so the cost is in
+            // one of these two writes and there was no reading that said which.
+            let seed_kb = u64::from(c.width)
+                .saturating_mul(u64::from(c.height))
+                .saturating_mul(u64::from(RGBA8_BPP))
+                / 1024;
             let ok = if c.target_gva != 0 {
+                let _span = StoreCostSpan::new("clear_seed_gva_us");
+                crate::runtime::drain::note_store_route("clear_seed_gva");
+                crate::runtime::drain::note_store_route_n("clear_seed_gva_kb", seed_kb);
                 let rgba = rgba.as_ref().expect("built for every GVA target above");
                 write_gva_rgba8(
                     state,
@@ -150,6 +162,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 // word, so the exchange belongs to the word and doing it per
                 // texel cost an allocation and two passes over the whole
                 // surface. See `contract::pixel_format::solid_bgra8`.
+                let _span = StoreCostSpan::new("clear_seed_t11_us");
+                crate::runtime::drain::note_store_route("clear_seed_t11");
+                crate::runtime::drain::note_store_route_n("clear_seed_t11_kb", seed_kb);
                 let bgra = solid_bgra8(c.width, c.height, &c.clear_color);
                 let stride = c.width.saturating_mul(RGBA8_BPP);
                 mapping_write::write_bgra8(
@@ -9243,4 +9258,25 @@ mod vulkan_split_tests {
             "two allocations at one secondary address must not share one image"
         );
     }
+}
+
+/// Whether the CLEAR-seed Store at the head of a draw chain runs, for this
+/// process.
+///
+/// Read once. The arms differ in what reaches the guest's pages, so a boot that
+/// flipped it midway would be two devices in one log — and the arm that does not
+/// write is an ablation whose damage is only visible in a photograph, so it has
+/// to hold for the whole boot the photograph is of.
+fn clear_seed_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let (state, value) = crate::env::read(crate::env::CLEAR_SEED);
+        let on = !matches!(state, crate::env::Switch::Off);
+        crate::observe::off(format!(
+            "clear_seed on={on} switch={state:?} value={}",
+            value.unwrap_or_else(|| "<unset>".into())
+        ));
+        on
+    })
 }

@@ -292,6 +292,22 @@ pub const LAZY_WRITEBACK: &str = "REIMS_VGPU_LAZY_WRITEBACK";
 /// one binary on one guest.
 pub const SLAB_RETAIN: &str = "REIMS_VGPU_SLAB_RETAIN";
 
+/// `off` narrows the CLEAR-seed Store at the head of a draw chain out of
+/// existence: the solid colour is not written into the guest's pages before the
+/// encode, and only what the draw's own Store lands reaches them.
+///
+/// It narrows in the sense this module requires — strictly fewer writes, and no
+/// write it can reach that the wider arm does not also make.
+///
+/// **It is an ablation and not a shipping arm.** The seed is what the guest sees
+/// outside the region a draw covers, so switching it off can lose pixels, and
+/// the failure mode is content rather than a counter. It exists because
+/// `prep_seed_us` is 8.6 µs of a 41 µs chain on the load probe's `blur=40` dial
+/// — 21 %, second only to the engine — and no elision of it can be designed
+/// against a cost nobody has priced. The A/B harness photographs both arms,
+/// which is the only way this arm's damage is visible at all.
+pub const CLEAR_SEED: &str = "REIMS_VGPU_CLEAR_SEED";
+
 /// `off` narrows a draw chain's pipeline resolution back to the full walk —
 /// object list, descriptor, decode, MTLB read, AIR carve and content hash, for
 /// the pipeline and both of its functions, on every draw.
@@ -487,9 +503,10 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 13] = [
+pub const ALL: [&str; 14] = [
     LAZY_WRITEBACK,
     SLAB_RETAIN,
+    CLEAR_SEED,
     GUEST_IMPORT,
     DRAW_LOG,
     GPU_STAMP,
