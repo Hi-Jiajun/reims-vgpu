@@ -46,6 +46,51 @@
 //! invalidated by declarations can beat `bgf_quiet`, so a low reading closes the
 //! design outright and a high one says go and establish the soundness.
 //!
+//! # What it read, and the number in it that is a warning
+//!
+//! Two driven macos-13 sustained-animation boots, one census second each:
+//!
+//! ```text
+//! quiet=57123  wrote=9396  first=178  dropped=0  tracked=6968  quiet_rate=0.859
+//! quiet=38990  wrote=4951  first=352  dropped=0  tracked=5707  quiet_rate=0.887
+//! ```
+//!
+//! The wiring check passes — `buffer_write_gen_bump` is non-zero on both — so
+//! the two id namespaces do overlap and `wrote` is a real population rather than
+//! a comparison that never moves.
+//!
+//! **But read the bump rate itself, because it is the finding.** Across the same
+//! two boots:
+//!
+//! ```text
+//!          validity_no_surface/s      buffer_write_gen_bump/s
+//! boot 1          4 847 (median)             520 (median), 99-626
+//! boot 2          4 151 (median)              31 (median), 29-60
+//! ```
+//!
+//! The guest issues ~4 800 validity records a second naming objects this device
+//! holds no mapping for, and on one of the two boots **31 of them a second**
+//! carried `clear_host_valid`. That is the whole of the guest's declared account
+//! of writing its own buffers, against ~20 800 gathers a second of ~1 900
+//! windows whose contents are animating at 68 frames a second.
+//!
+//! It is not credible that the guest rewrote its vertex and constant data 31
+//! times in a second it drew 15 000 frames' worth of moving geometry. The
+//! likeliest reading is that **it does not have to declare** — a Metal buffer in
+//! a shared storage mode needs no `didModifyRange`, because the host reads the
+//! same memory — and if that is so the declaration is not a complete account and
+//! `quiet_rate` is not an achievable hit rate but an upper bound on a rule that
+//! would serve stale bytes.
+//!
+//! So the 86-89 % above is **not** a licence, and the two orders of magnitude
+//! between the boots' bump rates is the reason to say so out loud rather than
+//! quote the higher one. The next instrument is a content audit on the same
+//! shape [`super::gather_witness::AUDIT_STRIDE`] uses: fold a sampled `quiet`
+//! window's bytes and check whether they moved. If they did, this design is
+//! closed and the cache needs the hypervisor half after all — which is a
+//! different and much more expensive problem, because that bound is a harvest
+//! cost and not a resize.
+//!
 //! # Why the hypervisor witness is not the instrument here
 //!
 //! [`super::gather_witness`] answers the same question soundly for the sampled
