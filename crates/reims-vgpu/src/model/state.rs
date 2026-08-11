@@ -1465,6 +1465,18 @@ pub struct PresentState {
     pub frame_width: u32,
     pub frame_height: u32,
     pub frame_generation: u32,
+    /// `MappingEntry::surface_content_epoch` of the captured frame — "these are
+    /// different pixels", where `frame_generation` is "the guest's pages hold
+    /// something different".
+    ///
+    /// The two came apart when the lazy type-11 Store
+    /// ([`crate::runtime::writeback_debt`]) started leaving a frame in the engine
+    /// resident and owing the pages a copy: the pixels move every frame and the
+    /// generation does not. Anything asking "is this a new frame to show" has to
+    /// read this one — `device::window_publish::window_frame_key` is the caller
+    /// that found out the hard way, discarding 20 % of a driven boot's frames as
+    /// unchanged.
+    pub frame_content_epoch: u32,
     pub frame_valid: bool,
     /// True only when DisplaySwap capture failed; first host paint retries.
     pub frame_encode_pending: bool,
@@ -3202,12 +3214,37 @@ impl DeviceState {
         self.validity_seq
     }
 
-    /// Advance [`MappingEntry::surface_content_epoch`] for a publish that
-    /// changed the mapping's pixels *without* writing its guest pages — the
-    /// deferred type-11 Store, which stores the frame into `surface_cache` and
-    /// arms a window. Returns the new epoch so the caller can stamp the
-    /// resident that holds those pixels in the same breath; the two must not be
-    /// separable, or the stamp records a currency that already moved.
+    /// Advance a mapping's content stamps for a publish that changed its pixels
+    /// *without* writing its guest pages — the lazy type-11 Store of
+    /// [`crate::runtime::writeback_debt`], which leaves the frame in the engine
+    /// resident and owes the pages a copy.
+    ///
+    /// Returns the new [`MappingEntry::surface_content_epoch`] so the caller can
+    /// stamp the resident that holds those pixels in the same breath; the two
+    /// must not be separable, or the stamp records a currency that already moved.
+    ///
+    /// # Why it moves two of [`Self::mark_mapping_written`]'s three stamps
+    ///
+    /// It is the same statement as that one — "this mapping's pixels are now
+    /// different" — differing only in where the pixels are, and the difference is
+    /// exactly `content_generation`. That field means *the guest's pages hold
+    /// something new*, and its consumers re-read those pages when it moves; a
+    /// lazy Store wrote no page, so moving it would send the compute rail to
+    /// re-seed bytes that did not change.
+    ///
+    /// The other two mean *the pixels are new*, wherever they are, and both move:
+    /// `surface_content_epoch` licenses the attachment LOAD elision, which is what
+    /// keeps a lazy Store from being read straight back off guest pages, and
+    /// `host_published_seq` orders this frame against the guest's own later
+    /// `clear_host_valid`, which is what
+    /// [`crate::runtime::resource_validity::licence_of`] answers at the payment.
+    ///
+    /// Anything else that has to notice a lazy Store belongs on the epoch and not
+    /// on the generation. The host window's publish key is the worked example:
+    /// it keyed on the generation, so a driven macos-13 boot with the lazy rail on
+    /// published 60 fresh frames a second against 314 `same_key` where the eager
+    /// arm published 81 against 131 — real frames discarded as unchanged. It now
+    /// carries `PresentState::frame_content_epoch` beside the generation.
     pub fn note_surface_content_published(&mut self, mapping_id: u32) -> u32 {
         let seq = self.next_validity_seq();
         let Some(m) = self.mappings.get_mut(&mapping_id) else {

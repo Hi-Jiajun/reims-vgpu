@@ -174,6 +174,17 @@ pub fn capture_present_frame(
     if need == 0 {
         return false;
     }
+    // "These are different pixels", which `generation` cannot say for a lazy
+    // type-11 Store: it leaves the frame in the engine resident and writes no
+    // guest page, so `content_generation` holds still while the pixels move.
+    // Read from the entry here rather than threaded in, because the caller
+    // resolved `generation` from that same entry and a second parameter is a
+    // second chance for the two to name different mappings.
+    let content_epoch = state
+        .mappings
+        .get(&mapping_id)
+        .map(|m| m.surface_content_epoch)
+        .unwrap_or(0);
     state.advance_present_epoch();
     // --- Capture readback elision ---
     // When the previous present's window publish handed the window an engine
@@ -228,6 +239,7 @@ pub fn capture_present_frame(
         state.present.frame_width = width;
         state.present.frame_height = height;
         state.present.frame_generation = generation;
+        state.present.frame_content_epoch = content_epoch;
         state.present.frame_valid = true;
         // First host paint after a present blits +0x188 (mirror the full path).
         state.present.frame_encode_pending = true;
@@ -345,6 +357,7 @@ pub fn capture_present_frame(
     state.present.frame_width = width;
     state.present.frame_height = height;
     state.present.frame_generation = generation;
+    state.present.frame_content_epoch = content_epoch;
     state.present.frame_valid = true;
     // Force the next host paint to blit +0x188. Early pre-boundary paints may
     // have latched painted_mapping/generation (live type-11 paint_mapping or
