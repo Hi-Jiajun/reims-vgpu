@@ -1094,21 +1094,68 @@ impl ResourcePools {
         }
     }
 
+    /// Reset a ring-slot command buffer and begin recording it, arming its GPU
+    /// timestamp pair in the same call.
+    ///
+    /// **This is the only way a ring-slot command buffer may be begun.** All five
+    /// submission kinds used to spell the reset-then-begin pair out by hand, and
+    /// the probe was wired into exactly one of them — which reported 51 % GPU
+    /// occupancy for a device whose writeback submissions carried no stamps at
+    /// all. Folding the arm into the begin is what makes a sixth kind unable to
+    /// join without one: there is no longer a shorter path to a recording slot CB.
+    ///
+    /// The `VkOp`s are parameters because each caller reports its own failure name
+    /// and those names are load-bearing in the fail log.
+    ///
+    /// # Safety
+    ///
+    /// `cb` must be the current slot's command buffer and must not be recording.
+    pub(crate) unsafe fn begin_slot_recording(
+        &mut self,
+        ctx: &DeviceContext,
+        cb: vk::CommandBuffer,
+        kind: gpu_span::Kind,
+        reset_op: VkOp,
+        begin_op: VkOp,
+    ) -> Result<(), DrawError> {
+        ctx.device
+            .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
+            .map_err(|e| DrawError::VkCall(VkCall::new(reset_op, e)))?;
+        ctx.device
+            .begin_command_buffer(
+                cb,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .map_err(|e| DrawError::VkCall(VkCall::new(begin_op, e)))?;
+        unsafe { self.gpu_span_arm(ctx, cb, kind) };
+        Ok(())
+    }
+
     /// Reset the current slot's timestamp pair and write the top one, so the
     /// submission about to be recorded reports its own GPU execution time.
     ///
-    /// Called once per command buffer that a draw *opens* — a batch joiner
-    /// appends to a CB that is already armed, and arming again would move the top
-    /// stamp forward past work the batch has already recorded. Both
-    /// `vkCmdResetQueryPool` and the write must be outside a render pass instance,
-    /// which the call site satisfies by sitting immediately after
+    /// Private, and reached only through [`Self::begin_slot_recording`]: a caller
+    /// that could arm without beginning could also begin without arming, which is
+    /// the failure this pairing exists to prevent. A batch joiner reaches neither
+    /// — it appends to a CB already armed, and arming again would move the top
+    /// stamp forward past work the batch has already recorded, reading as a fast
+    /// submission rather than as a broken one.
+    ///
+    /// Both `vkCmdResetQueryPool` and the write must be outside a render pass
+    /// instance, which the caller satisfies by sitting immediately after
     /// `vkBeginCommandBuffer`.
     ///
     /// # Safety
     ///
     /// `cb` must be the current slot's command buffer, recording, and outside any
     /// render pass.
-    pub(crate) unsafe fn gpu_span_arm(&mut self, ctx: &DeviceContext, cb: vk::CommandBuffer) {
+    unsafe fn gpu_span_arm(
+        &mut self,
+        ctx: &DeviceContext,
+        cb: vk::CommandBuffer,
+        kind: gpu_span::Kind,
+    ) {
         let Some(probe) = ctx.draw_spans.as_ref() else {
             return;
         };
@@ -1125,7 +1172,7 @@ impl ResourcePools {
             .cmd_reset_query_pool(cb, probe.pool, base, DrawSpanProbe::PER_SLOT);
         ctx.device
             .cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, probe.pool, base);
-        self.slots[slot].span = gpu_span::SlotSpan::Armed;
+        self.slots[slot].span = gpu_span::SlotSpan::Armed(kind);
         gpu_span::note_armed();
     }
 
@@ -1144,16 +1191,16 @@ impl ResourcePools {
         let Some(probe) = ctx.draw_spans.as_ref() else {
             return;
         };
-        if self.slots[slot].span != gpu_span::SlotSpan::Armed {
+        let gpu_span::SlotSpan::Armed(kind) = self.slots[slot].span else {
             return;
-        }
+        };
         ctx.device.cmd_write_timestamp(
             cb,
             vk::PipelineStageFlags::BOTTOM_OF_PIPE,
             probe.pool,
             DrawSpanProbe::base(slot) + 1,
         );
-        self.slots[slot].span = gpu_span::SlotSpan::Sealed;
+        self.slots[slot].span = gpu_span::SlotSpan::Sealed(kind);
         gpu_span::note_sealed();
     }
 
@@ -1183,11 +1230,11 @@ impl ResourcePools {
         let Some(probe) = ctx.draw_spans.as_ref() else {
             return;
         };
-        let sealed = self.slots[slot].span == gpu_span::SlotSpan::Sealed;
-        self.slots[slot].span = gpu_span::SlotSpan::Idle;
-        if !sealed {
+        let gpu_span::SlotSpan::Sealed(kind) =
+            std::mem::replace(&mut self.slots[slot].span, gpu_span::SlotSpan::Idle)
+        else {
             return;
-        }
+        };
         let mut ticks = [0u64; DrawSpanProbe::PER_SLOT as usize];
         if ctx
             .device
@@ -1199,7 +1246,7 @@ impl ResourcePools {
             )
             .is_ok()
         {
-            gpu_span::note_busy_ns(probe.elapsed_ns(ticks[0], ticks[1]));
+            gpu_span::note_busy_ns(kind, probe.elapsed_ns(ticks[0], ticks[1]));
         }
     }
 

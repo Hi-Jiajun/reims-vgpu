@@ -2966,21 +2966,15 @@ pub(crate) unsafe fn execute_draw_inner(
     // A batch joiner's CB is already recording (opened by the batch opener);
     // its commands append after the previous draw's end_render_pass.
     if !joins {
-        ctx.device
-            .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecResetCb, e)))?;
-        ctx.device
-            .begin_command_buffer(
+        unsafe {
+            pools.begin_slot_recording(
+                ctx,
                 cb,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecBeginCb, e)))?;
-        // Only on the arm that opens a command buffer. A joiner appends to one
-        // already armed, and re-arming would move its top stamp past draws the
-        // batch has already recorded — which would read as a fast submission
-        // rather than as a broken one.
-        unsafe { pools.gpu_span_arm(ctx, cb) };
+                super::gpu_span::Kind::Draw,
+                VkOp::ExecResetCb,
+                VkOp::ExecBeginCb,
+            )?
+        };
     }
 
     // Metal permits a pass to sample the same texture it renders into. Vulkan

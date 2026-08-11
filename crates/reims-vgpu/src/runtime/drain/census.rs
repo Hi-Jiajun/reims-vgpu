@@ -2712,14 +2712,44 @@ fn emit_draw_phase() {
 /// device's own recorded work rather than queue latency, and those are two
 /// different questions with two different fixes. `armed`/`sealed`/`read` say
 /// whether a low reading is a quiet GPU or a probe that did not close.
+///
+/// The five `*_us`/`*_n` pairs tile `busy_us`/`read` by what the submission was
+/// recorded for, so the shares say which rail owns the device's GPU time without
+/// an ablation. `unattributed` is the identity that keeps that honest: it is
+/// `read` minus the per-kind counts and must be zero.
+///
+/// **A per-second `busy_us` is not comparable across boots that delivered
+/// different amounts of work.** The guest sets the draw rate on this rail, so a
+/// change that slows the guest lowers `busy_us` by lowering the workload. Divide
+/// by `draw_phase draws` or by the kind's own `*_n` before comparing two arms —
+/// the writeback's own positive control halved the frame rate and lowered
+/// `busy_us` by 48 % while per-submission GPU cost moved 1.5 %.
 #[cfg(feature = "backend-vulkan")]
 fn emit_gpu_span() {
     let Some(w) = crate::backend::vulkan::engine::gpu_span::take_window() else {
         return;
     };
     crate::observe::off(format!(
-        "gpu_span busy_us={} busy_max_us={} read={} armed={} sealed={} unread={}",
-        w.busy_us, w.busy_max_us, w.read, w.armed, w.sealed, w.unread,
+        "gpu_span busy_us={} busy_max_us={} read={} armed={} sealed={} unread={} \
+         unattributed={} draw_us={} draw_n={} store_us={} store_n={} \
+         readback_us={} readback_n={} compute_us={} compute_n={} stamp_us={} stamp_n={}",
+        w.busy_us,
+        w.busy_max_us,
+        w.read,
+        w.armed,
+        w.sealed,
+        w.unread,
+        w.unattributed(),
+        w.kind_us[0],
+        w.kind_n[0],
+        w.kind_us[1],
+        w.kind_n[1],
+        w.kind_us[2],
+        w.kind_n[2],
+        w.kind_us[3],
+        w.kind_n[3],
+        w.kind_us[4],
+        w.kind_n[4],
     ));
 }
 

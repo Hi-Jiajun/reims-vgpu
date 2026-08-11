@@ -1017,19 +1017,19 @@ pub fn write_stamp_after_guest_writes(
         Some(pair) => pair,
         None => unsafe { pools.begin_entry(ctx, counters)? },
     };
-    let record = || -> Result<(), DrawError> {
+    // `mut` because the recording now arms the slot's GPU timestamp pair, which is
+    // state on `pools`. The closure is called once, immediately below, and never
+    // held across the submit that follows.
+    let mut record = || -> Result<(), DrawError> {
         unsafe {
             if appended.is_none() {
-                ctx.device
-                    .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
-                    .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteResetCb, e)))?;
-                ctx.device
-                    .begin_command_buffer(
-                        cb,
-                        &ash::vk::CommandBufferBeginInfo::default()
-                            .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                    )
-                    .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteBeginCb, e)))?;
+                pools.begin_slot_recording(
+                    ctx,
+                    cb,
+                    gpu_span::Kind::Stamp,
+                    VkOp::GuestWriteResetCb,
+                    VkOp::GuestWriteBeginCb,
+                )?;
             }
             // `ALL_COMMANDS` on the source side is not caution: what this must
             // follow is the writeback copies (TRANSFER) *and* any draw still
@@ -1086,6 +1086,7 @@ pub fn write_stamp_after_guest_writes(
         if appended.is_some() {
             pools.batch_flush_signalling(ctx, counters, semaphore, timeline)
         } else {
+            pools.gpu_span_seal_current(ctx, cb);
             ctx.device
                 .end_command_buffer(cb)
                 .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteEndCb, e)))
@@ -1928,16 +1929,15 @@ unsafe fn copy_image_level0_to_host_delivered(
     // recording and holds the draws the copy is about to read; resetting it
     // would discard them and beginning it again is invalid.
     if appended.is_none() {
-        ctx.device
-            .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
-            .map_err(|e| DrawError::VkCall(VkCall::new(ops.reset_cb, e)))?;
-        ctx.device
-            .begin_command_buffer(
+        unsafe {
+            pools.begin_slot_recording(
+                ctx,
                 cb,
-                &ash::vk::CommandBufferBeginInfo::default()
-                    .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )
-            .map_err(|e| DrawError::VkCall(VkCall::new(ops.begin_cb, e)))?;
+                gpu_span::Kind::Readback,
+                ops.reset_cb,
+                ops.begin_cb,
+            )?
+        };
     }
     // Unconditional, and the layout match is exactly why. A barrier is two
     // things — a layout transition and a dependency — and this rail needs the
@@ -2050,6 +2050,7 @@ unsafe fn copy_image_level0_to_host_delivered(
         // draws and the copy together.
         pools.batch_flush(ctx, counters)?;
     } else {
+        unsafe { pools.gpu_span_seal_current(ctx, cb) };
         ctx.device
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))?;
@@ -3147,16 +3148,15 @@ unsafe fn copy_image_level0_to_buffer(
         None => pools.begin_entry(ctx, counters)?,
     };
     if appended.is_none() {
-        ctx.device
-            .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteResetCb, e)))?;
-        ctx.device
-            .begin_command_buffer(
+        unsafe {
+            pools.begin_slot_recording(
+                ctx,
                 cb,
-                &ash::vk::CommandBufferBeginInfo::default()
-                    .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteBeginCb, e)))?;
+                gpu_span::Kind::Store,
+                VkOp::GuestWriteResetCb,
+                VkOp::GuestWriteBeginCb,
+            )?
+        };
     }
     // The device's own clock, for the reason the readback rail takes it: `fence_us`
     // is CPU wall clock and cannot tell "the GPU is copying eight megabytes across
@@ -3350,6 +3350,7 @@ unsafe fn copy_image_level0_to_buffer(
         // draws and this copy together.
         pools.batch_flush(ctx, counters)?;
     } else {
+        unsafe { pools.gpu_span_seal_current(ctx, cb) };
         ctx.device
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteEndCb, e)))?;

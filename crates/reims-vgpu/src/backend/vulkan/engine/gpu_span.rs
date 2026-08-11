@@ -1,5 +1,6 @@
-//! How long the GPU spent executing a draw submission, from timestamps the
-//! submission writes into its own command buffer.
+//! How long the GPU spent executing each ring-slot submission, from timestamps the
+//! submission writes into its own command buffer, tiled by what it was recorded
+//! for.
 //!
 //! # The reading this closes
 //!
@@ -47,6 +48,10 @@
 //! drain duty                0.56        0.58
 //! ```
 //!
+//! **Read that table knowing it covers draw submissions only** — the first version
+//! of this module armed exactly one of the five kinds. See "the control that caught
+//! it" below; the occupancy figure is a floor, not the device's total.
+//!
 //! Three things fall out, and the third is the one that changes what to work on.
 //!
 //! * **`slot_us` is 18-33 ms a second, not the 314 that
@@ -62,6 +67,39 @@
 //!   frames than "the rail is GPU-bound" ever was: nothing was bound, so nothing
 //!   could convert. It also says a frame count cannot rank a device change on this
 //!   rail at all, whatever the change does.
+//!
+//! # The control that caught the coverage hole, and what a control is for
+//!
+//! `REIMS_VGPU_SCATTER_SPLIT=on` cuts every writeback run into four sub-ranges
+//! that tile it exactly: byte-identical guest output, 4x the copy regions,
+//! documented to halve the frame rate on this host. It was run as a *positive
+//! control* — an arm where the instrument must move, because a probe that cannot
+//! fail has not been tested. One same-regime boot against the pair above:
+//!
+//! ```text
+//!                        base       SCATTER_SPLIT=on
+//! window_publish fresh  104.5/s     59.0/s            -44 %  (reproduces)
+//! draws                 29 180/s    14 770/s
+//! GPU us per submission    265.8       269.7          +1.5 %
+//! GPU us per draw           17.71       18.30         +3 %
+//! ```
+//!
+//! The frame rate halved exactly as documented and the per-submission GPU cost did
+//! not move — because the writeback's submission was one of the four kinds with no
+//! stamps in it. The probe was not measuring the rail the control moved. Hence
+//! [`Kind`], hence
+//! [`super::pools::ResourcePools::begin_slot_recording`] being the only way to begin
+//! a slot command buffer, and hence `unattributed` on the census line.
+//!
+//! Two lessons worth more than the numbers:
+//!
+//! * **`armed`/`sealed`/`read` could not have caught this.** They count what the
+//!   probe arms, so a whole kind that never arms is consistent with all three and
+//!   with `unread=0`. Coverage counters see holes *inside* what they cover.
+//! * **A per-second `busy_us` is not comparable across arms.** The guest sets the
+//!   draw rate here, so an arm that slows the guest lowers `busy_us` by lowering
+//!   the workload — 48 % lower, in the table above, for a rail that got *more*
+//!   expensive. Always normalise: per `draws`, or per the kind's own `*_n`.
 //!
 //! # Which makes `busy_us` the number to optimise, not frames
 //!
@@ -122,8 +160,57 @@
 //!   back. It must be zero by construction — `begin_entry` retires a slot before
 //!   reusing it, and retiring is where the read happens — so a non-zero reading
 //!   is a real defect in the ring's own ordering and not a tuning knob.
+//! * `unattributed` is `read` minus the per-kind counts and must be zero. It is the
+//!   one column that cannot agree trivially, because a submission is counted in
+//!   `read` before a kind is chosen — which is exactly the check that was missing
+//!   when a whole kind had no stamps.
+//!
+//! None of these can see a *sixth* kind that begins a slot command buffer without
+//! arming, and no counter can: that is why the arm is folded into
+//! `begin_slot_recording` and the raw reset-then-begin pair no longer appears at any
+//! call site. The invariant is structural rather than reported.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// What a ring-slot submission was recorded for.
+///
+/// Every command buffer a submission ring slot carries is one of these, and the
+/// per-kind totals sum to `busy_us` — which is what makes the reading a tiling of
+/// the device's GPU time rather than a sample of one rail. The first version of
+/// this module armed only [`Self::Draw`] and reported 51 % occupancy; the
+/// writeback rail's own positive control then moved the frame rate 44 % without
+/// moving `busy_us` per submission at all, because its submission was one of the
+/// four kinds that had no stamps. A tiling closes; that did not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Kind {
+    /// A draw, or a batch of them sharing one command buffer. Carries the guest
+    /// buffer gather and every render pass.
+    Draw = 0,
+    /// A rendered surface copied back into the guest's own pages — the writeback,
+    /// as either a scatter of transfer regions or the compute dispatch that
+    /// replaces them.
+    Store = 1,
+    /// A target image copied into a host-visible buffer for a guest read.
+    Readback = 2,
+    /// A guest compute dispatch.
+    Compute = 3,
+    /// The completion stamp's own submission, on the arm that writes it with a
+    /// command buffer rather than a word.
+    Stamp = 4,
+}
+
+const KINDS: usize = 5;
+
+impl Kind {
+    /// Every kind, for the census and for the tests that assert the tiling closes.
+    pub(crate) const ALL: [Kind; KINDS] = [
+        Kind::Draw,
+        Kind::Store,
+        Kind::Readback,
+        Kind::Compute,
+        Kind::Stamp,
+    ];
+}
 
 /// GPU nanoseconds accumulated across submissions in this census window.
 static BUSY_NS: AtomicU64 = AtomicU64::new(0);
@@ -134,6 +221,10 @@ static MAX_NS: AtomicU64 = AtomicU64::new(0);
 static ARMED: AtomicU64 = AtomicU64::new(0);
 static SEALED: AtomicU64 = AtomicU64::new(0);
 static UNREAD: AtomicU64 = AtomicU64::new(0);
+/// Per-kind nanoseconds and submission counts. These sum to [`BUSY_NS`] and
+/// [`READ`], and `the_kinds_tile_the_total` is what keeps that true.
+static KIND_NS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+static KIND_N: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
 
 /// One census window of GPU-side submission timing.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -150,6 +241,22 @@ pub struct GpuSpanWindow {
     pub sealed: u64,
     /// Slots re-armed before a previous arming was read. Zero by construction.
     pub unread: u64,
+    /// GPU microseconds per [`Kind`], in [`Kind::ALL`] order. Sums to
+    /// [`Self::busy_us`] up to the microsecond truncation of each part.
+    pub kind_us: [u64; KINDS],
+    /// Submissions per [`Kind`], in [`Kind::ALL`] order. Sums to [`Self::read`]
+    /// exactly.
+    pub kind_n: [u64; KINDS],
+}
+
+impl GpuSpanWindow {
+    /// The one column that says whether the tiling closed. Submissions read
+    /// against submissions attributed; anything but zero is a kind that reached
+    /// the read path without a label, which is a bug in this module and not a
+    /// property of the workload.
+    pub fn unattributed(&self) -> i64 {
+        self.read as i64 - self.kind_n.iter().sum::<u64>() as i64
+    }
 }
 
 /// Take and clear the window. `None` when nothing armed, so a host without
@@ -157,6 +264,13 @@ pub struct GpuSpanWindow {
 /// — and a line's presence is what says the probe ran.
 pub fn take_window() -> Option<GpuSpanWindow> {
     let armed = ARMED.swap(0, Ordering::Relaxed);
+    let mut kind_us = [0u64; KINDS];
+    let mut kind_n = [0u64; KINDS];
+    for (i, k) in Kind::ALL.iter().enumerate() {
+        kind_us[i] =
+            crate::observe::phase_clock::to_us(KIND_NS[*k as usize].swap(0, Ordering::Relaxed));
+        kind_n[i] = KIND_N[*k as usize].swap(0, Ordering::Relaxed);
+    }
     let w = GpuSpanWindow {
         busy_us: crate::observe::phase_clock::to_us(BUSY_NS.swap(0, Ordering::Relaxed)),
         busy_max_us: crate::observe::phase_clock::to_us(MAX_NS.swap(0, Ordering::Relaxed)),
@@ -164,6 +278,8 @@ pub fn take_window() -> Option<GpuSpanWindow> {
         armed,
         sealed: SEALED.swap(0, Ordering::Relaxed),
         unread: UNREAD.swap(0, Ordering::Relaxed),
+        kind_us,
+        kind_n,
     };
     (armed > 0).then_some(w)
 }
@@ -183,11 +299,14 @@ pub(crate) fn note_unread() {
     UNREAD.fetch_add(1, Ordering::Relaxed);
 }
 
-/// One submission's GPU execution time, from the delta between its two stamps.
-pub(crate) fn note_busy_ns(ns: u64) {
+/// One submission's GPU execution time, from the delta between its two stamps,
+/// charged both to the total and to the kind the command buffer was recorded for.
+pub(crate) fn note_busy_ns(kind: Kind, ns: u64) {
     BUSY_NS.fetch_add(ns, Ordering::Relaxed);
     READ.fetch_add(1, Ordering::Relaxed);
     MAX_NS.fetch_max(ns, Ordering::Relaxed);
+    KIND_NS[kind as usize].fetch_add(ns, Ordering::Relaxed);
+    KIND_N[kind as usize].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Where a ring slot's arming stands, so a read cannot invent a sample out of a
@@ -196,15 +315,19 @@ pub(crate) fn note_busy_ns(ns: u64) {
 /// A three-state enum rather than two bools because "armed but not sealed" and
 /// "sealed" are the two states a read must tell apart, and a pair of bools admits
 /// a fourth combination that means nothing.
+/// The kind travels with the state rather than beside it, so there is no
+/// representable slot that is sealed but unlabelled — which is the shape that
+/// would let a submission's time reach `busy_us` without reaching a `Kind` and
+/// make the tiling silently not close.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum SlotSpan {
     /// No stamp written since this slot was last read.
     #[default]
     Idle,
     /// Top stamp written; the command buffer is still recording.
-    Armed,
+    Armed(Kind),
     /// Both stamps written; the delta is readable once the fence signals.
-    Sealed,
+    Sealed(Kind),
 }
 
 #[cfg(test)]
@@ -219,8 +342,8 @@ mod tests {
         note_armed();
         note_armed();
         note_sealed();
-        note_busy_ns(3_000);
-        note_busy_ns(5_000);
+        note_busy_ns(Kind::Draw, 3_000);
+        note_busy_ns(Kind::Store, 5_000);
         let w = take_window().expect("two command buffers armed");
         assert_eq!(w.armed, 2);
         assert_eq!(w.sealed, 1);
@@ -245,17 +368,55 @@ mod tests {
     fn the_sum_and_the_high_water_are_different_readings() {
         let _ = take_window();
         note_armed();
-        note_busy_ns(1_000_000);
-        note_busy_ns(1_000_000);
+        note_busy_ns(Kind::Draw, 1_000_000);
+        note_busy_ns(Kind::Draw, 1_000_000);
         let even = take_window().expect("armed");
         note_armed();
-        note_busy_ns(1_900_000);
-        note_busy_ns(100_000);
+        note_busy_ns(Kind::Draw, 1_900_000);
+        note_busy_ns(Kind::Draw, 100_000);
         let skewed = take_window().expect("armed");
         assert_eq!(even.busy_us, skewed.busy_us, "the same total");
         assert!(
             skewed.busy_max_us > even.busy_max_us,
             "{skewed:?} vs {even:?}"
         );
+    }
+
+    /// The per-kind counts tile the total exactly. This is the invariant whose
+    /// absence made the first version of this module report 51 % GPU occupancy for
+    /// a device whose writeback submissions carried no stamps: with only one kind
+    /// wired, `read` and the sum of the kinds agreed trivially and the *missing*
+    /// submissions were invisible to both. `unattributed` is the column that
+    /// cannot agree trivially, because a submission reaching the read path is
+    /// counted once in `read` before any kind is chosen.
+    #[test]
+    fn the_kinds_tile_the_total() {
+        let _ = take_window();
+        note_armed();
+        for (i, k) in Kind::ALL.iter().enumerate() {
+            note_busy_ns(*k, 1_000_000 * (i as u64 + 1));
+        }
+        let w = take_window().expect("armed");
+        assert_eq!(w.unattributed(), 0, "{w:?}");
+        assert_eq!(w.kind_n.iter().sum::<u64>(), w.read, "{w:?}");
+        assert_eq!(w.kind_us.iter().sum::<u64>(), w.busy_us, "{w:?}");
+        // ...and the kinds are distinguished, not merged into one bucket: a
+        // version that charged every submission to `Draw` would pass every
+        // assertion above.
+        assert_eq!(w.kind_n, [1; 5], "{w:?}");
+        assert!(
+            w.kind_us[Kind::Stamp as usize] > w.kind_us[Kind::Draw as usize],
+            "{w:?}"
+        );
+    }
+
+    /// `Kind::ALL` is the census's column order and the array index in one, so a
+    /// variant added without a place in `ALL` would silently never be reported.
+    #[test]
+    fn every_kind_has_exactly_one_place_in_all() {
+        assert_eq!(Kind::ALL.len(), KINDS);
+        for (i, k) in Kind::ALL.iter().enumerate() {
+            assert_eq!(*k as usize, i, "ALL must be in discriminant order");
+        }
     }
 }
