@@ -162,6 +162,25 @@ pub const BATCH_MIXED_TARGETS: &str = "REIMS_VGPU_BATCH_MIXED_TARGETS";
 /// capability.
 pub const UNUSED_BINDS: &str = "REIMS_VGPU_UNUSED_BINDS";
 
+/// `off` returns the host window presenter to one present in flight at a time.
+///
+/// The wider arm — the default — lets several of the presenter's blits be in
+/// flight at once, because with one the presenter was a **ceiling** rather than
+/// a pacer: twelve driven macos-13 boots put its output at 1599-1696 frames
+/// while the device published 1760-2015 to it, `busy_acquire` 0 throughout. The
+/// swapchain always had an image free; the refusals were all the previous
+/// blit's fence, which retires behind queued guest work because the blit shares
+/// a queue with every guest draw.
+///
+/// It exists as a switch for the same reason [`BUFFER_EXTENT`] does — one
+/// binary, one branch, two arms — and because presentation depth is the kind of
+/// change whose failure is a stutter or a torn frame rather than a decline, so
+/// the previous behavior has to stay reachable without a rebuild.
+///
+/// Off is a refusal and never a permission: one present in flight is strictly
+/// less concurrency than several, never more.
+pub const PRESENT_DEPTH: &str = "REIMS_VGPU_PRESENT_DEPTH";
+
 /// What one variable says, including the two ways it says nothing usable.
 ///
 /// Four states rather than a `bool` because "unset", "explicitly on" and
@@ -235,7 +254,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 8] = [
+pub const ALL: [&str; 9] = [
     GUEST_IMPORT,
     DRAW_LOG,
     GPU_STAMP,
@@ -244,6 +263,7 @@ pub const ALL: [&str; 8] = [
     BUFFER_EXTENT,
     BATCH_MIXED_TARGETS,
     UNUSED_BINDS,
+    PRESENT_DEPTH,
 ];
 
 /// The state of every variable in [`ALL`], for the one-shot boot line.
