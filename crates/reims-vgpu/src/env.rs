@@ -298,16 +298,38 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 /// The writeback's scatter issues ~1 900 a second and does not notice any of
 /// that.
 ///
-/// # The one change that would flip it
+/// # What would flip it, and what would not
 ///
-/// Give a command buffer's gather destinations one arena buffer instead of one
-/// pooled slot each. Then a single dispatch covers every gather in the command
-/// buffer — `batch_flushes` is ~2 200/s against ~34 000 gathers — with `Dst`
-/// bound over the arena and each run's destination index absolute in it. That
-/// takes the dispatch count, the staging acquisitions and the descriptor sets
-/// all down by the same ~18x, against a GPU saving already measured at 56 %.
-/// It needs `BoundBuffer` to carry a suballocation offset, which is why it is
-/// not in the same change as this.
+/// **Not fewer dispatches.** The obvious move is to batch a command buffer's
+/// gathers into one, and the arithmetic refuses it: ~40 000 dispatches against
+/// ~26 500 draws is **1.5 per draw**, not 18 per command buffer. A gather is
+/// recorded ahead of its own draw's render pass and cannot be hoisted to the
+/// front of the command buffer, because a Store earlier in that same command
+/// buffer may have landed in the pages it reads — which is exactly why
+/// `ResourcePools::note_guest_write_recorded` invalidates the bind map. So
+/// batching buys at most 1.5x on the count.
+///
+/// **The per-dispatch cost, which is ~1.05 us of the 1.6 us a draw this
+/// regressed by.** Three things are paid per dispatch and all three are
+/// avoidable:
+///
+/// - an `acquire_staging` and a `write_staging` for a ~200-byte run table.
+///   One command-buffer-scoped arena for run tables, with each dispatch reading
+///   at its own offset, makes that ~2 200 acquisitions a second instead of
+///   40 000.
+/// - a descriptor-set allocation and an `update_descriptor_sets`. Two of the
+///   three bindings — the guest import and the run-table arena — are the *same
+///   buffer* for every dispatch in a command buffer. Only `Dst` differs, and
+///   only because each gathered window takes its own pooled slot. Suballocate
+///   those from one command-buffer arena instead and all three bindings become
+///   constant, so the whole command buffer needs **one** descriptor set.
+///   `BoundBuffer` already carries an offset, so the bind side of that is free.
+/// - the bind and push. With one set per command buffer, a dispatch is a push
+///   constant carrying its run-table base index and `vkCmdDispatch`.
+///
+/// Together that is ~0.05 us a dispatch against today's ~1.05, holding a GPU
+/// saving already measured at 56 %. That is the change worth making; a first
+/// pass at only the count is measurably not.
 ///
 /// Until then the switch is a permission rather than a refusal, which is the
 /// one place this module's own rule is bent. It is bent knowingly: that rule is
