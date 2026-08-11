@@ -113,6 +113,23 @@ fn layout_churn_probe_enabled() -> bool {
     })
 }
 
+/// Whether the pass-churn probe is on. **Default off**, and never anything but a
+/// probe: it adds one empty render pass instance per loading draw and removes
+/// nothing.
+///
+/// See its one call site for what it prices, and [`crate::env::PASS_CHURN`] for
+/// why the question is not otherwise answerable without building the merge it is
+/// pricing.
+fn pass_churn_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::env::read(crate::env::PASS_CHURN).0,
+            crate::env::Switch::On
+        )
+    })
+}
+
 fn compute_gather_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -3731,6 +3748,46 @@ pub(crate) unsafe fn execute_draw_inner(
     // worth building: `passheld_reachable` is how many draws a *local* merge
     // could take with no lookahead at all, and whatever bucket holds the rest
     // names the obstacle that would have to be hoisted to take them too.
+    //
+    // # What `passheld_*` read: a local merge is worth exactly nothing
+    //
+    // Two driven macos-13 sustained-animation boots, quiesced, sum identity
+    // exact on both families of both boots. The second latched the 60 Hz
+    // population and the first the fast one, and the split is the same to a
+    // tenth of a point either way — this is a structural property of the
+    // workload, not of a boot's pace:
+    //
+    // ```text
+    // bucket                       b1 (113 Hz)        b2 (59 Hz)
+    // outside_gather          849 627  81.6%     482 542  81.4%
+    // outside_snapshot         74 540   7.2%      42 211   7.1%
+    // no_join                  64 735   6.2%      38 004   6.4%
+    // pass_differs             42 068   4.0%      22 878   3.9%
+    // outside_resident_layout  10 772   1.0%       6 805   1.1%
+    // outside_sampled_upload      102   0.0%          96   0.0%
+    // reachable                     0      0            0      0
+    // ```
+    //
+    // **`reachable` is zero.** Every draw the attachment transition was hiding
+    // is hiding a guest gather behind it, which is a `vkCmdDispatch` and cannot
+    // be recorded inside a pass instance. So holding the pass open changes
+    // nothing on its own, and the 82 % is not a merge that exists — it is the
+    // merge that exists *if the gathers move*.
+    //
+    // Where they would move to is a second command buffer per batch: the
+    // dispatches recorded into a `pre` CB, the draws into the `main` one, both
+    // submitted in one `vkQueueSubmit` with a single compute→vertex barrier at
+    // the end of `pre` standing in for the ~1.3 per-draw barriers this device
+    // records today. That needs no lookahead — the two are recorded in parallel,
+    // not in order — which is what makes it reachable at all. It is a large
+    // change to the ring, and what the pass pair it removes is worth is priced
+    // first by [`crate::env::PASS_CHURN`].
+    //
+    // The three obstacles that would remain cannot follow the gathers into
+    // `pre`: a snapshot copies the target an earlier draw of this same batch
+    // wrote, and a resident-layout barrier orders against that same write, so
+    // both would be hoisted to *before* the write they depend on. They are 8.2 %
+    // together and they stay.
     let echo = super::pools::PassEcho {
         cb,
         pass: render_pass,
@@ -3869,6 +3926,51 @@ pub(crate) unsafe fn execute_draw_inner(
         ctx.device.cmd_end_query(cb, pool, 0);
     }
     ctx.device.cmd_end_render_pass(cb);
+    if pass_churn_probe_enabled() && load_uses_gpu_content {
+        // PROBE — `REIMS_VGPU_PASS_CHURN=on`. One extra render pass instance on
+        // the target this draw just finished with, loading and storing it and
+        // drawing nothing into it.
+        //
+        // It prices the pair this device pays on every batched draw and would
+        // stop paying if the pass were held open across a batch. `passheld_*`
+        // says 82 % of draws could share one instance once the guest gathers
+        // recorded between them are hoisted; hoisting needs a second command
+        // buffer per batch, and this says what that work would be worth before
+        // any of it is built. See [`crate::env::PASS_CHURN`].
+        //
+        // Pixel-neutral, which is what makes it a control rather than a change:
+        // `LOAD`/`STORE` preserves the attachment and no draw is recorded inside
+        // the instance. `load_uses_gpu_content` gates it because a `CLEAR` pass
+        // replayed here would clear away the draw's own output.
+        //
+        // The transition is the instance's, not a second confound: the pass has
+        // just left the attachment in `TRANSFER_SRC_OPTIMAL` and a `LOAD` pass
+        // names `initial_layout = COLOR_ATTACHMENT_OPTIMAL`, so the barrier is
+        // what the extra instance costs to begin. `LAYOUT_CHURN`'s six boots
+        // measured a full-attachment transition on this host at less than the
+        // boot-to-boot spread, so what separates the arms here is the pair.
+        let back = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(
+                vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            )
+            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .image(target_image)
+            .subresource_range(super::color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &back,
+        );
+        ctx.device
+            .cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
+        ctx.device.cmd_end_render_pass(cb);
+    }
     if layout_churn_probe_enabled() {
         // PROBE — `REIMS_VGPU_LAYOUT_CHURN=on`. One extra round trip of the
         // colour attachment's layout, out of `TRANSFER_SRC_OPTIMAL` and back

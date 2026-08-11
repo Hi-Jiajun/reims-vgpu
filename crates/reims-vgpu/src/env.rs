@@ -668,6 +668,45 @@ pub const GPU_SPANS: &str = "REIMS_VGPU_GPU_SPANS";
 /// one.
 pub const LAYOUT_CHURN: &str = "REIMS_VGPU_LAYOUT_CHURN";
 
+/// **Default off.** `on` records one extra empty render pass instance per
+/// loading draw, on the target the draw just finished with. A probe, never a
+/// change: it adds work and removes none, and the pixels are identical because
+/// the extra instance loads and stores the attachment and draws nothing into it.
+///
+/// # What it prices, and why nothing else can
+///
+/// Every batched draw opens and closes its own render pass. `passmerge_*` /
+/// `passheld_*` (see [`crate::backend::vulkan::engine`]'s `PassObstacles`) say
+/// how many of them *could* share one: 82 % of draws, once the guest gathers
+/// they record between the draws are hoisted out of the way. Hoisting them
+/// needs a second command buffer per batch, which is a large change to the ring,
+/// and nothing in this device says what the pass pair it would remove actually
+/// costs.
+///
+/// This is the positive control for that number, on the pattern
+/// [`LAYOUT_CHURN`] set: an arm that pays the cost *twice* prices it once. The
+/// probe records the transition back into `COLOR_ATTACHMENT_OPTIMAL` that a
+/// second instance needs, then a `vkCmdBeginRenderPass` / `vkCmdEndRenderPass`
+/// pair on the same render pass, framebuffer and area. The extra transition is
+/// not a confound: [`LAYOUT_CHURN`]'s six boots measured that this host's
+/// full-attachment transitions cost less than the boot-to-boot spread, so what
+/// separates the arms here is the pass pair.
+///
+/// Read it on `present_hz` over the fast population, which is what ranks a
+/// per-draw change on this device — the arithmetic and the elasticity are beside
+/// `crate::runtime::drain::census::VBL_REPORT_EARLY`. A pair that costs ~1.5 us
+/// of the ~14 us this device spends per draw is a ~10 % arm and separates
+/// cleanly; a pair that costs 0.2 us does not, and the merge is then an
+/// iGPU-and-tiler lever only, which is exactly what [`LAYOUT_CHURN`] concluded
+/// about the transitions.
+///
+/// Only loading draws take it. A `CLEAR` pass instance replayed after the draw
+/// would clear away what the draw just rendered, so the probe would not be
+/// pixel-neutral — and loading draws are the population a merge applies to
+/// anyway, since a clearing joiner gets a different `VkRenderPass` and could
+/// never have shared the instance.
+pub const PASS_CHURN: &str = "REIMS_VGPU_PASS_CHURN";
+
 /// **Default off.** `on` lets a declared object size narrow the guest bytes the
 /// gather rail *moves*, instead of only narrowing binds that stay above the
 /// zero-copy floor after narrowing — which is none of them.
@@ -851,7 +890,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 19] = [
+pub const ALL: [&str; 20] = [
     LAZY_WRITEBACK,
     SLAB_RETAIN,
     CLEAR_SEED,
@@ -875,6 +914,7 @@ pub const ALL: [&str; 19] = [
     COMPUTE_GATHER,
     GPU_SPANS,
     LAYOUT_CHURN,
+    PASS_CHURN,
     EXTENT_NARROW,
 ];
 
