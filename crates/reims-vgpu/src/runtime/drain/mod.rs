@@ -5231,12 +5231,12 @@ pub(crate) fn display_event_enabled<H: HostMemory>(host: &H, gpa: u64, event_mas
 /// ordering repairs: B3 received 54 % more VBL than A2 and presented the same 59
 /// frames a second.
 ///
-/// What the split is, is settled — see `VBL_REPORT_EARLY` beside
-/// [`census::VblCensus`]. The guest
-/// measures the rate it is served across **one early window**, latches 60 Hz or
-/// 120 Hz from it, and never revisits the answer however fast it is served
-/// afterwards. So this ordering can only matter to the extent it changes what
-/// that one window reads, which is a probability over boots and not a rate.
+/// The split is a property of the boot, not of the workload: a boot presents
+/// either ~60 or ~95-117 frames a second for its whole life, with nothing in
+/// between. What decides it is still open — see `VBL_REPORT_EARLY` beside
+/// [`census::VblCensus`], which also records the plausible-looking early-window
+/// explanation that twenty boots killed. So the outcome to rank this ordering
+/// against is a probability over boots and not a rate.
 ///
 /// **It does not change it.** Forty interleaved driven macos-13 boots, twenty an
 /// arm, no guest panic and no boot lost:

@@ -68,37 +68,49 @@ const VBL_REPORT_EVERY: u64 = 1024;
 /// later lines could recover it. Sixteen finer lines at the head of each arm cost
 /// nothing and cover the first ~9 s.
 ///
-/// # What it found: one window decides the whole boot
+/// # What it found, and the false positive it found first
 ///
-/// Eight driven macos-13 boots of one binary, quiesced host. The **first
-/// sustained `arm=delivered` window** — the guest's first stretch of holding VBL
-/// armed continuously, which lands around `delivered=128` — predicts the rate
-/// the guest keeps, 8 times out of 8:
+/// Boots on this rail are sharply bimodal: over 40 interleaved driven macos-13
+/// boots, 28 presented 94.8-117.0 frames a second and 12 presented 59.8-60.5,
+/// with nothing in between. Roughly three in ten lose half their frame rate.
+///
+/// The first reading off this instrument was that the **first sustained
+/// `arm=delivered` window** — the guest's first stretch of holding VBL armed,
+/// landing near `delivered=128` — predicted which population a boot fell into,
+/// 8 times out of 8. **It does not.** That run contained exactly one slow boot,
+/// so every feature of that one boot "predicted" the outcome perfectly. Twenty
+/// instrumented boots later:
 ///
 /// ```text
-/// boot   first sustained window   presented frames/s
-/// b1            60.5 Hz                  59
-/// b2-b8    119.2 - 120.5 Hz           99 - 108
+/// boots   first sustained window   latched
+///  B8,B9,B12,B16   119.6 - 120.3     slow
+///  B7                    44.1        fast
+///  the other 15     119.4 - 120.5    fast
 /// ```
 ///
-/// The guest measures the rate it is being served, once, and holds the answer.
+/// Four slow boots were served a clean ~120 Hz across that window and latched 60
+/// anyway, and one boot served 44 Hz latched fast. The window is ~120 Hz in 18
+/// of 20 boots whatever happens afterwards, so it carries no signal at all.
 ///
-/// **It does not revisit it.** b1 went on to receive 103-116 Hz of VBL for the
-/// rest of the boot, from `t=38 s` onward, and still presented 59 frames a
-/// second throughout. So this is not "the compositor runs as fast as it is
-/// paced": a guest that measured 60 Hz early keeps a 60 Hz compositor no matter
-/// what it is offered afterwards, and the only opportunity to influence it has
-/// closed by about nine seconds after the display comes up.
+/// **Treat a single-slow-boot sample as no sample.** The population that matters
+/// here shows up in 30 % of boots, so a run of eight contains one or two of them
+/// and cannot separate a cause from a coincidence. Forty boots is the order of
+/// sample size this question needs, and the same trap applies to any other
+/// feature someone thinks distinguishes the two.
 ///
-/// That is why the early lines matter more than every later line put together,
-/// and why a change to this device's steady-state pacing can be real and still
-/// move nothing: by the time the probe drives the guest, the factor of two has
-/// already been chosen.
+/// What every boot does share is the shape: two windows at ~120 Hz, a dip, a
+/// quiet stretch of ten seconds or more while the desktop comes up, then a ramp.
+/// The populations diverge only in where that ramp settles — fast boots at
+/// 110-120 Hz delivered, slow boots at 75-90 — and that is the outcome rather
+/// than a cause, because a 60 Hz compositor arms VBL less often by construction.
+/// A slow boot is not being starved of VBL when it settles: it receives ~85 a
+/// second and presents 60.
 ///
-/// What made b1's window read 60.5: across it the device delivered 64 VBL and
-/// declined 128, so the guest was found armed on about a third of ticks. Its
-/// re-arm turnaround, not the limiter, is what missed the grid — the limiter
-/// held its usual ~118 Hz in that boot as in every other.
+/// So the cause of the split is **open**. What is closed is that it is not the
+/// limiter (which holds ~118 Hz on every boot, fast or slow), not the claim
+/// ordering (40 interleaved boots, p≈0.7, see
+/// [`super::signal_display_refresh_classes`]), and not anything visible in the
+/// deciding window this instrument was built to expose.
 ///
 /// This is an instrument, not a rail: nothing branches on it.
 const VBL_REPORT_EARLY: u64 = 64;
