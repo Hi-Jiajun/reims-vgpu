@@ -2596,6 +2596,27 @@ fn shared_w32<H: HostMemory + HostOps>(host: &mut H, gpa: u64, off: u64, v: u32,
 /// pixel width. Modes are 1920×1080, 1440×1080, 1280×1024 (apple-gfx A/B
 /// reference geometry) plus 3840×2160 (4K UHD), each advertised at
 /// `DISPLAY_REFRESH_HZ` (120 Hz), so the guest always latches the 120 Hz mode.
+///
+/// # "Always" is measured, and it holds on the boots that look like it does not
+///
+/// About three macos-13 boots in ten present ~60 frames a second for their whole
+/// life rather than ~100-117, which reads exactly like a guest that selected a
+/// 60 Hz mode from this table. It did not. Twelve driven boots, asked over ssh
+/// while still up what mode they were running:
+///
+/// ```text
+/// boots      presented      system_profiler SPDisplaysDataType
+/// 5 fast    107 - 119 Hz    UI Looks like: 1920 x 1080 @ 120.00Hz
+/// 7 slow     59.9 - 61 Hz   UI Looks like: 1920 x 1080 @ 120.00Hz
+/// ```
+///
+/// Every boot, both populations, the same mode and the same 120.00 Hz. So mode
+/// negotiation is not where the split comes from, this table is doing its job,
+/// and a fix aimed at the timing elements would be aimed at nothing.
+///
+/// That leaves the cause downstream of mode selection, in what the guest's
+/// compositor does with a 120 Hz link it has correctly acquired. `VBL_REPORT_
+/// EARLY` beside [`census::VblCensus`] records what else has been ruled out.
 /// Element 0 (1920×1080) stays the native/preferred format (+0x210/+0x212 double
 /// as NativeFormat*Pixels), so boot resolution is unchanged and 4K is an
 /// additional selectable mode; the dynamic scanout/present/host-window geometry
