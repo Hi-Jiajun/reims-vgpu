@@ -756,13 +756,6 @@ fn vbl_contended_pulse(slot: &BoundDevice) {
     let Some(ops) = slot.ops else {
         return;
     };
-    // Both poll paths share one limiter, so both have to report into one census
-    // or the delivered rate reads low by whatever share of polls found the
-    // device lock contended.
-    if !crate::runtime::drain::claim_display_vbl(&slot.vbl_last_us, crate::observe::elapsed_us()) {
-        crate::runtime::drain::note_vbl(crate::runtime::drain::VBL_NOT_CLAIMED, now);
-        return;
-    }
     let page_size = slot.vbl_page_size.load(Ordering::Acquire);
     if page_size == 0 {
         // The locked poll publishes this with the rest of the snapshot, so a
@@ -776,13 +769,17 @@ fn vbl_contended_pulse(slot: &BoundDevice) {
     // This arm used to carry its own copy, and the copy had already lost a term:
     // it never read the enable word at all, so it set a pending bit the guest's
     // ISR would never clear and counted the write as `delivered`.
+    //
+    // The shared limiter lives in there too, so both arms report into one census
+    // and neither can spend a grid slot on a tick that found the guest disarmed.
     crate::runtime::drain::signal_display_refresh_classes(
         &mut host,
         gpa,
         slot.vbl_display_index.load(Ordering::Acquire),
         &slot.intr_disp,
         page_size as usize,
-        now,
+        &slot.vbl_last_us,
+        crate::observe::elapsed_us(),
     );
 }
 

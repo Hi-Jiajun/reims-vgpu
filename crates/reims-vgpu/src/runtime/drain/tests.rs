@@ -3119,6 +3119,114 @@ fn claim_display_vbl_long_stall_resyncs_without_burst() {
     assert!(!claim_display_vbl(&last, now + interval)); // same instant: no double
 }
 
+/// Stand up a display whose shared page is mapped and whose ONLINE is acked, so
+/// `signal_display_vbl_at` reaches the enable-mask read.
+#[cfg(test)]
+fn one_shot_display() -> (DeviceState, FakeHost, u64) {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let gpa = 0x7c000000u64;
+    host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+    state.display.shared_gpa = gpa;
+    state.display.display_index = 0;
+    state.display.online_acked = true;
+    (state, host, gpa)
+}
+
+#[cfg(test)]
+fn set_enable_mask(host: &mut FakeHost, gpa: u64, mask: u32) {
+    let mut m = [0u8; 4];
+    st32(&mut m, mask);
+    host.write_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &m).unwrap();
+}
+
+/// Did this tick hand the guest a VBL? Consumes the pending bit the way the
+/// guest's ISR does, so the next tick starts from a clean word.
+#[cfg(test)]
+fn took_vbl(host: &mut FakeHost, gpa: u64) -> bool {
+    let mut pending = [0u8; 4];
+    host.read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending)
+        .unwrap();
+    let got = ld32(&pending) & DISPLAY_VBL_EVENT_MASK != 0;
+    let mut zero = [0u8; 4];
+    st32(&mut zero, 0);
+    host.write_gpa(gpa + DISPLAY_SHARED_PENDING, &zero).unwrap();
+    got
+}
+
+/// A tick that samples the guest mid-turnaround must not spend the grid slot the
+/// guest is about to ask for.
+///
+/// macOS 13 arms VBL one shot at a time — it clears bit 0 inside its handler and
+/// sets it again when it next wants a frame — so a poll is as likely to find the
+/// mask disarmed as armed. While the claim happened *before* the mask read, that
+/// disarmed sample advanced the grid timestamp, and the guest's re-arm a
+/// millisecond later then waited a further full interval. Its delivery rate
+/// aliased to every other grid point, which is the 60-vs-120 boot-to-boot split.
+#[test]
+fn a_disarmed_tick_does_not_spend_the_grid_slot() {
+    use std::sync::atomic::AtomicU64;
+    let interval = DISPLAY_VBL_MIN_INTERVAL_US;
+    let (mut state, mut host, gpa) = one_shot_display();
+    let last = AtomicU64::new(0);
+
+    // The guest arms, and one interval in it is served.
+    set_enable_mask(&mut host, gpa, DISPLAY_VBL_EVENT_MASK | DISPLAY_ONLINE_EVENT_MASK);
+    signal_display_vbl_at(&mut state, &mut host, &last, interval);
+    assert!(took_vbl(&mut host, gpa), "an armed guest is served");
+
+    // It disarms inside its handler. The next grid point finds nothing armed.
+    set_enable_mask(&mut host, gpa, DISPLAY_ONLINE_EVENT_MASK);
+    signal_display_vbl_at(&mut state, &mut host, &last, 2 * interval);
+    assert!(!took_vbl(&mut host, gpa), "a disarmed guest is owed nothing");
+
+    // It re-arms a millisecond later. A full interval has now passed since the
+    // last *delivery*, so it must be served on the very next poll rather than
+    // waiting out another interval it already waited.
+    set_enable_mask(&mut host, gpa, DISPLAY_VBL_EVENT_MASK | DISPLAY_ONLINE_EVENT_MASK);
+    signal_display_vbl_at(&mut state, &mut host, &last, 2 * interval + 1_000);
+    assert!(
+        took_vbl(&mut host, gpa),
+        "the disarmed tick spent this guest's slot — the 60-Hz latch"
+    );
+}
+
+/// Reading the mask before claiming must not let the guest outrun the refresh
+/// rate the timing table advertises.
+///
+/// This is the direction the fix could have widened: the limiter is the only
+/// thing standing between a 240 Hz poll and a guest that holds VBL armed
+/// continuously, and it now runs after a read that succeeds far more often.
+#[test]
+fn a_continuously_armed_guest_is_still_capped_at_the_advertised_rate() {
+    use std::sync::atomic::AtomicU64;
+    let interval = DISPLAY_VBL_MIN_INTERVAL_US;
+    let (mut state, mut host, gpa) = one_shot_display();
+    let last = AtomicU64::new(0);
+    set_enable_mask(&mut host, gpa, DISPLAY_VBL_EVENT_MASK | DISPLAY_ONLINE_EVENT_MASK);
+
+    // Poll far faster than the grid, the way the 4 ms PCI heartbeat oversamples
+    // an 8333 us interval, and never disarm.
+    let step = interval / 8;
+    let polls = 400u64;
+    let mut delivered = 0u64;
+    for i in 1..=polls {
+        signal_display_vbl_at(&mut state, &mut host, &last, i * step);
+        if took_vbl(&mut host, gpa) {
+            delivered += 1;
+        }
+    }
+    let grid = polls * step / interval;
+    assert!(
+        delivered <= grid,
+        "delivered {delivered} exceeds the {grid} the advertised rate allows"
+    );
+    assert!(
+        delivered >= grid - 1,
+        "delivered {delivered} falls short of the grid {grid}"
+    );
+}
+
 /// After online is acked, a stale ONLINE bit (bit2) left in pending is
 /// suppressed by the present/VBL signalers instead of re-delivered — else the
 /// guest re-runs process_online → connectionChange → boot-progress overlay.

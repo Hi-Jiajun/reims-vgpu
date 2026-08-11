@@ -5188,6 +5188,40 @@ pub(crate) fn display_event_enabled<H: HostMemory>(host: &H, gpa: u64, event_mas
 /// One mask read, one pending read-modify-write and at most one interrupt per
 /// tick, so arming both classes does not double the doorbell rate.
 ///
+/// # The mask is read before the grid slot is claimed, and that ordering is load-bearing
+///
+/// A macOS 13 guest arms VBL **one shot at a time**: it sets bit 0, takes the
+/// delivery, clears it inside its handler, and sets it again when it next wants
+/// a frame. So on any given tick the mask is as likely to be mid-turnaround as
+/// armed, and a tick that samples it disarmed owes nothing.
+///
+/// Both callers used to claim the slot *first* and read the mask second, which
+/// meant a disarmed sample advanced the grid timestamp and **spent the slot the
+/// guest was about to ask for**. The guest then re-armed a millisecond later and
+/// waited a further full interval, so its delivery rate aliased to every other
+/// grid point — 60 Hz out of an advertised 120.
+///
+/// That is the boot-to-boot regime split, measured over six driven macos-13
+/// boots. Claims land at 117.6-118.4 Hz in every one of them, so the limiter and
+/// its phase lock were never the problem; what varied was how much of that grid
+/// reached the guest:
+///
+/// ```text
+/// delivered/claimed   presented frames/s   draws/s
+///        61-67 %            109             ~29 700
+///        28-39 %             59             ~15 000
+/// ```
+///
+/// Reading the mask first cannot deliver faster than the advertised rate —
+/// [`claim_display_vbl`] still gates every delivery on a full interval having
+/// elapsed since the last one. It only stops the device spending intervals on
+/// ticks that deliver nothing, which makes the delivered rate converge on the
+/// grid the timing table advertises instead of on a fraction of it.
+///
+/// The cost is that the four-byte enable-mask read now happens once per poll
+/// (~240 Hz) rather than once per claimed tick while the guest sits disarmed.
+/// That read is of a page already mapped for the VM's lifetime.
+///
 /// # Both poll arms call this
 ///
 /// The locked poll and the lock-free one taken when the device lock is contended
@@ -5195,14 +5229,23 @@ pub(crate) fn display_event_enabled<H: HostMemory>(host: &H, gpa: u64, event_mas
 /// had already diverged once — the lock-free one omitted the enable-mask check
 /// entirely. Sharing the body is what keeps a third divergence from being
 /// possible: there is one place that decides what a refresh tick writes.
+///
+/// The claim moved in here for the same reason. It was two lines in each caller,
+/// and both copies had the ordering bug above; as one line inside the body, an
+/// arm cannot reintroduce it without deleting it from the arm that works.
 pub(crate) fn signal_display_refresh_classes<H: HostMemory + HostOps>(
     host: &mut H,
     gpa: u64,
     display_index: u32,
     intr_disp: &std::sync::atomic::AtomicU32,
     page_size: usize,
-    now_ms: u64,
+    last_us: &std::sync::atomic::AtomicU64,
+    now_us: u64,
 ) {
+    // The limiter paces in microseconds because 120 Hz is not expressible in
+    // whole milliseconds; the census windows in milliseconds so its `t=` stays
+    // on the same scale as every other always-on line.
+    let now_ms = now_us / 1_000;
     let mut mask_le = [0u8; 4];
     if host
         .read_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &mut mask_le)
@@ -5220,18 +5263,28 @@ pub(crate) fn signal_display_refresh_classes<H: HostMemory + HostOps>(
     let vbl = mask & DISPLAY_VBL_EVENT_MASK != 0;
     let transaction = mask & DISPLAY_PRESENT_EVENT_MASK != 0;
 
+    // A tick that finds nothing armed returns **without consuming a grid slot**.
+    // This ordering is the whole of the one-shot fix; see the section on it in
+    // this function's doc.
+    if !vbl && !transaction {
+        note_vbl(VBL_NOT_ENABLED, now_ms);
+        return;
+    }
+    if !claim_display_vbl(last_us, now_us) {
+        note_vbl(VBL_NOT_CLAIMED, now_ms);
+        return;
+    }
+
     // Counted after the limiter so the arm is on the same grid as `delivered`
-    // and the two are directly comparable; a guest that never enables VBL then
-    // reports the rate it *would* have been paced at.
+    // and the two are directly comparable. A guest that arms only the
+    // transaction class still reports `not_enabled` here, because this arm names
+    // the VBL class and not "did the tick do anything".
     note_vbl(
         if vbl { VBL_DELIVERED } else { VBL_NOT_ENABLED },
         now_ms,
     );
     if transaction {
         note_display_present_signal(DISPLAY_PRESENT_REFRESH);
-    }
-    if !vbl && !transaction {
-        return;
     }
 
     let mut pending_le = [0u8; 4];
@@ -5284,10 +5337,6 @@ fn signal_display_vbl_at<H: HostMemory + HostOps>(
         note_vbl(VBL_NOT_ONLINE, now_ms);
         return;
     }
-    if !claim_display_vbl(last_us, now_us) {
-        note_vbl(VBL_NOT_CLAIMED, now_ms);
-        return;
-    }
     let page_size = state.page_size() as usize;
     signal_display_refresh_classes(
         host,
@@ -5295,7 +5344,8 @@ fn signal_display_vbl_at<H: HostMemory + HostOps>(
         state.display.display_index,
         &state.gfx.interrupt_status_disp,
         page_size,
-        now_ms,
+        last_us,
+        now_us,
     );
 }
 
