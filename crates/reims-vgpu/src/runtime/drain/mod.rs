@@ -1225,7 +1225,21 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
 /// must stay quiet — and reading the second as the first put a
 /// `packet_bad_size` line on the always-on channel for a healthy producer
 /// mid-write, while making `Incomplete` unreachable.
+/// Timed at the function for the same reason [`read_ring_bytes`] is: the count
+/// this keeps is the packet count both FIFOs are normalized by.
 fn decode_packet(
+    bytes: &[u8],
+    head: u32,
+    available: u32,
+    ring_capacity: u32,
+) -> Result<Packet, PacketError> {
+    let started = std::time::Instant::now();
+    let out = decode_packet_inner(bytes, head, available, ring_capacity);
+    census::note_drain_decode(started.elapsed().as_nanos() as u64);
+    out
+}
+
+fn decode_packet_inner(
     bytes: &[u8],
     head: u32,
     available: u32,
@@ -1286,7 +1300,23 @@ fn decode_packet(
     })
 }
 
+/// Timed at the function rather than at its four call sites, so both FIFOs and
+/// both reads per packet are counted and a fifth call site cannot be added
+/// without being measured.
 fn read_ring_bytes<M: HostMemory>(
+    mem: &M,
+    base_gpa: u64,
+    ring_size: u32,
+    absolute: u32,
+    len: u32,
+) -> Result<Vec<u8>, MemError> {
+    let started = std::time::Instant::now();
+    let out = read_ring_bytes_inner(mem, base_gpa, ring_size, absolute, len);
+    census::note_drain_ring(started.elapsed().as_nanos() as u64);
+    out
+}
+
+fn read_ring_bytes_inner<M: HostMemory>(
     mem: &M,
     base_gpa: u64,
     ring_size: u32,

@@ -901,6 +901,21 @@ pub(crate) struct DrainDutyCensus {
     /// probe, so it is not a property of one workload.
     tail_us: std::sync::atomic::AtomicU64,
     boundary_us: std::sync::atomic::AtomicU64,
+    /// The per-packet halves of that same residue: the ring snapshot reads and
+    /// the decode. Both run for every packet either FIFO drains, both sit
+    /// inside `drain_us`, and neither is inside any [`DrainPhase`] — so if the
+    /// third of the drain worker named by nothing is per-packet rather than
+    /// per-opcode, it is here.
+    ///
+    /// **Nanoseconds, not microseconds, and that is not a style choice.** These
+    /// fire tens of thousands of times a second and a single one costs well
+    /// under a microsecond, so `as_micros()` would truncate most samples to
+    /// zero and report a rail that runs constantly as free. `tail_us` above can
+    /// afford microseconds because it is sampled once per tranche.
+    ring_ns: std::sync::atomic::AtomicU64,
+    ring_reads: std::sync::atomic::AtomicU64,
+    decode_ns: std::sync::atomic::AtomicU64,
+    packets: std::sync::atomic::AtomicU64,
     max_tranche_us: std::sync::atomic::AtomicU64,
     /// Longest single Flush in the window. `flush_us/flushes` is a mean, and a
     /// mean cannot tell "every flush costs 7.7 ms" from "most are free and one
@@ -1072,6 +1087,22 @@ impl DrainDutyCensus {
         self.boundary_us.fetch_add(boundary_us, Relaxed);
     }
 
+    /// One ring snapshot read, in nanoseconds. Twice per packet — the header,
+    /// then the packet the header sized.
+    pub(crate) fn note_ring(&self, ns: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.ring_ns.fetch_add(ns, Relaxed);
+        self.ring_reads.fetch_add(1, Relaxed);
+    }
+
+    /// One packet decode, in nanoseconds. The count is the packet count for
+    /// both FIFOs, which is what every per-packet figure is normalized by.
+    pub(crate) fn note_decode(&self, ns: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.decode_ns.fetch_add(ns, Relaxed);
+        self.packets.fetch_add(1, Relaxed);
+    }
+
     /// Accumulate one completed tranche and return the line when a report is
     /// due. Returns the line rather than emitting it so the reporting rule is
     /// testable without a log sink: that the window resets on report (so the
@@ -1114,6 +1145,12 @@ impl DrainDutyCensus {
         let max_flush = self.max_flush_us.swap(0, Relaxed);
         let tail = self.tail_us.swap(0, Relaxed);
         let boundary = self.boundary_us.swap(0, Relaxed);
+        // Reported in microseconds like every other span on this line, but
+        // accumulated in nanoseconds — see the field docs.
+        let ring = self.ring_ns.swap(0, Relaxed) / 1000;
+        let ring_reads = self.ring_reads.swap(0, Relaxed);
+        let decode = self.decode_ns.swap(0, Relaxed) / 1000;
+        let packets = self.packets.swap(0, Relaxed);
         let slow = self.slow_tranches.swap(0, Relaxed);
         let busy = drain.saturating_add(publish);
         let duty = busy as f64 / (win_ms as f64 * 1000.0);
@@ -1123,6 +1160,7 @@ impl DrainDutyCensus {
              draw_us={draw} draws={draws} compute_us={compute} computes={computes} \
              flush_us={flush} flushes={flushes} max_flush_us={max_flush} \
              tail_us={tail} boundary_us={boundary} \
+             ring_us={ring} ring_reads={ring_reads} decode_us={decode} packets={packets} \
              slow_tranches={slow}/{tranches} slow_us={DRAIN_TRANCHE_SLOW_US}"
         ))
     }
@@ -1609,6 +1647,16 @@ fn list_lookup_age_route(hit: bool, us: u64) -> &'static str {
 /// boundary, both inside `drain_us` and inside no [`DrainPhase`].
 pub fn note_drain_tail(tail_us: u64, boundary_us: u64) {
     DRAIN_DUTY.note_tail(tail_us, boundary_us);
+}
+
+/// Attribute one ring snapshot read, in nanoseconds.
+pub fn note_drain_ring(ns: u64) {
+    DRAIN_DUTY.note_ring(ns);
+}
+
+/// Attribute one packet decode, in nanoseconds.
+pub fn note_drain_decode(ns: u64) {
+    DRAIN_DUTY.note_decode(ns);
 }
 
 /// Accumulate one completed drain tranche; emits at most once per second.
