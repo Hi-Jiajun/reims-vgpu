@@ -692,13 +692,16 @@ move it needs about twenty boots an arm — twelve cannot separate 0.4 from 0.7.
 rule from classifying a boot: that one is about which population a reading came from, this one is
 about the population *rate* being unstable across time on one host.
 
-What the split is **not**: not the display mode (both populations report `1920 x 1080 @ 120.00Hz`),
-not the VBL limiter (~118 Hz on fast and slow boots alike), not the claim ordering (40 interleaved
-boots, p≈0.7), not anything visible in the guest's first sustained VBL window, and not this device
-sitting on a frame-time cliff — making it ~20 % slower with `REIMS_VGPU_COMPUTE_GATHER=off` did not
-raise the slow rate — and not the host GPU clock, which is identical across both populations in the
-window before the guest latches. The cause is open, and every device-side cause anyone has named is
-now excluded. Read `VBL_REPORT_EARLY` beside
+**The split is not about VBL delivery, and six hypotheses that assumed it was all came back null.**
+The guest's compositor paces on a period the kernel hands it, which is initialised to a synthesised
+1/60 s and only corrected from the `IOFBCurrentPixelClock`/`IOFBCurrentPixelCount` framebuffer
+properties — and the paravirtual framebuffer driver suppresses those, on every boot, confirmed by
+`ioreg` on eleven. A boot therefore latches either 16 666 666 ns (paced, **exactly** 60 Hz) or 0
+(free-running, work-limited 95-117 Hz), once, for its life. That is why the slow population is a
+constant and the fast one is a 22 Hz spread, and it means the *fast* boots are the ones where the
+guest never learned a period. Do not "fix" it by forcing a second display-mode change: that would
+set the period on every boot and take the good 70 % down to 60 Hz. Full chain and the live
+confirmation are in `VBL_REPORT_EARLY` beside `runtime::drain::census::VblCensus`. Read `VBL_REPORT_EARLY` beside
 `runtime::drain::census::VblCensus` before spending boots on a new theory: a run of eight holds one
 or two slow boots and so cannot tell a cause from a coincidence, which has already produced one
 confident wrong answer here.

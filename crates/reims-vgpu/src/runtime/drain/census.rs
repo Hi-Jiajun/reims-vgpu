@@ -152,26 +152,67 @@ const VBL_REPORT_EVERY: u64 = 1024;
 /// the driven column alone would have produced a confident wrong answer, which
 /// is why the run split the windows before scoring.
 ///
-/// So the cause of the split is **open**. What is closed is that it is not the
-/// limiter (which holds ~118 Hz on every boot, fast or slow), not the claim
-/// ordering (40 interleaved boots, p≈0.7, see
-/// [`super::signal_display_refresh_classes`]), not the display mode (see
-/// [`super::fill_display_descriptor`]), not anything visible in the deciding
-/// window this instrument was built to expose, not a frame-time threshold this
-/// device sits near, and not the host GPU clock.
+/// # The cause: the compositor is paced by a constant the guest cannot correct
 ///
-/// Every device-side cause anyone here has been able to name is now excluded,
-/// which makes a guest-internal race — the order its own daemons and window
-/// server happen to start in, from one snapshot revert to the next — the
-/// hypothesis left standing. Nothing in this device can observe that, and a
-/// device change aimed at it would be aimed at nothing. Before spending another
-/// twenty boots, find a reading that would *distinguish* a guest-internal race
-/// from a device cause; a further exclusion is worth less than that.
+/// It is not the VBL rate at all, which is why six device-side hypotheses in a
+/// row came back null. The contract, and then the live confirmation:
 ///
-/// One methodological result came with it and belongs to anyone testing the next
-/// theory: the base rate **drifts**. It was 12 slow in 40 early in a session and
-/// 7 in 12 twice, hours later, on the same binary. Compare arms only within one
-/// interleaved run.
+/// 1. The guest's compositor schedules each frame on a timer at
+///    `lastVBL + period`. Nothing in it measures VBL arrivals, divides a rate or
+///    counts missed frames; `period` is taken verbatim from the kernel.
+/// 2. The kernel display-pipe layer ships `(lastVBL, lastVBL + fRefreshPeriod)`
+///    on every VBL notification, so `period` **is** `fRefreshPeriod`.
+/// 3. `fRefreshPeriod` is written in one place, on display-mode change. It is
+///    initialised to a synthesised **1/60 s = 16 666 666 ns** and only then
+///    replaced by the true value, `IOFBCurrentPixelCount * 1e9 /
+///    IOFBCurrentPixelClock`. Five early returns leave the 60 Hz default standing.
+/// 4. Those two `IOFramebuffer` properties are published only when the mode's
+///    detailed timing is marked valid, and the paravirtual framebuffer driver
+///    clears that valid bit and fills the timing with nothing — so the
+///    framebuffer layer *removes* both properties.
+///
+/// Confirmed live rather than argued: over eleven driven macos-13 boots `ioreg`
+/// finds **neither property on any boot** — not on the 59.5-60.1 Hz ones and not
+/// on the 97.5-114.3 Hz ones. The numbers are not even hard to come by; the same
+/// dump carries the detailed timing the guest built out of our table (pixel clock
+/// 15 848 840 000 Hz, 1920 + 10 000 by 1080 + 10 000), which works out to
+/// 8 333 332 ns — 120.00 Hz to five figures. The guest holds the inputs and the
+/// path that would use them is closed.
+///
+/// # Which of two values a boot latches is the whole split
+///
+/// `fRefreshPeriod` is never recomputed once set, so a boot ends on one of two:
+///
+/// - **16 666 666 ns** — the compositor paces on it and produces **exactly 60 Hz**.
+/// - **0**, when the first notification is sent before the mode-change path has
+///   run. A zero period puts the next wake time in the past, so the compositor
+///   **free-runs** and produces whatever it can, work-limited.
+///
+/// The measured populations are that fingerprint and nothing else: every slow
+/// boot on record sits in 59.5-60.5 Hz, a *constant*, and every fast one in
+/// 94.8-117.0 Hz, a *spread of twenty-two Hz*. A paced compositor cannot vary
+/// that much and a free-running one cannot be that flat.
+///
+/// So the fast boots are the ones where the guest never learned a period, and the
+/// correctly-configured outcome on this pathway is the *slow* one. State that
+/// before trying to fix it: forcing a second mode change — the obvious lever, and
+/// one this device owns through an offline/online cycle — would set
+/// `fRefreshPeriod` on every boot and take the good 70 % down to 60 Hz.
+///
+/// # What this closes
+///
+/// Not the limiter (~118 Hz on every boot, fast or slow), not the claim ordering
+/// (40 interleaved boots, p≈0.7, see [`super::signal_display_refresh_classes`]),
+/// not the display mode (see [`super::fill_display_descriptor`]; both populations
+/// report 120.00 Hz), not the early delivery window, not a frame-time threshold,
+/// and not the host GPU clock. All six were null for one reason: each was about
+/// how fast this device delivers VBL, and the guest's frame period is not derived
+/// from that.
+///
+/// One methodological result came out of the same runs and belongs to anyone
+/// testing the next theory: the base rate **drifts**. It was 12 slow in 40 early
+/// in a session and 7 in 12 twice, hours later, on the same binary. Compare arms
+/// only within one interleaved run.
 ///
 /// This is an instrument, not a rail: nothing branches on it.
 const VBL_REPORT_EARLY: u64 = 64;
@@ -283,6 +324,41 @@ pub(crate) fn note_vbl(arm: usize, now_ms: u64) {
     if let Some(line) = VBL.note(arm, now_ms) {
         crate::observe::off(line);
     }
+}
+
+/// One interrupt pulse dropped because an undelivered pulse of the same kind
+/// was still queued.
+///
+/// # Why a coalesced pulse is not the same as a delivered one
+///
+/// The prompt queue in `qemu::host_ops` collapses a second pulse of a kind into
+/// the first while the first is still waiting for QEMU's bottom half. For a
+/// status the guest reads back that is free — the status bits accumulate, so one
+/// interrupt carries both. **For VBL it is not free**, because the guest does not
+/// read a count, it reads a clock: it timestamps the vblank it is told about, and
+/// the interval it measures between two of them is what its compositor uses as
+/// its frame period. A vblank folded into another one is a vblank that never
+/// happened as far as the guest is concerned, and the interval it measures is
+/// then two grid periods instead of one.
+///
+/// So this counter and `display_vbl`'s `delivered` count different things and
+/// must not be read as one. `delivered` counts what **this device wrote**; the
+/// guest receives `delivered` minus the pulses counted here. A boot can report a
+/// healthy ~118 Hz delivered rate while the guest is being told about half of it,
+/// and every census in this crate would still read clean — which is why the two
+/// boot populations looked identical from the device side for as long as they
+/// did.
+///
+/// Counted, not refused: coalescing is still the right behaviour for the IOSFC
+/// pulse and for a backlog this device cannot help. The reading is what says
+/// whether it is happening on the VBL rail often enough to matter, and it is per
+/// kind so the two rails cannot be confused for one another.
+pub(crate) fn note_irq_coalesced(kind: crate::runtime::host::HostActionKind) {
+    let name = match kind {
+        crate::runtime::host::HostActionKind::IrqGfxPulse => "irq_coalesced_gfx",
+        _ => "irq_coalesced_iosfc",
+    };
+    crate::runtime::drain::note_store_route(name);
 }
 
 /// Which way the display present/transaction signal went. Indices into the
