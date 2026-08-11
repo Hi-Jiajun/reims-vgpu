@@ -5201,16 +5201,37 @@ pub(crate) fn display_event_enabled<H: HostMemory>(host: &H, gpa: u64, event_mas
 /// waited a further full interval, so its delivery rate aliased to every other
 /// grid point — 60 Hz out of an advertised 120.
 ///
-/// That is the boot-to-boot regime split, measured over six driven macos-13
-/// boots. Claims land at 117.6-118.4 Hz in every one of them, so the limiter and
-/// its phase lock were never the problem; what varied was how much of that grid
-/// reached the guest:
+/// # What it is worth, and the thing it does not explain
+///
+/// Six interleaved driven macos-13 boots, binary A/B (the ordering has no env
+/// switch), quiesced host. Delivered rate is taken from the gap between
+/// consecutive `arm=delivered` census lines, which are exactly 1024 deliveries
+/// apart — the `delivered=` field on the last line is quantised to that cadence
+/// and `window_hz` is unusable here, see [`census::VblCensus`].
 ///
 /// ```text
-/// delivered/claimed   presented frames/s   draws/s
-///        61-67 %            109             ~29 700
-///        28-39 %             59             ~15 000
+///            presented frames/s   delivered Hz (final window)
+/// old  A1           100.0                 92.8
+/// old  A3           101.5                107.8
+/// new  B1            99.0                110.0
+/// new  B2           111.0                112.5
+/// old  A2            60.0                 43.8
+/// new  B3            59.0                 67.5
 /// ```
+///
+/// Delivery rises on the new ordering in both populations, and in the fast one
+/// the arms are nearly disjoint against a 118 Hz grid ceiling. That is the
+/// mechanism showing up where it should: a guest re-arming every 8.33 ms races
+/// an 8.47 ms grid, so its turnaround lands past the grid point often, and it is
+/// precisely those ticks the old ordering spent.
+///
+/// **It does not explain the boot-to-boot regime split, and the first version of
+/// this doc claimed it did.** The guest latches either a ~60 Hz or a ~120 Hz
+/// display link early in the boot and holds it, and the split came out 2 fast to
+/// 1 slow on *both* arms — unchanged. The slow arm is not a delivery shortfall
+/// this ordering can repair: B3 received 54 % more VBL than A2 and presented the
+/// same 59 frames a second, so a guest in that state is not asking for more.
+/// Whatever picks the latch is upstream of everything here and is still open.
 ///
 /// Reading the mask first cannot deliver faster than the advertised rate —
 /// [`claim_display_vbl`] still gates every delivery on a full interval having

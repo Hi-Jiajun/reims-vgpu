@@ -3227,6 +3227,53 @@ fn a_continuously_armed_guest_is_still_capped_at_the_advertised_rate() {
     );
 }
 
+/// Both reporting arms measure their own window, and neither resets the other's.
+///
+/// A guest that arms VBL one shot at a time keeps `delivered` and `not_enabled`
+/// both live, so both report — and they shared one `last_report` pair, which made
+/// every window wrong precisely on the boots worth reading. The symptom in a real
+/// log is `window_hz=0.0`: an arm reaching its own 1024 subtracted the other
+/// arm's 1024 and got a zero-length count.
+#[test]
+fn the_two_reporting_vbl_arms_do_not_share_one_window() {
+    use crate::runtime::drain::{VblCensus, VBL_DELIVERED, VBL_NOT_ENABLED};
+    let c = VblCensus::default();
+
+    // A one-shot guest takes both arms on the same timeline — a tick either
+    // found it armed or did not — so both cross 1024 over one 8 ms grid and both
+    // report at the same instant. Each is 1024 events over its own 8192 ms, so
+    // both lines must read 125 Hz; with one shared pair whichever reports second
+    // subtracts the first's count and prints the `window_hz=0.0` that a real
+    // driven boot is full of.
+    let mut served = None;
+    let mut declined = None;
+    for i in 1..=1024u64 {
+        if let Some(l) = c.note(VBL_DELIVERED, i * 8) {
+            served = Some(l);
+        }
+        if let Some(l) = c.note(VBL_NOT_ENABLED, i * 8) {
+            declined = Some(l);
+        }
+    }
+    for (line, arm) in [
+        (served.expect("delivered reports at its own 1024"), "delivered"),
+        (
+            declined.expect("not_enabled reports at its own 1024"),
+            "not_enabled",
+        ),
+    ] {
+        assert!(line.contains(&format!("arm={arm}")), "{line}");
+        assert!(
+            !line.contains("window_hz=0.0"),
+            "{arm} had the other arm's count subtracted from it: {line}"
+        );
+        assert!(
+            line.contains("window_hz=125.0"),
+            "{arm} saw 1024 events over 8192 ms, which is 125 Hz: {line}"
+        );
+    }
+}
+
 /// After online is acked, a stale ONLINE bit (bit2) left in pending is
 /// suppressed by the present/VBL signalers instead of re-delivered — else the
 /// guest re-runs process_online → connectionChange → boot-progress overlay.

@@ -54,11 +54,30 @@ const VBL_REPORT_EVERY: u64 = 1024;
 /// cannot be added without the array growing with it.
 const VBL_ARMS: usize = VBL_NOT_ENABLED + 1;
 
+/// # `window_hz` is per reporting arm, and used not to be
+///
+/// Two arms report — `delivered` and `not_enabled` — and they shared one
+/// `last_report_ms`/`last_report_n` pair. Whenever both were live in the same
+/// boot the shared counter made every window wrong: an arm reporting at its own
+/// `n = 1024` subtracted the *other* arm's 1024 and printed `window_hz=0.0`, and
+/// the next report measured its count against a timestamp the other arm had
+/// moved. A boot alternating the two produced a column of zeroes and a column of
+/// rates over windows that never happened.
+///
+/// That is not a cosmetic log defect. `window_hz` is the only per-window reading
+/// of the rate the guest's compositor is paced at, and it read as broken exactly
+/// on the boots worth reading — a guest that arms VBL one shot at a time is the
+/// guest that makes both arms report. The delivered rate had to be recovered by
+/// differencing consecutive `delivered=` fields across lines instead.
+///
+/// So the window is per arm. `since_n` went with the fix rather than being
+/// repaired: an arm reports on every multiple of [`VBL_REPORT_EVERY`] of its own
+/// count and then stores that count, so the gap is always exactly
+/// `VBL_REPORT_EVERY` and computing it was the thing that could be wrong.
 #[derive(Default)]
 pub(crate) struct VblCensus {
     arms: [std::sync::atomic::AtomicU64; VBL_ARMS],
-    last_report_ms: std::sync::atomic::AtomicU64,
-    last_report_n: std::sync::atomic::AtomicU64,
+    last_report_ms: [std::sync::atomic::AtomicU64; VBL_ARMS],
 }
 
 impl VblCensus {
@@ -88,13 +107,14 @@ impl VblCensus {
         if !reports || !n.is_multiple_of(VBL_REPORT_EVERY) {
             return None;
         }
-        let since_ms = now_ms.saturating_sub(self.last_report_ms.swap(now_ms, Relaxed));
-        let since_n = n.saturating_sub(self.last_report_n.swap(n, Relaxed));
+        let since_ms = now_ms.saturating_sub(self.last_report_ms[arm].swap(now_ms, Relaxed));
         // Window rate, not a lifetime average: the lifetime figure carries the
         // pre-online stretch forever and would read low long after the display
-        // came up.
+        // came up. The count in the window is `VBL_REPORT_EVERY` by construction
+        // — this line exists because this arm's own count just reached a
+        // multiple of it — so the only variable is how long that took.
         let hz = if since_ms > 0 {
-            (since_n * 1000) as f64 / since_ms as f64
+            (VBL_REPORT_EVERY * 1000) as f64 / since_ms as f64
         } else {
             0.0
         };
