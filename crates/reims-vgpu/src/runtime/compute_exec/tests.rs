@@ -2456,3 +2456,38 @@ fn a_bind_past_the_argument_table_refuses_the_dispatch() {
         "clearing an unrelated slot leaves the refused one refused"
     );
 }
+
+/// A texture the kernel samples and the guest never bound gets a neutral image,
+/// and one the kernel merely declares does not.
+///
+/// This is the repair for the hole that killed a host. The descriptor set layout
+/// this device builds is assembled from what the guest bound, so a sampled image
+/// the guest left empty is absent from the layout entirely — and Mesa's Intel
+/// driver scores each *used* binding as `(use_count << 7) / array_size` over an
+/// array it sized to `max_binding + 1` and zero-filled, so the hole divides by
+/// zero and `vkCreateComputePipelines` raises `SIGFPE` rather than returning an
+/// error this device could decline on.
+///
+/// The negative half is not decoration. Provisioning for a declared-and-unused
+/// variable is legal but pays a descriptor for nothing, and it would destroy the
+/// census that separated the two populations in the first place — so a pass that
+/// filled both would look identical to this one on a boot and be wrong.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_sampled_image_the_kernel_uses_and_the_guest_left_empty_gets_a_neutral_texture() {
+    let spirv = crate::runtime::spirv_bind::test_module_with_two_sampled_images(33, 34);
+
+    // Nothing bound: 33 is sampled and needs the neutral texture; 34 is declared
+    // and never referenced, so it stays out of the layout.
+    assert_eq!(neutral_sampled_image_bindings(&spirv, &[]), vec![33]);
+
+    // The guest bound it after all — there is nothing to substitute.
+    assert_eq!(
+        neutral_sampled_image_bindings(&spirv, &[33]),
+        Vec::<u32>::new()
+    );
+
+    // A binding the guest supplied that the module does not carry is not
+    // invented back into the list.
+    assert_eq!(neutral_sampled_image_bindings(&spirv, &[99]), vec![33]);
+}

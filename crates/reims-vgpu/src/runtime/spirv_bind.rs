@@ -1675,6 +1675,191 @@ pub fn sampler_bindings(words: &[u32]) -> Vec<u32> {
     bindings
 }
 
+/// A module carrying two set-0 sampled images: one referenced by an `OpLoad`,
+/// one declared and never touched.
+///
+/// Lives here, out of any one `mod tests`, because three modules need the same
+/// fixture and because the opcode numbers it is built from are already constants
+/// in this file — a copy elsewhere would be those numbers spelled a second time,
+/// which is the duplication that goes stale silently.
+///
+/// Both halves are the point. Only the referenced variable is what Vulkan calls
+/// *statically used*, so a caller that cannot tell the two apart either refuses
+/// dispatches that are legal or admits the one that makes a driver divide by
+/// zero.
+#[cfg(test)]
+pub(crate) fn test_module_with_two_sampled_images(used: u32, declared_unused: u32) -> Vec<u32> {
+    const IMAGE_TY: u32 = 10;
+    const POINTER_TY: u32 = 11;
+    const USED_VAR: u32 = 12;
+    const UNUSED_VAR: u32 = 13;
+
+    let mut w = vec![
+        0x0723_0203,       // magic
+        0x0001_0600,       // version
+        0,                 // generator
+        32,                // bound
+        0,                 // schema
+        (2u32 << 16) | 17, // OpCapability
+        1,                 // Shader
+        (3u32 << 16) | 14, // OpMemoryModel
+        0,                 // Logical
+        1,                 // GLSL450
+    ];
+    for (var, binding) in [(USED_VAR, used), (UNUSED_VAR, declared_unused)] {
+        w.extend_from_slice(&[
+            (4u32 << 16) | OP_DECORATE as u32,
+            var,
+            DECORATION_BINDING,
+            binding,
+        ]);
+    }
+    // OpTypeImage %IMAGE_TY %2 2D 0 0 0 1 Unknown — `Sampled` 1 is the
+    // separate-image form, which is what makes these SAMPLED_IMAGE rather than
+    // the storage class that shares the opcode.
+    w.extend_from_slice(&[
+        (9u32 << 16) | OP_TYPE_IMAGE as u32,
+        IMAGE_TY,
+        2, // sampled type id
+        1, // Dim2D
+        0, // depth
+        0, // arrayed
+        0, // MS
+        IMAGE_SAMPLED_WITH_SAMPLER,
+        0, // Unknown format
+    ]);
+    w.extend_from_slice(&[
+        (4u32 << 16) | OP_TYPE_POINTER as u32,
+        POINTER_TY,
+        STORAGE_CLASS_UNIFORM_CONSTANT,
+        IMAGE_TY,
+    ]);
+    for var in [USED_VAR, UNUSED_VAR] {
+        w.extend_from_slice(&[
+            (4u32 << 16) | OP_VARIABLE as u32,
+            POINTER_TY,
+            var,
+            STORAGE_CLASS_UNIFORM_CONSTANT,
+        ]);
+    }
+    // The reference that makes `USED_VAR` statically used, and the only
+    // difference between the two variables.
+    w.extend_from_slice(&[(4u32 << 16) | OP_LOAD as u32, IMAGE_TY, 20, USED_VAR]);
+    w
+}
+
+/// Every distinct `Binding` decoration in the module, whatever it decorates.
+///
+/// Deliberately class-blind and deliberately cheap: this is the candidate list
+/// for "does the pipeline layout describe everything the module uses", and the
+/// question of *what* each binding is has already been answered by the walks
+/// that build the layout. Pair it with [`descriptor_static_use`], which answers
+/// `NotDeclared` for anything that is not a `UniformConstant` descriptor and so
+/// narrows this to the population that walk can reason about exactly.
+pub fn declared_binding_numbers(words: &[u32]) -> Vec<u32> {
+    let mut bindings = Vec::new();
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let word0 = words[i];
+        let word_count = (word0 >> 16) as usize;
+        let opcode = (word0 & 0xffff) as u16;
+        if word_count == 0 || i + word_count > words.len() {
+            break;
+        }
+        if opcode == OP_DECORATE && word_count >= 4 && words[i + 2] == DECORATION_BINDING {
+            bindings.push(words[i + 3]);
+        }
+        i += word_count;
+    }
+    bindings.sort_unstable();
+    bindings.dedup();
+    bindings
+}
+
+/// SPIR-V `OpTypeImage` `Sampled` operand value 1 — "will be used with a
+/// sampler". 2 is the storage-image form, which is a different descriptor type,
+/// and 0 means "either", which cannot be given a descriptor type without a guess.
+const IMAGE_SAMPLED_WITH_SAMPLER: u32 = 1;
+
+/// Set-0 `Binding` decorations carried by a *sampled image* variable.
+///
+/// The texture analogue of [`sampler_bindings`], and it exists for the same
+/// reason. The descriptor set layout this device builds is assembled from what
+/// the guest bound, so a binding the module carries and the guest left empty is
+/// absent from the layout entirely — not an unwritten slot in it.
+///
+/// Vulkan requires the pipeline layout to contain a descriptor for every
+/// resource the module *statically uses*, and a driver is entitled to assume it.
+/// Mesa's Intel driver indexes its own binding array by binding number, sizes it
+/// to `max_binding + 1`, zero-fills every number nothing declared, and then
+/// scores each used binding as `(use_count << 7) / array_size` when it decides
+/// which descriptors get a binding-table slot. A hole under a *used* binding
+/// therefore divides by zero: the process dies of `SIGFPE` inside
+/// `vkCreateComputePipelines`, with no error for the caller to see and no
+/// validation layer involved. That is why this is a hard requirement here and
+/// not a tidiness rule — see [`descriptor_static_use`] for the "used" bar, which
+/// is the only population that must be filled.
+///
+/// The class is read from the SPIR-V type, never from the binding number, for
+/// the reason [`BindingClass`] states. `Sampled` 1 is the separate-image form
+/// this device's translator emits; the storage form is a different descriptor
+/// type and is deliberately not returned here, and `SubpassData` is the
+/// framebuffer-fetch image the engine binds at its un-relocated number.
+pub fn sampled_image_bindings(words: &[u32]) -> Vec<u32> {
+    use std::collections::HashSet;
+
+    let mut image_types = HashSet::new();
+    let mut image_ptrs = HashSet::new();
+    let mut image_vars = HashSet::new();
+    let mut decorations = Vec::new();
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let word0 = words[i];
+        let word_count = (word0 >> 16) as usize;
+        let opcode = (word0 & 0xffff) as u16;
+        if word_count == 0 || i + word_count > words.len() {
+            break;
+        }
+        match opcode {
+            // OpTypeImage: result, sampled type, Dim, Depth, Arrayed, MS,
+            // Sampled, Format — so `Dim` is operand 3 and `Sampled` operand 7.
+            OP_TYPE_IMAGE
+                if word_count >= 9
+                    && words[i + 3] != DIM_SUBPASS_DATA
+                    && words[i + 7] == IMAGE_SAMPLED_WITH_SAMPLER =>
+            {
+                image_types.insert(words[i + 1]);
+            }
+            OP_TYPE_POINTER if word_count >= 4 => {
+                if words[i + 2] == STORAGE_CLASS_UNIFORM_CONSTANT
+                    && image_types.contains(&words[i + 3])
+                {
+                    image_ptrs.insert(words[i + 1]);
+                }
+            }
+            OP_VARIABLE if word_count >= 4 => {
+                if image_ptrs.contains(&words[i + 1])
+                    && words[i + 3] == STORAGE_CLASS_UNIFORM_CONSTANT
+                {
+                    image_vars.insert(words[i + 2]);
+                }
+            }
+            OP_DECORATE if word_count >= 4 && words[i + 2] == DECORATION_BINDING => {
+                decorations.push((words[i + 1], words[i + 3]));
+            }
+            _ => {}
+        }
+        i += word_count;
+    }
+    let mut bindings: Vec<u32> = decorations
+        .into_iter()
+        .filter_map(|(id, binding)| image_vars.contains(&id).then_some(binding))
+        .collect();
+    bindings.sort_unstable();
+    bindings.dedup();
+    bindings
+}
+
 /// SPIR-V `Dim` operand value `SubpassData` — the framebuffer-fetch image.
 const DIM_SUBPASS_DATA: u32 = 6;
 
@@ -2759,6 +2944,93 @@ mod tests {
     fn a_sampled_image_format_does_not_demand_the_storage_capability() {
         let words = module_with(&op_type_image(10, 1, 7));
         assert!(!required_image_capabilities(&words).extended_formats);
+    }
+
+    /// The candidate list is class-blind and the use test is not, which is the
+    /// division the layout backstop is built on.
+    ///
+    /// [`declared_binding_numbers`] must return both variables — it is the
+    /// cheap sweep that decides what gets asked about — while
+    /// [`descriptor_static_use`] separates the one Vulkan requires a descriptor
+    /// for from the one it is legal to omit. Asserting them together is what
+    /// says the pair partitions; either alone reads correct while the caller
+    /// built from them refuses legal work or admits the divide-by-zero.
+    #[test]
+    fn the_binding_sweep_is_class_blind_and_the_use_test_narrows_it() {
+        let words = test_module_with_two_sampled_images(33, 34);
+        assert_eq!(declared_binding_numbers(&words), vec![33, 34]);
+        assert_eq!(descriptor_static_use(&words, 33), DescriptorUse::Used);
+        assert_eq!(
+            descriptor_static_use(&words, 34),
+            DescriptorUse::DeclaredUnused
+        );
+        // Both are sampled images all the same — "declared and unused" is a
+        // statement about references, not about class.
+        assert_eq!(sampled_image_bindings(&words), vec![33, 34]);
+        // A binding no variable carries is not invented.
+        assert_eq!(descriptor_static_use(&words, 99), DescriptorUse::NotDeclared);
+    }
+
+    /// A module in the shape of the compositor kernel that killed a host: a
+    /// storage image, several sampled images and a sampler, all on set 0.
+    ///
+    /// The three walks must **partition** the bindings, which is why this
+    /// asserts all three rather than only the new one. Each returns a descriptor
+    /// type, and a binding that lands in two of them would be given two
+    /// conflicting layout entries; a binding that lands in none is the hole that
+    /// makes Mesa's Intel driver divide by zero. Reading either walk alone
+    /// cannot see that, because both look correct in isolation.
+    #[test]
+    fn the_sampled_image_walk_and_the_sampler_walk_partition_set_zero() {
+        const STORAGE_IMAGE_TY: u32 = 10;
+        const SAMPLED_IMAGE_TY: u32 = 11;
+        const SAMPLER_TY: u32 = 12;
+        const STORAGE_VAR: u32 = 30;
+        const SAMPLER_VAR: u32 = 33;
+
+        let mut body = Vec::new();
+        // Decorations first, the order a real module carries them in.
+        for (var, binding) in [(STORAGE_VAR, 32u32), (31, 33), (32, 34), (SAMPLER_VAR, 160)] {
+            body.extend_from_slice(&[
+                (4u32 << 16) | OP_DECORATE as u32,
+                var,
+                DECORATION_BINDING,
+                binding,
+            ]);
+        }
+        body.extend_from_slice(&op_type_image(STORAGE_IMAGE_TY, IMAGE_SAMPLED_STORAGE, 0));
+        body.extend_from_slice(&op_type_image(
+            SAMPLED_IMAGE_TY,
+            IMAGE_SAMPLED_WITH_SAMPLER,
+            0,
+        ));
+        body.extend_from_slice(&[(2u32 << 16) | OP_TYPE_SAMPLER as u32, SAMPLER_TY]);
+        for (ptr, pointee) in [(20, STORAGE_IMAGE_TY), (21, SAMPLED_IMAGE_TY), (22, SAMPLER_TY)] {
+            body.extend_from_slice(&[
+                (4u32 << 16) | OP_TYPE_POINTER as u32,
+                ptr,
+                STORAGE_CLASS_UNIFORM_CONSTANT,
+                pointee,
+            ]);
+        }
+        for (ptr, var) in [(20, STORAGE_VAR), (21, 31), (21, 32), (22, SAMPLER_VAR)] {
+            body.extend_from_slice(&[
+                (4u32 << 16) | OP_VARIABLE as u32,
+                ptr,
+                var,
+                STORAGE_CLASS_UNIFORM_CONSTANT,
+            ]);
+        }
+        let words = module_with(&body);
+
+        // The two sampled images, and neither the storage image nor the sampler.
+        assert_eq!(sampled_image_bindings(&words), vec![33, 34]);
+        // The sampler alone — the walk that already existed is unchanged.
+        assert_eq!(sampler_bindings(&words), vec![160]);
+        // The storage image belongs to neither walk — it is bound from the
+        // guest's own storage table, as a STORAGE_IMAGE descriptor.
+        assert!(!sampled_image_bindings(&words).contains(&32));
+        assert!(!sampler_bindings(&words).contains(&32));
     }
 
     /// An `Unknown`-format storage image plus a write demands

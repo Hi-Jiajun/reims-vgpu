@@ -185,6 +185,79 @@ impl crate::observe::Decline for ComputeBindOverflow {
     }
 }
 
+/// The sampled-image bindings that need a neutral texture: those the module
+/// statically uses and `bound` does not cover.
+///
+/// Vulkan requires the pipeline layout to contain a descriptor for every
+/// resource the module statically uses, and the layout this device builds is
+/// assembled from what the guest bound — so a texture the kernel samples and the
+/// guest left empty is absent from the layout entirely, not an unwritten slot in
+/// it. Besides being undefined by the specification, that hole is fatal on one
+/// of the two iGPU vendors this device supports: Mesa's Intel driver scores each
+/// used binding as `(use_count << 7) / array_size` over an array it sized to
+/// `max_binding + 1` and zero-filled, so it divides by zero and the host process
+/// dies of `SIGFPE` inside `vkCreateComputePipelines`.
+///
+/// Only [`DescriptorUse::Used`] is returned, which is the bar the specification
+/// actually sets. A declared-and-never-referenced variable is legal to omit and
+/// must stay omitted, or the census that separated those two populations cannot
+/// tell them apart any more. `Ambiguous` — two variables on one binding — is its
+/// own defect and is not repaired by picking one of them.
+#[cfg(feature = "backend-vulkan")]
+fn neutral_sampled_image_bindings(spirv: &[u32], bound: &[u32]) -> Vec<u32> {
+    crate::runtime::spirv_bind::sampled_image_bindings(spirv)
+        .into_iter()
+        .filter(|binding| {
+            !bound.contains(binding)
+                && crate::runtime::spirv_bind::descriptor_static_use(spirv, *binding).is_violation()
+        })
+        .collect()
+}
+
+/// Side length of the texture substituted for a sampled image the kernel
+/// samples and the guest never bound.
+///
+/// One texel, because there is nothing to derive a size from: the guest supplied
+/// no texture, and any larger extent would be a number chosen to look plausible.
+/// A kernel that asks this image its size gets 1×1 and that is reported, rather
+/// than a guess that reads as data.
+#[cfg(feature = "backend-vulkan")]
+const NEUTRAL_SAMPLED_IMAGE_EXTENT: u32 = 1;
+
+/// A sampled image the kernel statically uses and the guest never bound, given a
+/// neutral transparent texture so the pipeline layout can describe it.
+///
+/// **A repair that succeeded, not a success**, which is why it goes to the fail
+/// channel: the kernel samples a texture whose contents this device invented, and
+/// the reliance has to stay measurable so a later session can find out whether
+/// the guest ever depended on what was in it. Nothing here claims the read did
+/// not matter.
+///
+/// Omitting the binding instead is not the cheaper option. It is a specification
+/// violation, and on Mesa's Intel driver it is a `SIGFPE` that kills the host
+/// process — see the walk in [`crate::runtime::spirv_bind::sampled_image_bindings`].
+#[cfg(feature = "backend-vulkan")]
+struct NeutralSampledImage {
+    binding: u32,
+    width: u32,
+    height: u32,
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl crate::observe::Decline for NeutralSampledImage {
+    fn slug(&self) -> &'static str {
+        "compute_neutral_sampled_image_unbound"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("binding", self.binding.to_string()),
+            ("width", self.width.to_string()),
+            ("height", self.height.to_string()),
+        ]
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ComputeBufferBind {
     pub index: u32,
@@ -3766,6 +3839,49 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 ),
             });
         }
+    }
+
+    // Vulkan requires the pipeline layout to contain a descriptor for every
+    // resource the module *statically uses*. The layout this device builds is
+    // assembled from what the guest bound, so a texture the kernel samples and
+    // the guest left empty is absent from the layout entirely — not an unwritten
+    // slot in it. That is undefined behaviour by the specification and it is
+    // worse than that in practice: Mesa's Intel driver sizes its binding array
+    // to `max_binding + 1`, zero-fills every number nothing declared, and scores
+    // each used binding as `(use_count << 7) / array_size` when it picks
+    // binding-table slots. A hole under a used binding divides by zero, so the
+    // whole process dies of `SIGFPE` inside `vkCreateComputePipelines` with no
+    // error for this device to decline on. Fill it the way the sampler class
+    // below already fills its own.
+    //
+    // Only `Used` is filled. A declared-and-unused variable is legal to omit and
+    // must stay omitted, or the census that separated those two populations
+    // cannot tell them apart any more; `Ambiguous` is two variables on one
+    // binding, which is its own defect and is not repaired by picking one.
+    let bound: Vec<u32> = sampled_images.iter().map(|img| img.binding).collect();
+    for binding in neutral_sampled_image_bindings(&spirv, &bound) {
+        crate::observe::Emit::decline(
+            "compute_linux_sampled",
+            &NeutralSampledImage {
+                binding,
+                width: NEUTRAL_SAMPLED_IMAGE_EXTENT,
+                height: NEUTRAL_SAMPLED_IMAGE_EXTENT,
+            },
+        )
+        .field("pipe", acc.pipeline_ref)
+        .fail_once((u64::from(acc.pipeline_ref) << 32) | u64::from(binding));
+        sampled_images.push(ComputeSampledImageResource {
+            binding,
+            format: crate::backend::vulkan::engine::StorageImageFormat::Rgba8Unorm,
+            width: NEUTRAL_SAMPLED_IMAGE_EXTENT,
+            height: NEUTRAL_SAMPLED_IMAGE_EXTENT,
+            bytes: pixel_format::solid_rgba8(
+                NEUTRAL_SAMPLED_IMAGE_EXTENT,
+                NEUTRAL_SAMPLED_IMAGE_EXTENT,
+                &[0.0; 4],
+            ),
+            resident_bind: None,
+        });
     }
 
     let mut samplers = Vec::new();
