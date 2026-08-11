@@ -10,7 +10,7 @@
 //! on whether the *bytes* moved in between, and nothing has measured that.
 //!
 //! This crosses the two. For each bind that takes the gather rail it compares
-//! the owning buffer object's [`super::buffer_write_gen`] stamp against the one
+//! the owning buffer object's [`crate::runtime::buffer_write_gen`] stamp against the one
 //! this window carried the last time it was gathered, and reports the split:
 //!
 //! | route | meaning |
@@ -84,16 +84,52 @@
 //!
 //! So the 86-89 % above is **not** a licence, and the two orders of magnitude
 //! between the boots' bump rates is the reason to say so out loud rather than
-//! quote the higher one. The next instrument is a content audit on the same
-//! shape [`super::gather_witness::AUDIT_STRIDE`] uses: fold a sampled `quiet`
-//! window's bytes and check whether they moved. If they did, this design is
-//! closed and the cache needs the hypervisor half after all — which is a
-//! different and much more expensive problem, because that bound is a harvest
-//! cost and not a resize.
+//! quote the higher one.
+//!
+//! # The audit ran, and it closes the design — twice over
+//!
+//! Two driven macos-13 boots, 25 census seconds each, **21 204 real
+//! comparisons** (a fold of a sampled window against the previous fold of the
+//! same window, with no declared write in between):
+//!
+//! ```text
+//!         audit_ok   audit_moved   seed   restart   unchanged share
+//! boot 1     2 827         8 771      7       436             24.4 %
+//! boot 2     2 915         6 691      8     1 100             30.3 %
+//! ```
+//!
+//! Unlike [`crate::runtime::gather_witness`]'s audit — whose comparison ran **zero**
+//! times across three consecutive boots, so its `unsound=0` was never a
+//! measurement — this one compared twenty-one thousand times, and `restart` is
+//! 4-10 % rather than the dominant column. The reading is real.
+//!
+//! **First conclusion: the declaration is not a complete account.** Three
+//! quarters of the windows the guest declared nothing about had their bytes
+//! change between two binds. One boot read `quiet_rate=1.000` with `wrote=17` in
+//! a census second whose audit found 379 moved windows against 138 still ones —
+//! which is exactly the false positive this module's wiring check was written to
+//! catch, arriving through the other door. A cache invalidated by
+//! `writeInvalidates` would have served stale vertex data on most of its hits.
+//!
+//! **Second conclusion, and the larger one: there was never 91 % of work to
+//! remove.** `buffer_gather_working_set` measures 91 % of gathers as repeats of
+//! a window already assembled, and this crate's notes have read that as the
+//! size of the prize. It is not: a repeat whose bytes moved has to be re-copied
+//! by any cache, sound or not. **~27 % of repeats are unchanged**, so the
+//! ceiling on a content cache with a *perfect* oracle is about
+//! `0.91 x 0.27 = 25 %` of this rail's gathers — ~5 100 a second of ~20 800, and
+//! ~105 000 of its ~427 000 transfer regions.
+//!
+//! Against that, a sound cache needs the hypervisor half (a harvest cost over
+//! ~1 900 windows, not a resize) and ~288 MiB of device-local memory held across
+//! submissions. **Do not build it.** Three quarters of this rail's traffic is
+//! the guest genuinely changing its vertex and constant data, and the way to
+//! make that cheaper is to move it more cheaply — which is what the compute
+//! gather does — rather than to try not to move it.
 //!
 //! # Why the hypervisor witness is not the instrument here
 //!
-//! [`super::gather_witness`] answers the same question soundly for the sampled
+//! [`crate::runtime::gather_witness`] answers the same question soundly for the sampled
 //! rails, and its `MAX_TRACKED_WINDOWS` of 256 is a **harvest** bound rather
 //! than a memory one: `reims_vgpu_dirty_harvest` walks every page of every armed
 //! set on the BQL thread at each register write that hands the device work. The

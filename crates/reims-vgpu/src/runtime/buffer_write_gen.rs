@@ -45,7 +45,7 @@
 //!
 //! One entry per `(task, object)` the guest has declared a write to. A task's
 //! entries go when the task does, which is the same lifetime `bound_buffers`
-//! retires on and the only announcement this device gets. Past [`Self::MAX`] the
+//! retires on and the only announcement this device gets. Past [`BufferWriteGens::MAX`] the
 //! map is **cleared** rather than partially evicted: forgetting one object would
 //! make its next comparison read as clean, which is the direction that reports a
 //! cache hit for a window whose bytes moved. A clear makes every comparison read

@@ -104,13 +104,18 @@
 //!
 //! # Which is why the next change is not in this file
 //!
-//! Fewer dispatches has a floor of one per draw (the destination arena, ~35 %
-//! of `record`), and a ceiling of **none at all**:
-//! [`super::pools::buffer_gather_working_set`] measured 91 % of this rail's
-//! gathers as repeats of a window it already assembled. A content cache removes
-//! the dispatch, the run table, the descriptor set and the GPU copy together,
-//! and it makes every column above moot rather than smaller. Build that before
-//! anything else here.
+//! Fewer dispatches has a floor of one per draw — the destination arena, ~35 %
+//! of `record`. It does **not** have a ceiling of none: the content cache that
+//! would have removed the dispatch, the run table, the descriptor set and the
+//! GPU copy together is closed, because
+//! [`crate::runtime::buffer_gather_freshness`]'s audit found only ~27 % of this
+//! rail's repeats unchanged. Three quarters of it is the guest genuinely
+//! changing its vertex and constant data, and moving those bytes more cheaply is
+//! what this rail is for.
+//!
+//! So the destination arena is the remaining change here, and it is worth ~35 %
+//! of one of four columns. Weigh that against the writeback rail, whose own
+//! ablation is worth ~30 Hz, before spending a day on it.
 //!
 //! # This measures the planning, not the copy
 //!
