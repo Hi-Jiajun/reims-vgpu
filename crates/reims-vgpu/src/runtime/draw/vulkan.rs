@@ -8129,6 +8129,28 @@ fn arm_surface_writeback_debt<M: HostMemory + HostOps>(
     let Some(map_generation) = state.mappings.get(&mapping_id).map(|m| m.map_generation) else {
         return false;
     };
+    // The host surface cache is the *other* host-side copy of this mapping, and
+    // this Store has just superseded it without writing a byte anywhere. The
+    // eager arm ends with `surface_cache::forget` for exactly this reason; this
+    // arm cedes instead, because here the resident genuinely does hold the frame
+    // and a cession says so — see [`surface_cache::cede_surface_to_resident`],
+    // which was written for this call and had no caller.
+    //
+    // Without it the type-11 sampled ladder's host-cache rung serves the
+    // *previous* frame for as long as the debt is outstanding: that rung is
+    // gated on the guest-write witness alone, which by construction cannot see a
+    // publish this device made itself, and it sits above both rungs that read
+    // the guest's own pages, so nothing below corrects it. It repairs when the
+    // debt is paid, which is what makes it a flicker rather than a stuck layer.
+    //
+    // A geometry this cache would not have stored is refused rather than armed,
+    // per that function's contract: leaving a live entry beside a
+    // resident-authoritative window is the state this whole call exists to
+    // prevent, and the eager Store is always available.
+    if !crate::runtime::surface_cache::cede_surface_to_resident(state, mapping_id, width, height) {
+        crate::runtime::drain::note_store_route("wbdebt_uncedable_geometry");
+        return false;
+    }
     // The one call that says "these pixels changed and the guest's pages do not
     // hold them yet". It advances the surface's content epoch, which is what the
     // stamp below records, and `ResourceValidity::host_published_seq`, which is
@@ -8926,6 +8948,68 @@ mod vulkan_split_tests {
     /// Every one of those 121 lines had `want == mapgeom` and `hostgen=0`: the
     /// cache had never held the surface and its pages were readable. That pair is
     /// what makes reading them the fix rather than a guess.
+    /// The lazy type-11 Store publishes a frame nothing has written down yet, so
+    /// the host surface cache — the other host-side copy of the same mapping —
+    /// must stop naming the frame before it.
+    ///
+    /// The eager Store's GPU-direct arm ends in `surface_cache::forget` and says
+    /// why; the lazy arm published a strictly newer frame and left the entry
+    /// alone. The consumer that would read it is the type-11 sampled ladder's
+    /// host-cache rung, gated on the guest-write witness alone — which cannot
+    /// see a publish this device made itself — and sitting above both rungs that
+    /// read the guest's pages, so nothing below it corrects the answer.
+    ///
+    /// Asserted through `get_shared_with_gen`, which is the accessor that rung
+    /// actually calls: a cession leaves the entry present and empty, so a test
+    /// that only asked whether the map contained the key would pass either way.
+    #[test]
+    fn arming_a_writeback_debt_stops_the_host_cache_naming_the_previous_frame() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::runtime::mapping_write::write_bgra8;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let mid = 912u32;
+        let pfn = 0x31u32;
+        let gpa = (pfn as u64) << PAGE_SHIFT_X86;
+        host.map_range(gpa, 0x4000, 0);
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        let (w, h) = (4u32, 2u32);
+        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+
+        // Frame N, mirrored into the host cache by the write itself.
+        let frame_n = vec![0x11u8; (w * h * 4) as usize];
+        assert!(write_bgra8(&mut state, &mut host, mid, &frame_n, w * 4, w, h));
+        assert!(
+            crate::runtime::surface_cache::get_shared_with_gen(&state, mid, w, h).is_some(),
+            "the cache has to be warm or this test proves nothing"
+        );
+
+        // Frame N+1, rendered and deliberately not written down.
+        let identity = crate::backend::vulkan::engine::TargetIdentity::Gva {
+            gva: gpa,
+            width: w,
+            height: h,
+            generation: 1,
+            format: gva_resident_format(MTL_FORMAT_BGRA8_UNORM),
+        };
+        assert!(
+            arm_surface_writeback_debt(&mut state, &mut host, mid, &identity, w, h),
+            "a mapped surface at a cacheable geometry arms"
+        );
+        assert!(
+            crate::runtime::surface_cache::get_shared_with_gen(&state, mid, w, h).is_none(),
+            "frame N is still on offer while frame N+1 exists only on the GPU"
+        );
+    }
+
     #[test]
     fn a_type11_load_seed_falls_back_to_the_surfaces_own_guest_pages() {
         use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
