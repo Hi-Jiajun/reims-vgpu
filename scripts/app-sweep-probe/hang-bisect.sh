@@ -21,7 +21,15 @@
 #
 # Usage:
 #   scripts/app-sweep-probe/hang-bisect.sh [--rail NAME] [--seconds N]
-#     [--arms "shipping GUEST_IMPORT=off COMPUTE_GATHER=off ..."]
+#     [--arms "shipping GUEST_IMPORT=off COMPUTE_GATHER=off ..."] [--rounds N]
+#
+# **One boot per arm decides nothing.** Five driven macos-11 boots of one binary,
+# shipping or near it, logged 2, 13, 6, 2 and 12 kernel `GPU HANG` lines. Every
+# single-boot bisect table this script has produced sits inside that spread. Use
+# `--rounds` — it interleaves the arms round by round, so a drift in the host's
+# own state over an hour lands on both arms rather than on whichever ran second —
+# and read `stalls` in preference to `hangs`: a stall is one wait giving up and a
+# kernel line is one reset, and several stalls routinely share one reset.
 #
 # An arm is either the word `shipping` or one or more comma-joined `NAME=value`
 # pairs, each exported as `REIMS_VGPU_NAME=value` for that boot. A comma-joined
@@ -39,6 +47,7 @@ export LC_ALL=C
 RAIL="macos-11"
 SECONDS_PER_APP=12
 ARMS="shipping GUEST_IMPORT=off COMPUTE_GATHER=off COMPUTE_SCATTER=off"
+ROUNDS=1
 OUT="/tmp/reims-hang-bisect"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
@@ -47,6 +56,7 @@ while [ $# -gt 0 ]; do
     --rail) RAIL="$2"; shift 2 ;;
     --seconds) SECONDS_PER_APP="$2"; shift 2 ;;
     --arms) ARMS="$2"; shift 2 ;;
+    --rounds) ROUNDS="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
     -h|--help) sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
     *) echo "hang-bisect: unknown argument $1" >&2; exit 2 ;;
@@ -65,8 +75,9 @@ hangs_since() {
   journalctl -k --since "$1" --no-pager 2>/dev/null | grep -c 'GPU HANG' || true
 }
 
+for round in $(seq 1 "$ROUNDS"); do
 for arm in $ARMS; do
-  say "=== arm $arm ==="
+  say "=== round $round arm $arm ==="
   # Not a fixed sleep: an arm that just hung the GPU takes longer to die than
   # one that did not, and this bisect exists to run exactly those arms.
   "$REPO/scripts/app-sweep-probe/stop-previous-vm.sh" || \
@@ -87,7 +98,8 @@ for arm in $ARMS; do
   fi
 
   started=$(date '+%Y-%m-%d %H:%M:%S')
-  BOOTLOG="$OUT/$arm-boot.log"
+  tag="r$round-$arm"
+  BOOTLOG="$OUT/$tag-boot.log"
   TESTING_TIMEOUT=900 nohup "$REPO/vm/boot-x86.sh" --device reims-vgpu-pci \
     --rail "$RAIL" --testing >"$BOOTLOG" 2>&1 &
 
@@ -96,7 +108,7 @@ for arm in $ARMS; do
     [ -f /tmp/reims-vgpu-fail.log ] && { up=yes; break; }
     sleep 5
   done
-  [ "$up" = yes ] || { say "$arm: no device"; printf '%s\tNO-BOOT\t-\n' "$arm" >>"$RESULTS"; continue; }
+  [ "$up" = yes ] || { say "$tag: no device"; printf '%s\tNO-BOOT\t-\n' "$tag" >>"$RESULTS"; continue; }
 
   timeout 300 "$REPO/vm/guest-authorize.sh" >/dev/null 2>&1
   # Shared with `sweep-rails.sh`: it separates "still booting" from "stopped at
@@ -105,25 +117,39 @@ for arm in $ARMS; do
   # hang count would be a measurement of an idle GPU.
   dock=yes
   "$REPO/scripts/app-sweep-probe/wait-for-desktop.sh" --timeout 400 || dock=no
-  [ "$dock" = yes ] || { say "$arm: no desktop"; printf '%s\tNO-DESKTOP\t-\n' "$arm" >>"$RESULTS"; continue; }
+  [ "$dock" = yes ] || { say "$tag: no desktop"; printf '%s\tNO-DESKTOP\t-\n' "$tag" >>"$RESULTS"; continue; }
   sleep 8
 
   QMP_SOCK="$REPO/vm/disks/run/qmp.sock" timeout 700 \
     "$REPO/scripts/app-sweep-probe/app-sweep-probe.sh" --rail "$RAIL" \
     --seconds "$SECONDS_PER_APP" --torture-seconds 30 \
-    --keep "$OUT/$arm-work" >"$OUT/$arm-probe.log" 2>&1
+    --keep "$OUT/$tag-work" >"$OUT/$tag-probe.log" 2>&1
   probe=$?
 
+  # Keep the device's own log before the next arm truncates it: `stalls` is read
+  # from it, and it is the better-resolved of the two hang metrics — a stall is
+  # one wait giving up, a kernel line is one reset, and several stalls routinely
+  # share a reset.
+  cp -f /tmp/reims-vgpu-fail.log "$OUT/$tag-fail.log" 2>/dev/null || true
   pkill -f 'qemu-system-x86_6[4].*reims-vgpu' 2>/dev/null
   sleep 6
   hangs=$(hangs_since "$started")
-  freezes=$(grep -c 'FREEZE' "$OUT/$arm-probe.log" || true)
+  freezes=$(grep -c 'FREEZE' "$OUT/$tag-probe.log" || true)
+  stalls=$(grep -c 'reason=sync_exec_lock_hold ' "$OUT/$tag-fail.log" 2>/dev/null || true)
+  lost=$(grep -c 'vk_device_lost' "$OUT/$tag-fail.log" 2>/dev/null || true)
+  # The panic verdict outranks the probe's: a guest kernel panic can land after
+  # the probe has reported success, so an arm is not clean because `probe_exit`
+  # is 0.
+  panic=no
+  grep -q 'guest kernel panic' "$BOOTLOG" 2>/dev/null && panic=YES
   # The capability line says whether the arm took, so an override that was
   # ignored cannot be scored as an arm that ran.
-  caps=$(grep -m1 -o 'host_pointer_import=[a-z_]*' "$OUT/$arm-work"/*.log 2>/dev/null | head -1)
-  printf '%s\thangs=%s\tfreezes=%s\tprobe_exit=%s\t%s\n' \
-    "$arm" "$hangs" "$freezes" "$probe" "${caps:-caps=?}" >>"$RESULTS"
-  say "$arm: GPU hangs=$hangs freezes=$freezes probe_exit=$probe ${caps:-}"
+  caps=$(grep -m1 -o 'host_pointer_import=[a-z_]*' "$OUT/$tag-work"/*.log 2>/dev/null | head -1)
+  printf '%s\t%s\thangs=%s\tstalls=%s\tlost=%s\tfreezes=%s\tpanic=%s\tprobe_exit=%s\t%s\n' \
+    "$round" "$arm" "$hangs" "$stalls" "$lost" "$freezes" "$panic" "$probe" \
+    "${caps:-caps=?}" >>"$RESULTS"
+  say "$tag: GPU hangs=$hangs stalls=$stalls lost=$lost freezes=$freezes panic=$panic probe_exit=$probe ${caps:-}"
+done
 done
 
 echo
