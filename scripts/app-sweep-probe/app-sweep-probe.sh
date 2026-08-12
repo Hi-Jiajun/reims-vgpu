@@ -105,11 +105,51 @@ gssh() { timeout "${1:-20}" ssh -o BatchMode=yes -o ConnectTimeout=8 "$GUEST" "$
 [ -f "$FAILLOG" ] || { say "no fail log at $FAILLOG — is a boot running?" >&2; exit 2; }
 gssh 10 true || { say "no guest at $GUEST" >&2; exit 2; }
 
-SIZE=$(QMP_SOCK="$QMP_SOCK" timeout 20 "$REPO/scripts/qmp/qmp.py" size 2>/dev/null || echo "")
+# QMP sizes from QEMU's `DisplaySurface`, which under the host-owned window is
+# not the surface the guest is drawing into — it only usually still carries the
+# right dimensions. On macos-11 it has been seen reporting **1920x24** for a
+# composited desktop, and a probe that believes that drives a geometry no result
+# can be attributed to.
+#
+# So the answer is retried, and if it stays implausible the device's own
+# published scanout size is used instead: `host_window_start id=1 WxH` is what
+# this device told the window system, which is the strongest available statement
+# about how many pixels the guest has. Whichever source won is named, because a
+# run driven against a fallback geometry is a different measurement from one
+# driven against the guest's own.
+#
+# 400 rows is the floor. It is far below any desktop these rails boot at and far
+# above the degenerate values seen, so it separates the two without needing to
+# know the rail's real size.
+MIN_ROWS=400
+SIZE=""
+for _ in 1 2 3 4 5; do
+  SIZE=$(QMP_SOCK="$QMP_SOCK" timeout 20 "$REPO/scripts/qmp/qmp.py" size 2>/dev/null || echo "")
+  H=$(echo "$SIZE" | awk '{print $2}')
+  case "${H:-}" in ''|*[!0-9]*) ;; *) [ "$H" -ge "$MIN_ROWS" ] && break ;; esac
+  sleep 2
+done
 W=$(echo "$SIZE" | awk '{print $1}')
 H=$(echo "$SIZE" | awk '{print $2}')
-case "${W:-}${H:-}" in ''|*[!0-9]*) say "QMP would not report a display size (got '$SIZE')" >&2; exit 2 ;; esac
-say "rail=${RAIL:-unknown} display=${W}x${H} apps=[$APPS] ${SECONDS_PER_APP}s each"
+SIZE_FROM=qmp
+case "${W:-}${H:-}" in
+  ''|*[!0-9]*) W=""; H="" ;;
+  *) [ "$H" -lt "$MIN_ROWS" ] && { W=""; H=""; } ;;
+esac
+if [ -z "${H:-}" ]; then
+  DEV_SIZE=$(grep -m1 -oE 'host_window_start id=1 [0-9]+x[0-9]+' "$FAILLOG" 2>/dev/null \
+    | grep -oE '[0-9]+x[0-9]+' || true)
+  W=${DEV_SIZE%x*}
+  H=${DEV_SIZE#*x}
+  SIZE_FROM=device
+fi
+case "${W:-}${H:-}" in
+  ''|*[!0-9]*)
+    say "neither QMP nor the device would report a usable display size \
+(qmp said '$SIZE') — a run driven at an unknown geometry is not a measurement" >&2
+    exit 2 ;;
+esac
+say "rail=${RAIL:-unknown} display=${W}x${H} (from $SIZE_FROM) apps=[$APPS] ${SECONDS_PER_APP}s each"
 
 # The device's own name for this boot, so a result can be attributed the way
 # AGENTS.md requires. `vk_caps` lands once per device creation.
