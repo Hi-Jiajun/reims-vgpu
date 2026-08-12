@@ -1971,12 +1971,7 @@ unsafe fn copy_image_level0_to_host_delivered(
     // pool's results are undefined until reset, and resetting on the host needs
     // `hostQueryReset`, which is a Vulkan 1.2 feature this device does not ask
     // for.
-    if let Some(probe) = ctx.timestamps.as_ref() {
-        ctx.device
-            .cmd_reset_query_pool(cb, probe.pool, 0, context::TimestampProbe::SLOTS);
-        ctx.device
-            .cmd_write_timestamp(cb, ash::vk::PipelineStageFlags::TOP_OF_PIPE, probe.pool, 0);
-    }
+    unsafe { pools.readback_span_arm(ctx, cb) };
     // Nothing else supplies it. Queue submission order starts command buffers
     // in order; it does not finish them in order, and it is not a memory
     // dependency. A render pass's implicit final subpass dependency carries
@@ -2012,10 +2007,7 @@ unsafe fn copy_image_level0_to_host_delivered(
     // span from it to the end of the copy contains both. This slot is what
     // separates them: everything before it has reached TRANSFER, which after the
     // barrier means the draws are done.
-    if let Some(probe) = ctx.timestamps.as_ref() {
-        ctx.device
-            .cmd_write_timestamp(cb, ash::vk::PipelineStageFlags::TRANSFER, probe.pool, 1);
-    }
+    unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::TRANSFER, 1) };
     let region = [ash::vk::BufferImageCopy::default()
         .image_subresource(color_subresource_layers())
         .image_extent(ash::vk::Extent3D {
@@ -2052,14 +2044,9 @@ unsafe fn copy_image_level0_to_host_delivered(
         readback.buffer,
         &region,
     );
-    if let Some(probe) = ctx.timestamps.as_ref() {
-        ctx.device.cmd_write_timestamp(
-            cb,
-            ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            probe.pool,
-            2,
-        );
-    }
+    unsafe {
+        pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE, 2)
+    };
     if appended.is_some() {
         // `batch_flush` ends the command buffer, submits it with the fence
         // `batch_open_recording` handed back, and seals the batch's cleanup —
@@ -2094,38 +2081,11 @@ unsafe fn copy_image_level0_to_host_delivered(
         ReadbackPhase::Fence,
         fence_started.elapsed().as_micros() as u64,
     );
-    // Read against the fence that just signalled, so both queries are available
-    // and this cannot block. It divides `fence_us`: what is left after the GPU's
-    // own execution of this command buffer is the draw batch ahead of it plus
-    // the cost of asking, and only the first of those is work this device could
-    // make cheaper.
-    if let Some(probe) = ctx.timestamps.as_ref() {
-        let mut ticks = [0u64; context::TimestampProbe::SLOTS as usize];
-        match ctx.device.get_query_pool_results(
-            probe.pool,
-            0,
-            &mut ticks,
-            ash::vk::QueryResultFlags::TYPE_64,
-        ) {
-            // In f64, not integer ticks-times-period: `timestampPeriod` is a
-            // float and drivers do report values below 1 ns (a counter faster
-            // than 1 GHz), which an integer multiply would truncate to zero and
-            // report as "the GPU did nothing".
-            Ok(()) => {
-                let us = |from: usize, to: usize| {
-                    (ticks[to].saturating_sub(ticks[from]) as f64
-                        * probe.ns_per_tick.max(0.0) as f64
-                        / 1_000.0) as u64
-                };
-                crate::runtime::drain::note_readback_gpu_us(us(0, 1), us(1, 2));
-            }
-            Err(e) => crate::observe::Emit::decline(
-                "vk_timestamp_read",
-                &VkCall::new(VkOp::ContextGetQueryPoolResults, e),
-            )
-            .fail_once(0),
-        }
-    }
+    // The three queries this command buffer wrote are read when its ring slot
+    // retires, by `readback_span_read`, which is the one place a slot's fence is
+    // known signalled. They used to be read here, against this call's own fence
+    // — correct for this writer and not for the guest-page writeback, which
+    // shares the probe and does not wait.
     let map_started = std::time::Instant::now();
     let out = match lease.disarm() {
         // The mapping is already established for the slot's lifetime, so all
@@ -3148,8 +3108,6 @@ unsafe fn copy_image_level0_to_buffer(
 ) -> Result<(), DrawError> {
     use crate::runtime::drain::{note_readback_phase, ReadbackPhase};
     let submit_started = std::time::Instant::now();
-    // Before anything is recorded, and in particular before the reset below.
-    unsafe { publish_previous_writeback_timestamps(ctx) };
     // Appended to a recording batch where there is one, for the reason
     // `copy_image_level0_to_host_delivered` gives: `begin_entry` would submit
     // that batch only to submit this copy behind it, and the copy has to be
@@ -3186,12 +3144,7 @@ unsafe fn copy_image_level0_to_buffer(
     // The reset must be recorded into the same command buffer: a query pool's
     // results are undefined until reset, and resetting on the host needs
     // `hostQueryReset`, a Vulkan 1.2 feature this device does not ask for.
-    if let Some(probe) = ctx.timestamps.as_ref() {
-        ctx.device
-            .cmd_reset_query_pool(cb, probe.pool, 0, context::TimestampProbe::SLOTS);
-        ctx.device
-            .cmd_write_timestamp(cb, ash::vk::PipelineStageFlags::TOP_OF_PIPE, probe.pool, 0);
-    }
+    unsafe { pools.readback_span_arm(ctx, cb) };
     // Unconditional, for the reason `copy_image_level0_to_host_delivered` states
     // at length: the barrier is a layout transition *and* a dependency, and this
     // rail needs the dependency whether or not the layout already matches. A
@@ -3214,10 +3167,7 @@ unsafe fn copy_image_level0_to_buffer(
         &[],
         &barrier,
     );
-    if let Some(probe) = ctx.timestamps.as_ref() {
-        ctx.device
-            .cmd_write_timestamp(cb, ash::vk::PipelineStageFlags::TRANSFER, probe.pool, 1);
-    }
+    unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::TRANSFER, 1) };
     // One call per buffer, all of them into the same command buffer, so the
     // whole frame is still one submission and one fence however many RAMBlocks
     // it touched — and, on the linear plan, however many hops it takes.
@@ -3302,14 +3252,9 @@ unsafe fn copy_image_level0_to_buffer(
             }
         }
     }
-    if let Some(probe) = ctx.timestamps.as_ref() {
-        ctx.device.cmd_write_timestamp(
-            cb,
-            ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            probe.pool,
-            2,
-        );
-    }
+    unsafe {
+        pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE, 2)
+    };
     // The reader of these bytes is the guest's vCPU, which is a host reader as
     // far as this device is concerned: the memory is guest RAM the driver
     // imported, not device-local memory that owes a readback. So the write is
@@ -3384,60 +3329,6 @@ unsafe fn copy_image_level0_to_buffer(
         submit_started.elapsed().as_micros() as u64,
     );
     Ok(())
-}
-
-/// Publish the timestamps of the previous guest-page writeback, if it has
-/// finished.
-///
-/// Taken here rather than after a fence wait because there is no longer a fence
-/// wait to take it after — but the pair it reads is the only thing that can
-/// separate "the GPU is copying megabytes across PCIe" from "the round trip
-/// costs more than the work", so losing it would blind the rail this change is
-/// aimed at.
-///
-/// Sound to read at this point and nowhere else: the reset that invalidates
-/// these results is *recorded* into the command buffer below and executes on the
-/// GPU strictly after the previous copy wrote them, so on the host, right before
-/// that recording, the pool still holds the previous copy's ticks. Never waits —
-/// `NOT_READY` means the previous copy is still running and that sample is
-/// simply skipped, which is the correct answer for a probe rather than a gate.
-///
-/// # Safety
-///
-/// `ctx`'s query pool must not be recording, which is what makes this a read of
-/// the previous copy's results rather than a race with the current one.
-unsafe fn publish_previous_writeback_timestamps(ctx: &context::DeviceContext) {
-    let Some(probe) = ctx.timestamps.as_ref() else {
-        return;
-    };
-    let mut ticks = [0u64; context::TimestampProbe::SLOTS as usize];
-    match unsafe {
-        ctx.device.get_query_pool_results(
-            probe.pool,
-            0,
-            &mut ticks,
-            ash::vk::QueryResultFlags::TYPE_64,
-        )
-    } {
-        // In f64, not integer ticks-times-period: `timestampPeriod` is a
-        // float and drivers do report values below 1 ns, which an integer
-        // multiply would truncate to zero and report as "the GPU did nothing".
-        Ok(()) => {
-            let us = |from: usize, to: usize| {
-                (ticks[to].saturating_sub(ticks[from]) as f64 * probe.ns_per_tick.max(0.0) as f64
-                    / 1_000.0) as u64
-            };
-            crate::runtime::drain::note_readback_gpu_us(us(0, 1), us(1, 2));
-        }
-        // The previous copy has not finished, so there is nothing to read and
-        // nothing has gone wrong.
-        Err(ash::vk::Result::NOT_READY) => {}
-        Err(e) => crate::observe::Emit::decline(
-            "vk_timestamp_read",
-            &VkCall::new(VkOp::ContextGetQueryPoolResults, e),
-        )
-        .fail_once(0),
-    }
 }
 
 /// Import every RAMBlock in `imports` now, and report how many that took.

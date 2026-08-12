@@ -664,6 +664,7 @@ impl ResourcePools {
                         fence,
                         pending: None,
                         span: super::gpu_span::SlotSpan::Idle,
+                        readback_span_armed: false,
                     });
                 }
                 Err(e) => {
@@ -1222,6 +1223,98 @@ impl ResourcePools {
         unsafe { self.gpu_span_seal(ctx, cb, self.cur) };
     }
 
+    /// Reset this slot's readback timestamp region and write its start stamp.
+    ///
+    /// The reset must be recorded into the same command buffer that writes the
+    /// stamps: a query's results are undefined until it is reset, and resetting
+    /// on the host needs `hostQueryReset`, a Vulkan 1.2 feature this device does
+    /// not ask for.
+    ///
+    /// The region belongs to the current ring slot rather than being shared —
+    /// see [`TimestampProbe`], which used to be shared between the
+    /// readback (which waits its fence) and the guest-page writeback (which does
+    /// not), so two writebacks in flight reset each other's queries.
+    ///
+    /// # Safety
+    ///
+    /// `cb` must be the current slot's command buffer, recording, and outside
+    /// any render pass.
+    pub(crate) unsafe fn readback_span_arm(&mut self, ctx: &DeviceContext, cb: vk::CommandBuffer) {
+        let Some(probe) = ctx.timestamps.as_ref() else {
+            return;
+        };
+        let slot = self.cur;
+        let base = TimestampProbe::base(slot);
+        ctx.device
+            .cmd_reset_query_pool(cb, probe.pool, base, TimestampProbe::PER_SLOT);
+        ctx.device
+            .cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, probe.pool, base);
+        self.slots[slot].readback_span_armed = true;
+    }
+
+    /// Write one of the two later stamps of the current slot's readback region.
+    ///
+    /// `mark` is 1 for the point after the barrier — where the draws ahead are
+    /// known done — and 2 for the end of the copy. Silently does nothing if the
+    /// slot was never armed, so a caller that stamps without a start cannot
+    /// publish a delta against a query holding another submission's ticks.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::readback_span_arm`].
+    pub(crate) unsafe fn readback_span_mark(
+        &mut self,
+        ctx: &DeviceContext,
+        cb: vk::CommandBuffer,
+        stage: vk::PipelineStageFlags,
+        mark: u32,
+    ) {
+        debug_assert!(mark < TimestampProbe::PER_SLOT);
+        let Some(probe) = ctx.timestamps.as_ref() else {
+            return;
+        };
+        if !self.slots[self.cur].readback_span_armed {
+            return;
+        }
+        ctx.device.cmd_write_timestamp(
+            cb,
+            stage,
+            probe.pool,
+            TimestampProbe::base(self.cur) + mark,
+        );
+    }
+
+    /// Read a retiring slot's readback region and charge the two spans it holds.
+    ///
+    /// Called only with the slot's fence already signalled, which is what makes
+    /// the three queries available — so `vkGetQueryPoolResults` is asked without
+    /// `WAIT` and cannot block. This replaces a read that ran *before* the next
+    /// copy was recorded and argued that the previous copy's results were still
+    /// there because its reset had not executed yet. That argument assumed
+    /// submissions complete in submission order, which Vulkan does not grant.
+    unsafe fn readback_span_read(&mut self, ctx: &DeviceContext, slot: usize) {
+        let Some(probe) = ctx.timestamps.as_ref() else {
+            return;
+        };
+        if !std::mem::replace(&mut self.slots[slot].readback_span_armed, false) {
+            return;
+        }
+        let mut ticks = [0u64; TimestampProbe::PER_SLOT as usize];
+        if ctx
+            .device
+            .get_query_pool_results(
+                probe.pool,
+                TimestampProbe::base(slot),
+                &mut ticks,
+                vk::QueryResultFlags::TYPE_64,
+            )
+            .is_ok()
+        {
+            let us = |from: usize, to: usize| probe.scale.elapsed_ns(ticks[from], ticks[to]) / 1_000;
+            crate::runtime::drain::note_readback_gpu_us(us(0, 1), us(1, 2));
+        }
+    }
+
     /// Read a retiring slot's timestamp pair and charge the delta.
     ///
     /// Only ever called with the slot's fence already signaled, which is what
@@ -1250,7 +1343,7 @@ impl ResourcePools {
             )
             .is_ok()
         {
-            gpu_span::note_busy_ns(kind, probe.elapsed_ns(ticks[0], ticks[1]));
+            gpu_span::note_busy_ns(kind, probe.scale.elapsed_ns(ticks[0], ticks[1]));
         }
     }
 
@@ -1277,6 +1370,9 @@ impl ResourcePools {
         // the only thing that returns the slot's span state to `Idle` so the next
         // arming of it is not reported as a lost sample.
         unsafe { self.gpu_span_read(ctx, index) };
+        // The same argument, for the other probe: this slot's three readback
+        // queries are readable exactly now and never before.
+        unsafe { self.readback_span_read(ctx, index) };
         let pending = self.slots[index].pending.take().expect("checked above");
         self.in_flight = self.in_flight.saturating_sub(1);
         self.drain_cleanup(&ctx.device, pending);
@@ -5042,6 +5138,7 @@ mod recycle_tests {
                 storage_images: Vec::new(),
             }),
             span: super::gpu_span::SlotSpan::Idle,
+                        readback_span_armed: false,
         }
     }
 
@@ -5051,6 +5148,7 @@ mod recycle_tests {
             fence: vk::Fence::null(),
             pending: None,
             span: super::gpu_span::SlotSpan::Idle,
+                        readback_span_armed: false,
         }
     }
 

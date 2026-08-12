@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use super::buffer_slab::{BufferSlabToken, BUFFER_SLAB_IDLE_KEEP_EMPTY};
 use super::compute_execution::ComputeExecutionDecline;
-use super::context::{DeviceContext, DrawSpanProbe, FENCE_TIMEOUT_NS};
+use super::context::{DeviceContext, DrawSpanProbe, TimestampProbe, FENCE_TIMEOUT_NS};
 use super::counters::EngineCounters;
 use super::desc_arena::{DescriptorArena, DESC_BLOCK_MAX_SETS};
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
@@ -766,6 +766,14 @@ struct CmdSlot {
     /// Read and cleared when the slot retires, which is the first moment the
     /// fence makes the queries readable. See [`super::gpu_span`].
     span: gpu_span::SlotSpan,
+    /// Whether this slot's copy command buffer armed the three-query readback
+    /// region belonging to it.
+    ///
+    /// Same lifetime rule as [`Self::span`] and for the same reason — the fence
+    /// is what makes the region readable — but a separate flag because the two
+    /// probes are armed by different callers and a slot can carry either, both
+    /// or neither. Set by `readback_span_arm`, cleared by the read at retire.
+    readback_span_armed: bool,
 }
 
 /// In-flight ring depth: the next draw/dispatch records + submits while
