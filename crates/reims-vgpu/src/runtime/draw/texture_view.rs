@@ -606,15 +606,28 @@ impl crate::observe::Decline for LinearLoadRefusal {
     }
 }
 
-pub(super) fn load_linear_texture_rgba_host<M: HostMemory + HostOps>(
+/// Load a linear (buffer-backed) texture for sampling, keeping the layout its
+/// bytes are in.
+///
+/// A caller that passes anything but [`NativeUploads::NONE`] must carry the
+/// returned layout all the way to the bind: the bytes are then the guest's own
+/// and their length is `width * height * layout.bytes_per_texel()`, which for
+/// the half-float arms is not `width * height * 4`.
+// Eight, for [`load_linear_texture_impl`]'s reason: the last two are the
+// caller's own answers — which native layouts it carries, and which rung it is
+// — and neither is derivable here. Bundling the descriptor selectors into a
+// struct would hide which of them a call site varies.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_linear_texture_host<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
     level: u32,
     format_override: Option<u16>,
+    native: NativeUploads,
     site: crate::runtime::render_writeback::SettleSite,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, TexelLayout)> {
     load_linear_texture_impl(
         state,
         host,
@@ -622,15 +635,10 @@ pub(super) fn load_linear_texture_rgba_host<M: HostMemory + HostOps>(
         texture_ref,
         level,
         format_override,
-        // This wrapper drops the layout and its callers read the bytes as
-        // RGBA8, so it must be handed the one answer that guarantees they are:
-        // a native return here would be a half-float or BGRA8 buffer described
-        // by nothing.
-        NativeUploads::NONE,
+        native,
         site,
     )
     .ok()
-    .map(|(bytes, _)| bytes)
 }
 
 /// Which non-RGBA8 sampled layouts a caller of the linear loaders will carry.
@@ -847,10 +855,18 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // Safari source). Padded rows retain the conservative disjoint reads so we
     // never touch padding that the guest did not make readable.
     if bpr_u32 == tight {
-        let (rgba, fmt) = load_tight_linear_rgba_with(w, h, sample_fmt, native, |dst| {
-            gva_mem::read_task_gva_by_id(host, &state.tasks, task_id, gva, dst, state.page_shift)
+        let (rgba, fmt) =
+            load_tight_linear_rgba_with(w, h, sample_fmt, native, site.route(), |dst| {
+                gva_mem::read_task_gva_by_id(
+                    host,
+                    &state.tasks,
+                    task_id,
+                    gva,
+                    dst,
+                    state.page_shift,
+                )
                 .is_ok()
-        })?;
+            })?;
         return Ok((rgba, fmt));
     }
     // Padded rows. When the source bytes are already in the final upload order
@@ -908,7 +924,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
             state.page_shift,
         )
         .map_err(|_| R::PaddedRowUnreadable { row: y })?;
-        crate::runtime::draw::note_sampled_narrowing("padded_row_narrowed", 0, sample_fmt, w, h);
+        crate::runtime::draw::note_sampled_narrowing(site.route(), 0, sample_fmt, w, h);
         let dst_off = (y as usize) * (w as usize) * 4;
         if !pixel_format::convert_row_to_rgba8(sample_fmt, &row, w, &mut rgba[dst_off..]) {
             return Err(R::RowConvertUnsupported { format: sample_fmt });
@@ -917,11 +933,16 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     Ok((rgba, TexelLayout::Rgba8))
 }
 
+///
+/// `site` names the calling rung and is what a narrowing is reported under, so
+/// a `RGBA8`-by-design seed read and a sampled bind that lost precision are two
+/// census lines rather than one.
 pub(crate) fn load_tight_linear_rgba_with<F>(
     width: u32,
     height: u32,
     sample_format: u16,
     native: NativeUploads,
+    site: &'static str,
     mut read: F,
 ) -> Result<(Vec<u8>, TexelLayout), LinearLoadRefusal>
 where
@@ -968,7 +989,12 @@ where
         }
         return Ok((bytes, TexelLayout::Rgba8));
     }
-    crate::runtime::draw::note_sampled_narrowing("tight_row_narrowed", 0, sample_format, width, height);
+    // Keyed by the calling rung, not by "tight rows". Which rung narrowed is
+    // the question a boot's census leaves open otherwise: the colour LOAD seed
+    // reads RGBA8 by design and a narrowing there is expected, while one on the
+    // sampled rung is a texture the guest is about to read back through a
+    // shader. One shared slug reported both as the same event.
+    crate::runtime::draw::note_sampled_narrowing(site, 0, sample_format, width, height);
     let mut rgba = vec![0u8; rgba_len];
     for y in 0..height as usize {
         let src_off = y.checked_mul(tight as usize).ok_or(R::SizeOverflow)?;

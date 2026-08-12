@@ -1666,6 +1666,7 @@ fn tight_linear_load_uses_one_bulk_read_and_converts_rows() {
         2,
         MTL_FORMAT_BGRA8_UNORM,
         NativeUploads::NONE,
+        "test_tight_load",
         |native| {
             calls += 1;
             assert_eq!(native.len(), 16);
@@ -1695,6 +1696,7 @@ fn tight_linear_native_bgra8_keeps_bytes_and_reports_bgra8() {
         2,
         MTL_FORMAT_BGRA8_UNORM,
         NativeUploads::BGRA8,
+        "test_tight_load",
         |native| {
             calls += 1;
             native.copy_from_slice(&bgra);
@@ -1728,6 +1730,7 @@ fn a_half_float_sampled_texture_keeps_its_bytes_when_the_caller_takes_native_lay
         1,
         pixel_format::MTL_FORMAT_RGBA16_FLOAT,
         NativeUploads::ALL,
+        "test_tight_load",
         |dst| {
             assert_eq!(dst.len(), 16, "eight bytes a texel, not four");
             dst.copy_from_slice(&guest);
@@ -1745,6 +1748,7 @@ fn a_half_float_sampled_texture_keeps_its_bytes_when_the_caller_takes_native_lay
         1,
         pixel_format::MTL_FORMAT_RGBA16_FLOAT,
         NativeUploads::NONE,
+        "test_tight_load",
         |dst| {
             dst.copy_from_slice(&guest);
             true
@@ -1771,6 +1775,7 @@ fn a_two_channel_half_float_sampled_texture_reports_rg16_float() {
         1,
         pixel_format::MTL_FORMAT_RG16_FLOAT,
         NativeUploads::ALL,
+        "test_tight_load",
         |dst| {
             dst.copy_from_slice(&guest);
             true
@@ -1807,7 +1812,7 @@ fn a_padded_half_float_row_copies_straight_through_at_eight_bytes_a_texel() {
 fn tight_rgba_linear_load_preserves_native_bytes() {
     let native = [1, 2, 3, 4, 5, 6, 7, 8];
     let (rgba, fmt) =
-        load_tight_linear_rgba_with(2, 1, pixel_format::MTL_FORMAT_RGBA8_UNORM, NativeUploads::NONE, |dst| {
+        load_tight_linear_rgba_with(2, 1, pixel_format::MTL_FORMAT_RGBA8_UNORM, NativeUploads::NONE, "test_tight_load", |dst| {
             dst.copy_from_slice(&native);
             true
         })
@@ -1858,6 +1863,7 @@ fn the_cpu_upload_rails_count_every_srgb_downgrade() {
         1,
         pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB,
         NativeUploads::NONE,
+        "test_tight_load",
         |dst| {
             dst.copy_from_slice(&native);
             true
@@ -1888,7 +1894,7 @@ fn the_cpu_upload_rails_count_every_srgb_downgrade() {
     // stops distinguishing anything.
     srgb_census::reset_for_tests();
     let _ = linear_native_upload_format(pixel_format::MTL_FORMAT_RGBA8_UNORM, NativeUploads::NONE);
-    let _ = load_tight_linear_rgba_with(2, 1, pixel_format::MTL_FORMAT_BGRA8_UNORM, NativeUploads::BGRA8, |dst| {
+    let _ = load_tight_linear_rgba_with(2, 1, pixel_format::MTL_FORMAT_BGRA8_UNORM, NativeUploads::BGRA8, "test_tight_load", |dst| {
         dst.copy_from_slice(&native);
         true
     });
@@ -2369,7 +2375,7 @@ fn load_composite_premult_restores_seed_under_transparent() {
 fn a8_sample_preserves_alpha_coverage() {
     let native = [0, 17, 255];
     let (rgba, fmt) =
-        load_tight_linear_rgba_with(3, 1, pixel_format::MTL_FORMAT_A8_UNORM, NativeUploads::BGRA8, |dst| {
+        load_tight_linear_rgba_with(3, 1, pixel_format::MTL_FORMAT_A8_UNORM, NativeUploads::BGRA8, "test_tight_load", |dst| {
             dst.copy_from_slice(&native);
             true
         })

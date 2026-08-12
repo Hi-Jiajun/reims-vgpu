@@ -1539,32 +1539,43 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         }
     }
 
-    // Linear / view path returns only RGBA; the geometry comes from the decoded
-    // texture descriptor and from nowhere else. Neither a payload shorter than
-    // the descriptor's own `width * height * 4` nor a descriptor naming no
-    // extent at all is a geometry this call may invent one for: the caller turns
-    // `None` into a typed `DrawPreparationDecline::TextureResolveMissing`, which
-    // names the ref and the stage. `TextureDescriptor::extent` owns the second
-    // check and says what clamping the two fields up would have bound instead.
-    let mut rgba = load_sampled_rgba_static(
+    // The last-resort sampled rung. The geometry comes from the decoded texture
+    // descriptor and from nowhere else. Neither a payload shorter than the
+    // descriptor's own extent nor a descriptor naming no extent at all is a
+    // geometry this call may invent one for: the caller turns `None` into a
+    // typed `DrawPreparationDecline::TextureResolveMissing`, which names the ref
+    // and the stage. `TextureDescriptor::extent` owns the second check and says
+    // what clamping the two fields up would have bound instead.
+    //
+    // The layout is carried rather than assumed. This rung answered
+    // `TexelLayout::Rgba8` unconditionally and sized its own length check at
+    // four bytes a texel, so it was the one place a half-float texture could
+    // still be quantised after every rail above it learned not to — and it is
+    // the rung a `RGBA16Float` display-profile LUT actually lands on, because
+    // the three rungs above are reached only for a resource the draw already
+    // knows is a linear texture.
+    let (mut bytes, layout) = load_sampled_rgba_static(
         state,
         host,
         task_id,
         texture_ref,
+        native_uploads_for_host(),
         crate::runtime::render_writeback::SettleSite::LinearTextureSampled,
     )?;
     let (_entry, desc) = sampled_texture_descriptor(state, host, task_id, texture_ref)?;
     let (w, h) = decode_texture_descriptor(&desc).ok()?.extent()?;
-    let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
-    if rgba.len() < need {
+    let need = (w as usize)
+        .saturating_mul(h as usize)
+        .saturating_mul(layout.bytes_per_texel() as usize);
+    if bytes.len() < need {
         return None;
     }
-    rgba.truncate(need);
+    bytes.truncate(need);
     Some((
         w,
         h,
         0,
-        SampledSourceRequest::Bytes(std::sync::Arc::new(rgba), None, TexelLayout::Rgba8),
+        SampledSourceRequest::Bytes(std::sync::Arc::new(bytes), None, layout),
     ))
 }
 
