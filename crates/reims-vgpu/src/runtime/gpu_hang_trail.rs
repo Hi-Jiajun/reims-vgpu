@@ -156,7 +156,35 @@ static TRAIL: Mutex<Trail> = Mutex::new(Trail {
     notes: [None; CAPACITY],
     next: 0,
     total: 0,
+    seen_pipes: Vec::new(),
+    firsts: [None; FIRST_DRAW_KEPT],
+    firsts_next: 0,
 });
+
+/// Pipeline refs whose *first* draw is remembered.
+///
+/// The ring above holds the last twelve draws, which at twenty thousand draws a
+/// second is the last **half millisecond**. The wedge this exists to name begins
+/// within a few hundred milliseconds of an application's first frame, so twelve
+/// draws lands entirely after it: on the two archived macos-11 boots the device's
+/// last census and its first fence timeout are 5 s apart, and the trail printed
+/// beside that timeout holds ordinary compositing draws while the two pipelines
+/// the guest had just translated are nowhere in it.
+///
+/// A first-draw record answers the question the ring cannot reach without holding
+/// a hundred thousand entries. It is one push per *distinct* pipeline rather than
+/// one per draw, so sixteen of them span the whole of an application launching.
+const FIRST_DRAW_KEPT: usize = 16;
+
+/// Distinct pipeline refs tracked before the first-draw record stops recording.
+///
+/// A bound rather than a growing set, because the ref is a guest value and a
+/// guest that creates pipelines without bound would otherwise grow this without
+/// bound. Past it the set stops admitting *and* the ring stops recording, so a
+/// full set cannot turn every later draw into a "new pipeline" line — the
+/// failure direction that would flood the one log line this exists to produce.
+/// `pipe_firsts_full` says it happened.
+const SEEN_PIPES_MAX: usize = 4096;
 
 struct Trail {
     notes: [Option<DrawNote>; CAPACITY],
@@ -165,6 +193,15 @@ struct Trail {
     /// showing. A trail of twelve out of twelve is the whole boot; twelve out of
     /// four hundred thousand is a tail.
     total: u64,
+    /// Pipeline refs already drawn, sorted. A `Vec` and a `binary_search`
+    /// rather than a set: the population is a real guest's pipeline count, which
+    /// is hundreds, and at that size the compare is a cache line where a tree is
+    /// a pointer chase per level. This is on the per-draw path.
+    seen_pipes: Vec<u32>,
+    /// `(pipeline_ref, the draw ordinal it first drew at)`, oldest first once
+    /// wrapped.
+    firsts: [Option<(u32, u64)>; FIRST_DRAW_KEPT],
+    firsts_next: usize,
 }
 
 /// Record one draw this device is about to hand the engine.
@@ -175,6 +212,39 @@ pub fn note_draw(note: DrawNote) {
     trail.notes[slot] = Some(note);
     trail.next = (slot + 1) % CAPACITY;
     trail.total = trail.total.wrapping_add(1);
+
+    if let Err(at) = trail.seen_pipes.binary_search(&note.pipeline_ref) {
+        if trail.seen_pipes.len() >= SEEN_PIPES_MAX {
+            crate::runtime::drain::note_store_route("pipe_firsts_full");
+        } else {
+            trail.seen_pipes.insert(at, note.pipeline_ref);
+            let total = trail.total;
+            let slot = trail.firsts_next;
+            trail.firsts[slot] = Some((note.pipeline_ref, total));
+            trail.firsts_next = (slot + 1) % FIRST_DRAW_KEPT;
+        }
+    }
+}
+
+/// The pipelines this device has drawn for the first time most recently, oldest
+/// first, each with how many draws ago that was.
+///
+/// The reading this exists for: a wedge that begins in the second an application
+/// opens its first window is a wedge with new pipelines in front of it, and
+/// nothing else in the device says which. `None` before any draw, so a caller
+/// emits no line rather than an empty one.
+pub fn recent_pipeline_firsts() -> Option<String> {
+    let trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
+    if trail.total == 0 {
+        return None;
+    }
+    let total = trail.total;
+    let body = (0..FIRST_DRAW_KEPT)
+        .filter_map(|i| trail.firsts[(trail.firsts_next + i) % FIRST_DRAW_KEPT])
+        .map(|(pipe, at)| format!("pipe={pipe}@-{}", total.saturating_sub(at)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(format!("distinct={} {body}", trail.seen_pipes.len()))
 }
 
 /// Which size band a draw's fragment module falls in, as a route name.
@@ -248,6 +318,54 @@ mod tests {
             note_draw(note(1));
             assert!(trail().is_some(), "a note makes the trail readable");
         }
+    }
+
+    /// A pipeline is recorded on its **first** draw and never again, so the
+    /// record reaches back past what the twelve-entry ring can hold.
+    ///
+    /// That reach is the whole point. Twelve draws is half a millisecond on this
+    /// rail, and the wedge these instruments exist for begins in the few hundred
+    /// milliseconds after an application opens its first window — so the ring
+    /// lands entirely after it while a first-draw record still names the
+    /// pipelines that arrived with the window.
+    #[test]
+    fn a_pipeline_is_recorded_once_and_the_record_outreaches_the_ring() {
+        // The ring is process-wide and shared with the tests around this one, so
+        // everything here is asserted about ids only this test uses.
+        let old = 7_000_001u32;
+        note_draw(note(old));
+        // Far more draws than the ring holds, all of one already-seen pipeline:
+        // the ring has forgotten `old` entirely and the first-draw record has
+        // not, and no repeat has pushed a second entry for it.
+        for _ in 0..(CAPACITY * 4) {
+            note_draw(note(old));
+        }
+        let line = recent_pipeline_firsts().expect("draws were recorded");
+        assert_eq!(
+            line.matches(&format!("pipe={old}@")).count(),
+            1,
+            "a repeat must not re-record: {line}"
+        );
+        assert!(
+            !trail().expect("draws were recorded").contains("pipe=8_"),
+            "sanity: the ring holds only this test's repeats"
+        );
+
+        // A genuinely new pipeline lands at the newest end, and the ring keeps
+        // the newest `FIRST_DRAW_KEPT` of them.
+        for i in 0..(FIRST_DRAW_KEPT as u32) {
+            note_draw(note(7_100_000 + i));
+        }
+        let line = recent_pipeline_firsts().expect("draws were recorded");
+        assert!(
+            !line.contains(&format!("pipe={old}@")),
+            "the oldest first-draw ages out once {FIRST_DRAW_KEPT} newer ones arrive: {line}"
+        );
+        assert!(
+            line.contains(&format!("pipe={}@", 7_100_000 + FIRST_DRAW_KEPT as u32 - 1)),
+            "the newest first-draw is always present: {line}"
+        );
+        assert!(line.starts_with("distinct="), "{line}");
     }
 
     /// The ring keeps the *newest* entries and reports them oldest first, which
