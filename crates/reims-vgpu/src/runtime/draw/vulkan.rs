@@ -2188,6 +2188,13 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     // native rail for the same reason and one more: `texel_to_rgba8` has no arm
     // for them, because an arm would have to narrow ten bits of graded luma to
     // eight. `TexelLayout::has_cpu_loader_arm` is where that is stated.
+    //
+    // The half-float colour pair is deliberately **not** here yet. It belongs
+    // by the same argument the linear rails took — `texel_to_rgba8`'s arm for
+    // it clamps to `[0, 1]` and quantizes to 256 levels — but nothing has ever
+    // measured a type-5 view arriving in one, and this rail is the video-plane
+    // rail. `type5_view_narrowed` below is the measurement; add the arm when it
+    // fires, not before.
     let byte_format = match view.pixel_format {
         pixel_format::MTL_FORMAT_R8_UNORM => TexelLayout::R8,
         pixel_format::MTL_FORMAT_RG8_UNORM => TexelLayout::Rg8,
@@ -2247,6 +2254,17 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
             });
         };
         let mut rgba = vec![0u8; rgba_len];
+        // The third CPU convert in this crate, and the third that said nothing
+        // when it lost precision. `byte_format`'s table above names the video
+        // plane formats natively and folds everything else here, so a half-float
+        // type-5 view is quantized on the same terms the linear rails were.
+        crate::runtime::draw::note_sampled_narrowing(
+            "type5_view_narrowed",
+            texture_ref,
+            view.pixel_format,
+            view.width,
+            view.height,
+        );
         for y in 0..view.height as usize {
             let src_off = y.saturating_mul(tight as usize);
             let dst_off = y.saturating_mul(rgba_stride as usize);
@@ -5917,6 +5935,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let mut images: Vec<crate::backend::vulkan::engine::SampledImageResource> = Vec::new();
         let mut samplers: Vec<crate::backend::vulkan::engine::SamplerResource> = Vec::new();
         let mut sampler_binds: std::collections::BTreeSet<u32> = Default::default();
+        // Where each provisioned sampler's state came from, keyed by binding, for
+        // the hang trail. A `SamplerResource` cannot be asked this after the
+        // fact: a translated guest sampler that happens to be `Linear`/`Linear`
+        // and one this device invented are the same value, and only one of them
+        // is something the guest asked for. See
+        // [`crate::runtime::gpu_hang_trail::SamplerNote`].
+        let mut sampler_origin: std::collections::BTreeMap<u32, u8> = Default::default();
         {
             let mut push_tex = |index: u32,
                                 texture_ref: u32,
@@ -6287,9 +6312,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 let smp_bind = SAMPLER_BINDING_BASE + index + base_off;
                 if sampler_binds.insert(smp_bind) {
                     let mut sampler = if sampler_ref != 0 {
+                        sampler_origin.insert(smp_bind, b'g');
                         load_vulkan_sampler(state, host, req.task_id, sampler_ref, smp_bind)
                             .map_err(DrawError::DrawPreparation)?
                     } else {
+                        sampler_origin.insert(smp_bind, b'd');
                         crate::backend::vulkan::engine::SamplerResource::normalized_default(
                             smp_bind,
                         )
@@ -6391,6 +6418,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             0
                         };
                     if sampler_binds.insert(binding) {
+                        sampler_origin.insert(binding, b'c');
                         let sampler = reflected_static_sampler_resource(
                             if frag_stage { "fragment" } else { "vertex" },
                             binding,
@@ -6409,6 +6437,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 .chain(f_variant.sampler_bindings.iter())
             {
                 if sampler_binds.insert(binding) {
+                    sampler_origin.insert(binding, b'd');
                     samplers.push(
                         crate::backend::vulkan::engine::SamplerResource::normalized_default(
                             binding,
@@ -7305,11 +7334,69 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 format: image.format.as_raw() as u32,
                 width: image.width,
                 height: image.height,
+                // Only the CPU-bytes rail has bytes here to read. The gather
+                // rail's texels are in guest RAM and the target rail's are on
+                // the GPU; reading either one would be a device-memory access
+                // taken to write a log line, which is not a trade this makes.
+                texel0: match &image.source {
+                    crate::backend::vulkan::engine::SampledSource::Bytes(b) => b
+                        .get(..4)
+                        .map(|t| u32::from_le_bytes([t[0], t[1], t[2], t[3]]))
+                        .unwrap_or(0),
+                    _ => 0,
+                },
+            };
+        }
+        // And what it will sample them *through*. All four of the uber shader's
+        // unbounded loops share one sampler, and a `LINEAR` filter on a texture
+        // whose texels are the next UV walks a blend of two cells rather than
+        // either — so the third of the wedge's three hypotheses is a property of
+        // this list and of nothing the trail recorded before.
+        let mut sampler_notes = [crate::runtime::gpu_hang_trail::SamplerNote::default();
+            crate::runtime::gpu_hang_trail::SAMPLER_KEPT];
+        let mut smp_by_binding: Vec<&crate::backend::vulkan::engine::SamplerResource> =
+            resources.samplers.iter().collect();
+        smp_by_binding.sort_unstable_by_key(|s| s.binding);
+        for (slot, smp) in sampler_notes.iter_mut().zip(smp_by_binding.iter()) {
+            use crate::backend::vulkan::engine::{
+                SamplerAddressMode as A, SamplerFilter as F, SamplerMipFilter as M,
+            };
+            let filter = |f: F| match f {
+                F::Nearest => b'N',
+                F::Linear => b'L',
+            };
+            let address = |a: A| match a {
+                A::ClampToEdge => b'e',
+                A::MirrorClampToEdge => b'E',
+                A::Repeat => b'r',
+                A::MirrorRepeat => b'R',
+                A::ClampToZero => b'z',
+                A::ClampToBorderColor => b'b',
+            };
+            *slot = crate::runtime::gpu_hang_trail::SamplerNote {
+                binding: smp.binding,
+                min_filter: filter(smp.min_filter),
+                mag_filter: filter(smp.mag_filter),
+                mip_filter: match smp.mip_filter {
+                    M::NotMipmapped => b'n',
+                    M::Nearest => b'N',
+                    M::Linear => b'L',
+                },
+                address_u: address(smp.address_mode_u),
+                address_v: address(smp.address_mode_v),
+                // `?` is a sampler that reached the list by a route that did not
+                // record where its state came from, which is the reading that
+                // would send the next session looking for a fourth path rather
+                // than concluding anything about the three.
+                provenance: sampler_origin.get(&smp.binding).copied().unwrap_or(b'?'),
+                unnormalized: smp.unnormalized_coordinates,
             };
         }
         crate::runtime::gpu_hang_trail::note_draw(crate::runtime::gpu_hang_trail::DrawNote {
             sampled: sampled_notes,
             sampled_count: resources.sampled_images.len() as u32,
+            samplers: sampler_notes,
+            sampler_count: resources.samplers.len() as u32,
             pipeline_ref: req.pipeline_ref,
             vert_words: v_words.len() as u32,
             frag_words: f_words.len() as u32,

@@ -84,6 +84,12 @@ pub struct DrawNote {
     /// How many the draw provided, so the array reads as a truncation rather
     /// than as the whole list.
     pub sampled_count: u32,
+    /// Samplers this draw provided, lowest [`SAMPLER_KEPT`] first. See
+    /// [`SamplerNote`] for the hypothesis a trail of textures alone cannot
+    /// separate.
+    pub samplers: [SamplerNote; SAMPLER_KEPT],
+    /// How many the draw provided, for [`Self::sampled_count`]'s reason.
+    pub sampler_count: u32,
 }
 
 /// One fragment sampled binding, as the draw handed it to the engine.
@@ -116,6 +122,21 @@ pub struct SampledNote {
     pub format: u32,
     pub width: u32,
     pub height: u32,
+    /// The first four bytes of a CPU-bytes source, or `0` for a rail that put
+    /// no bytes on the CPU (`t`, `g`) and for an empty payload.
+    ///
+    /// For a **1x1** image this is the entire content, and that is what it is
+    /// here for. The uber shader's walk continues while `sample(uv).x > 0`, and
+    /// a 1x1 texture returns the same texel at every coordinate — so its red
+    /// channel decides, on its own and with no undefined memory anywhere in the
+    /// story, whether the loop exits immediately or never. The wedging draw
+    /// binds one at fragment index 7, which is one of the two the loops walk,
+    /// and nothing had ever read it.
+    ///
+    /// Four bytes and not a hash: the question is a *value*, not whether two
+    /// binds match. Larger images get their first texel too, which is worth
+    /// little on its own and costs nothing beside it.
+    pub texel0: u32,
 }
 
 /// Sampled bindings kept per note, lowest binding number first.
@@ -158,9 +179,90 @@ impl std::fmt::Display for SampledNote {
             self.format,
             self.width,
             self.height
+        )?;
+        if self.texel0 != 0 {
+            write!(f, ":t{:08x}", self.texel0)?;
+        }
+        Ok(())
+    }
+}
+
+/// One sampler this draw provided, as the draw handed it to the engine.
+///
+/// # Why the trail needed this too
+///
+/// [`SampledNote`] answered two of the three hypotheses the wedge left open —
+/// which rail supplied the texels, and what format the shader reads them as —
+/// and could not touch the third. The uber shader's four unbounded loops all
+/// sample through **one** sampler (set 0, binding 67 in m2v numbering, the
+/// guest's fragment sampler index 3), and what that sampler *is* decides
+/// whether `uv <- sample(uv).xy` walks the cells the guest wrote or a blend of
+/// their neighbours.
+///
+/// A pointer chain stored in a texture is the one content class for which
+/// `LINEAR` is not a quality choice: every sample between two cells returns a
+/// value that is in neither, so the walk leaves the graph the guest built and
+/// the terminating zero cell is never reached. `NEAREST` reads the stored
+/// value. This device has two ways to bind `LINEAR` where the guest did not ask
+/// for it — a bind whose `sampler_ref` is `0`, and a binding the residual
+/// SPIR-V scan provisions a default for — and both produce
+/// [`SamplerResource::normalized_default`], which is `Linear`/`Linear`. Nothing
+/// distinguished those from a translated guest sampler after the fact.
+///
+/// [`Self::provenance`] is therefore the field this exists for. The filters and
+/// address modes say what was bound; the provenance says whether the guest
+/// asked for it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SamplerNote {
+    /// Device-numbering set-0 binding. `0` means the slot is unused — no
+    /// sampler is ever bound below `SAMPLER_BINDING_BASE`.
+    pub binding: u32,
+    /// `N` nearest, `L` linear. ASCII rather than the backend's enum because
+    /// this type compiles on the Metal-direct arm, where
+    /// `backend::vulkan::engine` does not exist — the same constraint that
+    /// keeps [`SampledNote::format`] a raw number.
+    pub min_filter: u8,
+    pub mag_filter: u8,
+    /// `n` not mipmapped, `N` nearest, `L` linear.
+    pub mip_filter: u8,
+    /// Address mode on U and V: `e` clamp-to-edge, `E` mirror-clamp-to-edge,
+    /// `r` repeat, `R` mirror-repeat, `z` clamp-to-zero, `b` clamp-to-border.
+    pub address_u: u8,
+    pub address_v: u8,
+    /// Where the state came from: `g` a translated guest sampler object, `c` an
+    /// AIR constexpr sampler carried in reflection, `d` this device's own
+    /// [`SamplerResource::normalized_default`] — which is `LINEAR` and which no
+    /// guest asked for.
+    pub provenance: u8,
+    /// Unnormalized texel coordinates, which changes what a UV in `[0, 1]`
+    /// addresses and would move a chain walk off its cells on its own.
+    pub unnormalized: bool,
+}
+
+impl std::fmt::Display for SamplerNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "s{}:{}{}{}{}{}{}{}",
+            self.binding,
+            self.provenance as char,
+            self.min_filter as char,
+            self.mag_filter as char,
+            self.mip_filter as char,
+            self.address_u as char,
+            self.address_v as char,
+            if self.unnormalized { "!" } else { "" }
         )
     }
 }
+
+/// Samplers kept per entry.
+///
+/// Eight rather than [`SAMPLED_KEPT`]'s sixteen: a draw binds far fewer sampler
+/// states than textures — Metal's own limit is 16 and the compositing modules on
+/// record use a handful — and [`DrawNote::sampler_count`] says when even this
+/// truncated.
+pub const SAMPLER_KEPT: usize = 8;
 
 /// Gap binding numbers carried per entry.
 ///
@@ -209,6 +311,15 @@ impl std::fmt::Display for DrawNote {
                 .collect::<Vec<_>>()
                 .join(",");
             write!(f, " smp={}[{}]", self.sampled_count, body)?;
+        }
+        if self.sampler_count > 0 {
+            let shown = (self.sampler_count as usize).min(SAMPLER_KEPT);
+            let body = self.samplers[..shown]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            write!(f, " smpl={}[{}]", self.sampler_count, body)?;
         }
         Ok(())
     }

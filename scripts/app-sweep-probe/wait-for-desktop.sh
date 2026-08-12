@@ -30,10 +30,17 @@
 #
 # So the login window is now a collection point. Every time one is seen this
 # pulls `/Library/Logs/DiagnosticReports/*.ips` and the user's own copy to
-# `--reports DIR` first, and **refuses to log in** when any of them names a
-# crash. `--login-after-crash` is the override for a session that wants the
-# desktop anyway, and it is off by default: an unattended sweep must not trade a
-# crash report for a screenshot.
+# `--reports DIR` first, and **refuses to log in** when any of them was written
+# by *this boot*. `--login-after-crash` is the override for a session that wants
+# the desktop anyway, and it is off by default: an unattended sweep must not
+# trade a crash report for a screenshot.
+#
+# "This boot" is the whole qualifier and it was missing. These rails boot from
+# snapshots, so a report captured into the image is in every boot of it forever,
+# and macos-12's carries fourteen four-day-old `bluetoothd` ones. The gate fired
+# on them and skipped the entire rail — one of the two that carry the standing
+# GPU hang — with `WINDOWSERVER-CRASH` in the verdict table and no WindowServer
+# report anywhere in the directory it named. See `crashes_since_boot`.
 #
 # Usage:
 #   scripts/app-sweep-probe/wait-for-desktop.sh [--timeout N] [--password P]
@@ -85,7 +92,44 @@ collect_reports() {
     'tar -cf - -C / Library/Logs/DiagnosticReports 2>/dev/null; \
      tar -cf - -C "$HOME" Library/Logs/DiagnosticReports 2>/dev/null' \
     2>/dev/null | tar -xf - -C "$REPORTS" 2>/dev/null
-  find "$REPORTS" -name '*.ips' -o -name '*.crash' -o -name '*.panic' 2>/dev/null
+  find "$REPORTS" \( -name '*.ips' -o -name '*.crash' -o -name '*.panic' \) \
+    ! -name '._*' 2>/dev/null
+}
+
+# Of the collected reports, the ones this boot produced.
+#
+# **A report older than the guest's boot came with the snapshot.** Every rail
+# here boots from a snapshot and reverts on exit, so whatever crash reports were
+# in the image when it was captured are in every boot of it, forever. macos-12's
+# snapshot carries fourteen `bluetoothd` reports from 2026-08-08 — nothing to do
+# with graphics, four days older than any boot that finds them — and the first
+# version of this gate treated the whole directory as evidence. The result was
+# the worst possible one: **the rail was skipped as WINDOWSERVER-CRASH on every
+# boot**, and it is one of the two rails that carry the standing GPU hang. A gate
+# that cannot fire is better than one that always does, because an always-firing
+# one reads as a finding.
+#
+# The cutoff is the guest's own `kern.boottime`, taken over the same ssh rather
+# than from this host's clock — the two do not agree and it is the guest that
+# timestamps the reports. A reference file with that mtime is portable where
+# `find -newermt` is not.
+#
+# The AppleDouble `._` sidecars are excluded above for a smaller version of the
+# same mistake: they match `*.ips`, they are resource forks and not reports, and
+# counting them doubled every tally this script has ever printed.
+crashes_since_boot() {
+  local boot ref
+  boot=$(gssh 'sysctl -n kern.boottime' | sed -n 's/.*sec *= *\([0-9][0-9]*\).*/\1/p')
+  [ -z "$boot" ] && { printf '%s\n' "$@"; return; }
+  ref=$(mktemp) || { printf '%s\n' "$@"; return; }
+  # `date -d @epoch` on this Linux host; the epoch itself came from the guest, so
+  # no clock comparison crosses the boundary.
+  touch -d "@$boot" "$ref" 2>/dev/null || { rm -f "$ref"; printf '%s\n' "$@"; return; }
+  local f
+  for f in "$@"; do
+    [ -n "$f" ] && [ "$f" -nt "$ref" ] && printf '%s\n' "$f"
+  done
+  rm -f "$ref"
 }
 qmp() {
   QMP_SOCK="${QMP_SOCK:-$REPO/vm/disks/run/qmp.sock}" \
@@ -108,10 +152,14 @@ while [ "$SECONDS" -lt "$deadline" ]; do
     # check cannot see that class — the report is the only thing that can, and it
     # is sitting on the guest either way.
     crashes=$(collect_reports)
-    [ -n "$crashes" ] && {
-      say "crash reports present on a guest that reached the desktop — $REPORTS:"
-      printf '  %s\n' $crashes
-    }
+    fresh=$(crashes_since_boot $crashes)
+    if [ -n "$fresh" ]; then
+      say "crash reports from THIS boot on a guest that reached the desktop — $REPORTS:"
+      printf '  %s\n' $fresh
+    elif [ -n "$crashes" ]; then
+      say "$(printf '%s\n' $crashes | grep -c .) crash reports collected, all older \
+than this boot (they came with the snapshot) — $REPORTS"
+    fi
     exit 0
   fi
 
@@ -128,15 +176,23 @@ while [ "$SECONDS" -lt "$deadline" ]; do
       if [ "$collected" = no ]; then
         collected=yes
         crashes=$(collect_reports)
-        if [ -n "$crashes" ]; then
-          say "CRASH REPORTS collected into $REPORTS:"
-          printf '  %s\n' $crashes
+        fresh=$(crashes_since_boot $crashes)
+        if [ -n "$fresh" ]; then
+          say "CRASH REPORTS from this boot collected into $REPORTS:"
+          printf '  %s\n' $fresh
           if [ "$LOGIN_AFTER_CRASH" != yes ]; then
             say "refusing to log in — a login restarts the session over the evidence."
             say "pass --login-after-crash if the desktop is wanted anyway."
             exit 3
           fi
           say "--login-after-crash given; logging in over the crash anyway"
+        elif [ -n "$crashes" ]; then
+          # Collected and kept — they cost nothing and a later session may want
+          # them — but they are the snapshot's, not this boot's, so they do not
+          # decide anything. Said out loud because a silent "no crash" beside a
+          # populated reports directory reads like a bug in the collector.
+          say "$(printf '%s\n' $crashes | grep -c .) crash reports on the guest, \
+all predating this boot — snapshot baggage, not evidence; logging in"
         else
           say "no crash reports on the guest; this is a guest that never logged in"
         fi
