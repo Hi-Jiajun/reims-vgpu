@@ -129,6 +129,32 @@ pub struct DeviceFeatures {
     /// it has a packed 24/8 depth format will name one.
     pub d24_unorm_s8_attachment: bool,
     pub shader_int16: bool,
+    /// `VkPhysicalDeviceFeatures::shaderInt64` — whether a SPIR-V module may
+    /// declare the `Int64` capability.
+    ///
+    /// Not authored here: the modules this backend creates are translated from
+    /// the guest's AIR, and they declare `Int64` whenever the guest's shader
+    /// used a 64-bit integer — which CoreAnimation's parameter blocks do. A
+    /// module declaring a capability whose feature is not enabled is undefined
+    /// behaviour, not a decode error, and it is the shape that survives on one
+    /// driver and breaks on another: this was live on every boot, unnoticed,
+    /// until a validation run named it.
+    pub shader_int64: bool,
+    /// `VkPhysicalDeviceFeatures::fragmentStoresAndAtomics` — whether a
+    /// fragment shader's storage buffers and images may be written.
+    ///
+    /// Without it, every such variable in a fragment stage must carry the
+    /// `NonWritable` decoration, and a translated module carries whatever the
+    /// guest's own shader implied. This backend does not rewrite decorations,
+    /// so the only correct move is to ask for the feature where the host has
+    /// it. Same provenance as [`Self::shader_int64`] — a validation run named
+    /// it, and it had been undefined behaviour on every boot before that.
+    pub fragment_stores_and_atomics: bool,
+    /// `VkPhysicalDeviceFeatures::vertexPipelineStoresAndAtomics` — the same
+    /// rule as [`Self::fragment_stores_and_atomics`] for the vertex,
+    /// tessellation and geometry stages. Asked for separately because a device
+    /// may have one and not the other.
+    pub vertex_pipeline_stores_and_atomics: bool,
     pub storage_image_extended_formats: bool,
     pub storage_image_write_without_format: bool,
     /// `shaderStorageImageReadWithoutFormat`. The read half of the pair above:
@@ -275,11 +301,23 @@ impl DeviceFeatures {
     /// `occlusion_query_precise` likewise: `engine::exec` records
     /// `vkCmdBeginQuery` with `PRECISE` for a counting draw, and passing that
     /// bit is invalid without the feature enabled.
+    ///
+    /// `shader_int64`, `fragment_stores_and_atomics` and
+    /// `vertex_pipeline_stores_and_atomics` are bound in a way the rule above
+    /// does not read at a call site: they are properties of the **translated
+    /// SPIR-V**, not of anything this crate spells. The backend binds them
+    /// because it hands `vkCreateShaderModule` a module the guest's own shader
+    /// decided the shape of, so "what the backend binds" is whatever the guest
+    /// compiled — and asking for less than that is undefined behaviour rather
+    /// than a narrower device.
     pub fn enabled_features(&self) -> vk::PhysicalDeviceFeatures {
         vk::PhysicalDeviceFeatures::default()
             .robust_buffer_access(self.robust_buffer_access)
             .sampler_anisotropy(self.sampler_anisotropy)
             .shader_int16(self.shader_int16)
+            .shader_int64(self.shader_int64)
+            .fragment_stores_and_atomics(self.fragment_stores_and_atomics)
+            .vertex_pipeline_stores_and_atomics(self.vertex_pipeline_stores_and_atomics)
             .shader_storage_image_extended_formats(self.storage_image_extended_formats)
             .shader_storage_image_write_without_format(self.storage_image_write_without_format)
             .shader_storage_image_read_without_format(self.storage_image_read_without_format)
@@ -296,29 +334,41 @@ impl DeviceFeatures {
     /// rung; on [`MirrorClampToEdge::KhrExtension`] the extension string carries
     /// it instead, and on [`MirrorClampToEdge::Unsupported`] nothing is
     /// requested and the sampler path declines.
+    ///
+    /// # Why `storage8`, `float16` and `int8` are set *here* and not in their
+    /// own structs
+    ///
+    /// `VkPhysicalDevice8BitStorageFeatures` and
+    /// `VkPhysicalDeviceShaderFloat16Int8Features` were promoted into this
+    /// struct at Vulkan 1.2, and the spec forbids chaining a promoted struct
+    /// alongside the one that absorbed it
+    /// (`VUID-VkDeviceCreateInfo-pNext-02830`) — precisely so that one cannot
+    /// say `VK_TRUE` while the other says `VK_FALSE` for the same feature. This
+    /// device used to chain all three, with the promoted spellings left
+    /// `VK_FALSE` in this struct, so which value took effect was the driver's
+    /// choice of traversal. Every implementation observed took the union, so
+    /// nothing was lost in practice; it was still a contradiction the spec does
+    /// not define an answer for, and 1.2 is this backend's baseline, so the
+    /// promoted spelling is the only one needed.
+    ///
+    /// `storage16` is **not** here: 16-bit storage was promoted into
+    /// `VkPhysicalDeviceVulkan11Features`, which this chain does not carry, so
+    /// `VkPhysicalDevice16BitStorageFeatures` conflicts with nothing and stays
+    /// its own struct.
     pub fn enabled_vulkan12(&self) -> vk::PhysicalDeviceVulkan12Features<'static> {
         vk::PhysicalDeviceVulkan12Features::default()
             .shader_output_viewport_index(self.shader_output_viewport_index)
             .timeline_semaphore(self.timeline_semaphore)
             .sampler_mirror_clamp_to_edge(self.mirror_clamp_to_edge == MirrorClampToEdge::Core12)
+            .storage_buffer8_bit_access(self.storage8)
+            .shader_float16(self.float16)
+            .shader_int8(self.int8)
     }
 
     /// 16-bit storage-buffer access, for shaders that pack half-precision data.
     pub fn enabled_16bit_storage(&self) -> vk::PhysicalDevice16BitStorageFeatures<'static> {
         vk::PhysicalDevice16BitStorageFeatures::default()
             .storage_buffer16_bit_access(self.storage16)
-    }
-
-    /// 8-bit storage-buffer access.
-    pub fn enabled_8bit_storage(&self) -> vk::PhysicalDevice8BitStorageFeatures<'static> {
-        vk::PhysicalDevice8BitStorageFeatures::default().storage_buffer8_bit_access(self.storage8)
-    }
-
-    /// `shaderFloat16` / `shaderInt8`, which AIR uses for half and char types.
-    pub fn enabled_float16_int8(&self) -> vk::PhysicalDeviceShaderFloat16Int8Features<'static> {
-        vk::PhysicalDeviceShaderFloat16Int8Features::default()
-            .shader_float16(self.float16)
-            .shader_int8(self.int8)
     }
 
     /// One line naming every feature and limit this backend resolved against the
@@ -349,6 +399,9 @@ impl DeviceFeatures {
             max_sample_count,
             d24_unorm_s8_attachment,
             shader_int16,
+            shader_int64,
+            fragment_stores_and_atomics,
+            vertex_pipeline_stores_and_atomics,
             storage_image_extended_formats,
             storage_image_write_without_format,
             storage_image_read_without_format,
@@ -390,7 +443,9 @@ impl DeviceFeatures {
              max_compute_workgroup_size={max_compute_workgroup_size:?} \
              max_compute_shared_memory_bytes={max_compute_shared_memory_bytes} \
              max_sample_count={max_sample_count} d24_unorm_s8_attachment={d24_unorm_s8_attachment} \
-             shader_int16={shader_int16} \
+             shader_int16={shader_int16} shader_int64={shader_int64} \
+             fragment_stores_and_atomics={fragment_stores_and_atomics} \
+             vertex_pipeline_stores_and_atomics={vertex_pipeline_stores_and_atomics} \
              storage_image_extended_formats={storage_image_extended_formats} \
              storage_image_write_without_format={storage_image_write_without_format} \
              storage_image_read_without_format={storage_image_read_without_format} \
@@ -544,6 +599,10 @@ pub unsafe fn query(
         max_sample_count,
         d24_unorm_s8_attachment,
         shader_int16: supported.shader_int16 == vk::TRUE,
+        shader_int64: supported.shader_int64 == vk::TRUE,
+        fragment_stores_and_atomics: supported.fragment_stores_and_atomics == vk::TRUE,
+        vertex_pipeline_stores_and_atomics: supported.vertex_pipeline_stores_and_atomics
+            == vk::TRUE,
         storage_image_extended_formats: supported.shader_storage_image_extended_formats == vk::TRUE,
         storage_image_write_without_format: supported.shader_storage_image_write_without_format
             == vk::TRUE,
@@ -580,6 +639,9 @@ mod tests {
             max_sample_count: 8,
             d24_unorm_s8_attachment: true,
             shader_int16: true,
+            shader_int64: true,
+            fragment_stores_and_atomics: true,
+            vertex_pipeline_stores_and_atomics: true,
             storage_image_extended_formats: true,
             storage_image_write_without_format: true,
             storage_image_read_without_format: true,
@@ -871,5 +933,82 @@ mod tests {
             allowed, 1,
             "the feature gates the limit; a generous limit does not license a second slot"
         );
+    }
+
+    /// The three shader-shape features a **translated** module can demand, all
+    /// of which this device bound for its whole life without asking for them.
+    ///
+    /// Every other feature in this module is one the backend spells at a call
+    /// site, so the rule "enable only what the backend binds" can be checked by
+    /// finding that site. These three have no such site: they are properties of
+    /// SPIR-V that `metal2vulkan` produced from the guest's own AIR, and the
+    /// only place they appear is inside a `pCode` blob. That is why they were
+    /// missed, and why the check here is against the enable list rather than
+    /// against a caller.
+    ///
+    /// What named them was a driven macos-11 boot under the Khronos validation
+    /// layer: `VUID-VkShaderModuleCreateInfo-pCode-08740` for a module
+    /// declaring `Int64` with `shaderInt64` disabled, and
+    /// `VUID-RuntimeSpirv-NonWritable-06340` / `-06341` for storage buffers in
+    /// fragment and vertex stages that carried no `NonWritable` decoration
+    /// while the matching feature was off. All three are undefined behaviour
+    /// rather than a decode error, which is the class that runs for months on
+    /// one driver and resets the GPU on another.
+    #[test]
+    fn the_features_a_translated_module_can_demand_are_requested() {
+        let enabled = all_supported().enabled_features();
+        assert_eq!(
+            enabled.shader_int64,
+            vk::TRUE,
+            "a translated module declaring Int64 needs the feature enabled"
+        );
+        assert_eq!(
+            enabled.fragment_stores_and_atomics,
+            vk::TRUE,
+            "a fragment stage's storage buffer that is not NonWritable needs it"
+        );
+        assert_eq!(
+            enabled.vertex_pipeline_stores_and_atomics,
+            vk::TRUE,
+            "the vertex stage's half of the same rule"
+        );
+        // And a host that declines them is never asked, or `vkCreateDevice`
+        // fails for every guest instead of the pipelines that need them.
+        let none = DeviceFeatures::default().enabled_features();
+        assert_eq!(none.shader_int64, vk::FALSE);
+        assert_eq!(none.fragment_stores_and_atomics, vk::FALSE);
+        assert_eq!(none.vertex_pipeline_stores_and_atomics, vk::FALSE);
+    }
+
+    /// `VUID-VkDeviceCreateInfo-pNext-02830`: a promoted feature struct may not
+    /// be chained beside the `VkPhysicalDeviceVulkan12Features` that absorbed
+    /// it, so the promoted spelling has to carry the value.
+    ///
+    /// This device used to chain `VkPhysicalDevice8BitStorageFeatures` and
+    /// `VkPhysicalDeviceShaderFloat16Int8Features` next to a
+    /// `VkPhysicalDeviceVulkan12Features` whose matching fields were left
+    /// `VK_FALSE` — two structs disagreeing about one feature, which is exactly
+    /// what the VU exists to forbid. Asserting the 1.2 struct carries them is
+    /// what stops the separate structs coming back: there is nothing left for
+    /// them to say.
+    ///
+    /// 16-bit storage is deliberately absent. It was promoted into
+    /// `VkPhysicalDeviceVulkan11Features`, which this chain does not carry, so
+    /// its own struct conflicts with nothing.
+    #[test]
+    fn the_features_promoted_into_vulkan12_are_set_on_the_vulkan12_struct() {
+        let v12 = all_supported().enabled_vulkan12();
+        assert_eq!(v12.storage_buffer8_bit_access, vk::TRUE);
+        assert_eq!(v12.shader_float16, vk::TRUE);
+        assert_eq!(v12.shader_int8, vk::TRUE);
+        // A host that declines one must leave it clear on this struct too,
+        // because this struct is now the only place it is said.
+        let without = DeviceFeatures {
+            float16: false,
+            ..all_supported()
+        }
+        .enabled_vulkan12();
+        assert_eq!(without.shader_float16, vk::FALSE);
+        assert_eq!(without.shader_int8, vk::TRUE);
     }
 }
