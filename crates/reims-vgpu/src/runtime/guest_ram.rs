@@ -169,6 +169,11 @@ pub enum GuestRamError {
     /// than restrictive, and refused so the copying rails run instead of a rail
     /// whose every import is over budget.
     ImportBudgetEmpty,
+    /// A backend published a span ceiling smaller than its own import
+    /// granularity: no chunk of a RAMBlock could be both inside the ceiling and
+    /// a whole number of granules, so the rail has no legal import size at all.
+    /// Broken rather than restrictive, and refused so the copying rails run.
+    ImportSpanMaxBelowGranularity { span_max: u64, align: u64 },
     /// A zero-length slice. Nothing binds a zero-length range, and admitting one
     /// would make `offset == len` a legal reference to the byte past the end.
     SliceEmpty,
@@ -204,6 +209,7 @@ impl Decline for GuestRamError {
             Self::AlignmentNotPowerOfTwo { .. } => "guest_ram_alignment_not_power_of_two",
             Self::AlignmentUnsatisfiable { .. } => "guest_ram_alignment_unsatisfiable",
             Self::ImportBudgetEmpty => "guest_ram_import_budget_empty",
+            Self::ImportSpanMaxBelowGranularity { .. } => "guest_ram_import_span_max_below_granularity",
             Self::SliceEmpty => "guest_ram_slice_empty",
             Self::SliceOverflow { .. } => "guest_ram_slice_overflow",
             Self::SliceEndPastImport { .. } => "guest_ram_slice_end_past_import",
@@ -226,6 +232,10 @@ impl Decline for GuestRamError {
             Self::AlignmentUnsatisfiable { align, len } => {
                 vec![("align", align.to_string()), ("len", len.to_string())]
             }
+            Self::ImportSpanMaxBelowGranularity { span_max, align } => vec![
+                ("span_max", span_max.to_string()),
+                ("align", align.to_string()),
+            ],
             Self::SliceOverflow { offset, len } => {
                 vec![("offset", offset.to_string()), ("len", len.to_string())]
             }
@@ -584,6 +594,10 @@ static GRANULARITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// [`latch_import_limits`] for why the two are one call.
 static IMPORT_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The largest single import the active backend will ask a driver for, or 0
+/// before any backend has published. Published and withdrawn with the two above.
+static IMPORT_SPAN_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Publish the import limits a freshly created device resolved to: the
 /// granularity every import must meet, and the largest single import the device
 /// could hold.
@@ -603,7 +617,7 @@ static IMPORT_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// those masks name arbitrary bytes rather than refusing. A zero `budget` is
 /// refused with it: a device that can import guest RAM and holds nothing is not
 /// a device this rail can run on, and the honest answer is the copying rails.
-pub fn latch_import_limits(align: u64, budget: u64) {
+pub fn latch_import_limits(align: u64, budget: u64, span_max: u64) {
     if align == 0 || !align.is_power_of_two() {
         Emit::decline(EVENT, &GuestRamError::AlignmentNotPowerOfTwo { align }).fail();
         forget_import_limits();
@@ -614,14 +628,44 @@ pub fn latch_import_limits(align: u64, budget: u64) {
         forget_import_limits();
         return;
     }
+    // A span ceiling below the granularity cannot produce a single importable
+    // chunk, so it is the same refusal as an unusable alignment wearing a
+    // different number. Refused rather than clamped: clamping would import at a
+    // size the device's own limits said no to.
+    if span_max < align {
+        Emit::decline(
+            EVENT,
+            &GuestRamError::ImportSpanMaxBelowGranularity { span_max, align },
+        )
+        .fail();
+        forget_import_limits();
+        return;
+    }
     GRANULARITY.store(align, std::sync::atomic::Ordering::Relaxed);
     IMPORT_BUDGET.store(budget, std::sync::atomic::Ordering::Relaxed);
+    IMPORT_SPAN_MAX.store(span_max, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Withdraw the published limits: no device can import guest RAM.
 pub fn forget_import_limits() {
     GRANULARITY.store(0, std::sync::atomic::Ordering::Relaxed);
     IMPORT_BUDGET.store(0, std::sync::atomic::Ordering::Relaxed);
+    IMPORT_SPAN_MAX.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The largest single import the active backend will ask a driver for, or `None`
+/// before any backend has published.
+///
+/// Distinct from [`import_budget`], which bounds the *sum* of every live import
+/// against the roomiest heap. This bounds one `vkAllocateMemory`, and a RAMBlock
+/// longer than it is imported in several — see
+/// [`crate::backend::vulkan::caps::host_pointer::IMPORT_SPAN_CEILING`] for the
+/// driver defect that makes a single large import unsafe.
+pub fn import_span_max() -> Option<u64> {
+    match IMPORT_SPAN_MAX.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        span => Some(span),
+    }
 }
 
 /// The largest single import the active backend can hold, or `None` when no

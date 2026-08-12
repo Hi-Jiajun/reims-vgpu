@@ -758,6 +758,7 @@ impl DeviceContext {
                 crate::runtime::guest_ram::latch_import_limits(
                     host_pointer.min_alignment,
                     host_pointer.heap_budget,
+                    host_pointer.span_max,
                 );
             }
             _ => crate::runtime::guest_ram::forget_import_limits(),

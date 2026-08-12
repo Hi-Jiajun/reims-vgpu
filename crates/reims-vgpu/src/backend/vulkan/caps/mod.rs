@@ -143,6 +143,7 @@ mod tests {
                 rung: HostPointerImport::Supported,
                 min_alignment: 4096,
                 heap_budget: 8 << 30,
+                span_max: host_pointer::IMPORT_SPAN_CEILING,
             },
             portability_subset: false,
             device_api_version: api,
@@ -201,6 +202,7 @@ mod tests {
             rung: HostPointerImport::NoHostPointerExtension,
             min_alignment: 0,
             heap_budget: 0,
+            span_max: 0,
         };
         let line = c.selection_line("Apple M3 Max");
         assert!(

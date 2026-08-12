@@ -185,6 +185,16 @@ pub struct HostPointerCaps {
     /// Zero on every rung but [`HostPointerImport::Supported`], where no import
     /// may be made at all.
     pub heap_budget: u64,
+    /// The largest **single** `vkAllocateMemory` this device is trusted to
+    /// import correctly, which is not the same question as how much it can hold.
+    ///
+    /// [`Self::heap_budget`] bounds the total; this bounds one allocation, and a
+    /// RAMBlock longer than it is imported in several. See
+    /// [`IMPORT_SPAN_CEILING`] for why the bound exists at all and why it is not
+    /// simply a device limit.
+    ///
+    /// Zero on every rung but [`HostPointerImport::Supported`].
+    pub span_max: u64,
 }
 
 impl HostPointerCaps {
@@ -194,6 +204,7 @@ impl HostPointerCaps {
             rung,
             min_alignment: 0,
             heap_budget: 0,
+            span_max: 0,
         }
     }
 
@@ -292,12 +303,89 @@ pub unsafe fn query(
         .max()
         .unwrap_or(0);
 
+    // `maxMemoryAllocationSize` is Vulkan 1.1 core and the baseline is 1.2, so
+    // it is always answerable. `maxBufferSize` is Vulkan 1.3 (`maintenance4`)
+    // and is asked for only when the device is that new — a device that does not
+    // report one is not thereby unbounded, it is bounded by the two limits that
+    // remain.
+    let mut v11 = vk::PhysicalDeviceVulkan11Properties::default();
+    let mut v13 = vk::PhysicalDeviceVulkan13Properties::default();
+    let device_api = {
+        let mut base = vk::PhysicalDeviceProperties2::default();
+        unsafe { instance.get_physical_device_properties2(pd, &mut base) };
+        base.properties.api_version
+    };
+    let mut limits = vk::PhysicalDeviceProperties2::default().push_next(&mut v11);
+    if vk::api_version_major(device_api) > 1 || vk::api_version_minor(device_api) >= 3 {
+        limits = limits.push_next(&mut v13);
+    }
+    unsafe { instance.get_physical_device_properties2(pd, &mut limits) };
+
+    let span_max = [
+        IMPORT_SPAN_CEILING,
+        v11.max_memory_allocation_size,
+        // Zero means the device never filled it in, i.e. it is not a 1.3 device.
+        if v13.max_buffer_size == 0 {
+            u64::MAX
+        } else {
+            v13.max_buffer_size
+        },
+    ]
+    .into_iter()
+    .min()
+    .unwrap_or(IMPORT_SPAN_CEILING)
+        & !(min_alignment - 1);
+
     HostPointerCaps {
         rung: HostPointerImport::Supported,
         min_alignment,
         heap_budget,
+        span_max,
     }
 }
+
+/// The largest single host-pointer import this device will ask any driver for,
+/// before the device's own limits narrow it further.
+///
+/// # Why there is a ceiling that no Vulkan limit accounts for
+///
+/// `VkMemoryAllocateInfo::allocationSize` is a `VkDeviceSize`, so a 14 GiB
+/// import is a legal request and the API has nowhere to say otherwise. Mesa's
+/// Intel driver truncates it to 32 bits on the host-pointer import path: the
+/// readable window of the import is exactly `allocationSize mod 2^32`, and every
+/// byte past it reads back unrelated data. It is silent — `vkAllocateMemory`
+/// returns `VK_SUCCESS`, `vkCreateBuffer` accepts a buffer far larger than the
+/// window, `vkBindBufferMemory` accepts the pair, and only the reads are wrong.
+///
+/// Measured on Intel Arrow Lake / Mesa ANV 26.1.5 by bisecting the accepted
+/// import size at 4096-byte granularity: sizes whose value mod 2^32 is non-zero
+/// are accepted and readable only up to that remainder; a size that is an exact
+/// multiple of 2^32 is rejected outright with `ERROR_INVALID_EXTERNAL_HANDLE`.
+/// A 14 GiB RAMBlock therefore gave a 2 GiB window, which is why a guest on this
+/// host displayed nothing: roughly three quarters of its RAM gathered as
+/// garbage. Chunked imports of the same pages read correctly at every offset.
+///
+/// # Why 2 GiB and not "under 2^32"
+///
+/// The measured wall is `2^32`, and 4 GiB − 4096 imports correctly. Half of that
+/// is taken instead for three reasons: it is a power of two, so splitting a
+/// RAMBlock is a shift rather than a division; it leaves the arithmetic unable
+/// to land on the one size that fails loudly (an exact multiple of `2^32`); and
+/// it costs nothing to be wrong about, because chunking is invisible to a driver
+/// that handles the full size — such a driver just receives more, smaller
+/// imports, and every one of them is a legal allocation it would have accepted
+/// as part of a larger one.
+///
+/// This is deliberately **not** a driver-name branch, which `AGENTS.md` forbids
+/// and which would leave every other truncating driver broken. It is a bound on
+/// what this device asks for, applied everywhere.
+pub const IMPORT_SPAN_CEILING: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The ceiling has to be a multiple of any plausible import granularity, or the
+/// mask that applies the device's alignment to it would round it to zero on a
+/// host with a large page. A power of two at gigabyte scale satisfies every
+/// `minImportedHostPointerAlignment` a driver can report.
+const _: () = assert!(IMPORT_SPAN_CEILING.is_power_of_two());
 
 /// Which memory type an import of `bytes` at `host_ptr` must use, or `None` when
 /// the device accepts none that also meet `req`.
