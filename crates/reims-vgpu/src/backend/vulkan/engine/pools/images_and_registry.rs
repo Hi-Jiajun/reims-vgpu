@@ -1624,10 +1624,13 @@ impl ResourcePools {
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.content_ready = true;
             slot.content_epoch = None;
-            // Draw pass final_layout is TRANSFER_SRC_OPTIMAL, and the access
-            // that left it there is the pass's colour attachment write — not a
-            // transfer, despite the layout's name.
-            slot.access = ResidentAccess::ColorWrite(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+            // Derived from the pass builder's own constant rather than
+            // repeating the layout name: these two must agree or every later
+            // barrier is issued with the wrong `oldLayout`, which is undefined
+            // behaviour and not something a validation layer re-checks. The
+            // access that left it there is the pass's colour attachment write.
+            slot.access =
+                ResidentAccess::ColorWrite(crate::backend::vulkan::engine::caches::COLOR0_PASS_EXIT_LAYOUT);
         }
         self.set_sole_copy(identity, true);
     }

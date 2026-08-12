@@ -1982,9 +1982,16 @@ unsafe fn copy_image_level0_to_host_delivered(
     // draw: the guest-visible symptom is a composite that is missing what was
     // just drawn into it and comes back on the next redraw.
     //
-    // When `old_layout` already is TRANSFER_SRC_OPTIMAL the transition half is
-    // a no-op (`oldLayout == newLayout` is legal) and the barrier is doing only
-    // its other job, which is the job that was missing.
+    // `old_layout` is the caller's *tracked* layout, so this is a real
+    // transition whenever the resident is not already a transfer source — which
+    // is the common case, because a render pass leaves its attachment in
+    // [`caches::COLOR0_PASS_EXIT_LAYOUT`]. When the two do match the transition
+    // half is a legal no-op and the barrier is doing only its other job, which
+    // is the job that was missing. Every caller records the move with
+    // `registry_note_access(.., TransferRead)` so the tracked layout follows the
+    // image; a caller that did not would leave the next barrier naming an
+    // `oldLayout` the image is not in, which is undefined behaviour and not an
+    // error.
     let barrier = [ash::vk::ImageMemoryBarrier::default()
         .src_access_mask(src_access)
         .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)
@@ -3148,9 +3155,9 @@ unsafe fn copy_image_level0_to_buffer(
     // Unconditional, for the reason `copy_image_level0_to_host_delivered` states
     // at length: the barrier is a layout transition *and* a dependency, and this
     // rail needs the dependency whether or not the layout already matches. A
-    // render pass leaves its attachment in TRANSFER_SRC_OPTIMAL, so the common
-    // case transitions nothing and still must order this copy after the draws
-    // that produced the pixels.
+    // render pass leaves its attachment in [`caches::COLOR0_PASS_EXIT_LAYOUT`],
+    // so the common case is a real transition too, and it must still order this
+    // copy after the draws that produced the pixels.
     let barrier = [ash::vk::ImageMemoryBarrier::default()
         .src_access_mask(RESIDENT_READ_SRC_ACCESS)
         .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)

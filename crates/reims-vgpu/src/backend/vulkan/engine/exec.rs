@@ -4058,18 +4058,19 @@ pub(crate) unsafe fn execute_draw_inner(
         // the instance. `load_uses_gpu_content` gates it because a `CLEAR` pass
         // replayed here would clear away the draw's own output.
         //
-        // The transition is the instance's, not a second confound: the pass has
-        // just left the attachment in `TRANSFER_SRC_OPTIMAL` and a `LOAD` pass
-        // names `initial_layout = COLOR_ATTACHMENT_OPTIMAL`, so the barrier is
-        // what the extra instance costs to begin. `LAYOUT_CHURN`'s six boots
-        // measured a full-attachment transition on this host at less than the
-        // boot-to-boot spread, so what separates the arms here is the pair.
+        // No layout transition rides along any more, which narrows what this
+        // probe measures rather than weakening it: a pass now exits at
+        // [`super::caches::COLOR0_PASS_EXIT_LAYOUT`], which is what a `LOAD`
+        // pass names as its `initial_layout`, so this barrier carries the
+        // write-after-write dependency and nothing else. What separates the arms
+        // is the pass instance alone. Use `REIMS_VGPU_LAYOUT_CHURN` to price a
+        // transition; that is now the only arm that has one.
         let back = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
             .dst_access_mask(
                 vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
             )
-            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .old_layout(super::caches::COLOR0_PASS_EXIT_LAYOUT)
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
@@ -4087,47 +4088,31 @@ pub(crate) unsafe fn execute_draw_inner(
         ctx.device.cmd_end_render_pass(cb);
     }
     if layout_churn_probe_enabled() {
-        // PROBE — `REIMS_VGPU_LAYOUT_CHURN=on`. One extra round trip of the
-        // colour attachment's layout, out of `TRANSFER_SRC_OPTIMAL` and back
-        // into it, recorded where the pass has just left it there.
+        // PROBE — `REIMS_VGPU_LAYOUT_CHURN=on`. One round trip of the colour
+        // attachment's layout, out of [`super::caches::COLOR0_PASS_EXIT_LAYOUT`]
+        // into `TRANSFER_SRC_OPTIMAL` and straight back, recorded where the pass
+        // has just left it.
         //
-        // It exists to price what this device already pays twice a draw and has
-        // never measured. Every draw that loads its target barriers it from
-        // `TRANSFER_SRC_OPTIMAL` to `COLOR_ATTACHMENT_OPTIMAL` on the way in, and
-        // every render pass puts it back through `final_layout` on the way out —
-        // so a run of draws into one target transitions a full-size image twice
-        // per draw for no reader. On hardware that keeps colour compression
-        // metadata, moving an image to a transfer layout is a resolve over the
-        // whole attachment; on hardware that does not, it is free. Which of those
-        // this is decides whether that pair is worth removing, and no counter in
-        // this device can tell them apart.
+        // **This is now a re-enactment of what this device used to do on every
+        // draw, and it is the arm that prices what removing it bought.** A pass
+        // used to exit at `TRANSFER_SRC_OPTIMAL` so a present blit or readback
+        // could read it untransitioned, and every draw that loaded its target
+        // barriered it back — a full-attachment transition twice per draw, for a
+        // reader that ran on about 5 % of them. On hardware that keeps colour
+        // compression metadata (Intel CCS, AMD DCC, every tiler) each of those is
+        // a decompress or recompress of the whole attachment; on hardware that
+        // does not, it is a barrier and little else. Turning this switch on
+        // restores the pair without restoring anything else.
         //
         // A positive control rather than a change: the pixels are identical
         // because both layouts preserve contents and nothing is recorded between
         // the two barriers, so `us/draw` moving is the cost of two transitions
-        // and nothing else. If it does not move, the pair costs nothing here and
-        // the reading is that this host does not compress what it is asked to
-        // transfer.
+        // and nothing else. It ends where it started, so nothing downstream
+        // needs to know this ran.
         let out = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .image(target_image)
-            .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &out,
-        );
-        let back = [vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
             .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .old_layout(super::caches::COLOR0_PASS_EXIT_LAYOUT)
             .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
@@ -4138,33 +4123,61 @@ pub(crate) unsafe fn execute_draw_inner(
             vk::DependencyFlags::empty(),
             &[],
             &[],
+            &out,
+        );
+        let back = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .new_layout(super::caches::COLOR0_PASS_EXIT_LAYOUT)
+            .image(target_image)
+            .subresource_range(super::color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
             &back,
         );
     }
 
     if let Some(ref rb) = readback {
-        // The pass resolved the colour attachment to TRANSFER_SRC_OPTIMAL, so
-        // this copy needs no transition — but it does need a dependency, and
-        // the render pass does not give it one. Vulkan's implicit final subpass
+        // This copy needs a layout transition **and** a dependency, and the
+        // render pass gives it neither. Vulkan's implicit final subpass
         // dependency carries `dstStageMask = BOTTOM_OF_PIPE` and
         // `dstAccessMask = 0`: it makes the colour writes available and visible
         // to nothing. Recording the copy into the same command buffer is not a
         // dependency either — commands in one buffer are free to overlap.
         //
-        // Without this the readback can sample the attachment before the draw
-        // it was recorded after has finished writing it, and the bytes handed
-        // back are the ones from before the draw.
-        let flush_writes = [vk::MemoryBarrier::default()
+        // Without the dependency half the readback can sample the attachment
+        // before the draw it was recorded after has finished writing it, and the
+        // bytes handed back are the ones from before the draw.
+        //
+        // The transition half used to be free, because the pass exited at
+        // `TRANSFER_SRC_OPTIMAL` and this site could take it as read — a
+        // `vkCmdCopyImageToBuffer` naming a `srcImageLayout` the image is not
+        // actually in is undefined behaviour, not an error. It exits at
+        // [`super::caches::COLOR0_PASS_EXIT_LAYOUT`] now, so the transition is
+        // explicit, and it is put back afterwards so that
+        // `registry_mark_ready`'s claim about this resident stays true — that
+        // call runs below and records the pass's exit layout unconditionally.
+        let to_transfer = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .old_layout(super::caches::COLOR0_PASS_EXIT_LAYOUT)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .image(target_image)
+            .subresource_range(super::color_subresource_range())];
         ctx.device.cmd_pipeline_barrier(
             cb,
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             vk::PipelineStageFlags::TRANSFER,
             vk::DependencyFlags::empty(),
-            &flush_writes,
             &[],
             &[],
+            &to_transfer,
         );
         let region = [vk::BufferImageCopy::default()
             .image_subresource(super::color_subresource_layers())
@@ -4179,6 +4192,22 @@ pub(crate) unsafe fn execute_draw_inner(
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             rb.buffer,
             &region,
+        );
+        let back_to_exit = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .new_layout(super::caches::COLOR0_PASS_EXIT_LAYOUT)
+            .image(target_image)
+            .subresource_range(super::color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &back_to_exit,
         );
     }
     // A batch-eligible draw defers end_command_buffer + submit: its CB stays

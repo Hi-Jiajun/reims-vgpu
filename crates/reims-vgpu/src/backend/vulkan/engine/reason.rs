@@ -97,6 +97,21 @@ pub enum DrawReason {
     /// for. That is undefined behaviour a validation layer catches on someone
     /// else's GPU; declining by name is the honest answer.
     SamplerMirrorClampToEdgeUnsupported,
+    /// The guest sampler asks for pixel (unnormalized) coordinates **and** a
+    /// depth-compare function, and Vulkan forbids the pair outright
+    /// (`VUID-VkSamplerCreateInfo-unnormalizedCoordinates-01077`: `compareEnable`
+    /// must be `VK_FALSE`).
+    ///
+    /// Every other constraint an unnormalized sampler carries is conformed
+    /// silently by [`super::caches::ObjectCaches::get_or_create_sampler`],
+    /// because under Vulkan's own rules such a sampler may only be reached by an
+    /// explicit-LOD, non-minifying sample — so forcing `minFilter = magFilter`,
+    /// `mipmapMode = NEAREST`, `minLod = maxLod = 0` and anisotropy off changes
+    /// no result the guest can observe. A compare function is not in that class:
+    /// dropping it returns the sampled value instead of the comparison, which is
+    /// a different picture. So this one is a refusal by name rather than a
+    /// repair.
+    SamplerUnnormalizedCompare,
     /// The guest pipeline names one of `MTLBlendFactor`'s four dual-source
     /// factors (`Source1Color` .. `OneMinusSource1Alpha`, 15-18) and this device
     /// does not advertise `VkPhysicalDeviceFeatures::dualSrcBlend`.
@@ -230,6 +245,7 @@ impl crate::observe::Decline for DrawReason {
             Self::VisibilityCountingUnsupported { .. } => "visibility_counting_unsupported",
             Self::SamplerAnisotropyUnsupported => "sampler_anisotropy_unsupported",
             Self::SamplerMirrorClampToEdgeUnsupported => "sampler_mirror_clamp_to_edge_unsupported",
+            Self::SamplerUnnormalizedCompare => "sampler_unnormalized_compare",
             Self::DualSourceBlendUnsupported => "dual_source_blend_unsupported",
             Self::FillModeNonSolidUnsupported => "fill_mode_non_solid_unsupported",
             Self::DepthClampUnsupported => "depth_clamp_unsupported",
@@ -404,6 +420,7 @@ mod tests {
         DrawReason::VisibilityResultMode(TranslateReason::UnknownVisibilityResultMode(0)),
         DrawReason::SamplerAnisotropyUnsupported,
         DrawReason::SamplerMirrorClampToEdgeUnsupported,
+        DrawReason::SamplerUnnormalizedCompare,
         DrawReason::ConstantVertexAttribute,
         DrawReason::InstanceRateDivisorUnsupported { step_rate: 0 },
         DrawReason::InstanceRateDivisorOverLimit {
