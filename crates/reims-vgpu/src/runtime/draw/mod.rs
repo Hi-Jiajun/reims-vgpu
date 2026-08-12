@@ -1637,9 +1637,13 @@ fn buffer_texture_descriptor<M: HostMemory + HostOps>(
 /// device chose, reported where it is chosen, which is the same rule
 /// `frag_neutral_texture_substituted` follows.
 ///
-/// Deduped per (site, format) rather than per texture: the question a reader
-/// has is which formats this workload narrows and from where, and a compositor
-/// binds thousands of textures a second.
+/// Deduped per (site, format, **extent**) rather than per texture. Per (site,
+/// format) was the first shape and it under-reports in the direction that reads
+/// as reassuring: a boot narrowing a dozen different textures of one format
+/// prints one line, which is indistinguishable from a boot narrowing one. The
+/// extent separates those, and it is also the only field that ties a line to a
+/// binding in the hang trail, which prints extents and no refs. Still not per
+/// texture — a compositor binds thousands a second.
 pub(crate) fn note_sampled_narrowing(
     site: &'static str,
     texture_ref: u32,
@@ -1650,7 +1654,11 @@ pub(crate) fn note_sampled_narrowing(
     if !pixel_format::narrows_to_unorm8(fmt) {
         return;
     }
-    if !crate::observe::first_sight(site, u64::from(fmt)) {
+    // Format in the low 16 bits, then the extent. Both dimensions in full:
+    // 32x16 and 16x32 are different textures and a hash that folded them would
+    // report one.
+    let key = u64::from(fmt) | (u64::from(w) << 16) | (u64::from(h) << 40);
+    if !crate::observe::first_sight(site, key) {
         return;
     }
     crate::observe::fail(format!(
