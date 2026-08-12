@@ -55,6 +55,39 @@ SUMMARY="$OUT/summary.tsv"
 : >"$SUMMARY"
 say() { echo "sweep-rails: $*"; }
 
+# Build once, pin, and hand every rail the same binary.
+#
+# `boot-x86.sh` rebuilds in-tree QEMU on every boot unless `QEMU_BIN` names
+# something else, so a four-rail sweep used to be four builds off whatever the
+# tree held at each one. Nothing forced them to agree, and the way they stop
+# agreeing is not exotic: a sweep takes the better part of an hour, and anyone
+# editing Rust during it silently splits the run in two — producing a verdict
+# table that looks exactly like one binary's. The rails are the populations this
+# table compares, so they have to be one build or the comparison is not one.
+#
+# Exported, never passed as argv. `pkill -f 'qemu-system-x86_6[4].*reims-vgpu'`
+# matches whole command lines, so a pin named on one would match the shell that
+# named it; an environment variable never appears in `/proc/pid/cmdline`. The
+# pin must live in `vendor/qemu/build` because QEMU finds `pc-bios` relative to
+# its own path — a copy in /tmp dies on `kvmvapic.bin`.
+if [ -z "${QEMU_BIN:-}" ]; then
+  say "building once and pinning, so every rail runs one binary"
+  "$REPO/scripts/qemu-build/qemu-build.sh" --target x86_64 \
+    --backend "${REIMS_VGPU_BACKEND:-vulkan}" || {
+    echo "sweep-rails: qemu-build failed" >&2
+    exit 1
+  }
+  sweep_pin="$REPO/vendor/qemu/build/qemu-system-x86_64-sweep-$$"
+  cp -f "$REPO/vendor/qemu/build/qemu-system-x86_64" "$sweep_pin" || exit 1
+  export QEMU_BIN="$sweep_pin"
+  # The pin belongs to this run, so it goes when the run does. Without this
+  # every sweep leaves ~110 MB behind and they accumulate unnoticed.
+  trap 'rm -f "$sweep_pin"' EXIT
+  say "pinned $QEMU_BIN"
+else
+  say "QEMU_BIN already set ($QEMU_BIN) — every rail uses it"
+fi
+
 for rail in $RAILS; do
   say "=== $rail ==="
   # Waits for the port to be free rather than for a clock: a five-second sleep
