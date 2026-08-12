@@ -5166,7 +5166,16 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
         // `aliases` and not `==`: the destination is the conflict, not the
         // registry slot. Two attachments over one guest span at two formats are
         // two images, so `==` says no and the span is still written twice.
-        if identity.aliases(primary) {
+        //
+        // The rule is pairwise over the whole attachment set rather than a test
+        // against slot 0. Two *secondaries* over one destination write it twice
+        // in one pass for exactly the reason the primary case does, and this
+        // named `primary` alone — so slots 1 and 2 over one span were admitted,
+        // built into a framebuffer and drawn.
+        let aliases_a_sibling = out
+            .iter()
+            .any(|s: &SecondaryColorTarget| identity.aliases(&s.identity));
+        if identity.aliases(primary) || aliases_a_sibling {
             crate::runtime::census::present_proxy::note_secondary_mrt_drop(
                 crate::runtime::census::present_proxy::MrtDrop::AliasesPrimary,
                 c.width,

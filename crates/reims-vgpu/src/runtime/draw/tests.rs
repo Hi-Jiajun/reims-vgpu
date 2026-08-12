@@ -4695,6 +4695,78 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
     );
 }
 
+/// Two attachments over one destination are refused wherever the pair sits, not
+/// only when one of them is slot 0.
+///
+/// A pass that writes one image through two attachments has no correct
+/// rendering, which is why the primary case is a refusal rather than a silent
+/// drop. The same is true of two secondaries, and the check used to name
+/// `primary` alone — so slots 1 and 2 over one span were admitted and drawn.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn two_secondaries_over_one_destination_refuse_the_draw_like_a_primary_alias() {
+    use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RG16_FLOAT};
+    use crate::runtime::census::present_proxy::MrtDrop;
+    use crate::runtime::decode::resource::{PipelineColorAttachment, RenderPipelineDescriptor};
+
+    let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let pipeline = RenderPipelineDescriptor {
+        color_attachments: (0..3)
+            .map(|slot| PipelineColorAttachment {
+                slot,
+                ..PipelineColorAttachment::default()
+            })
+            .collect(),
+        ..RenderPipelineDescriptor::default()
+    };
+    let primary = crate::backend::vulkan::engine::TargetIdentity::Gva {
+        gva: 0x1000,
+        width: 64,
+        height: 64,
+        generation: 0,
+        format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
+    };
+    let rt = |slot: u32, texture_ref: u32, target_gva: u64, format: u16| ColorRtRequest {
+        slot,
+        texture_ref,
+        target_gva,
+        width: 64,
+        height: 64,
+        format,
+        ..ColorRtRequest::default()
+    };
+    let build = |colors: &[ColorRtRequest]| {
+        let mut host = crate::runtime::host::FakeHost::new();
+        build_secondary_targets(
+            &state, &mut host, 1, colors, &pipeline, &primary, 64, 64, [0.0; 4],
+        )
+    };
+
+    // The control: three distinct destinations build, so the refusal below is
+    // caused by the aliasing address and not by the third attachment existing.
+    let distinct = [
+        rt(0, 10, 0x1000, MTL_FORMAT_BGRA8_UNORM),
+        rt(1, 11, 0x2000, MTL_FORMAT_RG16_FLOAT),
+        rt(2, 12, 0x3000, MTL_FORMAT_RG16_FLOAT),
+    ];
+    assert_eq!(
+        build(&distinct).expect("three distinct spans build").len(),
+        2,
+        "the control must build both secondaries, or the case below proves nothing"
+    );
+
+    // Slots 1 and 2 name one span. Neither is the primary, so the old check saw
+    // nothing.
+    let aliased = [
+        rt(0, 10, 0x1000, MTL_FORMAT_BGRA8_UNORM),
+        rt(1, 11, 0x2000, MTL_FORMAT_RG16_FLOAT),
+        rt(2, 12, 0x2000, MTL_FORMAT_RG16_FLOAT),
+    ];
+    let refusal = build(&aliased).expect_err("two secondaries over one span is not renderable");
+    assert_eq!(refusal.slot, 2, "the second of the pair is the one refused");
+    assert_eq!(refusal.reason, MrtDrop::AliasesPrimary);
+}
+
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn fixed_state_gap_names_every_unrepresented_field() {
