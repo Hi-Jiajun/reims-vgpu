@@ -472,6 +472,35 @@ pub struct DrawRequest {
     pub color_input: bool,
 }
 
+impl DrawRequest {
+    /// Whether this draw binds `identity` as one of its own attachments.
+    ///
+    /// Sampling an attachment the same draw renders into is an attachment
+    /// feedback loop. Metal permits it; Vulkan does not, and a driver's answer
+    /// to one is undefined rather than an error it reports — so `exec` snapshots
+    /// the resident into a separate image instead of binding it, and this is the
+    /// test that sends it there.
+    ///
+    /// **Every attachment, not just the primary.** The test used to be
+    /// `req.target_identity == Some(identity)` written at the one call site,
+    /// which is slot 0 alone: a draw sampling one of its own MRT secondaries or
+    /// its own depth target compared unequal and took the bind-it-directly arm.
+    /// `SecondaryColorTarget::identity` exists precisely so a later draw can
+    /// sample that attachment, so the same-draw case is reachable by
+    /// construction rather than hypothetically.
+    ///
+    /// Widening this can only cost a copy. The snapshot arm is semantically
+    /// identical for every input — it binds a copy of the same resident content
+    /// — so a draw newly routed through it observes the same texels it did
+    /// before, and the risk of covering an attachment that did not strictly need
+    /// covering is bounded by one image copy.
+    pub fn writes_attachment(&self, identity: &TargetIdentity) -> bool {
+        self.target_identity.as_ref() == Some(identity)
+            || self.depth.as_ref().and_then(|d| d.identity.as_ref()) == Some(identity)
+            || self.secondary_targets.iter().any(|s| &s.identity == identity)
+    }
+}
+
 /// How many viewport/scissor slots one draw rasterizes into.
 ///
 /// The single number a Vulkan pipeline declares and `vkCmdSetViewport` /
@@ -1725,6 +1754,67 @@ pub struct SampledContentIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A draw that samples one of its own attachments must reach the snapshot
+    /// arm, and "its own" is every attachment it binds rather than slot 0.
+    ///
+    /// The secondary and depth cases below are the ones that fail against the
+    /// primary-only test this replaced, which is what makes them worth writing:
+    /// each was a live attachment feedback loop handed to the driver.
+    #[test]
+    fn a_draw_samples_its_own_attachment_on_every_slot_that_can_carry_one() {
+        let surface = |id: u32| TargetIdentity::Surface {
+            id,
+            width: 64,
+            height: 64,
+            generation: 0,
+            format: vk::Format::B8G8R8A8_UNORM,
+        };
+
+        let mut req = DrawRequest {
+            target_identity: Some(surface(1)),
+            ..DrawRequest::default()
+        };
+        assert!(req.writes_attachment(&surface(1)), "primary colour");
+        assert!(
+            !req.writes_attachment(&surface(9)),
+            "a target this draw does not bind is not a feedback loop, and \
+             routing it through the snapshot would cost a copy per draw"
+        );
+
+        req.secondary_targets.push(SecondaryColorTarget {
+            identity: surface(2),
+            width: 64,
+            height: 64,
+            format: vk::Format::B8G8R8A8_UNORM,
+            clear: [0.0; 4],
+            load: false,
+            blend: None,
+            color_write_mask: ColorWriteMask::default(),
+        });
+        assert!(req.writes_attachment(&surface(2)), "MRT secondary");
+
+        req.depth = Some(DepthState {
+            identity: Some(surface(3)),
+            test_enable: true,
+            write_enable: true,
+            compare: SamplerCompareFunction::Less,
+            clear_value: 1.0,
+            load: false,
+            stencil: None,
+        });
+        assert!(req.writes_attachment(&surface(3)), "depth");
+
+        // The generation is part of the identity, so a resident the guest has
+        // since rewritten is a different target and not this draw's attachment.
+        assert!(!req.writes_attachment(&TargetIdentity::Surface {
+            id: 1,
+            width: 64,
+            height: 64,
+            generation: 1,
+            format: vk::Format::B8G8R8A8_UNORM,
+        }));
+    }
 
     #[test]
     fn indexed_draw_range_decodes_both_wire_index_widths() {

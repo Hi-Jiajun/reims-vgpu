@@ -3008,7 +3008,7 @@ pub(crate) unsafe fn execute_draw_inner(
                         },
                     ));
                 }
-                if req.target_identity.as_ref() == Some(identity) {
+                if req.writes_attachment(identity) {
                     let image = pools.acquire_sampled(
                         ctx,
                         SampledKey {
