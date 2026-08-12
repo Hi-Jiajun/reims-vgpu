@@ -87,6 +87,11 @@
 //! entry was built from. Three 12-byte reads is three page-table walks, ~0.6 us,
 //! against the 4.68 us of work they authorise skipping.
 //!
+//! Byte-identical entries are only the same objects **in the same address
+//! space**, so the identity also carries the task's page-table root and object
+//! list — see [`TaskAddressSpace`], which explains why that is carried in the
+//! identity rather than invalidated at each of the three packets that move it.
+//!
 //! ## What that check does not cover, stated exactly
 //!
 //! An entry that has not changed permits two things this memo will not notice:
@@ -284,8 +289,52 @@ pub struct ResolvedRenderPipeline {
 /// entry is the identity.
 type EntryTriple = [ListObjectEntry; 3];
 
+/// The task address space the three entries above were read *through*.
+///
+/// A `ListObjectEntry` is `{object_type, descriptor_length, descriptor_gva}`,
+/// which is a complete identity only within one address space: the same GVA
+/// under two page-table roots names two different physical descriptors, and
+/// `read_identity` never dereferences `descriptor_gva` to notice. So the space
+/// is part of the identity, not an assumption about it.
+///
+/// # Why this is carried rather than invalidated at the mutation sites
+///
+/// Three packets retire the sibling bound-buffer registry and used to leave this
+/// memo standing — `apply_delete_task`, `apply_set_object_list` and
+/// `apply_define_task2` — the last two with comments saying, correctly, that no
+/// resolution keyed by reference survives them and that every GVA the task
+/// resolved may translate elsewhere now. The memo *is* a resolution keyed by
+/// reference, and its only invalidation was `forget_all` from `device_reset`.
+///
+/// Adding a fourth call site to those three would have left the same shape of
+/// bug waiting for a fifth packet. Carrying the coordinates instead means a
+/// lookup made under a different root simply fails to match, and there is no
+/// call site to remember — `AGENTS.md`'s "make the invariant unrepresentable"
+/// over a rule enforced by review. The fields are already in `TaskEntry`, so
+/// this costs one map lookup and no extra guest reads.
+///
+/// A task deleted and recreated with the same id, the same root, the same object
+/// list and identical entries is not distinguished, and does not need to be:
+/// the entries are re-read through the current root on every check, so such a
+/// task genuinely resolves to the same pipeline. What is left uncovered is a
+/// descriptor or MTLB rewritten *in place*, which is the module doc's
+/// documented gap and is unchanged by this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TaskAddressSpace {
+    directory_pfn: u32,
+    object_list_pfn: u32,
+    object_list_count: u32,
+}
+
+/// Everything a memoized resolution must still be true of to be served.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Identity {
+    space: TaskAddressSpace,
+    entries: EntryTriple,
+}
+
 struct Entry {
-    identity: EntryTriple,
+    identity: Identity,
     resolved: ResolvedRenderPipeline,
 }
 
@@ -385,12 +434,24 @@ fn read_identity<M: HostMemory + HostOps>(
     pipeline_ref: u32,
     vertex_ref: u32,
     fragment_ref: u32,
-) -> Option<EntryTriple> {
-    Some([
-        objects::lookup_list_entry(state, host, task_id, pipeline_ref)?,
-        objects::lookup_list_entry(state, host, task_id, vertex_ref)?,
-        objects::lookup_list_entry(state, host, task_id, fragment_ref)?,
-    ])
+) -> Option<Identity> {
+    // The space first: an entry read through a root this task no longer has is
+    // not a weaker identity, it is a different one, and reading the entries at
+    // all under a retired root is what the comparison exists to prevent.
+    let task = state.tasks.get(task_id)?;
+    let space = TaskAddressSpace {
+        directory_pfn: task.directory_pfn,
+        object_list_pfn: task.object_list_pfn,
+        object_list_count: task.object_list_count,
+    };
+    Some(Identity {
+        space,
+        entries: [
+            objects::lookup_list_entry(state, host, task_id, pipeline_ref)?,
+            objects::lookup_list_entry(state, host, task_id, vertex_ref)?,
+            objects::lookup_list_entry(state, host, task_id, fragment_ref)?,
+        ],
+    })
 }
 
 /// Whether `pipeline_ref`'s two shaders are **already translated**, answered
@@ -763,6 +824,67 @@ mod tests {
             ot[slot].object_type += 1;
             assert_ne!(base, ot, "slot {slot} object_type");
         }
+    }
+
+    /// A resolution is only valid in the address space it was taken in, and the
+    /// three object-list entries cannot say which space that was.
+    ///
+    /// `apply_set_object_list` retires the sibling bound-buffer registry with
+    /// the comment "no resolution keyed by reference survives it", and this memo
+    /// is exactly such a resolution. Its only invalidation was `device_reset`.
+    /// The fixture republishes a byte-identical object list at a different page
+    /// — which is what that packet does — and the first assertion is what makes
+    /// the second one mean something: the entries alone genuinely cannot tell
+    /// the two lists apart, so before this change the stale entry was served.
+    #[test]
+    fn the_task_address_space_is_part_of_the_identity() {
+        use crate::contract::endian::st32;
+        use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
+        use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
+        use crate::runtime::gva_mem::{define_task_pages_arm64e, write_task_gva_arm64e};
+        use crate::runtime::host::FakeHost;
+
+        const PIPELINE: u32 = 1;
+        const VERTEX: u32 = 2;
+        const FRAGMENT: u32 = 3;
+        const COUNT: u32 = 32;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+
+        // The same three entries into whichever page the list currently sits at,
+        // so the only difference between the two reads below is the space.
+        let publish = |host: &mut FakeHost, state: &DeviceState, base: u64| {
+            for r in [PIPELINE, VERTEX, FRAGMENT] {
+                let mut e = [0u8; OBJECT_LIST_ENTRY_LEN];
+                st32(&mut e[0..], 7u32 | (64u32 << 8));
+                e[4..12].copy_from_slice(&(0x2000u64 + u64::from(r) * 0x100).to_le_bytes());
+                let off = base + list_object_entry_offset(r, COUNT).unwrap();
+                write_task_gva_arm64e(host, &state.tasks[1], off, &e);
+            }
+        };
+
+        assert!(state.set_object_list(1, 0, COUNT));
+        publish(&mut host, &state, 0);
+        let first = read_identity(&state, &host, 1, PIPELINE, VERTEX, FRAGMENT)
+            .expect("the three entries are published");
+
+        assert!(state.set_object_list(1, 1, COUNT));
+        publish(&mut host, &state, 1u64 << PAGE_SHIFT_ARM64E);
+        let second = read_identity(&state, &host, 1, PIPELINE, VERTEX, FRAGMENT)
+            .expect("the three entries are published again");
+
+        assert_eq!(
+            first.entries, second.entries,
+            "this fixture only means something while the entries alone cannot tell \
+             the two object lists apart — if this fails, the test has stopped \
+             testing the address space and is passing for another reason"
+        );
+        assert_ne!(
+            first, second,
+            "a resolution taken against one object list was served against another"
+        );
     }
 
     /// The two sets [`VertexBindPlan`] carries used to be rebuilt inside the
