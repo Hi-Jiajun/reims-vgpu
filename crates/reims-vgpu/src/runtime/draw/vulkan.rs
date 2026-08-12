@@ -93,7 +93,23 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     };
 
     let mut any_store = false;
-    let mut color0_rgba: Option<Vec<u8>> = None;
+    // The seeded solid colour of attachment 0, as its recipe rather than as its
+    // pixels.
+    //
+    // This used to be the `Vec<u8>` itself, built by `solid_rgba8` inside the
+    // seed loop. Only one of this function's five exits returns it — the
+    // clear-only one at the bottom, where the record encoded no draw — and the
+    // three that matter under compositing (`chain_resident_established`, an armed
+    // Store, a real `draw_rgba`) each return something else and dropped it
+    // unread. On a macos-11 Safari-torture leg the seed loop landed 2.87 GB of
+    // solid colour through `write_gva_solid8`, which converts one row and repeats
+    // it; the full-surface image built beside it was the same 2.87 GB of
+    // allocate-and-fill, and 188 ms of the leg's 892 ms `prep_seed_us` sat
+    // outside both landing spans, which is where it was.
+    //
+    // Held as `(width, height, colour)` so the recipe costs a few words and the
+    // exit that wants pixels calls the same constructor with the same arguments.
+    let mut color0_solid: Option<(u32, u32, [f64; 4])> = None;
     // The engine draw's own refusal slug, kept so the skipped-draw tail can name
     // why its draws were skipped instead of guessing. `None` means the engine
     // draw was never attempted — this record carried no pipeline or no vertices.
@@ -118,11 +134,11 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             if c.width == 0 || c.height == 0 {
                 continue;
             }
-            // The only reader of a full-surface RGBA copy is this chain's
-            // `color0_rgba`. Neither writer below takes one — the GVA landing
-            // repeats a single row and the type-11 landing builds its own image
-            // in the mapping's order — so no other attachment materialises one.
-            let rgba = (i == 0).then(|| solid_rgba8(c.width, c.height, &c.clear_color));
+            // Neither writer below takes a full-surface RGBA copy — the GVA
+            // landing repeats a single row and the type-11 landing builds its own
+            // image in the mapping's order — so the only reader of one is the
+            // clear-only exit, and it is the one place that builds it.
+            let solid = (i == 0).then_some((c.width, c.height, c.clear_color));
             // Which branch this loop actually takes, how many bytes it lands and
             // what the landing costs. `prep_seed_us` is 8.6 µs of a 41 µs chain
             // on the `blur=40` dial and rebuilding the images without their two
@@ -184,7 +200,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             if ok {
                 any_store = true;
                 if i == 0 {
-                    color0_rgba = rgba;
+                    color0_solid = solid;
                 }
                 crate::observe::line(format!(
                     "linux_clear_store mid={} gva={:#x} {}x{} pipe={} load={}",
@@ -765,7 +781,27 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 u64::from(req.vertex_count),
             );
         }
-        (EncodeStatus::Ok, color0_rgba)
+        // The one exit that hands the seed on: this record encoded no draw, so
+        // the solid colour it landed *is* this chain's colour-0 content, and the
+        // next record loads it as its seed. Built here rather than in the loop
+        // above because the four exits before this one return without it.
+        //
+        // The route is what says the deferral is worth having: read it against
+        // `clear_seed_gva` + `clear_seed_t11`, which count the seeds, and the
+        // difference is the full-surface images that used to be built and
+        // dropped. A boot where the two are equal has nothing to save here.
+        (
+            EncodeStatus::Ok,
+            color0_solid.map(|(w, h, clear)| {
+                crate::runtime::drain::note_store_route("clear_seed_color0_image");
+                crate::runtime::drain::note_store_route_n(
+                    "clear_seed_color0_image_kb",
+                    u64::from(w).saturating_mul(u64::from(h)).saturating_mul(u64::from(RGBA8_BPP))
+                        / 1024,
+                );
+                solid_rgba8(w, h, &clear)
+            }),
+        )
     } else {
         (EncodeStatus::NoMetal("draw_vk_nothing_stored"), None)
     }
