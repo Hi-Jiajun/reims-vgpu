@@ -214,6 +214,47 @@ impl EngineState {
         }
     }
 
+    /// Everything a `VK_ERROR_DEVICE_LOST` obliges this device to do, in one
+    /// place: count it, poison the context, drop everything derived from the old
+    /// `VkDevice`, and bring a new one up.
+    ///
+    /// # Why this is a method and not eight lines at the call site
+    ///
+    /// It *was* eight lines at the call site, twice — the draw path and the
+    /// compute path — and every other way of observing a lost device had none of
+    /// them. `read_target`, `quiesce_guest_reads`, `flush_batched_draws`,
+    /// `retire_all`, `window_present_frame` and the stamp-completion thread all
+    /// propagated `DeviceLost` upward without poisoning anything, so the engine
+    /// went on submitting to a dead device for the rest of the boot.
+    ///
+    /// A driven macos-11 boot is what named it. The Maps leg's loss surfaced in
+    /// the stamp-completion thread's `vkWaitSemaphores` as
+    /// `stamp_wait_failed err=ERROR_DEVICE_LOST`; nothing poisoned, nothing
+    /// recreated — `vk_device_recreate_proven` appears zero times in that boot —
+    /// and every leg after it reported **`draws=0`** with a clean fail channel
+    /// and a healthy 1 s census cadence. A device that is dead and does not know
+    /// it looks exactly like a guest that stopped asking.
+    ///
+    /// Returns whether a fresh context came up, so a caller that can retry knows
+    /// whether retrying is worth anything.
+    fn on_device_lost(&mut self) -> bool {
+        self.counters.device_lost.fetch_add(1, Ordering::Relaxed);
+        self.owner.mark_device_lost();
+        self.flush_device_derived();
+        let EngineState {
+            ref mut owner,
+            ref counters,
+            ..
+        } = self;
+        match owner.ensure(counters) {
+            Ok(_) => true,
+            Err(error) => {
+                crate::observe::Emit::decline("vk_device_recreate", &error).fail_once(1);
+                false
+            }
+        }
+    }
+
     /// Drop everything derived from the current `VkDevice`, so the caller can
     /// bring a new one up under it.
     ///
@@ -653,7 +694,15 @@ pub fn window_present_frame(
     let presenter = window_presenter.as_mut().ok_or(DrawError::Facade(
         EngineFacadeDecline::WindowPresenterNotAttached,
     ))?;
-    unsafe { presenter.present(ctx, pools, counters, source, cpu) }
+    let out = unsafe { presenter.present(ctx, pools, counters, source, cpu) };
+    // The window thread cannot run the recovery from inside this borrow, so a
+    // loss seen here is latched for the drain's end-of-tranche flush. This is
+    // the observer that matters most when the guest has already stopped drawing:
+    // the presenter is then the only thing still touching the queue.
+    if let Err(DrawError::DeviceLost(_)) = out {
+        device_lost::note_device_lost_seen();
+    }
+    out
 }
 
 /// Destroy the engine-owned surface while the native AppKit window still
@@ -712,19 +761,7 @@ pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> 
             Ok(out)
         }
         Err(DrawError::DeviceLost(decline)) => {
-            guard.counters.device_lost.fetch_add(1, Ordering::Relaxed);
-            guard.owner.mark_device_lost();
-            guard.flush_device_derived();
-            if let Err(error) = {
-                let EngineState {
-                    ref mut owner,
-                    ref counters,
-                    ..
-                } = &mut *guard;
-                owner.ensure(counters)
-            } {
-                crate::observe::Emit::decline("vk_device_recreate", &error).fail_once(1);
-            }
+            guard.on_device_lost();
             Err(DrawError::DeviceLost(decline))
         }
         Err(e) => Err(e),
@@ -738,19 +775,37 @@ pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> 
 /// only bounds the idle-tail latency. No-op without a context or open batch.
 pub fn flush_batched_draws() {
     let mut guard = lock_engine();
-    let EngineState {
-        ref mut owner,
-        ref mut pools,
-        ref counters,
-        ..
-    } = &mut *guard;
-    let Some(ctx) = owner.ctx.as_ref() else {
+    // This runs at the end of every drain tranche, which is about once a second
+    // whether or not the guest is still submitting — so it is where a loss
+    // observed by a thread that cannot take the engine lock gets acted on. See
+    // `device_lost::note_device_lost_seen` for the boot that needed it.
+    if device_lost::take_device_lost_seen() {
+        guard.on_device_lost();
         return;
+    }
+    let lost = {
+        let EngineState {
+            ref mut owner,
+            ref mut pools,
+            ref counters,
+            ..
+        } = &mut *guard;
+        let Some(ctx) = owner.ctx.as_ref() else {
+            return;
+        };
+        match unsafe { pools.batch_flush(ctx, counters) } {
+            Ok(()) => false,
+            Err(e) => {
+                let lost = matches!(e, DrawError::DeviceLost(_));
+                crate::observe::Emit::decline("vk_batch_flush", &e).fail_once(0);
+                lost
+            }
+        }
     };
-    if let Err(e) = unsafe { pools.batch_flush(ctx, counters) } {
-        // A lost device surfaces again on the next draw, which runs the full
-        // recreate path; here just make the flush failure visible.
-        crate::observe::Emit::decline("vk_batch_flush", &e).fail_once(0);
+    // "A lost device surfaces again on the next draw" is only true while draws
+    // keep coming, and a device loss is one of the things that stops them.
+    if lost {
+        guard.on_device_lost();
     }
 }
 
@@ -970,8 +1025,12 @@ pub fn quiesce_guest_writes() {
     if let Err(e) = unsafe { pools.quiesce_guest_writes(ctx, counters) } {
         // The wait failed, so this device cannot say the frame reached the
         // guest's pages. Nothing here can hold the caller back — a stamp that
-        // never moves hangs the guest — so report it and let the lost device
-        // surface on the next draw.
+        // never moves hangs the guest — so report it, and latch a lost device
+        // rather than trusting the next draw to surface it, because a loss is
+        // one of the things that stops draws coming.
+        if matches!(e, DrawError::DeviceLost(_)) {
+            device_lost::note_device_lost_seen();
+        }
         crate::observe::Emit::decline("vk_guest_write_quiesce", &e).fail_once(0);
     }
     // Cleared whether the wait succeeded or failed, for the reason
@@ -1189,7 +1248,13 @@ pub fn quiesce_guest_reads() {
     if let Err(e) = unsafe { pools.quiesce_guest_reads(ctx, counters) } {
         // The wait failed, so this device cannot say the guest's pages are done
         // being read. Nothing here can hold the stamp back — the guest would
-        // hang — so report it and let the lost device surface on the next draw.
+        // hang — so report it, and latch a lost device rather than trusting the
+        // next draw to surface it. Both of these run under the engine lock but
+        // inside a borrow of it, so they latch rather than recover; the drain's
+        // end-of-tranche `flush_batched_draws` is what acts on it.
+        if matches!(e, DrawError::DeviceLost(_)) {
+            device_lost::note_device_lost_seen();
+        }
         crate::observe::Emit::decline("vk_guest_read_quiesce", &e).fail_once(0);
     }
 }
@@ -1213,19 +1278,7 @@ pub fn execute_compute_request(req: &ComputeRequest) -> Result<ComputeOutput, Co
             Ok(out)
         }
         Err(DrawError::DeviceLost(decline)) => {
-            guard.counters.device_lost.fetch_add(1, Ordering::Relaxed);
-            guard.owner.mark_device_lost();
-            guard.flush_device_derived();
-            if let Err(error) = {
-                let EngineState {
-                    ref mut owner,
-                    ref counters,
-                    ..
-                } = &mut *guard;
-                owner.ensure(counters)
-            } {
-                crate::observe::Emit::decline("vk_device_recreate", &error).fail_once(2);
-            }
+            guard.on_device_lost();
             Err(DrawError::DeviceLost(decline))
         }
         Err(e) => Err(e),
@@ -3852,6 +3905,38 @@ mod device_loss_window_rail_tests {
     /// It runs on any host because it needs no device: `test_poison_and_flush`
     /// reaches `flush_device_derived` with `owner.ctx` at `None`, which is
     /// exactly the arm where the take used to be skipped.
+    /// A loss seen by a thread that cannot take the engine lock still gets
+    /// recovered, because the drain's end-of-tranche flush consumes the latch.
+    ///
+    /// This is the shape that cost a whole boot: the stamp-completion thread saw
+    /// `ERROR_DEVICE_LOST` in `vkWaitSemaphores`, announced the stamp anyway
+    /// (correctly — a withheld stamp hangs the guest), and nothing anywhere
+    /// poisoned the context. Every path in this backend that is not the draw or
+    /// compute arm was written to "let the lost device surface on the next
+    /// draw", and the guest stopped drawing *because* its work stopped
+    /// completing. `flush_batched_draws` runs about once a second regardless,
+    /// which is what makes it the right consumer.
+    ///
+    /// The assertion is on the window rail rather than on the context, because
+    /// the flush is the observable half that needs no GPU: it is
+    /// `flush_device_derived` that clears it, and only `on_device_lost` calls
+    /// that from here.
+    #[test]
+    fn a_loss_latched_off_the_engine_lock_is_recovered_by_the_drain_flush() {
+        let _ = device_lost::take_device_lost_seen();
+        note_window_present_attached(true);
+        device_lost::note_device_lost_seen();
+        flush_batched_draws();
+        assert!(
+            !window_present_attached(),
+            "the end-of-tranche flush must run the recovery for a latched loss"
+        );
+        assert!(
+            !device_lost::take_device_lost_seen(),
+            "and take the latch, so one loss is recovered once"
+        );
+    }
+
     #[test]
     fn a_device_loss_flush_leaves_no_window_rail_claimed() {
         note_window_present_attached(true);

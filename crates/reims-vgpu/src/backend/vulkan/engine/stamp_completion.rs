@@ -315,11 +315,23 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
                  fence deadline; announcing it anyway so the guest is not left asleep)",
                 waiting.index, waiting.value
             )),
-            Err(e) => crate::observe::fail(format!(
-                "stamp_wait_failed reason=stamp_wait_failed index={} value={} err={e:?} \
-                 (announcing regardless, for the reason a timeout does)",
-                waiting.index, waiting.value
-            )),
+            Err(e) => {
+                crate::observe::fail(format!(
+                    "stamp_wait_failed reason=stamp_wait_failed index={} value={} err={e:?} \
+                     (announcing regardless, for the reason a timeout does)",
+                    waiting.index, waiting.value
+                ));
+                // Announcing is not recovering. This thread may not take the
+                // engine lock — it exists to announce guest fences while the
+                // drain worker holds it — so it latches the loss and the drain's
+                // end-of-tranche flush runs the recovery. Without this, a boot
+                // whose device dies *here* never rebuilds it: the guest stops
+                // drawing because its work stopped completing, and "the next
+                // draw will surface it" then waits forever.
+                if e == vk::Result::ERROR_DEVICE_LOST {
+                    super::device_lost::note_device_lost_seen();
+                }
+            }
         }
         shared
             .queue

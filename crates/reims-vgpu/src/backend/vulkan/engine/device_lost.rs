@@ -66,6 +66,39 @@ impl DeviceLostDecline {
     }
 }
 
+/// Set by any site that observes a lost device where it cannot run the recovery
+/// itself, and consumed by the next site that can.
+///
+/// # Why a latch and not a direct call
+///
+/// The recovery needs the engine lock. The stamp-completion thread is the one
+/// observer that must not take it — it exists to announce guest fences while the
+/// drain worker holds the engine, and locking there would deadlock the pair it
+/// was built to decouple. So it records the fact, and the drain's own
+/// end-of-tranche flush acts on it; that runs about once a second whether or not
+/// the guest is still submitting work.
+///
+/// That last clause is the whole point. Every other path in this backend was
+/// written to "let the lost device surface on the next draw", which is correct
+/// only while draws keep coming. On a driven macos-11 boot the loss surfaced
+/// here, in `vkWaitSemaphores` — `stamp_wait_failed err=ERROR_DEVICE_LOST` —
+/// and the guest then stopped drawing *because* of it: every leg after Maps
+/// reported `draws=0` against a clean fail channel and a healthy 1 s census, and
+/// `vk_device_recreate_proven` appears zero times in the whole boot. No draw was
+/// ever going to come and surface it.
+static DEVICE_LOST_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record that a lost device was seen somewhere that cannot recover from it.
+pub(crate) fn note_device_lost_seen() {
+    DEVICE_LOST_SEEN.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Take the latch if it is set. Callers must be able to run the recovery, since
+/// taking it is what makes them responsible for it.
+pub(crate) fn take_device_lost_seen() -> bool {
+    DEVICE_LOST_SEEN.swap(false, std::sync::atomic::Ordering::AcqRel)
+}
+
 impl Decline for DeviceLostDecline {
     fn slug(&self) -> &'static str {
         match self {
