@@ -406,6 +406,29 @@ pub const SLAB_RETAIN: &str = "REIMS_VGPU_SLAB_RETAIN";
 /// piece of this device's behaviour that has never been run both ways.
 pub const SAMPLED_IDENTITY: &str = "REIMS_VGPU_SAMPLED_IDENTITY";
 
+/// `on` audits **every** vouched gather bind instead of one in
+/// [`crate::runtime::gather_witness::AUDIT_STRIDE`].
+///
+/// It narrows in the sense this module requires, and it is the only switch here
+/// that narrows by doing *more* work: the fold is a read of the window, and a
+/// fold that disagrees spends the generation, so this arm can only turn
+/// elisions into re-gathers. It reaches no image the default arm does not also
+/// reach.
+///
+/// It exists because of what [`SAMPLED_IDENTITY`]'s doc says one paragraph up —
+/// a stale bind's failure mode is content, and no counter reports it. The
+/// content audit *is* that counter, and at a stride of sixty-four it samples
+/// about 1.6 % of the binds it could judge: a four-rail sweep of this host read
+/// 122 comparisons against some fourteen thousand vouches. A zero over 1.6 % of
+/// a population is evidence about 1.6 % of it. With this on the sweep judges
+/// every bind, which is the difference between believing the zero-copy sampled
+/// cache is sound and having measured it.
+///
+/// Not a shipping arm: at a stride of one the audit re-reads every window the
+/// cache exists to avoid reading, which is the whole 842 MB/s rail arriving
+/// through the alarm. Use it for a soundness sweep, never for a timing.
+pub const GATHER_AUDIT_ALL: &str = "REIMS_VGPU_GATHER_AUDIT_ALL";
+
 /// `off` narrows the CLEAR-seed Store at the head of a draw chain out of
 /// existence: the solid colour is not written into the guest's pages before the
 /// encode, and only what the draw's own Store lands reaches them.
@@ -1028,7 +1051,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 22] = [
+pub const ALL: [&str; 23] = [
     LAZY_WRITEBACK,
     SLAB_RETAIN,
     // Both absent until 2026-08-12, for the same reason `COMPUTE_GATHER` was:
@@ -1037,6 +1060,7 @@ pub const ALL: [&str; 22] = [
     // boot that cannot say which arm it ran is a boot whose content evidence is
     // unattributable.
     SAMPLED_IDENTITY,
+    GATHER_AUDIT_ALL,
     PIPELINE_MEMO,
     CLEAR_SEED,
     GUEST_IMPORT,

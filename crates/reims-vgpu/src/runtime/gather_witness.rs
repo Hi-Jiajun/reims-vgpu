@@ -135,6 +135,23 @@
 //! [`AUDIT_REBASELINE_LIMIT`] so a never-vouched window cannot pull the whole
 //! rail back through the audit.
 //!
+//! # A sweep can judge every bind instead of one in sixty-four
+//!
+//! The 122 comparisons above stand against some fourteen thousand vouches, so a
+//! zero there is evidence about 1.6 % of the population. That is the right ratio
+//! to ship — the fold is a read of the window, which is the rail this cache
+//! exists to remove — but it is the wrong ratio to answer "is this cache sound
+//! on this host" with.
+//!
+//! [`crate::env::GATHER_AUDIT_ALL`] sets [`AuditDensity::EveryBind`], under which
+//! every vouched bind is compared against the bind before it: the stride drops to
+//! 1 and a completed comparison leaves the window armed, its own fold being the
+//! next bind's baseline. It can only turn elisions into re-gathers, never the
+//! other way, so it is a narrowing switch in this crate's sense — one that
+//! narrows by doing more work. Run a rail sweep under it and `gw_audit_unsound`
+//! becomes a verdict on the whole boot rather than a sample of it. Never quote a
+//! timing from such a boot.
+//!
 //! So `gw_audit_restart` no longer means "structurally unable to compare"; it
 //! means one armed window was refused eight times running. The reading to take
 //! now is `gw_audit_ok` against `gw_audit_seed`: every arm resolves, so
@@ -391,11 +408,73 @@ struct Entry {
 }
 
 /// Per-device witness state: one entry per sampled window seen.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct GatherWitness {
     entries: BTreeMap<GatherKey, Entry>,
     /// Monotonic bind ordinal, stamped into [`Entry::last_seen`].
     binds: u64,
+    /// How often this device's content audit is allowed to compare.
+    ///
+    /// On the witness rather than in a process-wide `OnceLock` so a test can
+    /// state the arm it is testing. [`Default`] reads the environment, which is
+    /// what makes every construction site — the one in `DeviceState` and the
+    /// ones in this module's tests — pick the switch up without naming it.
+    audit: AuditDensity,
+}
+
+impl Default for GatherWitness {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            binds: 0,
+            audit: AuditDensity::from_env(),
+        }
+    }
+}
+
+/// How often the content audit compares a window against its own past.
+///
+/// The audit is a standing alarm on the one rule this whole module exists to
+/// uphold, and its density is the difference between believing that rule and
+/// having measured it — so the density is a stated policy rather than a
+/// constant read at the decision site.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AuditDensity {
+    /// One comparison per [`AUDIT_STRIDE`] binds of a window. The shipping arm:
+    /// the fold is a read of the window, which is the rail this cache removes.
+    #[default]
+    Strided,
+    /// Every bind this device vouches for is compared against the one before
+    /// it. A soundness sweep, never a timing — see [`crate::env::GATHER_AUDIT_ALL`].
+    EveryBind,
+}
+
+impl AuditDensity {
+    fn from_env() -> Self {
+        match crate::env::switch(crate::env::GATHER_AUDIT_ALL) {
+            crate::env::Switch::On => Self::EveryBind,
+            _ => Self::default(),
+        }
+    }
+
+    /// Binds of one window between baselines.
+    fn stride(self) -> u32 {
+        match self {
+            Self::Strided => AUDIT_STRIDE,
+            Self::EveryBind => 1,
+        }
+    }
+
+    /// Whether a completed comparison leaves the window armed.
+    ///
+    /// The fold a comparison just took describes the window as of that bind, so
+    /// it is already the baseline the next bind would be judged against. Staying
+    /// armed is what makes [`Self::EveryBind`] mean every bind rather than every
+    /// third — arm, compare, disarm is three binds per comparison, and a stride
+    /// of 1 alone would still judge only a third of the population.
+    fn stays_armed(self) -> bool {
+        matches!(self, Self::EveryBind)
+    }
 }
 
 /// Upper bound on tracked windows.
@@ -1000,6 +1079,9 @@ fn observe<M: crate::runtime::host::HostOps>(
         };
     }
 
+    // Copied out before the entry is borrowed mutably: the policy belongs to the
+    // witness and the decisions that read it belong to one of its entries.
+    let density = witness.audit;
     let entry = witness
         .entries
         .get_mut(&key)
@@ -1050,7 +1132,7 @@ fn observe<M: crate::runtime::host::HostOps>(
             };
             entry.fold = fold;
             entry.fold_valid = true;
-            entry.audit_armed = false;
+            entry.audit_armed = density.stays_armed();
             entry.rebaselines = 0;
             entry.binds_since_fold = 0;
             audit
@@ -1074,7 +1156,7 @@ fn observe<M: crate::runtime::host::HostOps>(
             entry.binds_since_fold = 0;
             ContentAudit::Restarted
         }
-    } else if entry.binds_since_fold >= AUDIT_STRIDE {
+    } else if entry.binds_since_fold >= density.stride() {
         // Arm: take the baseline whatever this bind's verdict is. The fold reads
         // the guest pages directly, so it describes the window on a vouched bind
         // (where the gather is skipped) exactly as it does on a refused one.
@@ -1305,6 +1387,91 @@ mod tests {
         assert_eq!(
             (guest_wrote.generation, guest_wrote.vouch),
             (13, GatherVouch::Fresh)
+        );
+    }
+
+    /// A witness at a stated audit density, for the two tests that are about the
+    /// density rather than about the witness.
+    fn witness_auditing(density: AuditDensity) -> GatherWitness {
+        GatherWitness {
+            audit: density,
+            ..GatherWitness::default()
+        }
+    }
+
+    /// [`AuditDensity::EveryBind`] judges every bind it can, and the shipping
+    /// stride judges none of the same population.
+    ///
+    /// Both arms are asserted because only the pair says the switch does
+    /// anything: the dense arm alone would pass against a witness that always
+    /// audited, and the strided arm alone against one that never did.
+    ///
+    /// Six binds rather than a computed count, and the dense arm is allowed its
+    /// first three — a comparison needs a baseline bind and a bind to spend it
+    /// on, and the first sight of a window is a rearm that has neither.
+    #[test]
+    fn every_bind_compares_where_the_shipping_stride_has_not_yet_looked() {
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+        let compares = |density| {
+            let mut host = crate::runtime::host::FakeHost::new();
+            let mut w = witness_auditing(density);
+            (0..6)
+                .map(|_| observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()))
+                .filter(|seen| seen.audit == ContentAudit::Agreed)
+                .count()
+        };
+        assert_eq!(
+            compares(AuditDensity::Strided),
+            0,
+            "the shipping stride is {AUDIT_STRIDE} binds, so six cannot reach a comparison"
+        );
+        assert_eq!(
+            compares(AuditDensity::EveryBind),
+            3,
+            "every bind after the first three must compare against the bind before it"
+        );
+    }
+
+    /// The reading the switch exists to produce: a writer that escapes **both**
+    /// halves of the witness is caught on the very next bind.
+    ///
+    /// This is the failure the sampled cache's identity-only lookup cannot report
+    /// any other way — an elision correctly taken and one wrongly taken are the
+    /// same absence — so the audit catching it is the only instrument there is.
+    /// The bytes here move with no guest store and no recorded host write, which
+    /// is exactly the shape of an unrecorded writer.
+    ///
+    /// The vouch is asserted too, and it is the half that matters at a bind: a
+    /// `Disagreed` audit that still handed back a live generation would leave the
+    /// next bind serving the same stale image the audit had just convicted.
+    #[test]
+    fn an_unrecorded_write_is_convicted_on_the_next_bind_and_spends_the_generation() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut w = witness_auditing(AuditDensity::EveryBind);
+        let mut buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+        let settled = bind_quietly(&mut w, &mut host, &GPAS, &runs, 4);
+        assert_eq!(
+            (settled.audit, settled.vouch),
+            (ContentAudit::Agreed, GatherVouch::Vouched),
+            "the window has to be under a live vouch before the escape means anything"
+        );
+
+        // Neither half is told. This is the writer the module's whole soundness
+        // argument assumes does not exist.
+        buf[2048] ^= 0xff;
+
+        let caught = observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, 77);
+        assert_eq!(
+            (caught.verdict, caught.audit),
+            (GatherVerdict::Vouched, ContentAudit::Disagreed),
+            "both halves vouched and the bytes had moved, which is the alarm's whole purpose"
+        );
+        assert_eq!(
+            (caught.generation, caught.vouch),
+            (77, GatherVouch::Fresh),
+            "a convicted vouch must not be handed on, or the next bind serves the stale image"
         );
     }
 
