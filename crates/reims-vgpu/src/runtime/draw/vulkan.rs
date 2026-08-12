@@ -1559,7 +1559,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         host,
         task_id,
         texture_ref,
-        native_uploads_for_host(),
+        native_uploads_asking_host(),
         crate::runtime::render_writeback::SettleSite::LinearTextureSampled,
     )?;
     let (_entry, desc) = sampled_texture_descriptor(state, host, task_id, texture_ref)?;
@@ -3884,39 +3884,6 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
 /// hard-coded four here would under-allocate an `RGBA16Float` image by half and
 /// the row copy would refuse rather than write past it, which is a lost bind
 /// dressed as a decline.
-/// Which native sampled layouts the CPU byte rails may hand the engine on this
-/// host.
-///
-/// [`NativeUploads`] is a parameter and not a constant because the answer has a
-/// capability half that `runtime/draw/texture_view.rs` cannot ask: an image is
-/// created at the layout's own `VkFormat`, and a host that cannot linearly
-/// filter that format would sample it through a sampler that asks for filtering
-/// anyway. This is the one place that asks, so the two halves of the answer are
-/// decided together.
-///
-/// `Bgra8` is unconditional: `B8G8R8A8_UNORM` carries
-/// `SAMPLED_IMAGE_FILTER_LINEAR` on every Vulkan implementation by mandate, and
-/// the rail that first took it argues the same. The half-float pair is asked
-/// about, because their mandate covers `SAMPLED_IMAGE` and this device's own
-/// table is what the zero-copy rail already consults for exactly this question.
-///
-/// Only reached on a memo miss, so the engine lock this takes is not on the
-/// nine-in-ten path.
-fn native_uploads_for_host() -> NativeUploads {
-    use crate::backend::vulkan::engine;
-    NativeUploads {
-        // One flag for both half-float layouts, so the answer is the
-        // conjunction: a host that filters one and not the other keeps neither
-        // on the native rail. Nothing on record separates them — both carry
-        // `SAMPLED_IMAGE_FILTER_LINEAR` by mandate — and a per-layout flag
-        // would be two fields nobody could point at a host that needed them.
-        float16: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba16Float)
-            && engine::supports_sampled_layout_linear_filter(TexelLayout::Rg16Float),
-        ..NativeUploads::BGRA8
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 fn native_scratch_to_upload(
     scratch: &[u8],
     w: u32,
@@ -3924,8 +3891,8 @@ fn native_scratch_to_upload(
     bpr: u64,
     sample_fmt: u16,
     tight: u64,
-    native: NativeUploads,
 ) -> Option<(Vec<u8>, TexelLayout)> {
+    let native = native_uploads_for(sample_fmt);
     let bpr = bpr as usize;
     if let Some(fmt) = linear_native_upload_format(sample_fmt, native)
         .filter(|fmt| tight == (w as u64).saturating_mul(fmt.bytes_per_texel() as u64))
@@ -3962,6 +3929,56 @@ fn native_scratch_to_upload(
         }
     }
     Some((out, TexelLayout::Rgba8))
+}
+
+/// Which native sampled layouts the CPU byte rails may hand the engine for this
+/// guest format on this host.
+///
+/// [`NativeUploads`] is a parameter of the loaders and not a constant because
+/// the answer has a capability half that `runtime/draw/texture_view.rs` cannot
+/// ask: an image is created at the layout's own `VkFormat`, and a host that
+/// cannot linearly filter that format would sample it through a sampler that
+/// asks for filtering anyway. This is the one place that asks, so the two
+/// halves of the answer are decided together.
+///
+/// `Bgra8` is unconditional: `B8G8R8A8_UNORM` carries
+/// `SAMPLED_IMAGE_FILTER_LINEAR` on every Vulkan implementation by mandate, and
+/// the rail that first took it argues the same.
+///
+/// **Keyed on the format so the common one never takes the engine lock.**
+/// `supports_sampled_layout_linear_filter` locks the engine and this sits on
+/// the rung carrying essentially all of the pathway's sampled traffic; asking
+/// it unconditionally would put two lock acquisitions on every memo miss to
+/// answer a question only two guest formats can make use of.
+/// [`pixel_format::narrows_to_unorm8`] is exactly the set of formats whose CPU
+/// arm is lossy, which is exactly the set the half-float flag can change the
+/// answer for — so keying on it is the same rule stated once, not a fast path
+/// that could disagree with the slow one.
+fn native_uploads_for(sample_format: u16) -> NativeUploads {
+    if !pixel_format::narrows_to_unorm8(sample_format) {
+        return NativeUploads::BGRA8;
+    }
+    native_uploads_asking_host()
+}
+
+/// The same answer for a caller that does not yet know the guest format.
+///
+/// The last-resort sampled rung resolves the format inside the loader, so it
+/// cannot key the question the way the hot rung does — and it does not need to:
+/// `settle_linear_texture_sampled` read **0** across a four-rail sweep, because
+/// every rung above it serves. A lock on a path that does not run is not a cost.
+fn native_uploads_asking_host() -> NativeUploads {
+    use crate::backend::vulkan::engine;
+    NativeUploads {
+        // One flag for both half-float layouts, so the answer is the
+        // conjunction: a host that filters one and not the other keeps neither
+        // on the native rail. Nothing on record separates them — both carry
+        // `SAMPLED_IMAGE_FILTER_LINEAR` by mandate — and a per-layout flag
+        // would be two fields nobody could point at a host that needed them.
+        float16: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba16Float)
+            && engine::supports_sampled_layout_linear_filter(TexelLayout::Rg16Float),
+        ..NativeUploads::BGRA8
+    }
 }
 
 /// The sampled linear ladder's hot rung: read the guest's own rows for this
@@ -4141,7 +4158,7 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     }
     // First sight or native bytes changed: convert fresh, new generation.
     let Some((rgba, fmt)) =
-        native_scratch_to_upload(&scratch, w, h, bpr, sample_fmt, tight, native_uploads_for_host())
+        native_scratch_to_upload(&scratch, w, h, bpr, sample_fmt, tight)
     else {
         state.guest_linear_scratch = scratch;
         return None;
