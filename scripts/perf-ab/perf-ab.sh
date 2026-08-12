@@ -30,6 +30,19 @@
 #
 # An arm is `shipping` or comma-joined `NAME=value` pairs exported as
 # `REIMS_VGPU_NAME=value`. One boot per arm per round.
+#
+# A pair whose name already begins with `INTEL_` is exported verbatim instead,
+# which is how a *driver* arm gets priced against a device arm in one
+# interleaved run. That matters because the thing being priced may not be one of
+# this crate's switches at all: the macos-11/12 GPU hang is Mesa's SIMD16/32
+# shader codegen, and what it would cost to work around is a question about
+# `INTEL_DEBUG=no16,no32` and nothing this device spells. Running the two arms as
+# separate blocks would answer it against two different base rates of the
+# slow-regime draw, which is exactly what the interleaving rule above exists to
+# prevent.
+#
+# Values use `+` where the variable wants a comma, because the arm string is
+# already comma-separated: `INTEL_DEBUG=no16+no32` exports `INTEL_DEBUG=no16,no32`.
 set -uo pipefail
 export LC_ALL=C
 
@@ -78,10 +91,21 @@ for arm in $ARMS; do
   say "=== round $round arm $arm ==="
   "$REPO/scripts/app-sweep-probe/stop-previous-vm.sh" || say "$tag: previous VM still holds :2222"
   rm -f /tmp/reims-vgpu-fail.log
+  # Both namespaces are swept, or an `INTEL_*` arm would leak into every later
+  # round and quietly make the whole run one arm.
   for stale in $(env | sed -n 's/^\(REIMS_VGPU_[A-Z0-9_]*\)=.*/\1/p'); do unset "$stale"; done
+  for stale in $(env | sed -n 's/^\(INTEL_[A-Z0-9_]*\)=.*/\1/p'); do unset "$stale"; done
   if [ "$arm" != shipping ]; then
     old_ifs=$IFS; IFS=,
-    for pair in $arm; do export "REIMS_VGPU_${pair%%=*}=${pair##*=}"; done
+    for pair in $arm; do
+      name="${pair%%=*}"; value="${pair##*=}"
+      case "$name" in
+        # A driver variable is exported under its own name; `+` becomes the
+        # comma the arm string could not carry.
+        INTEL_*) export "$name=${value//+/,}" ;;
+        *)       export "REIMS_VGPU_$name=$value" ;;
+      esac
+    done
     IFS=$old_ifs
   fi
 
