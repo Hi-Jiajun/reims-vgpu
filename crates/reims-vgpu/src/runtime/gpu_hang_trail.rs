@@ -77,6 +77,89 @@ pub struct DrawNote {
     /// The lowest [`GAP_KEPT`] of them, so the line names the binding and not
     /// only its count. Zero-padded past `min(frag_gap, GAP_KEPT)`.
     pub frag_gap_lo: [u32; GAP_KEPT],
+    /// Fragment sampled bindings this draw provided, lowest [`SAMPLED_KEPT`]
+    /// first. See [`SampledNote`] for why a trail that names only geometry could
+    /// not answer the question this was extended for.
+    pub sampled: [SampledNote; SAMPLED_KEPT],
+    /// How many the draw provided, so the array reads as a truncation rather
+    /// than as the whole list.
+    pub sampled_count: u32,
+}
+
+/// One fragment sampled binding, as the draw handed it to the engine.
+///
+/// # Why the trail needed this
+///
+/// The wedging draw is a compositing fragment module that walks a pointer chain
+/// *through a sampled image* — `uv <- sample(uv).xy`, continuing while
+/// `sample(uv).x > 0`, with no counter and no second exit. Zero exits on the
+/// first iteration and garbage never terminates, so the whole question is what
+/// this device put in that image. The trail recorded the draw's geometry and its
+/// two module sizes, which distinguishes the uber shader from a blit and says
+/// nothing at all about its inputs — so three live hypotheses (the wrong
+/// texture resolved, the wrong format bound, the wrong sampler built) were all
+/// equally unobservable from a wedged boot.
+///
+/// The fields are the three that separate them. `kind` says which rail supplied
+/// the texels; `format` says what the shader will read them *as*, which is the
+/// hypothesis that a chain stored as float pairs is being quantised by a
+/// narrower layout; the extent says whether the image is the one the guest meant.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SampledNote {
+    /// Device-numbering set-0 binding. `0` means the slot is unused — no sampled
+    /// resource is ever bound below `TEXTURE_BINDING_BASE`.
+    pub binding: u32,
+    /// Which rail supplied the texels: see [`SampledNote::kind_name`].
+    pub kind: u8,
+    /// `VkFormat`'s raw value. Kept as the number rather than a name because
+    /// this type compiles on the Metal-direct arm, where `ash` does not exist.
+    pub format: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Sampled bindings kept per note, lowest binding number first.
+///
+/// Sixteen and not four, and the reason is the same trap [`GAP_KEPT`] records
+/// one version of. The two bindings the uber shader walks are fragment texture
+/// indices **6 and 7**, which is `TEXTURE_BINDING_BASE + 6` and `+ 7` — so a
+/// list truncated at four would hold the four bindings nobody is asking about
+/// and drop both of the ones this exists to name. Sixteen clears them with room
+/// for the band to move, and [`DrawNote::sampled_count`] says when even that
+/// truncated.
+///
+/// The cost is `16 * size_of::<SampledNote>()` per entry over a ring of a few
+/// dozen, which is kilobytes, paid once and printed only after something has
+/// already gone wrong.
+pub const SAMPLED_KEPT: usize = 16;
+
+impl SampledNote {
+    /// One letter per supplying rail, so a note fits a log line.
+    ///
+    /// `b` CPU bytes, `t` a resident render target, `g` a guest window gathered
+    /// or imported, `?` a kind this predates.
+    pub fn kind_name(kind: u8) -> char {
+        match kind {
+            1 => 'b',
+            2 => 't',
+            3 => 'g',
+            _ => '?',
+        }
+    }
+}
+
+impl std::fmt::Display for SampledNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "b{}:{}:f{}:{}x{}",
+            self.binding,
+            Self::kind_name(self.kind),
+            self.format,
+            self.width,
+            self.height
+        )
+    }
 }
 
 /// Gap binding numbers carried per entry.
@@ -117,7 +200,17 @@ impl std::fmt::Display for DrawNote {
                     &self.frag_gap_lo[..(self.frag_gap as usize).min(GAP_KEPT)]
                 )
             }
-        )
+        )?;
+        if self.sampled_count > 0 {
+            let shown = (self.sampled_count as usize).min(SAMPLED_KEPT);
+            let body = self.sampled[..shown]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            write!(f, " smp={}[{}]", self.sampled_count, body)?;
+        }
+        Ok(())
     }
 }
 

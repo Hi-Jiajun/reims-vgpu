@@ -7213,7 +7213,37 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // together: past it the engine keys on digests and the ref is gone. See
         // [`crate::runtime::gpu_hang_trail`] for what reads it and why a counter
         // could not answer the question.
+        // What the draw is about to sample, lowest binding first. The trail's
+        // whole subject is a fragment module that walks a pointer chain through
+        // a sampled image, and until this it recorded the module's *size* and
+        // nothing about its inputs — so a wedged boot could not say which rail
+        // supplied the walked texture, what format the shader would read it as,
+        // or whether the extent was the one the guest meant.
+        //
+        // Sorted here rather than relied upon: `sampled_images` is in the order
+        // the two texture loops pushed it, vertex stage first, so the fragment
+        // bindings are neither first nor contiguous.
+        let mut sampled_notes = [crate::runtime::gpu_hang_trail::SampledNote::default();
+            crate::runtime::gpu_hang_trail::SAMPLED_KEPT];
+        let mut by_binding: Vec<&crate::backend::vulkan::engine::SampledImageResource> =
+            resources.sampled_images.iter().collect();
+        by_binding.sort_unstable_by_key(|i| i.binding);
+        for (slot, image) in sampled_notes.iter_mut().zip(by_binding.iter()) {
+            *slot = crate::runtime::gpu_hang_trail::SampledNote {
+                binding: image.binding,
+                kind: match &image.source {
+                    crate::backend::vulkan::engine::SampledSource::Bytes(_) => 1,
+                    crate::backend::vulkan::engine::SampledSource::Target(_) => 2,
+                    crate::backend::vulkan::engine::SampledSource::GuestRuns(..) => 3,
+                },
+                format: image.format.as_raw() as u32,
+                width: image.width,
+                height: image.height,
+            };
+        }
         crate::runtime::gpu_hang_trail::note_draw(crate::runtime::gpu_hang_trail::DrawNote {
+            sampled: sampled_notes,
+            sampled_count: resources.sampled_images.len() as u32,
             pipeline_ref: req.pipeline_ref,
             vert_words: v_words.len() as u32,
             frag_words: f_words.len() as u32,

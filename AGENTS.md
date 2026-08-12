@@ -634,10 +634,15 @@ a state to get past. `scripts/app-sweep-probe/wait-for-desktop.sh` now does the 
 typed, and **exits 3 without logging in** when any report is there. `--login-after-crash` overrides
 it and an unattended sweep must not pass it — a screenshot is not worth a crash report.
 
-Two readings that follow:
+Two readings that follow, and the first corrects what this file said when the rule was first written:
 
-- **`console` naming `_windowserver` is a crash; naming `root` is not.** `stat -f%Su /dev/console`
-  is the discriminator the script already had. A guest that genuinely never logged in answers `root`.
+- **The report is the crash detector; the console owner is not.** `stat -f%Su /dev/console`
+  answering `_windowserver` reads like an abort and is not one on its own — four driven macos-11
+  boots answered `_windowserver` at the login window with
+  `/Library/Logs/DiagnosticReports/` **empty**, which the collector proved by listing the directory
+  rather than by finding nothing in it. That directory is `root:admin 0750` and the rails' account is
+  in `admin`, so it is readable without `sudo`; the per-user copy does not exist until something
+  writes one. Quote the report, never the console owner.
 - **A crash can be invisible at the console.** Autologin restarts the session, so a WindowServer that
   aborted early can have a Dock by the time any harness looks. The report is the only thing that sees
   that class, which is why the success path collects too.
