@@ -453,6 +453,47 @@ pub(crate) fn descriptor_range(len: u64) -> u64 {
     }
 }
 
+/// The first binding either of a draw's modules statically uses that the
+/// descriptor set layout this draw would build does not describe, and which
+/// module named it.
+///
+/// The draw-path twin of `exec_compute::used_binding_absent_from_layout`, and it
+/// exists for the reason that one does: a used binding the layout omits is not
+/// undefined behaviour this device can absorb, it is `SIGFPE` inside
+/// `vkCreateGraphicsPipelines` on Mesa's Intel driver, which kills the QEMU
+/// process with no status to inspect and no guest packet left to fail. Refusing
+/// one draw is the only outcome that keeps the VM alive and says why.
+///
+/// Both modules, checked in fragment-first order because that is the stage the
+/// measured population fires on. The layout is shared — this device builds one
+/// set for the pipeline with `VERTEX | FRAGMENT` stage flags — so a binding is
+/// absent for both stages or for neither, and only the attribution differs.
+///
+/// Conservative by construction, and deliberately so:
+/// [`crate::runtime::spirv_bind::descriptor_static_use`] answers `NotDeclared`
+/// for anything that is not a `UniformConstant`, so a storage buffer is never
+/// refused on a guess about a root this walk cannot resolve. That is the same
+/// narrowing the compute twin documents, and it is what keeps this a backstop
+/// rather than a second opinion about every draw.
+fn used_binding_absent_from_layout(
+    vert_spirv: &[u32],
+    frag_spirv: &[u32],
+    layout: &[BindingSig],
+) -> Option<(u32, bool)> {
+    let absent = |spirv: &[u32]| -> Option<u32> {
+        crate::runtime::spirv_bind::declared_binding_numbers(spirv)
+            .into_iter()
+            .find(|binding| {
+                !layout.iter().any(|b| b.binding == *binding)
+                    && crate::runtime::spirv_bind::descriptor_static_use(spirv, *binding)
+                        .is_violation()
+            })
+    };
+    absent(frag_spirv)
+        .map(|binding| (binding, true))
+        .or_else(|| absent(vert_spirv).map(|binding| (binding, false)))
+}
+
 unsafe fn stage_buffer_content(
     ctx: &super::context::DeviceContext,
     pools: &mut ResourcePools,
@@ -2263,6 +2304,17 @@ pub(crate) unsafe fn execute_draw_inner(
         });
     }
     layout_bindings.sort_by_key(|b| b.binding);
+    // The backstop the compute path has carried since `25051457` and this one
+    // did not. Both of a draw's modules are checked, because either can name a
+    // binding the layout above omits and the divide-by-zero is in the driver's
+    // shared layout scoring rather than in anything stage-specific.
+    if let Some((binding, fragment)) =
+        used_binding_absent_from_layout(&req.vert_spirv, &req.frag_spirv, &layout_bindings)
+    {
+        return Err(DrawError::Unsupported(
+            super::reason::DrawReason::UsedBindingAbsentFromLayout { binding, fragment },
+        ));
+    }
     let layout_key = LayoutKey {
         bindings: layout_bindings,
     };
@@ -4705,6 +4757,78 @@ mod tests {
         GuestRun, GuestRunSource, SampledImageResource, SampledSource,
     };
     use crate::observe::Decline;
+
+    fn sig(binding: u32) -> BindingSig {
+        BindingSig {
+            binding,
+            ty: vk::DescriptorType::SAMPLED_IMAGE.as_raw() as u32,
+            stages: (vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT).as_raw(),
+        }
+    }
+
+    /// A binding a module statically uses and the layout omits is caught before
+    /// the pipeline is created, and is attributed to the stage that named it.
+    ///
+    /// This is a host-kill guard, not a correctness nicety: on Mesa's Intel
+    /// driver the omission is `(use_count << 7) / 0` inside
+    /// `vkCreateGraphicsPipelines`, which takes the QEMU process down with
+    /// `SIGFPE` — no Vulkan error, no guest packet to fail, no log line. The
+    /// compute path has refused this since `25051457`; this arm did not, and the
+    /// two arms consume the same wire form.
+    #[test]
+    fn a_used_binding_the_layout_omits_is_refused_before_the_pipeline_is_built() {
+        use crate::runtime::spirv_bind::test_support::module_with_descriptor;
+        let empty: Vec<u32> = Vec::new();
+
+        let frag_uses_33 = module_with_descriptor(33, true);
+        assert_eq!(
+            used_binding_absent_from_layout(&empty, &frag_uses_33, &[sig(32)]),
+            Some((33, true)),
+            "binding 33 is used by the fragment module and the layout names only 32, \
+             which is exactly the hole Mesa divides by"
+        );
+
+        let vert_uses_33 = module_with_descriptor(33, true);
+        assert_eq!(
+            used_binding_absent_from_layout(&vert_uses_33, &empty, &[sig(32)]),
+            Some((33, false)),
+            "the vertex module can name the hole just as well, and the layout is shared"
+        );
+    }
+
+    /// The two populations that must NOT be refused, because refusing either
+    /// costs the guest a draw it was entitled to.
+    ///
+    /// A declared-but-never-referenced variable is legal to omit from the
+    /// layout, and a binding the layout provides is not a hole however the
+    /// module uses it. Getting the first wrong would refuse a large share of
+    /// every real draw — the census that separated `Used` from `DeclaredUnused`
+    /// exists precisely because the two look identical to a declaration scan.
+    #[test]
+    fn a_declared_but_unused_binding_and_a_provided_one_are_both_left_alone() {
+        let empty: Vec<u32> = Vec::new();
+        use crate::runtime::spirv_bind::test_support::module_with_descriptor;
+
+        let declared_unused = module_with_descriptor(33, false);
+        assert_eq!(
+            used_binding_absent_from_layout(&empty, &declared_unused, &[sig(32)]),
+            None,
+            "SPIR-V 1.4 puts every global in OpEntryPoint's interface list, so a \
+             declaration is not a use and omitting it from the layout is legal"
+        );
+
+        let used = module_with_descriptor(33, true);
+        assert_eq!(
+            used_binding_absent_from_layout(&empty, &used, &[sig(32), sig(33)]),
+            None,
+            "the layout names 33, so there is no hole"
+        );
+        assert_eq!(
+            used_binding_absent_from_layout(&empty, &empty, &[]),
+            None,
+            "a draw with no modules and no layout has nothing to refuse"
+        );
+    }
 
     /// Build a `JoinTerms` from a bitmask, one bit per ladder rung in order.
     fn join_terms(bits: u32) -> JoinTerms {

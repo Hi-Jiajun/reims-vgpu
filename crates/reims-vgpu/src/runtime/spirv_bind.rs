@@ -2897,15 +2897,49 @@ mod tests {
         assert_eq!(words.len(), before + 2);
     }
 
+}
+
+/// Module builders shared by this module's own tests and by the engine tests
+/// that ask the same questions of a draw's two modules.
+///
+/// Here rather than copied into each test module: the answer
+/// [`descriptor_static_use`] gives turns on the exact word layout below — an
+/// `OpEntryPoint` interface list that names the variable without referencing it
+/// is what separates `DeclaredUnused` from `Used` — so a second hand-built
+/// module that drifted from this one would test a different question under the
+/// same name.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Build a minimal module: header, `OpCapability Shader`, `OpMemoryModel`,
+    /// then whatever body words are given.
+    pub(crate) fn module_with(body: &[u32]) -> Vec<u32> {
+        let mut words = vec![
+            0x0723_0203,       // magic
+            0x0001_0600,       // version
+            0,                 // generator
+            64,                // bound
+            0,                 // schema
+            (2u32 << 16) | 17, // OpCapability
+            1,                 // Shader
+            (3u32 << 16) | 14, // OpMemoryModel
+            0,
+            1,
+        ];
+        words.extend_from_slice(body);
+        words
+    }
+
     /// A fragment module declaring one `UniformConstant` variable on `binding`,
     /// named by `OpEntryPoint`'s interface list the way SPIR-V 1.4 requires, and
     /// referenced by an `OpLoad` only when `loaded`.
     ///
     /// The entry point is not decoration: from 1.4 its interface list carries
     /// every global variable whether the body touches it or not, so a module
-    /// without it would not exercise the one exclusion that decides this
-    /// function's answer.
-    fn module_with_descriptor(binding: u32, loaded: bool) -> Vec<u32> {
+    /// without it would not exercise the one exclusion that decides
+    /// [`descriptor_static_use`]'s answer.
+    pub(crate) fn module_with_descriptor(binding: u32, loaded: bool) -> Vec<u32> {
         const VAR: u32 = 10;
         const FN: u32 = 11;
         let mut body = vec![
@@ -2935,6 +2969,16 @@ mod tests {
             body.extend_from_slice(&[(4u32 << 16) | OP_LOAD as u32, 2, 12, VAR]);
         }
         module_with(&body)
+    }
+}
+
+#[cfg(test)]
+mod more_tests {
+    use super::test_support::module_with;
+    use super::*;
+
+    fn module_with_descriptor(binding: u32, loaded: bool) -> Vec<u32> {
+        super::test_support::module_with_descriptor(binding, loaded)
     }
 
     /// Declaration and static use are different questions, and only the second
@@ -3015,24 +3059,8 @@ mod tests {
         assert_eq!(slugs.len(), all.len());
     }
 
-    /// Build a minimal module: header, `OpCapability Shader`, `OpMemoryModel`,
-    /// then whatever body words are given.
-    fn module_with(body: &[u32]) -> Vec<u32> {
-        let mut words = vec![
-            0x0723_0203,       // magic
-            0x0001_0600,       // version
-            0,                 // generator
-            64,                // bound
-            0,                 // schema
-            (2u32 << 16) | 17, // OpCapability
-            1,                 // Shader
-            (3u32 << 16) | 14, // OpMemoryModel
-            0,
-            1,
-        ];
-        words.extend_from_slice(body);
-        words
-    }
+    // `module_with` is `test_support`'s, imported above: one builder, so a
+    // module built here and one built by an engine test are the same module.
 
     /// `OpTypeImage %result %sampled_ty 2D 0 0 0 <sampled> <format>` (9 words).
     fn op_type_image(result: u32, sampled: u32, format: u32) -> [u32; 9] {

@@ -180,6 +180,39 @@ pub enum DrawReason {
     SwapchainNoSurfaceFormat,
     /// The surface advertises no composite-alpha mode.
     SwapchainNoCompositeAlpha,
+    /// A binding one of this draw's two modules statically uses is absent from
+    /// the descriptor set layout this draw would build.
+    ///
+    /// The draw-path twin of
+    /// [`super::compute_execution::ComputeExecutionDecline::UsedBindingAbsentFromLayout`],
+    /// and it is the same host kill: Vulkan requires the pipeline layout to
+    /// describe every statically-used resource, and Mesa's Intel driver does not
+    /// merely assume that — it scores each used binding as
+    /// `(use_count << 7) / array_size` over an array it sized to
+    /// `max_binding + 1` and zero-filled, so an absent binding under a declared
+    /// one divides by zero and `vkCreateGraphicsPipelines` kills the process
+    /// with `SIGFPE` rather than returning an error. There is no status to
+    /// inspect afterwards and no guest packet to fail; the process is gone.
+    ///
+    /// The compute path has carried this backstop since `25051457` and the draw
+    /// path did not, which is the `## Before A Broad Sweep` rule about two arms
+    /// consuming one wire form: the neutralizing pass was ported and the refusal
+    /// that catches what it cannot neutralize was not.
+    ///
+    /// **Expected to stay at zero.** `runtime::draw`'s
+    /// `frag_unbound_textures_to_neutralize` fills the one repairable class
+    /// before the request is built, and
+    /// [`crate::runtime::spirv_bind::descriptor_static_use`] answers
+    /// `NotDeclared` for anything that is not a `UniformConstant`, so a storage
+    /// buffer — whose root that walk cannot resolve — is never refused on a
+    /// guess. A firing therefore names a class the neutralizing pass does not
+    /// cover, and costs one draw rather than the VM.
+    UsedBindingAbsentFromLayout {
+        binding: u32,
+        /// Which of the draw's two modules declared it, so a firing does not
+        /// need a second boot to say where to look.
+        fragment: bool,
+    },
 }
 
 impl crate::observe::Decline for DrawReason {
@@ -188,6 +221,7 @@ impl crate::observe::Decline for DrawReason {
     fn slug(&self) -> &'static str {
         match self {
             Self::SpirvInvalid => "spirv_module_invalid",
+            Self::UsedBindingAbsentFromLayout { .. } => "draw_used_binding_absent_from_layout",
             Self::DriverCallQuarantined => "driver_call_quarantined",
             Self::ResidentSampledNot2d { .. } => "resident_sampled_not_2d",
             Self::GuestRunSampledNot2d { .. } => "guest_run_sampled_not_2d",
@@ -237,6 +271,10 @@ impl std::fmt::Display for DrawReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "reason={}", self.slug())?;
         match self {
+            Self::UsedBindingAbsentFromLayout { binding, fragment } => {
+                let stage = if *fragment { "fragment" } else { "vertex" };
+                write!(f, " binding={binding} stage={stage}")
+            }
             Self::ResidentSampledNot2d { binding } | Self::GuestRunSampledNot2d { binding } => {
                 write!(f, " binding={binding}")
             }
