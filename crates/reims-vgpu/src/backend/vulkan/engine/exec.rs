@@ -420,6 +420,39 @@ fn single_run(
     clippy::too_many_arguments,
     reason = "buffer staging carries the Vulkan context, pools, binding, and lifetime sets"
 )]
+/// The `range` a storage-buffer descriptor gets: the bind's own length, not the
+/// rest of whatever buffer it landed in.
+///
+/// This used to be `vk::WHOLE_SIZE` on both the draw and the compute path, and
+/// that made the `robustBufferAccess` argument for the extent-narrowing rail
+/// vacuous. A staged bind's `VkBuffer` is created at a **power-of-two bucket**
+/// at least as large as the bytes written, and `write_staging` deliberately does
+/// not zero the tail. Robust access clamps against the *descriptor range*, so
+/// with `WHOLE_SIZE` the bytes between the bind's length and the end of the
+/// bucket are in bounds of the binding and return the previous tenant's data —
+/// another guest draw's constants. Commit 0005766b's body claimed robust access
+/// made an over-read "visibly wrong rather than unsound"; it did not, and stale
+/// bytes from an unrelated bind are strictly harder to see than zeroes.
+///
+/// With an exact range, a read past the bind's own declared object is clamped by
+/// the driver and reads zero, which is defined and diagnosable.
+///
+/// Zero keeps `WHOLE_SIZE`, because a zero `range` is not a legal descriptor. A
+/// zero-length storage bind is degenerate either way; this is not the place to
+/// refuse it.
+///
+/// One consequence worth stating: for an SSBO whose last member is a runtime
+/// array, `OpArrayLength` now reports the length derived from this range rather
+/// than from the bucket. That is the true size of what was staged, so it is the
+/// answer the shader should have been getting.
+pub(crate) fn descriptor_range(len: u64) -> u64 {
+    if len == 0 {
+        vk::WHOLE_SIZE
+    } else {
+        len
+    }
+}
+
 unsafe fn stage_buffer_content(
     ctx: &super::context::DeviceContext,
     pools: &mut ResourcePools,
@@ -2536,7 +2569,7 @@ pub(crate) unsafe fn execute_draw_inner(
             batch_eligible,
             &mut guest_gathers,
         )?;
-        storage_slots.push((resource.binding, slot));
+        storage_slots.push((resource.binding, slot, resource.content.len() as u64));
     }
 
     // Target seed staging (CPU import only — not LoadFromTarget).
@@ -3058,15 +3091,11 @@ pub(crate) unsafe fn execute_draw_inner(
         dset_pool = Some(pool);
         let buffer_infos: Vec<_> = storage_slots
             .iter()
-            .map(|(_, bound)| {
-                // `WHOLE_SIZE` is the rest of the buffer from `offset`. For a
-                // pooled slot that is the slot; for a guest window import it is
-                // the remainder of the guest's own pages, which the shader is
-                // already entitled to and which its own bounds keep it inside.
+            .map(|(_, bound, len)| {
                 vk::DescriptorBufferInfo::default()
                     .buffer(bound.buffer)
                     .offset(bound.offset)
-                    .range(vk::WHOLE_SIZE)
+                    .range(descriptor_range(*len))
             })
             .collect();
         let sampled_infos: Vec<_> = sampled
@@ -3087,7 +3116,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .image_view(target_view)
             .image_layout(vk::ImageLayout::GENERAL);
         let mut writes = Vec::new();
-        for (i, (binding, _)) in storage_slots.iter().enumerate() {
+        for (i, (binding, _, _)) in storage_slots.iter().enumerate() {
             writes.push(
                 vk::WriteDescriptorSet::default()
                     .dst_set(dset)

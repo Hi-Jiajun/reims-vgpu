@@ -507,11 +507,11 @@ pub(crate) unsafe fn execute_compute_inner(
         dset_pool = Some(pool);
         let buffer_infos: Vec<_> = storage_slots
             .iter()
-            .map(|(_, s, _, _)| {
+            .map(|(_, s, len, _)| {
                 vk::DescriptorBufferInfo::default()
                     .buffer(s.buffer)
                     .offset(0)
-                    .range(vk::WHOLE_SIZE)
+                    .range(super::exec::descriptor_range(*len as u64))
             })
             .collect();
         let sampled_infos: Vec<_> = sampled_slots
