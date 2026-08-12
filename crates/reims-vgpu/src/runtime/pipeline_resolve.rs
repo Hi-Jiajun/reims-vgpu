@@ -230,9 +230,23 @@ impl VertexBindPlan {
         let mut constant_step: Vec<u32> = desc
             .vertex_attributes
             .iter()
+            // No stride term, for the reason `attribute` below states in full:
+            // the draw walk does not use `a.stride`, it uses
+            // `draw::bind_attribute_stride`, which prefers the per-draw
+            // `attributeStride` the guest sent with the bind and falls back to
+            // the pipeline's only when there is none. A pipeline declaring
+            // stride 0 for a dynamic layout is therefore still walked, still
+            // emits a `Constant` step, and still needs the CPU base-instance
+            // prefix — while this set, filtered on the pipeline's stride, would
+            // say the bind may take the zero-copy rail. `execute_draw_inner`
+            // then refuses it with `ConstantVertexRequiresCpuBytes` and the draw
+            // is lost.
+            //
+            // Listing an index the walk turns out to skip costs one CPU staging
+            // read and never correctness, which is the direction a set derived
+            // from the pipeline alone is allowed to be wrong in.
             .filter(|a| {
                 a.format != 0
-                    && a.stride != 0
                     && crate::backend::vulkan::translate::vertex::step_function(a.declared_step_function)
                         == Ok(crate::backend::vulkan::engine::VertexStepFunction::Constant)
             })
@@ -891,13 +905,23 @@ mod tests {
     /// draw path from the same attribute list, and this pins the classification
     /// they replaced rather than the shape of the code that does it.
     ///
-    /// The interesting rows are the ones the old inline filter got right by
-    /// construction and a rewrite can get wrong: a Constant-step attribute whose
-    /// `format` is zero, and one whose `stride` is zero, are **not** constant
-    /// step for this purpose — the draw's attribute walk skips them, so a bind
-    /// of their buffer must stay eligible for the zero-copy rail — while both
-    /// still count as named by the attribute list, because that set is
-    /// deliberately unfiltered.
+    /// The interesting rows are the ones a rewrite can get wrong. A Constant-step
+    /// attribute whose `format` is zero is **not** constant step for this
+    /// purpose: the draw's attribute walk skips it, so a bind of its buffer stays
+    /// eligible for the zero-copy rail.
+    ///
+    /// A **zero `stride` is different, and it used to be filtered here too.** The
+    /// walk does not read `a.stride`; it reads `draw::bind_attribute_stride`,
+    /// which prefers the per-draw `attributeStride` the guest sent with the bind.
+    /// So a pipeline declaring stride 0 for a dynamic layout is still walked,
+    /// still emits a `Constant` step, and still needs the CPU base-instance
+    /// prefix — and this set saying otherwise put the bind on the zero-copy rail
+    /// and lost the whole draw to `ConstantVertexRequiresCpuBytes`. The rule the
+    /// `attribute` field's doc states applies to both sets: a set derived from
+    /// the pipeline alone may not depend on a field the draw re-derives.
+    ///
+    /// Both zero rows still count as *named* by the attribute list, because that
+    /// set is deliberately unfiltered.
     #[test]
     fn the_bind_plan_separates_constant_step_from_merely_named() {
         const CONSTANT: Option<u32> = Some(0);
@@ -916,7 +940,7 @@ mod tests {
                 attr(1, 0x21, 16, CONSTANT),      // constant, and it counts
                 attr(2, 0x21, 16, PER_INSTANCE),  // named, not constant
                 attr(3, 0, 16, CONSTANT),         // format 0: the walk skips it
-                attr(4, 0x21, 0, CONSTANT),       // stride 0: the walk skips it
+                attr(4, 0x21, 0, CONSTANT),       // stride 0: the draw supplies one
                 attr(1, 0x21, 32, PER_INSTANCE),  // a second attribute on buffer 1
                 attr(5, 0x21, 16, None),          // undeclared step is per-vertex
             ],
@@ -925,7 +949,13 @@ mod tests {
         let plan = VertexBindPlan::build(&desc);
 
         assert!(plan.is_constant_step(1), "declared Constant with real bytes");
-        for index in [2, 3, 4, 5] {
+        assert!(
+            plan.is_constant_step(4),
+            "a dynamic layout declares stride 0 and the draw supplies the real \
+             one, so this attribute is walked and needs the base-instance \
+             prefix; calling it zero-copy-eligible loses the draw"
+        );
+        for index in [2, 3, 5] {
             assert!(
                 !plan.is_constant_step(index),
                 "buffer {index} must keep the zero-copy rail"
