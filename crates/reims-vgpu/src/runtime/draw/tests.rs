@@ -1661,12 +1661,18 @@ fn gva_attachment_alias_samples_the_in_process_chain() {
 #[test]
 fn tight_linear_load_uses_one_bulk_read_and_converts_rows() {
     let mut calls = 0;
-    let (rgba, fmt) = load_tight_linear_rgba_with(2, 2, MTL_FORMAT_BGRA8_UNORM, false, |native| {
-        calls += 1;
-        assert_eq!(native.len(), 16);
-        native.copy_from_slice(&[3, 2, 1, 255, 6, 5, 4, 255, 9, 8, 7, 255, 12, 11, 10, 255]);
-        true
-    })
+    let (rgba, fmt) = load_tight_linear_rgba_with(
+        2,
+        2,
+        MTL_FORMAT_BGRA8_UNORM,
+        NativeUploads::NONE,
+        |native| {
+            calls += 1;
+            assert_eq!(native.len(), 16);
+            native.copy_from_slice(&[3, 2, 1, 255, 6, 5, 4, 255, 9, 8, 7, 255, 12, 11, 10, 255]);
+            true
+        },
+    )
     .expect("tight sample loads");
 
     assert_eq!(calls, 1);
@@ -1684,22 +1690,124 @@ fn tight_linear_load_uses_one_bulk_read_and_converts_rows() {
 fn tight_linear_native_bgra8_keeps_bytes_and_reports_bgra8() {
     let bgra = [3, 2, 1, 255, 6, 5, 4, 255, 9, 8, 7, 255, 12, 11, 10, 255];
     let mut calls = 0;
-    let (bytes, fmt) = load_tight_linear_rgba_with(2, 2, MTL_FORMAT_BGRA8_UNORM, true, |native| {
-        calls += 1;
-        native.copy_from_slice(&bgra);
-        true
-    })
+    let (bytes, fmt) = load_tight_linear_rgba_with(
+        2,
+        2,
+        MTL_FORMAT_BGRA8_UNORM,
+        NativeUploads::BGRA8,
+        |native| {
+            calls += 1;
+            native.copy_from_slice(&bgra);
+            true
+        },
+    )
     .expect("tight native sample loads");
     assert_eq!(calls, 1);
     assert_eq!(fmt, TexelLayout::Bgra8);
     assert_eq!(bytes, bgra, "native BGRA8 upload must not swizzle");
 }
 
+/// **The half-float regression gate.** A `RGBA16Float` sampled texture reaches
+/// the GPU as the guest's own bytes, in an `R16G16B16A16_SFLOAT` image.
+///
+/// Without the native arm this same call returns four bytes a texel through
+/// `f16_to_unorm8_lut`, which is what the second half asserts: the value `2.0`
+/// — ordinary for an extended-range compositor, and the whole reason the guest
+/// chose a float format — comes back as `255`, indistinguishable from `1.0`.
+/// Two half-floats above the unit interval that differ by 100 % arrive equal.
+#[test]
+fn a_half_float_sampled_texture_keeps_its_bytes_when_the_caller_takes_native_layouts() {
+    // Two texels: (1.0, 0.5, 0.0, 1.0) and (2.0, 1.0, 0.0, 1.0), IEEE binary16
+    // little-endian, which is byte-for-byte what `R16G16B16A16_SFLOAT` samples.
+    let guest: [u8; 16] = [
+        0x00, 0x3c, 0x00, 0x38, 0x00, 0x00, 0x00, 0x3c, // 1.0, 0.5, 0.0, 1.0
+        0x00, 0x40, 0x00, 0x3c, 0x00, 0x00, 0x00, 0x3c, // 2.0, 1.0, 0.0, 1.0
+    ];
+    let (bytes, fmt) = load_tight_linear_rgba_with(
+        2,
+        1,
+        pixel_format::MTL_FORMAT_RGBA16_FLOAT,
+        NativeUploads::ALL,
+        |dst| {
+            assert_eq!(dst.len(), 16, "eight bytes a texel, not four");
+            dst.copy_from_slice(&guest);
+            true
+        },
+    )
+    .expect("half-float sample loads");
+    assert_eq!(fmt, TexelLayout::Rgba16Float);
+    assert_eq!(bytes, guest, "a half-float upload must not convert");
+
+    // The same source through the lossy arm, so the gate states what it is
+    // guarding against rather than only what it wants.
+    let (narrowed, narrowed_fmt) = load_tight_linear_rgba_with(
+        2,
+        1,
+        pixel_format::MTL_FORMAT_RGBA16_FLOAT,
+        NativeUploads::NONE,
+        |dst| {
+            dst.copy_from_slice(&guest);
+            true
+        },
+    )
+    .expect("half-float sample loads through the convert arm too");
+    assert_eq!(narrowed_fmt, TexelLayout::Rgba8);
+    assert_eq!(narrowed.len(), 8, "converted to four bytes a texel");
+    assert_eq!(
+        narrowed[0], narrowed[4],
+        "1.0 and 2.0 both clamp to 255 — this is the loss the native arm avoids"
+    );
+}
+
+/// The two-channel companion takes the same rail at its own four-byte width,
+/// which is the width the RGBA8 output happens to share — so this is the case
+/// that would still pass if the gate were re-narrowed to `native_len ==
+/// rgba_len`, and it is here to pin the *layout*, not the length.
+#[test]
+fn a_two_channel_half_float_sampled_texture_reports_rg16_float() {
+    let guest: [u8; 8] = [0x00, 0x3c, 0x00, 0x38, 0x00, 0x40, 0x00, 0x3c];
+    let (bytes, fmt) = load_tight_linear_rgba_with(
+        2,
+        1,
+        pixel_format::MTL_FORMAT_RG16_FLOAT,
+        NativeUploads::ALL,
+        |dst| {
+            dst.copy_from_slice(&guest);
+            true
+        },
+    )
+    .expect("two-channel half-float sample loads");
+    assert_eq!(fmt, TexelLayout::Rg16Float);
+    assert_eq!(bytes, guest);
+}
+
+/// A padded source stride takes the straight row copy at the layout's own texel
+/// width. The row loop used to size its output from `RGBA8_BPP`, which for an
+/// eight-byte texel is half the rows' length — so this is the case that caught
+/// the allocation and not just the format.
+#[test]
+fn a_padded_half_float_row_copies_straight_through_at_eight_bytes_a_texel() {
+    assert_eq!(
+        linear_native_upload_format(pixel_format::MTL_FORMAT_RGBA16_FLOAT, NativeUploads::ALL),
+        Some(TexelLayout::Rgba16Float)
+    );
+    assert_eq!(
+        linear_native_upload_format(pixel_format::MTL_FORMAT_RGBA16_FLOAT, NativeUploads::BGRA8),
+        None,
+        "a caller that did not opt in must still get the RGBA8 convert"
+    );
+    assert_eq!(
+        TexelLayout::Rgba16Float.bytes_per_texel(),
+        8,
+        "the row copy sizes its output from this"
+    );
+}
+
 #[test]
 fn tight_rgba_linear_load_preserves_native_bytes() {
     let native = [1, 2, 3, 4, 5, 6, 7, 8];
     let (rgba, fmt) =
-        load_tight_linear_rgba_with(2, 1, pixel_format::MTL_FORMAT_RGBA8_UNORM, false, |dst| {
+        load_tight_linear_rgba_with(2, 1, pixel_format::MTL_FORMAT_RGBA8_UNORM, NativeUploads::NONE, |dst| {
             dst.copy_from_slice(&native);
             true
         })
@@ -1735,11 +1843,11 @@ fn the_cpu_upload_rails_count_every_srgb_downgrade() {
 
     // Native-upload rail: sRGB resolves exactly as its linear sibling.
     assert_eq!(
-        linear_native_upload_format(pixel_format::MTL_FORMAT_RGBA8_UNORM_SRGB, false),
-        linear_native_upload_format(pixel_format::MTL_FORMAT_RGBA8_UNORM, false),
+        linear_native_upload_format(pixel_format::MTL_FORMAT_RGBA8_UNORM_SRGB, NativeUploads::NONE),
+        linear_native_upload_format(pixel_format::MTL_FORMAT_RGBA8_UNORM, NativeUploads::NONE),
     );
     assert_eq!(
-        linear_native_upload_format(pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB, true),
+        linear_native_upload_format(pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB, NativeUploads::BGRA8),
         Some(TexelLayout::Bgra8),
     );
     // Tight-load rail: same layout, and the BGRA swap still happens when
@@ -1749,7 +1857,7 @@ fn the_cpu_upload_rails_count_every_srgb_downgrade() {
         2,
         1,
         pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB,
-        false,
+        NativeUploads::NONE,
         |dst| {
             dst.copy_from_slice(&native);
             true
@@ -1779,8 +1887,8 @@ fn the_cpu_upload_rails_count_every_srgb_downgrade() {
     // A linear source must never touch the census, or the proxy floods and
     // stops distinguishing anything.
     srgb_census::reset_for_tests();
-    let _ = linear_native_upload_format(pixel_format::MTL_FORMAT_RGBA8_UNORM, false);
-    let _ = load_tight_linear_rgba_with(2, 1, pixel_format::MTL_FORMAT_BGRA8_UNORM, true, |dst| {
+    let _ = linear_native_upload_format(pixel_format::MTL_FORMAT_RGBA8_UNORM, NativeUploads::NONE);
+    let _ = load_tight_linear_rgba_with(2, 1, pixel_format::MTL_FORMAT_BGRA8_UNORM, NativeUploads::BGRA8, |dst| {
         dst.copy_from_slice(&native);
         true
     });
@@ -2261,7 +2369,7 @@ fn load_composite_premult_restores_seed_under_transparent() {
 fn a8_sample_preserves_alpha_coverage() {
     let native = [0, 17, 255];
     let (rgba, fmt) =
-        load_tight_linear_rgba_with(3, 1, pixel_format::MTL_FORMAT_A8_UNORM, true, |dst| {
+        load_tight_linear_rgba_with(3, 1, pixel_format::MTL_FORMAT_A8_UNORM, NativeUploads::BGRA8, |dst| {
             dst.copy_from_slice(&native);
             true
         })

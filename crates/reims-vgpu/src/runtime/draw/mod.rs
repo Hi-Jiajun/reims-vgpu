@@ -5428,7 +5428,10 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
         crate::model::GuestLinearMemo {
             native: scratch,
             rgba: rgba.clone(),
-            bgra8: false,
+            // This rail converts every format to RGBA8 unconditionally — the
+            // loop above is `convert_row_to_rgba8` with no native arm — so the
+            // layout is fixed rather than chosen.
+            layout: crate::contract::pixel_format::TexelLayout::Rgba8,
             generation,
         },
         entry_bytes,

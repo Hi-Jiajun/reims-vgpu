@@ -149,6 +149,7 @@ pub enum SampledClass {
     Rgba8Unorm,
     Bgra8Unorm,
     Rgba16Float,
+    Rg16Float,
 }
 
 /// The byte layout of one guest texel on the sampled rails, independent of any
@@ -340,12 +341,8 @@ impl TexelLayout {
             // The two half-float colour layouts answer `true` because the arm
             // genuinely exists — `texel_to_rgba8` converts both through
             // `f16_to_unorm8_lut`. This is a statement about the loader, not an
-            // endorsement: that arm quantizes to 256 levels and clamps above
-            // 1.0, which for an extended-range compositor is lost highlight
-            // range. Answering `false` to force the native rail would be a lie
-            // about the loader and would leave a below-floor window with nothing
-            // to fall to; the native rail earns those binds by being reachable,
-            // not by the floor being unable to turn them away.
+            // endorsement, and [`Self::cpu_loader_arm_is_lossy`] is where the
+            // endorsement is withheld.
             Self::Rgba16Float | Self::Rg16Float => true,
             // The two sixteen-bit normalized layouts join the floats here for
             // the same reason and a different quantity: `texel_to_rgba8` has no
@@ -357,6 +354,56 @@ impl TexelLayout {
             | Self::Rg16Unorm
             | Self::Rgba16Unorm => false,
         }
+    }
+
+    /// Whether [`texel_to_rgba8`]'s arm for this layout loses information the
+    /// guest can see.
+    ///
+    /// An arm existing and an arm being *equivalent* are two different facts,
+    /// and conflating them is how a cost threshold becomes a data-loss gate.
+    /// The half-float colour arms go through `f16_to_unorm8_lut`: every channel
+    /// is clamped to `[0, 1]` and quantized to 256 levels, so a compositor
+    /// working in extended range has its highlights removed and a colour ramp
+    /// banded. That is not a slower way to the same pixels; it is different
+    /// pixels.
+    ///
+    /// Every other arm is exact — `Rgba8` is an identity copy, `Bgra8` a
+    /// channel swap, `R8`/`Rg8` a zero-extend that the matching one- and
+    /// two-channel Vulkan formats sample to identically.
+    pub fn cpu_loader_arm_is_lossy(self) -> bool {
+        match self {
+            Self::Rgba16Float | Self::Rg16Float => true,
+            Self::Rgba8
+            | Self::Bgra8
+            | Self::R8
+            | Self::Rg8
+            | Self::R16Float
+            | Self::R32Float
+            | Self::R16Unorm
+            | Self::Rg16Unorm
+            | Self::Rgba16Unorm => false,
+        }
+    }
+
+    /// Whether a **cost** threshold may turn this layout away from a GPU rail
+    /// onto the CPU byte loader.
+    ///
+    /// This is the question the zero-copy floors are really asking, and it is
+    /// derived from the two above rather than re-listed, so a layout added with
+    /// a lossy arm cannot be waved past by a floor that only checked whether an
+    /// arm existed. A floor is a performance decision exactly when the path it
+    /// declines to produces the same pixels; where the only CPU arm is lossy —
+    /// or absent — the same floor is a correctness gate wearing a threshold's
+    /// clothes.
+    ///
+    /// The half-float colour layouts are why this exists. They answered
+    /// `has_cpu_loader_arm()` truthfully and were therefore turned away by the
+    /// 64 KiB sampled floor, which is above a 64x64 `RGBA16Float` texture's
+    /// 32 KiB — so a colour-management LUT the guest stored in extended range
+    /// reached the shader clamped and quantized, every boot, reported by
+    /// `sampled_texture_narrowed` and by nothing else.
+    pub fn a_cost_floor_may_decline(self) -> bool {
+        self.has_cpu_loader_arm() && !self.cpu_loader_arm_is_lossy()
     }
 }
 
@@ -887,6 +934,7 @@ pub fn sampled_class(format: u16) -> Option<SampledClass> {
         MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => SampledClass::Rgba8Unorm,
         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => SampledClass::Bgra8Unorm,
         MTL_FORMAT_RGBA16_FLOAT => SampledClass::Rgba16Float,
+        MTL_FORMAT_RG16_FLOAT => SampledClass::Rg16Float,
         _ => return None,
     })
 }
@@ -2607,6 +2655,49 @@ mod tests {
             TexelLayout::ALL.len(),
             "two layouts share an index, or ALL holds one twice"
         );
+    }
+
+    /// **A cost floor may never be the reason a texture loses precision.**
+    ///
+    /// [`TexelLayout::a_cost_floor_may_decline`] is the zero-copy floors' whole
+    /// admission rule, and it must stay the conjunction it is derived from: a
+    /// layout may be turned away onto the CPU byte loader only where that
+    /// loader has an arm *and* the arm is exact. The half-float colour pair is
+    /// the case that made this necessary — both answer
+    /// `has_cpu_loader_arm() == true` truthfully, so a floor asking only that
+    /// question turned a 32 KiB `RGBA16Float` away from the exact rail and onto
+    /// one that clamps to `[0, 1]` and quantizes to 256 levels.
+    #[test]
+    fn a_cost_floor_may_only_decline_a_layout_whose_cpu_arm_is_exact() {
+        for &layout in TexelLayout::ALL {
+            assert_eq!(
+                layout.a_cost_floor_may_decline(),
+                layout.has_cpu_loader_arm() && !layout.cpu_loader_arm_is_lossy(),
+                "{layout:?} — the floor rule must stay derived, not re-listed"
+            );
+            if layout.cpu_loader_arm_is_lossy() {
+                assert!(
+                    layout.has_cpu_loader_arm(),
+                    "{layout:?} — an arm that does not exist cannot be lossy"
+                );
+                assert!(
+                    !layout.a_cost_floor_may_decline(),
+                    "{layout:?} has only a lossy CPU arm, so a byte threshold \
+                     declining it is data loss and not a cost decision"
+                );
+            }
+        }
+        // Named rather than derived, because the point is that these two are
+        // *not* in the set a floor may turn away, and a test that only checked
+        // the identity above would pass with the set empty.
+        for layout in [TexelLayout::Rgba16Float, TexelLayout::Rg16Float] {
+            assert!(layout.cpu_loader_arm_is_lossy(), "{layout:?}");
+            assert!(!layout.a_cost_floor_may_decline(), "{layout:?}");
+        }
+        for layout in [TexelLayout::Rgba8, TexelLayout::Bgra8, TexelLayout::R8] {
+            assert!(!layout.cpu_loader_arm_is_lossy(), "{layout:?}");
+            assert!(layout.a_cost_floor_may_decline(), "{layout:?}");
+        }
     }
 
     /// Four bytes wide is not the same as a four-byte colour order.

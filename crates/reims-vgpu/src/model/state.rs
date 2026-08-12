@@ -1752,11 +1752,19 @@ pub struct GuestLinearMemo {
     /// content change. Padding is included so a write anywhere in the span is
     /// observed by the byte-compare.
     pub native: Vec<u8>,
-    /// Tight upload bytes of `native`: swizzled RGBA8, or — when `bgra8` — the
-    /// guest's native BGRA8 order (uploaded into a BGRA8 image, no CPU swap).
+    /// Tight upload bytes of `native`, in whatever layout [`Self::layout`]
+    /// names: converted RGBA8, or the guest's own texels kept exactly.
     pub rgba: std::sync::Arc<Vec<u8>>,
-    /// `rgba` holds native BGRA8 texels (upload as `Bgra8`) rather than RGBA8.
-    pub bgra8: bool,
+    /// What [`Self::rgba`] holds, so the memo hit re-states the layout the
+    /// miss-fill chose.
+    ///
+    /// This was a `bgra8: bool`, and it could only spell two of the layouts the
+    /// loader can now produce — so a half-float image stored on the miss would
+    /// have come back out of a hit described as `Rgba8`: eight-byte texels bound
+    /// into a four-byte image, which is a length the engine refuses and, if it
+    /// had not, garbage. A `bool` standing in for an enum is the one shape
+    /// `rustc` cannot tell you has gone short.
+    pub layout: crate::contract::pixel_format::TexelLayout,
     /// Content generation: bumps only when the native bytes change.
     pub generation: u64,
 }

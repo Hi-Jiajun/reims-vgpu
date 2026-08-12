@@ -2260,10 +2260,10 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
         crate::model::GuestLinearMemo {
             native,
             rgba: rgba.clone(),
-            // The type-5 view path carries its own native format (R8/Rg8/…);
-            // this reused struct's `bgra8` flag is only read by the guest-linear
-            // memo, so it is not load-bearing here.
-            bgra8: false,
+            // The type-5 view path re-derives this from the view's own pixel
+            // format on every call, hit or miss, so storing it is a statement of
+            // what the bytes are rather than the source anything reads.
+            layout: byte_format,
             generation,
         },
         entry_bytes,
@@ -3522,13 +3522,20 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // decision at all — a small display-profile LUT would fall through to a
     // failed resolve.
     //
-    // Asked as `has_cpu_loader_arm` and not `is_four_byte_color`. The two
+    // Asked as `a_cost_floor_may_decline` and not `is_four_byte_color`. The two
     // agreed for as long as only four-byte colour could reach here, and they
     // stop agreeing the moment `R8`/`Rg8` are admitted above: those have arms
     // and are not four bytes, so the four-byte spelling would have waved every
     // one of them past the floor — including the 3.6 KiB scroll glyphs the
     // floor's own doc names as legitimately preferring the CPU byte path.
-    if native.has_cpu_loader_arm() && span < ZERO_COPY_SAMPLED_MIN_BYTES {
+    //
+    // Nor is it `has_cpu_loader_arm`, which it used to be. That admits a layout
+    // whose only arm is lossy, and the half-float colour pair is exactly that:
+    // a 64x64 `RGBA16Float` spans 32 KiB, sat under this 64 KiB floor, and was
+    // handed to `texel_to_rgba8` — clamped to the unit interval and quantized
+    // to 256 levels — on every boot. A floor is a cost decision only where the
+    // path it declines to produces the same pixels.
+    if native.a_cost_floor_may_decline() && span < ZERO_COPY_SAMPLED_MIN_BYTES {
         // Banded, because the floor's own doc argues from where the workload's
         // spans cluster relative to it, and a bare count cannot re-check that
         // argument on a workload the doc was not tuned against. The bands are
@@ -3782,7 +3789,11 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
         (native, bpp, base_off, bpr_u32 as u64)
     };
     let (span, row_length_texels) = strided_window_extent(w, h, bpp as u64, bpr)?;
-    if span < ZERO_COPY_SAMPLED_MIN_BYTES {
+    // Same rule as the linear rail's floor: a cost threshold may only turn a
+    // plane away onto a CPU arm that produces the same pixels. The type-11 rail
+    // needs no such qualifier because `is_four_byte_color` already fixes what
+    // reaches its floor; this one admits every layout the translation names.
+    if native.a_cost_floor_may_decline() && span < ZERO_COPY_SAMPLED_MIN_BYTES {
         return None;
     }
     // The owed frame, for the reason `try_type11_sample_zero_copy` states: a
@@ -3832,11 +3843,51 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
 /// cannot decode, which fall through to the general loader.
 /// Convert the raw native rows read for a guest-linear texture (row stride
 /// `bpr`, `tight` = the packed row byte count) into the tight upload buffer.
-/// A 4-byte straight upload — RGBA8, or BGRA8 kept native — gathers each row
-/// with a plain copy (padding skipped, no swizzle) and reports its native
-/// format; every other format converts to RGBA8 per row. Shared by the
-/// guest-linear memo's miss-fill so its padded and tight branches agree
-/// byte-for-byte with the direct loader.
+/// A straight upload — RGBA8, BGRA8 kept native, or half-float colour kept at
+/// its own width — gathers each row with a plain copy (padding skipped, no
+/// swizzle) and reports its native format; every other format converts to
+/// RGBA8 per row. Shared by the guest-linear memo's miss-fill so its padded and
+/// tight branches agree byte-for-byte with the direct loader.
+///
+/// The straight-upload output is sized from the chosen layout's own texel
+/// width. It was sized from `RGBA8_BPP` while only four-byte layouts could be
+/// chosen, and the half-float arms are eight and four bytes a texel — so a
+/// hard-coded four here would under-allocate an `RGBA16Float` image by half and
+/// the row copy would refuse rather than write past it, which is a lost bind
+/// dressed as a decline.
+/// Which native sampled layouts the CPU byte rails may hand the engine on this
+/// host.
+///
+/// [`NativeUploads`] is a parameter and not a constant because the answer has a
+/// capability half that `runtime/draw/texture_view.rs` cannot ask: an image is
+/// created at the layout's own `VkFormat`, and a host that cannot linearly
+/// filter that format would sample it through a sampler that asks for filtering
+/// anyway. This is the one place that asks, so the two halves of the answer are
+/// decided together.
+///
+/// `Bgra8` is unconditional: `B8G8R8A8_UNORM` carries
+/// `SAMPLED_IMAGE_FILTER_LINEAR` on every Vulkan implementation by mandate, and
+/// the rail that first took it argues the same. The half-float pair is asked
+/// about, because their mandate covers `SAMPLED_IMAGE` and this device's own
+/// table is what the zero-copy rail already consults for exactly this question.
+///
+/// Only reached on a memo miss, so the engine lock this takes is not on the
+/// nine-in-ten path.
+fn native_uploads_for_host() -> NativeUploads {
+    use crate::backend::vulkan::engine;
+    NativeUploads {
+        // One flag for both half-float layouts, so the answer is the
+        // conjunction: a host that filters one and not the other keeps neither
+        // on the native rail. Nothing on record separates them — both carry
+        // `SAMPLED_IMAGE_FILTER_LINEAR` by mandate — and a per-layout flag
+        // would be two fields nobody could point at a host that needed them.
+        float16: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba16Float)
+            && engine::supports_sampled_layout_linear_filter(TexelLayout::Rg16Float),
+        ..NativeUploads::BGRA8
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn native_scratch_to_upload(
     scratch: &[u8],
     w: u32,
@@ -3844,15 +3895,14 @@ fn native_scratch_to_upload(
     bpr: u64,
     sample_fmt: u16,
     tight: u64,
+    native: NativeUploads,
 ) -> Option<(Vec<u8>, TexelLayout)> {
-    let out_row = (w as usize).checked_mul(RGBA8_BPP as usize)?;
-    let out_len = out_row.checked_mul(h as usize)?;
     let bpr = bpr as usize;
-    if let Some(fmt) = linear_native_upload_format(sample_fmt, true)
-        .filter(|_| tight == (w as u64).saturating_mul(RGBA8_BPP as u64))
+    if let Some(fmt) = linear_native_upload_format(sample_fmt, native)
+        .filter(|fmt| tight == (w as u64).saturating_mul(fmt.bytes_per_texel() as u64))
     {
         let row_bytes = tight as usize;
-        let mut out = vec![0u8; out_len];
+        let mut out = vec![0u8; row_bytes.checked_mul(h as usize)?];
         for y in 0..h as usize {
             let src = y.checked_mul(bpr)?;
             let dst = y * row_bytes;
@@ -3861,8 +3911,16 @@ fn native_scratch_to_upload(
         }
         return Some((out, fmt));
     }
+    let out_row = (w as usize).checked_mul(RGBA8_BPP as usize)?;
+    let out_len = out_row.checked_mul(h as usize)?;
     let trow = tight as usize;
     let mut out = vec![0u8; out_len];
+    // This rung carries nearly all of the pathway's sampled traffic, so a
+    // narrowing taken here is the one most likely to be the narrowing that
+    // matters — and until this line existed the rung reported none at all while
+    // the general loader reported its own. Same key as the others, so a format
+    // narrowed on both rails is two lines and not one.
+    crate::runtime::draw::note_sampled_narrowing("linear_memo_narrowed", 0, sample_fmt, w, h);
     for y in 0..h as usize {
         let src = y.checked_mul(bpr)?;
         if !pixel_format::convert_row_to_rgba8(
@@ -4034,19 +4092,14 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
         // Vec equality is length + byte memcmp with early exit on change.
         Some(m) if m.native == scratch => {
             crate::runtime::drain::note_store_route("lin_memo_hit");
-            Some((m.rgba.clone(), m.generation, m.bgra8))
+            Some((m.rgba.clone(), m.generation, m.layout))
         }
         Some(_) => {
             crate::runtime::drain::note_store_route("lin_memo_changed");
             None
         }
     };
-    if let Some((rgba, generation, bgra8)) = hit {
-        let fmt = if bgra8 {
-            TexelLayout::Bgra8
-        } else {
-            TexelLayout::Rgba8
-        };
+    if let Some((rgba, generation, fmt)) = hit {
         state.guest_linear_scratch = scratch;
         return Some((
             rgba,
@@ -4058,7 +4111,9 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
         ));
     }
     // First sight or native bytes changed: convert fresh, new generation.
-    let Some((rgba, fmt)) = native_scratch_to_upload(&scratch, w, h, bpr, sample_fmt, tight) else {
+    let Some((rgba, fmt)) =
+        native_scratch_to_upload(&scratch, w, h, bpr, sample_fmt, tight, native_uploads_for_host())
+    else {
         state.guest_linear_scratch = scratch;
         return None;
     };
@@ -4070,7 +4125,7 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
         crate::model::GuestLinearMemo {
             native: scratch,
             rgba: rgba.clone(),
-            bgra8: fmt == TexelLayout::Bgra8,
+            layout: fmt,
             generation,
         },
         entry_bytes,
