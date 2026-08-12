@@ -57,9 +57,11 @@ say() { echo "sweep-rails: $*"; }
 
 for rail in $RAILS; do
   say "=== $rail ==="
-  # The bracket protects this shell; see the header.
-  pkill -f 'qemu-system-x86_6[4].*reims-vgpu' 2>/dev/null
-  sleep 5
+  # Waits for the port to be free rather than for a clock: a five-second sleep
+  # here left macos-11's just-GPU-reset QEMU holding :2222, and macos-12's boot
+  # died on the hostfwd rule and was reported NO-BOOT.
+  "$REPO/scripts/app-sweep-probe/stop-previous-vm.sh" || \
+    say "$rail: the previous VM would not let go of :2222 — this boot may fail on hostfwd"
   rm -f /tmp/reims-vgpu-fail.log
   BOOTLOG="$OUT/$rail-boot.log"
   TESTING_TIMEOUT=1200 nohup "$REPO/vm/boot-x86.sh" --device reims-vgpu-pci \

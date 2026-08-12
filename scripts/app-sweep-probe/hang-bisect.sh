@@ -59,8 +59,10 @@ hangs_since() {
 
 for arm in $ARMS; do
   say "=== arm $arm ==="
-  pkill -f 'qemu-system-x86_6[4].*reims-vgpu' 2>/dev/null
-  sleep 5
+  # Not a fixed sleep: an arm that just hung the GPU takes longer to die than
+  # one that did not, and this bisect exists to run exactly those arms.
+  "$REPO/scripts/app-sweep-probe/stop-previous-vm.sh" || \
+    say "$arm: previous VM still holds :2222"
   rm -f /tmp/reims-vgpu-fail.log
   # Exported, never passed as argv: a command line naming the arm would be
   # matched by the `pkill` above on the next round.

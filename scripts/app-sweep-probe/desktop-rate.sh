@@ -56,9 +56,10 @@ gssh() { timeout 25 ssh -o BatchMode=yes -o ConnectTimeout=5 macos-vm "$1" 2>/de
 
 for n in $(seq 1 "$BOOTS"); do
   say "=== $RAIL boot $n of $BOOTS ==="
-  # The bracket protects the shell issuing the kill; see AGENTS.md.
-  pkill -f 'qemu-system-x86_6[4].*reims-vgpu' 2>/dev/null
-  sleep 6
+  # Waits on the port rather than a clock, so a boot is never scored NO-BOOT for
+  # losing the hostfwd race with its own predecessor.
+  "$REPO/scripts/app-sweep-probe/stop-previous-vm.sh" || \
+    say "boot $n: previous VM still holds :2222"
   rm -f /tmp/reims-vgpu-fail.log
   BOOTLOG="$OUT/$n-boot.log"
   TESTING_TIMEOUT=900 nohup "$REPO/vm/boot-x86.sh" --device reims-vgpu-pci \
