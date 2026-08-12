@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# perf-ab.sh — interleaved A/B of driven boots, scored on the census fields that
+# rank a graphical change on this device.
+#
+# `hang-bisect.sh` is the same boot loop scored on kernel `GPU HANG` lines; this
+# is scored on frames and per-draw cost, and the differences between the two are
+# all rules from `AGENTS.md`:
+#
+# - **Interleave the arms.** A macos-13 boot latches one of two compositing
+#   regimes for its life and the *rate* at which it picks the slow one drifts
+#   across a day, so an arm measured in a block is measured against a different
+#   base rate from the other. Round-robin is the only ordering that cancels it.
+# - **Quote `present_hz` and `offered_hz` together.** The presenter passes
+#   everything it is offered, so `present_hz` alone cannot separate "the device
+#   published more frames" from "the presenter stopped being a ceiling".
+# - **Classify the boot before comparing it.** A slow-regime boot halves every
+#   frame-rate field and reads ~10 % higher on `us/draw` for reasons that have
+#   nothing to do with the change. The `regime` column here is the discriminator
+#   and per-draw numbers must be scored within the fast population only.
+# - **Say which probe a number came from.** A bursty interaction probe and a
+#   sustained one are two populations of draws that rank the device's costs in a
+#   different *order*, so the probe is a column and not a preamble.
+# - **Bracket one character of every `pkill -f` pattern** and pass the arm as an
+#   exported variable, never as argv: an ancestor command line naming the pin is
+#   matched by the `pkill` the next boot issues.
+#
+# Usage:
+#   scripts/perf-ab/perf-ab.sh [--rail NAME] [--arms "shipping FOO=off"]
+#     [--rounds N] [--probe PATH] [--seconds N] [--out DIR]
+#
+# An arm is `shipping` or comma-joined `NAME=value` pairs exported as
+# `REIMS_VGPU_NAME=value`. One boot per arm per round.
+set -uo pipefail
+export LC_ALL=C
+
+RAIL="macos-13"
+ARMS="shipping"
+ROUNDS=3
+SECS=40
+OUT="/tmp/reims-perf-ab"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PROBE="$REPO/scripts/sustained-animation-probe/sustained-animation-probe.sh"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --rail) RAIL="$2"; shift 2 ;;
+    --arms) ARMS="$2"; shift 2 ;;
+    --rounds) ROUNDS="$2"; shift 2 ;;
+    --probe) PROBE="$2"; shift 2 ;;
+    --seconds) SECS="$2"; shift 2 ;;
+    --out) OUT="$2"; shift 2 ;;
+    -h|--help) sed -n '2,35p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
+    *) echo "perf-ab: unknown argument $1" >&2; exit 2 ;;
+  esac
+done
+
+mkdir -p "$OUT"
+say() { echo "perf-ab: $*"; }
+RESULTS="$OUT/results.tsv"
+PROBE_NAME="$(basename "$PROBE" .sh)"
+printf 'round\tarm\tregime\tpresent_hz\toffered_hz\tdraws_s\tus_draw\tduty\tchain_us\tsampled_pct\tengine_pct\tstore_pct\tbinds_pct\tprobe\n' >"$RESULTS"
+
+# Median of a numeric column read from the fail log, over the census windows the
+# probe's own wall clock covers. Median rather than mean because one census
+# second inside a stall is worth more than every healthy second put together and
+# would drag a mean anywhere.
+median() { sort -n | awk '{v[NR]=$1} END{ if(NR==0){print "-"} else if(NR%2){printf "%.2f", v[(NR+1)/2]} else {printf "%.2f",(v[NR/2]+v[NR/2+1])/2} }'; }
+
+# Sum of a per-window census field over the boot. `store_routes`-shaped counters
+# reset each window, so summing is the answer and taking the last sample is the
+# error; the reverse holds for the cumulative high-waters, which this does not
+# read.
+sum_field() { grep -ho "$1=[0-9]*" "$2" 2>/dev/null | cut -d= -f2 | awk '{s+=$1} END{print s+0}'; }
+
+for round in $(seq 1 "$ROUNDS"); do
+for arm in $ARMS; do
+  tag="r${round}-${arm//[^A-Za-z0-9]/_}"
+  say "=== round $round arm $arm ==="
+  "$REPO/scripts/app-sweep-probe/stop-previous-vm.sh" || say "$tag: previous VM still holds :2222"
+  rm -f /tmp/reims-vgpu-fail.log
+  for stale in $(env | sed -n 's/^\(REIMS_VGPU_[A-Z0-9_]*\)=.*/\1/p'); do unset "$stale"; done
+  if [ "$arm" != shipping ]; then
+    old_ifs=$IFS; IFS=,
+    for pair in $arm; do export "REIMS_VGPU_${pair%%=*}=${pair##*=}"; done
+    IFS=$old_ifs
+  fi
+
+  BOOTLOG="$OUT/$tag-boot.log"
+  TESTING_TIMEOUT=900 nohup "$REPO/vm/boot-x86.sh" --device reims-vgpu-pci \
+    --rail "$RAIL" --testing >"$BOOTLOG" 2>&1 &
+
+  up=no
+  for _ in $(seq 1 60); do
+    [ -f /tmp/reims-vgpu-fail.log ] && { up=yes; break; }
+    sleep 5
+  done
+  [ "$up" = yes ] || { say "$tag: no device"; printf '%s\t%s\tNO-BOOT\n' "$round" "$arm" >>"$RESULTS"; continue; }
+
+  timeout 300 "$REPO/vm/guest-authorize.sh" >/dev/null 2>&1
+  "$REPO/scripts/app-sweep-probe/wait-for-desktop.sh" --timeout 400 \
+    || { say "$tag: no desktop"; printf '%s\t%s\tNO-DESKTOP\n' "$round" "$arm" >>"$RESULTS"; \
+         pkill -f 'qemu-system-x86_6[4].*reims-vgpu'; sleep 6; continue; }
+  sleep 8
+
+  # Everything before this point is boot noise; the scored window starts here.
+  MARK=$(grep -c '' /tmp/reims-vgpu-fail.log)
+  QMP_SOCK="$REPO/vm/disks/run/qmp.sock" timeout $((SECS + 240)) \
+    "$PROBE" "$OUT/$tag-work" "$SECS" >"$OUT/$tag-probe.log" 2>&1
+  probe_exit=$?
+  SLICE="$OUT/$tag-slice.log"
+  tail -n +"$((MARK + 1))" /tmp/reims-vgpu-fail.log >"$SLICE"
+  pkill -f 'qemu-system-x86_6[4].*reims-vgpu'; sleep 6
+
+  present=$(grep -ho 'present_hz=[0-9.]*' "$SLICE" | cut -d= -f2 | median)
+  offered=$(grep -ho 'offered_hz=[0-9.]*' "$SLICE" | cut -d= -f2 | median)
+  # A guest kernel panic outranks every number below it, and it can land after
+  # the probe has already reported success.
+  panic=no; grep -q 'guest kernel panic' "$BOOTLOG" && panic=yes
+
+  draws=$(sum_field 'draws' "$SLICE")
+  draw_us=$(sum_field 'draw_us' "$SLICE")
+  busy_us=$(sum_field 'busy_us' "$SLICE")
+  windows=$(grep -c 'OFF drain_duty' "$SLICE")
+  chain=$(sum_field 'chains' "$SLICE")
+  sampled=$(sum_field 'sampled_us' "$SLICE")
+  engine=$(sum_field 'engine_us' "$SLICE")
+  store=$(sum_field 'store_us' "$SLICE")
+  binds=$(sum_field 'binds_us' "$SLICE")
+  total_us=$((sampled + engine + store + binds))
+
+  read -r draws_s us_draw duty chain_us s_pct e_pct st_pct b_pct <<EOF
+$(awk -v d="$draws" -v du="$draw_us" -v b="$busy_us" -v w="$windows" -v c="$chain" \
+      -v s="$sampled" -v e="$engine" -v st="$store" -v bi="$binds" -v t="$total_us" \
+  'BEGIN{ printf "%.1f %.2f %.3f %.2f %.1f %.1f %.1f %.1f",
+      (w? d/w : 0), (d? du/d : 0), (w? b/(w*1000000) : 0), (c? (s+e+st+bi)/c : 0),
+      (t? 100*s/t : 0), (t? 100*e/t : 0), (t? 100*st/t : 0), (t? 100*bi/t : 0) }')
+EOF
+
+  # The regime is the discriminator, not a summary: on macos-13 the two
+  # populations are empty between roughly 61 and 94 Hz, so anything in between
+  # is `?` and is a boot to look at rather than to bin.
+  regime=$(awk -v p="$present" 'BEGIN{ if(p=="-"){print "none"} else if(p<70){print "slow"} else if(p>90){print "fast"} else {print "?"} }')
+  [ "$panic" = yes ] && regime="PANIC"
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$round" "$arm" "$regime" "$present" "$offered" "$draws_s" "$us_draw" "$duty" \
+    "$chain_us" "$s_pct" "$e_pct" "$st_pct" "$b_pct" "$PROBE_NAME" >>"$RESULTS"
+  say "$tag: regime=$regime present=$present offered=$offered draws/s=$draws_s us/draw=$us_draw duty=$duty probe_exit=$probe_exit"
+done
+done
+
+echo
+echo "=== perf A/B on $RAIL, probe $PROBE_NAME ==="
+column -t "$RESULTS" 2>/dev/null || cat "$RESULTS"
+echo
+echo "Score per-draw columns within the fast population only; quote present_hz"
+echo "and offered_hz together. A PANIC row is not a measurement."
