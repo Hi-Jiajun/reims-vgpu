@@ -96,14 +96,25 @@ use crate::runtime::host::HostAction;
 /// lost.
 const ENGINE_WINDOW_REDRAW_BACKSTOP: std::time::Duration =
     std::time::Duration::from_millis(GUEST_RESIZE_WARN_AFTER.as_millis() as u64 / 10);
-/// How many times [`App::reattach_engine`] may rebuild the presenter.
+/// How many rebuilds of the presenter may go unproven before the window stops
+/// trying.
 ///
-/// Derived, not chosen. `EngineFacadeDecline::WindowPresenterNotAttached` on a
-/// live window means one thing — a device loss took the presenter down with the
-/// `VkDevice` it was built on — and the engine gives up recreating that device
-/// after [`MAX_DEVICE_RECREATES`]. So there can never be more losses to recover
-/// from than that, and a bound written as its own number would be a second
-/// spelling of the same limit that could drift away from it.
+/// Derived from the engine's own device-recreate budget — and, the part that
+/// matters, **a storm budget in the same sense rather than a lifetime cap**.
+/// `ContextOwner::note_work_completed` zeroes `recreate_count` the moment guest
+/// work runs on a rebuilt device, on the reasoning that a device which recovered
+/// and is lost again later is a new incident and not the fourth step of the old
+/// one. Exactly the same holds for the presenter, so [`App::draw`] zeroes
+/// [`App::engine_reattempts`] on a present that reached the screen. What the
+/// bound then stops is a surface that genuinely cannot be created being retried
+/// once per redraw forever.
+///
+/// Reading it as a lifetime cap was measured wrong on real hardware, and the
+/// measurement is why this doc is here. A driven macos-11 boot lost the device
+/// more than eight times; the window rebuilt the presenter on the first three,
+/// logged `host_window_reattach status=ok attempt=3`, spent the budget, and sat
+/// out every later loss with the picture gone — which is most of the defect the
+/// re-attach exists to remove, reintroduced by its own bound.
 const MAX_ENGINE_REATTACHES: u32 = crate::backend::vulkan::engine::MAX_DEVICE_RECREATES;
 /// How long a guest-driven native resize request may stay unmatched by a
 /// winit `Resized` event before the always-on alarm names it. Live requests
@@ -1188,6 +1199,13 @@ impl App {
                 suboptimal,
             }) => {
                 self.engine_error_logged = false;
+                // A frame reached the screen, so whatever rebuilt the presenter
+                // is proven and its budget starts over — the same rule, for the
+                // same reason, as `ContextOwner::note_work_completed` applies to
+                // the device's own recreate count. Without this the bound is a
+                // lifetime cap and a rail that recovers eight times is left dark
+                // after the third. See [`MAX_ENGINE_REATTACHES`].
+                self.engine_reattempts = 0;
                 self.last_engine_seq = incoming_seq;
                 // A suboptimal present armed a swapchain recreation; redraw
                 // promptly so the corrected drawable replaces this one even if

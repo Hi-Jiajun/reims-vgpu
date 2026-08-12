@@ -1361,15 +1361,22 @@ fn set_mapping_geom_size_change_resets_content_generation() {
         m.content_generation, 0,
         "new size must not keep prior gen (new surface identity)"
     );
-    // Same size again: preserve gen (no identity change).
+    // Same declaration again: preserve gen (no identity change).
+    //
+    // The format is held at `0x73` here on purpose. This line used to re-declare
+    // at `0x50` while asserting only that the *size* was unchanged, so it was
+    // reading a format change as "nothing changed" — and the reset it was
+    // pinning tested two thirds of the declaration. A format change withdraws
+    // the claim too, and that axis is covered by
+    // `model::state::mapping_declaration_tests`.
     {
         let m = state.mappings.get_mut(&4).unwrap();
         m.content_generation = 3;
     }
-    assert!(state.set_mapping_geom(4, 1440, 1080, 0x50));
+    assert!(state.set_mapping_geom(4, 1440, 1080, 0x73));
     assert_eq!(
         state.mappings[&4].content_generation, 3,
-        "same size preserves generation"
+        "an unchanged declaration preserves generation"
     );
 }
 

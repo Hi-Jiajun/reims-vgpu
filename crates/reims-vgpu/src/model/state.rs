@@ -3072,9 +3072,24 @@ impl DeviceState {
             return false;
         }
         let e = self.mappings.entry(mapping_id).or_default();
-        // Geom change (mode switch / rematerialize) is a new surface identity:
-        // reset content_generation (the guest pages stay authoritative).
-        if e.width != width || e.height != height {
+        // A changed declaration (mode switch / rematerialize) is a new surface
+        // identity: reset `content_generation` and `surface_content_epoch`. The
+        // guest pages stay authoritative, so the cost of resetting when nothing
+        // really changed is one seed copy.
+        //
+        // **All three fields, not just the extent.** The epoch's claim is that a
+        // resident's pixels *are* this mapping's content, and it is what
+        // licenses the attachment LOAD elision — so it has to be withdrawn
+        // whenever the guest re-declares what those bytes mean. Extent alone
+        // read as sufficient because a format change usually moves the
+        // `TargetIdentity` too and picks up a different resident by itself. It
+        // does not always: `present_identity::surface_format` maps several guest
+        // declarations onto one `vk::Format` and falls back to the scanout order
+        // for any it cannot express, so a mapping going from a format with a
+        // linear texel to a compressed or planar one keeps its identity, keeps
+        // its resident, and keeps an epoch that was stamped against the old
+        // interpretation of the same bytes.
+        if e.width != width || e.height != height || e.format != format {
             e.content_generation = 0;
             e.surface_content_epoch = 0;
         }
@@ -3705,6 +3720,70 @@ mod fail_vocabulary_tests {
             assert_ne!(now, epoch, "a host write into guest RAM went unannounced");
             epoch = now;
         }
+    }
+}
+
+#[cfg(test)]
+mod mapping_declaration_tests {
+    use super::*;
+    use crate::model::{DeviceId, PAGE_SHIFT_X86};
+
+    fn state() -> DeviceState {
+        DeviceState::new(DeviceId(1), PAGE_SHIFT_X86)
+    }
+
+    fn declared(state: &DeviceState, id: u32) -> (u32, u32) {
+        let m = state.mappings.get(&id).expect("the mapping exists");
+        (m.content_generation, m.surface_content_epoch)
+    }
+
+    /// Re-declaring a mapping at the same extent but a different pixel format
+    /// withdraws the content claim, because the claim is about what the bytes
+    /// *mean* and the guest has just changed that.
+    ///
+    /// The reset used to test the extent alone, on the reasoning that a format
+    /// change moves the `TargetIdentity` and so picks up a different resident by
+    /// itself. `present_identity::surface_format` collapses several guest
+    /// declarations onto one `vk::Format` and falls back to the scanout order
+    /// for any it cannot express, so that reasoning does not hold for every
+    /// pair — and the failure is a resident served against an epoch stamped
+    /// under the previous interpretation.
+    #[test]
+    fn re_declaring_a_mapping_at_a_new_format_withdraws_its_content_claim() {
+        let mut state = state();
+        assert!(state.set_mapping_geom(7, 640, 480, 0x50));
+        let m = state.mappings.get_mut(&7).expect("the mapping exists");
+        m.content_generation = 9;
+        m.surface_content_epoch = 4;
+
+        // Same declaration in every field: nothing to withdraw.
+        assert!(state.set_mapping_geom(7, 640, 480, 0x50));
+        assert_eq!(
+            declared(&state, 7),
+            (9, 4),
+            "an unchanged declaration is not a new surface"
+        );
+
+        // Format alone, at one extent.
+        assert!(state.set_mapping_geom(7, 640, 480, 0x19));
+        assert_eq!(
+            declared(&state, 7),
+            (0, 0),
+            "the bytes mean something else now, so nothing may claim they are the content"
+        );
+    }
+
+    /// The extent half of the same rule, kept beside it so neither can be
+    /// dropped without the other being visible.
+    #[test]
+    fn re_declaring_a_mapping_at_a_new_extent_withdraws_its_content_claim() {
+        let mut state = state();
+        assert!(state.set_mapping_geom(7, 640, 480, 0x50));
+        let m = state.mappings.get_mut(&7).expect("the mapping exists");
+        m.content_generation = 9;
+        m.surface_content_epoch = 4;
+        assert!(state.set_mapping_geom(7, 800, 480, 0x50));
+        assert_eq!(declared(&state, 7), (0, 0));
     }
 }
 
