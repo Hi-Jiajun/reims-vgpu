@@ -120,16 +120,31 @@ for rail in $RAILS; do
 
   # sshd answering is not the desktop compositing, and a rail stopped at the
   # login window is not a rail still booting. `wait-for-desktop.sh` owns that
-  # distinction and logs in when that is what the wait is for; this loop used to
-  # do neither and reported macos-12 as NO-DESKTOP for a guest that had booted.
-  dock=yes
-  "$REPO/scripts/app-sweep-probe/wait-for-desktop.sh" --timeout 400 || dock=no
-  if [ "$dock" != yes ]; then
-    say "$rail: the Dock never appeared"
-    printf '%s\tNO-DESKTOP\t-\t%s\n' "$rail" \
-      "$(grep -qF 'guest kernel panic' "$BOOTLOG" && echo PANIC || echo no-panic)" >>"$SUMMARY"
-    continue
-  fi
+  # distinction; this loop used to make neither and reported macos-12 as
+  # NO-DESKTOP for a guest that had booted.
+  #
+  # Its exit 3 is its own verdict and outranks everything below: a login window
+  # with crash reports behind it is a **WindowServer crash**, and it says so
+  # rather than logging in over the evidence. Reported per rail, because a rail
+  # that crashes its window server is not a rail whose app verdicts mean
+  # anything.
+  "$REPO/scripts/app-sweep-probe/wait-for-desktop.sh" --timeout 400 \
+    --reports "$OUT/$rail-reports"
+  case $? in
+    0) ;;
+    3)
+      say "$rail: WINDOWSERVER CRASH — reports in $OUT/$rail-reports"
+      printf '%s\tWINDOWSERVER-CRASH\t-\t%s\n' "$rail" \
+        "$(grep -qF 'guest kernel panic' "$BOOTLOG" && echo PANIC || echo no-panic)" >>"$SUMMARY"
+      continue
+      ;;
+    *)
+      say "$rail: the Dock never appeared"
+      printf '%s\tNO-DESKTOP\t-\t%s\n' "$rail" \
+        "$(grep -qF 'guest kernel panic' "$BOOTLOG" && echo PANIC || echo no-panic)" >>"$SUMMARY"
+      continue
+      ;;
+  esac
   sleep 8   # dock and wallpaper settle
 
   QMP_SOCK="$REPO/vm/disks/run/qmp.sock" timeout 900 \

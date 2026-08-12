@@ -85,6 +85,23 @@ fn translate_words(name: &str, stage: Stage) -> Vec<u32> {
     words
 }
 
+/// The device binding number for sampler `index`.
+///
+/// `translate_words` widens the translator's bands, which moves a sampler out of
+/// metal2vulkan's `[64,96)` into this device's `[160,192)`. A request that keeps
+/// naming the pre-widen number provides a sampler at a binding the widened
+/// module does not use, and leaves the binding it *does* use absent from the
+/// descriptor set layout — so the fragment shader sampled through a descriptor
+/// nothing wrote. That was silent until `exec::used_binding_absent_from_layout`
+/// landed and started refusing the draw by name.
+///
+/// Derived from the constant rather than spelled, so the two cannot drift again.
+/// The texture band needs no such helper: `TEXTURE_BINDING_BASE` *is*
+/// metal2vulkan's texture base, so widening leaves a texture where it was.
+fn sampler_binding(index: u32) -> u32 {
+    reims_vgpu::runtime::spirv_bind::SAMPLER_BINDING_BASE + index
+}
+
 fn triangle_spirv() -> (Vec<u32>, Vec<u32>) {
     (
         translate_words("render_tri.air", Stage::Vertex),
@@ -551,7 +568,7 @@ fn depth_test_honored_compare_and_clear_wired() {
             identity: None,
             swizzle: Default::default(),
         });
-        req.samplers.push(SamplerResource::normalized_default(64));
+        req.samplers.push(SamplerResource::normalized_default(sampler_binding(0)));
         req.depth = Some(DepthState {
             // Parity fixtures bind no guest depth texture, so they exercise the
             // transient rail rather than the registry-resident one.
@@ -679,7 +696,7 @@ fn depth_test_honored_on_resident_target_path() {
             identity: None,
             swizzle: Default::default(),
         });
-        req.samplers.push(SamplerResource::normalized_default(64));
+        req.samplers.push(SamplerResource::normalized_default(sampler_binding(0)));
         req.depth = Some(DepthState {
             // Parity fixtures bind no guest depth texture, so they exercise the
             // transient rail rather than the registry-resident one.
@@ -814,7 +831,7 @@ fn stencil_test_honored_compare_ref_and_clear_wired() {
             identity: None,
             swizzle: Default::default(),
         });
-        req.samplers.push(SamplerResource::normalized_default(64));
+        req.samplers.push(SamplerResource::normalized_default(sampler_binding(0)));
         req.depth = Some(DepthState {
             // Parity fixtures bind no guest depth texture, so they exercise the
             // transient rail rather than the registry-resident one.
@@ -1809,7 +1826,7 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
         identity: None,
         swizzle: Default::default(),
     });
-    req.samplers.push(SamplerResource::normalized_default(64));
+    req.samplers.push(SamplerResource::normalized_default(sampler_binding(0)));
 
     match engine::execute_draw_request(&req) {
         Ok(_) => {}
@@ -2058,7 +2075,7 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
             identity: None,
             swizzle: Default::default(),
         });
-        req.samplers.push(SamplerResource::normalized_default(64));
+        req.samplers.push(SamplerResource::normalized_default(sampler_binding(0)));
         match engine::execute_draw_request(&req) {
             Ok(_) => Some(
                 engine::read_target(&identity)
@@ -2179,7 +2196,7 @@ fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
             identity: None,
             swizzle: plan,
         });
-        req.samplers.push(SamplerResource::normalized_default(64));
+        req.samplers.push(SamplerResource::normalized_default(sampler_binding(0)));
         match engine::execute_draw_request(&req) {
             Ok(_) => Some(engine::read_target(&identity).expect("read target").pixels),
             Err(e) if skip_if_no_gpu(&e.to_string()) => {

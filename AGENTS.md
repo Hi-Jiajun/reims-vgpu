@@ -620,6 +620,28 @@ is not a rail that passes, and one clean boot of it is not evidence — **band a
 at least six boots before believing a rate**, in both directions. A single green run says nothing,
 and so does a single red one.
 
+### A login window means WindowServer crashed. Pull the report. Do not log in.
+
+**If a boot shows the login screen, the guest's WindowServer aborted.** It is not "the desktop is
+taking a while" and it is not "nobody logged in yet" — the guest wrote a `.ips` crash report naming
+the failure, and that report is the most direct evidence this project ever gets about a graphics
+failure inside the guest. **Typing the password destroys it**: the login starts a fresh session over
+the top, and the next boot's snapshot revert throws the reports away with the overlay.
+
+This cost sessions before it was written down, because every harness here treated the login window as
+a state to get past. `scripts/app-sweep-probe/wait-for-desktop.sh` now does the opposite: it pulls
+`/Library/Logs/DiagnosticReports` and the user's copy into `--reports DIR` **before** anything is
+typed, and **exits 3 without logging in** when any report is there. `--login-after-crash` overrides
+it and an unattended sweep must not pass it — a screenshot is not worth a crash report.
+
+Two readings that follow:
+
+- **`console` naming `_windowserver` is a crash; naming `root` is not.** `stat -f%Su /dev/console`
+  is the discriminator the script already had. A guest that genuinely never logged in answers `root`.
+- **A crash can be invisible at the console.** Autologin restarts the session, so a WindowServer that
+  aborted early can have a Dock by the time any harness looks. The report is the only thing that sees
+  that class, which is why the success path collects too.
+
 ### A freeze verdict is a rate too, so an arm that fixes one is confirmed at n≥3
 
 The same rule as the panic rate, on the leg verdicts. macos-11's Maps leg froze on thirteen
