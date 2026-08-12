@@ -329,6 +329,14 @@
 //! * **The host console**, painting a mapping's bytes into the host window.
 //!   `scanout_paint` fires **six times in a whole boot**; the window presents
 //!   from the resident image, not from guest pages.
+//!
+//!   Read that against [`SettleSite::ScanoutPaint`] and not against the slug it
+//!   used to share. `scanout::paint_mapping` has two callers — the console, and
+//!   `read_mapping_bgra8`, which is a draw materialising a sampled type-11
+//!   texture — and until the sampled arm got [`SettleSite::SampledMappingRead`]
+//!   they charged one route. A macos-11 Safari-torture leg read 985 waits and
+//!   1.42 s on it, which is three orders of magnitude off the console's rate and
+//!   was entirely the second caller.
 //! * **The guest CPU**, which announces itself. Zero all boot.
 //!
 //! Against 1 556 writebacks a second. The `settle_linear_memo_read` pair says
@@ -645,7 +653,25 @@ settle_sites! {
     /// bytes.
     ComputeStageTexture => "settle_compute_stage_texture",
     /// `scanout::paint_mapping` — the host console reading a mapping to paint.
+    ///
+    /// The doc on [`crate::runtime::render_writeback`] says this "fires six
+    /// times in a whole boot", and that is true of the console. It was not true
+    /// of this *slug*, because `paint_mapping` has two callers and both charged
+    /// it: the console's `scanout_copy_mapping`, and `read_mapping_bgra8`, which
+    /// is sampled type-11 bind materialisation on a draw. A macos-11
+    /// Safari-torture leg read 985 waits and 1.42 s here, which is the second
+    /// caller, and the doc's six-a-boot reading was being applied to a number
+    /// three orders of magnitude off it. The sampled arm names itself below.
     ScanoutPaint => "settle_scanout_paint",
+    /// `scanout::read_mapping_bgra8` — a draw materialising a sampled type-11
+    /// texture out of a mapping's guest pages.
+    ///
+    /// Shares `paint_mapping`'s leaf with the console above and nothing else:
+    /// this is a draw-rate reader on the drain worker, the console is a
+    /// once-a-boot reader on the display thread, and folding them cost the
+    /// console's rate its meaning. The split is what says which of the two the
+    /// wait belongs to before anything is aimed at it.
+    SampledMappingRead => "settle_sampled_mapping_read",
     /// `drain::write_stamp` — the completion stamp's blocking fallback, taken
     /// when the GPU-ordered stamp path declined.
     CompletionStamp => "settle_completion_stamp",

@@ -449,7 +449,18 @@ fn paint_mapping_fragmented_pages_multi_import() {
     assert!(write_bgra8(&mut state, &mut host, mid, &frame, 8, 2, 2));
     let mut dst = vec![0u8; 16];
     assert!(
-        paint_mapping(&mut state, &mut host, mid, &mut dst, 8, 2, 2),
+        paint_mapping(
+            &mut state,
+            &mut host,
+            mid,
+            super::PaintDst {
+                bytes: &mut dst,
+                stride: 8,
+                width: 2,
+                height: 2
+            },
+            crate::runtime::render_writeback::SettleSite::ScanoutPaint
+        ),
         "fragmented paint must multi-import, not not_contig"
     );
     assert_eq!(&dst[..], &frame[..]);

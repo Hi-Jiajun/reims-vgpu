@@ -77,7 +77,18 @@ pub fn read_mapping_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
         return false;
     }
     let _ = crate::runtime::mapper::ensure_resolved_for_scanout(state, host, mapping_id);
-    paint_mapping(state, host, mapping_id, dst, dst_stride, width, height)
+    paint_mapping(
+        state,
+        host,
+        mapping_id,
+        PaintDst {
+            bytes: dst,
+            stride: dst_stride,
+            width,
+            height,
+        },
+        crate::runtime::render_writeback::SettleSite::SampledMappingRead,
+    )
 }
 
 /// Always-on census of the capture readback-elision ratio (never silent):
@@ -539,7 +550,18 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
     // Only latch painted_generation on a real pixel source. A clear-to-black
     // fallback must not stamp generation — that freezes the console on black
     // forever when the first paint races the mapper (Unchanged on next gen).
-    if paint_mapping(state, host, mapping_id, dst, dst_stride, width, height) {
+    if paint_mapping(
+        state,
+        host,
+        mapping_id,
+        PaintDst {
+            bytes: dst,
+            stride: dst_stride,
+            width,
+            height,
+        },
+        crate::runtime::render_writeback::SettleSite::ScanoutPaint,
+    ) {
         let need = (height as usize)
             .saturating_mul(width as usize)
             .saturating_mul(4);
@@ -874,15 +896,35 @@ impl crate::observe::Decline for CaptureDecline {
     }
 }
 
+/// Where a mapping paint lands: the buffer, its row stride, and the extent to
+/// fill. One parameter because the four travel together through every caller and
+/// a stride that belongs to a different buffer is the mistake worth making
+/// unspellable.
+struct PaintDst<'a> {
+    bytes: &'a mut [u8],
+    stride: u32,
+    width: u32,
+    height: u32,
+}
+
+/// `site` is the caller's own, not this leaf's. Both callers read the same guest
+/// pages the same way, and they are a once-a-boot console paint and a draw-rate
+/// sampled bind — so charging one slug made the console's settle rate unreadable
+/// and the sampled arm's invisible. Taken as an argument rather than named here
+/// so a third caller has to state which it is.
 fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
-    dst: &mut [u8],
-    dst_stride: u32,
-    width: u32,
-    height: u32,
+    dst: PaintDst<'_>,
+    site: crate::runtime::render_writeback::SettleSite,
 ) -> bool {
+    let PaintDst {
+        bytes: dst,
+        stride: dst_stride,
+        width,
+        height,
+    } = dst;
     use crate::runtime::mapping_write::type11_sample_window;
 
     // Every `false` return here shows as a black/stale console; log the specific
@@ -907,10 +949,7 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
     // is also what names the write. A mapping with no page list, or one holding
     // an entry that names no backing, cannot be ruled out and settles.
     crate::runtime::writeback_debt::settle_for_mapping_unless_disjoint(
-        state,
-        host,
-        mapping_id,
-        crate::runtime::render_writeback::SettleSite::ScanoutPaint,
+        state, host, mapping_id, site,
     );
 
     let Some(m) = state.mappings.get(&mapping_id) else {
