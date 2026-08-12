@@ -61,6 +61,58 @@ impl MirrorClampToEdge {
     }
 }
 
+/// How this device can satisfy Metal's guarantee that an out-of-bounds texture
+/// read is **defined**.
+///
+/// # Why this is not an optimization
+///
+/// Every shader this device runs was compiled by Apple for Metal, and the Metal
+/// Shading Language specifies out-of-range `texture.read`/`sample` coordinates:
+/// reads return zero and writes are dropped. Apple's shaders are written against
+/// that guarantee and use it — a blur or a convolution samples its neighbours at
+/// fixed texel offsets and lets the taps that fall outside the image return
+/// zero, rather than branching per tap.
+///
+/// Vulkan makes the same access **undefined** unless `robustImageAccess` is
+/// enabled. `robustBufferAccess`, which this device does enable and which the
+/// spec requires every implementation to support, covers buffers *only*; it says
+/// nothing about image accesses. So without this feature every one of those taps
+/// is undefined behaviour, and what a driver does with it is a driver's choice:
+/// returning zero anyway, returning garbage, or faulting.
+///
+/// This is the same class as the `shaderInt64` gap — a capability the guest's
+/// own modules depend on and this device was not asking for — and it is the one
+/// remaining semantic difference between Metal's execution model and this
+/// backend's that a validation layer cannot see, because undefined behaviour is
+/// not invalid usage.
+///
+/// Three rungs, for the same reason `MirrorClampToEdge` has three: *how* it is
+/// available decides what must be chained at device creation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImageRobustness {
+    /// `VkPhysicalDeviceVulkan13Features::robustImageAccess`. Preferred where the
+    /// host is 1.3, because it needs no extension string.
+    Core13,
+    /// `VK_EXT_image_robustness`, chained as
+    /// `VkPhysicalDeviceImageRobustnessFeaturesEXT`. The 1.2-baseline spelling,
+    /// and the one this project's own baseline implies is the common case.
+    ExtImageRobustness,
+    /// Neither. The host cannot promise Metal's guarantee, and this device runs
+    /// the guest's shaders anyway — there is nothing else it can do, since the
+    /// alternative is refusing every module Apple compiled. The rung is
+    /// **reported** so a boot on such a host says so, which is the difference
+    /// between a known gap and a silent one. Default, so a `DeviceFeatures`
+    /// built without a query never claims a promise it has not checked for.
+    #[default]
+    Unsupported,
+}
+
+impl ImageRobustness {
+    pub fn is_available(self) -> bool {
+        !matches!(self, Self::Unsupported)
+    }
+}
+
 /// The `maxImageDimension2D` every Vulkan 1.2 implementation must report at
 /// least (spec table "Required Limits"). Used only as the floor a queried
 /// value is clamped to, and as the answer when no device has been resolved.
@@ -227,6 +279,9 @@ pub struct DeviceFeatures {
     /// which is what every host did before it existed.
     pub timeline_semaphore: bool,
     pub mirror_clamp_to_edge: MirrorClampToEdge,
+    /// How this host can promise that an out-of-bounds texture read is defined,
+    /// which every Metal shader is entitled to assume. See [`ImageRobustness`].
+    pub image_robustness: ImageRobustness,
     /// `VkPhysicalDeviceFeatures::dualSrcBlend` — whether a pipeline may name
     /// the `SRC1_*` blend factors, which read the fragment shader's second
     /// colour output.
@@ -365,6 +420,23 @@ impl DeviceFeatures {
             .shader_int8(self.int8)
     }
 
+    /// Metal's out-of-bounds texture-read guarantee, when the host can make it.
+    ///
+    /// Chained by its `EXT` spelling on **both** available rungs.
+    /// `VK_EXT_image_robustness` was promoted to core at Vulkan 1.3 and its
+    /// feature struct is an alias of `VkPhysicalDeviceVulkan13Features`'s field,
+    /// so a 1.3 driver accepts either; using one spelling means there is no
+    /// second one to disagree with it, which is the trap
+    /// `VUID-VkDeviceCreateInfo-pNext-02830` exists for and which this device
+    /// has already been caught by once. What the rung decides is only whether an
+    /// extension *string* is also named — see [`Self::required_extensions`].
+    pub fn enabled_image_robustness(
+        &self,
+    ) -> vk::PhysicalDeviceImageRobustnessFeaturesEXT<'static> {
+        vk::PhysicalDeviceImageRobustnessFeaturesEXT::default()
+            .robust_image_access(self.image_robustness.is_available())
+    }
+
     /// 16-bit storage-buffer access, for shaders that pack half-precision data.
     pub fn enabled_16bit_storage(&self) -> vk::PhysicalDevice16BitStorageFeatures<'static> {
         vk::PhysicalDevice16BitStorageFeatures::default()
@@ -415,6 +487,7 @@ impl DeviceFeatures {
             shader_output_viewport_index,
             timeline_semaphore,
             mirror_clamp_to_edge,
+            image_robustness,
             dual_src_blend,
             fill_mode_non_solid,
             depth_clamp,
@@ -436,6 +509,7 @@ impl DeviceFeatures {
         };
         format!(
             "vk_features robust_buffer_access={robust_buffer_access} \
+             image_robustness={image_robustness:?} \
              sampler_anisotropy={sampler_anisotropy} max_sampler_anisotropy={max_sampler_anisotropy} \
              max_image_dimension_2d={max_image_dimension_2d} \
              max_compute_workgroup_invocations={max_compute_workgroup_invocations} \
@@ -468,6 +542,9 @@ impl DeviceFeatures {
         if self.mirror_clamp_to_edge == MirrorClampToEdge::KhrExtension {
             out.push(vk::KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_NAME.as_ptr());
         }
+        if self.image_robustness == ImageRobustness::ExtImageRobustness {
+            out.push(vk::EXT_IMAGE_ROBUSTNESS_NAME.as_ptr());
+        }
         out
     }
 }
@@ -490,11 +567,19 @@ pub unsafe fn query(
     let mut supported_8 = vk::PhysicalDevice8BitStorageFeatures::default();
     let mut supported_f16i8 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
     let mut supported_vulkan12 = vk::PhysicalDeviceVulkan12Features::default();
+    // Chained by its `EXT` spelling rather than the 1.3 one, because 1.2 is this
+    // backend's baseline and chaining a 1.3 struct to a 1.2 driver is not
+    // answerable. A 1.3 host advertises the extension too — promotion keeps the
+    // extension name valid — so one query covers both rungs and only the
+    // *enable* side has to know which it took.
+    let mut supported_image_robustness =
+        vk::PhysicalDeviceImageRobustnessFeaturesEXT::default();
     let mut features2 = vk::PhysicalDeviceFeatures2::default()
         .push_next(&mut supported_16)
         .push_next(&mut supported_8)
         .push_next(&mut supported_f16i8)
-        .push_next(&mut supported_vulkan12);
+        .push_next(&mut supported_vulkan12)
+        .push_next(&mut supported_image_robustness);
     unsafe { instance.get_physical_device_features2(pd, &mut features2) };
     let supported = features2.features;
     let props = unsafe { instance.get_physical_device_properties(pd) };
@@ -563,6 +648,18 @@ pub unsafe fn query(
 
     // Prefer the 1.2 core feature over the extension: it needs no extension
     // string and it is the spelling the baseline guarantees exists to ask about.
+    // Metal defines an out-of-bounds texture read and Vulkan does not, so this is
+    // taken whenever the host offers it. `Core13` needs no extension string;
+    // `ExtImageRobustness` names one. Both are the same guarantee.
+    let image_robustness = if supported_image_robustness.robust_image_access != vk::TRUE {
+        ImageRobustness::Unsupported
+    } else if props.api_version >= vk::API_VERSION_1_3 {
+        ImageRobustness::Core13
+    } else if has_extension(vk::EXT_IMAGE_ROBUSTNESS_NAME) {
+        ImageRobustness::ExtImageRobustness
+    } else {
+        ImageRobustness::Unsupported
+    };
     let mirror_clamp_to_edge = if supported_vulkan12.sampler_mirror_clamp_to_edge == vk::TRUE {
         MirrorClampToEdge::Core12
     } else if has_extension(vk::KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_NAME) {
@@ -573,6 +670,7 @@ pub unsafe fn query(
 
     DeviceFeatures {
         robust_buffer_access: supported.robust_buffer_access == vk::TRUE,
+        image_robustness,
         sampler_anisotropy: supported.sampler_anisotropy == vk::TRUE,
         dual_src_blend: supported.dual_src_blend == vk::TRUE,
         fill_mode_non_solid: supported.fill_mode_non_solid == vk::TRUE,
@@ -655,6 +753,7 @@ mod tests {
             shader_output_viewport_index: true,
             timeline_semaphore: true,
             mirror_clamp_to_edge: MirrorClampToEdge::Core12,
+            image_robustness: ImageRobustness::Core13,
             dual_src_blend: true,
             fill_mode_non_solid: true,
             depth_clamp: true,
@@ -754,6 +853,47 @@ mod tests {
         );
         assert!(caps.required_extensions().is_empty());
         assert!(!caps.mirror_clamp_to_edge.is_available());
+    }
+
+    /// The rung decides the extension string; **both available rungs enable the
+    /// feature.**
+    ///
+    /// Getting this backwards is the shape of the bug this module exists to
+    /// retire: naming an extension without enabling its feature, or enabling a
+    /// feature the device declined. The first silently does nothing, the second
+    /// fails `vkCreateDevice`.
+    #[test]
+    fn image_robustness_is_enabled_on_both_rungs_and_named_on_one() {
+        let ext_name = vk::EXT_IMAGE_ROBUSTNESS_NAME.as_ptr();
+
+        let core13 = DeviceFeatures {
+            image_robustness: ImageRobustness::Core13,
+            ..Default::default()
+        };
+        assert_eq!(core13.enabled_image_robustness().robust_image_access, vk::TRUE);
+        assert!(
+            !core13.required_extensions().contains(&ext_name),
+            "promoted to core at 1.3, so the string would be redundant"
+        );
+
+        let ext = DeviceFeatures {
+            image_robustness: ImageRobustness::ExtImageRobustness,
+            ..Default::default()
+        };
+        assert_eq!(ext.enabled_image_robustness().robust_image_access, vk::TRUE);
+        assert!(
+            ext.required_extensions().contains(&ext_name),
+            "the 1.2-baseline rung has to name the extension it is chaining"
+        );
+
+        let none = DeviceFeatures::default();
+        assert_eq!(
+            none.enabled_image_robustness().robust_image_access,
+            vk::FALSE,
+            "asking for a feature the host declined fails vkCreateDevice"
+        );
+        assert!(!none.required_extensions().contains(&ext_name));
+        assert!(!none.image_robustness.is_available());
     }
 
     /// A feature the device declines is never enabled — the enable list is a

@@ -909,6 +909,10 @@ impl DeviceContext {
         // was promoted into the 1.1 struct instead, which this chain does not
         // carry, so it keeps its own.
         let mut en16 = features.enabled_16bit_storage();
+        // Metal defines an out-of-bounds texture read; Vulkan does not unless
+        // this is enabled. Chained only when the host advertised it, because
+        // asking for a feature a device declined fails `vkCreateDevice`.
+        let mut en_image_robustness = features.enabled_image_robustness();
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
             .enabled_features(&enabled)
@@ -919,6 +923,9 @@ impl DeviceContext {
         }
         if has16 {
             dci = dci.push_next(&mut en16);
+        }
+        if features.image_robustness.is_available() {
+            dci = dci.push_next(&mut en_image_robustness);
         }
         let device = instance
             .create_device(pd, &dci, None)
