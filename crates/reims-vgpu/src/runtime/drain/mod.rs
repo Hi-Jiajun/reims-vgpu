@@ -4252,6 +4252,22 @@ fn process_child_packet<H: HostMemory + HostOps>(
                             "TRANSPORT reason=sync_exec_lock_hold_trail ch={channel_id} {trail}"
                         ));
                     }
+                    // The trail above is what this device *recorded*; this is
+                    // what it is still *waiting on*. They are different
+                    // questions and the second is the one a stall asks: the
+                    // oldest outstanding submission is the one every later one
+                    // is queued behind, and a stall whose oldest carries
+                    // `draws=0` is a wedge that is not in a draw at all.
+                    //
+                    // `None` here is a reading rather than a gap — it says this
+                    // tranche is blocked on something the submission ring did
+                    // not submit.
+                    if let Some(outstanding) = crate::runtime::gpu_hang_trail::outstanding() {
+                        crate::observe::fail(format!(
+                            "TRANSPORT reason=sync_exec_lock_hold_outstanding ch={channel_id} \
+                             {outstanding}"
+                        ));
+                    }
                     // The trail above is the last twelve draws, which at this
                     // rail's rate is the last half millisecond — and a wedged
                     // device goes on drawing about one draw per stall, so by the

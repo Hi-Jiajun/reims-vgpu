@@ -159,6 +159,12 @@ static TRAIL: Mutex<Trail> = Mutex::new(Trail {
     seen_pipes: Vec::new(),
     firsts: [None; FIRST_DRAW_KEPT],
     firsts_next: 0,
+    submits: [None; SUBMIT_SLOTS],
+    pending: Accumulating {
+        draws: 0,
+        heaviest: None,
+    },
+    submit_seq: 0,
 });
 
 /// Pipeline refs whose *first* draw is remembered.
@@ -210,6 +216,12 @@ struct Trail {
     /// answer to.
     firsts: [Option<(DrawNote, u64)>; FIRST_DRAW_KEPT],
     firsts_next: usize,
+    /// One entry per submission ring slot, live between its submit and its
+    /// fence retiring. See [`SubmitNote`].
+    submits: [Option<SubmitNote>; SUBMIT_SLOTS],
+    /// Draws noted since the last submission, not yet attributed to one.
+    pending: Accumulating,
+    submit_seq: u64,
 }
 
 /// Record one draw this device is about to hand the engine.
@@ -220,6 +232,7 @@ pub fn note_draw(note: DrawNote) {
     trail.notes[slot] = Some(note);
     trail.next = (slot + 1) % CAPACITY;
     trail.total = trail.total.wrapping_add(1);
+    trail.pending.admit(note);
 
     if let Err(at) = trail.seen_pipes.binary_search(&note.pipeline_ref) {
         if trail.seen_pipes.len() >= SEEN_PIPES_MAX {
@@ -280,6 +293,159 @@ fn frag_words_band(words: u32) -> &'static str {
         16_384..=65_535 => "fragwords_lt64k",
         _ => "fragwords_ge64k",
     }
+}
+
+/// Submission slots this can describe.
+///
+/// The submission ring is [`crate::backend::vulkan::engine::pools::RING_DEPTH`]
+/// deep, and that constant is not nameable here: this module compiles on the
+/// Metal-direct arm, where `backend::vulkan` does not exist. So the relation is
+/// asserted on the Vulkan side, where both names are in scope — see the
+/// `const _` beside `RING_DEPTH`. A capacity larger than the ring is harmless
+/// (the extra entries are never written); one smaller would silently drop the
+/// slot the wedge is on, which is the entire reading.
+pub const SUBMIT_SLOTS: usize = 16;
+
+/// One submission this device handed the queue, kept until its fence retires.
+///
+/// [`DrawNote`] answers "what was this device drawing", and the trail of the
+/// last twelve of them is the last half-millisecond. This answers the question
+/// that outlives it: **which submission never came back**. The ring retires in
+/// order and a slot's note is cleared only when its fence has signalled, so a
+/// slot still holding one is a submission still outstanding, and the lowest
+/// [`Self::seq`] among them is the one everything else is queued behind.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SubmitNote {
+    /// Submit ordinal, so "oldest outstanding" is a comparison and not an
+    /// inference from ring positions that wrap.
+    pub seq: u64,
+    /// The draw ordinal this submission closed at, for lining it up against
+    /// [`trail`]'s `kept=n/total`.
+    pub at_draw: u64,
+    /// Draws recorded into it.
+    ///
+    /// Zero is a real and interesting reading, not a gap: most submissions on
+    /// this device carry copies, resolves or stamp words rather than draws. A
+    /// wedge on a `draws=0` slot says the hang is not in a draw at all, which no
+    /// other instrument here can distinguish.
+    pub draws: u32,
+    /// The heaviest fragment module in it, whole rather than by reference.
+    ///
+    /// The same argument [`Trail::firsts`] makes: a pipeline ref alone sends the
+    /// reader to a log line that may not exist for that pipeline, and this
+    /// record already holds the answer.
+    pub heaviest: Option<DrawNote>,
+}
+
+impl std::fmt::Display for SubmitNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "#{} at_draw={} draws={}", self.seq, self.at_draw, self.draws)?;
+        match &self.heaviest {
+            Some(note) => write!(f, " heaviest=[{note}]"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// What has been recorded since the last submission, waiting to be attributed
+/// to one.
+#[derive(Clone, Copy, Debug, Default)]
+struct Accumulating {
+    draws: u32,
+    heaviest: Option<DrawNote>,
+}
+
+impl Accumulating {
+    fn admit(&mut self, note: DrawNote) {
+        self.draws = self.draws.saturating_add(1);
+        let heavier = match &self.heaviest {
+            Some(seen) => note.frag_words > seen.frag_words,
+            None => true,
+        };
+        if heavier {
+            self.heaviest = Some(note);
+        }
+    }
+}
+
+/// Record that the slot `slot` has been submitted, carrying everything noted
+/// since the previous submission.
+///
+/// Called from the one place both submit paths converge — a batch flush and a
+/// lone draw's own submit both reach `finish_entry_async`, which is also where
+/// the slot starts owing cleanup. Attributing at any earlier point would charge
+/// draws to a submission that had not closed yet.
+pub fn note_submit(slot: usize) {
+    let mut trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
+    if slot >= trail.submits.len() {
+        // Unreachable while the `const _` beside `RING_DEPTH` holds. Counted
+        // rather than panicked: this is an instrument, and it may not be the
+        // thing that takes a boot down. The accumulator is deliberately left
+        // alone — dropping it here would misattribute those draws to the *next*
+        // submission rather than losing them visibly.
+        drop(trail);
+        crate::runtime::drain::note_store_route("hang_submit_slot_over_capacity");
+        return;
+    }
+    let acc = std::mem::take(&mut trail.pending);
+    let seq = trail.submit_seq.wrapping_add(1);
+    let at_draw = trail.total;
+    trail.submit_seq = seq;
+    trail.submits[slot] = Some(SubmitNote {
+        seq,
+        at_draw,
+        draws: acc.draws,
+        heaviest: acc.heaviest,
+    });
+}
+
+/// Record that the slot `slot`'s fence has signalled and its work is done.
+pub fn note_retired(slot: usize) {
+    let mut trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = trail.submits.get_mut(slot) {
+        *entry = None;
+    }
+}
+
+/// Every submission still outstanding, oldest first, as one line's worth.
+///
+/// `None` when nothing is outstanding — which is itself a reading, and a
+/// surprising one at a stall: it says the wait this device is inside is not
+/// waiting on anything this ring submitted.
+pub fn outstanding() -> Option<String> {
+    let trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
+    render_outstanding(&trail.submits)
+}
+
+/// [`outstanding`]'s ordering and formatting, over a slice rather than the
+/// process-wide ring, so it can be tested for the property that matters.
+///
+/// Ordered by [`SubmitNote::seq`] and never by slot index: the ring wraps, so
+/// slot 0 is as likely to hold the newest submission as the oldest, and reading
+/// the array in index order would put an arbitrary rotation of the queue in
+/// front of the reader with the wedge somewhere in the middle of it.
+fn render_outstanding(submits: &[Option<SubmitNote>]) -> Option<String> {
+    let mut live: Vec<(usize, SubmitNote)> = submits
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, note)| note.map(|n| (slot, n)))
+        .collect();
+    if live.is_empty() {
+        return None;
+    }
+    live.sort_unstable_by_key(|(_, note)| note.seq);
+    let body = live
+        .iter()
+        .map(|(slot, note)| format!("[slot={slot} {note}]"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(format!("outstanding={} {body}", live.len()))
+}
+
+/// One slot's outstanding submission, for the wait that just failed on it.
+pub fn submission(slot: usize) -> Option<SubmitNote> {
+    let trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
+    trail.submits.get(slot).copied().flatten()
 }
 
 /// The trail, oldest first, as one line's worth of text.
@@ -462,6 +628,85 @@ mod tests {
         assert!(
             kept.1.parse::<u64>().expect("a total") > CAPACITY as u64,
             "the total counts every note, not the kept ones: {line}"
+        );
+    }
+
+    fn submit(seq: u64, draws: u32) -> Option<SubmitNote> {
+        Some(SubmitNote {
+            seq,
+            at_draw: seq * 10,
+            draws,
+            heaviest: None,
+        })
+    }
+
+    /// The wedge is the *oldest* outstanding submission, and the ring wraps —
+    /// so slot order is a rotation of submit order and reading the array as it
+    /// lies puts an arbitrary entry at the head of the list.
+    #[test]
+    fn outstanding_submissions_are_ordered_by_submit_and_not_by_slot() {
+        // Slot 0 holds the newest and slot 2 the oldest: exactly the rotation a
+        // ring that has wrapped produces.
+        let submits = [submit(9, 1), submit(10, 2), submit(7, 3), None];
+        let line = render_outstanding(&submits).expect("three are outstanding");
+        assert!(
+            line.starts_with("outstanding=3 "),
+            "the count leads the line: {line}"
+        );
+        let slots: Vec<&str> = line
+            .match_indices("slot=")
+            .map(|(at, _)| &line[at + 5..at + 6])
+            .collect();
+        assert_eq!(
+            slots,
+            ["2", "0", "1"],
+            "oldest submit first, whatever slot it landed in: {line}"
+        );
+    }
+
+    /// A ring with nothing outstanding is a real reading — it says the wait is
+    /// not on anything this ring submitted — and it must not spell the same as
+    /// an empty list.
+    #[test]
+    fn a_ring_with_nothing_outstanding_reports_nothing() {
+        assert!(render_outstanding(&[None, None]).is_none());
+        assert!(render_outstanding(&[]).is_none());
+    }
+
+    /// A submission carrying no draws is the discriminating reading: it says the
+    /// wedge is not in a draw. It must render, and it must not claim a heaviest.
+    #[test]
+    fn a_submission_with_no_draws_still_names_itself() {
+        let line = render_outstanding(&[submit(1, 0)]).expect("one is outstanding");
+        assert!(line.contains("draws=0"), "{line}");
+        assert!(
+            !line.contains("heaviest"),
+            "no draw means no heaviest module to name: {line}"
+        );
+    }
+
+    /// The heaviest fragment module in a submission is what tells a compositing
+    /// uber shader from the ordinary blits around it, so the accumulator keeps
+    /// the largest and not the most recent.
+    #[test]
+    fn a_submission_keeps_its_heaviest_module_and_not_its_last() {
+        let mut acc = Accumulating::default();
+        acc.admit(DrawNote {
+            pipeline_ref: 7,
+            frag_words: 95_212,
+            ..DrawNote::default()
+        });
+        acc.admit(DrawNote {
+            pipeline_ref: 8,
+            frag_words: 412,
+            ..DrawNote::default()
+        });
+        assert_eq!(acc.draws, 2);
+        let heaviest = acc.heaviest.expect("two draws were admitted");
+        assert_eq!(heaviest.frag_words, 95_212);
+        assert_eq!(
+            heaviest.pipeline_ref, 7,
+            "the heaviest draw's own pipeline, not the last draw's"
         );
     }
 }

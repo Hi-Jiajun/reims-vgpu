@@ -806,6 +806,17 @@ const _: () = assert!(
     "SlotMask must have one bit per ring slot"
 );
 
+/// The hang trail keeps one outstanding-submission record per ring slot, and it
+/// cannot name [`RING_DEPTH`] itself: that module compiles on the Metal-direct
+/// arm too, where `backend::vulkan` does not exist. This is the only place both
+/// constants are in scope, so the relation is asserted here. A trail too short
+/// would drop exactly the slot a wedge is on and report `outstanding` as if the
+/// ring were shallower than it is.
+const _: () = assert!(
+    RING_DEPTH <= crate::runtime::gpu_hang_trail::SUBMIT_SLOTS,
+    "the hang trail must hold one submission record per ring slot"
+);
+
 /// A GPU object displaced while a CB may still reference it. Destroyed only
 /// once every in-flight fence has retired.
 pub(crate) enum DeferredHandle {
