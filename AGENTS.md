@@ -2,23 +2,6 @@
 
 Operating guide for AI agents working in this repository.
 
-## Standing Invariant: never sample an image this device has not defined
-
-The guest's compositing fragment shader walks a pointer chain stored *inside a sampled image* —
-`uv <- sample(uv).xy`, continuing while `sample(uv).x > 0`, with no counter and no second exit. A
-zeroed image exits on the first iteration; **garbage never terminates, and neither does a value that
-has merely been moved off the cell it names.** So an image bound to a draw must carry the contents
-this device decoded, in the format the guest declared, exactly — a lossy conversion is as fatal here
-as an undefined one.
-
-This is what the macos-11 Maps and macos-12 Launchpad hangs were: a 64 KiB cost floor was pushing
-sub-floor half-float sampled textures onto a CPU arm that clamped to `[0,1]` and quantised to 256
-levels, and a quantised UV lands between cells. Fixed at `9a57611b`; both rails have since run five
-consecutive clean boots each against a baseline of thirteen consecutive freezes.
-`kb/a-cost-floor-quantised-the-pointer-chain-and-the-rung-that-did-it-was-silent.md` carries the
-trace. The invariant outlives the bug and is the reason a narrowing conversion anywhere in the
-sampled path needs a measurement rather than a byte threshold.
-
 ## What Belongs In This File
 
 Durable rules that change how an agent works: the principles below, the support matrix, the commands
@@ -618,15 +601,12 @@ Two readings that follow, and the first corrects what this file said when the ru
 
 ### A freeze verdict is a rate too, so an arm that fixes one is confirmed at n≥3
 
-The same rule as the panic rate, on the leg verdicts. macos-11's Maps leg froze on thirteen
-consecutive boots; `INTEL_DEBUG=no16,no32` then produced one `ok` with zero device recreates, which
-was reported as having found the cause of a hang four sessions had failed to localise. **Both
-repeats of that identical arm froze**, and it freezes macos-12's Launchpad too.
-
-One in three against zero in sixteen is `p ≈ 0.16` on a Fisher exact test — consistent with chance,
-and nowhere near a fix. Note which way that cuts: it does not establish that the arm does nothing
-either. An arm at n=3 with one `ok` is **unresolved**, and the only thing that settles it is more
-boots of the same arm.
+The same rule as the panic rate, on the leg verdicts. A leg that freezes has a *rate*, and a
+candidate arm that produces one passing boot has moved that rate by an amount one boot cannot
+measure. One `ok` in three against zero in sixteen is `p ≈ 0.16` on a Fisher exact test — consistent
+with chance. Note which way that cuts: it does not establish that the arm does nothing either. An
+arm at n=3 with one `ok` is **unresolved**, and the only thing that settles it is more boots of the
+same arm.
 
 Score arms on the asymmetry, which is real and cheap:
 
