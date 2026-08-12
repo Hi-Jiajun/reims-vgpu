@@ -19,10 +19,21 @@ The first candidate for supplying that garbage — a pooled sampled slot recycle
 partly overwritten — is **refuted**: every sampled upload here is full-extent, every length is
 validated before the copy, the pooled staging buffer zero-fills its remainder, and no memo outlives
 the recycle of the image it names. `kb/the-sampled-image-is-defined-everywhere-except-the-gathered-vouch.md`
-carries the full trace and the two real holes it did find. What is left un-eliminated is the one
-bind made with nothing read and nothing compared — the gathered sampled cache's identity-only
-lookup, whose correctness is entirely `runtime::gather_witness`. It now has a switch:
-`REIMS_VGPU_SAMPLED_IDENTITY=off`.
+carries the full trace and the two real holes it did find. The one bind made with nothing read and
+nothing compared — the gathered sampled cache's identity-only lookup — is **also eliminated**: one
+driven boot with the switch this session added, `REIMS_VGPU_SAMPLED_IDENTITY=off`, arm confirmed on
+the boot line and by 53 census windows of `sampled_identity_off`, and Maps froze anyway. The wedging
+draw does not even contain a gathered bind.
+
+**So the question is no longer whether an image is defined; it is what it is defined *as*.** The
+trail now names the wedged draw's sampled bindings, and the first thing that reading turned up is
+ours and silent: this device hands the shader a **unorm8 copy of a 64x64 `RGBA16Float` guest
+texture** — clamped to `[0,1]`, quantised to 256 levels — because the tight-row linear loader's
+native arms cover only the two eight-bit channel orders and everything else falls through to
+`texel_to_rgba8`. `sampled_texture_narrowed` reports it now. The three live hypotheses are the
+resolved texture, the format, and the sampler; the format one is the only one with a measurement
+behind it. Read `kb/the-wedging-draw-binds-seventeen-textures-and-one-of-them-is-quantised.md`
+before spending a boot.
 
 Where it stands, in reading order:
 
