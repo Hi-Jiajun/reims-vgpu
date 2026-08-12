@@ -67,20 +67,62 @@ pub struct DrawNote {
     pub height: u32,
     pub vertex_count: u32,
     pub instance_count: u32,
+    /// Set-0 bindings under [`MASK_BINDINGS`] the fragment module carries a
+    /// `Binding` decoration for.
+    pub frag_declared: u32,
+    /// Set-0 bindings under [`MASK_BINDINGS`] this draw will put in the
+    /// descriptor set layout.
+    pub frag_provided: u32,
+}
+
+impl DrawNote {
+    /// Bindings the module carries and the layout will not describe.
+    ///
+    /// Vulkan requires a descriptor for every resource a shader **statically
+    /// uses**, and a declared-but-never-referenced variable is legal to omit —
+    /// so this is a superset of the violation and not the violation itself. It
+    /// is the cheap question, asked per draw; `descriptor_static_use` is the
+    /// exact one and cannot answer for a storage buffer at all, which is
+    /// precisely the class the trail was built to look at.
+    pub fn frag_gap(self) -> u32 {
+        self.frag_declared & !self.frag_provided
+    }
+}
+
+/// How many binding numbers the two masks cover.
+///
+/// The bands this device relocates into put buffers below 32, sampled images at
+/// 32+ and samplers at 64+, so a `u32` reaches every buffer binding and the low
+/// end of the texture band. That is the range the hang trail is about: the
+/// question it exists to ask is which *buffer* a loop bound came from. A
+/// binding above it is simply not represented, which is why the mask is named
+/// for its width rather than described as complete.
+pub const MASK_BINDINGS: u32 = 32;
+
+/// One binding as a mask bit, or nothing when it is out of the mask's range.
+pub fn mask_bit(binding: u32) -> u32 {
+    if binding < MASK_BINDINGS {
+        1u32 << binding
+    } else {
+        0
+    }
 }
 
 impl std::fmt::Display for DrawNote {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "pipe={} vw={} fw={} {}x{} vtx={} inst={}",
+            "pipe={} vw={} fw={} {}x{} vtx={} inst={} fdecl={:#x} fprov={:#x} fgap={:#x}",
             self.pipeline_ref,
             self.vert_words,
             self.frag_words,
             self.width,
             self.height,
             self.vertex_count,
-            self.instance_count
+            self.instance_count,
+            self.frag_declared,
+            self.frag_provided,
+            self.frag_gap()
         )
     }
 }
@@ -213,6 +255,36 @@ mod tests {
         let first_at = line.find(&format!("pipe={first} ")).unwrap();
         let last_at = line.find(&format!("pipe={last} ")).unwrap();
         assert!(first_at < last_at, "oldest first: {line}");
+    }
+
+    /// The gap is what the layout will not describe, and a binding past the
+    /// mask's width is represented by neither side — so it can never appear as
+    /// a phantom gap, which is the one wrong answer this mask could give.
+    #[test]
+    fn a_binding_past_the_masks_width_is_absent_from_both_sides() {
+        assert_eq!(mask_bit(0), 1);
+        assert_eq!(mask_bit(MASK_BINDINGS - 1), 1 << (MASK_BINDINGS - 1));
+        assert_eq!(mask_bit(MASK_BINDINGS), 0, "out of range contributes nothing");
+        assert_eq!(mask_bit(96), 0, "a sampler band binding is out of range");
+
+        // A module declaring one in-range and one out-of-range binding, with
+        // neither provided: only the in-range one can be reported.
+        let note = DrawNote {
+            frag_declared: mask_bit(0) | mask_bit(96),
+            frag_provided: 0,
+            ..DrawNote::default()
+        };
+        assert_eq!(note.frag_gap(), 1);
+
+        // Provided-but-not-declared is not a gap. A layout may legally carry a
+        // descriptor the module never mentions; only the other direction is a
+        // specification violation.
+        let extra = DrawNote {
+            frag_declared: mask_bit(1),
+            frag_provided: mask_bit(1) | mask_bit(2),
+            ..DrawNote::default()
+        };
+        assert_eq!(extra.frag_gap(), 0);
     }
 
     /// The bands tile the whole `u32`, so no module size is uncounted, and the
