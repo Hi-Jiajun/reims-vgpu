@@ -650,6 +650,23 @@ pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> 
         ..
     } = &mut *guard;
     let result = unsafe { exec::execute_draw_inner(owner, caches, pools, counters, req) };
+    if result.is_err() {
+        // A draw can abandon after staging a gathered window and before the copy
+        // that fills it is recorded — `SampledResidentNotReady` and its two
+        // siblings are recoverable control flow raised in between. The owed copy
+        // lives in a local `Vec` and goes with the stack frame; the bind memo it
+        // was going to fill does not, and the next draw of the same command
+        // buffer would hit that memo, record nothing, and bind the recycled
+        // slot's **previous tenant** as its constant buffer or vertex stream.
+        //
+        // Forget exactly those entries. Counted rather than silent, because a
+        // zero here is what says the window was never open on a given workload,
+        // and no other counter in this device could see it.
+        let n = pools.discard_cb_binds_owed_a_gather();
+        if n > 0 {
+            crate::runtime::drain::note_store_route_n("cb_bind_dropped_unfilled_gather", n as u64);
+        }
+    }
     match result {
         Ok(out) => {
             // Guest work reached the GPU, so any recreate that got us here did

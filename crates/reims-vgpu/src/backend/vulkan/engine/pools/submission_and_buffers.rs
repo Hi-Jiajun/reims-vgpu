@@ -95,6 +95,7 @@ impl ResourcePools {
             gather_free: HashMap::new(),
             gather_live: Vec::new(),
             cb_bound_buffers: std::collections::HashMap::new(),
+            cb_gather_owed: Vec::new(),
             cb_graphics: super::CbGraphicsState::default(),
             staging_hits: 0,
             staging_misses: 0,
@@ -1847,6 +1848,41 @@ impl ResourcePools {
         self.cb_bound_buffers.insert(key, (bound, owner));
     }
 
+    /// Record that the bind just published is backed by a **recycled slot whose
+    /// gather has not been recorded yet** — see [`super::ResourcePools::cb_gather_owed`].
+    ///
+    /// Called from the one arm of `stage_buffer_content` that hands back a slot
+    /// it has not filled. Everything published without this call is answerable
+    /// the moment it is published.
+    pub(crate) fn note_cb_bind_owes_gather(&mut self, key: (usize, u64)) {
+        self.cb_gather_owed.push(key);
+    }
+
+    /// The owed gathers have been recorded into the command buffer, so every
+    /// bind that was waiting on one is now answerable.
+    ///
+    /// Called at the single point in `execute_draw_inner` that records them,
+    /// after both forms — the compute dispatches and the transfer copies — and
+    /// after the barrier that orders them before the draw.
+    pub(crate) fn note_cb_gathers_recorded(&mut self) {
+        self.cb_gather_owed.clear();
+    }
+
+    /// A draw abandoned before its gathers were recorded: forget exactly the
+    /// binds those gathers were going to fill.
+    ///
+    /// The rest of the memo is untouched, because a bind published by a draw
+    /// that completed is still correct and this rail carries ~4.8 binds a draw.
+    /// Returns how many were forgotten so a boot can say whether the window this
+    /// closes was ever open.
+    pub(crate) fn discard_cb_binds_owed_a_gather(&mut self) -> usize {
+        let n = self.cb_gather_owed.len();
+        for key in self.cb_gather_owed.drain(..) {
+            self.cb_bound_buffers.remove(&key);
+        }
+        n
+    }
+
     /// Drop every remembered bind. Called from the three places that end a
     /// slot's life — the seal, the recycle, and a recorded guest-page write.
     /// Drop every cached buffer bind, and say how many were dropped and by whom.
@@ -1893,6 +1929,10 @@ impl ResourcePools {
         crate::runtime::drain::note_store_route(why);
         crate::runtime::drain::note_store_route_n(entries_slug, n);
         self.cb_bound_buffers.clear();
+        // The owed list names keys in the map that just went, so it cannot
+        // outlive it — a surviving key would later remove whatever unrelated
+        // bind the next command buffer published under the same address.
+        self.cb_gather_owed.clear();
     }
 
     /// Bind the graphics pipeline unless this command buffer already carries it.
@@ -4040,6 +4080,79 @@ mod recycle_tests {
             pools.take_whole_sampled_cache().len(),
             0,
             "discarding an empty cache is a no-op, not a second sweep"
+        );
+    }
+
+    /// A bind whose gather was never recorded must not survive the draw that
+    /// abandoned, and the binds around it must.
+    ///
+    /// The gather arm of `stage_buffer_content` is the only one that publishes a
+    /// memo entry naming a slot it has not filled: the slot comes off the free
+    /// list holding the previous tenant's bytes, and what fills it is recorded
+    /// hundreds of lines later, past three recoverable sampled refusals. A draw
+    /// that takes one of those exits drops the owed copy with its stack frame.
+    /// If the memo entry outlives it, the next draw of the same command buffer
+    /// hits the memo, records no copy, and binds the previous tenant as its
+    /// constant buffer or vertex stream — wrong pixels, or a loop bound that
+    /// does not terminate.
+    ///
+    /// The second half is why this is a list and not a clear: entries published
+    /// by draws that completed are still correct, and this rail carries ~4.8
+    /// binds a draw.
+    #[test]
+    fn a_bind_whose_gather_was_never_recorded_does_not_outlive_the_draw() {
+        use crate::backend::vulkan::engine::exec::BoundBuffer;
+        use crate::backend::vulkan::engine::types::BufferContent;
+
+        let mut pools = ResourcePools::new();
+        let filled = BufferContent::Bytes(std::sync::Arc::new(vec![1u8; 64]));
+        let owed = BufferContent::Bytes(std::sync::Arc::new(vec![2u8; 128]));
+        let bound = |n: u64| BoundBuffer {
+            buffer: vk::Buffer::null(),
+            offset: n,
+        };
+
+        // A bind whose bytes are already where the descriptor points — a CPU
+        // write into mapped staging — and one that owes a gather.
+        let filled_bind = super::CbBind::of(&filled);
+        pools.note_cb_bound_buffer(filled_bind.clone(), bound(1));
+        let owed_bind = super::CbBind::of(&owed);
+        let owed_key = owed_bind.key();
+        pools.note_cb_bound_buffer(owed_bind.clone(), bound(2));
+        pools.note_cb_bind_owes_gather(owed_key);
+
+        assert_eq!(
+            pools.discard_cb_binds_owed_a_gather(),
+            1,
+            "exactly the unfilled bind is forgotten"
+        );
+        assert!(
+            pools.cb_bound_buffer(&owed_bind).is_none(),
+            "binding this would hand the shader the recycled slot's previous tenant"
+        );
+        assert!(
+            pools.cb_bound_buffer(&filled_bind).is_some(),
+            "a bind published by a draw that completed is still correct, and \
+             re-staging it is a cost this rail pays 4.8 times a draw"
+        );
+        assert_eq!(
+            pools.discard_cb_binds_owed_a_gather(),
+            0,
+            "the list is drained, so a second abandon cannot remove an unrelated \
+             bind the next command buffer published at the same address"
+        );
+
+        // Recording the gathers is what makes the entry answerable. After it, an
+        // abandoning draw has nothing to forget.
+        let owed_bind = super::CbBind::of(&owed);
+        pools.note_cb_bound_buffer(owed_bind.clone(), bound(3));
+        pools.note_cb_bind_owes_gather(owed_bind.key());
+        pools.note_cb_gathers_recorded();
+        assert_eq!(pools.discard_cb_binds_owed_a_gather(), 0);
+        assert!(
+            pools.cb_bound_buffer(&owed_bind).is_some(),
+            "a gather that reached the command buffer leaves a bind the rest of \
+             that command buffer may reuse"
         );
     }
 

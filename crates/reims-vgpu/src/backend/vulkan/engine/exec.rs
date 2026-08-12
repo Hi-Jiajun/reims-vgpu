@@ -472,6 +472,10 @@ unsafe fn stage_buffer_content(
         counters.note_buffer_bind_reused();
         return Ok(bound);
     }
+    // Set by the one arm that returns a slot it has not filled. Read after the
+    // `match` so the flag and the `note_cb_bound_buffer` below it cannot be
+    // separated by a future edit that adds an arm.
+    let mut gather_owed = false;
     let bound = match content {
         BufferContent::Bytes(b) => {
             let slot = {
@@ -511,6 +515,13 @@ unsafe fn stage_buffer_content(
                 // [`super::pools::buffer_gather_working_set`].
                 super::pools::buffer_gather_working_set::note_gathered(key.0, key.1);
                 gathers.push(pending);
+                // The slot this returns is recycled and still holds the previous
+                // tenant's bytes; what fills it is `pending`, and `pending` is
+                // recorded into the command buffer hundreds of lines below, past
+                // every recoverable refusal the sampled rungs raise. Until then
+                // the memo entry about to be published is not answerable, and
+                // this is what says so.
+                gather_owed = true;
                 bound
             } else {
                 // No import on this host, or an offset it will not bind at. The
@@ -534,6 +545,9 @@ unsafe fn stage_buffer_content(
         }
     };
     pools.note_cb_bound_buffer(bind, bound);
+    if gather_owed {
+        pools.note_cb_bind_owes_gather(key);
+    }
     Ok(bound)
 }
 
@@ -3611,6 +3625,12 @@ pub(crate) unsafe fn execute_draw_inner(
             &[],
         );
     }
+    // Every gather this draw owed is now in the command buffer, ordered ahead of
+    // the draw by the barrier above, so the bind memo entries that were waiting
+    // on one are answerable. Unconditional and outside the `is_empty` guard:
+    // a draw with no gathers of its own must still not carry a previous draw's
+    // owed list, and the list is empty in that case anyway.
+    pools.note_cb_gathers_recorded();
 
     // Guest-sourced sampled uploads: one buffer→image copy over either the
     // guest's imported pages or the scratch the CPU packed them into, differing

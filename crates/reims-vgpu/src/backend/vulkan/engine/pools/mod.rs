@@ -252,6 +252,25 @@ pub(crate) struct ResourcePools {
     /// the correctness edge: a bind after a Store into the same pages must see
     /// what the Store wrote, and reusing a copy taken before it would not.
     cb_bound_buffers: HashMap<(usize, u64), (super::exec::BoundBuffer, CbBindOwner)>,
+    /// Keys in `cb_bound_buffers` whose slot is **not yet filled**: a GPU gather
+    /// was planned for them and the copy or dispatch that lands it has not been
+    /// recorded into the command buffer.
+    ///
+    /// Every other arm of `stage_buffer_content` publishes a bind whose bytes
+    /// are already where the descriptor points — a `Bytes` bind is a CPU write
+    /// into mapped memory and a direct import binds the guest's own pages. The
+    /// gather arm is the exception: it hands back a **recycled** device-local
+    /// slot and owes a copy that `execute_draw_inner` records hundreds of lines
+    /// later, past every recoverable refusal the sampled rungs can raise. A draw
+    /// that abandons in between drops the owed copy — it lives in a local `Vec`
+    /// — and leaves the memo behind, so the next draw of the same command buffer
+    /// hits the memo, records no copy, and binds the slot's **previous tenant**
+    /// as its constant buffer or vertex stream.
+    ///
+    /// Tracked rather than solved by clearing the whole memo, because the entries
+    /// published by draws that did complete are still correct and this rail is
+    /// ~4.8 binds a draw.
+    cb_gather_owed: Vec<(usize, u64)>,
     /// Graphics state the command buffer now recording already carries — see
     /// [`CbGraphicsState`].
     cb_graphics: CbGraphicsState,
