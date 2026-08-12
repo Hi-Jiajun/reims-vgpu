@@ -9,11 +9,22 @@ handover must say so.** Not "identify the driver arm that avoids it" — *fix th
 supplies* so the hang stops happening. An environment switch that dodges it is a diagnosis, never a
 resolution. Correctness and performance work continues only where it does not delay this.
 
+**The mechanism is now known and it is ours.** The guest's compositing fragment shader walks a
+pointer chain stored *inside a sampled image* — `uv <- sample(uv).xy`, continuing while
+`sample(uv).x > 0`, with no counter and no second exit. A zeroed image exits on the first iteration;
+**garbage never terminates**. This device recycles sampled-image slots without defining them and
+uploads sub-rects into them, so a chase that leaves the uploaded window reads the previous
+texture's texels. The standing invariant that follows: **never let the GPU sample an image whose
+contents this device has not defined.**
+
 Where it stands, in reading order:
 
+- `kb/the-uber-shader-walks-a-pointer-chain-through-a-sampled-image.md` — the loop, the four inputs
+  that hang it against the two that do not, and the null results (the parameter block, 16-bit
+  induction, extent-derived bounds and loaded steps are all **exonerated** — do not re-run them).
 - `kb/the-wedge-is-one-submission-and-the-uber-shader-does-not-terminate.md` — the wedge is a single
-  submission carrying the CoreAnimation compositing uber shader over **64x64 pixels**, which
-  excludes "the shader is too slow here" by ~200 000x. A loop in that module does not terminate.
+  submission, `outstanding=1`, over as few as 4096 pixels, which excludes "the shader is too slow
+  here" by ~200 000x.
 - `kb/the-macos-11-hang-is-a-fence-this-device-gives-up-on-first.md` — the ordering, this device's
   own fence timeout measured innocent, and the suspects eliminated with measurements.
 - `kb/the-igpu-hang-survives-every-switch-being-off.md` — all eighteen narrowing switches off at
