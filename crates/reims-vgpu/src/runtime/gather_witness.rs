@@ -664,6 +664,90 @@ struct HostWriteCounts {
     /// non-quiet values are this device declining to rule the write out rather
     /// than a write that landed here, and the three want different repairs.
     pages_wrote: Option<crate::runtime::host_writes::HostWriteVerdict>,
+    /// Whether a guest-page write this device has **submitted but the GPU has
+    /// not yet executed** could land in this window.
+    ///
+    /// This does **not** feed the vouch, and the reason is the whole of why it
+    /// exists. The gather this cache elides is a GPU copy on the same queue as
+    /// the writeback, so it is ordered behind it and a retained image cannot
+    /// contain pre-copy bytes. [`fold_runs`] is not: it is a **CPU** read of the
+    /// same guest pages, and `render_writeback`'s rule for those is that a
+    /// host-side reader must settle first or it reads the pre-Store bytes. The
+    /// audit was added to this call path after `draw::vulkan`'s zero-copy rail
+    /// had already recorded "no settle here — this rail does not read anything",
+    /// which stopped being true when the fold arrived.
+    ///
+    /// So a fold taken while a copy is in flight over the window reads pre-copy
+    /// bytes, the next one reads post-copy bytes, both binds are legitimately
+    /// vouched, and the audit reports `gw_audit_unsound` for an image that was
+    /// never stale. This field is what lets the audit decline to compare across
+    /// that, so its remaining alarms are about the cache rather than about
+    /// itself.
+    pending: PendingWrites,
+}
+
+/// Whether a guest-page write this device has submitted but the GPU has not yet
+/// executed could land in the window being judged.
+///
+/// The three arms are the engine's `GuestWriteReach`, restated here so this
+/// module's signature does not name a backend type — the Metal arm has no such
+/// queue and answers [`Self::Disjoint`] by construction. Only `Disjoint` may
+/// vouch, but the other two are kept apart because they want different repairs:
+/// an `Overlap` is this device really writing the window it samples, and an
+/// `Unnamed` is a footprint nobody could name.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PendingWrites {
+    /// Nothing outstanding, or the outstanding footprint provably misses these
+    /// pages.
+    #[default]
+    Disjoint,
+    /// An outstanding write names one of these pages.
+    Overlap,
+    /// Something is outstanding and its pages could not be ruled out.
+    Unnamed,
+}
+
+impl PendingWrites {
+    /// What this device has submitted over `gpas` and the GPU has not run yet.
+    ///
+    /// One relaxed atomic load in the common case — the same gate
+    /// `settle_guest_writes_unless_disjoint` opens with — so a bind with nothing
+    /// outstanding pays what it paid before.
+    fn over(gpas: &[u64]) -> Self {
+        #[cfg(feature = "backend-vulkan")]
+        {
+            use crate::backend::vulkan::engine::GuestWriteReach as Reach;
+            if !crate::backend::vulkan::engine::guest_writes_outstanding() {
+                return Self::Disjoint;
+            }
+            match crate::backend::vulkan::engine::guest_writes_reaching(gpas) {
+                Reach::Disjoint => Self::Disjoint,
+                Reach::Overlap => Self::Overlap,
+                Reach::Unnamed => Self::Unnamed,
+            }
+        }
+        #[cfg(not(feature = "backend-vulkan"))]
+        {
+            let _ = gpas;
+            Self::Disjoint
+        }
+    }
+
+    /// Census route, so the new refusals are bandable rather than a silent drop
+    /// in the vouch rate.
+    fn route(self) -> &'static str {
+        match self {
+            Self::Disjoint => "gw_pending_disjoint",
+            Self::Overlap => "gw_pending_overlap",
+            Self::Unnamed => "gw_pending_unnamed",
+        }
+    }
+
+    /// Whether a vouch is still available. Only a proof of disjointness buys
+    /// one; both other answers are this device declining to rule the write out.
+    fn settled(self) -> bool {
+        matches!(self, Self::Disjoint)
+    }
 }
 
 /// The resolved window one gather will read.
@@ -760,6 +844,16 @@ pub enum ContentAudit {
     /// guest pages without either half of the witness seeing it, so every gather
     /// skipped since the last audit bound a stale image.
     Disagreed,
+    /// Not folded: a guest-page copy this device submitted is still in flight
+    /// over this window, so a CPU read of it now is neither the bytes before nor
+    /// reliably the bytes after.
+    ///
+    /// The audit's own limitation and not a finding about the cache. The gather
+    /// this cache elides is a GPU copy ordered behind that writeback on the same
+    /// queue; the fold is not ordered against it by anything, which is the rule
+    /// `render_writeback` states for every host-side reader of guest bytes.
+    /// Comparing across it reported the device's own queue as a stale image.
+    Indebted,
 }
 
 /// One bind's answers: what the witness decided, what the audit found, and the
@@ -872,7 +966,13 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
             .gather_witness
             .previous_pages_epoch(&key)
             .map(|since| state.host_writes.wrote_any_since(since, window.gpas)),
+        pending: PendingWrites::over(window.gpas),
     };
+    // Every bind, vouched or not, so the route is a denominator rather than a
+    // tally of refusals — the reading wanted is what fraction of binds this
+    // device has a copy in flight over, and a count with no denominator cannot
+    // say whether a repair moved it.
+    note_store_route(counts.pending.route());
     // Report the host-write half's grounds, not just its answer. Three of its
     // four non-quiet values are this device declining to rule a write out rather
     // than one that landed here, and they want different repairs — name the
@@ -925,6 +1025,10 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
         // to stay reachable at all.
         ContentAudit::Rebaselined => note_store_route("gw_audit_rebaseline"),
         ContentAudit::Agreed => note_store_route("gw_audit_ok"),
+        // Read beside `gw_audit_ok` the same way `gw_audit_restart` is: it is
+        // the audit's blind spot, and a boot where it dominates has an alarm
+        // that is looking away rather than one that is seeing nothing.
+        ContentAudit::Indebted => note_store_route("gw_audit_indebted"),
         ContentAudit::Disagreed => {
             note_store_route("gw_audit_unsound");
             // Once per window: a writer escaping both halves escapes them on
@@ -1023,6 +1127,7 @@ fn observe<M: crate::runtime::host::HostOps>(
     let HostWriteCounts {
         pages_epoch,
         pages_wrote,
+        pending,
     } = counts;
 
     witness.binds = witness.binds.wrapping_add(1);
@@ -1117,7 +1222,24 @@ fn observe<M: crate::runtime::host::HostOps>(
     // they are live there. On a vouched bind the gather will be skipped, but the
     // runs were resolved by the same producer in the same call and name the same
     // pages, which the entry's page set is checked against above.
-    let audit = if entry.audit_armed {
+    let audit = if !pending.settled() {
+        // A copy this device submitted is in flight over these pages and the
+        // fold is a CPU read of them, so whatever it reads now is neither the
+        // before nor reliably the after. Comparing across that reports the
+        // device's own queue as a stale image.
+        //
+        // Declines rather than settles. The audit is a diagnostic and must not
+        // introduce a stall the shipping path does not have — and it must not
+        // take the engine lock from inside the witness, which the drain thread
+        // reaches with its own locks held. Dropping the baseline is the honest
+        // answer: this window is not comparable right now, and the stride will
+        // bring it back when the queue is quiet.
+        entry.audit_armed = false;
+        entry.fold_valid = false;
+        entry.rebaselines = 0;
+        entry.binds_since_fold = 0;
+        ContentAudit::Indebted
+    } else if entry.audit_armed {
         // The claim under test is "a vouched bind means these bytes did not
         // move", so the bind that tests it is the *next vouched one* after a
         // baseline — not one sixty-four binds later. Waiting for the stride
@@ -1232,6 +1354,7 @@ mod tests {
     const QUIET: HostWriteCounts = HostWriteCounts {
         pages_epoch: 1,
         pages_wrote: Some(crate::runtime::host_writes::HostWriteVerdict::Quiet),
+        pending: PendingWrites::Disjoint,
     };
 
     /// One bind, discarding the audit — for the tests that are about the verdict.
@@ -1475,6 +1598,61 @@ mod tests {
         );
     }
 
+    /// The audit declines to compare across a copy this device has submitted and
+    /// the GPU has not run — and the *vouch* is untouched by it.
+    ///
+    /// Both halves matter and they pull opposite ways. The fold is a CPU read of
+    /// guest pages and is ordered against that copy by nothing, so comparing
+    /// across it reports the device's own queue as a stale image. The gather the
+    /// cache elides is a GPU copy on the same queue as the writeback, so it *is*
+    /// ordered and the vouch is still sound — making this refuse the vouch too
+    /// would cost re-gathers to fix a defect in the instrument.
+    ///
+    /// `Unnamed` is asserted beside `Overlap` because a footprint nobody could
+    /// name is not a proof of disjointness, and reading it as one is how the
+    /// blind spot would come back as "we could not tell, so we compared".
+    #[test]
+    fn an_unlanded_copy_stops_the_audit_comparing_and_leaves_the_vouch_alone() {
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+        let bind = |w: &mut GatherWitness, host: &mut crate::runtime::host::FakeHost, pending| {
+            observe(
+                w,
+                host,
+                KEY,
+                one_page(&GPAS, &runs),
+                HostWriteCounts { pending, ..QUIET },
+                next_gen(),
+            )
+        };
+
+        // Quiet queue: the audit reaches a comparison, which is the control —
+        // without it the assertions below would pass against an audit that never
+        // ran at all.
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut w = witness_auditing(AuditDensity::EveryBind);
+        let settled = bind_quietly(&mut w, &mut host, &GPAS, &runs, 4);
+        assert_eq!(
+            (settled.verdict, settled.audit),
+            (GatherVerdict::Vouched, ContentAudit::Agreed)
+        );
+
+        for pending in [PendingWrites::Overlap, PendingWrites::Unnamed] {
+            let seen = bind(&mut w, &mut host, pending);
+            assert_eq!(
+                seen.audit,
+                ContentAudit::Indebted,
+                "{pending:?} folded across a copy that has not landed"
+            );
+            assert_eq!(
+                seen.verdict,
+                GatherVerdict::Vouched,
+                "{pending:?} moved the vouch, which is ordered behind that copy and did not need to"
+            );
+            assert_eq!(seen.vouch, GatherVouch::Vouched);
+        }
+    }
+
     /// A window whose bytes and pages both stand still, bound twice: the whole
     /// point of the exercise, and the verdict whose count says what the cache
     /// saves.
@@ -1590,6 +1768,7 @@ mod tests {
             KEY,
             one_page(&GPAS, &runs),
             HostWriteCounts {
+                pending: PendingWrites::Disjoint,
                 pages_epoch: 2,
                 pages_wrote: Some(crate::runtime::host_writes::HostWriteVerdict::Overlap),
             },
@@ -1693,6 +1872,7 @@ mod tests {
                 KEY,
                 one_page(&GPAS, &runs),
                 HostWriteCounts {
+                    pending: PendingWrites::Disjoint,
                     pages_epoch: 2,
                     pages_wrote: Some(crate::runtime::host_writes::HostWriteVerdict::Overlap),
                 },
