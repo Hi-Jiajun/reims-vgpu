@@ -78,14 +78,17 @@ for n in $(seq 1 "$BOOTS"); do
   # WindowServer aborts ~13 s in when it aborts at all, so a verdict is
   # available long before the Dock would have appeared. Both are watched: the
   # crash is the interesting answer and the Dock is the passing one.
+  # Three outcomes, and a bare `pgrep -x Dock` loop reports all three as one.
+  # `wait-for-desktop.sh` handles the login window — macos-12 stops there on
+  # about half its boots — so a rail that only needed a password is not scored as
+  # a rail that failed. What is left after that is the interesting failure.
   verdict=TIMEOUT
-  for _ in $(seq 1 40); do
-    if gssh 'pgrep -x Dock >/dev/null'; then verdict=DESKTOP; break; fi
-    if [ -n "$(gssh 'ls /Library/Logs/DiagnosticReports/WindowServer*.crash 2>/dev/null')" ]; then
-      verdict=WS-CRASH; break
-    fi
-    sleep 10
-  done
+  "$REPO/scripts/app-sweep-probe/wait-for-desktop.sh" --timeout 400 \
+    >"$OUT/$n-desktop-wait.log" 2>&1 && verdict=DESKTOP
+  if [ "$verdict" != DESKTOP ] \
+    && [ -n "$(gssh 'ls /Library/Logs/DiagnosticReports/WindowServer*.crash 2>/dev/null')" ]; then
+    verdict=WS-CRASH
+  fi
 
   # Kept per boot and named by verdict, because the pair is the measurement.
   cp -f /tmp/reims-vgpu-fail.log "$OUT/$n-$verdict-fail.log" 2>/dev/null
