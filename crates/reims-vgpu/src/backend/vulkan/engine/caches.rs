@@ -586,13 +586,24 @@ pub(crate) const COLOR0_PASS_EXIT_LAYOUT: vk::ImageLayout =
 /// what makes the split unrepresentable: there is no longer an arm that adds a
 /// dependency for one attachment class without stating the others.
 ///
-/// # The outgoing `dst` scope is the pass's declared exit, not a guess
+/// # The outgoing `dst` scope covers every way the attachment is read next
 ///
-/// Slot 0's `finalLayout` is `TRANSFER_SRC_OPTIMAL` — the pass exists to be
-/// read back or presented — and secondary slots exit at
-/// `COLOR_ATTACHMENT_OPTIMAL` to be sampled by a later draw. So the outgoing
-/// dependency makes the stores visible to `TRANSFER` reads and to
-/// `FRAGMENT_SHADER` reads, which is exactly what those two exits are for.
+/// Every slot now exits at [`COLOR0_PASS_EXIT_LAYOUT`], so the nearest consumer
+/// is usually the next draw into the same target — which is why the attachment
+/// stages and accesses are in the destination scope, and why
+/// [`super::exec::pass_exit_needs_no_barrier`] may then drop that draw's own
+/// barrier entirely. `TRANSFER` and `FRAGMENT_SHADER` stay named because a
+/// readback, a present blit or a later sample can follow instead; each of those
+/// issues its own transition, and this is the scope that transition orders
+/// against.
+///
+/// # The incoming dependency is what makes the skip legal
+///
+/// `VK_SUBPASS_EXTERNAL` as `srcSubpass` scopes every command submitted before
+/// the render pass instance, in submission order. So the incoming dependency
+/// here — colour writes to attachment reads and writes — already orders the
+/// previous draw's store against this pass's `loadOp`, with no barrier from the
+/// draw. Weakening its source scope would silently make that skip unsound.
 fn external_dependencies(has_depth: bool, color_input: bool) -> [vk::SubpassDependency; 2] {
     // Colour is unconditional: every pass this device builds has slot 0.
     let mut attach_stages = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT;
@@ -1069,11 +1080,14 @@ impl ObjectCaches {
         }
         counters.pass_misses.fetch_add(1, Ordering::Relaxed);
         let target_format = key.color0_format;
+        // A `LOAD` pass names the layout the *previous* pass left the attachment
+        // in, so it reads the exit constant rather than respelling the layout.
+        // These two agreeing is what lets `exec::pass_exit_needs_no_barrier`
+        // drop the transition between consecutive draws into one target; a
+        // second spelling here would make that skip a missing transition the
+        // first time somebody changed one of them.
         let (load_op, initial) = if key.load_seed {
-            (
-                vk::AttachmentLoadOp::LOAD,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            )
+            (vk::AttachmentLoadOp::LOAD, COLOR0_PASS_EXIT_LAYOUT)
         } else {
             (vk::AttachmentLoadOp::CLEAR, vk::ImageLayout::UNDEFINED)
         };

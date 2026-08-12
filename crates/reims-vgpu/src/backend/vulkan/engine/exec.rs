@@ -3455,10 +3455,13 @@ pub(crate) unsafe fn execute_draw_inner(
             (req.width as u64) * (req.height as u64) * 4,
             std::sync::atomic::Ordering::Relaxed,
         );
-    } else if load_uses_gpu_content {
+    } else if load_uses_gpu_content
+        && !pass_exit_needs_no_barrier(target_prior_access(target_snapshotted, target_access))
+    {
         outside_pass.note(PassObstacle::TargetLayout);
-        // A prior direct sample may have left this target shader-readable;
-        // transition from the registry's tracked layout back to attachment use.
+        // A prior direct sample may have left this target shader-readable, or a
+        // readback may have left it a transfer source; transition from the
+        // registry's tracked layout back to attachment use.
         let prior = target_prior_access(target_snapshotted, target_access);
         let (src_stage, src_access) = prior.source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
@@ -3479,7 +3482,9 @@ pub(crate) unsafe fn execute_draw_inner(
             &[],
             &barrier,
         );
-    } else if target_snapshotted || target_access != super::pools::ResidentAccess::Untouched {
+    } else if !load_uses_gpu_content
+        && (target_snapshotted || target_access != super::pools::ResidentAccess::Untouched)
+    {
         outside_pass.note(PassObstacle::ClearWait);
         // The Clear render pass discards prior content via initialLayout
         // UNDEFINED, so nothing here preserves pixels — but its colour writes
@@ -4702,6 +4707,46 @@ fn target_prior_access(
     }
 }
 
+/// Whether a `LOAD` pass's own external subpass dependency already covers this
+/// prior access, so the draw needs no explicit barrier into attachment use.
+///
+/// # The one case, and why it is the common one
+///
+/// `ColorWrite(COLOR_ATTACHMENT_OPTIMAL)` means the last thing to touch this
+/// image was a render pass leaving it at
+/// [`super::caches::COLOR0_PASS_EXIT_LAYOUT`], which is exactly the
+/// `initialLayout` a `LOAD` pass names. So there is **no layout transition to
+/// perform**, and the only remaining job a barrier could do is order the
+/// previous pass's colour store against this pass's load — which
+/// [`super::caches::external_dependencies`] already does, unconditionally, on
+/// every pass this device builds: its incoming dependency runs
+/// `VK_SUBPASS_EXTERNAL → 0` with `COLOR_ATTACHMENT_OUTPUT` /
+/// `COLOR_ATTACHMENT_WRITE` in the source scope and the attachment stages and
+/// accesses in the destination. `VK_SUBPASS_EXTERNAL` as `srcSubpass` scopes
+/// every command submitted before the render pass instance in submission order,
+/// so the previous draw's store is inside it.
+///
+/// Every other access keeps its barrier and must:
+///
+/// - `ShaderRead` needs the transition *and* a scope the pass dependency does
+///   not name — `FRAGMENT_SHADER` is not in its source stages;
+/// - `TransferRead` and a snapshot need the transition;
+/// - `Untouched` does not reach here, because a `LOAD` pass with nothing to load
+///   is not a `LOAD` pass;
+/// - `ColorWrite` at any *other* layout is depth, which is not this attachment.
+///
+/// # What this is worth
+///
+/// It is the whole of `passmerge_outside_target_layout`, which was 82 % of draws
+/// on macos-13 and 29-37 % on macos-11 and macos-12. Moving the pass exit to
+/// `COLOR_ATTACHMENT_OPTIMAL` removed the *transition* those draws paid; this
+/// removes the `vkCmdPipelineBarrier` that was left recording nothing. The
+/// counter follows honestly — a draw that records no barrier is not charged an
+/// obstacle, so `passmerge_reachable` can be non-zero for the first time.
+fn pass_exit_needs_no_barrier(prior: super::pools::ResidentAccess) -> bool {
+    prior == super::pools::ResidentAccess::ColorWrite(super::caches::COLOR0_PASS_EXIT_LAYOUT)
+}
+
 /// Record the barrier that makes a registry-resident image readable as a
 /// transfer source, waiting for whatever last touched it.
 ///
@@ -5370,6 +5415,32 @@ mod tests {
                 "a snapshot of a {tracked:?} target is still the newest touch"
             );
             assert_eq!(target_prior_access(false, tracked), tracked);
+        }
+    }
+
+    /// Exactly one prior access lets a `LOAD` pass skip its own barrier, and it
+    /// is the one the pass's `VK_SUBPASS_EXTERNAL` dependency already covers.
+    ///
+    /// Written over `EVERY_ACCESS` rather than as two assertions so a new
+    /// `ResidentAccess` variant has to be classified here rather than silently
+    /// joining the skipping side. A wrong `true` costs a missing layout
+    /// transition, which is undefined behaviour and not an error.
+    #[test]
+    fn only_a_target_left_where_the_next_pass_wants_it_may_skip_its_barrier() {
+        for tracked in EVERY_ACCESS {
+            let skippable =
+                tracked == ResidentAccess::ColorWrite(super::super::caches::COLOR0_PASS_EXIT_LAYOUT);
+            assert_eq!(
+                pass_exit_needs_no_barrier(tracked),
+                skippable,
+                "{tracked:?}"
+            );
+            // A snapshot is this draw's own transfer read and always needs the
+            // transition back, whatever the registry was tracking.
+            assert!(
+                !pass_exit_needs_no_barrier(target_prior_access(true, tracked)),
+                "a snapshotted {tracked:?} target still has to come back from TRANSFER_SRC"
+            );
         }
     }
 
