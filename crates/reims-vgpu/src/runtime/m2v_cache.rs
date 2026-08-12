@@ -272,6 +272,38 @@ pub struct ShaderVariant {
     /// and the draw path ran it twice a draw. It is the larger half of what
     /// `sampled_phase`'s `Part::Reflect` brackets, measured at 10 486 us/s over
     /// 29 944 draws — 0.35 us a draw — on a driven macos-13 boot.
+    ///
+    /// # What it removed
+    ///
+    /// Twelve interleaved driven macos-13 sustained-animation boots, two pinned
+    /// binaries differing only by this and by
+    /// [`crate::runtime::pipeline_resolve::VertexBindPlan`], scored over the
+    /// fast population. Per draw, median over busy census windows, then mean and
+    /// range across boots:
+    ///
+    /// ```text
+    ///                before (n=4)              after (n=6)
+    /// reflect_us     0.340 [0.332..0.345]      0.021 [0.020..0.021]
+    /// sampled_us     1.911 [1.861..1.972]      1.640 [1.574..1.691]
+    /// engine_us      6.235 [6.065..6.338]      6.208 [6.033..6.283]
+    /// ```
+    ///
+    /// `reflect_us` is **−94 %** and `sampled_us` **−14 %**, both fully
+    /// disjoint. `engine_us` — a phase neither change touches — does not move,
+    /// which is the control that says the two arms are comparable at all.
+    ///
+    /// `draw_us/draw` overall reads 13.33 [13.05..13.61] against 13.03
+    /// [12.82..13.44]: −2.3 %, ranges overlapping. `present_hz` is 114.25
+    /// against 114.16 — no movement, which is exactly what a 2 % per-draw change
+    /// is supposed to look like here. **This bought a phase, not a frame**, and
+    /// the elasticity beside `crate::runtime::drain::census::VBL_REPORT_EARLY`
+    /// says it could not have bought a frame at that size.
+    ///
+    /// A first attempt at this reading ran the two pins in sequence rather than
+    /// interleaved, and reported `engine_us` **+18 %** with `gpu occupancy` up
+    /// and `present_hz` down — the GPU clocking down between the two groups,
+    /// with nothing in the log to say so. Interleaving is not optional for a pin
+    /// comparison on this host.
     pub sampler_bindings: Arc<[u32]>,
 }
 

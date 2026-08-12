@@ -231,6 +231,9 @@ pub(crate) struct ResourcePools {
     /// the correctness edge: a bind after a Store into the same pages must see
     /// what the Store wrote, and reusing a copy taken before it would not.
     cb_bound_buffers: HashMap<(usize, u64), super::exec::BoundBuffer>,
+    /// Graphics state the command buffer now recording already carries — see
+    /// [`CbGraphicsState`].
+    cb_graphics: CbGraphicsState,
     /// Staging free-list hits / misses and the miss bucket histogram; see
     /// `note_staging_miss`. Measure-only.
     staging_hits: u64,
@@ -613,6 +616,81 @@ pub(crate) struct PassEcho {
     pub(crate) pass: vk::RenderPass,
     pub(crate) fb: vk::Framebuffer,
     pub(crate) area: (u32, u32),
+}
+
+/// Graphics state a recording command buffer already carries, so a draw that
+/// wants the state its predecessor left does not record the call again.
+///
+/// # Why this is sound, and the one rule that makes it so
+///
+/// Pipeline binding and dynamic state are properties of a **command buffer's
+/// recording**, not of a render pass instance: Vulkan invalidates them at
+/// `vkBeginCommandBuffer` and nowhere else on this path, so a draw that ends its
+/// pass and begins another has not disturbed either. That is what makes the skip
+/// legal at all — every batched draw here opens and closes its own pass.
+///
+/// The hazard it does *not* clear is static pipeline state. When a pipeline
+/// declaring some state statically is bound, that state stops being dynamic, and
+/// a later pipeline declaring it dynamic leaves it undefined until set again.
+/// This device does not build every pipeline with the same dynamic-state list —
+/// `VK_DYNAMIC_STATE_STENCIL_REFERENCE` is listed only by pipelines with a
+/// stencil — so a cached dynamic value is not safe across a pipeline change.
+///
+/// **So a pipeline change clears the dynamic half.** That is the whole rule, it
+/// is one line in [`Self::bind_pipeline`], and it makes the question "which
+/// states did which pipeline declare dynamic" one nobody has to answer.
+///
+/// `cb` is carried for the reason [`PassEcho`] carries it: a command buffer
+/// handle is recycled, and state left by the previous user of the handle names
+/// bindings a `vkBeginCommandBuffer` has since made undefined. Every field is
+/// dropped together when the handle differs, so there is no path that clears one
+/// and keeps another.
+#[derive(Default)]
+pub(crate) struct CbGraphicsState {
+    /// The command buffer every other field is an assertion about.
+    cb: Option<vk::CommandBuffer>,
+    /// The graphics pipeline last bound into `cb`.
+    pipeline: Option<vk::Pipeline>,
+    /// The viewport array last handed to `vkCmdSetViewport`, and the scissor
+    /// array last handed to `vkCmdSetScissor`.
+    viewports: Vec<vk::Viewport>,
+    scissors: Vec<vk::Rect2D>,
+    /// The front/back references last handed to `vkCmdSetStencilReference`.
+    stencil: Option<(u32, u32)>,
+    /// Scratch the next draw builds into, so the comparison costs no allocation.
+    /// Swapped with the bound array when they differ rather than cloned.
+    vp_scratch: Vec<vk::Viewport>,
+    sc_scratch: Vec<vk::Rect2D>,
+}
+
+/// Whether two viewport arrays are the value the driver already has.
+///
+/// Field by field on the bit pattern, not `==` on the float: the question is
+/// "are these the bytes already sent", which is exactly bitwise equality, and it
+/// is also what keeps `clippy::float_cmp` quiet without an `allow` that would
+/// hide a real float comparison later. `VkViewport` is a fixed Vulkan structure
+/// of six floats and cannot grow a seventh.
+fn viewports_match(a: &[vk::Viewport], b: &[vk::Viewport]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x.x.to_bits() == y.x.to_bits()
+                && x.y.to_bits() == y.y.to_bits()
+                && x.width.to_bits() == y.width.to_bits()
+                && x.height.to_bits() == y.height.to_bits()
+                && x.min_depth.to_bits() == y.min_depth.to_bits()
+                && x.max_depth.to_bits() == y.max_depth.to_bits()
+        })
+}
+
+/// Whether two scissor arrays are the value the driver already has.
+fn scissors_match(a: &[vk::Rect2D], b: &[vk::Rect2D]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x.offset.x == y.offset.x
+                && x.offset.y == y.offset.y
+                && x.extent.width == y.extent.width
+                && x.extent.height == y.extent.height
+        })
 }
 
 pub(crate) struct OpenBatch {
@@ -3494,5 +3572,104 @@ mod idle_slab_trim_tests {
             None,
             "an unsettled pass leaves the hot path's churn budget in place"
         );
+    }
+}
+
+#[cfg(test)]
+mod dynamic_state_match_tests {
+    use super::{scissors_match, viewports_match};
+    use ash::vk;
+
+    fn vp(x: f32, y: f32, w: f32, h: f32, near: f32, far: f32) -> vk::Viewport {
+        vk::Viewport {
+            x,
+            y,
+            width: w,
+            height: h,
+            min_depth: near,
+            max_depth: far,
+        }
+    }
+
+    fn rect(x: i32, y: i32, w: u32, h: u32) -> vk::Rect2D {
+        vk::Rect2D {
+            offset: vk::Offset2D { x, y },
+            extent: vk::Extent2D {
+                width: w,
+                height: h,
+            },
+        }
+    }
+
+    /// Every field has to be compared, and the test is per field because the
+    /// failure of a missed one is silent: the draw renders through the previous
+    /// draw's viewport, which is wrong pixels with no error anywhere.
+    ///
+    /// `height` is negative on this device — Metal NDC is Y-up and Vulkan's is
+    /// Y-down, so every viewport is emitted flipped — which is why the base here
+    /// carries a negative height rather than a tidy positive one.
+    #[test]
+    fn one_differing_viewport_field_is_enough_to_resend() {
+        let base = [vp(1.0, 600.0, 800.0, -600.0, 0.0, 1.0)];
+        assert!(viewports_match(&base, &base.clone()));
+        for other in [
+            vp(2.0, 600.0, 800.0, -600.0, 0.0, 1.0),
+            vp(1.0, 601.0, 800.0, -600.0, 0.0, 1.0),
+            vp(1.0, 600.0, 801.0, -600.0, 0.0, 1.0),
+            vp(1.0, 600.0, 800.0, -601.0, 0.0, 1.0),
+            vp(1.0, 600.0, 800.0, -600.0, 0.5, 1.0),
+            vp(1.0, 600.0, 800.0, -600.0, 0.0, 0.5),
+        ] {
+            assert!(!viewports_match(&base, &[other]), "{other:?}");
+        }
+    }
+
+    /// A different count is a different bind whatever the shared prefix says.
+    /// The count is what the pipeline declared, so serving a two-slot draw from
+    /// a one-slot cache would leave slot 1 holding the previous pipeline's.
+    #[test]
+    fn a_shorter_or_longer_array_never_matches() {
+        let one = [vp(0.0, 0.0, 8.0, -8.0, 0.0, 1.0)];
+        let two = [one[0], one[0]];
+        assert!(!viewports_match(&one, &two));
+        assert!(!viewports_match(&two, &one));
+        assert!(!scissors_match(&[rect(0, 0, 8, 8)], &[]));
+    }
+
+    /// Bit patterns, not `==`: `-0.0 == 0.0` is true for floats and false for
+    /// "these are the bytes the driver already has". Resending is always safe
+    /// and never wrong, so the comparison is allowed to be stricter than
+    /// equality and must not be looser.
+    #[test]
+    fn negative_zero_is_a_different_viewport() {
+        let pos = [vp(0.0, 0.0, 8.0, -8.0, 0.0, 1.0)];
+        let neg = [vp(-0.0, 0.0, 8.0, -8.0, 0.0, 1.0)];
+        assert_eq!(pos[0].x, neg[0].x, "float equality says these are the same");
+        assert!(!viewports_match(&pos, &neg), "bit equality must not");
+    }
+
+    /// The same, per field, for the integer rectangles.
+    #[test]
+    fn one_differing_scissor_field_is_enough_to_resend() {
+        let base = [rect(4, 5, 800, 600)];
+        assert!(scissors_match(&base, &base.clone()));
+        for other in [
+            rect(5, 5, 800, 600),
+            rect(4, 6, 800, 600),
+            rect(4, 5, 801, 600),
+            rect(4, 5, 800, 601),
+        ] {
+            assert!(!scissors_match(&base, &[other]), "{other:?}");
+        }
+    }
+
+    /// An empty pair matches, which is what a freshly reset command buffer's
+    /// cache holds — and it must not make the first draw skip its bind. The
+    /// first draw always has at least one slot (`viewport_slot_count` never
+    /// returns zero), so an empty cache can never match it.
+    #[test]
+    fn an_empty_cache_matches_only_an_empty_request() {
+        assert!(viewports_match(&[], &[]));
+        assert!(!viewports_match(&[vp(0.0, 0.0, 1.0, -1.0, 0.0, 1.0)], &[]));
     }
 }

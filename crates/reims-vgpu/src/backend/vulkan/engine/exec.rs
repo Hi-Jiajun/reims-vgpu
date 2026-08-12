@@ -3822,8 +3822,10 @@ pub(crate) unsafe fn execute_draw_inner(
     ctx.device
         .cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
     pools.note_pass_opened(echo);
-    ctx.device
-        .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
+    // Only if this command buffer is not already carrying it — the three
+    // `dynstate_*` skips below hang off this one call, because a pipeline change
+    // is what invalidates them. See `super::pools::CbGraphicsState`.
+    unsafe { pools.bind_graphics_pipeline(&ctx.device, cb, counters, pipeline) };
     if let Some((pool, flags)) = occlusion {
         ctx.device.cmd_begin_query(cb, pool, 0, flags);
     }
@@ -3851,46 +3853,51 @@ pub(crate) unsafe fn execute_draw_inner(
     // request or `vkCmdSetViewport` binds a different count than the pipeline
     // declared.
     let slots = crate::backend::vulkan::engine::viewport_slot_count(req);
-    let viewports: Vec<vk::Viewport> = (0..slots)
-        .map(|i| {
-            let vp = req.viewports.get(i).copied().unwrap_or(default_vp);
-            vk::Viewport {
-                x: vp.x,
-                y: vp.y + vp.height,
-                width: vp.width,
-                height: -vp.height,
-                min_depth: vp.min_depth,
-                max_depth: vp.max_depth,
-            }
-        })
-        .collect();
-    ctx.device.cmd_set_viewport(cb, 0, &viewports);
-    let scissors: Vec<vk::Rect2D> = (0..slots)
-        .map(|i| {
-            let sc = req.scissors.get(i).copied().unwrap_or(default_sc);
-            let x = sc.x.min(req.width);
-            let y = sc.y.min(req.height);
-            vk::Rect2D {
-                offset: vk::Offset2D {
-                    x: x as i32,
-                    y: y as i32,
-                },
-                extent: vk::Extent2D {
-                    width: sc.width.min(req.width - x),
-                    height: sc.height.min(req.height - y),
-                },
-            }
-        })
-        .collect();
-    ctx.device.cmd_set_scissor(cb, 0, &scissors);
+    // Built into the pools' scratch rather than into two fresh `Vec`s: these are
+    // rebuilt every draw, and the comparison that decides whether the driver
+    // already has them needs a buffer it can swap rather than copy.
+    let (vp_scratch, sc_scratch) = pools.dynamic_scratch();
+    vp_scratch.extend((0..slots).map(|i| {
+        let vp = req.viewports.get(i).copied().unwrap_or(default_vp);
+        vk::Viewport {
+            x: vp.x,
+            y: vp.y + vp.height,
+            width: vp.width,
+            height: -vp.height,
+            min_depth: vp.min_depth,
+            max_depth: vp.max_depth,
+        }
+    }));
+    sc_scratch.extend((0..slots).map(|i| {
+        let sc = req.scissors.get(i).copied().unwrap_or(default_sc);
+        let x = sc.x.min(req.width);
+        let y = sc.y.min(req.height);
+        vk::Rect2D {
+            offset: vk::Offset2D {
+                x: x as i32,
+                y: y as i32,
+            },
+            extent: vk::Extent2D {
+                width: sc.width.min(req.width - x),
+                height: sc.height.min(req.height - y),
+            },
+        }
+    }));
+    unsafe { pools.set_dynamic_viewport_scissor(&ctx.device, cb, counters) };
     // Dynamic stencil reference (Metal `setStencilFrontReferenceValue:back…`)
     // — only bound for stencil pipelines, which list STENCIL_REFERENCE as a
-    // dynamic state; front/back set separately to honor Metal's split refs.
+    // dynamic state; front/back set together because Metal's split refs are one
+    // guest state and a cache that held half of it would be two.
     if let Some(s) = req.depth.as_ref().and_then(|d| d.stencil) {
-        ctx.device
-            .cmd_set_stencil_reference(cb, vk::StencilFaceFlags::FRONT, s.reference_front);
-        ctx.device
-            .cmd_set_stencil_reference(cb, vk::StencilFaceFlags::BACK, s.reference_back);
+        unsafe {
+            pools.set_dynamic_stencil_reference(
+                &ctx.device,
+                cb,
+                counters,
+                s.reference_front,
+                s.reference_back,
+            )
+        };
     }
 
     if let Some(dset) = dset {
@@ -4141,7 +4148,7 @@ pub(crate) unsafe fn execute_draw_inner(
         // on, and cheaper than computing a union of arbitrary rects.
         counters.note_draw_coverage(if rewrites_whole_attachment {
             super::counters::DrawCoverage::Full
-        } else if scissors.iter().any(|s| {
+        } else if pools.bound_scissors().iter().any(|s| {
             s.offset.x <= 0
                 && s.offset.y <= 0
                 && s.extent.width >= req.width

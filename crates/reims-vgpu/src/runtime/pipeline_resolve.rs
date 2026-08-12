@@ -183,6 +183,24 @@ pub const MEMO_CAPACITY: usize = 1024;
 /// at that size a sorted `binary_search` is a cache line and a compare where a
 /// tree is a pointer chase per level. The sort also makes the two sets
 /// canonical, so an equality between two resolutions means what it reads as.
+/// # The measurement did not confirm it, and this is what it said
+///
+/// The twelve interleaved boots quoted on
+/// [`crate::runtime::m2v_cache::ShaderVariant::sampler_bindings`] carried this
+/// change too, and `binds_us` — the column this targets — moved the **wrong
+/// way**: 2.477 [2.418..2.525] before against 2.636 [2.510..2.695] after, per
+/// draw. The ranges touch rather than separate, and the sub-column where the two
+/// set builds used to sit (`binds_us` less `bind_phase`'s three parts) rose 0.04
+/// us, which removing work cannot cause. So the honest reading is that
+/// `binds_us`'s boot-to-boot spread is wider than what this change is worth, not
+/// that the change costs anything.
+///
+/// It stays because it is strictly less work — two heap allocations and two tree
+/// builds a draw become two `binary_search`es over data the pipeline resolution
+/// already holds — and because per-draw allocation churn is a jitter source as
+/// well as a mean one. **No claim is made that it bought time.** If a future
+/// session wants one, `bind_phase` would need a fourth `Part` bracketing the
+/// lookups themselves; the three it has today do not reach them.
 pub struct VertexBindPlan {
     /// Buffer indices feeding at least one Constant-step attribute. A bind of
     /// one of these may not take the zero-copy rail: the engine prepends a CPU

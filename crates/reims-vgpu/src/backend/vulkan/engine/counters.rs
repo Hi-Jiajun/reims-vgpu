@@ -454,6 +454,25 @@ engine_counters! {
         /// buffer if it is taken against a boot's `batch_flush_draws /
         /// batch_flushes`, which says how many draws there were to reuse over.
         buffer_bind_reuses,
+        /// Graphics state a draw did **not** record because the command buffer
+        /// it joined was already carrying exactly it — see
+        /// `ResourcePools::CbGraphicsState`.
+        ///
+        /// Every draw asks all four questions, so each of these is out of
+        /// `chain_phase chains` and none can exceed it. `dynstate_pipeline_held`
+        /// is the one to read first: a pipeline change clears the other three by
+        /// construction, so it is the ceiling on them and a boot where it is
+        /// near zero is a boot where consecutive draws never share a pipeline
+        /// and this whole cache is inert.
+        ///
+        /// `dynstate_stencil_held` is out of the *stencil* draws rather than all
+        /// of them — a draw with no stencil state asks nothing and counts
+        /// nowhere — so it is the one that does not belong to the same
+        /// denominator.
+        dynstate_pipeline_held,
+        dynstate_viewport_held,
+        dynstate_scissor_held,
+        dynstate_stencil_held,
         sampled_cache_hits,
         sampled_identity_hits,
         sampled_cache_hit_bytes,
