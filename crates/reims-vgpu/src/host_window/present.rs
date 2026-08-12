@@ -96,6 +96,15 @@ use crate::runtime::host::HostAction;
 /// lost.
 const ENGINE_WINDOW_REDRAW_BACKSTOP: std::time::Duration =
     std::time::Duration::from_millis(GUEST_RESIZE_WARN_AFTER.as_millis() as u64 / 10);
+/// How many times [`App::reattach_engine`] may rebuild the presenter.
+///
+/// Derived, not chosen. `EngineFacadeDecline::WindowPresenterNotAttached` on a
+/// live window means one thing — a device loss took the presenter down with the
+/// `VkDevice` it was built on — and the engine gives up recreating that device
+/// after [`MAX_DEVICE_RECREATES`]. So there can never be more losses to recover
+/// from than that, and a bound written as its own number would be a second
+/// spelling of the same limit that could drift away from it.
+const MAX_ENGINE_REATTACHES: u32 = crate::backend::vulkan::engine::MAX_DEVICE_RECREATES;
 /// How long a guest-driven native resize request may stay unmatched by a
 /// winit `Resized` event before the always-on alarm names it. Live requests
 /// apply within single-digit milliseconds; one second means the window system
@@ -641,6 +650,12 @@ struct App {
     first_engine_present_logged: bool,
     first_engine_guest_logged: bool,
     engine_error_logged: bool,
+    /// How many times [`App::reattach_engine`] has rebuilt, or tried to rebuild,
+    /// the presenter after a device loss. Bounded by
+    /// [`MAX_ENGINE_REATTACHES`] so a surface that cannot be recreated is
+    /// retried a few times and then left alone, rather than once per redraw for
+    /// the life of the boot.
+    engine_reattempts: u32,
     /// A [`FramePublished`] arrived (or a present asked to be repeated) and no
     /// redraw has been requested for it yet. Consumed by `about_to_wait`, which
     /// is the one place that talks to the platform about redraws.
@@ -770,33 +785,9 @@ impl ApplicationHandler<FramePublished> for App {
                 return;
             }
         };
-        // Present from the engine's own device. Presenting the compositor
-        // resident from the device that rendered it is what removes the three
-        // full-frame host copies every presented layer otherwise pays: the
-        // drain's `read_target`, the publish copy, and a staging upload.
-        let attach = window
-            .display_handle()
-            .map_err(|error| WindowError::AttachDisplayHandle(error.to_string()))
-            .and_then(|display| {
-                window
-                    .window_handle()
-                    .map_err(|error| WindowError::AttachWindowHandle(error.to_string()))
-                    .map(|handle| (display.as_raw(), handle.as_raw()))
-            })
-            .and_then(|(display, handle)| {
-                let size = window.inner_size();
-                crate::backend::vulkan::engine::window_present_attach(
-                    display,
-                    handle,
-                    size.width.max(1),
-                    size.height.max(1),
-                )
-                .map_err(|error| WindowError::AttachEngine(error.to_string()))
-            });
-        match attach {
+        match Self::attach_engine(&window) {
             Ok(()) => {
                 self.engine_attached = true;
-                crate::backend::vulkan::engine::note_window_present_attached(true);
                 // Kick the first frame; RedrawRequested re-arms each subsequent
                 // one, so without this the window would never draw.
                 window.request_redraw();
@@ -896,9 +887,13 @@ impl ApplicationHandler<FramePublished> for App {
         // by `window`; releasing the window first makes the driver marshal to a
         // freed `wl_proxy` and crash. winit calls this before the loop ends, so
         // the ordering is explicit here rather than left to drop order.
+        //
+        // `window_present_detach` publishes the attached flag itself; this file
+        // used to set it here as a second statement, and the third site that
+        // takes the presenter — the engine's own device-loss flush — did not
+        // know to.
         if self.engine_attached {
             crate::backend::vulkan::engine::window_present_detach();
-            crate::backend::vulkan::engine::note_window_present_attached(false);
             self.engine_attached = false;
         }
         self.window = None;
@@ -997,6 +992,7 @@ impl App {
             first_engine_present_logged: false,
             first_engine_guest_logged: false,
             engine_error_logged: false,
+            engine_reattempts: 0,
             // The first tick draws: `engine_redraw_required` is set and there is
             // no publish behind the first frame, which is a clear rather than a
             // guest frame.
@@ -1058,6 +1054,91 @@ impl App {
             pointer_report(position, self.surface_dims(), self.guest_extent);
         self.cursor = (x, y);
         (self.on_input)(HostAction::input_pointer_move(x, y, width, height));
+    }
+
+    /// Build the engine-owned surface and swapchain over this native window.
+    ///
+    /// Present from the engine's own device. Presenting the compositor resident
+    /// from the device that rendered it is what removes the three full-frame
+    /// host copies every presented layer otherwise pays: the drain's
+    /// `read_target`, the publish copy, and a staging upload.
+    ///
+    /// Taken out of `resumed` so [`Self::reattach_engine`] can run it again on a
+    /// window that already exists. `window_present_attach` is idempotent — it
+    /// returns `Ok` if a presenter is already there — so calling it twice is
+    /// safe, and it is the engine that publishes the attached flag.
+    fn attach_engine(window: &Arc<Window>) -> Result<(), WindowError> {
+        let display = window
+            .display_handle()
+            .map_err(|error| WindowError::AttachDisplayHandle(error.to_string()))?
+            .as_raw();
+        let handle = window
+            .window_handle()
+            .map_err(|error| WindowError::AttachWindowHandle(error.to_string()))?
+            .as_raw();
+        let size = window.inner_size();
+        crate::backend::vulkan::engine::window_present_attach(
+            display,
+            handle,
+            size.width.max(1),
+            size.height.max(1),
+        )
+        .map_err(|error| WindowError::AttachEngine(error.to_string()))
+    }
+
+    /// Rebuild the presenter after the engine device was lost and recreated.
+    ///
+    /// # Why the window has to do this and nothing else can
+    ///
+    /// A `VK_ERROR_DEVICE_LOST` poisons the engine device; the next guest draw
+    /// destroys everything derived from it — caches, pools, and the presenter's
+    /// swapchain, surface and semaphores — and brings a fresh `VkDevice` up.
+    /// Every *guest* resource then rebuilds itself on demand, because the
+    /// registry is keyed by a `TargetIdentity` the guest re-presents and
+    /// `registry_ensure` recreates whatever is missing. The presenter was the
+    /// one thing with no such path: its only constructor sits in `resumed`,
+    /// winit calls `resumed` once per window, so the swapchain died and stayed
+    /// dead. The device recovered, the guest recovered, and the picture did not
+    /// come back for the rest of the boot — measured as seven recreates in one
+    /// driven macos-11 boot, after which every leg reported no frames at all.
+    ///
+    /// Bounded, and the bound is the point: a surface that genuinely cannot be
+    /// recreated must not be retried once per redraw forever. Past the bound the
+    /// window keeps running on whatever the previous behaviour was — a named
+    /// refusal per present — rather than spinning.
+    fn reattach_engine(&mut self) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        if self.engine_reattempts >= MAX_ENGINE_REATTACHES {
+            return;
+        }
+        self.engine_reattempts += 1;
+        match Self::attach_engine(&window) {
+            Ok(()) => {
+                // The presenter is new, so nothing on screen came from it and
+                // the sequence this loop last presented is not its history.
+                // Clearing it is what makes the next frame count as fresh
+                // instead of stale, which is the difference between recovering
+                // and looking recovered.
+                self.last_engine_seq = None;
+                self.engine_redraw_required = true;
+                self.engine_error_logged = false;
+                crate::observe::off(format!(
+                    "host_window_reattach status=ok attempt={}",
+                    self.engine_reattempts
+                ));
+                eprintln!(
+                    "reims-vgpu-window: engine presenter rebuilt after device loss \
+                     (attempt {})",
+                    self.engine_reattempts
+                );
+                self.force_redraw();
+            }
+            Err(error) => {
+                crate::observe::Emit::decline("host_window_reattach", &error).fail();
+            }
+        }
     }
 
     /// Present one frame through the engine presenter, or decide there is
@@ -1146,6 +1227,18 @@ impl App {
                     crate::observe::Emit::decline("host_window_present", &error).fail();
                     eprintln!("reims-vgpu-window: engine resident present failed: {error}");
                     self.engine_error_logged = true;
+                }
+                // This one error is recoverable and every other one is the
+                // presenter's own: it says the presenter is *gone*, which on a
+                // running window means a device loss destroyed it. See
+                // [`Self::reattach_engine`].
+                if matches!(
+                    error,
+                    crate::backend::vulkan::engine::DrawError::Facade(
+                        crate::backend::vulkan::engine::EngineFacadeDecline::WindowPresenterNotAttached
+                    )
+                ) {
+                    self.reattach_engine();
                 }
             }
         }

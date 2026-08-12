@@ -214,11 +214,34 @@ impl EngineState {
         }
     }
 
+    /// Drop everything derived from the current `VkDevice`, so the caller can
+    /// bring a new one up under it.
+    ///
+    /// Every *guest* resource comes back by itself after this: the registry is
+    /// keyed by a `TargetIdentity` the guest re-presents and `registry_ensure`
+    /// recreates whatever is missing, and pipelines, modules, passes and
+    /// samplers re-derive through `ObjectCaches` on next use. The presenter is
+    /// the exception — its only constructor is on the window thread — so this
+    /// takes it and publishes that it is gone, and
+    /// `host_window::present::App::reattach_engine` is what builds it again.
     fn flush_device_derived(&mut self) {
+        // Taken and published unconditionally, before anything fallible. The
+        // presenter's swapchain, surface and semaphores were made against the
+        // device that is going away; whether or not there is still a `ctx` to
+        // destroy them through, they are not usable after this and the flag that
+        // says a window rail exists must not outlive them. It did once — the
+        // take lived inside the `ctx` arm and the flag was published from the
+        // window thread, which had no idea this path existed — and the cost was
+        // the whole rest of the boot: `window_publish` kept routing frames at a
+        // presenter that was `None`.
+        #[cfg(feature = "host-window")]
+        let presenter = self.window_presenter.take();
+        #[cfg(feature = "host-window")]
+        note_window_present_attached(false);
         if let Some(ctx) = self.owner.ctx.as_ref() {
             unsafe {
                 #[cfg(feature = "host-window")]
-                if let Some(mut presenter) = self.window_presenter.take() {
+                if let Some(mut presenter) = presenter {
                     presenter.destroy(ctx, Some(&mut self.pools));
                 }
                 self.caches.destroy_all(&ctx.device);
@@ -562,6 +585,7 @@ pub fn window_present_attach(
     *window_presenter = Some(unsafe {
         window_present::WindowPresenter::create(ctx, display, window, width, height)?
     });
+    note_window_present_attached(true);
     Ok(())
 }
 
@@ -578,10 +602,21 @@ pub fn window_present_attach(
 static WINDOW_PRESENT_ATTACHED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Publish the window's rail choice. Called by the window thread from exactly
-/// the two places that create and destroy the presenter.
+/// Publish the window's rail choice.
+///
+/// Private, and called from exactly the three places that assign or take
+/// [`EngineState::window_presenter`]. It used to be `pub`, published by the
+/// window thread beside its own `window_present_attach` call — and the third
+/// site, [`EngineState::flush_device_derived`], did not know it existed. So a
+/// device loss destroyed the presenter and left this flag reading `true` for the
+/// rest of the boot: `window_publish` kept routing to a rail that was gone,
+/// every present after the loss failed
+/// `EngineFacadeDecline::WindowPresenterNotAttached`, and because the window
+/// thread latches its error log the whole thing was one line. The flag and the
+/// field are one fact now, and no caller outside this module can set one
+/// without the other.
 #[cfg(feature = "host-window")]
-pub fn note_window_present_attached(attached: bool) {
+fn note_window_present_attached(attached: bool) {
     WINDOW_PRESENT_ATTACHED.store(attached, Ordering::Release);
 }
 
@@ -629,6 +664,7 @@ pub fn window_present_detach() {
     let Some(mut presenter) = guard.window_presenter.take() else {
         return;
     };
+    note_window_present_attached(false);
     let EngineState {
         ref owner,
         ref mut pools,
@@ -3797,6 +3833,42 @@ pub fn test_poison_and_flush() {
     g.counters.device_lost.fetch_add(1, Ordering::Relaxed);
     g.owner.mark_device_lost();
     g.flush_device_derived();
+}
+
+#[cfg(all(test, feature = "host-window"))]
+mod device_loss_window_rail_tests {
+    use super::*;
+
+    /// A device-loss flush must leave the window rail claiming nothing.
+    ///
+    /// This fails on the tree before the flush published the flag. The flag was
+    /// written only by the window thread, so a loss destroyed the presenter and
+    /// left [`window_present_attached`] reading `true` with
+    /// `window_presenter == None` — after which `device::window_publish` kept
+    /// choosing a rail that was gone and every present failed
+    /// [`EngineFacadeDecline::WindowPresenterNotAttached`], once logged and then
+    /// silent, for the rest of the boot.
+    ///
+    /// It runs on any host because it needs no device: `test_poison_and_flush`
+    /// reaches `flush_device_derived` with `owner.ctx` at `None`, which is
+    /// exactly the arm where the take used to be skipped.
+    #[test]
+    fn a_device_loss_flush_leaves_no_window_rail_claimed() {
+        note_window_present_attached(true);
+        assert!(
+            window_present_attached(),
+            "precondition: the flag is what a successful attach publishes"
+        );
+        test_poison_and_flush();
+        assert!(
+            !window_present_attached(),
+            "the presenter died with the device, so nothing may still claim it"
+        );
+        assert!(
+            lock_engine().window_presenter.is_none(),
+            "and the field it shadows agrees"
+        );
+    }
 }
 
 #[cfg(test)]
