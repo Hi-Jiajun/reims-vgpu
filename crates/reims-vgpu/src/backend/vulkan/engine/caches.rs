@@ -1290,6 +1290,28 @@ impl ObjectCaches {
         // ones, so a boot's line count is the population and the `conformed`
         // field splits it. Reading only the conformed ones would miss exactly
         // the samplers the translator handles correctly, which is the control.
+        //
+        // # The VUID is real and it is **not** what hangs this GPU
+        //
+        // Both halves are measured, and the second one is why this stayed a
+        // census rather than becoming a repair. A driven macos-11 boot logs
+        // `min_mag_differed=false` on every unnormalized sampler it creates, so
+        // the mixed-filter shape above is not how this workload reaches the
+        // VUID — a *dynamically* bound `MTLSamplerState` is, because
+        // `metal2vulkan` intercepts only samplers whose state it knows at
+        // translate time and a runtime-bound one is invisible to it.
+        //
+        // A probe then forced `unnormalized_coordinates` false here, which makes
+        // `-08611` unreachable by construction: Maps froze anyway, with the same
+        // two device recreates. So the violation is a passenger. Do not spend
+        // another boot treating it as the hang, and do not read a future
+        // `sampler_unnormalized` line as one — it says a sampler exists, not
+        // that a frame was lost.
+        //
+        // Repairing it properly still needs the offset folded into the
+        // coordinate, which is exact only for an unnormalized sampler and so
+        // needs the normalization known at translate time. That is a
+        // `metal2vulkan` input this device does not currently supply.
         if key.unnormalized_coordinates {
             crate::observe::off(format!(
                 "sampler_unnormalized min_mag_differed={} conformed={} \
