@@ -1624,6 +1624,28 @@ fn row_walk_backward(
     dst_stride > src_stride
 }
 
+/// Whether [`texel_to_rgba8`] answers for this format by **narrowing** it
+/// rather than by rearranging bytes it can carry exactly.
+///
+/// The float arms go through `f16_to_unorm8_lut`, which does two things the
+/// unorm8 arms never do: it **clamps to `[0,1]`** and it **quantises to 256
+/// levels**. For a colour that is a small visible error. For a texture whose
+/// texels are *not* colours — a lookup table, a coordinate pair, a chain of
+/// offsets — it is data loss with no upper bound on the consequence, and it is
+/// silent, because the conversion succeeds.
+///
+/// [`TexelLayout::R16Float`] exists precisely so a single-channel float sampled
+/// bind escapes this. Its two- and four-channel siblings have no such layout, so
+/// they do not escape it, and the callers that convert a sampled texture are
+/// expected to say so — see `runtime::draw::note_sampled_narrowing`.
+///
+/// Asked of the **guest's** `MTLPixelFormat`, which is the only place the
+/// original width is still known: past the conversion every texel is four bytes
+/// and nothing downstream can tell a narrowed one from a native one.
+pub fn narrows_to_unorm8(format: u16) -> bool {
+    matches!(format, MTL_FORMAT_RGBA16_FLOAT | MTL_FORMAT_RG16_FLOAT)
+}
+
 pub fn convert_row_to_rgba8(format: u16, src: &[u8], pixels: u32, dst_rgba: &mut [u8]) -> bool {
     convert_row_to_rgba8_ex(format, src, pixels, dst_rgba, false)
 }

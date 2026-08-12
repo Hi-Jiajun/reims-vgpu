@@ -1620,6 +1620,45 @@ fn buffer_texture_descriptor<M: HostMemory + HostOps>(
     decode_buffer_texture_descriptor(&desc_bytes).ok()
 }
 
+/// Say, once per (site, format), that a sampled texture reached the GPU
+/// narrower than the guest stored it.
+///
+/// Every CPU-origin sampled loader here answers in RGBA8, which is exact for
+/// the unorm8 and single/dual-channel-8 formats and **lossy** for the float
+/// ones: `texel_to_rgba8`'s float arms clamp to `[0,1]` and quantise to 256
+/// levels. That is a small visible error for a colour and unbounded data loss
+/// for a texture whose texels are not colours — a colour-management LUT, a
+/// coordinate pair, a table of offsets a shader walks.
+///
+/// It has been silent for the whole life of these loaders, because the
+/// conversion *succeeds*: nothing downstream can tell a narrowed texel from a
+/// native one, and no counter distinguishes a texture that lost precision from
+/// one that never had any. So it goes on the fail channel — a degradation this
+/// device chose, reported where it is chosen, which is the same rule
+/// `frag_neutral_texture_substituted` follows.
+///
+/// Deduped per (site, format) rather than per texture: the question a reader
+/// has is which formats this workload narrows and from where, and a compositor
+/// binds thousands of textures a second.
+pub(crate) fn note_sampled_narrowing(
+    site: &'static str,
+    texture_ref: u32,
+    fmt: u16,
+    w: u32,
+    h: u32,
+) {
+    if !pixel_format::narrows_to_unorm8(fmt) {
+        return;
+    }
+    if !crate::observe::first_sight(site, u64::from(fmt)) {
+        return;
+    }
+    crate::observe::fail(format!(
+        "sampled_texture_narrowed reason={site} ref={texture_ref} fmt={fmt:#x} {w}x{h} \
+         to=rgba8 lost=clamp_to_unit_and_256_levels"
+    ));
+}
+
 /// Load an opcode-9 buffer-backed texture as tight RGBA8 (width, height, bytes).
 ///
 /// The sampled bytes are the source MTLBuffer's guest storage read at `offset`
@@ -1679,6 +1718,7 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
         ));
         return None;
     }
+    note_sampled_narrowing("buftex_narrowed", texture_ref, fmt, w, h);
     let row_pixels = w as usize;
     let dst_row = row_pixels.checked_mul(RGBA8_BPP as usize)?;
     let mut rgba = vec![0u8; dst_row.checked_mul(h as usize)?];

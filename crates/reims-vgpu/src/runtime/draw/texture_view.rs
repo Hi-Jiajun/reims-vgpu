@@ -832,6 +832,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
             state.page_shift,
         )
         .map_err(|_| R::PaddedRowUnreadable { row: y })?;
+        crate::runtime::draw::note_sampled_narrowing("padded_row_narrowed", 0, sample_fmt, w, h);
         let dst_off = (y as usize) * (w as usize) * 4;
         if !pixel_format::convert_row_to_rgba8(sample_fmt, &row, w, &mut rgba[dst_off..]) {
             return Err(R::RowConvertUnsupported { format: sample_fmt });
@@ -895,6 +896,7 @@ where
             _ => {}
         }
     }
+    crate::runtime::draw::note_sampled_narrowing("tight_row_narrowed", 0, sample_format, width, height);
     let mut rgba = vec![0u8; rgba_len];
     for y in 0..height as usize {
         let src_off = y.checked_mul(tight as usize).ok_or(R::SizeOverflow)?;
