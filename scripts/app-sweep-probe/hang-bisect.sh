@@ -82,12 +82,12 @@ for arm in $ARMS; do
   [ "$up" = yes ] || { say "$arm: no device"; printf '%s\tNO-BOOT\t-\n' "$arm" >>"$RESULTS"; continue; }
 
   timeout 300 "$REPO/vm/guest-authorize.sh" >/dev/null 2>&1
-  dock=no
-  for _ in $(seq 1 40); do
-    timeout 20 ssh -o BatchMode=yes -o ConnectTimeout=5 macos-vm \
-      'pgrep -x Dock >/dev/null' 2>/dev/null && { dock=yes; break; }
-    sleep 10
-  done
+  # Shared with `sweep-rails.sh`: it separates "still booting" from "stopped at
+  # the login window" and logs in for the second, which a bare `pgrep -x Dock`
+  # loop cannot do. An arm that never reaches a desktop drives nothing, so its
+  # hang count would be a measurement of an idle GPU.
+  dock=yes
+  "$REPO/scripts/app-sweep-probe/wait-for-desktop.sh" --timeout 400 || dock=no
   [ "$dock" = yes ] || { say "$arm: no desktop"; printf '%s\tNO-DESKTOP\t-\n' "$arm" >>"$RESULTS"; continue; }
   sleep 8
 

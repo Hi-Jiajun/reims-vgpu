@@ -83,13 +83,12 @@ for rail in $RAILS; do
   timeout 300 "$REPO/vm/guest-authorize.sh" >"$OUT/$rail-authorize.log" 2>&1 \
     || say "$rail: guest-authorize did not finish cleanly (see $OUT/$rail-authorize.log)"
 
-  # sshd answering is not the desktop compositing.
-  dock=no
-  for _ in $(seq 1 40); do
-    if timeout 20 ssh -o BatchMode=yes -o ConnectTimeout=5 macos-vm \
-        'pgrep -x Dock >/dev/null' 2>/dev/null; then dock=yes; break; fi
-    sleep 10
-  done
+  # sshd answering is not the desktop compositing, and a rail stopped at the
+  # login window is not a rail still booting. `wait-for-desktop.sh` owns that
+  # distinction and logs in when that is what the wait is for; this loop used to
+  # do neither and reported macos-12 as NO-DESKTOP for a guest that had booted.
+  dock=yes
+  "$REPO/scripts/app-sweep-probe/wait-for-desktop.sh" --timeout 400 || dock=no
   if [ "$dock" != yes ]; then
     say "$rail: the Dock never appeared"
     printf '%s\tNO-DESKTOP\t-\t%s\n' "$rail" \
