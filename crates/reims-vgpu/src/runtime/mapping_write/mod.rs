@@ -1160,12 +1160,30 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     };
     // Deferred-writeback flush-on-access: land pending resident content in
     // these pages before touching them.
-    crate::runtime::writeback_debt::settle_for_mapping(
-        state,
-        host,
-        mapping_id,
-        crate::runtime::render_writeback::SettleSite::MappingBgra8Write,
-    );
+    //
+    // Except when this write has ranges it must not touch. The payment writes the
+    // owed resident over the *whole* window with no exclusions, and the one
+    // caller that passes a skip list — `merge_guest_writes_into_pages` — passes
+    // exactly the pages the guest painted under a live resident. Paying first
+    // overwrites them, and the write below then restores everything *except*
+    // them, so the guest's repaint is destroyed by the mechanism built to keep
+    // it. What this write is about to land is the same surface at the same
+    // geometry (`GeometryMoved` above refuses anything else), so the owed frame
+    // is superseded rather than lost.
+    if skip.is_empty() {
+        crate::runtime::writeback_debt::settle_for_mapping(
+            state,
+            host,
+            mapping_id,
+            crate::runtime::render_writeback::SettleSite::MappingBgra8Write,
+        );
+    } else {
+        crate::runtime::writeback_debt::supersede_for_mapping(
+            state,
+            mapping_id,
+            crate::runtime::render_writeback::SettleSite::MappingBgra8Write,
+        );
+    }
     // Taken after the flush, because the flush can invalidate this mapping, and
     // once for the whole frame, because the loop below writes a row at a time.
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "bgra8") else {

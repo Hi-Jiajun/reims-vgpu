@@ -712,6 +712,101 @@ fn writing_guest_pages_moves_the_host_write_record_and_reading_them_does_not() {
 /// dropped and the resident's content claim withdrawn, so when it says "no
 /// host-side copy is known stale relative to these pages" there is no
 /// host-side copy at all.
+/// A write that must not touch some ranges may not discharge the mapping's
+/// writeback debt by *paying* it, because the payment has no skip list.
+///
+/// `merge_guest_writes_into_pages` is the ladder's whole correction for "the
+/// guest CPU painted this surface under a live resident": read the resident,
+/// land it in every page the guest did *not* write, keep the pages it did. It
+/// gets there through `write_bgra8_skipping`, whose first act was
+/// `settle_for_mapping` — and that pays the owed frame over the **whole** window
+/// with no exclusions. So the guest's pages were overwritten one statement before
+/// the skipping write restored everything around them, the merge reported
+/// success, and the repaint the merge exists to preserve was gone.
+///
+/// The debt is superseded instead: the caller is about to land the same
+/// surface's newer content at the same geometry, which `GeometryMoved` already
+/// enforces, so the owed frame is replaced rather than lost.
+#[test]
+fn a_skipping_write_supersedes_the_debt_instead_of_paying_it_over_the_skip() {
+    use crate::model::PAGE_SHIFT_X86;
+    const PAGE: u64 = 1 << PAGE_SHIFT_X86;
+    const W: u32 = 64;
+    const H: u32 = 64;
+
+    let mut state = DeviceState::new(DeviceId(7), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let base_pfn = 0x90u32;
+    host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 8 * PAGE as usize, 0x55);
+    let entries: Vec<u32> = (0..4)
+        .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+        .collect();
+    state.map_surface(7);
+    state.attach_mapping_internal(7, 0);
+    let m = state.mappings.get_mut(&7).unwrap();
+    m.mapping_internal = 1;
+    m.page_entries = entries;
+    assert!(state.set_mapping_geom(7, W, H, MTL_FORMAT_BGRA8_UNORM));
+    let map_generation = state.mappings[&7].map_generation;
+
+    let count = |r: &str| crate::runtime::drain::store_route_count(r);
+    let paid0 = count("wbdebt_paid_named");
+    let superseded0 = count("wbdebt_superseded_by_skipping_write");
+
+    // A Store owes this mapping a frame.
+    assert!(
+        state
+            .pending_writebacks
+            .arm(7, W, H, map_generation)
+            .is_none(),
+        "one debt cannot overflow a ledger of 32"
+    );
+
+    let frame = vec![0xAAu8; (W * H * 4) as usize];
+    assert!(write_bgra8_skipping(
+        &mut state,
+        &mut host,
+        7,
+        &frame,
+        W * 4,
+        W,
+        H,
+        &[(2 * PAGE, 3 * PAGE)]
+    ));
+
+    assert!(
+        state.pending_writebacks.get(7).is_none(),
+        "the debt must not survive: the frame it owes has just been landed"
+    );
+    assert_eq!(
+        count("wbdebt_superseded_by_skipping_write"),
+        superseded0 + 1,
+        "the debt is superseded by the write that is about to land the same \
+         surface, and the route is what prices how often the two co-occur"
+    );
+    assert_eq!(
+        count("wbdebt_paid_named"),
+        paid0,
+        "paying it writes the owed frame over the skip list, which is exactly \
+         the guest repaint this write was called to preserve"
+    );
+
+    // The whole-frame writer is unchanged and still pays: it has no ranges to
+    // protect, and a debt left standing there would be read straight past.
+    assert!(
+        state
+            .pending_writebacks
+            .arm(7, W, H, map_generation)
+            .is_none()
+    );
+    assert!(write_bgra8(&mut state, &mut host, 7, &frame, W * 4, W, H));
+    assert_eq!(
+        count("wbdebt_paid_named"),
+        paid0 + 1,
+        "a write with nothing to skip must still discharge the debt by paying it"
+    );
+}
+
 #[test]
 fn a_skipping_writeback_re_takes_the_stamp_so_the_skip_set_cannot_only_grow() {
     use crate::model::PAGE_SHIFT_X86;
