@@ -515,6 +515,93 @@ pub(crate) struct ObjectCaches {
     shader_digests: ShaderDigestIndex,
 }
 
+/// The two `VK_SUBPASS_EXTERNAL` dependencies every render pass this device
+/// builds must carry, covering **every** attachment class the pass has.
+///
+/// # Why this is unconditional, and what it cost to be conditional
+///
+/// Vulkan supplies an implicit external dependency for an attachment only *"if
+/// there is no subpass dependency from `VK_SUBPASS_EXTERNAL` to the first
+/// subpass that uses"* it — and the implicit one is per render pass, not per
+/// attachment. So the moment a pass declares one explicit external dependency
+/// for **any** reason, every attachment loses its implicit one.
+///
+/// This pass used to declare a pair only when it had a depth attachment, and
+/// that pair named the `EARLY`/`LATE_FRAGMENT_TESTS` stages and the
+/// depth-stencil accesses alone. The colour attachment silently lost the
+/// synchronization it had been getting for free, so on a depth pass:
+///
+/// - the incoming transition into `COLOR_ATTACHMENT_OPTIMAL` was not ordered
+///   against the `loadOp` clear that follows it, and
+/// - the outgoing transition into `TRANSFER_SRC_OPTIMAL` was not ordered
+///   against the subpass's own colour store, nor against the copy that reads
+///   the target afterwards.
+///
+/// All three were reported by the Khronos synchronization validation layer on a
+/// driven macos-11 boot, as `SYNC-HAZARD-WRITE-AFTER-WRITE` at
+/// `vkCmdBeginRenderPass` and `vkCmdEndRenderPass` and
+/// `SYNC-HAZARD-READ-AFTER-WRITE` at the `vkCmdCopyImage` /
+/// `vkCmdCopyImageToBuffer` that follows.
+///
+/// Building both dependencies here, always, from the pass's own composition is
+/// what makes the split unrepresentable: there is no longer an arm that adds a
+/// dependency for one attachment class without stating the others.
+///
+/// # The outgoing `dst` scope is the pass's declared exit, not a guess
+///
+/// Slot 0's `finalLayout` is `TRANSFER_SRC_OPTIMAL` — the pass exists to be
+/// read back or presented — and secondary slots exit at
+/// `COLOR_ATTACHMENT_OPTIMAL` to be sampled by a later draw. So the outgoing
+/// dependency makes the stores visible to `TRANSFER` reads and to
+/// `FRAGMENT_SHADER` reads, which is exactly what those two exits are for.
+fn external_dependencies(has_depth: bool, color_input: bool) -> [vk::SubpassDependency; 2] {
+    // Colour is unconditional: every pass this device builds has slot 0.
+    let mut attach_stages = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT;
+    let mut attach_writes = vk::AccessFlags::COLOR_ATTACHMENT_WRITE;
+    let mut attach_reads = vk::AccessFlags::COLOR_ATTACHMENT_READ;
+    if has_depth {
+        attach_stages |= vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+            | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS;
+        attach_writes |= vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE;
+        attach_reads |= vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ;
+    }
+    // Framebuffer fetch reads attachment 0 through the fragment stage, so the
+    // incoming transition has to be visible to that read too. The intra-subpass
+    // ordering is the separate `BY_REGION` dependency; this is the entry.
+    let (mut in_dst_stages, mut in_dst_access) = (attach_stages, attach_writes | attach_reads);
+    if color_input {
+        in_dst_stages |= vk::PipelineStageFlags::FRAGMENT_SHADER;
+        in_dst_access |= vk::AccessFlags::INPUT_ATTACHMENT_READ;
+    }
+    [
+        vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            // Whatever last wrote these images: a previous pass's colour store,
+            // a depth store, or the transfer that seeded a LOAD attachment.
+            .src_stage_mask(attach_stages | vk::PipelineStageFlags::TRANSFER)
+            .src_access_mask(attach_writes | vk::AccessFlags::TRANSFER_WRITE)
+            .dst_stage_mask(in_dst_stages)
+            .dst_access_mask(in_dst_access),
+        vk::SubpassDependency::default()
+            .src_subpass(0)
+            .dst_subpass(vk::SUBPASS_EXTERNAL)
+            .src_stage_mask(attach_stages)
+            .src_access_mask(attach_writes)
+            .dst_stage_mask(
+                vk::PipelineStageFlags::TRANSFER
+                    | vk::PipelineStageFlags::FRAGMENT_SHADER
+                    | attach_stages,
+            )
+            .dst_access_mask(
+                vk::AccessFlags::TRANSFER_READ
+                    | vk::AccessFlags::SHADER_READ
+                    | attach_writes
+                    | attach_reads,
+            ),
+    ]
+}
+
 impl ObjectCaches {
     pub(crate) fn new() -> Self {
         Self {
@@ -1000,40 +1087,6 @@ impl ObjectCaches {
             subpass_desc = subpass_desc.depth_stencil_attachment(depth_ref);
         }
         let subpass = [subpass_desc];
-        // Explicit subpass dependencies only for the depth pass — the color-only
-        // pass keeps relying on the implicit dependencies (byte-identical). The
-        // implicit external dependency synchronizes only COLOR_ATTACHMENT_OUTPUT,
-        // NOT the EARLY/LATE_FRAGMENT_TESTS stages a depth attachment's
-        // load-clear + test + store use, so the depth layout transition and the
-        // clear can race without these.
-        let depth_deps = [
-            vk::SubpassDependency::default()
-                .src_subpass(vk::SUBPASS_EXTERNAL)
-                .dst_subpass(0)
-                .src_stage_mask(
-                    vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
-                        | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
-                )
-                .dst_stage_mask(
-                    vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
-                        | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
-                )
-                .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                .dst_access_mask(
-                    vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
-                        | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                ),
-            vk::SubpassDependency::default()
-                .src_subpass(0)
-                .dst_subpass(vk::SUBPASS_EXTERNAL)
-                .src_stage_mask(vk::PipelineStageFlags::LATE_FRAGMENT_TESTS)
-                .dst_stage_mask(vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
-                .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                .dst_access_mask(
-                    vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
-                        | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                ),
-        ];
         // Framebuffer-fetch feedback loop: the same-pixel color-write →
         // input-read ordering within the one subpass. BY_REGION keeps it
         // framebuffer-local (the form MoltenVK lowers to tile-memory fetch).
@@ -1045,19 +1098,15 @@ impl ObjectCaches {
             .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
             .dst_access_mask(vk::AccessFlags::INPUT_ATTACHMENT_READ)
             .dependency_flags(vk::DependencyFlags::BY_REGION);
-        let mut deps: Vec<vk::SubpassDependency> = Vec::new();
-        if key.depth.is_some() {
-            deps.extend_from_slice(&depth_deps);
-        }
+        let mut deps: Vec<vk::SubpassDependency> =
+            external_dependencies(key.depth.is_some(), key.color_input).to_vec();
         if key.color_input {
             deps.push(fetch_dep);
         }
-        let mut rp_info = vk::RenderPassCreateInfo::default()
+        let rp_info = vk::RenderPassCreateInfo::default()
             .attachments(&attachments)
-            .subpasses(&subpass);
-        if !deps.is_empty() {
-            rp_info = rp_info.dependencies(&deps);
-        }
+            .subpasses(&subpass)
+            .dependencies(&deps);
         let rp = ctx.device.create_render_pass(&rp_info, None).map_err(|e| {
             let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateRenderPass, e));
             self.passes.insert_negative(key, err.clone());
@@ -1945,5 +1994,87 @@ mod object_cache_tests {
             index.get(&held[0]).is_none(),
             "and the reset is total, so nothing survives to be answered stale"
         );
+    }
+
+    /// Every pass shape states the colour scope on **both** external
+    /// dependencies, because declaring one explicit external dependency for any
+    /// reason removes the implicit one from every attachment.
+    ///
+    /// This is the check the previous shape could not pass. It built the pair
+    /// only for a depth pass and named depth-stencil stages and accesses alone,
+    /// so on `(depth, _)` the colour attachment's transitions were ordered
+    /// against nothing — which the synchronization validation layer reported at
+    /// both `vkCmdBeginRenderPass` and `vkCmdEndRenderPass`. Asserting the
+    /// colour terms across all four shapes is what stops a future edit adding a
+    /// dependency for one attachment class and dropping the others again.
+    #[test]
+    fn both_external_dependencies_name_the_colour_scope_in_every_pass_shape() {
+        for has_depth in [false, true] {
+            for color_input in [false, true] {
+                let [incoming, outgoing] = external_dependencies(has_depth, color_input);
+                let shape = format!("depth={has_depth} color_input={color_input}");
+
+                // Incoming: the transition into the attachment layout has to be
+                // ordered against the loadOp that writes it.
+                assert!(
+                    incoming
+                        .dst_stage_mask
+                        .contains(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT),
+                    "{shape}: the loadOp clear runs at COLOR_ATTACHMENT_OUTPUT"
+                );
+                assert!(
+                    incoming
+                        .dst_access_mask
+                        .contains(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+                    "{shape}: and it is a colour write"
+                );
+
+                // Outgoing: the final transition has to be ordered against the
+                // subpass's own store, and the store made visible to the copy
+                // that reads the target after the pass.
+                assert!(
+                    outgoing
+                        .src_stage_mask
+                        .contains(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT),
+                    "{shape}: the store runs at COLOR_ATTACHMENT_OUTPUT"
+                );
+                assert!(
+                    outgoing
+                        .src_access_mask
+                        .contains(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+                    "{shape}: and it is a colour write"
+                );
+                assert!(
+                    outgoing
+                        .dst_stage_mask
+                        .contains(vk::PipelineStageFlags::TRANSFER)
+                        && outgoing
+                            .dst_access_mask
+                            .contains(vk::AccessFlags::TRANSFER_READ),
+                    "{shape}: slot 0 exits at TRANSFER_SRC_OPTIMAL to be read back"
+                );
+
+                // Depth is stated only where the pass has a depth attachment —
+                // the fix is to add the missing class, not to name every class
+                // on every pass.
+                assert_eq!(
+                    incoming
+                        .dst_access_mask
+                        .contains(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE),
+                    has_depth,
+                    "{shape}: depth terms follow the depth attachment"
+                );
+
+                // Framebuffer fetch reads attachment 0 in the fragment stage, so
+                // the entry transition must be visible to that read as well.
+                assert_eq!(
+                    incoming
+                        .dst_access_mask
+                        .contains(vk::AccessFlags::INPUT_ATTACHMENT_READ),
+                    color_input,
+                    "{shape}: input-attachment terms follow the fetch"
+                );
+            }
+        }
     }
 }
