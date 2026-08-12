@@ -566,10 +566,15 @@ and so does a single red one.
 
 ### A freeze verdict is a rate too, so an arm that fixes one is confirmed at n≥3
 
-The same rule as the panic rate, on the leg verdicts, and it is easier to forget because a leg that
-has frozen on every boot you have seen reads as deterministic. macos-11's Maps leg froze on thirteen
-consecutive boots and then **passed on its own**, under an arm that froze on both its repeats. One
-`ok` was read as a fix and it was the leg's own pass rate.
+The same rule as the panic rate, on the leg verdicts. macos-11's Maps leg froze on thirteen
+consecutive boots; `INTEL_DEBUG=no16,no32` then produced one `ok` with zero device recreates, which
+was reported as having found the cause of a hang four sessions had failed to localise. **Both
+repeats of that identical arm froze**, and it freezes macos-12's Launchpad too.
+
+One in three against zero in sixteen is `p ≈ 0.16` on a Fisher exact test — consistent with chance,
+and nowhere near a fix. Note which way that cuts: it does not establish that the arm does nothing
+either. An arm at n=3 with one `ok` is **unresolved**, and the only thing that settles it is more
+boots of the same arm.
 
 Score arms on the asymmetry, which is real and cheap:
 
