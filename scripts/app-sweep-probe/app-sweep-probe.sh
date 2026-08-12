@@ -338,8 +338,15 @@ fi
 # Asked before the dismissal below, not after: Escape tears the capture UI down
 # and this is the only evidence that the Return landed on Screenshot rather than
 # on whatever else the grid had filtered to.
+# The process is `screencaptureui`, not `Screenshot`. Screenshot.app is a stub
+# that launches /System/Library/CoreServices/screencaptureui.app, so neither
+# `pgrep -x Screenshot` nor `pgrep -f Screenshot\.app` ever matches — this leg
+# reported NO-LAUNCH on macos-11, macos-13 and macos-14 in one sweep while the
+# capture toolbar is plainly visible in its own `-launchpad-screenshot-app.png`.
+# One pattern covering both spellings, so a rail that does name it `Screenshot`
+# still counts.
 LAUNCHED=no
-gssh 15 "pgrep -x Screenshot >/dev/null 2>&1 || pgrep -f 'Screenshot\.app' >/dev/null 2>&1" \
+gssh 15 "pgrep -x screencaptureui >/dev/null 2>&1 || pgrep -x Screenshot >/dev/null 2>&1" \
   && LAUNCHED=yes
 # Screenshot.app comes up as a floating capture bar over the desktop rather than
 # a window, so it is dismissed with Escape and not with Command-Q.
