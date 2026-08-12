@@ -8254,6 +8254,32 @@ fn arm_surface_writeback_debt<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("wbdebt_uncedable_geometry");
         return false;
     }
+    // The *third* host-side claim on this window, and the one this arm was
+    // missing. `compute_storage_residency` records that a storage image and the
+    // guest's pages both hold a window a compute dispatch wrote back, so
+    // `compute_exec::stage_texture_raw` may serve the storage image and skip the
+    // guest read entirely. This Store has just superseded both halves of that
+    // claim without writing a byte, so the next dispatch staging the same window
+    // would be fed the earlier dispatch's image and never see the render frame.
+    //
+    // The eager arm has always done this — `write_bgra8_from_resident_gpu` calls
+    // `invalidate_storage_residency_window` over the same extent — so without it
+    // here the two arms of `env::LAZY_WRITEBACK` disagree about what the GPU
+    // observes, which is the one thing that switch's doc promises they never do.
+    // Nothing else drops an entry from that map and no guest-write witness feeds
+    // it, so a stale claim is held until the window is written some other way.
+    if let Some(m) = state.mappings.get(&mapping_id) {
+        let format = if m.format != 0 {
+            m.format
+        } else {
+            pixel_format::MTL_FORMAT_BGRA8_UNORM
+        };
+        if let Some((base_off, _bpr, span_end)) =
+            crate::runtime::mapping_write::type11_sample_window(m, width, height, format)
+        {
+            state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
+        }
+    }
     // The one call that says "these pixels changed and the guest's pages do not
     // hold them yet". It advances the surface's content epoch, which is what the
     // stamp below records, and `ResourceValidity::host_published_seq`, which is
@@ -9103,6 +9129,31 @@ mod vulkan_split_tests {
             generation: 1,
             format: gva_resident_format(MTL_FORMAT_BGRA8_UNORM),
         };
+        // The third host-side claim on the same window: a compute dispatch's
+        // storage image, recorded as holding what the guest's pages hold. This
+        // Store supersedes both halves of that claim.
+        let (base_off, bpr, span_end) = crate::runtime::mapping_write::type11_sample_window(
+            state.mappings.get(&mid).expect("mapped above"),
+            w,
+            h,
+            MTL_FORMAT_BGRA8_UNORM,
+        )
+        .expect("a latched geometry resolves its window");
+        let residency = crate::model::ComputeStorageResidencyKey {
+            mapping_id: mid,
+            map_generation: state.mappings[&mid].map_generation,
+            surface_offset: base_off,
+            surface_bpr: bpr,
+            span_end,
+            width: w,
+            height: h,
+            pixel_format: MTL_FORMAT_BGRA8_UNORM,
+            texture_ref: 0,
+        };
+        state
+            .compute_storage_residency
+            .insert(residency, Default::default());
+
         assert!(
             arm_surface_writeback_debt(&mut state, &mut host, mid, &identity, w, h),
             "a mapped surface at a cacheable geometry arms"
@@ -9110,6 +9161,14 @@ mod vulkan_split_tests {
         assert!(
             crate::runtime::surface_cache::get_shared_with_gen(&state, mid, w, h).is_none(),
             "frame N is still on offer while frame N+1 exists only on the GPU"
+        );
+        assert!(
+            !state.compute_storage_residency.contains_key(&residency),
+            "the eager arm invalidates this window and the lazy one published a \
+             strictly newer frame into it; leaving the claim standing feeds the \
+             next dispatch the earlier dispatch's storage image instead of the \
+             render frame, and the two arms of LAZY_WRITEBACK then disagree \
+             about what the GPU observes"
         );
     }
 
