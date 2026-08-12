@@ -1264,6 +1264,46 @@ impl ObjectCaches {
                 return Err(err);
             }
         };
+        // One line per distinct unnormalized sampler this boot creates — the
+        // cache is what bounds it, so a workload with three such samplers logs
+        // three lines however many million binds it does.
+        //
+        // # What this is measuring, and why it is not a decline
+        //
+        // `VUID-vkCmdDispatch-None-08610`/`-08611` forbid an unnormalized sampler
+        // being *used* by an implicit-LOD, `Proj`, `Dref`, `Bias` or `Offset`
+        // sample, and `-08611` is the one violation a driven macos-11 boot under
+        // the Khronos validation layer still reports after every other one here
+        // was fixed. That is a property of the SPIR-V instruction, so this device
+        // cannot repair it — but it can say which samplers are candidates.
+        //
+        // `metal2vulkan` already emulates pixel-coordinate sampling in-shader
+        // rather than emitting `OpImageSample`, on three arms — a per-tap
+        // fetch-and-lerp for linear, a bicubic one, and a plain fetch for
+        // integer/nearest/arrayed. **All three of its predicates require
+        // `min_filter == mag_filter`**, so a pixel-coordinate sampler with
+        // *mixed* filters matches none of them and falls through to a real
+        // `OpImageSample` against the unnormalized sampler. `min_mag_differed`
+        // is therefore the field to read: a boot that logs it has the shape that
+        // produces the VUID, and a boot that never does has ruled it out.
+        // Logged for *every* unnormalized sampler and not only the conformed
+        // ones, so a boot's line count is the population and the `conformed`
+        // field splits it. Reading only the conformed ones would miss exactly
+        // the samplers the translator handles correctly, which is the control.
+        if key.unnormalized_coordinates {
+            crate::observe::off(format!(
+                "sampler_unnormalized min_mag_differed={} conformed={} \
+                 min={:?} mag={:?} mip={:?} address_u={:?} address_v={:?} aniso={}",
+                key.min_filter != key.mag_filter,
+                conformed != *key,
+                key.min_filter,
+                key.mag_filter,
+                key.mip_filter,
+                key.address_mode_u,
+                key.address_mode_v,
+                key.max_anisotropy,
+            ));
+        }
         let not_mipmapped = conformed.mip_filter == super::types::SamplerMipFilter::NotMipmapped;
         let (min_lod, max_lod) = if conformed.unnormalized_coordinates || not_mipmapped {
             (0.0, 0.0)
