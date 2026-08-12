@@ -1966,8 +1966,34 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
     crate::backend::vulkan::engine::SeedOrder,
 )> {
     use crate::backend::vulkan::engine::SeedOrder;
+    // The cache is the other host-side copy of these pages, and it sits above
+    // the only rung that reads the pages themselves — so a stale hit here is
+    // never corrected by anything below it. It takes the same witness the
+    // sampled path's read of this same map takes (`resolve_sampled_source`'s
+    // `guest_replaced`), spelled the same way and for the same reason: the
+    // coarse token says whether the guest wrote the *allocation*, and only when
+    // it did is the page list walked to say whether it wrote the *pixels*.
+    //
+    // Without it this rung served exactly the frame the elision gate two frames
+    // up had just refused. The caller computes `type11_guest_wrote_since_store`
+    // to decide whether the resident may carry the chain, declines when it says
+    // written, and then arrived here to be handed the same stale bytes out of
+    // the host cache. The pass composites onto them and its Store publishes
+    // them back over the guest's pages, which is the fixpoint this file's own
+    // note above `type11_load_currency_query` calls "renders correctly for a few
+    // frames then stays corrupted".
+    let guest_write = mapping_guest_write_verdict(state, host, mapping_id);
+    let site = guest_wrote_allocation(guest_write)
+        .then(|| guest_write_site(state, host, mapping_id, w, h));
+    let guest_replaced = !matches!(site, None | Some(GuestWriteSite::Elsewhere));
+    if guest_replaced {
+        crate::runtime::drain::note_store_route("t11seed_cache_refused_guest_wrote");
+    }
+    let cached = (!guest_replaced)
+        .then(|| crate::runtime::surface_cache::get_shared(state, mapping_id, w, h))
+        .flatten();
     let served =
-        if let Some(bgra) = crate::runtime::surface_cache::get_shared(state, mapping_id, w, h) {
+        if let Some(bgra) = cached {
             Some((bgra, SeedOrder::Bgra8, Type11SeedRung::Cache))
         } else {
             load_type11_mapping_rgba(state, host, mapping_id, None)
@@ -9144,6 +9170,101 @@ mod vulkan_split_tests {
         assert!(
             state.pending_writebacks.get(mid).is_none(),
             "the gather bound pages still owed a frame this device never wrote down"
+        );
+    }
+
+    /// The `LOAD` seed's host-cache rung must refuse a surface the hypervisor
+    /// watched the guest repaint, exactly as the sampled path's read of the same
+    /// map does.
+    ///
+    /// The two are one cache with two readers, and only one of them asked. The
+    /// damage is not a single wrong frame: this rung sits above the only rung
+    /// that reads the guest's pages, so nothing below corrects it, and the pass
+    /// that seeds from it composites onto the stale bytes and Stores them back
+    /// over the pages the guest just wrote. The guest's repaint is then gone
+    /// from both copies and the next frame loads what this one stored.
+    #[test]
+    fn the_type11_load_seed_cache_rung_refuses_a_surface_the_guest_rewrote() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::runtime::host::HostOps;
+        use crate::runtime::mapping_write::write_bgra8;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        // Not shared with any other test's: `first_sight` latches per
+        // `(reason, discriminant)` for the life of the process.
+        let mid = 913u32;
+        let pfn = 0x27u32;
+        let gpa = (pfn as u64) << PAGE_SHIFT_X86;
+        host.map_range(gpa, 0x4000, 0);
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).expect("mapped above");
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        let (w, h) = (4u32, 2u32);
+        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+
+        // What the guest painted, on the wire in BGRA and distinct per channel so
+        // a swizzle cannot pass for a rung.
+        let mut pages = vec![0u8; (w * h * 4) as usize];
+        for px in pages.chunks_exact_mut(4) {
+            px.copy_from_slice(&[0x10, 0x20, 0x30, 0xFF]);
+        }
+        assert!(write_bgra8(&mut state, &mut host, mid, &pages, w * 4, w, h));
+
+        // What this device last published for the same surface — an older frame,
+        // and the one the rung under test would serve.
+        let mut cached = vec![0u8; (w * h * 4) as usize];
+        for px in cached.chunks_exact_mut(4) {
+            px.copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xFF]);
+        }
+        crate::runtime::surface_cache::store(&mut state, mid, w, h, cached);
+
+        // Armed and stamped: with nothing written since, the cache is the
+        // fresher copy and must still win. Asserting this first is what stops
+        // the fix from being "refuse always", which would pass the real
+        // assertion below while costing every seed a guest read.
+        let token = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, mid)
+            .expect("FakeHost observes guest writes");
+        state
+            .mappings
+            .get_mut(&mid)
+            .expect("mapped above")
+            .guest_write_gen_at_store = host.guest_write_gen(token).expect("a live token has one");
+        let (bytes, order) = resolve_type11_load_seed(&mut state, &mut host, mid, w, h)
+            .expect("an unwritten surface may be seeded from the cache");
+        assert_eq!(order, crate::backend::vulkan::engine::SeedOrder::Bgra8);
+        assert_eq!(&bytes[..4], &[0xAA, 0xBB, 0xCC, 0xFF]);
+
+        // The guest CPU repaints the surface. No device operation, so the
+        // content epoch does not move and this is the only witness that sees it.
+        host.guest_wrote_page(gpa);
+        assert_eq!(
+            guest_write_site(&state, &host, mid, w, h),
+            // Whole-page, because the hypervisor's witness has page granularity
+            // and the surface's one page is the whole of its mapping offsets.
+            GuestWriteSite::Pixels(vec![(0, 1u64 << PAGE_SHIFT_X86)]),
+            "the write has to land inside the sampled window, or the rung under \
+             test is being asked the wrong question"
+        );
+
+        let (bytes, order) = resolve_type11_load_seed(&mut state, &mut host, mid, w, h)
+            .expect("the guest's own pages are still a seed");
+        assert_eq!(
+            order,
+            crate::backend::vulkan::engine::SeedOrder::Rgba8,
+            "a repainted surface must be seeded from its pages, not from the \
+             host cache that sits above them"
+        );
+        assert_eq!(
+            &bytes[..4],
+            &[0x30, 0x20, 0x10, 0xFF],
+            "the seed must carry what the guest painted, converted to RGBA — \
+             serving 0xAA/0xBB/0xCC here is the stale-frame fixpoint"
         );
     }
 
