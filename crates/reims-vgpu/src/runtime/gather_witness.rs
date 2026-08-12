@@ -97,8 +97,33 @@
 //! zero on this branch — the GPU-direct GVA Store wrote guest pages without
 //! recording them, and the audit was structurally incapable of noticing.
 //!
-//! **Any `gw_audit_unsound` reading taken before this repair is worthless in
-//! both directions**, and so is any claim resting on one.
+//! # On the Intel iGPU it *was* comparing, and its zero is a real reading
+//!
+//! The paragraphs above are a measurement of a host with a ~40 % refusal rate.
+//! This one is not. A four-rail sweep on the Arrow Lake iGPU sums to:
+//!
+//! ```text
+//!            gw_audit_ok  gw_audit_seed  gw_audit_restart  gw_audit_unsound   refusals/vouches
+//! macos-13           115             27                24                 0        838 / 13 331
+//! macos-11             7              1                 1                 0         22 /    756
+//! ```
+//!
+//! Six per cent refusals, not forty, so runs of `AUDIT_STRIDE` consecutive
+//! vouched binds are ordinary here and the comparison was reachable all along.
+//! **122 comparisons and zero disagreements is a real soundness reading for the
+//! zero-copy sampled cache on this host** — the first one this alarm has
+//! produced.
+//!
+//! So the two-phase arm is not resurrecting a dead alarm here; it makes the
+//! alarm's reachability independent of the refusal rate, which is what the
+//! 40 %-refusal host needed and what any future workload could need. Read a
+//! `gw_audit_unsound` zero as evidence only when `gw_audit_ok` beside it is
+//! large — that pairing is the whole point and it is why both are counted.
+//!
+//! It is not free: the arm folds twice per stride (once to take the baseline,
+//! once to check it) where the old design folded once, so `gw_audit_kb` roughly
+//! doubles — on the macos-13 sweep from 177 MB against a 14.6 GB rail, about
+//! 1.2 %, to about 2.4 %.
 //!
 //! **The repair is done.** The audit used to take its baseline and compare on
 //! the same stride bind, which is what made a comparison need `AUDIT_STRIDE`
