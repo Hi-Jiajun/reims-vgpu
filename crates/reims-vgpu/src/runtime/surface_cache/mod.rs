@@ -1274,6 +1274,94 @@ pub fn gva_backing_state<H: HostMemory>(
     }
 }
 
+/// Whether the GVA door may serve this key as `task_id`'s LOAD seed.
+///
+/// # Why the door needs a verdict it did not have
+///
+/// A LOAD seed is the attachment's *prior content*, and the matching Store
+/// writes the composite back — so a door that hands a pass another allocation's
+/// picture arms the next frame to load what this one stored. That is not a
+/// one-frame flicker; it persists until something else repaints.
+///
+/// The ref door has always been gated on exactly that (`texture_source_gva ==
+/// target_gva`). The GVA door was not, on the argument that "its key *is* the
+/// allocation". **That argument has two holes and this closes both.**
+///
+/// - **A GVA is only an allocation inside one task's address space, and
+///   [`crate::model::state::DeviceState::host_gva_surfaces`] is keyed by the
+///   address alone.** Every sibling structure here carries the task and says
+///   why — `guest_linear_memo` keys on `(task_id, gva, …)`, and `node_guard`'s
+///   own doc puts it as "these pages belong to the task's address space, so a
+///   reused id inheriting them would be watching memory that is now somebody
+///   else's". This one neither carried it nor explained its absence.
+/// - **[`gva_backing_state`] cannot see that collision**, so its measured zero
+///   is not evidence against it. It resolves the page table from
+///   `backing.task_id` — the task that *stored* the entry — so when another task
+///   asks at the same address, the walk uses the storing task's table, finds the
+///   page unchanged and answers [`GvaBackingState::Same`]. It is blind in
+///   exactly the direction that reads as healthy.
+///
+/// So the freshness question and the ownership question are different questions,
+/// and this asks both. `Moved` and `Unmapped` are refused for the reason the
+/// sampled rung already refuses them — the guest handed the address to another
+/// allocation and this cache is the stale side, where serving would be the
+/// corruption rather than the repair. Refusing costs a guest re-read, never a
+/// lost seed: the guest's own pages are the authoritative source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GvaSeedVerdict {
+    /// The entry belongs to the asking task and its address still names the
+    /// pages it was stored over.
+    Admit,
+    /// Recorded by a different task. A GVA means nothing across address spaces.
+    OtherTask,
+    /// The address now names different pages: positive evidence of reuse.
+    Moved,
+    /// The address does not translate, so ownership cannot be established.
+    Unmapped,
+    /// Nothing recorded, or the recording task is gone.
+    Unrecorded,
+}
+
+impl GvaSeedVerdict {
+    /// The route name for this verdict, so the refusals are counted and a future
+    /// session can price what the gate costs rather than argue it.
+    pub fn route(self) -> &'static str {
+        match self {
+            Self::Admit => "gva_seed_admit",
+            Self::OtherTask => "gva_seed_refused_other_task",
+            Self::Moved => "gva_seed_refused_moved",
+            Self::Unmapped => "gva_seed_refused_unmapped",
+            Self::Unrecorded => "gva_seed_refused_unrecorded",
+        }
+    }
+}
+
+/// [`GvaSeedVerdict`] for one key, asked by the task that wants to serve it.
+pub fn gva_seed_verdict<H: HostMemory>(
+    state: &DeviceState,
+    host: &H,
+    task_id: u32,
+    gva: u64,
+) -> GvaSeedVerdict {
+    let Some(entry) = state.host_gva_surfaces.get(&gva) else {
+        return GvaSeedVerdict::Unrecorded;
+    };
+    let Some(backing) = entry.backing.as_ref() else {
+        return GvaSeedVerdict::Unrecorded;
+    };
+    // Ownership before freshness: a walk of another task's page table answers a
+    // question about another task's memory, however fresh it says the pages are.
+    if backing.task_id != task_id {
+        return GvaSeedVerdict::OtherTask;
+    }
+    match gva_backing_state(state, host, gva) {
+        GvaBackingState::Same => GvaSeedVerdict::Admit,
+        GvaBackingState::Moved => GvaSeedVerdict::Moved,
+        GvaBackingState::Unmapped => GvaSeedVerdict::Unmapped,
+        GvaBackingState::Unrecorded => GvaSeedVerdict::Unrecorded,
+    }
+}
+
 /// Emit [`cache_levels`] at most once per census interval.
 ///
 /// Shares the one-second cadence the drain census already runs on, so a boot's

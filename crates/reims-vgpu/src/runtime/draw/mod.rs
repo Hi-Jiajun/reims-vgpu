@@ -5088,23 +5088,19 @@ fn seed_color_load<M: HostMemory + HostOps>(
         // dead weight rather than a defect — which is a claim about what to
         // evict, not about what to serve.
         //
-        // Keep this asking. It is the denominator that makes the level census
-        // interpretable, and its other three legs are pinned by
-        // `surface_cache`'s unit tests, so a zero here is a measured zero and
-        // not a probe that cannot tell the cases apart.
-        if target_gva != 0
-            && crate::runtime::surface_cache::has_gva(state, target_gva, width, height)
-        {
-            use crate::runtime::surface_cache::GvaBackingState as B;
-            crate::runtime::drain::note_store_route(
-                match crate::runtime::surface_cache::gva_backing_state(state, host, target_gva) {
-                    B::Unrecorded => "gva_seed_backing_unrecorded",
-                    B::Same => "gva_seed_backing_same",
-                    B::Unmapped => "gva_seed_backing_unmapped",
-                    B::Moved => "gva_seed_backing_moved",
-                },
-            );
-        }
+        // That reading is now taken by the serve's own admission verdict below
+        // rather than by a census beside it. `gva_seed_verdict` answers the same
+        // four states and one more — whether the entry is even this task's — and
+        // two spellings of one question is how the two ends of a rail come to
+        // disagree. Its `route()` names carry the counts; the old
+        // `gva_seed_backing_*` keys are gone, so a boot log or a `kb/` entry
+        // quoting them predates this.
+        //
+        // The zero above also has to be read with its blind spot: that census
+        // walked the page table of the task that *stored* the entry, so it could
+        // never have reported a second task asking at the same address. Its zero
+        // was a measured zero for freshness and no evidence at all for
+        // ownership.
         // Which door served, and — for the ref door — whether the pixels it
         // holds were produced over the address this seed is being served as.
         //
@@ -5147,8 +5143,39 @@ fn seed_color_load<M: HostMemory + HostOps>(
         // `surface_cache::mirror_linear_color_cache` is not — which is why this
         // is a currency test rather than the removal the zero would otherwise
         // invite.
-        let gva_served = target_gva != 0
+        // The GVA door's own admission test. `has_gva` answers "is there an
+        // entry of this geometry"; it does not answer "is this entry this
+        // task's, and does its address still name the pages it was stored
+        // over". Those are the two the ref door has always been gated on in
+        // spirit, and `gva_seed_verdict`'s doc records why the argument that the
+        // GVA key *is* the allocation does not survive contact with a second
+        // address space.
+        // `has_gva` stays the existence gate — is there an entry of this
+        // geometry — and the verdict only ever *removes* one from the door.
+        //
+        // It removes on **positive evidence** and nothing else: another task's
+        // address space, or an address the guest has re-pointed. `Unmapped` and
+        // `Unrecorded` keep serving, which is not laxity. `GvaBackingState`'s own
+        // doc records that a failed walk is transient here (this device
+        // routinely asks before the guest has finished mapping) and that an
+        // entry stored with no backing at all is a question that *cannot be
+        // asked*, not one answered "stale". Refusing those two as well regressed
+        // `color_load_seed_uses_provenance_and_preserves_black`, which stores an
+        // entry with `backing: None` and requires it served — so the two-state
+        // rule is the measured one, not a cautious guess.
+        let gva_present = target_gva != 0
             && crate::runtime::surface_cache::has_gva(state, target_gva, width, height);
+        let gva_served = gva_present && {
+            let verdict = crate::runtime::surface_cache::gva_seed_verdict(
+                state, host, task_id, target_gva,
+            );
+            crate::runtime::drain::note_store_route(verdict.route());
+            !matches!(
+                verdict,
+                crate::runtime::surface_cache::GvaSeedVerdict::OtherTask
+                    | crate::runtime::surface_cache::GvaSeedVerdict::Moved
+            )
+        };
         let ref_served = !gva_served
             && texture_ref != 0
             && target_gva != 0

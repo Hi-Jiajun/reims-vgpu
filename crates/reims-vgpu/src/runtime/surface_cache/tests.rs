@@ -57,6 +57,100 @@ fn the_backing_probe_separates_a_reassigned_address_from_an_unmapped_one() {
     assert_eq!(checked, 3);
 }
 
+/// A guest virtual address means nothing outside the address space it was
+/// recorded in, and this cache is keyed by the address alone.
+///
+/// Serving across tasks hands a render pass another process's picture as the
+/// attachment's prior content, and because the matching Store writes the
+/// composite back it persists rather than flickering. The freshness probe cannot
+/// catch it — `gva_backing_state` walks the page table of the task that *stored*
+/// the entry, so it answers `Same` however foreign the asker is, which is why
+/// the ownership test has to come first and separately.
+#[test]
+fn the_seed_door_refuses_an_address_recorded_by_another_task() {
+    use crate::model::GvaBacking;
+    let mut host = FakeHost::new();
+    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_depth1_task(&mut host, &mut st);
+
+    let gva = 1u64 << PAGE_SHIFT_ARM64E;
+    store_gva_owned(&mut st, gva, 2, 2, vec![0u8; 2 * 2 * 4], 0, None, true);
+    st.host_gva_surfaces.get_mut(&gva).unwrap().backing = Some(GvaBacking {
+        task_id: 1,
+        first_gpa: 5u64 << PAGE_SHIFT_ARM64E,
+    });
+
+    assert_eq!(
+        gva_seed_verdict(&st, &host, 1, gva),
+        GvaSeedVerdict::Admit,
+        "the task that stored it, over pages that have not moved"
+    );
+    assert_eq!(
+        gva_seed_verdict(&st, &host, 2, gva),
+        GvaSeedVerdict::OtherTask,
+        "another task's identical address is not this entry"
+    );
+    // The blind spot this exists to cover: the freshness probe is perfectly
+    // happy, because it never asked who was asking.
+    assert_eq!(
+        gva_backing_state(&st, &host, gva),
+        GvaBackingState::Same,
+        "which is exactly why a zero from that probe was never evidence"
+    );
+}
+
+/// `Moved` is the one state carrying positive evidence the pixels belong to
+/// someone else now, and the door computed it for a counter without acting on
+/// it. Refusing costs a guest re-read; serving costs a persistent wrong layer.
+#[test]
+fn the_seed_door_refuses_a_backing_the_guest_has_re_pointed() {
+    use crate::model::GvaBacking;
+    let mut host = FakeHost::new();
+    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let root_gpa = setup_depth1_task(&mut host, &mut st);
+
+    let gva = 2u64 << PAGE_SHIFT_ARM64E;
+    store_gva_owned(&mut st, gva, 2, 2, vec![0u8; 2 * 2 * 4], 0, None, true);
+    st.host_gva_surfaces.get_mut(&gva).unwrap().backing = Some(GvaBacking {
+        task_id: 1,
+        first_gpa: 6u64 << PAGE_SHIFT_ARM64E,
+    });
+    assert_eq!(gva_seed_verdict(&st, &host, 1, gva), GvaSeedVerdict::Admit);
+
+    repoint_pte(&mut host, root_gpa, 2, 12);
+    assert_eq!(
+        gva_seed_verdict(&st, &host, 1, gva),
+        GvaSeedVerdict::Moved,
+        "the address now names another allocation's pages"
+    );
+
+    repoint_pte(&mut host, root_gpa, 2, 0);
+    assert_eq!(
+        gva_seed_verdict(&st, &host, 1, gva),
+        GvaSeedVerdict::Unmapped,
+        "and an address that does not translate cannot establish ownership \
+         either — unmapped must not fold into moved"
+    );
+}
+
+/// Every verdict has to carry a distinct route name, or the counters that price
+/// this gate cannot say which arm refused.
+#[test]
+fn the_seed_verdicts_have_distinct_route_names() {
+    let all = [
+        GvaSeedVerdict::Admit,
+        GvaSeedVerdict::OtherTask,
+        GvaSeedVerdict::Moved,
+        GvaSeedVerdict::Unmapped,
+        GvaSeedVerdict::Unrecorded,
+    ];
+    let mut names: Vec<&str> = all.iter().map(|v| v.route()).collect();
+    let distinct = names.len();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), distinct, "one route name per verdict");
+}
+
 /// The gauge has to separate the two shapes a growing cache can take, or it
 /// cannot tell "many small surfaces" from "a few 4K ones" — which is the
 /// distinction the no-size-cap question turns on, since a 4K entry is ~4x a
