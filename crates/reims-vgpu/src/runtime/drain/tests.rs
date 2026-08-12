@@ -1856,6 +1856,58 @@ fn display_online_waits_for_enable_mask_then_signals() {
     assert!(host.actions.is_empty());
 }
 
+/// The first ONLINE pulse goes on the poll that first sees the enable bit, and
+/// does not wait out the re-assert cadence.
+///
+/// The guest is racing us for it. macOS's WindowServer asks
+/// `AppleParavirtFramebuffer` for a mappable VRAM aperture ~13 s into boot and
+/// aborts if it does not get one, taking the desktop with it for the life of the
+/// boot. This device used to gate the *enable-mask read* on the same divisor
+/// that paces the re-assert, so `apply_setup_shared_state` zeroing `poll_ctr`
+/// bought the handshake a full divisor of latency — measured at 2139-2365 ms
+/// across three boots, which is most of the margin WindowServer leaves.
+///
+/// So this is the ordering assertion and not a timing one: with the enable bit
+/// already set, one poll is enough. It fails on the previous code, which needed
+/// fifty.
+#[test]
+fn the_first_online_pulse_does_not_wait_out_the_reassert_cadence() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let gpa = 0x7b000000u64;
+    host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+    state.display.shared_gpa = gpa;
+    state.display.display_index = 0;
+    let mut m = [0u8; 4];
+    st32(&mut m, DISPLAY_ONLINE_EVENT_MASK);
+    host.write_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &m)
+        .unwrap();
+
+    // Exactly the state `apply_setup_shared_state` leaves behind, and then one
+    // single poll.
+    state.display.poll_ctr = 0;
+    state.display.online_tries = 0;
+    try_display_online(&mut state, &mut host);
+
+    assert_eq!(
+        state.display.online_tries, 1,
+        "the enable bit was set, so the first poll should have pulsed ONLINE \
+         rather than waiting for poll {DISPLAY_ONLINE_POLL_DIVISOR}"
+    );
+    assert_eq!(host.actions.len(), 1);
+    assert_eq!(host.actions[0].kind, HostActionKind::IrqGfxPulse);
+
+    // And the re-assert is still paced: the very next poll is not a multiple of
+    // the divisor, so it must not pulse again.
+    host.actions.clear();
+    try_display_online(&mut state, &mut host);
+    assert!(
+        host.actions.is_empty(),
+        "the divisor still paces every pulse after the first"
+    );
+    assert_eq!(state.display.online_tries, 1);
+}
+
 /// Display-lifecycle instrumentation: SETUP_SHARED_STATE, ONLINE ack, and the
 /// first ONLINE signal each leave an always-on line so a bad boot has a
 /// display-lifecycle timeline to correlate with post_converge_regress. A

@@ -5467,13 +5467,32 @@ pub fn try_display_online<H: HostMemory + HostOps>(state: &mut DeviceState, host
         }
         return;
     }
-    // Cadence: skip most ticks (archive divisor); still run often enough via
-    // gfx_update / drain that enable() is observed within seconds.
+    // The divisor is a cadence for **re-asserting** ONLINE, not for looking at
+    // whether the guest has enabled the display. It used to gate both, and that
+    // cost the first pulse a whole divisor of latency: `poll_ctr` is zeroed by
+    // `apply_setup_shared_state`, so the guest could set the enable bit
+    // immediately after registering the shared page and this device would not
+    // read it until 50 polls later.
+    //
+    // Measured, on three macos-11/12 boots, as the interval between
+    // `display_shared_state_setup` and `display_online_signal` in each boot's own
+    // log: 2365 ms, 2324 ms and 2139 ms. Fifty polls at the ~45 ms this is
+    // actually called at during early boot — the poll is driven by `gfx_update`
+    // and the drain, and neither runs at the 4 ms heartbeat before the guest is
+    // drawing anything. So essentially the whole of that interval was this gate.
+    //
+    // It is a real cost and not a cosmetic one, because the guest is racing us.
+    // macOS's WindowServer asks `AppleParavirtFramebuffer` for a mappable VRAM
+    // aperture about 13 s into boot and **aborts the process** if it does not get
+    // one — `CGXMappedDisplayStart` asserts, and the desktop never appears for
+    // the life of the boot. Onlining at 14.2 s loses that race and onlining at
+    // 11.9 s wins it, which is the whole margin.
+    //
+    // So the counter still advances every poll, the enable mask is read every
+    // poll, and the divisor now gates only the *repeat* — first pulse on the
+    // first poll that observes the enable bit, retries at the archive's ~200 ms.
     let ctr = state.display.poll_ctr.wrapping_add(1);
     state.display.poll_ctr = ctr;
-    if !ctr.is_multiple_of(DISPLAY_ONLINE_POLL_DIVISOR) {
-        return;
-    }
     let gpa = state.display.shared_gpa;
     let mut mask_le = [0u8; 4];
     if host
@@ -5537,6 +5556,11 @@ pub fn try_display_online<H: HostMemory + HostOps>(state: &mut DeviceState, host
                 state.display.poll_ctr,
             ));
         }
+        return;
+    }
+    // The guest has enabled. The first pulse goes now; every later one waits for
+    // the archive's cadence, which is what the divisor was always for.
+    if state.display.online_tries > 0 && !ctr.is_multiple_of(DISPLAY_ONLINE_POLL_DIVISOR) {
         return;
     }
     // pending word is atomic read-and-clear on the guest side.
