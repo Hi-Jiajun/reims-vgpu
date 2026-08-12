@@ -647,25 +647,35 @@ pub const GPU_SPANS: &str = "REIMS_VGPU_GPU_SPANS";
 /// layout transitions costs less than the ~5 % spread between two boots of one
 /// binary.
 ///
-/// The reading is that this host does not compress what it is asked to transfer:
-/// the colour attachment is created with `TRANSFER_SRC` usage, so the driver has
-/// no compression to resolve when the layout moves. **So do not remove the
-/// existing pair on this evidence.** Every loading draw barriers its target into
-/// `COLOR_ATTACHMENT_OPTIMAL` and the pass's `final_layout` puts it back, for a
-/// transfer reader that arrives a few times a second against tens of thousands of
-/// draws — it looks wasteful and it measures free, and the barrier family it sits
-/// in has had five live dependency bugs, so the refactor is all risk and no
-/// measured gain *here*.
+/// The reading was that *that* host did not compress what it was asked to
+/// transfer: the colour attachment is created with `TRANSFER_SRC` usage, so the
+/// driver had no compression to resolve when the layout moved.
 ///
-/// # Why it stays
+/// # The pair is gone, and this switch is now the control arm that prices it
 ///
-/// "Here" is the whole caveat, and it is why this is a kept probe rather than a
-/// deleted one. AMD and Intel parts keep colour compression metadata that a
-/// transfer layout can force a whole-attachment resolve of, and this project has
-/// no such host to boot. Anyone who has one can answer the question in two boots
-/// without writing any code: if `us/draw` rises on the `on` arm there, the pair
-/// is worth removing and this doc is wrong about their machine, not about this
-/// one.
+/// **Those six boots were taken on a discrete NVIDIA host**, and this doc used
+/// to end by saying so and inviting the experiment: "AMD and Intel parts keep
+/// colour compression metadata that a transfer layout can force a
+/// whole-attachment resolve of, and this project has no such host to boot.
+/// Anyone who has one can answer the question in two boots."
+///
+/// There is such a host now — Intel Arrow Lake / Mesa ANV — and the pair was
+/// removed there without waiting for those two boots. `caches::COLOR0_PASS_EXIT_LAYOUT`
+/// carries the reasoning; the short version is that the transition is only half
+/// of it. The other half is the `vkCmdPipelineBarrier` each loading draw
+/// recorded to undo the exit, which `exec::pass_exit_needs_no_barrier` drops
+/// outright because the pass's own `VK_SUBPASS_EXTERNAL` dependency already
+/// carries the ordering. That saving is driver CPU work at ~24 000 draws a
+/// second on a device measured to be CPU-bound in `record`, and it does not
+/// depend on compression existing at all.
+///
+/// So the honest state is: the *barrier* half is justified without a
+/// measurement, the *transition* half is not, and this switch is what measures
+/// it — turning it on re-enacts exactly the removed round trip and nothing else.
+/// `scripts/perf-ab/perf-ab.sh --rail macos-13 --arms "shipping LAYOUT_CHURN=on"`
+/// is the run, and it is owed. If `us/draw` does not rise on the `on` arm here
+/// either, the transition was free on this host too and the win is the barrier
+/// alone.
 pub const LAYOUT_CHURN: &str = "REIMS_VGPU_LAYOUT_CHURN";
 
 /// **Default off.** `on` records one extra empty render pass instance per
