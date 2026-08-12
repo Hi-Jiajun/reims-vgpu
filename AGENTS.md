@@ -2,72 +2,22 @@
 
 Operating guide for AI agents working in this repository.
 
-## Standing Priority: the host GPU hang outranks everything
+## Standing Invariant: never sample an image this device has not defined
 
-**Until the macos-11 / macos-12 GPU hang is fixed it is this repository's top priority, and every
-handover must say so.** Not "identify the driver arm that avoids it" — *fix the inputs this device
-supplies* so the hang stops happening. An environment switch that dodges it is a diagnosis, never a
-resolution. Correctness and performance work continues only where it does not delay this.
+The guest's compositing fragment shader walks a pointer chain stored *inside a sampled image* —
+`uv <- sample(uv).xy`, continuing while `sample(uv).x > 0`, with no counter and no second exit. A
+zeroed image exits on the first iteration; **garbage never terminates, and neither does a value that
+has merely been moved off the cell it names.** So an image bound to a draw must carry the contents
+this device decoded, in the format the guest declared, exactly — a lossy conversion is as fatal here
+as an undefined one.
 
-**The mechanism is known; which input supplies it is not.** The guest's compositing fragment shader
-walks a pointer chain stored *inside a sampled image* — `uv <- sample(uv).xy`, continuing while
-`sample(uv).x > 0`, with no counter and no second exit. A zeroed image exits on the first iteration;
-**garbage never terminates**. The standing invariant that follows: **never let the GPU sample an
-image whose contents this device has not defined.**
-
-The first candidate for supplying that garbage — a pooled sampled slot recycled and then only
-partly overwritten — is **refuted**: every sampled upload here is full-extent, every length is
-validated before the copy, the pooled staging buffer zero-fills its remainder, and no memo outlives
-the recycle of the image it names. `kb/the-sampled-image-is-defined-everywhere-except-the-gathered-vouch.md`
-carries the full trace and the two real holes it did find. The one bind made with nothing read and
-nothing compared — the gathered sampled cache's identity-only lookup — is **also eliminated**: one
-driven boot with the switch this session added, `REIMS_VGPU_SAMPLED_IDENTITY=off`, arm confirmed on
-the boot line and by 53 census windows of `sampled_identity_off`, and Maps froze anyway. The wedging
-draw does not even contain a gathered bind.
-
-**So the question is no longer whether an image is defined; it is what it is defined *as*.** The
-trail now names the wedged draw's sampled bindings, and the first thing that reading turned up is
-ours and silent: this device hands the shader a **unorm8 copy of a 64x64 `RGBA16Float` guest
-texture** — clamped to `[0,1]`, quantised to 256 levels — because the tight-row linear loader's
-native arms cover only the two eight-bit channel orders and everything else falls through to
-`texel_to_rgba8`. `sampled_texture_narrowed` reports it now. The three live hypotheses are the
-resolved texture, the format, and the sampler; the format one is the only one with a measurement
-behind it. Read `kb/the-wedging-draw-binds-seventeen-textures-and-one-of-them-is-quantised.md`
-before spending a boot.
-
-Where it stands, in reading order:
-
-- `kb/the-uber-shader-walks-a-pointer-chain-through-a-sampled-image.md` — the loop, the four inputs
-  that hang it against the two that do not, and the null results (the parameter block, 16-bit
-  induction, extent-derived bounds and loaded steps are all **exonerated** — do not re-run them).
-- `kb/the-wedge-is-one-submission-and-the-uber-shader-does-not-terminate.md` — the wedge is a single
-  submission, `outstanding=1`, over as few as 4096 pixels, which excludes "the shader is too slow
-  here" by ~200 000x.
-- `kb/the-macos-11-hang-is-a-fence-this-device-gives-up-on-first.md` — the ordering, this device's
-  own fence timeout measured innocent, and the suspects eliminated with measurements.
-- `kb/the-igpu-hang-survives-every-switch-being-off.md` — all eighteen narrowing switches off at
-  once, hang unmoved. **No optimization in this crate causes it.**
-
-Two rules that have each already cost a session a wrong answer:
-
-- **Read the first wedge only — and inside it, the oldest submission.** Every later
-  `vk_engine_fence_wedged` line in a boot names work queued behind a device that is already lost;
-  ranking them is how the uber shader was once called a passenger. The same mistake is available one
-  level down, because the line that prints first names the slot whose *wait* expired and not
-  necessarily the submission that hung. macos-12's Launchpad wedge prints `slot=0 held=#66928` with
-  a 1 196-word shader, and the `_queue` line beside it reads `outstanding=6` naming `slot=6 #66926`
-  — an older submission, carrying the uber shader. **Rank by the lowest submission number in the
-  `_queue` line**, not by print order.
-- **A FREEZE eliminates an arm; an `ok` confirms nothing.** The leg's measured baseline pass rate is
-  0/5, so one passing boot is not a fix — confirm at n>=3 and on a second rail before reporting one.
-  See the freeze-verdict rule under `## Verification`.
-
-**There is a second rail.** macos-12's `Launchpad->Screenshot` leg wedges on its own copy of the
-same uber shader (98 430 words against macos-11's 95 212), at 1920x1080. A candidate fix now has two
-rails to be checked on rather than one — see
-`kb/macos-12-launchpad-wedges-on-the-same-uber-shader.md` for the four-rail baseline table.
-
-This section goes when the hang goes, and not before.
+This is what the macos-11 Maps and macos-12 Launchpad hangs were: a 64 KiB cost floor was pushing
+sub-floor half-float sampled textures onto a CPU arm that clamped to `[0,1]` and quantised to 256
+levels, and a quantised UV lands between cells. Fixed at `9a57611b`; both rails have since run five
+consecutive clean boots each against a baseline of thirteen consecutive freezes.
+`kb/a-cost-floor-quantised-the-pointer-chain-and-the-rung-that-did-it-was-silent.md` carries the
+trace. The invariant outlives the bug and is the reason a narrowing conversion anywhere in the
+sampled path needs a measurement rather than a byte threshold.
 
 ## What Belongs In This File
 
@@ -538,9 +488,17 @@ measured from the device, and binding an extension a host does not advertise fai
 while importing a handle type it declines is undefined behavior inside the driver. Add a switch as a
 new refusal reason, never as a new permission.
 
-`REIMS_VGPU_GUEST_IMPORT=off` is the one that matters for verification: it takes a capable host down
-to the `disabled_by_env` rung, which is how the copying rails get exercised without hunting for
-hardware that lacks the extension.
+Two matter for verification rather than for ablation:
+
+- `REIMS_VGPU_GUEST_IMPORT=off` takes a capable host down to the `disabled_by_env` rung, which is
+  how the copying rails get exercised without hunting for hardware that lacks the extension.
+- `REIMS_VGPU_GATHER_AUDIT_ALL=on` makes the zero-copy sampled cache's content audit judge **every**
+  vouched bind instead of one in sixty-four. That cache is the only place in this device where an
+  image is bound with nothing read and nothing compared, and a stale bind's failure mode is content,
+  which no counter reports — the audit is the sole instrument, and at the shipping stride it samples
+  about 1.6 % of the binds it could judge. Run a rail sweep under it and read `gw_audit_unsound`
+  against `gw_audit_ok` beside it; a zero is only evidence when the `ok` is large. **Never quote a
+  timing from such a boot** — the fold re-reads the very windows the cache exists to avoid reading.
 
 ## Verification
 
