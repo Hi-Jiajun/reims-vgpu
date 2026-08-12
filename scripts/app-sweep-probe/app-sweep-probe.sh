@@ -35,6 +35,13 @@
 #           of a drain tranche — so a wedged drain thread emits nothing at all
 #           while the boot reads healthy. The freeze test is therefore a gap in
 #           `drain_duty` lines wider than FREEZE_GAP_S, measured per app.
+#   NO-FRAMES
+#           the leg ran and this device presented nothing at all. The FREEZE test
+#           above cannot see it: a drain worker whose GPU has been reset goes on
+#           writing one census a second with zero draws in it, so the gap stays
+#           at 1.0 and the leg reads `ok` at 0.0 Hz. One driven macos-11 boot
+#           reported five consecutive legs that way after Maps wedged the GPU,
+#           and a sweep judged on the verdict column would have called it 6/7.
 #   STALL   the guest is up and the device is drawing, but the screen did not
 #           change between two different applications. That is a compositor
 #           that latched, and no counter in this device can see it — only the
@@ -223,6 +230,13 @@ run_app() {
   local verdict=ok
   awk -v g="$gap" -v f="$FREEZE_GAP_S" 'BEGIN{exit !(g > f)}' && verdict=FREEZE
   [ "$drain_n" = 0 ] && verdict=FREEZE
+  # A leg that presented **nothing** is not a slow leg. The census-gap test
+  # cannot see this: the drain worker goes on writing one census a second with
+  # zero draws in it, so `gap` stays at 1.0 and the leg reads `ok` at 0.0 Hz.
+  # One driven macos-11 boot reported five consecutive legs that way after Maps
+  # wedged the GPU — `ok  present_hz med=0.0 min=0.0  worst census gap=1.0s` —
+  # and a sweep judged on the verdict column would have called it 6/7.
+  awk -v m="$hz_med" 'BEGIN{exit !(m + 0 <= 0)}' && verdict=NO-FRAMES
   [ "$live" = UNREACHABLE ] && verdict=GUEST-GONE
   if [ -n "$hash" ] && [ "$hash" = "$PREV_HASH" ]; then
     verdict="STALL(screen identical to $PREV_APP)"
@@ -273,6 +287,7 @@ if [ "$TORTURE_SECONDS" -gt 0 ]; then
     python3 "$REPO/scripts/app-sweep-probe/read_window.py" "$WORK/safari-torture.log")
   verdict=ok
   awk -v g="$gap" -v f="$FREEZE_GAP_S" 'BEGIN{exit !(g > f)}' && { verdict=FREEZE; FAILED=1; }
+  awk -v m="$hz_med" 'BEGIN{exit !(m + 0 <= 0)}' && { verdict=NO-FRAMES; FAILED=1; }
   gssh 15 true || { verdict=GUEST-GONE; FAILED=1; }
   printf 'Safari-torture\t%s\t%s\t%s\t%s\t%s\n' "$verdict" "$hz_med" "$hz_min" "$gap" "$alarms" \
     >>"$VERDICTS"
@@ -367,6 +382,7 @@ verdict=ok
 [ "$LAUNCHED" = yes ] || { verdict=NO-LAUNCH; FAILED=1; }
 [ "$LP_OPENED" = no ] && { verdict=NO-LAUNCHPAD; FAILED=1; }
 awk -v g="$gap" -v f="$FREEZE_GAP_S" 'BEGIN{exit !(g > f)}' && { verdict=FREEZE; FAILED=1; }
+awk -v m="$hz_med" 'BEGIN{exit !(m + 0 <= 0)}' && { verdict=NO-FRAMES; FAILED=1; }
 gssh 15 true || { verdict=GUEST-GONE; FAILED=1; }
 printf 'Launchpad->Screenshot\t%s\t%s\t%s\t%s\t%s\n' \
   "$verdict" "$hz_med" "$hz_min" "$gap" "$alarms" >>"$VERDICTS"

@@ -198,9 +198,17 @@ struct Trail {
     /// is hundreds, and at that size the compare is a cache line where a tree is
     /// a pointer chase per level. This is on the per-draw path.
     seen_pipes: Vec<u32>,
-    /// `(pipeline_ref, the draw ordinal it first drew at)`, oldest first once
-    /// wrapped.
-    firsts: [Option<(u32, u64)>; FIRST_DRAW_KEPT],
+    /// The first draw of each pipeline ref, with the draw ordinal it happened
+    /// at. Oldest first once wrapped.
+    ///
+    /// The whole note and not just the ref, because the ref alone sends the
+    /// reader to a log line that may not exist: `linux_m2v_resources` is emitted
+    /// only for a pipeline with a decoded fixed-state gap, so a boot naming
+    /// `pipe=91` eighteen draws before its wedge has nothing anywhere that says
+    /// how large that pipeline's modules are or what geometry it drew. That is
+    /// one more boot to answer a question this record was already holding the
+    /// answer to.
+    firsts: [Option<(DrawNote, u64)>; FIRST_DRAW_KEPT],
     firsts_next: usize,
 }
 
@@ -220,7 +228,7 @@ pub fn note_draw(note: DrawNote) {
             trail.seen_pipes.insert(at, note.pipeline_ref);
             let total = trail.total;
             let slot = trail.firsts_next;
-            trail.firsts[slot] = Some((note.pipeline_ref, total));
+            trail.firsts[slot] = Some((note, total));
             trail.firsts_next = (slot + 1) % FIRST_DRAW_KEPT;
         }
     }
@@ -241,7 +249,7 @@ pub fn recent_pipeline_firsts() -> Option<String> {
     let total = trail.total;
     let body = (0..FIRST_DRAW_KEPT)
         .filter_map(|i| trail.firsts[(trail.firsts_next + i) % FIRST_DRAW_KEPT])
-        .map(|(pipe, at)| format!("pipe={pipe}@-{}", total.saturating_sub(at)))
+        .map(|(note, at)| format!("[-{} {note}]", total.saturating_sub(at)))
         .collect::<Vec<_>>()
         .join(" ");
     Some(format!("distinct={} {body}", trail.seen_pipes.len()))
@@ -342,7 +350,7 @@ mod tests {
         }
         let line = recent_pipeline_firsts().expect("draws were recorded");
         assert_eq!(
-            line.matches(&format!("pipe={old}@")).count(),
+            line.matches(&format!("pipe={old} ")).count(),
             1,
             "a repeat must not re-record: {line}"
         );
@@ -358,11 +366,11 @@ mod tests {
         }
         let line = recent_pipeline_firsts().expect("draws were recorded");
         assert!(
-            !line.contains(&format!("pipe={old}@")),
+            !line.contains(&format!("pipe={old} ")),
             "the oldest first-draw ages out once {FIRST_DRAW_KEPT} newer ones arrive: {line}"
         );
         assert!(
-            line.contains(&format!("pipe={}@", 7_100_000 + FIRST_DRAW_KEPT as u32 - 1)),
+            line.contains(&format!("pipe={} ", 7_100_000 + FIRST_DRAW_KEPT as u32 - 1)),
             "the newest first-draw is always present: {line}"
         );
         assert!(line.starts_with("distinct="), "{line}");
