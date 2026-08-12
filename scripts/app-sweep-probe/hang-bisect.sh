@@ -23,8 +23,16 @@
 #   scripts/app-sweep-probe/hang-bisect.sh [--rail NAME] [--seconds N]
 #     [--arms "shipping GUEST_IMPORT=off COMPUTE_GATHER=off ..."]
 #
-# An arm is either the word `shipping` or a `NAME=value` that is exported as
-# `REIMS_VGPU_NAME=value` for that boot.
+# An arm is either the word `shipping` or one or more comma-joined `NAME=value`
+# pairs, each exported as `REIMS_VGPU_NAME=value` for that boot. A comma-joined
+# arm is how the whole set of narrowing switches gets tested in one boot, which
+# is the first question worth asking: if the hang survives every optimization
+# being switched off, no optimization causes it and there is nothing to bisect.
+#
+# Every `REIMS_VGPU_*` variable in the environment is cleared before each arm, so
+# an arm cannot inherit the previous one's switch. The names come from the
+# environment itself rather than a list kept here, because a list would go stale
+# the first time `env.rs` grows a switch and the drift is invisible.
 set -uo pipefail
 export LC_ALL=C
 
@@ -66,9 +74,16 @@ for arm in $ARMS; do
   rm -f /tmp/reims-vgpu-fail.log
   # Exported, never passed as argv: a command line naming the arm would be
   # matched by the `pkill` above on the next round.
-  unset REIMS_VGPU_GUEST_IMPORT REIMS_VGPU_COMPUTE_GATHER REIMS_VGPU_COMPUTE_SCATTER
+  for stale in $(env | sed -n 's/^\(REIMS_VGPU_[A-Z0-9_]*\)=.*/\1/p'); do
+    unset "$stale"
+  done
   if [ "$arm" != shipping ]; then
-    export "REIMS_VGPU_${arm%%=*}=${arm##*=}"
+    # Comma-joined, so one arm can carry every switch at once.
+    old_ifs=$IFS; IFS=,
+    for pair in $arm; do
+      export "REIMS_VGPU_${pair%%=*}=${pair##*=}"
+    done
+    IFS=$old_ifs
   fi
 
   started=$(date '+%Y-%m-%d %H:%M:%S')

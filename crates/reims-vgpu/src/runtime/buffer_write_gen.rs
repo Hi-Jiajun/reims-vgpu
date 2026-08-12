@@ -58,8 +58,9 @@ use std::collections::HashMap;
 #[derive(Default, Debug)]
 pub struct BufferWriteGens {
     gens: HashMap<(u32, u32), u64>,
-    /// Bumped on every clear, so a comparison spanning one is not mistaken for
-    /// a comparison that found the same generation twice. A reader stores this
+    /// Bumped on every drop of an entry — the whole-map clear and the per-task
+    /// retire alike — so a comparison spanning one is not mistaken for a
+    /// comparison that found the same generation twice. A reader stores this
     /// beside the generation and treats a change in it as "unknown".
     epoch: u64,
 }
@@ -119,8 +120,21 @@ impl BufferWriteGens {
     /// [`crate::runtime::bound_buffers`] states about its own registry: mapping
     /// an object id back to what resolved through it is machinery bought with
     /// nothing, and task teardown is rare.
+    ///
+    /// This bumps the epoch for the same reason the clear does, and the case is
+    /// not hypothetical: a guest reuses task ids. Drop `(5, 7)` at generation 3,
+    /// let a *different* task 5 create a *different* object 7 and declare three
+    /// writes to it, and a stamp taken before the retire compares equal to one
+    /// taken after — same epoch, same generation, unrelated bytes. That is the
+    /// one direction this whole type exists to refuse. Bumped only when an entry
+    /// actually went, so retiring a task that declared no writes costs no
+    /// reader's stamp.
     pub fn retire_task(&mut self, task_id: u32) {
+        let before = self.gens.len();
         self.gens.retain(|&(task, _), _| task != task_id);
+        if self.gens.len() != before {
+            self.epoch = self.epoch.wrapping_add(1);
+        }
     }
 
     /// Entries held.
@@ -214,6 +228,40 @@ mod tests {
             !g.stamp(1, 7).quiet_since(before),
             "the entry is gone, so its generation reads as 0 and cannot match"
         );
+    }
+
+    /// The retire is a forgetting, so it has to move the epoch exactly as the
+    /// clear does. A guest reuses task ids, and a generation that climbs back to
+    /// the value a reader recorded is the one shape where the entry going is not
+    /// enough on its own.
+    #[test]
+    fn a_stamp_that_straddles_a_retire_is_not_quiet() {
+        let mut g = BufferWriteGens::default();
+        for _ in 0..3 {
+            g.note_write(5, 7);
+        }
+        let before = g.stamp(5, 7);
+        g.retire_task(5);
+        // A different task 5, a different object 7, back to generation 3.
+        for _ in 0..3 {
+            g.note_write(5, 7);
+        }
+        assert!(
+            !g.stamp(5, 7).quiet_since(before),
+            "the tracked object was retired under this reader, so nothing it \
+             stamped is comparable across the gap however the count reads"
+        );
+    }
+
+    /// Retiring a task nothing was tracked for must not move anyone's stamp, or
+    /// task teardown alone would report every window as dirty.
+    #[test]
+    fn retiring_an_untracked_task_leaves_every_stamp_alone() {
+        let mut g = BufferWriteGens::default();
+        g.note_write(1, 7);
+        let before = g.stamp(1, 7);
+        g.retire_task(2);
+        assert!(g.stamp(1, 7).quiet_since(before));
     }
 
     /// The map stops at its bound rather than tracking a guest that creates
