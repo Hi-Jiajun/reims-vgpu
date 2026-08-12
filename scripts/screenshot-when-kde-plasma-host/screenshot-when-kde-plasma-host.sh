@@ -465,21 +465,57 @@ for c in magick convert; do
 done
 
 if [[ -n "$MAGICK" ]]; then
-  STATS="$("$MAGICK" "$OUT" -format 'max=%[fx:maxima*255] mean=%[fx:mean*255] colors=%k' info: 2>/dev/null || true)"
+  # `-alpha off` is the whole guard. `maxima` and `mean` are taken over every
+  # enabled channel, and spectacle writes RGBA with a fully opaque alpha, so on a
+  # black frame they read max=255 and mean=63.75 — that is 255/4, the alpha
+  # channel and three zeroes. The guard could not fire, and did not: a whole
+  # driven boot of a solidly black window was captured, measured "max=255
+  # mean=63.7673 colors=30", and passed as a good frame. The frames were used to
+  # judge a rail sweep.
+  #
+  # Discarding alpha first makes both numbers describe the picture. The same
+  # black capture then reads max=22 mean=0.02 and is refused.
+  STATS="$("$MAGICK" "$OUT" -alpha off \
+    -format 'max=%[fx:maxima*255] mean=%[fx:mean*255] colors=%k' info: 2>/dev/null || true)"
   if [[ -n "$STATS" ]]; then
     printf '%s: %s\n' "$SCRIPT_NAME" "$STATS" >&2
     MAXV="${STATS#max=}"
     MAXV="${MAXV%% *}"
     MAXV="${MAXV%%.*}"
+    MEANV="${STATS#*mean=}"
+    MEANV="${MEANV%% *}"
+
+    # Two arms, because the frame this guard exists to catch does not trip the
+    # obvious one. A black *window* capture is not uniformly black: the corners
+    # are rounded and anti-aliased against what is behind them, so the real
+    # black boot measured max=22 — over the max<=8 threshold, and passed.
+    #
+    # `mean` is what separates them, and by a wide margin: that black capture
+    # reads 0.024 against 94-99 for a composited desktop, and its 717 non-black
+    # pixels out of 920 320 are all corner artifacts. The threshold is 0.5, an
+    # order of magnitude above the black frame and below the darkest picture
+    # worth keeping — a macOS boot screen, black but for the Apple logo, is
+    # around 1.0 by the logo's area and brightness alone.
+    #
+    # The arms report separately so the message says which one fired: "nothing
+    # bright anywhere" and "almost nothing lit" are different failures.
+    BLACK_WHY=""
     if [[ "$MAXV" =~ ^[0-9]+$ ]] && [[ "$MAXV" -le 8 ]]; then
+      BLACK_WHY="max_rgb=${MAXV}, nothing brighter than near-black anywhere"
+    elif awk -v m="$MEANV" 'BEGIN{exit !(m+0 < 0.5)}' 2>/dev/null; then
+      BLACK_WHY="mean_rgb=${MEANV} with max_rgb=${MAXV}, i.e. black but for a \
+handful of edge pixels"
+    fi
+    if [[ -n "$BLACK_WHY" ]]; then
       if [[ "$ALLOW_BLACK" -eq 1 ]]; then
-        printf '%s: WARNING: capture is uniformly black (max=%s); --allow-black set\n' \
-          "$SCRIPT_NAME" "$MAXV" >&2
+        printf '%s: WARNING: capture is black (%s); --allow-black set\n' \
+          "$SCRIPT_NAME" "$BLACK_WHY" >&2
       else
-        die "capture is uniformly black (max_rgb=${MAXV}) → treating as a FAILED CAPTURE, \
+        die "capture is black (${BLACK_WHY}) → treating as a FAILED CAPTURE, \
 not as evidence the guest rendered black. The window was selected and active, so suspect the \
-capture path (cross-GPU dmabuf readback, or the window had not composited yet). Corroborate \
-with /tmp/reims-vgpu-thrash.log before concluding anything about present correctness. \
+capture path (cross-GPU dmabuf readback, or the window had not composited yet) — or the device, \
+which has produced exactly this for a whole boot when guest RAM was being gathered as garbage. \
+Corroborate with /tmp/reims-vgpu-fail.log before concluding anything about present correctness. \
 Pass --allow-black to keep a black PNG anyway. Wrote: ${OUT}"
       fi
     fi
