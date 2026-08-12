@@ -1955,6 +1955,26 @@ fn reclaimed_resample_band(since_ms: u64) -> &'static str {
     }
 }
 
+/// Whether one shader stage occupies any binding number in the **sampled band**,
+/// which holds textures and samplers together.
+///
+/// The band's relocation — `separate_sampled` — is what stops one stage's
+/// binding number landing on the other's, so the question it has to be triggered
+/// from is about the whole band and not about half of it. Asking only about
+/// textures leaves a stage that binds a sampler and no texture invisible to the
+/// trigger, and Metal argument tables are sticky across draws in an encoder, so
+/// a vertex sampler routinely survives a re-bind that zeroed the vertex
+/// textures. With the two stages unseparated their sampler at index 0 resolves
+/// to one binding, `push_smp` is first-writer-wins, and the loser's filter,
+/// address mode and LOD clamp are dropped while the layout's
+/// `VERTEX | FRAGMENT` stage flags let it go on sampling through the winner's.
+///
+/// A ref of zero is not a bind: it is the guest leaving a slot empty, which is
+/// the same reading `push_smp`'s own callers take.
+fn stage_uses_sampled_band(textures: &[TextureBind], samplers: &[SamplerBind]) -> bool {
+    textures.iter().any(|t| t.texture_ref != 0) || samplers.iter().any(|s| s.sampler_ref != 0)
+}
+
 fn resolve_type11_load_seed<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -5595,12 +5615,28 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let vtx_idx: std::collections::BTreeSet<u32> =
             vtx_storage.iter().map(|(i, _)| *i).collect();
         let buf_collide = frag_storage.iter().any(|(i, _)| vtx_idx.contains(i));
-        let has_vtx_tex = req.vertex_textures.iter().any(|t| t.texture_ref != 0);
-        let has_frag_tex = req.fragment_textures.iter().any(|t| t.texture_ref != 0);
+        // The sampled band holds textures **and** samplers, and the relocation is
+        // what stops one stage's binding number landing on the other's. So the
+        // trigger asks about the whole band: a stage with a sampler and no
+        // texture is still occupying binding numbers in it.
+        //
+        // Textures alone is what stood here, and Metal argument tables are sticky
+        // across draws in an encoder — a vertex sampler survives a re-bind that
+        // zeroed the vertex textures. With `has_vtx_tex` false the two stages'
+        // sampler at index 0 both resolve to `SAMPLER_BINDING_BASE + 0`, and
+        // `push_smp`'s `sampler_binds.insert` is first-writer-wins: the vertex
+        // sampler takes the binding and the fragment one is *dropped*. The layout
+        // gives every sampler `VERTEX | FRAGMENT` stage flags, so the fragment
+        // module then samples its textures through the vertex stage's filter,
+        // address mode and LOD clamp, with nothing refused and nothing counted.
+        let has_vtx_sampled =
+            stage_uses_sampled_band(&req.vertex_textures, &req.vertex_samplers);
+        let has_frag_sampled =
+            stage_uses_sampled_band(&req.fragment_textures, &req.fragment_samplers);
         let reflected_sampled_collision =
             reflected_sampled_binding_collision(&v_shader.reflection, &f_shader.reflection);
         let separate_sampled =
-            (has_vtx_tex && has_frag_tex) || buf_collide || reflected_sampled_collision;
+            (has_vtx_sampled && has_frag_sampled) || buf_collide || reflected_sampled_collision;
         // Sampled relocation first (archive order), then buffer band. The
         // buffer band lands at [104,136), clear of the [96,104) ColorInput /
         // framebuffer-fetch band, which neither relocation touches. The
@@ -6183,6 +6219,31 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         sampler.lod_max = max_bits;
                     }
                     samplers.push(sampler);
+                } else {
+                    // A second sampler resolving to a binding this draw already
+                    // provisioned. First-writer-wins, so this one's filter,
+                    // address mode and LOD clamp are dropped — and because the
+                    // layout gives every sampler `VERTEX | FRAGMENT` stage flags,
+                    // the stage that lost goes on sampling through the stage that
+                    // won.
+                    //
+                    // A **healthy zero** now that `separate_sampled` covers the
+                    // whole sampled band: with both stages relocated apart, two
+                    // stages cannot collide, and one stage cannot bind its own
+                    // index twice. A firing is the bug, not the report — most
+                    // likely a band whose relocation offset stopped separating
+                    // the two.
+                    crate::runtime::drain::note_store_route("sampler_bind_collided");
+                    if crate::observe::first_sight("sampler_bind_collided", u64::from(smp_bind)) {
+                        crate::observe::fail(format!(
+                            "sampler_bind_collided binding={smp_bind} index={index} \
+                             stage={} separate_sampled={separate_sampled} \
+                             (a second sampler resolved to a binding this draw had \
+                             already provisioned; its state is dropped and the \
+                             other stage's is what samples)",
+                            if frag_stage { "fragment" } else { "vertex" }
+                        ));
+                    }
                 }
                 Ok(())
             };
@@ -9227,6 +9288,44 @@ mod vulkan_split_tests {
         assert!(
             state.pending_writebacks.get(mid).is_none(),
             "the gather bound pages still owed a frame this device never wrote down"
+        );
+    }
+
+    /// A stage that binds a sampler and no texture is still in the sampled band,
+    /// so it still triggers the band's relocation.
+    ///
+    /// Asking only about textures is what stood here, and Metal argument tables
+    /// are sticky across draws in an encoder: a vertex sampler survives a re-bind
+    /// that zeroed the vertex textures. Unseparated, both stages' sampler at
+    /// index 0 resolves to `SAMPLER_BINDING_BASE`, `push_smp` takes the first
+    /// writer, and the fragment module goes on sampling through the vertex
+    /// stage's filter, address mode and LOD clamp with nothing refused.
+    #[test]
+    fn a_stage_that_binds_only_a_sampler_is_still_in_the_sampled_band() {
+        let tex = |texture_ref| TextureBind {
+            index: 0,
+            texture_ref,
+        };
+        let smp = |sampler_ref| SamplerBind {
+            index: 0,
+            sampler_ref,
+            ..Default::default()
+        };
+
+        assert!(
+            stage_uses_sampled_band(&[], &[smp(7)]),
+            "a sampler with no texture occupies a binding number all the same"
+        );
+        assert!(stage_uses_sampled_band(&[tex(3)], &[]));
+        assert!(stage_uses_sampled_band(&[tex(3)], &[smp(7)]));
+        assert!(
+            !stage_uses_sampled_band(&[], &[]),
+            "a stage that binds nothing is not in the band"
+        );
+        assert!(
+            !stage_uses_sampled_band(&[tex(0)], &[smp(0)]),
+            "a zero ref is the guest leaving a slot empty, not a bind — the same \
+             reading `push_smp`'s callers take"
         );
     }
 
