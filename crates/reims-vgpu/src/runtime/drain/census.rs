@@ -2665,89 +2665,14 @@ fn emit_engine_delta() {
     };
     let d = now.delta_since(&prev.unwrap_or_default());
     *prev = Some(now);
-    crate::observe::off(format!(
-        "engine_delta creates={} allocs={} batch_opens={} batch_joins={} batch_flushes={} \
-         batch_flush_draws={} batch_readback_joins={} readbacks={} readback_bytes={} render_post_wait_skips={} \
-         target_reads={} target_read_bytes={} gpu_stamps={} pipeline_misses={} \
-         shader_misses={} shader_hits={} shader_digest_hits={} shader_hash_words={} \
-         pass_misses={} layout_misses={} sampler_misses={} \
-         sampled_cache_hits={} sampled_identity_hits={} sampled_cache_hit_bytes={} \
-         sampled_cache_misses={} sampled_reuploads={} \
-         sampled_reupload_bytes={} sampled_gathers={} sampled_gather_bytes={} \
-         sampled_gather_skips={} sampled_gather_skip_bytes={} \
-         sampled_guest_imports={} sampled_guest_import_bytes={} \
-         sampled_gather_unvouched={} sampled_gather_unretained={} \
-         draw_cover_full={} draw_cover_loaded_full_scissor={} \
-         draw_cover_loaded_partial_scissor={} \
-         buffer_guest_imports={} buffer_guest_import_bytes={} \
-         buffer_guest_gathers={} buffer_guest_gather_bytes={} \
-         buffer_guest_gather_regions={} \
-         buffer_gather_dispatches={} buffer_gather_declined={} \
-         buffer_bind_reuses={} \
-         buffer_snapshot_binds={} \
-         guest_write_linear={} guest_write_rects={} guest_write_regions={} \
-         guest_write_dispatches={} guest_write_scatter_declined={} \
-         seed_uploads={} seed_upload_bytes={} \
-         ring_retire_blocks={} target_evicts={} desc_pool_grow={} gen_mismatch={}",
-        d.creates,
-        d.allocs,
-        d.batch_opens,
-        d.batch_joins,
-        d.batch_flushes,
-        d.batch_flush_draws,
-        d.batch_readback_joins,
-        d.readbacks,
-        d.readback_bytes,
-        d.render_post_wait_skips,
-        d.target_reads,
-        d.target_read_bytes,
-        d.gpu_stamps,
-        d.pipeline_misses,
-        d.shader_misses,
-        d.shader_hits,
-        d.shader_digest_hits,
-        d.shader_hash_words,
-        d.pass_misses,
-        d.layout_misses,
-        d.sampler_misses,
-        d.sampled_cache_hits,
-        d.sampled_identity_hits,
-        d.sampled_cache_hit_bytes,
-        d.sampled_cache_misses,
-        d.sampled_reuploads,
-        d.sampled_reupload_bytes,
-        d.sampled_gathers,
-        d.sampled_gather_bytes,
-        d.sampled_gather_skips,
-        d.sampled_gather_skip_bytes,
-        d.sampled_guest_imports,
-        d.sampled_guest_import_bytes,
-        d.sampled_gather_unvouched,
-        d.sampled_gather_unretained,
-        d.draw_cover_full,
-        d.draw_cover_loaded_full_scissor,
-        d.draw_cover_loaded_partial_scissor,
-        d.buffer_guest_imports,
-        d.buffer_guest_import_bytes,
-        d.buffer_guest_gathers,
-        d.buffer_guest_gather_bytes,
-        d.buffer_guest_gather_regions,
-        d.buffer_gather_dispatches,
-        d.buffer_gather_declined,
-        d.buffer_bind_reuses,
-        d.buffer_snapshot_binds,
-        d.guest_write_linear,
-        d.guest_write_rects,
-        d.guest_write_regions,
-        d.guest_write_dispatches,
-        d.guest_write_scatter_declined,
-        d.seed_uploads,
-        d.seed_upload_bytes,
-        d.ring_retire_blocks,
-        d.target_evicts,
-        d.desc_pool_grow,
-        d.gen_mismatch,
-    ));
+    // Generated from the counter vocabulary rather than named here, so this line
+    // cannot fall behind it again; see `CounterSnapshot::delta_fields`.
+    let mut line = String::from("engine_delta");
+    for (name, value) in d.delta_fields() {
+        use std::fmt::Write as _;
+        let _ = write!(line, " {name}={value}");
+    }
+    crate::observe::off(line);
     emit_registry_pressure(&now);
     emit_draw_phase();
 }
