@@ -2,6 +2,34 @@
 
 Operating guide for AI agents working in this repository.
 
+## Standing Priority: the host GPU hang outranks everything
+
+**Until the macos-11 / macos-12 GPU hang is fixed it is this repository's top priority, and every
+handover must say so.** Not "identify the driver arm that avoids it" — *fix the inputs this device
+supplies* so the hang stops happening. An environment switch that dodges it is a diagnosis, never a
+resolution. Correctness and performance work continues only where it does not delay this.
+
+Where it stands, in reading order:
+
+- `kb/the-wedge-is-one-submission-and-the-uber-shader-does-not-terminate.md` — the wedge is a single
+  submission carrying the CoreAnimation compositing uber shader over **64x64 pixels**, which
+  excludes "the shader is too slow here" by ~200 000x. A loop in that module does not terminate.
+- `kb/the-macos-11-hang-is-a-fence-this-device-gives-up-on-first.md` — the ordering, this device's
+  own fence timeout measured innocent, and the suspects eliminated with measurements.
+- `kb/the-igpu-hang-survives-every-switch-being-off.md` — all eighteen narrowing switches off at
+  once, hang unmoved. **No optimization in this crate causes it.**
+
+Two rules that have each already cost a session a wrong answer:
+
+- **Read the first wedge only.** Every later `vk_engine_fence_wedged` line in a boot names work
+  queued behind a device that is already lost. Ranking them is how the uber shader was called a
+  passenger.
+- **A FREEZE eliminates an arm; an `ok` confirms nothing.** The leg's measured baseline pass rate is
+  0/5, so one passing boot is not a fix — confirm at n>=3 and on a second rail before reporting one.
+  See the freeze-verdict rule under `## Verification`.
+
+This section goes when the hang goes, and not before.
+
 ## What Belongs In This File
 
 Durable rules that change how an agent works: the principles below, the support matrix, the commands
