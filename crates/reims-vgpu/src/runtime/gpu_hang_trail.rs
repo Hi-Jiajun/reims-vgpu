@@ -105,11 +105,39 @@ struct Trail {
 
 /// Record one draw this device is about to hand the engine.
 pub fn note_draw(note: DrawNote) {
+    crate::runtime::drain::note_store_route(frag_words_band(note.frag_words));
     let mut trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
     let slot = trail.next;
     trail.notes[slot] = Some(note);
     trail.next = (slot + 1) % CAPACITY;
     trail.total = trail.total.wrapping_add(1);
+}
+
+/// Which size band a draw's fragment module falls in, as a route name.
+///
+/// The trail answers "what was running when it wedged" and this answers the
+/// question that comes straight after it: **how often does that thing run at
+/// all**. A trail naming a 95 212-word module in the window before a stall means
+/// two very different things depending on whether that module ran twelve times
+/// in the boot or twelve thousand — a module that hangs every time it runs and a
+/// module that is merely marginal have different fixes, and the trail alone
+/// cannot tell them apart because it only ever prints after a stall.
+///
+/// Banded rather than a peak-plus-count pair because a boot has more than one
+/// large module (the pool this device translates holds five over 29 000 words)
+/// and a high-water would report only the largest. The bands are decade-ish
+/// powers of two over the observed population: everything this workload draws
+/// routinely is under a thousand words, and the compositing uber shaders are two
+/// orders of magnitude above that, so the interesting boundary is anywhere in
+/// between and the exact cuts do not matter.
+fn frag_words_band(words: u32) -> &'static str {
+    match words {
+        0..=1_023 => "fragwords_lt1k",
+        1_024..=4_095 => "fragwords_lt4k",
+        4_096..=16_383 => "fragwords_lt16k",
+        16_384..=65_535 => "fragwords_lt64k",
+        _ => "fragwords_ge64k",
+    }
 }
 
 /// The trail, oldest first, as one line's worth of text.
@@ -185,6 +213,26 @@ mod tests {
         let first_at = line.find(&format!("pipe={first} ")).unwrap();
         let last_at = line.find(&format!("pipe={last} ")).unwrap();
         assert!(first_at < last_at, "oldest first: {line}");
+    }
+
+    /// The bands tile the whole `u32`, so no module size is uncounted, and the
+    /// boundaries are exclusive on the way up: a reader summing them gets the
+    /// draw count.
+    #[test]
+    fn the_fragment_size_bands_tile_every_module_size() {
+        assert_eq!(frag_words_band(0), "fragwords_lt1k");
+        assert_eq!(frag_words_band(1_023), "fragwords_lt1k");
+        assert_eq!(frag_words_band(1_024), "fragwords_lt4k");
+        assert_eq!(frag_words_band(4_095), "fragwords_lt4k");
+        assert_eq!(frag_words_band(4_096), "fragwords_lt16k");
+        assert_eq!(frag_words_band(16_383), "fragwords_lt16k");
+        assert_eq!(frag_words_band(16_384), "fragwords_lt64k");
+        assert_eq!(frag_words_band(65_535), "fragwords_lt64k");
+        assert_eq!(frag_words_band(65_536), "fragwords_ge64k");
+        // The one this exists to separate: the compositing uber shader measured
+        // in the trail of a wedged macos-11 boot.
+        assert_eq!(frag_words_band(95_212), "fragwords_ge64k");
+        assert_eq!(frag_words_band(u32::MAX), "fragwords_ge64k");
     }
 
     /// The total is what says whether a full ring is the whole boot or its tail.

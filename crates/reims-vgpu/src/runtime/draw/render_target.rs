@@ -134,6 +134,27 @@ fn rt_type4_base_format(format: u16, mapping_id: u32) -> Option<u16> {
 /// `differs` is a healthy zero: the first non-zero line names a surface being
 /// rendered at the wrong geometry, which no other counter in this path could
 /// report.
+///
+/// # It stopped being zero, and the two populations under it need separating
+///
+/// A driven macos-11 boot on the Intel iGPU host, 2026-08-12, read `same` 1 271
+/// and `differs` **1**: `sid=56 view=1024x768 fmt=0x51 base=1024x768 fmt=0x50`.
+/// Geometry agrees; the *format* does not, and 0x50/0x51 are `BGRA8Unorm` and
+/// `BGRA8Unorm_sRGB`. So this device renders into a target the guest declared as
+/// sRGB using a UNORM attachment, and the hardware's linear-to-sRGB encode on
+/// write does not happen — the stored pixels are the shader's linear values,
+/// displayed as though they were sRGB.
+///
+/// That is a smaller and much safer repair than the geometry one this doc warns
+/// against — the two formats are the same bytes per texel, so nothing about the
+/// window moves — but it is one firing, and the risk that decides it is not
+/// visible in this counter: if the *same* surface also resolves `same`
+/// elsewhere, honouring the view would key two residents on one surface and the
+/// frame would alternate between them, which is a worse defect than the one
+/// being fixed. So the two populations are counted apart first
+/// (`rt_type5_view_differs_format_only` against `..._geometry`, which sum to
+/// `..._differs`), because they have different fixes, different risks, and one
+/// of them has still never been seen.
 fn note_rt_type5_view(
     view: Option<objects::Type5TextureView>,
     surface_id: u32,
@@ -146,9 +167,24 @@ fn note_rt_type5_view(
     let (base_w, base_h, base_fmt) = base;
     if view.width == base_w && view.height == base_h && view.pixel_format == base_fmt {
         crate::runtime::drain::note_store_route("rt_type5_view_same");
+        if differed_before(surface_id) {
+            // The reading that decides whether the format repair above is safe.
+            // A surface resolved both ways is one this device would key two
+            // residents on if the view were honoured, and a frame alternating
+            // between two images is worse than a frame in the wrong colour
+            // space. A boot reporting `differs_format_only` with this at zero is
+            // the one that licenses the repair.
+            crate::runtime::drain::note_store_route("rt_type5_view_sid_both_ways");
+        }
         return;
     }
     crate::runtime::drain::note_store_route("rt_type5_view_differs");
+    crate::runtime::drain::note_store_route(if view.width == base_w && view.height == base_h {
+        "rt_type5_view_differs_format_only"
+    } else {
+        "rt_type5_view_differs_geometry"
+    });
+    note_differed(surface_id);
     if crate::observe::first_sight("rt_type5_view_differs", surface_id as u64) {
         crate::observe::fail(format!(
             "rt_type5_view_differs sid={surface_id} view={}x{} fmt={:#x} plane={} \
@@ -157,6 +193,35 @@ fn note_rt_type5_view(
             view.width, view.height, view.pixel_format, view.plane_index
         ));
     }
+}
+
+/// Surface ids this ladder has resolved a render target through a *differing*
+/// type-5 view for.
+///
+/// Bounded, and the bound is the whole design: this exists to answer whether one
+/// surface is bound both ways in one boot, and the population it watches was one
+/// member on the boot that made it necessary. Past [`DIFFERED_MAX`] it stops
+/// admitting rather than growing or evicting — an evicting set would answer
+/// "not seen before" for a surface it had forgotten, which is the direction that
+/// reports the repair as safe when it is not. `rt_type5_view_differ_set_full`
+/// says the bound bit, and a boot that reports it has not answered the question.
+const DIFFERED_MAX: usize = 64;
+
+static DIFFERED: std::sync::Mutex<std::collections::BTreeSet<u32>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+fn note_differed(surface_id: u32) {
+    let mut set = DIFFERED.lock().unwrap_or_else(|e| e.into_inner());
+    if set.len() >= DIFFERED_MAX && !set.contains(&surface_id) {
+        crate::runtime::drain::note_store_route("rt_type5_view_differ_set_full");
+        return;
+    }
+    set.insert(surface_id);
+}
+
+fn differed_before(surface_id: u32) -> bool {
+    let set = DIFFERED.lock().unwrap_or_else(|e| e.into_inner());
+    !set.is_empty() && set.contains(&surface_id)
 }
 
 /// Where a colour attachment's `texture_ref` actually resolved to.
@@ -936,6 +1001,35 @@ mod tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
+
+    /// The both-ways watch answers "have I seen this surface through a
+    /// *differing* view", and it must not answer "no" for a surface it merely
+    /// stopped tracking. Forgetting one is the direction that reports the
+    /// format repair as safe on a surface it would break.
+    #[test]
+    fn the_differing_view_watch_stops_admitting_rather_than_forgetting() {
+        // Ids of its own, because the set is process-wide and shared with every
+        // other test in this binary.
+        let base = 0x0100_0000u32;
+        assert!(!differed_before(base), "nothing has been noted for this id");
+        note_differed(base);
+        assert!(differed_before(base));
+
+        // Fill past the bound with ids nothing else uses, then confirm the
+        // first one is still known: a set that evicted to make room would have
+        // dropped it, and that is the answer this watch may not give.
+        for i in 1..=(DIFFERED_MAX as u32 * 2) {
+            note_differed(base + i);
+        }
+        assert!(
+            differed_before(base),
+            "the bound must stop admissions, not evict what is already recorded"
+        );
+        assert!(
+            DIFFERED.lock().unwrap().len() <= DIFFERED_MAX,
+            "the set is bounded"
+        );
+    }
 
     /// A type-4 colour attachment whose mapping carries the decoder's format
     /// refusal must be declined, and every decline must be counted.
