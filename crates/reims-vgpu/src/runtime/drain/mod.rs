@@ -4239,6 +4239,19 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         result.render_attachment_resolves,
                         result.render_guest_stores
                     ));
+                    // What the engine was holding while this tranche waited.
+                    // This line is the only join anywhere between a stalled
+                    // submission and the pipeline objects in it, and a host GPU
+                    // hang is the case it exists for: the counts above say a
+                    // tranche took seconds, and nothing else says what it took
+                    // them on. Emitted beside the count rather than folded into
+                    // it because the two have different lengths and a reader
+                    // greps for one or the other.
+                    if let Some(trail) = crate::runtime::gpu_hang_trail::trail() {
+                        crate::observe::fail(format!(
+                            "TRANSPORT reason=sync_exec_lock_hold_trail ch={channel_id} {trail}"
+                        ));
+                    }
                 }
             }
         }

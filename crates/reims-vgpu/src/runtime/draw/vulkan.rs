@@ -7083,6 +7083,20 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             ));
         }
 
+        // The hang trail, recorded here because this is the last point at which
+        // the guest's pipeline ref and both translated module sizes are in scope
+        // together: past it the engine keys on digests and the ref is gone. See
+        // [`crate::runtime::gpu_hang_trail`] for what reads it and why a counter
+        // could not answer the question.
+        crate::runtime::gpu_hang_trail::note_draw(crate::runtime::gpu_hang_trail::DrawNote {
+            pipeline_ref: req.pipeline_ref,
+            vert_words: v_words.len() as u32,
+            frag_words: f_words.len() as u32,
+            width: w,
+            height: h,
+            vertex_count,
+            instance_count: req.instance_count,
+        });
         resources.vert_spirv = v_words;
         resources.frag_spirv = f_words;
         resources.width = w;
