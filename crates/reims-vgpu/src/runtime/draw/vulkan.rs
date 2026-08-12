@@ -3358,7 +3358,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    _texture_ref: u32,
+    texture_ref: u32,
     tex: &TextureDescriptor,
 ) -> Option<(u32, u32, SampledSourceRequest)> {
     use crate::backend::vulkan::engine;
@@ -3502,7 +3502,6 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("zc_lin_past_allocation");
         return None;
     }
-    // Same coherence rule as the CPU loaders: land any resident-authoritative
     // No settle here, and that is the difference between this rail and the CPU
     // loaders it replaces.
     //
@@ -3520,6 +3519,17 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // `try_type11_sample_zero_copy` and `try_type5_sample_zero_copy` are the two
     // rails that were already written this way, and this one is now consistent
     // with them.
+    //
+    // That argument is about a **submitted** writeback, and it does not extend
+    // to an owed one: a writeback debt is a frame this device rendered and
+    // deliberately did not write down, so there is no command on any queue for
+    // queue order to order and the pages hold the frame before it. The payment
+    // is what puts it on the queue; then the paragraph above applies again.
+    //
+    // Paid through the texture ref, the same call this rail's CPU twin makes,
+    // because a linear texture's bytes may alias a surface this device owes a
+    // frame and only `pay_for_texture` resolves one id namespace to the other.
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
     // Fixed per-texture window: the walk covers exactly the bound span.
     let (gpas, runs) = match task_gva_guest_run_window(state, host, task_id, gva, span) {
         Ok(window) => window,
@@ -3621,6 +3631,22 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     if span < ZERO_COPY_SAMPLED_MIN_BYTES {
         return None;
     }
+    // The owed frame, before anything looks at the pages that owe it.
+    //
+    // The comment on the linear rail explains why this rail needs no *settle* —
+    // a submitted writeback is already ahead of this gather in queue order, so a
+    // CPU fence wait buys nothing. A writeback **debt** is a different object: it
+    // has not been submitted, there is no command for queue order to order, and
+    // the surface's pages hold the frame before the one the resident is holding.
+    // Gathering them without paying binds the guest a stale frame.
+    //
+    // Paid before `note_gather` and not after, because the payment writes those
+    // pages: the witness has to see the write, or it vouches for bytes that
+    // changed underneath the vouch.
+    //
+    // Free when nothing is owed — `pay_for_mapping` is one emptiness check on
+    // the ledger, which is the answer on nearly every call.
+    crate::runtime::writeback_debt::pay_for_mapping(state, host, mid);
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
     let page = state.page_size() as usize;
     let seen = crate::runtime::gather_witness::note_gather(
@@ -3713,6 +3739,9 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     if span < ZERO_COPY_SAMPLED_MIN_BYTES {
         return None;
     }
+    // The owed frame, for the reason `try_type11_sample_zero_copy` states: a
+    // debt is not a submitted writeback and queue order cannot order it.
+    crate::runtime::writeback_debt::pay_for_mapping(state, host, mid);
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
     let page = state.page_size() as usize;
     let seen = crate::runtime::gather_witness::note_gather(
@@ -9007,6 +9036,66 @@ mod vulkan_split_tests {
         assert!(
             crate::runtime::surface_cache::get_shared_with_gen(&state, mid, w, h).is_none(),
             "frame N is still on offer while frame N+1 exists only on the GPU"
+        );
+    }
+
+    /// The type-11 zero-copy sampled rail hands the engine the surface's guest
+    /// pages, so an owed frame has to be written into them first.
+    ///
+    /// The rail is exempt from the *settle* and its comment says why: a
+    /// submitted writeback is already ahead of this gather in queue order. That
+    /// argument does not reach a writeback **debt**, which is not submitted at
+    /// all — there is no command for queue order to order, and the pages hold
+    /// the frame before the one the resident is holding. The exemption was
+    /// written before the debt rail existed and silently took the payment with
+    /// it.
+    #[test]
+    fn the_type11_zero_copy_gather_pays_the_frame_those_pages_owe() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+
+        // Over `ZERO_COPY_SAMPLED_MIN_BYTES`, which is the only gate that has
+        // ever declined this rail: 128x128 RGBA8 is exactly 64 KiB.
+        let (w, h) = (128u32, 128u32);
+        let span = (w * h * 4) as u64;
+        assert!(span >= ZERO_COPY_SAMPLED_MIN_BYTES);
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        // The rail refuses a host whose page views are transient before it ever
+        // builds one — see `type11_zero_copy_declines_transient_host_mappings`.
+        host.stable_map_pages = true;
+        let mid = 913u32;
+        let first_pfn = 0x40u32;
+        let pages = (span >> PAGE_SHIFT_X86) as u32;
+        host.map_range((first_pfn as u64) << PAGE_SHIFT_X86, span as usize, 0);
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = (0..pages)
+                .map(|i| ((first_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+                .collect();
+        }
+        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+
+        let map_generation = state.mappings.get(&mid).unwrap().map_generation;
+        assert!(
+            state
+                .pending_writebacks
+                .arm(mid, w, h, map_generation)
+                .is_none(),
+            "an empty ledger evicts nobody"
+        );
+
+        assert!(
+            try_type11_sample_zero_copy(&mut state, &mut host, mid, w, h).is_some(),
+            "the rail has to take, or this test proves nothing about what it does"
+        );
+        assert!(
+            state.pending_writebacks.get(mid).is_none(),
+            "the gather bound pages still owed a frame this device never wrote down"
         );
     }
 
