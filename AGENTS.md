@@ -564,6 +564,22 @@ is not a rail that passes, and one clean boot of it is not evidence — **band a
 at least six boots before believing a rate**, in both directions. A single green run says nothing,
 and so does a single red one.
 
+### A freeze verdict is a rate too, so an arm that fixes one is confirmed at n≥3
+
+The same rule as the panic rate, on the leg verdicts, and it is easier to forget because a leg that
+has frozen on every boot you have seen reads as deterministic. macos-11's Maps leg froze on thirteen
+consecutive boots and then **passed on its own**, under an arm that froze on both its repeats. One
+`ok` was read as a fix and it was the leg's own pass rate.
+
+Score arms on the asymmetry, which is real and cheap:
+
+- a **FREEZE eliminates** the arm — a candidate that does not fix it at n=1 does not fix it at n=6,
+  so single-boot arms are the right way to work through a list of suspects;
+- an **`ok` confirms nothing** on its own. Repeat the passing arm at least three times, and check a
+  second rail before believing it.
+
+Never report a fix from the boot that first showed it. Queue the repeats first and report once.
+
 ### A boot on a capable host does not exercise the copying rails
 
 Where the import works, every guest window takes it, and the copying rails run zero times — so a
