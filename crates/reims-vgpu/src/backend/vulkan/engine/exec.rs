@@ -5249,14 +5249,23 @@ mod tests {
     /// The invariant the whole type exists for: **where a resident sits does not
     /// tell you what a barrier over it must wait for.**
     ///
-    /// A render pass resolves its primary attachment to `TRANSFER_SRC_OPTIMAL`
-    /// through `final_layout` with no transfer having run, so a resident in that
-    /// layout was last written by a colour attachment write — while a resident a
-    /// present blit or readback just read sits in the *same* layout after a
-    /// transfer read. Two different dependencies, one layout.
+    /// A resident sitting in `TRANSFER_SRC_OPTIMAL` may have been put there by a
+    /// render pass's `final_layout`, with no transfer having run — in which case
+    /// the thing to wait for is a colour attachment write — or by the present
+    /// blit or a readback, in which case it is a transfer read. Two different
+    /// dependencies, one layout.
     ///
     /// Anyone who re-derives a source scope from `layout()` — which is the bug
     /// this replaced, five times over — makes these two agree and fails here.
+    ///
+    /// **The colliding pair is not currently reachable, and the test still
+    /// earns its place.** Since passes exit at
+    /// [`super::caches::COLOR0_PASS_EXIT_LAYOUT`] no two *reachable* variants
+    /// share a layout, so a `layout()`-derived scope would happen to be right
+    /// today. That is a property of one constant, not of the design: the
+    /// constructor still admits `ColorWrite` at any layout, and the last time
+    /// that constant moved it moved *to* a transfer layout. This test is what
+    /// makes the next move safe rather than the sixth instance of the bug.
     #[test]
     fn one_resident_layout_carries_two_different_dependencies() {
         let drawn = ResidentAccess::ColorWrite(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);

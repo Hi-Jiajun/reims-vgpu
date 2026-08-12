@@ -2263,7 +2263,12 @@ pub(super) mod pin_count_tests {
             generation: 1,
             content_ready,
             content_epoch: None,
-            access: ResidentAccess::ColorWrite(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+            // What `registry_mark_ready` actually records, read from the same
+            // constant it reads, so this fixture cannot drift into describing a
+            // resident no pass produces.
+            access: ResidentAccess::ColorWrite(
+                crate::backend::vulkan::engine::caches::COLOR0_PASS_EXIT_LAYOUT,
+            ),
             color_format: translate::pixel::SCANOUT_FORMAT,
             pin_count: 0,
             gpu_only_content: false,
