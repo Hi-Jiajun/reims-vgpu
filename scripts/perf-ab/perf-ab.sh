@@ -100,7 +100,13 @@ for arm in $ARMS; do
   "$REPO/scripts/app-sweep-probe/wait-for-desktop.sh" --timeout 400 \
     || { say "$tag: no desktop"; printf '%s\t%s\tNO-DESKTOP\n' "$round" "$arm" >>"$RESULTS"; \
          pkill -f 'qemu-system-x86_6[4].*reims-vgpu'; sleep 6; continue; }
-  sleep 8
+  # A desktop is not a settled device. One boot scored here read 3.5 Hz and
+  # 1 738 draws/s against a population of 50-58 Hz and 40-54 000 — and its slice
+  # holds 69 `air_loading` records and 6 translates, so the probe window was
+  # spent compiling the guest's shaders rather than drawing with them. The wait
+  # is long enough to put that behind the mark, and the cost is one settle per
+  # boot against an outlier that has to be found and excluded by hand.
+  sleep 25
 
   # Everything before this point is boot noise; the scored window starts here.
   MARK=$(grep -c '' /tmp/reims-vgpu-fail.log)
