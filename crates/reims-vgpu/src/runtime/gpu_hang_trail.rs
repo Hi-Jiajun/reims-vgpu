@@ -163,6 +163,7 @@ static TRAIL: Mutex<Trail> = Mutex::new(Trail {
     pending: Accumulating {
         draws: 0,
         heaviest: None,
+        kept: [None; SUBMIT_DRAWS_KEPT],
     },
     submit_seq: 0,
 });
@@ -335,15 +336,37 @@ pub struct SubmitNote {
     /// reader to a log line that may not exist for that pipeline, and this
     /// record already holds the answer.
     pub heaviest: Option<DrawNote>,
+    /// The first [`SUBMIT_DRAWS_KEPT`] draws in arrival order.
+    ///
+    /// [`Self::heaviest`] alone names one draw out of [`Self::draws`], and a
+    /// wedged submission carrying two of them leaves the reader inferring which
+    /// one hung from which is larger. That inference has been right so far —
+    /// the heaviest draw of the wedging submission is identical field for field
+    /// across independent boots, down to an unusual render extent, which a
+    /// merely-adjacent draw would have no reason to be — but it is an inference,
+    /// and this turns it into a reading. `draws <= SUBMIT_DRAWS_KEPT` means the
+    /// list is the whole submission; above it, `draws` says how much is missing.
+    pub kept: [Option<DrawNote>; SUBMIT_DRAWS_KEPT],
 }
+
+/// Draws recorded per submission, in arrival order.
+///
+/// Four rather than [`super::super::backend`]'s batch cap of 32: the wedged
+/// submissions measured on this rail carry two, so four holds the whole of the
+/// case this exists for while keeping the log line readable. `draws` is always
+/// the true count, so a truncation can never read as a complete list.
+pub const SUBMIT_DRAWS_KEPT: usize = 4;
 
 impl std::fmt::Display for SubmitNote {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "#{} at_draw={} draws={}", self.seq, self.at_draw, self.draws)?;
-        match &self.heaviest {
-            Some(note) => write!(f, " heaviest=[{note}]"),
-            None => Ok(()),
+        if let Some(note) = &self.heaviest {
+            write!(f, " heaviest=[{note}]")?;
         }
+        for (ordinal, note) in self.kept.iter().enumerate().filter_map(|(i, n)| n.map(|n| (i, n))) {
+            write!(f, " d{ordinal}=[{note}]")?;
+        }
+        Ok(())
     }
 }
 
@@ -353,10 +376,17 @@ impl std::fmt::Display for SubmitNote {
 struct Accumulating {
     draws: u32,
     heaviest: Option<DrawNote>,
+    kept: [Option<DrawNote>; SUBMIT_DRAWS_KEPT],
 }
 
 impl Accumulating {
     fn admit(&mut self, note: DrawNote) {
+        // Arrival order, and the *first* few rather than the last: a submission
+        // is attributed at its flush, so keeping the last would drop exactly the
+        // draw that opened the batch.
+        if let Some(slot) = self.kept.get_mut(self.draws as usize) {
+            *slot = Some(note);
+        }
         self.draws = self.draws.saturating_add(1);
         let heavier = match &self.heaviest {
             Some(seen) => note.frag_words > seen.frag_words,
@@ -396,6 +426,7 @@ pub fn note_submit(slot: usize) {
         at_draw,
         draws: acc.draws,
         heaviest: acc.heaviest,
+        kept: acc.kept,
     });
 }
 
@@ -637,6 +668,7 @@ mod tests {
             at_draw: seq * 10,
             draws,
             heaviest: None,
+            kept: [None; SUBMIT_DRAWS_KEPT],
         })
     }
 
@@ -682,6 +714,43 @@ mod tests {
         assert!(
             !line.contains("heaviest"),
             "no draw means no heaviest module to name: {line}"
+        );
+    }
+
+    /// A wedged submission carrying two draws must name both, or the reader is
+    /// left inferring which of them hung from which is larger.
+    #[test]
+    fn a_submission_keeps_its_draws_in_arrival_order() {
+        let mut acc = Accumulating::default();
+        for pipeline_ref in 1..=3 {
+            acc.admit(DrawNote {
+                pipeline_ref,
+                ..DrawNote::default()
+            });
+        }
+        let kept: Vec<u32> = acc.kept.iter().flatten().map(|n| n.pipeline_ref).collect();
+        assert_eq!(kept, [1, 2, 3], "arrival order, first-in");
+    }
+
+    /// Past the bound the list truncates, and `draws` is what says so — a
+    /// truncated list must never read as a complete submission.
+    #[test]
+    fn a_submission_past_the_kept_bound_still_reports_its_true_count() {
+        let mut acc = Accumulating::default();
+        for pipeline_ref in 0..(SUBMIT_DRAWS_KEPT as u32 + 3) {
+            acc.admit(DrawNote {
+                pipeline_ref,
+                ..DrawNote::default()
+            });
+        }
+        assert_eq!(acc.draws, SUBMIT_DRAWS_KEPT as u32 + 3);
+        assert_eq!(acc.kept.iter().flatten().count(), SUBMIT_DRAWS_KEPT);
+        let kept: Vec<u32> = acc.kept.iter().flatten().map(|n| n.pipeline_ref).collect();
+        assert_eq!(
+            kept,
+            (0..SUBMIT_DRAWS_KEPT as u32).collect::<Vec<_>>(),
+            "the first are kept, not the last — a submission is attributed at \
+             its flush and the opening draw is the one worth keeping"
         );
     }
 
