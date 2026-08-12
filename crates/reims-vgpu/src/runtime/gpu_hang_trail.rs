@@ -67,52 +67,38 @@ pub struct DrawNote {
     pub height: u32,
     pub vertex_count: u32,
     pub instance_count: u32,
-    /// Set-0 bindings under [`MASK_BINDINGS`] the fragment module carries a
-    /// `Binding` decoration for.
+    /// Distinct set-0 bindings the fragment module carries a `Binding`
+    /// decoration for.
     pub frag_declared: u32,
-    /// Set-0 bindings under [`MASK_BINDINGS`] this draw will put in the
-    /// descriptor set layout.
+    /// Distinct bindings this draw will put in the descriptor set layout.
     pub frag_provided: u32,
+    /// Of [`Self::frag_declared`], how many the layout will not describe.
+    pub frag_gap: u32,
+    /// The lowest [`GAP_KEPT`] of them, so the line names the binding and not
+    /// only its count. Zero-padded past `min(frag_gap, GAP_KEPT)`.
+    pub frag_gap_lo: [u32; GAP_KEPT],
 }
 
-impl DrawNote {
-    /// Bindings the module carries and the layout will not describe.
-    ///
-    /// Vulkan requires a descriptor for every resource a shader **statically
-    /// uses**, and a declared-but-never-referenced variable is legal to omit —
-    /// so this is a superset of the violation and not the violation itself. It
-    /// is the cheap question, asked per draw; `descriptor_static_use` is the
-    /// exact one and cannot answer for a storage buffer at all, which is
-    /// precisely the class the trail was built to look at.
-    pub fn frag_gap(self) -> u32 {
-        self.frag_declared & !self.frag_provided
-    }
-}
-
-/// How many binding numbers the two masks cover.
+/// Gap binding numbers carried per entry.
 ///
-/// The bands this device relocates into put buffers below 32, sampled images at
-/// 32+ and samplers at 64+, so a `u32` reaches every buffer binding and the low
-/// end of the texture band. That is the range the hang trail is about: the
-/// question it exists to ask is which *buffer* a loop bound came from. A
-/// binding above it is simply not represented, which is why the mask is named
-/// for its width rather than described as complete.
-pub const MASK_BINDINGS: u32 = 32;
-
-/// One binding as a mask bit, or nothing when it is out of the mask's range.
-pub fn mask_bit(binding: u32) -> u32 {
-    if binding < MASK_BINDINGS {
-        1u32 << binding
-    } else {
-        0
-    }
-}
+/// Counts, not a bitmask: this device relocates a fragment stage's buffers to
+/// 256+ and its sampled resources to 288+, so the numbers reach past 320 and a
+/// mask wide enough to hold them would be four words per entry to answer a
+/// question whose interesting answer is "which one". Four is what fits the log
+/// line beside everything else, and `frag_gap` says when it is a truncation.
+///
+/// The first version of this *was* a `u32` mask and it read `fdecl=0x0` on every
+/// draw of the shader it was built to look at — not because the module declares
+/// nothing, but because every binding it declares is above 255. The count is
+/// recorded here rather than in a commit body because that is the shape of
+/// mistake a reader of this field is most likely to repeat.
+pub const GAP_KEPT: usize = 4;
 
 impl std::fmt::Display for DrawNote {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "pipe={} vw={} fw={} {}x{} vtx={} inst={} fdecl={:#x} fprov={:#x} fgap={:#x}",
+            "pipe={} vw={} fw={} {}x{} vtx={} inst={} fdecl={} fprov={} fgap={}{}",
             self.pipeline_ref,
             self.vert_words,
             self.frag_words,
@@ -122,9 +108,45 @@ impl std::fmt::Display for DrawNote {
             self.instance_count,
             self.frag_declared,
             self.frag_provided,
-            self.frag_gap()
+            self.frag_gap,
+            if self.frag_gap == 0 {
+                String::new()
+            } else {
+                format!(
+                    "{:?}",
+                    &self.frag_gap_lo[..(self.frag_gap as usize).min(GAP_KEPT)]
+                )
+            }
         )
     }
+}
+
+
+/// The bindings a module declares that a layout will not describe: the count,
+/// and the lowest [`GAP_KEPT`] of them.
+///
+/// Vulkan requires a descriptor for every resource a shader **statically uses**,
+/// and a declared-but-never-referenced variable is legal to omit — so this is a
+/// superset of the violation and not the violation itself. It is the cheap
+/// question, asked per draw. `spirv_bind::descriptor_static_use` is the exact
+/// one and answers `NotDeclared` for anything that is not a `UniformConstant`,
+/// which by construction excludes every storage buffer — and a storage buffer is
+/// precisely the class this was built to look at.
+pub fn gap(declared: &[u32], provided: &[u32]) -> (u32, [u32; GAP_KEPT]) {
+    let mut count = 0u32;
+    let mut lo = [0u32; GAP_KEPT];
+    let mut missing: Vec<u32> = declared
+        .iter()
+        .copied()
+        .filter(|b| !provided.contains(b))
+        .collect();
+    missing.sort_unstable();
+    missing.dedup();
+    for (slot, binding) in lo.iter_mut().zip(missing.iter()) {
+        *slot = *binding;
+    }
+    count += missing.len() as u32;
+    (count, lo)
 }
 
 /// The ring. A `Mutex` rather than a lock-free structure because every writer is
@@ -257,34 +279,23 @@ mod tests {
         assert!(first_at < last_at, "oldest first: {line}");
     }
 
-    /// The gap is what the layout will not describe, and a binding past the
-    /// mask's width is represented by neither side — so it can never appear as
-    /// a phantom gap, which is the one wrong answer this mask could give.
+    /// A gap is counted in one direction only: a layout may legally carry a
+    /// descriptor the module never mentions, and only the reverse is a
+    /// specification violation. The kept list is a truncation of the count and
+    /// says so by disagreeing with it.
     #[test]
-    fn a_binding_past_the_masks_width_is_absent_from_both_sides() {
-        assert_eq!(mask_bit(0), 1);
-        assert_eq!(mask_bit(MASK_BINDINGS - 1), 1 << (MASK_BINDINGS - 1));
-        assert_eq!(mask_bit(MASK_BINDINGS), 0, "out of range contributes nothing");
-        assert_eq!(mask_bit(96), 0, "a sampler band binding is out of range");
+    fn the_gap_is_declared_minus_provided_and_names_its_lowest_members() {
+        let g = gap(&[0, 256, 258, 288, 290, 320], &[0, 256, 288]);
+        assert_eq!(g.0, 3, "258, 290 and 320 are unlaid out");
+        assert_eq!(g.1[..3], [258, 290, 320]);
 
-        // A module declaring one in-range and one out-of-range binding, with
-        // neither provided: only the in-range one can be reported.
-        let note = DrawNote {
-            frag_declared: mask_bit(0) | mask_bit(96),
-            frag_provided: 0,
-            ..DrawNote::default()
-        };
-        assert_eq!(note.frag_gap(), 1);
+        let none = gap(&[1, 2], &[1, 2, 3]);
+        assert_eq!(none.0, 0, "provided-but-not-declared is not a gap");
 
-        // Provided-but-not-declared is not a gap. A layout may legally carry a
-        // descriptor the module never mentions; only the other direction is a
-        // specification violation.
-        let extra = DrawNote {
-            frag_declared: mask_bit(1),
-            frag_provided: mask_bit(1) | mask_bit(2),
-            ..DrawNote::default()
-        };
-        assert_eq!(extra.frag_gap(), 0);
+        let many: Vec<u32> = (100..110).collect();
+        let over = gap(&many, &[]);
+        assert_eq!(over.0, 10, "the count is the whole gap");
+        assert_eq!(over.1, [100, 101, 102, 103], "the list is its lowest four");
     }
 
     /// The bands tile the whole `u32`, so no module size is uncounted, and the

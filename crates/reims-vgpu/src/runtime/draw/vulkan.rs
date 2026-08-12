@@ -7083,6 +7083,26 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             ));
         }
 
+        // Asked of the module rather than of m2v's reflection, which is the
+        // whole point: the render path's existing unbound guard walks
+        // `f_shader.reflection.bindings`, so a binding the translated SPIR-V
+        // carries and the reflection omits is checked by nothing.
+        // `descriptor_static_use` cannot close it either — it answers
+        // `NotDeclared` for anything that is not a `UniformConstant`, which by
+        // construction excludes every storage buffer.
+        let frag_declared_bindings =
+            crate::runtime::spirv_bind::declared_binding_numbers(&f_words);
+        let frag_layout_bindings: Vec<u32> = resources
+            .storage_buffers
+            .iter()
+            .map(|s| s.binding)
+            .chain(resources.sampled_images.iter().map(|i| i.binding))
+            .chain(resources.samplers.iter().map(|s| s.binding))
+            .collect();
+        let frag_gap = crate::runtime::gpu_hang_trail::gap(
+            &frag_declared_bindings,
+            &frag_layout_bindings,
+        );
         // The hang trail, recorded here because this is the last point at which
         // the guest's pipeline ref and both translated module sizes are in scope
         // together: past it the engine keys on digests and the ref is gone. See
@@ -7103,19 +7123,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // `descriptor_static_use` cannot close it either — it answers
             // `NotDeclared` for anything that is not a `UniformConstant`, which
             // by construction excludes every storage buffer.
-            frag_declared: crate::runtime::spirv_bind::declared_binding_numbers(&f_words)
-                .into_iter()
-                .fold(0u32, |m, b| m | crate::runtime::gpu_hang_trail::mask_bit(b)),
+            frag_declared: frag_declared_bindings.len() as u32,
             // What the engine will build the layout from: the storage binds this
             // draw resolved, at the numbers they will carry, plus the textures
             // and samplers it provided at theirs.
-            frag_provided: resources
-                .storage_buffers
-                .iter()
-                .map(|s| s.binding)
-                .chain(resources.sampled_images.iter().map(|i| i.binding))
-                .chain(resources.samplers.iter().map(|s| s.binding))
-                .fold(0u32, |m, b| m | crate::runtime::gpu_hang_trail::mask_bit(b)),
+            frag_provided: frag_layout_bindings.len() as u32,
+            frag_gap: frag_gap.0,
+            frag_gap_lo: frag_gap.1,
         });
         resources.vert_spirv = v_words;
         resources.frag_spirv = f_words;
