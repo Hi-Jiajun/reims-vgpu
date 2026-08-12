@@ -12,10 +12,13 @@
 # is; nobody is logged in. A whole rail was reported NO-DESKTOP for it.
 #
 # The console user is the discriminator and it costs one ssh round trip:
-# `stat -f%Su /dev/console` is `root` at the login window and the account name
-# once a session owns the console. So this waits, and when it finds the console
-# owned by root it types the password at the login window through QMP — host
-# side, because the guest cannot log itself in.
+# `stat -f%Su /dev/console` names the account once a session owns the console.
+# Before that it is a *system* account, and which one is not stable — the usual
+# answer is `root`, but a macos-11 guest whose WindowServer had aborted answered
+# `_windowserver`, measured live. So the test is not "is it root": it is "is it
+# an account a person could log in as", and every system answer — `root`, any
+# leading-underscore daemon account, or an empty string from an ssh that did not
+# land — counts as nobody being logged in.
 #
 # Usage:
 #   scripts/app-sweep-probe/wait-for-desktop.sh [--timeout N] [--password P]
@@ -62,12 +65,15 @@ while [ "$SECONDS" -lt "$deadline" ]; do
   fi
 
   console=$(gssh 'stat -f%Su /dev/console' || true)
+  # An empty answer is an ssh that did not land, not a verdict: say nothing and
+  # come round again rather than typing a password at a guest we cannot see.
+  [ -z "$console" ] && { sleep 10; continue; }
   case "$console" in
-    root)
-      state=login-window
+    root|_*)
+      state="login-window (console $console)"
       if [ "$attempts" -lt 2 ]; then
         attempts=$((attempts + 1))
-        say "console is owned by root — the login window; typing the password (attempt $attempts)"
+        say "console is owned by '$console' — nobody is logged in; typing the password (attempt $attempts)"
         # A single-account login window comes up with the password field focused,
         # so attempt one just types. If that did not take, the window was showing
         # the user *list* instead and the characters went nowhere: a Return picks
@@ -80,7 +86,8 @@ while [ "$SECONDS" -lt "$deadline" ]; do
         sleep 20
       fi
       ;;
-    '') state=${state} ;;   # ssh did not answer this round; say nothing new
+    # A real account owns the console, so someone is logged in and the desktop is
+    # merely still coming up. Nothing to do but wait.
     *) state="logged-in-as-$console" ;;
   esac
   sleep 10
