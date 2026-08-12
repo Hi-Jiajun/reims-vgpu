@@ -9,13 +9,20 @@ handover must say so.** Not "identify the driver arm that avoids it" — *fix th
 supplies* so the hang stops happening. An environment switch that dodges it is a diagnosis, never a
 resolution. Correctness and performance work continues only where it does not delay this.
 
-**The mechanism is now known and it is ours.** The guest's compositing fragment shader walks a
-pointer chain stored *inside a sampled image* — `uv <- sample(uv).xy`, continuing while
+**The mechanism is known; which input supplies it is not.** The guest's compositing fragment shader
+walks a pointer chain stored *inside a sampled image* — `uv <- sample(uv).xy`, continuing while
 `sample(uv).x > 0`, with no counter and no second exit. A zeroed image exits on the first iteration;
-**garbage never terminates**. This device recycles sampled-image slots without defining them and
-uploads sub-rects into them, so a chase that leaves the uploaded window reads the previous
-texture's texels. The standing invariant that follows: **never let the GPU sample an image whose
-contents this device has not defined.**
+**garbage never terminates**. The standing invariant that follows: **never let the GPU sample an
+image whose contents this device has not defined.**
+
+The first candidate for supplying that garbage — a pooled sampled slot recycled and then only
+partly overwritten — is **refuted**: every sampled upload here is full-extent, every length is
+validated before the copy, the pooled staging buffer zero-fills its remainder, and no memo outlives
+the recycle of the image it names. `kb/the-sampled-image-is-defined-everywhere-except-the-gathered-vouch.md`
+carries the full trace and the two real holes it did find. What is left un-eliminated is the one
+bind made with nothing read and nothing compared — the gathered sampled cache's identity-only
+lookup, whose correctness is entirely `runtime::gather_witness`. It now has a switch:
+`REIMS_VGPU_SAMPLED_IDENTITY=off`.
 
 Where it stands, in reading order:
 
@@ -32,12 +39,22 @@ Where it stands, in reading order:
 
 Two rules that have each already cost a session a wrong answer:
 
-- **Read the first wedge only.** Every later `vk_engine_fence_wedged` line in a boot names work
-  queued behind a device that is already lost. Ranking them is how the uber shader was called a
-  passenger.
+- **Read the first wedge only — and inside it, the oldest submission.** Every later
+  `vk_engine_fence_wedged` line in a boot names work queued behind a device that is already lost;
+  ranking them is how the uber shader was once called a passenger. The same mistake is available one
+  level down, because the line that prints first names the slot whose *wait* expired and not
+  necessarily the submission that hung. macos-12's Launchpad wedge prints `slot=0 held=#66928` with
+  a 1 196-word shader, and the `_queue` line beside it reads `outstanding=6` naming `slot=6 #66926`
+  — an older submission, carrying the uber shader. **Rank by the lowest submission number in the
+  `_queue` line**, not by print order.
 - **A FREEZE eliminates an arm; an `ok` confirms nothing.** The leg's measured baseline pass rate is
   0/5, so one passing boot is not a fix — confirm at n>=3 and on a second rail before reporting one.
   See the freeze-verdict rule under `## Verification`.
+
+**There is a second rail.** macos-12's `Launchpad->Screenshot` leg wedges on its own copy of the
+same uber shader (98 430 words against macos-11's 95 212), at 1920x1080. A candidate fix now has two
+rails to be checked on rather than one — see
+`kb/macos-12-launchpad-wedges-on-the-same-uber-shader.md` for the four-rail baseline table.
 
 This section goes when the hang goes, and not before.
 
