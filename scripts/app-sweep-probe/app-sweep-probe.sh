@@ -163,7 +163,8 @@ PREV_APP=""
 # One app: launch it, drive it, photograph it, and read the slice of the fail
 # log it produced. Everything that can fail says which failure it was.
 run_app() {
-  local app="$1" secs="$2" slug shot off gap cad_n hz_min hz_med drain_n alarms hash live
+  local app="$1" secs="$2" slug off gap cad_n hz_min hz_med drain_n alarms live
+  local shot="" hash=""
   slug=$(echo "$app" | tr 'A-Z ' 'a-z-')
 
   off=$(stat -c %s "$FAILLOG")
@@ -196,11 +197,19 @@ run_app() {
     qmp wheel up 12 0.03
   done
 
-  if [ -n "$SHOTS" ]; then
-    shot="$SHOTS/${RAIL:-rail}-$slug.png"
-    "$REPO/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh" \
-      -o "$shot" >/dev/null 2>&1 || shot=""
-    [ -n "$shot" ] && [ -f "$shot" ] && hash=$(sha256sum "$shot" | cut -c1-16) || hash=""
+  # Photographed unconditionally, because the frame is evidence and not a
+  # keepsake: two consecutive apps hashing identically is this probe's only
+  # detector for a host window that has stopped updating while the census keeps
+  # ticking from another thread. Gating it on `--shots` disabled the detector on
+  # exactly the run that exists to find hangs. `--shots` chooses whether the
+  # frame is *kept*, not whether it is taken.
+  shot="$WORK/$slug.png"
+  if "$REPO/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh" \
+    -o "$shot" >/dev/null 2>&1 && [ -f "$shot" ]; then
+    hash=$(sha256sum "$shot" | cut -c1-16)
+    [ -n "$SHOTS" ] && cp -f "$shot" "$SHOTS/${RAIL:-rail}-$slug.png"
+  else
+    shot=""
   fi
 
   # Is the guest still there? A panic is the boot script's verdict to report,
@@ -284,14 +293,36 @@ fi
 # the blurred full-screen layer, with Launchpad tearing down underneath it. That
 # teardown-plus-launch is the step that has to survive, not the blur.
 #
-# F4 is the stock Launchpad binding on every rail here.
+# It is opened with `open -a Launchpad` and not with F4. F4 is the glyph on an
+# Apple keyboard, where the key sends a HID *consumer* usage that macOS routes to
+# Launchpad; QMP's usb-kbd sends the plain F4 keycode, which is bound to nothing.
+# Photographed on macos-13 and macos-14: the desktop did not change, the eight
+# characters below went into whichever app was still frontmost, and the leg
+# reported on a Maps dialog for as long as the comment here claimed F4 was "the
+# stock binding on every rail". LaunchServices is the one route that behaves the
+# same on all four rails, and it needs no Apple Events consent.
+#
+# The frame before and after says whether it opened. A full-screen blur is the
+# largest composite these guests perform, so an identical hash across it means
+# nothing happened — either Launchpad did not come up, or the window is stuck,
+# and both are results this leg must not report as a pass.
 say "Launchpad -> Screenshot"
 off=$(stat -c %s "$FAILLOG")
-qmp key f4
+BEFORE="$WORK/launchpad-before.png"
+"$REPO/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh" \
+  -o "$BEFORE" >/dev/null 2>&1 || true
+gssh 20 'open -a Launchpad' || true
 sleep 5
-if [ -n "$SHOTS" ]; then
-  "$REPO/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh" \
-    -o "$SHOTS/${RAIL:-rail}-launchpad.png" >/dev/null 2>&1 || true
+LP_SHOT="$WORK/launchpad.png"
+LP_OPENED=unknown
+if "$REPO/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh" \
+  -o "$LP_SHOT" >/dev/null 2>&1 && [ -f "$LP_SHOT" ] && [ -f "$BEFORE" ]; then
+  if [ "$(sha256sum <"$BEFORE" | cut -c1-16)" = "$(sha256sum <"$LP_SHOT" | cut -c1-16)" ]; then
+    LP_OPENED=no
+  else
+    LP_OPENED=yes
+  fi
+  [ -n "$SHOTS" ] && cp -f "$LP_SHOT" "$SHOTS/${RAIL:-rail}-launchpad.png"
 fi
 # Launchpad's search field has focus the moment it opens, so the characters go
 # to it without a click. One per keystroke re-filter, then Return launches the
@@ -320,8 +351,14 @@ read -r gap cad_n hz_min hz_med drain_n alarms < <(
 verdict=ok
 # A Launchpad that opened, filtered and launched nothing is not a device
 # failure, but it is not a pass either — it means the step this leg exists to
-# exercise did not happen, and the counters below are a blurred desktop's.
+# exercise did not happen, and the counters below are a blurred desktop's. The
+# two are reported apart because they are two different failures: NO-LAUNCHPAD
+# is the trigger, NO-LAUNCH is the Return.
+# NO-LAUNCH is asserted first so NO-LAUNCHPAD can overwrite it: a Launchpad that
+# never opened cannot have launched anything, and the root cause is the one to
+# report.
 [ "$LAUNCHED" = yes ] || { verdict=NO-LAUNCH; FAILED=1; }
+[ "$LP_OPENED" = no ] && { verdict=NO-LAUNCHPAD; FAILED=1; }
 awk -v g="$gap" -v f="$FREEZE_GAP_S" 'BEGIN{exit !(g > f)}' && { verdict=FREEZE; FAILED=1; }
 gssh 15 true || { verdict=GUEST-GONE; FAILED=1; }
 printf 'Launchpad->Screenshot\t%s\t%s\t%s\t%s\t%s\n' \
