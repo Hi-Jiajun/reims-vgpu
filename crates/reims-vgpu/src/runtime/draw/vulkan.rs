@@ -5429,21 +5429,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 continue;
             }
             let allow_zc = !bind_plan.is_constant_step(b.index);
-            // The vertex shader's own reflection bounds its own `[[buffer(n)]]`
-            // binds. A buffer feeding `[[stage_in]]` is a vertex *attribute*
-            // rather than a declared argument, so reflection lists no Buffer at
-            // its index and the lookup declines to narrow it — which is correct
-            // twice over, because the vertex descriptor's stride is what would
-            // bound one of those and it is a different number.
-            let cap = crate::runtime::spirv_bind::reflected_buffer_extent(
-                &v_shader.reflection,
-                b.index,
-            );
-            let access = crate::runtime::spirv_bind::reflected_buffer_access(
-                &v_shader.reflection,
-                b.index,
-            );
-            crate::runtime::bind_phase::note_access(access);
             // A vertex buffer is read twice on this path — as the declared
             // argument reflection describes, and as the byte source for every
             // stage-in attribute naming this index, which it does not. Only the
@@ -5451,6 +5436,19 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // attribute list names keeps its guest bytes whatever reflection
             // says about the argument.
             let feeds_stage_in = bind_plan.feeds_stage_in(b.index);
+            // The vertex shader's own reflection bounds its own `[[buffer(n)]]`
+            // binds, and a stage-in index is excluded — see that function's doc
+            // for why the exclusion is not implied by the translator's output.
+            let cap = crate::runtime::spirv_bind::vertex_buffer_extent(
+                &v_shader.reflection,
+                b.index,
+                feeds_stage_in,
+            );
+            let access = crate::runtime::spirv_bind::reflected_buffer_access(
+                &v_shader.reflection,
+                b.index,
+            );
+            crate::runtime::bind_phase::note_access(access);
             let content = if crate::runtime::spirv_bind::may_serve_neutral(access, feeds_stage_in) {
                 crate::runtime::bind_phase::note_neutral_served();
                 crate::backend::vulkan::engine::BufferContent::Bytes(

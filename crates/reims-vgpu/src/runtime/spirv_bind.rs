@@ -2518,6 +2518,36 @@ pub fn may_serve_neutral(access: ReflectedBufferAccess, feeds_stage_in: bool) ->
         && !unused_binds_disabled()
 }
 
+/// [`reflected_buffer_extent`] for a **vertex** bind, carrying the same stage-in
+/// exclusion [`may_serve_neutral`] does and for the same reason.
+///
+/// Metal's vertex-descriptor layouts and its buffer argument table share one
+/// index space, so a vertex function may declare a bounded argument at an index
+/// the pipeline also uses as a vertex layout — which is why Apple's guidance is
+/// to place vertex buffers at high indices, and why the collision is legal
+/// rather than a decode error. Reflection then reports an `Object` whose size
+/// bounds the *argument*, and applying it truncates the *stream*: a few bytes
+/// staged where kilobytes were asked for, an attribute walk that picks the
+/// truncated content out for every attribute naming that index, and a draw that
+/// rasterises nothing or garbage. The `StageInBytesMissing` guard downstream
+/// fires only on an *empty* stream, so it does not catch a short one.
+///
+/// The two rails that narrow a vertex bind now spell one exclusion once. They
+/// were spelled apart, and the extent's call site rested on the argument
+/// [`may_serve_neutral`]'s own doc states and rejects — "the translator lists no
+/// `Buffer` at a pure stage-in index, so in principle such a bind classifies
+/// `Undeclared` and never reaches here".
+pub fn vertex_buffer_extent(
+    reflection: &ShaderReflection,
+    metal_index: u32,
+    feeds_stage_in: bool,
+) -> Option<u64> {
+    if feeds_stage_in {
+        return None;
+    }
+    reflected_buffer_extent(reflection, metal_index)
+}
+
 /// How reflection describes a `[[buffer(n)]]` bind's use by this stage.
 ///
 /// The asymmetry is the same one [`reflected_buffer_extent`] states, and for a
@@ -3280,6 +3310,41 @@ mod tests {
         assert_eq!(reflected_buffer_extent(&r, 2), None, "an undecided extent");
         assert_eq!(reflected_buffer_extent(&r, 3), None, "no extent carried");
         assert_eq!(reflected_buffer_extent(&r, 9), None, "not declared at all");
+    }
+
+    /// A vertex index the pipeline also uses as a `[[stage_in]]` layout takes no
+    /// extent, however confidently reflection describes the argument at it.
+    ///
+    /// One index space, two uses: reflection's `Object` bounds the declared
+    /// argument, and the same index is the byte source for every attribute
+    /// naming it. Applying the argument's bound to the stream stages a few bytes
+    /// where kilobytes were asked for, and the only guard downstream fires on an
+    /// *empty* stream rather than a short one.
+    ///
+    /// The sibling rail — [`may_serve_neutral`] — has carried this exclusion
+    /// from the start, and its doc rejects in as many words the argument the
+    /// extent rail was resting on. This asserts they now agree.
+    #[test]
+    fn a_vertex_stream_index_is_not_bounded_by_the_argument_declared_at_it() {
+        let mut r = empty_reflection(ShaderStage::Vertex);
+        r.bindings = vec![buffer_binding(3, Some(BufferExtent::Object { bytes: 64 }))];
+
+        assert_eq!(
+            vertex_buffer_extent(&r, 3, false),
+            Some(64),
+            "a declared argument that feeds no attribute keeps its bound"
+        );
+        assert_eq!(
+            vertex_buffer_extent(&r, 3, true),
+            None,
+            "the same index feeding stage-in must keep the whole stream — 64 \
+             bytes of a vertex buffer rasterises garbage and declines nothing"
+        );
+        assert!(
+            !may_serve_neutral(ReflectedBufferAccess::Unused, true),
+            "the two vertex narrowing rails have to agree on the exclusion, \
+             which is the whole point of it living beside this one"
+        );
     }
 
     /// A `metal_index` is unique only within a resource family, so the lookup
