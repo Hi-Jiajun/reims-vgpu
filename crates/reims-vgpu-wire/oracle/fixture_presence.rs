@@ -36,15 +36,15 @@ fn probe_wire_fixtures(default_dir: &str) {
     let dir = std::env::var("REIMS_WIRE_FIXTURES_DIR").unwrap_or_else(|_| default_dir.to_string());
     let required = std::env::var("REIMS_WIRE_FIXTURES_REQUIRED").is_ok();
 
+    let mut absent = false;
+
     for (file, cfg) in [
         ("fixtures.json", "wire_fixtures"),
         ("inventory.json", "wire_inventory"),
     ] {
         let path = format!("{dir}/{file}");
-        // Cargo re-runs on a watched path appearing as well as changing, so a
-        // capture taken after the build is picked up without a manual touch.
-        println!("cargo:rerun-if-changed={path}");
         if std::path::Path::new(&path).is_file() {
+            println!("cargo:rerun-if-changed={path}");
             println!("cargo:rustc-cfg={cfg}");
         } else if required {
             // The runtime assertion this replaces cannot fire any more — an
@@ -54,6 +54,33 @@ fn probe_wire_fixtures(default_dir: &str) {
                 "REIMS_WIRE_FIXTURES_REQUIRED is set but there is no {file} at \
                  {dir}; regenerate with scripts/wire-oracle/wire-oracle.sh"
             );
+        } else {
+            absent = true;
+        }
+    }
+
+    if absent {
+        // Watch the *containing directory* for the outputs that are not there
+        // yet, never the absent file by name. Cargo cannot stat a missing
+        // watched path, reads that as changed, and so marks the build script
+        // dirty on every single build — and since a dependent's fingerprint
+        // includes its build script's, naming an absent file here recompiled
+        // this crate, `reims-vgpu` and `reims-vgpu-paging` on every invocation
+        // on every checkout without the fixtures, which is every non-Apple one.
+        // A directory's recorded mtime moves when a file is created inside it,
+        // so watching the nearest one that exists keeps the property the
+        // by-name watch was for: a capture taken after a build is picked up
+        // without a manual touch. Climb at most one level, so a
+        // REIMS_WIRE_FIXTURES_DIR pointing into a tree that does not exist
+        // watches nothing rather than walking some huge ancestor.
+        let dir = std::path::Path::new(&dir);
+        let watch = if dir.is_dir() {
+            Some(dir)
+        } else {
+            dir.parent().filter(|parent| parent.is_dir())
+        };
+        if let Some(watch) = watch {
+            println!("cargo:rerun-if-changed={}", watch.display());
         }
     }
 }
