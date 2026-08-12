@@ -17,8 +17,10 @@
 #               so its draws arrive in bursts separated by real idle
 #   Contacts    a split view with a vibrancy sidebar (the material rail)
 #   Reminders   list animation and sheet presentation
-#   Launchpad   a full-screen blur of the whole desktop, which is the largest
-#               single composite any of these guests performs
+#   Launchpad   a full-screen blur of the whole desktop — the largest single
+#               composite any of these guests performs — then a live re-filter
+#               of the icon grid on every keystroke, and finally a real app
+#               launch (Screenshot.app) out of that layer as it tears down
 #
 # # What counts as a failure
 #
@@ -230,10 +232,20 @@ if [ "$TORTURE_SECONDS" -gt 0 ]; then
   sleep 2
 fi
 
-# Launchpad last: it blurs whatever is on the desktop, so running it after the
-# apps have been opened and closed exercises a larger composite than running it
-# against a bare wallpaper would. F4 is the stock binding on every rail here.
-say "Launchpad"
+# Launchpad last, and it is two composites rather than one. Opening it blurs
+# whatever is on the desktop — the largest single composite these guests
+# perform, and larger here than against a bare wallpaper because the apps above
+# have been opened and closed behind it. Then typing into it *re-filters the
+# grid live on every keystroke*, which is a second and quite different load:
+# icons fading out and the survivors re-laid-out, once per character.
+#
+# So the run does not stop at a photograph of Launchpad. It types `screenshot`
+# and presses Return, which launches Screenshot.app — a real app launch out of
+# the blurred full-screen layer, with Launchpad tearing down underneath it. That
+# teardown-plus-launch is the step that has to survive, not the blur.
+#
+# F4 is the stock Launchpad binding on every rail here.
+say "Launchpad -> Screenshot"
 off=$(stat -c %s "$FAILLOG")
 qmp key f4
 sleep 5
@@ -241,19 +253,44 @@ if [ -n "$SHOTS" ]; then
   "$REPO/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh" \
     -o "$SHOTS/${RAIL:-rail}-launchpad.png" >/dev/null 2>&1 || true
 fi
+# Launchpad's search field has focus the moment it opens, so the characters go
+# to it without a click. One per keystroke re-filter, then Return launches the
+# first hit.
+qmp type 'screenshot'
+sleep 3
+qmp key ret
+sleep 6
+if [ -n "$SHOTS" ]; then
+  "$REPO/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh" \
+    -o "$SHOTS/${RAIL:-rail}-launchpad-screenshot-app.png" >/dev/null 2>&1 || true
+fi
+# Asked before the dismissal below, not after: Escape tears the capture UI down
+# and this is the only evidence that the Return landed on Screenshot rather than
+# on whatever else the grid had filtered to.
+LAUNCHED=no
+gssh 15 "pgrep -x Screenshot >/dev/null 2>&1 || pgrep -f 'Screenshot\.app' >/dev/null 2>&1" \
+  && LAUNCHED=yes
+# Screenshot.app comes up as a floating capture bar over the desktop rather than
+# a window, so it is dismissed with Escape and not with Command-Q.
 qmp key esc
 sleep 2
 tail -c "+$((off + 1))" "$FAILLOG" >"$WORK/launchpad.log"
 read -r gap cad_n hz_min hz_med drain_n alarms < <(
   python3 "$REPO/scripts/app-sweep-probe/read_window.py" "$WORK/launchpad.log")
 verdict=ok
+# A Launchpad that opened, filtered and launched nothing is not a device
+# failure, but it is not a pass either — it means the step this leg exists to
+# exercise did not happen, and the counters below are a blurred desktop's.
+[ "$LAUNCHED" = yes ] || { verdict=NO-LAUNCH; FAILED=1; }
 awk -v g="$gap" -v f="$FREEZE_GAP_S" 'BEGIN{exit !(g > f)}' && { verdict=FREEZE; FAILED=1; }
 gssh 15 true || { verdict=GUEST-GONE; FAILED=1; }
-printf 'Launchpad\t%s\t%s\t%s\t%s\t%s\n' "$verdict" "$hz_med" "$hz_min" "$gap" "$alarms" >>"$VERDICTS"
-say "Launchpad: $verdict  present_hz med=$hz_med min=$hz_min  worst census gap=${gap}s  alarms=$alarms"
+printf 'Launchpad->Screenshot\t%s\t%s\t%s\t%s\t%s\n' \
+  "$verdict" "$hz_med" "$hz_min" "$gap" "$alarms" >>"$VERDICTS"
+say "Launchpad -> Screenshot: $verdict  screenshot_app_launched=$LAUNCHED  \
+present_hz med=$hz_med min=$hz_min  worst census gap=${gap}s  alarms=$alarms"
 
 echo
-echo "app                verdict                     hz_med  hz_min  gap_s  alarms"
-awk -F'\t' '{printf "%-18s %-27s %-7s %-7s %-6s %s\n", $1, $2, $3, $4, $5, $6}' "$VERDICTS"
+echo "app                   verdict                     hz_med  hz_min  gap_s  alarms"
+awk -F'\t' '{printf "%-21s %-27s %-7s %-7s %-6s %s\n", $1, $2, $3, $4, $5, $6}' "$VERDICTS"
 [ -n "$KEEP" ] && say "per-app log slices kept in $WORK"
 exit "$FAILED"
