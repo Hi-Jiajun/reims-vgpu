@@ -67,6 +67,8 @@ mkdir -p "$OUT"
 say() { echo "hang-bisect: $*"; }
 RESULTS="$OUT/results.tsv"
 : >"$RESULTS"
+# Tag to full arm, for the arms whose tag is a position rather than the string.
+: >"$OUT/arms.tsv"
 
 # The kernel's own count, bounded to this arm's wall clock. `--since` takes a
 # local timestamp, which is what `date` prints, so the two agree without a
@@ -76,6 +78,7 @@ hangs_since() {
 }
 
 for round in $(seq 1 "$ROUNDS"); do
+arm_no=0
 for arm in $ARMS; do
   say "=== round $round arm $arm ==="
   # Not a fixed sleep: an arm that just hung the GPU takes longer to die than
@@ -98,7 +101,19 @@ for arm in $ARMS; do
   fi
 
   started=$(date '+%Y-%m-%d %H:%M:%S')
-  tag="r$round-$arm"
+  # The arm names the files, but the arm this script's own header calls the
+  # first question worth asking carries every switch at once, and that string is
+  # longer than a filename may be. Past 48 characters the tag becomes the arm's
+  # position instead, and `arms.tsv` carries the full string — every failure
+  # here is `File name too long` on the boot log, which reads as a broken boot
+  # rather than as a name.
+  arm_no=$((arm_no + 1))
+  if [ "${#arm}" -le 48 ]; then
+    tag="r$round-$arm"
+  else
+    tag="r$round-arm$arm_no"
+  fi
+  printf '%s\t%s\n' "$tag" "$arm" >>"$OUT/arms.tsv"
   BOOTLOG="$OUT/$tag-boot.log"
   TESTING_TIMEOUT=900 nohup "$REPO/vm/boot-x86.sh" --device reims-vgpu-pci \
     --rail "$RAIL" --testing >"$BOOTLOG" 2>&1 &
