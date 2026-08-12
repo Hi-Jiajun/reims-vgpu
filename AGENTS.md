@@ -871,6 +871,16 @@ Do not hide warnings, skip an affected arm, or commit a dropped test
 count without calling it out — and **do not read "clippy clean" in a commit body as covering every
 arm**; it means the arms that commit ran.
 
+### Never run `cargo fmt`
+
+This crate is not kept rustfmt-clean and must not be made so in passing. One invocation rewrote 77
+files and 984 lines, nearly all of it code the change had nothing to do with, and the diff had to be
+thrown away and the two intended edits re-applied by hand. A reformatting commit would also bury
+every `git blame` line the doc comments here depend on.
+
+Match the surrounding style by hand. If a line you wrote is too long, wrap it the way its neighbours
+wrap. Reformatting is its own commit, decided deliberately, and nobody has decided it.
+
 One standing exception, carried by `#[allow]`s at the module declaration that states the reason.
 `backend::metal::error::Status` is large by design — the payload is what makes each refusal name the
 check that refused, and it is `Copy` and compared by value at hundreds of sites — so
