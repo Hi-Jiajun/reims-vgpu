@@ -495,9 +495,50 @@ impl DrawRequest {
     /// before, and the risk of covering an attachment that did not strictly need
     /// covering is bounded by one image copy.
     pub fn writes_attachment(&self, identity: &TargetIdentity) -> bool {
-        self.target_identity.as_ref() == Some(identity)
-            || self.depth.as_ref().and_then(|d| d.identity.as_ref()) == Some(identity)
-            || self.secondary_targets.iter().any(|s| &s.identity == identity)
+        self.attachment_slot(identity).is_some()
+    }
+
+    /// Which of this draw's attachments `identity` is, when it is one.
+    ///
+    /// The slot is carried rather than a bare `bool` so the census can say which
+    /// of the three matched, and two of the three answers are alarms: `Primary`
+    /// is the long-handled case, while a `Secondary` or `Depth` firing is a draw
+    /// the primary-only test used to hand the driver as a live feedback loop.
+    /// Zero on those two is the healthy reading.
+    pub fn attachment_slot(&self, identity: &TargetIdentity) -> Option<AttachmentSlot> {
+        if self.target_identity.as_ref() == Some(identity) {
+            Some(AttachmentSlot::Primary)
+        } else if self.secondary_targets.iter().any(|s| &s.identity == identity) {
+            Some(AttachmentSlot::Secondary)
+        } else if self.depth.as_ref().and_then(|d| d.identity.as_ref()) == Some(identity) {
+            Some(AttachmentSlot::Depth)
+        } else {
+            None
+        }
+    }
+}
+
+/// Which attachment of a draw a sampled identity turned out to be.
+///
+/// A type rather than the slot number it could have been: these three are this
+/// crate's own vocabulary rather than a guest value, and the consumers are a
+/// census name and a snapshot decision, so an integer would cost the
+/// exhaustiveness check at both and buy nothing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachmentSlot {
+    Primary,
+    Secondary,
+    Depth,
+}
+
+impl AttachmentSlot {
+    /// The census route for a draw that samples this attachment of its own.
+    pub fn sampled_self_route(self) -> &'static str {
+        match self {
+            Self::Primary => "sampled_self_primary",
+            Self::Secondary => "sampled_self_secondary",
+            Self::Depth => "sampled_self_depth",
+        }
     }
 }
 
@@ -1793,6 +1834,15 @@ mod tests {
             color_write_mask: ColorWriteMask::default(),
         });
         assert!(req.writes_attachment(&surface(2)), "MRT secondary");
+        assert_eq!(
+            req.attachment_slot(&surface(2)),
+            Some(AttachmentSlot::Secondary),
+            "the census has to be able to say which slot matched"
+        );
+        assert_eq!(
+            req.attachment_slot(&surface(1)),
+            Some(AttachmentSlot::Primary)
+        );
 
         req.depth = Some(DepthState {
             identity: Some(surface(3)),
@@ -1804,6 +1854,23 @@ mod tests {
             stencil: None,
         });
         assert!(req.writes_attachment(&surface(3)), "depth");
+        assert_eq!(
+            req.attachment_slot(&surface(3)),
+            Some(AttachmentSlot::Depth)
+        );
+        assert_eq!(req.attachment_slot(&surface(9)), None);
+        // Three distinct routes, so a census reading one of them cannot be a
+        // different slot's population.
+        let routes = [
+            AttachmentSlot::Primary,
+            AttachmentSlot::Secondary,
+            AttachmentSlot::Depth,
+        ]
+        .map(AttachmentSlot::sampled_self_route);
+        assert_eq!(
+            routes.iter().collect::<std::collections::HashSet<_>>().len(),
+            3
+        );
 
         // The generation is part of the identity, so a resident the guest has
         // since rewritten is a different target and not this draw's attachment.

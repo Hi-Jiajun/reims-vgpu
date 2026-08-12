@@ -2083,11 +2083,15 @@ pub(crate) unsafe fn execute_draw_inner(
     // and the query result is not readable until the command buffer has
     // completed — so a batched queried draw would return `None` for a count the
     // guest is about to read. The cost lands only on passes that arm a query.
+    // `DrawRequest::writes_attachment` and not a second spelling of it. This was
+    // written out here as `t == req.target_identity`, which is colour slot 0 —
+    // the same rule the snapshot decision carried, one of them narrower than the
+    // other, and a draw sampling its own MRT secondary was labelled a plain join
+    // here while being snapshotted there. It is census-only now (the join rule
+    // dropped this term), so the cost of the divergence was a wrong label rather
+    // than a wrong batch, which is exactly the kind that survives.
     let samples_own_target = req.sampled_images.iter().any(|s| {
-        matches!(
-            (&s.source, req.target_identity.as_ref()),
-            (SampledSource::Target(t), Some(own)) if t == own
-        )
+        matches!(&s.source, SampledSource::Target(t) if req.writes_attachment(t))
     });
     // Built once and asked twice: the join test below and the append at the end
     // of this function are the same four words, and a `BatchTarget` is how they
@@ -3008,7 +3012,12 @@ pub(crate) unsafe fn execute_draw_inner(
                         },
                     ));
                 }
-                if req.writes_attachment(identity) {
+                if let Some(slot) = req.attachment_slot(identity) {
+                    // Which attachment this draw is sampling of its own. The
+                    // primary is the case this arm has always taken; the other
+                    // two are the ones a primary-only test let past it, so they
+                    // are alarms and a zero on them is the healthy reading.
+                    crate::runtime::drain::note_store_route(slot.sampled_self_route());
                     let image = pools.acquire_sampled(
                         ctx,
                         SampledKey {
