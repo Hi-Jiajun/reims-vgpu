@@ -5994,19 +5994,30 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         crate::backend::vulkan::engine::SampledSource::Bytes(rgba)
                     }
                     SampledSourceRequest::Target(identity) => {
-                        // A resident bound directly reuses the registry's own
+                        // A resident bound *directly* reuses the registry's own
                         // image view, which the engine creates once per target
-                        // and cannot re-decorate per bind. Refuse rather than
-                        // bind it unswizzled: reading the wrong channels is a
-                        // rendering bug that looks like content, whereas a
-                        // named decline is one grep away.
-                        if view_swizzle.is_some() {
-                            crate::runtime::census::view_swizzle_census::note_declined(
-                                crate::runtime::census::view_swizzle_census::SwizzleDecline::ResidentDirectBind,
-                                texture_ref,
-                            );
-                            return Ok(());
-                        }
+                        // and cannot re-decorate per bind — so the channels a
+                        // type-8 view asked for have nowhere to go on that arm.
+                        //
+                        // The plan travels anyway. The engine reads it, sees a
+                        // non-identity plan, and takes the snapshot arm instead,
+                        // whose view it creates per bind from this very plan. So
+                        // the swizzle is honoured by a copy rather than dropped.
+                        //
+                        // Nothing to do here: the resource's `swizzle` field
+                        // below already folds `view_swizzle` in unconditionally,
+                        // and that is the field the engine reads. Setting the
+                        // format's own plan from it as well would apply the same
+                        // remap twice.
+                        //
+                        // This arm used to `return Ok(())` — no resource pushed
+                        // at all. That was not a decline: the unbound scan had
+                        // already counted `texture_ref != 0` as provided, so no
+                        // neutral image was substituted either, and the binding
+                        // went missing from a layout the fragment module
+                        // statically uses. The engine's
+                        // `used_binding_absent_from_layout` then refused the
+                        // whole draw, which cost the guest every pixel of it.
                         crate::backend::vulkan::engine::SampledSource::Target(identity)
                     }
                     SampledSourceRequest::GuestRuns(src, native, identity, vouch, components) => {

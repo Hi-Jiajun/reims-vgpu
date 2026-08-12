@@ -3012,12 +3012,39 @@ pub(crate) unsafe fn execute_draw_inner(
                         },
                     ));
                 }
-                if let Some(slot) = req.attachment_slot(identity) {
-                    // Which attachment this draw is sampling of its own. The
-                    // primary is the case this arm has always taken; the other
-                    // two are the ones a primary-only test let past it, so they
-                    // are alarms and a zero on them is the healthy reading.
-                    crate::runtime::drain::note_store_route(slot.sampled_self_route());
+                // Two reasons a resident cannot be bound through its own view.
+                //
+                // The first is the draw sampling an attachment it also renders
+                // into, which needs a copy taken before the pass writes it.
+                //
+                // The second is a **view swizzle**. The registry creates one
+                // image view per target and cannot re-decorate it per bind, so a
+                // bind asking for non-identity channels has nowhere to put them
+                // on the direct arm — but the snapshot's own view is created
+                // from `SampledKey::of(resource)`, whose `swizzle` field
+                // `acquire_sampled` hands to `vk_component_mapping`. So the copy
+                // is exactly where the swizzle becomes expressible, and taking
+                // it is what turns this bind from a dropped one into a correct
+                // one. The producer used to return before pushing any resource
+                // for such a bind, which left the binding absent from a layout
+                // its own module statically uses — refused downstream by
+                // `used_binding_absent_from_layout`, so the whole draw was lost.
+                let self_slot = req.attachment_slot(identity);
+                let swizzled = !resource.swizzle.is_identity();
+                if self_slot.is_some() || swizzled {
+                    match self_slot {
+                        // Which attachment this draw is sampling of its own. The
+                        // primary is the case this arm has always taken; the
+                        // other two are the ones a primary-only test let past
+                        // it, so they are alarms and a zero on them is the
+                        // healthy reading.
+                        Some(slot) => {
+                            crate::runtime::drain::note_store_route(slot.sampled_self_route())
+                        }
+                        None => crate::runtime::drain::note_store_route(
+                            "sampled_resident_swizzle_snapshot",
+                        ),
+                    }
                     let image = pools.acquire_sampled(
                         ctx,
                         SampledKey {
@@ -4606,10 +4633,29 @@ unsafe fn ad_hoc_attachment_views(
 ) -> Result<Vec<vk::ImageView>, DrawError> {
     let mut views = vec![primary_view];
     for sec in &req.secondary_targets {
-        let old_access = pools
-            .registry_get(&sec.identity)
+        let prior = pools.registry_get(&sec.identity);
+        let old_access = prior
             .map(|s| s.access)
             .unwrap_or(super::pools::ResidentAccess::Untouched);
+        // The primary's guard, on the slot that never had one. A secondary whose
+        // `load` is set becomes an `AttachmentLoadOp::LOAD` with
+        // `initialLayout = COLOR_ATTACHMENT_OPTIMAL`, which preserves whatever
+        // the image already holds — and a resident is born `content_ready =
+        // false` over an image recycled from the target pool, whose texels are
+        // some previous identity's. The pass would hand the draw those, and
+        // `registry_mark_ready_at` would then publish the result as ready to
+        // sample.
+        //
+        // Read before `registry_ensure_attachment` rather than after, because
+        // ensuring is what creates the resident: asking afterwards cannot tell a
+        // slot born in this call from one the guest has been rendering into.
+        if sec.load && !prior.is_some_and(|s| s.content_ready) {
+            return Err(DrawError::DrawExecution(
+                DrawExecutionDecline::LoadSecondaryContentNotReady {
+                    identity: sec.identity.clone(),
+                },
+            ));
+        }
         let (img, view) = pools.registry_ensure_attachment(
             ctx,
             sec.identity.clone(),

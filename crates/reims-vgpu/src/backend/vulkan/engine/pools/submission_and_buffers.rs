@@ -35,6 +35,56 @@ pub(crate) struct ReadbackLease {
     pub slot_size: u64,
 }
 
+/// Whether the identity-only lookup runs, given what the environment said.
+///
+/// Split from the read below so the one thing left to get wrong is testable
+/// without an environment. [`crate::env::read`] has already folded every
+/// negative spelling into [`crate::env::Switch::Off`]; what remains is which
+/// states count as off, and `Unrecognized` must not — a mistyped value would
+/// otherwise narrow this device silently, which is the opposite of what a
+/// mistyped switch should do.
+const fn identity_lookup_on(switch: crate::env::Switch) -> bool {
+    !matches!(switch, crate::env::Switch::Off)
+}
+
+/// Whether the sampled cache's identity-only lookup is on. **Default on**; see
+/// [`crate::env::SAMPLED_IDENTITY`] for what switching it off narrows and why
+/// that arm is worth having at all.
+fn sampled_identity_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| identity_lookup_on(crate::env::read(crate::env::SAMPLED_IDENTITY).0))
+}
+
+#[cfg(test)]
+mod sampled_identity_switch {
+    use super::identity_lookup_on;
+    use crate::env::Switch;
+
+    /// Only an explicit negative spelling narrows. Enumerated rather than
+    /// sampled: a new `Switch` variant that this does not mention fails to
+    /// compile, which is what stops a third state being silently folded into
+    /// whichever arm the author happened to think of.
+    #[test]
+    fn only_an_explicit_off_switches_the_identity_lookup_off() {
+        for switch in [
+            Switch::Unset,
+            Switch::On,
+            Switch::Off,
+            Switch::Unrecognized,
+        ] {
+            let expected = match switch {
+                Switch::Off => false,
+                Switch::Unset | Switch::On | Switch::Unrecognized => true,
+            };
+            assert_eq!(
+                identity_lookup_on(switch),
+                expected,
+                "{switch:?} decided the identity lookup the wrong way"
+            );
+        }
+    }
+}
+
 impl ResourcePools {
     pub(crate) fn guest_reset_counts(&self) -> (usize, usize, usize, usize) {
         let sampled = self.sampled_live.len() + self.sampled_free.len() + self.sampled_cache.len();
@@ -3362,12 +3412,25 @@ impl ResourcePools {
     ///
     /// The only way to reach a `Gathered` entry, whose bytes were never on the
     /// CPU to be digested.
+    ///
+    /// It is also the only bind in the sampled path that rests on evidence this
+    /// device did not read at bind time, which is why
+    /// [`crate::env::SAMPLED_IDENTITY`] can switch it off: with it off a
+    /// `Gathered` entry is unreachable and every guest-gather bind re-gathers,
+    /// which is strictly more copying and cannot reach a different image.
     fn find_sampled_by_identity(
         &mut self,
         key: SampledKey,
         identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
     ) -> Option<SampledSlot> {
         let id = identity?;
+        // Counted after the `identity?`, so the route bands the lookups this arm
+        // actually suppressed rather than every call — a bind with no identity
+        // could not have hit at any setting.
+        if !sampled_identity_enabled() {
+            crate::runtime::drain::note_store_route("sampled_identity_off");
+            return None;
+        }
         let index = self
             .sampled_cache
             .iter()
@@ -3555,8 +3618,15 @@ impl ResourcePools {
             // Nothing hashed the bytes, so nothing can recognise this image by
             // them. An entry with no identity to be found under would be
             // unreachable dead weight in a capped cache, so it is not admitted.
+            //
+            // The identity-only lookup being switched off makes *every*
+            // `Gathered` entry unreachable in exactly the same sense, so the
+            // same rule applies. Without this the ablation arm would keep
+            // filling the cache with entries nothing can find and evicting the
+            // content-compare entries that still work — measuring an
+            // accidentally poisoned cache rather than the arm asked for.
             SampledRetainContent::Gathered { len } => {
-                if identity.is_none() {
+                if identity.is_none() || !sampled_identity_enabled() {
                     crate::runtime::drain::note_store_route("sampled_admit_no_identity");
                     self.sampled_live.push(slot);
                     return Vec::new();

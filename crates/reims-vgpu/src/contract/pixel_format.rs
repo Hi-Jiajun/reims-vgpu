@@ -383,6 +383,18 @@ impl Default for SwizzlePlan {
 }
 
 impl SwizzlePlan {
+    /// Whether this plan moves nothing — every output channel takes its own
+    /// input.
+    ///
+    /// Derived from [`swizzle_identity`] rather than spelling the four sources a
+    /// second time, so there is nothing for a second spelling to disagree with.
+    /// The question is asked wherever a rail can carry channels one way but not
+    /// the other: a hardware component mapping expresses any plan, and a view
+    /// this device did not create expresses only this one.
+    pub fn is_identity(&self) -> bool {
+        *self == swizzle_identity()
+    }
+
     /// This plan applied **after** `inner`, as one plan.
     ///
     /// Two remaps stack whenever a texture's own channel layout does not sit

@@ -384,6 +384,28 @@ pub const LAZY_WRITEBACK: &str = "REIMS_VGPU_LAZY_WRITEBACK";
 /// one binary on one guest.
 pub const SLAB_RETAIN: &str = "REIMS_VGPU_SLAB_RETAIN";
 
+/// `off` narrows the sampled cache's **identity-only** lookup out of existence:
+/// a retained image is served only when its retained bytes compare equal to the
+/// bytes this bind is asking for, never on the producer's identity alone.
+///
+/// It narrows in the sense this module requires. The identity lookup is a
+/// shortcut in front of the content compare and reaches no image the compare
+/// could not also serve — with one asymmetry that is the whole point of having
+/// the switch: a `Gathered` entry has no retained bytes to compare, so with this
+/// off the guest-gather rail re-gathers and re-uploads every bind. That is
+/// strictly more copying and strictly fewer elisions, never a different image.
+///
+/// It exists because the identity lookup is the only place in the sampled path
+/// where an image is bound with **nothing read and nothing compared** — the bind
+/// rests entirely on the guest-write witness in
+/// [`crate::runtime::gather_witness`] having seen every write to the window. A
+/// witness that missed one binds a stale texture, and the failure mode is
+/// content: no counter can report it, because an elision correctly taken and one
+/// wrongly taken are the same absence. The eighteen-switch narrowing sweep that
+/// preceded this could not reach it — there was no switch — so it is the largest
+/// piece of this device's behaviour that has never been run both ways.
+pub const SAMPLED_IDENTITY: &str = "REIMS_VGPU_SAMPLED_IDENTITY";
+
 /// `off` narrows the CLEAR-seed Store at the head of a draw chain out of
 /// existence: the solid colour is not written into the guest's pages before the
 /// encode, and only what the draw's own Store lands reaches them.
@@ -1006,9 +1028,16 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 20] = [
+pub const ALL: [&str; 22] = [
     LAZY_WRITEBACK,
     SLAB_RETAIN,
+    // Both absent until 2026-08-12, for the same reason `COMPUTE_GATHER` was:
+    // added next to their constants and not here. `SAMPLED_IDENTITY`'s two arms
+    // differ in what the guest *sees* rather than in how fast it sees it, so a
+    // boot that cannot say which arm it ran is a boot whose content evidence is
+    // unattributable.
+    SAMPLED_IDENTITY,
+    PIPELINE_MEMO,
     CLEAR_SEED,
     GUEST_IMPORT,
     DRAW_LOG,

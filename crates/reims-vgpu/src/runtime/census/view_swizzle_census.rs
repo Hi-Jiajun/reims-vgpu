@@ -73,32 +73,34 @@ pub fn note_declined(reason: SwizzleDecline, texture_ref: u32) {
     }
 }
 
-/// The two ways a non-identity view swizzle fails to reach the GPU as a
-/// component mapping.
+/// The way a non-identity view swizzle fails to reach the GPU as a component
+/// mapping.
 ///
-/// Both are refusals of the zero-copy path even though only one refuses the
-/// bind: a CPU remap renders correctly and is therefore invisible in the output,
-/// which is exactly why it needs a name in the log.
+/// It is a refusal of the zero-copy path and not of the bind: a CPU remap
+/// renders correctly and is therefore invisible in the output, which is exactly
+/// why it needs a name in the log.
 ///
-/// This replaced a `pub mod decline` of bare `&str` constants. The slugs are
-/// `swizzle_`-prefixed because `cpu_remap` and `resident_direct_bind`, bare,
-/// name nothing about which rail wrote them — the same argument that prefixed
-/// the slate reasons.
+/// This replaced a `pub mod decline` of bare `&str` constants. The slug is
+/// `swizzle_`-prefixed because `cpu_remap`, bare, names nothing about which rail
+/// wrote it — the same argument that prefixed the slate reasons.
+///
+/// A second variant, `ResidentDirectBind`, is gone. It named a resident bound
+/// through the registry's own image view, which the engine creates once per
+/// target and cannot re-decorate — so that arm dropped the bind. It does not
+/// drop it any more: a swizzled resident bind now takes the snapshot arm, whose
+/// view the engine creates per bind and decorates from this very plan. The
+/// engine counts it as `sampled_resident_swizzle_snapshot`, which is a rail
+/// taken and not a swizzle lost, so it does not belong in this enum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SwizzleDecline {
     /// Every texel was rewritten by hand. Correct output, zero-copy lost.
     CpuRemap,
-    /// The source is a GPU-resident target bound directly, whose view the
-    /// engine owns and does not re-create per bind, so no per-bind component
-    /// mapping can be attached to it.
-    ResidentDirectBind,
 }
 
 impl crate::observe::Decline for SwizzleDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self::CpuRemap => "swizzle_cpu_remap",
-            Self::ResidentDirectBind => "swizzle_resident_direct_bind",
         }
     }
 }
@@ -114,27 +116,30 @@ pub fn reset_for_tests() {
 mod tests {
     use super::*;
 
-    /// Both slugs name the rail that wrote them.
+    /// Every slug names the rail that wrote it.
     ///
-    /// Bare, `cpu_remap` and `resident_direct_bind` say nothing about which
-    /// subsystem refused — the same argument that prefixed the slate reasons.
-    /// This asserts the prefix only; crate-wide distinctness is unchecked, and
-    /// naming the rail is what keeps a slug distinct for a reason rather than
-    /// by luck.
+    /// Bare, `cpu_remap` says nothing about which subsystem refused — the same
+    /// argument that prefixed the slate reasons. This asserts the prefix only;
+    /// crate-wide distinctness is unchecked, and naming the rail is what keeps a
+    /// slug distinct for a reason rather than by luck.
+    ///
+    /// The `match` is what makes this exhaustive: a variant added to
+    /// [`SwizzleDecline`] and not named here fails to compile, which a loop over
+    /// a hand-written list would not.
     #[test]
-    fn both_swizzle_slugs_name_their_rail() {
+    fn every_swizzle_slug_names_its_rail() {
         use crate::observe::Decline as _;
-        for r in [SwizzleDecline::CpuRemap, SwizzleDecline::ResidentDirectBind] {
+        let every: &[SwizzleDecline] = &[SwizzleDecline::CpuRemap];
+        for r in every {
+            match r {
+                SwizzleDecline::CpuRemap => {}
+            }
             assert!(
                 r.slug().starts_with("swizzle_"),
                 "{} is not namespaced to this rail",
                 r.slug()
             );
         }
-        assert_ne!(
-            SwizzleDecline::CpuRemap.slug(),
-            SwizzleDecline::ResidentDirectBind.slug()
-        );
     }
 
     /// A hot rail must cost one line per distinct (reason, ref), not one per
