@@ -189,10 +189,31 @@ pub(crate) struct ResourcePools {
     /// Buffer binds the command buffer now recording has already staged or
     /// gathered, keyed by the content that produced them.
     ///
-    /// The key is `(Arc` address`, length)` of the bind's content — the runtime
-    /// holds one `Arc` per resolved `(task, reference, offset)`, so two binds of
-    /// the same guest window are the same pointer and two different windows
-    /// cannot collide however their bytes compare.
+    /// The key is `(Arc` address`, length)` of the bind's content, and the entry
+    /// **holds that `Arc`** — see [`CbBind`]. Two binds of the same content are
+    /// then the same pointer, and two different contents cannot collide however
+    /// their bytes compare, because neither allocation can be freed while an
+    /// entry names it.
+    ///
+    /// The holding is the whole safety argument and it was once absent. The map
+    /// stored a bare [`super::exec::BoundBuffer`], which is `Copy` and owns
+    /// nothing, on the justification that "the runtime holds one `Arc` per
+    /// resolved `(task, reference, offset)`". That is true of the `GuestRuns`
+    /// arm, whose `Arc` lives in the bound-buffer registry, and false of the
+    /// `Bytes` arm, which is `Arc::new`-ed per bind from a freshly read `Vec`
+    /// and dropped with the `DrawRequest` that asked for it — while this map
+    /// survives to the end of the command buffer, up to `BATCH_MAX_DRAWS`
+    /// draws later. `ArcInner<Vec<u8>>` is a fixed 40-byte allocation whatever
+    /// the payload, so the allocator hands the address straight back, and the
+    /// next draw's unrelated read of the same length was served the previous
+    /// draw's bytes and counted as a reuse win.
+    ///
+    /// This crate states the rule correctly in two other places —
+    /// `caches.rs`'s `ShaderDigestIndex` ("drop the `Arc` from the entry and
+    /// this becomes a use-after-free dressed as a cache hit") and
+    /// [`buffer_gather_working_set`], which is keyed the same way and says it
+    /// does not owe the `Arc` because it is measure-only. This map is looked up
+    /// for a *bind* and does owe it.
     ///
     /// # Why the command buffer and not the draw
     ///
@@ -230,7 +251,7 @@ pub(crate) struct ResourcePools {
     /// pages** ([`ResourcePools::note_guest_write_recorded`]). That last one is
     /// the correctness edge: a bind after a Store into the same pages must see
     /// what the Store wrote, and reusing a copy taken before it would not.
-    cb_bound_buffers: HashMap<(usize, u64), super::exec::BoundBuffer>,
+    cb_bound_buffers: HashMap<(usize, u64), (super::exec::BoundBuffer, CbBindOwner)>,
     /// Graphics state the command buffer now recording already carries — see
     /// [`CbGraphicsState`].
     cb_graphics: CbGraphicsState,
@@ -2483,6 +2504,78 @@ const STAGING_MISS_EMIT_EVERY: u64 = 512;
 /// neither the descriptor arena nor the staging free lists is the next thing to
 /// give.
 pub(crate) const BATCH_MAX_DRAWS: u64 = 32;
+
+/// The allocation a `cb_bound_buffers` key names, held so the key cannot be
+/// answered by a different allocation that inherited the address.
+///
+/// Only the `Arc` the key is derived from, not the whole
+/// [`super::types::BufferContent`]: the `GuestRuns` arm carries a second `Vec`
+/// of guest references that the key says nothing about, and cloning it per bind
+/// would be real work rather than an atomic increment.
+///
+/// **Neither payload is ever read, and that is the design.** What this type
+/// contributes is a strong reference with the same lifetime as the map entry,
+/// so the address in the entry's key cannot be reissued to a different
+/// allocation while the entry can still answer for it. Its value matters only
+/// through `Drop`. Reading it would be a second way to get at bytes the entry
+/// already describes, which is not wanted.
+#[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "held for its Drop, never read — the strong reference is the whole contribution"
+)]
+pub(crate) enum CbBindOwner {
+    Bytes(std::sync::Arc<Vec<u8>>),
+    Runs(std::sync::Arc<Vec<super::types::GuestRun>>),
+}
+
+/// One bind's identity, inseparable from the allocation that identity names.
+///
+/// The point of the type is that [`ResourcePools::note_cb_bound_buffer`] takes
+/// it **by value**: there is no way to record an entry without handing over the
+/// `Arc` that keeps the key's address unique, so the defect described on
+/// `ResourcePools::cb_bound_buffers` cannot be reintroduced by a new call site.
+/// A raw `(usize, u64)` never reaches the map's API.
+///
+/// Constructing one costs a single `Arc` clone, paid on hits as well as misses.
+/// That is two atomics against a bind that already hashes and probes a map, and
+/// it buys an invariant a reviewer would otherwise have to re-derive.
+#[derive(Clone, Debug)]
+pub(crate) struct CbBind {
+    key: (usize, u64),
+    owner: CbBindOwner,
+}
+
+impl CbBind {
+    /// Derive the identity and take a reference to what it names, in one place,
+    /// so the address and the thing at that address cannot disagree.
+    pub(crate) fn of(content: &super::types::BufferContent) -> Self {
+        match content {
+            super::types::BufferContent::Bytes(b) => Self {
+                key: (std::sync::Arc::as_ptr(b) as usize, b.len() as u64),
+                owner: CbBindOwner::Bytes(std::sync::Arc::clone(b)),
+            },
+            super::types::BufferContent::GuestRuns(src) => Self {
+                key: (
+                    std::sync::Arc::as_ptr(&src.runs) as *const () as usize,
+                    src.total_len,
+                ),
+                owner: CbBindOwner::Runs(std::sync::Arc::clone(&src.runs)),
+            },
+        }
+    }
+
+    /// The `(address, length)` pair, for the callers that key something else on
+    /// the same identity — [`buffer_gather_working_set`] is the only one.
+    pub(crate) fn key(&self) -> (usize, u64) {
+        self.key
+    }
+
+    /// Split into what the map stores under it.
+    fn into_parts(self) -> ((usize, u64), CbBindOwner) {
+        (self.key, self.owner)
+    }
+}
 
 /// 128-bit content fingerprint for the sampled cache.
 ///

@@ -1821,23 +1821,30 @@ impl ResourcePools {
         self.guest_reads_in_flight = true;
     }
 
-    /// The buffer this command buffer already staged or gathered for `key`, if
+    /// The buffer this command buffer already staged or gathered for `bind`, if
     /// it still holds one. See `ResourcePools::cb_bound_buffers`.
     pub(crate) fn cb_bound_buffer(
         &self,
-        key: (usize, u64),
+        bind: &super::CbBind,
     ) -> Option<super::super::exec::BoundBuffer> {
-        self.cb_bound_buffers.get(&key).copied()
+        self.cb_bound_buffers.get(&bind.key()).map(|(b, _)| *b)
     }
 
-    /// Remember that `key`'s bytes are in `bound` for the rest of this command
+    /// Remember that `bind`'s bytes are in `bound` for the rest of this command
     /// buffer.
+    ///
+    /// Takes the [`super::CbBind`] by value because the entry has to keep the
+    /// `Arc` inside it: the map is keyed on that allocation's address, and an
+    /// address whose allocation has been freed is one the next unrelated bind of
+    /// the same length can be handed. Holding it is what makes the key unique
+    /// for as long as it is answerable.
     pub(crate) fn note_cb_bound_buffer(
         &mut self,
-        key: (usize, u64),
+        bind: super::CbBind,
         bound: super::super::exec::BoundBuffer,
     ) {
-        self.cb_bound_buffers.insert(key, bound);
+        let (key, owner) = bind.into_parts();
+        self.cb_bound_buffers.insert(key, (bound, owner));
     }
 
     /// Drop every remembered bind. Called from the three places that end a
@@ -4978,7 +4985,8 @@ mod recycle_tests {
     /// covered by another still having one.
     #[test]
     fn a_remembered_bind_does_not_survive_the_three_things_that_end_it() {
-        let key = (0xabc_usize, 4096u64);
+        let content = crate::backend::vulkan::engine::types::BufferContent::from(vec![7u8; 4096]);
+        let bind = super::super::CbBind::of(&content);
         let bound = crate::backend::vulkan::engine::exec::BoundBuffer {
             buffer: vk::Buffer::null(),
             offset: 0,
@@ -5004,17 +5012,65 @@ mod recycle_tests {
         ];
         for (what, end) in ends {
             let mut pools = ResourcePools::new();
-            pools.note_cb_bound_buffer(key, bound);
+            pools.note_cb_bound_buffer(bind.clone(), bound);
             assert!(
-                pools.cb_bound_buffer(key).is_some(),
+                pools.cb_bound_buffer(&bind).is_some(),
                 "a bind must be reusable before {what}"
             );
             end(&mut pools);
             assert!(
-                pools.cb_bound_buffer(key).is_none(),
+                pools.cb_bound_buffer(&bind).is_none(),
                 "a bind remembered across {what} names a slot no longer this command buffer's"
             );
         }
+    }
+
+    /// A remembered bind keeps the allocation its key names alive.
+    ///
+    /// This is the identity half of the map's contract, and the test above is
+    /// only the lifetime half — a bind can be dropped at all the right moments
+    /// and still be *answered by the wrong content* in between. The key is an
+    /// `Arc`'s address, and a `BufferContent::Bytes` is `Arc::new`-ed per bind
+    /// from a freshly read `Vec` and dropped with the `DrawRequest`. If the
+    /// entry does not hold that `Arc`, the allocator is free to hand the same
+    /// address to the next draw's unrelated read — `ArcInner<Vec<u8>>` is a
+    /// fixed 40-byte allocation whatever the payload, so it does — and a draw
+    /// renders through another draw's bytes with the reuse counted as a win.
+    ///
+    /// Asserted through a `Weak` rather than by trying to provoke a collision:
+    /// a test that frees an address and allocates again is at the allocator's
+    /// discretion and would be flaky in the direction that reads as passing.
+    /// "The map still holds it" is the invariant itself, and it is exact.
+    #[test]
+    fn a_remembered_bind_holds_the_allocation_its_key_names() {
+        let mut pools = ResourcePools::new();
+        let bound = crate::backend::vulkan::engine::exec::BoundBuffer {
+            buffer: vk::Buffer::null(),
+            offset: 0,
+        };
+
+        let content = crate::backend::vulkan::engine::types::BufferContent::from(vec![3u8; 256]);
+        let crate::backend::vulkan::engine::types::BufferContent::Bytes(strong) = &content else {
+            unreachable!("BufferContent::from(Vec<u8>) is the Bytes arm")
+        };
+        let watch = std::sync::Arc::downgrade(strong);
+
+        pools.note_cb_bound_buffer(super::super::CbBind::of(&content), bound);
+        drop(content);
+
+        assert!(
+            watch.upgrade().is_some(),
+            "the map dropped the allocation its key is the address of — that address \
+             is now free for the next bind of the same length to be given, and this \
+             entry would answer for it"
+        );
+
+        // And the holding ends with the entry, or the map is a leak instead.
+        pools.recycle_staging();
+        assert!(
+            watch.upgrade().is_none(),
+            "a cleared map still holds a bind's bytes"
+        );
     }
 
     /// The write ledger's own half, and the reason it is a ledger rather than a

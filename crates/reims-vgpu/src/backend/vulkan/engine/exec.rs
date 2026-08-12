@@ -429,14 +429,13 @@ unsafe fn stage_buffer_content(
     snapshot_volatile: bool,
     gathers: &mut Vec<PendingGuestGather>,
 ) -> Result<BoundBuffer, DrawError> {
-    let key = match content {
-        BufferContent::Bytes(b) => (std::sync::Arc::as_ptr(b) as usize, b.len() as u64),
-        BufferContent::GuestRuns(src) => (
-            std::sync::Arc::as_ptr(&src.runs) as *const () as usize,
-            src.total_len,
-        ),
-    };
-    if let Some(bound) = pools.cb_bound_buffer(key) {
+    // The identity and a reference to what it names, taken together — see
+    // [`super::pools::CbBind`]. The map cannot be told about a bind without
+    // being handed this, which is what keeps the key's address from being
+    // recycled under a live entry.
+    let bind = super::pools::CbBind::of(content);
+    let key = bind.key();
+    if let Some(bound) = pools.cb_bound_buffer(&bind) {
         counters.note_buffer_bind_reused();
         return Ok(bound);
     }
@@ -501,7 +500,7 @@ unsafe fn stage_buffer_content(
             }
         }
     };
-    pools.note_cb_bound_buffer(key, bound);
+    pools.note_cb_bound_buffer(bind, bound);
     Ok(bound)
 }
 
