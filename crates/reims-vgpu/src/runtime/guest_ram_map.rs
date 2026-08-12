@@ -270,6 +270,23 @@ impl Resolved {
             .map_err(MapRefusal::OutsideImport)?;
         GuestRef::new(Arc::clone(import), slice).map_err(MapRefusal::OutsideImport)
     }
+
+    /// The exclusive end GPA of the import backing `gpa`, or `None` if nothing
+    /// backs it.
+    ///
+    /// Exists so a caller can split a contiguous guest stretch at the seam
+    /// between two imports instead of being refused at it — see
+    /// [`references_for_runs`]. Deliberately not a public entry point: an import
+    /// boundary is this module's own bookkeeping, and the only thing outside it
+    /// may do with one is stop at it.
+    fn import_end(&self, gpa: u64) -> Option<u64> {
+        self.imports
+            .partition_point(|i| i.gpa_base() <= gpa)
+            .checked_sub(1)
+            .map(|last| &self.imports[last])
+            .filter(|i| i.contains_gpa(gpa))
+            .map(|i| i.gpa_base() + i.len())
+    }
 }
 
 /// Forget every import.
@@ -505,13 +522,39 @@ pub fn references_for_runs<H: HostOps + ?Sized>(
             if start >= end {
                 continue;
             }
+            // GPA-contiguous is not import-contiguous. A RAMBlock is imported in
+            // chunks, so a stretch the guest laid out as one run can cross a
+            // seam between two of them — and a `GuestRef` is an offset into one
+            // import, so it cannot describe both sides.
+            //
+            // Split at the seam rather than refuse at it. The consumers already
+            // take a list and a RAMBlock boundary has always been able to
+            // produce one, so two runs here are indistinguishable from two the
+            // guest's own page plan produced. Refusing instead would drop the
+            // *whole window* to the copying rail — a named, safe decline, but
+            // one that fires on roughly one writeback in 250 for no reason the
+            // guest could see, which is a chunk size leaking into throughput.
+            //
             // Within a run the GPAs are contiguous by construction, so one add
             // reaches any byte of it.
-            let gpa = gpas[run.start] + (start - run_start);
-            out.push(GuestWindowRun {
-                window_offset: start - window_start,
-                guest: resolved.reference(gpa, end - start)?,
-            });
+            let mut piece = start;
+            while piece < end {
+                let gpa = gpas[run.start] + (piece - run_start);
+                // `None` means nothing backs this address at all: hand the whole
+                // remainder to `reference` so it names that refusal rather than
+                // this loop inventing a second one.
+                let piece_end = match resolved.import_end(gpa) {
+                    Some(import_end) if import_end > gpa => {
+                        end.min(piece + (import_end - gpa))
+                    }
+                    _ => end,
+                };
+                out.push(GuestWindowRun {
+                    window_offset: piece - window_start,
+                    guest: resolved.reference(gpa, piece_end - piece)?,
+                });
+                piece = piece_end;
+            }
         }
         if out.is_empty() {
             return Err(report_once(MapRefusal::Scattered {
@@ -953,6 +996,64 @@ mod tests {
                 Some(MapRefusal::GpaNotInAnyImport { gpa: 0x8000_0000 }),
                 "the PCI hole is not guest RAM and chunking must not have covered it"
             );
+        });
+    }
+
+    /// A guest run that crosses a seam between two chunks of one RAMBlock is
+    /// **split**, not refused, and the pieces tile the request exactly.
+    ///
+    /// A `GuestRef` is an offset into one import, so it cannot describe both
+    /// sides of a seam. Refusing would be safe — a named decline, whole window
+    /// to the copying rail — and would put a chunk size the guest cannot see
+    /// into this device's throughput on roughly one writeback in 250. The
+    /// consumers already take a list, and a RAMBlock boundary has always been
+    /// able to produce one, so a split here is indistinguishable from a split
+    /// the guest's own page plan produced.
+    ///
+    /// Asserted on the tiling rather than on the count, because "two runs" would
+    /// still pass if the second one started in the wrong place.
+    #[test]
+    fn a_run_crossing_a_chunk_seam_is_split_and_the_pieces_tile_the_window() {
+        const CEILING: u64 = 0x2000_0000;
+        const PAGE: u64 = 0x1000;
+        with_span_max(PAGE, CEILING, || {
+            let mut host = two_spans();
+            // Two GPA-contiguous pages either side of the first chunk seam.
+            let gpas = [CEILING - PAGE, CEILING];
+            let runs = references_for_runs(&mut host, &gpas, PAGE, 0, 2 * PAGE)
+                .expect("both pages are guest RAM; a seam is not a refusal");
+
+            assert_eq!(runs.len(), 2, "one piece per import the run touches");
+            let mut want = 0u64;
+            for r in &runs {
+                assert_eq!(
+                    r.window_offset, want,
+                    "a piece does not begin where the last one ended"
+                );
+                want += r.guest.requested();
+            }
+            assert_eq!(want, 2 * PAGE, "the pieces do not cover the window");
+            assert!(
+                runs[0].guest.import().id() != runs[1].guest.import().id(),
+                "a split that stays inside one import is not a seam split"
+            );
+        });
+    }
+
+    /// The same run, with the seam moved out of its way, must stay one piece.
+    /// Without this the test above would pass on an implementation that split
+    /// every run in half.
+    #[test]
+    fn a_run_inside_one_chunk_is_not_split() {
+        const CEILING: u64 = 0x2000_0000;
+        const PAGE: u64 = 0x1000;
+        with_span_max(PAGE, CEILING, || {
+            let mut host = two_spans();
+            let gpas = [CEILING + PAGE, CEILING + 2 * PAGE];
+            let runs = references_for_runs(&mut host, &gpas, PAGE, 0, 2 * PAGE)
+                .expect("both pages are guest RAM");
+            assert_eq!(runs.len(), 1, "a run wholly inside one import is one piece");
+            assert_eq!(runs[0].guest.requested(), 2 * PAGE);
         });
     }
 
