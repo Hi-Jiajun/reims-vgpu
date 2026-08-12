@@ -859,6 +859,25 @@ pub const PASS_CHURN: &str = "REIMS_VGPU_PASS_CHURN";
 /// settle it, and the arm and its `bext_*` census stay so that they can.
 pub const EXTENT_NARROW: &str = "REIMS_VGPU_EXTENT_NARROW";
 
+/// **A count, not a switch.** How many draws one command buffer may carry,
+/// narrowing the compiled `BATCH_MAX_DRAWS`. Read through [`count`], so a value
+/// above the compiled cap is refused rather than obeyed.
+///
+/// It exists because the host kernel, not this device, owns the deadline a
+/// submission has to meet. i915 resets any context that holds `rcs0` past its
+/// `preempt_timeout_ms`, which is 7500 on the Arrow Lake iGPU this is measured
+/// on, and nothing in this crate bounds how much GPU time one command buffer's
+/// accumulated draws and gather dispatches add up to. Fewer draws per submission
+/// is the one lever that does, and it is strictly a narrowing: the same draws
+/// run, in more and smaller batches.
+///
+/// It is also the instrument that says *which* submission hung. At a cap of one
+/// the ring holds one draw per slot, so a fence that never signals names a
+/// single draw rather than up to thirty-two, and
+/// [`crate::runtime::gpu_hang_trail`]'s ring covers every submission still in
+/// flight instead of the last half millisecond of a batch.
+pub const BATCH_DRAWS: &str = "REIMS_VGPU_BATCH_DRAWS";
+
 /// What one variable says, including the two ways it says nothing usable.
 ///
 /// Four states rather than a `bool` because "unset", "explicitly on" and
@@ -878,6 +897,51 @@ pub enum Switch {
     /// the value is handed back by [`read`] for the caller to name in its own
     /// refusal, because only the caller knows which variable this was.
     Unrecognized,
+}
+
+/// A count narrowing a compiled bound, or why the value was not usable.
+///
+/// Separate from [`Switch`] because the two answer different questions and
+/// folding them into one enum would put a `Count(u64)` arm in front of every
+/// existing `match` on a boolean switch. This is additive; nothing that reads a
+/// switch changes.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Count {
+    /// Nothing set. The caller keeps the bound it compiled with.
+    Unset,
+    /// A value the caller may adopt: at least one and no more than its ceiling.
+    Narrowed(u64),
+    /// Set to something unusable, carrying the raw text so the refusal can
+    /// quote what it rejected.
+    Refused(String),
+}
+
+/// Read `name` as a count that may only *narrow* `ceiling`.
+///
+/// The rule from `AGENTS.md` — an override may narrow what the device does and
+/// may never widen it — is enforced here rather than at each call site, because
+/// a bound is exactly the shape where widening is the tempting mistake: a
+/// caller reading a raw number and using it would let `=64` push a submission
+/// past a limit that was measured, and the failure of that is a stutter rather
+/// than an error.
+///
+/// Zero is refused rather than clamped. A cap of zero says "no draw may ever
+/// join a batch", which is not a smaller version of the compiled behavior; it is
+/// a different one, and a typo that silently selected it would read as a device
+/// that had stopped drawing.
+pub fn count(name: &str, ceiling: u64) -> Count {
+    let Some(raw) = std::env::var_os(name) else {
+        return Count::Unset;
+    };
+    let value = raw.to_string_lossy().into_owned();
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Count::Unset;
+    }
+    match trimmed.parse::<u64>() {
+        Ok(n) if n >= 1 && n <= ceiling => Count::Narrowed(n),
+        _ => Count::Refused(value),
+    }
 }
 
 /// The spellings accepted for each state, ASCII-case-insensitively.
@@ -960,6 +1024,14 @@ pub const ALL: [&str; 20] = [
     EXTENT_NARROW,
 ];
 
+/// Every variable read as a [`count`] rather than as a [`Switch`].
+///
+/// A second list because [`report_line`] has to print these differently: a count
+/// has no on/off state to name, and running one through the switch parse would
+/// report `REIMS_VGPU_BATCH_DRAWS=4` as `unrecognized(4)` — a line saying the
+/// device rejected the very value it adopted.
+pub const ALL_COUNTS: [&str; 1] = [BATCH_DRAWS];
+
 /// The state of every variable in [`ALL`], for the one-shot boot line.
 ///
 /// Unset variables are on the line too, and deliberately: the reading a report
@@ -979,6 +1051,17 @@ pub fn report_line() -> String {
             Switch::Unrecognized => format!("unrecognized({})", value.unwrap_or_default()),
         };
         out.push_str(&format!(" {}={state}", short.to_ascii_lowercase()));
+    }
+    // The raw text, not the parse: the ceiling a count narrows belongs to the
+    // module that owns the bound, and this line is written before any device
+    // exists to ask. A refusal is reported where the bound is adopted.
+    for name in ALL_COUNTS {
+        let short = name.strip_prefix("REIMS_VGPU_").unwrap_or(name);
+        let raw = std::env::var_os(name)
+            .map(|v| v.to_string_lossy().into_owned())
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "unset".to_owned());
+        out.push_str(&format!(" {}={raw}", short.to_ascii_lowercase()));
     }
     out
 }
@@ -1012,6 +1095,76 @@ mod tests {
 
     fn probe(value: Option<&str>) -> Switch {
         with_probe(value, || switch("REIMS_VGPU_TEST_PROBE"))
+    }
+
+    fn probe_count(value: Option<&str>, ceiling: u64) -> Count {
+        with_probe(value, || count("REIMS_VGPU_TEST_PROBE", ceiling))
+    }
+
+    /// A count narrows its ceiling and never widens it.
+    ///
+    /// The widening arm is the one that matters. `AGENTS.md`'s rule — an
+    /// override may turn a rail off and may never turn one on — has a quiet
+    /// second form for a *bound*, where obeying a raw number lets an operator
+    /// push past a limit that was measured. A caller reading `str::parse`
+    /// directly would take `=64` against a ceiling of 32; this must not.
+    #[test]
+    fn a_count_narrows_its_ceiling_and_never_widens_it() {
+        assert_eq!(probe_count(Some("1"), 32), Count::Narrowed(1));
+        assert_eq!(probe_count(Some("8"), 32), Count::Narrowed(8));
+        // The ceiling itself is a legal narrowing to exactly the compiled bound.
+        assert_eq!(probe_count(Some("32"), 32), Count::Narrowed(32));
+        // One past it is a widening, and the value is quoted back so the
+        // refusal can say what it rejected.
+        assert_eq!(probe_count(Some("33"), 32), Count::Refused("33".to_owned()));
+        assert_eq!(
+            probe_count(Some("1000"), 32),
+            Count::Refused("1000".to_owned())
+        );
+    }
+
+    /// Zero is refused, not clamped to one.
+    ///
+    /// A cap of zero is not a smaller version of the compiled behavior — it says
+    /// no draw may ever join a batch — so a typo that selected it would read as
+    /// a device that had stopped drawing rather than as a rejected value.
+    #[test]
+    fn a_count_of_zero_is_refused_rather_than_clamped() {
+        assert_eq!(probe_count(Some("0"), 32), Count::Refused("0".to_owned()));
+    }
+
+    /// Anything that is not a count is refused with its own text, and an unset
+    /// or blank variable leaves the caller on its compiled bound.
+    #[test]
+    fn a_count_that_does_not_parse_is_refused_with_its_text() {
+        assert_eq!(probe_count(None, 32), Count::Unset);
+        assert_eq!(probe_count(Some("   "), 32), Count::Unset);
+        assert_eq!(probe_count(Some("on"), 32), Count::Refused("on".to_owned()));
+        assert_eq!(probe_count(Some("-1"), 32), Count::Refused("-1".to_owned()));
+        assert_eq!(
+            probe_count(Some("4.5"), 32),
+            Count::Refused("4.5".to_owned())
+        );
+    }
+
+    /// A count is reported as the value it was given, not run through the switch
+    /// parse.
+    ///
+    /// [`report_line`] is the only record of which arm a boot ran, and a count
+    /// pushed through [`read`] reports `4` as `unrecognized(4)` — a line saying
+    /// the device rejected the value it had in fact adopted, which is exactly
+    /// the "compare arms, not pins" trap the [`ALL`] doc records.
+    #[test]
+    fn a_count_is_reported_as_its_value_and_not_as_an_unrecognized_switch() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the lock serializes every mutation of this variable here, and
+        // the value is removed before the guard drops.
+        unsafe { std::env::set_var(BATCH_DRAWS, "4") };
+        let line = report_line();
+        unsafe { std::env::remove_var(BATCH_DRAWS) };
+        assert!(line.contains(" batch_draws=4"), "{line}");
+        assert!(!line.contains("unrecognized"), "{line}");
+        assert!(report_line().contains(" batch_draws=unset"));
     }
 
     /// Both directions, in every spelling the module claims to accept. A
@@ -1075,10 +1228,13 @@ mod tests {
     /// by grepping their own environment.
     #[test]
     fn every_name_carries_the_crate_prefix() {
-        // `ALL` rather than a second list: a list written twice is the thing
-        // this module exists to stop, and the boot line reads the same one.
-        let names = ALL;
-        for name in names {
+        // The declared lists rather than a third one written here: a list
+        // written twice is the thing this module exists to stop, and the boot
+        // line reads the same two. The uniqueness check below spans both, so a
+        // name appearing in each — read once as a switch and once as a count —
+        // fails here rather than reaching the line twice with two answers.
+        let names: Vec<&str> = ALL.iter().chain(ALL_COUNTS.iter()).copied().collect();
+        for name in &names {
             assert!(name.starts_with("REIMS_VGPU_"), "{name}");
             assert!(
                 name.bytes()
@@ -1103,7 +1259,7 @@ mod tests {
     fn the_boot_line_names_every_variable_set_or_not() {
         let line = report_line();
         assert!(line.starts_with("vgpu_env "), "{line}");
-        for name in ALL {
+        for name in ALL.iter().chain(ALL_COUNTS.iter()) {
             let short = name
                 .strip_prefix("REIMS_VGPU_")
                 .expect("the prefix is asserted above")

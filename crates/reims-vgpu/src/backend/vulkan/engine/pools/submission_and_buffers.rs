@@ -146,6 +146,7 @@ impl ResourcePools {
             graveyard: Vec::new(),
             target_free: FreePool::new(TARGET_FREE_CAP_PER_KEY, TARGET_FREE_CAP_TOTAL),
             open_batch: None,
+            batch_max_draws: super::batch_max_draws(),
             last_pass: None,
             slab: slab::SlabPool::new(),
             slabs: buffer_slab::BufferSlabs::new(),
@@ -1555,7 +1556,7 @@ impl ResourcePools {
         let Some(b) = self.open_batch.as_ref() else {
             return BatchFit::None;
         };
-        if b.draws >= BATCH_MAX_DRAWS {
+        if b.draws >= self.batch_max_draws {
             return BatchFit::Full;
         }
         if narrow_to_target && b.target != *target {
@@ -5751,5 +5752,64 @@ mod scatter_descriptor_sets_do_not_alias {
         assert!(pools.take_free_scatter_dset().is_some());
         assert!(pools.take_free_scatter_dset().is_some());
         assert!(pools.take_free_scatter_dset().is_none());
+    }
+
+    fn batch_target() -> super::BatchTarget {
+        super::BatchTarget {
+            identity: crate::backend::vulkan::engine::types::TargetIdentity::Surface {
+                id: 56,
+                width: 1024,
+                height: 768,
+                generation: 1,
+                format: vk::Format::B8G8R8A8_UNORM,
+            },
+            width: 1024,
+            height: 768,
+            bgra: true,
+        }
+    }
+
+    /// A batch fills at the pool's own cap, not at the compiled constant.
+    ///
+    /// This is the wiring, and it is the half that a test of the environment
+    /// parse alone cannot reach: [`super::BATCH_MAX_DRAWS`] was read directly by
+    /// `batch_fit`, so a narrowed cap that never arrived here would leave the
+    /// device batching thirty-two draws while the boot line reported one. That
+    /// failure is silent in exactly the direction that matters — an arm of a
+    /// bisect that did not take still produces a well-formed driven boot.
+    #[test]
+    fn a_batch_fills_at_the_pools_cap_and_not_at_the_compiled_constant() {
+        let target = batch_target();
+        let mut pools = ResourcePools::new();
+        pools.batch_max_draws = 4;
+        pools.open_batch = Some(super::OpenBatch {
+            cb: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            target: target.clone(),
+            draws: 3,
+            dsets: Vec::new(),
+        });
+        assert!(matches!(
+            pools.batch_fit(&target, false),
+            super::BatchFit::Open(..)
+        ));
+        if let Some(b) = pools.open_batch.as_mut() {
+            b.draws = 4;
+        }
+        assert!(matches!(
+            pools.batch_fit(&target, false),
+            super::BatchFit::Full
+        ));
+    }
+
+    /// The default cap is the compiled one, so a boot that sets nothing batches
+    /// exactly as every measurement behind [`super::BATCH_MAX_DRAWS`] did.
+    #[test]
+    fn a_pool_that_was_told_nothing_carries_the_compiled_cap() {
+        assert_eq!(
+            ResourcePools::new().batch_max_draws,
+            super::BATCH_MAX_DRAWS,
+            "an unset REIMS_VGPU_BATCH_DRAWS must leave the measured cap alone"
+        );
     }
 }

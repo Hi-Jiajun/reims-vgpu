@@ -512,6 +512,13 @@ pub(crate) struct ResourcePools {
     /// treat it as in flight; every path that claims a slot or quiesces the
     /// ring flushes it first ([`Self::batch_flush`]).
     open_batch: Option<OpenBatch>,
+    /// How many draws one command buffer may carry: [`BATCH_MAX_DRAWS`] unless
+    /// [`crate::env::BATCH_DRAWS`] narrowed it.
+    ///
+    /// A field rather than a read inside [`Self::batch_fit`], because that
+    /// function's doc promises it is pure and testable without a device and a
+    /// process-global environment read is neither.
+    batch_max_draws: u64,
     /// The render pass the last recorded draw opened — see [`PassEcho`].
     ///
     /// Observation only: nothing branches on it. It exists because "could this
@@ -2523,6 +2530,44 @@ const STAGING_MISS_EMIT_EVERY: u64 = 512;
 /// neither the descriptor arena nor the staging free lists is the next thing to
 /// give.
 pub(crate) const BATCH_MAX_DRAWS: u64 = 32;
+
+/// The draws-per-command-buffer cap this process runs with.
+///
+/// [`BATCH_MAX_DRAWS`] is what the measurement above chose against a discrete
+/// NVIDIA host. It is not a bound on GPU *time*, and the host kernel imposes one
+/// of those whether or not this device has an opinion: i915 resets a context
+/// that holds its engine past `preempt_timeout_ms`. So the cap is narrowable
+/// from the environment — see [`crate::env::BATCH_DRAWS`] for why that is the
+/// lever and what a cap of one buys as an instrument.
+///
+/// Read once per process. The two arms differ in how many submissions a workload
+/// makes, so a boot that flipped it midway would be two devices in one log — the
+/// same reason [`slab_retain_enabled`] latches.
+fn batch_max_draws() -> u64 {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        let cap = match crate::env::count(crate::env::BATCH_DRAWS, BATCH_MAX_DRAWS) {
+            crate::env::Count::Narrowed(n) => n,
+            crate::env::Count::Unset => BATCH_MAX_DRAWS,
+            // Fail-visible: a bound the operator asked for and did not get is a
+            // silent difference between what a bisect thinks it measured and
+            // what ran, which is the one thing an arm must never be.
+            crate::env::Count::Refused(raw) => {
+                crate::observe::fail(format!(
+                    "batch_draws_refused value={raw} ceiling={BATCH_MAX_DRAWS} \
+                     (a count from 1 to the ceiling narrows the cap; anything \
+                      else would widen it or stop every batch)"
+                ));
+                BATCH_MAX_DRAWS
+            }
+        };
+        crate::observe::off(format!(
+            "batch_draws cap={cap} compiled={BATCH_MAX_DRAWS}"
+        ));
+        cap
+    })
+}
 
 /// The allocation a `cb_bound_buffers` key names, held so the key cannot be
 /// answered by a different allocation that inherited the address.
