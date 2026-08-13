@@ -2835,6 +2835,7 @@ pub fn log_folded_function_constants(reflection: &ShaderReflection) -> usize {
     }
     let stage = match reflection.stage {
         ShaderStage::Vertex => "v",
+        ShaderStage::TessellationEvaluation => "te",
         ShaderStage::Fragment => "f",
         ShaderStage::Kernel => "k",
     };
@@ -3280,14 +3281,19 @@ mod more_tests {
             stage,
             entry_point: None,
             bindings: vec![],
+            argument_buffer_fields: vec![],
             vertex_attributes: vec![],
             varyings: vec![],
             render_targets: vec![],
             depth_members: vec![],
+            depth_qualifier: None,
             stencil_members: vec![],
             local_size: None,
             vertex_builtins: None,
+            tessellation: None,
             imageblock_layouts: vec![],
+            implicit_imageblock_attachments: vec![],
+            fragment_imageblock: None,
             datalayout: None,
             function_constants: vec![],
         }
@@ -3300,11 +3306,14 @@ mod more_tests {
             descriptor: Some(DescriptorLocation {
                 set: RESOURCE_DESCRIPTOR_SET,
                 binding: metal_index,
+                count: 1,
             }),
             param_index: None,
+            stage_input_location: None,
             address_space: None,
             declared_size: None,
             extent,
+            footprint: None,
             type_layout: None,
             type_name: None,
             texture_shape: None,
@@ -3546,11 +3555,17 @@ mod more_tests {
         ResourceBinding {
             kind: ResourceKind::Texture,
             metal_index: binding - TEXTURE_BINDING_BASE,
-            descriptor: Some(DescriptorLocation { set: 0, binding }),
+            descriptor: Some(DescriptorLocation {
+                set: 0,
+                binding,
+                count: 1,
+            }),
             param_index: None,
+            stage_input_location: None,
             address_space: None,
             declared_size: None,
             extent: None,
+            footprint: None,
             type_layout: None,
             type_name: None,
             texture_shape: Some(shape),
@@ -3575,11 +3590,14 @@ mod more_tests {
             descriptor: Some(DescriptorLocation {
                 set: RESOURCE_DESCRIPTOR_SET,
                 binding,
+                count: 1,
             }),
             param_index: None,
+            stage_input_location: None,
             address_space: None,
             declared_size: None,
             extent: None,
+            footprint: None,
             type_layout: None,
             type_name: None,
             texture_shape: None,
@@ -3613,6 +3631,7 @@ mod more_tests {
             component: TextureComponent::Float,
             writable,
             array_ref: false,
+            array_length: None,
             storage_format: None,
         }
     }
@@ -3804,11 +3823,13 @@ mod more_tests {
                 index: 0,
                 name: "enable_tap".to_string(),
                 type_name: "i1".to_string(),
+                abi_type_encoding: "b".to_string(),
             },
             FunctionConstant {
                 index: 3,
                 name: "channel_count".to_string(),
                 type_name: "i32".to_string(),
+                abi_type_encoding: "i".to_string(),
             },
         ];
         assert_eq!(log_folded_function_constants(&r), 2);

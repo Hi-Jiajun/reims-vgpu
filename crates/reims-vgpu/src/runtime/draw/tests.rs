@@ -90,9 +90,11 @@ fn rb(
         metal_index,
         descriptor: None,
         param_index: None,
+        stage_input_location: None,
         address_space: None,
         declared_size: None,
         extent: None,
+        footprint: None,
         type_layout: None,
         type_name: None,
         texture_shape: None,
@@ -917,13 +919,19 @@ fn shader_pull_reflection(bindings: &[u32]) -> metal2vulkan::reflect::ShaderRefl
             .map(|&binding| ResourceBinding {
                 kind: ResourceKind::Buffer,
                 metal_index: binding,
-                descriptor: Some(DescriptorLocation { set: 0, binding }),
+                descriptor: Some(DescriptorLocation {
+                    set: 0,
+                    binding,
+                    count: 1,
+                }),
                 param_index: None,
+                stage_input_location: None,
                 address_space: None,
                 declared_size: None,
                 // What the translator emits for a buffer carrying neither an
                 // object size nor a type name: the class that forbids narrowing.
                 extent: Some(BufferExtent::Unknown),
+                footprint: None,
                 type_layout: None,
                 type_name: None,
                 texture_shape: None,
@@ -932,10 +940,12 @@ fn shader_pull_reflection(bindings: &[u32]) -> metal2vulkan::reflect::ShaderRefl
                 static_sampler: None,
             })
             .collect(),
+        argument_buffer_fields: vec![],
         vertex_attributes: vec![],
         varyings: vec![],
         render_targets: vec![],
         depth_members: vec![],
+        depth_qualifier: None,
         stencil_members: vec![],
         local_size: None,
         vertex_builtins: Some(VertexBuiltins {
@@ -943,7 +953,10 @@ fn shader_pull_reflection(bindings: &[u32]) -> metal2vulkan::reflect::ShaderRefl
             uses_instance_index: false,
             writes_position: true,
         }),
+        tessellation: None,
         imageblock_layouts: vec![],
+        implicit_imageblock_attachments: vec![],
+        fragment_imageblock: None,
         datalayout: None,
         function_constants: vec![],
     }
