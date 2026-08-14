@@ -729,6 +729,7 @@ impl ResourcePools {
                 color_format: new.color_format,
                 pin_count: 0,
                 resource_released: false,
+                resource_owner_count: 0,
                 // Nothing has drawn into it, so it holds no guest work to lose.
                 // A recycled image arrives here too, and its stale contents are
                 // not this identity's content.
@@ -1614,8 +1615,25 @@ impl ResourcePools {
             .get(identity)
             .filter(|slot| slot.content_ready)
             .map(|slot| slot.memory.is_guest_imported())?;
-        self.pin_resident_target(identity, true)
-            .then_some(guest_imported)
+        // A new serialized owner may legitimately arrive while a transient GPU
+        // holder is finishing the previous owner's use of the same allocation.
+        // Revive the ownership before pinning; maintenance cannot retire the
+        // slot while this engine transaction holds the registry lock.
+        self.registry.get_mut(identity)?.resource_released = false;
+        if !self.pin_resident_target(identity, true) {
+            return None;
+        }
+        let slot = self.registry.get_mut(identity)?;
+        let Some(next) = slot.resource_owner_count.checked_add(1) else {
+            crate::observe::fail(format!(
+                "resident_resource_owner_overflow identity={identity:?}"
+            ));
+            // Undo the pin acquired above; the caller receives no lease.
+            self.pin_resident_target(identity, false);
+            return None;
+        };
+        slot.resource_owner_count = next;
+        Some(guest_imported)
     }
 
     /// End one serialized resource's ownership of its resident. The ownership
@@ -1641,12 +1659,20 @@ impl ResourcePools {
     /// whether the ownership pin was the last pin and the resident may retire
     /// immediately, or `None` when the identity was already absent.
     fn release_resident_ownership(&mut self, identity: &TargetIdentity) -> Option<bool> {
-        self.registry.get_mut(identity)?.resource_released = true;
+        let slot = self.registry.get_mut(identity)?;
+        if slot.resource_owner_count == 0 {
+            crate::observe::fail(format!(
+                "resident_resource_release_unbalanced identity={identity:?}"
+            ));
+            return Some(false);
+        }
+        slot.resource_owner_count -= 1;
+        slot.resource_released = slot.resource_owner_count == 0;
         self.pin_resident_target(identity, false);
         Some(
             self.registry
                 .get(identity)
-                .is_some_and(|slot| slot.pin_count == 0),
+                .is_some_and(|slot| slot.resource_released && slot.pin_count == 0),
         )
     }
 
@@ -2280,6 +2306,7 @@ pub(super) mod pin_count_tests {
             color_format: translate::pixel::SCANOUT_FORMAT,
             pin_count: 0,
             resource_released: false,
+            resource_owner_count: 0,
             gpu_only_content: false,
             last_touch_ms: 0,
         }
@@ -2467,7 +2494,7 @@ pub(super) mod pin_count_tests {
     }
 
     #[test]
-    fn ending_resource_ownership_blocks_new_retains_and_makes_it_retirable() {
+    fn ending_the_last_resource_ownership_makes_the_slot_retirable() {
         let mut pools = ResourcePools::new();
         let id = pinned_identity();
         pools.registry.insert(id.clone(), dummy_slot(true));
@@ -2475,8 +2502,29 @@ pub(super) mod pin_count_tests {
 
         assert_eq!(pools.retain_resident_target(&id), Some(false));
         assert_eq!(pools.release_resident_ownership(&id), Some(true));
-        assert_eq!(pools.retain_resident_target(&id), None);
         assert_eq!(pools.released_resident_keys(1), vec![id]);
+    }
+
+    #[test]
+    fn one_alias_release_does_not_end_another_resources_ownership() {
+        let mut pools = ResourcePools::new();
+        let id = pinned_identity();
+        pools.registry.insert(id.clone(), dummy_slot(true));
+        pools.registry_order.push_back(id.clone());
+
+        assert_eq!(pools.retain_resident_target(&id), Some(false));
+        assert_eq!(pools.retain_resident_target(&id), Some(false));
+        assert_eq!(pools.registry[&id].resource_owner_count, 2);
+        assert_eq!(pools.release_resident_ownership(&id), Some(false));
+        assert_eq!(pools.registry[&id].resource_owner_count, 1);
+        assert!(!pools.registry[&id].resource_released);
+        assert!(pools.released_resident_keys(1).is_empty());
+
+        assert_eq!(
+            pools.retain_resident_target(&id),
+            Some(false),
+            "the surviving alias keeps the shared allocation retainable"
+        );
     }
 
     #[test]

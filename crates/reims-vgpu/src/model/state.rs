@@ -4,6 +4,8 @@ use crate::model::{LruBytesMemo, GFX_MMIO_SIZE, MAX_CHANNELS};
 use crate::runtime::decode::resource::{
     DecodeStatus as ResourceDecodeStatus, Descriptor, ListObjectEntry,
 };
+#[cfg(feature = "backend-vulkan")]
+use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -582,14 +584,19 @@ pub struct TaskResource {
     /// Direct backend objects keep only a weak reference, so deletion—not an
     /// arbitrary idle timeout—makes them reclaimable.
     lifetime: Arc<TaskResourceLifetime>,
-    /// Engine object retained for this serialized resource lifetime.
+    /// Engine objects retained for this serialized resource lifetime.
     ///
     /// The lease owns its resident pin and allocation classification. Its
-    /// identity includes the mapping generation, so page recycling replaces
-    /// the lease instead of silently reusing the old allocation.
+    /// Each identity includes the mapping generation. A resource may own
+    /// several child identities concurrently; page recycling replaces only the
+    /// matching identity instead of overwriting an unrelated child lease.
     #[cfg(feature = "backend-vulkan")]
-    resident_target:
-        Mutex<Option<crate::backend::vulkan::engine::ResidentResourceLease>>,
+    resident_targets: Mutex<
+        HashMap<
+            crate::backend::vulkan::engine::TargetIdentity,
+            crate::backend::vulkan::engine::ResidentResourceLease,
+        >,
+    >,
 }
 
 impl TaskResource {
@@ -600,7 +607,7 @@ impl TaskResource {
             decoded: OnceLock::new(),
             lifetime: Arc::new(TaskResourceLifetime::new()),
             #[cfg(feature = "backend-vulkan")]
-            resident_target: Mutex::new(None),
+            resident_targets: Mutex::new(HashMap::new()),
         }
     }
 
@@ -647,21 +654,30 @@ impl TaskResource {
         use crate::backend::vulkan::engine::ResidentContentBacking;
 
         let mut held = self
-            .resident_target
+            .resident_targets
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(lease) = held.as_ref().filter(|lease| lease.matches(identity)) {
+        if let Some(lease) = held.get(identity).filter(|lease| lease.matches(identity)) {
             return lease.backing();
         }
-        *held = retain(identity);
-        crate::runtime::drain::note_store_route(if held.is_some() {
+        // An engine reset invalidates the lease under this exact identity, but
+        // another identity is another child resource, not a replacement. A
+        // texture can own several views/surfaces concurrently.
+        held.remove(identity);
+        let acquired = retain(identity);
+        let backing = acquired
+            .as_ref()
+            .map(|lease| lease.backing())
+            .unwrap_or(ResidentContentBacking::NotReady);
+        if let Some(lease) = acquired {
+            held.insert(identity.clone(), lease);
+        }
+        crate::runtime::drain::note_store_route(if backing != ResidentContentBacking::NotReady {
             "resident_resource_acquired"
         } else {
             "resident_resource_unavailable"
         });
-        held.as_ref()
-            .map(|lease| lease.backing())
-            .unwrap_or(ResidentContentBacking::NotReady)
+        backing
     }
 }
 
@@ -722,7 +738,7 @@ mod task_resource_resident_tests {
     }
 
     #[test]
-    fn a_resource_retains_one_target_lease_until_identity_or_engine_changes() {
+    fn a_resource_retains_each_child_identity_until_the_resource_ends() {
         let resource = TaskResource::new(ListObjectEntry::default(), Arc::from([]));
         let first = identity(1);
         let acquisitions = Cell::new(0_u32);
@@ -773,7 +789,23 @@ mod task_resource_resident_tests {
             ))
         });
         assert_eq!(backing, ResidentContentBacking::GuestAllocation);
-        assert_eq!(acquisitions.get(), 3, "a new mapping generation reacquires once");
+        assert_eq!(
+            acquisitions.get(),
+            3,
+            "a new mapping generation reacquires once"
+        );
+
+        assert_eq!(
+            resource.resident_target_backing_with(&first, |_| {
+                panic!("adding a child identity must not evict the first child")
+            }),
+            ResidentContentBacking::DeviceAllocation
+        );
+        assert_eq!(
+            acquisitions.get(),
+            3,
+            "both child identities remain retained"
+        );
         assert_eq!(
             crate::runtime::drain::census::store_route_count("resident_resource_acquired"),
             acquired_before + 3

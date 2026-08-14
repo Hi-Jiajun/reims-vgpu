@@ -1565,10 +1565,15 @@ pub(crate) struct ResidentTargetSlot {
     /// the first member's flush must not expose the image to eviction while
     /// a peer's window is still armed.
     pub pin_count: u32,
-    /// The serialized resource that owned this resident has ended its lifetime.
-    /// Existing GPU/window holders may finish, but new holders are refused and
-    /// the resident retires when the last pin leaves.
+    /// The last serialized resource owning this resident has ended its lifetime.
+    /// Existing GPU/window holders may finish, and the resident retires when the
+    /// last pin leaves unless a new serialized owner revives it first.
     pub resource_released: bool,
+    /// Serialized resources currently owning this identity. Kept separate from
+    /// `pin_count`, which also includes transient GPU and writeback holders.
+    /// One parent resource may have several child identities, and several
+    /// parents may alias one shared allocation.
+    pub resource_owner_count: u32,
     /// This image holds pixels that exist **nowhere else** — not in the guest's
     /// pages, not in any host-side copy. Destroying it destroys guest work.
     ///
@@ -3664,6 +3669,7 @@ mod resident_reuse_tests {
             color_format: format,
             pin_count: 0,
             resource_released: false,
+            resource_owner_count: 0,
             gpu_only_content: false,
             last_touch_ms: 0,
         }
