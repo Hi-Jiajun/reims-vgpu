@@ -141,7 +141,6 @@ impl ResourcePools {
         for (_, sampled) in self.guest_sampled.drain() {
             device.destroy_image_view(sampled.view, None);
             device.destroy_image(sampled.image, None);
-            device.free_memory(sampled.memory, None);
         }
         for s in self.storage_image_free.drain() {
             device.destroy_image_view(s.view, None);
@@ -169,9 +168,6 @@ impl ResourcePools {
             device.destroy_framebuffer(t.framebuffer, None);
             device.destroy_image_view(t.view, None);
             device.destroy_image(t.image, None);
-            if let super::ResidentMemory::GuestImported { memory, .. } = t.memory {
-                device.free_memory(memory, None);
-            }
         }
         self.registry_order.clear();
         // Every fence above was waited, so nothing can still be reading or

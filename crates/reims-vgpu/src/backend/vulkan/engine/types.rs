@@ -1945,9 +1945,11 @@ pub struct GuestSampledBacking {
 /// Keeping these together makes the retained resource its own synchronization
 /// authority: once admitted, the engine can publish the exact footprint that
 /// was validated with the allocation instead of reconstructing it at Store.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct GuestTargetMemory {
     pub backing: GuestTargetBacking,
+    /// The parent allocation whose one backend import all child views share.
+    pub import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
     pub pages: std::sync::Arc<[u64]>,
 }
 

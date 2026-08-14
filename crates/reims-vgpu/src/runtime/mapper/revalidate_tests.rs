@@ -251,20 +251,17 @@ fn mapping_io_still_rejects_non_ram_page_at_map_boundary() {
 fn invalidate_mapping_pages_bumps_map_generation_and_clears() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     state.map_surface(5);
-    {
+    let import_id = {
         let m = state.mappings.get_mut(&5).unwrap();
         m.page_entries = vec![1];
         m.contig_ptr = 0xdead;
         m.contig_len = 4096;
         m.contig_import = Some(std::sync::Arc::new(
-            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
-                0xdead_0000,
-                4096,
-                4096,
-            )
-            .expect("synthetic aligned import"),
+            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(0xdead_0000, 4096, 4096)
+                .expect("synthetic aligned import"),
         ));
-    }
+        m.contig_import.as_ref().unwrap().id()
+    };
     let gen0 = state.mappings.get(&5).unwrap().map_generation;
     assert!(state.invalidate_mapping_pages(5));
     let m = state.mappings.get(&5).unwrap();
@@ -273,6 +270,7 @@ fn invalidate_mapping_pages_bumps_map_generation_and_clears() {
     assert!(m.contig_import.is_none());
     assert!(m.map_generation != gen0);
     assert_eq!(state.retired_views, vec![(0xdead, 4096)]);
+    assert_eq!(state.retired_guest_imports, vec![import_id]);
 }
 
 /// Invalidating a mapping's pages drops the host-side copy of those pages.

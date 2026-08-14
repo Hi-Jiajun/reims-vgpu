@@ -774,19 +774,19 @@ impl ResourcePools {
     ) -> Option<ResidentTargetSlot> {
         let old = self.unregister_resident(identity, why)?;
         self.dispose_owed_framebuffer(&ctx.device, old.owed_framebuffer());
-        let retired = match old.memory {
+        let retired = match &old.memory {
             ResidentMemory::Recyclable(memory) => DeferredHandle::RecycleTarget(FreeTargetImage {
                 image: old.image,
-                memory,
+                memory: *memory,
                 view: old.view,
                 width: old.width,
                 height: old.height,
                 format: old.color_format,
             }),
-            ResidentMemory::GuestImported { memory, .. } => DeferredHandle::Image {
+            ResidentMemory::GuestImported { guest } => DeferredHandle::GuestImage {
                 image: old.image,
-                memory,
                 view: old.view,
+                _import: std::sync::Arc::clone(&guest.import),
             },
         };
         self.dispose(&ctx.device, retired);
@@ -908,6 +908,8 @@ impl ResourcePools {
         let imported = match guest_memory.as_ref() {
             Some(memory) => match super::super::linear_target_import::create(
                 ctx,
+                &mut self.host_ram_imports,
+                &memory.import,
                 memory.backing,
                 width,
                 height,
@@ -933,7 +935,6 @@ impl ResourcePools {
         };
         let (image, memory, view) = if let Some(imported) = imported {
             counters.note_create(CreateSite::RegistryImportedImage);
-            counters.note_alloc();
             let view = match ctx.device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
                     .image(imported.image)
@@ -945,7 +946,13 @@ impl ResourcePools {
                 Ok(view) => view,
                 Err(error) => {
                     ctx.device.destroy_image(imported.image, None);
-                    ctx.device.free_memory(imported.memory, None);
+                    let import = &guest_memory
+                        .as_ref()
+                        .expect("an imported target has guest memory")
+                        .import;
+                    if let Some(parent) = self.host_ram_imports.release_child(import) {
+                        parent.destroy(&ctx.device);
+                    }
                     return Err(DrawError::VkCall(VkCall::new(
                         VkOp::PoolsCreateRegistryView,
                         error,
@@ -956,7 +963,6 @@ impl ResourcePools {
             (
                 imported.image,
                 ResidentMemory::GuestImported {
-                    memory: imported.memory,
                     guest: guest_memory.expect("an imported target has guest memory"),
                 },
                 view,
@@ -1072,12 +1078,15 @@ impl ResourcePools {
             Err(e) => {
                 ctx.device.destroy_image_view(view, None);
                 ctx.device.destroy_image(image, None);
-                match memory {
+                match &memory {
                     ResidentMemory::Recyclable(_) => {
                         self.free_image_slab(&ctx.device, image);
                     }
-                    ResidentMemory::GuestImported { memory, .. } => {
-                        ctx.device.free_memory(memory, None);
+                    ResidentMemory::GuestImported { .. } => {}
+                }
+                if let ResidentMemory::GuestImported { guest } = &memory {
+                    if let Some(parent) = self.host_ram_imports.release_child(&guest.import) {
+                        parent.destroy(&ctx.device);
                     }
                 }
                 return Err(DrawError::VkCall(VkCall::new(
@@ -2477,7 +2486,6 @@ pub(super) mod pin_count_tests {
         let imported_id = surf(2);
         let mut imported = dummy_slot(true);
         imported.memory = ResidentMemory::GuestImported {
-            memory: vk::DeviceMemory::null(),
             guest: crate::backend::vulkan::engine::GuestTargetMemory {
                 backing: crate::backend::vulkan::engine::GuestTargetBacking {
                     allocation_host_ptr: 0x1000,
@@ -2485,6 +2493,12 @@ pub(super) mod pin_count_tests {
                     plane_offset: 0,
                     row_pitch: 64,
                 },
+                import: std::sync::Arc::new(
+                    crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                        0x1000, 0x4000, 0x1000,
+                    )
+                    .unwrap(),
+                ),
                 pages: std::sync::Arc::from([1_u64]),
             },
         };
@@ -2699,7 +2713,6 @@ pub(super) mod pin_count_tests {
         let mut pools = ResourcePools::new();
         let mut resident = new_resident(some_framebuffer(), vk::RenderPass::null());
         resident.memory = ResidentMemory::GuestImported {
-            memory: vk::DeviceMemory::null(),
             guest: crate::backend::vulkan::engine::GuestTargetMemory {
                 backing: crate::backend::vulkan::engine::GuestTargetBacking {
                     allocation_host_ptr: 0x1000,
@@ -2707,6 +2720,12 @@ pub(super) mod pin_count_tests {
                     plane_offset: 0,
                     row_pitch: 64,
                 },
+                import: std::sync::Arc::new(
+                    crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                        0x1000, 0x4000, 0x1000,
+                    )
+                    .unwrap(),
+                ),
                 pages: std::sync::Arc::from([0x2000, 0x3000]),
             },
         };

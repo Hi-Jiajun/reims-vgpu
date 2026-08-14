@@ -2029,6 +2029,20 @@ pub fn retire_resident_storage_content(identity: &crate::model::ComputeStorageRe
     guard.pools.note_compute_storage_content_retired(identity);
 }
 
+/// End one guest parent allocation's Vulkan lifetime.
+///
+/// The runtime emits this only when the mapping incarnation that owns the
+/// allocation ends. Existing child images keep the import until their own
+/// fence-safe retirement; an allocation with no children enters the same
+/// graveyard immediately so already-recorded buffer accesses finish first.
+pub fn retire_guest_import(import_id: crate::runtime::guest_ram::ImportId) {
+    let mut guard = lock_engine();
+    let Some(device) = guard.owner.ctx.as_ref().map(|ctx| ctx.device.clone()) else {
+        return;
+    };
+    unsafe { guard.pools.retire_guest_import(&device, import_id) };
+}
+
 /// A synchronous compute writeback landed this resident's output in the guest's
 /// own pages, so the image has stopped being the only place that output exists
 /// and the reclaim paths may take it.

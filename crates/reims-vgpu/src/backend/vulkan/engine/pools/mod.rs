@@ -829,9 +829,15 @@ pub(crate) enum DeferredHandle {
     GuestImage {
         image: vk::Image,
         view: vk::ImageView,
-        memory: vk::DeviceMemory,
         _import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
     },
+    /// The parent allocation and its whole-span buffer. It retires only after
+    /// the guest ended the parent lifetime and every child image was destroyed.
+    GuestAllocation(host_ram::ImportedHostRam),
+    /// Fence barrier captured when a parent allocation's guest lifetime ended.
+    /// Child retirement and this barrier may complete in either order; the
+    /// second one releases the parent.
+    GuestAllocationBarrier(crate::runtime::guest_ram::ImportId),
     /// A sampled-cache slot evicted by the LRU/byte cap. Instead of destroying
     /// it, the drain returns it to `sampled_free` for reuse (bounded per key) so
     /// a content-changing sampled input (live tile / video frame) re-uploads
@@ -883,12 +889,21 @@ impl ResourcePools {
             DeferredHandle::GuestImage {
                 image,
                 view,
-                memory,
                 _import,
             } => {
                 device.destroy_image_view(view, None);
                 device.destroy_image(image, None);
-                device.free_memory(memory, None);
+                if let Some(parent) = self.host_ram_imports.release_child(&_import) {
+                    crate::runtime::drain::note_store_route("guest_import_parent_released");
+                    parent.destroy(device);
+                }
+            }
+            DeferredHandle::GuestAllocation(parent) => parent.destroy(device),
+            DeferredHandle::GuestAllocationBarrier(import_id) => {
+                if let Some(parent) = self.host_ram_imports.retirement_fences_cleared(import_id) {
+                    crate::runtime::drain::note_store_route("guest_import_parent_released");
+                    parent.destroy(device);
+                }
             }
             DeferredHandle::RecycleSampled(slot) => {
                 device.destroy_image_view(slot.view, None);
@@ -988,7 +1003,6 @@ pub(crate) struct GuestSampledKey {
 
 struct GuestSampledSlot {
     image: vk::Image,
-    memory: vk::DeviceMemory,
     view: vk::ImageView,
     /// Keeps the checked packed-allocation bound alive for exactly as long as
     /// Vulkan can address it.
@@ -1497,11 +1511,10 @@ impl ResidentAccess {
 /// allocation, so recycling it under another identity would bind that surface's
 /// pages to unrelated guest work. The enum forces every retirement path to
 /// choose between those two operations.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) enum ResidentMemory {
     Recyclable(vk::DeviceMemory),
     GuestImported {
-        memory: vk::DeviceMemory,
         guest: crate::backend::vulkan::engine::GuestTargetMemory,
     },
 }

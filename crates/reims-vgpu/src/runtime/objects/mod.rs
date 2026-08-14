@@ -2155,12 +2155,19 @@ fn apply_type4_backing<M: HostMemory>(
             map_generation: m.map_generation,
         });
         // Contiguous view must be rebuilt.
+        let mut retired_import = None;
         if m.contig_ptr != 0 {
             state.retired_views.push((m.contig_ptr, m.contig_len));
             m.contig_ptr = 0;
             m.contig_len = 0;
             m.contig_gpas = Default::default();
-            m.contig_import = None;
+            retired_import = m.contig_import.take().map(|import| {
+                import.retire();
+                import.id()
+            });
+        }
+        if let Some(import) = retired_import {
+            state.retired_guest_imports.push(import);
         }
     }
 

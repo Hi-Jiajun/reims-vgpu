@@ -80,6 +80,28 @@ mod sampled_identity_switch {
 }
 
 impl ResourcePools {
+    /// End one guest parent allocation's backend lifetime. If child images are
+    /// still live, their deferred destruction releases it after the last fence.
+    pub(crate) unsafe fn retire_guest_import(
+        &mut self,
+        device: &ash::Device,
+        import_id: crate::runtime::guest_ram::ImportId,
+    ) {
+        match self.host_ram_imports.retire(import_id) {
+            host_ram::ParentRetire::Ready(parent) => {
+                crate::runtime::drain::note_store_route("guest_import_retired_now");
+                self.dispose(device, DeferredHandle::GuestAllocation(parent));
+            }
+            host_ram::ParentRetire::WaitingForChildren => {
+                crate::runtime::drain::note_store_route("guest_import_retired_waiting_child");
+                self.dispose(device, DeferredHandle::GuestAllocationBarrier(import_id));
+            }
+            host_ram::ParentRetire::NotImported => {
+                crate::runtime::drain::note_store_route("guest_import_retired_unimported");
+            }
+        }
+    }
+
     pub(crate) fn guest_reset_counts(&self) -> (usize, usize, usize, usize) {
         let sampled = self.sampled_live.len()
             + self.sampled_free.len()
@@ -381,7 +403,6 @@ impl ResourcePools {
                     DeferredHandle::GuestImage {
                         image: slot.image,
                         view: slot.view,
-                        memory: slot.memory,
                         _import: slot._import,
                     },
                 );
@@ -3235,6 +3256,8 @@ impl ResourcePools {
         let imported = match unsafe {
             super::super::linear_target_import::create(
                 ctx,
+                &mut self.host_ram_imports,
+                &import,
                 key.backing,
                 key.image.width,
                 key.image.height,
@@ -3258,7 +3281,6 @@ impl ResourcePools {
             }
         };
         counters.note_create(CreateSite::GuestSampledImage);
-        counters.note_alloc();
         let view = match unsafe {
             ctx.device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
@@ -3273,7 +3295,9 @@ impl ResourcePools {
             Ok(view) => view,
             Err(error) => {
                 ctx.device.destroy_image(imported.image, None);
-                ctx.device.free_memory(imported.memory, None);
+                if let Some(parent) = self.host_ram_imports.release_child(&import) {
+                    parent.destroy(&ctx.device);
+                }
                 return Err(DrawError::VkCall(VkCall::new(
                     VkOp::PoolsCreateSampledView,
                     error,
@@ -3291,7 +3315,6 @@ impl ResourcePools {
             key,
             GuestSampledSlot {
                 image: imported.image,
-                memory: imported.memory,
                 view,
                 _import: import,
                 owner,
@@ -4229,7 +4252,6 @@ mod recycle_tests {
         };
         let slot = GuestSampledSlot {
             image: vk::Image::null(),
-            memory: vk::DeviceMemory::null(),
             view: vk::ImageView::null(),
             _import: import,
             owner,

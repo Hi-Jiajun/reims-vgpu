@@ -8578,18 +8578,19 @@ fn type11_guest_target_backing<H: HostMemory + HostOps>(
         let format = crate::runtime::mapping_write::mapping_store_format(mapping);
         crate::runtime::mapping_write::type11_sample_window(mapping, c0.width, c0.height, format)?
     };
-    let (allocation_host_ptr, allocation_len, pages) =
-        crate::runtime::mapper::ensure_contig_view_with_pages(state, host, c0.mapping_id)?;
-    if span_end > allocation_len as u64 {
+    let (import, pages) =
+        crate::runtime::mapper::ensure_contig_import_with_pages(state, host, c0.mapping_id)?;
+    if span_end > import.len() {
         return None;
     }
     Some(crate::backend::vulkan::engine::GuestTargetMemory {
         backing: crate::backend::vulkan::engine::GuestTargetBacking {
-            allocation_host_ptr,
-            allocation_len: allocation_len as u64,
+            allocation_host_ptr: import.host_base(),
+            allocation_len: import.len(),
             plane_offset,
             row_pitch: u64::from(row_pitch),
         },
+        import,
         pages,
     })
 }

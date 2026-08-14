@@ -581,6 +581,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     // Read before the `get_mut` below takes `state` mutably.
     let page_shift = state.page_shift;
     let mut retired = None;
+    let mut retired_import = None;
     let mut incarnation_changed = false;
     let mut reprieved = false;
     let mut pages_changed = false;
@@ -601,7 +602,10 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
             m.contig_ptr = 0;
             m.contig_len = 0;
             m.contig_gpas = Default::default();
-            m.contig_import = None;
+            retired_import = m.contig_import.take().map(|import| {
+                import.retire();
+                import.id()
+            });
         }
         if pages_changed {
             DeviceState::bump_map_generation(m);
@@ -681,6 +685,9 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     }
     if let Some(v) = retired {
         state.retired_views.push(v);
+    }
+    if let Some(import) = retired_import {
+        state.retired_guest_imports.push(import);
     }
     if incarnation_changed {
         // The condemned backing really died and the id now carries a new
@@ -1473,6 +1480,16 @@ fn revalidate_timing_is_slow(elapsed_us: u64) -> bool {
 /// exactly that host. A transient view is never admitted to a backend import,
 /// so its only users are CPU copies that finish inside their own call.
 pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
+    // The backend allocation aliases the host view, so revoke the GPU parent
+    // first. Existing child images and recorded buffers hold it through their
+    // fence-safe retirement; the host view is stable on every backend that can
+    // import it, making `unmap_pages` a no-op there until device teardown.
+    #[cfg(feature = "backend-vulkan")]
+    for import in state.retired_guest_imports.drain(..) {
+        crate::backend::vulkan::engine::retire_guest_import(import);
+    }
+    #[cfg(not(feature = "backend-vulkan"))]
+    state.retired_guest_imports.clear();
     for (ptr, len) in state.retired_views.drain(..) {
         host.unmap_pages(ptr, len);
     }

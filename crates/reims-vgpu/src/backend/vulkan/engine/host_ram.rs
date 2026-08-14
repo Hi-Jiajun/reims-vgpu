@@ -42,6 +42,10 @@ use crate::runtime::guest_ram::{GuestRamError, GuestRamImport, GuestRef};
 pub(crate) struct ImportedHostRam {
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
+    /// Memory type selected when the parent allocation was imported. Child
+    /// images may alias this memory only when their own requirements name the
+    /// same type.
+    pub memory_type_index: u32,
     /// Bytes the import covers. The buffer spans all of it, so every
     /// [`crate::runtime::guest_ram::BoundRange`] inside the import is a valid
     /// offset into this one buffer.
@@ -80,6 +84,9 @@ pub enum HostRamDecline {
     Unsupported {
         rung: crate::backend::vulkan::caps::HostPointerImport,
     },
+    /// The guest ended this parent allocation's lifetime. Old child objects
+    /// may finish retiring, but no new view may resurrect its import identity.
+    Retired { import_id: u64 },
     /// `vkGetMemoryHostPointerPropertiesEXT` declined the pointer, or no memory
     /// type it named also satisfies what this device wants for guest memory.
     NoImportableMemoryType { host_base: usize },
@@ -104,6 +111,7 @@ impl Decline for HostRamDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self::Unsupported { .. } => "host_ram_import_unsupported",
+            Self::Retired { .. } => "host_ram_import_retired",
             Self::NoImportableMemoryType { .. } => "host_ram_import_no_importable_memory_type",
             Self::CreateBuffer { .. } => "host_ram_import_create_buffer",
             Self::TooSmall { .. } => "host_ram_import_too_small",
@@ -118,6 +126,7 @@ impl Decline for HostRamDecline {
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::Unsupported { rung } => vec![("rung", rung.slug().to_string())],
+            Self::Retired { import_id } => vec![("import_id", import_id.to_string())],
             Self::NoImportableMemoryType { host_base } => {
                 vec![("host_base", format!("{host_base:#x}"))]
             }
@@ -155,9 +164,23 @@ pub(crate) struct BoundGuestRam {
 }
 
 /// Every bounded host allocation this device has imported, keyed by identity.
+#[derive(Clone, Copy)]
+struct LiveImport {
+    allocation: ImportedHostRam,
+    child_images: usize,
+    retired: bool,
+    retirement_fences_cleared: bool,
+}
+
+pub(crate) enum ParentRetire {
+    NotImported,
+    WaitingForChildren,
+    Ready(ImportedHostRam),
+}
+
 #[derive(Default)]
 pub(crate) struct HostRamImports {
-    live: HashMap<u64, ImportedHostRam>,
+    live: HashMap<u64, LiveImport>,
     /// `true` for RAMBlock-coordinate imports, `false` for packed task aliases.
     kinds: HashMap<u64, bool>,
     /// Driver refusals are properties of this pointer/device pair. Holding the
@@ -166,6 +189,11 @@ pub(crate) struct HostRamImports {
 }
 
 impl HostRamImports {
+    fn remove_live(&mut self, key: u64) -> Option<ImportedHostRam> {
+        self.kinds.remove(&key);
+        self.live.remove(&key).map(|entry| entry.allocation)
+    }
+
     /// Resolve `guest_ref` to a bindable range, importing its RAMBlock if this
     /// is the first reference into it.
     ///
@@ -215,6 +243,78 @@ impl HostRamImports {
         unsafe { self.ensure(ctx, import) }.map(|(_, made)| made)
     }
 
+    /// Return the one device-memory import owned by `import`'s allocation.
+    ///
+    /// Child buffers and images are views into this parent allocation; they do
+    /// not import the host pointer again. The caller still has to validate the
+    /// child's memory requirements and bind offset before using the handle.
+    pub(crate) unsafe fn allocation(
+        &mut self,
+        ctx: &super::context::DeviceContext,
+        import: &GuestRamImport,
+    ) -> Result<ImportedHostRam, HostRamDecline> {
+        unsafe { self.ensure(ctx, import) }.map(|(live, _)| live)
+    }
+
+    /// Record one child image bound into this parent allocation.
+    pub(crate) fn retain_child(&mut self, import: &GuestRamImport) {
+        let entry = self
+            .live
+            .get_mut(&import.id().get())
+            .expect("a child can only retain the parent it just bound");
+        entry.child_images = entry
+            .child_images
+            .checked_add(1)
+            .expect("child image reference count overflow");
+    }
+
+    /// Release one retired child. Returns the parent allocation exactly when
+    /// its guest lifetime has ended and this was its last child.
+    pub(crate) fn release_child(&mut self, import: &GuestRamImport) -> Option<ImportedHostRam> {
+        let key = import.id().get();
+        let entry = self.live.get_mut(&key)?;
+        entry.child_images = entry
+            .child_images
+            .checked_sub(1)
+            .expect("every child release has a matching retain");
+        if entry.retired && entry.child_images == 0 && entry.retirement_fences_cleared {
+            return self.remove_live(key);
+        }
+        None
+    }
+
+    /// The submission slots that were open when the parent retired have all
+    /// completed. Returns the allocation when child retirement completed too.
+    pub(crate) fn retirement_fences_cleared(
+        &mut self,
+        import_id: crate::runtime::guest_ram::ImportId,
+    ) -> Option<ImportedHostRam> {
+        let key = import_id.get();
+        let entry = self.live.get_mut(&key)?;
+        entry.retirement_fences_cleared = true;
+        if entry.retired && entry.child_images == 0 {
+            return self.remove_live(key);
+        }
+        None
+    }
+
+    /// End a guest parent allocation's lifetime. Existing children keep its
+    /// Vulkan import alive until their in-flight-safe retirement completes.
+    pub(crate) fn retire(
+        &mut self,
+        import_id: crate::runtime::guest_ram::ImportId,
+    ) -> ParentRetire {
+        let key = import_id.get();
+        let Some(entry) = self.live.get_mut(&key) else {
+            return ParentRetire::NotImported;
+        };
+        entry.retired = true;
+        if entry.child_images == 0 {
+            return ParentRetire::Ready(self.remove_live(key).expect("the entry was found above"));
+        }
+        ParentRetire::WaitingForChildren
+    }
+
     /// The one place a RAMBlock becomes an import, so "have we imported this
     /// block" is asked once and cannot be answered two ways.
     ///
@@ -227,8 +327,11 @@ impl HostRamImports {
         import: &GuestRamImport,
     ) -> Result<(ImportedHostRam, bool), HostRamDecline> {
         let key = import.id().get();
+        if import.is_retired() {
+            return Err(HostRamDecline::Retired { import_id: key });
+        }
         if let Some(live) = self.live.get(&key) {
-            return Ok((*live, false));
+            return Ok((live.allocation, false));
         }
         if let Some(decline) = self.declined.get(&key) {
             return Err(*decline);
@@ -240,7 +343,15 @@ impl HostRamImports {
                 return Err(decline);
             }
         };
-        self.live.insert(key, made);
+        self.live.insert(
+            key,
+            LiveImport {
+                allocation: made,
+                child_images: 0,
+                retired: false,
+                retirement_fences_cleared: false,
+            },
+        );
         self.kinds.insert(key, import.gpa_base().is_some());
         Ok((made, true))
     }
@@ -252,7 +363,7 @@ impl HostRamImports {
     /// No submission may still reference any imported buffer.
     pub(crate) unsafe fn destroy_all(&mut self, device: &ash::Device) {
         for (_, live) in self.live.drain() {
-            unsafe { live.destroy(device) };
+            unsafe { live.allocation.destroy(device) };
         }
         self.kinds.clear();
         self.declined.clear();
@@ -260,7 +371,7 @@ impl HostRamImports {
 
     /// Bytes of guest RAM this device currently has imported, for the census.
     pub(crate) fn imported_bytes(&self) -> u64 {
-        self.live.values().map(|l| l.size).sum()
+        self.live.values().map(|l| l.allocation.size).sum()
     }
 
     /// How many RAMBlocks are imported. One or two on an ordinary machine, and
@@ -396,6 +507,7 @@ unsafe fn import_ramblock(
             Ok(()) => Ok(ImportedHostRam {
                 buffer,
                 memory,
+                memory_type_index,
                 size,
             }),
             Err(result) => {
@@ -540,6 +652,7 @@ mod tests {
             HostRamDecline::Unsupported {
                 rung: HostPointerImport::Unqueried,
             },
+            HostRamDecline::Retired { import_id: 1 },
             HostRamDecline::NoImportableMemoryType { host_base: 0 },
             HostRamDecline::CreateBuffer {
                 result: vk::Result::ERROR_UNKNOWN,
@@ -563,6 +676,90 @@ mod tests {
         for slug in slugs {
             assert!(slug.starts_with("host_ram_import_"), "{slug}");
         }
+    }
+
+    #[test]
+    fn a_retired_parent_waits_for_its_last_child_and_cannot_resurrect() {
+        let import = GuestRamImport::new_host_allocation(0x1000, 0x4000, 0x1000)
+            .expect("aligned synthetic import");
+        let key = import.id().get();
+        let allocation = ImportedHostRam {
+            buffer: vk::Buffer::null(),
+            memory: vk::DeviceMemory::null(),
+            memory_type_index: 0,
+            size: 0x4000,
+        };
+        let mut imports = HostRamImports::default();
+        imports.live.insert(
+            key,
+            LiveImport {
+                allocation,
+                child_images: 0,
+                retired: false,
+                retirement_fences_cleared: false,
+            },
+        );
+        imports.retain_child(&import);
+        imports.retain_child(&import);
+        import.retire();
+
+        assert!(matches!(
+            imports.retire(import.id()),
+            ParentRetire::WaitingForChildren
+        ));
+        assert!(
+            imports.release_child(&import).is_none(),
+            "one child remains"
+        );
+        assert!(
+            imports.retirement_fences_cleared(import.id()).is_none(),
+            "the retirement barrier passed but one child remains"
+        );
+        assert_eq!(
+            imports.release_child(&import).map(|parent| parent.size),
+            Some(0x4000),
+            "the last child hands the parent back exactly once"
+        );
+        assert!(!imports.live.contains_key(&key));
+        assert!(import.is_retired());
+    }
+
+    #[test]
+    fn parent_release_waits_when_the_last_child_finishes_before_the_fence_barrier() {
+        let import = GuestRamImport::new_host_allocation(0x5000, 0x4000, 0x1000)
+            .expect("aligned synthetic import");
+        let key = import.id().get();
+        let mut imports = HostRamImports::default();
+        imports.live.insert(
+            key,
+            LiveImport {
+                allocation: ImportedHostRam {
+                    buffer: vk::Buffer::null(),
+                    memory: vk::DeviceMemory::null(),
+                    memory_type_index: 0,
+                    size: 0x4000,
+                },
+                child_images: 0,
+                retired: false,
+                retirement_fences_cleared: false,
+            },
+        );
+        imports.retain_child(&import);
+        import.retire();
+        assert!(matches!(
+            imports.retire(import.id()),
+            ParentRetire::WaitingForChildren
+        ));
+        assert!(
+            imports.release_child(&import).is_none(),
+            "the retirement fence has not completed"
+        );
+        assert_eq!(
+            imports
+                .retirement_fences_cleared(import.id())
+                .map(|parent| parent.size),
+            Some(0x4000)
+        );
     }
 
     #[test]

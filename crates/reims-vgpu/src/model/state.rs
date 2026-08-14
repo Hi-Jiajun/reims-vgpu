@@ -2430,9 +2430,12 @@ pub struct DeviceState {
     pub draining_mask: u32,
     /// Contiguous mapping views (`MappingEntry::contig_ptr`) whose page tables
     /// changed. `DeviceState` cannot unmap (no HostOps); the runtime flushes
-    /// these via `HostOps::unmap_pages` after dropping the Metal objects that
-    /// alias them (`mapper::flush_retired_views`).
+    /// these via `HostOps::unmap_pages` after retiring the backend objects and
+    /// parent allocations that alias them (`mapper::flush_retired_views`).
     pub retired_views: Vec<(usize, usize)>,
+    /// Backend parent allocations detached with `retired_views`. The runtime
+    /// retires the GPU import before releasing the host view it aliases.
+    pub retired_guest_imports: Vec<crate::runtime::guest_ram::ImportId>,
     /// Guest-write tokens whose page list is gone, awaiting release through
     /// `HostOps::untrack_guest_writes`. Drained by
     /// `mapper::flush_retired_views` alongside `retired_views`, for the same
@@ -2567,6 +2570,7 @@ impl DeviceState {
             draining_channel: 0,
             draining_mask: 0,
             retired_views: Vec::new(),
+            retired_guest_imports: Vec::new(),
             retired_guest_write_tokens: Vec::new(),
             retired_linear_residents: Vec::new(),
             pending_writebacks: crate::runtime::writeback_debt::PendingWritebacks::default(),
@@ -2591,16 +2595,21 @@ impl DeviceState {
 
     /// Detach `e`'s contiguous view for later unmap (page table changed).
     /// Returns the retired (ptr, len) to push into `retired_views`.
-    fn take_mapping_view(e: &mut MappingEntry) -> Option<(usize, usize)> {
-        if e.contig_ptr == 0 {
-            return None;
-        }
-        let v = (e.contig_ptr, e.contig_len);
+    fn take_mapping_view(
+        e: &mut MappingEntry,
+    ) -> (
+        Option<(usize, usize)>,
+        Option<crate::runtime::guest_ram::ImportId>,
+    ) {
+        let import = e.contig_import.take().map(|import| {
+            import.retire();
+            import.id()
+        });
+        let view = (e.contig_ptr != 0).then_some((e.contig_ptr, e.contig_len));
         e.contig_ptr = 0;
         e.contig_len = 0;
         e.contig_gpas = Default::default();
-        e.contig_import = None;
-        Some(v)
+        (view, import)
     }
 
     /// Detach the guest-write token, returning it for release through
@@ -2626,8 +2635,12 @@ impl DeviceState {
         let mut views = std::mem::take(&mut self.retired_views);
         let mut tokens = std::mem::take(&mut self.retired_guest_write_tokens);
         for mapping in self.mappings.values_mut() {
-            if let Some(view) = Self::take_mapping_view(mapping) {
+            let (view, import) = Self::take_mapping_view(mapping);
+            if let Some(view) = view {
                 views.push(view);
+            }
+            if let Some(import) = import {
+                self.retired_guest_imports.push(import);
             }
             let token = Self::take_guest_write_token(mapping);
             if token != 0 {
@@ -3172,10 +3185,13 @@ impl DeviceState {
         e.page_table_kva = 0;
         e.condemned_entries = None;
         Self::bump_map_generation(e);
-        let retired = Self::take_mapping_view(e);
+        let (retired, retired_import) = Self::take_mapping_view(e);
         let retired_token = Self::take_guest_write_token(e);
         if let Some(v) = retired {
             self.retired_views.push(v);
+        }
+        if let Some(import) = retired_import {
+            self.retired_guest_imports.push(import);
         }
         if retired_token != 0 {
             self.retired_guest_write_tokens.push(retired_token);
@@ -3203,10 +3219,13 @@ impl DeviceState {
         }
         e.condemned_entries = Some(std::mem::take(&mut e.page_entries));
         e.page_table_kva = 0;
-        let retired = Self::take_mapping_view(e);
+        let (retired, retired_import) = Self::take_mapping_view(e);
         let retired_token = Self::take_guest_write_token(e);
         if let Some(v) = retired {
             self.retired_views.push(v);
+        }
+        if let Some(import) = retired_import {
+            self.retired_guest_imports.push(import);
         }
         if retired_token != 0 {
             self.retired_guest_write_tokens.push(retired_token);
@@ -3254,10 +3273,13 @@ impl DeviceState {
         e.width = 0;
         e.height = 0;
         e.format = 0;
-        let retired = Self::take_mapping_view(e);
+        let (retired, retired_import) = Self::take_mapping_view(e);
         let retired_token = Self::take_guest_write_token(e);
         if let Some(v) = retired {
             self.retired_views.push(v);
+        }
+        if let Some(import) = retired_import {
+            self.retired_guest_imports.push(import);
         }
         if retired_token != 0 {
             self.retired_guest_write_tokens.push(retired_token);
@@ -3293,10 +3315,13 @@ impl DeviceState {
             e.width = 0;
             e.height = 0;
             e.format = 0;
-            let retired = Self::take_mapping_view(e);
+            let (retired, retired_import) = Self::take_mapping_view(e);
             let retired_token = Self::take_guest_write_token(e);
             if let Some(v) = retired {
                 self.retired_views.push(v);
+            }
+            if let Some(import) = retired_import {
+                self.retired_guest_imports.push(import);
             }
             if retired_token != 0 {
                 self.retired_guest_write_tokens.push(retired_token);
@@ -3343,10 +3368,13 @@ impl DeviceState {
         e.width = 0;
         e.height = 0;
         e.format = 0;
-        let retired = Self::take_mapping_view(e);
+        let (retired, retired_import) = Self::take_mapping_view(e);
         let retired_token = Self::take_guest_write_token(e);
         if let Some(v) = retired {
             self.retired_views.push(v);
+        }
+        if let Some(import) = retired_import {
+            self.retired_guest_imports.push(import);
         }
         if retired_token != 0 {
             self.retired_guest_write_tokens.push(retired_token);

@@ -307,6 +307,10 @@ impl GuestRamError {
 #[derive(Debug)]
 pub struct GuestRamImport {
     id: ImportId,
+    /// Set once the guest allocation lifetime ends. The identity is never
+    /// reusable, and a stale child holding this object may not recreate a
+    /// backend import after retirement.
+    retired: std::sync::atomic::AtomicBool,
     /// Guest physical address of the first byte covered, when this is a
     /// RAMBlock import. A packed task-VA alias has no linear GPA coordinate.
     gpa_base: Option<u64>,
@@ -383,6 +387,7 @@ impl GuestRamImport {
 
         Ok(Self {
             id: ImportId::allocate(),
+            retired: std::sync::atomic::AtomicBool::new(false),
             gpa_base: Some(region.gpa_base + head),
             host_base: host_base as usize,
             len,
@@ -421,6 +426,7 @@ impl GuestRamImport {
         }
         Ok(Self {
             id: ImportId::allocate(),
+            retired: std::sync::atomic::AtomicBool::new(false),
             gpa_base: None,
             host_base,
             len,
@@ -431,6 +437,19 @@ impl GuestRamImport {
     /// This import's identity. Every [`GuestSlice`] it makes carries it.
     pub fn id(&self) -> ImportId {
         self.id
+    }
+
+    /// End this allocation identity. Existing backend children may finish,
+    /// but no new child or import may be created from it afterward.
+    pub(crate) fn retire(&self) {
+        self.retired
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the allocation identity has ended and may no longer acquire new
+    /// backend children.
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Guest physical address of the first byte covered.
@@ -833,6 +852,17 @@ mod tests {
             align,
         )
         .expect("region is aligned and non-empty")
+    }
+
+    #[test]
+    fn retirement_is_monotonic_on_the_allocation_identity() {
+        let import = import(0x4000, 0x1000);
+        let id = import.id();
+        assert!(!import.is_retired());
+        import.retire();
+        import.retire();
+        assert!(import.is_retired());
+        assert_eq!(import.id(), id, "retirement never creates a new identity");
     }
 
     /// The bound, at the byte it exists for. A two-byte slice starting at the

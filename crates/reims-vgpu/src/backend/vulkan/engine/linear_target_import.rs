@@ -4,10 +4,14 @@
 //! correct only when the driver's actual subresource layout places its first
 //! texel at the plane's declared offset, uses the same row pitch, fits inside
 //! the retained packed alias, and accepts a memory type the host pointer also
-//! accepts. Those facts belong together because every one participates in the
-//! same `vkBindImageMemory` equation.
+//! accepts. The imported allocation is the parent resource; each image is a
+//! child view alias-bound at its checked plane offset. Those facts belong
+//! together because every one participates in the same `vkBindImageMemory`
+//! equation.
 
 use ash::vk;
+
+use crate::observe::Decline;
 
 use super::context::DeviceContext;
 use super::types::GuestTargetBacking;
@@ -40,6 +44,8 @@ fn subresource_aspect(mode: LayoutMode) -> vk::ImageAspectFlags {
 pub(super) enum WindowRefusal {
     UnsupportedTopology,
     HostImportUnavailable,
+    ParentAllocationMismatch,
+    ParentImport(super::host_ram::HostRamDecline),
     HostPointerMisaligned,
     SubresourceAfterPlane,
     BindOffsetMisaligned,
@@ -49,8 +55,6 @@ pub(super) enum WindowRefusal {
     DedicatedBindingRequired,
     ModifierQuery(vk::Result),
     CreateImage(vk::Result),
-    PointerProperties(vk::Result),
-    AllocateMemory(vk::Result),
     BindImage(vk::Result),
 }
 
@@ -59,6 +63,8 @@ impl WindowRefusal {
         match self {
             Self::UnsupportedTopology => "discrete_topology",
             Self::HostImportUnavailable => "no_host_import",
+            Self::ParentAllocationMismatch => "parent_allocation_mismatch",
+            Self::ParentImport(inner) => Decline::slug(&inner),
             Self::HostPointerMisaligned => "host_pointer_misaligned",
             Self::SubresourceAfterPlane => "subresource_after_plane",
             Self::BindOffsetMisaligned => "bind_offset_misaligned",
@@ -68,33 +74,32 @@ impl WindowRefusal {
             Self::DedicatedBindingRequired => "dedicated_binding_required",
             Self::ModifierQuery(_) => "modifier_query_failed",
             Self::CreateImage(_) => "create_failed",
-            Self::PointerProperties(_) => "pointer_properties_failed",
-            Self::AllocateMemory(_) => "allocate_failed",
             Self::BindImage(_) => "bind_failed",
         }
     }
 
     pub(super) fn result(self) -> Option<vk::Result> {
         match self {
-            Self::CreateImage(result)
-            | Self::ModifierQuery(result)
-            | Self::PointerProperties(result)
-            | Self::AllocateMemory(result)
-            | Self::BindImage(result) => Some(result),
+            Self::CreateImage(result) | Self::ModifierQuery(result) | Self::BindImage(result) => {
+                Some(result)
+            }
             _ => None,
         }
     }
 }
-
 impl crate::observe::Decline for WindowRefusal {
     fn slug(&self) -> &'static str {
         (*self).slug()
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
-        self.result()
-            .map(|result| vec![("result", format!("{result:?}"))])
-            .unwrap_or_default()
+        match self {
+            Self::ParentImport(inner) => crate::observe::Decline::fields(inner),
+            _ => self
+                .result()
+                .map(|result| vec![("result", format!("{result:?}"))])
+                .unwrap_or_default(),
+        }
     }
 }
 
@@ -201,6 +206,13 @@ fn external_import_is_shareable(features: vk::ExternalMemoryFeatureFlags) -> boo
         && !features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY)
 }
 
+fn parent_allocation_matches(
+    import: &crate::runtime::guest_ram::GuestRamImport,
+    backing: GuestTargetBacking,
+) -> bool {
+    import.host_base() == backing.allocation_host_ptr && import.len() == backing.allocation_len
+}
+
 unsafe fn explicit_linear_supported(
     ctx: &DeviceContext,
     format: vk::Format,
@@ -271,6 +283,7 @@ unsafe fn query_explicit_linear_support(
         .ty(vk::ImageType::TYPE_2D)
         .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
         .usage(usage)
+        .flags(vk::ImageCreateFlags::ALIAS)
         .push_next(&mut modifier)
         .push_next(&mut external);
     let mut external_properties = vk::ExternalImageFormatProperties::default();
@@ -289,16 +302,22 @@ unsafe fn query_explicit_linear_support(
 
 pub(super) struct ImportedTarget {
     pub image: vk::Image,
-    pub memory: vk::DeviceMemory,
 }
 
 /// Create a linear image whose storage is the guest surface allocation itself.
 ///
 /// A refusal is an optional-rail answer: callers keep the ordinary optimal
-/// resident. Once this returns an image, its memory is a one-to-one import and
-/// must be freed directly rather than entering the resident recycle slab.
+/// resident. Once this returns an image, only the child image was created: its
+/// memory is owned by [`super::host_ram::HostRamImports`] and must not be freed
+/// when the child retires.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the child binding validates its parent, geometry, format and complete Vulkan usage"
+)]
 pub(super) unsafe fn create(
     ctx: &DeviceContext,
+    imports: &mut super::host_ram::HostRamImports,
+    import: &crate::runtime::guest_ram::GuestRamImport,
     backing: GuestTargetBacking,
     width: u32,
     height: u32,
@@ -313,6 +332,11 @@ pub(super) unsafe fn create(
     if ctx.external_memory_host.is_none() {
         return Err(WindowRefusal::HostImportUnavailable);
     }
+    if !parent_allocation_matches(import, backing) {
+        return Err(WindowRefusal::ParentAllocationMismatch);
+    }
+    let allocation =
+        unsafe { imports.allocation(ctx, import) }.map_err(WindowRefusal::ParentImport)?;
     let alignment = ctx.caps.host_pointer.min_alignment;
     if alignment == 0
         || !(backing.allocation_host_ptr as u64).is_multiple_of(alignment)
@@ -329,6 +353,7 @@ pub(super) unsafe fn create(
         let explicit = unsafe {
             create_with_layout(
                 ctx,
+                allocation,
                 backing,
                 width,
                 height,
@@ -338,6 +363,7 @@ pub(super) unsafe fn create(
             )
         };
         if explicit.is_ok() {
+            imports.retain_child(import);
             return explicit;
         }
         // A format/modifier combination is structural, but an individual row
@@ -346,6 +372,7 @@ pub(super) unsafe fn create(
         let ordinary = unsafe {
             create_with_layout(
                 ctx,
+                allocation,
                 backing,
                 width,
                 height,
@@ -354,11 +381,16 @@ pub(super) unsafe fn create(
                 LayoutMode::DriverLinear,
             )
         };
-        return ordinary.or(explicit);
+        let result = ordinary.or(explicit);
+        if result.is_ok() {
+            imports.retain_child(import);
+        }
+        return result;
     }
-    unsafe {
+    let result = unsafe {
         create_with_layout(
             ctx,
+            allocation,
             backing,
             width,
             height,
@@ -366,12 +398,17 @@ pub(super) unsafe fn create(
             usage,
             LayoutMode::DriverLinear,
         )
+    };
+    if result.is_ok() {
+        imports.retain_child(import);
     }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
 unsafe fn create_with_layout(
     ctx: &DeviceContext,
+    allocation: super::host_ram::ImportedHostRam,
     backing: GuestTargetBacking,
     width: u32,
     height: u32,
@@ -379,13 +416,10 @@ unsafe fn create_with_layout(
     usage: vk::ImageUsageFlags,
     mode: LayoutMode,
 ) -> Result<ImportedTarget, WindowRefusal> {
-    let ext = ctx
-        .external_memory_host
-        .as_ref()
-        .ok_or(WindowRefusal::HostImportUnavailable)?;
     let handle = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
     let mut external = vk::ExternalMemoryImageCreateInfo::default().handle_types(handle);
     let base = vk::ImageCreateInfo::default()
+        .flags(vk::ImageCreateFlags::ALIAS)
         .image_type(vk::ImageType::TYPE_2D)
         .format(format)
         .extent(vk::Extent3D {
@@ -447,26 +481,9 @@ unsafe fn create_with_layout(
                 },
             )
         };
-        let mut pointer = vk::MemoryHostPointerPropertiesEXT::default();
-        let pointer_result = unsafe {
-            (ext.fp().get_memory_host_pointer_properties_ext)(
-                ext.device(),
-                handle,
-                backing.allocation_host_ptr as *const std::ffi::c_void,
-                &mut pointer,
-            )
-        };
-        if pointer_result != vk::Result::SUCCESS {
-            return Err(WindowRefusal::PointerProperties(pointer_result));
-        }
-        let compatible =
-            pointer.memory_type_bits & requirements.memory_requirements.memory_type_bits;
-        let picked = ctx.memory_type_with(
-            compatible,
-            backing.allocation_len,
-            &ctx.caps
-                .memory_request(crate::backend::vulkan::caps::MemoryClass::Upload),
-        );
+        let parent_type_bits = 1_u32
+            .checked_shl(allocation.memory_type_index)
+            .ok_or(WindowRefusal::NoMemoryType)?;
         let plan = match mode {
             LayoutMode::DriverLinear => plan_window(
                 layout,
@@ -474,8 +491,8 @@ unsafe fn create_with_layout(
                 backing.allocation_len,
                 backing.plane_offset,
                 backing.row_pitch,
-                pointer.memory_type_bits,
-                picked.map(|pick| pick.index),
+                parent_type_bits,
+                Some(allocation.memory_type_index),
                 dedicated.requires_dedicated_allocation != 0,
             ),
             LayoutMode::ExplicitLinear => plan_explicit_window(
@@ -484,28 +501,18 @@ unsafe fn create_with_layout(
                 backing.allocation_len,
                 backing.plane_offset,
                 backing.row_pitch,
-                pointer.memory_type_bits,
-                picked.map(|pick| pick.index),
+                parent_type_bits,
+                Some(allocation.memory_type_index),
                 dedicated.requires_dedicated_allocation != 0,
             ),
         }?;
-        let mut host_import = vk::ImportMemoryHostPointerInfoEXT::default()
-            .handle_type(handle)
-            .host_pointer(backing.allocation_host_ptr as *mut std::ffi::c_void);
-        let allocate = vk::MemoryAllocateInfo::default()
-            .allocation_size(backing.allocation_len)
-            .memory_type_index(plan.memory_type_index)
-            .push_next(&mut host_import);
-        let memory = unsafe { ctx.device.allocate_memory(&allocate, None) }
-            .map_err(WindowRefusal::AllocateMemory)?;
         if let Err(result) = unsafe {
             ctx.device
-                .bind_image_memory(image, memory, plan.bind_offset)
+                .bind_image_memory(image, allocation.memory, plan.bind_offset)
         } {
-            unsafe { ctx.device.free_memory(memory, None) };
             return Err(WindowRefusal::BindImage(result));
         }
-        Ok(ImportedTarget { image, memory })
+        Ok(ImportedTarget { image })
     })();
     if result.is_err() {
         unsafe { ctx.device.destroy_image(image, None) };
@@ -556,6 +563,7 @@ pub(super) unsafe fn probe_window(
     let handle = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
     let mut external = vk::ExternalMemoryImageCreateInfo::default().handle_types(handle);
     let create = vk::ImageCreateInfo::default()
+        .flags(vk::ImageCreateFlags::ALIAS)
         .image_type(vk::ImageType::TYPE_2D)
         .format(format)
         .extent(vk::Extent3D {
@@ -659,6 +667,34 @@ mod tests {
             alignment,
             memory_type_bits: bits,
         }
+    }
+
+    #[test]
+    fn a_child_can_only_name_the_parent_import_that_owns_its_allocation() {
+        let import =
+            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(0x1000, 0x4000, 0x1000)
+                .expect("aligned synthetic import");
+        let backing = GuestTargetBacking {
+            allocation_host_ptr: 0x1000,
+            allocation_len: 0x4000,
+            plane_offset: 0x1000,
+            row_pitch: 256,
+        };
+        assert!(parent_allocation_matches(&import, backing));
+        assert!(!parent_allocation_matches(
+            &import,
+            GuestTargetBacking {
+                allocation_host_ptr: 0x5000,
+                ..backing
+            }
+        ));
+        assert!(!parent_allocation_matches(
+            &import,
+            GuestTargetBacking {
+                allocation_len: 0x3000,
+                ..backing
+            }
+        ));
     }
 
     #[test]
