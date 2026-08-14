@@ -838,6 +838,14 @@ pub fn flush_batched_draws() {
 /// was outstanding.
 static GUEST_WRITE_DEBT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether a recorded command buffer can still read imported guest RAM.
+///
+/// Kept beside the write-side debt so completion-stamp routing can answer the
+/// common no-work case without taking the engine lock. The pool owns the ledger;
+/// this atomic is only its lock-free summary.
+pub(super) static GUEST_READ_DEBT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Which guest pages the outstanding writeback lands in, when it can be said.
 ///
 /// [`GUEST_WRITE_DEBT`] answers "is anything outstanding", and every caller that
@@ -1055,24 +1063,29 @@ pub fn quiesce_guest_writes() {
 
 /// Whether any guest-page writeback is submitted and not yet settled.
 ///
-/// The same flag [`quiesce_guest_writes`] short-circuits on, exposed so a caller
-/// can ask whether there is anything to order behind *before* deciding how to
-/// order it. Reading it is one relaxed-acquire load.
+/// The same flag [`quiesce_guest_writes`] short-circuits on. Host-side readers
+/// use this to avoid taking the engine lock when no GPU write can race them.
 pub fn guest_writes_outstanding() -> bool {
     GUEST_WRITE_DEBT.load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// Record the completion stamp's word into the GPU queue behind the writebacks
-/// this device still owes, and return without waiting for any of it.
+/// Whether a completion stamp must be queued behind guest-memory access.
+pub fn guest_access_outstanding() -> bool {
+    GUEST_READ_DEBT.load(std::sync::atomic::Ordering::Acquire) || guest_writes_outstanding()
+}
+
+/// Record the completion stamp's word into the GPU queue behind the work this
+/// device has accepted, and return without waiting for any of it.
 ///
 /// # The ordering this buys, and the one it does not
 ///
-/// The rule is unchanged: the guest may not observe the stamp until the frame is
-/// in its pages. [`quiesce_guest_writes`] enforces it by having this thread block
-/// until the copies have executed and then storing the word itself — one CPU
-/// round trip per stamp, measured at 1 368 us with only 628 us of it the copy.
-/// This records the word as a transfer into the same imported RAMBlock the
-/// copies write, behind a barrier that names every command submitted before it.
+/// A completion stamp is a queue fence: the guest may not observe it until the
+/// commands preceding it have completed. That includes writes into guest pages
+/// and reads from guest pages the guest may reuse after observing the stamp.
+/// The blocking rail enforces the memory-lifetime half by retiring the queue and
+/// then storing the word from the CPU. This rail records the word as a transfer
+/// into the imported RAMBlock, behind a barrier that names every command
+/// submitted before it.
 ///
 /// The barrier is the whole argument. A pipeline barrier applies to all commands
 /// submitted earlier in submission order on the same queue, not merely to the
@@ -1095,7 +1108,7 @@ pub fn guest_writes_outstanding() -> bool {
 /// it the blocking way. Nothing is recorded and no timeline value is left
 /// outstanding — a reservation whose submit fails is signalled from the host so
 /// the completion thread does not block behind it.
-pub fn write_stamp_after_guest_writes(
+pub fn write_completion_stamp(
     guest_ref: &crate::runtime::guest_ram::GuestRef,
     index: u32,
     value: u32,
@@ -1231,6 +1244,10 @@ pub fn write_stamp_after_guest_writes(
         unsafe { completion.abandon(&ctx.device, timeline) };
         return Err(e);
     }
+    // The queued stamp now carries the ordering for every guest read recorded
+    // before this submission. A later read records a fresh debt; retaining this
+    // one would submit an otherwise empty stamp for every later CPU-only packet.
+    pools.take_guest_read_debt();
     counters.gpu_stamps.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
@@ -3007,7 +3024,7 @@ unsafe fn plan_guest_scatter_dispatches(
 /// A local reinterpret rather than a dependency: `u32` has no padding and no
 /// invalid bit patterns, and the destination is a `*mut u8` memcpy either way.
 /// The endianness is the host's, which is the guest's, which is what the shader
-/// reads — the same reasoning `write_stamp_after_guest_writes` states for its
+/// reads — the same reasoning `write_completion_stamp` states for its
 /// one word, one layer up.
 pub(crate) fn run_table_bytes(words: &[u32]) -> &[u8] {
     // SAFETY: `u32` is `Copy` with no padding, so any `[u32]` is a valid `[u8]`

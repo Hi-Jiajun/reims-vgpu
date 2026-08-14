@@ -897,7 +897,7 @@ impl StampWait {
 ///
 /// **One thing this was expected to do and does not.** `batch_flushes` is
 /// unchanged (0.987, 1.90 draws a flush against 1.85). The reasoning was that
-/// `engine::write_stamp_after_guest_writes` appends to the open batch and then
+/// `engine::write_completion_stamp` appends to the open batch and then
 /// flushes it, so removing the stamps should let the batch accumulate. It does
 /// not, so the batch is flushed by something else and the stamp rode along with
 /// a flush that was already going to happen. Do not repeat the claim that the
@@ -1559,10 +1559,9 @@ fn note_stamp_direction<H: HostMemory + HostOps>(host: &H, gpa: u64, index: u32,
 ///
 /// `false` means the caller still owes the stamp and must settle it the blocking
 /// way. Four things answer `false`, and only the last is a fault: the operator
-/// narrowed the rail with `REIMS_VGPU_GPU_STAMP=off`; nothing was owed, so there
-/// is nothing to order behind and the plain store is both correct and cheaper;
-/// the stamp page would not resolve to imported guest RAM; or the engine
-/// declined, which it reports itself.
+/// narrowed the rail with `REIMS_VGPU_GPU_STAMP=off`; no preceding command
+/// accesses guest RAM; the stamp page would not resolve to imported guest RAM;
+/// or the engine declined, which it reports itself.
 ///
 /// The word is four bytes inside one page, so the contiguity rule
 /// `reference_for_pages` enforces is satisfied by construction — but it is asked
@@ -1578,10 +1577,10 @@ fn stamp_word_ordered_on_gpu<H: HostMemory + HostOps>(
     if crate::env::switch(crate::env::GPU_STAMP) == crate::env::Switch::Off {
         return false;
     }
-    // Nothing owed means nothing to order behind. Taking the GPU rail here would
-    // add a submission and a thread hop to buy an ordering that already holds,
-    // and most stamps in a boot are this case.
-    if !crate::backend::vulkan::engine::guest_writes_outstanding() {
+    // A CPU-only packet has nothing queued behind it. Reads count just as much
+    // as writes: once this stamp moves, the guest may repaint or free the pages
+    // a preceding command buffer still sources.
+    if !crate::backend::vulkan::engine::guest_access_outstanding() {
         return false;
     }
     let page_size = state.page_size();
@@ -1600,7 +1599,7 @@ fn stamp_word_ordered_on_gpu<H: HostMemory + HostOps>(
     // before the submit, because after it the word is the GPU's and reading it
     // back says nothing about what this device promised.
     note_stamp_direction(host, gpa, index, value);
-    crate::backend::vulkan::engine::write_stamp_after_guest_writes(&guest_ref, index, value).is_ok()
+    crate::backend::vulkan::engine::write_completion_stamp(&guest_ref, index, value).is_ok()
 }
 
 /// Write stamp value to FIFO base page slot and set status bit.

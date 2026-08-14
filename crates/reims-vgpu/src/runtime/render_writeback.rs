@@ -488,7 +488,7 @@
 //! simply must not turn a parked plan into a submission. Every other variant is a
 //! host toucher of guest bytes and lands everything parked before it reads.
 //!
-//! `engine::write_stamp_after_guest_writes` needs no change for this: it orders
+//! `engine::write_completion_stamp` needs no change for this: it orders
 //! the stamp word behind outstanding copies with a GPU barrier in the same queue
 //! and never calls the settle, so a plan that is still parked is simply not
 //! something it claims anything about.
@@ -532,7 +532,7 @@
 //! ordered before the guest can observe it by the completion stamp: the stamp
 //! word is written behind an `ALL_COMMANDS -> TRANSFER` barrier and every
 //! submitted guest-page write settles before the stamp moves. See
-//! `backend::vulkan::engine::write_stamp_after_guest_writes`.
+//! `backend::vulkan::engine::write_completion_stamp`.
 
 use crate::model::DeviceState;
 #[cfg(feature = "backend-vulkan")]
@@ -712,7 +712,7 @@ settle_sites! {
 ///
 /// The guest is ordered separately and does not come through here: its
 /// completion stamp is written behind a barrier that already subsumes these
-/// copies (`engine::write_stamp_after_guest_writes`).
+/// copies (`engine::write_completion_stamp`).
 ///
 /// Free when nothing is outstanding — the engine keeps a debt flag and this
 /// returns without touching a queue when it is clear. `site` is what a boot

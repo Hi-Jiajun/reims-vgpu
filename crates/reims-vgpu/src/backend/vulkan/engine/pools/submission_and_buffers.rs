@@ -2033,6 +2033,7 @@ impl ResourcePools {
     /// executes, so the next completion stamp waits for it.
     pub(crate) fn note_guest_read_recorded(&mut self) {
         self.guest_reads_in_flight = true;
+        super::super::GUEST_READ_DEBT.store(true, Ordering::Release);
     }
 
     /// The buffer this command buffer already staged or gathered for `bind`, if
@@ -2283,7 +2284,9 @@ impl ResourcePools {
     /// that cannot import guest RAM as a host pointer the answer is always
     /// `false`.
     pub(crate) fn take_guest_read_debt(&mut self) -> bool {
-        std::mem::take(&mut self.guest_reads_in_flight)
+        let had_debt = std::mem::take(&mut self.guest_reads_in_flight);
+        super::super::GUEST_READ_DEBT.store(false, Ordering::Release);
+        had_debt
     }
 
     /// Record that a submitted command buffer **writes** guest RAM when it
@@ -5412,6 +5415,7 @@ mod recycle_tests {
     #[test]
     fn a_stamp_waits_for_guest_reads_only_when_one_was_recorded() {
         let mut pools = ResourcePools::new();
+        assert!(!super::super::super::guest_access_outstanding());
         assert!(
             !pools.take_guest_read_debt(),
             "a device that has recorded nothing owes no wait; this is every \
@@ -5419,7 +5423,12 @@ mod recycle_tests {
         );
 
         pools.note_guest_read_recorded();
+        assert!(
+            super::super::super::guest_access_outstanding(),
+            "a read-only packet still needs its completion stamp queued behind the GPU read"
+        );
         assert!(pools.take_guest_read_debt());
+        assert!(!super::super::super::guest_access_outstanding());
         assert!(
             !pools.take_guest_read_debt(),
             "one recorded read is one wait, not a wait at every stamp after it"
