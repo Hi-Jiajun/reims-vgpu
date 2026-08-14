@@ -3395,7 +3395,7 @@ fn gva_layer_host_cache_roundtrip_for_sample() {
         &rgba,
         true,
     );
-    let cached = crate::runtime::surface_cache::get_texture(&state, tex_ref, w, h)
+    let cached = crate::runtime::surface_cache::get_texture(&state, 0, tex_ref, w, h)
         .expect("texture_ref encode cache");
     // BGRA storage
     assert_eq!(&cached[0..4], &[185, 126, 81, 255]);
@@ -3671,6 +3671,7 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
     );
     crate::runtime::surface_cache::store_texture(
         &mut state,
+        task_id,
         texture_ref,
         w,
         h,
@@ -5075,11 +5076,13 @@ fn texture_ref_cache_geom_mismatch_does_not_hit_get_texture() {
     let tex_ref = 53u32;
     let mut full = vec![0u8; 1920 * 1152 * 4];
     full[3] = 255;
-    host_cache_store_rgba8(&mut state, tex_ref, 1920, 1152, &full);
+    host_cache_store_rgba8(&mut state, 0, tex_ref, 1920, 1152, &full);
     // Exact geom hit
-    assert!(crate::runtime::surface_cache::get_texture(&state, tex_ref, 1920, 1152).is_some());
+    assert!(
+        crate::runtime::surface_cache::get_texture(&state, 0, tex_ref, 1920, 1152).is_some()
+    );
     // Wrong geom (type-3 L0 recycle) miss
-    assert!(crate::runtime::surface_cache::get_texture(&state, tex_ref, 115, 16).is_none());
+    assert!(crate::runtime::surface_cache::get_texture(&state, 0, tex_ref, 115, 16).is_none());
     // surface_id map must stay empty for texture_ref stores
     assert!(crate::runtime::surface_cache::get(&state, tex_ref, 1920, 1152).is_none());
 }

@@ -4044,6 +4044,7 @@ pub(crate) fn load_vulkan_sampler<M: HostMemory + HostOps>(
 #[cfg(test)]
 fn host_cache_store_rgba8(
     state: &mut DeviceState,
+    task_id: u32,
     texture_ref: u32,
     width: u32,
     height: u32,
@@ -4059,7 +4060,15 @@ fn host_cache_store_rgba8(
         return;
     }
     let bgra = swap_rb_channels(&rgba[..need]);
-    crate::runtime::surface_cache::store_texture(state, texture_ref, width, height, bgra, 0);
+    crate::runtime::surface_cache::store_texture(
+        state,
+        task_id,
+        texture_ref,
+        width,
+        height,
+        bgra,
+        0,
+    );
 }
 
 /// Advance the guest-visible publish milestones for a type-11 Store whose
@@ -5242,8 +5251,13 @@ fn seed_color_load<M: HostMemory + HostOps>(
         let ref_served = !gva_served
             && texture_ref != 0
             && target_gva != 0
-            && crate::runtime::surface_cache::texture_source_gva(state, texture_ref, width, height)
-                == Some(target_gva);
+            && crate::runtime::surface_cache::texture_source_gva(
+                state,
+                task_id,
+                texture_ref,
+                width,
+                height,
+            ) == Some(target_gva);
         if gva_served {
             crate::runtime::drain::note_store_route("load_seed_color_from_gva");
         } else if texture_ref != 0 {
@@ -5260,7 +5274,13 @@ fn seed_color_load<M: HostMemory + HostOps>(
         let cached = if gva_served {
             crate::runtime::surface_cache::get_gva(state, target_gva, width, height)
         } else if ref_served {
-            crate::runtime::surface_cache::get_texture(state, texture_ref, width, height)
+            crate::runtime::surface_cache::get_texture(
+                state,
+                task_id,
+                texture_ref,
+                width,
+                height,
+            )
         } else {
             None
         };

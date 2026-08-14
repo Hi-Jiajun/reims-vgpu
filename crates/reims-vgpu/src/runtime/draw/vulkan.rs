@@ -5580,6 +5580,7 @@ pub(crate) fn host_cache_store_gva_layer<M: HostMemory + HostOps>(
     if texture_ref != 0 {
         crate::runtime::surface_cache::store_texture(
             state,
+            task_id,
             texture_ref,
             width,
             height,

@@ -233,13 +233,13 @@ fn every_host_cache_producer_draws_from_one_generation_source() {
 
     store(&mut st, 7, 4, 4, px.clone());
     seen.insert(
-        get_from_with_gen(&st.host_surfaces, 7, 4, 4)
+        get_from_with_gen(&st.host_surfaces, &7, 4, 4)
             .expect("mid store")
             .1,
     );
-    store_texture(&mut st, 9, 4, 4, px.clone(), 0);
+    store_texture(&mut st, 3, 9, 4, 4, px.clone(), 0);
     seen.insert(
-        get_from_with_gen(&st.host_texture_surfaces, 9, 4, 4)
+        get_from_with_gen(&st.host_texture_surfaces, &(3, 9), 4, 4)
             .expect("ref store")
             .1,
     );
@@ -519,9 +519,31 @@ fn texture_and_surface_namespaces_are_separate() {
     let mut tex = vec![0u8; 16];
     tex[0] = 2;
     store(&mut st, 5, w, h, surface);
-    store_texture(&mut st, 5, w, h, tex, 0);
+    store_texture(&mut st, 3, 5, w, h, tex, 0);
     assert_eq!(get(&st, 5, w, h).unwrap()[0], 1);
-    assert_eq!(get_texture(&st, 5, w, h).unwrap()[0], 2);
+    assert_eq!(get_texture(&st, 3, 5, w, h).unwrap()[0], 2);
+}
+
+/// Texture object refs are local to their task. Two processes routinely use
+/// the same small integer, and replacing or evicting one must not discard the
+/// other process's render seed.
+#[test]
+fn texture_cache_keeps_same_numbered_refs_in_separate_tasks() {
+    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let (texture_ref, w, h) = (5, 2, 2);
+    store_texture(&mut st, 0, texture_ref, w, h, vec![0x11; 16], 0x1000);
+    store_texture(&mut st, 1, texture_ref, w, h, vec![0x22; 16], 0x2000);
+
+    assert_eq!(get_texture(&st, 0, texture_ref, w, h).unwrap()[0], 0x11);
+    assert_eq!(get_texture(&st, 1, texture_ref, w, h).unwrap()[0], 0x22);
+
+    evict_texture(&mut st, 1, texture_ref);
+    assert!(get_texture(&st, 1, texture_ref, w, h).is_none());
+    assert_eq!(
+        get_texture(&st, 0, texture_ref, w, h).unwrap()[0],
+        0x11,
+        "evicting a client texture must preserve WindowServer's same-numbered seed"
+    );
 }
 
 /// The ref cache remembers which address produced its pixels, and a store at
@@ -537,22 +559,22 @@ fn the_ref_cache_remembers_which_address_produced_its_pixels() {
     let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let (w, h) = (2u32, 2u32);
     assert_eq!(
-        texture_source_gva(&st, 5, w, h),
+        texture_source_gva(&st, 3, 5, w, h),
         None,
         "no entry, no answer — an absent entry must not read as address 0"
     );
-    store_texture(&mut st, 5, w, h, vec![1u8; 16], 0x4000);
-    assert_eq!(texture_source_gva(&st, 5, w, h), Some(0x4000));
+    store_texture(&mut st, 3, 5, w, h, vec![1u8; 16], 0x4000);
+    assert_eq!(texture_source_gva(&st, 3, 5, w, h), Some(0x4000));
     // The guest re-points the texture and stores again: the recorded address
     // must move with the pixels, or a later serve compares against a stale one.
-    store_texture(&mut st, 5, w, h, vec![2u8; 16], 0x9000);
-    assert_eq!(texture_source_gva(&st, 5, w, h), Some(0x9000));
+    store_texture(&mut st, 3, 5, w, h, vec![2u8; 16], 0x9000);
+    assert_eq!(texture_source_gva(&st, 3, 5, w, h), Some(0x9000));
     // A producer with no address records none, which is its own case at the
     // serve site: unknowable, neither "same" nor "different".
-    store_texture(&mut st, 5, w, h, vec![3u8; 16], 0);
-    assert_eq!(texture_source_gva(&st, 5, w, h), Some(0));
+    store_texture(&mut st, 3, 5, w, h, vec![3u8; 16], 0);
+    assert_eq!(texture_source_gva(&st, 3, 5, w, h), Some(0));
     assert_eq!(
-        texture_source_gva(&st, 5, w + 1, h),
+        texture_source_gva(&st, 3, 5, w + 1, h),
         None,
         "a geometry the entry does not answer at answers nothing here either"
     );
@@ -637,7 +659,7 @@ fn host_surface_cache_hit_validates_geom_and_truncates_to_need() {
     let mut map: std::collections::BTreeMap<u32, HostSurface> = Default::default();
 
     // Absent id.
-    assert_eq!(get_from_with_gen(&map, id, w, h), None);
+    assert_eq!(get_from_with_gen(&map, &id, w, h), None);
 
     // Store an over-allocated (need + slop) buffer with a distinct host_gen.
     let mut bgra = vec![0xABu8; need + 16];
@@ -654,22 +676,22 @@ fn host_surface_cache_hit_validates_geom_and_truncates_to_need() {
     );
 
     // Geometry mismatch on either axis must miss (no resize-serve).
-    assert_eq!(get_from_with_gen(&map, id, w + 1, h), None);
-    assert_eq!(get_from_with_gen(&map, id, w, h + 1), None);
+    assert_eq!(get_from_with_gen(&map, &id, w + 1, h), None);
+    assert_eq!(get_from_with_gen(&map, &id, w, h + 1), None);
 
     // Exact hit: exactly `need` bytes (slop truncated) + the entry host_gen.
-    let (bytes, gen) = get_from_with_gen(&map, id, w, h).expect("exact geom must hit");
+    let (bytes, gen) = get_from_with_gen(&map, &id, w, h).expect("exact geom must hit");
     assert_eq!(bytes.len(), need, "must truncate to width*height*BPP");
     assert_eq!(gen, 9, "must report the entry host_gen");
     assert!(bytes.iter().all(|&b| b == 0xAB), "no slop byte leaks in");
 
     // get_from is the same content, generation dropped.
-    assert_eq!(get_from(&map, id, w, h), Some(bytes));
+    assert_eq!(get_from(&map, &id, w, h), Some(bytes));
 
     // Empty bytes -> None even with matching geometry.
     map.get_mut(&id).unwrap().bgra = std::sync::Arc::new(Vec::new());
     assert_eq!(
-        get_from_with_gen(&map, id, w, h),
+        get_from_with_gen(&map, &id, w, h),
         None,
         "empty entry misses"
     );
@@ -677,7 +699,7 @@ fn host_surface_cache_hit_validates_geom_and_truncates_to_need() {
     // Non-empty but short of `need` -> None (truncated store, no partial serve).
     map.get_mut(&id).unwrap().bgra = std::sync::Arc::new(vec![0xABu8; need - 1]);
     assert_eq!(
-        get_from_with_gen(&map, id, w, h),
+        get_from_with_gen(&map, &id, w, h),
         None,
         "under-`need` bytes must not be served",
     );

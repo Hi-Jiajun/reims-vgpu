@@ -1084,6 +1084,7 @@ fn pay_gva<M: HostMemory + HostOps>(
     if let Err(reason) = crate::runtime::render_writeback::store_gva_frame(
         state,
         host,
+        key.task_id,
         &identity,
         &request,
         key.texture_ref,

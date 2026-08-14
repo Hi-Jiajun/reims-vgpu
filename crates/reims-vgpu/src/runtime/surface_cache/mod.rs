@@ -7,7 +7,7 @@
 //!
 //! Namespace split (2026-07-13 live x86):
 //! - [`store`] / [`get`] — **type-4 surface_id / mapping_id** only (`host_surfaces`)
-//! - [`store_texture`] / [`get_texture`] — type-2/3 color targets by object ref
+//! - [`store_texture`] / [`get_texture`] — type-2/3 color targets by task/object ref
 //! - [`store_gva_owned`] / [`get_gva`] — type-2/3 by target GVA (survives ref rebinding)
 //!
 //! Never put texture_ref into `host_surfaces`: list ids collide with mids and
@@ -26,15 +26,15 @@ use crate::runtime::host::HostMemory;
 /// the entry being replaced: an entry-local counter restarts whenever the entry
 /// is re-created, and half of this cache's identity contract is that a
 /// generation names one content for the life of the device.
-fn store_into(
-    map: &mut std::collections::BTreeMap<u32, HostSurface>,
-    id: u32,
+fn store_into<K: Ord>(
+    map: &mut std::collections::BTreeMap<K, HostSurface>,
+    id: K,
     width: u32,
     height: u32,
     bgra: std::sync::Arc<Vec<u8>>,
     generation: u64,
 ) {
-    if id == 0 || !scanout_extent_ok(width, height) {
+    if !scanout_extent_ok(width, height) {
         return;
     }
     let need = (height as usize)
@@ -55,22 +55,22 @@ fn store_into(
     entry.guest_holds_bytes = true;
 }
 
-fn get_from(
-    map: &std::collections::BTreeMap<u32, HostSurface>,
-    id: u32,
+fn get_from<'a, K: Ord>(
+    map: &'a std::collections::BTreeMap<K, HostSurface>,
+    id: &K,
     width: u32,
     height: u32,
-) -> Option<&[u8]> {
+) -> Option<&'a [u8]> {
     get_from_with_gen(map, id, width, height).map(|(bgra, _)| bgra)
 }
 
-fn get_from_with_gen(
-    map: &std::collections::BTreeMap<u32, HostSurface>,
-    id: u32,
+fn get_from_with_gen<'a, K: Ord>(
+    map: &'a std::collections::BTreeMap<K, HostSurface>,
+    id: &K,
     width: u32,
     height: u32,
-) -> Option<(&[u8], u64)> {
-    let e = map.get(&id)?;
+) -> Option<(&'a [u8], u64)> {
+    let e = map.get(id)?;
     if e.width != width || e.height != height || e.bgra.is_empty() {
         return None;
     }
@@ -98,6 +98,9 @@ pub fn store_shared(
     height: u32,
     bgra: std::sync::Arc<Vec<u8>>,
 ) {
+    if surface_id == 0 {
+        return;
+    }
     let generation = state.next_sampled_content_generation();
     store_into(
         &mut state.host_surfaces,
@@ -184,7 +187,7 @@ fn fill_tight_rows(dst: &mut [u8], src: &[u8], src_stride: u32, row: usize, heig
 
 /// Borrow host-cache frame when geom matches request (surface_id namespace).
 pub fn get(state: &DeviceState, surface_id: u32, width: u32, height: u32) -> Option<&[u8]> {
-    get_from(&state.host_surfaces, surface_id, width, height)
+    get_from(&state.host_surfaces, &surface_id, width, height)
 }
 
 /// [`get_shared`], plus the generation that names these exact bytes.
@@ -209,7 +212,7 @@ pub fn get_shared_with_gen(
     width: u32,
     height: u32,
 ) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
-    let (_, host_gen) = get_from_with_gen(&state.host_surfaces, surface_id, width, height)?;
+    let (_, host_gen) = get_from_with_gen(&state.host_surfaces, &surface_id, width, height)?;
     // Deliberately delegated rather than reimplemented: `get_shared` owns the
     // rule for a stored buffer carrying slop past `width * height * 4`, and a
     // second copy of that rule here could drift from it.
@@ -309,7 +312,7 @@ pub fn get_shared(
     width: u32,
     height: u32,
 ) -> Option<std::sync::Arc<Vec<u8>>> {
-    let need = get_from(&state.host_surfaces, surface_id, width, height)?.len();
+    let need = get_from(&state.host_surfaces, &surface_id, width, height)?.len();
     let e = state.host_surfaces.get(&surface_id)?;
     Some(if e.bgra.len() == need {
         std::sync::Arc::clone(&e.bgra)
@@ -318,7 +321,7 @@ pub fn get_shared(
     })
 }
 
-/// Type-2/3 encode cache by texture object ref (not surface_id).
+/// Type-2/3 encode cache by task-local texture object ref (not surface_id).
 ///
 /// `source_gva` is the address the producing Store rendered into, kept so
 /// [`texture_source_gva`] can tell a later serve whether this entry's pixels
@@ -326,33 +329,43 @@ pub fn get_shared(
 /// had no GVA.
 pub fn store_texture(
     state: &mut DeviceState,
+    task_id: u32,
     texture_ref: u32,
     width: u32,
     height: u32,
     bgra: Vec<u8>,
     source_gva: u64,
 ) {
+    if texture_ref == 0 {
+        return;
+    }
     let generation = state.next_sampled_content_generation();
     store_into(
         &mut state.host_texture_surfaces,
-        texture_ref,
+        (task_id, texture_ref),
         width,
         height,
         std::sync::Arc::new(bgra),
         generation,
     );
-    if let Some(e) = state.host_texture_surfaces.get_mut(&texture_ref) {
+    if let Some(e) = state.host_texture_surfaces.get_mut(&(task_id, texture_ref)) {
         e.source_gva = source_gva;
     }
 }
 
 pub fn get_texture(
     state: &DeviceState,
+    task_id: u32,
     texture_ref: u32,
     width: u32,
     height: u32,
 ) -> Option<&[u8]> {
-    get_from(&state.host_texture_surfaces, texture_ref, width, height)
+    get_from(
+        &state.host_texture_surfaces,
+        &(task_id, texture_ref),
+        width,
+        height,
+    )
 }
 
 /// The address the entry behind [`get_texture`] was produced over, or `None`
@@ -363,19 +376,25 @@ pub fn get_texture(
 /// question is asked once per serve while the slice is used per texel.
 pub fn texture_source_gva(
     state: &DeviceState,
+    task_id: u32,
     texture_ref: u32,
     width: u32,
     height: u32,
 ) -> Option<u64> {
-    get_from(&state.host_texture_surfaces, texture_ref, width, height)?;
+    get_from(
+        &state.host_texture_surfaces,
+        &(task_id, texture_ref),
+        width,
+        height,
+    )?;
     state
         .host_texture_surfaces
-        .get(&texture_ref)
+        .get(&(task_id, texture_ref))
         .map(|e| e.source_gva)
 }
 
-pub fn evict_texture(state: &mut DeviceState, texture_ref: u32) {
-    state.host_texture_surfaces.remove(&texture_ref);
+pub fn evict_texture(state: &mut DeviceState, task_id: u32, texture_ref: u32) {
+    state.host_texture_surfaces.remove(&(task_id, texture_ref));
 }
 
 /// The identity of one linear compute window: which object it is, where its
@@ -671,7 +690,15 @@ pub fn mirror_linear_color_cache<M: HostMemory + crate::runtime::host::HostOps>(
         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => {}
         _ => return,
     }
-    store_texture(state, w.texture_ref, w.width, w.height, bgra.clone(), w.gva);
+    store_texture(
+        state,
+        w.task_id,
+        w.texture_ref,
+        w.width,
+        w.height,
+        bgra.clone(),
+        w.gva,
+    );
     let backing = gva_backing(state, host, w.task_id, w.gva, w.width, w.height);
     // `false`: this runs *before* the caller's guest write, so at this instant
     // the guest's pages do not hold these bytes. The caller calls

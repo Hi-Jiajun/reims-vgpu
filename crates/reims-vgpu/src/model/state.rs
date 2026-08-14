@@ -2171,10 +2171,14 @@ pub struct DeviceState {
     /// See [`crate::runtime::surface_cache`] and kb tahoe-x86-host-reims_vgpu §8.5.
     /// **Surface_id namespace only** — never texture_ref (object list ids collide).
     pub host_surfaces: BTreeMap<u32, HostSurface>,
-    /// Discrete encode cache for type-2/3 GVA color targets, keyed by texture
-    /// object ref. Separate from [`Self::host_surfaces`] so list ids cannot
-    /// clobber type-4 present mids (live: sky `tex_ref=24` vs mid 24).
-    pub host_texture_surfaces: BTreeMap<u32, HostSurface>,
+    /// Discrete encode cache for type-2/3 GVA color targets, keyed by
+    /// `(task_id, texture_ref)`.
+    ///
+    /// Object-list refs are local to a task. Separate from
+    /// [`Self::host_surfaces`] so list ids cannot clobber type-4 present mids,
+    /// and task-qualified so one address space cannot replace or evict another
+    /// task's same-numbered texture.
+    pub host_texture_surfaces: BTreeMap<(u32, u32), HostSurface>,
     /// Same type-2/3 encode content keyed by target GVA — survives texture_ref
     /// rebinding / small-atlas overwrite of the ref slot.
     ///
@@ -2984,19 +2988,11 @@ impl DeviceState {
         self.task_resources.delete_task(task_id);
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
+        self.host_texture_surfaces
+            .retain(|&(t, _), _| t != task_id);
         // Clear texture→mapping latches for this task.
-        let doomed_refs: Vec<u32> = self
-            .texture_to_mapping
-            .keys()
-            .filter_map(|&(t, r)| if t == task_id { Some(r) } else { None })
-            .collect();
         self.texture_to_mapping.retain(|&(t, _), _| t != task_id);
-        // Drop texture-ref encode slots that were latched for this task. Other
-        // refs are left (cache is ref-keyed without task); delete_object also
-        // evicts. GVA encode cache retained until Unmap of that range.
-        for r in doomed_refs {
-            self.host_texture_surfaces.remove(&r);
-        }
+        // GVA encode cache retained until Unmap of that range.
         // Task teardown ≡ all GPU VA maps for this task go away — retire any
         // HostOps views we held (does not touch host_gva_surfaces encode).
         // Runtime flushes retired_views via HostOps::unmap_pages.
@@ -3069,7 +3065,10 @@ impl DeviceState {
     /// it is unpinned and its deferred window dropped rather than left to write
     /// pixels read from the old pages into the new ones.
     pub fn invalidate_object_host_copies(&mut self, task_id: u32, ref_: u32) -> (bool, bool) {
-        let had_texture = self.host_texture_surfaces.remove(&ref_).is_some();
+        let had_texture = self
+            .host_texture_surfaces
+            .remove(&(task_id, ref_))
+            .is_some();
         let had_linear = match self.host_linear_textures.remove(&(task_id, ref_)) {
             Some(e) => {
                 self.retire_linear_resident(task_id, ref_, &e);

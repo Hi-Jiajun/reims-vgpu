@@ -1207,6 +1207,7 @@ crate::observe::decline::decline_display!(GvaWritebackDecline);
 pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
+    task_id: u32,
     identity: &crate::backend::vulkan::engine::TargetIdentity,
     c0: &crate::runtime::draw::ColorRtRequest,
     texture_ref: u32,
@@ -1295,7 +1296,7 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     // may go on naming one.
     crate::runtime::surface_cache::evict_gva(state, c0.target_gva);
     if texture_ref != 0 {
-        crate::runtime::surface_cache::evict_texture(state, texture_ref);
+        crate::runtime::surface_cache::evict_texture(state, task_id, texture_ref);
     }
     // The copy means this image has stopped being the only place these pixels
     // exist, so the reclaim paths may take it — the same handover

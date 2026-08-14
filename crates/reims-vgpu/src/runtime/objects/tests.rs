@@ -1913,12 +1913,26 @@ fn a_repoint_drops_the_ref_keyed_host_copies_of_the_object() {
     let (task, object) = (7u32, 4242u32);
 
     state.host_texture_surfaces.insert(
-        object,
+        (task, object),
         crate::model::HostSurface {
             width: 4,
             height: 4,
             bgra: std::sync::Arc::new(vec![0xAB; 4 * 4 * 4]),
             host_gen: 1,
+            producer_object_type: 0,
+            last_touch: 0,
+            backing: None,
+            guest_holds_bytes: false,
+            source_gva: 0,
+        },
+    );
+    state.host_texture_surfaces.insert(
+        (task + 1, object),
+        crate::model::HostSurface {
+            width: 4,
+            height: 4,
+            bgra: std::sync::Arc::new(vec![0xEF; 4 * 4 * 4]),
+            host_gen: 2,
             producer_object_type: 0,
             last_touch: 0,
             backing: None,
@@ -1946,8 +1960,14 @@ fn a_repoint_drops_the_ref_keyed_host_copies_of_the_object() {
     super::replace_physical(&mut state, &mut host, task, object);
 
     assert!(
-        !state.host_texture_surfaces.contains_key(&object),
+        !state.host_texture_surfaces.contains_key(&(task, object)),
         "the ref-keyed texture copy was read from pages the guest has re-pointed"
+    );
+    assert!(
+        state
+            .host_texture_surfaces
+            .contains_key(&(task + 1, object)),
+        "a re-point must not evict another task's same-numbered texture copy"
     );
     assert!(
         !state.host_linear_textures.contains_key(&(task, object)),

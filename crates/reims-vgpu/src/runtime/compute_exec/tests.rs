@@ -1640,7 +1640,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
         Some(rgba.as_slice())
     );
     assert_eq!(
-        &surface_cache::get_texture(&state, texture_ref, 2, 2).unwrap()[..4],
+        &surface_cache::get_texture(&state, task_id, texture_ref, 2, 2).unwrap()[..4],
         &[3, 2, 1, 4],
         "RGBA compute output mirrors into the BGRA render-sample cache"
     );
