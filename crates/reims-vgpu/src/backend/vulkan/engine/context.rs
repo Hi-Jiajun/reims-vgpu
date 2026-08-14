@@ -913,6 +913,7 @@ impl DeviceContext {
         // this is enabled. Chained only when the host advertised it, because
         // asking for a feature a device declined fails `vkCreateDevice`.
         let mut en_image_robustness = features.enabled_image_robustness();
+        let mut en_attachment_feedback = features.enabled_attachment_feedback_loop_layout();
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
             .enabled_features(&enabled)
@@ -926,6 +927,9 @@ impl DeviceContext {
         }
         if features.image_robustness.is_available() {
             dci = dci.push_next(&mut en_image_robustness);
+        }
+        if features.attachment_feedback_loop_layout {
+            dci = dci.push_next(&mut en_attachment_feedback);
         }
         let device = instance
             .create_device(pd, &dci, None)

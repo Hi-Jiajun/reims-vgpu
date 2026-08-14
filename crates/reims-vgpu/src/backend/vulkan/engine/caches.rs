@@ -116,6 +116,7 @@ pub(crate) fn canonicalize_layout_bindings(
 pub(crate) const MAX_SECONDARY_ATTACH: usize = 7;
 const _: () =
     assert!(1 + MAX_SECONDARY_ATTACH == crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS);
+const _: () = assert!(MAX_SECONDARY_ATTACH < u8::BITS as usize);
 
 /// A secondary MRT attachment's contribution to the render-pass / pipeline key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
@@ -169,6 +170,11 @@ pub(crate) struct PassKey {
     /// self-dependency — the Vulkan feedback-loop form MoltenVK lowers to Metal
     /// programmable blending. `false` keeps the pass byte-identical.
     pub color_input: bool,
+    /// Bit N says colour attachment N is also sampled through
+    /// `VK_EXT_attachment_feedback_loop_layout`. The decoded render pass has at
+    /// most eight colour attachments, so the wire-derived attachment table is
+    /// the bound and one byte carries the whole set.
+    pub feedback_colors: u8,
 }
 
 impl PassKey {
@@ -181,6 +187,29 @@ impl PassKey {
             secondary_count: 0,
             depth: None,
             color_input: false,
+            feedback_colors: 0,
+        }
+    }
+
+    pub(crate) fn color_feedback(self, index: usize) -> bool {
+        index < u8::BITS as usize && self.feedback_colors & (1u8 << index) != 0
+    }
+
+    pub(crate) fn color_layout(self, index: usize) -> vk::ImageLayout {
+        if self.color_feedback(index) {
+            vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+        } else if index == 0 && self.color_input {
+            vk::ImageLayout::GENERAL
+        } else {
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        }
+    }
+
+    pub(crate) fn color_final_layout(self, index: usize) -> vk::ImageLayout {
+        if self.color_feedback(index) {
+            vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+        } else {
+            COLOR0_PASS_EXIT_LAYOUT
         }
     }
 }
@@ -1121,8 +1150,9 @@ impl ObjectCaches {
         // drop the transition between consecutive draws into one target; a
         // second spelling here would make that skip a missing transition the
         // first time somebody changed one of them.
+        let color0_final = key.color_final_layout(0);
         let (load_op, initial) = if key.load_seed {
-            (vk::AttachmentLoadOp::LOAD, COLOR0_PASS_EXIT_LAYOUT)
+            (vk::AttachmentLoadOp::LOAD, color0_final)
         } else {
             (vk::AttachmentLoadOp::CLEAR, vk::ImageLayout::UNDEFINED)
         };
@@ -1140,15 +1170,11 @@ impl ObjectCaches {
             .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
             .initial_layout(initial)
-            .final_layout(COLOR0_PASS_EXIT_LAYOUT)];
+            .final_layout(color0_final)];
         // Framebuffer fetch: when attachment 0 is also a subpass input, BOTH
         // references must use GENERAL (same-attachment color+input requires it);
         // the pass still transitions initial→GENERAL→final automatically.
-        let color0_layout = if key.color_input {
-            vk::ImageLayout::GENERAL
-        } else {
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
-        };
+        let color0_layout = key.color_layout(0);
         let mut color_ref = vec![vk::AttachmentReference::default()
             .attachment(0)
             .layout(color0_layout)];
@@ -1156,11 +1182,10 @@ impl ObjectCaches {
             .iter()
             .enumerate()
         {
+            let attachment_index = i + 1;
+            let final_layout = key.color_final_layout(attachment_index);
             let (sload, sinitial) = if sec.load {
-                (
-                    vk::AttachmentLoadOp::LOAD,
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                )
+                (vk::AttachmentLoadOp::LOAD, final_layout)
             } else {
                 (vk::AttachmentLoadOp::CLEAR, vk::ImageLayout::UNDEFINED)
             };
@@ -1173,12 +1198,12 @@ impl ObjectCaches {
                     .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
                     .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
                     .initial_layout(sinitial)
-                    .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+                    .final_layout(final_layout),
             );
             color_ref.push(
                 vk::AttachmentReference::default()
                     .attachment(1 + i as u32)
-                    .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+                    .layout(key.color_layout(attachment_index)),
             );
         }
         // Depth attachment is appended LAST (after color + secondaries), so its
@@ -1226,7 +1251,7 @@ impl ObjectCaches {
         });
         let input_ref = [vk::AttachmentReference::default()
             .attachment(0)
-            .layout(vk::ImageLayout::GENERAL)];
+            .layout(key.color_layout(0))];
         let mut subpass_desc = vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(&color_ref);
@@ -1252,6 +1277,23 @@ impl ObjectCaches {
             external_dependencies(key.depth.is_some(), key.color_input).to_vec();
         if key.color_input {
             deps.push(fetch_dep);
+        }
+        if key.feedback_colors != 0 {
+            deps.push(
+                vk::SubpassDependency::default()
+                    .src_subpass(0)
+                    .dst_subpass(0)
+                    .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                    .dst_stage_mask(
+                        vk::PipelineStageFlags::VERTEX_SHADER
+                            | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    )
+                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .dependency_flags(
+                        vk::DependencyFlags::BY_REGION | vk::DependencyFlags::FEEDBACK_LOOP_EXT,
+                    ),
+            );
         }
         let rp_info = vk::RenderPassCreateInfo::default()
             .attachments(&attachments)
@@ -1833,6 +1875,9 @@ impl ObjectCaches {
             .layout(pipeline_layout)
             .render_pass(render_pass)
             .subpass(0);
+        if key.pass.feedback_colors != 0 {
+            gpci = gpci.flags(vk::PipelineCreateFlags::COLOR_ATTACHMENT_FEEDBACK_LOOP_EXT);
+        }
         if key.pass.depth.is_some() {
             gpci = gpci.depth_stencil_state(&depth_stencil);
         }
@@ -2438,5 +2483,38 @@ mod object_cache_tests {
                 );
             }
         }
+    }
+
+    /// The pass key is the single source of truth for every place that names an
+    /// attachment layout. Feedback wins over the older input-attachment shape
+    /// because a descriptor sampling the colour target cannot legally name
+    /// GENERAL while the subpass reference names the extension layout.
+    #[test]
+    fn feedback_attachment_layout_is_derived_consistently_from_the_mask() {
+        let mut key = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
+        key.color_input = true;
+        key.feedback_colors = (1 << 0) | (1 << 3);
+
+        for index in 0..=MAX_SECONDARY_ATTACH {
+            let feedback = index == 0 || index == 3;
+            assert_eq!(key.color_feedback(index), feedback);
+            assert_eq!(
+                key.color_layout(index),
+                if feedback {
+                    vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+                } else {
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+                }
+            );
+            assert_eq!(
+                key.color_final_layout(index),
+                if feedback {
+                    vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+                } else {
+                    COLOR0_PASS_EXIT_LAYOUT
+                }
+            );
+        }
+        assert!(!key.color_feedback(u8::BITS as usize));
     }
 }

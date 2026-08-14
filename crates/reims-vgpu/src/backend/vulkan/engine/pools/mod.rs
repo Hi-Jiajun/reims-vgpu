@@ -1372,6 +1372,9 @@ pub(crate) enum ResidentAccess {
     /// `final_layout` — `TRANSFER_SRC_OPTIMAL` for a primary target,
     /// `COLOR_ATTACHMENT_OPTIMAL` for an MRT secondary.
     ColorWrite(vk::ImageLayout),
+    /// A colour attachment was read by shaders and written by colour output in
+    /// an attachment-feedback-loop pass.
+    ColorFeedback,
     /// A draw sampled it.
     ShaderRead,
     /// A transfer read it: a present blit, a guest-page readback, a GPU seed
@@ -1385,6 +1388,7 @@ impl ResidentAccess {
         match self {
             Self::Untouched => vk::ImageLayout::UNDEFINED,
             Self::ColorWrite(layout) => layout,
+            Self::ColorFeedback => vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT,
             Self::ShaderRead => vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             Self::TransferRead => vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
         }
@@ -1416,6 +1420,14 @@ impl ResidentAccess {
             Self::ColorWrite(_) => (
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            ),
+            Self::ColorFeedback => (
+                vk::PipelineStageFlags::VERTEX_SHADER
+                    | vk::PipelineStageFlags::FRAGMENT_SHADER
+                    | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::COLOR_ATTACHMENT_READ
+                    | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
             ),
             Self::ShaderRead => (
                 vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,

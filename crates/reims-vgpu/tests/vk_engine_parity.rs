@@ -1202,10 +1202,10 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
     assert_fullscreen_fragment_color("resident_sample_reloaded", &semantic_rgba(&loaded), 16, 16);
 }
 
-/// Attachment feedback is represented as a GPU snapshot, matching Metal's
-/// prior-content sampling without binding one image for read and write at once.
+/// Attachment feedback binds the resident in place when the host exposes the
+/// Vulkan feedback-loop contract, and otherwise uses one shared GPU snapshot.
 #[test]
-fn resident_sample_alias_uses_gpu_snapshot_without_roundtrip() {
+fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
     let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let identity = TargetIdentity::Surface {
@@ -1229,6 +1229,8 @@ fn resident_sample_alias_uses_gpu_snapshot_without_roundtrip() {
     let mut alias = engine_req(&v, &f, 16, 16);
     alias.target_identity = Some(identity.clone());
     alias.load_from_target = true;
+    alias.skip_readback = true;
+    alias.render_pass_continues = true;
     alias.sampled_images.push(SampledImageResource {
         binding: 1,
         array_element: 0,
@@ -1257,7 +1259,7 @@ fn resident_sample_alias_uses_gpu_snapshot_without_roundtrip() {
         volume: false,
         cube: false,
         one_dim: false,
-        source: SampledSource::Target(identity),
+        source: SampledSource::Target(identity.clone()),
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
@@ -1265,16 +1267,31 @@ fn resident_sample_alias_uses_gpu_snapshot_without_roundtrip() {
     });
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
-    let out = engine::execute_draw_request(&alias).expect("resident alias GPU snapshot");
-    assert_fullscreen_fragment_color("resident_sample_alias", &semantic_rgba(&out), 16, 16);
+    engine::execute_draw_request(&alias).expect("resident alias feedback");
+    let out = engine::read_target(&identity)
+        .expect("read native feedback result after deferred draw")
+        .into_rgba8();
+    assert_fullscreen_fragment_color("resident_sample_alias", &out, 16, 16);
     let delta = engine::counter_snapshot().delta_since(&before);
-    assert_eq!(delta.sampled_gpu_binds, 2, "GPU snapshot proxy: {delta:?}");
     assert_eq!(
-        delta.sampled_free_allocs, 1,
-        "two bindings of one attachment/key share one snapshot image: {delta:?}"
+        delta.sampled_gpu_binds, 2,
+        "GPU resident-bind proxy: {delta:?}"
+    );
+    let expected_snapshot_allocs = u64::from(!engine::attachment_feedback_loop_active());
+    assert_eq!(
+        delta.sampled_free_allocs, expected_snapshot_allocs,
+        "two bindings share one snapshot only on a host without feedback-loop support: {delta:?}"
     );
     assert_eq!(delta.sampled_reuploads, 0, "no host reupload: {delta:?}");
-    assert_eq!(delta.readbacks, 1, "only target readback: {delta:?}");
+    assert_eq!(
+        delta.readbacks, 0,
+        "the draw stays deferred; its explicit target read joins the batch: {delta:?}"
+    );
+    assert_eq!(delta.target_reads, 1, "one explicit target read: {delta:?}");
+    assert_eq!(
+        delta.batch_readback_joins, 1,
+        "the read must exercise the open-pass close before its image barrier: {delta:?}"
+    );
 }
 
 #[test]

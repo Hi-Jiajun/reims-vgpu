@@ -981,6 +981,15 @@ enum PreparedSampled {
         view: vk::ImageView,
         access: super::pools::ResidentAccess,
     },
+    /// A colour attachment read through the same resident view while this draw
+    /// writes it. This is legal only under the attachment-feedback-loop
+    /// capability and pass shape selected before preparation; unsupported or
+    /// non-identity views keep the snapshot arm below.
+    Feedback {
+        binding: u32,
+        array_element: u32,
+        view: vk::ImageView,
+    },
     Snapshot {
         binding: u32,
         array_element: u32,
@@ -997,6 +1006,7 @@ impl PreparedSampled {
             Self::Upload { binding, .. }
             | Self::Cached { binding, .. }
             | Self::Resident { binding, .. }
+            | Self::Feedback { binding, .. }
             | Self::Snapshot { binding, .. }
             | Self::GuestGather { binding, .. } => *binding,
         }
@@ -1007,6 +1017,7 @@ impl PreparedSampled {
             Self::Upload { array_element, .. }
             | Self::Cached { array_element, .. }
             | Self::Resident { array_element, .. }
+            | Self::Feedback { array_element, .. }
             | Self::Snapshot { array_element, .. }
             | Self::GuestGather { array_element, .. } => *array_element,
         }
@@ -1017,10 +1028,38 @@ impl PreparedSampled {
             Self::Upload { image, .. } => image.view,
             Self::Cached { image, .. } => image.view,
             Self::Resident { view, .. } => *view,
+            Self::Feedback { view, .. } => *view,
             Self::Snapshot { image, .. } => image.view,
             Self::GuestGather { image, .. } => image.view,
         }
     }
+
+    fn descriptor_layout(&self) -> vk::ImageLayout {
+        match self {
+            Self::Feedback { .. } => vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT,
+            _ => vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }
+    }
+}
+
+/// The colour attachment index that can use Vulkan's feedback-loop contract.
+///
+/// The registry owns one identity view, so only the exact 2D identity-view
+/// shape can bind it directly. Every other source retains the copy-backed
+/// snapshot, including depth: capability support must only remove work from a
+/// shape whose Vulkan contract is fully represented here.
+fn feedback_color_index(
+    req: &DrawRequest,
+    resource: &super::types::SampledImageResource,
+    supported: bool,
+) -> Option<usize> {
+    if !supported || !SampledKey::of(resource).is_plain_2d_identity_view() {
+        return None;
+    }
+    let SampledSource::Target(identity) = &resource.source else {
+        return None;
+    };
+    req.color_attachment_index(identity)
 }
 
 /// `vkCmdCopyBufferToImage` requires `bufferOffset` to be a multiple of 4 and of
@@ -2571,6 +2610,13 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     pass_key.secondary_count = req.secondary_targets.len() as u8;
     pass_key.color_input = req.color_input;
+    for resource in &req.sampled_images {
+        if let Some(index) =
+            feedback_color_index(req, resource, ctx.features.attachment_feedback_loop_layout)
+        {
+            pass_key.feedback_colors |= 1u8 << index;
+        }
+    }
     // Depth is opt-in per draw (only a non-trivial MTLDepthStencilState reaches
     // here) and composes with MRT: the pass appends its attachment after the
     // secondaries, `clear_values` appends its clear after theirs, and the ad-hoc
@@ -3304,7 +3350,18 @@ pub(crate) unsafe fn execute_draw_inner(
                 // `used_binding_absent_from_layout`, so the whole draw was lost.
                 let self_slot = req.attachment_slot(identity);
                 let swizzled = !resource.swizzle.is_identity();
-                if self_slot.is_some() || swizzled {
+                if let Some(_attachment_index) = feedback_color_index(
+                    req,
+                    resource,
+                    ctx.features.attachment_feedback_loop_layout,
+                ) {
+                    crate::runtime::drain::note_store_route("sampled_self_feedback_loop");
+                    sampled.push(PreparedSampled::Feedback {
+                        binding: resource.binding,
+                        array_element: resource.array_element,
+                        view: source_view,
+                    });
+                } else if self_slot.is_some() || swizzled {
                     match self_slot {
                         // Which attachment this draw is sampling of its own. The
                         // primary is the case this arm has always taken; the
@@ -3500,7 +3557,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .map(|image| {
                 vk::DescriptorImageInfo::default()
                     .image_view(image.view())
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .image_layout(image.descriptor_layout())
             })
             .collect();
         let sampler_infos: Vec<_> = sampler_handles
@@ -3508,10 +3565,11 @@ pub(crate) unsafe fn execute_draw_inner(
             .map(|(_, s)| vk::DescriptorImageInfo::default().sampler(*s))
             .collect();
         // Framebuffer fetch: the input attachment IS the color target's view;
-        // GENERAL matches the subpass references (see `get_or_create_pass`).
+        // derive the same layout as the subpass reference. A draw that also
+        // samples the target upgrades both from GENERAL to the feedback layout.
         let color_input_info = vk::DescriptorImageInfo::default()
             .image_view(target_view)
-            .image_layout(vk::ImageLayout::GENERAL);
+            .image_layout(pass_key.color_layout(0));
         let mut writes = Vec::new();
         for (i, (binding, _, _)) in storage_slots.iter().enumerate() {
             writes.push(
@@ -3587,11 +3645,37 @@ pub(crate) unsafe fn execute_draw_inner(
     // below, to charge this draw to one bucket of `passmerge_*` and one of
     // `passheld_*`.
     let mut outside_pass = PassObstacles::default();
+    let echo = super::pools::PassEcho {
+        cb,
+        pass: render_pass,
+        fb: target_fb,
+        area: (req.width, req.height),
+    };
+    let target_feedback = pass_key.color_feedback(0);
+    let target_pass_layout = pass_key.color_layout(0);
+    let target_dst_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+        | if target_feedback {
+            vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER
+        } else {
+            vk::PipelineStageFlags::empty()
+        };
+    let target_dst_access = vk::AccessFlags::COLOR_ATTACHMENT_READ
+        | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+        | if target_feedback {
+            vk::AccessFlags::SHADER_READ
+        } else {
+            vk::AccessFlags::empty()
+        };
+    let target_dependency = if target_feedback {
+        vk::DependencyFlags::FEEDBACK_LOOP_EXT
+    } else {
+        vk::DependencyFlags::empty()
+    };
 
-    // Metal permits a pass to sample the same texture it renders into. Vulkan
-    // does not permit that attachment feedback loop on this path, so capture
-    // the prior resident content into a same-format GPU image before changing
-    // the attachment. This preserves the old CPU snapshot semantics without a
+    // Fallback for attachment feedback loops the optional native contract
+    // cannot represent (unsupported host, depth, or a non-identity view):
+    // capture the prior resident content into a same-format GPU image before
+    // changing the attachment. This preserves Metal's semantics without a
     // readback or host upload.
     let mut snapshotted_targets = std::collections::HashSet::new();
     let mut snapshotted_images = std::collections::HashSet::new();
@@ -3712,18 +3796,16 @@ pub(crate) unsafe fn execute_draw_inner(
         );
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(
-                vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-            )
+            .dst_access_mask(target_dst_access)
             .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(target_pass_layout)
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
         ctx.device.cmd_pipeline_barrier(
             cb,
             vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::DependencyFlags::empty(),
+            target_dst_stage,
+            target_dependency,
             &[],
             &[],
             &barrier,
@@ -3775,18 +3857,16 @@ pub(crate) unsafe fn execute_draw_inner(
         );
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(
-                vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-            )
+            .dst_access_mask(target_dst_access)
             .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(target_pass_layout)
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
         ctx.device.cmd_pipeline_barrier(
             cb,
             vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::DependencyFlags::empty(),
+            target_dst_stage,
+            target_dependency,
             &[],
             &[],
             &barrier,
@@ -3799,6 +3879,7 @@ pub(crate) unsafe fn execute_draw_inner(
             std::sync::atomic::Ordering::Relaxed,
         );
     } else if load_uses_gpu_content
+        && !(target_feedback && req.continues_render_pass && pools.open_pass_echoes(&echo))
         && !pass_exit_needs_no_barrier(target_prior_access(target_snapshotted, target_access))
     {
         unsafe { outside_pass.before_record(PassObstacle::TargetLayout, pools, &ctx.device, cb) };
@@ -3809,18 +3890,16 @@ pub(crate) unsafe fn execute_draw_inner(
         let (src_stage, src_access) = prior.source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
-            .dst_access_mask(
-                vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-            )
+            .dst_access_mask(target_dst_access)
             .old_layout(prior.layout())
-            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(target_pass_layout)
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
         ctx.device.cmd_pipeline_barrier(
             cb,
             src_stage,
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::DependencyFlags::empty(),
+            target_dst_stage,
+            target_dependency,
             &[],
             &[],
             &barrier,
@@ -4078,18 +4157,16 @@ pub(crate) unsafe fn execute_draw_inner(
         );
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(
-                vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-            )
+            .dst_access_mask(target_dst_access)
             .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(target_pass_layout)
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
         ctx.device.cmd_pipeline_barrier(
             cb,
             vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::DependencyFlags::empty(),
+            target_dst_stage,
+            target_dependency,
             &[],
             &[],
             &barrier,
@@ -4137,26 +4214,46 @@ pub(crate) unsafe fn execute_draw_inner(
     // prior draw) must transition back to color-attachment use, and the write
     // must wait for that prior read (WAR). A freshly-created secondary tracks
     // UNDEFINED and needs no barrier — the render pass discards on CLEAR.
-    for (_id, image, access) in &mrt_secondaries {
+    for (secondary_index, (_id, image, access)) in mrt_secondaries.iter().enumerate() {
         if *access == super::pools::ResidentAccess::Untouched {
             continue;
         }
+        let attachment_index = secondary_index + 1;
+        let feedback = pass_key.color_feedback(attachment_index);
+        if feedback && req.continues_render_pass && pools.open_pass_echoes(&echo) {
+            continue;
+        }
+        let dst_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+            | if feedback {
+                vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER
+            } else {
+                vk::PipelineStageFlags::empty()
+            };
+        let dst_access = vk::AccessFlags::COLOR_ATTACHMENT_READ
+            | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+            | if feedback {
+                vk::AccessFlags::SHADER_READ
+            } else {
+                vk::AccessFlags::empty()
+            };
         unsafe { outside_pass.before_record(PassObstacle::MrtLayout, pools, &ctx.device, cb) };
         let (src_stage, src_access) = access.source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
-            .dst_access_mask(
-                vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-            )
+            .dst_access_mask(dst_access)
             .old_layout(access.layout())
-            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(pass_key.color_layout(attachment_index))
             .image(*image)
             .subresource_range(super::color_subresource_range())];
         ctx.device.cmd_pipeline_barrier(
             cb,
             src_stage,
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::DependencyFlags::empty(),
+            dst_stage,
+            if feedback {
+                vk::DependencyFlags::FEEDBACK_LOOP_EXT
+            } else {
+                vk::DependencyFlags::empty()
+            },
             &[],
             &[],
             &barrier,
@@ -4227,12 +4324,6 @@ pub(crate) unsafe fn execute_draw_inner(
     // closed at the exact recording site of every copy, barrier, dispatch, or
     // query reset Vulkan forbids inside it; this ladder therefore remains an
     // instrument for the continuation opportunities those commands consume.
-    let echo = super::pools::PassEcho {
-        cb,
-        pass: render_pass,
-        fb: target_fb,
-        area: (req.width, req.height),
-    };
     let continues = joins && pools.pass_echoes(&echo);
     let continues_open =
         continues_open_render_pass(req.continues_render_pass, pools.open_pass_echoes(&echo));
@@ -4266,6 +4357,24 @@ pub(crate) unsafe fn execute_draw_inner(
         ctx.device
             .cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
         pools.note_pass_opened(echo);
+    }
+    if pass_key.feedback_colors != 0 {
+        // Order each feedback draw's reads after the preceding colour writes.
+        // This is deliberately a memory barrier inside the render pass: an
+        // image transition here would be invalid, while closing the pass would
+        // throw away the continuation this extension makes possible.
+        let barrier = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::BY_REGION | vk::DependencyFlags::FEEDBACK_LOOP_EXT,
+            &barrier,
+            &[],
+            &[],
+        );
     }
     // Only if this command buffer is not already carrying it — the three
     // `dynstate_*` skips below hang off this one call, because a pipeline change
@@ -4394,7 +4503,7 @@ pub(crate) unsafe fn execute_draw_inner(
     } else {
         unsafe { pools.close_open_pass(&ctx.device, cb) };
     }
-    if pass_churn_probe_enabled() && load_uses_gpu_content {
+    if pass_churn_probe_enabled() && load_uses_gpu_content && !target_feedback {
         // PROBE — `REIMS_VGPU_PASS_CHURN=on`. One extra render pass instance on
         // the target this draw just finished with, loading and storing it and
         // drawing nothing into it.
@@ -4440,7 +4549,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
         ctx.device.cmd_end_render_pass(cb);
     }
-    if layout_churn_probe_enabled() {
+    if layout_churn_probe_enabled() && !target_feedback {
         // PROBE — `REIMS_VGPU_LAYOUT_CHURN=on`. One round trip of the colour
         // attachment's layout, out of [`super::caches::COLOR0_PASS_EXIT_LAYOUT`]
         // into `TRANSFER_SRC_OPTIMAL` and straight back, recorded where the pass
@@ -4517,17 +4626,17 @@ pub(crate) unsafe fn execute_draw_inner(
         // `registry_mark_ready`'s claim about this resident stays true — that
         // call runs below and records the pass's exit layout unconditionally.
         let to_transfer = [vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .src_access_mask(target_dst_access)
             .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-            .old_layout(super::caches::COLOR0_PASS_EXIT_LAYOUT)
+            .old_layout(target_pass_layout)
             .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
         ctx.device.cmd_pipeline_barrier(
             cb,
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            target_dst_stage,
             vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
+            target_dependency,
             &[],
             &[],
             &to_transfer,
@@ -4548,16 +4657,16 @@ pub(crate) unsafe fn execute_draw_inner(
         );
         let back_to_exit = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_READ)
-            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(target_dst_access)
             .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .new_layout(super::caches::COLOR0_PASS_EXIT_LAYOUT)
+            .new_layout(target_pass_layout)
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
         ctx.device.cmd_pipeline_barrier(
             cb,
             vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::DependencyFlags::empty(),
+            target_dst_stage,
+            target_dependency,
             &[],
             &[],
             &back_to_exit,
@@ -4640,7 +4749,14 @@ pub(crate) unsafe fn execute_draw_inner(
         } else {
             super::counters::DrawCoverage::LoadedPartialScissor
         });
-        pools.registry_mark_ready(identity);
+        if target_feedback {
+            pools.registry_mark_ready_with_access(
+                identity,
+                super::pools::ResidentAccess::ColorFeedback,
+            );
+        } else {
+            pools.registry_mark_ready(identity);
+        }
     }
     // MRT secondary attachments settle at COLOR_ATTACHMENT_OPTIMAL (the pass
     // final layout) and become sampleable residents; the consumer's
@@ -4648,8 +4764,16 @@ pub(crate) unsafe fn execute_draw_inner(
     // carrying the color-write→shader-read dependency. (The ad-hoc MRT
     // framebuffer is disposed below, after `finish_entry_async` — see there.)
     if is_mrt {
-        for (identity, _image, _old) in &mrt_secondaries {
-            pools.registry_mark_ready_at(identity, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        for (secondary_index, (identity, _image, _old)) in mrt_secondaries.iter().enumerate() {
+            let attachment_index = secondary_index + 1;
+            if pass_key.color_feedback(attachment_index) {
+                pools.registry_mark_ready_with_access(
+                    identity,
+                    super::pools::ResidentAccess::ColorFeedback,
+                );
+            } else {
+                pools.registry_mark_ready_at(identity, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+            }
         }
     }
     // The depth pass stores unconditionally and settles at
@@ -5715,13 +5839,80 @@ mod tests {
     /// than sample. A new variant that nothing here mentions fails to compile,
     /// which is the point: each one is a rail that can leave a resident in a
     /// state some barrier has to name.
-    const EVERY_ACCESS: [ResidentAccess; 5] = [
+    const EVERY_ACCESS: [ResidentAccess; 6] = [
         ResidentAccess::Untouched,
         ResidentAccess::ColorWrite(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
         ResidentAccess::ColorWrite(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+        ResidentAccess::ColorFeedback,
         ResidentAccess::ShaderRead,
         ResidentAccess::TransferRead,
     ];
+
+    fn target_sample(identity: super::super::types::TargetIdentity) -> SampledImageResource {
+        SampledImageResource {
+            binding: 32,
+            array_element: 0,
+            descriptor_count: 1,
+            width: 16,
+            height: 16,
+            layers: 1,
+            arrayed: false,
+            volume: false,
+            cube: false,
+            one_dim: false,
+            source: SampledSource::Target(identity),
+            byte_origin: Default::default(),
+            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+            identity: None,
+            swizzle: Default::default(),
+        }
+    }
+
+    /// Capability and view shape jointly select the native feedback contract.
+    /// Turning the optional feature off, naming a non-attachment resident, or
+    /// asking for a view the registry does not own must all preserve the
+    /// snapshot fallback rather than silently broadening the direct arm.
+    #[test]
+    fn feedback_loop_selection_is_capability_and_contract_gated() {
+        let primary = super::super::types::TargetIdentity::Surface {
+            id: 7,
+            width: 16,
+            height: 16,
+            generation: 1,
+            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+        };
+        let mut req = DrawRequest {
+            target_identity: Some(primary.clone()),
+            ..DrawRequest::default()
+        };
+        let plain = target_sample(primary.clone());
+        assert_eq!(feedback_color_index(&req, &plain, true), Some(0));
+        assert_eq!(feedback_color_index(&req, &plain, false), None);
+
+        let mut non_plain = target_sample(primary);
+        non_plain.arrayed = true;
+        assert_eq!(feedback_color_index(&req, &non_plain, true), None);
+
+        let secondary = secondary_with_clear([0.0; 4]);
+        let secondary_identity = secondary.identity.clone();
+        req.secondary_targets.push(secondary);
+        assert_eq!(
+            feedback_color_index(&req, &target_sample(secondary_identity), true),
+            Some(1)
+        );
+
+        let unrelated = super::super::types::TargetIdentity::Surface {
+            id: 99,
+            width: 16,
+            height: 16,
+            generation: 1,
+            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+        };
+        assert_eq!(
+            feedback_color_index(&req, &target_sample(unrelated), true),
+            None
+        );
+    }
 
     /// The invariant the whole type exists for: **where a resident sits does not
     /// tell you what a barrier over it must wait for.**

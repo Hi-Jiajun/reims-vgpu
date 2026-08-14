@@ -993,11 +993,14 @@ impl ResourcePools {
         // reclaims and retries on out-of-memory rather than trimming ahead of
         // one. See `recoverable_residents`.
         self.note_registry_reach();
-        let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
+        let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
             | vk::ImageUsageFlags::INPUT_ATTACHMENT
             | vk::ImageUsageFlags::TRANSFER_SRC
             | vk::ImageUsageFlags::TRANSFER_DST
             | vk::ImageUsageFlags::SAMPLED;
+        if ctx.features.attachment_feedback_loop_layout {
+            usage |= vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT;
+        }
         // Reuse a recycled image+memory+view of identical (geometry, format)
         // before allocating a fresh one — the usage set is identical across all
         // registry targets, so a recycled image of the same geometry/format is
@@ -1515,10 +1518,22 @@ impl ResourcePools {
         identity: &TargetIdentity,
         layout: vk::ImageLayout,
     ) {
+        self.registry_mark_ready_with_access(identity, ResidentAccess::ColorWrite(layout));
+    }
+
+    /// Publish newly rendered colour contents together with the exact access
+    /// contract the pass left behind. Feedback-loop passes are both shader
+    /// reads and colour writes, so reducing them to a plain colour write would
+    /// lose half of the next barrier's source scope.
+    pub(crate) fn registry_mark_ready_with_access(
+        &mut self,
+        identity: &TargetIdentity,
+        access: ResidentAccess,
+    ) {
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.content_ready = true;
             slot.content_epoch = None;
-            slot.access = ResidentAccess::ColorWrite(layout);
+            slot.access = access;
         }
         self.set_sole_copy(identity, true);
     }
@@ -1621,18 +1636,12 @@ impl ResourcePools {
     /// [`Self::registry_mark_ready_at`], which is what keeps the reset total
     /// rather than a list of the writers somebody remembered.
     pub(crate) fn registry_mark_ready(&mut self, identity: &TargetIdentity) {
-        if let Some(slot) = self.registry.get_mut(identity) {
-            slot.content_ready = true;
-            slot.content_epoch = None;
-            // Derived from the pass builder's own constant rather than
-            // repeating the layout name: these two must agree or every later
-            // barrier is issued with the wrong `oldLayout`, which is undefined
-            // behaviour and not something a validation layer re-checks. The
-            // access that left it there is the pass's colour attachment write.
-            slot.access =
-                ResidentAccess::ColorWrite(crate::backend::vulkan::engine::caches::COLOR0_PASS_EXIT_LAYOUT);
-        }
-        self.set_sole_copy(identity, true);
+        self.registry_mark_ready_with_access(
+            identity,
+            ResidentAccess::ColorWrite(
+                crate::backend::vulkan::engine::caches::COLOR0_PASS_EXIT_LAYOUT,
+            ),
+        );
     }
 
     /// Record that this resident's current pixels have been copied somewhere

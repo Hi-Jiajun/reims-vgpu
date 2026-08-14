@@ -490,10 +490,9 @@ impl DrawRequest {
     /// Whether this draw binds `identity` as one of its own attachments.
     ///
     /// Sampling an attachment the same draw renders into is an attachment
-    /// feedback loop. Metal permits it; Vulkan does not, and a driver's answer
-    /// to one is undefined rather than an error it reports — so `exec` snapshots
-    /// the resident into a separate image instead of binding it, and this is the
-    /// test that sends it there.
+    /// feedback loop. Vulkan requires that relationship to be declared through
+    /// an optional extension; `exec` binds the resident under that contract
+    /// where available and snapshots it on every other host or view shape.
     ///
     /// **Every attachment, not just the primary.** The test used to be
     /// `req.target_identity == Some(identity)` written at the one call site,
@@ -503,13 +502,29 @@ impl DrawRequest {
     /// sample that attachment, so the same-draw case is reachable by
     /// construction rather than hypothetically.
     ///
-    /// Widening this can only cost a copy. The snapshot arm is semantically
-    /// identical for every input — it binds a copy of the same resident content
-    /// — so a draw newly routed through it observes the same texels it did
-    /// before, and the risk of covering an attachment that did not strictly need
-    /// covering is bounded by one image copy.
+    /// Widening this can only select an attachment-safe disposition: the native
+    /// extension rail when its narrower view contract also holds, or the
+    /// snapshot fallback otherwise.
     pub fn writes_attachment(&self, identity: &TargetIdentity) -> bool {
         self.attachment_slot(identity).is_some()
+    }
+
+    /// The colour-attachment index occupied by `identity`, with primary at
+    /// zero and MRT secondaries following in framebuffer order.
+    ///
+    /// Vulkan's feedback-loop layout is selected per attachment, so the exact
+    /// index is part of the answer. Keeping that ordering here beside the
+    /// request fields prevents the render-pass builder and sampled resolver
+    /// from each reconstructing it differently.
+    pub fn color_attachment_index(&self, identity: &TargetIdentity) -> Option<usize> {
+        if self.target_identity.as_ref() == Some(identity) {
+            Some(0)
+        } else {
+            self.secondary_targets
+                .iter()
+                .position(|target| &target.identity == identity)
+                .map(|index| index + 1)
+        }
     }
 
     /// Which of this draw's attachments `identity` is, when it is one.
@@ -520,14 +535,12 @@ impl DrawRequest {
     /// the primary-only test used to hand the driver as a live feedback loop.
     /// Zero on those two is the healthy reading.
     pub fn attachment_slot(&self, identity: &TargetIdentity) -> Option<AttachmentSlot> {
-        if self.target_identity.as_ref() == Some(identity) {
-            Some(AttachmentSlot::Primary)
-        } else if self
-            .secondary_targets
-            .iter()
-            .any(|s| &s.identity == identity)
-        {
-            Some(AttachmentSlot::Secondary)
+        if let Some(index) = self.color_attachment_index(identity) {
+            Some(if index == 0 {
+                AttachmentSlot::Primary
+            } else {
+                AttachmentSlot::Secondary
+            })
         } else if self.depth.as_ref().and_then(|d| d.identity.as_ref()) == Some(identity) {
             Some(AttachmentSlot::Depth)
         } else {
@@ -1903,6 +1916,8 @@ mod tests {
             Some(AttachmentSlot::Secondary),
             "the census has to be able to say which slot matched"
         );
+        assert_eq!(req.color_attachment_index(&surface(1)), Some(0));
+        assert_eq!(req.color_attachment_index(&surface(2)), Some(1));
         assert_eq!(
             req.attachment_slot(&surface(1)),
             Some(AttachmentSlot::Primary)

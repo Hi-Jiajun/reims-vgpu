@@ -296,6 +296,12 @@ pub struct DeviceFeatures {
     /// How this host can promise that an out-of-bounds texture read is defined,
     /// which every Metal shader is entitled to assume. See [`ImageRobustness`].
     pub image_robustness: ImageRobustness,
+    /// `VK_EXT_attachment_feedback_loop_layout`: whether a render attachment
+    /// may also be bound as a sampled image in the extension's explicit
+    /// feedback-loop layout. This is the native Vulkan spelling of Metal's
+    /// attachment self-sampling contract; hosts without it keep the snapshot
+    /// copy rail.
+    pub attachment_feedback_loop_layout: bool,
     /// `VkPhysicalDeviceFeatures::dualSrcBlend` — whether a pipeline may name
     /// the `SRC1_*` blend factors, which read the fragment shader's second
     /// colour output.
@@ -470,6 +476,13 @@ impl DeviceFeatures {
             .robust_image_access(self.image_robustness.is_available())
     }
 
+    pub fn enabled_attachment_feedback_loop_layout(
+        &self,
+    ) -> vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT<'static> {
+        vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT::default()
+            .attachment_feedback_loop_layout(self.attachment_feedback_loop_layout)
+    }
+
     /// 16-bit storage-buffer access, for shaders that pack half-precision data.
     pub fn enabled_16bit_storage(&self) -> vk::PhysicalDevice16BitStorageFeatures<'static> {
         vk::PhysicalDevice16BitStorageFeatures::default()
@@ -526,6 +539,7 @@ impl DeviceFeatures {
             descriptor_binding_partially_bound,
             mirror_clamp_to_edge,
             image_robustness,
+            attachment_feedback_loop_layout,
             dual_src_blend,
             fill_mode_non_solid,
             depth_clamp,
@@ -548,6 +562,7 @@ impl DeviceFeatures {
         format!(
             "vk_features robust_buffer_access={robust_buffer_access} \
              image_robustness={image_robustness:?} \
+             attachment_feedback_loop_layout={attachment_feedback_loop_layout} \
              sampler_anisotropy={sampler_anisotropy} max_sampler_anisotropy={max_sampler_anisotropy} \
              max_image_dimension_2d={max_image_dimension_2d} \
              max_compute_workgroup_invocations={max_compute_workgroup_invocations} \
@@ -588,6 +603,9 @@ impl DeviceFeatures {
         }
         if self.image_robustness == ImageRobustness::ExtImageRobustness {
             out.push(vk::EXT_IMAGE_ROBUSTNESS_NAME.as_ptr());
+        }
+        if self.attachment_feedback_loop_layout {
+            out.push(vk::EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_NAME.as_ptr());
         }
         out
     }
@@ -709,10 +727,25 @@ pub unsafe fn query(
     } else {
         MirrorClampToEdge::Unsupported
     };
+    // Unlike promoted feature structs above, this one exists only with its
+    // extension. Do not put it on the unconditional features2 chain: asking a
+    // 1.2 device about a structure whose extension it did not advertise is not
+    // a capability query that device promised to accept.
+    let attachment_feedback_loop_layout =
+        if has_extension(vk::EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_NAME) {
+            let mut feedback = vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT::default();
+            let mut feedback_features =
+                vk::PhysicalDeviceFeatures2::default().push_next(&mut feedback);
+            unsafe { instance.get_physical_device_features2(pd, &mut feedback_features) };
+            feedback.attachment_feedback_loop_layout == vk::TRUE
+        } else {
+            false
+        };
 
     DeviceFeatures {
         robust_buffer_access: supported.robust_buffer_access == vk::TRUE,
         image_robustness,
+        attachment_feedback_loop_layout,
         sampler_anisotropy: supported.sampler_anisotropy == vk::TRUE,
         dual_src_blend: supported.dual_src_blend == vk::TRUE,
         fill_mode_non_solid: supported.fill_mode_non_solid == vk::TRUE,
@@ -815,6 +848,7 @@ mod tests {
             descriptor_binding_partially_bound: true,
             mirror_clamp_to_edge: MirrorClampToEdge::Core12,
             image_robustness: ImageRobustness::Core13,
+            attachment_feedback_loop_layout: true,
             dual_src_blend: true,
             fill_mode_non_solid: true,
             depth_clamp: true,
@@ -836,6 +870,7 @@ mod tests {
         assert_eq!(all_supported().enabled_features().dual_src_blend, vk::TRUE);
         let without = DeviceFeatures {
             dual_src_blend: false,
+            attachment_feedback_loop_layout: false,
             ..all_supported()
         };
         assert_eq!(without.enabled_features().dual_src_blend, vk::FALSE);
@@ -874,7 +909,10 @@ mod tests {
     /// The 1.2 rung sets the core feature bit and asks for no extension.
     #[test]
     fn the_core_rung_needs_no_extension_string() {
-        let caps = all_supported();
+        let caps = DeviceFeatures {
+            attachment_feedback_loop_layout: false,
+            ..all_supported()
+        };
         assert_eq!(
             caps.enabled_vulkan12().sampler_mirror_clamp_to_edge,
             vk::TRUE
@@ -890,6 +928,7 @@ mod tests {
     fn the_extension_rung_asks_for_the_extension_and_not_the_core_bit() {
         let caps = DeviceFeatures {
             mirror_clamp_to_edge: MirrorClampToEdge::KhrExtension,
+            attachment_feedback_loop_layout: false,
             ..all_supported()
         };
         assert_eq!(
@@ -906,6 +945,7 @@ mod tests {
     fn without_support_nothing_is_requested() {
         let caps = DeviceFeatures {
             mirror_clamp_to_edge: MirrorClampToEdge::Unsupported,
+            attachment_feedback_loop_layout: false,
             ..all_supported()
         };
         assert_eq!(
@@ -958,6 +998,33 @@ mod tests {
         );
         assert!(!none.required_extensions().contains(&ext_name));
         assert!(!none.image_robustness.is_available());
+    }
+
+    /// This extension has one indivisible contract: the queried feature, the
+    /// feature enabled at device creation, and its extension string must move
+    /// together. Naming only the extension leaves the layout unusable; asking
+    /// for the feature without the advertised extension fails device creation.
+    #[test]
+    fn attachment_feedback_loop_feature_and_extension_move_together() {
+        let name = vk::EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_NAME.as_ptr();
+        let on = DeviceFeatures {
+            attachment_feedback_loop_layout: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            on.enabled_attachment_feedback_loop_layout()
+                .attachment_feedback_loop_layout,
+            vk::TRUE
+        );
+        assert!(on.required_extensions().contains(&name));
+
+        let off = DeviceFeatures::default();
+        assert_eq!(
+            off.enabled_attachment_feedback_loop_layout()
+                .attachment_feedback_loop_layout,
+            vk::FALSE
+        );
+        assert!(!off.required_extensions().contains(&name));
     }
 
     /// A feature the device declines is never enabled — the enable list is a
@@ -1091,6 +1158,7 @@ mod tests {
         assert!(on.starts_with("vk_features "), "{on}");
         assert!(on.contains("depth_clamp=true"), "{on}");
         assert!(on.contains("timeline_semaphore=true"), "{on}");
+        assert!(on.contains("attachment_feedback_loop_layout=true"), "{on}");
         assert!(on.contains("subgroup_size=64"), "{on}");
         // The layout probes report the *missing* set, which is empty here.
         assert!(on.contains("no_linear_filter=none"), "{on}");
@@ -1099,6 +1167,10 @@ mod tests {
         let off = DeviceFeatures::default().report_line();
         assert!(off.contains("depth_clamp=false"), "{off}");
         assert!(off.contains("timeline_semaphore=false"), "{off}");
+        assert!(
+            off.contains("attachment_feedback_loop_layout=false"),
+            "{off}"
+        );
         assert!(
             off.contains("mirror_clamp_to_edge=Unsupported"),
             "the rung, not a bool: which spelling a device has decides what is \

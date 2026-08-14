@@ -2046,6 +2046,10 @@ unsafe fn copy_image_level0_to_host_delivered(
             )?
         };
     }
+    // A deferred draw may have left its render pass standing in this same
+    // command buffer. The image barrier and copy below are outside-pass
+    // commands; recording either inside that pass is invalid.
+    unsafe { pools.close_open_pass(&ctx.device, cb) };
     // Unconditional, and the layout match is exactly why. A barrier is two
     // things — a layout transition and a dependency — and this rail needs the
     // second one whether or not it needs the first. Every render pass resolves
@@ -2093,7 +2097,7 @@ unsafe fn copy_image_level0_to_host_delivered(
         cb,
         ash::vk::PipelineStageFlags::ALL_COMMANDS,
         ash::vk::PipelineStageFlags::TRANSFER,
-        ash::vk::DependencyFlags::empty(),
+        feedback_transition_dependency(old_layout),
         &[],
         &[],
         &barrier,
@@ -3228,6 +3232,7 @@ unsafe fn copy_image_level0_to_buffer(
             )?
         };
     }
+    unsafe { pools.close_open_pass(&ctx.device, cb) };
     // The device's own clock, for the reason the readback rail takes it: `fence_us`
     // is CPU wall clock and cannot tell "the GPU is copying eight megabytes across
     // PCIe" from "the round trip costs more than the work". Those have opposite
@@ -3257,7 +3262,7 @@ unsafe fn copy_image_level0_to_buffer(
         cb,
         ash::vk::PipelineStageFlags::ALL_COMMANDS,
         ash::vk::PipelineStageFlags::TRANSFER,
-        ash::vk::DependencyFlags::empty(),
+        feedback_transition_dependency(snap.layout),
         &[],
         &[],
         &barrier,
@@ -3589,9 +3594,48 @@ fn narrow_readback_to_rgba8(
 /// The `srcAccessMask` a resident color target's readback must drain.
 const RESIDENT_READ_SRC_ACCESS: ash::vk::AccessFlags = ash::vk::AccessFlags::from_raw(
     ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE.as_raw()
+        | ash::vk::AccessFlags::COLOR_ATTACHMENT_READ.as_raw()
         | ash::vk::AccessFlags::TRANSFER_WRITE.as_raw()
-        | ash::vk::AccessFlags::SHADER_WRITE.as_raw(),
+        | ash::vk::AccessFlags::SHADER_WRITE.as_raw()
+        | ash::vk::AccessFlags::SHADER_READ.as_raw(),
 );
+
+/// Dependency flag required when a barrier transitions an image out of the
+/// attachment-feedback-loop layout. Derived from the tracked old layout at the
+/// two resident-copy barriers so no caller can forget the extension contract.
+fn feedback_transition_dependency(layout: ash::vk::ImageLayout) -> ash::vk::DependencyFlags {
+    if layout == ash::vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT {
+        ash::vk::DependencyFlags::FEEDBACK_LOOP_EXT
+    } else {
+        ash::vk::DependencyFlags::empty()
+    }
+}
+
+#[cfg(test)]
+mod feedback_transition_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_feedback_layout_requires_the_feedback_dependency_flag() {
+        assert_eq!(
+            feedback_transition_dependency(
+                ash::vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT,
+            ),
+            ash::vk::DependencyFlags::FEEDBACK_LOOP_EXT
+        );
+        for layout in [
+            ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        ] {
+            assert_eq!(
+                feedback_transition_dependency(layout),
+                ash::vk::DependencyFlags::empty(),
+                "{layout:?}"
+            );
+        }
+    }
+}
 
 /// The per-call `VkOp` names for a resident target readback.
 ///
@@ -3770,6 +3814,17 @@ pub fn object_cache_levels() -> [usize; 6] {
 /// the sweep's old answer against the new one and fails as if the device broke.
 pub fn batch_max_draws() -> u64 {
     pools::BATCH_MAX_DRAWS
+}
+
+/// Whether the live Vulkan device can execute colour-attachment self-sampling
+/// through the attachment-feedback-loop contract. Tests use the answer to
+/// distinguish the native rail from its required snapshot fallback.
+pub fn attachment_feedback_loop_active() -> bool {
+    lock_engine()
+        .owner
+        .ctx
+        .as_ref()
+        .is_some_and(|ctx| ctx.features.attachment_feedback_loop_layout)
 }
 
 pub fn counter_snapshot() -> CounterSnapshot {
