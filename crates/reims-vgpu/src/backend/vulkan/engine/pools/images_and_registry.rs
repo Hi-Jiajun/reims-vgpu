@@ -154,9 +154,9 @@ struct NewResident {
     /// per-slot framebuffer. Compatibility, not handle identity, decides reuse.
     render_pass: vk::RenderPass,
     /// `None` exactly when `framebuffer` is null. Unlike the creation handle,
-    /// this is the Vulkan compatibility identity: a load-action-only change can
-    /// reuse the framebuffer rather than replacing it between encoder records.
-    framebuffer_compatibility: Option<PassCompatibilityKey>,
+    /// this is the Vulkan compatibility identity: actions, layouts, and
+    /// dependencies can change without replacing it between encoder records.
+    framebuffer_compatibility: Option<FramebufferCompatibilityKey>,
     width: u32,
     height: u32,
     generation: u64,
@@ -206,7 +206,7 @@ impl ResourcePools {
                 None,
             )
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateStorageImage, e)))?;
-        counters.note_create();
+        counters.note_create(CreateSite::StorageImage);
         let req = ctx.device.get_image_memory_requirements(image);
         let mt = ctx
             .memory_type_for(req.memory_type_bits, req.size, MemoryClass::DeviceLocal)
@@ -273,7 +273,7 @@ impl ResourcePools {
                 ctx.device.destroy_image(image, None);
                 DrawError::VkCall(VkCall::new(VkOp::PoolsCreateStorageImageView, e))
             })?;
-        counters.note_create();
+        counters.note_create(CreateSite::StorageImageView);
         let slot = StorageImageSlot {
             image,
             memory,
@@ -942,7 +942,7 @@ impl ResourcePools {
         width: u32,
         height: u32,
         render_pass: vk::RenderPass,
-        framebuffer_compatibility: PassCompatibilityKey,
+        framebuffer_compatibility: FramebufferCompatibilityKey,
         generation: u64,
         format: vk::Format,
         guest_memory: Option<crate::backend::vulkan::engine::GuestTargetMemory>,
@@ -986,7 +986,7 @@ impl ResourcePools {
                     .map_err(|e| {
                         DrawError::VkCall(VkCall::new(VkOp::PoolsCreateRegistryFramebuffer, e))
                     })?;
-                counters.note_create();
+                counters.note_create(CreateSite::RegistryFramebuffer);
                 self.dispose_owed_framebuffer(&ctx.device, old_fb);
                 let slot = self.registry.get_mut(&identity).unwrap();
                 slot.framebuffer = framebuffer;
@@ -1056,7 +1056,7 @@ impl ResourcePools {
             None => None,
         };
         let (image, memory, view) = if let Some(imported) = imported {
-            counters.note_create();
+            counters.note_create(CreateSite::RegistryImportedImage);
             counters.note_alloc();
             let view = match ctx.device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
@@ -1076,7 +1076,7 @@ impl ResourcePools {
                     )));
                 }
             };
-            counters.note_create();
+            counters.note_create(CreateSite::RegistryImageView);
             (
                 imported.image,
                 ResidentMemory::GuestImported {
@@ -1112,7 +1112,7 @@ impl ResourcePools {
                     None,
                 )
                 .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateRegistryTarget, e)))?;
-            counters.note_create();
+            counters.note_create(CreateSite::RegistryImage);
             let ireq = ctx.device.get_image_memory_requirements(image);
             let memory = match self.bind_image_slab(
                 ctx,
@@ -1179,7 +1179,7 @@ impl ResourcePools {
                     )));
                 }
             };
-            counters.note_create();
+            counters.note_create(CreateSite::RegistryImageView);
             (image, ResidentMemory::Recyclable(memory), view)
         };
         let attachments = [view];
@@ -1210,7 +1210,7 @@ impl ResourcePools {
                 )));
             }
         };
-        counters.note_create();
+        counters.note_create(CreateSite::RegistryFramebuffer);
         self.register_resident(
             &identity,
             NewResident {
@@ -1303,7 +1303,7 @@ impl ResourcePools {
                 .map_err(|e| {
                     DrawError::VkCall(VkCall::new(VkOp::PoolsCreateMrtSecondaryTarget, e))
                 })?;
-            counters.note_create();
+            counters.note_create(CreateSite::MrtImage);
             let ireq = ctx.device.get_image_memory_requirements(image);
             let imt = ctx
                 .memory_type_for(ireq.memory_type_bits, ireq.size, MemoryClass::DeviceLocal)
@@ -1351,7 +1351,7 @@ impl ResourcePools {
                     ctx.device.destroy_image(image, None);
                     DrawError::VkCall(VkCall::new(VkOp::PoolsCreateMrtSecondaryView, e))
                 })?;
-            counters.note_create();
+            counters.note_create(CreateSite::MrtImageView);
             (image, memory, view)
         };
         self.register_resident(
@@ -1512,7 +1512,7 @@ impl ResourcePools {
                 None,
             )
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateDepthImage, e)))?;
-        counters.note_create();
+        counters.note_create(CreateSite::DepthImage);
         let ireq = ctx.device.get_image_memory_requirements(image);
         let imt = ctx
             .memory_type_for(ireq.memory_type_bits, ireq.size, MemoryClass::DeviceLocal)
@@ -1562,7 +1562,7 @@ impl ResourcePools {
                 ctx.device.destroy_image(image, None);
                 DrawError::VkCall(VkCall::new(VkOp::PoolsCreateDepthView, e))
             })?;
-        counters.note_create();
+        counters.note_create(CreateSite::DepthImageView);
         Ok((image, memory, view))
     }
 
@@ -1590,7 +1590,7 @@ impl ResourcePools {
                 None,
             )
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateMrtFramebuffer, e)))?;
-        counters.note_create();
+        counters.note_create(CreateSite::MrtFramebuffer);
         Ok(fb)
     }
 
@@ -2592,7 +2592,7 @@ pub(super) mod pin_count_tests {
                 false,
                 translate::pixel::SCANOUT_FORMAT,
             )
-            .compatibility()
+            .framebuffer_compatibility()
         });
         NewResident {
             image: vk::Image::null(),

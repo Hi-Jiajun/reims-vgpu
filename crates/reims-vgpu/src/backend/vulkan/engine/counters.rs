@@ -759,11 +759,95 @@ engine_counters! {
         compute_storage_sole_copy_peak_bytes,
     }
 }
+macro_rules! create_sites {
+    ($($variant:ident => $slug:literal),+ $(,)?) => {
+        /// The Vulkan object lifetime a successful create call belongs to.
+        ///
+        /// A single `creates` total cannot distinguish a pipeline compiled once
+        /// from a framebuffer rebuilt per draw. Every create charged to the
+        /// total carries this type, so adding an unclassified charge fails to
+        /// compile instead of silently widening the remainder of a census.
+        #[repr(usize)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(crate) enum CreateSite {
+            $($variant),+
+        }
+
+        const CREATE_SITES: &[(CreateSite, &str)] = &[
+            $((CreateSite::$variant, $slug)),+
+        ];
+
+        impl CreateSite {
+            fn index(self) -> usize {
+                self as usize
+            }
+        }
+    };
+}
+
+create_sites! {
+    ShaderModule => "shader_module",
+    DescriptorSetLayout => "descriptor_set_layout",
+    PipelineLayout => "pipeline_layout",
+    RenderPass => "render_pass",
+    Sampler => "sampler",
+    GraphicsPipeline => "graphics_pipeline",
+    ComputePipeline => "compute_pipeline",
+    StorageImage => "storage_image",
+    StorageImageView => "storage_image_view",
+    RegistryFramebuffer => "registry_framebuffer",
+    RegistryImportedImage => "registry_imported_image",
+    RegistryImage => "registry_image",
+    RegistryImageView => "registry_image_view",
+    MrtImage => "mrt_image",
+    MrtImageView => "mrt_image_view",
+    DepthImage => "depth_image",
+    DepthImageView => "depth_image_view",
+    MrtFramebuffer => "mrt_framebuffer",
+    CommandPool => "command_pool",
+    DescriptorPool => "descriptor_pool",
+    Fence => "fence",
+    StagingBuffer => "staging_buffer",
+    GatherBuffer => "gather_buffer",
+    ReadbackBuffer => "readback_buffer",
+    TargetImage => "target_image",
+    TargetImageView => "target_image_view",
+    TargetFramebuffer => "target_framebuffer",
+    GuestSampledImage => "guest_sampled_image",
+    GuestSampledImageView => "guest_sampled_image_view",
+    SampledImage => "sampled_image",
+    SampledImageView => "sampled_image_view",
+    QueryPool => "query_pool",
+}
+
+static CREATE_SITE_COUNTS: [AtomicU64; CREATE_SITES.len()] =
+    [const { AtomicU64::new(0) }; CREATE_SITES.len()];
+static CREATE_COUNT: AtomicU64 = AtomicU64::new(0);
+const CREATE_EMIT_EVERY: u64 = 512;
+
+fn emit_create_site_census() {
+    use std::fmt::Write as _;
+    let mut line = String::from("vk_create_sites");
+    for (site, name) in CREATE_SITES {
+        let _ = write!(
+            line,
+            " {name}={}",
+            CREATE_SITE_COUNTS[site.index()].load(Ordering::Relaxed)
+        );
+    }
+    crate::observe::off(line);
+}
+
 /// The `note_*` helpers: the increments that are not a bare `fetch_add(1)` at
 /// the call site, because they move a count and a byte total together.
 impl EngineCounters {
-    pub fn note_create(&self) {
+    pub(crate) fn note_create(&self, site: CreateSite) {
         self.creates.fetch_add(1, Ordering::Relaxed);
+        CREATE_SITE_COUNTS[site.index()].fetch_add(1, Ordering::Relaxed);
+        let count = CREATE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if count % CREATE_EMIT_EVERY == 0 {
+            emit_create_site_census();
+        }
     }
 
     pub fn note_alloc(&self) {
@@ -948,7 +1032,7 @@ mod tests {
     #[test]
     fn note_helpers_update_event_and_byte_counters_together() {
         let counters = EngineCounters::default();
-        counters.note_create();
+        counters.note_create(CreateSite::ShaderModule);
         counters.note_alloc();
         counters.note_readback(4096);
         counters.note_seed_upload(1024);

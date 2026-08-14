@@ -10,7 +10,7 @@ use super::caches::{
     PipelineKey, SecondaryAttachKey, MAX_SECONDARY_ATTACH,
 };
 use super::context::ContextOwner;
-use super::counters::EngineCounters;
+use super::counters::{CreateSite, EngineCounters};
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::draw_execution::DrawExecutionDecline;
 use super::draw_validation::DrawValidationDecline;
@@ -3164,10 +3164,10 @@ pub(crate) unsafe fn execute_draw_inner(
         color_only.host_accessible_color0 = pass_key.host_accessible_color0;
         (
             caches.get_or_create_pass(ctx, color_only, counters, pools)?,
-            color_only.compatibility(),
+            color_only.framebuffer_compatibility(),
         )
     } else {
-        (render_pass, pass_key.compatibility())
+        (render_pass, pass_key.framebuffer_compatibility())
     };
     phase.enter(super::draw_phase::Phase::Acquire);
     // (identity, image, tracked-layout-before-this-draw) per secondary — used
@@ -4568,6 +4568,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 .device
                 .create_query_pool(&ci, None)
                 .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecCreateQueryPool, e)))?;
+            counters.note_create(CreateSite::QueryPool);
             unsafe { outside_pass.before_record(PassObstacle::QueryReset, pools, &ctx.device, cb) };
             ctx.device.cmd_reset_query_pool(cb, pool, 0, 1);
             Some((pool, flags))

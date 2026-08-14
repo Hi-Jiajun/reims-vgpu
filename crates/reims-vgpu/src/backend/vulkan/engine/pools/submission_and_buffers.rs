@@ -727,7 +727,7 @@ impl ResourcePools {
                 None,
             )
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateCommandPool, e)))?;
-        counters.note_create();
+        counters.note_create(CreateSite::CommandPool);
         let cmd_bufs = ctx
             .device
             .allocate_command_buffers(
@@ -747,7 +747,7 @@ impl ResourcePools {
             ctx.device.destroy_command_pool(cmd_pool, None);
             return Err(e);
         }
-        counters.note_create();
+        counters.note_create(CreateSite::DescriptorPool);
         let mut slots = Vec::with_capacity(RING_DEPTH);
         for cmd_buf in cmd_bufs.into_iter() {
             // Fences start unsignaled: a slot with no pending cleanup is never
@@ -757,7 +757,7 @@ impl ResourcePools {
                 .create_fence(&vk::FenceCreateInfo::default(), None)
             {
                 Ok(fence) => {
-                    counters.note_create();
+                    counters.note_create(CreateSite::Fence);
                     slots.push(CmdSlot {
                         cmd_buf,
                         fence,
@@ -2691,7 +2691,7 @@ impl ResourcePools {
                 None,
             )
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateStaging, e)))?;
-        counters.note_create();
+        counters.note_create(CreateSite::StagingBuffer);
         let req = ctx.device.get_buffer_memory_requirements(buffer);
         let mt = ctx
             .memory_type_for(req.memory_type_bits, req.size, MemoryClass::Upload)
@@ -2816,7 +2816,7 @@ impl ResourcePools {
                 None,
             )
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateGuestGather, e)))?;
-        counters.note_create();
+        counters.note_create(CreateSite::GatherBuffer);
         let req = ctx.device.get_buffer_memory_requirements(buffer);
         let token = self
             .slabs
@@ -3067,7 +3067,7 @@ impl ResourcePools {
                 None,
             )
             .map_err(|e| DrawError::VkCall(VkCall::new(create_op, e)))?;
-        counters.note_create();
+        counters.note_create(CreateSite::ReadbackBuffer);
         let req = ctx.device.get_buffer_memory_requirements(buffer);
         let mt = ctx
             .memory_type_for(req.memory_type_bits, req.size, MemoryClass::Readback)
@@ -3319,7 +3319,7 @@ impl ResourcePools {
                 None,
             )
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateTargetImage, e)))?;
-        counters.note_create();
+        counters.note_create(CreateSite::TargetImage);
         let ireq = ctx.device.get_image_memory_requirements(image);
         let memory = match self.bind_image_slab(ctx, image, &ireq, VkOp::PoolsBindTarget, counters)
         {
@@ -3347,7 +3347,7 @@ impl ResourcePools {
                 )));
             }
         };
-        counters.note_create();
+        counters.note_create(CreateSite::TargetImageView);
         let attachments = [view];
         let framebuffer = match ctx.device.create_framebuffer(
             &vk::FramebufferCreateInfo::default()
@@ -3369,7 +3369,7 @@ impl ResourcePools {
                 )));
             }
         };
-        counters.note_create();
+        counters.note_create(CreateSite::TargetFramebuffer);
         if self.target_order.len() >= TARGET_POOL_MAX_ENTRIES {
             if let Some(old_k) = self.target_order.first().cloned() {
                 if let Some(old) = self.targets.remove(&old_k) {
@@ -3467,7 +3467,7 @@ impl ResourcePools {
                 return Ok(None);
             }
         };
-        counters.note_create();
+        counters.note_create(CreateSite::GuestSampledImage);
         counters.note_alloc();
         let view = match unsafe {
             ctx.device.create_image_view(
@@ -3490,7 +3490,7 @@ impl ResourcePools {
                 )));
             }
         };
-        counters.note_create();
+        counters.note_create(CreateSite::GuestSampledImageView);
         let use_ = GuestSampledUse {
             image: imported.image,
             view,
@@ -3619,7 +3619,7 @@ impl ResourcePools {
                 None,
             )
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateSampledImage, e)))?;
-        counters.note_create();
+        counters.note_create(CreateSite::SampledImage);
         let req = ctx.device.get_image_memory_requirements(image);
         let memory = match self.bind_image_slab(ctx, image, &req, VkOp::PoolsBindSampled, counters)
         {
@@ -3660,7 +3660,7 @@ impl ResourcePools {
                 )));
             }
         };
-        counters.note_create();
+        counters.note_create(CreateSite::SampledImageView);
         let slot = SampledSlot {
             image,
             memory,

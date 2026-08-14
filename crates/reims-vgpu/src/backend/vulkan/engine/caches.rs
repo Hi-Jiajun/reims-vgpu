@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 // ash Handle trait not required here.
 
 use super::context::DeviceContext;
-use super::counters::EngineCounters;
+use super::counters::{CreateSite, EngineCounters};
 use super::digest::Digest128;
 use super::pools::{DeferredHandle, ResourcePools};
 use super::types::{
@@ -225,6 +225,21 @@ impl PassKey {
         PassCompatibilityKey(key)
     }
 
+    /// The render-pass state Vulkan uses to decide framebuffer compatibility.
+    ///
+    /// Attachment load actions, attachment-reference layouts, and subpass
+    /// dependencies do not participate. Host accessibility changes only the
+    /// primary attachment's layouts and external dependency; feedback changes
+    /// layouts and a dependency. Neither requires a framebuffer to be rebuilt.
+    /// Attachment formats and the subpass attachment-reference shape remain in
+    /// the key.
+    pub(crate) fn framebuffer_compatibility(self) -> FramebufferCompatibilityKey {
+        let mut key = self.compatibility().0;
+        key.host_accessible_color0 = false;
+        key.feedback_colors = 0;
+        FramebufferCompatibilityKey(key)
+    }
+
     pub(crate) fn color_layout(self, index: usize) -> vk::ImageLayout {
         if self.color_feedback(index) {
             vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
@@ -251,6 +266,11 @@ impl PassKey {
 /// so a load action cannot accidentally enter a pipeline or framebuffer key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct PassCompatibilityKey(PassKey);
+
+/// The subset of [`PassKey`] that Vulkan requires to agree when a framebuffer
+/// created against one render pass is used with another.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct FramebufferCompatibilityKey(PassKey);
 
 impl PassCompatibilityKey {
     pub(crate) fn secondary_count(self) -> usize {
@@ -1095,7 +1115,7 @@ impl ObjectCaches {
             self.shaders.insert_negative(key, err.clone());
             err
         })?;
-        counters.note_create();
+        counters.note_create(CreateSite::ShaderModule);
         if let Some(old) = self.shaders.insert(key, module) {
             pools.dispose(&ctx.device, DeferredHandle::ShaderModule(old));
         }
@@ -1157,7 +1177,7 @@ impl ObjectCaches {
                     self.layouts.insert_negative(key.clone(), err.clone());
                     err
                 })?;
-            counters.note_create();
+            counters.note_create(CreateSite::DescriptorSetLayout);
             d
         };
         let layouts: Vec<vk::DescriptorSetLayout> = if dsl == vk::DescriptorSetLayout::null() {
@@ -1179,7 +1199,7 @@ impl ObjectCaches {
                 self.layouts.insert_negative(key.clone(), err.clone());
                 err
             })?;
-        counters.note_create();
+        counters.note_create(CreateSite::PipelineLayout);
         if let Some((old_dsl, old_pl)) = self.layouts.insert(key.clone(), (dsl, pl)) {
             pools.dispose(&ctx.device, DeferredHandle::PipelineLayout(old_pl));
             if old_dsl != vk::DescriptorSetLayout::null() {
@@ -1370,7 +1390,7 @@ impl ObjectCaches {
             self.passes.insert_negative(key, err.clone());
             err
         })?;
-        counters.note_create();
+        counters.note_create(CreateSite::RenderPass);
         if let Some(old) = self.passes.insert(key, rp) {
             pools.dispose(&ctx.device, DeferredHandle::RenderPass(old));
         }
@@ -1564,7 +1584,7 @@ impl ObjectCaches {
                 self.samplers.insert_negative(*key, err.clone());
                 err
             })?;
-        counters.note_create();
+        counters.note_create(CreateSite::Sampler);
         if let Some(old) = self.samplers.insert(*key, sampler) {
             pools.dispose(&ctx.device, DeferredHandle::Sampler(old));
         }
@@ -1976,7 +1996,7 @@ impl ObjectCaches {
             self.pipelines.insert_negative(key.clone(), err.clone());
             err
         })?[0];
-        counters.note_create();
+        counters.note_create(CreateSite::GraphicsPipeline);
         // A fresh pipeline compile grew the VkPipelineCache — persist it so
         // the next boot warm-starts (file write is off-thread, debounced).
         ctx.persist_pipeline_cache();
@@ -2046,7 +2066,7 @@ impl ObjectCaches {
                 .insert_negative(key.clone(), err.clone());
             err
         })?[0];
-        counters.note_create();
+        counters.note_create(CreateSite::ComputePipeline);
         // Same warm-start persistence as the graphics path.
         ctx.persist_pipeline_cache();
         if let Some(old) = self.compute_pipelines.insert(key.clone(), pipe) {
@@ -2060,10 +2080,8 @@ impl ObjectCaches {
 mod object_cache_tests {
     use super::*;
 
-    /// Vulkan render-pass compatibility excludes load/store actions but retains
-    /// attachment formats and subpass shape. This is the relation shared by
-    /// pipeline caching, framebuffer reuse, and an encoder continuation; if one
-    /// consumer grows its own approximation, the three disagree again.
+    /// Pipeline and live-pass compatibility exclude load actions but retain
+    /// attachment formats and subpass shape.
     #[test]
     fn pass_compatibility_ignores_only_load_actions() {
         let mut clear = PassKey::single(false, vk::Format::B8G8R8A8_UNORM);
@@ -2094,6 +2112,32 @@ mod object_cache_tests {
         let mut different_depth = load;
         different_depth.depth.as_mut().unwrap().stencil = false;
         assert_ne!(clear.compatibility(), different_depth.compatibility());
+    }
+
+    /// Framebuffers bind attachment views, not load actions, layouts, or
+    /// dependencies. A transport change on the same retained attachment must
+    /// therefore keep the framebuffer, while a changed input-attachment shape
+    /// must not.
+    #[test]
+    fn framebuffer_compatibility_ignores_transport_and_dependency_state() {
+        let plain = PassKey::single(false, vk::Format::B8G8R8A8_UNORM);
+        let mut transported = plain;
+        transported.load_seed = true;
+        transported.host_accessible_color0 = true;
+        transported.feedback_colors = 1;
+
+        assert_eq!(
+            plain.framebuffer_compatibility(),
+            transported.framebuffer_compatibility()
+        );
+        assert_ne!(plain.compatibility(), transported.compatibility());
+
+        let mut input = transported;
+        input.color_input = true;
+        assert_ne!(
+            plain.framebuffer_compatibility(),
+            input.framebuffer_compatibility()
+        );
     }
 
     #[test]

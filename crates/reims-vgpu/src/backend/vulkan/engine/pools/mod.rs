@@ -10,10 +10,10 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use super::buffer_slab::{BufferSlabToken, BUFFER_SLAB_IDLE_KEEP_EMPTY};
-use super::caches::PassCompatibilityKey;
+use super::caches::{FramebufferCompatibilityKey, PassCompatibilityKey};
 use super::compute_execution::ComputeExecutionDecline;
 use super::context::{DeviceContext, DrawSpanProbe, TimestampProbe, FENCE_TIMEOUT_NS};
-use super::counters::EngineCounters;
+use super::counters::{CreateSite, EngineCounters};
 use super::desc_arena::{DescriptorArena, DESC_BLOCK_MAX_SETS};
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::types::{DrawError, ResidentReclaim, StorageImageFormat, TargetIdentity};
@@ -1565,7 +1565,7 @@ pub(crate) struct ResidentTargetSlot {
     pub view: vk::ImageView,
     pub framebuffer: vk::Framebuffer,
     pub render_pass: vk::RenderPass,
-    pub framebuffer_compatibility: Option<PassCompatibilityKey>,
+    pub framebuffer_compatibility: Option<FramebufferCompatibilityKey>,
     pub width: u32,
     pub height: u32,
     pub generation: u64,
