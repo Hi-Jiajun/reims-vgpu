@@ -20,7 +20,8 @@ use super::pools::{
 use super::stage_phase;
 use super::types::{
     BufferContent, ColorWriteMask, DrawError, DrawOutput, DrawRequest, SampledSource,
-    ScissorResource, SeedOrder, VertexStepFunction, ViewportResource, VisibilityResultMode,
+    ResidentReclaim, ScissorResource, SeedOrder, TargetIdentity, VertexStepFunction,
+    ViewportResource, VisibilityResultMode,
 };
 use super::vk_call::{VkCall, VkOp};
 
@@ -2298,6 +2299,47 @@ fn note_depth_load_without_content(width: u32, height: u32, stencil: bool) {
     }
 }
 
+/// Validate the resident state a sampled target needs at the authoritative
+/// point: inside the draw's engine transaction.
+///
+/// Runtime preparation carries the serialized resource identity. It must not
+/// query this mutable registry first: such a result can change before the draw
+/// acquires the engine, while this decision cannot race a reclaim or target
+/// replacement.
+fn validate_sampled_resident(
+    binding: u32,
+    identity: &TargetIdentity,
+    resource_width: u32,
+    resource_height: u32,
+    held: Option<(bool, u32, u32)>,
+    prior: Option<ResidentReclaim>,
+) -> Result<(), DrawExecutionDecline> {
+    let Some((content_ready, resident_width, resident_height)) = held else {
+        return Err(DrawExecutionDecline::SampledResidentMissing {
+            binding,
+            identity: identity.clone(),
+            prior,
+        });
+    };
+    if !content_ready {
+        return Err(DrawExecutionDecline::SampledResidentNotReady {
+            binding,
+            identity: identity.clone(),
+        });
+    }
+    if resident_width != resource_width || resident_height != resource_height {
+        return Err(DrawExecutionDecline::SampledResidentGeometryMismatch {
+            binding,
+            identity: identity.clone(),
+            resident_width,
+            resident_height,
+            resource_width,
+            resource_height,
+        });
+    }
+    Ok(())
+}
+
 pub(crate) unsafe fn execute_draw_inner(
     owner: &mut ContextOwner,
     caches: &mut ObjectCaches,
@@ -3101,20 +3143,11 @@ pub(crate) unsafe fn execute_draw_inner(
     // resident on — see `acquire_depth_view`. `None` on the 2D path so nothing
     // changes there.
     let mut transient_depth: Option<(Option<OwnedDepthImage>, vk::Framebuffer)> = None;
-    // Mark everything this draw is about to read *before* resolving its own
-    // target, so a reclaim between here and `prepare_sampled` cannot take one
-    // of this draw's own sampled sources.
-    //
-    // The idle drain is what could: it destroys any resident untouched for
-    // `IDLE_TARGET_AGE_MS`, and it runs off the poll heartbeat on another
-    // thread, so a source last read a while ago is reachable right up to the
-    // lookup a few hundred lines below — the gap between the
-    // `resident_content_ready` guard the resolver already performs and
-    // `prepare_sampled`. Marking them used closes it, because both reclaim
-    // paths treat a marked resident as in use, and a source this draw is about
-    // to read is by construction the most recently used thing in the registry.
-    // It reuses the recency the sampled resolve already records rather than
-    // threading a protected set through `registry_ensure`.
+    // Mark everything this draw is about to read before resolving its own
+    // target. The whole operation runs under the engine transaction, so an
+    // idle reclaim cannot interleave with validation or binding; the early
+    // mark preserves the source's recency if resolving the destination needs
+    // to choose a capacity victim.
     for s in &req.sampled_images {
         if let SampledSource::Target(identity) = &s.source {
             pools.registry_note_sampled_use(identity);
@@ -3385,47 +3418,36 @@ pub(crate) unsafe fn execute_draw_inner(
                 // aging it out between two attempts is how a recoverable
                 // not-ready became a permanent missing.
                 pools.registry_note_sampled_use(identity);
-                let (source_image, source_view, source_layout, source_bgra, source_ready, sw, sh) =
-                    pools
-                        .registry_get(identity)
-                        .map(|slot| {
-                            (
-                                slot.image,
-                                slot.view,
-                                slot.access,
-                                slot.scanout_order(),
-                                slot.content_ready,
-                                slot.width,
-                                slot.height,
-                            )
-                        })
-                        .ok_or_else(|| {
-                            DrawError::DrawExecution(DrawExecutionDecline::SampledResidentMissing {
-                                binding: resource.binding,
-                                identity: identity.clone(),
-                                prior: pools.prior_reclaim(identity),
-                            })
-                        })?;
-                if !source_ready {
-                    return Err(DrawError::DrawExecution(
-                        DrawExecutionDecline::SampledResidentNotReady {
-                            binding: resource.binding,
-                            identity: identity.clone(),
-                        },
-                    ));
-                }
-                if sw != resource.width || sh != resource.height {
-                    return Err(DrawError::DrawExecution(
-                        DrawExecutionDecline::SampledResidentGeometryMismatch {
-                            binding: resource.binding,
-                            identity: identity.clone(),
-                            resident_width: sw,
-                            resident_height: sh,
-                            resource_width: resource.width,
-                            resource_height: resource.height,
-                        },
-                    ));
-                }
+                let held = pools.registry_get(identity).map(|slot| {
+                    (
+                        slot.image,
+                        slot.view,
+                        slot.access,
+                        slot.scanout_order(),
+                        slot.content_ready,
+                        slot.width,
+                        slot.height,
+                    )
+                });
+                let prior = held.is_none().then(|| pools.prior_reclaim(identity)).flatten();
+                validate_sampled_resident(
+                    resource.binding,
+                    identity,
+                    resource.width,
+                    resource.height,
+                    held.as_ref().map(|held| (held.4, held.5, held.6)),
+                    prior,
+                )
+                .map_err(DrawError::DrawExecution)?;
+                let (
+                    source_image,
+                    source_view,
+                    source_layout,
+                    source_bgra,
+                    _source_ready,
+                    _resident_width,
+                    _resident_height,
+                ) = held.expect("validated resident is held");
                 // Two reasons a resident cannot be bound through its own view.
                 //
                 // The first is the draw sampling an attachment it also renders
@@ -5426,6 +5448,49 @@ pub(super) unsafe fn barrier_resident_for_transfer_read(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sampled_identity() -> TargetIdentity {
+        TargetIdentity::Surface {
+            id: 7,
+            width: 64,
+            height: 32,
+            generation: 3,
+            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+        }
+    }
+
+    /// A serialized target reference is admitted without a preparation-side
+    /// registry query; the engine transaction remains responsible for every
+    /// mutable resident condition.
+    #[test]
+    fn sampled_resident_state_is_validated_at_execution() {
+        let identity = sampled_identity();
+        assert!(matches!(
+            validate_sampled_resident(34, &identity, 64, 32, None, None),
+            Err(DrawExecutionDecline::SampledResidentMissing {
+                binding: 34,
+                prior: None,
+                ..
+            })
+        ));
+        assert!(matches!(
+            validate_sampled_resident(34, &identity, 64, 32, Some((false, 64, 32)), None),
+            Err(DrawExecutionDecline::SampledResidentNotReady { binding: 34, .. })
+        ));
+        assert!(matches!(
+            validate_sampled_resident(34, &identity, 64, 32, Some((true, 63, 32)), None),
+            Err(DrawExecutionDecline::SampledResidentGeometryMismatch {
+                binding: 34,
+                resident_width: 63,
+                resource_width: 64,
+                ..
+            })
+        ));
+        assert_eq!(
+            validate_sampled_resident(34, &identity, 64, 32, Some((true, 64, 32)), None),
+            Ok(())
+        );
+    }
 
     #[test]
     fn an_open_render_pass_continues_only_within_the_same_encoder() {

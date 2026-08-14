@@ -103,12 +103,6 @@ pub enum DrawPreparationDecline {
         index: u32,
         texture_ref: u32,
     },
-    AttachmentAliasResidentNotReady {
-        index: u32,
-        texture_ref: u32,
-        width: u32,
-        height: u32,
-    },
     TextureResolveMissing {
         stage: &'static str,
         index: u32,
@@ -145,11 +139,6 @@ pub enum DrawPreparationDecline {
         stage: &'static str,
         feature: &'static str,
         count: usize,
-    },
-    ChainResidentNotReady {
-        target_gva: u64,
-        width: u32,
-        height: u32,
     },
     IndexLoad {
         reason: IndexLoadReason,
@@ -313,9 +302,6 @@ impl Decline for DrawPreparationDecline {
             Self::AttachmentAliasIdentityMissing { .. } => {
                 "draw_prepare_attachment_alias_identity_missing"
             }
-            Self::AttachmentAliasResidentNotReady { .. } => {
-                "draw_prepare_attachment_alias_resident_not_ready"
-            }
             Self::TextureResolveMissing { .. } => "draw_prepare_texture_resolve_missing",
             Self::TextureDimensionUnsupported { .. } => {
                 "draw_prepare_texture_dimension_unsupported"
@@ -327,7 +313,6 @@ impl Decline for DrawPreparationDecline {
             Self::ReflectedInterfaceUnsupported { .. } => {
                 "draw_prepare_reflected_interface_unsupported"
             }
-            Self::ChainResidentNotReady { .. } => "draw_prepare_chain_resident_not_ready",
             Self::IndexLoad { reason } => reason.slug(),
             Self::ChainResidentIdentityMissing { .. } => {
                 "draw_prepare_chain_resident_identity_missing"
@@ -514,17 +499,6 @@ impl Decline for DrawPreparationDecline {
                 ("index", index.to_string()),
                 ("texture_ref", texture_ref.to_string()),
             ],
-            Self::AttachmentAliasResidentNotReady {
-                index,
-                texture_ref,
-                width,
-                height,
-            } => vec![
-                ("index", index.to_string()),
-                ("texture_ref", texture_ref.to_string()),
-                ("width", width.to_string()),
-                ("height", height.to_string()),
-            ],
             Self::TextureResolveMissing {
                 stage,
                 index,
@@ -585,12 +559,7 @@ impl Decline for DrawPreparationDecline {
                 ("feature", (*feature).to_string()),
                 ("count", count.to_string()),
             ],
-            Self::ChainResidentNotReady {
-                target_gva,
-                width,
-                height,
-            }
-            | Self::ChainResidentIdentityMissing {
+            Self::ChainResidentIdentityMissing {
                 target_gva,
                 width,
                 height,
@@ -838,12 +807,6 @@ mod tests {
                 index: 2,
                 texture_ref: 7,
             },
-            DrawPreparationDecline::AttachmentAliasResidentNotReady {
-                index: 2,
-                texture_ref: 7,
-                width: 1280,
-                height: 720,
-            },
             DrawPreparationDecline::TextureResolveMissing {
                 stage: "fragment",
                 index: 2,
@@ -874,11 +837,6 @@ mod tests {
                 stage: "fragment",
                 feature: "fragment_imageblock",
                 count: 2,
-            },
-            DrawPreparationDecline::ChainResidentNotReady {
-                target_gva: 0x12000,
-                width: 1280,
-                height: 720,
             },
             DrawPreparationDecline::ChainResidentIdentityMissing {
                 target_gva: 0x12000,
@@ -998,7 +956,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 43, "the draw-preparation reason census moved");
+        assert_eq!(before, 41, "the draw-preparation reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-preparation slug");
     }
 

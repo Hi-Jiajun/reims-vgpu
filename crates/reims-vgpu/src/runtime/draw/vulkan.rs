@@ -6330,18 +6330,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                         },
                                     )
                                 })?;
-                                if !crate::backend::vulkan::engine::resident_content_ready(
-                                    &identity,
-                                ) {
-                                    return Err(DrawError::DrawPreparation(
-                                        DrawPreparationDecline::AttachmentAliasResidentNotReady {
-                                            index,
-                                            texture_ref,
-                                            width: identity.width(),
-                                            height: identity.height(),
-                                        },
-                                    ));
-                                }
                                 (
                                     identity.width(),
                                     identity.height(),
@@ -6745,24 +6733,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // alias.
         let type11_guest_backing = type11_guest_target_backing(state, host, req);
         let type11_resident_target = type11_store_identity(state, req, writeback_guest);
-        if req.chain_from_resident {
-            if let Some(identity) = render_chain_identity(state, req) {
-                if crate::backend::vulkan::engine::resident_content_ready(&identity) {
-                    chain_load_from_target = true;
-                } else {
-                    // The armed chain lost its resident (engine reset /
-                    // registry eviction). Seeding from stale guest/cache
-                    // bytes here would silently wipe the chained records —
-                    // fail visibly and let the exec loop abandon the chain.
-                    return Err(DrawError::DrawPreparation(
-                        DrawPreparationDecline::ChainResidentNotReady {
-                            target_gva: req.colors.first().map(|c| c.target_gva).unwrap_or(0),
-                            width: w,
-                            height: h,
-                        },
-                    ));
-                }
-            }
+        if req.chain_from_resident && render_chain_identity(state, req).is_some() {
+            // The serialized chain names the resident it intends to load;
+            // existence and readiness are engine state and are validated
+            // atomically with target acquisition by `execute_draw_request`.
+            // A preparation-time query could only be a stale hint and cost
+            // a second engine transaction for the same command.
+            chain_load_from_target = true;
         }
         // Colour0's LOAD seed was skipped by `mrt_draw_request` because the
         // engine still held what the render Store published into its guest
