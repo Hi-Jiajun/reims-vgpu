@@ -84,6 +84,89 @@ fn resolve_type11_from_list() {
     assert_eq!((m.width, m.height, m.format), (64, 32, 0x50));
 }
 
+/// A list entry and descriptor are construction input for a resource, not
+/// mutable bind-time state.
+///
+/// Moving the task's object list changes where future resources are
+/// constructed from; it does not retarget an object that is already live. An
+/// explicit delete ends that lifetime, and reusing the reference constructs a
+/// new object from the then-current descriptor.
+#[test]
+fn resources_keep_construction_input_until_explicit_delete() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+
+    let first = resolve_resource(&state, &host, 1, 1).expect("first construction");
+    assert_eq!(ld32(&first.descriptor), 9);
+
+    // Rewrite the descriptor and move the list somewhere unreadable. Neither
+    // operation changes the already-registered object.
+    let _ = host.write_gpa(data_gpa + 0x40, &10u32.to_le_bytes());
+    assert!(state.set_object_list(1, 0xdead, 8));
+    let retained = resolve_resource(&state, &host, 1, 1).expect("registered object");
+    assert!(Arc::ptr_eq(&first, &retained));
+    assert_eq!(ld32(&retained.descriptor), 9);
+
+    // Delete and reuse is the lifecycle edge that permits the same reference
+    // to name a newly-constructed resource.
+    assert!(state.delete_object(1, 1));
+    assert!(state.set_object_list(1, 0, 8));
+    let replacement = resolve_resource(&state, &host, 1, 1).expect("replacement construction");
+    assert!(!Arc::ptr_eq(&first, &replacement));
+    assert_eq!(ld32(&replacement.descriptor), 10);
+}
+
+#[test]
+fn task_lifetime_retires_all_of_its_resource_objects() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let resource = resolve_resource(&state, &host, 1, 1).expect("construction");
+    assert!(state.task_resources.get(1, 1).is_some());
+
+    assert!(state.delete_task(1));
+    assert!(state.task_resources.get(1, 1).is_none());
+    assert_eq!(ld32(&resource.descriptor), 9, "an outstanding host owner remains valid");
+}
+
+#[test]
+fn the_resource_registry_accepts_exactly_the_resource_constructor_types() {
+    let accepted: Vec<u8> = (0..=u8::MAX)
+        .filter(|&object_type| object_type_is_resource(object_type))
+        .collect();
+    assert_eq!(accepted, [1, 2, 3, 4, 5, 8, 9, 11, 12, 13, 14, 15]);
+}
+
+/// Serializer state has its own lifetime. A `DeleteResource`-scoped registry
+/// must not retain its descriptor and hide a later update.
+#[test]
+fn non_resource_descriptors_are_read_again() {
+    use crate::runtime::decode::resource::OBJECT_TYPE_TYPE7;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let mut entry = [0u8; 12];
+    st32(&mut entry, u32::from(OBJECT_TYPE_TYPE7) | (4u32 << 8));
+    entry[4..].copy_from_slice(&0x80u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 24, &entry);
+    let _ = host.write_gpa(data_gpa + 0x80, &1u32.to_le_bytes());
+
+    let (_, first) = resolve_descriptor(&state, &host, 1, 2, &[OBJECT_TYPE_TYPE7])
+        .expect("first serializer descriptor");
+    assert_eq!(ld32(&first), 1);
+    assert!(state.task_resources.get(1, 2).is_none());
+
+    let _ = host.write_gpa(data_gpa + 0x80, &2u32.to_le_bytes());
+    let (_, second) = resolve_descriptor(&state, &host, 1, 2, &[OBJECT_TYPE_TYPE7])
+        .expect("updated serializer descriptor");
+    assert_eq!(ld32(&second), 2);
+    assert!(state.task_resources.get(1, 2).is_none());
+}
+
 /// The type-4 decoder refuses a descriptor it cannot decode as declared, and
 /// says which check refused.
 ///

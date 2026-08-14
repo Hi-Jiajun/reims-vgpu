@@ -53,7 +53,6 @@ use crate::contract::pass_action::{
     MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD, MTL_STORE_ACTION_STORE,
 };
 use crate::runtime::decode::render::{DepthAttachment, ScissorRect, StencilAttachment};
-use crate::runtime::decode::resource::ListObjectEntry;
 #[cfg(feature = "backend-vulkan")]
 use crate::runtime::decode::resource::TextureDescriptor;
 use crate::runtime::decode::resource::{
@@ -1603,24 +1602,27 @@ fn buffer_texture_descriptor<M: HostMemory + HostOps>(
     host: &M,
     task_id: u32,
     texture_ref: u32,
-    entry: Option<ListObjectEntry>,
+    resource: Option<&crate::model::TaskResource>,
 ) -> Option<BufferTextureDescriptor> {
-    // Reuse a caller-resolved object-list entry when supplied: the guest object
-    // list is immutable for the life of a draw (the device never writes those
-    // pages), so a precomputed entry is byte-identical to a fresh lookup and
-    // saves a redundant guest-DMA read+decode per sampled bind.
-    let entry = entry.or_else(|| objects::lookup_list_entry(state, host, task_id, texture_ref))?;
-    if entry.object_type != OBJECT_TYPE_TEXTURE_VIEW {
+    let owned;
+    let resource = match resource {
+        Some(resource) => resource,
+        None => {
+            owned = objects::resolve_resource(state, host, task_id, texture_ref).ok()?;
+            &owned
+        }
+    };
+    if resource.entry.object_type != OBJECT_TYPE_TEXTURE_VIEW {
         return None;
     }
-    let desc_bytes = objects::read_descriptor(state, host, task_id, &entry)?;
+    let desc_bytes = &resource.descriptor;
     if !matches!(
-        texture_type8_opcode(&desc_bytes),
+        texture_type8_opcode(desc_bytes),
         Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE) | Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE)
     ) {
         return None;
     }
-    decode_buffer_texture_descriptor(&desc_bytes).ok()
+    decode_buffer_texture_descriptor(desc_bytes).ok()
 }
 
 /// Say, once per (site, format), that a sampled texture reached the GPU

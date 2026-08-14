@@ -3846,31 +3846,27 @@ fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
     assert_eq!(layout, TexelLayout::Bgra8);
     assert_eq!(&sampled[..4], &[255, 0, 0, 255]);
 
-    // Regression guard for the resolve-once optimization
-    // (SAMPLED-BIND-RESOLVE-ONCE): threading the caller-resolved object-list
-    // entry must produce a byte-identical sample to a fresh internal lookup.
-    // This is only sound because the guest object list is immutable for the
-    // life of the draw; if a future change ever made a threaded entry diverge
-    // from a fresh lookup (stale-content class), this fails.
-    let threaded_entry = objects::lookup_list_entry(&state, &host, 1, texture_ref);
+    // Threading the caller-resolved resource must produce a byte-identical
+    // sample to retrieving that same retained object inside the resolver.
+    let threaded_resource = objects::resolve_resource(&state, &host, 1, texture_ref).ok();
     assert!(
-        threaded_entry.is_some(),
-        "type-5 fixture must expose an object-list entry to thread"
+        threaded_resource.is_some(),
+        "type-5 fixture must expose a resource to thread"
     );
     let (tw, th, tmid, tsrc) =
-        resolve_sampled_source(&mut state, &mut host, 1, texture_ref, threaded_entry, true)
-            .expect("threaded-entry sample must resolve");
+        resolve_sampled_source(&mut state, &mut host, 1, texture_ref, threaded_resource, true)
+            .expect("threaded-resource sample must resolve");
     assert_eq!(
         (tw, th, tmid),
         (width, height, sampled_mid),
-        "threaded entry changed the resolved geometry/mid"
+        "threaded resource changed the resolved geometry/mid"
     );
     let SampledSourceRequest::Bytes(tsampled, _, _, _) = tsrc else {
-        panic!("threaded-entry sample changed the source variant");
+        panic!("threaded-resource sample changed the source variant");
     };
     assert_eq!(
         tsampled, sampled,
-        "threaded entry must yield byte-identical sampled content"
+        "threaded resource must yield byte-identical sampled content"
     );
 }
 

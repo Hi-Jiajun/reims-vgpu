@@ -956,8 +956,12 @@ pub(super) fn sampled_texture_descriptor<M: HostMemory>(
     host: &M,
     task_id: u32,
     texture_ref: u32,
-) -> Option<(crate::runtime::decode::resource::ListObjectEntry, Vec<u8>)> {
-    let entry = objects::lookup_list_entry(state, host, task_id, texture_ref)?;
+) -> Option<(
+    crate::runtime::decode::resource::ListObjectEntry,
+    std::sync::Arc<[u8]>,
+)> {
+    let resource = objects::resolve_resource(state, host, task_id, texture_ref).ok()?;
+    let entry = resource.entry;
     use crate::runtime::decode::resource::{OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT};
     if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
     {
@@ -971,8 +975,7 @@ pub(super) fn sampled_texture_descriptor<M: HostMemory>(
             ));
         }
     }
-    let bytes = objects::read_descriptor(state, host, task_id, &entry)?;
-    Some((entry, bytes))
+    Some((entry, std::sync::Arc::clone(&resource.descriptor)))
 }
 
 /// Resolve a sampled texture ref to `(width, height, mapping_id, source)`.
@@ -1036,7 +1039,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
-    entry: Option<ListObjectEntry>,
+    resource: Option<std::sync::Arc<crate::model::TaskResource>>,
     may_bind_resident: bool,
 ) -> Option<(u32, u32, u32, SampledSourceRequest)> {
     if texture_ref == 0 {
@@ -1046,10 +1049,15 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     // Opcode-9 buffer-backed texture (type-8): the sampled bytes are an MTLBuffer's
     // guest storage, not a view over another texture. Resolve it directly before
     // the view/surface paths (which would mis-decode the opcode-9 descriptor).
-    // `entry` (when supplied by the caller) reuses the object-list read this call
-    // and its buffer-texture / view classification below would otherwise each
-    // repeat — the guest object list is immutable for the draw.
-    if let Some(bt) = buffer_texture_descriptor(state, host, task_id, texture_ref, entry) {
+    // `resource` (when supplied by the caller) serves every classification and
+    // descriptor consumer below from the one retained object.
+    if let Some(bt) = buffer_texture_descriptor(
+        state,
+        host,
+        task_id,
+        texture_ref,
+        resource.as_deref(),
+    ) {
         let (w, h, rgba) = load_buffer_texture_rgba(state, host, task_id, texture_ref, &bt)?;
         return Some((
             w,
@@ -1073,25 +1081,26 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     //   type-4 Surface         — the ref *is* the surface id
     //   type-11 IOSurface      — resolves to the mapping id it was created on
     //
-    // `resolve_type11_ref` re-reads this same entry and returns `None` for every
+    // `resolve_type11_ref` retrieves this same resource and returns `None` for every
     // type but 11, so it can only ever fill a slot the classification above left
     // empty. Hence an `Option`, not a list of candidates to choose between.
     let mut is_linear_tex = false;
     let mut is_type5 = false;
     let mut type5_view: Option<objects::Type5TextureView> = None;
     let mut surface: Option<u32> = None;
-    let resolved_entry =
-        entry.or_else(|| objects::lookup_list_entry(state, host, task_id, texture_ref));
-    if let Some(entry) = resolved_entry {
+    let resolved_resource = resource.or_else(|| {
+        objects::resolve_resource(state, host, task_id, texture_ref).ok()
+    });
+    if let Some(resource) = resolved_resource.as_ref() {
+        let entry = resource.entry;
         if entry.object_type == objects::OBJECT_TYPE_REF_TEXTURE {
             is_type5 = true;
-            if let Some(desc) = objects::read_descriptor(state, host, task_id, &entry) {
-                if let Ok(t5) = reims_vgpu_wire::device_desc::type5_header(&desc) {
-                    let sid = t5.surface_id.get();
-                    if sid != 0 {
-                        type5_view = objects::decode_type5_texture_view(&desc);
-                        surface = Some(sid);
-                    }
+            let desc = &resource.descriptor;
+            if let Ok(t5) = reims_vgpu_wire::device_desc::type5_header(desc) {
+                let sid = t5.surface_id.get();
+                if sid != 0 {
+                    type5_view = objects::decode_type5_texture_view(desc);
+                    surface = Some(sid);
                 }
             }
         }
@@ -1531,10 +1540,10 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         // descriptor blob and run the identical `decode_texture_descriptor`; the
         // object list is immutable for the draw, so one read+decode serves both.
         // Both readers take only the decoded descriptor.
-        if let Some(tex) = resolved_entry.and_then(|e| {
-            objects::read_descriptor(state, host, task_id, &e)
-                .and_then(|d| decode_texture_descriptor(&d).ok())
-        }) {
+        if let Some(tex) = resolved_resource
+            .as_ref()
+            .and_then(|resource| decode_texture_descriptor(&resource.descriptor).ok())
+        {
             // Above the gather: a span whose pages a render Store published and
             // nothing has written since is already an engine image, so there is
             // nothing to gather and — the point of the rung — no writeback to
@@ -6202,12 +6211,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // where its texels come from. `sampled_phase::Part::Lookup` is
                 // this pair and nothing else, so the object-list walk is priced
                 // against the resolve below rather than summed into it.
-                let (texture_entry, view_swizzle) = {
+                let (texture_resource, view_swizzle) = {
                     let _s = crate::runtime::sampled_phase::Span::open(
                         crate::runtime::sampled_phase::Part::Lookup,
                     );
-                    let texture_entry =
-                        objects::lookup_list_entry(state, host, req.task_id, texture_ref);
+                    let texture_resource =
+                        objects::resolve_resource(state, host, req.task_id, texture_ref).ok();
                     // A type-8 view's channel remap. Resolved here rather than in
                     // the loaders because it describes how the bind READS the
                     // texture, not what the texture contains: the engine hands it
@@ -6217,7 +6226,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     let view_swizzle = resolve_texture_view(state, host, req.task_id, texture_ref)
                         .and_then(|view| view.swizzle)
                         .filter(|plan| !pixel_format::swizzle_is_identity(plan));
-                    (texture_entry, view_swizzle)
+                    (texture_resource, view_swizzle)
                 };
                 // Where the texels come from, which is the part with the cache
                 // behind it. Scoped to a block so it closes at the resolve and
@@ -6298,7 +6307,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             host,
                             req.task_id,
                             texture_ref,
-                            texture_entry,
+                            texture_resource,
                             view_swizzle.is_none(),
                         ) else {
                             let detail = sample_miss_detail(state, host, req.task_id, texture_ref);

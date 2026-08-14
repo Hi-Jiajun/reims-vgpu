@@ -20,7 +20,7 @@ use crate::contract::iosurface_pages::{
     DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS, DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE,
     PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
 };
-use crate::model::{DeviceState, MappingEntry, TaskTable};
+use crate::model::{DeviceState, MappingEntry, TaskResource, TaskTable};
 use crate::runtime::decode::resource::{
     decode_list_object_entry, list_object_entry_offset, ListObjectEntry, OBJECT_LIST_ENTRY_LEN,
     OBJECT_TYPE_IOSURFACE,
@@ -28,6 +28,7 @@ use crate::runtime::decode::resource::{
 use crate::runtime::gva_mem;
 use crate::runtime::host::HostMemory;
 use crate::runtime::texture;
+use std::sync::Arc;
 
 pub mod slot_recheck;
 
@@ -1550,6 +1551,57 @@ pub enum LadderRung {
     DescRead { declared_len: u32 },
 }
 
+/// Object tags constructed through the task's resource registry.
+///
+/// Bit `n` names object type `n + 1`. The resource constructor accepts exactly
+/// types 1, 2, 3, 4, 5, 8, 9, 11, 12, 13, 14, and 15. Function (6), serializer
+/// state (7), and type 10 have separate registries and lifetimes, so retaining
+/// their descriptors until `DeleteResource` would conflate distinct APIs.
+const RESOURCE_CONSTRUCTOR_TYPE_MASK: u16 = 0x7d9f;
+
+fn object_type_is_resource(object_type: u8) -> bool {
+    object_type
+        .checked_sub(1)
+        .filter(|&bit| bit < u16::BITS as u8)
+        .is_some_and(|bit| RESOURCE_CONSTRUCTOR_TYPE_MASK & (1u16 << bit) != 0)
+}
+
+/// Retrieve or construct the resource named by `task_id` / `obj_ref`.
+///
+/// A successful construction snapshots the object-list entry and descriptor
+/// bytes for the lifetime of that reference. Subsequent binds retrieve the
+/// retained resource; guest memory is consulted again only after an explicit
+/// resource deletion or task teardown. Failed constructions are not retained,
+/// so a descriptor that is still being published can succeed on retry.
+pub fn resolve_resource<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    obj_ref: u32,
+) -> Result<Arc<TaskResource>, LadderRung> {
+    if let Some(resource) = state.task_resources.get(task_id, obj_ref) {
+        return Ok(resource);
+    }
+
+    let entry = lookup_list_entry(state, host, task_id, obj_ref)
+        .ok_or(LadderRung::NoListEntry)?;
+    if !object_type_is_resource(entry.object_type) {
+        return Err(LadderRung::WrongType {
+            got: entry.object_type,
+        });
+    }
+    let bytes = read_descriptor(state, host, task_id, &entry).ok_or(LadderRung::DescRead {
+        declared_len: entry.descriptor_length,
+    })?;
+    let resource = Arc::new(TaskResource {
+        entry,
+        descriptor: Arc::from(bytes),
+    });
+    Ok(state
+        .task_resources
+        .register(task_id, obj_ref, resource))
+}
+
 /// Look `obj_ref` up in `task_id`'s list, require its type to be one of `want`,
 /// and read its descriptor bytes.
 ///
@@ -1572,7 +1624,19 @@ pub fn resolve_descriptor<M: HostMemory>(
     task_id: u32,
     obj_ref: u32,
     want: &[u8],
-) -> Result<(ListObjectEntry, Vec<u8>), LadderRung> {
+) -> Result<(ListObjectEntry, Arc<[u8]>), LadderRung> {
+    if let Some(resource) = state.task_resources.get(task_id, obj_ref) {
+        if !want.contains(&resource.entry.object_type) {
+            return Err(LadderRung::WrongType {
+                got: resource.entry.object_type,
+            });
+        }
+        return Ok((resource.entry, Arc::clone(&resource.descriptor)));
+    }
+
+    // Keep the ladder's type check ahead of the descriptor read. A caller
+    // asking for the wrong kind must not turn an unreadable descriptor into a
+    // different refusal merely because resource retention is enabled.
     let entry = lookup_list_entry(state, host, task_id, obj_ref).ok_or(LadderRung::NoListEntry)?;
     if !want.contains(&entry.object_type) {
         return Err(LadderRung::WrongType {
@@ -1582,7 +1646,19 @@ pub fn resolve_descriptor<M: HostMemory>(
     let bytes = read_descriptor(state, host, task_id, &entry).ok_or(LadderRung::DescRead {
         declared_len: entry.descriptor_length,
     })?;
-    Ok((entry, bytes))
+    if !object_type_is_resource(entry.object_type) {
+        return Ok((entry, Arc::from(bytes)));
+    }
+    let resource = state.task_resources.register(task_id, obj_ref, Arc::new(TaskResource {
+        entry,
+        descriptor: Arc::from(bytes),
+    }));
+    if !want.contains(&resource.entry.object_type) {
+        return Err(LadderRung::WrongType {
+            got: resource.entry.object_type,
+        });
+    }
+    Ok((resource.entry, Arc::clone(&resource.descriptor)))
 }
 
 /// Why a type-1 buffer ref did not yield a backing span.
@@ -1651,30 +1727,40 @@ pub fn resolve_type11_ref<M: HostMemory>(
     task_id: u32,
     ref_: u32,
 ) -> Option<u32> {
-    let entry = lookup_list_entry(state, host, task_id, ref_)?;
-    // The list entry passed validation (descriptor_gva != 0, length != 0) but
-    // its descriptor blob is unreadable — genuine, only for a bound entry.
-    let Some(desc) = read_descriptor(state, host, task_id, &entry) else {
-        note_type11_fail(
-            task_id,
-            ref_,
-            crate::observe::ladder_slug!("type11", desc_read),
-            format!(
-                "type11_resolve_fail reason=type11_desc_read task={task_id} ref={ref_} obj_type={} desc_gva={:#x} desc_len={}",
-                entry.object_type, entry.descriptor_gva, entry.descriptor_length
-            ),
-        );
-        return None;
+    let resource = match resolve_resource(state, host, task_id, ref_) {
+        Ok(resource) => resource,
+        Err(LadderRung::DescRead { .. }) => {
+            // Keep this failure scoped to a confirmed type-11 object. The
+            // second lookup is only on the failed-construction path; successful
+            // binds retrieve the retained resource without a guest read.
+            if let Some(entry) = lookup_list_entry(state, host, task_id, ref_)
+                .filter(|entry| entry.object_type == OBJECT_TYPE_IOSURFACE)
+            {
+                note_type11_fail(
+                    task_id,
+                    ref_,
+                    crate::observe::ladder_slug!("type11", desc_read),
+                    format!(
+                        "type11_resolve_fail reason=type11_desc_read task={task_id} ref={ref_} obj_type={} desc_gva={:#x} desc_len={}",
+                        entry.object_type, entry.descriptor_gva, entry.descriptor_length
+                    ),
+                );
+            }
+            return None;
+        }
+        Err(_) => return None,
     };
-    // Record the ref as live; the type and descriptor come from the guest's own
-    // list at every use, never from here.
+    let entry = resource.entry;
+    let desc = &resource.descriptor;
+    // Record the ref as live so the explicit delete path retires its associated
+    // host-side content as well as the retained resource object.
     let _ = state.insert_object(task_id, ref_);
     if entry.object_type != OBJECT_TYPE_IOSURFACE {
         // Legitimate: this ref is a different object type, not a texture. Normal
         // control flow (resolve_type11_refs skips it) — never a failure.
         return None;
     }
-    if !texture::register_from_descriptor_bytes(state, OBJECT_TYPE_IOSURFACE, &desc) {
+    if !texture::register_from_descriptor_bytes(state, OBJECT_TYPE_IOSURFACE, desc) {
         // A confirmed IOSurface texture whose descriptor could not register —
         // the draw then samples a missing/black texture.
         note_type11_fail(

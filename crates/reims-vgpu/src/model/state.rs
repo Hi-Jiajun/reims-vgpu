@@ -1,9 +1,10 @@
 //! Device-owned state: registers, rings, tasks, mapper, present, fail log.
 
 use crate::model::{LruBytesMemo, GFX_MMIO_SIZE, MAX_CHANNELS};
+use crate::runtime::decode::resource::ListObjectEntry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Opaque device instance id (QEMU handle).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -553,6 +554,72 @@ impl TaskTable {
     /// How many tasks are live. Not the size of the id space — there is none.
     pub fn live_count(&self) -> usize {
         self.live_ids().count()
+    }
+}
+
+/// A resource constructed from one task/object-list reference.
+///
+/// The object-list entry and its descriptor are construction input. Once the
+/// resource exists, binds retrieve this retained object rather than consulting
+/// guest memory again. The guest ends that lifetime explicitly by deleting the
+/// resource or the task that owns it.
+#[derive(Debug)]
+pub struct TaskResource {
+    pub entry: ListObjectEntry,
+    pub descriptor: Arc<[u8]>,
+}
+
+/// Per-task resource objects, keyed by the guest's `(task, reference)` pair.
+///
+/// Interior synchronization keeps resource lookup available to encode helpers
+/// that only borrow [`DeviceState`] immutably. Those helpers run while the
+/// device already owns its state, but making the registry itself synchronized
+/// also makes the lifetime rule explicit instead of relying on that outer
+/// serialization.
+#[derive(Debug, Default)]
+pub struct TaskResources(Mutex<BTreeMap<(u32, u32), Arc<TaskResource>>>);
+
+impl TaskResources {
+    pub fn get(&self, task_id: u32, ref_: u32) -> Option<Arc<TaskResource>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(task_id, ref_))
+            .cloned()
+    }
+
+    /// Publish a newly constructed object unless another lookup won the race.
+    pub fn register(
+        &self,
+        task_id: u32,
+        ref_: u32,
+        resource: Arc<TaskResource>,
+    ) -> Arc<TaskResource> {
+        Arc::clone(
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry((task_id, ref_))
+                .or_insert(resource),
+        )
+    }
+
+    pub fn delete(&self, task_id: u32, ref_: u32) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&(task_id, ref_))
+            .is_some()
+    }
+
+    pub fn delete_task(&self, task_id: u32) -> usize {
+        let mut resources = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before = resources.len();
+        resources.retain(|&(task, _), _| task != task_id);
+        before - resources.len()
     }
 }
 
@@ -1842,15 +1909,13 @@ pub struct DeviceState {
     pub released_pages: crate::runtime::released_pages::ReleasedPages,
     /// Live object refs per task, as `(task_id, ref)`.
     ///
-    /// Membership only — deliberately carries no descriptor payload. Every
-    /// consumer that needs an object's type or descriptor reads the guest's own
-    /// list through `objects::lookup_list_entry`, which walks guest memory at
-    /// use time; a cached copy here would be a second source of truth for
-    /// something the guest can rewrite under us. What the set *is* load-bearing
-    /// for is [`Self::delete_object`], which gates the host-side resource
-    /// teardown (`host_texture_surfaces`, `host_linear_textures`,
-    /// `texture_to_mapping`) on whether the ref was live.
+    /// This is membership for host-copy teardown. [`Self::task_resources`]
+    /// owns the corresponding resource objects and their immutable descriptor
+    /// construction input.
     pub objects: std::collections::BTreeSet<(u32, u32)>,
+    /// Retained resource objects, with the task/reference lifetime defined by
+    /// [`TaskResources`].
+    pub task_resources: TaskResources,
     /// Type-11 texture object ref → mapping_id: (task_id, ref) -> mapping_id.
     pub texture_to_mapping: BTreeMap<(u32, u32), u32>,
     pub mappings: BTreeMap<u32, MappingEntry>,
@@ -2188,6 +2253,7 @@ impl DeviceState {
             node_guard: std::collections::BTreeMap::new(),
             released_pages: crate::runtime::released_pages::ReleasedPages::default(),
             objects: std::collections::BTreeSet::new(),
+            task_resources: TaskResources::default(),
             texture_to_mapping: BTreeMap::new(),
             mappings: BTreeMap::new(),
             host_surfaces: BTreeMap::new(),
@@ -2617,6 +2683,7 @@ impl DeviceState {
         }
         // Drop objects for this task on redefine.
         self.objects.retain(|&(t, _)| t != task_id);
+        self.task_resources.delete_task(task_id);
         // A deleted task's whole address space goes with it, so its live
         // mappings are not leaks and a reused id must not inherit them.
         self.map_audit.remove(&task_id);
@@ -2663,6 +2730,7 @@ impl DeviceState {
             return false;
         }
         self.objects.retain(|&(t, _)| t != task_id);
+        self.task_resources.delete_task(task_id);
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         // Clear texture→mapping latches for this task.
@@ -2723,11 +2791,12 @@ impl DeviceState {
 
     pub fn delete_object(&mut self, task_id: u32, ref_: u32) -> bool {
         let removed = self.objects.remove(&(task_id, ref_));
-        if removed {
+        let resource_removed = self.task_resources.delete(task_id, ref_);
+        if removed || resource_removed {
             self.invalidate_object_host_copies(task_id, ref_);
             self.texture_to_mapping.remove(&(task_id, ref_));
         }
-        removed
+        removed || resource_removed
     }
 
     /// Drop this device's ref-keyed host copies of an object's *contents*, for a
