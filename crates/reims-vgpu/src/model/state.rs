@@ -1028,16 +1028,14 @@ pub struct MappingEntry {
     /// whenever `page_entries` change; see `DeviceState::retired_views`.
     pub contig_ptr: usize,
     pub contig_len: usize,
-    /// `map_generation` whose page list was measured non-packed, so no
-    /// contiguous view can exist over it. `None` = not measured for the
-    /// current list.
+    /// `map_generation` whose page list the host refused to expose as one
+    /// packed view. `None` = not asked for the current list.
     ///
-    /// "Packed or not" is a pure function of `page_entries`, and
-    /// `map_generation` names that list — the same key that makes `contig_ptr`
-    /// above safe to cache. Without it every caller on a fragmented mapping
-    /// re-collected the whole page-GPA vector and re-scanned it only to reach
-    /// the answer it reached last time.
-    pub contig_fragmented_gen: Option<u32>,
+    /// The host answer is stable for one page list, and `map_generation` names
+    /// that list — the same key that makes `contig_ptr` above safe to cache.
+    /// Without it every caller repeats a host mapping attempt that cannot
+    /// become possible until the guest changes the list.
+    pub contig_refused_gen: Option<u32>,
     /// Live [`crate::runtime::host::HostOps::track_guest_writes`] token for the
     /// page list in [`Self::page_entries`], or 0 when the host cannot observe
     /// guest writes (or none has been asked for yet).

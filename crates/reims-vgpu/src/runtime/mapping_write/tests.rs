@@ -1138,12 +1138,11 @@ fn fragmented_raw_rect_bulk_imports_runs_not_rows() {
     assert!(write_full_rect_raw_at(
         &mut state, &mut host, mid, 0, 2048, 6160, 4, 4, 4, &src, 16,
     ));
-    // One successful import per maximal GPA run, and nothing else: the
-    // fragmented page list gives `contig_run_count` above 1 in Rust, so the
-    // packed-view fast path never spends a call the host can only refuse.
-    // The old row loop took nine attempts for these four rows and scaled
-    // with height.
-    assert_eq!(host.map_pages_calls, 2);
+    // One full-view attempt plus one successful import per maximal GPA run.
+    // The refusal is cached for this page-list generation, so the extra call
+    // is constant rather than per row. The old row loop took nine attempts for
+    // these four rows and scaled with height.
+    assert_eq!(host.map_pages_calls, 3);
     let calls_after_write = host.map_pages_calls;
 
     let mut row = [0u8; 16];
@@ -1151,7 +1150,7 @@ fn fragmented_raw_rect_bulk_imports_runs_not_rows() {
         &mut state, &mut host, mid, 4096, &mut row,
     ));
     assert_eq!(row, [0x2a; 16]);
-    assert_eq!(calls_after_write, 2);
+    assert_eq!(calls_after_write, 3);
 }
 
 /// The BGRA row writers reach `observe::footprint`.

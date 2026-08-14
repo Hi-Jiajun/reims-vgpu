@@ -2462,6 +2462,10 @@ fn a_fragmented_writeback_stages_nothing_when_the_staged_frame_is_the_source() {
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
+    // This test prices the fallback after a host declines a scattered alias.
+    // The default fixture can build a packed bounce view and would correctly
+    // take the contiguous arm instead.
+    host.strict_linux_map = true;
     // Large enough to span several guest pages: a frame that fits in one page is
     // contiguous by construction and would never reach the path under test.
     let (w, h) = (256u32, 64u32);

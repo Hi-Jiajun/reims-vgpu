@@ -304,8 +304,8 @@ fn invalidate_mapping_pages_drops_the_host_cache_of_those_pages() {
     );
 }
 
-/// The "cannot pack" verdict is derived once per page list, not once per
-/// call, and a new page list re-derives it.
+/// A host refusal is derived once per page list, not once per call, and a new
+/// page list re-asks the host.
 ///
 /// Before this cache every call on a fragmented mapping rebuilt the page-GPA
 /// vector, rescanned it for runs, and emitted a line — 471 757 of them in
@@ -313,7 +313,7 @@ fn invalidate_mapping_pages_drops_the_host_cache_of_those_pages() {
 /// line count is therefore the assertion: repeated calls must add none, and
 /// the magnitude the old line carried must still be readable as `served=`.
 #[test]
-fn fragmented_verdict_is_derived_once_per_page_list() {
+fn a_host_refusal_is_cached_but_fragmentation_is_still_offered_to_it() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     host.strict_linux_map = true;
@@ -333,13 +333,13 @@ fn fragmented_verdict_is_derived_once_per_page_list() {
     let lines = || -> Vec<String> {
         cap.lines()
             .into_iter()
-            .filter(|l| l.starts_with("OFF contig_view_fragmented"))
+            .filter(|l| l.starts_with("OFF contig_view_refused"))
             .collect()
     };
     for _ in 0..16 {
         assert!(
             ensure_contig_view(&mut state, &mut host, mid).is_none(),
-            "fragmented list must never pack"
+            "this fixture models a host that declines scattered aliases"
         );
     }
     let first = lines();
@@ -349,7 +349,7 @@ fn fragmented_verdict_is_derived_once_per_page_list() {
         "16 calls on one page list must derive (and say) the verdict once: {first:?}"
     );
     assert!(
-        first[0].contains(" pages=2 runs=2 "),
+        first[0].contains(" pages=2 physical_runs=2 "),
         "the derived line keeps its shape: {}",
         first[0]
     );
@@ -369,7 +369,7 @@ fn fragmented_verdict_is_derived_once_per_page_list() {
         "a new page list must re-derive and re-report: {after:?}"
     );
     assert!(
-        after[1].contains(" pages=3 runs=3 "),
+        after[1].contains(" pages=3 physical_runs=3 "),
         "the second line describes the second list: {}",
         after[1]
     );
@@ -388,10 +388,14 @@ fn fragmented_verdict_is_derived_once_per_page_list() {
         16,
         "served must count cached answers too: {after:?}"
     );
+    assert_eq!(
+        host.map_pages_calls, 2,
+        "each page-list generation must reach the host exactly once"
+    );
 }
 
-/// Product Linux: full page list is non-packed → ensure_contig_view fails;
-/// write_mapping_bytes still lands bytes via maximal packed runs.
+/// A host without a scattered-alias primitive declines the full view;
+/// `write_mapping_bytes` still lands bytes via maximal packed runs.
 #[test]
 fn multi_import_fragmented_mapping_write() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);

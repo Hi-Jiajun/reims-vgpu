@@ -1879,26 +1879,26 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
     None
 }
 
-/// Device-wide count of [`ensure_contig_view`] calls answered "fragmented",
-/// whether the verdict was derived or served from `contig_fragmented_gen`.
-/// Reported as `served=` on every `contig_view_fragmented` line so the
+/// Device-wide count of [`ensure_contig_view`] calls the host refused,
+/// whether the verdict was derived or served from `contig_refused_gen`.
+/// Reported as `served=` on every `contig_view_refused` line so the
 /// magnitude the old per-call line carried survives its deduplication.
-static CONTIG_FRAGMENTED_SERVED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static CONTIG_REFUSED_SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Contiguous host-VA view over the mapping's guest pages (unified memory).
 ///
-/// Builds the view on first use via [`HostOps::map_pages`] (mach_vm_remap of
-/// guest RAM). Returns `(ptr, len)`. The view is the single storage for
-/// surface content: Metal textures are created directly on it, so there is
-/// nothing to synchronize — resolve failure here must fail the caller visibly.
+/// Builds the view on first use via [`HostOps::map_pages`]. The host may return
+/// a direct run or reconstruct a scattered page list as one shared virtual
+/// alias; either answer is the same packed byte sequence to the caller.
+/// Returns `(ptr, len)`.
 ///
 /// **Safe zero-copy contract:** always [`revalidate_mapping_pages`] first so a
 /// cached contig never aliases PFNs after ReplacePhysical / guest recycle.
 ///
-/// On Linux, only a **packed** sequential host run succeeds. Fragmented
-/// IOSurface page lists must use [`write_mapping_bytes`] / [`read_mapping_bytes`]
-/// or multi-run import-present.
+/// A refusal is cached on the page-list generation. Whether scattered pages
+/// can be packed is a host capability: pre-rejecting them here would make a
+/// shared file-backed alias unreachable and force the scatter paths even when
+/// the host can express the exact view.
 pub fn ensure_contig_view<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -1920,35 +1920,28 @@ pub fn ensure_contig_view<H: HostMemory + HostOps>(
         // GPAs and rescanned them every time, and said so in the always-on sink
         // every time: 471 757 lines in one 2 900 s boot, the sole prefix ever to
         // trip `log_flood_detected`, at up to 1 826 lines in a one-second window.
-        if m.contig_fragmented_gen == Some(m.map_generation) {
-            CONTIG_FRAGMENTED_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if m.contig_refused_gen == Some(m.map_generation) {
+            CONTIG_REFUSED_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return None;
         }
     }
     let gpas = mapping_page_gpas(state, host, mapping_id)?;
     let page_sz = crate::contract::iosurface_pages::page_size_of(state.page_shift) as usize;
-    // A fragmented page list can never map as one packed view, and asking
-    // anyway turns documented control flow ("use write_mapping_bytes /
-    // read_mapping_bytes / multi-run import-present") into a logged
-    // `qemu_map_pages_callback_failed`.
     let runs = reims_vgpu_paging::runs::contig_run_count(&gpas, page_sz as u64);
-    if runs != 1 {
-        let served = CONTIG_FRAGMENTED_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let Some(ptr) = host.map_pages(&gpas, page_sz) else {
+        let served = CONTIG_REFUSED_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let m = state.mappings.get_mut(&mapping_id)?;
-        m.contig_fragmented_gen = Some(m.map_generation);
+        m.contig_refused_gen = Some(m.map_generation);
         let generation = m.map_generation;
-        // One line per (mapping, page list) rather than per call. The count the
-        // per-call line used to carry moves to `served`, a device-wide
-        // cumulative total of fragmented answers, so a census still reads
-        // magnitude off the newest line while the line count now measures
-        // distinct fragmented page lists — which is what the slug claims.
+        // One line per (mapping, page list) rather than per call. Physical run
+        // count remains diagnosis: it distinguishes a host that declined even
+        // a direct run from one that cannot reconstruct a scattered list.
         crate::observe::off(format!(
-            "contig_view_fragmented mid={mapping_id} pages={} runs={runs} generation={generation} served={served}",
+            "contig_view_refused mid={mapping_id} pages={} physical_runs={runs} generation={generation} served={served}",
             gpas.len(),
         ));
         return None;
-    }
-    let ptr = host.map_pages(&gpas, page_sz)?;
+    };
     let len = gpas.len() * page_sz;
     let m = state.mappings.get_mut(&mapping_id)?;
     m.contig_ptr = ptr;

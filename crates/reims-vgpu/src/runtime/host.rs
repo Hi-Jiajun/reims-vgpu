@@ -680,10 +680,10 @@ pub struct FakeHost {
     pub actions: Vec<HostAction>,
     pub mono_ns: u64,
     pub bh_scheduled: bool,
-    /// When true (any host platform): `map_pages` matches the product Linux
-    /// PCI shim (`reims_vgpu_pci_map_pages`) — packed sequential host alias inside an
-    /// existing range only; no provisioning, no bounce/remap for scattered
-    /// GPAs. Used to unit-test multi-import of fragmented GVA spans.
+    /// When true (any host platform): `map_pages` models a host that can return
+    /// only an already-packed sequential alias. The product x86 shim can also
+    /// reconstruct scattered shared pages; this narrower fixture exercises the
+    /// refusal and multi-run fallback arms.
     pub strict_linux_map: bool,
     /// Test-controlled answer for [`HostOps::map_pages_stable`]. Keep separate
     /// from `strict_linux_map`: packed shape and pointer lifetime are distinct
@@ -1409,11 +1409,9 @@ impl HostOps for FakeHost {
             return None;
         }
         if self.strict_linux_map {
-            // Match reims_vgpu_pci_map_pages on EVERY host platform: a packed
-            // sequential alias inside one already-provisioned RAM range only.
-            // No range provisioning, no remap/bounce packing of fragmented
-            // lists, and the alias is never tracked as a view (unmap of a
-            // product Linux alias is a no-op).
+            // Model a host limited to a packed sequential alias inside one
+            // already-provisioned RAM range. No range provisioning and no
+            // remap/bounce packing of fragmented lists.
             if gpas.iter().any(|&gpa| self.range_containing(gpa).is_none()) {
                 return None;
             }
