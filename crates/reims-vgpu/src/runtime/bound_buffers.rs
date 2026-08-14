@@ -1,4 +1,4 @@
-//! Draw-time buffer binds, resolved once per reference and held.
+//! Linear resources resolved once per reference and held.
 //!
 //! # The shape this follows
 //!
@@ -17,6 +17,11 @@
 //! about four orders of magnitude less often than it draws.
 //!
 //! So this holds the resolution and the draw path looks it up.
+//!
+//! Linear textures use the same packed allocation. Their level offset and row
+//! pitch become image coordinates over it, while buffer records carry their
+//! offset to the bind. Both are views of one resource-owned mapping; neither
+//! needs a second task-page walk after that mapping is retained.
 //!
 //! # What a held resolution is, and is not
 //!
@@ -111,6 +116,9 @@ pub struct PackedBuffer {
     /// Offset of `gva` inside the page-aligned host allocation.
     pub head: u64,
     pub import: Arc<crate::runtime::guest_ram::GuestRamImport>,
+    /// Physical page list behind the packed alias, retained so resource views
+    /// can build witnesses without walking the task page table again.
+    pub gpas: Arc<Vec<u64>>,
     /// Persistent whole-buffer sources shared by every offset bind.
     pub runs: Arc<Vec<GuestRun>>,
     pub pages: Arc<Vec<GuestWindowRun>>,
@@ -535,6 +543,7 @@ mod tests {
                 size: 0x7000,
                 head: 0x800,
                 import,
+                gpas: Arc::new(Vec::new()),
                 runs: Arc::new(Vec::new()),
                 pages: Arc::new(Vec::new()),
             }),

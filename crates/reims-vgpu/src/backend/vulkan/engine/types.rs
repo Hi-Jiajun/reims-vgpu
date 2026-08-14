@@ -1814,11 +1814,10 @@ pub enum SampledSource {
     Bytes(std::sync::Arc<Vec<u8>>),
     /// Bind a prior GPU-resident target directly (no CPU round-trip).
     Target(TargetIdentity),
-    /// Zero-copy guest origin: the GPU gathers the texel bytes from imported
-    /// guest RAM inside the draw's own command buffer (two-hop: imported
-    /// buffer → pooled scratch → image). No CPU read and no hash — guest CPU
-    /// writes are observed at execute time (at least as fresh as the CPU path's
-    /// encode-time read).
+    /// Guest-memory origin. A resource-owned packed allocation binds as a
+    /// linear sampled image directly; hosts or layouts that decline it retain
+    /// the copy-backed route from imported buffers into an optimal image. No
+    /// CPU read or hash is required on either GPU route.
     ///
     /// The gather is elided where a retained image already answers to the bind's
     /// identity, which is what [`crate::runtime::gather_witness::GatherVouch`]
@@ -1840,8 +1839,9 @@ pub struct GuestRun {
     pub len: u64,
 }
 
-/// Guest-RAM texel source: `runs` cover the linear texel window in order
-/// (`sum(len) == total_len`). With `row_length_texels == 0` the window is
+/// Guest-RAM texel source: the requested window is
+/// `source_offset..source_offset + total_len` inside `runs`. With
+/// `row_length_texels == 0` the window is
 /// tight (`total_len == tight_row_bytes * height`); a nonzero value gives
 /// the guest row stride in texels for padded layouts, and the window then
 /// spans `(height-1) * stride_bytes + tight_row_bytes` (the final row needs
@@ -1890,6 +1890,10 @@ pub struct GuestRunSource {
     /// `Arc` because a source is cloned per bind and these are shared, immutable
     /// and never rebuilt.
     pub pages: Option<std::sync::Arc<Vec<crate::runtime::guest_ram_map::GuestWindowRun>>>,
+    /// One resource-owned packed allocation that can back a linear sampled
+    /// image directly. When the host declines that image layout, `runs` and
+    /// `pages` remain the complete copy-backed fallback for the same texels.
+    pub direct_image: Option<GuestSampledBacking>,
 }
 
 /// A render attachment's prior contents, read from the surface's own guest
@@ -1914,12 +1918,21 @@ pub struct GuestTargetSeed {
 /// allocation and the plane coordinates together is what lets the engine
 /// derive `vkBindImageMemory`'s offset without manufacturing a pointer before
 /// the plane or extending the import past its real bound.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct GuestTargetBacking {
     pub allocation_host_ptr: usize,
     pub allocation_len: u64,
     pub plane_offset: u64,
     pub row_pitch: u64,
+}
+
+/// A sampled plane within the packed allocation retained for its guest
+/// resource. The import owns the checked allocation bound; `backing` carries
+/// only the image-layout coordinates derived inside that bound.
+#[derive(Clone, Debug)]
+pub struct GuestSampledBacking {
+    pub backing: GuestTargetBacking,
+    pub import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
 }
 
 /// An importable guest allocation and the physical pages it owns.

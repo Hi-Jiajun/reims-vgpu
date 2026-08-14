@@ -5018,9 +5018,23 @@ fn packed_buffer_alias_is_reused_across_offsets() {
         gva: 0x800,
         size: 0x4800,
     };
-    let first = super::vulkan::packed_buffer_resolution(&mut state, &mut host, 1, 7, &backing);
+    let first = super::vulkan::packed_resource_resolution(
+        &mut state,
+        &mut host,
+        1,
+        7,
+        &backing,
+        super::vulkan::PackedResourceRail::Buffer,
+    );
     let calls = host.map_pages_calls;
-    let second = super::vulkan::packed_buffer_resolution(&mut state, &mut host, 1, 7, &backing);
+    let second = super::vulkan::packed_resource_resolution(
+        &mut state,
+        &mut host,
+        1,
+        7,
+        &backing,
+        super::vulkan::PackedResourceRail::Buffer,
+    );
     crate::runtime::guest_ram::forget_import_limits();
 
     let (PackedBufferResolution::Available(first), PackedBufferResolution::Available(second)) =
@@ -5073,6 +5087,38 @@ fn packed_buffer_alias_is_reused_across_offsets() {
         state.bound_buffers.len(),
         0,
         "a packed resource does not grow the per-offset resolution registry"
+    );
+}
+
+#[test]
+#[cfg(feature = "backend-vulkan")]
+fn sampled_plane_keeps_the_packed_allocation_and_checks_its_extent() {
+    use crate::runtime::bound_buffers::PackedBuffer;
+    use crate::runtime::guest_ram::GuestRamImport;
+
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(0x7f00_0000_0000, 0x8000, 0x1000)
+            .expect("aligned packed allocation"),
+    );
+    let packed = PackedBuffer {
+        gva: 0x1800,
+        size: 0x6000,
+        head: 0x800,
+        import: std::sync::Arc::clone(&import),
+        gpas: std::sync::Arc::new(vec![0; 8]),
+        runs: std::sync::Arc::new(Vec::new()),
+        pages: std::sync::Arc::new(Vec::new()),
+    };
+    let sampled = super::vulkan::sampled_backing_from_packed(&packed, 0x1000, 512, 0x2000)
+        .expect("the plane lies inside the packed allocation");
+    assert_eq!(sampled.backing.allocation_host_ptr, import.host_base());
+    assert_eq!(sampled.backing.allocation_len, import.len());
+    assert_eq!(sampled.backing.plane_offset, 0x1800);
+    assert_eq!(sampled.backing.row_pitch, 512);
+    assert!(std::sync::Arc::ptr_eq(&sampled.import, &import));
+    assert!(
+        super::vulkan::sampled_backing_from_packed(&packed, 0x7000, 512, 0x1001).is_none(),
+        "a plane may not extend the imported allocation to fit"
     );
 }
 

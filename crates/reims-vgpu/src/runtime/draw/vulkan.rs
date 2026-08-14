@@ -2222,6 +2222,7 @@ fn try_type11_target_guest_seed<M: HostMemory + HostOps>(
             total_len: span,
             row_length_texels,
             pages: guest_page_window(host, gpas, page, base_off % page, span),
+            direct_image: None,
         },
         format: source_format,
     })
@@ -2872,20 +2873,28 @@ fn coalesce_pages_to_runs<M: HostOps>(
     Some(runs)
 }
 
-/// Resolve one buffer object to the packed host allocation shared by all of
-/// its offset binds. A negative result is held under the same retirement rules
-/// as a positive one: mappings do not become complete without a map/object
-/// notification, and those notifications remove the entry.
-pub(super) fn packed_buffer_resolution<M: HostMemory + HostOps>(
+/// Resolve one linear resource to the packed host allocation shared by all of
+/// its buffer offsets or texture planes. A negative result is held under the
+/// same retirement rules as a positive one: mappings do not become complete
+/// without a map/object notification, and those notifications remove the
+/// entry.
+#[derive(Clone, Copy)]
+pub(super) enum PackedResourceRail {
+    Buffer,
+    LinearSample,
+}
+
+pub(super) fn packed_resource_resolution<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    buffer_ref: u32,
+    resource_ref: u32,
     backing: &BufferBacking,
+    rail: PackedResourceRail,
 ) -> crate::runtime::bound_buffers::PackedBufferResolution {
     use crate::runtime::bound_buffers::{PackedBuffer, PackedBufferResolution};
 
-    if let Some(held) = state.bound_buffers.packed(task_id, buffer_ref) {
+    if let Some(held) = state.bound_buffers.packed(task_id, resource_ref) {
         let matches = match held {
             PackedBufferResolution::Available(buffer) => {
                 buffer.gva == backing.gva && buffer.size == backing.size
@@ -2946,6 +2955,7 @@ pub(super) fn packed_buffer_resolution<M: HostMemory + HostOps>(
             size: backing.size,
             head,
             import,
+            gpas: std::sync::Arc::new(gpas),
             runs: std::sync::Arc::new(vec![crate::backend::vulkan::engine::GuestRun {
                 host_ptr: host_base.checked_add(head as usize)?,
                 len: backing.size,
@@ -2960,13 +2970,23 @@ pub(super) fn packed_buffer_resolution<M: HostMemory + HostOps>(
     })()
     .unwrap_or_else(unavailable);
 
-    crate::runtime::drain::note_store_route(match made {
-        PackedBufferResolution::Available(_) => "zc_buffer_packed_alias",
-        PackedBufferResolution::Unavailable { .. } => "zc_buffer_packed_unavailable",
+    crate::runtime::drain::note_store_route(match (rail, &made) {
+        (PackedResourceRail::Buffer, PackedBufferResolution::Available(_)) => {
+            "zc_buffer_packed_alias"
+        }
+        (PackedResourceRail::Buffer, PackedBufferResolution::Unavailable { .. }) => {
+            "zc_buffer_packed_unavailable"
+        }
+        (PackedResourceRail::LinearSample, PackedBufferResolution::Available(_)) => {
+            "zc_lin_packed_alias"
+        }
+        (PackedResourceRail::LinearSample, PackedBufferResolution::Unavailable { .. }) => {
+            "zc_lin_packed_unavailable"
+        }
     });
     state
         .bound_buffers
-        .insert_packed(task_id, buffer_ref, made.clone());
+        .insert_packed(task_id, resource_ref, made.clone());
     made
 }
 
@@ -2982,6 +3002,27 @@ pub(super) fn slice_packed_buffer(
         source_offset: offset,
         runs: std::sync::Arc::clone(&packed.runs),
         pages: Some(std::sync::Arc::clone(&packed.pages)),
+    })
+}
+
+pub(super) fn sampled_backing_from_packed(
+    packed: &crate::runtime::bound_buffers::PackedBuffer,
+    level_offset: u64,
+    row_pitch: u64,
+    span: u64,
+) -> Option<crate::backend::vulkan::engine::GuestSampledBacking> {
+    let plane_offset = packed.head.checked_add(level_offset)?;
+    plane_offset
+        .checked_add(span)
+        .filter(|end| *end <= packed.import.len())?;
+    Some(crate::backend::vulkan::engine::GuestSampledBacking {
+        backing: crate::backend::vulkan::engine::GuestTargetBacking {
+            allocation_host_ptr: packed.import.host_base(),
+            allocation_len: packed.import.len(),
+            plane_offset,
+            row_pitch,
+        },
+        import: std::sync::Arc::clone(&packed.import),
     })
 }
 
@@ -3121,7 +3162,14 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route_n("zc_buffer_extent_saved_bytes", full - span);
     }
     if let crate::runtime::bound_buffers::PackedBufferResolution::Available(packed) =
-        packed_buffer_resolution(state, host, task_id, buffer_ref, backing)
+        packed_resource_resolution(
+            state,
+            host,
+            task_id,
+            buffer_ref,
+            backing,
+            PackedResourceRail::Buffer,
+        )
     {
         if let Some(bound) = slice_packed_buffer(&packed, offset, span) {
             crate::runtime::drain::note_store_route("zc_buffer_imported");
@@ -3179,6 +3227,7 @@ fn bound_buffer_content(
         total_len: bound.span,
         row_length_texels: 0,
         pages: bound.pages.clone(),
+        direct_image: None,
     })
 }
 
@@ -3934,7 +3983,84 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // because a linear texture's bytes may alias a surface this device owes a
     // frame and only `pay_for_texture` resolves one id namespace to the other.
     crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
-    // Fixed per-texture window: the walk covers exactly the bound span.
+    // Retain the texture's complete allocation once. A sampled image needs the
+    // allocation base, level offset and row pitch together; reducing it to the
+    // level's page runs would throw away the resource shape and force a copy.
+    let packed = tex
+        .allocation_base_gva(state.page_shift)
+        .filter(|_| tex.allocation_size != 0)
+        .and_then(|allocation_gva| {
+            let backing = BufferBacking {
+                gva: allocation_gva,
+                size: tex.allocation_size,
+            };
+            match packed_resource_resolution(
+                state,
+                host,
+                task_id,
+                texture_ref,
+                &backing,
+                PackedResourceRail::LinearSample,
+            ) {
+                crate::runtime::bound_buffers::PackedBufferResolution::Available(packed) => {
+                    Some(packed)
+                }
+                crate::runtime::bound_buffers::PackedBufferResolution::Unavailable { .. } => None,
+            }
+        });
+
+    if let Some(packed) = packed {
+        let page = state.page_size();
+        let packed_offset = packed.head.checked_add(layout.offset)?;
+        let first_page = usize::try_from(packed_offset / page).ok()?;
+        let head_off = packed_offset % page;
+        let page_count = usize::try_from(head_off.checked_add(span)?.div_ceil(page)).ok()?;
+        let witness_gpas = packed.gpas.get(first_page..first_page.checked_add(page_count)?)?;
+        let witness_runs = [engine::GuestRun {
+            host_ptr: packed
+                .import
+                .host_base()
+                .checked_add(usize::try_from(packed_offset).ok()?)?,
+            len: span,
+        }];
+        let seen = crate::runtime::gather_witness::note_gather(
+            state,
+            host,
+            crate::runtime::gather_witness::GatherRail::Linear,
+            crate::runtime::gather_witness::GatherKey::TaskGva { task_id, gva },
+            crate::runtime::gather_witness::GatherWindow {
+                gpas: witness_gpas,
+                runs: &witness_runs,
+                span,
+                page_size: page as usize,
+            },
+        );
+        return Some((
+            w,
+            h,
+            SampledSourceRequest::GuestRuns(
+                engine::GuestRunSource {
+                    runs: std::sync::Arc::clone(&packed.runs),
+                    source_offset: layout.offset,
+                    total_len: span,
+                    row_length_texels,
+                    pages: Some(std::sync::Arc::clone(&packed.pages)),
+                    direct_image: sampled_backing_from_packed(
+                        &packed,
+                        layout.offset,
+                        layout.row_stride,
+                        span,
+                    ),
+                },
+                native,
+                LinearSampleIdentity::from(seen.identity),
+                seen.vouch,
+                native_components,
+            ),
+        ));
+    }
+
+    // The copy-backed fallback still covers exactly the bound level window.
     let (gpas, runs) = match task_gva_guest_run_window(state, host, task_id, gva, span) {
         Ok(window) => window,
         Err(refusal) => {
@@ -3969,6 +4095,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 total_len: span,
                 row_length_texels,
                 pages: guest_page_window(host, gpas, page as u64, gva % page as u64, span),
+                direct_image: None,
             },
             native,
             LinearSampleIdentity::from(seen.identity),
@@ -4073,6 +4200,7 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
             total_len: span,
             row_length_texels,
             pages: guest_page_window(host, gpas, page as u64, base_off % page as u64, span),
+            direct_image: None,
         },
         native,
         LinearSampleIdentity::from(seen.identity),
@@ -4173,6 +4301,7 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
             total_len: span,
             row_length_texels,
             pages: guest_page_window(host, gpas, page as u64, base_off % page as u64, span),
+            direct_image: None,
         },
         native,
         LinearSampleIdentity::from(seen.identity),

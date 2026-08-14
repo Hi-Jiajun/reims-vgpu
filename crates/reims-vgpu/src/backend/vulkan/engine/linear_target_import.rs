@@ -320,7 +320,9 @@ pub(super) unsafe fn create(
     {
         return Err(WindowRefusal::HostPointerMisaligned);
     }
-    if ctx.features.attachment_feedback_loop_layout {
+    if ctx.features.attachment_feedback_loop_layout
+        && usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+    {
         usage |= vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT;
     }
     if unsafe { explicit_linear_supported(ctx, format, usage) }? {

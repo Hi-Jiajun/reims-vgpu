@@ -314,6 +314,10 @@ pub(crate) struct ResourcePools {
     /// candidates only; a hit always requires full byte equality.
     sampled_cache: Vec<ResidentSampledSlot>,
     sampled_cache_bytes: usize,
+    /// Linear sampled images bound directly over resource-owned packed guest
+    /// allocations. Unlike upload slots these images never enter a recycle
+    /// pool: their memory aliases one specific guest allocation.
+    guest_sampled: HashMap<GuestSampledKey, GuestSampledSlot>,
     /// What [`SAMPLED_CACHE_CAP`] and [`SAMPLED_CACHE_BYTE_CAP`] have thrown
     /// away, most recently evicted at the front, carrying no images — see
     /// [`SampledVictim`].
@@ -835,6 +839,12 @@ pub(crate) enum DeferredHandle {
         view: vk::ImageView,
         memory: vk::DeviceMemory,
     },
+    GuestImage {
+        image: vk::Image,
+        view: vk::ImageView,
+        memory: vk::DeviceMemory,
+        _import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
+    },
     /// A sampled-cache slot evicted by the LRU/byte cap. Instead of destroying
     /// it, the drain returns it to `sampled_free` for reuse (bounded per key) so
     /// a content-changing sampled input (live tile / video frame) re-uploads
@@ -882,6 +892,16 @@ impl ResourcePools {
                 if !self.slab.free_image(device, image) {
                     device.free_memory(memory, None);
                 }
+            }
+            DeferredHandle::GuestImage {
+                image,
+                view,
+                memory,
+                _import,
+            } => {
+                device.destroy_image_view(view, None);
+                device.destroy_image(image, None);
+                device.free_memory(memory, None);
             }
             DeferredHandle::RecycleSampled(slot) => {
                 device.destroy_image_view(slot.view, None);
@@ -970,6 +990,30 @@ pub(crate) struct SampledSlot {
     /// channels. Identity is the overwhelmingly common case and keeps its own
     /// free list, so a rare swizzled bind cannot fragment the hot one.
     pub swizzle: crate::contract::pixel_format::SwizzlePlan,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct GuestSampledKey {
+    pub(crate) image: SampledKey,
+    pub(crate) backing: crate::backend::vulkan::engine::GuestTargetBacking,
+}
+
+struct GuestSampledSlot {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    /// Keeps the checked packed-allocation bound alive for exactly as long as
+    /// Vulkan can address it.
+    _import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
+    initialized: bool,
+    last_touch_ms: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct GuestSampledUse {
+    pub(crate) image: vk::Image,
+    pub(crate) view: vk::ImageView,
+    pub(crate) initialized: bool,
 }
 
 /// Which lifetime owns a newly acquired sampled image. Upload images may enter

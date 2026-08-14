@@ -138,6 +138,11 @@ impl ResourcePools {
             device.destroy_image(s.slot.image, None);
         }
         self.sampled_cache_bytes = 0;
+        for (_, sampled) in self.guest_sampled.drain() {
+            device.destroy_image_view(sampled.view, None);
+            device.destroy_image(sampled.image, None);
+            device.free_memory(sampled.memory, None);
+        }
         for s in self.storage_image_free.drain() {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);

@@ -165,6 +165,7 @@ impl ResourcePools {
             attachment_snapshot_live: Vec::new(),
             sampled_cache: Vec::new(),
             sampled_cache_bytes: 0,
+            guest_sampled: HashMap::new(),
             sampled_victims: std::collections::VecDeque::new(),
             storage_image_free: FreePool::new(
                 STORAGE_IMAGE_FREE_CAP_PER_KEY,
@@ -441,6 +442,34 @@ impl ResourcePools {
         trimmed
     }
 
+    unsafe fn trim_aged_guest_sampled(
+        &mut self,
+        device: &ash::Device,
+        cutoff: u64,
+        max: usize,
+    ) -> usize {
+        let keys: Vec<_> = self
+            .guest_sampled
+            .iter()
+            .filter_map(|(key, slot)| (slot.last_touch_ms <= cutoff).then_some(key.clone()))
+            .take(max)
+            .collect();
+        for key in &keys {
+            if let Some(slot) = self.guest_sampled.remove(key) {
+                self.dispose(
+                    device,
+                    DeferredHandle::GuestImage {
+                        image: slot.image,
+                        view: slot.view,
+                        memory: slot.memory,
+                        _import: slot._import,
+                    },
+                );
+            }
+        }
+        keys.len()
+    }
+
     /// Device-free half of [`Self::trim_aged_sampled_cache`]: remove up to `max`
     /// sampled-cache entries whose `last_touch_ms <= cutoff`, decrement the byte
     /// accounting, and return their slots for the caller to dispose. Split out so
@@ -654,6 +683,7 @@ impl ResourcePools {
         // cutoff frees them once idle without touching an actively-sampled entry.
         let sampled_cutoff = self.idle_clock_ms.saturating_sub(IDLE_TARGET_AGE_MS);
         self.trim_aged_sampled_cache(&ctx.device, sampled_cutoff, IDLE_RECYCLE_TRIM_PER_PASS);
+        self.trim_aged_guest_sampled(&ctx.device, sampled_cutoff, IDLE_RECYCLE_TRIM_PER_PASS);
         // …and the compute-storage residents, the standalone-VkDeviceMemory pool the
         // render-registry / sampled-cache drains above do not cover. A settled
         // compute-heavy session's blur/decode storage images are pinned until an
@@ -3364,6 +3394,110 @@ impl ResourcePools {
         counters: &EngineCounters,
     ) -> Result<SampledSlot, DrawError> {
         unsafe { self.acquire_sampled_for(ctx, sk, counters, SampledTransientUse::Upload) }
+    }
+
+    /// Bind a 2D sampled image directly over one packed guest allocation.
+    /// `Ok(None)` is an optional-rail decline; the caller retains its complete
+    /// buffer-to-image fallback over the same source.
+    pub(crate) unsafe fn acquire_guest_sampled(
+        &mut self,
+        ctx: &DeviceContext,
+        key: GuestSampledKey,
+        import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
+        counters: &EngineCounters,
+    ) -> Result<Option<GuestSampledUse>, DrawError> {
+        if let Some(slot) = self.guest_sampled.get_mut(&key) {
+            slot.last_touch_ms = self.idle_clock_ms;
+            return Ok(Some(GuestSampledUse {
+                image: slot.image,
+                view: slot.view,
+                initialized: slot.initialized,
+            }));
+        }
+        // A component mapping is legal on the view; only the image
+        // dimensionality must be the ordinary single-plane 2D form.
+        if key.image.layers != 1
+            || key.image.volume
+            || key.image.cube
+            || key.image.arrayed
+            || key.image.one_dim
+        {
+            return Ok(None);
+        }
+        let imported = match unsafe {
+            super::super::linear_target_import::create(
+                ctx,
+                key.backing,
+                key.image.width,
+                key.image.height,
+                key.image.format,
+                vk::ImageUsageFlags::SAMPLED,
+            )
+        } {
+            Ok(imported) => imported,
+            Err(reason) => {
+                crate::runtime::drain::note_store_route("sampled_direct_declined");
+                let hash = crate::backend::hash::hash_u64(
+                    crate::backend::hash::hash_bytes(reason.slug().as_bytes()),
+                    key.image.format.as_raw() as u32 as u64,
+                );
+                crate::observe::Emit::decline("vk_guest_sampled", &reason)
+                    .field("format", format!("{:?}", key.image.format))
+                    .field("width", key.image.width)
+                    .field("height", key.image.height)
+                    .fail_once(hash);
+                return Ok(None);
+            }
+        };
+        counters.note_create();
+        counters.note_alloc();
+        let view = match unsafe {
+            ctx.device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(imported.image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(key.image.format)
+                    .components(translate::pixel::vk_component_mapping(&key.image.swizzle))
+                    .subresource_range(super::super::color_subresource_range()),
+                None,
+            )
+        } {
+            Ok(view) => view,
+            Err(error) => {
+                ctx.device.destroy_image(imported.image, None);
+                ctx.device.free_memory(imported.memory, None);
+                return Err(DrawError::VkCall(VkCall::new(
+                    VkOp::PoolsCreateSampledView,
+                    error,
+                )));
+            }
+        };
+        counters.note_create();
+        let use_ = GuestSampledUse {
+            image: imported.image,
+            view,
+            initialized: false,
+        };
+        self.guest_sampled.insert(
+            key,
+            GuestSampledSlot {
+                image: imported.image,
+                memory: imported.memory,
+                view,
+                _import: import,
+                initialized: false,
+                last_touch_ms: self.idle_clock_ms,
+            },
+        );
+        crate::runtime::drain::note_store_route("sampled_direct_created");
+        Ok(Some(use_))
+    }
+
+    pub(crate) fn mark_guest_sampled_read(&mut self, key: &GuestSampledKey) {
+        if let Some(slot) = self.guest_sampled.get_mut(key) {
+            slot.initialized = true;
+            slot.last_touch_ms = self.idle_clock_ms;
+        }
     }
 
     pub(crate) unsafe fn acquire_attachment_snapshot(

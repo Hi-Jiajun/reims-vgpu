@@ -1034,6 +1034,17 @@ enum PreparedSampled {
         /// Bytes the copy names, for the cache's byte-cap accounting.
         gathered_len: usize,
     },
+    /// A linear image whose storage is the guest resource's packed allocation.
+    /// It remains in GENERAL after first use so host and shader access can
+    /// alternate without copying its texels into an optimal image.
+    GuestDirect {
+        binding: u32,
+        array_element: u32,
+        image: vk::Image,
+        view: vk::ImageView,
+        key: super::pools::GuestSampledKey,
+        initialized: bool,
+    },
     Cached {
         binding: u32,
         array_element: u32,
@@ -1076,6 +1087,7 @@ impl PreparedSampled {
             | Self::Resident { binding, .. }
             | Self::Feedback { binding, .. }
             | Self::Snapshot { binding, .. }
+            | Self::GuestDirect { binding, .. }
             | Self::GuestGather { binding, .. } => *binding,
         }
     }
@@ -1087,6 +1099,7 @@ impl PreparedSampled {
             | Self::Resident { array_element, .. }
             | Self::Feedback { array_element, .. }
             | Self::Snapshot { array_element, .. }
+            | Self::GuestDirect { array_element, .. }
             | Self::GuestGather { array_element, .. } => *array_element,
         }
     }
@@ -1098,6 +1111,7 @@ impl PreparedSampled {
             Self::Resident { view, .. } => *view,
             Self::Feedback { view, .. } => *view,
             Self::Snapshot { image, .. } => image.view,
+            Self::GuestDirect { view, .. } => *view,
             Self::GuestGather { image, .. } => image.view,
         }
     }
@@ -1106,6 +1120,7 @@ impl PreparedSampled {
         match self {
             Self::Feedback { .. } => vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT,
             Self::Resident { next_access, .. } => next_access.layout(),
+            Self::GuestDirect { .. } => vk::ImageLayout::GENERAL,
             _ => vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         }
     }
@@ -1863,7 +1878,11 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                     ));
                 }
                 let sum: u64 = src.runs.iter().map(|r| r.len).sum();
-                if sum != src.total_len || src.runs.is_empty() {
+                let covered = src.source_offset.checked_add(src.total_len);
+                if src.total_len == 0
+                    || src.runs.is_empty()
+                    || covered.is_none_or(|end| end > sum)
+                {
                     return Err(DrawError::DrawValidation(
                         DrawValidationDecline::GuestSampleCoverage {
                             binding: image.binding,
@@ -3576,6 +3595,31 @@ pub(crate) unsafe fn execute_draw_inner(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             SampledSource::GuestRuns(src, vouch) => {
+                if let Some(direct) = src.direct_image.as_ref() {
+                    let key = super::pools::GuestSampledKey {
+                        image: SampledKey::of(resource),
+                        backing: direct.backing,
+                    };
+                    if let Some(bound) = unsafe {
+                        pools.acquire_guest_sampled(
+                            ctx,
+                            key.clone(),
+                            std::sync::Arc::clone(&direct.import),
+                            counters,
+                        )?
+                    } {
+                        crate::runtime::drain::note_store_route("sampled_direct_bound");
+                        sampled.push(PreparedSampled::GuestDirect {
+                            binding: resource.binding,
+                            array_element: resource.array_element,
+                            image: bound.image,
+                            view: bound.view,
+                            key,
+                            initialized: bound.initialized,
+                        });
+                        continue;
+                    }
+                }
                 // The producer vouches for this identity only when both halves
                 // of the guest-write witness say the window's bytes cannot have
                 // moved since the gather that filled the retained image: no
@@ -4160,6 +4204,47 @@ pub(crate) unsafe fn execute_draw_inner(
             &[],
             &barrier,
         );
+    }
+
+    // CPU-origin sampled uploads.
+    // Resource-owned guest images are born PREINITIALIZED and remain GENERAL.
+    // Only their first use needs an image-layout transition. Host writes made
+    // before queue submission are made available to device reads by the
+    // submission's host-memory dependency; restating that dependency as an
+    // image barrier at every bind would force an otherwise-continuable render
+    // pass to end for content whose layout never changed.
+    let mut transitioned_guest_direct = std::collections::HashSet::new();
+    for image in &sampled {
+        let PreparedSampled::GuestDirect {
+            image,
+            key,
+            initialized,
+            ..
+        } = image
+        else {
+            continue;
+        };
+        if *initialized || !transitioned_guest_direct.insert(*image) {
+            continue;
+        }
+        unsafe { outside_pass.before_record(PassObstacle::SampledUpload, pools, &ctx.device, cb) };
+        let barrier = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::HOST_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .old_layout(vk::ImageLayout::PREINITIALIZED)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .image(*image)
+            .subresource_range(super::color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::HOST,
+            vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &barrier,
+        );
+        pools.mark_guest_sampled_read(key);
     }
 
     // CPU-origin sampled uploads.
@@ -5828,6 +5913,7 @@ mod tests {
                 total_len: 0x1000,
                 row_length_texels: 0,
                 pages: None,
+                direct_image: None,
             })
         };
         let a = CbBind::of(&content(0));
@@ -5871,6 +5957,7 @@ mod tests {
                 total_len: 16,
                 row_length_texels: 0,
                 pages: None,
+                direct_image: None,
             })
         };
         let vertex_only = content(0x1000);
@@ -6123,6 +6210,7 @@ mod tests {
                         // A fixture over a dummy host address names no guest
                         // RAM, so there is no reference an import could bind.
                         pages: None,
+                        direct_image: None,
                     },
                     // No witness ran for a synthetic source, so nothing vouches:
                     // the gather is the only disposition this fixture can take.
@@ -6161,6 +6249,7 @@ mod tests {
                     total_len: declared,
                     row_length_texels,
                     pages: None,
+                    direct_image: None,
                 },
                 format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
             }),
@@ -6528,6 +6617,36 @@ mod tests {
         assert!(validate_v1(&req).is_ok());
     }
 
+    #[test]
+    fn sampled_subrange_validates_inside_its_resource_owned_runs() {
+        let mut req = guest_run_req(4, 4, 4 * 4 * 4, 0);
+        {
+            let SampledSource::GuestRuns(source, _) = &mut req.sampled_images[0].source else {
+                panic!("the fixture is guest-backed")
+            };
+            source.source_offset = 32;
+            source.runs = std::sync::Arc::new(vec![GuestRun {
+                host_ptr: 0x1000,
+                len: source.source_offset + source.total_len,
+            }]);
+        }
+        assert!(validate_v1(&req).is_ok());
+
+        {
+            let SampledSource::GuestRuns(source, _) = &mut req.sampled_images[0].source else {
+                panic!("the fixture is guest-backed")
+            };
+            source.runs = std::sync::Arc::new(vec![GuestRun {
+                host_ptr: 0x1000,
+                len: source.source_offset + source.total_len - 1,
+            }]);
+        }
+        assert_eq!(
+            validation_slug(&req),
+            "vk_draw_validate_guest_sample_coverage"
+        );
+    }
+
     /// A native attachment seed may carry guest row padding, but its declared
     /// span and host-run coverage must describe exactly the bytes the Vulkan
     /// copy reads. This is the shape produced by IOSurface rows whose BPR is
@@ -6676,6 +6795,7 @@ mod tests {
             row_length_texels,
             // A fixture over a dummy host address has no guest pages.
             pages: None,
+            direct_image: None,
         })
     }
 
@@ -6852,6 +6972,7 @@ mod tests {
             row_length_texels: 0,
             // A fixture over a host `Vec` has no guest pages.
             pages: None,
+            direct_image: None,
         });
         assert_eq!(content.len(), 20);
         let bytes = content.cpu_bytes();

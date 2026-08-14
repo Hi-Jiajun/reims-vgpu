@@ -2409,6 +2409,7 @@ fn partial_draw_preserves_a_native_guest_target_seed() {
             total_len: backing.len() as u64,
             row_length_texels: 0,
             pages: None,
+            direct_image: None,
         },
         format: SURFACE_TEST_FORMAT,
     });
