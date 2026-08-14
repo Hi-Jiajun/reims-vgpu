@@ -3145,6 +3145,7 @@ pub(crate) unsafe fn execute_draw_inner(
             pools.registry_note_sampled_use(identity);
         }
     }
+    let mut target_guest_backed = false;
     let mut target_loads_guest_backing = false;
     let (target_image, target_fb, target_access, target_view) =
         if let Some(identity) = &req.target_identity {
@@ -3160,9 +3161,8 @@ pub(crate) unsafe fn execute_draw_inner(
                 req.guest_target_backing,
                 counters,
             )?;
-            let target_guest_backed = t.memory.is_guest_imported();
-            target_loads_guest_backing =
-                target_guest_backed && req.load_guest_target_backing;
+            target_guest_backed = t.memory.is_guest_imported();
+            target_loads_guest_backing = target_guest_backed && req.load_guest_target_backing;
             if target_loads_guest_backing {
                 // The imported image *is* the guest seed. The pass key already
                 // uses LOAD whenever a seed was supplied; switching the source
@@ -4925,6 +4925,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(DrawOutput {
             pixels: Vec::new(),
+            target_guest_backed,
             pixels_bgra: output_bgra,
             // Unreachable with a query armed: `batch_eligible` excludes one, so
             // `defer_submit` is false for every queried draw. Stated as `None`
@@ -5010,6 +5011,7 @@ pub(crate) unsafe fn execute_draw_inner(
             pools.wait_entry_fence(ctx, counters, fence)?;
             return Ok(DrawOutput {
                 pixels: Vec::new(),
+                target_guest_backed,
                 pixels_bgra: output_bgra,
                 occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
             });
@@ -5019,6 +5021,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(DrawOutput {
             pixels: Vec::new(),
+            target_guest_backed,
             pixels_bgra: output_bgra,
             occlusion_samples: None,
         });
@@ -5064,6 +5067,7 @@ pub(crate) unsafe fn execute_draw_inner(
 
     Ok(DrawOutput {
         pixels,
+        target_guest_backed,
         pixels_bgra,
         occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
     })

@@ -662,6 +662,14 @@ pub struct SecondaryColorTarget {
 #[derive(Debug, Default)]
 pub struct DrawOutput {
     pub pixels: Vec<u8>,
+    /// Whether color attachment zero was rendered through the retained guest
+    /// allocation supplied on this request.
+    ///
+    /// Reported by the engine rather than inferred by the runtime: capability,
+    /// layout, memory-type and creation checks can all send one request to the
+    /// ordinary resident fallback, and only the engine knows which image the
+    /// draw actually encoded against.
+    pub target_guest_backed: bool,
     /// Physical channel order of `pixels`: BGRA8 when true, semantic RGBA8
     /// otherwise. Empty when `skip_readback`, in which case this states the
     /// order the attachment *would* have read back in.

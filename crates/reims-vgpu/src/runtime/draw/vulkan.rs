@@ -313,7 +313,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     ));
                 }
             }
-            Ok(M2vDrawSpan::ResidentSurfaceStore) => {
+            Ok(M2vDrawSpan::ResidentSurfaceStore { guest_backed }) => {
                 // Into the same `t11_store_us` bucket the synchronous and `Owned`
                 // routes report, because the whole claim of this rail is that the
                 // bucket shrinks. Leaving it unbracketed would move the arm's cost
@@ -326,7 +326,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     .first()
                     .map(|c0| (c0.mapping_id, c0.width, c0.height, c0.format));
                 let stored = c0_store
-                    .map(|(mid, cw, ch, _)| store_surface_resident(state, host, req, mid, cw, ch))
+                    .map(|(mid, cw, ch, _)| {
+                        store_surface_resident(state, host, req, mid, cw, ch, guest_backed)
+                    })
                     .unwrap_or(false);
                 match (stored, c0_store) {
                     (true, Some((mid, cw, ch, fmt))) => {
@@ -5118,7 +5120,7 @@ enum M2vDrawSpan {
     /// different routes. Distinct from [`Self::Pixels`] because there are no
     /// pixels — a caller that treated an empty frame as one would write a blank
     /// framebuffer into guest memory.
-    ResidentSurfaceStore,
+    ResidentSurfaceStore { guest_backed: bool },
 }
 
 /// Name the guest-Store route this record actually took, once per distinct
@@ -7836,7 +7838,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             return Ok(M2vDrawSpan::ResidentGvaStore);
         }
         if surface_resident_store {
-            return Ok(M2vDrawSpan::ResidentSurfaceStore);
+            return Ok(M2vDrawSpan::ResidentSurfaceStore {
+                guest_backed: out.target_guest_backed,
+            });
         }
         Ok(M2vDrawSpan::Pixels {
             bytes: pixels,
@@ -8713,6 +8717,10 @@ pub(crate) fn read_resident_chain(state: &DeviceState, req: &DrawEncodeRequest) 
 /// draw's `target_identity` — so the image read here is the image the draw
 /// rendered into. Deriving it a second way is how a writeback ends up
 /// publishing a frame the draw is not in.
+fn should_defer_surface_store(lazy_enabled: bool, guest_backed: bool) -> bool {
+    lazy_enabled && !guest_backed
+}
+
 fn store_surface_resident<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -8720,6 +8728,7 @@ fn store_surface_resident<M: HostMemory + HostOps>(
     mapping_id: u32,
     width: u32,
     height: u32,
+    guest_backed: bool,
 ) -> bool {
     // The union belongs to the draws that just ran whether or not the write
     // below succeeds, and leaving it un-reset on a refused write would fold this
@@ -8728,17 +8737,21 @@ fn store_surface_resident<M: HostMemory + HostOps>(
     let Some(identity) = type11_store_identity(state, req, true) else {
         return false;
     };
-    // Owe the frame rather than write it, when the rail is on. The resident this
-    // draw just filled is the only place these pixels exist and the engine
-    // already refuses to reclaim such a slot, so nothing has to be pinned and
-    // nothing resolved is held — see `runtime::writeback_debt` for why that
-    // distinction is the whole difference from the rail that corrupted the
-    // guest's page tables.
-    if crate::runtime::writeback_debt::lazy_writeback_enabled()
+    // A copied resident may defer the transfer until something reads the
+    // mapping. A guest-backed resident may not: its Store is already the draw
+    // into that allocation, so deferring creates an invented second operation
+    // and makes correctness depend on the texture identity outliving the
+    // command that synchronized it. Publish the existing alias eagerly and let
+    // the completion stamp carry its queue ordering.
+    let lazy = crate::runtime::writeback_debt::lazy_writeback_enabled();
+    if should_defer_surface_store(lazy, guest_backed)
         && arm_surface_writeback_debt(state, host, mapping_id, &identity, width, height)
     {
         crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
         return true;
+    }
+    if lazy && guest_backed {
+        crate::runtime::drain::note_store_route("target_store_shared_eager");
     }
     if !crate::runtime::render_writeback::store_render_frame(
         state, host, mapping_id, &identity, width, height,
@@ -8893,6 +8906,14 @@ mod vulkan_split_tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
+
+    #[test]
+    fn a_guest_backed_store_is_never_turned_into_a_future_copy() {
+        assert!(!should_defer_surface_store(true, true));
+        assert!(!should_defer_surface_store(false, true));
+        assert!(should_defer_surface_store(true, false));
+        assert!(!should_defer_surface_store(false, false));
+    }
 
     /// The blank-with-host-entry loss must be reported as a subset of a
     /// population, not as a bare count.
