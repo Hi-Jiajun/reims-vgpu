@@ -302,6 +302,12 @@ pub struct DeviceFeatures {
     /// attachment self-sampling contract; hosts without it keep the snapshot
     /// copy rail.
     pub attachment_feedback_loop_layout: bool,
+    /// `VK_EXT_image_drm_format_modifier`, used only for the explicit linear
+    /// plane layout that gives a shared guest target its declared row pitch.
+    /// This is an extension capability rather than a device feature bit: when
+    /// absent, imported targets keep the ordinary linear-layout probe and its
+    /// copied fallback.
+    pub image_drm_format_modifier: bool,
     /// `VkPhysicalDeviceFeatures::dualSrcBlend` — whether a pipeline may name
     /// the `SRC1_*` blend factors, which read the fragment shader's second
     /// colour output.
@@ -540,6 +546,7 @@ impl DeviceFeatures {
             mirror_clamp_to_edge,
             image_robustness,
             attachment_feedback_loop_layout,
+            image_drm_format_modifier,
             dual_src_blend,
             fill_mode_non_solid,
             depth_clamp,
@@ -563,6 +570,7 @@ impl DeviceFeatures {
             "vk_features robust_buffer_access={robust_buffer_access} \
              image_robustness={image_robustness:?} \
              attachment_feedback_loop_layout={attachment_feedback_loop_layout} \
+             image_drm_format_modifier={image_drm_format_modifier} \
              sampler_anisotropy={sampler_anisotropy} max_sampler_anisotropy={max_sampler_anisotropy} \
              max_image_dimension_2d={max_image_dimension_2d} \
              max_compute_workgroup_invocations={max_compute_workgroup_invocations} \
@@ -606,6 +614,9 @@ impl DeviceFeatures {
         }
         if self.attachment_feedback_loop_layout {
             out.push(vk::EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_NAME.as_ptr());
+        }
+        if self.image_drm_format_modifier {
+            out.push(vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME.as_ptr());
         }
         out
     }
@@ -741,11 +752,13 @@ pub unsafe fn query(
         } else {
             false
         };
+    let image_drm_format_modifier = has_extension(vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME);
 
     DeviceFeatures {
         robust_buffer_access: supported.robust_buffer_access == vk::TRUE,
         image_robustness,
         attachment_feedback_loop_layout,
+        image_drm_format_modifier,
         sampler_anisotropy: supported.sampler_anisotropy == vk::TRUE,
         dual_src_blend: supported.dual_src_blend == vk::TRUE,
         fill_mode_non_solid: supported.fill_mode_non_solid == vk::TRUE,
@@ -849,6 +862,7 @@ mod tests {
             mirror_clamp_to_edge: MirrorClampToEdge::Core12,
             image_robustness: ImageRobustness::Core13,
             attachment_feedback_loop_layout: true,
+            image_drm_format_modifier: true,
             dual_src_blend: true,
             fill_mode_non_solid: true,
             depth_clamp: true,
@@ -871,6 +885,7 @@ mod tests {
         let without = DeviceFeatures {
             dual_src_blend: false,
             attachment_feedback_loop_layout: false,
+            image_drm_format_modifier: false,
             ..all_supported()
         };
         assert_eq!(without.enabled_features().dual_src_blend, vk::FALSE);
@@ -911,6 +926,7 @@ mod tests {
     fn the_core_rung_needs_no_extension_string() {
         let caps = DeviceFeatures {
             attachment_feedback_loop_layout: false,
+            image_drm_format_modifier: false,
             ..all_supported()
         };
         assert_eq!(
@@ -929,6 +945,7 @@ mod tests {
         let caps = DeviceFeatures {
             mirror_clamp_to_edge: MirrorClampToEdge::KhrExtension,
             attachment_feedback_loop_layout: false,
+            image_drm_format_modifier: false,
             ..all_supported()
         };
         assert_eq!(
@@ -946,6 +963,7 @@ mod tests {
         let caps = DeviceFeatures {
             mirror_clamp_to_edge: MirrorClampToEdge::Unsupported,
             attachment_feedback_loop_layout: false,
+            image_drm_format_modifier: false,
             ..all_supported()
         };
         assert_eq!(
@@ -1025,6 +1043,19 @@ mod tests {
             vk::FALSE
         );
         assert!(!off.required_extensions().contains(&name));
+    }
+
+    #[test]
+    fn explicit_drm_layout_names_its_extension_only_when_available() {
+        let name = vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME.as_ptr();
+        let on = DeviceFeatures {
+            image_drm_format_modifier: true,
+            ..Default::default()
+        };
+        assert!(on.required_extensions().contains(&name));
+        assert!(!DeviceFeatures::default()
+            .required_extensions()
+            .contains(&name));
     }
 
     /// A feature the device declines is never enabled — the enable list is a

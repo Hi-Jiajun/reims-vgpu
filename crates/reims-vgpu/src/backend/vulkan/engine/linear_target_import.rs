@@ -19,6 +19,24 @@ struct WindowPlan {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayoutMode {
+    DriverLinear,
+    ExplicitLinear,
+}
+
+// The linear DRM modifier is the API value zero. Unlike vendor modifiers, it
+// describes ordinary row-major storage and therefore lets the guest's declared
+// byte offset and row pitch be stated directly in the image-create contract.
+const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+
+fn subresource_aspect(mode: LayoutMode) -> vk::ImageAspectFlags {
+    match mode {
+        LayoutMode::DriverLinear => vk::ImageAspectFlags::COLOR,
+        LayoutMode::ExplicitLinear => vk::ImageAspectFlags::MEMORY_PLANE_0_EXT,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WindowRefusal {
     UnsupportedTopology,
     HostImportUnavailable,
@@ -29,6 +47,7 @@ pub(super) enum WindowRefusal {
     AllocationTooShort,
     NoMemoryType,
     DedicatedBindingRequired,
+    ModifierQuery(vk::Result),
     CreateImage(vk::Result),
     PointerProperties(vk::Result),
     AllocateMemory(vk::Result),
@@ -47,6 +66,7 @@ impl WindowRefusal {
             Self::AllocationTooShort => "allocation_too_short",
             Self::NoMemoryType => "no_memory_type",
             Self::DedicatedBindingRequired => "dedicated_binding_required",
+            Self::ModifierQuery(_) => "modifier_query_failed",
             Self::CreateImage(_) => "create_failed",
             Self::PointerProperties(_) => "pointer_properties_failed",
             Self::AllocateMemory(_) => "allocate_failed",
@@ -57,6 +77,7 @@ impl WindowRefusal {
     pub(super) fn result(self) -> Option<vk::Result> {
         match self {
             Self::CreateImage(result)
+            | Self::ModifierQuery(result)
             | Self::PointerProperties(result)
             | Self::AllocateMemory(result)
             | Self::BindImage(result) => Some(result),
@@ -110,13 +131,160 @@ fn plan_window(
         return Err(WindowRefusal::NoMemoryType);
     }
     let memory_type_index = memory_type_index.ok_or(WindowRefusal::NoMemoryType)?;
-    if requires_dedicated && bind_offset != 0 {
+    if requires_dedicated {
         return Err(WindowRefusal::DedicatedBindingRequired);
     }
     Ok(WindowPlan {
         bind_offset,
         memory_type_index,
     })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the explicit layout validates every term returned for the imported image"
+)]
+fn plan_explicit_window(
+    layout: vk::SubresourceLayout,
+    requirements: vk::MemoryRequirements,
+    allocation_len: u64,
+    plane_offset: u64,
+    guest_row_pitch: u64,
+    pointer_memory_type_bits: u32,
+    memory_type_index: Option<u32>,
+    requires_dedicated: bool,
+) -> Result<WindowPlan, WindowRefusal> {
+    if layout.offset != plane_offset {
+        return Err(WindowRefusal::SubresourceAfterPlane);
+    }
+    if layout.row_pitch != guest_row_pitch {
+        return Err(WindowRefusal::RowPitchMismatch);
+    }
+    if requirements.alignment == 0 || requirements.size > allocation_len {
+        return Err(WindowRefusal::AllocationTooShort);
+    }
+    if requirements.memory_type_bits & pointer_memory_type_bits == 0 {
+        return Err(WindowRefusal::NoMemoryType);
+    }
+    let memory_type_index = memory_type_index.ok_or(WindowRefusal::NoMemoryType)?;
+    if requires_dedicated {
+        return Err(WindowRefusal::DedicatedBindingRequired);
+    }
+    Ok(WindowPlan {
+        bind_offset: 0,
+        memory_type_index,
+    })
+}
+
+fn required_modifier_features(usage: vk::ImageUsageFlags) -> vk::FormatFeatureFlags {
+    let mut required = vk::FormatFeatureFlags::empty();
+    if usage.contains(vk::ImageUsageFlags::SAMPLED) {
+        required |= vk::FormatFeatureFlags::SAMPLED_IMAGE;
+    }
+    if usage
+        .intersects(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::INPUT_ATTACHMENT)
+    {
+        required |= vk::FormatFeatureFlags::COLOR_ATTACHMENT
+            | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND;
+    }
+    if usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) {
+        required |= vk::FormatFeatureFlags::TRANSFER_SRC;
+    }
+    if usage.contains(vk::ImageUsageFlags::TRANSFER_DST) {
+        required |= vk::FormatFeatureFlags::TRANSFER_DST;
+    }
+    required
+}
+
+fn external_import_is_shareable(features: vk::ExternalMemoryFeatureFlags) -> bool {
+    features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+        && !features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY)
+}
+
+unsafe fn explicit_linear_supported(
+    ctx: &DeviceContext,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+) -> Result<bool, WindowRefusal> {
+    if !ctx.features.image_drm_format_modifier {
+        return Ok(false);
+    }
+    let key = (format.as_raw(), usage.as_raw());
+    if let Some(answer) = ctx
+        .explicit_linear_support
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get(&key)
+        .copied()
+    {
+        return Ok(answer);
+    }
+
+    let answer = unsafe { query_explicit_linear_support(ctx, format, usage) }?;
+    ctx.explicit_linear_support
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(key, answer);
+    Ok(answer)
+}
+
+unsafe fn query_explicit_linear_support(
+    ctx: &DeviceContext,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+) -> Result<bool, WindowRefusal> {
+    let mut modifier_list = vk::DrmFormatModifierPropertiesListEXT::default();
+    let mut properties = vk::FormatProperties2::default().push_next(&mut modifier_list);
+    unsafe {
+        ctx.instance
+            .get_physical_device_format_properties2(ctx.pd, format, &mut properties)
+    };
+    let mut modifiers = vec![
+        vk::DrmFormatModifierPropertiesEXT::default();
+        modifier_list.drm_format_modifier_count as usize
+    ];
+    let mut modifier_list = vk::DrmFormatModifierPropertiesListEXT::default()
+        .drm_format_modifier_properties(&mut modifiers);
+    let mut properties = vk::FormatProperties2::default().push_next(&mut modifier_list);
+    unsafe {
+        ctx.instance
+            .get_physical_device_format_properties2(ctx.pd, format, &mut properties)
+    };
+    let required = required_modifier_features(usage);
+    if !modifiers.iter().any(|modifier| {
+        modifier.drm_format_modifier == DRM_FORMAT_MOD_LINEAR
+            && modifier.drm_format_modifier_plane_count == 1
+            && modifier
+                .drm_format_modifier_tiling_features
+                .contains(required)
+    }) {
+        return Ok(false);
+    }
+
+    let handle = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
+    let mut modifier = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+        .drm_format_modifier(DRM_FORMAT_MOD_LINEAR)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default().handle_type(handle);
+    let info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(format)
+        .ty(vk::ImageType::TYPE_2D)
+        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+        .usage(usage)
+        .push_next(&mut modifier)
+        .push_next(&mut external);
+    let mut external_properties = vk::ExternalImageFormatProperties::default();
+    let mut properties = vk::ImageFormatProperties2::default().push_next(&mut external_properties);
+    unsafe {
+        ctx.instance
+            .get_physical_device_image_format_properties2(ctx.pd, &info, &mut properties)
+    }
+    .map_err(WindowRefusal::ModifierQuery)?;
+    Ok(external_import_is_shareable(
+        external_properties
+            .external_memory_properties
+            .external_memory_features,
+    ))
 }
 
 pub(super) struct ImportedTarget {
@@ -142,10 +310,9 @@ pub(super) unsafe fn create(
     if ctx.caps.memory.topology != MemoryTopology::Unified {
         return Err(WindowRefusal::UnsupportedTopology);
     }
-    let ext = ctx
-        .external_memory_host
-        .as_ref()
-        .ok_or(WindowRefusal::HostImportUnavailable)?;
+    if ctx.external_memory_host.is_none() {
+        return Err(WindowRefusal::HostImportUnavailable);
+    }
     let alignment = ctx.caps.host_pointer.min_alignment;
     if alignment == 0
         || !(backing.allocation_host_ptr as u64).is_multiple_of(alignment)
@@ -156,9 +323,67 @@ pub(super) unsafe fn create(
     if ctx.features.attachment_feedback_loop_layout {
         usage |= vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT;
     }
+    if unsafe { explicit_linear_supported(ctx, format, usage) }? {
+        let explicit = unsafe {
+            create_with_layout(
+                ctx,
+                backing,
+                width,
+                height,
+                format,
+                usage,
+                LayoutMode::ExplicitLinear,
+            )
+        };
+        if explicit.is_ok() {
+            return explicit;
+        }
+        // A format/modifier combination is structural, but an individual row
+        // pitch can still violate that modifier's alignment. Preserve the
+        // ordinary exact-pitch route where it happens to fit.
+        let ordinary = unsafe {
+            create_with_layout(
+                ctx,
+                backing,
+                width,
+                height,
+                format,
+                usage,
+                LayoutMode::DriverLinear,
+            )
+        };
+        return ordinary.or(explicit);
+    }
+    unsafe {
+        create_with_layout(
+            ctx,
+            backing,
+            width,
+            height,
+            format,
+            usage,
+            LayoutMode::DriverLinear,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_with_layout(
+    ctx: &DeviceContext,
+    backing: GuestTargetBacking,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+    mode: LayoutMode,
+) -> Result<ImportedTarget, WindowRefusal> {
+    let ext = ctx
+        .external_memory_host
+        .as_ref()
+        .ok_or(WindowRefusal::HostImportUnavailable)?;
     let handle = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
     let mut external = vk::ExternalMemoryImageCreateInfo::default().handle_types(handle);
-    let create = vk::ImageCreateInfo::default()
+    let base = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
         .format(format)
         .extent(vk::Extent3D {
@@ -169,12 +394,34 @@ pub(super) unsafe fn create(
         .mip_levels(1)
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
-        .tiling(vk::ImageTiling::LINEAR)
         .usage(usage)
-        .initial_layout(vk::ImageLayout::PREINITIALIZED)
-        .push_next(&mut external);
-    let image =
-        unsafe { ctx.device.create_image(&create, None) }.map_err(WindowRefusal::CreateImage)?;
+        .initial_layout(vk::ImageLayout::PREINITIALIZED);
+    let image = match mode {
+        LayoutMode::DriverLinear => {
+            let create = base
+                .tiling(vk::ImageTiling::LINEAR)
+                .push_next(&mut external);
+            unsafe { ctx.device.create_image(&create, None) }
+        }
+        LayoutMode::ExplicitLinear => {
+            let plane_layout = [vk::SubresourceLayout {
+                offset: backing.plane_offset,
+                size: 0,
+                row_pitch: backing.row_pitch,
+                array_pitch: 0,
+                depth_pitch: 0,
+            }];
+            let mut explicit = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+                .drm_format_modifier(DRM_FORMAT_MOD_LINEAR)
+                .plane_layouts(&plane_layout);
+            let create = base
+                .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+                .push_next(&mut external)
+                .push_next(&mut explicit);
+            unsafe { ctx.device.create_image(&create, None) }
+        }
+    }
+    .map_err(WindowRefusal::CreateImage)?;
 
     let result = (|| {
         let mut dedicated = vk::MemoryDedicatedRequirements::default();
@@ -188,7 +435,11 @@ pub(super) unsafe fn create(
             ctx.device.get_image_subresource_layout(
                 image,
                 vk::ImageSubresource {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    // Modifier images describe memory planes, not format
+                    // aspects. A single-plane linear modifier therefore has
+                    // exactly MEMORY_PLANE_0_EXT; ordinary linear images keep
+                    // the colour aspect query.
+                    aspect_mask: subresource_aspect(mode),
                     mip_level: 0,
                     array_layer: 0,
                 },
@@ -214,16 +465,28 @@ pub(super) unsafe fn create(
             &ctx.caps
                 .memory_request(crate::backend::vulkan::caps::MemoryClass::Upload),
         );
-        let plan = plan_window(
-            layout,
-            requirements.memory_requirements,
-            backing.allocation_len,
-            backing.plane_offset,
-            backing.row_pitch,
-            pointer.memory_type_bits,
-            picked.map(|pick| pick.index),
-            dedicated.requires_dedicated_allocation != 0,
-        )?;
+        let plan = match mode {
+            LayoutMode::DriverLinear => plan_window(
+                layout,
+                requirements.memory_requirements,
+                backing.allocation_len,
+                backing.plane_offset,
+                backing.row_pitch,
+                pointer.memory_type_bits,
+                picked.map(|pick| pick.index),
+                dedicated.requires_dedicated_allocation != 0,
+            ),
+            LayoutMode::ExplicitLinear => plan_explicit_window(
+                layout,
+                requirements.memory_requirements,
+                backing.allocation_len,
+                backing.plane_offset,
+                backing.row_pitch,
+                pointer.memory_type_bits,
+                picked.map(|pick| pick.index),
+                dedicated.requires_dedicated_allocation != 0,
+            ),
+        }?;
         let mut host_import = vk::ImportMemoryHostPointerInfoEXT::default()
             .handle_type(handle)
             .host_pointer(backing.allocation_host_ptr as *mut std::ffi::c_void);
@@ -449,17 +712,91 @@ mod tests {
             Err(WindowRefusal::NoMemoryType)
         );
         assert_eq!(
-            plan_window(
-                layout(0, 256),
+            plan_window(layout(0, 256), req, 16384, 4096, 256, 0b010, Some(1), true,),
+            Err(WindowRefusal::DedicatedBindingRequired)
+        );
+    }
+
+    #[test]
+    fn explicit_layout_binds_the_import_at_zero() {
+        assert_eq!(
+            plan_explicit_window(
+                layout(4096, 7040),
+                requirements(8 << 20, 4096, 0b110),
+                12 << 20,
+                4096,
+                7040,
+                0b010,
+                Some(1),
+                false,
+            ),
+            Ok(WindowPlan {
+                bind_offset: 0,
+                memory_type_index: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_layout_must_be_returned_exactly() {
+        let req = requirements(8192, 4096, 0b010);
+        assert_eq!(
+            plan_explicit_window(layout(0, 256), req, 16384, 4096, 256, 0b010, Some(1), false,),
+            Err(WindowRefusal::SubresourceAfterPlane)
+        );
+        assert_eq!(
+            plan_explicit_window(
+                layout(4096, 512),
                 req,
                 16384,
                 4096,
                 256,
                 0b010,
                 Some(1),
-                true,
+                false,
             ),
-            Err(WindowRefusal::DedicatedBindingRequired)
+            Err(WindowRefusal::RowPitchMismatch)
         );
+    }
+
+    #[test]
+    fn modifier_features_follow_the_declared_usage() {
+        let features = required_modifier_features(
+            vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
+        );
+        assert!(features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE));
+        assert!(features.contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT));
+        assert!(features.contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND));
+        assert!(features.contains(vk::FormatFeatureFlags::TRANSFER_SRC));
+        assert!(features.contains(vk::FormatFeatureFlags::TRANSFER_DST));
+    }
+
+    #[test]
+    fn explicit_layout_queries_the_memory_plane() {
+        assert_eq!(
+            subresource_aspect(LayoutMode::DriverLinear),
+            vk::ImageAspectFlags::COLOR
+        );
+        assert_eq!(
+            subresource_aspect(LayoutMode::ExplicitLinear),
+            vk::ImageAspectFlags::MEMORY_PLANE_0_EXT
+        );
+    }
+
+    #[test]
+    fn explicit_import_requires_a_non_dedicated_importable_image() {
+        assert!(external_import_is_shareable(
+            vk::ExternalMemoryFeatureFlags::IMPORTABLE
+        ));
+        assert!(!external_import_is_shareable(
+            vk::ExternalMemoryFeatureFlags::empty()
+        ));
+        assert!(!external_import_is_shareable(
+            vk::ExternalMemoryFeatureFlags::IMPORTABLE
+                | vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY
+        ));
     }
 }

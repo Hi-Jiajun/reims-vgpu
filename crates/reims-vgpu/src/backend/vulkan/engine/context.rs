@@ -3,8 +3,10 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use ash::vk;
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use super::counters::EngineCounters;
 use super::device_lost::DeviceLostDecline;
@@ -516,6 +518,10 @@ pub(crate) struct DeviceContext {
     /// this rather than re-querying: a feature asked about in two places is a
     /// feature that will eventually be enabled in one of them.
     pub features: crate::backend::vulkan::caps::device_features::DeviceFeatures,
+    /// Per-format/usage answers for explicit linear external-image layout.
+    /// Physical-device support is immutable, while target identities churn, so
+    /// the query belongs to the device lifetime rather than each image lifetime.
+    pub explicit_linear_support: Mutex<HashMap<(i32, u32), bool>>,
     /// Combined depth-stencil format supported for DEPTH_STENCIL_ATTACHMENT on
     /// this device (D32_SFLOAT_S8_UINT preferred, D24_UNORM_S8_UINT fallback).
     /// Used only by the stencil-test path; depth-only uses D32_SFLOAT.
@@ -1167,6 +1173,7 @@ impl DeviceContext {
             max_sampler_anisotropy: features.max_sampler_anisotropy,
             sampler_anisotropy: features.sampler_anisotropy,
             features,
+            explicit_linear_support: Mutex::new(HashMap::new()),
             depth_stencil_format,
             timestamps,
             draw_spans,
