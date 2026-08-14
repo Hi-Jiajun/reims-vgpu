@@ -1391,6 +1391,23 @@ pub fn write_completion_stamp(
     Ok(())
 }
 
+/// Let every older completion on `index` publish before a CPU fallback writes
+/// a newer value into that FIFO's shared stamp slot.
+pub fn quiesce_completion_stamps(index: u32) {
+    if !stamp_completion::fifo_has_pending_stamp(index) {
+        return;
+    }
+    let guard = lock_engine();
+    if let Some(completion) = guard
+        .owner
+        .ctx
+        .as_ref()
+        .and_then(|ctx| ctx.stamp_completion.as_ref())
+    {
+        completion.wait_for_fifo_idle(index);
+    }
+}
+
 pub fn quiesce_guest_reads() {
     let mut guard = lock_engine();
     let EngineState {

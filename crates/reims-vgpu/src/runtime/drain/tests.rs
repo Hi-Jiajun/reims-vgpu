@@ -1,4 +1,15 @@
 use super::*;
+
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_cpu_only_stamp_queues_behind_an_older_completion_on_its_fifo() {
+    assert!(!stamp_needs_gpu_ordering(false, false));
+    assert!(stamp_needs_gpu_ordering(true, false));
+    assert!(
+        stamp_needs_gpu_ordering(false, true),
+        "publishing a CPU-only stamp ahead of an older GPU completion would move the slot backward"
+    );
+}
 use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86, PAGE_SIZE_ARM64E};
 
 /// I2's carve-out, asserted rather than trusted: a partial packet is the

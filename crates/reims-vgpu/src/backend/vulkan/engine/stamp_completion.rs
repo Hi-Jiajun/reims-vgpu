@@ -52,8 +52,31 @@
 //! the blocking rail every host used before this existed.
 
 use ash::vk;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+
+/// Pending completions owned by one FIFO before its producer must wait.
+///
+/// This is the FIFO contract's queue depth, not a tuning knob. Keeping the
+/// bound per FIFO matters: pressure on one channel must not consume another
+/// channel's completion capacity.
+const FIFO_PENDING_STAMP_CAPACITY: usize = 32;
+
+/// FIFOs with at least one completion whose word has not yet been published.
+///
+/// The drain worker needs this before taking the engine lock: a CPU-only stamp
+/// still has to join the completion queue when an older stamp for the same FIFO
+/// is pending, or it can publish ahead and the older completion later moves the
+/// guest's fence backwards. There is one process-global engine and one
+/// completion worker, so this is the lock-free projection of that worker's
+/// per-FIFO counts.
+static PENDING_FIFO_MASK: AtomicU32 = AtomicU32::new(0);
+
+const _: () = assert!(crate::model::MAX_CHANNELS <= u32::BITS as usize);
+
+pub(crate) fn fifo_has_pending_stamp(index: u32) -> bool {
+    index < u32::BITS && PENDING_FIFO_MASK.load(Ordering::Acquire) & (1u32 << index) != 0
+}
 
 /// Raise the guest-visible interrupt for a completed stamp slot.
 ///
@@ -118,9 +141,36 @@ struct Waiting {
     stamp: u32,
 }
 
+#[derive(Default)]
+struct PendingQueue {
+    waiting: std::collections::VecDeque<Waiting>,
+    per_fifo: [usize; crate::model::MAX_CHANNELS],
+}
+
+impl PendingQueue {
+    fn is_full(&self, index: usize) -> bool {
+        self.per_fifo[index] == FIFO_PENDING_STAMP_CAPACITY
+    }
+
+    fn push(&mut self, waiting: Waiting) {
+        self.per_fifo[waiting.index as usize] += 1;
+        self.waiting.push_back(waiting);
+    }
+
+    fn pop_front(&mut self) -> Option<Waiting> {
+        let waiting = self.waiting.pop_front()?;
+        self.per_fifo[waiting.index as usize] -= 1;
+        Some(waiting)
+    }
+
+    fn has_pending(&self, index: usize) -> bool {
+        self.per_fifo[index] != 0
+    }
+}
+
 /// The queue the drain worker pushes to and the completion thread drains.
 struct Shared {
-    queue: Mutex<std::collections::VecDeque<Waiting>>,
+    queue: Mutex<PendingQueue>,
     /// Woken by a push and by shutdown. The thread waits here only when the
     /// queue is empty; otherwise it is blocked in `vkWaitSemaphores`, which is
     /// where it should be.
@@ -161,7 +211,7 @@ impl StampCompletion {
         let ci = vk::SemaphoreCreateInfo::default().push_next(&mut type_info);
         let semaphore = unsafe { device.create_semaphore(&ci, None) }?;
         let shared = Arc::new(Shared {
-            queue: Mutex::new(std::collections::VecDeque::new()),
+            queue: Mutex::new(PendingQueue::default()),
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
             next_value: AtomicU64::new(0),
@@ -210,17 +260,56 @@ impl StampCompletion {
         word: crate::runtime::guest_ram::GuestRef,
         stamp: u32,
     ) {
-        self.shared
-            .queue
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push_back(Waiting {
-                timeline,
-                index,
-                word,
-                stamp,
-            });
+        let Some(slot) = ((index as usize) < crate::model::MAX_CHANNELS).then_some(index as usize)
+        else {
+            crate::observe::fail(format!(
+                "stamp_fifo_out_of_range reason=stamp_fifo_out_of_range index={index} \
+                 max_channels={}",
+                crate::model::MAX_CHANNELS
+            ));
+            return;
+        };
+        let mut queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        while queue.is_full(slot) && !self.shared.stop.load(Ordering::Acquire) {
+            queue = self
+                .shared
+                .wake
+                .wait(queue)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        if self.shared.stop.load(Ordering::Acquire) {
+            return;
+        }
+        queue.push(Waiting {
+            timeline,
+            index,
+            word,
+            stamp,
+        });
+        PENDING_FIFO_MASK.fetch_or(1u32 << index, Ordering::Release);
+        drop(queue);
         self.shared.wake.notify_one();
+    }
+
+    /// Wait until this FIFO has no queued completion word left to publish.
+    ///
+    /// Used only before the CPU fallback writes a newer value. GPU work may
+    /// already be settled while its completion worker has not yet stored the
+    /// older word; waiting on the GPU alone would still permit that older store
+    /// to land after the fallback and move the guest's fence backwards.
+    pub(crate) fn wait_for_fifo_idle(&self, index: u32) {
+        let Some(slot) = ((index as usize) < crate::model::MAX_CHANNELS).then_some(index as usize)
+        else {
+            return;
+        };
+        let mut queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        while queue.has_pending(slot) && !self.shared.stop.load(Ordering::Acquire) {
+            queue = self
+                .shared
+                .wake
+                .wait(queue)
+                .unwrap_or_else(|e| e.into_inner());
+        }
     }
 
     /// Stop the thread and destroy the semaphore.
@@ -247,6 +336,7 @@ impl StampCompletion {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
+        PENDING_FIFO_MASK.store(0, Ordering::Release);
         unsafe { device.destroy_semaphore(self.semaphore, None) };
     }
 }
@@ -264,7 +354,7 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
                 if shared.stop.load(Ordering::Acquire) {
                     return;
                 }
-                if let Some(front) = queue.front().cloned() {
+                if let Some(front) = queue.waiting.front().cloned() {
                     break Some(front);
                 }
                 let (guard, _) = shared
@@ -326,11 +416,15 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
                 waiting.index, waiting.stamp
             ));
         }
-        shared
-            .queue
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop_front();
+        {
+            let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            queue.pop_front();
+            let slot = waiting.index as usize;
+            if !queue.has_pending(slot) {
+                PENDING_FIFO_MASK.fetch_and(!(1u32 << waiting.index), Ordering::Release);
+            }
+        }
+        shared.wake.notify_all();
         announce(waiting.index);
         if stopping {
             return;
@@ -350,12 +444,55 @@ fn publish_stamp_word(waiting: &Waiting) -> bool {
 mod tests {
     use super::*;
 
+    fn waiting(index: u32, stamp: u32) -> Waiting {
+        let mut word = Box::new(0u32);
+        let import = Arc::new(
+            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                (&mut *word) as *mut u32 as usize,
+                std::mem::size_of::<u32>() as u64,
+                std::mem::align_of::<u32>() as u64,
+            )
+            .expect("test import"),
+        );
+        // The import deliberately owns no allocation. Leak this one-word test
+        // backing so every queued GuestRef remains valid for the test's life.
+        Box::leak(word);
+        let slice = import.slice(0, 4).expect("stamp word");
+        Waiting {
+            timeline: u64::from(stamp) + 1,
+            index,
+            word: crate::runtime::guest_ram::GuestRef::new(import, slice).expect("guest word"),
+            stamp,
+        }
+    }
+
+    #[test]
+    fn pending_capacity_is_per_fifo_and_fifo_order_is_preserved() {
+        let mut queue = PendingQueue::default();
+        for stamp in 0..FIFO_PENDING_STAMP_CAPACITY as u32 {
+            queue.push(waiting(0, stamp));
+        }
+        assert!(queue.is_full(0));
+        assert!(!queue.is_full(1));
+        queue.push(waiting(1, 0xfeed));
+
+        for stamp in 0..FIFO_PENDING_STAMP_CAPACITY as u32 {
+            let entry = queue.pop_front().expect("root completion");
+            assert_eq!((entry.index, entry.stamp), (0, stamp));
+        }
+        assert!(!queue.has_pending(0));
+        assert!(queue.has_pending(1));
+        let child = queue.pop_front().expect("child completion");
+        assert_eq!((child.index, child.stamp), (1, 0xfeed));
+        assert!(!queue.has_pending(1));
+    }
+
     /// Reservation order is submission order, and only successful submissions
     /// become attachable completion points.
     #[test]
     fn reservations_are_monotonic_and_success_is_published_separately() {
         let shared = Shared {
-            queue: Mutex::new(std::collections::VecDeque::new()),
+            queue: Mutex::new(PendingQueue::default()),
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
             next_value: AtomicU64::new(0),
