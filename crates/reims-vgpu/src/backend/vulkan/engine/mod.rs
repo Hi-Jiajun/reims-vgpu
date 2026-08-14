@@ -1523,8 +1523,28 @@ pub fn resident_presentable(identity: &TargetIdentity, width: u32, height: u32) 
         .is_some_and(|slot| pools::slot_presentable(slot, width, height))
 }
 
-/// Why this present cannot come from a resident, as a census route name, or
-/// `None` when it can.
+fn resident_present_decision(
+    pools: &ResourcePools,
+    identity: &TargetIdentity,
+    width: u32,
+    height: u32,
+) -> Result<(), &'static str> {
+    let Some(slot) = pools.registry_get(identity) else {
+        return Err("winpub_no_resident");
+    };
+    match pools::slot_present_decline(slot, width, height) {
+        None => Ok(()),
+        Some(pools::ResidentPresentDecline::ContentNotReady) => {
+            Err("winpub_content_not_ready")
+        }
+        Some(pools::ResidentPresentDecline::ScanoutOrder) => Err("winpub_scanout_order"),
+        Some(pools::ResidentPresentDecline::Geometry) => Err("winpub_geometry"),
+    }
+}
+
+/// Maintain the resident working set for one published frame and decide
+/// whether that frame can be presented directly, returning the exact fallback
+/// route when it cannot.
 ///
 /// The direct present is the point of owning the window on the engine's own
 /// device: the fallback copies the whole framebuffer through host memory every
@@ -1532,21 +1552,29 @@ pub fn resident_presentable(identity: &TargetIdentity, width: u32, height: u32) 
 /// `bool` here and the caller fell through without naming any of them, so a boot
 /// reading `direct_frac=0.00` in every census window — against a documented
 /// expectation of `1.00` — said only that it had stopped, never why.
-pub fn resident_present_decline_route(
+///
+/// The displayed identity is refreshed by the maintenance operation before it
+/// selects reclaim victims. Returning the present decision from the same
+/// transaction keeps that one resource lifecycle atomic and avoids entering
+/// the engine separately to touch, maintain, test, and then diagnose it.
+pub fn prepare_window_resident_present(
     identity: &TargetIdentity,
     width: u32,
     height: u32,
-) -> Option<&'static str> {
-    let guard = lock_engine();
-    let Some(slot) = guard.pools.registry_get(identity) else {
-        return Some("winpub_no_resident");
-    };
-    match pools::slot_present_decline(slot, width, height) {
-        None => None,
-        Some(pools::ResidentPresentDecline::ContentNotReady) => Some("winpub_content_not_ready"),
-        Some(pools::ResidentPresentDecline::ScanoutOrder) => Some("winpub_scanout_order"),
-        Some(pools::ResidentPresentDecline::Geometry) => Some("winpub_geometry"),
+) -> Result<(), &'static str> {
+    let now_ms = crate::observe::elapsed_ms() as u64;
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ..
+    } = &mut *guard;
+    if let Some(ctx) = owner.ctx.as_ref() {
+        unsafe {
+            pools.advance_registry_touch_and_drain(ctx, now_ms, Some(identity));
+        }
     }
+    resident_present_decision(pools, identity, width, height)
 }
 
 /// What storage owns a ready resident's pixels.
@@ -1894,17 +1922,6 @@ pub fn pin_resident_target(identity: &TargetIdentity) -> bool {
 pub fn unpin_resident_target(identity: &TargetIdentity) {
     let mut guard = lock_engine();
     let _ = guard.pools.pin_resident_target(identity, false);
-}
-
-/// Refresh a resident target's idle-drain timestamp without doing GPU work.
-/// The present publish uses this so the displayed resident is not
-/// reclaimed underneath the window on a present that does no draw.
-pub fn touch_resident_target(identity: Option<&TargetIdentity>, now_ms: u64) {
-    let Some(identity) = identity else {
-        return;
-    };
-    let mut guard = lock_engine();
-    guard.pools.registry_touch_at(identity, now_ms);
 }
 
 /// Which engine entry point's initialization prologue refused, for the

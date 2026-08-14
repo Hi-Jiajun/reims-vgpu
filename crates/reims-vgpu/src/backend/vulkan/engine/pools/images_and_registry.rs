@@ -2231,10 +2231,9 @@ impl ResourcePools {
             Self::high_water(self.registry_sole_copy_peak, self.registry_sole_copy);
     }
 
-    /// Refresh a resident's idle-drain timestamp to at least `now_ms`. Used by
-    /// host-window direct present before the export attempt so offscreen
-    /// compositor peers needed for route-B tile compositing do not age out while
-    /// the displayed member remains active.
+    /// Test seam for advancing one resident's idle age without running the
+    /// device-touching reclaim operation.
+    #[cfg(test)]
     pub(crate) fn registry_touch_at(&mut self, identity: &TargetIdentity, now_ms: u64) {
         if now_ms > self.idle_clock_ms {
             self.idle_clock_ms = now_ms;
