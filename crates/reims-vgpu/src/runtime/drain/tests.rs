@@ -2,13 +2,12 @@ use super::*;
 
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn a_cpu_only_stamp_queues_behind_an_older_completion_on_its_fifo() {
-    assert!(!stamp_needs_gpu_ordering(false, false));
-    assert!(stamp_needs_gpu_ordering(true, false));
-    assert!(
-        stamp_needs_gpu_ordering(false, true),
-        "publishing a CPU-only stamp ahead of an older GPU completion would move the slot backward"
-    );
+fn a_cpu_only_stamp_publishes_now_unless_its_fifo_has_an_older_completion() {
+    assert_eq!(StampOrder::from_debt(false, false), StampOrder::CpuReady);
+    assert_eq!(StampOrder::from_debt(true, false), StampOrder::Queued);
+    assert_eq!(StampOrder::from_debt(false, true), StampOrder::Queued);
+    assert!(!StampOrder::CpuReady.needs_blocking_fallback());
+    assert!(StampOrder::Declined.needs_blocking_fallback());
 }
 use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86, PAGE_SIZE_ARM64E};
 
@@ -631,8 +630,14 @@ fn replace_physical_retires_only_the_named_resource() {
         guest_write: Default::default(),
         seq: 0,
     };
-    assert_eq!(state.pending_writebacks.arm_gva(key(12), debt(0x4000, 1)), None);
-    assert_eq!(state.pending_writebacks.arm_gva(key(13), debt(0x8000, 2)), None);
+    assert_eq!(
+        state.pending_writebacks.arm_gva(key(12), debt(0x4000, 1)),
+        None
+    );
+    assert_eq!(
+        state.pending_writebacks.arm_gva(key(13), debt(0x8000, 2)),
+        None
+    );
 
     let mut payload = vec![0u8; 8];
     payload[0..4].copy_from_slice(&3u32.to_le_bytes());

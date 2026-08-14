@@ -479,14 +479,13 @@
 //! 1 556 — a factor of six rather than forty-three, and still worth 45 % of the
 //! per-draw cost. See [`crate::runtime::writeback_debt`].
 //!
-//! **That factor is only available if the three stamp sites do not land parked
+//! **That factor is only available if the two fallback stamp sites do not land parked
 //! plans**, and it is a contract statement rather than a shortcut. A completion
 //! stamp says a submission finished; it does not say the guest may read the
-//! resource. [`SettleSite::CompletionStamp`], [`SettleSite::RootStamp`] and
-//! [`SettleSite::ChildStamp`] are the three that fire at that cadence, and a
-//! settle from any of them still has to wait what is already *submitted* — it
-//! simply must not turn a parked plan into a submission. Every other variant is a
-//! host toucher of guest bytes and lands everything parked before it reads.
+//! resource. [`SettleSite::CompletionStamp`] and [`SettleSite::RootStamp`] are
+//! fallback waits for a completion the asynchronous rail could not carry; they
+//! still must not turn a parked plan into a submission. Every other variant is
+//! a host toucher of guest bytes and lands everything parked before it reads.
 //!
 //! `engine::write_completion_stamp` needs no change for this: it orders
 //! the stamp word behind outstanding copies with a GPU barrier in the same queue
@@ -682,8 +681,6 @@ settle_sites! {
     CompletionStamp => "settle_completion_stamp",
     /// `drain::drain_main_fifo` — the root packet's completion stamp.
     RootStamp => "settle_root_stamp",
-    /// `drain::process_child_packet` — a child packet's completion stamp.
-    ChildStamp => "settle_child_stamp",
     /// `mapping_write::write_bgra8_inner` — the copying type-11 Store.
     MappingBgra8Write => "settle_mapping_bgra8_write",
     /// `mapping_write::write_rgba8_image_changed`.

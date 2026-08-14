@@ -32,7 +32,7 @@
 //! integer collides with an unrelated mapping id.
 //!
 //! A named synchronize pays only its object list through
-//! [`settle_for_resources`]. Readers that know a mapping or texture call
+//! [`submit_for_resources`]. Readers that know a mapping or texture call
 //! [`pay_for_mapping`] or [`pay_for_texture`]. Only a genuinely unnameable
 //! aliasing reader uses [`pay_all`]. Completion stamps alone do not publish
 //! resources.
@@ -865,20 +865,23 @@ pub fn settle_unnamed<M: HostMemory + HostOps>(
     crate::runtime::render_writeback::settle_guest_writes(site);
 }
 
-/// Publish exactly the resources named by a synchronize command, then wait for
-/// those transfers. The object list is the scope of the API operation; an
-/// unrelated host-valid texture remains resident-authoritative.
-pub fn settle_for_resources<M: HostMemory + HostOps>(
+/// Submit exactly the resources named by an asynchronous synchronize command.
+///
+/// The object list is the scope of the API operation; an unrelated host-valid
+/// texture remains resident-authoritative. Completion belongs to the FIFO: the
+/// transfers recorded here precede that packet's queue point, and its pending
+/// stamp publishes only after that point completes. Waiting here would turn the
+/// asynchronous command into a device-wide drain and then make the stamp wait a
+/// second time for work already known complete.
+pub fn submit_for_resources<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     object_ids: &[u32],
-    site: crate::runtime::render_writeback::SettleSite,
 ) {
     for &object_id in object_ids {
         pay_for_texture(state, host, task_id, object_id);
     }
-    crate::runtime::render_writeback::settle_guest_writes(site);
 }
 
 /// [`settle_for_mapping`] over
@@ -1333,18 +1336,12 @@ mod tests {
     /// A synchronize list is a scope, not merely a trigger. Publishing one
     /// object must leave an unrelated resource host-authoritative.
     #[test]
-    fn resource_synchronization_pays_only_named_objects() {
+    fn asynchronous_resource_synchronization_submits_only_named_objects() {
         let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
         let mut host = crate::runtime::FakeHost::new();
         assert_eq!(state.pending_writebacks.arm(7, 64, 64, 1), None);
         assert_eq!(state.pending_writebacks.arm(8, 64, 64, 1), None);
-        settle_for_resources(
-            &mut state,
-            &mut host,
-            1,
-            &[7],
-            crate::runtime::render_writeback::SettleSite::ChildStamp,
-        );
+        submit_for_resources(&mut state, &mut host, 1, &[7]);
         assert!(state.pending_writebacks.get(7).is_none());
         assert!(state.pending_writebacks.get(8).is_some());
     }

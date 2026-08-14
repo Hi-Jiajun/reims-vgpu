@@ -1557,31 +1557,64 @@ fn note_stamp_direction<H: HostMemory + HostOps>(host: &H, gpa: u64, index: u32,
 /// Queue this stamp behind the FIFO completion point of the guest-memory work
 /// it follows, so the drain worker never blocks on that work.
 ///
-/// `false` means the caller still owes the stamp and must settle it the blocking
-/// way. Four things answer `false`, and only the last is a fault: the operator
-/// narrowed the rail with `REIMS_VGPU_GPU_STAMP=off`; neither preceding work nor
-/// an older completion on this FIFO needs ordering; the stamp page would not
-/// resolve to imported guest RAM; or the engine declined, which it reports
-/// itself.
+/// [`StampOrder::CpuReady`] means the caller may publish immediately;
+/// [`StampOrder::Declined`] means it must settle through the blocking fallback.
+/// Keeping those answers distinct is load-bearing: another thread may arm an
+/// unrelated guest write after this function observes no preceding work, and a
+/// fallback that re-reads the global debt would incorrectly wait for that later
+/// work before completing this FIFO.
 ///
 /// The word is four bytes inside one page, so the contiguity rule
 /// `reference_for_pages` enforces is satisfied by construction — but it is asked
 /// rather than assumed, because a stamp page outside an imported RAMBlock is
 /// exactly the case that must fall back rather than be written blind.
 #[cfg(feature = "backend-vulkan")]
-fn stamp_needs_gpu_ordering(guest_access: bool, fifo_pending: bool) -> bool {
-    guest_access || fifo_pending
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StampOrder {
+    CpuReady,
+    Queued,
+    Declined,
 }
 
 #[cfg(feature = "backend-vulkan")]
-fn stamp_word_ordered_on_fifo<H: HostMemory + HostOps>(
+impl StampOrder {
+    fn from_debt(guest_access: bool, fifo_pending: bool) -> Self {
+        if guest_access || fifo_pending {
+            Self::Queued
+        } else {
+            Self::CpuReady
+        }
+    }
+
+    fn needs_blocking_fallback(self) -> bool {
+        self == Self::Declined
+    }
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn note_stamp_guest_ref_refusal(refusal: &crate::runtime::guest_ram_map::MapRefusal) {
+    use crate::runtime::guest_ram_map::MapRefusal;
+    let route = match refusal {
+        MapRefusal::NoBackendImport => "stamp_guest_ref_no_backend_import",
+        MapRefusal::HostRefused(_) => "stamp_guest_ref_host_refused",
+        MapRefusal::NoUsableRegion { .. } => "stamp_guest_ref_no_usable_region",
+        MapRefusal::ImportExceedsHeap { .. } => "stamp_guest_ref_import_exceeds_heap",
+        MapRefusal::GpaNotInAnyImport { .. } => "stamp_guest_ref_gpa_not_imported",
+        MapRefusal::OutsideImport(_) => "stamp_guest_ref_outside_import",
+        MapRefusal::Scattered { .. } => "stamp_guest_ref_scattered",
+    };
+    note_store_route(route);
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn stamp_word_order_on_fifo<H: HostMemory + HostOps>(
     state: &DeviceState,
     host: &mut H,
     index: u32,
     value: u32,
-) -> bool {
+) -> StampOrder {
     if crate::env::switch(crate::env::GPU_STAMP) == crate::env::Switch::Off {
-        return false;
+        return StampOrder::Declined;
     }
     // A CPU-only packet normally has nothing queued behind it. It must still
     // join an older pending completion on this same FIFO: publishing it now
@@ -1591,31 +1624,49 @@ fn stamp_word_ordered_on_fifo<H: HostMemory + HostOps>(
     let guest_access = crate::backend::vulkan::engine::guest_access_outstanding();
     let fifo_pending =
         crate::backend::vulkan::engine::stamp_completion::fifo_has_pending_stamp(index);
-    if !stamp_needs_gpu_ordering(guest_access, fifo_pending) {
-        return false;
+    if StampOrder::from_debt(guest_access, fifo_pending) == StampOrder::CpuReady {
+        return StampOrder::CpuReady;
     }
     let page_size = state.page_size();
     let Some(off) = stamp_slot_offset(index, page_size) else {
-        return false;
+        return StampOrder::Declined;
     };
     let gpa = state.pfn_gpa(state.gfx.fifo_base_page) + off;
     let page = gpa & !(page_size - 1);
     let in_page = gpa - page;
-    let Ok(guest_ref) =
-        crate::runtime::guest_ram_map::reference_for_pages(host, &[page], page_size, in_page, 4)
-    else {
-        return false;
+    let guest_ref = match crate::runtime::guest_ram_map::reference_for_pages(
+        host,
+        &[page],
+        page_size,
+        in_page,
+        4,
+    ) {
+        Ok(guest_ref) => guest_ref,
+        Err(refusal) => {
+            note_stamp_guest_ref_refusal(&refusal);
+            return StampOrder::Declined;
+        }
     };
     // The direction check the CPU rail gets from `note_stamp_direction`. Taken
     // before enqueueing because the completion thread owns the next write and
     // reading the word afterward says nothing about what this device promised.
     note_stamp_direction(host, gpa, index, value);
     let queued =
-        crate::backend::vulkan::engine::write_completion_stamp(&guest_ref, index, value).is_ok();
+        match crate::backend::vulkan::engine::write_completion_stamp(&guest_ref, index, value) {
+            Ok(()) => true,
+            Err(_) => {
+                note_store_route("stamp_gpu_engine_declined");
+                false
+            }
+        };
     if queued && !guest_access {
         note_store_route("stamp_pending_fifo_chained");
     }
-    queued
+    if queued {
+        StampOrder::Queued
+    } else {
+        StampOrder::Declined
+    }
 }
 
 /// Write stamp value to FIFO base page slot and set status bit.
@@ -1655,32 +1706,32 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     // `backend::vulkan::engine::stamp_completion` for the measurement that says
     // it cannot be deferred to anything slower.
     #[cfg(feature = "backend-vulkan")]
-    if stamp_word_ordered_on_fifo(state, host, index, stamp_value) {
-        // Advanced at submit, not at completion. From here the guest may see the
-        // word at any moment, so a window still armed has already outlived this
-        // fence — which is what `armed_stamp_seq` is compared against, and
-        // dating it from the completion would call that window punctual.
-        state.completion_stamp_seq = state.completion_stamp_seq.wrapping_add(1);
-        return;
+    {
+        let order = stamp_word_order_on_fifo(state, host, index, stamp_value);
+        if order == StampOrder::Queued {
+            // Advanced at submit, not at completion. From here the guest may see the
+            // word at any moment, so a window still armed has already outlived this
+            // fence — which is what `armed_stamp_seq` is compared against, and
+            // dating it from the completion would call that window punctual.
+            state.completion_stamp_seq = state.completion_stamp_seq.wrapping_add(1);
+            return;
+        }
+        if order.needs_blocking_fallback() {
+            crate::backend::vulkan::engine::quiesce_completion_stamps(index);
+            // The asynchronous route was required but could not carry the
+            // completion. Only this answer may re-read global debt: CpuReady
+            // already proved the packet had nothing preceding it, and work
+            // another thread arms afterward belongs after this stamp.
+            crate::runtime::render_writeback::settle_guest_writes(
+                crate::runtime::render_writeback::SettleSite::CompletionStamp,
+            );
+            crate::backend::vulkan::engine::quiesce_guest_reads();
+        }
     }
-    #[cfg(feature = "backend-vulkan")]
-    crate::backend::vulkan::engine::quiesce_completion_stamps(index);
-    // The flush above submits its copies without waiting for them, so "owed" is
-    // not yet "landed" until this returns. One settle for every window the pass
-    // issued, taken after all of them are on the queue, rather than one blocking
-    // fence per window taken between them.
+    #[cfg(not(feature = "backend-vulkan"))]
     crate::runtime::render_writeback::settle_guest_writes(
         crate::runtime::render_writeback::SettleSite::CompletionStamp,
     );
-    // And the other half of that sentence: everything this device is still
-    // *reading* out of guest RAM has to be done reading. A draw that binds guest
-    // pages through the imported RAMBlock reads them when its command buffer
-    // executes, and this stamp is what tells the guest those pages are free to
-    // repaint. The owed-writes flush above cannot stand in for it — it settles
-    // residents into guest memory and knows nothing about what a submission
-    // still sources.
-    #[cfg(feature = "backend-vulkan")]
-    crate::backend::vulkan::engine::quiesce_guest_reads();
     let Some(off) = stamp_slot_offset(index, state.page_size()) else {
         return;
     };
@@ -2421,21 +2472,30 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                         // order, while `completed` stays false so this drain does
                         // not announce an unfinished root stamp.
                         #[cfg(feature = "backend-vulkan")]
-                        if stamp_word_ordered_on_fifo(state, host, 0, packet.completion_stamp) {
-                            note_store_route("root_stamp_ordered_gpu");
-                            state.completion_stamp_seq = state.completion_stamp_seq.wrapping_add(1);
-                            continue;
+                        {
+                            let order =
+                                stamp_word_order_on_fifo(state, host, 0, packet.completion_stamp);
+                            if order == StampOrder::Queued {
+                                note_store_route("root_stamp_ordered_gpu");
+                                state.completion_stamp_seq =
+                                    state.completion_stamp_seq.wrapping_add(1);
+                                continue;
+                            }
+                            if order.needs_blocking_fallback() {
+                                // A declined asynchronous route still owes both
+                                // guest reads and writes before the CPU publishes
+                                // the word, and must let an older root word land.
+                                crate::backend::vulkan::engine::quiesce_completion_stamps(0);
+                                crate::runtime::render_writeback::settle_guest_writes(
+                                    crate::runtime::render_writeback::SettleSite::RootStamp,
+                                );
+                                crate::backend::vulkan::engine::quiesce_guest_reads();
+                            }
                         }
-                        // A declined asynchronous route still owes both guest
-                        // reads and writes before the CPU publishes the word,
-                        // and must let any older queued root word land first.
-                        #[cfg(feature = "backend-vulkan")]
-                        crate::backend::vulkan::engine::quiesce_completion_stamps(0);
+                        #[cfg(not(feature = "backend-vulkan"))]
                         crate::runtime::render_writeback::settle_guest_writes(
                             crate::runtime::render_writeback::SettleSite::RootStamp,
                         );
-                        #[cfg(feature = "backend-vulkan")]
-                        crate::backend::vulkan::engine::quiesce_guest_reads();
                         let gpa = state.pfn_gpa(state.gfx.fifo_base_page) + off;
                         if gpa_map::write_u32(
                             host,
@@ -3864,12 +3924,11 @@ fn apply_map_family<H: HostMemory + HostOps>(
                 // Synchronization is resource-scoped. Apple batches the named
                 // resources into transfer encoders; synchronizing one object
                 // does not publish every other host-valid texture in the task.
-                crate::runtime::writeback_debt::settle_for_resources(
+                crate::runtime::writeback_debt::submit_for_resources(
                     state,
                     host,
                     cmd.task_id,
                     &cmd.object_ids,
-                    crate::runtime::render_writeback::SettleSite::ChildStamp,
                 );
                 if family == MapFamily::SynchronizeAndDiscardResources {
                     let discarded = crate::runtime::writeback_debt::discard_gva_resources(
