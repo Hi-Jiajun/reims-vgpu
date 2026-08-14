@@ -1031,6 +1031,8 @@ enum PreparedSampled {
         source: GuestTexels,
         /// `bufferRowLength` for the buffer→image copy (0 = tight rows).
         row_length_texels: u32,
+        volume: bool,
+        layers: u32,
         /// Bytes the copy names, for the cache's byte-cap accounting.
         gathered_len: usize,
     },
@@ -1834,24 +1836,17 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             }
             SampledSource::Bytes(_) => {}
             SampledSource::GuestRuns(src, _) => {
-                // The zero-copy gather uploads a single array layer into a
-                // single-depth image (`layer_count: 1`, `depth: 1` below), so
-                // it serves any shape that is one layer deep: plain 2D, a
-                // single-layer 2D array, and the 1D / single-layer 1D-array
-                // color-transfer LUTs. Volume and multi-layer shapes still
-                // decline by name — the gather would upload only their first
-                // slice.
-                if image.volume || image.cube || image.layers != 1 {
+                // A cube's face ordering is not carried by this source. Arrays
+                // and volumes are ordinary consecutive image planes and the
+                // copy below consumes all of them.
+                if image.cube {
                     return Err(DrawError::Unsupported(
                         super::reason::DrawReason::GuestRunSampledNot2d {
                             binding: image.binding,
                         },
                     ));
                 }
-                // Padded layouts (`row_length_texels != 0`) span
-                // `(height-1) * stride + tight_row` — the final row carries
-                // only its texels (see `GuestRunSource`); tight layouts match
-                // the full `width * height` window.
+                let planes = image.layers as usize;
                 let run_expected = if src.row_length_texels == 0 {
                     expected
                 } else {
@@ -1866,7 +1861,9 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                             },
                         ));
                     }
-                    (image.height as usize - 1) * stride + tight_row
+                    (planes - 1) * image.height as usize * stride
+                        + (image.height as usize - 1) * stride
+                        + tight_row
                 };
                 if src.total_len as usize != run_expected {
                     return Err(DrawError::DrawValidation(
@@ -3723,6 +3720,8 @@ pub(crate) unsafe fn execute_draw_inner(
                     image: img,
                     source,
                     row_length_texels: src.row_length_texels,
+                    volume: resource.volume,
+                    layers: resource.layers,
                     gathered_len: src.total_len as usize,
                 });
                 // Back to the deciding half for the next texture in the loop.
@@ -4463,6 +4462,8 @@ pub(crate) unsafe fn execute_draw_inner(
             image: img,
             source,
             row_length_texels,
+            volume,
+            layers,
             ..
         } = image
         else {
@@ -4477,8 +4478,8 @@ pub(crate) unsafe fn execute_draw_inner(
             img.image,
             img.width,
             img.height,
-            1,
-            1,
+            if *volume { 1 } else { *layers },
+            if *volume { *layers } else { 1 },
             *row_length_texels,
         );
     }
@@ -6629,6 +6630,33 @@ mod tests {
     #[test]
     fn guest_runs_tight_total_validates() {
         let req = guest_run_req(1240, 622, 1240 * 622 * 4, 0);
+        assert!(validate_v1(&req).is_ok());
+    }
+
+    #[test]
+    fn guest_runs_volume_validates_every_depth_plane() {
+        let mut req = guest_run_req(16, 8, 16 * 8 * 4 * 3, 0);
+        req.sampled_images[0].volume = true;
+        req.sampled_images[0].layers = 3;
+        assert!(validate_v1(&req).is_ok());
+
+        let SampledSource::GuestRuns(source, _) = &mut req.sampled_images[0].source else {
+            panic!("the fixture is guest-backed")
+        };
+        source.total_len -= 1;
+        assert_eq!(
+            validation_slug(&req),
+            "vk_draw_validate_guest_sample_length"
+        );
+    }
+
+    #[test]
+    fn padded_guest_run_volume_counts_interplane_row_stride() {
+        // Three 4-texel-by-2-row planes at a six-texel row pitch: five full
+        // padded rows followed by the final tight row.
+        let mut req = guest_run_req(4, 2, 5 * 24 + 16, 6);
+        req.sampled_images[0].volume = true;
+        req.sampled_images[0].layers = 3;
         assert!(validate_v1(&req).is_ok());
     }
 

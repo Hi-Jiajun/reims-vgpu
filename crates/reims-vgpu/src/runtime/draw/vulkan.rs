@@ -809,6 +809,8 @@ pub(super) enum SampledSourceRequest {
     GuestRuns(
         crate::backend::vulkan::engine::GuestRunSource,
         TexelLayout,
+        /// Consecutive depth planes carried by the source window.
+        u32,
         LinearSampleIdentity,
         crate::runtime::gather_witness::GatherVouch,
         pixel_format::SwizzlePlan,
@@ -1654,9 +1656,12 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         crate::runtime::render_writeback::SettleSite::LinearTextureSampled,
     )?;
     let (_entry, desc) = sampled_texture_descriptor(state, host, task_id, texture_ref)?;
-    let (w, h) = decode_texture_descriptor(&desc).ok()?.extent()?;
+    let tex = decode_texture_descriptor(&desc).ok()?;
+    let (w, h) = tex.extent()?;
+    let planes = tex.levels.first()?.planes();
     let need = (w as usize)
         .saturating_mul(h as usize)
+        .saturating_mul(planes as usize)
         .saturating_mul(layout.bytes_per_texel() as usize);
     if bytes.len() < need {
         return None;
@@ -2554,10 +2559,10 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     ))
 }
 
-/// Zero-copy floor: below this the CPU byte path (one small
-/// read + memo) is cheaper than a recorded GPU gather followed by a transfer
-/// into device-local image memory. Performance threshold only — never a
-/// correctness gate.
+/// Copied sampled-gather floor: below this the CPU byte path (one small read +
+/// memo) is cheaper than a recorded buffer-to-image transfer. Performance
+/// threshold only — never a correctness gate and never a gate on a direct
+/// buffer-backed image.
 ///
 /// Set to 64 KiB from a video-playback census: after the type-5 plane rail
 /// landed, the whole remaining CPU copy under video was `t11_guest`
@@ -2572,10 +2577,11 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
 /// surfaces, so the band it opens to zero-copy is exactly those per-frame video
 /// composites.
 ///
-/// The floor is also the *only* thing that has ever declined the type-11
-/// gather: over 1 051 sampled declines it was 100% of them, which is why the
-/// rail no longer carries a reason enum to distinguish the rest.
-pub(super) const ZERO_COPY_SAMPLED_MIN_BYTES: u64 = 64 * 1024;
+/// Resource construction is independent of byte length: when a retained guest
+/// allocation can back the sampled image directly, that is the resource and no
+/// crossover is consulted. This floor applies only after direct construction
+/// is unavailable and the remaining GPU path would copy into another image.
+pub(super) const SAMPLED_GATHER_MIN_BYTES: u64 = 64 * 1024;
 
 /// Zero-copy floor for draw-time vertex/storage buffer binds. Performance
 /// threshold only — never a correctness gate; below it the bind takes the CPU
@@ -3150,6 +3156,25 @@ pub(super) fn strided_window_extent(w: u32, h: u32, bpp: u64, bpr: u64) -> Optio
         u32::try_from(bpr / bpp).ok()?
     };
     Some((span, row_length_texels))
+}
+
+/// Byte window and Vulkan row pitch for one complete linear texture level.
+/// Depth planes are consecutive at `row_stride * height`; only the final
+/// plane's final-row padding is outside the sampled window.
+pub(super) fn strided_level_extent(
+    layout: &crate::runtime::decode::resource::TextureLevelLayout,
+    bpp: u64,
+) -> Option<(u64, u32)> {
+    let (last_plane, row_length_texels) = strided_window_extent(
+        layout.width,
+        layout.height,
+        bpp,
+        layout.row_stride,
+    )?;
+    let preceding_planes = u64::from(layout.planes() - 1)
+        .checked_mul(layout.row_stride)?
+        .checked_mul(u64::from(layout.height))?;
+    Some((preceding_planes.checked_add(last_plane)?, row_length_texels))
 }
 
 /// Gather `span` bytes from `base_off` into mapping `mid`'s guest pages as host
@@ -3901,7 +3926,7 @@ fn zc_lin_no_layout_route(reason: translate::TranslateReason) -> &'static str {
     }
 }
 
-fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
+pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
@@ -4009,49 +4034,12 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("zc_lin_no_extent");
         return None;
     }
-    let Some((span, row_length_texels)) =
-        strided_window_extent(w, h, bpp as u64, layout.row_stride)
+    let Some((span, row_length_texels)) = strided_level_extent(layout, bpp as u64)
     else {
         crate::runtime::drain::note_store_route("zc_lin_unstrideable");
         return None;
     };
-    // The min-byte floor keeps small textures on the cheaper CPU memo/cache
-    // path. It applies to every layout that has somewhere to be turned away
-    // *to*: the single-channel float LUTs have no CPU loader arm
-    // (`texel_to_rgba8` returns `None` for them), so this native gather is
-    // their only correct rail and a floor over them would not be a cost
-    // decision at all — a small display-profile LUT would fall through to a
-    // failed resolve.
-    //
-    // Asked as `a_cost_floor_may_decline` and not `is_four_byte_color`. The two
-    // agreed for as long as only four-byte colour could reach here, and they
-    // stop agreeing the moment `R8`/`Rg8` are admitted above: those have arms
-    // and are not four bytes, so the four-byte spelling would have waved every
-    // one of them past the floor — including the 3.6 KiB scroll glyphs the
-    // floor's own doc names as legitimately preferring the CPU byte path.
-    //
-    // Nor is it `has_cpu_loader_arm`, which it used to be. That admits a layout
-    // whose only arm is lossy, and the half-float colour pair is exactly that:
-    // a 64x64 `RGBA16Float` spans 32 KiB, sat under this 64 KiB floor, and was
-    // handed to `texel_to_rgba8` — clamped to the unit interval and quantized
-    // to 256 levels — on every boot. A floor is a cost decision only where the
-    // path it declines to produces the same pixels.
-    if native.a_cost_floor_may_decline() && span < ZERO_COPY_SAMPLED_MIN_BYTES {
-        // Banded, because the floor's own doc argues from where the workload's
-        // spans cluster relative to it, and a bare count cannot re-check that
-        // argument on a workload the doc was not tuned against. The bands are
-        // read against the floor: a population sitting just under it is the
-        // floor mis-set, and one sitting two decades under it is the floor
-        // doing what it was written to do.
-        crate::runtime::drain::note_store_route(if span < 4 * 1024 {
-            "zc_lin_below_floor_lt4k"
-        } else if span < 16 * 1024 {
-            "zc_lin_below_floor_lt16k"
-        } else {
-            "zc_lin_below_floor_lt64k"
-        });
-        return None;
-    }
+    let planes = layout.planes();
     if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
         crate::runtime::drain::note_store_route("zc_lin_past_allocation");
         return None;
@@ -4111,54 +4099,81 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
         });
 
     if let Some(packed) = packed {
-        let page = state.page_size();
-        let packed_offset = packed.head.checked_add(layout.offset)?;
-        let first_page = usize::try_from(packed_offset / page).ok()?;
-        let head_off = packed_offset % page;
-        let page_count = usize::try_from(head_off.checked_add(span)?.div_ceil(page)).ok()?;
-        let witness_gpas = packed.gpas.get(first_page..first_page.checked_add(page_count)?)?;
-        let witness_runs = [engine::GuestRun {
-            host_ptr: packed
-                .import
-                .host_base()
-                .checked_add(usize::try_from(packed_offset).ok()?)?,
-            len: span,
-        }];
-        let seen = crate::runtime::gather_witness::note_gather(
-            state,
-            host,
-            crate::runtime::gather_witness::GatherRail::Linear,
-            crate::runtime::gather_witness::GatherKey::TaskGva { task_id, gva },
-            crate::runtime::gather_witness::GatherWindow {
-                gpas: witness_gpas,
-                runs: &witness_runs,
-                span,
-                page_size: page as usize,
-            },
-        );
-        return Some((
-            w,
-            h,
-            SampledSourceRequest::GuestRuns(
-                engine::GuestRunSource {
-                    runs: std::sync::Arc::clone(&packed.runs),
-                    source_offset: layout.offset,
-                    total_len: span,
-                    row_length_texels,
-                    pages: Some(std::sync::Arc::clone(&packed.pages)),
-                    direct_image: sampled_backing_from_packed(
-                        &packed,
-                        layout.offset,
-                        layout.row_stride,
-                        span,
-                    ),
+        let direct_image = (planes == 1)
+            .then(|| {
+                sampled_backing_from_packed(&packed, layout.offset, layout.row_stride, span)
+            })
+            .flatten();
+        if direct_image.is_some() && span < SAMPLED_GATHER_MIN_BYTES {
+            crate::runtime::drain::note_store_route("zc_lin_direct_below_gather_floor");
+        }
+        if direct_image.is_some()
+            || !native.a_cost_floor_may_decline()
+            || span >= SAMPLED_GATHER_MIN_BYTES
+        {
+            let page = state.page_size();
+            let packed_offset = packed.head.checked_add(layout.offset)?;
+            let first_page = usize::try_from(packed_offset / page).ok()?;
+            let head_off = packed_offset % page;
+            let page_count = usize::try_from(head_off.checked_add(span)?.div_ceil(page)).ok()?;
+            let witness_gpas = packed
+                .gpas
+                .get(first_page..first_page.checked_add(page_count)?)?;
+            let witness_runs = [engine::GuestRun {
+                host_ptr: packed
+                    .import
+                    .host_base()
+                    .checked_add(usize::try_from(packed_offset).ok()?)?,
+                len: span,
+            }];
+            let seen = crate::runtime::gather_witness::note_gather(
+                state,
+                host,
+                crate::runtime::gather_witness::GatherRail::Linear,
+                crate::runtime::gather_witness::GatherKey::TaskGva { task_id, gva },
+                crate::runtime::gather_witness::GatherWindow {
+                    gpas: witness_gpas,
+                    runs: &witness_runs,
+                    span,
+                    page_size: page as usize,
                 },
-                native,
-                LinearSampleIdentity::from(seen.identity),
-                seen.vouch,
-                native_components,
-            ),
-        ));
+            );
+            return Some((
+                w,
+                h,
+                SampledSourceRequest::GuestRuns(
+                    engine::GuestRunSource {
+                        runs: std::sync::Arc::clone(&packed.runs),
+                        source_offset: layout.offset,
+                        total_len: span,
+                        row_length_texels,
+                        pages: Some(std::sync::Arc::clone(&packed.pages)),
+                        direct_image,
+                    },
+                    native,
+                    planes,
+                    LinearSampleIdentity::from(seen.identity),
+                    seen.vouch,
+                    native_components,
+                ),
+            ));
+        }
+    }
+
+    // Only the copied fallback has a size crossover. A direct image above was
+    // constructed from the guest allocation exactly as the resource contract
+    // describes, so its size never selects a different ownership model.
+    // Single-channel float LUTs have no equivalent CPU loader arm and therefore
+    // cannot be declined on cost grounds even on this fallback.
+    if native.a_cost_floor_may_decline() && span < SAMPLED_GATHER_MIN_BYTES {
+        crate::runtime::drain::note_store_route(if span < 4 * 1024 {
+            "zc_lin_below_floor_lt4k"
+        } else if span < 16 * 1024 {
+            "zc_lin_below_floor_lt16k"
+        } else {
+            "zc_lin_below_floor_lt64k"
+        });
+        return None;
     }
 
     // The copy-backed fallback still covers exactly the bound level window.
@@ -4199,6 +4214,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 direct_image: None,
             },
             native,
+            planes,
             LinearSampleIdentity::from(seen.identity),
             seen.vouch,
             native_components,
@@ -4261,9 +4277,6 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     // `is_four_byte_color` gate above already fixes it at four.
     let (span, row_length_texels) =
         strided_window_extent(w, h, native.bytes_per_texel() as u64, bpr)?;
-    if span < ZERO_COPY_SAMPLED_MIN_BYTES {
-        return None;
-    }
     // The owed frame, before anything looks at the pages that owe it.
     //
     // The comment on the linear rail explains why this rail needs no *settle* —
@@ -4293,13 +4306,20 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
             origin: crate::backend::vulkan::engine::SampledByteOrigin::SurfaceGuestFallback,
         },
     ) {
+        if span < SAMPLED_GATHER_MIN_BYTES {
+            crate::runtime::drain::note_store_route("zc_t11_direct_below_gather_floor");
+        }
         return Some(SampledSourceRequest::GuestRuns(
             source,
             native,
+            1,
             LinearSampleIdentity::from(seen.identity),
             seen.vouch,
             pixel_format::swizzle_identity(),
         ));
+    }
+    if span < SAMPLED_GATHER_MIN_BYTES {
+        return None;
     }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
     let page = state.page_size() as usize;
@@ -4325,6 +4345,7 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
             direct_image: None,
         },
         native,
+        1,
         LinearSampleIdentity::from(seen.identity),
         seen.vouch,
         // Identity: this rail admitted the format only after checking its plan
@@ -4396,9 +4417,6 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     // plane away onto a CPU arm that produces the same pixels. The type-11 rail
     // needs no such qualifier because `is_four_byte_color` already fixes what
     // reaches its floor; this one admits every layout the translation names.
-    if native.a_cost_floor_may_decline() && span < ZERO_COPY_SAMPLED_MIN_BYTES {
-        return None;
-    }
     // The owed frame, for the reason `try_type11_sample_zero_copy` states: a
     // debt is not a submitted writeback and queue order cannot order it.
     crate::runtime::writeback_debt::pay_for_mapping(state, host, mid);
@@ -4415,13 +4433,20 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
             origin: crate::backend::vulkan::engine::SampledByteOrigin::SerializedSurfaceView,
         },
     ) {
+        if span < SAMPLED_GATHER_MIN_BYTES {
+            crate::runtime::drain::note_store_route("zc_t5_direct_below_gather_floor");
+        }
         return Some(SampledSourceRequest::GuestRuns(
             source,
             native,
+            1,
             LinearSampleIdentity::from(seen.identity),
             seen.vouch,
             pixel_format::swizzle_identity(),
         ));
+    }
+    if native.a_cost_floor_may_decline() && span < SAMPLED_GATHER_MIN_BYTES {
+        return None;
     }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
     let page = state.page_size() as usize;
@@ -4447,6 +4472,7 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
             direct_image: None,
         },
         native,
+        1,
         LinearSampleIdentity::from(seen.identity),
         seen.vouch,
         // Identity: this rail admitted the format only after checking its plan
@@ -4485,6 +4511,7 @@ fn native_scratch_to_upload(
     scratch: &[u8],
     w: u32,
     h: u32,
+    planes: u32,
     bpr: u64,
     sample_fmt: u16,
     tight: u64,
@@ -4495,17 +4522,19 @@ fn native_scratch_to_upload(
         .filter(|fmt| tight == (w as u64).saturating_mul(fmt.bytes_per_texel() as u64))
     {
         let row_bytes = tight as usize;
-        let mut out = vec![0u8; row_bytes.checked_mul(h as usize)?];
-        for y in 0..h as usize {
-            let src = y.checked_mul(bpr)?;
-            let dst = y * row_bytes;
+        let rows = (h as usize).checked_mul(planes as usize)?;
+        let mut out = vec![0u8; row_bytes.checked_mul(rows)?];
+        for row_index in 0..rows {
+            let src = row_index.checked_mul(bpr)?;
+            let dst = row_index * row_bytes;
             out.get_mut(dst..dst + row_bytes)?
                 .copy_from_slice(scratch.get(src..src + row_bytes)?);
         }
         return Some((out, fmt));
     }
     let out_row = (w as usize).checked_mul(RGBA8_BPP as usize)?;
-    let out_len = out_row.checked_mul(h as usize)?;
+    let rows = (h as usize).checked_mul(planes as usize)?;
+    let out_len = out_row.checked_mul(rows)?;
     let trow = tight as usize;
     let mut out = vec![0u8; out_len];
     // This rung carries nearly all of the pathway's sampled traffic, so a
@@ -4514,13 +4543,13 @@ fn native_scratch_to_upload(
     // the general loader reported its own. Same key as the others, so a format
     // narrowed on both rails is two lines and not one.
     crate::runtime::draw::note_sampled_narrowing("linear_memo_narrowed", 0, sample_fmt, w, h);
-    for y in 0..h as usize {
-        let src = y.checked_mul(bpr)?;
+    for row_index in 0..rows {
+        let src = row_index.checked_mul(bpr)?;
         if !pixel_format::convert_row_to_rgba8(
             sample_fmt,
             scratch.get(src..src + trow)?,
             w,
-            &mut out[y * out_row..],
+            &mut out[row_index * out_row..],
         ) {
             return None;
         }
@@ -4589,7 +4618,8 @@ fn native_uploads_asking_host() -> NativeUploads {
 ///   memory, `read_descriptor` re-reads the descriptor, and `level_gva` derives
 ///   the span from that. No step caches, so a recycled `texture_ref` cannot
 ///   hand this the previous resource's address.
-/// - The staleness check is exact, not sampled. The full `bpr * h` native span
+/// - The staleness check is exact, not sampled. The full
+///   `bpr * h * depth_planes` native span
 ///   is re-read every call and compared byte for byte against the memo
 ///   (`m.native == scratch`), padding included, so a guest write anywhere in
 ///   the span misses the memo.
@@ -4619,24 +4649,27 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     let sample_fmt = effective_view_sample_format(declared_format, None)?;
     let (_, layout) = tex.level_gva(0, state.page_shift)?;
     let bpr = layout.row_stride;
+    let planes = layout.planes();
     let tight = pixel_format::tight_row_bytes(w, declared_format)? as u64;
     // Padded strides ride the same memo now — the native read below covers the
-    // full `bpr*h` span (padding included, so a write anywhere is observed) and
+    // full `bpr*h*planes` span (padding included, so a write anywhere is
+    // observed) and
     // `native_scratch_to_upload` gathers the tight rows. A sub-tight stride
     // (impossible geometry) or a zero dimension declines to the fallback.
     if bpr < tight || w == 0 || h == 0 {
         return None;
     }
-    // `bpr*h` and not `TextureLevelLayout::read_span`, which every reader that
-    // walks only the tight rows uses instead. This one really does read the last
-    // row's padding — that is what makes the memo's byte-for-byte compare able to
-    // notice a guest write into it — so it is charged for what it touches.
+    // `bpr*h*planes` and not `TextureLevelLayout::slice_read_span`, which every
+    // reader that walks only the tight rows uses instead. This one really does
+    // read the last row's padding — that is what makes the memo's byte-for-byte
+    // compare able to notice a guest write into it — so it is charged for what
+    // it touches.
     //
     // The consequence is a third way to decline, and the one most worth knowing:
     // an image the guest sized to `offset + read_span` exactly is refused here
     // and served by the general loader below, which uses the tighter rule. That
     // is a slower path, not lost work.
-    let span = bpr.checked_mul(h as u64)?;
+    let span = bpr.checked_mul(h as u64)?.checked_mul(u64::from(planes))?;
     let native_len = host_alloc_len(span)?;
     if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
         return None;
@@ -4695,7 +4728,7 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
         state.guest_linear_scratch = scratch;
         return None;
     }
-    let key = (task_id, gva, w, h, sample_fmt);
+    let key = (task_id, gva, w, h, planes, sample_fmt);
     // Three-way, because "the memo did not answer" has two causes that want
     // opposite fixes and a hit/miss pair cannot tell them apart.
     //
@@ -4753,7 +4786,9 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
         ));
     }
     // First sight or native bytes changed: convert fresh, new generation.
-    let Some((rgba, fmt)) = native_scratch_to_upload(&scratch, w, h, bpr, sample_fmt, tight) else {
+    let Some((rgba, fmt)) =
+        native_scratch_to_upload(&scratch, w, h, planes, bpr, sample_fmt, tight)
+    else {
         state.guest_linear_scratch = scratch;
         return None;
     };
@@ -6787,7 +6822,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             host,
                             req.task_id,
                             texture_ref,
-                            texture_resource,
+                            texture_resource.clone(),
                             view_swizzle.is_none(),
                         ) else {
                             let detail = sample_miss_detail(state, host, req.task_id, texture_ref);
@@ -6818,6 +6853,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // where Metal presents them; non-identity only where a rail
                 // handed the guest's own bytes over untouched.
                 let mut sampled_components = pixel_format::swizzle_identity();
+                let mut source_planes = 1;
                 let source = match loaded {
                     SampledSourceRequest::Bytes(rgba, identity, byte_format, origin) => {
                         bytes_identity = identity;
@@ -6852,9 +6888,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         // whole draw, which cost the guest every pixel of it.
                         crate::backend::vulkan::engine::SampledSource::Target(identity)
                     }
-                    SampledSourceRequest::GuestRuns(src, native, identity, vouch, components) => {
+                    SampledSourceRequest::GuestRuns(
+                        src,
+                        native,
+                        planes,
+                        identity,
+                        vouch,
+                        components,
+                    ) => {
                         sampled_format = native;
                         sampled_components = components;
+                        source_planes = planes;
                         bytes_identity = Some(identity);
                         crate::backend::vulkan::engine::SampledSource::GuestRuns(src, vouch)
                     }
@@ -6906,8 +6950,19 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     volume,
                     cube,
                     one_dim,
-                    layers,
+                    mut layers,
                 } = shape;
+                if volume {
+                    layers = texture_resource
+                        .as_ref()
+                        .and_then(|resource| match resource.decoded() {
+                            Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) => {
+                                tex.levels.first().map(|level| level.planes())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(source_planes);
+                }
                 // A Vulkan 1D image is defined to have height 1; the descriptor
                 // may report the LUT's texel count in either axis, so collapse
                 // to a single row and fold the other axis into the width the
@@ -10370,11 +10425,11 @@ mod vulkan_split_tests {
         use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
         use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
-        // At the discrete-memory floor, which is the only gate that has ever
-        // declined this rail there: 128x128 RGBA8 is exactly 64 KiB.
+        // Keep this large enough that either the direct resource or the copied
+        // fallback can take; the test is about debt payment, not ownership.
         let (w, h) = (128u32, 128u32);
         let span = (w * h * 4) as u64;
-        assert!(span >= ZERO_COPY_SAMPLED_MIN_BYTES);
+        assert!(span >= SAMPLED_GATHER_MIN_BYTES);
 
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut host = FakeHost::new();

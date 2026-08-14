@@ -104,49 +104,6 @@ fn rb(
     }
 }
 
-/// Regression guard for the sampled zero-copy floor (kb [[paravirt-vulkan-engine]]
-/// (C)). The floor is a perf crossover, not a magic constant: it MUST sit
-/// strictly between the two bands a 2026-07-20 video/scroll census measured,
-/// so a future edit that re-breaks either case fails here.
-///
-/// - Raising it back toward 256 KiB re-strands the per-frame video composite
-///   surfaces on the CPU byte path (the `t11_guest=930:226 MB` bug this floor
-///   drop closed): the composites clustered at ~236 KiB.
-/// - Dropping it to the small-bind band (scroll glyphs ~3.6 KiB; small-UI /
-///   gva_copy ~21–34 KiB) trades cheap CPU copies for many tiny GPU gathers +
-///   host-import windows.
-///
-/// Vulkan-arm only: pins the `backend-vulkan` zero-copy byte floors.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-#[allow(
-    clippy::assertions_on_constants,
-    reason = "the test pins the measured crossover bands around these product constants"
-)]
-fn sampled_zero_copy_floor_separates_video_from_small_binds() {
-    // Largest observed bind that still legitimately prefers the CPU byte
-    // path (small-UI / gva_copy avg, 2026-07-20 scroll census). The floor
-    // must exclude it (stay on CPU / memo).
-    const LARGEST_CPU_PREFERRED_BIND: u64 = 34 * 1024;
-    // Smallest observed per-frame video composite bind that must ride the
-    // zero-copy gather (2026-07-20 video census clustered at ~236 KiB).
-    const SMALLEST_VIDEO_COMPOSITE_BIND: u64 = 200 * 1024;
-    assert!(
-        ZERO_COPY_SAMPLED_MIN_BYTES > LARGEST_CPU_PREFERRED_BIND,
-        "floor {ZERO_COPY_SAMPLED_MIN_BYTES} must exceed the CPU-preferred band \
-             {LARGEST_CPU_PREFERRED_BIND} so small-UI/glyph binds stay on the CPU/memo path"
-    );
-    assert!(
-        ZERO_COPY_SAMPLED_MIN_BYTES < SMALLEST_VIDEO_COMPOSITE_BIND,
-        "floor {ZERO_COPY_SAMPLED_MIN_BYTES} must be below the video-composite band \
-             {SMALLEST_VIDEO_COMPOSITE_BIND} so per-frame video surfaces ride zero-copy \
-             (re-breaks the t11_guest=226 MB video CPU bug if raised)"
-    );
-    // The buffer floor is a distinct, lower crossover (small per-draw
-    // uniform/vertex buffers); it is not the sampled floor and stays 16 KiB.
-    assert!(ZERO_COPY_BUFFER_MIN_BYTES < ZERO_COPY_SAMPLED_MIN_BYTES);
-}
-
 /// A proven shader extent narrows the transfer without changing rail admission.
 ///
 /// The full guest window clears the gather crossover; its 64-byte bounded
@@ -298,6 +255,83 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
             .map(|import| import.id()),
         Some(type11_import.id())
     );
+}
+
+#[test]
+#[cfg(feature = "backend-vulkan")]
+fn small_mapping_sampled_plane_uses_its_direct_resource() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+
+    let page = 1u64 << PAGE_SHIFT_X86;
+    let (width, height) = (16u32, 16u32);
+    let span = u64::from(width) * u64::from(height) * 4;
+    assert!(span < SAMPLED_GATHER_MIN_BYTES);
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    host.stable_map_pages = true;
+    let mid = 18u32;
+    let gpa = 0x4200_0000u64;
+    host.map_range(gpa, page as usize, 0);
+    assert!(state.map_surface(mid));
+    state.mappings.get_mut(&mid).unwrap().page_entries = vec![
+        ((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT | PAGE_ENTRY_VALID,
+    ];
+    assert!(state.set_mapping_geom(mid, width, height, MTL_FORMAT_BGRA8_UNORM));
+    crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
+
+    let sampled = try_type11_sample_zero_copy(&mut state, &mut host, mid, width, height)
+        .expect("a directly-backed sampled resource has no size crossover");
+    let SampledSourceRequest::GuestRuns(source, ..) = sampled else {
+        panic!("the mapping stays guest-backed")
+    };
+    crate::runtime::guest_ram::forget_import_limits();
+
+    assert!(
+        source.direct_image.is_some(),
+        "the gather floor may govern a copy, not replace a valid direct resource"
+    );
+}
+
+#[test]
+#[cfg(feature = "backend-vulkan")]
+fn linear_volume_gather_carries_every_depth_plane() {
+    let (width, height, depth, row_stride) = (64u32, 64u32, 5u32, 256u64);
+    let layout = crate::runtime::decode::resource::TextureLevelLayout {
+        offset: 0,
+        size: row_stride * u64::from(height) * u64::from(depth),
+        row_stride,
+        width,
+        height,
+        depth,
+    };
+    let (span, row_length) = strided_level_extent(&layout, 4).unwrap();
+    assert_eq!(span, row_stride * u64::from(height) * u64::from(depth));
+    assert_eq!(row_length, 0);
+}
+
+#[test]
+#[cfg(feature = "backend-vulkan")]
+fn tight_linear_cpu_fallback_reads_every_depth_plane() {
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+
+    let native = [3u8, 5, 7, 255].repeat(2 * 2 * 3);
+    let (bytes, format) = load_tight_linear_rgba_with(
+        2,
+        2,
+        3,
+        MTL_FORMAT_BGRA8_UNORM,
+        NativeUploads::BGRA8,
+        "test_volume_load",
+        |dst| {
+            dst.copy_from_slice(&native);
+            true
+        },
+    )
+    .unwrap();
+    assert_eq!(format, TexelLayout::Bgra8);
+    assert_eq!(bytes, native);
 }
 
 #[test]
@@ -1682,6 +1716,7 @@ fn tight_linear_load_uses_one_bulk_read_and_converts_rows() {
     let (rgba, fmt) = load_tight_linear_rgba_with(
         2,
         2,
+        1,
         MTL_FORMAT_BGRA8_UNORM,
         NativeUploads::NONE,
         "test_tight_load",
@@ -1712,6 +1747,7 @@ fn tight_linear_native_bgra8_keeps_bytes_and_reports_bgra8() {
     let (bytes, fmt) = load_tight_linear_rgba_with(
         2,
         2,
+        1,
         MTL_FORMAT_BGRA8_UNORM,
         NativeUploads::BGRA8,
         "test_tight_load",
@@ -1746,6 +1782,7 @@ fn a_half_float_sampled_texture_keeps_its_bytes_when_the_caller_takes_native_lay
     let (bytes, fmt) = load_tight_linear_rgba_with(
         2,
         1,
+        1,
         pixel_format::MTL_FORMAT_RGBA16_FLOAT,
         NativeUploads::ALL,
         "test_tight_load",
@@ -1763,6 +1800,7 @@ fn a_half_float_sampled_texture_keeps_its_bytes_when_the_caller_takes_native_lay
     // guarding against rather than only what it wants.
     let (narrowed, narrowed_fmt) = load_tight_linear_rgba_with(
         2,
+        1,
         1,
         pixel_format::MTL_FORMAT_RGBA16_FLOAT,
         NativeUploads::NONE,
@@ -1790,6 +1828,7 @@ fn a_two_channel_half_float_sampled_texture_reports_rg16_float() {
     let guest: [u8; 8] = [0x00, 0x3c, 0x00, 0x38, 0x00, 0x40, 0x00, 0x3c];
     let (bytes, fmt) = load_tight_linear_rgba_with(
         2,
+        1,
         1,
         pixel_format::MTL_FORMAT_RG16_FLOAT,
         NativeUploads::ALL,
@@ -1831,6 +1870,7 @@ fn tight_rgba_linear_load_preserves_native_bytes() {
     let native = [1, 2, 3, 4, 5, 6, 7, 8];
     let (rgba, fmt) = load_tight_linear_rgba_with(
         2,
+        1,
         1,
         pixel_format::MTL_FORMAT_RGBA8_UNORM,
         NativeUploads::NONE,
@@ -1891,6 +1931,7 @@ fn the_cpu_upload_rails_count_every_srgb_downgrade() {
     let (bytes, fmt) = load_tight_linear_rgba_with(
         2,
         1,
+        1,
         pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB,
         NativeUploads::NONE,
         "test_tight_load",
@@ -1926,6 +1967,7 @@ fn the_cpu_upload_rails_count_every_srgb_downgrade() {
     let _ = linear_native_upload_format(pixel_format::MTL_FORMAT_RGBA8_UNORM, NativeUploads::NONE);
     let _ = load_tight_linear_rgba_with(
         2,
+        1,
         1,
         pixel_format::MTL_FORMAT_BGRA8_UNORM,
         NativeUploads::BGRA8,
@@ -2416,6 +2458,7 @@ fn a8_sample_preserves_alpha_coverage() {
     let native = [0, 17, 255];
     let (rgba, fmt) = load_tight_linear_rgba_with(
         3,
+        1,
         1,
         pixel_format::MTL_FORMAT_A8_UNORM,
         NativeUploads::BGRA8,

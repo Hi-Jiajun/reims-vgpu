@@ -2174,10 +2174,11 @@ pub struct DeviceState {
     /// byte-exact against the memoized copy — a guest write is always seen;
     /// only the swizzle+alloc (and the engine's content hash+memcmp, via the
     /// generation identity) are skipped on unchanged content. Keyed by
-    /// (task_id, level-0 gva, width, height, sample format). Byte-bounded LRU
+    /// (task_id, level-0 gva, width, height, depth planes, sample format).
+    /// Byte-bounded LRU
     /// ([`GUEST_LINEAR_MEMO_BYTE_CAP`]): a cap crossing evicts the least-recently
     /// -used entries down to a low-water mark, never bulk-clearing the hot set.
-    pub guest_linear_memo: LruBytesMemo<(u32, u64, u32, u32, u16), GuestLinearMemo>,
+    pub guest_linear_memo: LruBytesMemo<(u32, u64, u32, u32, u32, u16), GuestLinearMemo>,
     /// Whether the hypervisor's guest-write generation would be a sound "these
     /// texels did not change" key for the zero-copy sampled gathers, measured
     /// against the bytes themselves. See

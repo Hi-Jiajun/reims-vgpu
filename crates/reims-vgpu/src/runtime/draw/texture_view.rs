@@ -787,6 +787,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
         .ok_or(R::NoLevelGva { level })?;
     let w = layout.width;
     let h = layout.height;
+    let planes = layout.planes();
     let bpr = layout.row_stride;
     if bpr > u32::MAX as u64 {
         return Err(R::SizeOverflow);
@@ -805,11 +806,13 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     }
     let need_rgba = (w as u64)
         .checked_mul(h as u64)
+        .and_then(|n| n.checked_mul(u64::from(planes)))
         .and_then(|n| n.checked_mul(RGBA8_BPP as u64))
         .and_then(host_alloc_len)
         .ok_or(R::SizeOverflow)?;
-    // The extent actually read, not `bpr * h` — see `TextureLevelLayout::read_span`.
-    let span = layout.read_span(tight).ok_or(R::SizeOverflow)?;
+    // Every depth plane belongs to the level; only the final plane's final-row
+    // padding lies outside the bytes this loader reads.
+    let span = layout.slice_read_span(tight).ok_or(R::SizeOverflow)?;
     let end = layout.offset.saturating_add(span);
     if tex.allocation_size != 0 && end > tex.allocation_size {
         return Err(R::SpanExceedsAllocation {
@@ -823,8 +826,8 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     //
     // Narrowed on this read's own pages, as `load_linear_guest_memoized` is: the
     // walk runs only when something is outstanding, and the pages read are the
-    // ones `read_span` names — not `bpr * h`, so a padded source does not claim
-    // the trailing padding it never touches.
+    // ones `slice_read_span` names — not `bpr * h * planes`, so a padded source
+    // does not claim the final trailing padding it never touches.
     // The reads below walk a raw task GVA, but the reference names a resource,
     // and a debt is keyed by mapping id — so only what this reference resolves
     // to is paid. `note_unnamed_reach` stays as the standing alarm for the one
@@ -856,7 +859,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // never touch padding that the guest did not make readable.
     if bpr_u32 == tight {
         let (rgba, fmt) =
-            load_tight_linear_rgba_with(w, h, sample_fmt, native, site.route(), |dst| {
+            load_tight_linear_rgba_with(w, h, planes, sample_fmt, native, site.route(), |dst| {
                 gva_mem::read_task_gva_by_id(
                     host,
                     &state.tasks,
@@ -885,14 +888,17 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
         (tight as u64) == (w as u64).saturating_mul(fmt.bytes_per_texel() as u64)
     }) {
         let row_bytes = tight as usize;
-        let out_len = row_bytes.checked_mul(h as usize).ok_or(R::SizeOverflow)?;
+        let rows = (h as usize)
+            .checked_mul(planes as usize)
+            .ok_or(R::SizeOverflow)?;
+        let out_len = row_bytes.checked_mul(rows).ok_or(R::SizeOverflow)?;
         let mut rgba = vec![0u8; out_len];
-        for y in 0..h {
-            let row_gva = (y as u64)
+        for row_index in 0..rows {
+            let row_gva = (row_index as u64)
                 .checked_mul(bpr)
                 .and_then(|off| gva.checked_add(off))
                 .ok_or(R::SizeOverflow)?;
-            let dst_off = (y as usize).checked_mul(row_bytes).ok_or(R::SizeOverflow)?;
+            let dst_off = row_index.checked_mul(row_bytes).ok_or(R::SizeOverflow)?;
             let dst = rgba
                 .get_mut(dst_off..dst_off + row_bytes)
                 .ok_or(R::SizeOverflow)?;
@@ -904,14 +910,17 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
                 dst,
                 state.page_shift,
             )
-            .map_err(|_| R::PaddedRowUnreadable { row: y })?;
+            .map_err(|_| R::PaddedRowUnreadable {
+                row: u32::try_from(row_index).unwrap_or(u32::MAX),
+            })?;
         }
         return Ok((rgba, fmt));
     }
     let mut rgba = vec![0u8; need_rgba];
     let mut row = vec![0u8; tight as usize];
-    for y in 0..h {
-        let row_gva = (y as u64)
+    let rows = h.checked_mul(planes).ok_or(R::SizeOverflow)?;
+    for row_index in 0..rows {
+        let row_gva = (row_index as u64)
             .checked_mul(bpr)
             .and_then(|off| gva.checked_add(off))
             .ok_or(R::SizeOverflow)?;
@@ -923,9 +932,9 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
             &mut row,
             state.page_shift,
         )
-        .map_err(|_| R::PaddedRowUnreadable { row: y })?;
+        .map_err(|_| R::PaddedRowUnreadable { row: row_index })?;
         crate::runtime::draw::note_sampled_narrowing(site.route(), 0, sample_fmt, w, h);
-        let dst_off = (y as usize) * (w as usize) * 4;
+        let dst_off = (row_index as usize) * (w as usize) * 4;
         if !pixel_format::convert_row_to_rgba8(sample_fmt, &row, w, &mut rgba[dst_off..]) {
             return Err(R::RowConvertUnsupported { format: sample_fmt });
         }
@@ -940,6 +949,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
 pub(crate) fn load_tight_linear_rgba_with<F>(
     width: u32,
     height: u32,
+    planes: u32,
     sample_format: u16,
     native: NativeUploads,
     site: &'static str,
@@ -952,13 +962,14 @@ where
     let tight = pixel_format::tight_row_bytes(width, sample_format).ok_or(R::FormatBppUnknown {
         format: sample_format,
     })?;
+    let rows = height.checked_mul(planes).ok_or(R::SizeOverflow)?;
     let native_len = (tight as u64)
-        .checked_mul(height as u64)
+        .checked_mul(rows as u64)
         .and_then(host_alloc_len)
         .ok_or(R::SizeOverflow)?;
     let rgba_stride = width.checked_mul(RGBA8_BPP).ok_or(R::SizeOverflow)?;
     let rgba_len = (rgba_stride as u64)
-        .checked_mul(height as u64)
+        .checked_mul(rows as u64)
         .and_then(host_alloc_len)
         .ok_or(R::SizeOverflow)?;
     let mut bytes = vec![0u8; native_len];
@@ -996,7 +1007,7 @@ where
     // shader. One shared slug reported both as the same event.
     crate::runtime::draw::note_sampled_narrowing(site, 0, sample_format, width, height);
     let mut rgba = vec![0u8; rgba_len];
-    for y in 0..height as usize {
+    for y in 0..rows as usize {
         let src_off = y.checked_mul(tight as usize).ok_or(R::SizeOverflow)?;
         let dst_off = y.checked_mul(rgba_stride as usize).ok_or(R::SizeOverflow)?;
         if !pixel_format::convert_row_to_rgba8(
