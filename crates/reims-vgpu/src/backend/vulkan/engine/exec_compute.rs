@@ -705,7 +705,14 @@ pub(crate) unsafe fn execute_compute_inner(
             // names what last *touched* the image rather than where it sits —
             // are `barrier_resident_for_transfer_read`'s to answer, and this
             // site had each of them wrong once.
-            super::exec::barrier_resident_for_transfer_read(&ctx.device, cb, src_image, src_access);
+            let next_access = super::pools::ResidentAccess::transfer_read(false);
+            super::exec::barrier_resident_for_transfer_read(
+                &ctx.device,
+                cb,
+                src_image,
+                src_access,
+                next_access,
+            );
             let copy = [vk::ImageCopy::default()
                 .src_subresource(super::color_subresource_layers())
                 .dst_subresource(super::color_subresource_layers())
@@ -717,7 +724,7 @@ pub(crate) unsafe fn execute_compute_inner(
             ctx.device.cmd_copy_image(
                 cb,
                 src_image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                next_access.layout(),
                 img.image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &copy,

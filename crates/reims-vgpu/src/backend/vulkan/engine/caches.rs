@@ -142,6 +142,14 @@ pub(crate) struct DepthAttachKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct PassKey {
     pub load_seed: bool, // LOAD vs CLEAR (slot 0)
+    /// Slot 0 aliases memory the host may modify between submissions.
+    ///
+    /// A linear image is host-accessible only in `PREINITIALIZED` or `GENERAL`.
+    /// The former is an image's one-way birth layout, so a retained imported
+    /// attachment must use `GENERAL` for both its pass layout and its exit
+    /// layout. This bit partitions render passes and pipelines from ordinary
+    /// device-local attachments, which retain their dedicated layouts.
+    pub host_accessible_color0: bool,
     /// Slot-0 attachment format, as a format rather than a channel-order flag.
     ///
     /// This used to be `bgra: bool`, meaning `B8G8R8A8_UNORM` or
@@ -182,6 +190,7 @@ impl PassKey {
     pub(crate) fn single(load_seed: bool, color0_format: ash::vk::Format) -> Self {
         Self {
             load_seed,
+            host_accessible_color0: false,
             color0_format,
             secondary: [SecondaryAttachKey::default(); MAX_SECONDARY_ATTACH],
             secondary_count: 0,
@@ -198,7 +207,7 @@ impl PassKey {
     pub(crate) fn color_layout(self, index: usize) -> vk::ImageLayout {
         if self.color_feedback(index) {
             vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
-        } else if index == 0 && self.color_input {
+        } else if index == 0 && (self.color_input || self.host_accessible_color0) {
             vk::ImageLayout::GENERAL
         } else {
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
@@ -206,7 +215,9 @@ impl PassKey {
     }
 
     pub(crate) fn color_final_layout(self, index: usize) -> vk::ImageLayout {
-        if self.color_feedback(index) {
+        if index == 0 && self.host_accessible_color0 {
+            vk::ImageLayout::GENERAL
+        } else if self.color_feedback(index) {
             vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
         } else {
             COLOR0_PASS_EXIT_LAYOUT
@@ -571,7 +582,7 @@ pub(crate) struct ObjectCaches {
 ///
 /// # This is the one spelling, and the registry derives from it
 ///
-/// [`super::pools::ResourcePools::registry_mark_ready`] records the layout a
+/// [`super::pools::ResourcePools::registry_mark_ready_at`] records the layout a
 /// finished pass left its target in, and it must name the same layout this
 /// `finalLayout` does or every subsequent barrier is issued with the wrong
 /// `oldLayout` — which is undefined behaviour, not a validation error, because
@@ -655,7 +666,11 @@ pub(crate) const COLOR0_PASS_EXIT_LAYOUT: vk::ImageLayout =
 /// here — colour writes to attachment reads and writes — already orders the
 /// previous draw's store against this pass's `loadOp`, with no barrier from the
 /// draw. Weakening its source scope would silently make that skip unsound.
-fn external_dependencies(has_depth: bool, color_input: bool) -> [vk::SubpassDependency; 2] {
+fn external_dependencies(
+    has_depth: bool,
+    color_input: bool,
+    host_accessible_color0: bool,
+) -> [vk::SubpassDependency; 2] {
     // Colour is unconditional: every pass this device builds has slot 0.
     let mut attach_stages = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT;
     let mut attach_writes = vk::AccessFlags::COLOR_ATTACHMENT_WRITE;
@@ -674,14 +689,20 @@ fn external_dependencies(has_depth: bool, color_input: bool) -> [vk::SubpassDepe
         in_dst_stages |= vk::PipelineStageFlags::FRAGMENT_SHADER;
         in_dst_access |= vk::AccessFlags::INPUT_ATTACHMENT_READ;
     }
+    let mut source_stages = attach_stages | vk::PipelineStageFlags::TRANSFER;
+    let mut source_access = attach_writes | vk::AccessFlags::TRANSFER_WRITE;
+    if host_accessible_color0 {
+        source_stages |= vk::PipelineStageFlags::HOST;
+        source_access |= vk::AccessFlags::HOST_WRITE;
+    }
     [
         vk::SubpassDependency::default()
             .src_subpass(vk::SUBPASS_EXTERNAL)
             .dst_subpass(0)
             // Whatever last wrote these images: a previous pass's colour store,
             // a depth store, or the transfer that seeded a LOAD attachment.
-            .src_stage_mask(attach_stages | vk::PipelineStageFlags::TRANSFER)
-            .src_access_mask(attach_writes | vk::AccessFlags::TRANSFER_WRITE)
+            .src_stage_mask(source_stages)
+            .src_access_mask(source_access)
             .dst_stage_mask(in_dst_stages)
             .dst_access_mask(in_dst_access),
         vk::SubpassDependency::default()
@@ -1273,8 +1294,12 @@ impl ObjectCaches {
             .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
             .dst_access_mask(vk::AccessFlags::INPUT_ATTACHMENT_READ)
             .dependency_flags(vk::DependencyFlags::BY_REGION);
-        let mut deps: Vec<vk::SubpassDependency> =
-            external_dependencies(key.depth.is_some(), key.color_input).to_vec();
+        let mut deps: Vec<vk::SubpassDependency> = external_dependencies(
+            key.depth.is_some(),
+            key.color_input,
+            key.host_accessible_color0,
+        )
+        .to_vec();
         if key.color_input {
             deps.push(fetch_dep);
         }
@@ -2417,72 +2442,112 @@ mod object_cache_tests {
     fn both_external_dependencies_name_the_colour_scope_in_every_pass_shape() {
         for has_depth in [false, true] {
             for color_input in [false, true] {
-                let [incoming, outgoing] = external_dependencies(has_depth, color_input);
-                let shape = format!("depth={has_depth} color_input={color_input}");
+                for host_accessible in [false, true] {
+                    let [incoming, outgoing] =
+                        external_dependencies(has_depth, color_input, host_accessible);
+                    let shape = format!(
+                        "depth={has_depth} color_input={color_input} host={host_accessible}"
+                    );
 
-                // Incoming: the transition into the attachment layout has to be
-                // ordered against the loadOp that writes it.
-                assert!(
-                    incoming
-                        .dst_stage_mask
-                        .contains(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT),
-                    "{shape}: the loadOp clear runs at COLOR_ATTACHMENT_OUTPUT"
-                );
-                assert!(
-                    incoming
-                        .dst_access_mask
-                        .contains(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
-                    "{shape}: and it is a colour write"
-                );
-
-                // Outgoing: the final transition has to be ordered against the
-                // subpass's own store, and the store made visible to the copy
-                // that reads the target after the pass.
-                assert!(
-                    outgoing
-                        .src_stage_mask
-                        .contains(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT),
-                    "{shape}: the store runs at COLOR_ATTACHMENT_OUTPUT"
-                );
-                assert!(
-                    outgoing
-                        .src_access_mask
-                        .contains(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
-                    "{shape}: and it is a colour write"
-                );
-                assert!(
-                    outgoing
-                        .dst_stage_mask
-                        .contains(vk::PipelineStageFlags::TRANSFER)
-                        && outgoing
+                    // Incoming: the transition into the attachment layout has to be
+                    // ordered against the loadOp that writes it.
+                    assert!(
+                        incoming
+                            .dst_stage_mask
+                            .contains(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT),
+                        "{shape}: the loadOp clear runs at COLOR_ATTACHMENT_OUTPUT"
+                    );
+                    assert!(
+                        incoming
                             .dst_access_mask
-                            .contains(vk::AccessFlags::TRANSFER_READ),
-                    "{shape}: a reader still barriers slot 0 into TRANSFER_SRC_OPTIMAL \
+                            .contains(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+                        "{shape}: and it is a colour write"
+                    );
+
+                    // Outgoing: the final transition has to be ordered against the
+                    // subpass's own store, and the store made visible to the copy
+                    // that reads the target after the pass.
+                    assert!(
+                        outgoing
+                            .src_stage_mask
+                            .contains(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT),
+                        "{shape}: the store runs at COLOR_ATTACHMENT_OUTPUT"
+                    );
+                    assert!(
+                        outgoing
+                            .src_access_mask
+                            .contains(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+                        "{shape}: and it is a colour write"
+                    );
+                    assert!(
+                        outgoing
+                            .dst_stage_mask
+                            .contains(vk::PipelineStageFlags::TRANSFER)
+                            && outgoing
+                                .dst_access_mask
+                                .contains(vk::AccessFlags::TRANSFER_READ),
+                        "{shape}: a reader still barriers slot 0 into TRANSFER_SRC_OPTIMAL \
                      for itself, and this is the scope its transition orders against"
-                );
+                    );
 
-                // Depth is stated only where the pass has a depth attachment —
-                // the fix is to add the missing class, not to name every class
-                // on every pass.
-                assert_eq!(
-                    incoming
-                        .dst_access_mask
-                        .contains(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE),
-                    has_depth,
-                    "{shape}: depth terms follow the depth attachment"
-                );
+                    // Depth is stated only where the pass has a depth attachment —
+                    // the fix is to add the missing class, not to name every class
+                    // on every pass.
+                    assert_eq!(
+                        incoming
+                            .dst_access_mask
+                            .contains(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE),
+                        has_depth,
+                        "{shape}: depth terms follow the depth attachment"
+                    );
 
-                // Framebuffer fetch reads attachment 0 in the fragment stage, so
-                // the entry transition must be visible to that read as well.
-                assert_eq!(
-                    incoming
-                        .dst_access_mask
-                        .contains(vk::AccessFlags::INPUT_ATTACHMENT_READ),
-                    color_input,
-                    "{shape}: input-attachment terms follow the fetch"
-                );
+                    // Framebuffer fetch reads attachment 0 in the fragment stage, so
+                    // the entry transition must be visible to that read as well.
+                    assert_eq!(
+                        incoming
+                            .dst_access_mask
+                            .contains(vk::AccessFlags::INPUT_ATTACHMENT_READ),
+                        color_input,
+                        "{shape}: input-attachment terms follow the fetch"
+                    );
+                    assert_eq!(
+                        incoming
+                            .src_stage_mask
+                            .contains(vk::PipelineStageFlags::HOST)
+                            && incoming
+                                .src_access_mask
+                                .contains(vk::AccessFlags::HOST_WRITE),
+                        host_accessible,
+                        "{shape}: host writes source only a host-accessible attachment"
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn a_host_accessible_primary_stays_general_between_every_pass_shape() {
+        let mut key = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
+        key.host_accessible_color0 = true;
+        for color_input in [false, true] {
+            for feedback in [false, true] {
+                key.color_input = color_input;
+                key.feedback_colors = u8::from(feedback);
+                assert_eq!(
+                    key.color_layout(0),
+                    if feedback {
+                        vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+                    } else {
+                        vk::ImageLayout::GENERAL
+                    }
+                );
+                assert_eq!(key.color_final_layout(0), vk::ImageLayout::GENERAL);
+            }
+        }
+        assert_eq!(
+            key.color_layout(1),
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        );
     }
 
     /// The pass key is the single source of truth for every place that names an

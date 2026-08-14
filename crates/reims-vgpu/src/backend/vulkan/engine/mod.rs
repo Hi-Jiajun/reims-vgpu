@@ -26,8 +26,8 @@ mod exec_compute;
 mod facade_decline;
 mod guest_scatter;
 mod host_ram;
-mod linear_target_import;
 pub mod init_decline;
+mod linear_target_import;
 mod pools;
 mod scatter_shader;
 pub(crate) mod stamp_completion;
@@ -322,9 +322,8 @@ const CAP_GPU_ONLY_BIT: u32 =
 const _: () = assert!(CAP_GPU_ONLY_BIT < u64::BITS);
 
 impl DeviceCapabilitySnapshot {
-    const CONSERVATIVE: Self = Self(
-        crate::backend::vulkan::caps::device_features::VULKAN_MIN_IMAGE_DIMENSION_2D as u64,
-    );
+    const CONSERVATIVE: Self =
+        Self(crate::backend::vulkan::caps::device_features::VULKAN_MIN_IMAGE_DIMENSION_2D as u64);
 
     fn from_device(ctx: &context::DeviceContext) -> Self {
         Self::from_parts(&ctx.features, ctx.caps.quirks)
@@ -362,22 +361,21 @@ impl DeviceCapabilitySnapshot {
     }
 }
 
-static DEVICE_CAPABILITIES: AtomicU64 =
-    AtomicU64::new(DeviceCapabilitySnapshot::CONSERVATIVE.0);
+static DEVICE_CAPABILITIES: AtomicU64 = AtomicU64::new(DeviceCapabilitySnapshot::CONSERVATIVE.0);
 
 fn device_capabilities() -> DeviceCapabilitySnapshot {
     DeviceCapabilitySnapshot(DEVICE_CAPABILITIES.load(Ordering::Acquire))
 }
 
 pub(super) fn publish_device_capabilities(ctx: &context::DeviceContext) {
-    DEVICE_CAPABILITIES.store(DeviceCapabilitySnapshot::from_device(ctx).0, Ordering::Release);
+    DEVICE_CAPABILITIES.store(
+        DeviceCapabilitySnapshot::from_device(ctx).0,
+        Ordering::Release,
+    );
 }
 
 fn clear_device_capabilities() {
-    DEVICE_CAPABILITIES.store(
-        DeviceCapabilitySnapshot::CONSERVATIVE.0,
-        Ordering::Release,
-    );
+    DEVICE_CAPABILITIES.store(DeviceCapabilitySnapshot::CONSERVATIVE.0, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -398,8 +396,7 @@ mod device_capability_snapshot_tests {
 
     #[test]
     fn one_word_preserves_every_published_device_answer() {
-        let mut features =
-            crate::backend::vulkan::caps::device_features::DeviceFeatures::default();
+        let mut features = crate::backend::vulkan::caps::device_features::DeviceFeatures::default();
         features.max_image_dimension_2d = 16_384;
         features.color_attachment_blend[TexelLayout::Rgba16Float.index()] = true;
 
@@ -1512,8 +1509,7 @@ pub struct ResidentResourceLease {
 
 impl ResidentResourceLease {
     pub fn matches(&self, identity: &TargetIdentity) -> bool {
-        self.identity == *identity
-            && self.epoch == RESIDENT_RESOURCE_EPOCH.load(Ordering::Acquire)
+        self.identity == *identity && self.epoch == RESIDENT_RESOURCE_EPOCH.load(Ordering::Acquire)
     }
 
     pub fn backing(&self) -> ResidentContentBacking {
@@ -1521,10 +1517,7 @@ impl ResidentResourceLease {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_new(
-        identity: TargetIdentity,
-        backing: ResidentContentBacking,
-    ) -> Self {
+    pub(crate) fn test_new(identity: TargetIdentity, backing: ResidentContentBacking) -> Self {
         Self {
             identity,
             backing,
@@ -1565,10 +1558,7 @@ pub fn retain_resident_resource(identity: &TargetIdentity) -> Option<ResidentRes
     })
 }
 
-fn classify_resident_content(
-    content_ready: bool,
-    guest_imported: bool,
-) -> ResidentContentBacking {
+fn classify_resident_content(content_ready: bool, guest_imported: bool) -> ResidentContentBacking {
     match (content_ready, guest_imported) {
         (false, _) => ResidentContentBacking::NotReady,
         (true, true) => ResidentContentBacking::GuestAllocation,
@@ -1581,9 +1571,7 @@ pub fn resident_content_backing(identity: &TargetIdentity) -> ResidentContentBac
     guard
         .pools
         .registry_get(identity)
-        .map(|slot| {
-            classify_resident_content(slot.content_ready, slot.memory.is_guest_imported())
-        })
+        .map(|slot| classify_resident_content(slot.content_ready, slot.memory.is_guest_imported()))
         .unwrap_or(ResidentContentBacking::NotReady)
 }
 
@@ -1675,7 +1663,7 @@ pub fn resident_content_epoch(identity: &TargetIdentity) -> Option<u32> {
 /// pinned a content-ready slot at this identity and stamped it under the engine
 /// lock, so by the time it lands:
 ///
-/// - [`ResidentContent::Unstamped`] is expected traffic. `registry_mark_ready`
+/// - [`ResidentContent::Unstamped`] is expected traffic. `registry_mark_ready_at`
 ///   clears the stamp on every draw into a slot, so a later pass over the same
 ///   surface says the resident no longer holds the frame this window promised.
 ///   Declining is correct; the newer pass owns the surface now.
@@ -2179,6 +2167,7 @@ unsafe fn copy_image_level0_to_host(
     counters: &EngineCounters,
     image: ash::vk::Image,
     old_layout: ash::vk::ImageLayout,
+    read_layout: ash::vk::ImageLayout,
     src_access: ash::vk::AccessFlags,
     width: u32,
     height: u32,
@@ -2191,6 +2180,7 @@ unsafe fn copy_image_level0_to_host(
         counters,
         image,
         old_layout,
+        read_layout,
         src_access,
         width,
         height,
@@ -2221,6 +2211,7 @@ unsafe fn copy_image_level0_to_host_delivered(
     counters: &EngineCounters,
     image: ash::vk::Image,
     old_layout: ash::vk::ImageLayout,
+    read_layout: ash::vk::ImageLayout,
     src_access: ash::vk::AccessFlags,
     width: u32,
     height: u32,
@@ -2350,7 +2341,7 @@ unsafe fn copy_image_level0_to_host_delivered(
         .src_access_mask(src_access)
         .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)
         .old_layout(old_layout)
-        .new_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .new_layout(read_layout)
         .image(image)
         .subresource_range(color_subresource_range())];
     ctx.device.cmd_pipeline_barrier(
@@ -2398,13 +2389,8 @@ unsafe fn copy_image_level0_to_host_delivered(
     // open draw batch before claiming a slot (`batch_readback_joins` is 58.8%
     // of all batch flushes). Collapsing those two is the lever; see
     // `pools::BATCH_MAX_DRAWS`.
-    ctx.device.cmd_copy_image_to_buffer(
-        cb,
-        image,
-        ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        readback.buffer,
-        &region,
-    );
+    ctx.device
+        .cmd_copy_image_to_buffer(cb, image, read_layout, readback.buffer, &region);
     unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE, 2) };
     if appended.is_some() {
         // `batch_flush` ends the command buffer, submits it with the fence
@@ -2631,6 +2617,7 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
     }
     let rb_size =
         (snap.width as u64) * (snap.height as u64) * u64::from(RESIDENT_READ_BYTES_PER_TEXEL);
+    let read_access = pools::ResidentAccess::transfer_read(snap.guest_backing.is_some());
     unsafe {
         let delivered = copy_image_level0_to_host_delivered(
             ctx,
@@ -2638,6 +2625,7 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
             counters,
             snap.image,
             snap.layout,
+            read_access.layout(),
             RESIDENT_READ_SRC_ACCESS,
             snap.width,
             snap.height,
@@ -2645,7 +2633,7 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
             target_readback_ops(),
             ReadbackDelivery::Lease,
         )?;
-        pools.registry_note_access(identity, pools::ResidentAccess::TransferRead);
+        pools.registry_note_access(identity, read_access);
         counters.note_target_read(rb_size);
         Ok(match delivered {
             ReadbackResult::Leased { token, ptr, len } => Some(LeasedFrame {
@@ -2953,7 +2941,10 @@ pub fn copy_target_to_guest_pages(
             .guest_write_dispatches
             .fetch_add(plan.dispatches(), Ordering::Relaxed);
         copy_image_level0_to_buffer(ctx, pools, counters, &snap, &plan)?;
-        pools.registry_note_access(identity, pools::ResidentAccess::TransferRead);
+        pools.registry_note_access(
+            identity,
+            pools::ResidentAccess::transfer_read(snap.guest_backing.is_some()),
+        );
         counters.note_target_read(u64::from(dst.width) * u64::from(dst.height) * 4);
     }
     // Past the last fallible step, so this runs exactly when the copy is on the
@@ -3606,11 +3597,12 @@ unsafe fn copy_image_level0_to_buffer(
     // render pass leaves its attachment in [`caches::COLOR0_PASS_EXIT_LAYOUT`],
     // so the common case is a real transition too, and it must still order this
     // copy after the draws that produced the pixels.
+    let read_access = pools::ResidentAccess::transfer_read(snap.guest_backing.is_some());
     let barrier = [ash::vk::ImageMemoryBarrier::default()
         .src_access_mask(RESIDENT_READ_SRC_ACCESS)
         .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)
         .old_layout(snap.layout)
-        .new_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .new_layout(read_access.layout())
         .image(snap.image)
         .subresource_range(color_subresource_range())];
     ctx.device.cmd_pipeline_barrier(
@@ -3632,7 +3624,7 @@ unsafe fn copy_image_level0_to_buffer(
                 ctx.device.cmd_copy_image_to_buffer(
                     cb,
                     snap.image,
-                    ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    read_access.layout(),
                     *buffer,
                     regions,
                 );
@@ -3647,7 +3639,7 @@ unsafe fn copy_image_level0_to_buffer(
             ctx.device.cmd_copy_image_to_buffer(
                 cb,
                 snap.image,
-                ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                read_access.layout(),
                 *scratch,
                 &one,
             );
@@ -4107,6 +4099,7 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
     // not what the caller can read.
     let pixels = (snap.width as u64) * (snap.height as u64);
     let rb_size = pixels * u64::from(layout.bytes_per_texel());
+    let read_access = pools::ResidentAccess::transfer_read(snap.guest_backing.is_some());
     unsafe {
         let out = copy_image_level0_to_host(
             ctx,
@@ -4114,13 +4107,14 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
             counters,
             snap.image,
             snap.layout,
+            read_access.layout(),
             RESIDENT_READ_SRC_ACCESS,
             snap.width,
             snap.height,
             rb_size,
             target_readback_ops(),
         )?;
-        pools.registry_note_access(identity, pools::ResidentAccess::TransferRead);
+        pools.registry_note_access(identity, read_access);
         counters.note_target_read(rb_size);
         // A wide resident is quantized here rather than refused; see
         // `narrow_readback_to_rgba8` for why that direction is the safe one.

@@ -1379,24 +1379,45 @@ pub(crate) enum ResidentAccess {
     ColorWrite(vk::ImageLayout),
     /// A colour attachment was read by shaders and written by colour output in
     /// an attachment-feedback-loop pass.
-    ColorFeedback,
+    ColorFeedback(vk::ImageLayout),
     /// A draw sampled it.
-    ShaderRead,
+    ShaderRead(vk::ImageLayout),
     /// A transfer read it: a present blit, a guest-page readback, a GPU seed
     /// copy, or this draw's own copy-on-sample snapshot.
-    TransferRead,
+    TransferRead(vk::ImageLayout),
 }
 
 impl ResidentAccess {
+    /// Layout for a sampled read. Imported linear images stay host-accessible
+    /// between device operations; ordinary images use the dedicated read-only
+    /// layout.
+    pub(crate) const fn shader_read(host_accessible: bool) -> Self {
+        Self::ShaderRead(if host_accessible {
+            vk::ImageLayout::GENERAL
+        } else {
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        })
+    }
+
+    /// Layout for a transfer read, preserving host access for imported linear
+    /// images while ordinary images use the dedicated transfer layout.
+    pub(crate) const fn transfer_read(host_accessible: bool) -> Self {
+        Self::TransferRead(if host_accessible {
+            vk::ImageLayout::GENERAL
+        } else {
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+        })
+    }
+
     /// Where the image is — the `old_layout` a barrier over it must name.
     pub(crate) fn layout(self) -> vk::ImageLayout {
         match self {
             Self::Untouched => vk::ImageLayout::UNDEFINED,
             Self::GuestBacking => vk::ImageLayout::PREINITIALIZED,
             Self::ColorWrite(layout) => layout,
-            Self::ColorFeedback => vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT,
-            Self::ShaderRead => vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            Self::TransferRead => vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            Self::ColorFeedback(layout) | Self::ShaderRead(layout) | Self::TransferRead(layout) => {
+                layout
+            }
         }
     }
 
@@ -1428,7 +1449,7 @@ impl ResidentAccess {
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
             ),
-            Self::ColorFeedback => (
+            Self::ColorFeedback(_) => (
                 vk::PipelineStageFlags::VERTEX_SHADER
                     | vk::PipelineStageFlags::FRAGMENT_SHADER
                     | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
@@ -1436,11 +1457,11 @@ impl ResidentAccess {
                     | vk::AccessFlags::COLOR_ATTACHMENT_READ
                     | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
             ),
-            Self::ShaderRead => (
+            Self::ShaderRead(_) => (
                 vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::AccessFlags::SHADER_READ,
             ),
-            Self::TransferRead => (
+            Self::TransferRead(_) => (
                 vk::PipelineStageFlags::TRANSFER,
                 vk::AccessFlags::TRANSFER_READ,
             ),
@@ -2195,8 +2216,8 @@ const SAMPLED_FREE_CAP_TOTAL: usize = 64;
 /// routes every other view shape through the general sampled pool, making the
 /// largest dedicated snapshot population `draws × attachments` rather than
 /// `draws × texture-table width`.
-const ATTACHMENT_SNAPSHOT_BATCH_CAP: usize = BATCH_MAX_DRAWS as usize
-    * (crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS + 1);
+const ATTACHMENT_SNAPSHOT_BATCH_CAP: usize =
+    BATCH_MAX_DRAWS as usize * (crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS + 1);
 /// Every attachment may have the same geometry and view key, so the per-key
 /// bound is the whole batch population rather than only its draw count.
 const ATTACHMENT_SNAPSHOT_FREE_CAP_PER_KEY: usize = ATTACHMENT_SNAPSHOT_BATCH_CAP;
@@ -3111,10 +3132,7 @@ mod sampled_key_tests {
         assert!(plain.is_plain_2d_identity_view());
 
         let mut variants = Vec::new();
-        variants.push(SampledKey {
-            layers: 2,
-            ..plain
-        });
+        variants.push(SampledKey { layers: 2, ..plain });
         variants.push(SampledKey {
             volume: true,
             ..plain

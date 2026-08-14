@@ -297,6 +297,7 @@ enum BlitSource {
     Resident {
         image: vk::Image,
         access: super::pools::ResidentAccess,
+        next_access: super::pools::ResidentAccess,
         width: u32,
         height: u32,
     },
@@ -335,9 +336,20 @@ impl BlitSource {
         cmd: vk::CommandBuffer,
     ) -> vk::ImageLayout {
         match self {
-            Self::Resident { image, access, .. } => {
-                super::exec::barrier_resident_for_transfer_read(device, cmd, *image, *access);
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+            Self::Resident {
+                image,
+                access,
+                next_access,
+                ..
+            } => {
+                super::exec::barrier_resident_for_transfer_read(
+                    device,
+                    cmd,
+                    *image,
+                    *access,
+                    *next_access,
+                );
+                next_access.layout()
             }
             Self::Staged {
                 image, first_use, ..
@@ -1147,6 +1159,7 @@ impl WindowPresenter {
                     slot.access,
                     slot.width,
                     slot.height,
+                    slot.memory.is_guest_imported(),
                 )
             })
         });
@@ -1176,7 +1189,7 @@ impl WindowPresenter {
             staged
         };
         let mut pinned = Vec::with_capacity(1);
-        if let Some((identity, _, _, _, _)) = selected.as_ref() {
+        if let Some((identity, _, _, _, _, _)) = selected.as_ref() {
             if !pools.pin_resident_target(identity, true) {
                 return Err(DrawError::Facade(
                     EngineFacadeDecline::WindowSourceDisappearedBeforePin {
@@ -1194,11 +1207,14 @@ impl WindowPresenter {
         let blit = selected
             .as_ref()
             .map(
-                |(_, image, access, base_width, base_height)| BlitSource::Resident {
-                    image: *image,
-                    access: *access,
-                    width: *base_width,
-                    height: *base_height,
+                |(_, image, access, base_width, base_height, host_accessible)| {
+                    BlitSource::Resident {
+                        image: *image,
+                        access: *access,
+                        next_access: super::pools::ResidentAccess::transfer_read(*host_accessible),
+                        width: *base_width,
+                        height: *base_height,
+                    }
                 },
             )
             .or(staged);
@@ -1306,10 +1322,10 @@ impl WindowPresenter {
                     (0, 0, base_width, base_height),
                     (vp.x, vp.y, vp.x + vp.width, vp.y + vp.height),
                 );
-                if let Some((identity, _, _, _, _)) = selected.as_ref() {
+                if let Some((identity, _, _, _, _, host_accessible)) = selected.as_ref() {
                     pools.registry_note_access(
                         identity,
-                        super::pools::ResidentAccess::TransferRead,
+                        super::pools::ResidentAccess::transfer_read(*host_accessible),
                     );
                 }
             } else {

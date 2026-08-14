@@ -93,7 +93,7 @@ use super::*;
 /// alarm since it was written:
 ///
 /// - **The class it guarded is closed.** Every draw that stores into a target
-///   marks it sole-copy ([`ResourcePools::registry_mark_ready`]), and only a
+///   marks it sole-copy ([`ResourcePools::registry_mark_ready_at`]), and only a
 ///   writeback clears it, so a resident the drain is *allowed* to take has
 ///   demonstrably been copied out to the guest's own pages. What a reclaim costs
 ///   is the re-fetch, not the pixels — and `sampled_resident_missing` was 0 on
@@ -604,7 +604,7 @@ impl ResourcePools {
     ) {
         if let Some(resident) = self.compute_storage_registry.get_mut(identity) {
             resident.generation = generation;
-            resident.access = ResidentAccess::TransferRead;
+            resident.access = ResidentAccess::transfer_read(false);
         }
         // The dispatch just wrote this image, so nothing outside it holds the
         // result yet.
@@ -814,7 +814,7 @@ impl ResourcePools {
     ///   ago, so it carries no content stamp and no epoch; nothing has
     ///   transitioned it, so its layout is `UNDEFINED`; and no window holds it,
     ///   so it is unpinned. These are not defaults a creation site may pick —
-    ///   `registry_mark_ready`, the type-11 LOAD gate and the idle drain each
+    ///   `registry_mark_ready_at`, the type-11 LOAD gate and the idle drain each
     ///   read one of them, and an arm that guessed differently would be
     ///   answering a question the others think they already asked.
     /// - **The idle-drain clock belongs to the registry.** `last_touch_ms` comes
@@ -1023,7 +1023,12 @@ impl ResourcePools {
         // always built below (it binds this specific render_pass).
         let imported = match guest_memory.as_ref() {
             Some(memory) => match super::super::linear_target_import::create(
-                ctx, memory.backing, width, height, format, usage,
+                ctx,
+                memory.backing,
+                width,
+                height,
+                format,
+                usage,
             ) {
                 Ok(imported) => Some(imported),
                 Err(reason) => {
@@ -1579,12 +1584,21 @@ impl ResourcePools {
         Ok(fb)
     }
 
+    #[cfg(test)]
+    pub(crate) fn registry_mark_ready(&mut self, identity: &TargetIdentity) {
+        self.registry_mark_ready_at(
+            identity,
+            crate::backend::vulkan::engine::caches::COLOR0_PASS_EXIT_LAYOUT,
+        );
+    }
+
     /// Mark a resident ready after a render pass wrote it as a colour
     /// attachment and left it at an explicit `final_layout` — the MRT secondary
     /// arm, which settles at `COLOR_ATTACHMENT_OPTIMAL` where
-    /// [`Self::registry_mark_ready`]'s primary settles at
-    /// `TRANSFER_SRC_OPTIMAL`. Both record the same *access*; only the layout
-    /// differs, which is the distinction [`ResidentAccess::ColorWrite`] carries.
+    /// The layout is the pass's exact `finalLayout`, including `GENERAL` for a
+    /// host-accessible primary. Recording it beside the access is what keeps a
+    /// later barrier from naming an optimized layout the imported image is not
+    /// in.
     pub(crate) fn registry_mark_ready_at(
         &mut self,
         identity: &TargetIdentity,
@@ -1641,9 +1655,8 @@ impl ResourcePools {
             // OPTIMAL unconditionally, so this is where the image is left and it
             // is the `initial_layout` the next LOAD pass names. The two agreeing
             // is what makes a LOAD valid without a barrier between the passes.
-            slot.access = ResidentAccess::ColorWrite(
-                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            );
+            slot.access =
+                ResidentAccess::ColorWrite(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         }
     }
 
@@ -1722,21 +1735,6 @@ impl ResourcePools {
 
     /// Mark a resident ready after a draw stored into it.
     ///
-    /// Clears `content_epoch`: this image's pixels just changed, and until
-    /// something publishes them as the mapping's content and stamps the slot,
-    /// nothing may claim they match a mapping epoch. Every path that ends in a
-    /// resident holding new pixels comes through here or
-    /// [`Self::registry_mark_ready_at`], which is what keeps the reset total
-    /// rather than a list of the writers somebody remembered.
-    pub(crate) fn registry_mark_ready(&mut self, identity: &TargetIdentity) {
-        self.registry_mark_ready_with_access(
-            identity,
-            ResidentAccess::ColorWrite(
-                crate::backend::vulkan::engine::caches::COLOR0_PASS_EXIT_LAYOUT,
-            ),
-        );
-    }
-
     /// Record that this resident's current pixels have been copied somewhere
     /// that outlives the image — the guest's own pages — so reclaiming it now
     /// costs redundant work rather than the frame.
@@ -1774,13 +1772,17 @@ impl ResourcePools {
 
     /// Record a non-writing touch of a resident: a draw sampled it, or a
     /// transfer read it out (present blit, guest-page readback, GPU seed
-    /// source). The writing touches go through [`Self::registry_mark_ready`]
-    /// and [`Self::registry_mark_ready_at`], which also vouch for the pixels.
+    /// source). The writing touches go through [`Self::registry_mark_ready_at`]
+    /// or [`Self::registry_mark_ready_with_access`], which also vouch for the pixels.
     ///
     /// Every rail that touches a resident has to land in one of the three,
     /// because the next barrier over that image derives its source scope from
     /// what it finds here — see [`ResidentAccess`].
-    pub(crate) fn registry_note_access(&mut self, identity: &TargetIdentity, access: ResidentAccess) {
+    pub(crate) fn registry_note_access(
+        &mut self,
+        identity: &TargetIdentity,
+        access: ResidentAccess,
+    ) {
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.access = access;
         }
@@ -2537,10 +2539,7 @@ pub(super) mod pin_count_tests {
         pools
             .registry
             .insert(recyclable_id.clone(), dummy_slot(true));
-        assert_eq!(
-            pools.retain_resident_target(&recyclable_id),
-            Some(false)
-        );
+        assert_eq!(pools.retain_resident_target(&recyclable_id), Some(false));
         assert_eq!(pools.registry[&recyclable_id].pin_count, 1);
 
         let imported_id = surf(2);
@@ -2725,9 +2724,15 @@ pub(super) mod pin_count_tests {
         pools.register_resident(&identity, resident);
 
         let slot = pools.registry.get(&identity).expect("registered");
-        assert!(slot.content_ready, "the allocation carries its prior texels");
+        assert!(
+            slot.content_ready,
+            "the allocation carries its prior texels"
+        );
         assert_eq!(slot.access, ResidentAccess::GuestBacking);
-        assert!(!slot.gpu_only_content, "the guest allocation is the other copy");
+        assert!(
+            !slot.gpu_only_content,
+            "the guest allocation is the other copy"
+        );
 
         pools.registry_mark_ready(&identity);
         assert!(
