@@ -416,7 +416,11 @@ fn apply_delete_task(state: &mut DeviceState, payload: &[u8], channel: Option<u3
     // names bytes that are no longer this task's. Here rather than at the two
     // call sites: the root and child FIFOs both reach this, and a rule written
     // twice is the one that diverges.
-    note_bb_retired("bb_retire_delete_task", state.retire_bound_buffers_for_task(task_id));
+    crate::runtime::writeback_debt::retire_gva_for_task(state, task_id);
+    note_bb_retired(
+        "bb_retire_delete_task",
+        state.retire_bound_buffers_for_task(task_id),
+    );
     let ok = state.delete_task(task_id);
     crate::observe::off(format!(
         "delete_task site={} task={task_id} ok={} plen={}",
@@ -468,6 +472,7 @@ fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Optio
     let count = ld32(&payload[SET_OBJECT_LIST_COUNT..]);
     // A new object list re-points every reference on this task, so no
     // resolution keyed by reference survives it. Both FIFOs reach this.
+    crate::runtime::writeback_debt::retire_gva_for_task(state, task_id);
     note_bb_retired(
         "bb_retire_set_object_list",
         state.retire_bound_buffers_for_task(task_id),
@@ -510,7 +515,11 @@ fn apply_define_task2<H: HostMemory + HostOps>(
     // through the old one may translate elsewhere now. Keyed on the shifted
     // `task_id`, not `raw_id` — the registry is keyed the way the draw path
     // keys it, and `raw_id` is the wrong number by a factor of two.
-    note_bb_retired("bb_retire_define_task2", state.retire_bound_buffers_for_task(task_id));
+    crate::runtime::writeback_debt::retire_gva_for_task(state, task_id);
+    note_bb_retired(
+        "bb_retire_define_task2",
+        state.retire_bound_buffers_for_task(task_id),
+    );
     state.define_task(task_id, length, dir);
     // Capture directory + root/depth so one boot shows the page-table identity.
     let Some(slot) = state.tasks.get(task_id) else {
@@ -2367,9 +2376,7 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
             Ok(packet) => {
                 // The main FIFO stamps per packet and latches nothing, so there is
                 // no pending value here for a wait to be answered from.
-                if note_packet_stamp_waits(state, host, None, &packet, None)
-                    == StampVerdict::Hold
-                {
+                if note_packet_stamp_waits(state, host, None, &packet, None) == StampVerdict::Hold {
                     // Same hold as the child drain, and this is the timeline
                     // where it matters most: the measured root wait is a
                     // `DELETE_TASK` ordered behind a child FIFO's stamp, so
@@ -3361,8 +3368,7 @@ fn observe_page_table_nodes<H: HostMemory + HostOps>(
     if !node_guard::enabled() {
         return;
     }
-    let Some(geometry) =
-        reims_vgpu_paging::resolve::geometry_for_page_shift(state.page_shift)
+    let Some(geometry) = reims_vgpu_paging::resolve::geometry_for_page_shift(state.page_shift)
     else {
         return;
     };
@@ -3574,7 +3580,10 @@ fn apply_map_family<H: HostMemory + HostOps>(
             // never-fired signal there is.
             note_store_route(verdict.slug());
             if verdict.is_finding()
-                && crate::observe::first_sight(verdict.slug(), u64::from(task_id) << 32 | u64::from(channel_id))
+                && crate::observe::first_sight(
+                    verdict.slug(),
+                    u64::from(task_id) << 32 | u64::from(channel_id),
+                )
             {
                 let live = intervals.live_count();
                 crate::observe::fail(format!(
@@ -3668,9 +3677,8 @@ fn apply_map_family<H: HostMemory + HostOps>(
                 "bb_retire_map_range",
                 state.retire_bound_buffers_in_range(task_id, gva, length),
             );
-            let n = crate::runtime::gva_view::retire_gva_views_overlapping(
-                state, task_id, gva, length,
-            );
+            let n =
+                crate::runtime::gva_view::retire_gva_views_overlapping(state, task_id, gva, length);
             let op = if family == MapFamily::UnmapMemory {
                 "unmap_memory"
             } else {
@@ -3810,12 +3818,9 @@ fn apply_map_family<H: HostMemory + HostOps>(
             // host-cached pixels for a resource the guest has just
             // CPU-written, so the line has to say which check refused
             // and not only that one did.
-            Err(e) => note_resource_list_decode_fail(
-                "InvalidateResources",
-                packet.opcode,
-                channel_id,
-                e,
-            ),
+            Err(e) => {
+                note_resource_list_decode_fail("InvalidateResources", packet.opcode, channel_id, e)
+            }
         }
     } else if matches!(
         family,
@@ -3824,9 +3829,9 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // Two opcodes, one arm, because the reference host validates
         // both with byte-for-byte the same check — `{u32 task, u32
         // count}` then `count` 4-byte object ids — and the synchronise
-        // obligation they name is the same one. `0x3e` adds a discard of
-        // the named resources' contents on top, which this device does
-        // not act on and reports below.
+        // obligation they name is the same one. `0x3e` then releases the
+        // named resources' transfer backings while preserving their host
+        // textures and resource identities.
         //
         // The command carries `{task, count}` and a list of object ids,
         // and nothing else — no region, no direction. It is the guest
@@ -3846,16 +3851,26 @@ fn apply_map_family<H: HostMemory + HostOps>(
         use crate::runtime::decode::fifo::decode_synchronize_resources;
         match decode_synchronize_resources(&packet.payload) {
             Ok(cmd) => {
-                // The guest asking for a resource synchronize is the one
-                // host-to-guest copy the contract actually names, so it is the
-                // land point every owed frame is owed to. A driven boot issues
-                // zero of these; a boot where this arm fires is a boot where the
-                // lazy rail is being asked for exactly what it defers.
-                crate::runtime::writeback_debt::settle_unnamed(
+                // Synchronization is resource-scoped. Apple batches the named
+                // resources into transfer encoders; synchronizing one object
+                // does not publish every other host-valid texture in the task.
+                crate::runtime::writeback_debt::settle_for_resources(
                     state,
                     host,
+                    cmd.task_id,
+                    &cmd.object_ids,
                     crate::runtime::render_writeback::SettleSite::ChildStamp,
                 );
+                if family == MapFamily::SynchronizeAndDiscardResources {
+                    let discarded = crate::runtime::writeback_debt::discard_gva_resources(
+                        state,
+                        cmd.task_id,
+                        &cmd.object_ids,
+                    );
+                    if discarded != 0 {
+                        note_store_route_n("gva_transfer_backing_discarded", discarded as u64);
+                    }
+                }
                 let oid = cmd.object_ids.first().copied().unwrap_or(0);
                 if crate::observe::draw_log_enabled() {
                     crate::observe::line(format!(
@@ -3879,17 +3894,6 @@ fn apply_map_family<H: HostMemory + HostOps>(
             // black frame the guest has no way to notice.
             Err(e) => note_resource_list_decode_fail(name, packet.opcode, channel_id, e),
         }
-        // The half of `0x3e` that is not the synchronise. Reported after
-        // the synchronise has run, so the record cannot be read as the
-        // whole command having been dropped.
-        if family == MapFamily::SynchronizeAndDiscardResources {
-            note_unimplemented(
-                state,
-                channel_id,
-                UnimplementedCommand::SynchronizeAndDiscardResources,
-                packet,
-            );
-        }
     } else {
         let w0 = if plen >= 4 {
             crate::contract::endian::ld32(&packet.payload[0..])
@@ -3907,7 +3911,6 @@ fn apply_map_family<H: HostMemory + HostOps>(
         ));
     }
 }
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChildPacketDisposition {
@@ -3995,6 +3998,9 @@ fn process_child_packet<H: HostMemory + HostOps>(
                     "bb_retire_delete_resource",
                     state.retire_bound_buffers_for_ref(task_id, id),
                 );
+                if crate::runtime::writeback_debt::retire_gva_resource(state, task_id, id) {
+                    note_store_route("gva_resource_retired");
+                }
                 let _ = state.delete_object(task_id, id);
             }
         }
@@ -4047,7 +4053,9 @@ fn process_child_packet<H: HostMemory + HostOps>(
         // op6 `CmdDisplayTransaction2_DEPRECATED` and op7
         // `CmdDisplayTransaction3`. They differ only in where the surface word
         // sits, which `display_txn_trailer_slots` owns for all three.
-        opcode @ (CHILD_OP_DISPLAY_SWAP | CHILD_OP_DISPLAY_TRANSACTION2 | CHILD_OP_DISPLAY_TRANSACTION3) => {
+        opcode @ (CHILD_OP_DISPLAY_SWAP
+        | CHILD_OP_DISPLAY_TRANSACTION2
+        | CHILD_OP_DISPLAY_TRANSACTION3) => {
             note_display_txn_payload(state, channel_id, packet);
             let Some(mapping) = present_surface_id(opcode, &packet.payload) else {
                 crate::observe::fail(format!(
@@ -4327,6 +4335,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                     // The packet names an object, not a range, and which
                     // references resolved through it is not recorded — so the
                     // task's resolutions go together.
+                    crate::runtime::writeback_debt::retire_gva_for_task(state, cmd.task_id);
                     note_bb_retired(
                         "bb_retire_replace_physical",
                         state.retire_bound_buffers_for_task(cmd.task_id),
@@ -4366,10 +4375,22 @@ fn process_child_packet<H: HostMemory + HostOps>(
             apply_map_family(state, host, channel_id, packet, MapFamily::MapMemory2);
         }
         CHILD_OP_INVALIDATE_RESOURCES => {
-            apply_map_family(state, host, channel_id, packet, MapFamily::InvalidateResources);
+            apply_map_family(
+                state,
+                host,
+                channel_id,
+                packet,
+                MapFamily::InvalidateResources,
+            );
         }
         CHILD_OP_SYNCHRONIZE_RESOURCES => {
-            apply_map_family(state, host, channel_id, packet, MapFamily::SynchronizeResources);
+            apply_map_family(
+                state,
+                host,
+                channel_id,
+                packet,
+                MapFamily::SynchronizeResources,
+            );
         }
         CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES => {
             apply_map_family(
@@ -4390,8 +4411,8 @@ fn process_child_packet<H: HostMemory + HostOps>(
             );
         }
         // `CmdDiscardResources`: the discard half of `0x3e` on its own, with the
-        // same payload contract, and nothing owed to the guest — a discard this
-        // device ignores costs memory and never correctness.
+        // same payload contract. It releases each resource's transfer backing;
+        // prepare or synchronize recreates that backing lazily if needed.
         //
         // The payload is still decoded, with `0x35`'s decoder because the host
         // validates all three with the same check. A malformed one is worth a
@@ -4401,12 +4422,16 @@ fn process_child_packet<H: HostMemory + HostOps>(
         CHILD_OP_DISCARD_RESOURCES => {
             use crate::runtime::decode::fifo::decode_synchronize_resources;
             match decode_synchronize_resources(&packet.payload) {
-                Ok(_) => note_unimplemented(
-                    state,
-                    channel_id,
-                    UnimplementedCommand::DiscardResources,
-                    packet,
-                ),
+                Ok(cmd) => {
+                    let discarded = crate::runtime::writeback_debt::discard_gva_resources(
+                        state,
+                        cmd.task_id,
+                        &cmd.object_ids,
+                    );
+                    if discarded != 0 {
+                        note_store_route_n("gva_transfer_backing_discarded", discarded as u64);
+                    }
+                }
                 Err(e) => {
                     note_resource_list_decode_fail("DiscardResources", packet.opcode, channel_id, e)
                 }
@@ -5403,10 +5428,7 @@ pub(crate) fn signal_display_refresh_classes<H: HostMemory + HostOps>(
     // and the two are directly comparable. A guest that arms only the
     // transaction class still reports `not_enabled` here, because this arm names
     // the VBL class and not "did the tick do anything".
-    note_vbl(
-        if vbl { VBL_DELIVERED } else { VBL_NOT_ENABLED },
-        now_ms,
-    );
+    note_vbl(if vbl { VBL_DELIVERED } else { VBL_NOT_ENABLED }, now_ms);
     if transaction {
         note_display_present_signal(DISPLAY_PRESENT_REFRESH);
     }

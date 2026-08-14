@@ -151,9 +151,8 @@ pub enum Phase {
     /// between two workloads is measuring something one of them does and the
     /// other does not, and the span holds exactly two candidates.
     PrepSeed = 13,
-    /// `sync_store_allowed_pages` — the page-table walk that bounds the
-    /// synchronous GVA Store, taken before any GPU work so the set predates the
-    /// submit.
+    /// `sync_store_allowed_pages` — the page-table walk that bounds the eager
+    /// GVA fallback, taken before any GPU work so the set predates the submit.
     PrepPages = 14,
 }
 

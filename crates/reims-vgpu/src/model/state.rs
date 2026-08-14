@@ -100,8 +100,7 @@ impl ExecFault {
 /// writing the handler rather than by more reverse engineering.
 ///
 /// The variants that carry no risk of losing guest work say so in their own
-/// docs. A reader ranking the fail log needs that distinction: the discard hints
-/// cost memory and the display-state commands cost a wrong panel state.
+/// docs. A reader ranking the fail log needs that distinction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnimplementedCommand {
     /// `CmdDebug` (`0x00`). A host-side trace marker; nothing is owed.
@@ -136,20 +135,6 @@ pub enum UnimplementedCommand {
     /// continues immediately, which reorders nothing but can race a guest that
     /// used the delay for settling.
     Delay,
-    /// `CmdDiscardResources` (`0x3f`). A hint that the named resources' contents
-    /// are no longer needed; ignoring it costs memory and never correctness.
-    /// Nothing of this command is executed.
-    DiscardResources,
-    /// The discard half of `CmdSynchronizeAndDiscardResources` (`0x3e`).
-    ///
-    /// Its own variant rather than a second use of [`Self::DiscardResources`],
-    /// because the two declines do not mean the same thing and a shared slug
-    /// cannot say which fired: on `0x3f` the whole command was dropped, while
-    /// here the synchronise half **did** run and only the discard hint was
-    /// ignored. A reader ranking the log needs that difference — the first is a
-    /// resource the guest expected to be released, the second is only memory
-    /// held longer than asked.
-    SynchronizeAndDiscardResources,
     /// One of the reference host's retired opcodes. Its handler accepts the
     /// packet and does nothing with the payload, so matching it is fidelity
     /// rather than a gap — the record exists to say an old guest is still
@@ -165,10 +150,6 @@ impl UnimplementedCommand {
             Self::DisplaySleepState => "cmd_display_sleep_state_unimplemented",
             Self::DisplaySetProperties => "cmd_display_set_properties_unimplemented",
             Self::Delay => "cmd_delay_unimplemented",
-            Self::DiscardResources => "cmd_discard_resources_unimplemented",
-            Self::SynchronizeAndDiscardResources => {
-                "cmd_synchronize_and_discard_resources_discard_unimplemented"
-            }
             Self::Deprecated => "cmd_deprecated",
         }
     }
@@ -182,8 +163,6 @@ impl UnimplementedCommand {
             Self::DisplaySleepState => "CmdDisplaySleepState",
             Self::DisplaySetProperties => "CmdDisplaySetProperties",
             Self::Delay => "CmdDelay",
-            Self::DiscardResources => "CmdDiscardResources",
-            Self::SynchronizeAndDiscardResources => "CmdSynchronizeAndDiscardResources",
             Self::Deprecated => "CmdDeprecated",
         }
     }
@@ -2118,9 +2097,10 @@ pub struct DeviceState {
     /// ([`crate::runtime::render_writeback::retire_linear_residents`]) so the
     /// pinned images become LRU-evictable instead of leaking.
     pub retired_linear_residents: Vec<ComputeStorageResidencyKey>,
-    /// Type-11 surfaces whose latest frame is still only in the engine resident,
-    /// because nothing has read their guest pages since the Store that produced
-    /// it. See [`crate::runtime::writeback_debt`], which owns every transition.
+    /// Surface and GVA resources whose latest frame is still only in the engine
+    /// resident, because nothing has synchronized or read their guest pages
+    /// since the Store that produced it. See
+    /// [`crate::runtime::writeback_debt`], which owns every transition.
     ///
     /// Empty unless [`crate::env::LAZY_WRITEBACK`] is on, and empty on the
     /// `backend-metal` arm, which arms nothing.
@@ -2257,9 +2237,6 @@ impl DeviceState {
             view_stale_reads: 0,
         }
     }
-
-
-
 
     /// Detach `e`'s contiguous view for later unmap (page table changed).
     /// Returns the retired (ptr, len) to push into `retired_views`.

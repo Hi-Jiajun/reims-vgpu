@@ -133,7 +133,19 @@ pub fn apply(
         // gather has no substitute for. Recorded only on the miss, because an
         // object with a mapping already carries `content_generation` and a
         // second spelling of one fact is a divergence waiting to happen.
-        if !hit {
+        // A task-local texture reference can numerically collide with a
+        // mapping id: they are distinct guest namespaces. While a GVA frame is
+        // owed, that texture needs its own generation even when the integer
+        // happened to hit an unrelated mapping above, or the guest's CPU write
+        // would leave the old resident authoritative.
+        let gva_owed =
+            state
+                .pending_writebacks
+                .has_gva(crate::runtime::writeback_debt::GvaResourceKey {
+                    task_id,
+                    texture_ref: object_id,
+                });
+        if !hit || gva_owed {
             state.buffer_write_gen.note_write(task_id, object_id);
         }
         crate::runtime::drain::note_store_route(site.clear_host_route());
@@ -257,7 +269,6 @@ pub fn writeback_refused(state: &DeviceState, mapping_id: u32) -> bool {
     licence == WritebackLicence::Superseded
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,8 +313,6 @@ mod tests {
         assert!(after.host_stated && after.guest_stated);
     }
 
-
-
     /// A texture ref and the mapping it resolves to are one guest resource, so a
     /// statement about the ref has to land on the mapping. One that stopped at
     /// the ref would leave the mapping still claiming host-valid bytes the guest
@@ -322,6 +331,52 @@ mod tests {
         );
     }
 
+    /// Mapping ids and task-local texture refs are separate namespaces. When
+    /// their integers collide, invalidating the mapping must not hide the guest
+    /// write from a host-authoritative GVA resident owned by the texture ref.
+    #[test]
+    fn a_numeric_mapping_collision_still_invalidates_an_owed_gva_resource() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let task_id = 4;
+        let texture_ref = 12;
+        state.mappings.entry(texture_ref).or_default().mapped = true;
+        let key = crate::runtime::writeback_debt::GvaResourceKey {
+            task_id,
+            texture_ref,
+        };
+        let before = state.buffer_write_gen.stamp(task_id, texture_ref);
+        let _ = state.pending_writebacks.arm_gva(
+            key,
+            crate::runtime::writeback_debt::GvaWritebackDebt {
+                gva: 0x4000,
+                row_stride: 256,
+                width: 64,
+                height: 64,
+                format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+                generation: 7,
+                guest_write: before,
+                seq: 0,
+            },
+        );
+
+        let out = apply(
+            &mut state,
+            task_id,
+            texture_ref,
+            quad(1, 0, 0, 0),
+            ValiditySite::ExecTable,
+        );
+
+        assert_eq!(out.bumped, 1, "the colliding mapping still invalidates");
+        assert!(
+            !state
+                .buffer_write_gen
+                .stamp(task_id, texture_ref)
+                .quiet_since(before),
+            "the distinct GVA resource must see the same guest-write declaration"
+        );
+    }
+
     /// An id no registry answers for is reported, not silently skipped.
     #[test]
     fn an_unknown_object_is_reported_as_a_miss() {
@@ -336,7 +391,6 @@ mod tests {
         assert!(out.missed);
         assert_eq!(out.bumped, 0);
     }
-
     #[test]
     fn object_id_zero_applies_to_nothing() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -417,5 +471,4 @@ mod tests {
             before + 1
         );
     }
-
 }

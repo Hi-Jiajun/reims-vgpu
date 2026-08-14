@@ -782,7 +782,12 @@ fn composite_named_present_captures_the_named_member_however_far_it_lags() {
     state.present.height = h;
 
     let present_named = |state: &mut DeviceState, host: &mut FakeHost, mid: u32| {
-        process_child_packet(state, host, 5, &present_packet(CHILD_OP_DISPLAY_TRANSACTION2, mid));
+        process_child_packet(
+            state,
+            host,
+            5,
+            &present_packet(CHILD_OP_DISPLAY_TRANSACTION2, mid),
+        );
     };
 
     // Healthy alternation: both members publish, the named member is captured.
@@ -2167,7 +2172,11 @@ fn the_vbl_census_reports_window_rate_and_separates_the_silent_arms() {
             lines.push(l);
         }
     }
-    assert_eq!(lines.len(), 16, "one report per 64 deliveries over the head");
+    assert_eq!(
+        lines.len(),
+        16,
+        "one report per 64 deliveries over the head"
+    );
     assert!(
         lines.iter().all(|l| l.contains("window_hz=125.0")),
         "every early window is 64 deliveries over 512 ms: {lines:?}"
@@ -3081,7 +3090,10 @@ fn signal_display_vbl_declines_a_class_the_guest_did_not_enable() {
 
     // And the same tick delivers once the guest turns the class on, which is
     // what says the decline above is the mask and not some other refusal.
-    host.put_u32(gpa + DISPLAY_SHARED_ENABLE_MASK, 0x0e | DISPLAY_VBL_EVENT_MASK);
+    host.put_u32(
+        gpa + DISPLAY_SHARED_ENABLE_MASK,
+        0x0e | DISPLAY_VBL_EVENT_MASK,
+    );
     host.actions.clear();
     last_ms.store(0, std::sync::atomic::Ordering::Release);
     signal_display_vbl_at(&mut state, &mut host, &last_ms, 5_000_000);
@@ -3093,7 +3105,11 @@ fn signal_display_vbl_declines_a_class_the_guest_did_not_enable() {
         0,
         "the guest enabled VBL, so the pending bit is owed"
     );
-    assert_eq!(host.actions.len(), 1, "the guest enabled VBL, so an IRQ is owed");
+    assert_eq!(
+        host.actions.len(),
+        1,
+        "the guest enabled VBL, so an IRQ is owed"
+    );
 }
 
 /// The VBL limiter is phase-locked to a fixed interval grid so poll jitter
@@ -3204,7 +3220,8 @@ fn one_shot_display() -> (DeviceState, FakeHost, u64) {
 fn set_enable_mask(host: &mut FakeHost, gpa: u64, mask: u32) {
     let mut m = [0u8; 4];
     st32(&mut m, mask);
-    host.write_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &m).unwrap();
+    host.write_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &m)
+        .unwrap();
 }
 
 /// Did this tick hand the guest a VBL? Consumes the pending bit the way the
@@ -3238,19 +3255,30 @@ fn a_disarmed_tick_does_not_spend_the_grid_slot() {
     let last = AtomicU64::new(0);
 
     // The guest arms, and one interval in it is served.
-    set_enable_mask(&mut host, gpa, DISPLAY_VBL_EVENT_MASK | DISPLAY_ONLINE_EVENT_MASK);
+    set_enable_mask(
+        &mut host,
+        gpa,
+        DISPLAY_VBL_EVENT_MASK | DISPLAY_ONLINE_EVENT_MASK,
+    );
     signal_display_vbl_at(&mut state, &mut host, &last, interval);
     assert!(took_vbl(&mut host, gpa), "an armed guest is served");
 
     // It disarms inside its handler. The next grid point finds nothing armed.
     set_enable_mask(&mut host, gpa, DISPLAY_ONLINE_EVENT_MASK);
     signal_display_vbl_at(&mut state, &mut host, &last, 2 * interval);
-    assert!(!took_vbl(&mut host, gpa), "a disarmed guest is owed nothing");
+    assert!(
+        !took_vbl(&mut host, gpa),
+        "a disarmed guest is owed nothing"
+    );
 
     // It re-arms a millisecond later. A full interval has now passed since the
     // last *delivery*, so it must be served on the very next poll rather than
     // waiting out another interval it already waited.
-    set_enable_mask(&mut host, gpa, DISPLAY_VBL_EVENT_MASK | DISPLAY_ONLINE_EVENT_MASK);
+    set_enable_mask(
+        &mut host,
+        gpa,
+        DISPLAY_VBL_EVENT_MASK | DISPLAY_ONLINE_EVENT_MASK,
+    );
     signal_display_vbl_at(&mut state, &mut host, &last, 2 * interval + 1_000);
     assert!(
         took_vbl(&mut host, gpa),
@@ -3270,7 +3298,11 @@ fn a_continuously_armed_guest_is_still_capped_at_the_advertised_rate() {
     let interval = DISPLAY_VBL_MIN_INTERVAL_US;
     let (mut state, mut host, gpa) = one_shot_display();
     let last = AtomicU64::new(0);
-    set_enable_mask(&mut host, gpa, DISPLAY_VBL_EVENT_MASK | DISPLAY_ONLINE_EVENT_MASK);
+    set_enable_mask(
+        &mut host,
+        gpa,
+        DISPLAY_VBL_EVENT_MASK | DISPLAY_ONLINE_EVENT_MASK,
+    );
 
     // Poll far faster than the grid, the way the 4 ms PCI heartbeat oversamples
     // an 8333 us interval, and never disarm.
@@ -3323,7 +3355,10 @@ fn the_two_reporting_vbl_arms_do_not_share_one_window() {
         }
     }
     for (line, arm) in [
-        (served.expect("delivered reports at its own 1024"), "delivered"),
+        (
+            served.expect("delivered reports at its own 1024"),
+            "delivered",
+        ),
         (
             declined.expect("not_enabled reports at its own 1024"),
             "not_enabled",
@@ -4099,7 +4134,11 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
     // op6 does serialize a transaction, so the plane-list reading is its own
     // and must survive. Same alarm, different explanation.
     let cap = crate::observe::FailCapture::start();
-    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, vec![7u8; 64]));
+    note_display_txn_payload(
+        &mut state,
+        5,
+        &packet(CHILD_OP_DISPLAY_TRANSACTION2, vec![7u8; 64]),
+    );
     let lines = cap.lines();
     let line = lines
         .iter()
@@ -4164,8 +4203,14 @@ fn display_txn_trailer_slots_follow_the_emitting_command() {
     );
     // The present path reads the same field the census does, for every command.
     for (op, off) in [
-        (CHILD_OP_DISPLAY_TRANSACTION2, DISPLAY_TRANSACTION2_SURFACE_ID),
-        (CHILD_OP_DISPLAY_TRANSACTION3, DISPLAY_TRANSACTION3_SURFACE_ID),
+        (
+            CHILD_OP_DISPLAY_TRANSACTION2,
+            DISPLAY_TRANSACTION2_SURFACE_ID,
+        ),
+        (
+            CHILD_OP_DISPLAY_TRANSACTION3,
+            DISPLAY_TRANSACTION3_SURFACE_ID,
+        ),
         (CHILD_OP_DISPLAY_SWAP, DISPLAY_SWAP_MAPPING),
     ] {
         let mut p = vec![0u8; display_txn_trailer_len(op)];
@@ -4245,10 +4290,6 @@ fn a_resident_carried_present_is_unsampled_not_black() {
         PresentContentVerdict::Content
     );
 }
-
-
-
-
 
 /// Root and child `DefineTask2` decode one wire field one way.
 ///
@@ -5424,7 +5465,12 @@ fn a_delete_object_counts_the_kind_its_record_names() {
 
     // The one kind this device holds anything by ref for. Its counter reading
     // above zero on a boot is the signal that would justify a handler.
-    process_child_packet(&mut state, &mut host, 4, &destroy_packet(OPCODE_DELETE_FENCE));
+    process_child_packet(
+        &mut state,
+        &mut host,
+        4,
+        &destroy_packet(OPCODE_DELETE_FENCE),
+    );
     assert_eq!(
         store_route_count("child_delete_object_fence"),
         fence_before + 1,
@@ -5492,9 +5538,8 @@ fn a_retired_slot_is_reported_as_retired_and_not_as_undecodable() {
 /// payload that *fails* it: a count the packet has no room for. A swallowed
 /// command would report nothing.
 ///
-/// The synchronise half of `0x3e` is not asserted here because it is a no-op
-/// when no writeback is outstanding, which is every unit test; what is asserted
-/// is that the packet went through the arm that performs it.
+/// A valid packet is fully handled and a malformed one proves the payload
+/// reached the shared decoder.
 #[test]
 fn the_discarding_commands_share_the_synchronize_record_layout() {
     use crate::runtime::decode::fifo::ResourceListDecodeError;
@@ -5504,33 +5549,14 @@ fn the_discarding_commands_share_the_synchronize_record_layout() {
     st32(&mut good[0..], 7); // task
     st32(&mut good[4..], 1); // count
     st32(&mut good[8..], 0x2a); // object id
-    // The same header claiming four records in a packet that holds one.
+                                // The same header claiming four records in a packet that holds one.
     let mut liar = good.clone();
     st32(&mut liar[4..], 4);
 
-    // The two share a record layout and are declined for *different* reasons:
-    // `0x3f` drops the whole command, while `0x3e`'s synchronise half runs and
-    // only its discard hint is ignored. One slug for both could not say which
-    // fired, which is the defect the split reason exists to prevent.
-    for (opcode, expected) in [
-        (
-            CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES,
-            UnimplementedCommand::SynchronizeAndDiscardResources,
-        ),
-        (
-            CHILD_OP_DISCARD_RESOURCES,
-            UnimplementedCommand::DiscardResources,
-        ),
+    for opcode in [
+        CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES,
+        CHILD_OP_DISCARD_RESOURCES,
     ] {
-        assert_ne!(
-            expected.slug(),
-            if expected == UnimplementedCommand::DiscardResources {
-                UnimplementedCommand::SynchronizeAndDiscardResources.slug()
-            } else {
-                UnimplementedCommand::DiscardResources.slug()
-            },
-            "the two discard declines must not share a slug"
-        );
         let packet = |payload: &Vec<u8>| Packet {
             opcode,
             stamp_waits: Vec::new(),
@@ -5546,12 +5572,11 @@ fn the_discarding_commands_share_the_synchronize_record_layout() {
             ChildPacketDisposition::Complete
         );
         assert!(
-            state.fails.iter().any(|e| matches!(
-                e,
-                FailEvent::UnimplementedChildCommand { command, .. } if *command == expected
-            )),
-            "{opcode:#x}: the discard this device does not act on must be visible, \
-             under its own reason and not the other opcode's"
+            !state
+                .fails
+                .iter()
+                .any(|e| matches!(e, FailEvent::UnimplementedChildCommand { .. })),
+            "{opcode:#x}: a valid discard is fully handled"
         );
         assert!(
             !state
@@ -5622,23 +5647,13 @@ fn each_map_family_command_takes_its_own_branch() {
     // five neighbours: whether the named mapping's content generation moved, and
     // whether the command reported itself unimplemented.
     for (opcode, payload, bumps_generation, declined) in [
-        (
-            CHILD_OP_INVALIDATE_RESOURCES,
-            &invalidate,
-            true,
-            None,
-        ),
-        (
-            CHILD_OP_SYNCHRONIZE_RESOURCES,
-            &synchronize,
-            false,
-            None,
-        ),
+        (CHILD_OP_INVALIDATE_RESOURCES, &invalidate, true, None),
+        (CHILD_OP_SYNCHRONIZE_RESOURCES, &synchronize, false, None),
         (
             CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES,
             &synchronize,
             false,
-            Some(UnimplementedCommand::SynchronizeAndDiscardResources),
+            None,
         ),
         (
             CHILD_OP_DELETE_IOSURFACE_BACKING2,
@@ -6078,7 +6093,11 @@ fn the_map_interval_audit_counts_a_clean_pairing_and_not_only_a_finding() {
 #[test]
 fn a_coalesced_stamp_keeps_the_latest_value_across_the_u32_wrap() {
     let mut pending = PendingStamp::default();
-    assert_eq!(pending.owed(), None, "a drain that stamped nothing owes nothing");
+    assert_eq!(
+        pending.owed(),
+        None,
+        "a drain that stamped nothing owes nothing"
+    );
 
     pending.latch(7);
     pending.latch(9);
@@ -6115,21 +6134,42 @@ fn a_pending_stamp_discharges_a_wait_on_its_own_slot_and_no_other() {
     let mut pending = PendingStamp::default();
     pending.latch(20);
 
-    let met = StampWait { index: SLOT, value: 20 };
+    let met = StampWait {
+        index: SLOT,
+        value: 20,
+    };
     assert!(
         pending.discharges(SLOT, met),
         "a wait at exactly the latched value is discharged"
     );
     assert!(
-        pending.discharges(SLOT, StampWait { index: SLOT, value: 12 }),
+        pending.discharges(
+            SLOT,
+            StampWait {
+                index: SLOT,
+                value: 12
+            }
+        ),
         "and so is one behind it"
     );
     assert!(
-        !pending.discharges(SLOT, StampWait { index: SLOT, value: 21 }),
+        !pending.discharges(
+            SLOT,
+            StampWait {
+                index: SLOT,
+                value: 21
+            }
+        ),
         "a wait past the latched value is not discharged by it"
     );
     assert!(
-        !pending.discharges(SLOT, StampWait { index: SLOT + 1, value: 1 }),
+        !pending.discharges(
+            SLOT,
+            StampWait {
+                index: SLOT + 1,
+                value: 1
+            }
+        ),
         "a wait on another slot is not this drain's to answer"
     );
     assert!(

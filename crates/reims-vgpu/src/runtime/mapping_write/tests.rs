@@ -2287,4 +2287,3 @@ fn rect_raw_roundtrip_subregion() {
         8
     ));
 }
-

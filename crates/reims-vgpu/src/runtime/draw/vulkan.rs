@@ -1,6 +1,6 @@
 //! Vulkan-backend half of the [`super`] draw encode path: sampled-source
 //! resolution, zero-copy load paths, metal2vulkan draw submission, and the
-//! deferred GVA/surface store windows.
+//! host-authoritative GVA/surface Store ownership.
 //!
 //! The whole module is gated on `backend-vulkan` at its declaration in
 //! [`super`], which also re-exports these items flat so callers keep addressing
@@ -210,10 +210,10 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         }
     }
 
-    // Pages the synchronous GVA Store below is allowed to reach, resolved
+    // Pages the eager GVA fallback below is allowed to reach, resolved
     // **before** any GPU work.
     //
-    // That Store's write was documented as needing no bound because "the command
+    // The write was documented as needing no bound because "the command
     // being executed is what names its destination, and its authorisation is the
     // page table at the moment it runs". That is true of the CLEAR store above,
     // which is a solid colour written on this thread with nothing in between. It
@@ -224,9 +224,12 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // authorised — which is exactly the shape the deferred rail was corrupting
     // guest memory through before it was bounded.
     //
-    // Resolved here rather than at the write so the set predates the submit.
-    // `None` when there is no GVA target, no writeback, or the walk cannot name
-    // the span — an unresolvable span is not an authorisation to write anywhere.
+    // Resolved here rather than at the fallback write so the set predates the
+    // submit. The host-authoritative path keeps no pages from this walk; its
+    // eventual transfer performs one fresh walk and verifies the allocation
+    // generation before writing. `None` here means there is no GVA target, no
+    // writeback, or the walk cannot name the span — an unresolvable span is not
+    // an authorisation for the eager fallback to write anywhere.
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::PrepPages);
     let sync_store_pages =
         sync_store_allowed_pages(state, host, req.task_id, colors.first(), writeback_guest);
@@ -245,9 +248,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // pages by `store_surface_resident`, so this encode owes the caller nothing
     // further.
     let mut surface_store_armed = false;
-    // GVA render Store: the frame was written into the target's guest pages by
-    // `store_gva_frame`, so this encode owes the caller nothing further. The
-    // twin of `surface_store_armed`, and it returns through the same door.
+    // GVA render Store: the frame remains authoritative in the resident and a
+    // resource-scoped debt records the future transfer. The twin of
+    // `surface_store_armed`, and it returns through the same door.
     let mut gva_store_armed = false;
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
         req.chain_resident_established = false;
@@ -272,64 +275,26 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 ));
             }
             Ok(M2vDrawSpan::ResidentGvaStore) => {
-                // Landed from the resident the draw just produced, in this call.
-                // This Store used to arm a deferred window instead; the window
-                // rail is gone, and on a driven boot this route armed 88 windows
-                // in 51 seconds against the surface rail's 21 314, so what it
-                // deferred was never where the cost was.
                 let _store_span = StoreCostSpan::new("gva_store_us");
                 note_type11_store_route("gva_flush");
-                // The GPU writes the guest's pages directly, exactly as the
-                // type-11 surface Store does. Tried first because when it works
-                // there is nothing left to do: no fence is waited on, no
-                // staging buffer is mapped and no host pass over the frame
-                // happens at all. Every decline below pays a blocking readback
-                // of the whole framebuffer plus a per-row conversion of it,
-                // which is this device's largest single cost.
-                let direct = req.colors.first().and_then(|c0| {
-                    let identity = gva_chain_identity(req)?;
-                    Some((
-                        crate::runtime::render_writeback::store_gva_frame(
+                // Metal Store preserves the attachment in host GPU memory. It
+                // does not synchronize that texture into guest backing; the
+                // resource-validity protocol asks for that separately. The
+                // live resource retains its transfer backing until explicit
+                // discard or delete; the debt records only content ownership.
+                let landed = req.colors.first().is_some_and(|c0| {
+                    gva_chain_identity(req).is_some_and(|identity| {
+                        crate::runtime::writeback_debt::arm_gva(
                             state,
                             host,
-                            &identity,
+                            req.task_id,
                             c0,
-                            c0.texture_ref,
-                            sync_store_pages.as_ref(),
-                        ),
-                        c0.target_gva,
-                    ))
+                            &identity,
+                        )
+                    })
                 });
-                let landed = match direct {
-                    Some((Ok(_), gva)) => {
-                        note_type11_store_route("gva_flush_gpu_direct");
-                        crate::observe::line(format!(
-                            "linux_m2v_draw ok resident_gva_store_direct pipe={} {}x{} gva={gva:#x}",
-                            req.pipeline_ref, pass_w, pass_h
-                        ));
-                        true
-                    }
-                    Some((Err(decline), gva)) => {
-                        // Latched per target as well as per reason: a host
-                        // without the import declines every Store of every
-                        // target, and a line each would drown the channel.
-                        crate::observe::Emit::decline("gva_flush_gpu_declined", &decline)
-                            .field("gva", format!("{gva:#x}"))
-                            .field("geom", format!("{pass_w}x{pass_h}"))
-                            .fail_once(gva);
-                        note_type11_store_route("gva_flush_gpu_declined");
-                        false
-                    }
-                    // No color0 or no identity: the same pair
-                    // `gva_store_defer_eligible` already required to reach this
-                    // arm, so a `None` here is a contradiction rather than a
-                    // routing answer.
-                    None => {
-                        note_type11_store_route("gva_flush_no_identity");
-                        false
-                    }
-                };
                 if landed {
+                    note_type11_store_route("gva_resident_authoritative");
                     gva_store_armed = true;
                 } else {
                     // The copying rail: read the resident the draw just
@@ -1575,7 +1540,9 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
             // nothing to gather and — the point of the rung — no writeback to
             // wait for. See [`try_gva_resident_sample`].
             if may_bind_resident {
-                if let Some((w, h, src)) = try_gva_resident_sample(state, host, task_id, &tex) {
+                if let Some((w, h, src)) =
+                    try_gva_resident_sample(state, host, task_id, texture_ref, &tex)
+                {
                     return Some((w, h, 0, src));
                 }
             }
@@ -3317,6 +3284,7 @@ fn load_buffer_content<M: HostMemory + HostOps>(
 /// the same five by hand is how they come to disagree about one of them.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct GvaSpan {
+    pub texture_ref: u32,
     pub gva: u64,
     pub row_stride: u32,
     pub width: u32,
@@ -3334,9 +3302,8 @@ pub(super) struct GvaSpan {
 /// names them on its own census routes — the rule is shared, the vocabulary is
 /// not, so a reading says which rung refused as well as why.
 pub(super) enum GvaResidentRefusal {
-    /// The page walk came up short, so the span has no key to look up. The same
-    /// refusal the Store itself takes; a target that never got a key was never a
-    /// candidate.
+    /// The resource has no complete initial transfer backing, so it has no
+    /// usable resident identity yet.
     NoGeneration,
     /// The witness will not call the pages quiet.
     Wrote(crate::runtime::gva_store_witness::GvaWriteReach),
@@ -3352,13 +3319,9 @@ pub(super) enum GvaResidentRefusal {
 /// is written once because a copied version of this rule is the next
 /// divergence. The callers differ only in what they do with the answer.
 ///
-/// The generation is recomputed from the span's *current* page set rather than
-/// read out of whatever witness entry sits at this address. The map can hold an
-/// orphan, a target whose pages have since moved keyed under the hash they had,
-/// and an orphan's token still answers about pages that now belong to something
-/// else. Recomputing makes a moved page list miss, which is
-/// [`crate::runtime::gva_store_witness`]'s own rule: the wrong answer is
-/// unreachable rather than guarded.
+/// A named resource uses its stable host-texture generation and retained
+/// transfer backing. The page-set fallback remains only for an attachment with
+/// no resource reference and therefore no protocol lifetime to carry.
 pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -3368,6 +3331,7 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
     use crate::runtime::gva_store_witness::{reach, GvaTargetKey};
 
     let GvaSpan {
+        texture_ref,
         gva,
         row_stride,
         width: w,
@@ -3377,11 +3341,42 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
     if gva == 0 || w == 0 || h == 0 {
         return Err(GvaResidentRefusal::NoGeneration);
     }
-    let generation = gva_span_alloc_generation(state, host, task_id, gva, row_stride, h);
+    let span_bytes = u64::from(row_stride).saturating_mul(u64::from(h));
+    let generation = if texture_ref != 0 {
+        crate::runtime::writeback_debt::gva_resource_generation(
+            state,
+            host,
+            crate::runtime::writeback_debt::GvaResourceKey {
+                task_id,
+                texture_ref,
+            },
+            gva,
+            span_bytes,
+        )
+    } else {
+        gva_span_alloc_generation(state, host, task_id, gva, row_stride, h)
+    };
     if generation == 0 {
         return Err(GvaResidentRefusal::NoGeneration);
     }
     let resident_format = gva_resident_format(format);
+    let identity = crate::backend::vulkan::engine::TargetIdentity::Gva {
+        gva,
+        width: w,
+        height: h,
+        generation,
+        format: resident_format,
+    };
+    // An unpaid Store says the guest pages are deliberately stale and this
+    // image is authoritative. The older witness below answers the opposite
+    // state: a Store was copied out and both locations still agree. Keeping
+    // those states distinct prevents a skipped copy from masquerading as a
+    // statement about bytes that were never written.
+    if crate::runtime::writeback_debt::gva_resident_authoritative(state, &identity) {
+        return crate::backend::vulkan::engine::resident_content_ready(&identity)
+            .then_some(identity)
+            .ok_or(GvaResidentRefusal::NoResident);
+    }
     let verdict = reach(
         state,
         host,
@@ -3396,17 +3391,9 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
     if !verdict.is_quiet() {
         return Err(GvaResidentRefusal::Wrote(verdict));
     }
-    let identity = crate::backend::vulkan::engine::TargetIdentity::Gva {
-        gva,
-        width: w,
-        height: h,
-        generation,
-        format: resident_format,
-    };
-    if !crate::backend::vulkan::engine::resident_content_ready(&identity) {
-        return Err(GvaResidentRefusal::NoResident);
-    }
-    Ok(identity)
+    crate::backend::vulkan::engine::resident_content_ready(&identity)
+        .then_some(identity)
+        .ok_or(GvaResidentRefusal::NoResident)
 }
 
 /// May the colour LOAD seed at this GVA attachment be skipped, because the
@@ -3497,6 +3484,7 @@ pub(super) fn try_gva_resident_sample<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
+    texture_ref: u32,
     tex: &TextureDescriptor,
 ) -> Option<(u32, u32, SampledSourceRequest)> {
     use crate::runtime::drain::note_store_route;
@@ -3509,6 +3497,7 @@ pub(super) fn try_gva_resident_sample<M: HostMemory + HostOps>(
         host,
         task_id,
         GvaSpan {
+            texture_ref,
             gva,
             row_stride,
             width: w,
@@ -4530,7 +4519,7 @@ pub(super) fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     None
 }
 
-/// Guest pages the Vulkan draw's single synchronous GVA Store may write.
+/// Guest pages the Vulkan draw's eager GVA fallback may write.
 ///
 /// The Vulkan rail writes back only color attachment 0, so this narrows
 /// [`sync_store_target_pages`] to that record and to the case where this record
@@ -5257,7 +5246,7 @@ fn note_type11_store_route(route: &'static str) {
     reason = "every argument is a distinct wire-derived input to the attachment set"
 )]
 pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     colors: &[ColorRtRequest],
@@ -5341,14 +5330,27 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
                 gva: c.target_gva,
                 width: c.width,
                 height: c.height,
-                generation: gva_span_alloc_generation(
-                    state,
-                    host,
-                    task_id,
-                    c.target_gva,
-                    c.row_stride,
-                    c.height,
-                ),
+                generation: if c.texture_ref != 0 {
+                    crate::runtime::writeback_debt::gva_resource_generation(
+                        state,
+                        host,
+                        crate::runtime::writeback_debt::GvaResourceKey {
+                            task_id,
+                            texture_ref: c.texture_ref,
+                        },
+                        c.target_gva,
+                        u64::from(c.row_stride).saturating_mul(u64::from(c.height)),
+                    )
+                } else {
+                    gva_span_alloc_generation(
+                        state,
+                        host,
+                        task_id,
+                        c.target_gva,
+                        c.row_stride,
+                        c.height,
+                    )
+                },
                 // The format this attachment's image is actually created with,
                 // not a re-derivation of it. `registry_ensure_attachment` takes
                 // `format` — resolved just above by `color_attachment` — so
@@ -6314,8 +6316,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     }
                 };
                 let mut bytes_identity = None;
-                let mut byte_origin =
-                    crate::backend::vulkan::engine::SampledByteOrigin::Synthetic;
+                let mut byte_origin = crate::backend::vulkan::engine::SampledByteOrigin::Synthetic;
                 // Byte layout of a CPU-origin bind. Default RGBA8; a source that
                 // already holds its bytes in an uploadable order keeps them —
                 // BGRA8 from the type-4 scanout cache, a native single/dual-channel
@@ -7088,10 +7089,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // final record back and perform the normal synchronous guest Store.
         // Cross-pass deferred ownership remains gated below.
         let mut resident_render_chain = false;
-        // Deferred GVA Store rail: the final/single record also stays on the
-        // registry resident (skip_readback) — the caller arms a flush-on-
-        // access window instead of the sync readback + guest write on the
-        // stamp path (`arm_gva_deferred_store`).
+        // Host-authoritative GVA Store rail: the final/single record also stays
+        // on the registry resident (skip_readback). The caller records the
+        // resource declaration and transfers only when synchronization or an
+        // actual guest-page reader makes that copy observable.
         let mut gva_resident_store = false;
         if req.chain_from_resident || (store_is_store && !writeback_guest) {
             if let Some(identity) = render_chain_identity(state, req) {
@@ -8419,7 +8420,7 @@ fn stamp_type11_resident<M: HostMemory + HostOps>(
 /// golden-ratio constant (2^64 / phi rounded to odd), used here only to spread
 /// page GPAs — which are dense multiples of the page size, so their low bits are
 /// all zero — across the whole word before the XOR fold.
-fn gva_page_set_hash(pages: &std::collections::HashSet<u64>) -> u64 {
+pub(crate) fn gva_page_set_hash(pages: &std::collections::HashSet<u64>) -> u64 {
     let mut hash: u64 = 0;
     for p in pages {
         hash ^= p.wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -8427,29 +8428,14 @@ fn gva_page_set_hash(pages: &std::collections::HashSet<u64>) -> u64 {
     hash
 }
 
-/// Allocation identity of this draw's color0 GVA render target: the hash of the
-/// guest physical pages its span resolves to right now.
+/// Host-texture identity of this draw's color0 GVA resource.
 ///
-/// The engine registry keys a `TargetIdentity::Gva` on all four of its fields,
-/// so this is the only field that can separate two guest allocations reusing one
-/// address at one geometry. Identical pages means literally the same guest
-/// memory and sharing the image is correct; different pages means a different
-/// allocation, and sharing would hand the second one the first one's pixels as
-/// its prior content — which is exactly what the cross-pass resident Load in
-/// [`encode_draw_chain`] reads.
-///
-/// Resolved once per draw, before any GPU work, and carried on
-/// [`DrawEncodeRequest::gva_alloc_gen`] so every identity the draw builds agrees.
-/// Returns 0 when color0 is not a GVA target and when the walk does not cover
-/// the whole span: an incomplete walk names no allocation, and a hash of the
-/// pages that happened to resolve would be an identity the guest never had.
-///
-/// A generation that disagrees with the one a resident was created under can
-/// only *miss* the registry lookup, which costs a CPU seed and never produces
-/// wrong pixels. Sharing a slot is the wrong-content direction, so every
-/// ambiguity here resolves toward the miss.
+/// A task-local texture reference keeps one generation from creation through
+/// ordinary task map changes and transfer-backing discard. Explicit resource
+/// delete ends that lifetime. A target with no resource reference falls back to
+/// the page-set identity because it has no protocol lifetime to name instead.
 fn gva_alloc_generation<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &mut DeviceState,
     host: &mut M,
     req: &DrawEncodeRequest,
 ) -> u64 {
@@ -8461,14 +8447,27 @@ fn gva_alloc_generation<M: HostMemory + HostOps>(
     }
     // Same span as the deferred arm walks (`arm_gva_deferred_store`) so the two
     // describe one region: the guest bytes a Store into this target writes.
-    gva_span_alloc_generation(
-        state,
-        host,
-        req.task_id,
-        c0.target_gva,
-        c0.row_stride,
-        c0.height,
-    )
+    if c0.texture_ref != 0 {
+        crate::runtime::writeback_debt::gva_resource_generation(
+            state,
+            host,
+            crate::runtime::writeback_debt::GvaResourceKey {
+                task_id: req.task_id,
+                texture_ref: c0.texture_ref,
+            },
+            c0.target_gva,
+            u64::from(c0.row_stride).saturating_mul(u64::from(c0.height)),
+        )
+    } else {
+        gva_span_alloc_generation(
+            state,
+            host,
+            req.task_id,
+            c0.target_gva,
+            c0.row_stride,
+            c0.height,
+        )
+    }
 }
 
 /// The page-set generation of one `row_stride * height` GVA span under one task.
@@ -8479,7 +8478,7 @@ fn gva_alloc_generation<M: HostMemory + HostOps>(
 ///
 /// A short walk yields 0. An incomplete walk names no allocation, and hashing the
 /// pages that happened to resolve would be an identity the guest never had.
-fn gva_span_alloc_generation<M: HostMemory + HostOps>(
+pub(crate) fn gva_span_alloc_generation<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &mut M,
     task_id: u32,
@@ -8563,7 +8562,7 @@ pub(crate) fn gva_chain_identity(
 /// for per host: a widening that reads the spec's table instead of the device
 /// is the shape AGENTS.md names, and this one would fail at `vkCreateImage`
 /// rather than decline.
-fn gva_resident_format(format: u16) -> ash::vk::Format {
+pub(crate) fn gva_resident_format(format: u16) -> ash::vk::Format {
     use crate::backend::vulkan::translate::pixel;
     let Some(layout) = pixel_format::store_texel_order(format) else {
         return pixel::RESIDENT_RGBA_FORMAT;
@@ -8586,13 +8585,11 @@ fn gva_resident_format(format: u16) -> ash::vk::Format {
 /// shape, and reading it as the hot path sends the next reader at a premise that
 /// has already been fixed.
 ///
-/// Both Store rails write the guest's pages from the GPU now. `ResidentGvaStore`
-/// goes to `render_writeback::store_gva_frame` and `ResidentSurfaceStore` to
-/// `store_surface_resident`; this function is what each falls back to when its
-/// arm declines, plus `writeback_chain_rgba`. A driven Safari-drag boot puts
-/// `gva_store_sync` at **3 for the whole boot** against `gva_flush_gpu_direct`
-/// and `render_flush_gpu_direct` carrying the rail. `draw_phase`'s `wait_us` and
-/// `readback_us` are both flat zero across the drag.
+/// Both Store rails normally leave the frame host-authoritative. Their payments
+/// use the GPU-direct guest-page copies in `render_writeback`; this function is
+/// what either Store falls back to when it cannot arm or materialize that copy,
+/// plus `writeback_chain_rgba`. The ordinary path therefore has no framebuffer
+/// readback or CPU conversion at Store time.
 ///
 /// So this is genuinely the abandon path, and it is a cost rather than a lost
 /// frame — but it is the expensive one, and the reason to keep it narrow: it
@@ -8788,7 +8785,12 @@ fn arm_surface_writeback_debt<M: HostMemory + HostOps>(
         .arm(mapping_id, width, height, map_generation);
     if let Some(evicted) = evicted {
         crate::runtime::drain::note_store_route("wbdebt_evicted");
-        crate::runtime::writeback_debt::pay_for_mapping(state, host, evicted);
+        if !crate::runtime::writeback_debt::pay_key(state, host, evicted) {
+            let armed = state.pending_writebacks.take(mapping_id);
+            debug_assert!(armed.is_some());
+            crate::runtime::drain::note_store_route("wbdebt_capacity_fallback");
+            return false;
+        }
     }
     true
 }
@@ -8803,7 +8805,12 @@ fn gva_store_defer_eligible(req: &DrawEncodeRequest) -> bool {
     let Some(c0) = req.colors.first() else {
         return false;
     };
-    if c0.mapping_id != 0 || c0.target_gva == 0 || c0.row_stride == 0 {
+    if c0.mapping_id != 0
+        || c0.target_gva == 0
+        || c0.row_stride == 0
+        || c0.texture_ref == 0
+        || req.gva_alloc_gen == 0
+    {
         return false;
     }
     let Some(identity) = gva_chain_identity(req) else {
@@ -9234,55 +9241,42 @@ mod vulkan_split_tests {
         }
     }
 
-    /// A GVA render target is named by the guest memory behind it, not by its
-    /// address.
-    ///
-    /// The engine registry keys a resident on every field of
-    /// `TargetIdentity::Gva`. With `generation` constant the key was
-    /// `(gva, width, height)`, so a second guest allocation handed the same
-    /// address at the same geometry got **the same GPU image** — and the
-    /// cross-pass resident Load in `encode_draw_chain` then reads the first
-    /// allocation's pixels as the second one's prior content. The guest recycles
-    /// render-target addresses hard enough for that to be ~5.6 % of arms.
-    ///
-    /// Only the generation may separate them: the same address at the same
-    /// geometry backed by the same page must still be one identity, or every
-    /// re-render of a live buffer would mint a slot and lose its content.
+    /// A GVA render target is named by its live task-local resource, whose host
+    /// texture survives task virtual-memory map changes. Delete ends that
+    /// lifetime; reusing the integer afterwards must mint another identity.
     #[test]
-    fn a_gva_targets_identity_follows_its_guest_pages_not_its_address() {
+    fn a_gva_targets_identity_follows_resource_lifetime() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut host = FakeHost::new();
         map_one_gva_page(&mut host, 4);
         state.define_task(1, 0x1_0000, 2);
 
         let mut req = one_page_gva_request();
-        let gen_a = super::gva_alloc_generation(&state, &mut host, &req);
+        let gen_a = super::gva_alloc_generation(&mut state, &mut host, &req);
         assert_ne!(gen_a, 0, "a fully walked GVA span must name its allocation");
         req.gva_alloc_gen = gen_a;
         let id_a = super::gva_chain_identity(&req).expect("a GVA color0 has a chain identity");
 
         // The same buffer rendered again: same pages, so the same resident.
         assert_eq!(
-            super::gva_alloc_generation(&state, &mut host, &req),
+            super::gva_alloc_generation(&mut state, &mut host, &req),
             gen_a,
             "an unchanged mapping must not mint a second identity"
         );
 
-        // The guest frees the target and its allocator hands the address to a
-        // different page. Same task, same GVA, same geometry.
+        // Ordinary virtual-memory remapping does not retarget the live resource.
         map_one_gva_page(&mut host, 5);
-        let gen_b = super::gva_alloc_generation(&state, &mut host, &req);
-        assert_ne!(
-            gen_b, gen_a,
-            "different guest pages are a different allocation"
-        );
+        let gen_b = super::gva_alloc_generation(&mut state, &mut host, &req);
+        assert_eq!(gen_b, gen_a);
         req.gva_alloc_gen = gen_b;
         let id_b = super::gva_chain_identity(&req).expect("a GVA color0 has a chain identity");
+        assert_eq!(id_a, id_b);
 
-        assert_ne!(
-            id_a, id_b,
-            "two allocations at one address must not share one image"
-        );
+        assert!(crate::runtime::writeback_debt::retire_gva_resource(
+            &mut state, 1, 7
+        ));
+        let gen_c = super::gva_alloc_generation(&mut state, &mut host, &req);
+        assert_ne!(gen_c, gen_a, "delete ends the host texture's lifetime");
         assert_eq!(
             (id_a.width(), id_a.height()),
             (id_b.width(), id_b.height()),
@@ -10389,9 +10383,9 @@ mod vulkan_split_tests {
             format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
         };
 
-        let gen_of = |host: &mut FakeHost| {
+        let mut gen_of = |host: &mut FakeHost| {
             let secs = super::build_secondary_targets(
-                &state, host, 1, &colors, &pipeline, &primary, 8, 8, [0.0; 4],
+                &mut state, host, 1, &colors, &pipeline, &primary, 8, 8, [0.0; 4],
             )
             .expect("slot 1 is a resolvable secondary");
             assert_eq!(secs.len(), 1, "slot 1 is a resolvable secondary");
@@ -10412,14 +10406,10 @@ mod vulkan_split_tests {
             "an unchanged mapping must not mint a second identity"
         );
 
-        // The guest hands GVA 0x1000 to a different page. Same task, same
-        // address, same geometry — only the memory changed.
+        // The live secondary resource retains its host texture across a task
+        // page-table change.
         map_one_gva_page(&mut host, 5);
-        assert_ne!(
-            gen_of(&mut host),
-            gen_a,
-            "two allocations at one secondary address must not share one image"
-        );
+        assert_eq!(gen_of(&mut host), gen_a);
     }
 }
 

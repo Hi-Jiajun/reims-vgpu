@@ -900,17 +900,13 @@ pub struct DrawEncodeRequest {
     /// target (no CPU pixels, no guest Store). The exec chain loop arms
     /// `chain_from_resident` for the next record when set.
     pub chain_resident_established: bool,
-    /// Allocation identity of the color0 GVA render target: the
-    /// order-independent hash of the guest physical pages backing
-    /// `row_stride * height` at `colors[0].target_gva`.
+    /// Lifetime identity of the color0 GVA render resource.
     ///
     /// Resolved once per draw, before any GPU work, by
     /// `draw::vulkan::gva_alloc_generation`, and carried here so every
-    /// `TargetIdentity::Gva` this draw builds — the pinned Store identity, the
-    /// cross-pass Load identity, the deferred window's stored copy — agrees on
-    /// one `generation`. Two guest allocations that reuse one address at one
-    /// geometry then get two registry slots instead of one shared GPU image
-    /// whose pixels belong to whichever of them rendered last.
+    /// `TargetIdentity::Gva` this draw builds agrees on one `generation`.
+    /// Resource delete changes it; ordinary task map changes and transfer-
+    /// backing discard do not.
     ///
     /// 0 means "no allocation named": color0 is not a GVA target, or the span
     /// does not fully walk. Vulkan rail only; the Metal arm never reads it.
@@ -4429,6 +4425,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                     host,
                     task_id,
                     vulkan::GvaSpan {
+                        texture_ref: att.texture_ref,
                         gva,
                         row_stride: bpr,
                         width: mw,
@@ -4628,6 +4625,18 @@ pub(crate) struct StoreTargetPages {
 }
 
 impl StoreTargetPages {
+    /// Reconstitute a transfer destination from a live resource's retained
+    /// backing. The entries are physical page identities; bounded guest slices
+    /// are created only when the backend submits the transfer.
+    #[cfg(feature = "backend-vulkan")]
+    pub(crate) fn from_ordered(ordered: &[u64], span: u64) -> Self {
+        Self {
+            ordered: ordered.to_vec(),
+            set: ordered.iter().copied().collect(),
+            span,
+        }
+    }
+
     /// The same pages as a membership test, which is the bound
     /// [`write_gva_rgba8_within`] takes.
     pub(crate) fn membership(&self) -> &std::collections::HashSet<u64> {

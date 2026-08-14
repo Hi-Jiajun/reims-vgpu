@@ -1,104 +1,60 @@
-//! Owe a type-11 surface's guest pages a frame, and pay only when something
-//! reads them.
+//! Resource-validity ownership for render targets.
 //!
-//! # Why an owed frame is not a deferred plan
+//! A render Store preserves pixels in the host attachment. It does not imply a
+//! host-to-guest transfer. The guest makes that transfer observable by naming
+//! the resource in `CmdSynchronizeResources`, or this device needs the guest
+//! bytes itself for a fallback reader. Until then, [`PendingWritebacks`] records
+//! that the engine image is authoritative and repeated Stores into the resource
+//! replace one another without touching guest RAM.
 //!
-//! [`crate::runtime::render_writeback`]'s doc carries the measurement this rail
-//! exists for and the wreckage of the shape that must not be built again. The
-//! short form of both:
+//! # A resource owns its transfer backing
 //!
-//! * A driven macos-13 sustained-animation boot issues **~840 type-11 surface
-//!   Stores a second** and **~850 GVA Stores**, each copying a whole frame into
-//!   guest pages. Over the same second, everything that *reads* those pages
-//!   totals **six** — five colour LOAD seeds and one host-console paint. Every
-//!   frame written between two reads is replaced before anything looks at it.
-//! * The rail that tried to collect that before parked a **resolved plan** —
-//!   host pointers walked at the Store — and landed it later. Four driven boots,
-//!   four guest kernel panics, all of them page-table corruption: the guest
-//!   recycles a surface's backing inside the park window and the land wrote a
-//!   full frame into whatever now owned those pages.
+//! Type-11 debts carry a mapping id, geometry, and map generation. GVA debts
+//! carry the task-local texture reference, GVA declaration, geometry, format,
+//! and resource generation. The live GVA resource separately retains the
+//! ordered physical pages of its transfer backing. Ordinary task unmap changes
+//! virtual-address bookkeeping but does not retarget that resource. Explicit
+//! discard drops the transfer backing, and the next prepare or synchronize
+//! resolves it again without replacing the host texture.
 //!
-//! So this module holds **no** resolved memory. A debt is four integers naming
-//! the mapping, its geometry and the `map_generation` the Store was taken under.
-//! Paying it re-derives the identity from [`DeviceState`] *at that moment*, walks
-//! the page tables *at that moment*, and calls the ordinary
-//! [`crate::runtime::render_writeback::store_render_frame`]. A surface whose
-//! backing the guest recycled either fails the generation check and is dropped,
-//! or resolves to the pages it now owns — which is what a Store landing at that
-//! moment would have written anyway. There is nothing stale to hold because
-//! nothing is held.
+//! This is the safety property the former deferred-window design lacked: it
+//! parked raw host pointers across guest execution. This model retains page
+//! identities, not pointers; every transfer still constructs bounded
+//! `GuestSlice`s from the owning RAMBlock import.
 //!
-//! # What keeps the pixels alive
+//! # Validity transitions decide direction
 //!
-//! An unpaid debt says the frame exists only in the engine's resident image, and
-//! the engine already has that concept: `ResidentTargetSlot::gpu_only_content`
-//! is what the reclaim paths skip. The eager Store clears it through
-//! `note_resident_content_copied_out` as soon as the copy is recorded, because
-//! the guest's pages then hold the pixels too. Arming a debt is exactly the case
-//! where that is *not* true yet, so the arm does not clear it and the flag is
-//! load-bearing rather than incidental — no separate pin, and no pin to leak.
+//! A GPU Store makes the host image authoritative. A later guest
+//! `clear_host_valid` makes the guest copy newer; payment then abandons the host
+//! image rather than overwriting the guest's work. Surface resources use
+//! `ResourceValidity`'s ordered sequence. Task-GVA resources use the validity
+//! generation keyed by `(task, texture_ref)`, including the case where that
+//! integer collides with an unrelated mapping id.
 //!
-//! # The reader set is the settle set, and that is not a coincidence
+//! A named synchronize pays only its object list through
+//! [`settle_for_resources`]. Readers that know a mapping or texture call
+//! [`pay_for_mapping`] or [`pay_for_texture`]. Only a genuinely unnameable
+//! aliasing reader uses [`pay_all`]. Completion stamps alone do not publish
+//! resources.
 //!
-//! A host-side reader of guest bytes this device wrote is already obliged to
-//! call [`crate::runtime::render_writeback::settle_guest_writes`] first, or it
-//! reads the pre-Store bytes. That obligation predates this rail and its call
-//! sites are enumerated by [`crate::runtime::render_writeback::SettleSite`], so
-//! the set of places that must pay a debt is the set of places that already
-//! settle — with two amendments:
+//! The engine's `gpu_only_content` flag keeps an unpaid image alive. A
+//! successful payment calls `note_resident_content_copied_out`; replacement,
+//! invalidation, task retirement, and generation movement release the same
+//! ownership without inventing a guest write.
 //!
-//! * The three completion-stamp sites must **not** pay. A stamp says a
-//!   submission finished; what says the guest may read a resource's bytes is the
-//!   host-valid flag the guest itself owns and the synchronize it issues before a
-//!   CPU read. Paying at the stamp is what made the old deferred window's
-//!   coalescing structurally unreachable, and the contract does not ask for it.
-//! * A reader that names a `mapping_id` pays only that mapping's debt
-//!   ([`pay_for_mapping`]); one that cannot name a mapping — a GVA span, a
-//!   buffer read, an aliasing walk — pays everything ([`pay_all`]). Aliasing
-//!   across the id namespaces is real rather than theoretical (see
-//!   [`crate::runtime::host_writes`]), so "cannot name one" resolves to "owes all
-//!   of them" and never to "owes none".
-//!
-//! Missing a reader costs a **stale frame**, not a corrupted guest: the reader
-//! sees the previous Store's pixels. That is a visible defect and the A/B
-//! harness photographs both arms for exactly this reason.
-//!
-//! # The guest's own write is answered at the payment, not at the claim
-//!
-//! `clear_host_valid` is the guest saying it wrote the resource's bytes itself,
-//! and an owed frame older than that write must be abandoned rather than landed
-//! on top of the guest's work. Nothing in [`crate::runtime::resource_validity`]
-//! is hooked to do it: the arm publishes through
-//! `DeviceState::note_surface_content_published`, which stamps
-//! `ResourceValidity::host_published_seq`, and the guest's claim stamps
-//! `host_cleared_seq` as it already did. Which happened last is then
-//! [`crate::runtime::resource_validity::licence_of`]'s existing answer, read once
-//! at the payment.
-//!
-//! Deciding it there rather than at the claim is what keeps one exit path. A
-//! payment holds the target identity — it has just re-derived it — so the arm
-//! that abandons a frame can also hand the resident back to the reclaim, which a
-//! hook on the claim could not: `clear_host_valid` fires ~1 600 times a second
-//! and knows only a mapping id.
-//!
-//! # The ledger is bounded by a type, not by a sweep
-//!
-//! [`PendingWritebacks`] is the only container, its insert is the only way in,
-//! and it holds at most [`crate::runtime::writeback_debt::MAX_DEBTS`] entries: a
-//! mapping arming past that limit
-//! pays the oldest debt on the spot rather than growing the map. Six distinct
-//! surfaces carry a driven boot, so the bound is ~5x the observed working set
-//! and a boot that reaches it is reporting something about the guest.
+//! [`MAX_DEBTS`] bounds only anonymous type-11 surface debts. GVA resource
+//! lifetime is explicit — resource discard/delete and task teardown — so an
+//! unrelated capacity limit must not invent an early synchronization point.
 
 use crate::model::DeviceState;
 use crate::runtime::host::{HostMemory, HostOps};
 
 /// Debts held at once, before an arm pays the oldest to make room.
 ///
-/// A driven macos-13 sustained-animation boot names about six distinct type-11
-/// surfaces (`render_writeback`'s second census), so this is a ceiling with
-/// headroom rather than a working figure. `wbdebt_evicted` firing is the boot
-/// saying the guest's surface set outgrew it.
+/// This is the existing measured ceiling for the ledger, now shared by both
+/// backing representations rather than duplicated per representation. An
+/// insertion past it pays the oldest frame, so the bound can cost coalescing but
+/// cannot lose pixels. `wbdebt_evicted` reports when a workload reaches it.
 pub const MAX_DEBTS: usize = 32;
 
 /// A frame owed to one type-11 mapping's guest pages.
@@ -121,27 +77,74 @@ pub struct WritebackDebt {
     pub seq: u64,
 }
 
-/// Every type-11 mapping owed a frame, keyed by mapping id.
+/// The guest resource that owns one GVA render attachment.
 ///
-/// One debt per mapping by construction: a second Store into a mapping replaces
-/// the first, which is the coalescing the whole rail exists for and the reason
-/// the key is the mapping rather than the Store.
+/// Unlike the address, this is also what `CmdSynchronizeResources` names. A
+/// task is part of the key because object references are task-local.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GvaResourceKey {
+    pub task_id: u32,
+    pub texture_ref: u32,
+}
+
+/// A frame held only by a GVA target's engine-resident image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GvaWritebackDebt {
+    pub gva: u64,
+    pub row_stride: u32,
+    pub width: u32,
+    pub height: u32,
+    pub format: u16,
+    pub generation: u64,
+    pub guest_write: crate::runtime::buffer_write_gen::BufferWriteStamp,
+    pub seq: u64,
+}
+
+/// The transfer backing retained by one live GVA texture resource.
+///
+/// The resource owns this physical-page identity after its virtual declaration
+/// has been resolved. Task unmap changes the task's CPU mapping bookkeeping; it
+/// does not retarget a live resource. An explicit resource discard drops only
+/// `pages`, allowing the next prepare/synchronize to establish a new transfer
+/// backing without changing the host texture's identity.
+#[derive(Clone, Debug)]
+struct GvaResourceState {
+    generation: u64,
+    gva: u64,
+    span: u64,
+    pages: Option<std::sync::Arc<[u64]>>,
+}
+
+/// One entry in the bounded ledger, irrespective of backing kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WritebackKey {
+    Mapping(u32),
+}
+
+/// Every render resource whose current frame exists only in a host resident.
+///
+/// Surface resources key by mapping id; GVA resources key by their task-local
+/// texture reference. In either representation, a second Store replaces the
+/// first rather than queueing another frame.
 #[derive(Debug, Default)]
 pub struct PendingWritebacks {
     debts: std::collections::BTreeMap<u32, WritebackDebt>,
+    gva_debts: std::collections::BTreeMap<GvaResourceKey, GvaWritebackDebt>,
+    gva_resources: std::collections::BTreeMap<GvaResourceKey, GvaResourceState>,
     next_seq: u64,
+    next_gva_generation: u64,
 }
 
 impl PendingWritebacks {
     /// Mappings currently owed a frame.
     pub fn len(&self) -> usize {
-        self.debts.len()
+        self.debts.len() + self.gva_debts.len()
     }
 
     /// Whether anything is owed at all — the check every reader makes, and the
     /// one that has to be free.
     pub fn is_empty(&self) -> bool {
-        self.debts.is_empty()
+        self.debts.is_empty() && self.gva_debts.is_empty()
     }
 
     /// What `mapping_id` is owed, if anything.
@@ -161,12 +164,12 @@ impl PendingWritebacks {
         all.into_iter().map(|(_, id)| id).collect()
     }
 
-    /// The mapping whose debt has been owed longest.
-    fn oldest(&self) -> Option<u32> {
+    /// The surface mapping whose debt has been owed longest.
+    fn oldest(&self) -> Option<WritebackKey> {
         self.debts
             .iter()
             .min_by_key(|(_, d)| d.seq)
-            .map(|(id, _)| *id)
+            .map(|(id, _)| WritebackKey::Mapping(*id))
     }
 
     /// Record that `mapping_id` is owed a frame, returning the mapping whose
@@ -188,7 +191,7 @@ impl PendingWritebacks {
         width: u32,
         height: u32,
         map_generation: u32,
-    ) -> Option<u32> {
+    ) -> Option<WritebackKey> {
         let evict = match self.debts.len() >= MAX_DEBTS && !self.debts.contains_key(&mapping_id) {
             true => self.oldest(),
             false => None,
@@ -209,6 +212,177 @@ impl PendingWritebacks {
         }
         crate::runtime::drain::note_store_route("wbdebt_armed");
         evict
+    }
+
+    /// Record a host-authoritative frame for one GVA resource.
+    ///
+    /// A second Store through the same task-local texture reference replaces
+    /// the earlier debt. The returned previous debt names an older resident
+    /// identity that the caller must release when the declaration changed.
+    #[must_use = "a replaced resource debt may own an older resident identity"]
+    pub fn arm_gva(
+        &mut self,
+        key: GvaResourceKey,
+        mut debt: GvaWritebackDebt,
+    ) -> Option<GvaWritebackDebt> {
+        debt.seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let previous = self.gva_debts.insert(key, debt);
+        if previous.is_some() {
+            crate::runtime::drain::note_store_route("gvadebt_superseded");
+        }
+        crate::runtime::drain::note_store_route("gvadebt_armed");
+        previous
+    }
+
+    /// Establish or retrieve the lifetime identity of one live GVA resource.
+    ///
+    /// `pages` is accepted only on the first resolution after construction or
+    /// explicit discard. Repeated draws and ordinary task unmaps keep the
+    /// retained physical backing and the same host-texture generation.
+    pub fn ensure_gva_resource(
+        &mut self,
+        key: GvaResourceKey,
+        gva: u64,
+        span: u64,
+        pages: Option<Vec<u64>>,
+    ) -> u64 {
+        if let Some(resource) = self.gva_resources.get_mut(&key) {
+            if resource.gva == gva && resource.span == span && resource.pages.is_none() {
+                resource.pages = pages.map(std::sync::Arc::from);
+            }
+            return resource.generation;
+        }
+        self.next_gva_generation = self.next_gva_generation.wrapping_add(1);
+        if self.next_gva_generation == 0 {
+            self.next_gva_generation = 1;
+        }
+        let generation = self.next_gva_generation;
+        self.gva_resources.insert(
+            key,
+            GvaResourceState {
+                generation,
+                gva,
+                span,
+                pages: pages.map(std::sync::Arc::from),
+            },
+        );
+        generation
+    }
+
+    #[cfg(any(feature = "backend-vulkan", test))]
+    fn gva_resource_backing(
+        &self,
+        key: GvaResourceKey,
+    ) -> Option<(u64, u64, u64, std::sync::Arc<[u64]>)> {
+        let resource = self.gva_resources.get(&key)?;
+        Some((
+            resource.generation,
+            resource.gva,
+            resource.span,
+            std::sync::Arc::clone(resource.pages.as_ref()?),
+        ))
+    }
+
+    #[cfg(any(feature = "backend-vulkan", test))]
+    fn gva_resource_status(&self, key: GvaResourceKey) -> Option<(u64, u64, u64, bool)> {
+        self.gva_resources.get(&key).map(|resource| {
+            (
+                resource.generation,
+                resource.gva,
+                resource.span,
+                resource.pages.is_some(),
+            )
+        })
+    }
+
+    /// Release the transfer buffer of each named resource while preserving its
+    /// host texture and lifetime identity.
+    pub fn discard_gva_resources(&mut self, task_id: u32, object_ids: &[u32]) -> usize {
+        let mut discarded = 0;
+        for &texture_ref in object_ids {
+            let key = GvaResourceKey {
+                task_id,
+                texture_ref,
+            };
+            if let Some(resource) = self.gva_resources.get_mut(&key) {
+                discarded += usize::from(resource.pages.take().is_some());
+            }
+        }
+        discarded
+    }
+
+    fn retire_gva_resource(&mut self, key: GvaResourceKey) -> (bool, Option<GvaWritebackDebt>) {
+        let existed = self.gva_resources.remove(&key).is_some();
+        (existed, self.gva_debts.remove(&key))
+    }
+
+    pub fn get_gva(&self, key: GvaResourceKey) -> Option<GvaWritebackDebt> {
+        self.gva_debts.get(&key).copied()
+    }
+
+    pub fn has_gva(&self, key: GvaResourceKey) -> bool {
+        self.gva_debts.contains_key(&key)
+    }
+
+    pub fn take_gva(&mut self, key: GvaResourceKey) -> Option<GvaWritebackDebt> {
+        self.gva_debts.remove(&key)
+    }
+
+    /// Put back a debt whose guest backing was temporarily unavailable.
+    /// Preserves its original age: inability to pay does not make an old frame
+    /// the newest member of the ledger.
+    #[cfg(feature = "backend-vulkan")]
+    fn restore_gva(&mut self, key: GvaResourceKey, debt: GvaWritebackDebt) {
+        let previous = self.gva_debts.insert(key, debt);
+        debug_assert!(
+            previous.is_none(),
+            "a taken debt restores into its own hole"
+        );
+    }
+
+    fn gvas_by_age(&self) -> Vec<GvaResourceKey> {
+        let mut all: Vec<(u64, GvaResourceKey)> = self
+            .gva_debts
+            .iter()
+            .map(|(key, debt)| (debt.seq, *key))
+            .collect();
+        all.sort_unstable();
+        all.into_iter().map(|(_, key)| key).collect()
+    }
+
+    fn gvas_for_task(&self, task_id: u32) -> Vec<GvaResourceKey> {
+        self.gva_resources
+            .keys()
+            .filter(|key| key.task_id == task_id)
+            .copied()
+            .collect()
+    }
+
+    #[cfg(feature = "backend-vulkan")]
+    fn gva_for_identity(
+        &self,
+        identity: &crate::backend::vulkan::engine::TargetIdentity,
+    ) -> Option<(GvaResourceKey, GvaWritebackDebt)> {
+        let crate::backend::vulkan::engine::TargetIdentity::Gva {
+            gva,
+            width,
+            height,
+            generation,
+            ..
+        } = *identity
+        else {
+            return None;
+        };
+        self.gva_debts
+            .iter()
+            .find(|(_, debt)| {
+                debt.gva == gva
+                    && debt.width == width
+                    && debt.height == height
+                    && debt.generation == generation
+            })
+            .map(|(key, debt)| (*key, *debt))
     }
 }
 
@@ -283,6 +457,12 @@ pub fn pay_all<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
             continue;
         };
         pay(state, host, mapping_id, debt, "wbdebt_paid_all");
+    }
+    for key in state.pending_writebacks.gvas_by_age() {
+        let Some(debt) = state.pending_writebacks.take_gva(key) else {
+            continue;
+        };
+        let _ = pay_gva(state, host, key, debt, GvaPaySite::All);
     }
 }
 
@@ -392,15 +572,23 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
     if state.pending_writebacks.is_empty() {
         return;
     }
-    // Both spellings, in the order `resource_validity::apply` uses: a reference
-    // that is itself a mapping id, and the per-task registration. Paying one
-    // leaves the ledger holding the other, so asking twice costs a map lookup
-    // and cannot pay the wrong surface.
+    let gva_key = GvaResourceKey {
+        task_id,
+        texture_ref,
+    };
+    let mut named = false;
+    if let Some(debt) = state.pending_writebacks.take_gva(gva_key) {
+        named = true;
+        let _ = pay_gva(state, host, gva_key, debt, GvaPaySite::Named);
+    }
+    // Both surface spellings, in the order `resource_validity::apply` uses: a
+    // reference that is itself a mapping id, and the per-task registration.
+    // Paying one leaves the ledger holding the other, so asking twice costs a
+    // map lookup and cannot pay the wrong surface.
     let mapped = state
         .texture_to_mapping
         .get(&(task_id, texture_ref))
         .copied();
-    let mut named = false;
     if state.pending_writebacks.get(texture_ref).is_some() {
         named = true;
         pay_for_mapping(state, host, texture_ref);
@@ -413,6 +601,200 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
     }
     if !named {
         crate::runtime::drain::note_store_route("wbdebt_texture_owes_nothing");
+    }
+}
+
+/// The stable host-texture identity for one task-local GVA resource.
+///
+/// The first successful resolution retains the ordered physical pages that the
+/// resource's transfer buffer names. Later calls return the same generation and
+/// backing even if the task removes its virtual mapping. After explicit
+/// discard, the next call may establish a replacement transfer backing while
+/// preserving the host texture's generation.
+#[cfg(feature = "backend-vulkan")]
+pub fn gva_resource_generation<M: HostMemory>(
+    state: &mut DeviceState,
+    host: &M,
+    key: GvaResourceKey,
+    gva: u64,
+    span: u64,
+) -> u64 {
+    if let Some((generation, declared_gva, declared_span, has_pages)) =
+        state.pending_writebacks.gva_resource_status(key)
+    {
+        if declared_gva != gva || declared_span != span {
+            crate::observe::fail(format!(
+                "gva_resource_refused task={} texture={} reason=declaration_changed",
+                key.task_id, key.texture_ref
+            ));
+            return 0;
+        }
+        if has_pages {
+            return generation;
+        }
+    }
+    let page_size = state.page_size();
+    let ordered = crate::runtime::gva_mem::task_gva_page_gpas(
+        host,
+        &state.tasks,
+        key.task_id,
+        gva,
+        span,
+        state.page_shift,
+    );
+    let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
+    let pages = (ordered.len() as u64 == want).then_some(ordered);
+    state
+        .pending_writebacks
+        .ensure_gva_resource(key, gva, span, pages)
+}
+
+/// Record a GVA render result as host-authoritative without touching guest
+/// pages. Returns `false` when the attachment has no resource identity and must
+/// use the eager transfer path.
+#[cfg(feature = "backend-vulkan")]
+pub fn arm_gva<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    _host: &mut M,
+    task_id: u32,
+    c0: &crate::runtime::draw::ColorRtRequest,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+) -> bool {
+    let Some(generation) = (match *identity {
+        crate::backend::vulkan::engine::TargetIdentity::Gva { generation, .. } => Some(generation),
+        _ => None,
+    }) else {
+        return false;
+    };
+    if c0.texture_ref == 0 || generation == 0 {
+        return false;
+    }
+    // Every older host-side spelling of this resource is stale as soon as the
+    // render finishes. In particular, a compute storage resident and the
+    // linear byte cache can otherwise sit above the guest-page reader and serve
+    // the frame that preceded this Store indefinitely.
+    state.invalidate_object_host_copies(task_id, c0.texture_ref);
+    crate::runtime::surface_cache::evict_gva(state, c0.target_gva);
+    let key = GvaResourceKey {
+        task_id,
+        texture_ref: c0.texture_ref,
+    };
+    let debt = GvaWritebackDebt {
+        gva: c0.target_gva,
+        row_stride: c0.row_stride,
+        width: c0.width,
+        height: c0.height,
+        format: c0.format,
+        generation,
+        guest_write: state.buffer_write_gen.stamp(task_id, c0.texture_ref),
+        seq: 0,
+    };
+    let previous = state.pending_writebacks.arm_gva(key, debt);
+    if let Some(previous) = previous.filter(|previous| !same_gva_identity(*previous, debt)) {
+        release_gva(previous);
+    }
+    true
+}
+
+/// Whether this exact GVA resident is the host-authoritative copy named by an
+/// unpaid resource debt.
+#[cfg(feature = "backend-vulkan")]
+pub fn gva_resident_authoritative(
+    state: &DeviceState,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+) -> bool {
+    let Some((key, debt)) = state.pending_writebacks.gva_for_identity(identity) else {
+        return false;
+    };
+    state
+        .buffer_write_gen
+        .stamp(key.task_id, key.texture_ref)
+        .quiet_since(debt.guest_write)
+}
+
+/// Retire host-authoritative resources whose task-local references are about to
+/// be replaced. The pixels are deliberately not copied: after this lifecycle
+/// transition the old object no longer names guest storage to synchronize.
+pub fn retire_gva_for_task(state: &mut DeviceState, task_id: u32) -> usize {
+    let keys = state.pending_writebacks.gvas_for_task(task_id);
+    let mut retired = 0;
+    for key in keys {
+        let (_, debt) = state.pending_writebacks.retire_gva_resource(key);
+        retired += 1;
+        #[cfg(feature = "backend-vulkan")]
+        if let Some(debt) = debt {
+            release_gva(debt);
+        }
+        #[cfg(not(feature = "backend-vulkan"))]
+        let _ = debt;
+    }
+    if retired != 0 {
+        crate::runtime::drain::note_store_route_n("gvadebt_retired_task", retired as u64);
+    }
+    retired
+}
+
+/// Retire one resource at its explicit lifetime boundary.
+pub fn retire_gva_resource(state: &mut DeviceState, task_id: u32, texture_ref: u32) -> bool {
+    let key = GvaResourceKey {
+        task_id,
+        texture_ref,
+    };
+    let (existed, debt) = state.pending_writebacks.retire_gva_resource(key);
+    #[cfg(feature = "backend-vulkan")]
+    if let Some(debt) = debt {
+        release_gva(debt);
+    }
+    #[cfg(not(feature = "backend-vulkan"))]
+    let _ = debt;
+    existed || debt.is_some()
+}
+
+/// Release named resources' retained transfer backings.
+pub fn discard_gva_resources(state: &mut DeviceState, task_id: u32, object_ids: &[u32]) -> usize {
+    state
+        .pending_writebacks
+        .discard_gva_resources(task_id, object_ids)
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn same_gva_identity(a: GvaWritebackDebt, b: GvaWritebackDebt) -> bool {
+    a.gva == b.gva
+        && a.width == b.width
+        && a.height == b.height
+        && a.generation == b.generation
+        && a.format == b.format
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn gva_identity(debt: GvaWritebackDebt) -> crate::backend::vulkan::engine::TargetIdentity {
+    crate::backend::vulkan::engine::TargetIdentity::Gva {
+        gva: debt.gva,
+        width: debt.width,
+        height: debt.height,
+        generation: debt.generation,
+        format: crate::runtime::draw::gva_resident_format(debt.format),
+    }
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn release_gva(debt: GvaWritebackDebt) {
+    crate::backend::vulkan::engine::note_resident_content_copied_out(&gva_identity(debt));
+}
+
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn pay_key<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    key: WritebackKey,
+) -> bool {
+    match key {
+        WritebackKey::Mapping(mapping_id) => {
+            if let Some(debt) = state.pending_writebacks.take(mapping_id) {
+                pay(state, host, mapping_id, debt, "wbdebt_paid_evicted");
+            }
+            true
+        }
     }
 }
 
@@ -480,6 +862,22 @@ pub fn settle_unnamed<M: HostMemory + HostOps>(
     site: crate::runtime::render_writeback::SettleSite,
 ) {
     pay_all(state, host);
+    crate::runtime::render_writeback::settle_guest_writes(site);
+}
+
+/// Publish exactly the resources named by a synchronize command, then wait for
+/// those transfers. The object list is the scope of the API operation; an
+/// unrelated host-valid texture remains resident-authoritative.
+pub fn settle_for_resources<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    object_ids: &[u32],
+    site: crate::runtime::render_writeback::SettleSite,
+) {
+    for &object_id in object_ids {
+        pay_for_texture(state, host, task_id, object_id);
+    }
     crate::runtime::render_writeback::settle_guest_writes(site);
 }
 
@@ -603,6 +1001,103 @@ fn pay<M: HostMemory + HostOps>(
     crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GvaPaySite {
+    Named,
+    All,
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl GvaPaySite {
+    fn route(self) -> &'static str {
+        match self {
+            Self::Named => "gvadebt_paid_named",
+            Self::All => "gvadebt_paid_all",
+        }
+    }
+}
+
+/// Materialize one host-authoritative GVA resource into its retained transfer
+/// backing. After explicit discard, synchronize lazily recreates that backing;
+/// ordinary virtual-memory unmap does not participate in resource lifetime.
+#[cfg(feature = "backend-vulkan")]
+fn pay_gva<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    key: GvaResourceKey,
+    debt: GvaWritebackDebt,
+    site: GvaPaySite,
+) -> bool {
+    let identity = gva_identity(debt);
+    let now = state.buffer_write_gen.stamp(key.task_id, key.texture_ref);
+    if !now.quiet_since(debt.guest_write) {
+        crate::runtime::drain::note_store_route("gvadebt_abandoned_guest_wrote");
+        release_gva(debt);
+        return true;
+    }
+    let Some(span) = u64::from(debt.row_stride).checked_mul(u64::from(debt.height)) else {
+        crate::observe::fail(format!(
+            "gvadebt_pay_lost task={} texture={} reason=span_overflow",
+            key.task_id, key.texture_ref
+        ));
+        release_gva(debt);
+        return true;
+    };
+    let generation = gva_resource_generation(state, host, key, debt.gva, span);
+    let Some((backing_generation, backing_gva, backing_span, ordered)) =
+        state.pending_writebacks.gva_resource_backing(key)
+    else {
+        state.pending_writebacks.restore_gva(key, debt);
+        crate::runtime::drain::note_store_route(match site {
+            GvaPaySite::Named => "gvadebt_named_unmapped",
+            GvaPaySite::All => "gvadebt_all_unmapped",
+        });
+        if site == GvaPaySite::Named {
+            crate::observe::fail(format!(
+                "gvadebt_pay_blocked task={} texture={} reason=span_unresolved",
+                key.task_id, key.texture_ref
+            ));
+        }
+        return false;
+    };
+    if generation == 0
+        || backing_generation != debt.generation
+        || backing_gva != debt.gva
+        || backing_span != span
+    {
+        crate::runtime::drain::note_store_route("gvadebt_generation_moved");
+        release_gva(debt);
+        return true;
+    }
+    let pages = crate::runtime::draw::StoreTargetPages::from_ordered(&ordered, span);
+    let request = crate::runtime::draw::ColorRtRequest {
+        texture_ref: key.texture_ref,
+        target_gva: debt.gva,
+        row_stride: debt.row_stride,
+        width: debt.width,
+        height: debt.height,
+        format: debt.format,
+        store_action: crate::contract::pass_action::MTL_STORE_ACTION_STORE,
+        ..Default::default()
+    };
+    crate::runtime::drain::note_store_route(site.route());
+    if let Err(reason) = crate::runtime::render_writeback::store_gva_frame(
+        state,
+        host,
+        &identity,
+        &request,
+        key.texture_ref,
+        Some(&pages),
+    ) {
+        crate::observe::fail(format!(
+            "gvadebt_pay_lost task={} texture={} reason={reason}",
+            key.task_id, key.texture_ref
+        ));
+        release_gva(debt);
+    }
+    true
+}
+
 /// [`pay`] on an arm with no Vulkan engine to owe a frame to.
 ///
 /// Unreachable rather than merely unused: the only arm site is the type-11
@@ -618,6 +1113,17 @@ fn pay<M: HostMemory + HostOps>(
     _debt: WritebackDebt,
     _route: &'static str,
 ) {
+}
+
+#[cfg(not(feature = "backend-vulkan"))]
+fn pay_gva<M: HostMemory + HostOps>(
+    _state: &mut DeviceState,
+    _host: &mut M,
+    _key: GvaResourceKey,
+    _debt: GvaWritebackDebt,
+    _site: GvaPaySite,
+) -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -662,7 +1168,11 @@ mod tests {
         }
         assert_eq!(pending.len(), MAX_DEBTS);
         let evicted = pending.arm(MAX_DEBTS as u32, 64, 64, 1);
-        assert_eq!(evicted, Some(0), "the oldest arm is the one handed back");
+        assert_eq!(
+            evicted,
+            Some(WritebackKey::Mapping(0)),
+            "the oldest arm is the one handed back"
+        );
         assert_eq!(
             pending.len(),
             MAX_DEBTS + 1,
@@ -700,5 +1210,141 @@ mod tests {
         assert_eq!(pending.arm(2, 1, 1, 1), None);
         assert_eq!(pending.arm(5, 1, 1, 1), None);
         assert_eq!(pending.mappings_by_age(), vec![9, 2, 5]);
+    }
+
+    fn gva_debt(generation: u64) -> GvaWritebackDebt {
+        GvaWritebackDebt {
+            gva: 0x4000,
+            row_stride: 256,
+            width: 64,
+            height: 64,
+            format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            generation,
+            guest_write: Default::default(),
+            seq: 0,
+        }
+    }
+
+    /// The resource reference, not the GVA, owns coherence. Reusing the same
+    /// resource for another Store replaces its debt exactly as repeated Stores
+    /// into one IOSurface do.
+    #[test]
+    fn a_second_gva_store_on_one_resource_replaces_the_first() {
+        let mut pending = PendingWritebacks::default();
+        let key = GvaResourceKey {
+            task_id: 3,
+            texture_ref: 19,
+        };
+        assert_eq!(pending.arm_gva(key, gva_debt(7)), None);
+        let previous = pending.arm_gva(key, gva_debt(8));
+        assert_eq!(previous.map(|debt| debt.generation), Some(7));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.get_gva(key).map(|debt| debt.generation), Some(8));
+    }
+
+    /// GVA resources have protocol lifetime, not an arbitrary ledger capacity.
+    /// Holding more than the anonymous-surface coalescing bound must not invent
+    /// a transfer or drop an older resource's host-authoritative frame.
+    #[test]
+    fn gva_resources_are_not_evicted_by_the_surface_debt_bound() {
+        let mut pending = PendingWritebacks::default();
+        for texture_ref in 1..=(MAX_DEBTS as u32 + 8) {
+            let key = GvaResourceKey {
+                task_id: 2,
+                texture_ref,
+            };
+            pending.ensure_gva_resource(
+                key,
+                u64::from(texture_ref) << 16,
+                4096,
+                Some(vec![u64::from(texture_ref) << 12]),
+            );
+            assert_eq!(pending.arm_gva(key, gva_debt(texture_ref.into())), None);
+        }
+        assert_eq!(pending.len(), MAX_DEBTS + 8);
+        assert_eq!(pending.gvas_by_age().len(), MAX_DEBTS + 8);
+    }
+
+    /// Ordinary virtual-memory bookkeeping does not retarget a live resource.
+    /// A repeated prepare with a different walk keeps the original transfer
+    /// backing until the protocol explicitly discards it.
+    #[test]
+    fn a_live_resource_retains_its_backing_until_discard() {
+        let mut pending = PendingWritebacks::default();
+        let key = GvaResourceKey {
+            task_id: 3,
+            texture_ref: 19,
+        };
+        let generation = pending.ensure_gva_resource(key, 0x4000, 4096, Some(vec![0x9000]));
+        assert_eq!(
+            pending.ensure_gva_resource(key, 0x4000, 4096, Some(vec![0xa000])),
+            generation
+        );
+        assert_eq!(&*pending.gva_resource_backing(key).unwrap().3, &[0x9000]);
+
+        assert_eq!(pending.discard_gva_resources(3, &[19]), 1);
+        assert!(pending.gva_resource_backing(key).is_none());
+        assert_eq!(
+            pending.ensure_gva_resource(key, 0x4000, 4096, Some(vec![0xa000])),
+            generation,
+            "discard replaces the transfer backing, not the host texture"
+        );
+        assert_eq!(&*pending.gva_resource_backing(key).unwrap().3, &[0xa000]);
+    }
+
+    /// Delete is the resource lifetime boundary. Reusing the same task-local
+    /// reference after delete receives a new host-texture identity.
+    #[test]
+    fn deleting_and_recreating_a_resource_changes_its_generation() {
+        let mut pending = PendingWritebacks::default();
+        let key = GvaResourceKey {
+            task_id: 3,
+            texture_ref: 19,
+        };
+        let first = pending.ensure_gva_resource(key, 0x4000, 4096, Some(vec![0x9000]));
+        assert!(pending.retire_gva_resource(key).0);
+        let second = pending.ensure_gva_resource(key, 0x4000, 4096, Some(vec![0xa000]));
+        assert_ne!(first, second);
+    }
+
+    /// A guest validity transition after the Store makes guest memory newer
+    /// than the held resident. The debt remains available for an orderly
+    /// abandon, but it must immediately stop licensing host-resident reads.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn a_guest_write_revokes_gva_resident_authority() {
+        let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
+        let key = GvaResourceKey {
+            task_id: 4,
+            texture_ref: 12,
+        };
+        let debt = gva_debt(99);
+        let _ = state.pending_writebacks.arm_gva(key, debt);
+        let identity = gva_identity(debt);
+        assert!(gva_resident_authoritative(&state, &identity));
+        state
+            .buffer_write_gen
+            .note_write(key.task_id, key.texture_ref);
+        assert!(!gva_resident_authoritative(&state, &identity));
+        assert!(state.pending_writebacks.get_gva(key).is_some());
+    }
+
+    /// A synchronize list is a scope, not merely a trigger. Publishing one
+    /// object must leave an unrelated resource host-authoritative.
+    #[test]
+    fn resource_synchronization_pays_only_named_objects() {
+        let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
+        let mut host = crate::runtime::FakeHost::new();
+        assert_eq!(state.pending_writebacks.arm(7, 64, 64, 1), None);
+        assert_eq!(state.pending_writebacks.arm(8, 64, 64, 1), None);
+        settle_for_resources(
+            &mut state,
+            &mut host,
+            1,
+            &[7],
+            crate::runtime::render_writeback::SettleSite::ChildStamp,
+        );
+        assert!(state.pending_writebacks.get(7).is_none());
+        assert!(state.pending_writebacks.get(8).is_some());
     }
 }

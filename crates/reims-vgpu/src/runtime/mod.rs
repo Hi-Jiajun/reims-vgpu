@@ -47,11 +47,6 @@ pub mod fence_exec;
 /// zero-copy sampled gathers? Measurement, not policy.
 #[cfg(feature = "backend-vulkan")]
 pub mod gather_witness;
-/// Gated with the `GuestWriteVerdict` it reuses and the `TargetIdentity` it
-/// keys on, both of which are Vulkan-side; the type-11 twin this mirrors
-/// (`mapper::mapping_guest_write_verdict`) carries the same gate.
-#[cfg(feature = "backend-vulkan")]
-pub mod gva_store_witness;
 /// Guest-physical control-plane writes via HostOps map_pages.
 pub mod gpa_map;
 /// The last few pieces of work handed to the GPU, so a host GPU hang can name
@@ -67,6 +62,11 @@ pub mod guest_ram_map;
 /// both backends and every test arm reach it.
 /// Task GVA → guest RAM reads.
 pub mod gva_mem;
+/// Gated with the `GuestWriteVerdict` it reuses and the `TargetIdentity` it
+/// keys on, both of which are Vulkan-side; the type-11 twin this mirrors
+/// (`mapper::mapping_guest_write_verdict`) carries the same gate.
+#[cfg(feature = "backend-vulkan")]
+pub mod gva_store_witness;
 /// Task-GVA HostOps views (MapMemory2 / UnmapMemory lifecycle).
 pub mod gva_view;
 /// CmdHeapTextureSizeAndAlign wire decode + host requirement query.
@@ -94,24 +94,25 @@ pub mod mapper;
 pub mod mapping_write;
 /// generateMipmaps for multi-mip type-2/3 linear textures.
 pub mod mipmap;
+pub mod mmio;
+/// MTLB container → wrapped-AIR carve for metal2vulkan.
+pub mod mtlb;
 pub mod node_guard;
+/// Object-list lookup and type-11 registration.
+pub mod objects;
+/// A draw's pipeline and both its shaders, resolved once per pipeline object.
+#[cfg(feature = "backend-vulkan")]
+pub mod pipeline_resolve;
+pub mod plan;
+/// The resident identity a type-11 guest surface renders into.
+#[cfg(feature = "backend-vulkan")]
+pub mod present_identity;
 /// Whether a range's page-table entries are in the state the guest's own next
 /// edit of them requires — the direction that is ordered is the map.
 pub mod range_coverage;
 pub mod released_pages;
-pub mod mmio;
-/// MTLB container → wrapped-AIR carve for metal2vulkan.
-pub mod mtlb;
-/// Object-list lookup and type-11 registration.
-pub mod objects;
-pub mod plan;
-/// A draw's pipeline and both its shaders, resolved once per pipeline object.
-#[cfg(feature = "backend-vulkan")]
-pub mod pipeline_resolve;
-/// The resident identity a type-11 guest surface renders into.
-#[cfg(feature = "backend-vulkan")]
-pub mod present_identity;
-/// Land a render Store's frame in the guest's pages, at the Store.
+/// Transfer a host-resident render frame into guest pages when synchronization
+/// or a guest-memory reader makes the bytes observable.
 pub mod render_writeback;
 /// The guest's per-resource validity quad, from both of its producers.
 pub mod resource_validity;
@@ -130,7 +131,7 @@ pub mod surface_cache;
 pub mod task_slot;
 /// Texture / type-11 geometry registration.
 pub mod texture;
-/// Owe a type-11 surface's guest pages a frame, and pay when something reads.
+/// Track host-authoritative surface and GVA frames, and transfer them on demand.
 pub mod writeback_debt;
 
 /// The unit-test host double, gated with its definition. An ungated re-export

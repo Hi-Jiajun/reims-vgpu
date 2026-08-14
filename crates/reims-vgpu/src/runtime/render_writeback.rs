@@ -1,15 +1,19 @@
-//! Land a render Store's frame in the guest's pages.
+//! Materialize a host-authoritative render target in guest pages.
 //!
-//! A type-11 render Store names a mapping and a resident image the draw just
-//! rendered into. This module copies the one into the other and returns. There
-//! is no window, no pin held across the call, and nothing to land later.
+//! These functions implement the transfer half of resource synchronization.
+//! The render Store itself normally leaves the frame in its engine resident;
+//! [`crate::runtime::writeback_debt`] calls back here when an explicit
+//! synchronize or an actual guest-byte reader requires a guest copy. An eager
+//! fallback may call the same functions at Store time, so both timings produce
+//! identical bytes through one implementation.
 //!
-//! # The type-11 rail can now be asked to owe the copy instead
+//! # Both render-target representations can owe the copy
 //!
 //! [`crate::runtime::writeback_debt`] is the rail this doc spent four sections
 //! designing and one section burying, built in the one shape the four guest
-//! panics do not rule out: nothing resolved is held, and a payment re-derives
-//! the identity and re-walks the page tables at the moment it runs. Read that
+//! panics do not rule out: type-11 mappings are resolved at payment, while a
+//! live GVA resource retains the physical-page identity of its transfer
+//! backing without retaining raw host pointers. Read that
 //! module's doc first if you are here about deferral; what follows is the
 //! measurement it stands on, and three of its numbers are now known to be wrong
 //! in the ways below.
@@ -18,8 +22,8 @@
 //! type-11 Stores are superseded before anything reads their pages**, `store_us`
 //! falls 0.89 against 9.56 us a chain, `draw_us` 14.62 against 26.52, and five
 //! of six on-arm boots present at 105.8-109.2 Hz against a 77.2-78.6 Hz
-//! baseline. `store_gva_frame` below is **not** deferred and still writes its
-//! ~850 frames a second eagerly.
+//! baseline. GVA targets use the same ownership rule now; their debt is keyed by
+//! the task-local resource reference and paid into its retained transfer backing.
 //!
 //! ## What that rail corrected here
 //!
@@ -40,11 +44,12 @@
 //!   censuses further down could not see, because both measured the spacing of
 //!   Stores rather than the spacing of reads.
 //!
-//! # Why the frame is written here rather than deferred
+//! # Why no resolved transfer is held across the ownership window
 //!
-//! It used to be deferred. A Store armed a window naming the pinned resident,
-//! and the window was landed either by the next completion stamp or by a host
-//! path that touched the mapping's bytes first. The argument for that shape was
+//! An older design deferred a resolved transfer. A Store armed a window naming
+//! the pinned resident, and the window was landed either by the next completion
+//! stamp or by a host path that touched the mapping's bytes first. The argument
+//! for that shape was
 //! coalescing: several passes fully covering one surface inside one submission
 //! would land once instead of once each.
 //!
@@ -1124,12 +1129,13 @@ crate::observe::decline::decline_display!(GvaWritebackDecline);
 /// against it: both end in `copy_target_to_guest_pages` and they differ only in
 /// how the destination pages are named. A mapping carries its own page list and
 /// a page-table vouch licenses it; a GVA carries neither, so the licence is the
-/// walk the command took **before it was submitted** — `pages`, which the
-/// caller resolved at that point and which this rail may not widen.
+/// exact page list supplied in `pages`, which this rail may not widen. The eager
+/// fallback captures it before draw submission; deferred payment gets it from
+/// the live resource's transfer backing.
 ///
-/// # Why this is the whole cost of a GVA Store
+/// # Why this is the whole cost of a GVA synchronization
 ///
-/// The rail this stands in front of reads the resident back to the host
+/// The fallback behind this call reads the resident back to the host
 /// (`read_resident_chain`, a blocking fence) and then writes it out again a row
 /// at a time through `convert_rgba8_to_row`. On a driven desktop-compositing
 /// boot that is 59 % of render Stores and most of the time the device spends
@@ -1181,7 +1187,8 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     }
     let bpt = u64::from(order.bytes_per_texel());
     let row_stride = u64::from(c0.row_stride);
-    if row_stride == 0 || !row_stride.is_multiple_of(bpt) || row_stride < u64::from(c0.width) * bpt {
+    if row_stride == 0 || !row_stride.is_multiple_of(bpt) || row_stride < u64::from(c0.width) * bpt
+    {
         return Err(GvaWritebackDecline::PitchNotTexels {
             row_stride: c0.row_stride,
         });
@@ -1202,10 +1209,9 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     // the copying rail leaves it alone too. The two rails must land identical
     // guest memory or a fallback would be visible.
     let extent = u64::from(c0.height.saturating_sub(1)) * row_stride + u64::from(c0.width) * bpt;
-    let runs = crate::runtime::guest_ram_map::references_for_runs(
-        host, gpas, page_size, in_page, extent,
-    )
-    .map_err(|refusal| GvaWritebackDecline::GuestRefRefused { refusal })?;
+    let runs =
+        crate::runtime::guest_ram_map::references_for_runs(host, gpas, page_size, in_page, extent)
+            .map_err(|refusal| GvaWritebackDecline::GuestRefRefused { refusal })?;
     let target = crate::backend::vulkan::engine::GuestPageTarget {
         runs,
         // Checked above to divide exactly, so this is the guest's pitch and not
@@ -1283,11 +1289,7 @@ mod tests {
                 site,
                 site.route()
             );
-            assert_eq!(
-                site.route_us(),
-                format!("{}_us", site.route()),
-                "{site:?}"
-            );
+            assert_eq!(site.route_us(), format!("{}_us", site.route()), "{site:?}");
         }
         assert_eq!(seen.len(), SettleSite::ALL.len());
     }

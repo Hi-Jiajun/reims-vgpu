@@ -4599,7 +4599,7 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
 
     let mut host = crate::runtime::host::FakeHost::new();
     let secs = build_secondary_targets(
-        &state, &mut host, 1, &colors, &pipeline, &primary, 64, 64, [0.0; 4],
+        &mut state, &mut host, 1, &colors, &pipeline, &primary, 64, 64, [0.0; 4],
     )
     .expect("a contiguous, geometry-matching, resolvable secondary builds");
     assert_eq!(secs.len(), 1, "one secondary attachment expected");
@@ -4629,7 +4629,7 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
     };
     let mut host = crate::runtime::host::FakeHost::new();
     let secs = build_secondary_targets(
-        &state, &mut host, 1, &colors, &unblended, &primary, 64, 64, [0.0; 4],
+        &mut state, &mut host, 1, &colors, &unblended, &primary, 64, 64, [0.0; 4],
     )
     .expect("the same secondary builds whether or not its slot blends");
     assert_eq!(secs.len(), 1);
@@ -4659,7 +4659,7 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
     use crate::runtime::census::present_proxy::MrtDrop;
     use crate::runtime::decode::resource::{PipelineColorAttachment, RenderPipelineDescriptor};
 
-    let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let pipeline = RenderPipelineDescriptor {
         color_attachments: vec![
             PipelineColorAttachment {
@@ -4701,10 +4701,10 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
         ..ColorRtRequest::default()
     };
 
-    let build = |slot1: &ColorRtRequest| {
+    let mut build = |slot1: &ColorRtRequest| {
         let mut host = crate::runtime::host::FakeHost::new();
         build_secondary_targets(
-            &state,
+            &mut state,
             &mut host,
             1,
             &[slot0.clone(), slot1.clone()],
@@ -4784,7 +4784,7 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
     // refused: `Ok(empty)` is the classic single-RT path, byte-identical.
     let mut host = crate::runtime::host::FakeHost::new();
     let single = build_secondary_targets(
-        &state,
+        &mut state,
         &mut host,
         1,
         std::slice::from_ref(&slot0),
@@ -4815,7 +4815,7 @@ fn two_secondaries_over_one_destination_refuse_the_draw_like_a_primary_alias() {
     use crate::runtime::census::present_proxy::MrtDrop;
     use crate::runtime::decode::resource::{PipelineColorAttachment, RenderPipelineDescriptor};
 
-    let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let pipeline = RenderPipelineDescriptor {
         color_attachments: (0..3)
             .map(|slot| PipelineColorAttachment {
@@ -4841,10 +4841,10 @@ fn two_secondaries_over_one_destination_refuse_the_draw_like_a_primary_alias() {
         format,
         ..ColorRtRequest::default()
     };
-    let build = |colors: &[ColorRtRequest]| {
+    let mut build = |colors: &[ColorRtRequest]| {
         let mut host = crate::runtime::host::FakeHost::new();
         build_secondary_targets(
-            &state, &mut host, 1, colors, &pipeline, &primary, 64, 64, [0.0; 4],
+            &mut state, &mut host, 1, colors, &pipeline, &primary, 64, 64, [0.0; 4],
         )
     };
 
@@ -6027,7 +6027,7 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
     let served = store_route_count("gvarung_resident");
 
     assert!(
-        super::try_gva_resident_sample(&mut state, &mut host, 1, &tex).is_none(),
+        super::try_gva_resident_sample(&mut state, &mut host, 1, 7, &tex).is_none(),
         "no Store has stamped this span, so nothing licenses serving a resident for it"
     );
     assert_eq!(
@@ -6056,7 +6056,7 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
     };
     note_store(&mut state, &mut host, orphan, &gpas);
     assert!(
-        super::try_gva_resident_sample(&mut state, &mut host, 1, &tex).is_none(),
+        super::try_gva_resident_sample(&mut state, &mut host, 1, 7, &tex).is_none(),
         "a stale page set stamped at this address must not answer for the one that replaced it"
     );
     assert_eq!(
