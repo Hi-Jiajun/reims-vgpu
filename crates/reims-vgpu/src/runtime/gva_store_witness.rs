@@ -351,7 +351,6 @@ impl GvaWriteReach {
             Self::Host(HostWriteVerdict::Quiet) => "gvaw_host_quiet",
             Self::Host(HostWriteVerdict::Overlap) => "gvaw_host_overlap",
             Self::Host(HostWriteVerdict::Unnamed) => "gvaw_host_unnamed",
-            Self::Host(HostWriteVerdict::Forgotten) => "gvaw_host_forgotten",
         }
     }
 
@@ -365,7 +364,8 @@ impl GvaWriteReach {
 /// Ask both witnesses about `key`.
 ///
 /// The guest half is asked first because it is a word; the host-write half
-/// walks a ring and is only reached when the guest half is clean.
+/// indexes the target's page epochs and is only reached when the guest half is
+/// clean.
 pub fn reach<H: HostOps>(state: &DeviceState, host: &H, key: GvaTargetKey) -> GvaWriteReach {
     let Some(e) = state.gva_store_witness.entries.get(&key) else {
         return GvaWriteReach::Guest(GuestWriteVerdict::NoMapping);

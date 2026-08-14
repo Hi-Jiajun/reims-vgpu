@@ -2583,7 +2583,7 @@ impl DeviceState {
             bound_buffers: crate::runtime::bound_buffers::BoundBuffers::default(),
             buffer_write_gen: crate::runtime::buffer_write_gen::BufferWriteGens::default(),
             sampled_content_gen: 0,
-            host_writes: crate::runtime::host_writes::HostWrites::default(),
+            host_writes: crate::runtime::host_writes::HostWrites::new(page_shift),
             guest_linear_scratch: Vec::new(),
             type5_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             type11_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
@@ -3525,13 +3525,31 @@ impl DeviceState {
 
     /// The same, for a writer that knows which mapping's pages it is landing in.
     pub fn note_host_wrote_mapping(&mut self, mapping_id: u32) {
-        // A mapping whose pages cannot be named exactly cannot have its write
-        // ruled out later, so it is recorded as an unnamed one rather than as an
-        // empty (or short) page set.
-        match self.mapping_reach_pages(mapping_id) {
-            Some(pages) => self.host_writes.note_mapping(Some(&pages)),
-            None => self.host_writes.note_unknown(),
+        let Some(entries) = self
+            .mappings
+            .get(&mapping_id)
+            .map(|mapping| mapping.page_entries.as_slice())
+            .filter(|entries| !entries.is_empty())
+        else {
+            self.host_writes.note_unknown();
+            return;
+        };
+        let shift = self.page_shift;
+        if entries
+            .iter()
+            .any(|&entry| crate::contract::iosurface_pages::entry_gpa_shift(entry, shift).is_none())
+        {
+            // A mapping whose pages cannot be named exactly cannot have its
+            // write ruled out later. Record one unnamed write rather than the
+            // resolvable prefix.
+            self.host_writes.note_unknown();
+            return;
         }
+        self.host_writes
+            .note_page_iter(entries.iter().map(|&entry| {
+                crate::contract::iosurface_pages::entry_gpa_shift(entry, shift)
+                    .expect("page entries were validated above")
+            }));
     }
 
     /// Issue a sampled-content generation that has never been issued before.
