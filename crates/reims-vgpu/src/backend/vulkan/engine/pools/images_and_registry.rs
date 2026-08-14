@@ -1703,6 +1703,23 @@ impl ResourcePools {
         true
     }
 
+    /// Retain a live resource's resident and report whether that resident is
+    /// the guest allocation itself.
+    ///
+    /// The pin and the allocation-kind read are one registry operation. A
+    /// caller that performed them separately could observe a different slot
+    /// between the two and would also pay two engine transactions for one
+    /// resource acquisition.
+    pub(crate) fn retain_resident_target(&mut self, identity: &TargetIdentity) -> Option<bool> {
+        let guest_imported = self
+            .registry
+            .get(identity)
+            .filter(|slot| slot.content_ready)
+            .map(|slot| slot.memory.is_guest_imported())?;
+        self.pin_resident_target(identity, true)
+            .then_some(guest_imported)
+    }
+
     /// Mark a resident ready after a draw stored into it.
     ///
     /// Clears `content_epoch`: this image's pixels just changed, and until
@@ -2511,6 +2528,38 @@ pub(super) mod pin_count_tests {
         pools.registry.insert(id.clone(), dummy_slot(false));
         assert!(!pools.pin_resident_target(&id, true), "not-ready slot");
         assert_eq!(pools.registry.get(&id).unwrap().pin_count, 0);
+    }
+
+    #[test]
+    fn retaining_a_resource_returns_the_pinned_allocations_kind() {
+        let mut pools = ResourcePools::new();
+        let recyclable_id = pinned_identity();
+        pools
+            .registry
+            .insert(recyclable_id.clone(), dummy_slot(true));
+        assert_eq!(
+            pools.retain_resident_target(&recyclable_id),
+            Some(false)
+        );
+        assert_eq!(pools.registry[&recyclable_id].pin_count, 1);
+
+        let imported_id = surf(2);
+        let mut imported = dummy_slot(true);
+        imported.memory = ResidentMemory::GuestImported {
+            memory: vk::DeviceMemory::null(),
+            guest: crate::backend::vulkan::engine::GuestTargetMemory {
+                backing: crate::backend::vulkan::engine::GuestTargetBacking {
+                    allocation_host_ptr: 0x1000,
+                    allocation_len: 0x4000,
+                    plane_offset: 0,
+                    row_pitch: 64,
+                },
+                pages: std::sync::Arc::from([1_u64]),
+            },
+        };
+        pools.registry.insert(imported_id.clone(), imported);
+        assert_eq!(pools.retain_resident_target(&imported_id), Some(true));
+        assert_eq!(pools.registry[&imported_id].pin_count, 1);
     }
 
     fn surf(id: u32) -> TargetIdentity {

@@ -81,7 +81,7 @@ use context::ContextOwner;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use pools::ResourcePools;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use types::ComputeError;
 
 /// The colour aspect of a single-mip, single-layer image — the shape of every
@@ -268,6 +268,7 @@ impl EngineState {
     /// takes it and publishes that it is gone, and
     /// `host_window::present::App::reattach_engine` is what builds it again.
     fn flush_device_derived(&mut self) {
+        RESIDENT_RESOURCE_EPOCH.fetch_add(1, Ordering::Release);
         // Taken and published unconditionally, before anything fallible. The
         // presenter's swapchain, surface and semaphores were made against the
         // device that is going away; whether or not there is still a `ctx` to
@@ -299,6 +300,15 @@ impl EngineState {
 }
 
 static ENGINE: Lazy<Mutex<EngineState>> = Lazy::new(|| Mutex::new(EngineState::new()));
+
+/// Generation of the resident registry resource handles refer into.
+///
+/// Reset and device recreation replace the whole registry. A resource object
+/// may outlive either operation, so its lease carries this generation and
+/// treats a mismatch as an absent handle. Release also checks it under the
+/// engine lock, preventing an old lease from unpinning a new resident that
+/// happens to reuse the same identity.
+static RESIDENT_RESOURCE_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 /// Which thread class is asking for the engine lock.
 ///
@@ -564,6 +574,7 @@ pub struct GuestResetStats {
 /// immutable content-keyed shader/pipeline caches.
 pub fn reset_guest_state() -> GuestResetStats {
     let mut guard = lock_engine();
+    RESIDENT_RESOURCE_EPOCH.fetch_add(1, Ordering::Release);
     let (resident_targets, pooled_targets, sampled_images, storage_images) =
         guard.pools.guest_reset_counts();
     let stats = GuestResetStats {
@@ -1363,6 +1374,73 @@ pub enum ResidentContentBacking {
     NotReady,
     GuestAllocation,
     DeviceAllocation,
+}
+
+/// One live resource object's ownership of a resident target.
+///
+/// Construction pins the target against cache eviction. Dropping the object
+/// releases exactly that pin unless a device/reset boundary has already
+/// replaced the registry, in which case the old pin disappeared with it.
+#[derive(Debug)]
+pub struct ResidentResourceLease {
+    identity: TargetIdentity,
+    backing: ResidentContentBacking,
+    epoch: u64,
+}
+
+impl ResidentResourceLease {
+    pub fn matches(&self, identity: &TargetIdentity) -> bool {
+        self.identity == *identity
+            && self.epoch == RESIDENT_RESOURCE_EPOCH.load(Ordering::Acquire)
+    }
+
+    pub fn backing(&self) -> ResidentContentBacking {
+        self.backing
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_new(
+        identity: TargetIdentity,
+        backing: ResidentContentBacking,
+    ) -> Self {
+        Self {
+            identity,
+            backing,
+            epoch: RESIDENT_RESOURCE_EPOCH.load(Ordering::Acquire),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_advance_resident_resource_epoch() {
+    RESIDENT_RESOURCE_EPOCH.fetch_add(1, Ordering::Release);
+}
+
+impl Drop for ResidentResourceLease {
+    fn drop(&mut self) {
+        let mut guard = lock_engine();
+        if self.epoch == RESIDENT_RESOURCE_EPOCH.load(Ordering::Acquire) {
+            let _ = guard.pools.pin_resident_target(&self.identity, false);
+        }
+    }
+}
+
+/// Resolve a serialized resource object to a retained engine target.
+///
+/// Allocation ownership is immutable for the returned lease. Mutable content
+/// readiness is still validated by draw execution on every use.
+pub fn retain_resident_resource(identity: &TargetIdentity) -> Option<ResidentResourceLease> {
+    let mut guard = lock_engine();
+    let guest_imported = guard.pools.retain_resident_target(identity)?;
+    Some(ResidentResourceLease {
+        identity: identity.clone(),
+        backing: if guest_imported {
+            ResidentContentBacking::GuestAllocation
+        } else {
+            ResidentContentBacking::DeviceAllocation
+        },
+        epoch: RESIDENT_RESOURCE_EPOCH.load(Ordering::Acquire),
+    })
 }
 
 fn classify_resident_content(
@@ -4038,6 +4116,7 @@ pub fn reset_draw_counters() {
 /// Test-only: destroy device, clear recreate budget, rebuild on next draw.
 pub fn test_reset_engine() {
     let mut g = lock_engine();
+    RESIDENT_RESOURCE_EPOCH.fetch_add(1, Ordering::Release);
     // A healthy `DeviceContext` is kept across the reset; only the pools, the
     // caches and the owner's flags are rebuilt.
     //

@@ -1221,8 +1221,19 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // change. What guards this rung today is the guest-write witness
                 // below, which is the witness the LOAD elision's epoch pair
                 // cannot supply anyway.
-                let resident_backing =
-                    crate::backend::vulkan::engine::resident_content_backing(&resident_id);
+                let resident_backing = resolved_resource
+                    .as_ref()
+                    .filter(|resource| {
+                        resource.entry.object_type
+                            == crate::runtime::decode::resource::OBJECT_TYPE_IOSURFACE
+                    })
+                    .map(|resource| resource.resident_target_backing(&resident_id))
+                    // Type-4 surfaces have no serialized resource object to
+                    // own a lease. Keep their existing query path; type 11 is
+                    // the object-lifetime rail this branch optimizes.
+                    .unwrap_or_else(|| {
+                        crate::backend::vulkan::engine::resident_content_backing(&resident_id)
+                    });
                 let resident_ready = resident_backing
                     != crate::backend::vulkan::engine::ResidentContentBacking::NotReady;
                 if resident_ready {

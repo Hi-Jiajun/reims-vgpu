@@ -578,6 +578,14 @@ pub struct TaskResource {
     /// total decoder refuses, and keep that refusal too so those consumers do
     /// not silently widen the total contract.
     decoded: OnceLock<Result<Descriptor, ResourceDecodeStatus>>,
+    /// Engine object retained for this serialized resource lifetime.
+    ///
+    /// The lease owns its resident pin and allocation classification. Its
+    /// identity includes the mapping generation, so page recycling replaces
+    /// the lease instead of silently reusing the old allocation.
+    #[cfg(feature = "backend-vulkan")]
+    resident_target:
+        Mutex<Option<crate::backend::vulkan::engine::ResidentResourceLease>>,
 }
 
 impl TaskResource {
@@ -586,6 +594,8 @@ impl TaskResource {
             entry,
             descriptor,
             decoded: OnceLock::new(),
+            #[cfg(feature = "backend-vulkan")]
+            resident_target: Mutex::new(None),
         }
     }
 
@@ -597,6 +607,111 @@ impl TaskResource {
                 &self.descriptor,
             )
         })
+    }
+
+    /// Retain and classify the engine target named by this resource.
+    ///
+    /// Warm binds read the resource-owned lease without entering the engine.
+    /// A changed identity or engine epoch releases the old lease and resolves
+    /// a new one; execution remains the authority for mutable content state.
+    #[cfg(feature = "backend-vulkan")]
+    pub fn resident_target_backing(
+        &self,
+        identity: &crate::backend::vulkan::engine::TargetIdentity,
+    ) -> crate::backend::vulkan::engine::ResidentContentBacking {
+        self.resident_target_backing_with(identity, |identity| {
+            crate::backend::vulkan::engine::retain_resident_resource(identity)
+        })
+    }
+
+    #[cfg(feature = "backend-vulkan")]
+    fn resident_target_backing_with(
+        &self,
+        identity: &crate::backend::vulkan::engine::TargetIdentity,
+        retain: impl FnOnce(
+            &crate::backend::vulkan::engine::TargetIdentity,
+        ) -> Option<crate::backend::vulkan::engine::ResidentResourceLease>,
+    ) -> crate::backend::vulkan::engine::ResidentContentBacking {
+        use crate::backend::vulkan::engine::ResidentContentBacking;
+
+        let mut held = self
+            .resident_target
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(lease) = held.as_ref().filter(|lease| lease.matches(identity)) {
+            return lease.backing();
+        }
+        *held = retain(identity);
+        held.as_ref()
+            .map(|lease| lease.backing())
+            .unwrap_or(ResidentContentBacking::NotReady)
+    }
+}
+
+#[cfg(all(test, feature = "backend-vulkan"))]
+mod task_resource_resident_tests {
+    use super::*;
+    use crate::backend::vulkan::engine::{
+        ResidentContentBacking, ResidentResourceLease, TargetIdentity,
+    };
+    use std::cell::Cell;
+
+    fn identity(generation: u64) -> TargetIdentity {
+        TargetIdentity::Surface {
+            id: 9,
+            width: 64,
+            height: 32,
+            generation,
+            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+        }
+    }
+
+    #[test]
+    fn a_resource_retains_one_target_lease_until_identity_or_engine_changes() {
+        let resource = TaskResource::new(ListObjectEntry::default(), Arc::from([]));
+        let first = identity(1);
+        let acquisitions = Cell::new(0_u32);
+
+        let backing = resource.resident_target_backing_with(&first, |identity| {
+            acquisitions.set(acquisitions.get() + 1);
+            Some(ResidentResourceLease::test_new(
+                identity.clone(),
+                ResidentContentBacking::GuestAllocation,
+            ))
+        });
+        assert_eq!(backing, ResidentContentBacking::GuestAllocation);
+        assert_eq!(acquisitions.get(), 1);
+
+        let backing = resource.resident_target_backing_with(&first, |_| {
+            panic!("a warm bind must not reacquire its live resource")
+        });
+        assert_eq!(backing, ResidentContentBacking::GuestAllocation);
+
+        crate::backend::vulkan::engine::test_advance_resident_resource_epoch();
+        let backing = resource.resident_target_backing_with(&first, |identity| {
+            acquisitions.set(acquisitions.get() + 1);
+            Some(ResidentResourceLease::test_new(
+                identity.clone(),
+                ResidentContentBacking::DeviceAllocation,
+            ))
+        });
+        assert_eq!(backing, ResidentContentBacking::DeviceAllocation);
+        assert_eq!(acquisitions.get(), 2, "an engine reset reacquires once");
+
+        let replacement = identity(2);
+        let backing = resource.resident_target_backing_with(&replacement, |identity| {
+            acquisitions.set(acquisitions.get() + 1);
+            Some(ResidentResourceLease::test_new(
+                identity.clone(),
+                ResidentContentBacking::GuestAllocation,
+            ))
+        });
+        assert_eq!(backing, ResidentContentBacking::GuestAllocation);
+        assert_eq!(acquisitions.get(), 3, "a new mapping generation reacquires once");
+
+        // The synthetic leases have no registry pins behind them. Make the
+        // final drop stale so it exercises the reset-safe no-op release.
+        crate::backend::vulkan::engine::test_advance_resident_resource_epoch();
     }
 }
 
