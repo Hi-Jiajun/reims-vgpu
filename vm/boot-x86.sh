@@ -513,8 +513,9 @@ fi
 QEMU_ARGS=(
   -enable-kvm
   -m "$RAM"
+  -object "memory-backend-memfd,id=reims-ram,size=$RAM,share=on"
   -cpu "${CPU_MODEL},-hle,-rtm,kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,${CPU_OPTIONS}"
-  -machine q35
+  -machine q35,memory-backend=reims-ram
   -smp "$CPU_THREADS",cores="$CPU_CORES",sockets="$CPU_SOCKETS"
   -device qemu-xhci,id=xhci
   -device usb-kbd,bus=xhci.0

@@ -161,6 +161,25 @@ pub enum DrawReason {
     /// No queue family supports graphics and compute together, which the
     /// engine's single-queue submit model requires.
     NoCombinedGraphicsComputeQueue,
+    /// A shader declares a descriptor array with unpopulated Metal handle
+    /// slots, but the host cannot make those slots legally partially bound.
+    DescriptorArrayUnsupported {
+        binding: u32,
+        count: u32,
+        required_descriptors: u32,
+        descriptor_limit: u32,
+        partially_bound: bool,
+        dynamic_indexing: bool,
+    },
+    /// Two resources claim one Vulkan binding with incompatible descriptor
+    /// type, stage visibility, or array width.
+    DescriptorBindingConflict {
+        binding: u32,
+        first_type: u32,
+        first_count: u32,
+        second_type: u32,
+        second_count: u32,
+    },
     // The memory-type lookups. Each is a `memory_type_for(bits, class)` that
     // found nothing: the device advertises no memory type satisfying the buffer
     // or image's requirement bits under the class this allocation needs. That is
@@ -257,6 +276,8 @@ impl crate::observe::Decline for DrawReason {
             Self::InstanceRateDivisorUnsupported { .. } => "instance_rate_divisor_unsupported",
             Self::InstanceRateDivisorOverLimit { .. } => "instance_rate_divisor_over_limit",
             Self::NoCombinedGraphicsComputeQueue => "no_combined_graphics_compute_queue",
+            Self::DescriptorArrayUnsupported { .. } => "descriptor_array_unsupported",
+            Self::DescriptorBindingConflict { .. } => "descriptor_binding_conflict",
             Self::NoHostVisibleMemoryForStaging { .. } => "no_host_visible_memory_for_staging",
             Self::NoHostVisibleMemoryForReadback { .. } => "no_host_visible_memory_for_readback",
             Self::NoHostVisibleMemoryForStats { .. } => "no_host_visible_memory_for_stats",
@@ -331,6 +352,33 @@ impl std::fmt::Display for DrawReason {
                 write!(f, " memory_type_bits={memory_type_bits:#x}")
             }
             Self::QueueCannotPresent { queue_family } => write!(f, " queue_family={queue_family}"),
+            Self::DescriptorArrayUnsupported {
+                binding,
+                count,
+                required_descriptors,
+                descriptor_limit,
+                partially_bound,
+                dynamic_indexing,
+            } => {
+                write!(
+                    f,
+                    " binding={binding} count={count} required_descriptors={required_descriptors} \
+                     descriptor_limit={descriptor_limit} partially_bound={} dynamic_indexing={}",
+                    u8::from(*partially_bound),
+                    u8::from(*dynamic_indexing)
+                )
+            }
+            Self::DescriptorBindingConflict {
+                binding,
+                first_type,
+                first_count,
+                second_type,
+                second_count,
+            } => write!(
+                f,
+                " binding={binding} first_type={first_type} first_count={first_count} \
+                 second_type={second_type} second_count={second_count}"
+            ),
             _ => Ok(()),
         }
     }
@@ -428,6 +476,21 @@ mod tests {
             limit: 0,
         },
         DrawReason::NoCombinedGraphicsComputeQueue,
+        DrawReason::DescriptorArrayUnsupported {
+            binding: 0,
+            count: 2,
+            required_descriptors: 2,
+            descriptor_limit: 1,
+            partially_bound: false,
+            dynamic_indexing: false,
+        },
+        DrawReason::DescriptorBindingConflict {
+            binding: 0,
+            first_type: 0,
+            first_count: 1,
+            second_type: 1,
+            second_count: 2,
+        },
         DrawReason::NoHostVisibleMemoryForStaging {
             memory_type_bits: 0,
         },

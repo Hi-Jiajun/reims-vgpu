@@ -257,7 +257,7 @@ impl Resolved {
         // one host's correctness for another's throughput.
         let import = self
             .imports
-            .partition_point(|i| i.gpa_base() <= gpa)
+            .partition_point(|i| i.gpa_base().is_some_and(|base| base <= gpa))
             .checked_sub(1)
             .map(|last| &self.imports[last])
             .filter(|i| i.contains_gpa(gpa))
@@ -281,11 +281,11 @@ impl Resolved {
     /// may do with one is stop at it.
     fn import_end(&self, gpa: u64) -> Option<u64> {
         self.imports
-            .partition_point(|i| i.gpa_base() <= gpa)
+            .partition_point(|i| i.gpa_base().is_some_and(|base| base <= gpa))
             .checked_sub(1)
             .map(|last| &self.imports[last])
             .filter(|i| i.contains_gpa(gpa))
-            .map(|i| i.gpa_base() + i.len())
+            .and_then(|i| i.gpa_base().map(|base| base + i.len()))
     }
 }
 
@@ -375,8 +375,7 @@ pub fn warm<H: HostOps + ?Sized>(host: &mut H) {
     {
         let imports = imports();
         if !imports.is_empty() {
-            let (warmed, bytes) =
-                crate::backend::vulkan::engine::warm_guest_ram_imports(&imports);
+            let (warmed, bytes) = crate::backend::vulkan::engine::warm_guest_ram_imports(&imports);
             if warmed > 0 {
                 crate::observe::off(format!(
                     "guest_ram_warm blocks={warmed} bytes={bytes} spans={}",
@@ -544,9 +543,7 @@ pub fn references_for_runs<H: HostOps + ?Sized>(
                 // remainder to `reference` so it names that refusal rather than
                 // this loop inventing a second one.
                 let piece_end = match resolved.import_end(gpa) {
-                    Some(import_end) if import_end > gpa => {
-                        end.min(piece + (import_end - gpa))
-                    }
+                    Some(import_end) if import_end > gpa => end.min(piece + (import_end - gpa)),
                     _ => end,
                 };
                 out.push(GuestWindowRun {
@@ -757,7 +754,7 @@ fn resolve<H: HostOps + ?Sized>(host: &mut H) -> Resolved {
     for (n, import) in imports.iter().enumerate() {
         crate::observe::off(format!(
             "guest_ram_span n={n}/{count} gpa={:#x} len={} mib={}",
-            import.gpa_base(),
+            import.gpa_base().expect("RAMBlock imports have a GPA base"),
             import.len(),
             import.len() / (1024 * 1024),
         ));
@@ -888,10 +885,10 @@ mod tests {
     #[test]
     fn chunking_tiles_the_block_exactly() {
         for (len, span_max) in [
-            (0x8000u64, 0x2000u64),  // exact multiple
-            (0x9001, 0x2000),        // ragged remainder
-            (0x1000, 0x2000),        // already inside the ceiling
-            (0x2000, 0x2000),        // exactly the ceiling
+            (0x8000u64, 0x2000u64), // exact multiple
+            (0x9001, 0x2000),       // ragged remainder
+            (0x1000, 0x2000),       // already inside the ceiling
+            (0x2000, 0x2000),       // exactly the ceiling
         ] {
             let span = GuestRamRegion {
                 gpa_base: 0x1_0000_0000,
@@ -949,7 +946,7 @@ mod tests {
                 assert!(
                     i.len() <= CEILING,
                     "import at {:#x} is {} bytes, past the {CEILING} ceiling",
-                    i.gpa_base(),
+                    i.gpa_base().expect("RAMBlock imports have a GPA base"),
                     i.len()
                 );
             }

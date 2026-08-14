@@ -3323,6 +3323,8 @@ fn finish_stream<M: HostMemory + HostOps>(
             };
             {
                 fill_draw_binds_from_pending(&mut req, pd);
+                (req.continues_render_pass, req.render_pass_continues) =
+                    render_pass_chain_position(di, draw_list.len());
                 // A resident type-11 target carries attachment contents between
                 // records without a CPU chain buffer. Like a native Metal render
                 // pass, only the final record performs the guest-visible Store;
@@ -3676,6 +3678,14 @@ impl crate::observe::Decline for ChainAbandonDecline {
 /// Seedless fixed-attachment template for records after the first draw in one
 /// serialized Metal render pass. Construct fields explicitly so a multi-MiB
 /// CPU LOAD seed is not cloned merely to reuse attachment identity/geometry.
+/// Position one draw in the decoded Metal render encoder that owns it.
+/// A one-draw encoder has neither edge; longer encoders expose exactly one
+/// start, one end, and a continuation on both sides of every middle draw.
+fn render_pass_chain_position(index: usize, len: usize) -> (bool, bool) {
+    debug_assert!(index < len);
+    (index > 0, index + 1 < len)
+}
+
 fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::DrawEncodeRequest {
     let colors = first
         .colors

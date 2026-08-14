@@ -47,6 +47,23 @@ pub enum DrawValidationDecline {
         actual: usize,
         expected: usize,
     },
+    TargetGuestSeedFormat {
+        source: vk::Format,
+        target: vk::Format,
+    },
+    TargetGuestSeedRowStride {
+        stride: usize,
+        tight_row: usize,
+    },
+    TargetGuestSeedLength {
+        actual: u64,
+        expected: usize,
+    },
+    TargetGuestSeedCoverage {
+        covered: u64,
+        declared: u64,
+    },
+    SeedConflictsGuestSeed,
     SeedMissingTargetIdentity,
     SeedConflictsCpuSeed,
     SeedConflictsLoadFromTarget,
@@ -103,6 +120,11 @@ pub enum DrawValidationDecline {
     },
     DuplicateSampledDescriptorBinding {
         binding: u32,
+    },
+    SampledArrayElementOutOfRange {
+        binding: u32,
+        element: u32,
+        count: u32,
     },
     DuplicateSamplerDescriptorBinding {
         binding: u32,
@@ -202,6 +224,13 @@ impl Decline for DrawValidationDecline {
             Self::NonPositiveViewport { .. } => "vk_draw_validate_non_positive_viewport",
             Self::NonFiniteBlendConstants => "vk_draw_validate_non_finite_blend_constants",
             Self::TargetSeedLength { .. } => "vk_draw_validate_target_seed_length",
+            Self::TargetGuestSeedFormat { .. } => "vk_draw_validate_target_guest_seed_format",
+            Self::TargetGuestSeedRowStride { .. } => {
+                "vk_draw_validate_target_guest_seed_row_stride"
+            }
+            Self::TargetGuestSeedLength { .. } => "vk_draw_validate_target_guest_seed_length",
+            Self::TargetGuestSeedCoverage { .. } => "vk_draw_validate_target_guest_seed_coverage",
+            Self::SeedConflictsGuestSeed => "vk_draw_validate_seed_conflicts_guest_seed",
             Self::SeedMissingTargetIdentity => "vk_draw_validate_seed_missing_target_identity",
             Self::SeedConflictsCpuSeed => "vk_draw_validate_seed_conflicts_cpu_seed",
             Self::SeedConflictsLoadFromTarget => "vk_draw_validate_seed_conflicts_load_from_target",
@@ -227,6 +256,9 @@ impl Decline for DrawValidationDecline {
             }
             Self::DuplicateSampledDescriptorBinding { .. } => {
                 "vk_draw_validate_duplicate_sampled_descriptor_binding"
+            }
+            Self::SampledArrayElementOutOfRange { .. } => {
+                "vk_draw_validate_sampled_array_element_out_of_range"
             }
             Self::DuplicateSamplerDescriptorBinding { .. } => {
                 "vk_draw_validate_duplicate_sampler_descriptor_binding"
@@ -299,6 +331,22 @@ impl Decline for DrawValidationDecline {
                 ("actual", actual.to_string()),
                 ("expected", expected.to_string()),
             ],
+            Self::TargetGuestSeedFormat { source, target } => vec![
+                ("source", format!("{source:?}")),
+                ("target", format!("{target:?}")),
+            ],
+            Self::TargetGuestSeedRowStride { stride, tight_row } => vec![
+                ("stride", stride.to_string()),
+                ("tight_row", tight_row.to_string()),
+            ],
+            Self::TargetGuestSeedLength { actual, expected } => vec![
+                ("actual", actual.to_string()),
+                ("expected", expected.to_string()),
+            ],
+            Self::TargetGuestSeedCoverage { covered, declared } => vec![
+                ("covered", covered.to_string()),
+                ("declared", declared.to_string()),
+            ],
             Self::IndexedVertexRange {
                 min_index,
                 max_index,
@@ -324,6 +372,15 @@ impl Decline for DrawValidationDecline {
             | Self::DuplicateSamplerDescriptorBinding { binding } => {
                 vec![("binding", binding.to_string())]
             }
+            Self::SampledArrayElementOutOfRange {
+                binding,
+                element,
+                count,
+            } => vec![
+                ("binding", binding.to_string()),
+                ("element", element.to_string()),
+                ("count", count.to_string()),
+            ],
             Self::VertexStrideTooSmall {
                 location,
                 stride,
@@ -453,6 +510,7 @@ impl Decline for DrawValidationDecline {
             | Self::EmptyFragmentSpirv
             | Self::NonFiniteViewport
             | Self::NonFiniteBlendConstants
+            | Self::SeedConflictsGuestSeed
             | Self::SeedMissingTargetIdentity
             | Self::SeedConflictsCpuSeed
             | Self::SeedConflictsLoadFromTarget
@@ -504,6 +562,23 @@ mod tests {
                 actual: 3,
                 expected: 4,
             },
+            DrawValidationDecline::TargetGuestSeedFormat {
+                source: vk::Format::R8_UNORM,
+                target: vk::Format::R8G8_UNORM,
+            },
+            DrawValidationDecline::TargetGuestSeedRowStride {
+                stride: 4,
+                tight_row: 8,
+            },
+            DrawValidationDecline::TargetGuestSeedLength {
+                actual: 3,
+                expected: 4,
+            },
+            DrawValidationDecline::TargetGuestSeedCoverage {
+                covered: 3,
+                declared: 4,
+            },
+            DrawValidationDecline::SeedConflictsGuestSeed,
             DrawValidationDecline::SeedMissingTargetIdentity,
             DrawValidationDecline::SeedConflictsCpuSeed,
             DrawValidationDecline::SeedConflictsLoadFromTarget,
@@ -539,6 +614,11 @@ mod tests {
             DrawValidationDecline::ConstantStepGuestRuns { location: 0 },
             DrawValidationDecline::DuplicateStorageDescriptorBinding { binding: 0 },
             DrawValidationDecline::DuplicateSampledDescriptorBinding { binding: 0 },
+            DrawValidationDecline::SampledArrayElementOutOfRange {
+                binding: 32,
+                element: 2,
+                count: 2,
+            },
             DrawValidationDecline::DuplicateSamplerDescriptorBinding { binding: 0 },
             DrawValidationDecline::SampledZeroGeometry {
                 binding: 32,
@@ -624,7 +704,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 44, "the validator's reason census moved");
+        assert_eq!(before, 50, "the validator's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-validation slug");
     }
 

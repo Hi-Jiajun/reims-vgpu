@@ -379,6 +379,13 @@ pub struct DrawRequest {
     /// `surface_cache` does — can seed a draw with a refcount instead of a
     /// whole-framebuffer copy.
     pub target_rgba8: Option<std::sync::Arc<Vec<u8>>>,
+    /// Guest-page form of the same LOAD seed. Mutually exclusive with
+    /// [`Self::target_rgba8`], [`Self::load_from_target`] and
+    /// [`Self::seed_from_target`]. The engine imports/gathers these bytes in
+    /// the draw command buffer and falls back to their host aliases if import
+    /// is unavailable, so the runtime never needs to allocate a framebuffer to
+    /// express the surface's own contents.
+    pub target_guest_seed: Option<GuestTargetSeed>,
     /// Byte order of the CPU seed above, relative to the attachment it seeds.
     ///
     /// The attachment's order is [`TargetIdentity::is_bgra`] and nothing else.
@@ -400,9 +407,10 @@ pub struct DrawRequest {
     /// Load the live GPU image for [`DrawRequest::target_identity`] instead of
     /// seeding the attachment from the CPU. Requires that resident to exist.
     ///
-    /// This, `target_rgba8` and [`DrawRequest::target_clear`] are the whole
-    /// load action, and they are ordered: `load_from_target` wins, else a seed
-    /// is uploaded, else the attachment clears to `target_clear`.
+    /// This, [`Self::target_rgba8`], [`Self::target_guest_seed`] and
+    /// [`DrawRequest::target_clear`] are the whole load action, and they are
+    /// ordered: `load_from_target` wins, else exactly one seed is copied, else
+    /// the attachment clears to `target_clear`.
     pub load_from_target: bool,
     /// Clear value for the primary colour attachment, in semantic float
     /// channels — the same shape [`SecondaryColorTarget::clear`] has carried all
@@ -470,6 +478,12 @@ pub struct DrawRequest {
     /// an INPUT_ATTACHMENT descriptor pointing at the color target's view.
     /// `false` (default) keeps the pass byte-identical to the pre-fetch engine.
     pub color_input: bool,
+    /// The preceding engine request belongs to this draw's Metal render
+    /// encoder. Used only when its Vulkan pass is still open and identical.
+    pub continues_render_pass: bool,
+    /// The decoded Metal render encoder contains another draw after this one.
+    /// Allows the Vulkan pass to remain open across the engine-call boundary.
+    pub render_pass_continues: bool,
 }
 
 impl DrawRequest {
@@ -508,7 +522,11 @@ impl DrawRequest {
     pub fn attachment_slot(&self, identity: &TargetIdentity) -> Option<AttachmentSlot> {
         if self.target_identity.as_ref() == Some(identity) {
             Some(AttachmentSlot::Primary)
-        } else if self.secondary_targets.iter().any(|s| &s.identity == identity) {
+        } else if self
+            .secondary_targets
+            .iter()
+            .any(|s| &s.identity == identity)
+        {
             Some(AttachmentSlot::Secondary)
         } else if self.depth.as_ref().and_then(|d| d.identity.as_ref()) == Some(identity) {
             Some(AttachmentSlot::Depth)
@@ -939,6 +957,10 @@ impl From<Vec<u8>> for BufferContent {
 #[derive(Debug)]
 pub struct SampledImageResource {
     pub binding: u32,
+    /// Element within the Vulkan descriptor array at [`Self::binding`].
+    pub array_element: u32,
+    /// Declared descriptor-array cardinality. Scalar Metal textures carry one.
+    pub descriptor_count: u32,
     pub width: u32,
     pub height: u32,
     pub layers: u32,
@@ -951,6 +973,14 @@ pub struct SampledImageResource {
     /// `TYPE_1D_ARRAY`. Mutually exclusive with `volume` and `cube`.
     pub one_dim: bool,
     pub source: SampledSource,
+    /// API resource family that produced [`SampledSource::Bytes`].
+    ///
+    /// This is accounting metadata, not an execution selector: it cannot change
+    /// how a texture is validated, cached, uploaded, or sampled. Keeping the
+    /// family on the resource lets the upload site attribute only bytes that
+    /// actually missed the sampled-image cache; counting at the runtime
+    /// resolver would charge cache hits as copies that never happened.
+    pub byte_origin: SampledByteOrigin,
     /// Format the image and its view are created with, and the layout
     /// [`SampledSource::Bytes`] / [`SampledSource::GuestRuns`] content is read
     /// as (ignored for [`SampledSource::Target`], which carries its own
@@ -972,6 +1002,24 @@ pub struct SampledImageResource {
     /// content rail it was already on, including the zero-copy one — a CPU
     /// remap would force every swizzled bind onto the upload path.
     pub swizzle: crate::contract::pixel_format::SwizzlePlan,
+}
+
+/// Contract-level source of a CPU-materialized sampled image.
+///
+/// The variants follow the decoded resource families rather than call sites so
+/// the census can identify an API rail that should expose stronger backing
+/// guarantees. [`Self::Synthetic`] covers tests and the fail-visible neutral
+/// texture used after an unbound guest resource.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SampledByteOrigin {
+    #[default]
+    Synthetic,
+    AttachmentAlias,
+    BufferBackedTexture,
+    SerializedSurfaceView,
+    SurfaceHostCache,
+    SurfaceGuestFallback,
+    LinearTexture,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
@@ -1287,6 +1335,8 @@ pub struct ComputeBufferOutput {
 #[derive(Debug)]
 pub struct ComputeStorageImageResource {
     pub binding: u32,
+    pub array_element: u32,
+    pub descriptor_count: u32,
     pub format: StorageImageFormat,
     pub width: u32,
     pub height: u32,
@@ -1334,6 +1384,8 @@ pub struct ComputeStorageResidency {
 #[derive(Debug)]
 pub struct ComputeSampledImageResource {
     pub binding: u32,
+    pub array_element: u32,
+    pub descriptor_count: u32,
     pub format: StorageImageFormat,
     pub width: u32,
     pub height: u32,
@@ -1673,9 +1725,7 @@ impl TargetIdentity {
         match self {
             Self::Surface { format, .. } => *format,
             Self::Gva { format, .. } => *format,
-            Self::Texture { .. } | Self::Anonymous { .. } => {
-                translate::pixel::RESIDENT_RGBA_FORMAT
-            }
+            Self::Texture { .. } | Self::Anonymous { .. } => translate::pixel::RESIDENT_RGBA_FORMAT,
         }
     }
 }
@@ -1731,7 +1781,7 @@ pub struct GuestRun {
     pub len: u64,
 }
 
-/// Zero-copy sampled source: `runs` cover the linear texel window in order
+/// Guest-RAM texel source: `runs` cover the linear texel window in order
 /// (`sum(len) == total_len`). With `row_length_texels == 0` the window is
 /// tight (`total_len == tight_row_bytes * height`); a nonzero value gives
 /// the guest row stride in texels for padded layouts, and the window then
@@ -1775,6 +1825,20 @@ pub struct GuestRunSource {
     /// `Arc` because a source is cloned per bind and these are shared, immutable
     /// and never rebuilt.
     pub pages: Option<std::sync::Arc<Vec<crate::runtime::guest_ram_map::GuestWindowRun>>>,
+}
+
+/// A render attachment's prior contents, read from the surface's own guest
+/// pages rather than materialized as a host framebuffer.
+///
+/// `source` carries both representations of the same window: bounded RAMBlock
+/// references for the native import rail and stable host aliases for its exact
+/// CPU fallback. `format` is the guest plane's physical texel layout; a raw
+/// buffer→image copy performs no conversion, so validation requires it to equal
+/// the attachment format before either representation may be used.
+#[derive(Clone, Debug)]
+pub struct GuestTargetSeed {
+    pub source: GuestRunSource,
+    pub format: ash::vk::Format,
 }
 
 /// Producer-assigned identity + generation for CPU-sourced sampled content.
@@ -1868,7 +1932,10 @@ mod tests {
         ]
         .map(AttachmentSlot::sampled_self_route);
         assert_eq!(
-            routes.iter().collect::<std::collections::HashSet<_>>().len(),
+            routes
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
             3
         );
 

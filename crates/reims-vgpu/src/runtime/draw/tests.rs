@@ -147,75 +147,25 @@ fn sampled_zero_copy_floor_separates_video_from_small_binds() {
     assert!(ZERO_COPY_BUFFER_MIN_BYTES < ZERO_COPY_SAMPLED_MIN_BYTES);
 }
 
-/// A shader extent may narrow the gather rail only while the bind stays on it.
+/// A proven shader extent narrows the transfer without changing rail admission.
 ///
-/// This is the rule that keeps the extent rail from costing what it saves, and
-/// the arithmetic is the whole of it: `load_buffer_content` drops any cap below
-/// [`ZERO_COPY_BUFFER_MIN_BYTES`], because a cap under the floor moves the bind
-/// off the gather rail and therefore out of the held-resolution registry, which
-/// three driven macos-13 Maps boots measured as a ~50 % rise in `binds_us/chain`
-/// against no change in `draw_us/draw`.
-///
-/// The filter is asserted here rather than through a draw because a draw cannot
-/// reach it without a live device, and the property is arithmetic on one
-/// constant. What a boot measures is the *consequence*; what this pins is that
-/// the gate is on the floor and not on some other number.
-///
-/// Vulkan-arm only: the floor it reads is a `backend-vulkan` constant, and the
-/// gather rail it gates does not exist on the Metal-direct arm.
+/// The full guest window clears the gather crossover; its 64-byte bounded
+/// object is still served through that rail and the held-resolution registry,
+/// but only those 64 bytes are walked and copied. This is the behavioral split
+/// that an earlier implementation lost by comparing the cap to the floor.
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn an_extent_cap_below_the_gather_floor_is_not_applied_to_the_gather_rail() {
-    use super::vulkan::gather_cap_for;
+fn a_small_reflected_object_stays_on_the_gather_rail_and_moves_only_its_extent() {
+    use super::vulkan::gather_span_if_eligible;
 
-    // The population today's shaders actually declare: 60 captured AIR blobs ran
-    // median 64 bytes, max 512, and a driven boot reads 1.03 million `Object`
-    // verdicts a boot between 65 and 512 bytes against 79 above 64 KiB. None of
-    // these may reach the gather rail on the default arm.
-    for cap in [4u64, 64, 288, 512, ZERO_COPY_BUFFER_MIN_BYTES - 1] {
-        assert_eq!(
-            gather_cap_for(Some(cap), false),
-            None,
-            "cap {cap} must not narrow the gather by default"
-        );
-    }
-    // A declared object at or above the floor still narrows: the bind stays on
-    // the rail, keeps its registry entry, and gathers less.
-    for cap in [ZERO_COPY_BUFFER_MIN_BYTES, ZERO_COPY_BUFFER_MIN_BYTES + 1] {
-        assert_eq!(gather_cap_for(Some(cap), false), Some(cap), "cap {cap}");
-    }
-    // A bind with no declared object has nothing to narrow by on either arm.
-    assert_eq!(gather_cap_for(None, false), None);
-    assert_eq!(gather_cap_for(None, true), None);
-}
-
-/// `REIMS_VGPU_EXTENT_NARROW=on` keeps the caps the floor drops, which is the
-/// whole of the arm.
-///
-/// The one that matters is the population above: 512 bytes and under is where
-/// essentially every declared object sits, so an arm that kept only the caps
-/// already above 16 KiB would be the default arm with extra steps and would
-/// measure as no change — which is exactly how a switch gets called neutral.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn the_narrowing_arm_keeps_the_caps_the_floor_drops() {
-    use super::vulkan::gather_cap_for;
-
-    for cap in [4u64, 64, 288, 512, ZERO_COPY_BUFFER_MIN_BYTES - 1] {
-        assert_eq!(
-            gather_cap_for(Some(cap), true),
-            Some(cap),
-            "cap {cap} is the population this arm exists for"
-        );
-    }
-    // And it changes nothing about the caps that already cleared the floor.
-    for cap in [ZERO_COPY_BUFFER_MIN_BYTES, 1 << 20] {
-        assert_eq!(
-            gather_cap_for(Some(cap), true),
-            gather_cap_for(Some(cap), false),
-            "cap {cap} must not depend on the arm"
-        );
-    }
+    let full = ZERO_COPY_BUFFER_MIN_BYTES * 4;
+    assert_eq!(gather_span_if_eligible(full, Some(64)), Some(64));
+    assert_eq!(gather_span_if_eligible(full, None), Some(full));
+    assert_eq!(
+        gather_span_if_eligible(ZERO_COPY_BUFFER_MIN_BYTES - 1, Some(64)),
+        None,
+        "a genuinely sub-floor guest window stays off the gather rail"
+    );
 }
 
 /// The window math the three sampled zero-copy rails now share.
@@ -322,7 +272,7 @@ fn cpu_portability_store_publishes_composite() {
 
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn frag_unbound_scan_reports_missing_standard_kinds_and_embedded_textures() {
+fn frag_unbound_scan_reports_only_missing_standard_kinds() {
     use crate::runtime::draw::{FragUnbound, FragUnboundClass};
     use metal2vulkan::reflect::ResourceKind as K;
     let gap = |class, metal_index| FragUnbound { class, metal_index };
@@ -344,31 +294,36 @@ fn frag_unbound_scan_reports_missing_standard_kinds_and_embedded_textures() {
         rb(K::StorageImage, 4),
         rb(K::StaticSampler, 1),
     ];
-    // All standard resources bound → `unbound` empty; the embedded texture is
-    // always reported (render path cannot source it) regardless of binding.
-    let (unbound, embedded) =
-        frag_unbound_scan(&bindings, |i| [1, 2].contains(&i), |i| i == 3, |i| i == 0, |_| true);
+    // All standard resources bound → no gap. Unsupported synthetic resources
+    // are handled by the earlier reflection-interface preflight.
+    let unbound = frag_unbound_scan(
+        &bindings,
+        |i| [1, 2].contains(&i),
+        |i| i == 3,
+        |i| i == 0,
+        |_| true,
+    );
     assert!(unbound.is_empty());
-    assert_eq!(embedded, vec![9]);
 
     // Drop the texture bind → exactly tex3 reported (synthetics stay silent).
-    let (unbound, _) = frag_unbound_scan(&bindings, |i| [1, 2].contains(&i), |_| false, |i| i == 0, |_| true);
+    let unbound = frag_unbound_scan(
+        &bindings,
+        |i| [1, 2].contains(&i),
+        |_| false,
+        |i| i == 0,
+        |_| true,
+    );
     assert_eq!(unbound, vec![tex(3)]);
 
     // Drop buffer 2 + sampler 0 → both reported, ordered by declaration.
-    let (unbound, _) = frag_unbound_scan(&bindings, |i| i == 1, |i| i == 3, |_| false, |_| true);
+    let unbound = frag_unbound_scan(&bindings, |i| i == 1, |i| i == 3, |_| false, |_| true);
     assert_eq!(unbound, vec![buf(2), smp(0)]);
-
-    // A reflection with no embedded texture returns an empty embedded list.
-    let standard_only = [rb(K::Buffer, 1), rb(K::Texture, 3), rb(K::Sampler, 0)];
-    let (_, embedded) = frag_unbound_scan(&standard_only, |_| true, |_| true, |_| true, |_| true);
-    assert!(embedded.is_empty());
 
     // An unprovided texture the translated module never declares is NOT a gap:
     // the reflection comes from the AIR signature, so a `[[texture(n)]]` the
     // shader never samples produces an entry for a descriptor the SPIR-V does
     // not carry. Reporting it was a false alarm on three rails.
-    let (unbound, _) = frag_unbound_scan(
+    let unbound = frag_unbound_scan(
         &bindings,
         |i| [1, 2].contains(&i),
         |_| false,
@@ -382,7 +337,7 @@ fn frag_unbound_scan_reports_missing_standard_kinds_and_embedded_textures() {
 
     // ...but a buffer and a sampler are still reported, because the module
     // predicate is asked of textures only.
-    let (unbound, _) = frag_unbound_scan(&bindings, |i| i == 1, |i| i == 3, |_| false, |_| false);
+    let unbound = frag_unbound_scan(&bindings, |i| i == 1, |i| i == 3, |_| false, |_| false);
     assert_eq!(unbound, vec![buf(2), smp(0)]);
 
     // The class survives the scan as a type, so a consumer that needs the SPIR-V
@@ -962,22 +917,6 @@ fn shader_pull_reflection(bindings: &[u32]) -> metal2vulkan::reflect::ShaderRefl
     }
 }
 
-/// Minimal SPIR-V that declares one StorageBuffer variable at `binding`, with
-/// pointer provenance reaching a leaf (mirrors spirv_bind's own fixture).
-#[cfg(feature = "backend-vulkan")]
-fn storage_buffer_spirv(binding: u32) -> Vec<u32> {
-    const OP_VARIABLE: u32 = 59;
-    const OP_DECORATE: u32 = 71;
-    const OP_ACCESS_CHAIN: u32 = 65;
-    const STORAGE_CLASS_STORAGE_BUFFER: u32 = 12;
-    const DECORATION_BINDING: u32 = 33;
-    let mut w = vec![0x0723_0203, 0x0001_0000, 0, 12, 0];
-    w.extend([(4 << 16) | OP_VARIABLE, 1, 2, STORAGE_CLASS_STORAGE_BUFFER]);
-    w.extend([(4 << 16) | OP_DECORATE, 2, DECORATION_BINDING, binding]);
-    w.extend([(5 << 16) | OP_ACCESS_CHAIN, 3, 4, 2, 5]);
-    w
-}
-
 /// Regression: WebKit's glyph vertex shader declares stride-48 stage-in on
 /// buffer 1 but never reads it as an attribute — it indexes the same buffer
 /// as a per-glyph `StorageBuffer` (binding 1) by gl_InstanceIndex. Skipping
@@ -1048,17 +987,17 @@ fn reorder_rb_in_place_is_a_no_op_when_the_orders_already_agree() {
     }
 }
 
-/// Vulkan-arm only: SPIR-V storage-binding reflection has no Metal analogue.
+/// Vulkan-arm only: a stage-in buffer can also be a direct shader buffer.
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn stage_in_buffer_read_as_ssbo_is_bound_as_storage() {
-    let words = storage_buffer_spirv(1);
+    let reflection = shader_pull_reflection(&[1]);
     // Buffer 1 is stage-in AND read as SSBO -> must be exposed as storage.
-    assert!(vertex_buffer_needs_storage_binding(&words, 1, true));
+    assert!(vertex_buffer_needs_storage_binding(&reflection, 1, true));
     // A plain non-stage-in buffer is always storage.
-    assert!(vertex_buffer_needs_storage_binding(&words, 2, false));
+    assert!(vertex_buffer_needs_storage_binding(&reflection, 2, false));
     // A stage-in buffer the shader does NOT read as an SSBO stays stage-in only.
-    assert!(!vertex_buffer_needs_storage_binding(&words, 3, true));
+    assert!(!vertex_buffer_needs_storage_binding(&reflection, 3, true));
 }
 
 /// Resident GVA chain wiring: the identity is built only for GVA color0
@@ -1621,8 +1560,6 @@ fn attachment_alias_resident_chain_selection() {
     ));
 }
 
-
-
 /// Vulkan-arm only: `AttachmentAliasSample` and its resolver are
 /// `backend-vulkan` items.
 #[cfg(feature = "backend-vulkan")]
@@ -1824,12 +1761,18 @@ fn a_padded_half_float_row_copies_straight_through_at_eight_bytes_a_texel() {
 #[test]
 fn tight_rgba_linear_load_preserves_native_bytes() {
     let native = [1, 2, 3, 4, 5, 6, 7, 8];
-    let (rgba, fmt) =
-        load_tight_linear_rgba_with(2, 1, pixel_format::MTL_FORMAT_RGBA8_UNORM, NativeUploads::NONE, "test_tight_load", |dst| {
+    let (rgba, fmt) = load_tight_linear_rgba_with(
+        2,
+        1,
+        pixel_format::MTL_FORMAT_RGBA8_UNORM,
+        NativeUploads::NONE,
+        "test_tight_load",
+        |dst| {
             dst.copy_from_slice(&native);
             true
-        })
-        .expect("tight RGBA sample loads");
+        },
+    )
+    .expect("tight RGBA sample loads");
     assert_eq!(fmt, TexelLayout::Rgba8);
     assert_eq!(rgba, native);
 }
@@ -1861,11 +1804,17 @@ fn the_cpu_upload_rails_count_every_srgb_downgrade() {
 
     // Native-upload rail: sRGB resolves exactly as its linear sibling.
     assert_eq!(
-        linear_native_upload_format(pixel_format::MTL_FORMAT_RGBA8_UNORM_SRGB, NativeUploads::NONE),
+        linear_native_upload_format(
+            pixel_format::MTL_FORMAT_RGBA8_UNORM_SRGB,
+            NativeUploads::NONE
+        ),
         linear_native_upload_format(pixel_format::MTL_FORMAT_RGBA8_UNORM, NativeUploads::NONE),
     );
     assert_eq!(
-        linear_native_upload_format(pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB, NativeUploads::BGRA8),
+        linear_native_upload_format(
+            pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB,
+            NativeUploads::BGRA8
+        ),
         Some(TexelLayout::Bgra8),
     );
     // Tight-load rail: same layout, and the BGRA swap still happens when
@@ -1907,10 +1856,17 @@ fn the_cpu_upload_rails_count_every_srgb_downgrade() {
     // stops distinguishing anything.
     srgb_census::reset_for_tests();
     let _ = linear_native_upload_format(pixel_format::MTL_FORMAT_RGBA8_UNORM, NativeUploads::NONE);
-    let _ = load_tight_linear_rgba_with(2, 1, pixel_format::MTL_FORMAT_BGRA8_UNORM, NativeUploads::BGRA8, "test_tight_load", |dst| {
-        dst.copy_from_slice(&native);
-        true
-    });
+    let _ = load_tight_linear_rgba_with(
+        2,
+        1,
+        pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        NativeUploads::BGRA8,
+        "test_tight_load",
+        |dst| {
+            dst.copy_from_slice(&native);
+            true
+        },
+    );
     assert_eq!(
         downgrade_lines() - before,
         3,
@@ -2005,7 +1961,10 @@ fn each_bind_slot_bound_equals_its_own_basis() {
 
     // Buffers: an argument table, and the one class where Apple's serializer
     // and Metal's encoder name the same number.
-    assert_eq!(MAX_BUFFER_BIND_SLOTS, reims_vgpu_wire::ops::bind_limit::BUFFER);
+    assert_eq!(
+        MAX_BUFFER_BIND_SLOTS,
+        reims_vgpu_wire::ops::bind_limit::BUFFER
+    );
 
     // Textures and samplers: band widths in the flat descriptor binding space,
     // not tables. A texture at the bound would carry sampler 0's binding.
@@ -2064,7 +2023,7 @@ fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
             index: MAX_BUFFER_BIND_SLOTS - 1,
             buffer_ref: 7,
             offset: 0,
-                attribute_stride: None,
+            attribute_stride: None,
         }],
         fragment_textures: vec![TextureBind {
             index: MAX_TEXTURE_BIND_SLOTS - 1,
@@ -2088,7 +2047,7 @@ fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
                     index: MAX_BUFFER_BIND_SLOTS,
                     buffer_ref: 7,
                     offset: 0,
-                attribute_stride: None,
+                    attribute_stride: None,
                 }],
                 ..Default::default()
             },
@@ -2115,7 +2074,7 @@ fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
                 fragment_samplers: vec![SamplerBind {
                     index: MAX_SAMPLER_BIND_SLOTS,
                     sampler_ref: 11,
-            lod_clamp: None,
+                    lod_clamp: None,
                 }],
                 ..Default::default()
             },
@@ -2145,7 +2104,7 @@ fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
             index: MAX_BUFFER_BIND_SLOTS + 4,
             buffer_ref: 0,
             offset: 0,
-                attribute_stride: None,
+            attribute_stride: None,
         }],
         fragment_textures: vec![TextureBind {
             index: MAX_TEXTURE_BIND_SLOTS + 4,
@@ -2387,12 +2346,18 @@ fn load_composite_premult_restores_seed_under_transparent() {
 #[test]
 fn a8_sample_preserves_alpha_coverage() {
     let native = [0, 17, 255];
-    let (rgba, fmt) =
-        load_tight_linear_rgba_with(3, 1, pixel_format::MTL_FORMAT_A8_UNORM, NativeUploads::BGRA8, "test_tight_load", |dst| {
+    let (rgba, fmt) = load_tight_linear_rgba_with(
+        3,
+        1,
+        pixel_format::MTL_FORMAT_A8_UNORM,
+        NativeUploads::BGRA8,
+        "test_tight_load",
+        |dst| {
             dst.copy_from_slice(&native);
             true
-        })
-        .expect("A8 sample loads");
+        },
+    )
+    .expect("A8 sample loads");
     assert_eq!(
         fmt,
         TexelLayout::Rgba8,
@@ -3122,8 +3087,18 @@ fn a_solid_gva_landing_matches_the_full_image_landing_it_replaced() {
 
     let (mut h1, mut s1) = guest(page_shift);
     assert!(
-        write_gva_solid8(&mut s1, &mut h1, 1, gva, w, h, bpr, MTL_FORMAT_BGRA8_UNORM, &clear)
-            .is_ok(),
+        write_gva_solid8(
+            &mut s1,
+            &mut h1,
+            1,
+            gva,
+            w,
+            h,
+            bpr,
+            MTL_FORMAT_BGRA8_UNORM,
+            &clear
+        )
+        .is_ok(),
         "the solid landing must succeed"
     );
 
@@ -3859,7 +3834,7 @@ fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
         resolve_sampled_source(&mut state, &mut host, 1, texture_ref, None, true)
             .expect("type-5 descriptor surface must sample");
     assert_eq!((width, height, sampled_mid), (4, 3, surface_id));
-    let SampledSourceRequest::Bytes(sampled, _, layout) = sampled else {
+    let SampledSourceRequest::Bytes(sampled, _, layout, _) = sampled else {
         panic!("cache-backed fixture unexpectedly resolved a resident target");
     };
     // The host-cache rung uploads the scanout cache's BGRA8 verbatim, so this is
@@ -3890,7 +3865,7 @@ fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
         (width, height, sampled_mid),
         "threaded entry changed the resolved geometry/mid"
     );
-    let SampledSourceRequest::Bytes(tsampled, _, _) = tsrc else {
+    let SampledSourceRequest::Bytes(tsampled, _, _, _) = tsrc else {
         panic!("threaded-entry sample changed the source variant");
     };
     assert_eq!(
@@ -3994,7 +3969,7 @@ fn type11_host_cache_rung_identity_tracks_the_cached_frame() {
     let resolve = |state: &mut DeviceState, host: &mut FakeHost| {
         let (_, _, _, src) = resolve_sampled_source(state, host, 1, texture_ref, None, true)
             .expect("host-cache rung must serve the stored frame");
-        let SampledSourceRequest::Bytes(bytes, identity, layout) = src else {
+        let SampledSourceRequest::Bytes(bytes, identity, layout, _) = src else {
             panic!("cache-backed fixture unexpectedly resolved a resident target");
         };
         // The cache holds BGRA8 and the upload declares BGRA8, so the bytes go
@@ -4197,7 +4172,7 @@ fn type5_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
         (sample_w, sample_h, sample_mid),
         (width, height, surface_id)
     );
-    let SampledSourceRequest::Bytes(sampled, _, byte_format) = sampled else {
+    let SampledSourceRequest::Bytes(sampled, _, byte_format, _) = sampled else {
         panic!("serialized view unexpectedly resolved a resident target");
     };
     // Native RG8 upload: two bytes per texel, tight rows (an R8G8_UNORM
@@ -4791,9 +4766,13 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
             },
         ),
     ] {
-        let refusal = build(&slot1)
-            .expect_err(&format!("{reason:?} must refuse the draw, not drop to single-RT"));
-        assert_eq!(refusal.reason, reason, "the refusal names the check that bailed");
+        let refusal = build(&slot1).expect_err(&format!(
+            "{reason:?} must refuse the draw, not drop to single-RT"
+        ));
+        assert_eq!(
+            refusal.reason, reason,
+            "the refusal names the check that bailed"
+        );
         assert_eq!(
             refusal.slot, slot1.slot,
             "the refusal names the guest's own slot number, so a reader knows \
@@ -5008,6 +4987,67 @@ fn guest_runs_decline_on_unstable_host_mappings() {
     );
 }
 
+/// One whole-buffer host allocation is made per task/reference and offset binds
+/// become slices of it. The second lookup must not ask the host to reconstruct
+/// the same virtual range again.
+#[test]
+#[cfg(feature = "backend-vulkan")]
+fn packed_buffer_alias_is_reused_across_offsets() {
+    use crate::contract::endian::st32;
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::runtime::bound_buffers::PackedBufferResolution;
+
+    let page_shift = PAGE_SHIFT_X86;
+    let page = 1u64 << page_shift;
+    let mut host = FakeHost::new();
+    host.stable_map_pages = true;
+    let (dir_gpa, root_gpa, data_gpa) = (2 * page, 3 * page, 4 * page);
+    host.map_range(dir_gpa, page as usize, 0);
+    host.map_range(root_gpa, page as usize, 0);
+    host.map_range(data_gpa, (2 * page) as usize, 0);
+    let mut directory = [0u8; 8];
+    st32(&mut directory[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut directory[DIRECTORY_DEPTH as usize..], 1);
+    host.write_gpa(dir_gpa, &directory).unwrap();
+    let mut ptes = [0u8; 8];
+    st32(&mut ptes[0..4], 4);
+    st32(&mut ptes[4..8], 5);
+    host.write_gpa(root_gpa, &ptes).unwrap();
+
+    crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
+    let mut state = DeviceState::new(DeviceId(1), page_shift);
+    state.define_task(1, page, 2);
+    let backing = super::BufferBacking {
+        gva: 0x800,
+        size: 0x1800,
+    };
+    let first = super::vulkan::packed_buffer_resolution(&mut state, &mut host, 1, 7, &backing);
+    let calls = host.map_pages_calls;
+    let second = super::vulkan::packed_buffer_resolution(&mut state, &mut host, 1, 7, &backing);
+    crate::runtime::guest_ram::forget_import_limits();
+
+    let (PackedBufferResolution::Available(first), PackedBufferResolution::Available(second)) =
+        (first, second)
+    else {
+        panic!("the fully mapped allocation must pack")
+    };
+    assert_eq!(
+        host.map_pages_calls, calls,
+        "the second offset reuses the alias"
+    );
+    assert_eq!(first.import.id(), second.import.id());
+    let a = super::vulkan::slice_packed_buffer(&first, 0, 0x800).unwrap();
+    let b = super::vulkan::slice_packed_buffer(&first, 0x1000, 0x800).unwrap();
+    assert_eq!(
+        a.pages.as_ref().unwrap()[0].guest.import().id(),
+        first.import.id()
+    );
+    assert_eq!(
+        b.pages.as_ref().unwrap()[0].guest.import().id(),
+        first.import.id()
+    );
+}
+
 /// The window refusals name **which** check refused, because the census that
 /// ranks them turns on telling two of them apart.
 ///
@@ -5020,9 +5060,9 @@ fn guest_runs_decline_on_unstable_host_mappings() {
 #[test]
 #[cfg(feature = "backend-vulkan")]
 fn a_window_refusal_names_which_check_refused() {
+    use super::vulkan::WindowRefusal;
     use crate::contract::endian::st32;
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use super::vulkan::WindowRefusal;
 
     let page_shift = crate::model::PAGE_SHIFT_X86;
     let page = 1u64 << page_shift;
@@ -5228,8 +5268,14 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
 
     let armed = sync_store_allowed_pages(&state, &host, 1, Some(&c0), true)
         .expect("a resolvable GVA target must be bounded");
-    assert_eq!(armed.membership().len(), 1, "64x64 BGRA8 tight covers one 16 KiB page");
-    assert!(armed.membership().contains(&((pt_base as u64 + 1) << PAGE_SHIFT_ARM64E)));
+    assert_eq!(
+        armed.membership().len(),
+        1,
+        "64x64 BGRA8 tight covers one 16 KiB page"
+    );
+    assert!(armed
+        .membership()
+        .contains(&((pt_base as u64 + 1) << PAGE_SHIFT_ARM64E)));
 
     // The guest hands that virtual page to a different allocation while the GPU
     // is working. The write that follows must not reach the new owner.
@@ -5432,7 +5478,11 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
         }
         let armed = sync_store_target_pages(&rig.state, &rig.host, 1, &target)
             .expect("a resolvable GVA target must be bounded");
-        assert_eq!(armed.membership().len(), 2, "64x128 BGRA8 tight covers two 16 KiB pages");
+        assert_eq!(
+            armed.membership().len(),
+            2,
+            "64x128 BGRA8 tight covers two 16 KiB pages"
+        );
 
         // The guest re-points the span's second page mid-flight.
         rig.point(2, moved_to);
@@ -6138,7 +6188,10 @@ fn only_a_statically_used_texture_gap_is_given_a_neutral_image() {
             DescriptorUse::DeclaredUnused,
         ),
         (gap(FragUnboundClass::Texture, 5), DescriptorUse::Ambiguous),
-        (gap(FragUnboundClass::Texture, 6), DescriptorUse::NotDeclared),
+        (
+            gap(FragUnboundClass::Texture, 6),
+            DescriptorUse::NotDeclared,
+        ),
         // Both other classes answer `Used` unconditionally from
         // `frag_unbound_static_use`, so they are exactly the case that would slip
         // through a filter written on the verdict alone.

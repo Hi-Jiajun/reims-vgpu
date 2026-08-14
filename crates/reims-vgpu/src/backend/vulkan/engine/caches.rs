@@ -67,11 +67,33 @@ pub(crate) struct BindingSig {
     pub binding: u32,
     pub ty: u32, // vk::DescriptorType as u32
     pub stages: u32,
+    pub count: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct LayoutKey {
     pub bindings: Vec<BindingSig>,
+}
+
+pub(crate) fn canonicalize_layout_bindings(
+    mut bindings: Vec<BindingSig>,
+) -> Result<Vec<BindingSig>, super::DrawError> {
+    bindings.sort_by_key(|binding| binding.binding);
+    for pair in bindings.windows(2) {
+        if pair[0].binding == pair[1].binding && pair[0] != pair[1] {
+            return Err(super::DrawError::Unsupported(
+                super::reason::DrawReason::DescriptorBindingConflict {
+                    binding: pair[0].binding,
+                    first_type: pair[0].ty,
+                    first_count: pair[0].count,
+                    second_type: pair[1].ty,
+                    second_count: pair[1].count,
+                },
+            ));
+        }
+    }
+    bindings.dedup();
+    Ok(bindings)
 }
 
 /// Max secondary color attachments (MRT slot 1..): every colour slot Apple's
@@ -1012,19 +1034,32 @@ impl ObjectCaches {
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(b.binding)
                     .descriptor_type(vk::DescriptorType::from_raw(b.ty as i32))
-                    .descriptor_count(1)
+                    .descriptor_count(b.count)
                     .stage_flags(vk::ShaderStageFlags::from_raw(b.stages))
             })
             .collect();
         let dsl = if bindings.is_empty() {
             vk::DescriptorSetLayout::null()
         } else {
+            let binding_flags: Vec<_> = key
+                .bindings
+                .iter()
+                .map(|binding| {
+                    if binding.count > 1 {
+                        vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                    } else {
+                        vk::DescriptorBindingFlags::empty()
+                    }
+                })
+                .collect();
+            let mut flags = vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
+                .binding_flags(&binding_flags);
+            let create_info = vk::DescriptorSetLayoutCreateInfo::default()
+                .bindings(&bindings)
+                .push_next(&mut flags);
             let d = ctx
                 .device
-                .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
-                    None,
-                )
+                .create_descriptor_set_layout(&create_info, None)
                 .map_err(|e| {
                     let err =
                         DrawError::VkCall(VkCall::new(VkOp::CachesCreateDescriptorSetLayout, e));
@@ -1885,7 +1920,8 @@ impl ObjectCaches {
             Ok(breadcrumb) => breadcrumb,
             Err(hit) => {
                 let err = self.note_quarantined("create_compute_pipelines", &hit);
-                self.compute_pipelines.insert_negative(key.clone(), err.clone());
+                self.compute_pipelines
+                    .insert_negative(key.clone(), err.clone());
                 return Err(err);
             }
         };
@@ -1912,6 +1948,31 @@ impl ObjectCaches {
 #[cfg(test)]
 mod object_cache_tests {
     use super::*;
+
+    #[test]
+    fn layout_bindings_coalesce_array_elements_and_refuse_conflicting_shapes() {
+        let sig = |count| BindingSig {
+            binding: 32,
+            ty: vk::DescriptorType::SAMPLED_IMAGE.as_raw() as u32,
+            stages: vk::ShaderStageFlags::COMPUTE.as_raw(),
+            count,
+        };
+        assert_eq!(
+            canonicalize_layout_bindings(vec![sig(8), sig(8)]),
+            Ok(vec![sig(8)])
+        );
+        assert!(matches!(
+            canonicalize_layout_bindings(vec![sig(8), sig(4)]),
+            Err(super::super::DrawError::Unsupported(
+                super::super::reason::DrawReason::DescriptorBindingConflict {
+                    binding: 32,
+                    first_count: 8,
+                    second_count: 4,
+                    ..
+                }
+            ))
+        ));
+    }
 
     fn unnormalized_key() -> SamplerStateKey {
         use super::super::types::{
@@ -1976,8 +2037,8 @@ mod object_cache_tests {
     /// is a named refusal and not a repair.
     #[test]
     fn an_unnormalized_sampler_with_a_compare_function_is_refused_by_name() {
-        use crate::observe::Decline as _;
         use super::super::types::SamplerCompareFunction;
+        use crate::observe::Decline as _;
         let mut key = unnormalized_key();
         key.compare_function = SamplerCompareFunction::LessEqual;
         let reason = vulkan_conformed_sampler(&key).expect_err("compare is refused");
@@ -2219,7 +2280,11 @@ mod object_cache_tests {
         let mut index = ShaderDigestIndex::default();
         let words = std::sync::Arc::new(vec![0x0723_0203u32, 0x0001_0000, 0x000d_000b]);
         let twin = std::sync::Arc::new((*words).clone());
-        let digest = Digest128 { a: 0xA1, b: 0xB2, len: 3 };
+        let digest = Digest128 {
+            a: 0xA1,
+            b: 0xB2,
+            len: 3,
+        };
 
         assert_eq!(index.get(&words), None, "nothing walked yet");
         index.insert(&words, digest);
@@ -2269,7 +2334,14 @@ mod object_cache_tests {
             .map(|i| std::sync::Arc::new(vec![i as u32]))
             .collect();
         for (i, words) in held.iter().enumerate() {
-            index.insert(words, Digest128 { a: i as u64, b: 0, len: 1 });
+            index.insert(
+                words,
+                Digest128 {
+                    a: i as u64,
+                    b: 0,
+                    len: 1,
+                },
+            );
         }
         assert_eq!(index.map.len(), SHADER_DIGEST_ENTRIES);
         assert!(index.get(&held[0]).is_some());

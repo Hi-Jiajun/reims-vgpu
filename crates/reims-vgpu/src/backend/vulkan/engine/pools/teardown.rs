@@ -16,6 +16,10 @@ impl ResourcePools {
         // to cmd_pool (destroyed below) and its dsets to desc_pool; the
         // accumulated transients are already in the live lists.
         self.open_batch = None;
+        // No command from this CB will be submitted now. Destroying its command
+        // pool discards the unfinished recording, including an open pass, so
+        // there is neither a legal nor a useful cmd_end_render_pass to emit.
+        self.open_pass = None;
         self.forget_pass_echo();
         // Best-effort quiesce: wait every in-flight fence so no CB references
         // what we are about to destroy. On device loss the waits fail — the

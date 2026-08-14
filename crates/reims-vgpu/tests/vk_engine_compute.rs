@@ -466,6 +466,8 @@ fn compute_storage_image_rgba8unorm_known_result() {
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
             binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
@@ -505,6 +507,8 @@ fn compute_storage_image_rgba8unorm_known_result() {
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
             binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
@@ -536,6 +540,8 @@ fn compute_storage_image_rgba8unorm_known_result() {
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
             binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
@@ -613,6 +619,8 @@ fn every_admitted_compute_storage_resident_survives_past_the_retired_slot_cap() 
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
             binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
@@ -701,6 +709,8 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
             binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
             format: StorageImageFormat::Bgra8Unorm,
             width: w,
             height: h,
@@ -763,6 +773,8 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
             samplers: vec![],
             storage_images: vec![ComputeStorageImageResource {
                 binding: 0,
+                array_element: 0,
+                descriptor_count: 1,
                 format: StorageImageFormat::Rgba8Unorm,
                 width: w,
                 height: h,
@@ -809,7 +821,6 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
     );
 }
 
-
 /// Copy-on-sample contract: a sampled input bound to a generation-matching
 /// resident storage image is seeded by a device-local copy (zero-placeholder
 /// `bytes` never uploaded, `compute_sampled_uploads == 0`) and fetches the
@@ -853,6 +864,8 @@ fn compute_sampled_resident_copy_and_lost_resident() {
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
             binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
@@ -881,6 +894,8 @@ fn compute_sampled_resident_copy_and_lost_resident() {
         }],
         sampled_images: vec![ComputeSampledImageResource {
             binding: 32,
+            array_element: 0,
+            descriptor_count: 1,
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
@@ -938,7 +953,6 @@ fn compute_sampled_resident_copy_and_lost_resident() {
     );
 }
 
-
 /// Sampled inputs must use SAMPLED_IMAGE descriptors and remain input-only.
 #[test]
 fn compute_sampled_image_fetch_preserves_float_bits() {
@@ -963,6 +977,8 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
         }],
         sampled_images: vec![ComputeSampledImageResource {
             binding: 32,
+            array_element: 0,
+            descriptor_count: 1,
             format: StorageImageFormat::Rgba32Float,
             width: 1,
             height: 1,
@@ -1171,6 +1187,8 @@ fn compute_storage_image_r16float_if_supported() {
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
             binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
             format: StorageImageFormat::R16Float,
             width: 2,
             height: 2,

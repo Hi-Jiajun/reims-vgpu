@@ -66,12 +66,7 @@ mod sampled_identity_switch {
     /// whichever arm the author happened to think of.
     #[test]
     fn only_an_explicit_off_switches_the_identity_lookup_off() {
-        for switch in [
-            Switch::Unset,
-            Switch::On,
-            Switch::Off,
-            Switch::Unrecognized,
-        ] {
+        for switch in [Switch::Unset, Switch::On, Switch::Off, Switch::Unrecognized] {
             let expected = match switch {
                 Switch::Off => false,
                 Switch::Unset | Switch::On | Switch::Unrecognized => true,
@@ -131,11 +126,9 @@ impl ResourcePools {
     /// for a whole boot. A count that tracks the workload is a per-resource
     /// import, which the extension does not guarantee works and which pays the
     /// driver's page pinning for an answer that never changes.
-    pub(crate) fn host_ram_import_census(&self) -> (usize, u64) {
-        (
-            self.host_ram_imports.len(),
-            self.host_ram_imports.imported_bytes(),
-        )
+    pub(crate) fn host_ram_import_census(&self) -> (usize, usize, u64) {
+        let (ramblocks, aliases) = self.host_ram_imports.counts();
+        (ramblocks, aliases, self.host_ram_imports.imported_bytes())
     }
 
     pub(crate) fn new() -> Self {
@@ -198,6 +191,7 @@ impl ResourcePools {
             open_batch: None,
             batch_max_draws: super::batch_max_draws(),
             last_pass: None,
+            open_pass: None,
             slab: slab::SlabPool::new(),
             slabs: buffer_slab::BufferSlabs::new(),
             host_ram_imports: host_ram::HostRamImports::default(),
@@ -1360,7 +1354,8 @@ impl ResourcePools {
             )
             .is_ok()
         {
-            let us = |from: usize, to: usize| probe.scale.elapsed_ns(ticks[from], ticks[to]) / 1_000;
+            let us =
+                |from: usize, to: usize| probe.scale.elapsed_ns(ticks[from], ticks[to]) / 1_000;
             crate::runtime::drain::note_readback_gpu_us(us(0, 1), us(1, 2));
         }
     }
@@ -1456,10 +1451,11 @@ impl ResourcePools {
     /// end it.
     ///
     /// The command buffer is **already recording** — the caller must not begin
-    /// or reset it — and it is between render passes, because a batch only
-    /// admits a draw that has ended its own. The fence is the one returned here
-    /// precisely so the caller can wait it after `batch_flush` without having to
-    /// reach back into a batch that no longer exists by then.
+    /// or reset it. It may carry the preceding draw's still-open render pass;
+    /// every command that cannot live there closes it at its recording site.
+    /// The fence is the one returned here precisely so the caller can wait it
+    /// after `batch_flush` without having to reach back into a batch that no
+    /// longer exists by then.
     pub(crate) fn batch_open_recording(&self) -> Option<(vk::CommandBuffer, vk::Fence)> {
         self.open_batch.as_ref().map(|b| (b.cb, b.fence))
     }
@@ -1718,12 +1714,13 @@ impl ResourcePools {
     /// amortizing the per-draw submit+fence cost N-fold.
     ///
     /// `narrow_to_target` is [`crate::env::BATCH_MIXED_TARGETS`] switched off.
-    /// The default is that the batch's own target does not decide this: every
-    /// batched draw begins and ends its own render pass, the flush reads only
-    /// the CB, the fence and the accumulated descriptor sets, and the readback
-    /// rail already appends a copy of *some other* target's image to whatever
-    /// batch happens to be recording. Passing the parameter rather than reading
-    /// the environment here keeps this function pure and testable.
+    /// The default is that the batch's own target does not decide this: a draw
+    /// from another Metal encoder closes any retained pass before beginning its
+    /// own, while the flush itself reads only the CB, fence, and accumulated
+    /// descriptor sets. The readback rail likewise appends a copy of *some
+    /// other* target's image to whatever batch is recording. Passing the
+    /// parameter rather than reading the environment here keeps this function
+    /// pure and testable.
     pub(crate) fn batch_fit(&self, target: &BatchTarget, narrow_to_target: bool) -> BatchFit {
         let Some(b) = self.open_batch.as_ref() else {
             return BatchFit::None;
@@ -1764,6 +1761,23 @@ impl ResourcePools {
     /// and nowhere else, so the echo always names a pass that is standing.
     pub(crate) fn note_pass_opened(&mut self, echo: PassEcho) {
         self.last_pass = Some(echo);
+        self.open_pass = Some(echo);
+    }
+
+    /// Whether `echo` is the render pass that is actually still open.
+    pub(crate) fn open_pass_echoes(&self, echo: &PassEcho) -> bool {
+        self.open_pass.as_ref() == Some(echo)
+    }
+
+    /// End the pass in `cb` before recording a command that cannot live inside
+    /// it or ending the command buffer. No-op when the preceding draw ended its
+    /// pass normally.
+    pub(crate) unsafe fn close_open_pass(&mut self, device: &ash::Device, cb: vk::CommandBuffer) {
+        let Some(open) = self.open_pass.take() else {
+            return;
+        };
+        debug_assert_eq!(open.cb, cb, "open render pass belongs to another command buffer");
+        unsafe { device.cmd_end_render_pass(open.cb) };
     }
 
     /// Forget everything remembered about the command buffer that was
@@ -1784,6 +1798,7 @@ impl ResourcePools {
     /// The handle comparison inside that struct is the second lock on the same
     /// door, not the first.
     pub(crate) fn forget_pass_echo(&mut self) {
+        debug_assert!(self.open_pass.is_none(), "forgetting an open render pass");
         self.last_pass = None;
         self.cb_graphics.cb = None;
         self.cb_graphics.pipeline = None;
@@ -1907,6 +1922,7 @@ impl ResourcePools {
         };
         // The CB is about to be ended and submitted, so no pass inside it is
         // still open to continue.
+        unsafe { self.close_open_pass(&ctx.device, batch.cb) };
         self.forget_pass_echo();
         counters.batch_flushes.fetch_add(1, Ordering::Relaxed);
         counters
@@ -2136,7 +2152,9 @@ impl ResourcePools {
             g.stencil = None;
         }
         if g.pipeline == Some(pipeline) {
-            counters.dynstate_pipeline_held.fetch_add(1, Ordering::Relaxed);
+            counters
+                .dynstate_pipeline_held
+                .fetch_add(1, Ordering::Relaxed);
             return;
         }
         g.pipeline = Some(pipeline);
@@ -2178,13 +2196,17 @@ impl ResourcePools {
     ) {
         let g = &mut self.cb_graphics;
         if super::viewports_match(&g.vp_scratch, &g.viewports) {
-            counters.dynstate_viewport_held.fetch_add(1, Ordering::Relaxed);
+            counters
+                .dynstate_viewport_held
+                .fetch_add(1, Ordering::Relaxed);
         } else {
             std::mem::swap(&mut g.viewports, &mut g.vp_scratch);
             unsafe { device.cmd_set_viewport(cb, 0, &g.viewports) };
         }
         if super::scissors_match(&g.sc_scratch, &g.scissors) {
-            counters.dynstate_scissor_held.fetch_add(1, Ordering::Relaxed);
+            counters
+                .dynstate_scissor_held
+                .fetch_add(1, Ordering::Relaxed);
         } else {
             std::mem::swap(&mut g.scissors, &mut g.sc_scratch);
             unsafe { device.cmd_set_scissor(cb, 0, &g.scissors) };
@@ -2218,7 +2240,9 @@ impl ResourcePools {
     ) {
         let g = &mut self.cb_graphics;
         if g.stencil == Some((front, back)) {
-            counters.dynstate_stencil_held.fetch_add(1, Ordering::Relaxed);
+            counters
+                .dynstate_stencil_held
+                .fetch_add(1, Ordering::Relaxed);
             return;
         }
         g.stencil = Some((front, back));
@@ -5234,7 +5258,7 @@ mod recycle_tests {
                 storage_images: Vec::new(),
             }),
             span: super::gpu_span::SlotSpan::Idle,
-                        readback_span_armed: false,
+            readback_span_armed: false,
         }
     }
 
@@ -5244,7 +5268,7 @@ mod recycle_tests {
             fence: vk::Fence::null(),
             pending: None,
             span: super::gpu_span::SlotSpan::Idle,
-                        readback_span_armed: false,
+            readback_span_armed: false,
         }
     }
 

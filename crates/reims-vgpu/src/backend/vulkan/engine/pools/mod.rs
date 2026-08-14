@@ -525,6 +525,10 @@ pub(crate) struct ResourcePools {
     /// draw have continued the previous one's pass" is not answerable from any
     /// counter this device had, and the answer is the size of the merge.
     last_pass: Option<PassEcho>,
+    /// Render pass currently open in the deferred batch command buffer.
+    /// Unlike `last_pass`, this is executable state: every outside-pass command
+    /// and every command-buffer end must close it first.
+    open_pass: Option<PassEcho>,
     /// Offset suballocator for DEVICE_LOCAL optimal images (targets, sampled,
     /// storage, resident registry). Sub-allocates many image binds from a few
     /// large `VkDeviceMemory` blocks to collapse the per-image
@@ -645,13 +649,12 @@ pub(crate) enum BatchFit {
 /// The render pass instance the previously recorded draw opened, and the
 /// command buffer it opened it in.
 ///
-/// Instrument for the merge this device has not taken: every batched draw
-/// begins and ends its own render pass, so a joiner whose pass is identical to
-/// its predecessor's *and* which records nothing between the two could have
-/// stayed inside the open one. `pass` and `fb` are what make two passes the same
-/// instance — a `CLEAR` joiner gets a different `pass` from a `LOAD` one, which
-/// is why the handle is compared rather than the target identity that decides
-/// batching. `area` is the render area, which must agree for the same reason.
+/// A draw in the same decoded Metal render encoder can stay inside this pass
+/// when its predecessor left it open and no Vulkan command that must be outside
+/// a pass intervened. `pass` and `fb` are what make two passes the same instance
+/// — a `CLEAR` joiner gets a different `pass` from a `LOAD` one, which is why the
+/// handle is compared rather than the target identity that decides batching.
+/// `area` is the render area, which must agree for the same reason.
 ///
 /// `cb` is carried because a command buffer handle is recycled: an echo left
 /// behind by the previous user of this handle names a pass that was ended and
@@ -2581,9 +2584,7 @@ fn batch_max_draws() -> u64 {
                 BATCH_MAX_DRAWS
             }
         };
-        crate::observe::off(format!(
-            "batch_draws cap={cap} compiled={BATCH_MAX_DRAWS}"
-        ));
+        crate::observe::off(format!("batch_draws cap={cap} compiled={BATCH_MAX_DRAWS}"));
         cap
     })
 }
@@ -2917,6 +2918,8 @@ mod sampled_key_tests {
     fn resource(arrayed: bool, volume: bool, cube: bool, one_dim: bool) -> SampledImageResource {
         SampledImageResource {
             binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
             width: 7,
             height: 5,
             layers: 3,
@@ -2925,6 +2928,7 @@ mod sampled_key_tests {
             cube,
             one_dim,
             source: SampledSource::Bytes(std::sync::Arc::new(Vec::new())),
+            byte_origin: Default::default(),
             format: ash::vk::Format::R8G8B8A8_UNORM,
             identity: None,
             swizzle: SwizzlePlan::default(),

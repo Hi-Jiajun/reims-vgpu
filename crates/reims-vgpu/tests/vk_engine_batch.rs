@@ -185,6 +185,66 @@ fn batched_draws_compose_and_flush_on_read() {
     }
 }
 
+/// Two LOAD draws from one decoded Metal render encoder retain one Vulkan pass
+/// instance. The priming draw gives the resident defined contents so both test
+/// draws use the same LOAD render-pass object; the continuation counter makes
+/// this fail if they regress to two begin/end pairs while the pixel check keeps
+/// the optimized recording honest.
+#[test]
+fn one_metal_encoder_continues_one_vulkan_render_pass() {
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_102,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+
+    let prime = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    match engine::execute_draw_request(&prime) {
+        Ok(_) => {}
+        Err(e) => {
+            let msg = e.to_string();
+            if skip_if_no_gpu(&msg) {
+                eprintln!("skipping: {msg}");
+                return;
+            }
+            panic!("priming draw: {msg}");
+        }
+    }
+    engine::read_target(&identity).expect("prime resident");
+
+    let before = engine::counter_snapshot();
+    let mut first = batch_req(&vert, &frag, &identity, true, half_scissor(true));
+    first.render_pass_continues = true;
+    engine::execute_draw_request(&first).expect("encoder first draw");
+
+    let mut second = batch_req(&vert, &frag, &identity, true, half_scissor(false));
+    second.continues_render_pass = true;
+    engine::execute_draw_request(&second).expect("encoder second draw");
+
+    let px = engine::read_target(&identity)
+        .expect("flush continued pass")
+        .into_rgba8();
+    let delta = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        delta.render_pass_continuations, 1,
+        "the second encoder draw must reuse the pass instance: {delta:?}"
+    );
+    for y in [0u32, H / 2, H - 1] {
+        for x in [W / 4, 3 * W / 4] {
+            let i = ((y * W + x) * 4) as usize;
+            assert!(
+                is_frag_color(&px[i..i + 4]),
+                "continued render pass at ({x},{y}) = {:?}",
+                &px[i..i + 4]
+            );
+        }
+    }
+}
+
 /// A draw to a DIFFERENT target joins the open batch, and both targets still
 /// receive exactly their own draw's pixels.
 ///
@@ -525,6 +585,8 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
     });
     req.sampled_images.push(SampledImageResource {
         binding: 32,
+        array_element: 0,
+        descriptor_count: 1,
         width: 2,
         height: 2,
         layers: 1,
@@ -532,25 +594,27 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
         volume: false,
         cube: false,
         one_dim: false,
-        source: SampledSource::GuestRuns(GuestRunSource {
-            runs: std::sync::Arc::new(vec![
-                GuestRun {
-                    host_ptr: ptr as usize,
-                    len: 8,
-                },
-                GuestRun {
-                    host_ptr: ptr as usize + 8,
-                    len: 8,
-                },
-            ]),
-            total_len: 16,
-            row_length_texels: 0,
-            pages: None,
-        },
-        // A fixture over a host `Vec` went through no witness, so the gather is
-        // the only disposition available to it.
-        reims_vgpu::runtime::gather_witness::GatherVouch::Fresh,
+        source: SampledSource::GuestRuns(
+            GuestRunSource {
+                runs: std::sync::Arc::new(vec![
+                    GuestRun {
+                        host_ptr: ptr as usize,
+                        len: 8,
+                    },
+                    GuestRun {
+                        host_ptr: ptr as usize + 8,
+                        len: 8,
+                    },
+                ]),
+                total_len: 16,
+                row_length_texels: 0,
+                pages: None,
+            },
+            // A fixture over a host `Vec` went through no witness, so the gather is
+            // the only disposition available to it.
+            reims_vgpu::runtime::gather_witness::GatherVouch::Fresh,
         ),
+        byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
         swizzle: Default::default(),
@@ -714,6 +778,16 @@ fn a_scattered_guest_buffer_window_is_gathered_by_the_gpu_in_one_region_per_stre
     assert_eq!(
         d.buffer_guest_gathers, 1,
         "the scattered window must be assembled by the GPU: {d:?}"
+    );
+    assert_eq!(
+        d.buffer_guest_gather_storage_bytes,
+        STRETCH * 3,
+        "this physical gather is consumed only as a storage buffer: {d:?}"
+    );
+    assert_eq!(
+        d.buffer_guest_gather_vertex_bytes + d.buffer_guest_gather_shared_bytes,
+        0,
+        "the role-byte columns must not double-charge this gather: {d:?}"
     );
     assert_eq!(
         d.buffer_guest_gather_regions, 3,

@@ -1,5 +1,5 @@
-//! Import a RAMBlock's host mapping as `VkDeviceMemory` and bind a `VkBuffer`
-//! over all of it.
+//! Import a bounded host mapping as `VkDeviceMemory` and bind a `VkBuffer` over
+//! all of it.
 //!
 //! This is the one place guest memory becomes something the engine can bind.
 //! Which *bytes* a draw reaches is decided before it gets here and is carried by
@@ -8,24 +8,17 @@
 //! and [`super::super::caps::host_pointer`] for the capability that gates the
 //! whole rail.
 //!
-//! # One import per RAMBlock, and no cache
+//! # One import per allocation identity
 //!
-//! The expensive step happens once per RAMBlock for the device's life, and the
-//! cheap step — naming a range inside it — is a bounds check. Nothing on the
-//! path a draw takes walks a page list, allocates, or takes a per-page kernel
-//! reference, so there is nothing left for a cache to amortise.
+//! RAMBlocks are imported once for the device's life. A scattered task buffer
+//! may also arrive as a stable packed host alias, created once per live guest
+//! buffer reference; its many draw offsets are still only bounds checks.
 //!
-//! So [`HostRamImports`] is a map with no eviction policy and no capacity. It
-//! holds at most one entry per span the shim reported, which on an ordinary
-//! machine is one or two. That is the whole prize of the model, and a future
-//! change that adds an eviction rule here has almost certainly misunderstood it:
-//! evicting an import does not free guest RAM, it only forces the next draw to
-//! pay `get_user_pages` again for a mapping that never moved.
-//!
-//! **Do not import the same RAMBlock twice.** `VK_EXT_external_memory_host`
-//! does not guarantee that importing one host allocation twice into one device
-//! works, which is why the map is keyed on
-//! [`crate::runtime::guest_ram::ImportId`] and the key is never reused.
+//! [`HostRamImports`] keys both forms by
+//! [`crate::runtime::guest_ram::ImportId`], so one allocation identity is never
+//! imported twice. The driver is allowed to refuse a packed alias; that answer
+//! is remembered and its caller gathers instead. The census separates RAMBlock
+//! entries from aliases so resource-shaped growth is visible.
 //!
 //! # What the import does not promise
 //!
@@ -43,8 +36,8 @@ use ash::vk;
 use crate::observe::Decline;
 use crate::runtime::guest_ram::{GuestRamError, GuestRamImport, GuestRef};
 
-/// One RAMBlock living on the GPU as a bindable buffer, with no copy between it
-/// and the guest's own view of those bytes.
+/// One host allocation living on the GPU as a bindable buffer, with no copy
+/// between it and the guest's own view of those bytes.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ImportedHostRam {
     pub buffer: vk::Buffer,
@@ -161,10 +154,15 @@ pub(crate) struct BoundGuestRam {
     pub head: vk::DeviceSize,
 }
 
-/// Every RAMBlock this device has imported, keyed by import identity.
+/// Every bounded host allocation this device has imported, keyed by identity.
 #[derive(Default)]
 pub(crate) struct HostRamImports {
     live: HashMap<u64, ImportedHostRam>,
+    /// `true` for RAMBlock-coordinate imports, `false` for packed task aliases.
+    kinds: HashMap<u64, bool>,
+    /// Driver refusals are properties of this pointer/device pair. Holding the
+    /// answer prevents every draw from repeating a failed allocation.
+    declined: HashMap<u64, HostRamDecline>,
 }
 
 impl HostRamImports {
@@ -232,8 +230,18 @@ impl HostRamImports {
         if let Some(live) = self.live.get(&key) {
             return Ok((*live, false));
         }
-        let made = unsafe { import_ramblock(ctx, import) }?;
+        if let Some(decline) = self.declined.get(&key) {
+            return Err(*decline);
+        }
+        let made = match unsafe { import_ramblock(ctx, import) } {
+            Ok(made) => made,
+            Err(decline) => {
+                self.declined.insert(key, decline);
+                return Err(decline);
+            }
+        };
         self.live.insert(key, made);
+        self.kinds.insert(key, import.gpa_base().is_some());
         Ok((made, true))
     }
 
@@ -246,6 +254,8 @@ impl HostRamImports {
         for (_, live) in self.live.drain() {
             unsafe { live.destroy(device) };
         }
+        self.kinds.clear();
+        self.declined.clear();
     }
 
     /// Bytes of guest RAM this device currently has imported, for the census.
@@ -256,8 +266,17 @@ impl HostRamImports {
     /// How many RAMBlocks are imported. One or two on an ordinary machine, and
     /// the number that must not grow with the workload — a rising count here is
     /// the per-resource import the model exists to avoid.
-    pub(crate) fn len(&self) -> usize {
-        self.live.len()
+    pub(crate) fn counts(&self) -> (usize, usize) {
+        self.live.keys().fold((0, 0), |(ramblocks, aliases), key| {
+            // Every live entry is created from the import passed to `ensure`;
+            // retain its kind beside the handle so the census does not call a
+            // packed task allocation a RAMBlock.
+            if self.kinds.get(key).copied().unwrap_or(false) {
+                (ramblocks + 1, aliases)
+            } else {
+                (ramblocks, aliases + 1)
+            }
+        })
     }
 }
 
@@ -407,7 +426,6 @@ unsafe fn import_ramblock(
     ));
     bound
 }
-
 
 /// A check that stopped a resident's frame from being copied straight into the
 /// guest's own pages, so the flush took the CPU route instead.
@@ -644,7 +662,7 @@ mod tests {
     #[test]
     fn an_empty_map_reports_no_imports() {
         let imports = HostRamImports::default();
-        assert_eq!(imports.len(), 0);
+        assert_eq!(imports.counts(), (0, 0));
         assert_eq!(imports.imported_bytes(), 0);
     }
 }

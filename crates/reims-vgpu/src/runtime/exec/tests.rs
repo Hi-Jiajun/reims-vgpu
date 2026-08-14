@@ -15,6 +15,14 @@ use crate::runtime::decode::render::{
 };
 use crate::runtime::host::FakeHost;
 
+#[test]
+fn render_pass_chain_edges_follow_the_decoded_encoder() {
+    assert_eq!(render_pass_chain_position(0, 1), (false, false));
+    assert_eq!(render_pass_chain_position(0, 3), (false, true));
+    assert_eq!(render_pass_chain_position(1, 3), (true, true));
+    assert_eq!(render_pass_chain_position(2, 3), (true, false));
+}
+
 /// The abandon line must say how much guest work it dropped.
 ///
 /// This break was silent, and the counter that would have caught it

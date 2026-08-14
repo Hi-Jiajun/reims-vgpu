@@ -674,6 +674,68 @@ crate::observe::decline_display!(ComputeSpirvDecline);
 
 impl std::error::Error for ComputeSpirvDecline {}
 
+/// A reflected kernel resource whose Vulkan ABI this runtime cannot yet
+/// populate. Kept separate from malformed SPIR-V: the translation is valid,
+/// but executing it without decoding the owner argument buffer would bind the
+/// wrong resource.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComputeReflectionDecline {
+    ReflectedResourceUnsupported {
+        pipeline_ref: u32,
+        index: u32,
+        binding: Option<u32>,
+        kind: &'static str,
+    },
+    ReflectedInterfaceUnsupported {
+        pipeline_ref: u32,
+        feature: &'static str,
+        count: usize,
+    },
+}
+
+impl crate::observe::Decline for ComputeReflectionDecline {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::ReflectedResourceUnsupported { .. } => "compute_reflection_resource_unsupported",
+            Self::ReflectedInterfaceUnsupported { .. } => {
+                "compute_reflection_interface_unsupported"
+            }
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::ReflectedResourceUnsupported {
+                pipeline_ref,
+                index,
+                binding,
+                kind,
+            } => vec![
+                ("pipeline_ref", pipeline_ref.to_string()),
+                ("index", index.to_string()),
+                (
+                    "binding",
+                    binding.map_or_else(|| "none".to_string(), |value| value.to_string()),
+                ),
+                ("kind", (*kind).to_string()),
+            ],
+            Self::ReflectedInterfaceUnsupported {
+                pipeline_ref,
+                feature,
+                count,
+            } => vec![
+                ("pipeline_ref", pipeline_ref.to_string()),
+                ("feature", (*feature).to_string()),
+                ("count", count.to_string()),
+            ],
+        }
+    }
+}
+
+crate::observe::decline_display!(ComputeReflectionDecline);
+
+impl std::error::Error for ComputeReflectionDecline {}
+
 /// Apply one decoded compute command to accum, or run a dispatch / sequencing op.
 ///
 /// `seg` carries the whole segment's mutable state: the accum this record
@@ -1086,11 +1148,24 @@ pub(crate) struct StagedBuffer {
     pub pages: std::collections::HashSet<u64>,
 }
 
+/// Conservative whole-allocation staging used by the Metal-direct callers,
+/// which do not translate the shader through the reflection-producing path.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 pub(crate) fn stage_buffer<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
     bind: &ComputeBufferBind,
+) -> Result<StagedBuffer, ComputeStatus> {
+    stage_buffer_with_extent(state, host, task_id, bind, None)
+}
+
+pub(crate) fn stage_buffer_with_extent<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    bind: &ComputeBufferBind,
+    extent_cap: Option<u64>,
 ) -> Result<StagedBuffer, ComputeStatus> {
     // Eight distinct checks answer with `MissingBuffer`; the status carries
     // which one, so the caller's line and this one name the same slug.
@@ -1148,7 +1223,8 @@ pub(crate) fn stage_buffer<M: HostMemory + HostOps>(
             format!("size={size:#x}"),
         );
     }
-    let avail = size - bind.offset;
+    let full = size - bind.offset;
+    let avail = extent_cap.map_or(full, |cap| full.min(cap));
     let Some(want) = host_alloc_len(avail).filter(|&n| n > 0) else {
         return miss(
             ComputeStatus::MissingBuffer("compute_stage_buf_want_bad"),
@@ -1190,6 +1266,15 @@ pub(crate) fn stage_buffer<M: HostMemory + HostOps>(
             }
         ));
         return Err(ComputeStatus::GuestIo("compute_stage_buf_gva_read"));
+    }
+    // Count only a cap that actually staged. A failed walk saved no traffic and
+    // must not make the rail look effective merely because reflection answered.
+    if avail < full {
+        crate::runtime::drain::note_store_route("compute_buffer_extent_narrowed");
+        crate::runtime::drain::note_store_route_n(
+            "compute_buffer_extent_saved_bytes",
+            full - avail,
+        );
     }
     let pages = staged_span_pages(state, host, task_id, gva, bytes.len() as u64);
     Ok(StagedBuffer {
@@ -1277,6 +1362,10 @@ fn staged_span_pages<M: HostMemory>(
 
 pub(crate) struct StagedTexture {
     pub binding: u32,
+    #[cfg(feature = "backend-vulkan")]
+    pub array_element: u32,
+    #[cfg(feature = "backend-vulkan")]
+    pub descriptor_count: u32,
     /// The guest ref this was staged from. Carried so a refusal downstream can
     /// name the object the guest bound and not only the slot it bound it to.
     /// Read by the direct-Metal rail's format refusal; the Vulkan arm reaches
@@ -1835,6 +1924,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         ));
         return Ok(StagedTexture {
             binding,
+            #[cfg(feature = "backend-vulkan")]
+            array_element: 0,
+            #[cfg(feature = "backend-vulkan")]
+            descriptor_count: 1,
             #[cfg(all(feature = "backend-metal", target_os = "macos"))]
             texture_ref,
             pixel_format: format,
@@ -2277,6 +2370,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         }
         return Ok(StagedTexture {
             binding,
+            #[cfg(feature = "backend-vulkan")]
+            array_element: 0,
+            #[cfg(feature = "backend-vulkan")]
+            descriptor_count: 1,
             #[cfg(all(feature = "backend-metal", target_os = "macos"))]
             texture_ref,
             pixel_format: stage_fmt,
@@ -2586,6 +2683,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     }
     Ok(StagedTexture {
         binding,
+        #[cfg(feature = "backend-vulkan")]
+        array_element: 0,
+        #[cfg(feature = "backend-vulkan")]
+        descriptor_count: 1,
         #[cfg(all(feature = "backend-metal", target_os = "macos"))]
         texture_ref,
         pixel_format: stage_format,
@@ -3366,11 +3467,14 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     let Some(pipeline) = load_compute_pipeline(state, host, task_id, acc.pipeline_ref) else {
         return ComputeStatus::MissingPipeline("compute_vk_pipeline_load");
     };
-    if pipeline.stage_input.is_some() || acc.imageblock.is_some() || acc.stage_in_region.is_some() {
+    if linux_stage_input_or_imageblock_unsupported(pipeline.stage_input.is_some(), acc) {
         crate::observe::fail(format!(
-            "compute_linux unsupported pipe={} stage_in={} imageblock={} (need SPI parity)",
+            "compute_linux unsupported pipe={} stage_in_desc={} stage_in_direct={} \
+             stage_in_indirect={} imageblock={} (need SPI parity)",
             acc.pipeline_ref,
             pipeline.stage_input.is_some() as u8,
+            acc.stage_in_region.is_some() as u8,
+            acc.stage_in_region_indirect.is_some() as u8,
             acc.imageblock.is_some() as u8
         ));
         return ComputeStatus::Unsupported("linux_stage_in_imageblock");
@@ -3398,31 +3502,11 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         return ComputeStatus::BadGrid("compute_vk_zero_dims");
     };
 
-    // Stage buffers first (page_shift-correct). Texture staging follows kernel
-    // translation because sampled-vs-storage access is a SPIR-V interface fact.
-    // The translation cache keeps warm dispatches cheap; no Vulkan work occurs
-    // until every declared resource has staged successfully.
-    let mut staged_bufs: Vec<StagedBuffer> = Vec::new();
-    for b in &acc.buffers {
-        match stage_buffer(state, host, task_id, b) {
-            Ok(s) => staged_bufs.push(s),
-            Err(e) => {
-                // `st={e:?}` alone was not greppable: the Debug spelling was
-                // the only handle on which of stage_buffer's eight checks
-                // refused. `reason=` names it.
-                crate::observe::fail(format!(
-                    "compute_linux stage_buf fail reason={} pipe={} idx={} ref={} off={:#x} class={}",
-                    e.reason(),
-                    acc.pipeline_ref,
-                    b.index,
-                    b.buffer_ref,
-                    b.offset,
-                    e.class()
-                ));
-                return e;
-            }
-        }
-    }
+    // Translate before staging buffers. The final adopted SPIR-V carries the
+    // conservative byte footprint that decides how much of each allocation the
+    // dispatch can touch; staging first discarded that answer and copied every
+    // bind through the end of its allocation.
+    //
     // MTLB → AIR → SPIR-V (LocalSize = threadgroup dims).
     let Some(mtlb) = load_mtlb(
         state,
@@ -3459,6 +3543,38 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             return ComputeStatus::MetalFailed("compute_vk_translate");
         }
     };
+    if let Some(unsupported) = crate::runtime::spirv_bind::first_unsupported_vulkan_interface(
+        &kernel_shader.reflection,
+        metal2vulkan::reflect::ShaderStage::Kernel,
+    ) {
+        let reason = ComputeReflectionDecline::ReflectedInterfaceUnsupported {
+            pipeline_ref: acc.pipeline_ref,
+            feature: unsupported.feature,
+            count: unsupported.count,
+        };
+        crate::observe::Emit::decline("compute_linux_reflection", &reason)
+            .fail_once(u64::from(acc.pipeline_ref));
+        return ComputeStatus::Unsupported(crate::observe::Decline::slug(&reason));
+    }
+    if let Some(resource) =
+        crate::runtime::spirv_bind::first_unsupported_vulkan_resource(&kernel_shader.reflection)
+    {
+        let kind = crate::runtime::spirv_bind::unsupported_vulkan_resource_kind_name(resource.kind)
+            .expect("helper returned an unsupported Vulkan resource");
+        let reason = ComputeReflectionDecline::ReflectedResourceUnsupported {
+            pipeline_ref: acc.pipeline_ref,
+            index: resource.metal_index,
+            binding: resource.descriptor.map(|descriptor| descriptor.binding),
+            kind,
+        };
+        crate::observe::Emit::decline("compute_linux_reflection", &reason)
+            .fail_once((u64::from(acc.pipeline_ref) << 32) | u64::from(resource.metal_index));
+        return ComputeStatus::Unsupported(crate::observe::Decline::slug(&reason));
+    }
+    let reflected_local_size = kernel_shader
+        .reflection
+        .local_size
+        .expect("kernel cache admits only the requested reflected local size");
     let mut spirv = match spirv_words_le(&kernel_shader.spirv) {
         Ok(w) => w,
         Err(e) => {
@@ -3469,41 +3585,77 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         }
     };
 
-    let mut buffer_accesses = Vec::with_capacity(staged_bufs.len());
+    // Stage buffers only after translation has published the final-module
+    // footprint and access. No Vulkan work occurs until every declared resource
+    // has staged successfully. A bind reflection calls `Unused` or does not
+    // declare is skipped before resolving its descriptor, walking its pages, or
+    // allocating its staging Vec.
+    let mut staged_bufs: Vec<StagedBuffer> = Vec::new();
+    let mut buffer_accesses = Vec::with_capacity(acc.buffers.len());
     let mut buffer_readonly_count = 0usize;
     let mut buffer_writable_count = 0usize;
     let mut buffer_unused_count = 0usize;
-    for s in &staged_bufs {
-        use crate::runtime::spirv_bind::BufferAccess;
-        match crate::runtime::spirv_bind::buffer_access(&spirv, s.bind.index) {
-            Some(BufferAccess::ReadOnly) => {
-                buffer_readonly_count += 1;
-                buffer_accesses.push((s.bind.index, false));
-            }
-            Some(BufferAccess::Writable) => {
-                buffer_writable_count += 1;
-                buffer_accesses.push((s.bind.index, true));
-            }
-            Some(BufferAccess::PointerEscape) => {
-                crate::observe::fail(format!(
-                    "compute_linux buffer_access fail reason=spirv_pointer_escape pipe={} idx={} ref={}",
-                    acc.pipeline_ref, s.bind.index, s.bind.buffer_ref
-                ));
-                return ComputeStatus::Unsupported("buffer_spirv_pointer_escape");
-            }
-            Some(BufferAccess::AmbiguousBinding) => {
-                crate::observe::fail(format!(
-                    "compute_linux buffer_access fail reason=spirv_ambiguous_binding pipe={} idx={} ref={}",
-                    acc.pipeline_ref, s.bind.index, s.bind.buffer_ref
-                ));
-                return ComputeStatus::Unsupported("buffer_spirv_ambiguous_binding");
-            }
-            None => {
+    let mut buffer_absent_count = 0usize;
+    let mut buffer_unknown_count = 0usize;
+    for b in &acc.buffers {
+        use crate::runtime::spirv_bind::ReflectedBufferAccess;
+        let access =
+            crate::runtime::spirv_bind::reflected_buffer_access(&kernel_shader.reflection, b.index);
+        let writable = match access {
+            ReflectedBufferAccess::Unused => {
                 buffer_unused_count += 1;
-                crate::observe::line(format!(
-                    "compute_linux buffer_unused pipe={} idx={} ref={}",
-                    acc.pipeline_ref, s.bind.index, s.bind.buffer_ref
+                crate::runtime::drain::note_store_route("compute_buffer_unused_reflected");
+                continue;
+            }
+            ReflectedBufferAccess::Absent => {
+                buffer_unused_count += 1;
+                buffer_absent_count += 1;
+                crate::runtime::drain::note_store_route("compute_buffer_absent_reflected");
+                continue;
+            }
+            ReflectedBufferAccess::ReadOnly => {
+                buffer_readonly_count += 1;
+                false
+            }
+            ReflectedBufferAccess::Writable => {
+                buffer_writable_count += 1;
+                true
+            }
+            ReflectedBufferAccess::Unknown => {
+                // A declared descriptor with no access answer stays on the
+                // conservative read/write arm. The per-translate reflection
+                // guard names the malformed fact; this count shows how often a
+                // dispatch had to pay for it.
+                buffer_writable_count += 1;
+                buffer_unknown_count += 1;
+                true
+            }
+        };
+        let extent = crate::runtime::spirv_bind::reflected_compute_buffer_extent(
+            &kernel_shader.reflection,
+            b.index,
+            [wg_x, wg_y, wg_z],
+            reflected_local_size,
+        );
+        match stage_buffer_with_extent(state, host, task_id, b, extent) {
+            Ok(s) => {
+                buffer_accesses.push((b.index, writable));
+                staged_bufs.push(s);
+            }
+            Err(e) => {
+                // `st={e:?}` alone was not greppable: the Debug spelling was
+                // the only handle on which of stage_buffer's checks refused.
+                // `reason=` names it.
+                crate::observe::fail(format!(
+                    "compute_linux stage_buf fail reason={} pipe={} idx={} ref={} off={:#x} class={}",
+                    e.reason(),
+                    acc.pipeline_ref,
+                    b.index,
+                    b.buffer_ref,
+                    b.offset,
+                    e.class()
                 ));
+                return e;
             }
         }
     }
@@ -3514,7 +3666,17 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         use crate::runtime::spirv_bind::{
             ImageAccess, ReflectedComputeTexture, StorageImageAccess,
         };
-        let binding = crate::runtime::spirv_bind::TEXTURE_BINDING_BASE + t.index;
+        let Some(descriptor) = crate::runtime::spirv_bind::reflected_texture_descriptor(
+            &kernel_shader.reflection,
+            t.index,
+        ) else {
+            crate::observe::line(format!(
+                "compute_linux texture_unused pipe={} i={} ref={}",
+                acc.pipeline_ref, t.index, t.texture_ref
+            ));
+            continue;
+        };
+        let binding = descriptor.binding;
         // Both the sampled-vs-storage class and the shape come solely from the
         // translator's reflection — the declared Metal texture type, exact at
         // translate time. The always-on `census_reflection_wellformed` guard
@@ -3573,7 +3735,9 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             None
         };
         match stage_texture_raw(state, host, task_id, t.texture_ref, binding, is_storage) {
-            Ok(s) => {
+            Ok(mut s) => {
+                s.array_element = descriptor.array_element;
+                s.descriptor_count = descriptor.descriptor_count;
                 if let Some(storage_access) = storage_access {
                     if storage_access == "write_only" {
                         storage_writeonly_count += 1;
@@ -3619,12 +3783,14 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     // A dispatch that staged its resources is expected control flow; the
     // refusals on this path each emit their own typed decline.
     crate::observe::line(format!(
-        "compute_linux stage_ok pipe={} nbuf={} bro={} brw={} bunused={} ntex={} sampled={} storage={} swo={} grid=[{grid_x},{grid_y},{grid_z}] tg=[{tg_x},{tg_y},{tg_z}] encode=engine",
+        "compute_linux stage_ok pipe={} nbuf={} bro={} brw={} bunused={} babsent={} bunknown={} ntex={} sampled={} storage={} swo={} grid=[{grid_x},{grid_y},{grid_z}] tg=[{tg_x},{tg_y},{tg_z}] encode=engine",
         acc.pipeline_ref,
         staged_bufs.len(),
         buffer_readonly_count,
         buffer_writable_count,
         buffer_unused_count,
+        buffer_absent_count,
+        buffer_unknown_count,
         staged_tex.len(),
         sampled_count,
         storage_count,
@@ -3661,12 +3827,15 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             return ComputeStatus::Unsupported("storage_no_selector_specialize");
         };
         let guest_fmt = selector_to_engine_storage(selector);
-        let Some(shader_decl) = crate::runtime::spirv_bind::image_format(&spirv, t.binding) else {
+        let Some(shader_decl) = crate::runtime::spirv_bind::reflected_storage_image_format(
+            &kernel_shader.reflection,
+            t.binding,
+        ) else {
             crate::observe::fail(format!(
-                "compute_linux storage_format fail reason=spirv_format_missing pipe={} bind={} guest={guest_fmt:?} simg={}",
+                "compute_linux storage_format fail reason=reflection_format_missing pipe={} bind={} guest={guest_fmt:?} simg={}",
                 acc.pipeline_ref, t.binding, selector as u32
             ));
-            return ComputeStatus::Unsupported("storage_spirv_format_missing");
+            return ComputeStatus::Unsupported("storage_reflection_format_missing");
         };
         let specialized = match specialized_storage_image_format(
             guest_fmt,
@@ -3800,6 +3969,8 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             }
             storage_images.push(ComputeStorageImageResource {
                 binding: t.binding,
+                array_element: t.array_element,
+                descriptor_count: t.descriptor_count,
                 format: shader_fmt,
                 width: t.width,
                 height: t.height,
@@ -3825,6 +3996,8 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             };
             sampled_images.push(ComputeSampledImageResource {
                 binding: t.binding,
+                array_element: t.array_element,
+                descriptor_count: t.descriptor_count,
                 format: sampled_fmt,
                 width: t.width,
                 height: t.height,
@@ -3872,6 +4045,8 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         .fail_once((u64::from(acc.pipeline_ref) << 32) | u64::from(binding));
         sampled_images.push(ComputeSampledImageResource {
             binding,
+            array_element: 0,
+            descriptor_count: 1,
             format: crate::backend::vulkan::engine::StorageImageFormat::Rgba8Unorm,
             width: NEUTRAL_SAMPLED_IMAGE_EXTENT,
             height: NEUTRAL_SAMPLED_IMAGE_EXTENT,
@@ -3884,10 +4059,17 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         });
     }
 
+    // Reflection is the sampler interface emitted alongside this exact module.
+    // Derive it once per dispatch instead of walking every SPIR-V instruction
+    // once to filter guest samplers and again to provision defaults.
+    let reflected_samplers = kernel_shader.variant(false, false).samplers.clone();
     let mut samplers = Vec::new();
     for s in &acc.samplers {
         let binding = crate::runtime::spirv_bind::SAMPLER_BINDING_BASE + s.index;
-        if !crate::runtime::spirv_bind::sampler_bindings(&spirv).contains(&binding) {
+        if reflected_samplers
+            .binary_search_by_key(&binding, |sampler| sampler.binding)
+            .is_err()
+        {
             continue;
         }
         let mut sampler = match crate::runtime::draw::load_vulkan_sampler(
@@ -3911,10 +4093,35 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         }
         samplers.push(sampler);
     }
-    for binding in crate::runtime::spirv_bind::sampler_bindings(&spirv) {
-        if !samplers.iter().any(|sampler| sampler.binding == binding) {
-            samplers
-                .push(crate::backend::vulkan::engine::SamplerResource::normalized_default(binding));
+    for reflected in reflected_samplers.iter() {
+        if !samplers
+            .iter()
+            .any(|sampler| sampler.binding == reflected.binding)
+        {
+            if let Some(state) = reflected.static_state {
+                let sampler = match crate::runtime::draw::reflected_static_sampler_resource(
+                    "kernel",
+                    reflected.binding,
+                    state,
+                ) {
+                    Ok(sampler) => sampler,
+                    Err(reason) => {
+                        crate::observe::Emit::decline("compute_linux_static_sampler", &reason)
+                            .field("pipe", acc.pipeline_ref)
+                            .fail_once(
+                                (u64::from(acc.pipeline_ref) << 32) | u64::from(reflected.binding),
+                            );
+                        return ComputeStatus::Unsupported("compute_static_sampler_unsupported");
+                    }
+                };
+                samplers.push(sampler);
+            } else {
+                samplers.push(
+                    crate::backend::vulkan::engine::SamplerResource::normalized_default(
+                        reflected.binding,
+                    ),
+                );
+            }
         }
     }
 
@@ -4026,6 +4233,17 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         staged_tex.len(),
     ));
     ComputeStatus::Ok
+}
+
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn linux_stage_input_or_imageblock_unsupported(
+    pipeline_stage_input: bool,
+    acc: &ComputeAccum,
+) -> bool {
+    pipeline_stage_input
+        || acc.imageblock.is_some()
+        || acc.stage_in_region.is_some()
+        || acc.stage_in_region_indirect.is_some()
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -4300,7 +4518,12 @@ fn specialized_storage_image_format(
         // R32 sint/float and the packed Rgb9e5 stay sampled-only until a live
         // capture justifies enabling their storage path.
         V::R32Uint => (1, S::R32ui),
-        V::R32Sint | V::R32Float | V::Rgb9e5Ufloat | V::R16Unorm | V::Rg16Unorm | V::Rgba16Unorm => {
+        V::R32Sint
+        | V::R32Float
+        | V::Rgb9e5Ufloat
+        | V::R16Unorm
+        | V::Rg16Unorm
+        | V::Rgba16Unorm => {
             return Err("spirv_sampled_only_format_as_storage");
         }
         V::Rgba32Float => (0, S::Rgba32Float),
@@ -4494,7 +4717,7 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
 
     let mut staged_bufs: Vec<StagedBuffer> = Vec::new();
     for b in &acc.buffers {
-        match stage_buffer(state, host, task_id, b) {
+        match stage_buffer_with_extent(state, host, task_id, b, None) {
             Ok(s) => staged_bufs.push(s),
             Err(e) => return e,
         }

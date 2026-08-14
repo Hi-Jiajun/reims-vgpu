@@ -24,6 +24,11 @@ pub enum ComputeValidationDecline {
     DuplicateSampledImageBinding {
         binding: u32,
     },
+    SampledArrayElementOutOfRange {
+        binding: u32,
+        element: u32,
+        count: u32,
+    },
     SampledZeroGeometry {
         binding: u32,
         width: u32,
@@ -44,6 +49,11 @@ pub enum ComputeValidationDecline {
     },
     DuplicateStorageImageBinding {
         binding: u32,
+    },
+    StorageArrayElementOutOfRange {
+        binding: u32,
+        element: u32,
+        count: u32,
     },
     StorageZeroGeometry {
         binding: u32,
@@ -71,12 +81,18 @@ impl Decline for ComputeValidationDecline {
             Self::DuplicateSampledImageBinding { .. } => {
                 "vk_compute_validate_duplicate_sampled_image_binding"
             }
+            Self::SampledArrayElementOutOfRange { .. } => {
+                "vk_compute_validate_sampled_array_element_out_of_range"
+            }
             Self::SampledZeroGeometry { .. } => "vk_compute_validate_sampled_zero_geometry",
             Self::SampledBytesLength { .. } => "vk_compute_validate_sampled_bytes_length",
             Self::InvalidSamplerLod { .. } => "vk_compute_validate_invalid_sampler_lod",
             Self::DuplicateSamplerBinding { .. } => "vk_compute_validate_duplicate_sampler_binding",
             Self::DuplicateStorageImageBinding { .. } => {
                 "vk_compute_validate_duplicate_storage_image_binding"
+            }
+            Self::StorageArrayElementOutOfRange { .. } => {
+                "vk_compute_validate_storage_array_element_out_of_range"
             }
             Self::StorageZeroGeometry { .. } => "vk_compute_validate_storage_zero_geometry",
             Self::StorageBytesLength { .. } => "vk_compute_validate_storage_bytes_length",
@@ -97,6 +113,20 @@ impl Decline for ComputeValidationDecline {
             | Self::DuplicateStorageImageBinding { binding } => {
                 vec![("binding", binding.to_string())]
             }
+            Self::SampledArrayElementOutOfRange {
+                binding,
+                element,
+                count,
+            }
+            | Self::StorageArrayElementOutOfRange {
+                binding,
+                element,
+                count,
+            } => vec![
+                ("binding", binding.to_string()),
+                ("element", element.to_string()),
+                ("count", count.to_string()),
+            ],
             Self::SampledZeroGeometry {
                 binding,
                 width,
@@ -154,6 +184,11 @@ mod tests {
             ComputeValidationDecline::DuplicateStorageBufferBinding { binding: 0 },
             ComputeValidationDecline::EmptyStorageBuffer { binding: 0 },
             ComputeValidationDecline::DuplicateSampledImageBinding { binding: 32 },
+            ComputeValidationDecline::SampledArrayElementOutOfRange {
+                binding: 32,
+                element: 2,
+                count: 2,
+            },
             ComputeValidationDecline::SampledZeroGeometry {
                 binding: 32,
                 width: 0,
@@ -171,6 +206,11 @@ mod tests {
             },
             ComputeValidationDecline::DuplicateSamplerBinding { binding: 64 },
             ComputeValidationDecline::DuplicateStorageImageBinding { binding: 34 },
+            ComputeValidationDecline::StorageArrayElementOutOfRange {
+                binding: 34,
+                element: 2,
+                count: 2,
+            },
             ComputeValidationDecline::StorageZeroGeometry {
                 binding: 34,
                 width: 1,
@@ -202,7 +242,7 @@ mod tests {
         // non-2D image shape. A compute texture binding is one flat plane
         // window or one linear GVA level, so there is no slice or depth axis
         // for a request to get wrong.
-        assert_eq!(before, 14, "the compute validator's reason census moved");
+        assert_eq!(before, 16, "the compute validator's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate compute-validation slug");
     }
 

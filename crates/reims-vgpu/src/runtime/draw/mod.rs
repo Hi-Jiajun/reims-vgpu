@@ -454,11 +454,20 @@ fn reorder_rb_in_place(px: &mut [u8], have_bgra: bool, want_bgra: bool) {
 /// StorageBuffer. WebKit's glyph vertex shader is exactly that (a stride-48
 /// stage-in is declared but never read; the function indexes the same buffer as
 /// a per-glyph record array — `StorageBuffer` binding 1 — by `gl_InstanceIndex`).
-/// Detection is purely structural: a `StorageBuffer` decoration at `idx` in the
-/// translated vertex SPIR-V. Never keyed on a shader/struct/variable name.
+/// Detection is purely structural: a buffer binding at `idx` in the adopted
+/// reflection for the translated vertex module. Never keyed on a
+/// shader/struct/variable name.
 #[cfg(feature = "backend-vulkan")]
-fn vertex_buffer_needs_storage_binding(v_words: &[u32], idx: u32, is_stage_in: bool) -> bool {
-    !is_stage_in || crate::runtime::spirv_bind::buffer_access(v_words, idx).is_some()
+fn vertex_buffer_needs_storage_binding(
+    reflection: &metal2vulkan::reflect::ShaderReflection,
+    idx: u32,
+    is_stage_in: bool,
+) -> bool {
+    !is_stage_in
+        || reflection.bindings.iter().any(|binding| {
+            binding.kind == metal2vulkan::reflect::ResourceKind::Buffer
+                && binding.metal_index == idx
+        })
 }
 
 /// Which directly-bound Metal resource class a [`FragUnbound`] names.
@@ -535,23 +544,18 @@ fn frag_unbound_textures_to_neutralize(
         .collect()
 }
 
-/// One pass over the fragment reflection classifying the two bind gaps the render
-/// path cannot recover from. Returns `(unbound, embedded)`:
-/// - **`unbound`** — standard directly-bound kinds (`[[buffer(n)]]` /
-///   `[[texture(n)]]` / `[[sampler(n)]]`) the shader DECLARES but the draw never
-///   provided (per the caller's membership predicates). Each names a descriptor the
-///   translated SPIR-V references yet the Vulkan engine leaves unbound — an
-///   undefined read that paints garbage. `ColorInput` / `ThreadgroupBuffer` /
-///   `StorageImage` reach the shader by
-///   other paths (validated by `census_reflection_wellformed`) and are skipped.
-/// - **`embedded`** — `EmbeddedArgBufferTexture` synthetic indices: textures
-///   metal2vulkan flattened out of an `air.indirect_buffer` argument. The compute
-///   path resolves these; the render (fragment) path has no code to source them, so
-///   each is structurally unbindable here.
+/// One pass over the fragment reflection finding standard directly-bound kinds
+/// (`[[buffer(n)]]` / `[[texture(n)]]` / `[[sampler(n)]]`) the shader declares
+/// but the draw never provided. Each names a descriptor the translated SPIR-V
+/// references yet the Vulkan engine leaves unbound—an undefined read that
+/// paints garbage. `ColorInput` / `ThreadgroupBuffer` are served elsewhere;
+/// storage textures are declined before this scan because the render engine has
+/// no storage-image descriptor path.
 ///
 /// Membership is by caller-supplied predicates so the hot (all-bound) path
-/// allocates nothing — both returned `Vec`s stay empty (no heap) unless a genuine
-/// gap exists, which is near-never on a healthy boot.
+/// allocates nothing unless a genuine gap exists, which is near-never on a
+/// healthy boot. Unsupported reflected resource families are refused before
+/// this scan and therefore have no second classification here.
 #[cfg(feature = "backend-vulkan")]
 fn frag_unbound_scan(
     bindings: &[metal2vulkan::reflect::ResourceBinding],
@@ -559,10 +563,9 @@ fn frag_unbound_scan(
     has_tex: impl Fn(u32) -> bool,
     has_smp: impl Fn(u32) -> bool,
     tex_declared_in_module: impl Fn(u32) -> bool,
-) -> (Vec<FragUnbound>, Vec<u32>) {
+) -> Vec<FragUnbound> {
     use metal2vulkan::reflect::ResourceKind;
     let mut unbound: Vec<FragUnbound> = Vec::new();
-    let mut embedded: Vec<u32> = Vec::new();
     for rb in bindings {
         let (cls, provided) = match rb.kind {
             ResourceKind::Buffer => (FragUnboundClass::Buffer, has_buf(rb.metal_index)),
@@ -570,10 +573,6 @@ fn frag_unbound_scan(
                 (FragUnboundClass::Texture, has_tex(rb.metal_index))
             }
             ResourceKind::Sampler => (FragUnboundClass::Sampler, has_smp(rb.metal_index)),
-            ResourceKind::EmbeddedArgBufferTexture => {
-                embedded.push(rb.metal_index);
-                continue;
-            }
             _ => continue,
         };
         if provided {
@@ -598,7 +597,7 @@ fn frag_unbound_scan(
             metal_index: rb.metal_index,
         });
     }
-    (unbound, embedded)
+    unbound
 }
 
 /// Ask the specification's own question of one reported gap: does the module
@@ -872,6 +871,14 @@ pub struct DrawEncodeRequest {
     /// content from the engine target instead of a CPU seed. Set by the exec
     /// chain loop (Vulkan rail only); default false.
     pub chain_from_resident: bool,
+    /// This draw continues the Metal render encoder of the preceding draw in
+    /// the same decoded stream. Vulkan may keep an identical render pass open
+    /// when no command that is illegal inside it intervenes.
+    pub continues_render_pass: bool,
+    /// Another draw in this decoded Metal render encoder follows this one.
+    /// Vulkan may defer `vkCmdEndRenderPass` until that draw, an outside-pass
+    /// command, or the command-buffer flush closes it.
+    pub render_pass_continues: bool,
     /// This pass's colour0 is a GVA target whose `MTLLoadActionLoad` was **not**
     /// seeded, because the engine still holds what the render Store published
     /// into its guest pages. Set by `mrt_draw_request` from
@@ -1413,9 +1420,9 @@ pub(crate) fn load_render_mtlb_pair<M: HostMemory + HostOps>(
 /// ~4.7 CPU snapshots/draw under Safari scroll, each of which previously paid
 /// the object-list entry read + descriptor read + decode in the failed ZC
 /// attempt *and* again in the CPU fallback).
-struct BufferBacking {
-    gva: u64,
-    size: u64,
+pub(super) struct BufferBacking {
+    pub(super) gva: u64,
+    pub(super) size: u64,
 }
 
 /// The slug for each way a type-1 buffer ref fails to yield a span.
@@ -4035,7 +4042,6 @@ pub(crate) fn load_vulkan_sampler<M: HostMemory + HostOps>(
     vulkan_sampler_resource(sampler_ref, binding, &sampler)
 }
 
-
 /// Store encode RGBA8 into **texture_ref** host cache as BGRA (not surface_id).
 #[cfg(test)]
 fn host_cache_store_rgba8(
@@ -5063,7 +5069,6 @@ fn write_mapping_rgba8_rect<M: HostMemory + HostOps>(
     )
 }
 
-
 /// Seed color RT LOAD from guest type-11 (BGRA→RGBA) or type-2/3/view linear RGBA.
 ///
 /// Every color RT is an ephemeral host RT now, so every `Load` needs this: the
@@ -5214,9 +5219,8 @@ fn seed_color_load<M: HostMemory + HostOps>(
         let gva_present = target_gva != 0
             && crate::runtime::surface_cache::has_gva(state, target_gva, width, height);
         let gva_served = gva_present && {
-            let verdict = crate::runtime::surface_cache::gva_seed_verdict(
-                state, host, task_id, target_gva,
-            );
+            let verdict =
+                crate::runtime::surface_cache::gva_seed_verdict(state, host, task_id, target_gva);
             crate::runtime::drain::note_store_route(verdict.route());
             !matches!(
                 verdict,
@@ -5329,7 +5333,16 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
     // convert unconditionally — `load_buffer_texture_rgba` and
     // `load_type11_mapping_rgba` have no native arm — so they state the layout
     // they always produced rather than being handed a choice they cannot make.
-    load_linear_texture_host(state, host, task_id, tex_ref, level, fmt_override, native, site)
+    load_linear_texture_host(
+        state,
+        host,
+        task_id,
+        tex_ref,
+        level,
+        fmt_override,
+        native,
+        site,
+    )
 }
 
 /// Size a recycled scratch buffer to `span` for a `filled`-byte rect, without
@@ -5753,6 +5766,10 @@ mod memo_scratch_tests {
         .collect();
         tags.sort_unstable();
         tags.dedup();
-        assert_eq!(tags.len(), 3, "two causes share a tag and cannot be told apart");
+        assert_eq!(
+            tags.len(),
+            3,
+            "two causes share a tag and cannot be told apart"
+        );
     }
 }

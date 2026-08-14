@@ -804,116 +804,6 @@ pub const LAYOUT_CHURN: &str = "REIMS_VGPU_LAYOUT_CHURN";
 /// us/draw — excluded as slow, and a single such boot says nothing either.
 pub const PASS_CHURN: &str = "REIMS_VGPU_PASS_CHURN";
 
-/// **Default off.** `on` lets a declared object size narrow the guest bytes the
-/// gather rail *moves*, instead of only narrowing binds that stay above the
-/// zero-copy floor after narrowing — which is none of them.
-///
-/// # Why the rail is inert without it, and why the floor is the reason
-///
-/// `spirv_bind::reflected_buffer_extent` answers `Object` for **57 % of buffer
-/// binds** at the current translator pin, and essentially every answer is 512
-/// bytes or less. `ZERO_COPY_BUFFER_MIN_BYTES` is 16 KiB, so
-/// `load_buffer_content` drops every one of those caps before the rail sees it,
-/// and `try_buffer_zero_copy_resolved` then resolves the whole rest of the
-/// allocation. Both narrowing counters read **zero** across a driven boot of 2.57
-/// million binds.
-///
-/// The bytes behind that, two driven macos-13 boots, summed over the boot:
-///
-/// ```text
-///                            boot 1      boot 2
-/// bext_capped_span_bytes     274.1 GB    272.9 GB
-/// bext_would_save_bytes      274.0 GB    272.9 GB   (99.97 % of the capped)
-/// bext_uncapped_span_bytes   287.3 GB    283.7 GB
-/// ```
-///
-/// That reads as "49 % of every byte this rail moves sits behind a cap that
-/// would remove 99.97 % of it", and the gather is ~55 % of all the GPU time this
-/// device spends (see [`GUEST_IMPORT`]). **Both halves of that sentence are
-/// true and the conclusion drawn from it was still wrong**; the six boots below
-/// say why.
-///
-/// # What it is actually worth: bytes yes, time no
-///
-/// Six interleaved driven macos-13 boots, one binary, quiesced host,
-/// `sustained-animation-probe`. The byte columns are the mechanism's own
-/// control and they are **fully disjoint**:
-///
-/// ```text
-/// arm   gather KB/draw    gathers/draw   zc_buffer_held   narrowed
-/// on         95.5             0.578         2 671 242       7 054
-/// on         98.4             0.585         1 521 450       6 868
-/// on         98.4             0.584         1 496 094       6 679
-/// off       112.6             0.652         1 538 409           0
-/// off       111.2             0.645         1 121 638           0
-/// off       109.4             0.643         2 711 284           0
-/// ```
-///
-/// So the rail moves **12.3 % fewer bytes** in **10 % fewer gathers**, the gate
-/// holds at zero on the `off` arm, and `zc_buffer_held` does *not* fall — the
-/// registry churn that sank the earlier attempt is genuinely avoided, and both
-/// arms' screenshots show a correct desktop.
-///
-/// `us/draw` does not move. Banded within regime, because the guest picks its
-/// own draw rate per boot and the two populations are not comparable:
-///
-/// ```text
-/// regime ~245-255 draws/frame (GPU 23 % busy)   on 15.45, 15.55 | off 15.24, 15.54
-/// regime ~272-274 draws/frame (GPU 41-43 % busy) on 13.77       | off 14.53
-/// ```
-///
-/// At the idle regime the arms interleave, at n=2 against n=2. The one loaded
-/// pair reads −5.2 % for `on`, which is close to the ~6.8 % a 12.3 % byte cut
-/// off a 55 %-of-GPU-time rail predicts — but it is one pair against one pair,
-/// and the same table shows `us/draw` varying by more than that between two
-/// boots of the *same* arm. It is a lead, not a result.
-///
-/// **The 49 % headroom figure is an over-count, and this is the trap to avoid
-/// repeating.** `note_extent_headroom` charges every bind that reaches the
-/// gather rail — about 2.6 M of them — while the GPU only gathers ~640 k times
-/// a boot, because `buffer_bind_reuses` collapses repeats inside one command
-/// buffer before any copy happens. `bext_would_save_bytes` is therefore an upper
-/// bound over *binds*, not over *gathers*, and the honest reduction is the 12.3 %
-/// measured above. Do not flip a default on it.
-///
-/// # What `on` changes, and what it deliberately does not
-///
-/// Only which length is compared against the floor. The floor decides whether a
-/// bind is worth the zero-copy rail *at all*, and that is a question about the
-/// window the guest bound — so it is asked of the full span on both arms. The
-/// narrowed length then decides how much of that window is walked and copied.
-///
-/// That distinction is the whole point. `load_buffer_content`'s doc records an
-/// earlier attempt that applied the cap to the rail *decision*: it saved 2.2 GB a
-/// run, halved `zc_buffer_held` by pushing binds off the registry onto CPU reads,
-/// and bought no time. This arm cannot do that — every bind stays on the rail it
-/// was on, with the same registry entry, and only the extent moves.
-///
-/// It was also ranked on `draw_us/draw`, a CPU wall clock, before this device
-/// could time the GPU. The gather is a PCIe copy; no CPU counter was going to see
-/// it.
-///
-/// # Why it is off by default
-///
-/// Reading fewer bytes than a shader touches is wrong pixels with no error
-/// anywhere, and the entire safety argument is the translator's `Object` verdict
-/// meaning what it says. `robustBufferAccess` bounds-clamps an over-read rather
-/// than leaving it undefined, so the failure mode is visibly wrong rather than
-/// unsound — but visibly wrong is still wrong, and this stays off until an A/B
-/// has both the `gpu_span` reading and a screenshot.
-///
-/// It now has both, and the screenshot passed while the number did not: the six
-/// boots above bought no time on the host that can be measured here. Reading
-/// fewer guest bytes than the guest declared is a correctness risk taken on the
-/// translator's word, and a risk with no measured return is not a default.
-///
-/// What would overturn this is a host where the gather is the constraint rather
-/// than 55 % of a device that is idle three-quarters of the second — which is
-/// exactly the iGPU column of the support matrix, and see [`GUEST_IMPORT`] for
-/// why that host wants a different answer on this whole family. Two boots there
-/// settle it, and the arm and its `bext_*` census stay so that they can.
-pub const EXTENT_NARROW: &str = "REIMS_VGPU_EXTENT_NARROW";
-
 /// **A count, not a switch.** How many draws one command buffer may carry,
 /// narrowing the compiled `BATCH_MAX_DRAWS`. Read through [`count`], so a value
 /// above the compiled cap is refused rather than obeyed.
@@ -1051,7 +941,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 23] = [
+pub const ALL: [&str; 22] = [
     LAZY_WRITEBACK,
     SLAB_RETAIN,
     // Both absent until 2026-08-12, for the same reason `COMPUTE_GATHER` was:
@@ -1084,7 +974,6 @@ pub const ALL: [&str; 23] = [
     GPU_SPANS,
     LAYOUT_CHURN,
     PASS_CHURN,
-    EXTENT_NARROW,
 ];
 
 /// Every variable read as a [`count`] rather than as a [`Switch`].

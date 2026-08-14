@@ -53,12 +53,12 @@
 //! `[gva + offset, gva + size)` — the span the bind actually asked for — so two
 //! binds of one reference at different offsets are two resolutions.
 //!
-//! Resolving the whole allocation once and slicing would collapse those, and it
-//! is what Apple does, but it would also refuse a bind whose allocation has an
-//! unmapped tail page even though the bind itself resolves. Apple can afford
-//! that because `visitUnmappedRanges` tells them which sub-ranges are live;
-//! this device has no such record, so it keeps the narrower key and the wider
-//! admission.
+//! The packed-alias rail does resolve the whole allocation once and slice it,
+//! which is what Apple does. It is an optional answer beside this narrower
+//! registry: if an unmapped tail prevents the whole allocation from being
+//! reconstructed, the exact offset/cap window still resolves here and gathers.
+//! That preserves the wider admission while collapsing the common fully-mapped
+//! case to one host allocation and one Vulkan import per reference.
 //!
 //! **This used to say the two keys agree in practice, because a reference is
 //! bound at one offset. That was never counted, and it is false.** A driven x86
@@ -99,6 +99,44 @@ use std::sync::Arc;
 
 use crate::backend::vulkan::engine::GuestRun;
 use crate::runtime::guest_ram_map::GuestWindowRun;
+
+/// One task buffer reconstructed as a stable, contiguous host allocation.
+///
+/// The allocation follows the buffer's task-virtual byte order even when its
+/// guest-physical pages are scattered. Every offset bind can therefore slice
+/// this one checked import instead of gathering the same pages into scratch.
+#[derive(Clone, Debug)]
+pub struct PackedBuffer {
+    pub gva: u64,
+    pub size: u64,
+    /// Offset of `gva` inside the page-aligned host allocation.
+    pub head: u64,
+    pub import: Arc<crate::runtime::guest_ram::GuestRamImport>,
+}
+
+#[derive(Clone, Debug)]
+pub enum PackedBufferResolution {
+    Available(PackedBuffer),
+    /// The whole declared allocation could not be mapped. Narrow, individually
+    /// walkable binds remain valid and use the existing gather rail.
+    Unavailable {
+        gva: u64,
+        size: u64,
+    },
+}
+
+impl PackedBufferResolution {
+    fn overlaps(&self, gva: u64, len: u64) -> bool {
+        let (base, span) = match self {
+            Self::Available(buffer) => (buffer.gva, buffer.size),
+            Self::Unavailable { gva, size } => (*gva, *size),
+        };
+        if len == 0 || span == 0 {
+            return false;
+        }
+        base < gva.saturating_add(len) && gva < base.saturating_add(span)
+    }
+}
 
 /// A resolved bind: where this reference's bytes live, as the engine binds them.
 ///
@@ -212,6 +250,7 @@ pub fn note_registry_levels(state: &crate::model::DeviceState) {
 #[derive(Default, Debug)]
 pub struct BoundBuffers {
     held: HashMap<Key, BoundBuffer>,
+    packed: HashMap<(u32, u32), PackedBufferResolution>,
 }
 
 impl BoundBuffers {
@@ -251,6 +290,14 @@ impl BoundBuffers {
         );
     }
 
+    pub fn packed(&self, task_id: u32, buffer_ref: u32) -> Option<&PackedBufferResolution> {
+        self.packed.get(&(task_id, buffer_ref))
+    }
+
+    pub fn insert_packed(&mut self, task_id: u32, buffer_ref: u32, packed: PackedBufferResolution) {
+        self.packed.insert((task_id, buffer_ref), packed);
+    }
+
     /// Drop everything held for one task.
     ///
     /// The answer for a page-table root change, a new object list, a deleted
@@ -259,6 +306,7 @@ impl BoundBuffers {
     pub fn retire_task(&mut self, task_id: u32) -> usize {
         let before = self.held.len();
         self.held.retain(|k, _| k.task != task_id);
+        self.packed.retain(|(task, _), _| *task != task_id);
         before - self.held.len()
     }
 
@@ -291,6 +339,7 @@ impl BoundBuffers {
         let before = self.held.len();
         self.held
             .retain(|k, _| k.task != task_id || k.buffer_ref != buffer_ref);
+        self.packed.remove(&(task_id, buffer_ref));
         before - self.held.len()
     }
 
@@ -301,12 +350,15 @@ impl BoundBuffers {
         let before = self.held.len();
         self.held
             .retain(|k, b| k.task != task_id || !b.overlaps(gva, len));
+        self.packed
+            .retain(|(task, _), b| *task != task_id || !b.overlaps(gva, len));
         before - self.held.len()
     }
 
     /// Drop everything. Device reset, where no guest state survives.
     pub fn clear(&mut self) {
         self.held.clear();
+        self.packed.clear();
     }
 
     /// How many resolutions are held, for the census.
@@ -426,6 +478,69 @@ mod tests {
         assert_eq!(b.len(), 1);
     }
 
+    /// Whole-buffer alias answers share the reference lifecycle even when no
+    /// offset resolution has been materialized yet.
+    #[test]
+    fn packed_alias_answers_retire_with_their_reference_and_mapping() {
+        let mut b = BoundBuffers::default();
+        b.insert_packed(
+            1,
+            7,
+            PackedBufferResolution::Unavailable {
+                gva: 0x4000,
+                size: 0x3000,
+            },
+        );
+        b.insert_packed(
+            1,
+            8,
+            PackedBufferResolution::Unavailable {
+                gva: 0x9000,
+                size: 0x1000,
+            },
+        );
+        assert!(b.packed(1, 7).is_some());
+        assert_eq!(b.retire_range(1, 0x5000, 0x1000), 0);
+        assert!(b.packed(1, 7).is_none(), "overlapping alias answer");
+        assert!(b.packed(1, 8).is_some(), "unrelated alias answer");
+        assert_eq!(b.retire_ref(1, 8), 0);
+        assert!(b.packed(1, 8).is_none());
+    }
+
+    #[test]
+    fn one_packed_import_serves_every_offset_of_a_reference() {
+        let import = Arc::new(
+            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                0x7f00_0000_0000,
+                0x8000,
+                0x1000,
+            )
+            .expect("aligned allocation"),
+        );
+        let id = import.id();
+        let mut b = BoundBuffers::default();
+        b.insert_packed(
+            3,
+            9,
+            PackedBufferResolution::Available(PackedBuffer {
+                gva: 0x10800,
+                size: 0x7000,
+                head: 0x800,
+                import,
+            }),
+        );
+        let PackedBufferResolution::Available(packed) = b.packed(3, 9).unwrap() else {
+            panic!("available above")
+        };
+        for (offset, span) in [(0, 0x1000), (0x1800, 0x2000), (0x5000, 0x800)] {
+            let slice = packed
+                .import
+                .slice(packed.head + offset, span)
+                .expect("each bind lies in the one allocation");
+            assert_eq!(slice.import(), id);
+        }
+    }
+
     /// A range retire is scoped to its task: the same GVA under another task is
     /// a different address space and must not be touched.
     #[test]
@@ -481,7 +596,10 @@ mod tests {
         assert_eq!(b.retire_ref(1, 7), 4, "every offset of reference 7");
         assert!(b.get(1, 7, 0, None).is_none());
         assert!(b.get(1, 7, 0x9000, None).is_none());
-        assert!(b.get(1, 8, 0, None).is_some(), "a sibling reference survives");
+        assert!(
+            b.get(1, 8, 0, None).is_some(),
+            "a sibling reference survives"
+        );
         assert!(b.get(2, 7, 0, None).is_some(), "another task's survives");
         assert_eq!(b.len(), 2);
 

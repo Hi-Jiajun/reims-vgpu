@@ -151,6 +151,38 @@ fn reflected_translate_populates_datalayout_and_stage() {
     );
 }
 
+/// A translated vertex shader's final-module footprint reaches the exact byte
+/// cap the draw binder consumes. This is the end-to-end half of the synthetic
+/// arithmetic tests in `spirv_bind`: the fixture reads `float4` records from
+/// buffer 0 and `float2` records from buffer 1 at `vertex_id`, so a draw of
+/// vertices 4..7 needs the exclusive prefixes 112 and 56 bytes respectively.
+#[test]
+fn translated_vertex_footprints_bound_the_draws_buffer_prefixes() {
+    if !have_llvm_dis() {
+        eprintln!("skipping: llvm-dis not on PATH");
+        return;
+    }
+    let (_spirv, reflection) = translate_reflected("textured_quad", Stage::Vertex);
+    let bounds = spirv_bind::RenderBufferIndexBounds::new(4, 3, 0, 1, false);
+    assert_eq!(
+        spirv_bind::reflected_render_buffer_extent(&reflection, 0, bounds),
+        Some(112)
+    );
+    assert_eq!(
+        spirv_bind::reflected_render_buffer_extent(&reflection, 1, bounds),
+        Some(56)
+    );
+    assert_eq!(
+        spirv_bind::reflected_render_buffer_extent(
+            &reflection,
+            0,
+            spirv_bind::RenderBufferIndexBounds::new(4, 3, 0, 1, true),
+        ),
+        None,
+        "an indexed draw cannot substitute index_count for the indices' values"
+    );
+}
+
 /// End-to-end through reims-vgpu's own cache: a cold `translate_cached_reflected`
 /// emits SPIR-V with a populated reflection, and a warm second call for the same
 /// AIR returns the same entry off the cache rather than re-translating.

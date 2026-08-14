@@ -191,7 +191,7 @@ pub const MEMO_CAPACITY: usize = 1024;
 /// # The measurement did not confirm it, and this is what it said
 ///
 /// The twelve interleaved boots quoted on
-/// [`crate::runtime::m2v_cache::ShaderVariant::sampler_bindings`] carried this
+/// [`crate::runtime::m2v_cache::ShaderVariant::samplers`] carried this
 /// change too, and `binds_us` — the column this targets — moved the **wrong
 /// way**: 2.477 [2.418..2.525] before against 2.636 [2.510..2.695] after, per
 /// draw. The ranges touch rather than separate, and the sub-column where the two
@@ -247,8 +247,9 @@ impl VertexBindPlan {
             // from the pipeline alone is allowed to be wrong in.
             .filter(|a| {
                 a.format != 0
-                    && crate::backend::vulkan::translate::vertex::step_function(a.declared_step_function)
-                        == Ok(crate::backend::vulkan::engine::VertexStepFunction::Constant)
+                    && crate::backend::vulkan::translate::vertex::step_function(
+                        a.declared_step_function,
+                    ) == Ok(crate::backend::vulkan::engine::VertexStepFunction::Constant)
             })
             .map(|a| a.buffer_index)
             .collect();
@@ -582,8 +583,7 @@ pub fn translations_ready<M: HostMemory + HostOps>(
         note_store_route("preflight_memo_absent");
         return false;
     };
-    if read_identity(state, host, task_id, pipeline_ref, vertex_ref, fragment_ref)
-        == Some(identity)
+    if read_identity(state, host, task_id, pipeline_ref, vertex_ref, fragment_ref) == Some(identity)
     {
         note_store_route("preflight_memo_ready");
         return true;
@@ -937,18 +937,21 @@ mod tests {
         };
         let desc = RenderPipelineDescriptor {
             vertex_attributes: vec![
-                attr(1, 0x21, 16, CONSTANT),      // constant, and it counts
-                attr(2, 0x21, 16, PER_INSTANCE),  // named, not constant
-                attr(3, 0, 16, CONSTANT),         // format 0: the walk skips it
-                attr(4, 0x21, 0, CONSTANT),       // stride 0: the draw supplies one
-                attr(1, 0x21, 32, PER_INSTANCE),  // a second attribute on buffer 1
-                attr(5, 0x21, 16, None),          // undeclared step is per-vertex
+                attr(1, 0x21, 16, CONSTANT),     // constant, and it counts
+                attr(2, 0x21, 16, PER_INSTANCE), // named, not constant
+                attr(3, 0, 16, CONSTANT),        // format 0: the walk skips it
+                attr(4, 0x21, 0, CONSTANT),      // stride 0: the draw supplies one
+                attr(1, 0x21, 32, PER_INSTANCE), // a second attribute on buffer 1
+                attr(5, 0x21, 16, None),         // undeclared step is per-vertex
             ],
             ..Default::default()
         };
         let plan = VertexBindPlan::build(&desc);
 
-        assert!(plan.is_constant_step(1), "declared Constant with real bytes");
+        assert!(
+            plan.is_constant_step(1),
+            "declared Constant with real bytes"
+        );
         assert!(
             plan.is_constant_step(4),
             "a dynamic layout declares stride 0 and the draw supplies the real \

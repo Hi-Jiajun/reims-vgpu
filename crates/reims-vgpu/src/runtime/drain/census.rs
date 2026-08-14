@@ -2610,18 +2610,18 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
 /// currently reach, against what the machine reported.
 #[cfg(feature = "backend-vulkan")]
 fn emit_guest_import_levels() {
-    let (bytes, count) = crate::backend::vulkan::engine::guest_import_census();
+    let (bytes, count, aliases) = crate::backend::vulkan::engine::guest_import_census();
     let (spans, span_bytes) = crate::runtime::guest_ram_map::span_census();
     // An engine that never imported emits nothing, so a host on a negative
     // `host_pointer` rung — or a boot before the first guest window — costs no
     // line, and a zero here always means the copying rails rather than silence.
-    if count == 0 {
+    if count == 0 && aliases == 0 {
         return;
     }
     crate::observe::off(format!(
-        "guest_import_levels (levels, not per-interval) ramblocks={count}/{spans} \
-         mib={}/{} (imported/reported; a span is imported at first reference, \
-         so below is lazy and above is impossible)",
+        "guest_import_levels (levels, not per-interval) ramblocks={count}/{spans} aliases={aliases} \
+         imported_mib={} ramblock_reported_mib={} (RAMBlock spans import lazily; \
+         packed aliases add to imported_mib without changing the reported RAM size)",
         bytes / (1024 * 1024),
         span_bytes / (1024 * 1024),
     ));

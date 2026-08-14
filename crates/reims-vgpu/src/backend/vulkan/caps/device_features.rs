@@ -181,6 +181,14 @@ pub struct DeviceFeatures {
     /// it has a packed 24/8 depth format will name one.
     pub d24_unorm_s8_attachment: bool,
     pub shader_int16: bool,
+    /// Dynamically uniform indexing into sampled-image descriptor arrays.
+    pub sampled_image_array_dynamic_indexing: bool,
+    /// Dynamically uniform indexing into storage-image descriptor arrays.
+    pub storage_image_array_dynamic_indexing: bool,
+    /// Effective sampled-image descriptor capacity for one stage and set.
+    pub sampled_image_descriptor_limit: u32,
+    /// Effective storage-image descriptor capacity for one stage and set.
+    pub storage_image_descriptor_limit: u32,
     /// `VkPhysicalDeviceFeatures::shaderInt64` — whether a SPIR-V module may
     /// declare the `Int64` capability.
     ///
@@ -278,6 +286,12 @@ pub struct DeviceFeatures {
     /// gated on: the rail that uses it falls back to blocking the drain worker,
     /// which is what every host did before it existed.
     pub timeline_semaphore: bool,
+    /// `descriptorBindingPartiallyBound`, used for Metal texture-handle arrays.
+    /// Metal permits array slots to be nil; Vulkan descriptor arrays otherwise
+    /// require every statically declared element to contain a valid descriptor.
+    /// Hosts without this optional Vulkan 1.2 feature decline those shaders by
+    /// name rather than allocating invented textures or leaving invalid slots.
+    pub descriptor_binding_partially_bound: bool,
     pub mirror_clamp_to_edge: MirrorClampToEdge,
     /// How this host can promise that an out-of-bounds texture read is defined,
     /// which every Metal shader is entitled to assume. See [`ImageRobustness`].
@@ -339,6 +353,22 @@ pub struct DeviceFeatures {
 }
 
 impl DeviceFeatures {
+    /// Whether this device can bind a Metal sampled-texture handle array.
+    /// Both halves are required: the shader indexes an array, and Metal permits
+    /// the guest to leave array elements nil.
+    pub fn sampled_descriptor_arrays(&self, required_descriptors: u32) -> bool {
+        self.descriptor_binding_partially_bound
+            && self.sampled_image_array_dynamic_indexing
+            && required_descriptors <= self.sampled_image_descriptor_limit
+    }
+
+    /// Storage-image counterpart of [`Self::sampled_descriptor_arrays`].
+    pub fn storage_descriptor_arrays(&self, required_descriptors: u32) -> bool {
+        self.descriptor_binding_partially_bound
+            && self.storage_image_array_dynamic_indexing
+            && required_descriptors <= self.storage_image_descriptor_limit
+    }
+
     /// The BGRA-storage composite path needs the format-less write feature and
     /// BGRA8 as a usable storage image. Named once so the pair cannot drift
     /// apart at a call site.
@@ -370,6 +400,8 @@ impl DeviceFeatures {
             .robust_buffer_access(self.robust_buffer_access)
             .sampler_anisotropy(self.sampler_anisotropy)
             .shader_int16(self.shader_int16)
+            .shader_sampled_image_array_dynamic_indexing(self.sampled_image_array_dynamic_indexing)
+            .shader_storage_image_array_dynamic_indexing(self.storage_image_array_dynamic_indexing)
             .shader_int64(self.shader_int64)
             .fragment_stores_and_atomics(self.fragment_stores_and_atomics)
             .vertex_pipeline_stores_and_atomics(self.vertex_pipeline_stores_and_atomics)
@@ -414,6 +446,7 @@ impl DeviceFeatures {
         vk::PhysicalDeviceVulkan12Features::default()
             .shader_output_viewport_index(self.shader_output_viewport_index)
             .timeline_semaphore(self.timeline_semaphore)
+            .descriptor_binding_partially_bound(self.descriptor_binding_partially_bound)
             .sampler_mirror_clamp_to_edge(self.mirror_clamp_to_edge == MirrorClampToEdge::Core12)
             .storage_buffer8_bit_access(self.storage8)
             .shader_float16(self.float16)
@@ -471,6 +504,10 @@ impl DeviceFeatures {
             max_sample_count,
             d24_unorm_s8_attachment,
             shader_int16,
+            sampled_image_array_dynamic_indexing,
+            storage_image_array_dynamic_indexing,
+            sampled_image_descriptor_limit,
+            storage_image_descriptor_limit,
             shader_int64,
             fragment_stores_and_atomics,
             vertex_pipeline_stores_and_atomics,
@@ -486,6 +523,7 @@ impl DeviceFeatures {
             int8,
             shader_output_viewport_index,
             timeline_semaphore,
+            descriptor_binding_partially_bound,
             mirror_clamp_to_edge,
             image_robustness,
             dual_src_blend,
@@ -518,6 +556,10 @@ impl DeviceFeatures {
              max_compute_shared_memory_bytes={max_compute_shared_memory_bytes} \
              max_sample_count={max_sample_count} d24_unorm_s8_attachment={d24_unorm_s8_attachment} \
              shader_int16={shader_int16} shader_int64={shader_int64} \
+             sampled_image_array_dynamic_indexing={sampled_image_array_dynamic_indexing} \
+             storage_image_array_dynamic_indexing={storage_image_array_dynamic_indexing} \
+             sampled_image_descriptor_limit={sampled_image_descriptor_limit} \
+             storage_image_descriptor_limit={storage_image_descriptor_limit} \
              fragment_stores_and_atomics={fragment_stores_and_atomics} \
              vertex_pipeline_stores_and_atomics={vertex_pipeline_stores_and_atomics} \
              storage_image_extended_formats={storage_image_extended_formats} \
@@ -526,7 +568,9 @@ impl DeviceFeatures {
              bgra8_storage={bgra8_storage} no_linear_filter={} no_blendable_attachment={} \
              storage16={storage16} storage8={storage8} float16={float16} int8={int8} \
              shader_output_viewport_index={shader_output_viewport_index} \
-             timeline_semaphore={timeline_semaphore} mirror_clamp_to_edge={mirror_clamp_to_edge:?} \
+             timeline_semaphore={timeline_semaphore} \
+             descriptor_binding_partially_bound={descriptor_binding_partially_bound} \
+             mirror_clamp_to_edge={mirror_clamp_to_edge:?} \
              dual_src_blend={dual_src_blend} fill_mode_non_solid={fill_mode_non_solid} \
              depth_clamp={depth_clamp} multi_viewport={multi_viewport} max_viewports={max_viewports} \
              occlusion_query_precise={occlusion_query_precise}",
@@ -572,8 +616,7 @@ pub unsafe fn query(
     // answerable. A 1.3 host advertises the extension too — promotion keeps the
     // extension name valid — so one query covers both rungs and only the
     // *enable* side has to know which it took.
-    let mut supported_image_robustness =
-        vk::PhysicalDeviceImageRobustnessFeaturesEXT::default();
+    let mut supported_image_robustness = vk::PhysicalDeviceImageRobustnessFeaturesEXT::default();
     let mut features2 = vk::PhysicalDeviceFeatures2::default()
         .push_next(&mut supported_16)
         .push_next(&mut supported_8)
@@ -610,9 +653,8 @@ pub unsafe fn query(
     let mut color_attachment_blend = [false; TexelLayout::ALL.len()];
     for &layout in TexelLayout::ALL {
         let format = crate::backend::vulkan::translate::pixel::vk_texel_layout(layout);
-        let features =
-            unsafe { instance.get_physical_device_format_properties(pd, format) }
-                .optimal_tiling_features;
+        let features = unsafe { instance.get_physical_device_format_properties(pd, format) }
+            .optimal_tiling_features;
         sampled_linear_filter[layout.index()] =
             features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR);
         color_attachment_blend[layout.index()] = features.contains(
@@ -697,6 +739,18 @@ pub unsafe fn query(
         max_sample_count,
         d24_unorm_s8_attachment,
         shader_int16: supported.shader_int16 == vk::TRUE,
+        sampled_image_array_dynamic_indexing: supported.shader_sampled_image_array_dynamic_indexing
+            == vk::TRUE,
+        storage_image_array_dynamic_indexing: supported.shader_storage_image_array_dynamic_indexing
+            == vk::TRUE,
+        sampled_image_descriptor_limit: props
+            .limits
+            .max_per_stage_descriptor_sampled_images
+            .min(props.limits.max_descriptor_set_sampled_images),
+        storage_image_descriptor_limit: props
+            .limits
+            .max_per_stage_descriptor_storage_images
+            .min(props.limits.max_descriptor_set_storage_images),
         shader_int64: supported.shader_int64 == vk::TRUE,
         fragment_stores_and_atomics: supported.fragment_stores_and_atomics == vk::TRUE,
         vertex_pipeline_stores_and_atomics: supported.vertex_pipeline_stores_and_atomics
@@ -715,6 +769,8 @@ pub unsafe fn query(
         int8: supported_f16i8.shader_int8 == vk::TRUE,
         shader_output_viewport_index: supported_vulkan12.shader_output_viewport_index == vk::TRUE,
         timeline_semaphore: supported_vulkan12.timeline_semaphore == vk::TRUE,
+        descriptor_binding_partially_bound: supported_vulkan12.descriptor_binding_partially_bound
+            == vk::TRUE,
         mirror_clamp_to_edge,
     }
 }
@@ -737,6 +793,10 @@ mod tests {
             max_sample_count: 8,
             d24_unorm_s8_attachment: true,
             shader_int16: true,
+            sampled_image_array_dynamic_indexing: true,
+            storage_image_array_dynamic_indexing: true,
+            sampled_image_descriptor_limit: u32::MAX,
+            storage_image_descriptor_limit: u32::MAX,
             shader_int64: true,
             fragment_stores_and_atomics: true,
             vertex_pipeline_stores_and_atomics: true,
@@ -752,6 +812,7 @@ mod tests {
             int8: true,
             shader_output_viewport_index: true,
             timeline_semaphore: true,
+            descriptor_binding_partially_bound: true,
             mirror_clamp_to_edge: MirrorClampToEdge::Core12,
             image_robustness: ImageRobustness::Core13,
             dual_src_blend: true,
@@ -870,7 +931,10 @@ mod tests {
             image_robustness: ImageRobustness::Core13,
             ..Default::default()
         };
-        assert_eq!(core13.enabled_image_robustness().robust_image_access, vk::TRUE);
+        assert_eq!(
+            core13.enabled_image_robustness().robust_image_access,
+            vk::TRUE
+        );
         assert!(
             !core13.required_extensions().contains(&ext_name),
             "promoted to core at 1.3, so the string would be redundant"
@@ -1112,12 +1176,55 @@ mod tests {
             vk::TRUE,
             "the vertex stage's half of the same rule"
         );
+        assert_eq!(
+            enabled.shader_sampled_image_array_dynamic_indexing,
+            vk::TRUE
+        );
+        assert_eq!(
+            enabled.shader_storage_image_array_dynamic_indexing,
+            vk::TRUE
+        );
         // And a host that declines them is never asked, or `vkCreateDevice`
         // fails for every guest instead of the pipelines that need them.
         let none = DeviceFeatures::default().enabled_features();
         assert_eq!(none.shader_int64, vk::FALSE);
         assert_eq!(none.fragment_stores_and_atomics, vk::FALSE);
         assert_eq!(none.vertex_pipeline_stores_and_atomics, vk::FALSE);
+        assert_eq!(none.shader_sampled_image_array_dynamic_indexing, vk::FALSE);
+        assert_eq!(none.shader_storage_image_array_dynamic_indexing, vk::FALSE);
+    }
+
+    #[test]
+    fn descriptor_arrays_require_indexing_and_partially_bound_support() {
+        let all = all_supported();
+        assert!(all.sampled_descriptor_arrays(128));
+        assert!(all.storage_descriptor_arrays(128));
+
+        assert!(!DeviceFeatures {
+            descriptor_binding_partially_bound: false,
+            ..all
+        }
+        .sampled_descriptor_arrays(128));
+        assert!(!DeviceFeatures {
+            sampled_image_array_dynamic_indexing: false,
+            ..all
+        }
+        .sampled_descriptor_arrays(128));
+        assert!(!DeviceFeatures {
+            storage_image_array_dynamic_indexing: false,
+            ..all
+        }
+        .storage_descriptor_arrays(128));
+        assert!(!DeviceFeatures {
+            sampled_image_descriptor_limit: 127,
+            ..all
+        }
+        .sampled_descriptor_arrays(128));
+        assert!(!DeviceFeatures {
+            storage_image_descriptor_limit: 127,
+            ..all
+        }
+        .storage_descriptor_arrays(128));
     }
 
     /// `VUID-VkDeviceCreateInfo-pNext-02830`: a promoted feature struct may not
@@ -1141,14 +1248,17 @@ mod tests {
         assert_eq!(v12.storage_buffer8_bit_access, vk::TRUE);
         assert_eq!(v12.shader_float16, vk::TRUE);
         assert_eq!(v12.shader_int8, vk::TRUE);
+        assert_eq!(v12.descriptor_binding_partially_bound, vk::TRUE);
         // A host that declines one must leave it clear on this struct too,
         // because this struct is now the only place it is said.
         let without = DeviceFeatures {
             float16: false,
+            descriptor_binding_partially_bound: false,
             ..all_supported()
         }
         .enabled_vulkan12();
         assert_eq!(without.shader_float16, vk::FALSE);
+        assert_eq!(without.descriptor_binding_partially_bound, vk::FALSE);
         assert_eq!(without.shader_int8, vk::TRUE);
     }
 }

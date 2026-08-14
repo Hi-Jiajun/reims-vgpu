@@ -303,6 +303,15 @@ engine_counters! {
         seed_gpu_copy_bytes,
         sampled_reuploads,
         sampled_reupload_bytes,
+        /// Actual sampled upload bytes, partitioned by decoded API resource.
+        /// These fields sum to `sampled_reupload_bytes`.
+        sampled_reupload_attachment_bytes,
+        sampled_reupload_buffer_texture_bytes,
+        sampled_reupload_surface_view_bytes,
+        sampled_reupload_surface_cache_bytes,
+        sampled_reupload_surface_guest_bytes,
+        sampled_reupload_linear_texture_bytes,
+        sampled_reupload_synthetic_bytes,
         /// Sampled binds served by gathering scattered guest pages into staging
         /// (`SampledSource::GuestRuns`), and the bytes those gathers moved.
         ///
@@ -477,6 +486,13 @@ engine_counters! {
         buffer_guest_gathers,
         buffer_guest_gather_bytes,
         buffer_guest_gather_regions,
+        /// Gathered windows consumed only by fixed-function vertex fetch.
+        buffer_guest_gather_vertex_bytes,
+        /// Gathered windows consumed only through a shader storage-buffer bind.
+        buffer_guest_gather_storage_bytes,
+        /// Gathered windows consumed by both fixed-function vertex fetch and a
+        /// shader storage-buffer bind. Counted once, like the physical gather.
+        buffer_guest_gather_shared_bytes,
         /// Compute dispatches the buffer gather issued in place of those
         /// regions, and the plans that could not become one.
         ///
@@ -564,6 +580,9 @@ engine_counters! {
         batch_joins,
         batch_flushes,
         batch_flush_draws,
+        /// Draws recorded inside the render pass instance their preceding draw
+        /// left open for the same decoded Metal render encoder.
+        render_pass_continuations,
         /// Readbacks that appended their copy to a batch that was still
         /// recording, and so were submitted with it instead of behind it.
         ///
@@ -766,10 +785,32 @@ impl EngineCounters {
         self.seed_upload_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub fn note_sampled_reupload(&self, bytes: u64) {
+    pub fn note_sampled_reupload(&self, bytes: u64, origin: super::types::SampledByteOrigin) {
         self.sampled_reuploads.fetch_add(1, Ordering::Relaxed);
         self.sampled_reupload_bytes
             .fetch_add(bytes, Ordering::Relaxed);
+        let split = match origin {
+            super::types::SampledByteOrigin::AttachmentAlias => {
+                &self.sampled_reupload_attachment_bytes
+            }
+            super::types::SampledByteOrigin::BufferBackedTexture => {
+                &self.sampled_reupload_buffer_texture_bytes
+            }
+            super::types::SampledByteOrigin::SerializedSurfaceView => {
+                &self.sampled_reupload_surface_view_bytes
+            }
+            super::types::SampledByteOrigin::SurfaceHostCache => {
+                &self.sampled_reupload_surface_cache_bytes
+            }
+            super::types::SampledByteOrigin::SurfaceGuestFallback => {
+                &self.sampled_reupload_surface_guest_bytes
+            }
+            super::types::SampledByteOrigin::LinearTexture => {
+                &self.sampled_reupload_linear_texture_bytes
+            }
+            super::types::SampledByteOrigin::Synthetic => &self.sampled_reupload_synthetic_bytes,
+        };
+        split.fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub fn note_sampled_gather(&self, bytes: u64) {
@@ -788,12 +829,23 @@ impl EngineCounters {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub fn note_buffer_guest_gather(&self, bytes: u64, regions: u64) {
+    pub(super) fn note_buffer_guest_gather(
+        &self,
+        bytes: u64,
+        regions: u64,
+        role: super::exec::BufferGatherRole,
+    ) {
         self.buffer_guest_gathers.fetch_add(1, Ordering::Relaxed);
         self.buffer_guest_gather_bytes
             .fetch_add(bytes, Ordering::Relaxed);
         self.buffer_guest_gather_regions
             .fetch_add(regions, Ordering::Relaxed);
+        let counter = match role {
+            super::exec::BufferGatherRole::Vertex => &self.buffer_guest_gather_vertex_bytes,
+            super::exec::BufferGatherRole::Storage => &self.buffer_guest_gather_storage_bytes,
+            super::exec::BufferGatherRole::Shared => &self.buffer_guest_gather_shared_bytes,
+        };
+        counter.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Record how much of its target one draw could have written.
@@ -961,6 +1013,48 @@ mod tests {
         // And neither is the skip, which counts the population these two divide
         // the complement of. Nothing above took the skip path.
         assert_eq!(s.sampled_gather_skips, 0);
+    }
+
+    /// Source attribution is a partition of uploads that actually happened,
+    /// not a second population counted earlier at resource resolution.
+    #[test]
+    fn sampled_reupload_source_bytes_partition_the_total() {
+        use super::super::types::SampledByteOrigin;
+
+        let counters = EngineCounters::default();
+        let origins = [
+            SampledByteOrigin::AttachmentAlias,
+            SampledByteOrigin::BufferBackedTexture,
+            SampledByteOrigin::SerializedSurfaceView,
+            SampledByteOrigin::SurfaceHostCache,
+            SampledByteOrigin::SurfaceGuestFallback,
+            SampledByteOrigin::LinearTexture,
+            SampledByteOrigin::Synthetic,
+        ];
+        for (index, origin) in origins.into_iter().enumerate() {
+            counters.note_sampled_reupload((index + 1) as u64, origin);
+        }
+
+        let s = counters.snapshot();
+        assert_eq!(s.sampled_reuploads, 7);
+        assert_eq!(s.sampled_reupload_bytes, 28);
+        assert_eq!(s.sampled_reupload_attachment_bytes, 1);
+        assert_eq!(s.sampled_reupload_buffer_texture_bytes, 2);
+        assert_eq!(s.sampled_reupload_surface_view_bytes, 3);
+        assert_eq!(s.sampled_reupload_surface_cache_bytes, 4);
+        assert_eq!(s.sampled_reupload_surface_guest_bytes, 5);
+        assert_eq!(s.sampled_reupload_linear_texture_bytes, 6);
+        assert_eq!(s.sampled_reupload_synthetic_bytes, 7);
+        assert_eq!(
+            s.sampled_reupload_attachment_bytes
+                + s.sampled_reupload_buffer_texture_bytes
+                + s.sampled_reupload_surface_view_bytes
+                + s.sampled_reupload_surface_cache_bytes
+                + s.sampled_reupload_surface_guest_bytes
+                + s.sampled_reupload_linear_texture_bytes
+                + s.sampled_reupload_synthetic_bytes,
+            s.sampled_reupload_bytes
+        );
     }
 
     #[test]

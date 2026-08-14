@@ -5,7 +5,9 @@
 use ash::vk;
 use std::collections::BTreeSet;
 
-use super::caches::{BindingSig, ComputePipelineKey, LayoutKey, ObjectCaches};
+use super::caches::{
+    canonicalize_layout_bindings, BindingSig, ComputePipelineKey, LayoutKey, ObjectCaches,
+};
 use super::compute_execution::ComputeExecutionDecline;
 use super::compute_validation::ComputeValidationDecline;
 use super::context::ContextOwner;
@@ -20,6 +22,7 @@ use super::vk_call::{VkCall, VkOp};
 
 struct PreparedStorageImage {
     binding: u32,
+    array_element: u32,
     slot: StorageImageSlot,
     seed: Option<BufferSlot>,
     dst: ComputeImageDst,
@@ -37,6 +40,7 @@ struct PreparedStorageImage {
 /// from a host staging upload or from a device-local resident copy.
 struct PreparedSampledImage {
     binding: u32,
+    array_element: u32,
     img: StorageImageSlot,
     upload: Option<BufferSlot>,
     /// Copy-on-sample source `(resident image, what last touched it)`.
@@ -81,7 +85,7 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
     }
     let mut bindings = BTreeSet::new();
     for b in &req.storage_buffers {
-        if !bindings.insert(b.binding) {
+        if !bindings.insert((b.binding, 0)) {
             return Err(DrawError::ComputeValidation(
                 ComputeValidationDecline::DuplicateStorageBufferBinding { binding: b.binding },
             ));
@@ -93,7 +97,16 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
         }
     }
     for img in &req.sampled_images {
-        if !bindings.insert(img.binding) {
+        if img.descriptor_count == 0 || img.array_element >= img.descriptor_count {
+            return Err(DrawError::ComputeValidation(
+                ComputeValidationDecline::SampledArrayElementOutOfRange {
+                    binding: img.binding,
+                    element: img.array_element,
+                    count: img.descriptor_count,
+                },
+            ));
+        }
+        if !bindings.insert((img.binding, img.array_element)) {
             return Err(DrawError::ComputeValidation(
                 ComputeValidationDecline::DuplicateSampledImageBinding {
                     binding: img.binding,
@@ -134,7 +147,7 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        if !bindings.insert(sampler.binding) {
+        if !bindings.insert((sampler.binding, 0)) {
             return Err(DrawError::ComputeValidation(
                 ComputeValidationDecline::DuplicateSamplerBinding {
                     binding: sampler.binding,
@@ -143,7 +156,16 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
         }
     }
     for img in &req.storage_images {
-        if !bindings.insert(img.binding) {
+        if img.descriptor_count == 0 || img.array_element >= img.descriptor_count {
+            return Err(DrawError::ComputeValidation(
+                ComputeValidationDecline::StorageArrayElementOutOfRange {
+                    binding: img.binding,
+                    element: img.array_element,
+                    count: img.descriptor_count,
+                },
+            ));
+        }
+        if !bindings.insert((img.binding, img.array_element)) {
             return Err(DrawError::ComputeValidation(
                 ComputeValidationDecline::DuplicateStorageImageBinding {
                     binding: img.binding,
@@ -239,8 +261,7 @@ fn used_binding_absent_from_layout(spirv: &[u32], layout: &[BindingSig]) -> Opti
         .into_iter()
         .find(|binding| {
             !layout.iter().any(|b| b.binding == *binding)
-                && crate::runtime::spirv_bind::descriptor_static_use(spirv, *binding)
-                    .is_violation()
+                && crate::runtime::spirv_bind::descriptor_static_use(spirv, *binding).is_violation()
         })
 }
 
@@ -275,6 +296,7 @@ pub(crate) unsafe fn execute_compute_inner(
             binding: b.binding,
             ty: vk::DescriptorType::STORAGE_BUFFER.as_raw() as u32,
             stages: vk::ShaderStageFlags::COMPUTE.as_raw(),
+            count: 1,
         });
     }
     for img in &req.sampled_images {
@@ -282,6 +304,7 @@ pub(crate) unsafe fn execute_compute_inner(
             binding: img.binding,
             ty: vk::DescriptorType::SAMPLED_IMAGE.as_raw() as u32,
             stages: vk::ShaderStageFlags::COMPUTE.as_raw(),
+            count: img.descriptor_count,
         });
     }
     for sampler in &req.samplers {
@@ -289,6 +312,7 @@ pub(crate) unsafe fn execute_compute_inner(
             binding: sampler.binding,
             ty: vk::DescriptorType::SAMPLER.as_raw() as u32,
             stages: vk::ShaderStageFlags::COMPUTE.as_raw(),
+            count: 1,
         });
     }
     for img in &req.storage_images {
@@ -296,9 +320,52 @@ pub(crate) unsafe fn execute_compute_inner(
             binding: img.binding,
             ty: vk::DescriptorType::STORAGE_IMAGE.as_raw() as u32,
             stages: vk::ShaderStageFlags::COMPUTE.as_raw(),
+            count: img.descriptor_count,
         });
     }
-    layout_bindings.sort_by_key(|b| b.binding);
+    let layout_bindings = canonicalize_layout_bindings(layout_bindings)?;
+    for binding in layout_bindings.iter().filter(|binding| binding.count > 1) {
+        let descriptor_type = vk::DescriptorType::from_raw(binding.ty as i32);
+        let dynamic_indexing = match descriptor_type {
+            vk::DescriptorType::SAMPLED_IMAGE => ctx.features.sampled_image_array_dynamic_indexing,
+            vk::DescriptorType::STORAGE_IMAGE => ctx.features.storage_image_array_dynamic_indexing,
+            _ => true,
+        };
+        let required_descriptors = layout_bindings
+            .iter()
+            .filter(|candidate| {
+                vk::DescriptorType::from_raw(candidate.ty as i32) == descriptor_type
+            })
+            .fold(0u32, |total, candidate| {
+                total.saturating_add(candidate.count)
+            });
+        let arrays_supported = match descriptor_type {
+            vk::DescriptorType::SAMPLED_IMAGE => {
+                ctx.features.sampled_descriptor_arrays(required_descriptors)
+            }
+            vk::DescriptorType::STORAGE_IMAGE => {
+                ctx.features.storage_descriptor_arrays(required_descriptors)
+            }
+            _ => true,
+        };
+        let descriptor_limit = match descriptor_type {
+            vk::DescriptorType::SAMPLED_IMAGE => ctx.features.sampled_image_descriptor_limit,
+            vk::DescriptorType::STORAGE_IMAGE => ctx.features.storage_image_descriptor_limit,
+            _ => u32::MAX,
+        };
+        if !arrays_supported {
+            return Err(DrawError::Unsupported(
+                super::reason::DrawReason::DescriptorArrayUnsupported {
+                    binding: binding.binding,
+                    count: binding.count,
+                    required_descriptors,
+                    descriptor_limit,
+                    partially_bound: ctx.features.descriptor_binding_partially_bound,
+                    dynamic_indexing,
+                },
+            ));
+        }
+    }
 
     if let Some(binding) = used_binding_absent_from_layout(&req.spirv, &layout_bindings) {
         return Err(DrawError::ComputeExecution(
@@ -404,6 +471,7 @@ pub(crate) unsafe fn execute_compute_inner(
         };
         sampled_slots.push(PreparedSampledImage {
             binding: resource.binding,
+            array_element: resource.array_element,
             img,
             upload,
             resident_src,
@@ -488,6 +556,7 @@ pub(crate) unsafe fn execute_compute_inner(
         )?);
         simg_slots.push(PreparedStorageImage {
             binding: resource.binding,
+            array_element: resource.array_element,
             slot: img,
             seed: st,
             dst,
@@ -549,6 +618,7 @@ pub(crate) unsafe fn execute_compute_inner(
                 vk::WriteDescriptorSet::default()
                     .dst_set(dset)
                     .dst_binding(prepared.binding)
+                    .dst_array_element(prepared.array_element)
                     .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                     .image_info(std::slice::from_ref(&sampled_infos[i])),
             );
@@ -567,6 +637,7 @@ pub(crate) unsafe fn execute_compute_inner(
                 vk::WriteDescriptorSet::default()
                     .dst_set(dset)
                     .dst_binding(prepared.binding)
+                    .dst_array_element(prepared.array_element)
                     .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                     .image_info(std::slice::from_ref(&image_infos[i])),
             );
@@ -995,10 +1066,7 @@ pub(crate) unsafe fn execute_compute_inner(
         .dispatches
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    Ok(ComputeOutput {
-        buffers,
-        images,
-    })
+    Ok(ComputeOutput { buffers, images })
 }
 
 /// Copy a completely initialized mapped Vulkan output without first touching
@@ -1043,10 +1111,14 @@ mod tests {
             binding,
             ty: vk::DescriptorType::SAMPLED_IMAGE.as_raw() as u32,
             stages: vk::ShaderStageFlags::COMPUTE.as_raw(),
+            count: 1,
         };
 
         assert_eq!(used_binding_absent_from_layout(&spirv, &[]), Some(33));
-        assert_eq!(used_binding_absent_from_layout(&spirv, &[sig(34)]), Some(33));
+        assert_eq!(
+            used_binding_absent_from_layout(&spirv, &[sig(34)]),
+            Some(33)
+        );
         // Covering the used binding is sufficient: 34 is declared and never
         // referenced, so leaving it out is legal and must not be reported.
         assert_eq!(used_binding_absent_from_layout(&spirv, &[sig(33)]), None);
@@ -1073,6 +1145,8 @@ mod tests {
     fn resident_sample_resource() -> ComputeSampledImageResource {
         ComputeSampledImageResource {
             binding: 32,
+            array_element: 0,
+            descriptor_count: 1,
             format: StorageImageFormat::Rgba8Unorm,
             width: 1,
             height: 1,
@@ -1128,6 +1202,36 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_array_elements_share_one_binding_without_being_duplicates() {
+        let mut first = resident_sample_resource();
+        first.descriptor_count = 8;
+        let mut second = resident_sample_resource();
+        second.array_element = 7;
+        second.descriptor_count = 8;
+        let request = ComputeRequest {
+            spirv: vec![0x0723_0203],
+            entry: "main".into(),
+            grid: [1, 1, 1],
+            sampled_images: vec![first, second],
+            ..Default::default()
+        };
+        assert_eq!(validate_compute(&request), Ok(()));
+
+        let mut out_of_range = request;
+        out_of_range.sampled_images[1].array_element = 8;
+        assert!(matches!(
+            validate_compute(&out_of_range),
+            Err(DrawError::ComputeValidation(
+                ComputeValidationDecline::SampledArrayElementOutOfRange {
+                    binding: 32,
+                    element: 8,
+                    count: 8,
+                }
+            ))
+        ));
+    }
+
+    #[test]
     fn resident_sample_shape_causes_are_not_collapsed() {
         let exact = resident_sample_resource();
         assert_eq!(
@@ -1165,6 +1269,8 @@ mod tests {
             grid: [1, 1, 1],
             sampled_images: vec![ComputeSampledImageResource {
                 binding: 32,
+                array_element: 0,
+                descriptor_count: 1,
                 format: StorageImageFormat::Rgba8Unorm,
                 width: 1,
                 height: 1,
@@ -1174,6 +1280,8 @@ mod tests {
             samplers: vec![SamplerResource::normalized_default(64)],
             storage_images: vec![ComputeStorageImageResource {
                 binding: 34,
+                array_element: 0,
+                descriptor_count: 1,
                 format: StorageImageFormat::Rgba8Uint,
                 width: 1,
                 height: 1,

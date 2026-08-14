@@ -122,6 +122,30 @@ pub enum DrawPreparationDecline {
         binding: u32,
         kind: String,
     },
+    /// The render engine currently exposes guest textures as sampled images.
+    /// Binding a reflected storage image through that descriptor type would be
+    /// invalid Vulkan, so refuse before constructing the request.
+    TextureAccessUnsupported {
+        stage: &'static str,
+        index: u32,
+        texture_ref: u32,
+        binding: u32,
+        access: &'static str,
+    },
+    /// A valid reflected resource needs a runtime provisioning path this
+    /// backend does not implement. Treating its index as an ordinary stream
+    /// bind—or as absent—leaves real shader work unbound.
+    ReflectedResourceUnsupported {
+        stage: &'static str,
+        index: u32,
+        binding: Option<u32>,
+        kind: &'static str,
+    },
+    ReflectedInterfaceUnsupported {
+        stage: &'static str,
+        feature: &'static str,
+        count: usize,
+    },
     ChainResidentNotReady {
         target_gva: u64,
         width: u32,
@@ -226,13 +250,6 @@ pub enum DrawPreparationDecline {
         stage: &'static str,
         binding: u32,
     },
-    StaticSamplerReflectionDescriptorMissing {
-        stage: &'static str,
-    },
-    StaticSamplerReflectionStateMissing {
-        stage: &'static str,
-        binding: u32,
-    },
 }
 
 fn log_token(detail: &str) -> String {
@@ -303,6 +320,13 @@ impl Decline for DrawPreparationDecline {
             Self::TextureDimensionUnsupported { .. } => {
                 "draw_prepare_texture_dimension_unsupported"
             }
+            Self::TextureAccessUnsupported { .. } => "draw_prepare_texture_access_unsupported",
+            Self::ReflectedResourceUnsupported { .. } => {
+                "draw_prepare_reflected_resource_unsupported"
+            }
+            Self::ReflectedInterfaceUnsupported { .. } => {
+                "draw_prepare_reflected_interface_unsupported"
+            }
             Self::ChainResidentNotReady { .. } => "draw_prepare_chain_resident_not_ready",
             Self::IndexLoad { reason } => reason.slug(),
             Self::ChainResidentIdentityMissing { .. } => {
@@ -353,12 +377,6 @@ impl Decline for DrawPreparationDecline {
             }
             Self::StaticSamplerMagFilterUnsupported { .. } => {
                 "draw_prepare_static_sampler_mag_filter_unsupported"
-            }
-            Self::StaticSamplerReflectionDescriptorMissing { .. } => {
-                "draw_prepare_static_sampler_reflection_descriptor_missing"
-            }
-            Self::StaticSamplerReflectionStateMissing { .. } => {
-                "draw_prepare_static_sampler_reflection_state_missing"
             }
         }
     }
@@ -531,6 +549,42 @@ impl Decline for DrawPreparationDecline {
                 ("binding", binding.to_string()),
                 ("kind", log_token(kind)),
             ],
+            Self::TextureAccessUnsupported {
+                stage,
+                index,
+                texture_ref,
+                binding,
+                access,
+            } => vec![
+                ("stage", (*stage).to_string()),
+                ("index", index.to_string()),
+                ("texture_ref", texture_ref.to_string()),
+                ("binding", binding.to_string()),
+                ("access", (*access).to_string()),
+            ],
+            Self::ReflectedResourceUnsupported {
+                stage,
+                index,
+                binding,
+                kind,
+            } => vec![
+                ("stage", (*stage).to_string()),
+                ("index", index.to_string()),
+                (
+                    "binding",
+                    binding.map_or_else(|| "none".to_string(), |value| value.to_string()),
+                ),
+                ("kind", (*kind).to_string()),
+            ],
+            Self::ReflectedInterfaceUnsupported {
+                stage,
+                feature,
+                count,
+            } => vec![
+                ("stage", (*stage).to_string()),
+                ("feature", (*feature).to_string()),
+                ("count", count.to_string()),
+            ],
             Self::ChainResidentNotReady {
                 target_gva,
                 width,
@@ -684,13 +738,6 @@ impl Decline for DrawPreparationDecline {
                 ("stage", (*stage).to_string()),
                 ("binding", binding.to_string()),
             ],
-            Self::StaticSamplerReflectionDescriptorMissing { stage } => {
-                vec![("stage", (*stage).to_string())]
-            }
-            Self::StaticSamplerReflectionStateMissing { stage, binding } => vec![
-                ("stage", (*stage).to_string()),
-                ("binding", binding.to_string()),
-            ],
         }
     }
 }
@@ -810,6 +857,24 @@ mod tests {
                 binding: 34,
                 kind: "Cube".into(),
             },
+            DrawPreparationDecline::TextureAccessUnsupported {
+                stage: "fragment",
+                index: 2,
+                texture_ref: 7,
+                binding: 34,
+                access: "storage",
+            },
+            DrawPreparationDecline::ReflectedResourceUnsupported {
+                stage: "fragment",
+                index: 2,
+                binding: Some(34),
+                kind: "embedded_texture",
+            },
+            DrawPreparationDecline::ReflectedInterfaceUnsupported {
+                stage: "fragment",
+                feature: "fragment_imageblock",
+                count: 2,
+            },
             DrawPreparationDecline::ChainResidentNotReady {
                 target_gva: 0x12000,
                 width: 1280,
@@ -911,11 +976,6 @@ mod tests {
                 stage: "fragment",
                 binding: 64,
             },
-            DrawPreparationDecline::StaticSamplerReflectionDescriptorMissing { stage: "fragment" },
-            DrawPreparationDecline::StaticSamplerReflectionStateMissing {
-                stage: "fragment",
-                binding: 64,
-            },
         ]
     }
 
@@ -938,7 +998,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 42, "the draw-preparation reason census moved");
+        assert_eq!(before, 43, "the draw-preparation reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-preparation slug");
     }
 

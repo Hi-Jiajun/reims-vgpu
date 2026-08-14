@@ -53,7 +53,7 @@
 //! PTE-corruption class the surface page-ownership guards exist for.
 //! It applied to the dma-buf and it applies here.
 //!
-//! # One import per RAMBlock, for the lifetime of the VM
+//! # RAMBlock imports and packed task-buffer aliases
 //!
 //! GPA → HVA is linear *within* a RAMBlock, so one import covers every guest
 //! page in it and a resource becomes an `(offset, len)` pair rather than a page
@@ -62,10 +62,12 @@
 //! it is why a scattered surface is not un-importable: it is N slices over one
 //! import.
 //!
-//! **Do not import per resource.** The extension does not guarantee that
-//! importing the same host allocation twice into one device works, and
-//! re-importing per draw pays the driver's `get_user_pages` thousands of times a
-//! second for an answer that never changes.
+//! A task buffer whose physical pages are scattered has no single range inside
+//! a RAMBlock. On a host that can construct a stable packed alias, that alias is
+//! a second kind of import: one per live `(task, buffer reference)`, sliced for
+//! every offset bind and retired with the reference or its mappings. Importing
+//! the alias is optional; a driver may refuse it and the existing gather remains
+//! the correctness path. It is never attempted per draw.
 
 use crate::contract::checked::align_up_u64;
 use crate::observe::{Decline, Emit};
@@ -209,7 +211,9 @@ impl Decline for GuestRamError {
             Self::AlignmentNotPowerOfTwo { .. } => "guest_ram_alignment_not_power_of_two",
             Self::AlignmentUnsatisfiable { .. } => "guest_ram_alignment_unsatisfiable",
             Self::ImportBudgetEmpty => "guest_ram_import_budget_empty",
-            Self::ImportSpanMaxBelowGranularity { .. } => "guest_ram_import_span_max_below_granularity",
+            Self::ImportSpanMaxBelowGranularity { .. } => {
+                "guest_ram_import_span_max_below_granularity"
+            }
             Self::SliceEmpty => "guest_ram_slice_empty",
             Self::SliceOverflow { .. } => "guest_ram_slice_overflow",
             Self::SliceEndPastImport { .. } => "guest_ram_slice_end_past_import",
@@ -226,7 +230,10 @@ impl Decline for GuestRamError {
             | Self::SliceEmpty
             | Self::ImportBudgetEmpty => Vec::new(),
             Self::RegionWraps { host_va, len } => {
-                vec![("host_va", format!("{host_va:#x}")), ("len", len.to_string())]
+                vec![
+                    ("host_va", format!("{host_va:#x}")),
+                    ("len", len.to_string()),
+                ]
             }
             Self::AlignmentNotPowerOfTwo { align } => vec![("align", align.to_string())],
             Self::AlignmentUnsatisfiable { align, len } => {
@@ -285,11 +292,11 @@ impl GuestRamError {
     }
 }
 
-/// One RAMBlock, imported once, and the only thing that can name a byte in it.
+/// One bounded host allocation, and the only thing that can name a byte in it.
 ///
-/// Created at device init and held for the VM's lifetime. Not per draw, not per
-/// window, not per resource — see the module doc for why re-importing is both
-/// unsupported and expensive.
+/// A RAMBlock form is created at device init and held for the VM's lifetime. A
+/// packed task-buffer form is created once per live guest buffer reference. Both
+/// are sliced by checked relative offsets; neither is created per draw/window.
 ///
 /// The backend's handle for the import (a `VkDeviceMemory` and its whole-region
 /// `VkBuffer`, or an `MTLBuffer`) lives beside this in the backend, keyed by
@@ -300,8 +307,9 @@ impl GuestRamError {
 #[derive(Debug)]
 pub struct GuestRamImport {
     id: ImportId,
-    /// Guest physical address of the first byte *covered*, after any trim.
-    gpa_base: u64,
+    /// Guest physical address of the first byte covered, when this is a
+    /// RAMBlock import. A packed task-VA alias has no linear GPA coordinate.
+    gpa_base: Option<u64>,
     /// Host virtual address of the first byte covered, after any trim. The
     /// address handed to the backend's import call, and never a subrange of it.
     host_base: usize,
@@ -375,8 +383,46 @@ impl GuestRamImport {
 
         Ok(Self {
             id: ImportId::allocate(),
-            gpa_base: region.gpa_base + head,
+            gpa_base: Some(region.gpa_base + head),
             host_base: host_base as usize,
+            len,
+            align,
+        })
+    }
+
+    /// Bound an already-packed, stable host allocation for backend import.
+    ///
+    /// Unlike [`Self::new`], this allocation has no guest-physical coordinate:
+    /// its consecutive host pages may name arbitrary GPAs in one task's virtual
+    /// order. It can therefore be sliced only by relative offset, never through
+    /// [`Self::slice_for_gpa`]. The host owns the mapping and must keep it live
+    /// until the backend device has released every import made from it.
+    pub fn new_host_allocation(
+        host_base: usize,
+        len: u64,
+        align: u64,
+    ) -> Result<Self, GuestRamError> {
+        if align == 0 || !align.is_power_of_two() {
+            return Err(GuestRamError::AlignmentNotPowerOfTwo { align }.report());
+        }
+        if host_base == 0 {
+            return Err(GuestRamError::RegionUnmapped.report());
+        }
+        if len == 0 {
+            return Err(GuestRamError::RegionEmpty.report());
+        }
+        let host = host_base as u64;
+        host.checked_add(len)
+            .filter(|end| *end <= usize::MAX as u64)
+            .ok_or(GuestRamError::RegionWraps { host_va: host, len })
+            .map_err(GuestRamError::report)?;
+        if !host.is_multiple_of(align) || !len.is_multiple_of(align) {
+            return Err(GuestRamError::AlignmentUnsatisfiable { align, len }.report());
+        }
+        Ok(Self {
+            id: ImportId::allocate(),
+            gpa_base: None,
+            host_base,
             len,
             align,
         })
@@ -388,7 +434,7 @@ impl GuestRamImport {
     }
 
     /// Guest physical address of the first byte covered.
-    pub fn gpa_base(&self) -> u64 {
+    pub fn gpa_base(&self) -> Option<u64> {
         self.gpa_base
     }
 
@@ -421,7 +467,8 @@ impl GuestRamImport {
 
     /// Whether `gpa` falls inside the covered span.
     pub fn contains_gpa(&self, gpa: u64) -> bool {
-        gpa >= self.gpa_base && gpa - self.gpa_base < self.len
+        self.gpa_base
+            .is_some_and(|base| gpa >= base && gpa - base < self.len)
     }
 
     /// The only constructor of a [`GuestSlice`].
@@ -471,13 +518,21 @@ impl GuestRamImport {
     /// [`Self::slice`] addressed by guest physical address, which is how every
     /// decoded resource names its bytes.
     pub fn slice_for_gpa(&self, gpa: u64, len: u64) -> Result<GuestSlice, GuestRamError> {
+        let Some(gpa_base) = self.gpa_base else {
+            return Err(GuestRamError::GpaOutsideImport {
+                gpa,
+                gpa_base: 0,
+                len: self.len,
+            }
+            .report());
+        };
         let outside = GuestRamError::GpaOutsideImport {
             gpa,
-            gpa_base: self.gpa_base,
+            gpa_base,
             len: self.len,
         };
         let offset = gpa
-            .checked_sub(self.gpa_base)
+            .checked_sub(gpa_base)
             .ok_or(outside)
             .map_err(GuestRamError::report)?;
         if offset >= self.len {
@@ -887,7 +942,13 @@ mod tests {
     fn a_slice_is_widened_to_the_granularity_and_says_by_how_much() {
         let import = import(0x2000, 0x1000);
         let slice = import.slice(5, 4).expect("inside");
-        assert_eq!(import.resolve(&slice), Ok(BoundRange { offset: 0, len: 0x1000 }));
+        assert_eq!(
+            import.resolve(&slice),
+            Ok(BoundRange {
+                offset: 0,
+                len: 0x1000
+            })
+        );
         assert_eq!(slice.head(), 5);
         assert_eq!(slice.requested(), 4);
         assert_eq!(slice.bound_len(), 0x1000);
@@ -934,7 +995,7 @@ mod tests {
             len: 0x4000,
         };
         let import = GuestRamImport::new(region, 0x1000).expect("trims to fit");
-        assert_eq!(import.gpa_base(), region.gpa_base + 0x800);
+        assert_eq!(import.gpa_base(), Some(region.gpa_base + 0x800));
         assert_eq!(import.host_base(), 0x7f00_0000_1000);
         assert_eq!(import.len(), 0x3000);
 
@@ -946,9 +1007,31 @@ mod tests {
             import.slice_for_gpa(region.gpa_base + 0x800 + 0x3000, 4),
             Err(GuestRamError::GpaOutsideImport { .. })
         ));
-        assert!(import.slice_for_gpa(import.gpa_base(), 4).is_ok());
-        assert!(import.contains_gpa(import.gpa_base()));
+        let gpa_base = import.gpa_base().expect("RAMBlock coordinate");
+        assert!(import.slice_for_gpa(gpa_base, 4).is_ok());
+        assert!(import.contains_gpa(gpa_base));
         assert!(!import.contains_gpa(region.gpa_base));
+    }
+
+    /// A packed task-address alias is bounded like RAM, but deliberately has no
+    /// GPA interpretation: adjacent bytes may come from unrelated guest frames.
+    #[test]
+    fn a_packed_host_allocation_slices_only_by_relative_offset() {
+        let import = GuestRamImport::new_host_allocation(0x7f00_0000_0000, 0x4000, 0x1000)
+            .expect("aligned stable allocation");
+        assert_eq!(import.gpa_base(), None);
+        let slice = import.slice(0x1800, 0x800).expect("inside allocation");
+        assert_eq!(
+            import.resolve(&slice),
+            Ok(BoundRange {
+                offset: 0x1000,
+                len: 0x1000,
+            })
+        );
+        assert!(matches!(
+            import.slice_for_gpa(0x1800, 0x800),
+            Err(GuestRamError::GpaOutsideImport { .. })
+        ));
     }
 
     /// A block the granularity cannot fit in is refused by name, rather than
@@ -1037,10 +1120,7 @@ mod tests {
         let all = [
             GuestRamError::RegionEmpty,
             GuestRamError::RegionUnmapped,
-            GuestRamError::RegionWraps {
-                host_va: 0,
-                len: 0,
-            },
+            GuestRamError::RegionWraps { host_va: 0, len: 0 },
             GuestRamError::AlignmentNotPowerOfTwo { align: 0 },
             GuestRamError::AlignmentUnsatisfiable { align: 0, len: 0 },
             GuestRamError::SliceEmpty,
@@ -1053,7 +1133,10 @@ mod tests {
                 aligned_end: 0,
                 import_len: 0,
             },
-            GuestRamError::SliceForeignImport { slice: 0, import: 0 },
+            GuestRamError::SliceForeignImport {
+                slice: 0,
+                import: 0,
+            },
             GuestRamError::GpaOutsideImport {
                 gpa: 0,
                 gpa_base: 0,

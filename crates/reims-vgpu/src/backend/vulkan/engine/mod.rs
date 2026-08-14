@@ -62,13 +62,14 @@ pub use types::{
     BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask, ComputeBufferResource,
     ComputeOutput, ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource,
     ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
-    DrawError, DrawOutput, DrawRequest, FillMode, GuestRun, GuestRunSource, IndexType,
-    IndexedDrawResource, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
-    SampledSource, SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
-    SamplerMipFilter, SamplerResource, ScissorResource, SecondaryColorTarget, SeedOrder,
-    StencilFaceOps, StencilOp, StencilState, StorageBufferResource, StorageImageFormat,
-    TargetIdentity, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
-    ViewportResource, VisibilityResultMode, WindowPresentSource, COLOR_INPUT_BINDING,
+    DrawError, DrawOutput, DrawRequest, FillMode, GuestRun, GuestRunSource, GuestTargetSeed,
+    IndexType, IndexedDrawResource, PrimitiveTopology, SampledByteOrigin, SampledContentIdentity,
+    SampledImageResource, SampledSource, SamplerAddressMode, SamplerBorderColor,
+    SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource, ScissorResource,
+    SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
+    StorageBufferResource, StorageImageFormat, TargetIdentity, VertexAttributeFormat,
+    VertexAttributeResource, VertexStepFunction, ViewportResource, VisibilityResultMode,
+    WindowPresentSource, COLOR_INPUT_BINDING,
 };
 pub(crate) use vk_call::{VkCall, VkOp};
 #[cfg(feature = "host-window")]
@@ -2140,9 +2141,7 @@ unsafe fn copy_image_level0_to_host_delivered(
         readback.buffer,
         &region,
     );
-    unsafe {
-        pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE, 2)
-    };
+    unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE, 2) };
     if appended.is_some() {
         // `batch_flush` ends the command buffer, submits it with the fence
         // `batch_open_recording` handed back, and seals the batch's cleanup —
@@ -3348,9 +3347,7 @@ unsafe fn copy_image_level0_to_buffer(
             }
         }
     }
-    unsafe {
-        pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE, 2)
-    };
+    unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE, 2) };
     // The reader of these bytes is the guest's vCPU, which is a host reader as
     // far as this device is concerned: the memory is guest RAM the driver
     // imported, not device-local memory that owes a readback. So the write is
@@ -3515,10 +3512,10 @@ pub fn warm_guest_ram_imports(
 /// level, flat is healthy, and a rise is the alarm. It is read every window
 /// rather than once at import time precisely because one line at import time
 /// cannot tell "imported once" from "imported once per window".
-pub fn guest_import_census() -> (u64, usize) {
+pub fn guest_import_census() -> (u64, usize, usize) {
     let guard = lock_engine();
-    let (count, bytes) = guard.pools.host_ram_import_census();
-    (bytes, count)
+    let (ramblocks, aliases, bytes) = guard.pools.host_ram_import_census();
+    (bytes, ramblocks, aliases)
 }
 
 /// Bytes per texel a resident target readback delivers.
