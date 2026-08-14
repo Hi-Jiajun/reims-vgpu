@@ -7216,8 +7216,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // this draw's primary attachment instead, in which case handing it the
         // surface allocation would bind two unrelated resources together.
         if resources.target_identity == type11_render_identity(state, req) {
-            resources.guest_target_backing = type11_guest_backing;
-            resources.load_guest_target_backing = resources.guest_target_backing.is_some()
+            resources.guest_target_memory = type11_guest_backing;
+            resources.load_guest_target_backing = resources.guest_target_memory.is_some()
                 && req.colors.first().is_some_and(|color| {
                     color.load_action == MTL_LOAD_ACTION_LOAD && color.target_seed_rgba.is_none()
                 });
@@ -7225,8 +7225,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Type-11 Load used to have a GPU rail here — ~170 lines of front-frame
         // retention policy resolving which resident image held the frame the
         // guest computes its damage against. It was reachable only under
-        // `try_import`. A Store now always reads back and always seeds from
-        // guest pages, so there is no resident-only attachment to reseed.
+        // `try_import`. A shared resident now keeps the guest allocation as
+        // its own backing, while a copied resident is always landed before its
+        // guest pages become a later seed, so neither needs a separate
+        // front-frame retention policy.
         // Metal path always passes color0 blend into the encoder. Linux/engine
         // previously left `resources.blend = None` → opaque replace for every
         // draw, so Load seeds (gray/wallpaper/logo bases) were wiped by sparse
@@ -8027,7 +8029,7 @@ fn type11_guest_target_backing<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     req: &DrawEncodeRequest,
-) -> Option<crate::backend::vulkan::engine::GuestTargetBacking> {
+) -> Option<crate::backend::vulkan::engine::GuestTargetMemory> {
     if !host.map_pages_stable() {
         return None;
     }
@@ -8038,16 +8040,19 @@ fn type11_guest_target_backing<H: HostMemory + HostOps>(
         let format = crate::runtime::mapping_write::mapping_store_format(mapping);
         crate::runtime::mapping_write::type11_sample_window(mapping, c0.width, c0.height, format)?
     };
-    let (allocation_host_ptr, allocation_len) =
-        crate::runtime::mapper::ensure_contig_view(state, host, c0.mapping_id)?;
+    let (allocation_host_ptr, allocation_len, pages) =
+        crate::runtime::mapper::ensure_contig_view_with_pages(state, host, c0.mapping_id)?;
     if span_end > allocation_len as u64 {
         return None;
     }
-    Some(crate::backend::vulkan::engine::GuestTargetBacking {
-        allocation_host_ptr,
-        allocation_len: allocation_len as u64,
-        plane_offset,
-        row_pitch: u64::from(row_pitch),
+    Some(crate::backend::vulkan::engine::GuestTargetMemory {
+        backing: crate::backend::vulkan::engine::GuestTargetBacking {
+            allocation_host_ptr,
+            allocation_len: allocation_len as u64,
+            plane_offset,
+            row_pitch: u64::from(row_pitch),
+        },
+        pages,
     })
 }
 
@@ -8717,8 +8722,21 @@ pub(crate) fn read_resident_chain(state: &DeviceState, req: &DrawEncodeRequest) 
 /// draw's `target_identity` — so the image read here is the image the draw
 /// rendered into. Deriving it a second way is how a writeback ends up
 /// publishing a frame the draw is not in.
-fn should_defer_surface_store(lazy_enabled: bool, guest_backed: bool) -> bool {
-    lazy_enabled && !guest_backed
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SurfaceStorePlan {
+    SynchronizeGuestBacking,
+    DeferCopy,
+    CopyNow,
+}
+
+fn surface_store_plan(lazy_enabled: bool, guest_backed: bool) -> SurfaceStorePlan {
+    if guest_backed {
+        SurfaceStorePlan::SynchronizeGuestBacking
+    } else if lazy_enabled {
+        SurfaceStorePlan::DeferCopy
+    } else {
+        SurfaceStorePlan::CopyNow
+    }
 }
 
 fn store_surface_resident<M: HostMemory + HostOps>(
@@ -8744,14 +8762,29 @@ fn store_surface_resident<M: HostMemory + HostOps>(
     // command that synchronized it. Publish the existing alias eagerly and let
     // the completion stamp carry its queue ordering.
     let lazy = crate::runtime::writeback_debt::lazy_writeback_enabled();
-    if should_defer_surface_store(lazy, guest_backed)
+    let plan = surface_store_plan(lazy, guest_backed);
+    if plan == SurfaceStorePlan::DeferCopy
         && arm_surface_writeback_debt(state, host, mapping_id, &identity, width, height)
     {
         crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
         return true;
     }
-    if lazy && guest_backed {
-        crate::runtime::drain::note_store_route("target_store_shared_eager");
+    if plan == SurfaceStorePlan::SynchronizeGuestBacking {
+        if lazy {
+            crate::runtime::drain::note_store_route("target_store_shared_eager");
+        }
+        match crate::runtime::render_writeback::store_guest_backed_frame(
+            state, mapping_id, &identity, width, height,
+        ) {
+            Ok(()) => return true,
+            Err(decline) => {
+                crate::observe::Emit::decline("target_store_shared_declined", &decline)
+                    .field("mapping", mapping_id)
+                    .field("geom", format!("{width}x{height}"))
+                    .fail_once(u64::from(mapping_id));
+                crate::runtime::drain::note_store_route("target_store_shared_declined");
+            }
+        }
     }
     if !crate::runtime::render_writeback::store_render_frame(
         state, host, mapping_id, &identity, width, height,
@@ -8909,10 +8942,16 @@ mod vulkan_split_tests {
 
     #[test]
     fn a_guest_backed_store_is_never_turned_into_a_future_copy() {
-        assert!(!should_defer_surface_store(true, true));
-        assert!(!should_defer_surface_store(false, true));
-        assert!(should_defer_surface_store(true, false));
-        assert!(!should_defer_surface_store(false, false));
+        assert_eq!(
+            surface_store_plan(true, true),
+            SurfaceStorePlan::SynchronizeGuestBacking
+        );
+        assert_eq!(
+            surface_store_plan(false, true),
+            SurfaceStorePlan::SynchronizeGuestBacking
+        );
+        assert_eq!(surface_store_plan(true, false), SurfaceStorePlan::DeferCopy);
+        assert_eq!(surface_store_plan(false, false), SurfaceStorePlan::CopyNow);
     }
 
     /// The blank-with-host-entry loss must be reported as a subset of a

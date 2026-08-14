@@ -600,6 +600,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
             retired = Some((m.contig_ptr, m.contig_len));
             m.contig_ptr = 0;
             m.contig_len = 0;
+            m.contig_gpas = Default::default();
         }
         if pages_changed {
             DeviceState::bump_map_generation(m);
@@ -1904,6 +1905,18 @@ pub fn ensure_contig_view<H: HostMemory + HostOps>(
     host: &mut H,
     mapping_id: u32,
 ) -> Option<(usize, usize)> {
+    ensure_contig_view_with_pages(state, host, mapping_id).map(|(ptr, len, _)| (ptr, len))
+}
+
+/// [`ensure_contig_view`] plus the guest-physical footprint owned by the view.
+///
+/// The footprint is retained with an imported GPU resource so synchronizing
+/// that resource never has to reconstruct its backing from a mapping id.
+pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+) -> Option<(usize, usize, std::sync::Arc<[u64]>)> {
     // Always revalidate before returning a cached contig (ReplacePhysical /
     // recycle must not leave a live view over freelist PFNs).
     if !revalidate_mapping_pages(state, host, mapping_id) {
@@ -1913,7 +1926,14 @@ pub fn ensure_contig_view<H: HostMemory + HostOps>(
     {
         let m = state.mappings.get(&mapping_id)?;
         if m.contig_ptr != 0 {
-            return Some((m.contig_ptr, m.contig_len));
+            if m.contig_gpas.is_empty() {
+                return None;
+            }
+            return Some((
+                m.contig_ptr,
+                m.contig_len,
+                std::sync::Arc::clone(&m.contig_gpas),
+            ));
         }
         // The negative verdict caches on exactly the key that makes the
         // positive one above safe. Re-deriving it per call collected the page
@@ -1943,10 +1963,12 @@ pub fn ensure_contig_view<H: HostMemory + HostOps>(
         return None;
     };
     let len = gpas.len() * page_sz;
+    let gpas: std::sync::Arc<[u64]> = gpas.into();
     let m = state.mappings.get_mut(&mapping_id)?;
     m.contig_ptr = ptr;
     m.contig_len = len;
-    Some((ptr, len))
+    m.contig_gpas = std::sync::Arc::clone(&gpas);
+    Some((ptr, len, gpas))
 }
 
 /// Record the guest frames a mapping-rail write of `[off, off+len)` lands in.

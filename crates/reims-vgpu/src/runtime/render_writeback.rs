@@ -974,6 +974,25 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
     true
 }
 
+/// Publish a Store for a resident whose attachment memory is the guest mapping.
+#[cfg(feature = "backend-vulkan")]
+pub fn store_guest_backed_frame(
+    state: &mut DeviceState,
+    mapping_id: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    width: u32,
+    height: u32,
+) -> Result<(), crate::runtime::mapping_write::GpuWritebackDecline> {
+    let started = std::time::Instant::now();
+    crate::runtime::drain::note_store_route("surface_flush");
+    let bytes = crate::runtime::mapping_write::synchronize_guest_backed_resident(
+        state, mapping_id, identity, width, height,
+    )?;
+    crate::runtime::drain::note_store_route("render_flush_gpu_direct");
+    finish(state, mapping_id, identity, bytes as usize, started);
+    Ok(())
+}
+
 /// Hand the currency witness back to the image the frame came out of, and score
 /// the write.
 ///

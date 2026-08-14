@@ -1094,6 +1094,57 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     Ok(span_end - base_off)
 }
 
+/// Publish a Store from an attachment already backed by this mapping.
+///
+/// Import admission retained the mapping's bounded allocation and physical-page
+/// footprint in the resident. Synchronization therefore names that resident;
+/// it does not reconstruct a `GuestPageTarget`, re-walk the page table, or
+/// reacquire one guest reference per page.  Those operations describe a copy
+/// destination, and this path has no copy destination—the attachment is the
+/// guest allocation.
+#[cfg(feature = "backend-vulkan")]
+pub fn synchronize_guest_backed_resident(
+    state: &mut DeviceState,
+    mapping_id: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    width: u32,
+    height: u32,
+) -> Result<u64, GpuWritebackDecline> {
+    if !scanout_extent_ok(width, height) {
+        return Err(GpuWritebackDecline::NotWritable);
+    }
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return Err(GpuWritebackDecline::NotWritable);
+    };
+    if !m.mapped || m.page_entries.is_empty() {
+        return Err(GpuWritebackDecline::NotWritable);
+    }
+    let (mw, mh, format) = mapping_write_geometry(m, width, height);
+    if mw != width || mh != height {
+        return Err(GpuWritebackDecline::GeometryMoved {
+            latched_width: mw,
+            latched_height: mh,
+            frame_width: width,
+            frame_height: height,
+        });
+    }
+    let Some((base_off, _bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
+        return Err(GpuWritebackDecline::WindowUnresolved {
+            width: mw,
+            height: mh,
+            format,
+        });
+    };
+    crate::backend::vulkan::engine::synchronize_guest_backed_target(identity)
+        .map_err(|inner| GpuWritebackDecline::Engine { inner })?;
+
+    mapper::note_mapping_write_footprint(state, mapping_id, base_off, span_end - base_off);
+    state.note_host_wrote_mapping(mapping_id);
+    state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
+    let _ = state.mark_mapping_written(mapping_id);
+    crate::runtime::surface_cache::forget(state, mapping_id);
+    Ok(span_end - base_off)
+}
 
 /// The geometry and pixel format a writeback to this mapping must land in.
 ///

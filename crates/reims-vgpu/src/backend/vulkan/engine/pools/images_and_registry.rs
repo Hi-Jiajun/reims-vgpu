@@ -939,7 +939,7 @@ impl ResourcePools {
         render_pass: vk::RenderPass,
         generation: u64,
         format: vk::Format,
-        guest_backing: Option<crate::backend::vulkan::engine::GuestTargetBacking>,
+        guest_memory: Option<crate::backend::vulkan::engine::GuestTargetMemory>,
         counters: &EngineCounters,
     ) -> Result<&ResidentTargetSlot, DrawError> {
         // The format arrives resolved rather than as a channel-order flag, and
@@ -1021,9 +1021,9 @@ impl ResourcePools {
         // The recycled contents are stale — the slot is inserted with
         // layout=UNDEFINED / content_ready=false, and a fresh framebuffer is
         // always built below (it binds this specific render_pass).
-        let imported = match guest_backing {
-            Some(backing) => match super::super::linear_target_import::create(
-                ctx, backing, width, height, format, usage,
+        let imported = match guest_memory.as_ref() {
+            Some(memory) => match super::super::linear_target_import::create(
+                ctx, memory.backing, width, height, format, usage,
             ) {
                 Ok(imported) => Some(imported),
                 Err(reason) => {
@@ -1068,7 +1068,7 @@ impl ResourcePools {
                 imported.image,
                 ResidentMemory::GuestImported {
                     memory: imported.memory,
-                    backing: guest_backing.expect("an imported target has guest backing"),
+                    guest: guest_memory.expect("an imported target has guest memory"),
                 },
                 view,
             )
@@ -2662,11 +2662,14 @@ pub(super) mod pin_count_tests {
         let mut resident = new_resident(some_framebuffer(), vk::RenderPass::null());
         resident.memory = ResidentMemory::GuestImported {
             memory: vk::DeviceMemory::null(),
-            backing: crate::backend::vulkan::engine::GuestTargetBacking {
-                allocation_host_ptr: 0x1000,
-                allocation_len: 0x4000,
-                plane_offset: 0,
-                row_pitch: 64,
+            guest: crate::backend::vulkan::engine::GuestTargetMemory {
+                backing: crate::backend::vulkan::engine::GuestTargetBacking {
+                    allocation_host_ptr: 0x1000,
+                    allocation_len: 0x4000,
+                    plane_offset: 0,
+                    row_pitch: 64,
+                },
+                pages: std::sync::Arc::from([0x2000, 0x3000]),
             },
         };
         let identity = surf(1);

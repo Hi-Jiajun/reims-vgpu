@@ -1455,31 +1455,38 @@ impl ResidentAccess {
 /// allocation, so recycling it under another identity would bind that surface's
 /// pages to unrelated guest work. The enum forces every retirement path to
 /// choose between those two operations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ResidentMemory {
     Recyclable(vk::DeviceMemory),
     GuestImported {
         memory: vk::DeviceMemory,
-        backing: crate::backend::vulkan::engine::GuestTargetBacking,
+        guest: crate::backend::vulkan::engine::GuestTargetMemory,
     },
 }
 
 impl ResidentMemory {
-    pub(crate) fn handle(self) -> vk::DeviceMemory {
+    pub(crate) fn handle(&self) -> vk::DeviceMemory {
         match self {
-            Self::Recyclable(memory) | Self::GuestImported { memory, .. } => memory,
+            Self::Recyclable(memory) | Self::GuestImported { memory, .. } => *memory,
         }
     }
 
-    pub(crate) fn is_guest_imported(self) -> bool {
+    pub(crate) fn is_guest_imported(&self) -> bool {
         matches!(self, Self::GuestImported { .. })
     }
 
     pub(crate) fn guest_backing(
-        self,
+        &self,
     ) -> Option<crate::backend::vulkan::engine::GuestTargetBacking> {
         match self {
-            Self::GuestImported { backing, .. } => Some(backing),
+            Self::GuestImported { guest, .. } => Some(guest.backing),
+            Self::Recyclable(_) => None,
+        }
+    }
+
+    pub(crate) fn guest_pages(&self) -> Option<std::sync::Arc<[u64]>> {
+        match self {
+            Self::GuestImported { guest, .. } => Some(std::sync::Arc::clone(&guest.pages)),
             Self::Recyclable(_) => None,
         }
     }

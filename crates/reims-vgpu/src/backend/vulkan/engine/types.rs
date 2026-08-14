@@ -413,9 +413,9 @@ pub struct DrawRequest {
     /// device. The Vulkan engine still verifies the complete image-binding
     /// equation (layout offset, row pitch, allocation extent and memory type)
     /// before using it; any mismatch keeps the ordinary resident image.
-    pub guest_target_backing: Option<GuestTargetBacking>,
+    pub guest_target_memory: Option<GuestTargetMemory>,
     /// Load the primary attachment's prior contents from
-    /// [`Self::guest_target_backing`] when that backing is admitted.
+    /// [`Self::guest_target_memory`] when that backing is admitted.
     ///
     /// Separate from carrying the backing because CLEAR and DontCare Stores
     /// should still render directly into guest memory while discarding its old
@@ -1910,6 +1910,17 @@ pub struct GuestTargetBacking {
     pub allocation_len: u64,
     pub plane_offset: u64,
     pub row_pitch: u64,
+}
+
+/// An importable guest allocation and the physical pages it owns.
+///
+/// Keeping these together makes the retained resource its own synchronization
+/// authority: once admitted, the engine can publish the exact footprint that
+/// was validated with the allocation instead of reconstructing it at Store.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuestTargetMemory {
+    pub backing: GuestTargetBacking,
+    pub pages: std::sync::Arc<[u64]>,
 }
 
 /// Producer-assigned identity + generation for CPU-sourced sampled content.

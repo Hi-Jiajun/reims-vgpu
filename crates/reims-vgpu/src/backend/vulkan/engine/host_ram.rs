@@ -436,6 +436,9 @@ unsafe fn import_ramblock(
 /// counted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GuestWriteDecline {
+    /// The named resident is an ordinary device allocation rather than the
+    /// guest allocation synchronization requires.
+    NoSharedBacking,
     /// The device cannot import guest RAM at all. Carries the rung so the log
     /// says which check refused; expected on every host without the extension.
     Unsupported {
@@ -484,6 +487,7 @@ pub enum GuestWriteDecline {
 impl Decline for GuestWriteDecline {
     fn slug(&self) -> &'static str {
         match self {
+            Self::NoSharedBacking => "gpu_writeback_no_shared_backing",
             Self::Unsupported { .. } => "gpu_writeback_unsupported",
             Self::ResidentFormatMismatch { .. } => "gpu_writeback_resident_format_mismatch",
             Self::GeometryMoved { .. } => "gpu_writeback_geometry_moved",
@@ -497,6 +501,7 @@ impl Decline for GuestWriteDecline {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
+            Self::NoSharedBacking => Vec::new(),
             Self::Unsupported { rung } => vec![("rung", rung.slug().to_string())],
             Self::ResidentFormatMismatch { held, want } => vec![
                 ("resident", format!("{held:?}")),
@@ -558,6 +563,14 @@ mod tests {
         for slug in slugs {
             assert!(slug.starts_with("host_ram_import_"), "{slug}");
         }
+    }
+
+    #[test]
+    fn a_missing_shared_backing_has_its_own_sync_refusal() {
+        assert_eq!(
+            GuestWriteDecline::NoSharedBacking.slug(),
+            "gpu_writeback_no_shared_backing"
+        );
     }
 
     /// A bound refusal keeps the inner check's name rather than being renamed

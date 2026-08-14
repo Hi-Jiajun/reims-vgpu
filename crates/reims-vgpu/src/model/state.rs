@@ -1020,14 +1020,20 @@ pub struct MappingEntry {
     pub device_desc: Vec<u8>,
     /// Contiguous host-VA view over `page_entries` (`HostOps::map_pages`,
     /// mach_vm_remap of guest RAM). 0 = not built. This is the surface storage
-    /// for the guest mapping, and it is read and written by the **CPU only**:
-    /// Metal render targets used to be created directly on this view, which
-    /// gave the host GPU a handle on guest RAM, and that alias is deleted.
-    /// Guest CPU writes and host page reads still see one copy; a GPU Store
-    /// reaches it through the writeback. Retired (never freed in place)
+    /// for the guest mapping. Guest CPU writes and host page reads see this
+    /// allocation directly; on a capable unified-memory backend an imported
+    /// render attachment retains the same view. Retired (never freed in place)
     /// whenever `page_entries` change; see `DeviceState::retired_views`.
     pub contig_ptr: usize,
     pub contig_len: usize,
+    /// Guest-physical pages represented by `contig_ptr`, in allocation order.
+    ///
+    /// Kept with the view because a resource synchronization names the
+    /// resource, not a freshly reconstructed destination. The backend retains
+    /// this footprint with an imported attachment and uses it to order host
+    /// readers against the GPU write without walking the mapping again at
+    /// Store time.
+    pub contig_gpas: std::sync::Arc<[u64]>,
     /// `map_generation` whose page list the host refused to expose as one
     /// packed view. `None` = not asked for the current list.
     ///
@@ -2311,6 +2317,7 @@ impl DeviceState {
         let v = (e.contig_ptr, e.contig_len);
         e.contig_ptr = 0;
         e.contig_len = 0;
+        e.contig_gpas = Default::default();
         Some(v)
     }
 

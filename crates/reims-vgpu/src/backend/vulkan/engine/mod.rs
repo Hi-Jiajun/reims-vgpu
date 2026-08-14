@@ -64,13 +64,13 @@ pub use types::{
     ComputeOutput, ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource,
     ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
     DrawError, DrawOutput, DrawRequest, FillMode, GuestRun, GuestRunSource, GuestTargetBacking,
-    GuestTargetSeed, IndexType, IndexedDrawResource, PrimitiveTopology, SampledByteOrigin,
-    SampledContentIdentity, SampledImageResource, SampledSource, SamplerAddressMode,
-    SamplerBorderColor, SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource,
-    ScissorResource, SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
-    StorageBufferResource, StorageImageFormat, TargetIdentity, VertexAttributeFormat,
-    VertexAttributeResource, VertexStepFunction, ViewportResource, VisibilityResultMode,
-    WindowPresentSource, COLOR_INPUT_BINDING,
+    GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource, PrimitiveTopology,
+    SampledByteOrigin, SampledContentIdentity, SampledImageResource, SampledSource,
+    SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
+    SamplerMipFilter, SamplerResource, ScissorResource, SecondaryColorTarget, SeedOrder,
+    StencilFaceOps, StencilOp, StencilState, StorageBufferResource, StorageImageFormat,
+    TargetIdentity, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
+    ViewportResource, VisibilityResultMode, WindowPresentSource, COLOR_INPUT_BINDING,
 };
 pub(crate) use vk_call::{VkCall, VkOp};
 #[cfg(feature = "host-window")]
@@ -2726,6 +2726,30 @@ pub fn copy_target_to_guest_pages(
     Ok(())
 }
 
+/// Synchronize a resident that is already backed by its guest allocation.
+///
+/// The resource owns both its imported binding and the physical-page footprint
+/// retained when that binding was admitted. Synchronization therefore names
+/// only the resource: it publishes the existing GPU write to the completion
+/// ledger and performs no destination reconstruction or copy.
+pub fn synchronize_guest_backed_target(identity: &TargetIdentity) -> Result<(), DrawError> {
+    use host_ram::GuestWriteDecline;
+    let mut guard = lock_engine();
+    let pools = &mut guard.pools;
+    let snap = resident_read_snapshot(pools, identity)?;
+    if snap.guest_backing.is_none() {
+        return Err(DrawError::GuestPageWrite(
+            GuestWriteDecline::NoSharedBacking,
+        ));
+    }
+    let pages = snap.guest_pages.ok_or(DrawError::GuestPageWrite(
+        GuestWriteDecline::NoSharedBacking,
+    ))?;
+    crate::runtime::drain::note_store_route("target_sync_shared_backing");
+    record_guest_write_debt(pools, identity, &pages);
+    Ok(())
+}
+
 fn shared_backing_settles(
     resident: Option<GuestTargetBacking>,
     destination: Option<GuestTargetBacking>,
@@ -3755,6 +3779,7 @@ struct ResidentReadSnapshot {
     /// lands the right texel.
     format: ash::vk::Format,
     guest_backing: Option<GuestTargetBacking>,
+    guest_pages: Option<std::sync::Arc<[u64]>>,
 }
 
 impl ResidentReadSnapshot {
@@ -3790,6 +3815,7 @@ fn resident_read_snapshot(
         layout: slot.access.layout(),
         format: slot.color_format,
         guest_backing: slot.memory.guest_backing(),
+        guest_pages: slot.memory.guest_pages(),
     })
 }
 

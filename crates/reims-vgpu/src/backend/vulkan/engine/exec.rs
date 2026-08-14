@@ -3158,7 +3158,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 primary_pass,
                 gen,
                 color0_format,
-                req.guest_target_backing,
+                req.guest_target_memory.clone(),
                 counters,
             )?;
             target_guest_backed = t.memory.is_guest_imported();

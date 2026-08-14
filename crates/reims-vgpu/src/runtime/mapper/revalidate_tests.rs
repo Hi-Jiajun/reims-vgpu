@@ -563,9 +563,14 @@ fn a_contiguous_mapping_write_marks_only_the_pages_its_offset_reaches() {
             (((gpa1 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
         ];
     }
+    let (_, _, pages) = ensure_contig_view_with_pages(&mut state, &mut host, mid)
+        .expect("the fixture must take the fast path or it is testing the other one");
+    assert_eq!(&*pages, &[gpa0, gpa1]);
+    let (_, _, reused) = ensure_contig_view_with_pages(&mut state, &mut host, mid)
+        .expect("the retained view remains live");
     assert!(
-        ensure_contig_view(&mut state, &mut host, mid).is_some(),
-        "the fixture must take the fast path or it is testing the other one"
+        std::sync::Arc::ptr_eq(&pages, &reused),
+        "resource synchronization must retain the admitted footprint, not rebuild it"
     );
     let vouched = vouch_mapping_pages_verdict(&mut state, &host, mid)
         .1
