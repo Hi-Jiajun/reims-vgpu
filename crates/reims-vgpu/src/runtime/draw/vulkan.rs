@@ -793,13 +793,14 @@ pub(super) enum SampledSourceRequest {
     /// imported guest RAM inside the draw CB — no CPU read, no memo, no
     /// hash. Carries the native texel layout the image is created with.
     /// Guest-RAM runs the engine gathers from, the byte layout of those texels,
-    /// the identity that lets the engine bind a retained image instead of
-    /// gathering at all, and what the guest-write witness says that identity is
-    /// worth (see [`crate::runtime::gather_witness`]).
+    /// an optional copied-content identity, and what the guest-write witness
+    /// says that identity is worth (see [`crate::runtime::gather_witness`]).
     ///
-    /// The identity is not optional on this rail: every window that reaches here
-    /// went through the witness, and the witness names every window it is asked
-    /// about. The vouch beside it is the part that varies.
+    /// A resource-owned direct image has no copied content to witness and
+    /// carries no identity. A copy-backed source carries the identity that lets
+    /// the engine bind a retained gathered image without gathering again. If a
+    /// backend declines a supplied direct image, the absent identity makes the
+    /// copy fallback gather conservatively on that bind.
     /// The last field is the **format's own** channel plan, not the guest's
     /// view swizzle: this rail binds guest bytes untouched, so a format whose
     /// Metal channels do not sit identically on the Vulkan format carrying them
@@ -811,7 +812,7 @@ pub(super) enum SampledSourceRequest {
         TexelLayout,
         /// Consecutive depth planes carried by the source window.
         u32,
-        LinearSampleIdentity,
+        Option<LinearSampleIdentity>,
         crate::runtime::gather_witness::GatherVouch,
         pixel_format::SwizzlePlan,
     ),
@@ -1165,7 +1166,9 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // it samples byte-identically (video NV12 R8/RG8, BGRA8/
                 // RGBA8). This bypasses the ~1.5 MB/plane/frame CPU read +
                 // upload the CPU loader below would pay every decoded frame.
-                if let Some(src) = try_type5_sample_zero_copy(state, host, mid, view) {
+                if let Some(src) = resolved_resource.as_ref().and_then(|resource| {
+                    try_type5_sample_zero_copy(state, host, mid, view, resource.lifetime_ref())
+                }) {
                     // Success path: a healthy video decodes ~2 planes/frame,
                     // so this fires per-bind (~99k lines/boot). The aggregate
                     // lives in `sampled_branch_census` (`t5_zc=count:bytes`),
@@ -1538,7 +1541,9 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // guest bytes are taken unconditionally. Declining the gather is
                 // expected control flow — the CPU byte loader below serves the
                 // same pixels — so it stays quiet, like the type-2/3 rail's.
-                if let Some(src) = try_type11_sample_zero_copy(state, host, mid, w, h) {
+                if let Some(src) = resolved_resource.as_ref().and_then(|resource| {
+                    try_type11_sample_zero_copy(state, host, mid, w, h, resource.lifetime_ref())
+                }) {
                     note_type11_sample_rung("t11rung_zero_copy", guest_write);
                     return Some((w, h, mid, src));
                 }
@@ -1609,9 +1614,14 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     return Some((w, h, 0, src));
                 }
             }
-            if let Some((w, h, src)) =
-                try_linear_sample_zero_copy(state, host, task_id, texture_ref, tex)
-            {
+            if let Some((w, h, src)) = try_linear_sample_zero_copy(
+                state,
+                host,
+                task_id,
+                texture_ref,
+                tex,
+                resolved_resource.as_ref()?.lifetime_ref(),
+            ) {
                 return Some((w, h, 0, src));
             }
             if let Some((w, h, rgba, identity, byte_format)) =
@@ -3016,6 +3026,7 @@ pub(super) fn sampled_backing_from_packed(
     level_offset: u64,
     row_pitch: u64,
     span: u64,
+    owner: crate::model::TaskResourceLifetimeRef,
 ) -> Option<crate::backend::vulkan::engine::GuestSampledBacking> {
     let plane_offset = packed.head.checked_add(level_offset)?;
     plane_offset
@@ -3029,32 +3040,30 @@ pub(super) fn sampled_backing_from_packed(
             row_pitch,
         },
         import: std::sync::Arc::clone(&packed.import),
+        owner,
         origin: crate::backend::vulkan::engine::SampledByteOrigin::LinearTexture,
     })
 }
 
-/// Build one sampled plane and its copy fallback from the mapping's retained
-/// allocation. The exact page slice is used only by the freshness witness;
-/// both GPU dispositions retain the whole allocation because that is the
-/// resource whose plane offset and row pitch the descriptor names.
+/// Build one directly sampled plane from the mapping's retained allocation.
+/// The complete allocation is the resource whose plane offset and row pitch
+/// the descriptor names; no copied-image freshness witness participates in
+/// this resource-owned disposition.
 struct MappedSamplePlane {
     mapping_id: u32,
     base_off: u64,
     row_pitch: u64,
     span: u64,
     row_length_texels: u32,
-    rail: crate::runtime::gather_witness::GatherRail,
     origin: crate::backend::vulkan::engine::SampledByteOrigin,
+    owner: crate::model::TaskResourceLifetimeRef,
 }
 
 fn mapped_sampled_source<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     plane: MappedSamplePlane,
-) -> Option<(
-    crate::backend::vulkan::engine::GuestRunSource,
-    crate::runtime::gather_witness::GatherOutcome,
-)> {
+) -> Option<crate::backend::vulkan::engine::GuestRunSource> {
     use crate::backend::vulkan::engine::{GuestRun, GuestRunSource};
     use crate::runtime::guest_ram::GuestRef;
 
@@ -3064,42 +3073,16 @@ fn mapped_sampled_source<M: HostMemory + HostOps>(
         row_pitch,
         span,
         row_length_texels,
-        rail,
         origin,
+        owner,
     } = plane;
 
-    let (import, gpas) =
+    let (import, _gpas) =
         crate::runtime::mapper::ensure_contig_import_with_pages(state, host, mapping_id)?;
     let end = base_off.checked_add(span)?;
     if end > import.len() {
         return None;
     }
-    let page = state.page_size();
-    let first_page = usize::try_from(base_off / page).ok()?;
-    let head = base_off % page;
-    let page_count = usize::try_from(head.checked_add(span)?.div_ceil(page)).ok()?;
-    let witness_gpas = gpas.get(first_page..first_page.checked_add(page_count)?)?;
-    let witness_runs = [GuestRun {
-        host_ptr: import
-            .host_base()
-            .checked_add(usize::try_from(base_off).ok()?)?,
-        len: span,
-    }];
-    let seen = crate::runtime::gather_witness::note_gather(
-        state,
-        host,
-        rail,
-        crate::runtime::gather_witness::GatherKey::Mapping {
-            mid: mapping_id,
-            base_off,
-        },
-        crate::runtime::gather_witness::GatherWindow {
-            gpas: witness_gpas,
-            runs: &witness_runs,
-            span,
-            page_size: page as usize,
-        },
-    );
     let whole = import.slice(0, import.len()).ok()?;
     let guest = GuestRef::new(std::sync::Arc::clone(&import), whole).ok()?;
     let direct_image = Some(crate::backend::vulkan::engine::GuestSampledBacking {
@@ -3110,27 +3093,25 @@ fn mapped_sampled_source<M: HostMemory + HostOps>(
             row_pitch,
         },
         import: std::sync::Arc::clone(&import),
+        owner,
         origin,
     });
-    Some((
-        GuestRunSource {
-            runs: std::sync::Arc::new(vec![GuestRun {
-                host_ptr: import.host_base(),
-                len: import.len(),
-            }]),
-            source_offset: base_off,
-            total_len: span,
-            row_length_texels,
-            pages: Some(std::sync::Arc::new(vec![
-                crate::runtime::guest_ram_map::GuestWindowRun {
-                    window_offset: 0,
-                    guest,
-                },
-            ])),
-            direct_image,
-        },
-        seen,
-    ))
+    Some(GuestRunSource {
+        runs: std::sync::Arc::new(vec![GuestRun {
+            host_ptr: import.host_base(),
+            len: import.len(),
+        }]),
+        source_offset: base_off,
+        total_len: span,
+        row_length_texels,
+        pages: Some(std::sync::Arc::new(vec![
+            crate::runtime::guest_ram_map::GuestWindowRun {
+                window_offset: 0,
+                guest,
+            },
+        ])),
+        direct_image,
+    })
 }
 
 /// The byte extent of a `w × h` image at `bpr` bytes per row and `bpp` bytes per
@@ -3932,6 +3913,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     task_id: u32,
     texture_ref: u32,
     tex: &TextureDescriptor,
+    owner: crate::model::TaskResourceLifetimeRef,
 ) -> Option<(u32, u32, SampledSourceRequest)> {
     use crate::backend::vulkan::engine;
     // The object-list entry + descriptor are resolved+decoded once by the caller
@@ -4101,16 +4083,40 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     if let Some(packed) = packed {
         let direct_image = (planes == 1)
             .then(|| {
-                sampled_backing_from_packed(&packed, layout.offset, layout.row_stride, span)
+                sampled_backing_from_packed(
+                    &packed,
+                    layout.offset,
+                    layout.row_stride,
+                    span,
+                    owner.clone(),
+                )
             })
             .flatten();
         if direct_image.is_some() && span < SAMPLED_GATHER_MIN_BYTES {
             crate::runtime::drain::note_store_route("zc_lin_direct_below_gather_floor");
         }
-        if direct_image.is_some()
-            || !native.a_cost_floor_may_decline()
-            || span >= SAMPLED_GATHER_MIN_BYTES
-        {
+        if direct_image.is_some() {
+            return Some((
+                w,
+                h,
+                SampledSourceRequest::GuestRuns(
+                    engine::GuestRunSource {
+                        runs: std::sync::Arc::clone(&packed.runs),
+                        source_offset: layout.offset,
+                        total_len: span,
+                        row_length_texels,
+                        pages: Some(std::sync::Arc::clone(&packed.pages)),
+                        direct_image,
+                    },
+                    native,
+                    planes,
+                    None,
+                    crate::runtime::gather_witness::GatherVouch::Fresh,
+                    native_components,
+                ),
+            ));
+        }
+        if !native.a_cost_floor_may_decline() || span >= SAMPLED_GATHER_MIN_BYTES {
             let page = state.page_size();
             let packed_offset = packed.head.checked_add(layout.offset)?;
             let first_page = usize::try_from(packed_offset / page).ok()?;
@@ -4152,7 +4158,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                     },
                     native,
                     planes,
-                    LinearSampleIdentity::from(seen.identity),
+                    Some(LinearSampleIdentity::from(seen.identity)),
                     seen.vouch,
                     native_components,
                 ),
@@ -4215,7 +4221,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             },
             native,
             planes,
-            LinearSampleIdentity::from(seen.identity),
+            Some(LinearSampleIdentity::from(seen.identity)),
             seen.vouch,
             native_components,
         ),
@@ -4235,6 +4241,7 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     mid: u32,
     w: u32,
     h: u32,
+    owner: crate::model::TaskResourceLifetimeRef,
 ) -> Option<SampledSourceRequest> {
     use crate::backend::vulkan::engine;
     use crate::runtime::mapping_write::type11_sample_window;
@@ -4293,7 +4300,7 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     // Free when nothing is owed — `pay_for_mapping` is one emptiness check on
     // the ledger, which is the answer on nearly every call.
     crate::runtime::writeback_debt::pay_for_mapping(state, host, mid);
-    if let Some((source, seen)) = mapped_sampled_source(
+    if let Some(source) = mapped_sampled_source(
         state,
         host,
         MappedSamplePlane {
@@ -4302,8 +4309,8 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
             row_pitch: bpr,
             span,
             row_length_texels,
-            rail: crate::runtime::gather_witness::GatherRail::Type11,
             origin: crate::backend::vulkan::engine::SampledByteOrigin::SurfaceGuestFallback,
+            owner,
         },
     ) {
         if span < SAMPLED_GATHER_MIN_BYTES {
@@ -4313,8 +4320,8 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
             source,
             native,
             1,
-            LinearSampleIdentity::from(seen.identity),
-            seen.vouch,
+            None,
+            crate::runtime::gather_witness::GatherVouch::Fresh,
             pixel_format::swizzle_identity(),
         ));
     }
@@ -4346,7 +4353,7 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
         },
         native,
         1,
-        LinearSampleIdentity::from(seen.identity),
+        Some(LinearSampleIdentity::from(seen.identity)),
         seen.vouch,
         // Identity: this rail admitted the format only after checking its plan
         // was identity, so there is nothing to fold in.
@@ -4368,6 +4375,7 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     host: &mut M,
     mid: u32,
     view: objects::Type5TextureView,
+    owner: crate::model::TaskResourceLifetimeRef,
 ) -> Option<SampledSourceRequest> {
     use crate::backend::vulkan::engine;
     use crate::runtime::mapping_write::type5_sample_window;
@@ -4420,7 +4428,7 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     // The owed frame, for the reason `try_type11_sample_zero_copy` states: a
     // debt is not a submitted writeback and queue order cannot order it.
     crate::runtime::writeback_debt::pay_for_mapping(state, host, mid);
-    if let Some((source, seen)) = mapped_sampled_source(
+    if let Some(source) = mapped_sampled_source(
         state,
         host,
         MappedSamplePlane {
@@ -4429,8 +4437,8 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
             row_pitch: bpr,
             span,
             row_length_texels,
-            rail: crate::runtime::gather_witness::GatherRail::Type5,
             origin: crate::backend::vulkan::engine::SampledByteOrigin::SerializedSurfaceView,
+            owner,
         },
     ) {
         if span < SAMPLED_GATHER_MIN_BYTES {
@@ -4440,8 +4448,8 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
             source,
             native,
             1,
-            LinearSampleIdentity::from(seen.identity),
-            seen.vouch,
+            None,
+            crate::runtime::gather_witness::GatherVouch::Fresh,
             pixel_format::swizzle_identity(),
         ));
     }
@@ -4473,7 +4481,7 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
         },
         native,
         1,
-        LinearSampleIdentity::from(seen.identity),
+        Some(LinearSampleIdentity::from(seen.identity)),
         seen.vouch,
         // Identity: this rail admitted the format only after checking its plan
         // was identity, so there is nothing to fold in.
@@ -6899,7 +6907,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         sampled_format = native;
                         sampled_components = components;
                         source_planes = planes;
-                        bytes_identity = Some(identity);
+                        bytes_identity = identity;
                         crate::backend::vulkan::engine::SampledSource::GuestRuns(src, vouch)
                     }
                 };
@@ -10450,6 +10458,8 @@ mod vulkan_split_tests {
                 .collect();
         }
         assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+        let resource =
+            crate::model::TaskResource::new(Default::default(), std::sync::Arc::from([]));
 
         let map_generation = state.mappings.get(&mid).unwrap().map_generation;
         assert!(
@@ -10461,7 +10471,8 @@ mod vulkan_split_tests {
         );
 
         assert!(
-            try_type11_sample_zero_copy(&mut state, &mut host, mid, w, h).is_some(),
+            try_type11_sample_zero_copy(&mut state, &mut host, mid, w, h, resource.lifetime_ref())
+                .is_some(),
             "the rail has to take, or this test proves nothing about what it does"
         );
         assert!(

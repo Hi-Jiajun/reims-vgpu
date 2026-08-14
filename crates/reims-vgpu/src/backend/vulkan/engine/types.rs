@@ -1819,13 +1819,11 @@ pub enum SampledSource {
     /// the copy-backed route from imported buffers into an optimal image. No
     /// CPU read or hash is required on either GPU route.
     ///
-    /// The gather is elided where a retained image already answers to the bind's
+    /// A copy is elided where a retained image already answers to the bind's
     /// identity, which is what [`crate::runtime::gather_witness::GatherVouch`]
-    /// says is possible. `Fresh` means the identity was minted this bind and no
-    /// retained image can match it, so the copy runs and the result is retained
-    /// for the next bind to hit; carrying it lets the engine report *why* a
-    /// gather happened instead of inferring it from the identity being present,
-    /// which it always is.
+    /// says is possible. Resource-owned direct images carry no copied-content
+    /// identity. If the backend declines one, the copy fallback therefore runs
+    /// conservatively instead of reusing content that was never witnessed.
     GuestRuns(GuestRunSource, crate::runtime::gather_witness::GatherVouch),
 }
 
@@ -1933,6 +1931,9 @@ pub struct GuestTargetBacking {
 pub struct GuestSampledBacking {
     pub backing: GuestTargetBacking,
     pub import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
+    /// The serialized resource that owns this image. The engine keeps this
+    /// weak so its cache cannot extend the guest-visible resource lifetime.
+    pub owner: crate::model::TaskResourceLifetimeRef,
     /// Resource family for accounting only; never an execution selector.
     pub origin: SampledByteOrigin,
 }

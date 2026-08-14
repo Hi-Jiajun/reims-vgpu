@@ -578,6 +578,10 @@ pub struct TaskResource {
     /// total decoder refuses, and keep that refusal too so those consumers do
     /// not silently widen the total contract.
     decoded: OnceLock<Result<Descriptor, ResourceDecodeStatus>>,
+    /// Identity whose strong lifetime is exactly this serialized resource.
+    /// Direct backend objects keep only a weak reference, so deletion—not an
+    /// arbitrary idle timeout—makes them reclaimable.
+    lifetime: Arc<TaskResourceLifetime>,
     /// Engine object retained for this serialized resource lifetime.
     ///
     /// The lease owns its resident pin and allocation classification. Its
@@ -594,6 +598,7 @@ impl TaskResource {
             entry,
             descriptor,
             decoded: OnceLock::new(),
+            lifetime: Arc::new(TaskResourceLifetime::new()),
             #[cfg(feature = "backend-vulkan")]
             resident_target: Mutex::new(None),
         }
@@ -607,6 +612,13 @@ impl TaskResource {
                 &self.descriptor,
             )
         })
+    }
+
+    pub fn lifetime_ref(&self) -> TaskResourceLifetimeRef {
+        TaskResourceLifetimeRef {
+            id: self.lifetime.id,
+            live: Arc::downgrade(&self.lifetime),
+        }
     }
 
     /// Retain and classify the engine target named by this resource.
@@ -650,6 +662,44 @@ impl TaskResource {
         held.as_ref()
             .map(|lease| lease.backing())
             .unwrap_or(ResidentContentBacking::NotReady)
+    }
+}
+
+static NEXT_TASK_RESOURCE_LIFETIME: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+#[derive(Debug)]
+struct TaskResourceLifetime {
+    id: u64,
+}
+
+impl TaskResourceLifetime {
+    fn new() -> Self {
+        let id = NEXT_TASK_RESOURCE_LIFETIME
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |id| id.checked_add(1),
+            )
+            .expect("task resource lifetime identity exhausted");
+        Self { id }
+    }
+}
+
+/// Weak backend-facing proof that one serialized resource still exists.
+#[derive(Clone, Debug)]
+pub struct TaskResourceLifetimeRef {
+    id: u64,
+    live: std::sync::Weak<TaskResourceLifetime>,
+}
+
+impl TaskResourceLifetimeRef {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.live.strong_count() != 0
     }
 }
 

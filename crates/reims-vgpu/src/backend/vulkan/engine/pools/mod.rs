@@ -998,6 +998,7 @@ pub(crate) struct SampledSlot {
 pub(crate) struct GuestSampledKey {
     pub(crate) image: SampledKey,
     pub(crate) backing: crate::backend::vulkan::engine::GuestTargetBacking,
+    pub(crate) owner_id: u64,
 }
 
 struct GuestSampledSlot {
@@ -1007,12 +1008,14 @@ struct GuestSampledSlot {
     /// Keeps the checked packed-allocation bound alive for exactly as long as
     /// Vulkan can address it.
     _import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
+    /// Weak resource lifetime: the cache must not keep the guest object alive.
+    owner: crate::model::TaskResourceLifetimeRef,
     initialized: bool,
-    last_touch_ms: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct GuestSampledUse {
+    pub(crate) key: GuestSampledKey,
     pub(crate) image: vk::Image,
     pub(crate) view: vk::ImageView,
     pub(crate) initialized: bool,

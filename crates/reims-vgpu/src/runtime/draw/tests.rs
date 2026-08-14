@@ -182,7 +182,16 @@ fn type11_zero_copy_declines_transient_host_mappings() {
     }
     assert!(state.set_mapping_geom(mid, width, height, MTL_FORMAT_BGRA8_UNORM));
 
-    assert!(try_type11_sample_zero_copy(&mut state, &mut host, mid, width, height).is_none());
+    let resource = crate::model::TaskResource::new(Default::default(), std::sync::Arc::from([]));
+    assert!(try_type11_sample_zero_copy(
+        &mut state,
+        &mut host,
+        mid,
+        width,
+        height,
+        resource.lifetime_ref(),
+    )
+    .is_none());
     assert_eq!(
         host.map_pages_calls, 0,
         "transient hosts must decline before creating an importable view"
@@ -215,13 +224,35 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
     }
     assert!(state.set_mapping_geom(mid, 128, 128, MTL_FORMAT_BGRA8_UNORM));
     crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
+    let type11_witnesses = crate::runtime::drain::store_route_count("gw_rail_t11");
+    let type5_witnesses = crate::runtime::drain::store_route_count("gw_rail_t5");
+    let type11_resource =
+        crate::model::TaskResource::new(Default::default(), std::sync::Arc::from([]));
+    let type5_resource =
+        crate::model::TaskResource::new(Default::default(), std::sync::Arc::from([]));
 
-    let type11 = try_type11_sample_zero_copy(&mut state, &mut host, mid, 128, 128)
-        .expect("the mapping's color plane is sampleable");
-    let SampledSourceRequest::GuestRuns(type11, ..) = type11 else {
+    let type11 = try_type11_sample_zero_copy(
+        &mut state,
+        &mut host,
+        mid,
+        128,
+        128,
+        type11_resource.lifetime_ref(),
+    )
+    .expect("the mapping's color plane is sampleable");
+    let SampledSourceRequest::GuestRuns(type11, _, _, type11_identity, ..) = type11 else {
         panic!("the mapping stays guest-backed")
     };
-    let type11_import = type11.direct_image.expect("stable allocation binds directly").import;
+    assert_eq!(type11_identity, None);
+    assert_eq!(
+        crate::runtime::drain::store_route_count("gw_rail_t11"),
+        type11_witnesses,
+        "a direct resource has no copied image whose freshness needs witnessing"
+    );
+    let type11_import = type11
+        .direct_image
+        .expect("stable allocation binds directly")
+        .import;
 
     let type5 = try_type5_sample_zero_copy(
         &mut state,
@@ -234,12 +265,22 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
             depth: 1,
             plane_index: 0,
         },
+        type5_resource.lifetime_ref(),
     )
     .expect("the serialized plane view is sampleable");
-    let SampledSourceRequest::GuestRuns(type5, ..) = type5 else {
+    let SampledSourceRequest::GuestRuns(type5, _, _, type5_identity, ..) = type5 else {
         panic!("the plane view stays guest-backed")
     };
-    let type5_import = type5.direct_image.expect("stable allocation binds directly").import;
+    assert_eq!(type5_identity, None);
+    assert_eq!(
+        crate::runtime::drain::store_route_count("gw_rail_t5"),
+        type5_witnesses,
+        "a direct plane has no copied image whose freshness needs witnessing"
+    );
+    let type5_import = type5
+        .direct_image
+        .expect("stable allocation binds directly")
+        .import;
     crate::runtime::guest_ram::forget_import_limits();
 
     assert_eq!(
@@ -280,9 +321,17 @@ fn small_mapping_sampled_plane_uses_its_direct_resource() {
     ];
     assert!(state.set_mapping_geom(mid, width, height, MTL_FORMAT_BGRA8_UNORM));
     crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
+    let resource = crate::model::TaskResource::new(Default::default(), std::sync::Arc::from([]));
 
-    let sampled = try_type11_sample_zero_copy(&mut state, &mut host, mid, width, height)
-        .expect("a directly-backed sampled resource has no size crossover");
+    let sampled = try_type11_sample_zero_copy(
+        &mut state,
+        &mut host,
+        mid,
+        width,
+        height,
+        resource.lifetime_ref(),
+    )
+    .expect("a directly-backed sampled resource has no size crossover");
     let SampledSourceRequest::GuestRuns(source, ..) = sampled else {
         panic!("the mapping stays guest-backed")
     };
@@ -5220,15 +5269,29 @@ fn sampled_plane_keeps_the_packed_allocation_and_checks_its_extent() {
         runs: std::sync::Arc::new(Vec::new()),
         pages: std::sync::Arc::new(Vec::new()),
     };
-    let sampled = super::vulkan::sampled_backing_from_packed(&packed, 0x1000, 512, 0x2000)
-        .expect("the plane lies inside the packed allocation");
+    let resource = crate::model::TaskResource::new(Default::default(), std::sync::Arc::from([]));
+    let sampled = super::vulkan::sampled_backing_from_packed(
+        &packed,
+        0x1000,
+        512,
+        0x2000,
+        resource.lifetime_ref(),
+    )
+    .expect("the plane lies inside the packed allocation");
     assert_eq!(sampled.backing.allocation_host_ptr, import.host_base());
     assert_eq!(sampled.backing.allocation_len, import.len());
     assert_eq!(sampled.backing.plane_offset, 0x1800);
     assert_eq!(sampled.backing.row_pitch, 512);
     assert!(std::sync::Arc::ptr_eq(&sampled.import, &import));
     assert!(
-        super::vulkan::sampled_backing_from_packed(&packed, 0x7000, 512, 0x1001).is_none(),
+        super::vulkan::sampled_backing_from_packed(
+            &packed,
+            0x7000,
+            512,
+            0x1001,
+            resource.lifetime_ref(),
+        )
+        .is_none(),
         "a plane may not extend the imported allocation to fit"
     );
 }

@@ -442,20 +442,14 @@ impl ResourcePools {
         trimmed
     }
 
-    unsafe fn trim_aged_guest_sampled(
-        &mut self,
-        device: &ash::Device,
-        cutoff: u64,
-        max: usize,
-    ) -> usize {
-        let keys: Vec<_> = self
-            .guest_sampled
-            .iter()
-            .filter_map(|(key, slot)| (slot.last_touch_ms <= cutoff).then_some(key.clone()))
-            .take(max)
-            .collect();
+    /// Reclaim direct images only after their serialized resource dies.
+    /// Unlike copied sampled content, these images are the resource itself;
+    /// time since the last bind says nothing about their lifetime.
+    unsafe fn trim_dead_guest_sampled(&mut self, device: &ash::Device, max: usize) -> usize {
+        let keys = self.dead_guest_sampled_keys(max);
         for key in &keys {
             if let Some(slot) = self.guest_sampled.remove(key) {
+                crate::runtime::drain::note_store_route("sampled_direct_resource_retired");
                 self.dispose(
                     device,
                     DeferredHandle::GuestImage {
@@ -468,6 +462,14 @@ impl ResourcePools {
             }
         }
         keys.len()
+    }
+
+    fn dead_guest_sampled_keys(&self, max: usize) -> Vec<GuestSampledKey> {
+        self.guest_sampled
+            .iter()
+            .filter_map(|(key, slot)| (!slot.owner.is_live()).then_some(key.clone()))
+            .take(max)
+            .collect()
     }
 
     /// Device-free half of [`Self::trim_aged_sampled_cache`]: remove up to `max`
@@ -683,7 +685,10 @@ impl ResourcePools {
         // cutoff frees them once idle without touching an actively-sampled entry.
         let sampled_cutoff = self.idle_clock_ms.saturating_sub(IDLE_TARGET_AGE_MS);
         self.trim_aged_sampled_cache(&ctx.device, sampled_cutoff, IDLE_RECYCLE_TRIM_PER_PASS);
-        self.trim_aged_guest_sampled(&ctx.device, sampled_cutoff, IDLE_RECYCLE_TRIM_PER_PASS);
+        // Direct images are resource objects, not copied content. Their weak
+        // owner expires when the object table drops the serialized resource;
+        // the same bounded maintenance pass then releases the Vulkan object.
+        self.trim_dead_guest_sampled(&ctx.device, IDLE_RECYCLE_TRIM_PER_PASS);
         // …and the compute-storage residents, the standalone-VkDeviceMemory pool the
         // render-registry / sampled-cache drains above do not cover. A settled
         // compute-heavy session's blur/decode storage images are pinned until an
@@ -3420,13 +3425,20 @@ impl ResourcePools {
     pub(crate) unsafe fn acquire_guest_sampled(
         &mut self,
         ctx: &DeviceContext,
-        key: GuestSampledKey,
+        image: SampledKey,
+        backing: crate::backend::vulkan::engine::GuestTargetBacking,
         import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
+        owner: crate::model::TaskResourceLifetimeRef,
         counters: &EngineCounters,
     ) -> Result<Option<GuestSampledUse>, DrawError> {
+        let key = GuestSampledKey {
+            image,
+            backing,
+            owner_id: owner.id(),
+        };
         if let Some(slot) = self.guest_sampled.get_mut(&key) {
-            slot.last_touch_ms = self.idle_clock_ms;
             return Ok(Some(GuestSampledUse {
+                key,
                 image: slot.image,
                 view: slot.view,
                 initialized: slot.initialized,
@@ -3492,6 +3504,7 @@ impl ResourcePools {
         };
         counters.note_create(CreateSite::GuestSampledImageView);
         let use_ = GuestSampledUse {
+            key: key.clone(),
             image: imported.image,
             view,
             initialized: false,
@@ -3503,8 +3516,8 @@ impl ResourcePools {
                 memory: imported.memory,
                 view,
                 _import: import,
+                owner,
                 initialized: false,
-                last_touch_ms: self.idle_clock_ms,
             },
         );
         crate::runtime::drain::note_store_route("sampled_direct_created");
@@ -3514,7 +3527,6 @@ impl ResourcePools {
     pub(crate) fn mark_guest_sampled_read(&mut self, key: &GuestSampledKey) {
         if let Some(slot) = self.guest_sampled.get_mut(key) {
             slot.initialized = true;
-            slot.last_touch_ms = self.idle_clock_ms;
         }
     }
 
@@ -4417,6 +4429,69 @@ mod recycle_tests {
             ),
             swizzle: Default::default(),
         }
+    }
+
+    fn direct_sampled(
+        owner: crate::model::TaskResourceLifetimeRef,
+        host_ptr: usize,
+    ) -> (GuestSampledKey, GuestSampledSlot) {
+        let import = std::sync::Arc::new(
+            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                host_ptr, 0x1000, 0x1000,
+            )
+            .unwrap(),
+        );
+        let backing = crate::backend::vulkan::engine::GuestTargetBacking {
+            allocation_host_ptr: host_ptr,
+            allocation_len: 0x1000,
+            plane_offset: 0,
+            row_pitch: 64,
+        };
+        let key = GuestSampledKey {
+            image: null_slot(16, 16).key(),
+            backing,
+            owner_id: owner.id(),
+        };
+        let slot = GuestSampledSlot {
+            image: vk::Image::null(),
+            memory: vk::DeviceMemory::null(),
+            view: vk::ImageView::null(),
+            _import: import,
+            owner,
+            initialized: false,
+        };
+        (key, slot)
+    }
+
+    #[test]
+    fn direct_sampled_images_follow_resource_lifetime_not_idle_age() {
+        let mut pools = ResourcePools::new();
+        let live = crate::model::TaskResource::new(Default::default(), std::sync::Arc::from([]));
+        let dead_ref = {
+            let dead =
+                crate::model::TaskResource::new(Default::default(), std::sync::Arc::from([]));
+            dead.lifetime_ref()
+        };
+        let (live_key, live_slot) = direct_sampled(live.lifetime_ref(), 0x1000_0000);
+        let (dead_key, dead_slot) = direct_sampled(dead_ref, 0x1000_0000);
+        assert_ne!(
+            live_key, dead_key,
+            "two API resources remain distinct even when they alias one allocation"
+        );
+        pools.guest_sampled.insert(live_key.clone(), live_slot);
+        pools.guest_sampled.insert(dead_key.clone(), dead_slot);
+
+        pools.idle_clock_ms = IDLE_TARGET_AGE_MS * 100;
+        assert_eq!(
+            pools.dead_guest_sampled_keys(8),
+            vec![dead_key],
+            "arbitrary idle age must not destroy a live API resource"
+        );
+
+        drop(live);
+        let dead = pools.dead_guest_sampled_keys(8);
+        assert_eq!(dead.len(), 2);
+        assert!(dead.contains(&live_key));
     }
 
     /// [`GatheredName`] decides when two gathers are one window, and this is the

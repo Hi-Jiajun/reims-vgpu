@@ -3597,15 +3597,13 @@ pub(crate) unsafe fn execute_draw_inner(
             }
             SampledSource::GuestRuns(src, vouch) => {
                 if let Some(direct) = src.direct_image.as_ref() {
-                    let key = super::pools::GuestSampledKey {
-                        image: SampledKey::of(resource),
-                        backing: direct.backing,
-                    };
                     if let Some(bound) = unsafe {
                         pools.acquire_guest_sampled(
                             ctx,
-                            key.clone(),
+                            SampledKey::of(resource),
+                            direct.backing,
                             std::sync::Arc::clone(&direct.import),
+                            direct.owner.clone(),
                             counters,
                         )?
                     } {
@@ -3625,19 +3623,21 @@ pub(crate) unsafe fn execute_draw_inner(
                             array_element: resource.array_element,
                             image: bound.image,
                             view: bound.view,
-                            key,
+                            key: bound.key,
                             initialized: bound.initialized,
                         });
                         continue;
                     }
                 }
-                // The producer vouches for this identity only when both halves
-                // of the guest-write witness say the window's bytes cannot have
+                // A copy-backed producer vouches for its identity only when
+                // both halves of the guest-write witness say the window's bytes cannot have
                 // moved since the gather that filled the retained image: no
                 // guest store into the pages, and no write by this device
                 // either. So the retained image is bound with nothing read and
                 // nothing compared — which is the whole point, since reading
-                // the bytes to compare them is the cost being removed.
+                // the bytes to compare them is the cost being removed. A
+                // declined direct image carries no identity, so this lookup
+                // misses without touching the copied-content ledger.
                 if let Some(image) = pools.find_gathered_sampled(
                     SampledKey::of(resource),
                     resource.identity,
@@ -3656,11 +3656,11 @@ pub(crate) unsafe fn execute_draw_inner(
                 // left to spend it on. Taken here because this is the only point
                 // holding both the witness's answer and the cache's.
                 //
-                // The witness's answer is `vouch` and never `resource.identity`.
-                // Asking the identity was the same question the *producer* had
-                // already answered structurally — it names every window it is
-                // asked about — so the "no vouch" half read zero on every bind
-                // of every boot.
+                // The witness's answer is `vouch`; the identity names the
+                // content it judged. A direct source that reached this point
+                // was declined by the backend and carries neither copied
+                // content nor a vouchable identity, so `Fresh` correctly names
+                // the required conservative gather.
                 counters.note_sampled_gather_unskipped(*vouch);
                 let img = pools.acquire_sampled(ctx, SampledKey::of(resource), counters)?;
                 // Everything from here to the end of this arm moves bytes;
