@@ -5,9 +5,8 @@
 //! is what recycles the pools. A staging, readback, sampled or storage-image
 //! slot handed to a batch is not free when its caller is done with it; it rides
 //! `PendingGpuCleanup` until `retire_slot` has waited that batch's fence, and
-//! only then does `drain_cleanup` push it back onto a free list. The idle-drain
-//! planner in this file decides when the trims that shrink those lists may run
-//! at all.
+//! only then does `drain_cleanup` push it back onto a free list. Periodic
+//! maintenance decides when those already-free lists may shrink.
 //!
 //! The image *registry* is keyed by identity rather than by slot and lives in
 //! [`super::images_and_registry`]; destroying everything here is
@@ -186,8 +185,8 @@ impl ResourcePools {
             compute_storage_sole_copy: NonPinnedTotals::default(),
             compute_storage_sole_copy_peak: NonPinnedTotals::default(),
             idle_clock_ms: 0,
-            last_drain_ms: 0,
-            settled_drain_passes: 0,
+            last_maintenance_ms: 0,
+            settled_maintenance_passes: 0,
             cmd_pool: vk::CommandPool::null(),
             desc_arena: DescriptorArena::empty(),
             scatter: None,
@@ -212,59 +211,22 @@ impl ResourcePools {
             initialized: false,
         }
     }
-    /// Advance the wall-clock idle-drain clock to `now_ms`, keep the presented
-    /// target alive (`display`), and — if an idle pass is due — select a bounded
-    /// set of aged non-pinned residents to reclaim. Pure — no GPU work — so the
-    /// aging + throttle logic is unit-testable without a device.
-    ///
-    /// Returns `None` when no pass is due (before the first age window, or inside
-    /// the throttle interval); `Some(victims)` (possibly empty) when a pass fired.
-    /// The `Some`/`None` distinction is load-bearing: the caller also trims the
-    /// recycle pools on a fired pass, and an empty registry with a full recycle
-    /// pool must still trim.
-    ///
-    /// `display` is the currently-presented target's identity: it is resolved via
-    /// `registry_get` (a read that does not stamp), so at true idle — where the
-    /// poll heartbeat still ticks this clock but no publish re-touches the frame —
-    /// it would otherwise age out from under the display. Stamping it here every
-    /// call makes it un-ageable while it is on screen.
-    pub(super) fn plan_idle_drain(
-        &mut self,
-        now_ms: u64,
-        display: Option<&TargetIdentity>,
-    ) -> Option<Vec<TargetIdentity>> {
+    /// Advance the registry clock and report whether a bounded maintenance pass
+    /// is due. The pass may release objects already outside every live resource
+    /// (dead direct images and free-pool entries), but elapsed time is never an
+    /// authority to destroy a live resident.
+    pub(super) fn plan_idle_maintenance(&mut self, now_ms: u64) -> bool {
         if now_ms > self.idle_clock_ms {
             self.idle_clock_ms = now_ms;
         }
         let now = self.idle_clock_ms;
-        if let Some(id) = display {
-            if let Some(slot) = self.registry.get_mut(id) {
-                slot.last_touch_ms = now;
-            }
-        }
-        if now < IDLE_TARGET_AGE_MS
-            || now.saturating_sub(self.last_drain_ms) < IDLE_DRAIN_INTERVAL_MS
+        if now < IDLE_MAINTENANCE_START_MS
+            || now.saturating_sub(self.last_maintenance_ms) < MAINTENANCE_INTERVAL_MS
         {
-            return None;
+            return false;
         }
-        self.last_drain_ms = now;
-        let cutoff = now - IDLE_TARGET_AGE_MS;
-        let mut victims = Vec::new();
-        for k in &self.registry_order {
-            if victims.len() >= IDLE_TARGET_DRAIN_MAX_PER_CALL {
-                break;
-            }
-            // Age is a reason to reclaim only what something else still holds.
-            // `gpu_only_content` is the slot whose pixels exist nowhere but this
-            // image, and no age makes destroying one anything but a lost frame —
-            // see `ResidentTargetSlot::gpu_only_content`.
-            if self.registry.get(k).is_some_and(|s| {
-                s.pin_count == 0 && !s.gpu_only_content && s.last_touch_ms <= cutoff
-            }) {
-                victims.push(k.clone());
-            }
-        }
-        Some(victims)
+        self.last_maintenance_ms = now;
+        true
     }
 
     /// Destroy up to `max` images from the image recycle pools (`sampled_free`
@@ -391,7 +353,7 @@ impl ResourcePools {
         // The DEVICE_LOCAL image slab, under the same settled state as the
         // pools above rather than at the caller — which is how it came to run on
         // *every* fired pass instead. The pass fires every
-        // `IDLE_DRAIN_INTERVAL_MS` whenever the poll heartbeat ticks, which is
+        // `MAINTENANCE_INTERVAL_MS` whenever the poll heartbeat ticks, which is
         // most of the time on any workload that does not saturate the drain
         // worker, so trimming to zero there handed back the block the next frame
         // re-allocated. [`IDLE_SLAB_KEEP_EMPTY`] carries the boot that read 257
@@ -404,42 +366,6 @@ impl ResourcePools {
             self.slab.trim_empty_blocks(device, keep);
         }
         trimmed + buf_trimmed
-    }
-
-    /// Reclaim up to `max` sampled-cache entries whose last use is at least
-    /// `IDLE_TARGET_AGE_MS` behind the idle clock (`cutoff`) — the upload-side
-    /// analogue of the resident-target idle drain. At idle a video session's
-    /// retained frame textures (the ≤128 MiB `sampled_cache`) are otherwise
-    /// pinned until new content evicts them by LRU, which never happens on a
-    /// static desktop, so they hold VRAM for the guest lifetime (measured
-    /// `sampled=64` / resident +~96 MiB frozen after a video tab closed).
-    /// Age-gating means an actively-sampled entry (hit every frame, so
-    /// `last_touch_ms` fresh) is never trimmed — only entries idle past the age
-    /// fall out, so a live session is undisturbed (no re-upload hitch). Terminal
-    /// destroy via `dispose(Image)` (not `RecycleSampled`): an idle-stale frame
-    /// will not be re-sampled, so caching it in `sampled_free` would defeat the
-    /// drain; freeing the image releases its slab sub-range exactly like the
-    /// target drain. In-flight-safe (deferred until the referencing CB retires).
-    /// Returns the count trimmed, reflected in the always-on `sampled=` census.
-    unsafe fn trim_aged_sampled_cache(
-        &mut self,
-        device: &ash::Device,
-        cutoff: u64,
-        max: usize,
-    ) -> usize {
-        let aged = self.take_aged_sampled_slots(cutoff, max);
-        let trimmed = aged.len();
-        for slot in aged {
-            self.dispose(
-                device,
-                DeferredHandle::Image {
-                    image: slot.image,
-                    view: slot.view,
-                    memory: slot.memory,
-                },
-            );
-        }
-        trimmed
     }
 
     /// Reclaim direct images only after their serialized resource dies.
@@ -472,26 +398,6 @@ impl ResourcePools {
             .collect()
     }
 
-    /// Device-free half of [`Self::trim_aged_sampled_cache`]: remove up to `max`
-    /// sampled-cache entries whose `last_touch_ms <= cutoff`, decrement the byte
-    /// accounting, and return their slots for the caller to dispose. Split out so
-    /// the age selection + byte bookkeeping is unit-testable without a GPU
-    /// (mirrors [`Self::plan_idle_drain`] returning victims for the caller to
-    /// dispose).
-    fn take_aged_sampled_slots(&mut self, cutoff: u64, max: usize) -> Vec<SampledSlot> {
-        let mut taken = Vec::new();
-        let mut i = 0;
-        while i < self.sampled_cache.len() && taken.len() < max {
-            if self.sampled_cache[i].last_touch_ms <= cutoff {
-                taken.push(self.evict_sampled_entry(i, SampledVictimRoute::Aged));
-                // `remove(i)` shifted the next entry into slot `i`; do not advance.
-            } else {
-                i += 1;
-            }
-        }
-        taken
-    }
-
     /// Take entry `index` out of the sampled cache, charge the byte accounting,
     /// and remember what was lost.
     ///
@@ -519,79 +425,15 @@ impl ResourcePools {
         evicted.slot
     }
 
-    /// Reclaim up to `max` compute-storage residents whose last use is at least
-    /// `IDLE_TARGET_AGE_MS` behind the idle clock (`cutoff`) — the compute analogue
-    /// of the resident-target idle drain. Each resident is a standalone (non-slab)
-    /// `VkDeviceMemory`, so a settled compute-heavy session (blur passes, a decode
-    /// storage image) otherwise pins whole allocations for the guest lifetime —
-    /// nothing else trims this registry until an allocation fails.
-    /// Age-gating leaves an actively-dispatched resident (touched every pass, so
-    /// `last_touch_ms` fresh) untouched and skips pinned residents (deferred
-    /// writeback, only-copy-on-GPU), the same predicate the allocation-failure
-    /// reclaim selects on. Terminal destroy
-    /// via `dispose(Image)`; in-flight-safe (deferred until the referencing CB
-    /// retires). Returns the count trimmed, reflected in the `st_res` census.
-    unsafe fn trim_aged_compute_storage(
-        &mut self,
-        device: &ash::Device,
-        cutoff: u64,
-        max: usize,
-    ) -> usize {
-        let aged = self.take_aged_storage_residents(cutoff, max);
-        let trimmed = aged.len();
-        for slot in aged {
-            self.dispose(
-                device,
-                DeferredHandle::Image {
-                    image: slot.image,
-                    view: slot.view,
-                    memory: slot.memory,
-                },
-            );
-        }
-        trimmed
-    }
-
-    /// Device-free half of [`Self::trim_aged_compute_storage`]: remove up to `max`
-    /// non-pinned compute-storage residents whose `last_touch_ms <= cutoff` from
-    /// the registry and its LRU order, and return their slots for the caller to
-    /// dispose. Split out so the age/pin selection is unit-testable without a GPU
-    /// (mirrors [`Self::take_aged_sampled_slots`]).
-    fn take_aged_storage_residents(&mut self, cutoff: u64, max: usize) -> Vec<StorageImageSlot> {
-        let victims: Vec<ComputeStorageResidencyKey> = self
-            .compute_storage_order
-            .iter()
-            .filter(|k| {
-                // `gpu_only_content` is dispatch output that exists nowhere but
-                // this image, and no age makes destroying one anything but a
-                // refused dispatch later — see
-                // `ResidentStorageImageSlot::gpu_only_content`.
-                self.compute_storage_registry
-                    .get(*k)
-                    .is_some_and(|r| !r.pinned && !r.gpu_only_content && r.last_touch_ms <= cutoff)
-            })
-            .take(max)
-            .copied()
-            .collect();
-        let mut taken = Vec::with_capacity(victims.len());
-        for k in victims {
-            if let Some(resident) = self.remove_compute_storage_resident(&k) {
-                taken.push(resident.slot);
-            }
-        }
-        taken
-    }
-
-    /// Update the consecutive-settled-pass counter for a fired idle-drain pass
-    /// that reclaimed `drained` registry victims, and return whether the
-    /// HOST_VISIBLE buffer pools may be trimmed this pass.
+    /// Update the consecutive-settled-pass counter for maintenance and return
+    /// whether the HOST_VISIBLE buffer pools may be trimmed this pass.
     ///
-    /// A pass is settled only if it drained no registry victim AND no staging
-    /// buffer was acquired since the previous pass. The trim then needs
+    /// A pass is settled only if no staging buffer was acquired since the
+    /// previous pass. The trim then needs
     /// `SETTLED_PASSES_FOR_BUFFER_TRIM` consecutive settled passes.
     ///
-    /// The victim count alone was the wrong signal, and its own doc comment named
-    /// the failure it was meant to prevent: "a single quiet pass mid-playback
+    /// Upload traffic is the direct signal for the failure this gate prevents:
+    /// "a single quiet pass mid-playback
     /// cannot steal a staging buffer and spike the next upload's latency with a
     /// full `vkAllocateMemory`". Registry victims go to zero when the session is
     /// idle *and* when it is busy with a stable working set — a steady animation
@@ -606,98 +448,35 @@ impl ResourcePools {
     /// directly instead of inferred. At true idle the guest stops publishing, no
     /// draw acquires staging, and the trim still fires and still returns the
     /// memory.
-    pub(super) fn note_drain_settled(&mut self, drained: usize) -> bool {
+    pub(super) fn note_maintenance_settled(&mut self) -> bool {
         let acquires = self.staging_hits.wrapping_add(self.staging_misses);
         let uploads_ran = acquires != self.settled_staging_mark;
         self.settled_staging_mark = acquires;
-        if drained == 0 && !uploads_ran {
-            self.settled_drain_passes = self.settled_drain_passes.saturating_add(1);
+        if !uploads_ran {
+            self.settled_maintenance_passes = self.settled_maintenance_passes.saturating_add(1);
         } else {
-            self.settled_drain_passes = 0;
+            self.settled_maintenance_passes = 0;
         }
-        self.settled_drain_passes >= SETTLED_PASSES_FOR_BUFFER_TRIM
+        self.settled_maintenance_passes >= SETTLED_PASSES_FOR_BUFFER_TRIM
     }
 
-    /// Advance the wall-clock idle-drain clock and reclaim a bounded number of
-    /// non-pinned residents untouched for `IDLE_TARGET_AGE_MS`. Called from the
-    /// poll heartbeat (ticks even when the guest stops publishing) and each
-    /// publish. This is the mechanism that lets a compositing burst be *absorbed*
-    /// with no slot count trimming it, while still returning
-    /// VRAM to the baseline working set once the burst ends — even on a static
-    /// page where no further publishes occur: a burst's targets are all
-    /// recently-touched (kept), and its stale leftovers age out ~2 s later. Pinned
-    /// slots (deferred-write windows) are never drained — they leave via their own
-    /// window lifecycle. Reclaimed images route through the same in-flight-safe
-    /// recycle/dispose path as an allocation-failure reclaim; they are NOT counted as
-    /// `target_evicts` (that counter is the thrash signal, and idle reclamation is
-    /// not thrash). On a fired pass it also trims the recycle pools
-    /// ([`Self::trim_recycle_pools`]) — at idle those are pure retained VRAM.
-    /// Returns the count of registry residents drained this call, for the
-    /// always-on census.
-    pub(crate) unsafe fn advance_registry_touch_and_drain(
+    /// Run periodic maintenance for objects that are already outside live
+    /// resource ownership. Live render, sampled, and compute residents leave
+    /// only through explicit lifetime changes or allocation-pressure recovery;
+    /// an idle interval is not a resource-state transition.
+    pub(crate) unsafe fn advance_registry_maintenance(
         &mut self,
         ctx: &DeviceContext,
+        counters: &EngineCounters,
         now_ms: u64,
-        display: Option<&TargetIdentity>,
     ) {
-        let Some(victims) = self.plan_idle_drain(now_ms, display) else {
+        if !self.plan_idle_maintenance(now_ms) {
             return;
-        };
-        let drained = victims.len();
-        for k in victims {
-            // The same bookkeeping exit the eviction and recreate paths take.
-            // This loop used to hand-write it, and had already parted from the
-            // others in the way `retire_resident`'s doc says copies here part:
-            // it disposed `old.framebuffer` unconditionally.
-            if let Some(old) = self.unregister_resident(&k, ResidentReclaim::IdleDrained) {
-                self.dispose_owed_framebuffer(&ctx.device, old.owed_framebuffer());
-                // Terminal DESTROY, not RecycleTarget: an idle-drained resident is
-                // stale by `IDLE_TARGET_AGE_MS` — it is not being actively recycled
-                // (that is the capacity-eviction path's job for a per-frame video
-                // output), so caching it in `target_free` would defeat the whole
-                // point of the drain. `RecycleTarget` keeps the image's slab
-                // sub-allocation live, so a diverse burst (hundreds of distinct
-                // geometries, ≤ `TARGET_FREE_CAP_PER_KEY` each) would cache every
-                // image and no slab block could ever empty — measured VRAM stuck at
-                // 1532 MiB after the registry drained to ~22. Freeing the image
-                // releases its slab sub-range; when a block's last sub-allocation
-                // leaves, the slab returns it to the driver (`SLAB_KEEP_EMPTY`), so
-                // VRAM returns to the idle baseline.
-                self.dispose(
-                    &ctx.device,
-                    DeferredHandle::Image {
-                        image: old.image,
-                        view: old.view,
-                        memory: old.memory.handle(),
-                    },
-                );
-            }
         }
-        // Track settled-ness and decide whether this pass may trim the expensive
-        // HOST_VISIBLE buffer pools.
-        let trim_buffers = self.note_drain_settled(drained);
-        // A fired pass also returns the recycle pools' idle VRAM to the driver.
+        self.retire_released_residents(ctx, counters, IDLE_RECYCLE_TRIM_PER_PASS);
+        let trim_buffers = self.note_maintenance_settled();
         self.trim_recycle_pools(&ctx.device, IDLE_RECYCLE_TRIM_PER_PASS, trim_buffers);
-        // …and ages out the sampled-content cache, the upload-side pool the
-        // recycle/buffer trims above do not cover. A settled video session's
-        // frame textures (≤128 MiB) are pinned until LRU eviction that never
-        // comes on a static desktop; age-gating on the same `IDLE_TARGET_AGE_MS`
-        // cutoff frees them once idle without touching an actively-sampled entry.
-        let sampled_cutoff = self.idle_clock_ms.saturating_sub(IDLE_TARGET_AGE_MS);
-        self.trim_aged_sampled_cache(&ctx.device, sampled_cutoff, IDLE_RECYCLE_TRIM_PER_PASS);
-        // Direct images are resource objects, not copied content. Their weak
-        // owner expires when the object table drops the serialized resource;
-        // the same bounded maintenance pass then releases the Vulkan object.
         self.trim_dead_guest_sampled(&ctx.device, IDLE_RECYCLE_TRIM_PER_PASS);
-        // …and the compute-storage residents, the standalone-VkDeviceMemory pool the
-        // render-registry / sampled-cache drains above do not cover. A settled
-        // compute-heavy session's blur/decode storage images are pinned until an
-        // LRU eviction that never comes on a static desktop; the same age cutoff
-        // frees them once idle without touching an actively-dispatched resident.
-        self.trim_aged_compute_storage(&ctx.device, sampled_cutoff, IDLE_RECYCLE_TRIM_PER_PASS);
-        // The image slab's empty blocks are released by `trim_recycle_pools`
-        // above, next to the buffer slab's and under the same settled gate —
-        // one policy, one call site, so the two cannot drift apart again.
     }
 
     /// Cumulative transient sampled/snapshot pool recycle diagnostics:
@@ -1758,8 +1537,7 @@ impl ResourcePools {
     /// through the one removal site and return the slots for the caller to
     /// dispose.
     ///
-    /// Split out for the same reason [`Self::take_aged_sampled_slots`] is, and
-    /// here the accounting is the part that would break silently. A discard that
+    /// Split out so the accounting is testable without a device. A discard that
     /// emptied `sampled_cache` without returning `sampled_cache_bytes` to zero
     /// would leave the byte cap believing it was full for the rest of the boot,
     /// and every later admission would evict a live entry to make room that was
@@ -3883,8 +3661,7 @@ impl ResourcePools {
     /// Device-free half of [`Self::admit_sampled_slot`]: place the entry, charge
     /// the byte accounting, and return the slots the caps pushed out for the
     /// caller to dispose. Split out so admission — the rail that decides whether
-    /// a window is gathered twice — is reachable from a test with no GPU, the
-    /// same split [`Self::take_aged_sampled_slots`] carries for the age trim.
+    /// a window is gathered twice — is reachable from a test with no GPU.
     ///
     /// The three arms that decline hand the slot back to `sampled_live`, which
     /// this entry's own [`Self::seal_entry`] has just emptied — so it is swept
@@ -4214,11 +3991,9 @@ fn sampled_evict_route(len: usize, bytes: usize) -> Option<&'static str> {
 ///   `sampled_reach_beyond_ledger` are every gathered miss that carried an
 ///   identity, so the total is bounded above by
 ///   `sampled_gather_unretained + sampled_gather_unvouched`.
-/// - `sampled_reach_lost_to_cap + sampled_reach_lost_to_age` equals the count
-///   ladder's total, and it is the pair that says *which* fix. A miss lost to
-///   the caps is about cache size; a miss lost to the idle drain is about
-///   `IDLE_TARGET_AGE_MS` being shorter than the guest's re-bind interval, and
-///   no amount of extra cache reaches it.
+/// - `sampled_reach_lost_to_cap` classifies a cache-capacity miss. The former
+///   age-loss route no longer exists because elapsed time is not a guest
+///   resource-lifetime event.
 ///
 /// A large `beyond_ledger` is not a licence to lengthen the ledger. It says the
 /// workload's reuse distance is past eight times the cache, and a cache that
@@ -4481,7 +4256,7 @@ mod recycle_tests {
         pools.guest_sampled.insert(live_key.clone(), live_slot);
         pools.guest_sampled.insert(dead_key.clone(), dead_slot);
 
-        pools.idle_clock_ms = IDLE_TARGET_AGE_MS * 100;
+        pools.idle_clock_ms = IDLE_MAINTENANCE_START_MS * 100;
         assert_eq!(
             pools.dead_guest_sampled_keys(8),
             vec![dead_key],
@@ -5078,14 +4853,10 @@ mod recycle_tests {
         assert_eq!(pools.sampled_free.count_for(&small), 1);
     }
 
-    /// The idle sampled-cache trim reclaims only entries idle past
-    /// `IDLE_TARGET_AGE_MS` (an actively-sampled entry is touched every frame and
-    /// must survive), decrements the byte accounting by exactly the trimmed
-    /// entries, and is bounded per pass — so a live video session is never
-    /// disturbed while a settled one's ≤128 MiB of frame textures return to the
-    /// driver.
+    /// Maintenance leaves sampled-cache entries alone regardless of their age;
+    /// the cache's count and byte bounds remain the removal policy.
     #[test]
-    fn idle_trim_reclaims_only_aged_sampled_cache_entries() {
+    fn maintenance_does_not_reclaim_sampled_cache_entries_by_age() {
         let mut pools = ResourcePools::new();
         let push = |pools: &mut ResourcePools, w: u32, h: u32, touch: u64, len: usize| {
             pools.sampled_cache_bytes = pools.sampled_cache_bytes.saturating_add(len);
@@ -5101,41 +4872,21 @@ mod recycle_tests {
                 last_touch_ms: touch,
             });
         };
-        push(&mut pools, 1920, 1080, 1_000, 8_000_000); // aged
-        push(&mut pools, 1280, 720, 1_500, 4_000_000); // aged
-        push(&mut pools, 640, 480, 9_000, 1_000_000); // freshly touched
+        push(&mut pools, 1920, 1080, 1_000, 8_000_000);
+        push(&mut pools, 1280, 720, 1_500, 4_000_000);
+        push(&mut pools, 640, 480, 9_000, 1_000_000);
         assert_eq!(pools.sampled_cache.len(), 3);
         assert_eq!(pools.sampled_cache_bytes, 13_000_000);
 
-        // Idle clock at 10_000 ms → cutoff = 10_000 - IDLE_TARGET_AGE_MS.
-        let cutoff = 10_000u64.saturating_sub(IDLE_TARGET_AGE_MS);
-        let taken = pools.take_aged_sampled_slots(cutoff, IDLE_RECYCLE_TRIM_PER_PASS);
-
-        assert_eq!(taken.len(), 2, "only the two aged entries are taken");
-        assert_eq!(pools.sampled_cache.len(), 1, "the fresh entry stays cached");
-        assert_eq!(
-            pools.sampled_cache[0].slot.width, 640,
-            "the surviving entry is the freshly-touched one"
-        );
-        assert_eq!(
-            pools.sampled_cache_bytes, 1_000_000,
-            "byte accounting drops exactly the two aged entries"
-        );
-
-        // Per-pass bound: three more aged entries, max=2 → only two taken.
-        push(&mut pools, 100, 100, 0, 500_000);
-        push(&mut pools, 101, 101, 0, 500_000);
-        push(&mut pools, 102, 102, 0, 500_000);
-        assert_eq!(pools.take_aged_sampled_slots(cutoff, 2).len(), 2);
+        assert!(pools.plan_idle_maintenance(10_000));
+        assert_eq!(pools.sampled_cache.len(), 3);
+        assert_eq!(pools.sampled_cache_bytes, 13_000_000);
     }
 
-    /// The compute-storage residents are standalone (non-slab) VkDeviceMemory, so a
-    /// settled compute session that leaves stale residents pins whole allocations
-    /// until an LRU eviction that never comes on a static desktop. The idle drain
-    /// must reclaim exactly the non-pinned residents idle past the age cutoff, leave
-    /// a freshly-touched or pinned resident alone, and bound the batch per pass.
+    /// Compute-storage residents are standalone allocations, but elapsed time
+    /// still cannot end their guest-visible lifetime.
     #[test]
-    fn idle_trim_reclaims_only_aged_non_pinned_compute_storage() {
+    fn maintenance_does_not_reclaim_compute_storage_by_age() {
         let mut pools = ResourcePools::new();
         let admit = |pools: &mut ResourcePools, tex: u32, touch: u64, pinned: bool| {
             let id = ComputeStorageResidencyKey::linear(0, tex, 0, 0, 0, 8, 8, 0);
@@ -5158,38 +4909,9 @@ mod recycle_tests {
         admit(&mut pools, 4, 9_000, false); // freshly touched — must survive
         assert_eq!(pools.compute_storage_registry.len(), 4);
 
-        // Idle clock at 10_000 ms → cutoff = 10_000 - IDLE_TARGET_AGE_MS.
-        let cutoff = 10_000u64.saturating_sub(IDLE_TARGET_AGE_MS);
-        let taken = pools.take_aged_storage_residents(cutoff, IDLE_RECYCLE_TRIM_PER_PASS);
-
-        assert_eq!(
-            taken.len(),
-            2,
-            "only the two aged non-pinned residents are taken"
-        );
-        assert_eq!(
-            pools.compute_storage_registry.len(),
-            2,
-            "pinned + fresh survive"
-        );
-        assert_eq!(
-            pools.compute_storage_order.len(),
-            2,
-            "the LRU order drops exactly the reclaimed residents"
-        );
-        assert!(
-            pools
-                .compute_storage_registry
-                .keys()
-                .all(|k| k.texture_ref == 3 || k.texture_ref == 4),
-            "the survivors are the pinned (3) and the freshly-touched (4) residents"
-        );
-
-        // Per-pass bound: three more aged residents, max=2 → only two taken.
-        admit(&mut pools, 5, 0, false);
-        admit(&mut pools, 6, 0, false);
-        admit(&mut pools, 7, 0, false);
-        assert_eq!(pools.take_aged_storage_residents(cutoff, 2).len(), 2);
+        assert!(pools.plan_idle_maintenance(10_000));
+        assert_eq!(pools.compute_storage_registry.len(), 4);
+        assert_eq!(pools.compute_storage_order.len(), 4);
     }
 
     /// A compute-storage resident holding dispatch output nothing has copied out
@@ -5210,22 +4932,15 @@ mod recycle_tests {
         // The dispatch wrote it. Nothing else holds the result.
         pools.mark_resident_storage_image(&id, 7);
 
-        let cutoff = 10_000u64.saturating_sub(IDLE_TARGET_AGE_MS);
-        assert!(
-            pools.take_aged_storage_residents(cutoff, 4).is_empty(),
-            "aged past the cutoff and unpinned, but it is the only copy"
-        );
-        assert!(
-            pools.take_aged_storage_residents(cutoff * 10, 4).is_empty(),
-            "no age makes destroying the only copy anything but a refused dispatch"
-        );
+        assert!(pools.plan_idle_maintenance(10_000));
+        assert!(pools.compute_storage_registry.contains_key(&id));
 
         // A readback lands and the same resident is reclaimable like any other.
         assert!(pools.note_compute_storage_copied_out(&id));
-        assert_eq!(
-            pools.take_aged_storage_residents(cutoff, 4).len(),
-            1,
-            "with the output held elsewhere, reclaiming costs redundant work only"
+        assert!(pools.plan_idle_maintenance(100_000));
+        assert!(
+            pools.compute_storage_registry.contains_key(&id),
+            "a current backing permits pressure reclaim, not time-based removal"
         );
     }
 
@@ -5359,8 +5074,7 @@ mod recycle_tests {
         id
     }
 
-    /// `compute_resident_snapshot` is a *use*, so the age drain does not take a
-    /// resident that a chain is reading but never dispatches into again.
+    /// `compute_resident_snapshot` records a use without changing lifetime.
     ///
     /// The sibling of `a_read_only_compute_storage_resident_is_not_aged_out`
     /// over the other read-only accessor. All three of them took `&self` and
@@ -5381,20 +5095,19 @@ mod recycle_tests {
         // consumer touches a resident it never dispatches into again.
         assert!(pools.compute_resident_snapshot(&read).is_some());
 
-        let cutoff = 10_000u64.saturating_sub(IDLE_TARGET_AGE_MS);
-        pools.take_aged_storage_residents(cutoff, IDLE_RECYCLE_TRIM_PER_PASS);
+        pools.plan_idle_maintenance(20_000);
 
         assert!(
             pools.compute_storage_registry.contains_key(&read),
             "a resident a chain is reading is in use and must not be destroyed"
         );
         assert!(
-            !pools.compute_storage_registry.contains_key(&untouched),
-            "its untouched peer is still reclaimed — the fix must not disable the drain"
+            pools.compute_storage_registry.contains_key(&untouched),
+            "elapsed time does not end the untouched resource's lifetime"
         );
     }
 
-    /// A resident that is only ever *read* survives the age drain.
+    /// A resident that is only ever read remains live.
     ///
     /// The produce-once/sample-many case: a compute chain writes an image and
     /// later chains sample it without dispatching into it again. All three
@@ -5414,16 +5127,15 @@ mod recycle_tests {
         pools.idle_clock_ms = 10_000;
         assert!(pools.compute_resident_sample_source(&read).is_some());
 
-        let cutoff = 10_000u64.saturating_sub(IDLE_TARGET_AGE_MS);
-        pools.take_aged_storage_residents(cutoff, IDLE_RECYCLE_TRIM_PER_PASS);
+        pools.plan_idle_maintenance(20_000);
 
         assert!(
             pools.compute_storage_registry.contains_key(&read),
             "a resident a chain is reading is in use and must not be destroyed"
         );
         assert!(
-            !pools.compute_storage_registry.contains_key(&untouched),
-            "its untouched peer is still reclaimed — the fix must not disable the drain"
+            pools.compute_storage_registry.contains_key(&untouched),
+            "elapsed time does not end the untouched resource's lifetime"
         );
     }
 

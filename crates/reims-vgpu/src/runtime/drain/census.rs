@@ -2732,7 +2732,7 @@ fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot)
         now.registry_non_pinned_peak_bytes >> 20,
         now.sampled_gpu_binds,
         now.resident_resample_peak_ms,
-        crate::backend::vulkan::engine::IDLE_TARGET_AGE_MS,
+        crate::backend::vulkan::engine::IDLE_MAINTENANCE_START_MS,
         now.slab_carved_bytes >> 20,
         now.slab_held_bytes >> 20,
         now.registry_sole_copy_peak,

@@ -281,8 +281,8 @@ pub(crate) struct ResourcePools {
     staging_misses: u64,
     staging_miss_bins: [usize; STAGING_BUCKET_BINS],
     staging_miss_us_bins: [u64; STAGING_BUCKET_BINS],
-    /// `staging_hits + staging_misses` at the previous fired idle pass; see
-    /// `note_drain_settled`.
+    /// `staging_hits + staging_misses` at the previous maintenance pass; see
+    /// `note_maintenance_settled`.
     settled_staging_mark: u64,
     /// Target images + framebuffers keyed by geometry + render_pass identity.
     targets: HashMap<(TargetKey, u64), TargetSlot>, // u64 = render_pass as u64
@@ -337,24 +337,20 @@ pub(crate) struct ResourcePools {
     /// reading it. That sweep is gone — the allocation bounds this population
     /// now, see `ResourcePools::recoverable_compute_storage_residents` — and
     /// what remains reads this order only to be deterministic, oldest-created
-    /// first. Recency still lives on the slot
-    /// ([`ResidentStorageImageSlot::last_touch_ms`]) for the age drain, which is
-    /// the one rule that still consults a stamp.
+    /// first. Recency is diagnostic rather than a removal policy.
     compute_storage_order: VecDeque<ComputeStorageResidencyKey>,
     /// Identity-keyed resident target registry (workstream D).
     registry: HashMap<TargetIdentity, ResidentTargetSlot>,
     /// Insertion order for [`Self::registry`], oldest *created* at the front. A
     /// `VecDeque` because the retired cap-eviction sweep popped and rotated at
-    /// the front; what reads it now — `recoverable_residents` and the idle
-    /// drain — only walks it, so the container is no longer load-bearing and the
-    /// order is.
+    /// the front; pressure recovery and released-resource maintenance only walk
+    /// it, so the container is no longer load-bearing and the order is.
     ///
     /// **Not use order.** Nothing promotes an entry when a draw reuses it, so
     /// this alone would make a session-long resident the permanent front and the
-    /// first candidate of every burst. Recency lives on the slot
-    /// ([`ResidentTargetSlot::last_touch_ms`]), which the idle drain reads
-    /// directly rather than reordering this list — so a promotion stays off the
-    /// per-bind path while this order still makes ties deterministic.
+    /// first candidate of every burst. Touch timestamps remain diagnostic, so
+    /// promotion stays off the per-bind path while this order keeps pressure
+    /// recovery deterministic.
     registry_order: VecDeque<TargetIdentity>,
     /// Recently reclaimed identities and which path took each, so a draw that
     /// samples a missing resident can say whether this device ever held one.
@@ -377,12 +373,8 @@ pub(crate) struct ResourcePools {
     /// Longest a resident had gone untouched before something read it, in
     /// milliseconds of the idle clock, for the life of the pools.
     ///
-    /// The margin against `IDLE_TARGET_AGE_MS`, which is the age at which the
-    /// drain destroys a resident terminally. `resident_resample_band`'s bands
-    /// give the distribution and this gives the worst case; the bands could not
-    /// distinguish their one over-half-cutoff sample sitting at 1.0 s from
-    /// sitting at 1.9 s, and those are opposite answers to whether this cutoff
-    /// has room.
+    /// `resident_resample_band` gives the distribution and this gives the worst
+    /// case. The reading is observational; residency does not branch on it.
     ///
     /// A high-water rather than a windowed value for the same reason
     /// `registry_non_pinned_peak` is: the question is "how close did this boot
@@ -422,25 +414,18 @@ pub(crate) struct ResourcePools {
     /// an allocation failure would have found something in.
     compute_storage_sole_copy: NonPinnedTotals,
     compute_storage_sole_copy_peak: NonPinnedTotals,
-    /// Monotonic wall-clock milliseconds for the resident-target idle drain, fed
-    /// from the poll heartbeat and each publish ([`Self::advance_registry_touch_and_drain`]).
-    /// Each admit/hit/present stamps its slot's `last_touch_ms` with this value;
-    /// the drain reclaims non-pinned residents whose stamp is `IDLE_TARGET_AGE_MS`
-    /// behind. Wall-clock (not a publish counter) so it keeps advancing when the
-    /// guest stops publishing, returning idle VRAM to baseline on a static page.
+    /// Monotonic wall clock for diagnostics and bounded maintenance cadence,
+    /// fed from the poll heartbeat and each publish.
     idle_clock_ms: u64,
-    /// Wall-clock ms of the last reclaim pass — enforces `IDLE_DRAIN_INTERVAL_MS`
-    /// spacing so the ~244 Hz poll cadence cannot empty the registry at once.
-    last_drain_ms: u64,
-    /// Consecutive fired idle-drain passes that reclaimed **zero** registry
-    /// residents. A pass that drains ≥1 victim means the working set is still
-    /// churning (active video keeps aging out old frame RTs), so we reset to 0.
+    /// Wall-clock ms of the last maintenance pass.
+    last_maintenance_ms: u64,
+    /// Consecutive maintenance passes without upload activity.
     /// The HOST_VISIBLE buffer pool trim (a full `vkAllocateMemory` re-alloc on
     /// the upload hot path when it refills) only fires once this crosses
     /// `SETTLED_PASSES_FOR_BUFFER_TRIM`, so a single quiet pass mid-video cannot
     /// steal a 64 MiB staging buffer and spike the next upload's latency. The
     /// image/slab trims stay ungated — they refill via cheap slab suballocation.
-    settled_drain_passes: u32,
+    settled_maintenance_passes: u32,
     /// Persistent command pool; each ring slot owns one primary CB.
     cmd_pool: vk::CommandPool,
     /// Growable descriptor-pool arena (FREE_DESCRIPTOR_SET blocks). Grows a new
@@ -596,8 +581,8 @@ pub(crate) struct ResourcePools {
     /// A window's flush used to unpin its resident as soon as the copy returned,
     /// which was safe only because the copy had already executed by then. With
     /// the wait deferred, unpinning at that point would let the
-    /// allocation-failure reclaim or the idle drain take an image the GPU has
-    /// not read yet. The pin is transferred here instead and released by
+    /// allocation-pressure reclaim take an image the GPU has not read yet. The
+    /// pin is transferred here instead and released by
     /// [`ResourcePools::quiesce_guest_writes`], which waits the whole ring — so
     /// the interval it covers is exactly the interval the copy can still be
     /// running in.
@@ -1224,15 +1209,9 @@ struct ResidentSampledSlot {
     /// Producer identity of the retained content; lets a same-identity,
     /// same-generation rebind skip the content hash + compare entirely.
     identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
-    /// Value of [`ResourcePools::idle_clock_ms`] at this entry's last use (admit
-    /// or `find_cached_sampled` hit). The idle drain
-    /// ([`ResourcePools::advance_registry_touch_and_drain`]) reclaims an entry
-    /// once its touch falls `IDLE_TARGET_AGE_MS` behind the clock — so a settled
-    /// video session's frame textures (the ≤128 MiB sampled cache) are returned
-    /// to the driver at idle instead of pinned for the guest lifetime, while an
-    /// actively-sampled entry (hit every frame) never ages out. Mirrors the
-    /// resident-target registry drain; the sampled cache is the analogous
-    /// upload-side pool the buffer/target idle trims already cover.
+    /// Value of [`ResourcePools::idle_clock_ms`] at this entry's last use, kept
+    /// for cache diagnostics. Removal is governed by the cache's count/byte
+    /// capacity, not by this timestamp.
     last_touch_ms: u64,
 }
 
@@ -1308,15 +1287,8 @@ struct ResidentStorageImageSlot {
     /// when one is available. A ratio near 1 means an allocation failure would
     /// find nothing here to give back.
     gpu_only_content: bool,
-    /// Value of `ResourcePools::idle_clock_ms` (wall-clock ms) at this resident's
-    /// last use (admit or `acquire_resident_storage_image` hit). The idle drain
-    /// ([`ResourcePools::advance_registry_touch_and_drain`]) reclaims a non-pinned
-    /// resident once its touch falls `IDLE_TARGET_AGE_MS` behind the clock — so a
-    /// compute-heavy burst's stale residents (a settled page's blur/decode storage
-    /// images) are returned to the driver instead of pinning standalone
-    /// VkDeviceMemory allocations for the
-    /// guest lifetime, while an actively-dispatched resident (touched every pass)
-    /// never ages out. Mirrors [`ResidentTargetSlot::last_touch_ms`].
+    /// Value of `ResourcePools::idle_clock_ms` at this resident's last use,
+    /// retained for diagnostics. It is not a lifetime or eviction deadline.
     last_touch_ms: u64,
 }
 
@@ -1535,12 +1507,6 @@ pub(crate) enum ResidentMemory {
 }
 
 impl ResidentMemory {
-    pub(crate) fn handle(&self) -> vk::DeviceMemory {
-        match self {
-            Self::Recyclable(memory) | Self::GuestImported { memory, .. } => *memory,
-        }
-    }
-
     pub(crate) fn is_guest_imported(&self) -> bool {
         matches!(self, Self::GuestImported { .. })
     }
@@ -1599,6 +1565,10 @@ pub(crate) struct ResidentTargetSlot {
     /// the first member's flush must not expose the image to eviction while
     /// a peer's window is still armed.
     pub pin_count: u32,
+    /// The serialized resource that owned this resident has ended its lifetime.
+    /// Existing GPU/window holders may finish, but new holders are refused and
+    /// the resident retires when the last pin leaves.
+    pub resource_released: bool,
     /// This image holds pixels that exist **nowhere else** — not in the guest's
     /// pages, not in any host-side copy. Destroying it destroys guest work.
     ///
@@ -1712,13 +1682,8 @@ pub(crate) struct ResidentTargetSlot {
     /// Sampled and staging images are written on other paths, but they are not
     /// registry residents and hold no identity a later draw could resolve.
     pub gpu_only_content: bool,
-    /// Value of `ResourcePools::idle_clock_ms` (wall-clock ms) at this target's
-    /// last use (admit, `registry_ensure` hit, or present touch). The idle drain
-    /// ([`ResourcePools::advance_registry_touch_and_drain`]) reclaims a non-pinned
-    /// resident once its touch falls `IDLE_TARGET_AGE_MS` behind the current
-    /// clock — so a burst's stale targets (a settled YouTube page's thumbnail RTs)
-    /// are reclaimed instead of pinning VRAM for the guest lifetime, while an
-    /// actively-drawn target (touched every frame) never ages out.
+    /// Value of `ResourcePools::idle_clock_ms` at this target's last use,
+    /// retained for reuse-distance diagnostics. It is not a lifetime deadline.
     pub last_touch_ms: u64,
 }
 
@@ -1853,226 +1818,14 @@ impl FreeTargetImage {
     }
 }
 
-/// Wall-clock milliseconds a non-pinned resident may go untouched before the
-/// idle drain reclaims it. An actively-drawn target is touched every frame (and
-/// the presented target is touched every poll) so it never ages out, while a
-/// burst's stale targets (a settled page's thumbnail RTs) are reclaimed ~2 s
-/// after last use — so a burst is absorbed whole and its VRAM still comes back,
-/// which is what lets the population have no count bounding it at all.
-///
-/// **Wall-clock, not publish-count:** the drain clock is fed from the poll
-/// heartbeat (`device_poll`, ~244 Hz), which ticks even when the guest stops
-/// compositing and issuing present publishes. A publish-count clock froze on a
-/// static page — measured at zero publishes per second — so a burst's ~260 stale
-/// residents (~516 MiB) never aged out and VRAM never returned to the ~1005 MiB
-/// idle baseline. Real time keeps advancing regardless of guest activity.
-///
-/// # This value has 20 % margin on a routine workload, and that is measured
-///
-/// Reclaim here is terminal — `retire_resident` writes nothing back and nothing
-/// recreates a resident's content — so a resident aged out and then sampled
-/// refuses permanently. What keeps that from happening is that reading a
-/// resident touches it, which only works while the gap *between* reads stays
-/// under this value. Nothing reported that gap until
-/// `resident_resample_peak_ms` did.
-///
-/// Driven x86/PCI, `web-content-probe --churn 1`:
-///
-/// ```text
-///   registry_pressure ... resample_peak_ms=1609/2000
-/// ```
-///
-/// **1609 ms of a 2000 ms budget.** Not a contrived workload — a web page
-/// loading and churning. The distribution is not the reassuring part either:
-/// ~25 000 resamples land under 250 ms and then a handful jump straight to the
-/// top band, so the tail is not a gentle slope this value sits far above. It is
-/// a rare long gap that came within 391 ms of destroying a resident something
-/// was about to read.
-///
-/// Two things follow, and neither is "make the number bigger":
-///
-/// - A zero `sampled_resident_missing` on this workload is a near miss, not
-///   headroom. The margin is ~20 %, and a slower host, a heavier page or a
-///   contended machine eats that — every `us=` number this device reports is
-///   wall clock on a shared machine, and this cutoff is measured in the same
-///   wall clock.
-/// - The reclaim runs on a timer with no reference to memory pressure at all.
-///   On an idle desktop (~56 residents) it destroys terminally while freeing
-///   VRAM nobody wants back, which is pure downside; the burst it was written
-///   for is the only time the risk buys anything.
-///
-/// # A memory-pressure gate on the drain was tried, measured, and reverted
-///
-/// The obvious answer to that last bullet — skip the drain while the population
-/// is below some fraction of the slot count that then bounded it — was
-/// implemented and measured on a driven x86/PCI boot with
-/// `web-content-probe --churn 1`, floor at half that count:
-///
-/// ```text
-///                                   gate off   gate on
-///   slab_mib peak held (MiB)             456       584
-///   slab_mib SETTLED (MiB)                64       464
-///   t11sample_reclaimed_from_pages        36        26
-///   distinct mappings affected             5         3
-/// ```
-///
-/// The settled row is the verdict: **at rest the gate held 464 MiB where the
-/// ungated drain holds 64 — 7.25x** — because the floor is where the drain stops,
-/// so in steady state it returned no VRAM at all, which was its whole purpose.
-/// What it bought was a 28 % cut in destroy-then-sample events, none of which was
-/// shown to lose guest work. Do not re-add it in slot or in byte form; a byte
-/// floor stops the drain at the same steady state for the same reason.
-///
-/// The class it was reaching for is real but narrower than a population gate can
-/// address: a resident whose content exists **only** in VRAM must never be aged
-/// out at all, at any population, while one the guest can re-serve from its own
-/// pages costs only redundant work when it is. That distinction is a property of
-/// the resident, not of how many of them there are.
-///
-/// Reopen signal: `past_cutoff` non-zero in the `resident_resample_*` bands, or
-/// `resample_peak_ms` reaching this value, both of which mean a resident
-/// survived only because the drain is throttled and had not reached it yet.
-///
-/// **Both have since fired and neither reopened this.** Two driven x86/PCI
-/// boots, window-drag probe, quiesced: `past_cutoff` 1 of 48 738 resamples and
-/// 4 of 392 534, `resample_peak_ms` 2007 and 2005. `resident_resample_band`'s
-/// own doc carries why that is a cost rather than a risk — every resident the
-/// drain may take has been copied out to the guest's pages, so the reading to
-/// act on is `t11sample_reclaimed_from_pages` (2085 and 1937 on those boots) and
-/// not these four. Do not read a `past_cutoff` line as an imminent loss.
-///
-/// # Uncensored, this value is 3-5x too short — and the peak above could not
-/// have said so
-///
-/// `resident_resample_peak_ms` measures the interval between two reads of a
-/// resident that survived both, so it structurally cannot report a gap longer
-/// than this constant: past it the resident is gone, and the read that would
-/// have closed the interval falls through to the guest's pages instead. Every
-/// reading taken from that peak is therefore truncated by the very policy it is
-/// being used to judge, and will always make this value look *just barely*
-/// adequate.
-///
-/// `draw::vulkan::reclaimed_resample_band` closes the interval from the other
-/// side, using the time the reclaim itself is now stamped with: a resident read
-/// `since` ms after being destroyed had gone at least
-/// `IDLE_TARGET_AGE_MS + since` between uses. Driven x86/PCI,
-/// `web-content-probe --churn 1`, 26 fall-throughs:
-///
-/// ```text
-///   t11sample_reclaimed_within_1x_cutoff    0     (<2 s after the destroy)
-///   t11sample_reclaimed_within_2x_cutoff    2     (2-4 s after)
-///   t11sample_reclaimed_within_4x_cutoff   24     (4-8 s after)
-///   t11sample_reclaimed_past_4x_cutoff      0
-/// ```
-///
-/// Not one came back within a further cutoff's worth of time, and 24 of 26 came
-/// back **4-8 s after being destroyed** — so their true interval between uses is
-/// `2 s + 4-8 s` = **6-10 seconds**. Individual lines put it exactly:
-/// `since_reclaim_ms=4117` and `4521` on menu-bar strips, ~6.1-6.5 s. On the
-/// same boot a *surviving* resident recorded `resample_peak_ms=6445`, which
-/// confirms the interval directly on a resident the policy did not truncate.
-///
-/// ## Two later boots put more of the mass past the last band, not less
-///
-/// The reading above has a floor built into it — the top band was empty, so it
-/// could only say "at least 4-8 s". Two driven x86/PCI boots taken after the
-/// resident-registry slot counts were retired, same probe at `-n 10 --churn 1`,
-/// summing the per-window route counters rather than quoting one window:
-///
-/// ```text
-///                                   26-event boot   boot A   boot B
-///   t11sample_reclaimed_from_pages              26       54       66
-///     ...within_1x_cutoff                        0        1        0
-///     ...within_2x_cutoff                        2        0        0
-///     ...within_4x_cutoff                       24        9        5
-///     ...past_4x_cutoff                          0       44       61
-/// ```
-///
-/// **The mass moved to the top band**, which is open-ended: 44 of 54 and 61 of
-/// 66 came back more than 8 s after being destroyed, so their true interval
-/// between uses is over 10 s and the bands no longer bound it from above. The
-/// conclusion below is unchanged in direction and stronger in degree.
-///
-/// **Not attributable to retiring the slot counts.** Those walks reported
-/// `evicts=0` on every boot ever measured, so they were removing nothing and the
-/// idle drain — the only thing that reclaims here — is untouched. The non-pinned
-/// peak moved 194 -> 223 across the same change with `evicts=0` on both sides,
-/// which is workload variance rather than a count that had been holding the
-/// population down. What is *not* established is how much of 26 -> 54/66 is
-/// variance either; three boots is not a distribution, and the earlier one was
-/// taken in a different session.
-///
-/// None of it is lost work: `sampled_resident_missing` is 0 on both boots and
-/// the fall-through re-serves from the guest's own pages. It is redundant
-/// upload, and the count of it roughly doubled.
-///
-/// So this is not a value with a thin margin. It is between three and five times
-/// shorter than the re-use interval of the surfaces it destroys, and a strip
-/// redrawn every several seconds is not an exotic guest behaviour.
-///
-/// # The VRAM before/after, and why the value stays at 2000 anyway
-///
-/// The paragraph above used to end "raising it needs its own before/after on
-/// VRAM, which `peak_mib` — the registry's attachment bytes, not the device's
-/// footprint — cannot supply". That measurement has now been taken, against the
-/// host driver's own accounting (`nvidia-smi --query-gpu=memory.used`, sampled
-/// every 2 s, minus a flat 1025 MiB idle-desktop baseline). Three driven
-/// x86/PCI boots, `web-content-probe -n 10 --churn 1`, QEMU relinked between
-/// arms, nothing else running:
-///
-/// ```text
-///   age_ms   peak Δ   mean Δ   at-rest Δ   reclaims   registry peak_mib
-///     2000   546 MiB  249 MiB    279 MiB          6              190
-///     7000   834 MiB  413 MiB    778 MiB          5              396
-///    12000   886 MiB  426 MiB    883 MiB          0              441
-/// ```
-///
-/// **Raising it buys almost nothing until it buys everything, and the price is
-/// paid at rest.** 2000 → 7000 more than doubles the at-rest footprint (+499
-/// MiB) and removes one reclaim out of six. Only at 12000 does the class close,
-/// for +604 MiB held for the life of the guest. The reuse-interval distribution
-/// has a long tail — at 7000 the survivors came back with `since_reclaim_ms` of
-/// 86 and 1010, i.e. true intervals of ~7.1 and ~8.0 s — so each increment
-/// chases the tail rather than clearing it.
-///
-/// That trade is the one `af70d69f` already rejected once, for the same reason
-/// and at a similar magnitude: a gate holding 400 MiB at rest was reverted. Six
-/// avoided re-uploads across a ~90 s driven run does not pay for half a
-/// gigabyte of resident VRAM, and the fall-through is not a loss — the guest's
-/// own pages still hold the pixels, which `ResidentTargetSlot::gpu_only_content`
-/// is what guarantees. So this stays at 2000, now as a measured decision rather
-/// than an unexamined one.
-///
-/// One reading worth keeping separately: the registry's `peak_mib` moved
-/// 190 → 441 (+251 MiB) across the same span the device footprint moved
-/// 279 → 883 (+604 MiB). It understates the real cost by ~2.4x, which is the
-/// concrete form of the warning that it is attachment bytes and not the
-/// device's footprint. Do not size this constant from it.
-///
-/// What would change the answer is a workload with a working set large enough
-/// that the drain is reclaiming under real pressure rather than on a timer; the
-/// counts here (6, 5, 0) are small enough that only the 12000 arm's zero is
-/// clearly outside run-to-run noise.
-///
-/// # This is the crate's only eviction bound that is an age
-///
-/// Every other bound governing a removal here is a capacity — a count of
-/// entries or bytes. This one is a deadline, and the difference matters when
-/// reasoning about what a reading means: a capacity bound firing says the
-/// working set outgrew the table, while this one firing says only that time
-/// passed. A second age-based eviction is the thing to watch for; give it a
-/// name carrying `LIMIT`, because the bound *is* a limit on idle age.
-pub(crate) const IDLE_TARGET_AGE_MS: u64 = 2000;
-/// Minimum wall-clock spacing between reclaim passes. The poll path calls the
-/// drain ~244×/s; without this it would empty the whole registry in well under a
-/// second. At `IDLE_TARGET_DRAIN_MAX_PER_CALL` per pass this bounds reclaim to
-/// ~40 residents/s — a ~260-target burst drains to baseline over ~6.5 s, gently
-/// (no dispose storm that would itself be a P3 hitch).
-const IDLE_DRAIN_INTERVAL_MS: u64 = 100;
-/// Max non-pinned residents the idle drain reclaims per pass — bounds each drain
-/// pass so a large stale set (a ~600-target burst) drains gradually instead of
-/// stalling one call with hundreds of image destroys.
-const IDLE_TARGET_DRAIN_MAX_PER_CALL: usize = 4;
+/// Delay before periodic maintenance begins. Maintenance releases dead resource
+/// objects and already-free pool storage; it never uses age to remove a live
+/// resident.
+pub(crate) const IDLE_MAINTENANCE_START_MS: u64 = 2000;
+/// Minimum wall-clock spacing between bounded maintenance passes. The poll path
+/// runs far more often; throttling avoids repeated free-pool work under the
+/// engine lock.
+const MAINTENANCE_INTERVAL_MS: u64 = 100;
 /// Reclaimed identities remembered for [`ResourcePools::reclaimed_recent`].
 ///
 /// Sized to comfortably span one burst's reclamations so the answer is still
@@ -2212,21 +1965,11 @@ struct SampledVictim {
     route: SampledVictimRoute,
 }
 
-/// Which of the two things that empty the sampled cache took this entry.
-///
-/// They want opposite fixes and a reach series that folded them together would
-/// point at the wrong one: a window lost to the caps says the cache is too
-/// small for the workload's reuse distance, and a window lost to the idle drain
-/// says `IDLE_TARGET_AGE_MS` is shorter than the interval the guest re-binds at.
-/// The first was the only path the ledger recorded when it was written, so an
-/// aged-out window reported `sampled_reach_beyond_ledger` — the same answer as a
-/// window the cache had genuinely never held.
+/// Why a sampled cache entry stopped being reusable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SampledVictimRoute {
     /// [`SAMPLED_CACHE_CAP`] or [`SAMPLED_CACHE_BYTE_CAP`] was over budget.
     Cap,
-    /// The entry went untouched past `IDLE_TARGET_AGE_MS`.
-    Aged,
     /// The whole cache was discarded because a submission that had already
     /// published entries into it never reached the queue, so nothing in it could
     /// be trusted to hold what its name claimed. Not a capacity signal and not
@@ -2239,7 +1982,6 @@ impl SampledVictimRoute {
     fn route(self) -> &'static str {
         match self {
             Self::Cap => "sampled_reach_lost_to_cap",
-            Self::Aged => "sampled_reach_lost_to_age",
             Self::Discarded => "sampled_reach_lost_to_discard",
         }
     }
@@ -2444,7 +2186,7 @@ impl<K: std::hash::Hash + Eq, V> FreePool<K, V> {
     /// signatures carry no `ash::Device`, so they cannot destroy an entry a cap
     /// would reject. The caps therefore bound only the deferred
     /// `DeferredHandle::Recycle*` route; what bounds this one is
-    /// `trim_recycle_pools` on the idle drain. That asymmetry is real and was
+    /// `trim_recycle_pools` during maintenance. That asymmetry is real and was
     /// measured: one 4x4K video session held `sfree=203` against a `total` of 64.
     fn push_uncapped(&mut self, key: K, entry: V) {
         self.free.entry(key).or_default().push(entry);
@@ -2462,7 +2204,7 @@ impl<K: std::hash::Hash + Eq, V> FreePool<K, V> {
         got
     }
 
-    /// Take any retained entry, for the idle trim that drains the pool toward
+    /// Take any retained entry, for maintenance that drains the pool toward
     /// empty. Not a reuse, so it does not move the hit/alloc split.
     fn pop_any(&mut self) -> Option<V>
     where
@@ -2491,22 +2233,18 @@ impl<K: std::hash::Hash + Eq, V> FreePool<K, V> {
     }
 }
 
-/// Images destroyed from the recycle pools per idle-drain pass. The recycle pools
-/// exist for *active* per-frame reuse; at idle (the drain only fires after
-/// `IDLE_TARGET_AGE_MS` of no touch) they are pure retained VRAM, so each pass
-/// also trims them toward empty. Bounded like the registry drain so a large pool
-/// drains gradually (no dispose storm) and refills a few-per-frame when activity
-/// resumes (no re-alloc hitch).
+/// Images destroyed from recycle pools per maintenance pass. These objects are
+/// already outside every live resource; the initial delay and bounded batch avoid
+/// a disposal storm and let the pools refill gradually when activity resumes.
 const IDLE_RECYCLE_TRIM_PER_PASS: usize = 8;
 
-/// Consecutive zero-victim idle-drain passes required before the HOST_VISIBLE
+/// Consecutive maintenance passes without upload activity required before the HOST_VISIBLE
 /// buffer pools (`staging_free`/`readback_free`) are trimmed. Unlike the image
 /// pools (cheap slab suballocation refill), a trimmed staging buffer costs a
 /// full `vkAllocateMemory` when the next upload refills it — on the upload hot
 /// path that spikes inter-VBL latency. Gating on N consecutive settled passes
-/// (drain interval `IDLE_DRAIN_INTERVAL_MS`) ensures a single quiet pass during
-/// active video — where old frame RTs mostly but not always age out each pass —
-/// cannot trigger a mid-playback buffer re-alloc. At true idle the counter
+/// (interval `MAINTENANCE_INTERVAL_MS`) ensures a single quiet pass during
+/// active video cannot trigger a mid-playback buffer re-allocation. At true idle the counter
 /// climbs and the buffers drain to zero within a few hundred ms of settling.
 const SETTLED_PASSES_FOR_BUFFER_TRIM: u32 = 3;
 
@@ -2518,7 +2256,7 @@ const SETTLED_PASSES_FOR_BUFFER_TRIM: u32 = 3;
 /// VRAM is the explicit goal.
 ///
 /// **The settled gate is what makes zero safe, and it was missing.** The drain
-/// fires every `IDLE_DRAIN_INTERVAL_MS` (100 ms) whenever the poll heartbeat
+/// fires every `MAINTENANCE_INTERVAL_MS` (100 ms) whenever the poll heartbeat
 /// ticks, which is *most of the time* on any workload that does not saturate the
 /// drain worker — and it used to trim to zero on every one of those passes,
 /// overriding the hot path's budget between two frames of a live animation. A
@@ -3925,6 +3663,7 @@ mod resident_reuse_tests {
             access: ResidentAccess::Untouched,
             color_format: format,
             pin_count: 0,
+            resource_released: false,
             gpu_only_content: false,
             last_touch_ms: 0,
         }
@@ -3991,7 +3730,7 @@ mod idle_slab_trim_tests {
     /// An idle pass that is not settled must leave the image slab alone.
     ///
     /// This is the whole of the policy, and the case it protects is not idle at
-    /// all: the drain fires every `IDLE_DRAIN_INTERVAL_MS` whenever the poll
+    /// all: the drain fires every `MAINTENANCE_INTERVAL_MS` whenever the poll
     /// heartbeat ticks, so a workload with 100 ms gaps between frames reaches it
     /// between every pair of them. Trimming there returns the block the next
     /// frame re-allocates — measured at 257 allocations against 162 trims of a

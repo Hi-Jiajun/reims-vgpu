@@ -698,28 +698,13 @@ pub fn device_poll(id: u64) -> bool {
     slot.vbl_page_size
         .store(device.state.page_size(), Ordering::Release);
     // Census both source polls and the independently time-gated VBL rate.
-    // Drive the resident idle-drain off the poll heartbeat, which ticks even when
-    // the guest stops compositing (a static page means no publishes at all).
-    // A publish-clocked drain froze there, pinning a burst's ~260
-    // stale residents (~516 MiB) for the guest lifetime; the wall clock keeps
-    // advancing and returns VRAM to baseline. The presented target is kept alive
-    // by identity so it is never reclaimed from under the display. The engine
-    // throttles the actual reclaim to IDLE_DRAIN_INTERVAL_MS internally.
+    // Drive bounded maintenance from the poll heartbeat, which ticks even when
+    // the guest stops publishing. The wall clock returns already-dead resources
+    // and free-pool memory; it has no authority over live residency, which is
+    // governed by resource lifetime and allocation pressure.
     #[cfg(feature = "backend-vulkan")]
     {
-        let present = &device.state.present;
-        let display_id = present.frame_valid.then(|| {
-            crate::runtime::present_identity::surface_identity(
-                &device.state,
-                present.frame_mapping,
-                present.frame_width,
-                present.frame_height,
-            )
-        });
-        crate::backend::vulkan::engine::maintain_idle_residents(
-            display_id.as_ref(),
-            crate::observe::elapsed_ms() as u64,
-        );
+        crate::backend::vulkan::engine::maintain_resources(crate::observe::elapsed_ms() as u64);
     }
     // Pre-boundary early-console → host window (headless-safe: the heartbeat
     // drives poll even under -display none). No-op post-boundary or with no

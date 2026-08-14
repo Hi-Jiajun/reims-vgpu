@@ -39,10 +39,9 @@ pub use pools::buffer_gather_working_set::census as buffer_gather_working_set_ce
 /// the same place: `pools` is private, and this line is only interpretable
 /// beside the eviction routes the census already emits.
 pub use pools::sampled_working_set::census as sampled_working_set_census;
-/// The ceiling `registry_non_pinned_peak` is read against. Re-exported because
-/// `pools` is private and the census that reports the band lives outside this
-/// module: a peak with no cap beside it is a number, not a reading.
-pub(crate) use pools::IDLE_TARGET_AGE_MS;
+/// Reference interval used only to keep reuse-distance census bands stable.
+/// Residency policy does not read it.
+pub(crate) use pools::IDLE_MAINTENANCE_START_MS;
 pub mod gather_phase;
 pub mod gpu_span;
 pub mod reason;
@@ -1567,11 +1566,12 @@ pub fn prepare_window_resident_present(
     let EngineState {
         ref mut owner,
         ref mut pools,
+        ref counters,
         ..
     } = &mut *guard;
     if let Some(ctx) = owner.ctx.as_ref() {
         unsafe {
-            pools.advance_registry_touch_and_drain(ctx, now_ms, Some(identity));
+            pools.advance_registry_maintenance(ctx, counters, now_ms);
         }
     }
     resident_present_decision(pools, identity, width, height)
@@ -1591,9 +1591,10 @@ pub enum ResidentContentBacking {
 
 /// One live resource object's ownership of a resident target.
 ///
-/// Construction pins the target against cache eviction. Dropping the object
-/// releases exactly that pin unless a device/reset boundary has already
-/// replaced the registry, in which case the old pin disappeared with it.
+/// Construction pins the target for the serialized resource lifetime. Dropping
+/// the object ends that lifetime, blocks new retention, and retires the host
+/// object once outstanding users release their pins. A device/reset boundary
+/// replaces the registry and invalidates the old lease epoch.
 #[derive(Debug)]
 pub struct ResidentResourceLease {
     identity: TargetIdentity,
@@ -1629,7 +1630,19 @@ impl Drop for ResidentResourceLease {
     fn drop(&mut self) {
         let mut guard = lock_engine();
         if self.epoch == RESIDENT_RESOURCE_EPOCH.load(Ordering::Acquire) {
-            let _ = guard.pools.pin_resident_target(&self.identity, false);
+            let EngineState {
+                ref owner,
+                ref mut pools,
+                ref counters,
+                ..
+            } = *guard;
+            if let Some(ctx) = owner.ctx.as_ref() {
+                unsafe {
+                    let _ = pools.release_resident_resource(ctx, &self.identity, counters);
+                }
+            } else {
+                let _ = pools.pin_resident_target(&self.identity, false);
+            }
         }
     }
 }
@@ -1715,10 +1728,8 @@ mod resident_content_backing_tests {
 /// device destroyed cannot.
 ///
 /// The second half of the pair is how many milliseconds ago the reclaim
-/// happened, which is what makes the reading uncensored: a resident read `since`
-/// ms after being destroyed had gone at least `IDLE_TARGET_AGE_MS + since`
-/// between uses, and that tail is invisible to `resident_resample_peak_ms`
-/// because the resident it would have been measured on no longer exists.
+/// happened. It measures how quickly pressure-reclaimed content was wanted
+/// again; it is not an idle-lifetime calculation.
 pub fn resident_absent_after_reclaim(
     identity: &TargetIdentity,
 ) -> Option<(types::ResidentReclaim, u64)> {
@@ -1761,9 +1772,8 @@ pub fn resident_content_epoch(identity: &TargetIdentity) -> Option<u32> {
 ///   clears the stamp on every draw into a slot, so a later pass over the same
 ///   surface says the resident no longer holds the frame this window promised.
 ///   Declining is correct; the newer pass owns the surface now.
-/// - [`ResidentContent::Absent`] is not. Nothing may evict a pinned slot —
-///   the allocation-failure reclaim and the idle drain both skip pinned slots by
-///   design — so an identity that has gone missing between the arm and the fence means
+/// - [`ResidentContent::Absent`] is not. Allocation-pressure reclaim skips every
+///   pinned slot, so an identity that has gone missing between arm and fence means
 ///   the two spellings of it disagree: the arm pinned one `TargetIdentity` and
 ///   the flush rebuilt another. That is a lost frame *and* a leaked pin, and it
 ///   is the same defect shape as `74748d2` and `021e64b`, which is why it must
@@ -2031,10 +2041,9 @@ pub fn retire_resident_storage_content(identity: &crate::model::ComputeStorageRe
 /// pages, and the resident stayed flagged as unreproducible for the life of the
 /// guest.
 ///
-/// Every reclaim path refuses a sole copy — the idle drain, and
-/// `reclaim_compute_storage_for_allocation_retry` — so those residents were
-/// unreclaimable by anything. The registry only grew, and an allocation failure
-/// found nothing to give back at the one moment it needed something. That is
+/// Allocation-pressure recovery refuses a sole copy, so those residents were
+/// unreclaimable. The registry only grew, and an allocation failure found
+/// nothing to give back at the one moment it needed something. That is
 /// the shape of the leak `retire_resident_storage_content` was written to stop
 /// for a *dead* cache entry, arriving instead through the live path.
 ///
@@ -4220,23 +4229,22 @@ pub fn read_target(identity: &TargetIdentity) -> Result<TargetReadback, DrawErro
     read_target_inner(identity)
 }
 
-/// Advance the wall-clock resident-target idle-drain clock to `now_ms`, keep the
-/// currently-presented target (`display`) alive, and reclaim aged non-pinned
-/// residents. Called from the poll heartbeat (so the clock keeps ticking when the
-/// guest stops publishing) and each present publish. No-op before the device
-/// context exists.
-pub fn maintain_idle_residents(display: Option<&TargetIdentity>, now_ms: u64) {
+/// Run bounded maintenance for dead resources and already-free pool entries.
+/// Live residency is controlled by resource lifetime and allocation pressure,
+/// never by this clock.
+pub fn maintain_resources(now_ms: u64) {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
         ref mut pools,
+        ref counters,
         ..
     } = &mut *guard;
     let Some(ctx) = owner.ctx.as_ref() else {
         return;
     };
     unsafe {
-        pools.advance_registry_touch_and_drain(ctx, now_ms, display);
+        pools.advance_registry_maintenance(ctx, counters, now_ms);
     }
 }
 

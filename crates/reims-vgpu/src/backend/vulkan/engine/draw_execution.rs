@@ -400,7 +400,7 @@ mod tests {
             DrawExecutionDecline::SampledResidentMissing {
                 binding: 32,
                 identity: identity(),
-                prior: Some(ResidentReclaim::IdleDrained),
+                prior: Some(ResidentReclaim::AllocationReclaimed),
             },
             DrawExecutionDecline::SampledResidentNotReady {
                 binding: 32,

@@ -702,8 +702,7 @@ engine_counters! {
         /// than something a boot can be asked for. That is the gap this closes.
         registry_non_pinned_peak,
         /// Worst gap, in milliseconds, between a resident being touched and
-        /// being read again — the margin against `IDLE_TARGET_AGE_MS`, the age
-        /// at which the idle drain destroys a resident terminally.
+        /// being read again. Diagnostic only; residency does not branch on it.
         ///
         /// Cumulative high-water, like `registry_non_pinned_peak` and for the
         /// same reason: the question is how close this boot ever came, and a gap

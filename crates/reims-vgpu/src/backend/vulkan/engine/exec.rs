@@ -2300,7 +2300,7 @@ unsafe fn acquire_depth_view(
 /// **first** into a depth texture, so `MTLLoadActionLoad` on undefined contents
 /// is the guest's own undefined behaviour and a CLEAR is a conformant answer.
 /// Or the depth resident was **reclaimed** between two passes that meant to
-/// chain — real lost depth, bounded by `IDLE_TARGET_AGE_MS`, and the reading
+/// chain — real lost depth, bounded by `IDLE_MAINTENANCE_START_MS`, and the reading
 /// that would justify giving depth residents an age of their own.
 ///
 /// Latched per geometry-and-aspect rather than per pipeline: what a reader needs

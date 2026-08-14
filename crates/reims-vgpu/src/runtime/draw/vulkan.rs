@@ -1422,17 +1422,15 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 //
                 // `ResidentTargetSlot::gpu_only_content` closed it at the
                 // reclaim end, which is the only end that can be closed: both
-                // selectors that choose a victim, `plan_idle_drain` and
-                // `recoverable_residents`, now skip such a slot at any age and
-                // any population, and the capacity walk exceeds its cap rather
-                // than take one. So **a resident that reaches this arm was, by
+                // allocation-pressure recovery skips such a slot at any
+                // population. So **a resident that reaches this arm was, by
                 // construction, not the sole copy of its pixels when it was
                 // reclaimed** — something had copied them out, which is what
                 // cleared the flag.
                 //
                 // The guarantee therefore does not live here and cannot be
                 // asserted here; it lives beside those two selectors, held by
-                // `a_resident_that_is_the_only_copy_of_its_pixels_is_never_aged_out`,
+                // `elapsed_time_never_reclaims_a_live_resident`,
                 // `the_capacity_walk_finds_no_victim_rather_than_destroy_the_only_copy`
                 // and `no_reclaim_cause_may_take_the_only_copy_of_a_frame` —
                 // the last of which is exhaustive over `ResidentReclaim`, so a
@@ -1442,7 +1440,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // What the line below still reports is a **cost**, not a
                 // soundness risk: this device paid for the reclaim by re-reading
                 // guest pages. It stays on the fail channel because the reclaim
-                // cutoff is a measured trade (see `IDLE_TARGET_AGE_MS`) and the
+                // cutoff is a measured trade (see `IDLE_MAINTENANCE_START_MS`) and the
                 // reliance on it should stay visible, not because a firing means
                 // something was lost.
                 if !resident_ready {
@@ -1457,7 +1455,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                         // censored out of it and a reclaim policy tuned from it
                         // is tuned from data it destroyed the tail of. A
                         // resident read here had gone at least
-                        // `IDLE_TARGET_AGE_MS + since_ms` between uses.
+                        // `IDLE_MAINTENANCE_START_MS + since_ms` between uses.
                         crate::runtime::drain::note_store_route(reclaimed_resample_band(since_ms));
                         if crate::observe::first_sight("sampled_resident_reclaimed", u64::from(mid))
                         {
@@ -2132,27 +2130,11 @@ fn note_type11_load_seed(
 ///
 /// `None` means the guest's LOAD could not be honoured at all, and
 /// [`note_type11_load_seed`] has already said which check refused.
-/// Band how long after this device destroyed a resident the guest came back to
-/// sample it, in multiples of the age at which the drain destroyed it.
-///
-/// The missing half of `resident_resample_peak_ms`. That peak measures the gap
-/// between two reads of a resident that *survived* both, so it cannot see a gap
-/// longer than `IDLE_TARGET_AGE_MS` — the resident it would have been measured
-/// on was destroyed partway through, and the sample that would have closed the
-/// interval falls through to the guest's pages instead. Tuning the cutoff from
-/// that peak means tuning it from a distribution the policy truncates, and it
-/// will always look like the cutoff is just barely enough.
-///
-/// A resident read `since_ms` after being reclaimed had gone at least
-/// `IDLE_TARGET_AGE_MS + since_ms` between uses, so these bands are the tail:
-/// `gt_4x` means the guest's real re-use interval on that surface is more than
-/// five times the cutoff.
-///
-/// Multiples of the cutoff rather than absolute milliseconds, for the reason
-/// `resident_resample_band`'s are fractions of it: a reading must not outlive
-/// the bound it was taken against.
+/// Band how long after pressure recovery the guest wanted the resident again.
+/// The fixed reference interval keeps existing census buckets comparable; it
+/// has no role in deciding whether the resident remains alive.
 fn reclaimed_resample_band(since_ms: u64) -> &'static str {
-    let cutoff = crate::backend::vulkan::engine::IDLE_TARGET_AGE_MS;
+    let cutoff = crate::backend::vulkan::engine::IDLE_MAINTENANCE_START_MS;
     if since_ms < cutoff {
         "t11sample_reclaimed_within_1x_cutoff"
     } else if since_ms < cutoff * 2 {

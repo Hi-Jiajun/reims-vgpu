@@ -1,126 +1,16 @@
-//! The resident-image registry and the storage images beside it — the
-//! [`ResourcePools`] methods whose unit is a *guest identity* rather than a
-//! slot.
+//! Guest-identity keyed render and storage residents.
 //!
-//! A registry entry outlives any one submission. The guest names the same
-//! surface across frames, so an entry is keyed by `TargetIdentity`, held alive
-//! by a pin count, and reclaimed by an idle drain or an allocation failure
-//! rather than by a fence — which is why none of this sits with the ring in
-//! [`super::submission_and_buffers`].
-//!
-//! The two meet in one place: the idle-drain planner over there picks its
-//! victims out of the registry order maintained here.
-//!
-//! `use super::*` is the seam. This is an `impl` chapter of the module that
-//! declares `ResourcePools` and owns its fields, not a layer beneath it.
+//! A live entry outlives submissions and remains resident until its serialized
+//! resource ends, its identity is explicitly replaced, or allocation pressure
+//! requires recovery. Fences govern in-flight safety; elapsed time does not end
+//! resource lifetime.
 
 use super::*;
 
-/// Band how long a resident had gone untouched before something read it,
-/// against the cutoff that would have destroyed it.
-///
-/// The idle drain terminally destroys any non-pinned resident untouched for
-/// `IDLE_TARGET_AGE_MS`, and nothing recreates a resident's content — so a draw
-/// that samples one afterwards refuses permanently. What stops that today is
-/// that a resident being read is touched by the read
-/// ([`ResourcePools::registry_note_sampled_use`]), which only helps while the
-/// gaps between reads stay under the cutoff. A guest that renders a layer, has
-/// it occluded for longer than that, and then reveals it is the shape that loses
-/// it.
-///
-/// `sampled_resident_missing` reading zero cannot say whether that is far away
-/// or one slow frame away — it is a drop counter, and this project's own rule is
-/// that a drop counter reading zero is not a measurement: a gap that peaks at
-/// 50 ms and one that peaks at 1900 ms both report zero, and only one of them
-/// says the cutoff has headroom. This is the reach that separates them, in time
-/// rather than in slots, and it is the same instrument the bind tables already
-/// have as their `reach_route` bands.
-///
-/// Read `resident_resample_past_cutoff` as the alarm: a resident that was read
-/// after sitting longer than its own drain cutoff survived only because the
-/// drain is throttled to `IDLE_TARGET_DRAIN_MAX_PER_CALL` per pass and had not
-/// reached it yet. A non-zero reading there is the argument for changing the
-/// drain — it does not mean content was lost, it means the margin is gone.
-///
-/// Bands are fractions of `IDLE_TARGET_AGE_MS` rather than absolute
-/// milliseconds, so retuning the cutoff moves them with it and no reading is
-/// ever quoted against a bound it did not come from. Division rather than
-/// multiplication so a large gap cannot overflow the comparison.
-///
-/// # First reading, and it is not the comfortable one
-///
-/// Driven x86/PCI boot, `web-content-probe --churn 1`, whole run, against
-/// `IDLE_TARGET_AGE_MS` = 2000 ms:
-///
-/// ```text
-///   lt_eighth_cutoff   (<250 ms)      24643
-///   lt_quarter_cutoff  (250-499 ms)     413
-///   lt_half_cutoff     (500-999 ms)       5
-///   under_cutoff       (1000-1999 ms)     1
-///   past_cutoff        (>=2000 ms)        0
-/// ```
-///
-/// The distribution is overwhelmingly under an eighth of the cutoff, which is
-/// the answer that would have been assumed. The reading that matters is the
-/// **1**: one resample arrived after its resident had sat between 1000 and
-/// 1999 ms, so somewhere between half the budget and none of it was left. The
-/// drain destroys at `last_touch_ms <= now - cutoff` and is throttled to
-/// `IDLE_TARGET_DRAIN_MAX_PER_CALL` per pass, so that resident was not yet a
-/// victim — but it is not the case that this workload stays an order of
-/// magnitude clear of the cutoff, which is what `sampled_resident_missing=0`
-/// on its own invites you to conclude.
-///
-/// Finer bands past the half mark are what would say whether that one sample sat
-/// at 1.0 s or at 1.9 s, and those are very different margins. This does not
-/// resolve it; it establishes that the question is live.
-///
-/// # `past_cutoff` has since fired, and it does not mean what it was written to
-///
-/// Two later driven x86/PCI boots, window-drag probe, quiesced, the second on a
-/// guest running a page animation:
-///
-/// ```text
-///                        boot A     boot B
-///   resamples, all bands   48738     392534
-///   past_cutoff                1          4
-///   resample_peak_ms        2007       2005
-/// ```
-///
-/// So both signals the top of this doc and [`IDLE_TARGET_AGE_MS`] name as the
-/// argument for changing the drain are now non-zero, routinely, on ordinary
-/// desktop work. Read that as the margin being gone, which it is — and not as
-/// work being at risk, which it no longer is. Two things changed underneath the
-/// alarm since it was written:
-///
-/// - **The class it guarded is closed.** Every draw that stores into a target
-///   marks it sole-copy ([`ResourcePools::registry_mark_ready_at`]), and only a
-///   writeback clears it, so a resident the drain is *allowed* to take has
-///   demonstrably been copied out to the guest's own pages. What a reclaim costs
-///   is the re-fetch, not the pixels — and `sampled_resident_missing` was 0 on
-///   both boots above, as it must be.
-/// - **The re-fetch is the reading worth having**, and it is much larger than
-///   these four: `t11sample_reclaimed_from_pages` was 2085 and 1937 on the same
-///   two boots, with 88.5 % of boot A's coming back more than 8 s after the
-///   destroy. The drain is churning residents the workload returns to, while
-///   `peak_mib=81` and `slab_mib=39/136` say VRAM was under no pressure at all.
-///
-/// Neither of those is fixed by moving this cutoff, and
-/// [`IDLE_TARGET_AGE_MS`]'s own history says why a population gate is not the
-/// answer either. What they change is what a `past_cutoff` reading is evidence
-/// *of*: a cost, measurable in re-fetches, rather than an imminent loss.
-///
-/// # Reading the count against `resident_samples`
-///
-/// The band total is about **twice** `sampled_gpu_binds` (25062 against 12531 on
-/// the run above, exactly 2x). That is not a discrepancy:
-/// [`ResourcePools::registry_note_sampled_use`] is called from two sites per
-/// draw — the pre-pass loop that marks every sampled target before the render
-/// target is ensured, and the resolve loop that binds them — while
-/// `sampled_gpu_binds` increments once per bind. So these bands count *touches*
-/// and `resident_samples` counts *binds*. Do not divide one by the other and
-/// call the result a rate.
+/// Band observed intervals between sampled uses. This is a reuse-distance
+/// diagnostic only; no residency decision reads it.
 fn resident_resample_band(idle_ms: u64) -> &'static str {
-    let cutoff = IDLE_TARGET_AGE_MS;
+    let cutoff = IDLE_MAINTENANCE_START_MS;
     if idle_ms < cutoff / 8 {
         "resident_resample_lt_eighth_cutoff"
     } else if idle_ms < cutoff / 4 {
@@ -300,7 +190,7 @@ impl ResourcePools {
     ) -> Result<ResidentStorageImageUse, DrawError> {
         // A shape change re-keys the identity, and one identity holds one slot,
         // so the old image is destroyed. Every other removal in this registry
-        // skips a pinned resident — the cap sweep and the age drain both do —
+        // skips a pinned resident, as allocation-pressure recovery does,
         // because a pin means the content owes a deferred writeback and exists
         // nowhere but that image. This path did not, so a re-shape between a
         // Store and its flush discarded accepted guest output with nothing said,
@@ -394,8 +284,7 @@ impl ResourcePools {
     /// the re-key is safe to perform.
     ///
     /// Split out from [`ResourcePools::acquire_resident_storage_image`] so the
-    /// pin check is unit-testable without a device, the same reason
-    /// `take_aged_storage_residents` is split from its disposal half.
+    /// pin check is unit-testable without a device.
     pub(crate) fn compute_rekey_refusal(
         &self,
         identity: &ComputeStorageResidencyKey,
@@ -437,8 +326,8 @@ impl ResourcePools {
     /// prerequisite that was missing — and the reason the two registries did not
     /// change together — is that `reclaim_for_allocation_retry` gave back target
     /// residents and recycle pools and nothing from here, so removing the count
-    /// alone would have left this population with the age drain trimming it and
-    /// nothing to hand back when an allocation failed.
+    /// alone would have left this population with nothing to hand back when an
+    /// allocation failed.
     /// [`Self::reclaim_compute_storage_for_allocation_retry`] is that half.
     ///
     /// Ordering is `compute_storage_order`, so the result is deterministic and
@@ -568,23 +457,14 @@ impl ResourcePools {
         );
     }
 
-    /// Record that something read this resident, refreshing its reclaim stamp.
+    /// Record that something read this resident for reuse-distance diagnostics.
     ///
     /// Reading a resident is using it. The three read-only accessors below all
     /// mean "a guest chain is about to consume this image" — the stage-time
     /// guest-read skip, the copy-on-sample gate, and the flush/sample snapshot —
     /// so a produce-once/sample-many resident that is never dispatched into
-    /// again is in continuous use while looking stone-cold to both reclaim
-    /// rules, which read `last_touch_ms`: the cap sweep takes the minimum and
-    /// the age drain compares it against its cutoff.
-    ///
-    /// The sibling target registry had exactly this defect and names it at its
-    /// own call site: "aging it out between two attempts is how a recoverable
-    /// not-ready became a permanent missing." Here the loss is a refused
-    /// dispatch — `ResidentSampleAbsent` or `ResidentSeedGenerationLost` — so
-    /// the stamp is written by the accessors themselves rather than by their
-    /// callers, because a caller that forgets is indistinguishable from this
-    /// bug.
+    /// again remains observable even when it is never dispatched into. No
+    /// reclaim decision reads this timestamp.
     fn note_compute_resident_use(&mut self, identity: &ComputeStorageResidencyKey) {
         let touch = self.idle_clock_ms;
         if let Some(resident) = self.compute_storage_registry.get_mut(identity) {
@@ -754,10 +634,8 @@ impl ResourcePools {
     /// `DeviceContext` to dispose what it removes, and the bookkeeping — which
     /// is the part that was diverging — is worth testing without a GPU.
     ///
-    /// Every path that removes a live entry comes through here, including the
-    /// idle drain in [`super::submission_and_buffers`], which disposes on its
-    /// own terms and so is not a [`Self::retire_resident`] caller. It is the
-    /// death counterpart of [`Self::register_resident`], and the pair is why
+    /// Every path that removes a live entry comes through here. It is the death
+    /// counterpart of [`Self::register_resident`], and the pair is why
     /// `registry` and `registry_order` cannot fall out of step.
     ///
     /// `registry_order` is pruned whether or not the map held the entry, which
@@ -817,13 +695,11 @@ impl ResourcePools {
     ///   ago, so it carries no content stamp and no epoch; nothing has
     ///   transitioned it, so its layout is `UNDEFINED`; and no window holds it,
     ///   so it is unpinned. These are not defaults a creation site may pick —
-    ///   `registry_mark_ready_at`, the type-11 LOAD gate and the idle drain each
-    ///   read one of them, and an arm that guessed differently would be
+    ///   `registry_mark_ready_at` and the type-11 LOAD gate read them, and an arm
+    ///   that guessed differently would be
     ///   answering a question the others think they already asked.
-    /// - **The idle-drain clock belongs to the registry.** `last_touch_ms` comes
-    ///   from `idle_clock_ms`, which the poll heartbeat advances. A creation site
-    ///   that stamped its own value would age against a different clock than the
-    ///   drain reads.
+    /// - **The diagnostic clock belongs to the registry.** `last_touch_ms` comes
+    ///   from `idle_clock_ms`, which the poll heartbeat advances.
     /// - **`registry` and `registry_order` are written together.** They are one
     ///   structure split for lookup and for order. An entry in the map but not
     ///   the order is a resident no sweep can ever choose; one in the order but
@@ -852,6 +728,7 @@ impl ResourcePools {
                 },
                 color_format: new.color_format,
                 pin_count: 0,
+                resource_released: false,
                 // Nothing has drawn into it, so it holds no guest work to lose.
                 // A recycled image arrives here too, and its stale contents are
                 // not this identity's content.
@@ -884,13 +761,9 @@ impl ResourcePools {
     /// [`Self::note_resident_reclaimed`]. The primary path was the one that
     /// disposed `old.framebuffer` without asking whether the slot had one.
     ///
-    /// It is not the *only* exit, and reading it as one is how the fourth stayed
-    /// out of step. The idle drain destroys rather than recycles and does not
-    /// count a `target_evict`, both deliberately, so it cannot come through
-    /// here — what it shares is [`Self::unregister_resident`] and
-    /// [`ResidentTargetSlot::owed_framebuffer`], which is why the bookkeeping
-    /// and the null question are each their own function rather than lines in
-    /// this body.
+    /// Resource release also comes through here but is not counted as an
+    /// eviction: the guest ended that lifetime. Bookkeeping and the framebuffer
+    /// null question remain centralized so removal paths cannot diverge.
     unsafe fn retire_resident(
         &mut self,
         ctx: &DeviceContext,
@@ -916,9 +789,11 @@ impl ResourcePools {
             },
         };
         self.dispose(&ctx.device, retired);
-        counters
-            .target_evicts
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if why != ResidentReclaim::ResourceReleased {
+            counters
+                .target_evicts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         Some(old)
     }
 
@@ -1698,7 +1573,7 @@ impl ResourcePools {
         let Some(slot) = self.registry.get_mut(identity) else {
             return false;
         };
-        if pinned && !slot.content_ready {
+        if pinned && (!slot.content_ready || slot.resource_released) {
             return false;
         }
         if !pinned && slot.pin_count == 0 {
@@ -1741,6 +1616,64 @@ impl ResourcePools {
             .map(|slot| slot.memory.is_guest_imported())?;
         self.pin_resident_target(identity, true)
             .then_some(guest_imported)
+    }
+
+    /// End one serialized resource's ownership of its resident. The ownership
+    /// pin is released exactly once. If an in-flight holder still has the target
+    /// pinned, retirement waits for maintenance after that holder finishes; no
+    /// new holder may retain the released resource.
+    pub(crate) unsafe fn release_resident_resource(
+        &mut self,
+        ctx: &DeviceContext,
+        identity: &TargetIdentity,
+        counters: &EngineCounters,
+    ) -> bool {
+        let Some(unpinned) = self.release_resident_ownership(identity) else {
+            return false;
+        };
+        if unpinned {
+            self.retire_resident(ctx, identity, ResidentReclaim::ResourceReleased, counters);
+        }
+        true
+    }
+
+    /// Device-free ownership transition behind resource release. Returns
+    /// whether the ownership pin was the last pin and the resident may retire
+    /// immediately, or `None` when the identity was already absent.
+    fn release_resident_ownership(&mut self, identity: &TargetIdentity) -> Option<bool> {
+        self.registry.get_mut(identity)?.resource_released = true;
+        self.pin_resident_target(identity, false);
+        Some(
+            self.registry
+                .get(identity)
+                .is_some_and(|slot| slot.pin_count == 0),
+        )
+    }
+
+    fn released_resident_keys(&self, max: usize) -> Vec<TargetIdentity> {
+        self.registry_order
+            .iter()
+            .filter(|identity| {
+                self.registry.get(*identity).is_some_and(|slot| {
+                    slot.resource_released && slot.pin_count == 0
+                })
+            })
+            .take(max)
+            .cloned()
+            .collect()
+    }
+
+    pub(super) unsafe fn retire_released_residents(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+        max: usize,
+    ) -> usize {
+        let victims = self.released_resident_keys(max);
+        for identity in &victims {
+            self.retire_resident(ctx, identity, ResidentReclaim::ResourceReleased, counters);
+        }
+        victims.len()
     }
 
     /// Mark a resident ready after a draw stored into it.
@@ -1967,14 +1900,9 @@ impl ResourcePools {
     /// ([`crate::backend::vulkan::caps::memory_topology::MemoryProfile::device_local_bytes`])
     /// measured in gigabytes. One constant could not be both.
     ///
-    /// **And it could only ever have fired on residents in active use.** The idle
-    /// drain ([`ResourcePools::advance_registry_touch_and_drain`]) already
-    /// reclaims anything untouched for `IDLE_TARGET_AGE_MS`, at up to
-    /// `IDLE_TARGET_DRAIN_MAX_PER_CALL` per pass every `IDLE_DRAIN_INTERVAL_MS` —
-    /// about forty a second. So the standing population *is* the live
-    /// two-second working set, and a count crossing it means the guest is using
-    /// more targets than the count allowed, which is the worst moment to take one
-    /// away. Measured, it never came close: peak 194 of 320 under
+    /// A count crossing under load means the guest is using more targets than
+    /// the count allowed, which is the worst moment to take one away. Measured,
+    /// it never came close: peak 194 of 320 under
     /// `web-content-probe --churn 1`, `evicts=0` on every boot ever taken.
     ///
     /// # What bounds it now
@@ -1984,9 +1912,8 @@ impl ResourcePools {
     /// out-of-memory result it calls [`Self::reclaim_for_allocation_retry`],
     /// which gives back every recycle pool plus everything this function returns,
     /// and retries once. If that still fails the draw refuses with the driver's
-    /// own error. That is a GPU refusing because its memory is full — current,
-    /// attributable, and self-healing, since the idle drain frees the space for
-    /// the next attempt — rather than a count destroying an earlier accepted
+    /// own error. That is a GPU refusing because its memory is full — current
+    /// and attributable — rather than a count destroying an earlier accepted
     /// result in order to break a future draw.
     ///
     /// The sole-copy population was already exempt from the count and already
@@ -2104,17 +2031,10 @@ impl ResourcePools {
     ///
     /// Out of device memory is the one refusal this device can still do
     /// something about, and since the slot count was retired it is the only thing
-    /// bounding this population. The idle drain returns VRAM on a 2 s timer, so
-    /// at the moment an allocation fails the registry is usually holding
-    /// residents it was entitled to drop and had simply not got to yet. Refusing the guest's draw
-    /// while still holding them is not "the GPU is out of memory"; it is this
-    /// device declining to tidy up first, which is not what the hardware being
-    /// emulated does.
-    ///
-    /// Age is deliberately ignored. The drain cutoff is a throughput compromise,
-    /// and by this point throughput is already lost — what is left is whether the
-    /// draw survives at all. `pin_count` and `gpu_only_content` are still
-    /// honoured, so this can only ever cost re-reads, never a frame.
+    /// bounding this population. At allocation failure the registry may hold
+    /// reproducible residents it can safely give back. `pin_count` and
+    /// `gpu_only_content` are honoured, so this can only cost re-reads, never a
+    /// frame.
     ///
     /// The recycle pools go first and go completely, including the HOST_VISIBLE
     /// buffer pools that `trim_recycle_pools` otherwise holds back behind
@@ -2276,13 +2196,10 @@ impl ResourcePools {
     /// happened, for a caller that needs to know how long ago rather than only
     /// what.
     ///
-    /// This is what uncensors `resident_resample_peak_ms`. That peak can only
-    /// observe gaps for residents that *survived* to be read, so a reclaim
-    /// policy tuned from it is tuned from data it destroyed the tail of — every
-    /// gap longer than the cutoff shows up as an absence, not as a longer gap.
-    /// Pairing this with `IDLE_TARGET_AGE_MS` recovers the missing side: a
-    /// resident read `since` ms after being reclaimed had gone at least
-    /// `IDLE_TARGET_AGE_MS + since` ms between uses.
+    /// This distinguishes a missing identity that was explicitly released or
+    /// pressure-reclaimed from one that this device never held. The timestamp
+    /// reports how quickly it was requested again; it does not infer an idle
+    /// lifetime or authorize another reclaim.
     pub(crate) fn prior_reclaim_at(
         &self,
         identity: &TargetIdentity,
@@ -2312,32 +2229,11 @@ impl ResourcePools {
     /// See [`resident_resample_band`] for why this also bands how long the
     /// resident had been sitting untouched before the read.
     ///
-    /// Reading a resident was not a use. `last_touch_ms` was refreshed by
-    /// `registry_ensure` (a draw rendering *into* the target), by the present
-    /// touch, and by nothing else — while the sampled-source resolve in
-    /// `execute_draw_inner` goes through `registry_get`, which takes `&self` and
-    /// therefore cannot mark anything. A resident that every frame samples but
-    /// no frame draws into consequently aged as if it were abandoned.
-    ///
-    /// That is the shape of a compositor backdrop: the desktop behind a
-    /// translucent panel is rendered once and then read by every vibrancy draw
-    /// over it. After `IDLE_TARGET_AGE_MS` the idle drain took it, and the drain
-    /// is a terminal destroy rather than a recycle, so the pixels were gone. The
-    /// next draw to sample it refuses with
-    /// `vk_draw_exec_sampled_resident_missing`, and because the exec loop
-    /// abandons the remaining records of a packet once a record cannot encode,
-    /// one missing backdrop drops a whole packet of draws.
-    ///
-    /// Nothing recreates a resident except a draw rendering into that identity,
-    /// so a backdrop the guest considers still valid is never rebuilt: the
-    /// refusal repeats for the life of the boot. That is why this class survives
-    /// closing the application that caused the pressure and why only a reboot
-    /// clears it.
-    ///
-    /// The stamp this writes is the one the idle drain reads — it compares
-    /// `last_touch_ms` against `IDLE_TARGET_AGE_MS` — so recording a read here is
-    /// what keeps a resident nothing draws into from aging out under one that
-    /// every frame samples.
+    /// Sampling is a real use even when no draw renders back into the target.
+    /// Refresh the timestamp so reuse-distance diagnostics describe all GPU
+    /// access, including compositor backdrops. No residency decision reads this
+    /// timestamp: live targets end through resource lifetime or, when safe,
+    /// allocation-pressure recovery.
     pub(crate) fn registry_note_sampled_use(&mut self, identity: &TargetIdentity) {
         let touch = self.idle_clock_ms;
         if let Some(slot) = self.registry.get_mut(identity) {
@@ -2345,10 +2241,8 @@ impl ResourcePools {
             slot.last_touch_ms = touch;
             crate::runtime::drain::note_store_route(resident_resample_band(idle_ms));
             // The bands give the distribution; this gives the margin. They
-            // answer different questions, and the bands alone could not say
-            // whether their one sample above the half mark sat at 1.0 s or at
-            // 1.9 s against a 2 s cutoff — which is the difference between
-            // comfortable and one slow frame from a permanent loss.
+            // answer different questions: the peak preserves the longest exact
+            // reuse interval while the bands keep a cheap distribution.
             self.resident_resample_peak_ms = self.resident_resample_peak_ms.max(idle_ms);
         }
     }
@@ -2385,6 +2279,7 @@ pub(super) mod pin_count_tests {
             ),
             color_format: translate::pixel::SCANOUT_FORMAT,
             pin_count: 0,
+            resource_released: false,
             gpu_only_content: false,
             last_touch_ms: 0,
         }
@@ -2569,6 +2464,35 @@ pub(super) mod pin_count_tests {
         pools.registry.insert(imported_id.clone(), imported);
         assert_eq!(pools.retain_resident_target(&imported_id), Some(true));
         assert_eq!(pools.registry[&imported_id].pin_count, 1);
+    }
+
+    #[test]
+    fn ending_resource_ownership_blocks_new_retains_and_makes_it_retirable() {
+        let mut pools = ResourcePools::new();
+        let id = pinned_identity();
+        pools.registry.insert(id.clone(), dummy_slot(true));
+        pools.registry_order.push_back(id.clone());
+
+        assert_eq!(pools.retain_resident_target(&id), Some(false));
+        assert_eq!(pools.release_resident_ownership(&id), Some(true));
+        assert_eq!(pools.retain_resident_target(&id), None);
+        assert_eq!(pools.released_resident_keys(1), vec![id]);
+    }
+
+    #[test]
+    fn released_resource_waits_for_existing_holders_but_not_for_time() {
+        let mut pools = ResourcePools::new();
+        let id = pinned_identity();
+        pools.registry.insert(id.clone(), dummy_slot(true));
+        pools.registry_order.push_back(id.clone());
+
+        assert_eq!(pools.retain_resident_target(&id), Some(false));
+        assert!(pools.pin_resident_target(&id, true), "in-flight holder");
+        assert_eq!(pools.release_resident_ownership(&id), Some(false));
+        assert!(pools.released_resident_keys(1).is_empty());
+
+        assert!(pools.pin_resident_target(&id, false));
+        assert_eq!(pools.released_resident_keys(1), vec![id]);
     }
 
     fn surf(id: u32) -> TargetIdentity {
@@ -2802,7 +2726,7 @@ pub(super) mod pin_count_tests {
     /// `pin_count == 0` is true of a resident that was written back *and* of one
     /// that never was.
     #[test]
-    fn a_resident_that_is_the_only_copy_of_its_pixels_is_never_aged_out() {
+    fn elapsed_time_never_reclaims_a_live_resident() {
         let mut pools = ResourcePools::new();
         admit(&mut pools, surf(1), 10, 0);
         // The MRT-secondary path: rendered into, marked ready at the pass's
@@ -2810,21 +2734,15 @@ pub(super) mod pin_count_tests {
         pools.registry_mark_ready_at(&surf(1), vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         pools.registry_touch_at(&surf(1), 10);
 
-        let now = 10 + IDLE_TARGET_AGE_MS + 1;
-        assert_eq!(
-            pools.plan_idle_drain(now, None),
-            Some(Vec::new()),
-            "aged past the cutoff and unpinned, but destroying it destroys the frame"
-        );
+        let now = 10 + IDLE_MAINTENANCE_START_MS + 1;
+        assert!(pools.plan_idle_maintenance(now));
+        assert!(pools.registry.contains_key(&surf(1)));
 
         // Ten more cutoffs' worth of idleness changes nothing: this is not a
         // longer timer, it is a different question.
-        let much_later = now + IDLE_TARGET_AGE_MS * 10;
-        assert_eq!(
-            pools.plan_idle_drain(much_later, None),
-            Some(Vec::new()),
-            "no age makes destroying the only copy anything but a loss"
-        );
+        let much_later = now + IDLE_MAINTENANCE_START_MS * 10;
+        assert!(pools.plan_idle_maintenance(much_later));
+        assert!(pools.registry.contains_key(&surf(1)));
 
         // Something copies the pixels out — a landed flush, a writeback Store —
         // and the same resident is now exactly as reclaimable as any other.
@@ -2832,11 +2750,11 @@ pub(super) mod pin_count_tests {
             pools.registry_note_content_copied_out(&surf(1)),
             "the slot is there to be cleared"
         );
-        let later_still = much_later + IDLE_DRAIN_INTERVAL_MS + 1;
-        assert_eq!(
-            pools.plan_idle_drain(later_still, None),
-            Some(vec![surf(1)]),
-            "with the pixels held elsewhere, reclaiming costs redundant work only"
+        let later_still = much_later + MAINTENANCE_INTERVAL_MS + 1;
+        assert!(pools.plan_idle_maintenance(later_still));
+        assert!(
+            pools.registry.contains_key(&surf(1)),
+            "a current guest copy makes pressure reclaim safe, not time authoritative"
         );
     }
 
@@ -2895,9 +2813,9 @@ pub(super) mod pin_count_tests {
     #[test]
     fn no_reclaim_cause_may_take_the_only_copy_of_a_frame() {
         for cause in [
-            ResidentReclaim::IdleDrained,
             ResidentReclaim::AllocationReclaimed,
             ResidentReclaim::Recreated,
+            ResidentReclaim::ResourceReleased,
         ] {
             let mut pools = ResourcePools::new();
             admit(&mut pools, surf(1), 10, 0);
@@ -2905,14 +2823,7 @@ pub(super) mod pin_count_tests {
             // never stamped, never written back.
             pools.registry_mark_ready(&surf(1));
             pools.registry_touch_at(&surf(1), 10);
-            let aged = 10 + IDLE_TARGET_AGE_MS + 1;
-
             match cause {
-                ResidentReclaim::IdleDrained => assert_eq!(
-                    pools.plan_idle_drain(aged, None),
-                    Some(Vec::new()),
-                    "the idle drain must not offer a sole copy at any age"
-                ),
                 ResidentReclaim::AllocationReclaimed => assert!(
                     pools.recoverable_residents().is_empty(),
                     "a device out of memory refuses the next allocation rather \
@@ -2921,7 +2832,7 @@ pub(super) mod pin_count_tests {
                 // Exempt, and the assertion says why rather than skipping: the
                 // slot is still the sole copy, and that is not what stops this
                 // cause — the guest asking for a different target is.
-                ResidentReclaim::Recreated => assert!(
+                ResidentReclaim::Recreated | ResidentReclaim::ResourceReleased => assert!(
                     pools
                         .registry
                         .get(&surf(1))
@@ -3100,53 +3011,41 @@ pub(super) mod pin_count_tests {
         );
     }
 
-    /// A non-pinned resident untouched for `IDLE_TARGET_AGE_MS` is selected; a
+    /// A non-pinned resident untouched for `IDLE_MAINTENANCE_START_MS` is selected; a
     /// freshly-touched peer and a pinned peer are not. The wall clock advances to
     /// the passed `now_ms` (not a per-call increment), so a static guest that
     /// keeps ticking the poll heartbeat still reclaims stale VRAM.
     #[test]
-    fn plan_idle_drain_selects_only_aged_non_pinned() {
+    fn maintenance_never_selects_live_residents_by_age() {
         let mut pools = ResourcePools::new();
         admit(&mut pools, surf(1), 10, 0); // aged, non-pinned  -> victim
         admit(&mut pools, surf(2), 10, 1); // aged but PINNED   -> kept
                                            // now = 10 + AGE + 1 so slot 1's cutoff is crossed; a fresh slot is not.
-        let now = 10 + IDLE_TARGET_AGE_MS + 1;
+        let now = 10 + IDLE_MAINTENANCE_START_MS + 1;
         admit(&mut pools, surf(3), now, 0); // fresh            -> kept
-        let victims = pools.plan_idle_drain(now, None).expect("pass due");
-        assert_eq!(victims, vec![surf(1)], "only the aged non-pinned resident");
+        assert!(pools.plan_idle_maintenance(now), "maintenance pass is due");
+        assert_eq!(pools.registry.len(), 3, "time changes no live residency");
         assert_eq!(pools.idle_clock_ms, now, "clock advanced to wall time");
     }
 
     /// A reclaim records *when*, so the gap the drain censored can be recovered.
     ///
-    /// `resident_resample_peak_ms` measures the interval between two reads of a
-    /// resident that survived both, so it structurally cannot observe a gap
-    /// longer than `IDLE_TARGET_AGE_MS`: past that the resident is gone and the
-    /// closing read falls through to the guest's pages, recording an absence
-    /// rather than a longer interval. Tuning the cutoff from that peak means
-    /// tuning it from a distribution the policy itself truncates.
-    ///
-    /// The reclaim stamp is what closes the interval from the other side — a
-    /// resident read `since` ms after being destroyed had gone at least
-    /// `IDLE_TARGET_AGE_MS + since` between uses.
-    ///
-    /// Fails without the stamp: `reclaimed_recent` carries no time at all.
+    /// A reclaim records when it happened so diagnostics can report how soon an
+    /// explicitly released or pressure-reclaimed identity was requested again.
     #[test]
     fn a_reclaim_records_when_so_the_censored_gap_can_be_recovered() {
         let mut pools = ResourcePools::new();
         admit(&mut pools, surf(1), 0, 0);
         pools.idle_clock_ms = 5_000;
-        pools.unregister_resident(&surf(1), ResidentReclaim::IdleDrained);
+        pools.unregister_resident(&surf(1), ResidentReclaim::AllocationReclaimed);
 
         let (why, at) = pools
             .prior_reclaim_at(&surf(1))
             .expect("a reclaim is recorded with its time");
-        assert_eq!(why, ResidentReclaim::IdleDrained);
-        assert_eq!(at, 5_000, "stamped with the drain's own clock");
+        assert_eq!(why, ResidentReclaim::AllocationReclaimed);
+        assert_eq!(at, 5_000, "stamped with the maintenance clock");
 
-        // The guest comes back 3 s after the destroy, so it had gone at least
-        // IDLE_TARGET_AGE_MS + 3000 between uses — a gap the surviving-resident
-        // peak could never have reported.
+        // The guest comes back 3 s after the destroy.
         pools.idle_clock_ms = 8_000;
         assert_eq!(
             pools.idle_clock_ms().saturating_sub(at),
@@ -3161,20 +3060,12 @@ pub(super) mod pin_count_tests {
         );
     }
 
-    /// The resample bands are fractions of the drain cutoff, so retuning the
-    /// cutoff moves them with it and no reading is ever quoted against a bound
-    /// it did not come from.
-    ///
-    /// The boundary that matters is the last one. `past_cutoff` is exactly the
-    /// case where a resident was read after sitting longer than the age at which
-    /// the drain would have destroyed it, so it survived only because the drain
-    /// is throttled to `IDLE_TARGET_DRAIN_MAX_PER_CALL` per pass and had not
-    /// reached it. `IDLE_TARGET_AGE_MS` itself must therefore land in that band
-    /// and not under it: the drain's own comparison is `last_touch_ms <= cutoff`,
-    /// so a resident exactly at the cutoff is already a victim.
+    /// The resample bands use the maintenance start interval as a stable scale.
+    /// They are diagnostics only: crossing any boundary has no effect on a live
+    /// resident's lifetime.
     #[test]
     fn the_resident_resample_bands_are_fractions_of_the_drain_cutoff() {
-        let c = IDLE_TARGET_AGE_MS;
+        let c = IDLE_MAINTENANCE_START_MS;
         for (idle, expected) in [
             (0, "resident_resample_lt_eighth_cutoff"),
             (c / 8 - 1, "resident_resample_lt_eighth_cutoff"),
@@ -3220,11 +3111,11 @@ pub(super) mod pin_count_tests {
         assert!(pools.registry.contains_key(&surf(1)));
 
         // Destroyed: absent, and the cause survives.
-        pools.unregister_resident(&surf(1), ResidentReclaim::IdleDrained);
+        pools.unregister_resident(&surf(1), ResidentReclaim::AllocationReclaimed);
         assert!(!pools.registry.contains_key(&surf(1)));
         assert_eq!(
             pools.prior_reclaim(&surf(1)),
-            Some(ResidentReclaim::IdleDrained)
+            Some(ResidentReclaim::AllocationReclaimed)
         );
 
         // Re-created: the record is still in history, so only the presence
@@ -3236,7 +3127,7 @@ pub(super) mod pin_count_tests {
         );
         assert_eq!(
             pools.prior_reclaim(&surf(1)),
-            Some(ResidentReclaim::IdleDrained),
+            Some(ResidentReclaim::AllocationReclaimed),
             "history is deliberately not cleared on re-admit, which is why the \
              presence check cannot be dropped"
         );
@@ -3247,7 +3138,7 @@ pub(super) mod pin_count_tests {
     /// A high-water, so a large gap early is not erased by a run of small ones
     /// after it — which is the whole reason it is not a windowed reading. The
     /// margin question is "how close did this boot ever come to
-    /// `IDLE_TARGET_AGE_MS`", and a gap that peaks between two census samples is
+    /// `IDLE_MAINTENANCE_START_MS`", and a gap that peaks between two census samples is
     /// exactly what an instantaneous value misses.
     ///
     /// Fails without the fix: nothing records the gap at all.
@@ -3270,33 +3161,20 @@ pub(super) mod pin_count_tests {
         );
 
         // And a larger one does raise it.
-        pools.idle_clock_ms = 1_000 + IDLE_TARGET_AGE_MS;
+        pools.idle_clock_ms = 1_000 + IDLE_MAINTENANCE_START_MS;
         pools.registry_note_sampled_use(&surf(1));
-        assert_eq!(pools.resident_resample_peak_ms(), IDLE_TARGET_AGE_MS);
+        assert_eq!(pools.resident_resample_peak_ms(), IDLE_MAINTENANCE_START_MS);
 
         // A read of an identity the registry does not hold records nothing —
         // there is no gap to measure, and counting it as one would report a
         // margin that no resident ever spent.
         pools.idle_clock_ms = u64::MAX;
         pools.registry_note_sampled_use(&surf(99));
-        assert_eq!(pools.resident_resample_peak_ms(), IDLE_TARGET_AGE_MS);
+        assert_eq!(pools.resident_resample_peak_ms(), IDLE_MAINTENANCE_START_MS);
     }
 
-    /// A resident that a draw only ever *samples* survives the idle drain.
-    ///
-    /// This is the compositor-backdrop case: the desktop behind a translucent
-    /// panel is rendered once and then read by every vibrancy draw over it.
-    /// Before [`ResourcePools::registry_note_sampled_use`] existed, reading a
-    /// resident refreshed nothing — `registry_ensure` (render *into*) and the
-    /// present touch were the only writers of `last_touch_ms` — so the backdrop
-    /// aged exactly as if it had been abandoned and the drain terminally
-    /// destroyed it. Every later draw sampling it then refused with
-    /// `vk_draw_exec_sampled_resident_missing`, and nothing recreates a resident
-    /// except a draw rendering into that identity, so the refusal held for the
-    /// rest of the boot.
-    ///
-    /// Fails without the fix: with the body of `registry_note_sampled_use`
-    /// removed, `surf(1)` is selected and the assertion reports it as a victim.
+    /// A resident that a draw only ever samples remains live, and its diagnostic
+    /// timestamp reflects that use.
     #[test]
     fn a_sampled_only_resident_is_not_aged_out() {
         let mut pools = ResourcePools::new();
@@ -3304,22 +3182,16 @@ pub(super) mod pin_count_tests {
         // into again — only read.
         admit(&mut pools, surf(1), 10, 0);
         admit(&mut pools, surf(2), 10, 0);
-        let now = 10 + IDLE_TARGET_AGE_MS + 1;
+        let now = 10 + IDLE_MAINTENANCE_START_MS + 1;
         // The drain's clock has to be current before a use can be recorded
         // against it; the real caller advances it from the poll heartbeat.
-        pools.plan_idle_drain(now, None);
+        pools.plan_idle_maintenance(now);
         pools.registry_note_sampled_use(&surf(1));
         // A second pass, far enough after the first to clear the throttle.
-        let later = now + IDLE_DRAIN_INTERVAL_MS + 1;
-        let victims = pools.plan_idle_drain(later, None).expect("pass due");
-        assert!(
-            !victims.contains(&surf(1)),
-            "a resident being sampled is in use and must not be destroyed"
-        );
-        assert!(
-            victims.contains(&surf(2)),
-            "its untouched peer is still reclaimed — the fix must not disable the drain"
-        );
+        let later = now + MAINTENANCE_INTERVAL_MS + 1;
+        assert!(pools.plan_idle_maintenance(later), "second pass is due");
+        assert!(pools.registry.contains_key(&surf(1)));
+        assert!(pools.registry.contains_key(&surf(2)));
     }
 
     /// A pinned resident is never offered to the allocation-failure reclaim, and
@@ -3395,11 +3267,11 @@ pub(super) mod pin_count_tests {
     #[test]
     fn the_reclaim_history_names_the_path_and_is_bounded() {
         let mut pools = ResourcePools::new();
-        pools.note_resident_reclaimed(&surf(1), ResidentReclaim::IdleDrained);
+        pools.note_resident_reclaimed(&surf(1), ResidentReclaim::AllocationReclaimed);
         pools.note_resident_reclaimed(&surf(2), ResidentReclaim::AllocationReclaimed);
         assert_eq!(
             pools.prior_reclaim(&surf(1)),
-            Some(ResidentReclaim::IdleDrained)
+            Some(ResidentReclaim::AllocationReclaimed)
         );
         assert_eq!(
             pools.prior_reclaim(&surf(2)),
@@ -3430,52 +3302,37 @@ pub(super) mod pin_count_tests {
         );
     }
 
-    /// The reclaim pass is throttled to `IDLE_DRAIN_INTERVAL_MS`: a second call
+    /// The reclaim pass is throttled to `MAINTENANCE_INTERVAL_MS`: a second call
     /// inside the interval selects nothing even though a resident is aged, so the
     /// ~244 Hz poll cadence cannot empty the registry at once. The clock still
     /// advances (admits stay fresh).
     #[test]
-    fn plan_idle_drain_throttles_between_passes() {
+    fn maintenance_is_throttled_between_passes() {
         let mut pools = ResourcePools::new();
         admit(&mut pools, surf(1), 0, 0);
-        let t0 = IDLE_TARGET_AGE_MS + 1;
-        assert_eq!(pools.plan_idle_drain(t0, None), Some(vec![surf(1)]));
-        // Simulate the dispose the real caller (advance_registry_touch_and_drain)
-        // performs for each selected victim.
-        pools.registry.remove(&surf(1));
-        pools.registry_order.retain(|k| k != &surf(1));
+        let t0 = IDLE_MAINTENANCE_START_MS + 1;
+        assert!(pools.plan_idle_maintenance(t0));
         admit(&mut pools, surf(2), 0, 0);
-        // A call one ms later is inside the interval → no pass (None), despite
-        // surf(2) being aged.
-        assert_eq!(
-            pools.plan_idle_drain(t0 + 1, None),
-            None,
-            "throttled: no pass"
-        );
+        assert!(!pools.plan_idle_maintenance(t0 + 1), "throttled: no pass");
         assert_eq!(
             pools.idle_clock_ms,
             t0 + 1,
             "clock still advances when throttled"
         );
-        // Past the interval → the next aged resident is selected.
-        assert_eq!(
-            pools.plan_idle_drain(t0 + IDLE_DRAIN_INTERVAL_MS, None),
-            Some(vec![surf(2)])
-        );
+        assert!(pools.plan_idle_maintenance(t0 + MAINTENANCE_INTERVAL_MS));
+        assert_eq!(pools.registry.len(), 2, "maintenance owns no live residents");
     }
 
-    /// Each pass selects at most `IDLE_TARGET_DRAIN_MAX_PER_CALL` so a huge stale
-    /// set drains gradually (no dispose storm that would be a P3 hitch itself).
+    /// A maintenance pass cannot shrink a live registry, regardless of its size.
     #[test]
-    fn plan_idle_drain_bounds_batch_per_pass() {
+    fn maintenance_does_not_shrink_a_large_live_registry() {
         let mut pools = ResourcePools::new();
-        for i in 0..(IDLE_TARGET_DRAIN_MAX_PER_CALL as u32 + 5) {
+        const LIVE_RESIDENTS: usize = 9;
+        for i in 0..LIVE_RESIDENTS as u32 {
             admit(&mut pools, surf(100 + i), 0, 0);
         }
-        let victims = pools
-            .plan_idle_drain(IDLE_TARGET_AGE_MS + 1, None)
-            .expect("pass due");
-        assert_eq!(victims.len(), IDLE_TARGET_DRAIN_MAX_PER_CALL);
+        assert!(pools.plan_idle_maintenance(IDLE_MAINTENANCE_START_MS + 1));
+        assert_eq!(pools.registry.len(), LIVE_RESIDENTS);
     }
 
     /// A pass with no registry victim but live staging traffic is NOT settled.
@@ -3492,102 +3349,84 @@ pub(super) mod pin_count_tests {
         // Quiet the gate first, so the assertion below is about uploads and not
         // about the counter still warming up.
         for _ in 0..SETTLED_PASSES_FOR_BUFFER_TRIM {
-            pools.note_drain_settled(0);
+            pools.note_maintenance_settled();
         }
         assert!(
-            pools.note_drain_settled(0),
+            pools.note_maintenance_settled(),
             "no victims, no uploads → settled"
         );
 
         // One staging acquire between passes — no victim, still not settled.
         pools.staging_hits += 1;
         assert!(
-            !pools.note_drain_settled(0),
+            !pools.note_maintenance_settled(),
             "uploads ran between passes; the buffer pools must not be trimmed"
         );
         // …and the gate stays shut while uploads keep flowing, however many
         // zero-victim passes go by.
         for _ in 0..(SETTLED_PASSES_FOR_BUFFER_TRIM * 3) {
             pools.staging_misses += 1;
-            assert!(!pools.note_drain_settled(0), "still uploading");
+            assert!(!pools.note_maintenance_settled(), "still uploading");
         }
         // Uploads stop: the gate reopens after the usual consecutive passes.
         for _ in 0..(SETTLED_PASSES_FOR_BUFFER_TRIM - 1) {
-            assert!(!pools.note_drain_settled(0), "counter restarted from zero");
+            assert!(!pools.note_maintenance_settled(), "counter restarted from zero");
         }
-        assert!(pools.note_drain_settled(0), "settled once uploads stopped");
+        assert!(pools.note_maintenance_settled(), "settled once uploads stopped");
     }
 
     /// The HOST_VISIBLE buffer trim gate: only permitted after
-    /// `SETTLED_PASSES_FOR_BUFFER_TRIM` consecutive zero-victim passes, and any
-    /// pass that drains ≥1 victim (active churn) resets the counter — so a
-    /// staging buffer cannot be freed and re-alloc'd mid-video.
+    /// `SETTLED_PASSES_FOR_BUFFER_TRIM` consecutive passes without upload
+    /// activity, so a staging buffer cannot be freed and re-allocated mid-video.
     #[test]
-    fn note_drain_settled_gates_buffer_trim_on_consecutive_idle() {
+    fn note_maintenance_settled_gates_buffer_trim_on_consecutive_idle() {
         let mut pools = ResourcePools::new();
         // Fewer than the threshold of quiet passes: no buffer trim yet.
         for _ in 0..(SETTLED_PASSES_FOR_BUFFER_TRIM - 1) {
-            assert!(!pools.note_drain_settled(0), "not settled enough yet");
+            assert!(!pools.note_maintenance_settled(), "not settled enough yet");
         }
         // The Nth consecutive zero-victim pass crosses the threshold.
         assert!(
-            pools.note_drain_settled(0),
+            pools.note_maintenance_settled(),
             "N consecutive settled passes → trim allowed"
         );
         // A subsequent quiet pass stays allowed.
-        assert!(pools.note_drain_settled(0), "stays settled");
-        // A pass that drains a victim (active churn) resets the counter…
-        assert!(
-            !pools.note_drain_settled(1),
-            "any drained victim resets settled state"
-        );
+        assert!(pools.note_maintenance_settled(), "stays settled");
+        // Upload activity resets the counter.
+        pools.staging_hits += 1;
+        assert!(!pools.note_maintenance_settled(), "uploads reset settled state");
         // …and the gate stays closed until the run rebuilds.
         for _ in 0..(SETTLED_PASSES_FOR_BUFFER_TRIM - 1) {
-            assert!(!pools.note_drain_settled(0), "counter restarted from zero");
+            assert!(!pools.note_maintenance_settled(), "counter restarted from zero");
         }
-        assert!(pools.note_drain_settled(0), "settled again after rebuild");
+        assert!(pools.note_maintenance_settled(), "settled again after rebuild");
     }
 
     /// The presented target passed as `display` is stamped to the current clock
-    /// every call, so even though it is only resolved via `registry_get` (never
-    /// re-drawn on a static page) it never ages out from under the display.
+    /// every call, so reuse-distance diagnostics include presentation reads.
     #[test]
-    fn plan_idle_drain_keeps_display_target_alive() {
+    fn maintenance_keeps_the_display_target_alive_without_a_special_case() {
         let mut pools = ResourcePools::new();
         admit(&mut pools, surf(1), 0, 0); // would be aged...
-        let now = IDLE_TARGET_AGE_MS + 500;
+        let now = IDLE_MAINTENANCE_START_MS + 500;
         // ...but it is the presented target this frame.
-        let victims = pools
-            .plan_idle_drain(now, Some(&surf(1)))
-            .expect("pass due");
-        assert!(victims.is_empty(), "display target must not be reclaimed");
-        assert_eq!(
-            pools.registry.get(&surf(1)).unwrap().last_touch_ms,
-            now,
-            "display target stamped fresh"
-        );
+        assert!(pools.plan_idle_maintenance(now));
+        assert!(pools.registry.contains_key(&surf(1)));
     }
 
-    /// `registry_touch_at` refreshes a target against the idle-drain cutoff
-    /// without going through the draw path, so a target that is registered but
-    /// not being drawn survives a static desktop interval when a caller still
-    /// needs it.
+    /// Touching changes diagnostics, not lifetime: both touched and untouched
+    /// live targets survive a static desktop interval.
     #[test]
-    fn registry_touch_at_defers_the_idle_drain_for_an_untouched_target() {
+    fn maintenance_does_not_require_touching_a_live_target() {
         let mut pools = ResourcePools::new();
         admit(&mut pools, surf(1), 0, 0); // displayed target
         admit(&mut pools, surf(4), 0, 0); // registered but undrawn, otherwise aged
-        let now = IDLE_TARGET_AGE_MS + 500;
+        let now = IDLE_MAINTENANCE_START_MS + 500;
 
         pools.registry_touch_at(&surf(4), now);
-        let victims = pools
-            .plan_idle_drain(now, Some(&surf(1)))
-            .expect("pass due");
-        assert_eq!(
-            victims,
-            Vec::<TargetIdentity>::new(),
-            "the display target and the touched target both survive"
-        );
+        assert!(pools.plan_idle_maintenance(now));
+        assert!(pools.registry.contains_key(&surf(1)));
+        assert!(pools.registry.contains_key(&surf(4)));
         assert_eq!(
             pools.registry.get(&surf(4)).unwrap().last_touch_ms,
             now,

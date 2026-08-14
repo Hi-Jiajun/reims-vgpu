@@ -1631,8 +1631,6 @@ pub enum TargetIdentity {
 /// value of recording this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResidentReclaim {
-    /// The idle drain aged it out. A terminal destroy, not a recycle.
-    IdleDrained,
     /// An allocation was refused and the reclaim retry gave it back, because it
     /// was neither pinned nor the only copy of its pixels. A terminal destroy of
     /// the image, but not of the pixels — the guest's own pages still hold them,
@@ -1641,14 +1639,18 @@ pub enum ResidentReclaim {
     /// `registry_ensure` replaced it for the same identity at a new geometry,
     /// generation or format.
     Recreated,
+    /// The serialized resource that owned this resident was explicitly deleted
+    /// or replaced. The guest ended the resource lifetime, so the host object no
+    /// longer participates in allocation-pressure recovery.
+    ResourceReleased,
 }
 
 impl ResidentReclaim {
     pub fn slug(self) -> &'static str {
         match self {
-            Self::IdleDrained => "idle_drained",
             Self::AllocationReclaimed => "allocation_reclaimed",
             Self::Recreated => "recreated",
+            Self::ResourceReleased => "resource_released",
         }
     }
 }
