@@ -1303,28 +1303,30 @@ pub fn guest_access_outstanding() -> bool {
 
 /// Where one FIFO completion stamp obtained its ordering point.
 ///
-/// A batched stamp closes work that already needed submitting; otherwise the
-/// stamp reuses the newest successful FIFO submission. Keeping it as a type
+/// A batched stamp waits for the open batch's eventual submission; otherwise
+/// the stamp reuses the newest successful FIFO submission. Keeping it as a type
 /// makes the counter choice exhaustive and gives the rule a device-free
 /// behavioural test.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StampPointSource {
     Batch,
+    PressureFlush,
     Reused,
 }
 
 impl StampPointSource {
-    fn from_open_batch(open: bool) -> Self {
-        if open {
-            Self::Batch
-        } else {
-            Self::Reused
+    fn from_route(open: bool, deferred: bool) -> Self {
+        match (open, deferred) {
+            (true, true) => Self::Batch,
+            (true, false) => Self::PressureFlush,
+            (false, _) => Self::Reused,
         }
     }
 
     fn count(self, counters: &EngineCounters) {
         let counter = match self {
             Self::Batch => &counters.gpu_stamp_batch_points,
+            Self::PressureFlush => &counters.gpu_stamp_pressure_flushes,
             Self::Reused => &counters.gpu_stamp_reused_points,
         };
         counter.fetch_add(1, Ordering::Relaxed);
@@ -1336,18 +1338,22 @@ mod stamp_point_source_tests {
     use super::*;
 
     #[test]
-    fn a_flushed_batch_and_a_reused_point_are_counted_apart() {
+    fn a_deferred_batch_and_a_reused_point_are_counted_apart() {
         let counters = EngineCounters::default();
-        StampPointSource::from_open_batch(true).count(&counters);
-        StampPointSource::from_open_batch(false).count(&counters);
-        StampPointSource::from_open_batch(false).count(&counters);
+        StampPointSource::from_route(true, true).count(&counters);
+        StampPointSource::from_route(true, false).count(&counters);
+        StampPointSource::from_route(false, false).count(&counters);
+        StampPointSource::from_route(false, false).count(&counters);
 
         let snapshot = counters.snapshot();
         assert_eq!(snapshot.gpu_stamp_batch_points, 1);
+        assert_eq!(snapshot.gpu_stamp_pressure_flushes, 1);
         assert_eq!(snapshot.gpu_stamp_reused_points, 2);
         assert_eq!(
-            snapshot.gpu_stamp_batch_points + snapshot.gpu_stamp_reused_points,
-            3,
+            snapshot.gpu_stamp_batch_points
+                + snapshot.gpu_stamp_pressure_flushes
+                + snapshot.gpu_stamp_reused_points,
+            4,
             "every successful GPU stamp has exactly one completion-point source"
         );
     }
@@ -1362,11 +1368,14 @@ mod stamp_point_source_tests {
 /// commands preceding it have completed. That includes writes into guest pages
 /// and reads from guest pages the guest may reuse after observing the stamp.
 /// The blocking rail retires the queue and then stores the word from the CPU.
-/// This rail gives every FIFO-owned submission a monotonic timeline point. The
-/// completion thread waits the newest point, release-stores the word through its
-/// checked [`crate::runtime::guest_ram::GuestRef`], and raises the interrupt.
-/// Queue order makes that one point cover every earlier guest-memory read and
-/// write without manufacturing a submission for the four-byte stamp.
+/// This rail gives every FIFO-owned submission a monotonic timeline point. If a
+/// draw batch is still recording, the stamp enters the bounded pending queue
+/// without closing it; the batch's eventual successful submit assigns the
+/// point. The completion thread waits that point, release-stores the word
+/// through its checked [`crate::runtime::guest_ram::GuestRef`], and raises the
+/// interrupt. Queue order makes one point cover every earlier guest-memory read
+/// and write without manufacturing a submission or a command-buffer boundary
+/// for the four-byte stamp.
 ///
 /// **It does not order the interrupt**, and that is not an oversight. The guest
 /// reads the stamp word directly and sleeps on it with a one-second deadline, so
@@ -1404,21 +1413,28 @@ pub fn write_completion_stamp(
         }));
     };
     let had_batch = pools.batch_open_recording().is_some();
-    if had_batch {
-        unsafe { pools.batch_flush(ctx, counters)? };
+    let deferred = had_batch
+        && completion.queue_for_next_submission(index, guest_ref.clone(), value);
+    if !deferred {
+        // A full pending ring cannot wait while this thread owns the open
+        // command buffer: submitting it is what lets completions retire. This
+        // is the pressure path only; the ordinary stamp leaves the batch open.
+        if had_batch {
+            unsafe { pools.batch_flush(ctx, counters)? };
+        }
+        let Some((_, timeline)) = completion.latest_submitted() else {
+            let decline = GuestWriteDecline::NoCompletionPoint;
+            crate::observe::Emit::decline("gpu_completion_stamp", &decline).fail();
+            return Err(DrawError::GuestPageWrite(decline));
+        };
+        completion.wait_for_stamp(timeline, index, guest_ref.clone(), value);
     }
-    let Some((_, timeline)) = completion.latest_submitted() else {
-        let decline = GuestWriteDecline::NoCompletionPoint;
-        crate::observe::Emit::decline("gpu_completion_stamp", &decline).fail();
-        return Err(DrawError::GuestPageWrite(decline));
-    };
-    completion.wait_for_stamp(timeline, index, guest_ref.clone(), value);
     // The queued stamp now carries the ordering for every guest read recorded
     // before this submission. A later read records a fresh debt; retaining this
     // one would submit an otherwise empty stamp for every later CPU-only packet.
     pools.take_guest_read_debt();
     counters.gpu_stamps.fetch_add(1, Ordering::Relaxed);
-    StampPointSource::from_open_batch(had_batch).count(counters);
+    StampPointSource::from_route(had_batch, deferred).count(counters);
     Ok(())
 }
 

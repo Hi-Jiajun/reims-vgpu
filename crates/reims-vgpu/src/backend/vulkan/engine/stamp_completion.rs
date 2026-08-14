@@ -132,7 +132,12 @@ fn announce(index: u32) {
 #[derive(Clone, Debug)]
 struct Waiting {
     /// Timeline value the FIFO submission preceding this stamp signals.
-    timeline: u64,
+    ///
+    /// `None` is a stamp recorded while a deferred draw batch is still open.
+    /// The next successful queue submission assigns its point to every such
+    /// record. Keeping the record pending before the submit is what preserves
+    /// FIFO chaining without making the stamp close the command buffer.
+    timeline: Option<u64>,
     /// Stamp slot index, for the interrupt-status bit.
     index: u32,
     /// The checked shared-memory word written before the interrupt is raised.
@@ -165,6 +170,17 @@ impl PendingQueue {
 
     fn has_pending(&self, index: usize) -> bool {
         self.per_fifo[index] != 0
+    }
+
+    fn bind_unsubmitted(&mut self, timeline: u64) -> usize {
+        let mut bound = 0;
+        for waiting in &mut self.waiting {
+            if waiting.timeline.is_none() {
+                waiting.timeline = Some(timeline);
+                bound += 1;
+            }
+        }
+        bound
     }
 }
 
@@ -244,6 +260,15 @@ impl StampCompletion {
     /// Publish a successfully submitted queue point.
     pub(crate) fn note_submitted(&self, value: u64) {
         self.shared.latest_submitted.store(value, Ordering::Release);
+        let bound = self
+            .shared
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bind_unsubmitted(value);
+        if bound != 0 {
+            self.shared.wake.notify_all();
+        }
     }
 
     /// The newest successfully submitted queue point.
@@ -281,7 +306,7 @@ impl StampCompletion {
             return;
         }
         queue.push(Waiting {
-            timeline,
+            timeline: Some(timeline),
             index,
             word,
             stamp,
@@ -289,6 +314,43 @@ impl StampCompletion {
         PENDING_FIFO_MASK.fetch_or(1u32 << index, Ordering::Release);
         drop(queue);
         self.shared.wake.notify_one();
+    }
+
+    /// Register a stamp behind the command buffer that is still recording.
+    ///
+    /// Returns `false` instead of blocking when this FIFO's contract-sized
+    /// pending ring is full. The caller owns the open command buffer, so
+    /// sleeping there would prevent the very submission that can make room;
+    /// it must submit the batch and retry against that concrete point.
+    pub(crate) fn queue_for_next_submission(
+        &self,
+        index: u32,
+        word: crate::runtime::guest_ram::GuestRef,
+        stamp: u32,
+    ) -> bool {
+        let Some(slot) = ((index as usize) < crate::model::MAX_CHANNELS).then_some(index as usize)
+        else {
+            crate::observe::fail(format!(
+                "stamp_fifo_out_of_range reason=stamp_fifo_out_of_range index={index} \
+                 max_channels={}",
+                crate::model::MAX_CHANNELS
+            ));
+            return false;
+        };
+        let mut queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.is_full(slot) || self.shared.stop.load(Ordering::Acquire) {
+            return false;
+        }
+        queue.push(Waiting {
+            timeline: None,
+            index,
+            word,
+            stamp,
+        });
+        PENDING_FIFO_MASK.fetch_or(1u32 << index, Ordering::Release);
+        drop(queue);
+        self.shared.wake.notify_one();
+        true
     }
 
     /// Wait until this FIFO has no queued completion word left to publish.
@@ -355,7 +417,9 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
                     return;
                 }
                 if let Some(front) = queue.waiting.front().cloned() {
-                    break Some(front);
+                    if front.timeline.is_some() {
+                        break Some(front);
+                    }
                 }
                 let (guard, _) = shared
                     .wake
@@ -368,7 +432,8 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
             return;
         };
         let semaphores = [semaphore];
-        let values = [waiting.timeline];
+        let timeline = waiting.timeline.expect("front was checked as submitted");
+        let values = [timeline];
         let info = vk::SemaphoreWaitInfo::default()
             .semaphores(&semaphores)
             .values(&values);
@@ -385,7 +450,7 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
                         "stamp_wait_timeout reason=stamp_wait_timeout index={} value={} \
                      (the submission carrying this stamp's word has not executed within the \
                      fence deadline; announcing it anyway so the guest is not left asleep)",
-                        waiting.index, waiting.timeline
+                        waiting.index, timeline
                     ));
                     false
                 }
@@ -393,7 +458,7 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
                     crate::observe::fail(format!(
                         "stamp_wait_failed reason=stamp_wait_failed index={} value={} err={e:?} \
                      (announcing regardless, for the reason a timeout does)",
-                        waiting.index, waiting.timeline
+                        waiting.index, timeline
                     ));
                     // Announcing is not recovering. This thread may not take the
                     // engine lock — it exists to announce guest fences while the
@@ -459,7 +524,7 @@ mod tests {
         Box::leak(word);
         let slice = import.slice(0, 4).expect("stamp word");
         Waiting {
-            timeline: u64::from(stamp) + 1,
+            timeline: Some(u64::from(stamp) + 1),
             index,
             word: crate::runtime::guest_ram::GuestRef::new(import, slice).expect("guest word"),
             stamp,
@@ -531,7 +596,7 @@ mod tests {
         let slice = import.slice(4, 4).expect("second word");
         let word = crate::runtime::guest_ram::GuestRef::new(import, slice).expect("guest word");
         let waiting = Waiting {
-            timeline: 7,
+            timeline: Some(7),
             index: 2,
             word,
             stamp: 0x89ab_cdef,
@@ -546,5 +611,23 @@ mod tests {
         assert!(should_publish(true, false));
         assert!(!should_publish(false, false));
         assert!(!should_publish(true, true));
+    }
+
+    #[test]
+    fn an_open_batch_stamp_binds_only_when_submission_succeeds() {
+        let mut queue = PendingQueue::default();
+        let mut submitted = waiting(0, 1);
+        submitted.timeline = Some(7);
+        let mut deferred_a = waiting(0, 2);
+        deferred_a.timeline = None;
+        let mut deferred_b = waiting(1, 3);
+        deferred_b.timeline = None;
+        queue.push(submitted);
+        queue.push(deferred_a);
+        queue.push(deferred_b);
+
+        assert_eq!(queue.bind_unsubmitted(11), 2);
+        let points: Vec<Option<u64>> = queue.waiting.iter().map(|w| w.timeline).collect();
+        assert_eq!(points, vec![Some(7), Some(11), Some(11)]);
     }
 }

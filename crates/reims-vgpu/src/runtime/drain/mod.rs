@@ -895,13 +895,11 @@ impl StampWait {
 /// These are undriven boots: they prove the desktop composites on each driver,
 /// not that the saving reproduces there. Only macos-13 has been driven.
 ///
-/// **One thing this was expected to do and does not.** `batch_flushes` is
-/// unchanged (0.987, 1.90 draws a flush against 1.85). The reasoning was that
-/// `engine::write_completion_stamp` appends to the open batch and then
-/// flushes it, so removing the stamps should let the batch accumulate. It does
-/// not, so the batch is flushed by something else and the stamp rode along with
-/// a flush that was already going to happen. Do not repeat the claim that the
-/// stamp was what flushed the draw batch.
+/// Completion publication does not close an open draw batch. It registers the
+/// stamp in the bounded pending queue and the batch's eventual successful
+/// submission assigns its completion point. The pending-stamp capacity remains
+/// the pressure bound: filling it submits the batch rather than sleeping while
+/// holding the only command buffer that can make room.
 ///
 /// [`Self::latch`] takes the **maximum in wrapping-signed order** rather than
 /// the last value seen. For a well-formed guest those are the same, and taking

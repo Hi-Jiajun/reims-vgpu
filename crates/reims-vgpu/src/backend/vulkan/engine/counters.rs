@@ -604,9 +604,12 @@ engine_counters! {
         /// through `begin_entry` would put a diagnostic in the signature of the
         /// device's hottest slot claim.
         batch_readback_joins,
-        /// Completion stamps whose ordering point came from flushing an open
-        /// draw batch.
+        /// Completion stamps parked for the open draw batch's eventual
+        /// submission point.
         gpu_stamp_batch_points,
+        /// Completion stamps that found their FIFO's bounded pending ring full
+        /// and therefore submitted the open batch to make room.
+        gpu_stamp_pressure_flushes,
         /// Completion stamps that reused the newest successful FIFO submission
         /// because no draw batch remained open.
         gpu_stamp_reused_points,
