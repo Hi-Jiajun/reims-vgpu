@@ -229,7 +229,7 @@ impl ResourcePools {
             host_ram_imports: host_ram::HostRamImports::default(),
             guest_reads_in_flight: false,
             guest_writes_in_flight: false,
-            unpin_on_settle: Vec::new(),
+            guest_write_pins_live: Vec::new(),
             initialized: false,
         }
     }
@@ -1444,6 +1444,7 @@ impl ResourcePools {
                 sampled,
                 attachment_snapshots: std::mem::take(&mut self.attachment_snapshot_live),
                 storage_images: std::mem::take(&mut self.storage_image_live),
+                unpin_residents: std::mem::take(&mut self.guest_write_pins_live),
             },
             admissions,
         }
@@ -2138,7 +2139,7 @@ impl ResourcePools {
     /// # The pin is taken here, not handed in
     ///
     /// It used to be handed in: the deferred-Store rail pinned the resident,
-    /// then gave that pin to this ledger to release at the settle. That rail was
+    /// then gave that pin to this ledger to release after execution. That rail was
     /// removed with `runtime::storage_flush`, and it held every product caller
     /// of [`ResourcePools::pin_resident_target`]`(_, true)` — so this ledger went
     /// on releasing a pin nobody had taken, once per GPU-direct writeback, and
@@ -2166,7 +2167,7 @@ impl ResourcePools {
         );
         self.guest_writes_in_flight = true;
         if self.pin_resident_target(identity, true) {
-            self.unpin_on_settle.push(identity.clone());
+            self.guest_write_pins_live.push(identity.clone());
         }
     }
 
@@ -2201,16 +2202,7 @@ impl ResourcePools {
         if !self.take_guest_write_debt() {
             return Ok(());
         }
-        let waited = unsafe { self.retire_all(ctx, counters) };
-        // Released whether or not the wait succeeded. A failed wait leaves the
-        // slot pending and the next claimant re-waits, so the copy is still
-        // ordered ahead of anything that reuses the image — and holding these
-        // pins for the rest of the boot is how a whole framebuffer per failure
-        // becomes unreclaimable.
-        for identity in std::mem::take(&mut self.unpin_on_settle) {
-            self.pin_resident_target(&identity, false);
-        }
-        waited
+        unsafe { self.retire_all(ctx, counters) }
     }
 
     /// Wait until nothing this device has recorded will read guest RAM again.
@@ -2279,6 +2271,9 @@ impl ResourcePools {
     /// # Safety
     /// The CB that referenced these resources must have retired.
     unsafe fn drain_cleanup(&mut self, device: &ash::Device, mut pending: PendingGpuCleanup) {
+        for identity in pending.unpin_residents.drain(..) {
+            self.pin_resident_target(&identity, false);
+        }
         self.desc_arena.free(device, &pending.dsets);
         // The fence this entry waited on is exactly what makes a rewrite of
         // these safe, so the free list is fed from here and nowhere else.
@@ -5346,6 +5341,7 @@ mod recycle_tests {
                 sampled: Vec::new(),
                 attachment_snapshots: Vec::new(),
                 storage_images: Vec::new(),
+                unpin_residents: Vec::new(),
             }),
             span: super::gpu_span::SlotSpan::Idle,
             readback_span_armed: false,
@@ -5544,10 +5540,10 @@ mod recycle_tests {
     /// one that was never taken.
     ///
     /// Device-free: `quiesce_guest_writes` needs a `DeviceContext` for the wait,
-    /// so this drives the two halves it composes — that recording the copy pins,
-    /// and that the settle releases exactly what it pinned.
+    /// so this drives the two halves it composes — recording the copy's pin and
+    /// transferring that pin to the submission that releases it.
     #[test]
-    fn a_submitted_writeback_holds_its_residents_pin_until_the_settle() {
+    fn a_submitted_writeback_holds_its_residents_pin_until_its_slot_retires() {
         let mut pools = ResourcePools::new();
         let identity = TargetIdentity::Surface {
             id: 7,
@@ -5574,11 +5570,11 @@ mod recycle_tests {
         pools.note_guest_write_recorded(&identity);
         assert_eq!(pools.registry[&identity].pin_count, 2);
 
-        // What the settle does after the wait. Split out from `retire_all` so
-        // this is testable without a device; the release is unconditional there
-        // for the same reason the debt is taken before the wait.
-        assert!(pools.take_guest_write_debt());
-        for held in std::mem::take(&mut pools.unpin_on_settle) {
+        // Sealing transfers the pins to the exact submission that references
+        // them. Model that slot's fence retirement without a Vulkan device.
+        let mut cleanup = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
+        assert!(pools.guest_write_pins_live.is_empty());
+        for held in cleanup.unpin_residents.drain(..) {
             pools.pin_resident_target(&held, false);
         }
         assert_eq!(
@@ -5586,19 +5582,19 @@ mod recycle_tests {
             "every pin the ledger took is released exactly once"
         );
         assert!(
-            pools.unpin_on_settle.is_empty(),
-            "a settled pin must not be released a second time at the next stamp"
+            cleanup.unpin_residents.is_empty(),
+            "a retired pin must not be released a second time"
         );
     }
 
-    /// Another holder's pin survives a writeback's settle.
+    /// Another holder's pin survives a writeback submission's retirement.
     ///
     /// The hazard the ledger's own pin closes, and the one its guard could not
     /// report: an unpin at zero is logged, but an unpin that lands on *someone
     /// else's* count is silent and leaves them reading an image the reclaim may
     /// now take. The host window's present pin is the live second holder.
     #[test]
-    fn a_writeback_settle_does_not_release_another_holders_pin() {
+    fn a_writeback_retirement_does_not_release_another_holders_pin() {
         let mut pools = ResourcePools::new();
         let identity = TargetIdentity::Surface {
             id: 9,
@@ -5621,8 +5617,8 @@ mod recycle_tests {
         pools.note_guest_write_recorded(&identity);
         assert_eq!(pools.registry[&identity].pin_count, 2);
 
-        assert!(pools.take_guest_write_debt());
-        for held in std::mem::take(&mut pools.unpin_on_settle) {
+        let mut cleanup = pools.seal_entry(Vec::new(), Vec::new()).cleanup;
+        for held in cleanup.unpin_residents.drain(..) {
             pools.pin_resident_target(&held, false);
         }
         assert_eq!(
@@ -5648,7 +5644,7 @@ mod recycle_tests {
         // No slot at all: nothing to pin, and nothing for a reclaim to take.
         pools.note_guest_write_recorded(&identity);
         assert!(
-            pools.unpin_on_settle.is_empty(),
+            pools.guest_write_pins_live.is_empty(),
             "no pin was taken, so none may be released"
         );
         assert!(

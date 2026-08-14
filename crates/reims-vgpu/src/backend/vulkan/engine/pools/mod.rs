@@ -575,22 +575,20 @@ pub(crate) struct ResourcePools {
     /// waits into one and lets the copies pipeline against each other on the
     /// GPU instead of stopping the queue between them.
     guest_writes_in_flight: bool,
-    /// Residents held pinned because a submitted-but-unsettled writeback copy
-    /// reads them.
+    /// Residents pinned by guest-page copies in the command buffer currently
+    /// being recorded. [`ResourcePools::seal_entry`] transfers them to that
+    /// submission's [`PendingGpuCleanup`].
     ///
     /// A window's flush used to unpin its resident as soon as the copy returned,
     /// which was safe only because the copy had already executed by then. With
     /// the wait deferred, unpinning at that point would let the
     /// allocation-pressure reclaim take an image the GPU has not read yet. The
-    /// pin is transferred here instead and released by
-    /// [`ResourcePools::quiesce_guest_writes`], which waits the whole ring — so
-    /// the interval it covers is exactly the interval the copy can still be
-    /// running in.
+    /// pin is transferred here instead and then to the ring slot, which
+    /// releases it when that slot's fence retires.
     ///
-    /// Cannot strand a pin: nothing is pushed here without also setting
-    /// `guest_writes_in_flight`, and every setting of that flag is answered by a
-    /// quiesce at the next completion stamp.
-    unpin_on_settle: Vec<TargetIdentity>,
+    /// Cannot strand a pin: every entry that can submit passes through
+    /// `seal_entry`, and every sealed cleanup belongs to one retiring slot.
+    guest_write_pins_live: Vec<TargetIdentity>,
     initialized: bool,
 }
 
@@ -953,6 +951,9 @@ pub(crate) struct PendingGpuCleanup {
     sampled: Vec<SampledSlot>,
     attachment_snapshots: Vec<SampledSlot>,
     storage_images: Vec<StorageImageSlot>,
+    /// Resident pins held by guest-page copies in this submission. The slot's
+    /// fence is their lifetime boundary.
+    unpin_residents: Vec<TargetIdentity>,
 }
 
 /// What one sealed entry hands back: the cleanup its ring slot owes once the
