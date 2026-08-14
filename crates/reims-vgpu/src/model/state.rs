@@ -642,6 +642,11 @@ impl TaskResource {
             return lease.backing();
         }
         *held = retain(identity);
+        crate::runtime::drain::note_store_route(if held.is_some() {
+            "resident_resource_acquired"
+        } else {
+            "resident_resource_unavailable"
+        });
         held.as_ref()
             .map(|lease| lease.backing())
             .unwrap_or(ResidentContentBacking::NotReady)
@@ -671,6 +676,8 @@ mod task_resource_resident_tests {
         let resource = TaskResource::new(ListObjectEntry::default(), Arc::from([]));
         let first = identity(1);
         let acquisitions = Cell::new(0_u32);
+        let acquired_before =
+            crate::runtime::drain::census::store_route_count("resident_resource_acquired");
 
         let backing = resource.resident_target_backing_with(&first, |identity| {
             acquisitions.set(acquisitions.get() + 1);
@@ -681,11 +688,20 @@ mod task_resource_resident_tests {
         });
         assert_eq!(backing, ResidentContentBacking::GuestAllocation);
         assert_eq!(acquisitions.get(), 1);
+        assert_eq!(
+            crate::runtime::drain::census::store_route_count("resident_resource_acquired"),
+            acquired_before + 1
+        );
 
         let backing = resource.resident_target_backing_with(&first, |_| {
             panic!("a warm bind must not reacquire its live resource")
         });
         assert_eq!(backing, ResidentContentBacking::GuestAllocation);
+        assert_eq!(
+            crate::runtime::drain::census::store_route_count("resident_resource_acquired"),
+            acquired_before + 1,
+            "a warm bind must not be counted as another acquisition"
+        );
 
         crate::backend::vulkan::engine::test_advance_resident_resource_epoch();
         let backing = resource.resident_target_backing_with(&first, |identity| {
@@ -708,10 +724,37 @@ mod task_resource_resident_tests {
         });
         assert_eq!(backing, ResidentContentBacking::GuestAllocation);
         assert_eq!(acquisitions.get(), 3, "a new mapping generation reacquires once");
+        assert_eq!(
+            crate::runtime::drain::census::store_route_count("resident_resource_acquired"),
+            acquired_before + 3
+        );
 
         // The synthetic leases have no registry pins behind them. Make the
         // final drop stale so it exercises the reset-safe no-op release.
         crate::backend::vulkan::engine::test_advance_resident_resource_epoch();
+    }
+
+    #[test]
+    fn an_unavailable_target_is_counted_and_retried() {
+        let resource = TaskResource::new(ListObjectEntry::default(), Arc::from([]));
+        let unavailable_before =
+            crate::runtime::drain::census::store_route_count("resident_resource_unavailable");
+        let attempts = Cell::new(0_u32);
+
+        for _ in 0..2 {
+            assert_eq!(
+                resource.resident_target_backing_with(&identity(1), |_| {
+                    attempts.set(attempts.get() + 1);
+                    None
+                }),
+                ResidentContentBacking::NotReady
+            );
+        }
+        assert_eq!(attempts.get(), 2, "an absent target must remain retryable");
+        assert_eq!(
+            crate::runtime::drain::census::store_route_count("resident_resource_unavailable"),
+            unavailable_before + 2
+        );
     }
 }
 

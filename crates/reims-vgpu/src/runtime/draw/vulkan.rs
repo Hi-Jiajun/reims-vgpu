@@ -1224,13 +1224,12 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 let resident_backing = resolved_resource
                     .as_ref()
                     .filter(|resource| {
-                        resource.entry.object_type
-                            == crate::runtime::decode::resource::OBJECT_TYPE_IOSURFACE
+                        resource_type_owns_surface_resident(resource.entry.object_type)
                     })
                     .map(|resource| resource.resident_target_backing(&resident_id))
-                    // Type-4 surfaces have no serialized resource object to
-                    // own a lease. Keep their existing query path; type 11 is
-                    // the object-lifetime rail this branch optimizes.
+                    // An unclassified ref has no resource object to own a
+                    // lease. Keep its existing query path so compatibility
+                    // traffic still reaches the copying rails.
                     .unwrap_or_else(|| {
                         crate::backend::vulkan::engine::resident_content_backing(&resident_id)
                     });
@@ -1674,6 +1673,46 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
             crate::backend::vulkan::engine::SampledByteOrigin::LinearTexture,
         ),
     ))
+}
+
+/// Whether a decoded resource object owns the resident reached by the surface
+/// branch above.
+///
+/// Base surfaces, texture views, and IOSurface textures are three construction
+/// forms of a texture object. Each carries one stable resource reference for
+/// its lifetime; a view additionally names its parent, but that does not make
+/// its own reference transient. Other object kinds can reach this resolver as
+/// probes, but cannot produce the `surface` value whose resident is retained.
+fn resource_type_owns_surface_resident(object_type: u8) -> bool {
+    matches!(
+        object_type,
+        objects::OBJECT_TYPE_SURFACE
+            | objects::OBJECT_TYPE_REF_TEXTURE
+            | crate::runtime::decode::resource::OBJECT_TYPE_IOSURFACE
+    )
+}
+
+#[cfg(test)]
+mod resource_resident_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn every_surface_texture_construction_form_owns_its_resident() {
+        for object_type in [
+            objects::OBJECT_TYPE_SURFACE,
+            objects::OBJECT_TYPE_REF_TEXTURE,
+            crate::runtime::decode::resource::OBJECT_TYPE_IOSURFACE,
+        ] {
+            assert!(resource_type_owns_surface_resident(object_type));
+        }
+        for object_type in [
+            crate::runtime::decode::resource::OBJECT_TYPE_BUFFER,
+            crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE,
+            crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VARIANT,
+        ] {
+            assert!(!resource_type_owns_surface_resident(object_type));
+        }
+    }
 }
 
 #[inline]
