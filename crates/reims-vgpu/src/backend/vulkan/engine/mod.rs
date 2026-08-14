@@ -302,6 +302,23 @@ impl EngineState {
 
 static ENGINE: Lazy<Mutex<EngineState>> = Lazy::new(|| Mutex::new(EngineState::new()));
 
+/// Whether the current device owns a recorded batch that has not been
+/// submitted yet.
+///
+/// The batch itself stays exclusively under [`ENGINE`]. This publication says
+/// only whether the drain's idle-tail boundary has work that justifies entering
+/// that transaction. The recording thread publishes after installing the batch
+/// and clears while removing it, so `false` never permits an open batch to idle.
+static BATCH_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(super) fn publish_batch_open(open: bool) {
+    BATCH_OPEN.store(open, std::sync::atomic::Ordering::Release);
+}
+
+fn end_of_tranche_requires_engine(batch_open: bool, device_lost: bool) -> bool {
+    batch_open || device_lost
+}
+
 /// Lock-free publication of the immutable answers attached to the current
 /// Vulkan device.
 ///
@@ -936,6 +953,12 @@ pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> 
 /// prefetch, next non-joinable draw) already flushes via begin_entry, so this
 /// only bounds the idle-tail latency. No-op without a context or open batch.
 pub fn flush_batched_draws() {
+    if !end_of_tranche_requires_engine(
+        BATCH_OPEN.load(std::sync::atomic::Ordering::Acquire),
+        device_lost::device_lost_seen(),
+    ) {
+        return;
+    }
     let mut guard = lock_engine();
     // This runs at the end of every drain tranche, which is about once a second
     // whether or not the guest is still submitting — so it is where a loss
@@ -968,6 +991,19 @@ pub fn flush_batched_draws() {
     // keep coming, and a device loss is one of the things that stops them.
     if lost {
         guard.on_device_lost();
+    }
+}
+
+#[cfg(test)]
+mod end_of_tranche_gate_tests {
+    use super::end_of_tranche_requires_engine;
+
+    #[test]
+    fn only_owned_batch_or_recovery_work_enters_the_engine() {
+        assert!(!end_of_tranche_requires_engine(false, false));
+        assert!(end_of_tranche_requires_engine(true, false));
+        assert!(end_of_tranche_requires_engine(false, true));
+        assert!(end_of_tranche_requires_engine(true, true));
     }
 }
 

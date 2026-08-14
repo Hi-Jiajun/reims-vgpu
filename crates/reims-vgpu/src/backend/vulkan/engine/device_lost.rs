@@ -93,6 +93,15 @@ pub(crate) fn note_device_lost_seen() {
     DEVICE_LOST_SEEN.store(true, std::sync::atomic::Ordering::Release);
 }
 
+/// Whether recovery work is waiting, without taking responsibility for it.
+///
+/// The end-of-tranche gate uses this only to decide whether to enter the engine
+/// transaction. A loss arriving just after a `false` answer remains latched and
+/// is consumed by the next tranche.
+pub(crate) fn device_lost_seen() -> bool {
+    DEVICE_LOST_SEEN.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Take the latch if it is set. Callers must be able to run the recovery, since
 /// taking it is what makes them responsible for it.
 pub(crate) fn take_device_lost_seen() -> bool {

@@ -136,6 +136,7 @@ impl ResourcePools {
     }
 
     pub(crate) fn new() -> Self {
+        super::super::publish_batch_open(false);
         Self {
             staging_free: HashMap::new(),
             staging_live: Vec::new(),
@@ -1831,6 +1832,23 @@ impl ResourcePools {
         self.cb_graphics.stencil = None;
     }
 
+    fn install_open_batch(&mut self, batch: OpenBatch) {
+        debug_assert!(self.open_batch.is_none(), "replacing an open batch");
+        self.open_batch = Some(batch);
+        super::super::publish_batch_open(true);
+    }
+
+    fn take_open_batch(&mut self) -> Option<OpenBatch> {
+        let batch = self.open_batch.take();
+        super::super::publish_batch_open(false);
+        batch
+    }
+
+    pub(super) fn discard_open_batch(&mut self) {
+        self.open_batch = None;
+        super::super::publish_batch_open(false);
+    }
+
     /// Record a batch-deferred draw's completion: open the batch on its ring
     /// slot (opener) or extend it (joiner), accumulating the per-draw descriptor
     /// set for the single flush-time seal. The CB stays in recording state;
@@ -1884,7 +1902,7 @@ impl ResourcePools {
                     self.slots[self.cur].pending.is_none(),
                     "batch opener's slot already owes cleanup"
                 );
-                self.open_batch = Some(OpenBatch {
+                self.install_open_batch(OpenBatch {
                     cb,
                     fence,
                     target,
@@ -1941,7 +1959,7 @@ impl ResourcePools {
         counters: &EngineCounters,
         signal: Option<(vk::Semaphore, u64)>,
     ) -> Result<(), DrawError> {
-        let Some(mut batch) = self.open_batch.take() else {
+        let Some(mut batch) = self.take_open_batch() else {
             return Ok(());
         };
         // The CB is about to be ended and submitted, so no pass inside it is
@@ -5749,10 +5767,32 @@ mod recycle_tests {
         assert!(pools.graveyard.is_empty());
     }
 
-    /// The open draw batch records into `cur` without being submitted, so its
-    /// slot has no pending cleanup yet — but its CB already references pool
-    /// objects. Its bit must be in the mask, or a dispose during an open batch
-    /// would free something the flush is about to submit against.
+    /// Installing and taking the owned batch publish the exact state the drain
+    /// tail uses to decide whether it has submission work.
+    #[test]
+    fn batch_ownership_publishes_and_clears_the_tail_gate() {
+        let mut pools = ResourcePools::new();
+        assert!(!crate::backend::vulkan::engine::BATCH_OPEN.load(Ordering::Acquire));
+        pools.install_open_batch(OpenBatch {
+            cb: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            target: BatchTarget {
+                identity: TargetIdentity::Anonymous { slot: 0 },
+                width: 16,
+                height: 16,
+                bgra: false,
+            },
+            draws: 1,
+            dsets: Vec::new(),
+        });
+        assert!(crate::backend::vulkan::engine::BATCH_OPEN.load(Ordering::Acquire));
+        assert!(pools.take_open_batch().is_some());
+        assert!(!crate::backend::vulkan::engine::BATCH_OPEN.load(Ordering::Acquire));
+    }
+
+    /// The slot mask and the tail publication describe the same owned batch,
+    /// but answer different readers: reclamation under the engine lock and the
+    /// drain boundary before it takes that lock.
     #[test]
     fn the_open_batch_slot_counts_as_open_even_though_it_owes_no_cleanup() {
         let mut pools = ResourcePools::new();
