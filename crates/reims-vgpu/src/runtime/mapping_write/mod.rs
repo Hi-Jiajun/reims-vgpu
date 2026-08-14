@@ -924,19 +924,32 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
             format,
         });
     };
+    let shared_backing = if host.map_pages_stable() {
+        mapper::ensure_contig_view(state, host, mapping_id).map(|(ptr, len)| {
+            crate::backend::vulkan::engine::GuestTargetBacking {
+                allocation_host_ptr: ptr,
+                allocation_len: len as u64,
+                plane_offset: base_off,
+                row_pitch: u64::from(bpr),
+            }
+        })
+    } else {
+        None
+    };
     // One live window per physical format is enough to answer the remaining
     // device-level question: whether the driver's actual linear layout and
     // memory requirements agree with a guest plane on this host. The packed
-    // view is the allocation a direct image would retain; no behavior branches
-    // on this report yet.
+    // view is the allocation a direct image retains. The report remains useful
+    // because creation declines are per target and this gives the full binding
+    // equation once per physical format.
     let probe_key = dst_format.as_raw() as u32 as u64;
     if crate::observe::first_sight("vk_linear_target_window_probe", probe_key) {
-        if let Some((ptr, len)) = mapper::ensure_contig_view(state, host, mapping_id) {
+        if let Some(backing) = shared_backing {
             crate::backend::vulkan::engine::probe_guest_backed_target(
-                ptr,
-                len as u64,
-                base_off,
-                u64::from(bpr),
+                backing.allocation_host_ptr,
+                backing.allocation_len,
+                backing.plane_offset,
+                backing.row_pitch,
                 mw,
                 mh,
                 dst_format,
@@ -1053,6 +1066,7 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
         // from its width, and the engine refuses the copy outright if the
         // resident does not hold exactly this.
         format: dst_format,
+        shared_backing,
     };
     // Both witnesses before the copy rather than after it, matching
     // `contig_for_write`: a refused write costs a spurious bump, which makes a

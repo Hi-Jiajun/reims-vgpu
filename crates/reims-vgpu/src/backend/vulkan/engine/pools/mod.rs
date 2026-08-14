@@ -1368,6 +1368,11 @@ pub(crate) struct NonPinnedTotals {
 pub(crate) enum ResidentAccess {
     /// Created or recycled; nothing has touched the image.
     Untouched,
+    /// A newly imported linear image whose existing texels were most recently
+    /// written through the shared host allocation. Its initial Vulkan layout
+    /// is `PREINITIALIZED`, the only image birth state that preserves those
+    /// bytes across the first transition.
+    GuestBacking,
     /// A render pass wrote it as a colour attachment and left it in that pass's
     /// `final_layout` — `TRANSFER_SRC_OPTIMAL` for a primary target,
     /// `COLOR_ATTACHMENT_OPTIMAL` for an MRT secondary.
@@ -1387,6 +1392,7 @@ impl ResidentAccess {
     pub(crate) fn layout(self) -> vk::ImageLayout {
         match self {
             Self::Untouched => vk::ImageLayout::UNDEFINED,
+            Self::GuestBacking => vk::ImageLayout::PREINITIALIZED,
             Self::ColorWrite(layout) => layout,
             Self::ColorFeedback => vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT,
             Self::ShaderRead => vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
@@ -1417,6 +1423,7 @@ impl ResidentAccess {
                 vk::PipelineStageFlags::TOP_OF_PIPE,
                 vk::AccessFlags::empty(),
             ),
+            Self::GuestBacking => (vk::PipelineStageFlags::HOST, vk::AccessFlags::HOST_WRITE),
             Self::ColorWrite(_) => (
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
@@ -1441,9 +1448,46 @@ impl ResidentAccess {
     }
 }
 
+/// Ownership route for a resident image's memory.
+///
+/// A recyclable allocation belongs to the image slab and may re-enter the
+/// geometry-keyed target pool. A guest import aliases one particular surface
+/// allocation, so recycling it under another identity would bind that surface's
+/// pages to unrelated guest work. The enum forces every retirement path to
+/// choose between those two operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResidentMemory {
+    Recyclable(vk::DeviceMemory),
+    GuestImported {
+        memory: vk::DeviceMemory,
+        backing: crate::backend::vulkan::engine::GuestTargetBacking,
+    },
+}
+
+impl ResidentMemory {
+    pub(crate) fn handle(self) -> vk::DeviceMemory {
+        match self {
+            Self::Recyclable(memory) | Self::GuestImported { memory, .. } => memory,
+        }
+    }
+
+    pub(crate) fn is_guest_imported(self) -> bool {
+        matches!(self, Self::GuestImported { .. })
+    }
+
+    pub(crate) fn guest_backing(
+        self,
+    ) -> Option<crate::backend::vulkan::engine::GuestTargetBacking> {
+        match self {
+            Self::GuestImported { backing, .. } => Some(backing),
+            Self::Recyclable(_) => None,
+        }
+    }
+}
+
 pub(crate) struct ResidentTargetSlot {
     pub image: vk::Image,
-    pub memory: vk::DeviceMemory,
+    pub memory: ResidentMemory,
     pub view: vk::ImageView,
     pub framebuffer: vk::Framebuffer,
     pub render_pass: vk::RenderPass,
@@ -3740,7 +3784,7 @@ mod staging_mapping_tests {
 
 #[cfg(test)]
 mod resident_reuse_tests {
-    use super::{ResidentAccess, ResidentTargetSlot};
+    use super::{ResidentAccess, ResidentMemory, ResidentTargetSlot};
     use crate::backend::vulkan::translate;
     use ash::vk;
 
@@ -3748,7 +3792,7 @@ mod resident_reuse_tests {
     fn slot(width: u32, height: u32, generation: u64, format: vk::Format) -> ResidentTargetSlot {
         ResidentTargetSlot {
             image: vk::Image::null(),
-            memory: vk::DeviceMemory::null(),
+            memory: ResidentMemory::Recyclable(vk::DeviceMemory::null()),
             view: vk::ImageView::null(),
             framebuffer: vk::Framebuffer::null(),
             render_pass: vk::RenderPass::null(),

@@ -10,33 +10,77 @@
 use ash::vk;
 
 use super::context::DeviceContext;
+use super::types::GuestTargetBacking;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WindowPlan {
     bind_offset: u64,
+    memory_type_index: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WindowRefusal {
+pub(super) enum WindowRefusal {
+    UnsupportedTopology,
+    HostImportUnavailable,
+    HostPointerMisaligned,
     SubresourceAfterPlane,
     BindOffsetMisaligned,
     RowPitchMismatch,
     AllocationTooShort,
     NoMemoryType,
+    DedicatedBindingRequired,
+    CreateImage(vk::Result),
+    PointerProperties(vk::Result),
+    AllocateMemory(vk::Result),
+    BindImage(vk::Result),
 }
 
 impl WindowRefusal {
-    fn slug(self) -> &'static str {
+    pub(super) fn slug(self) -> &'static str {
         match self {
+            Self::UnsupportedTopology => "discrete_topology",
+            Self::HostImportUnavailable => "no_host_import",
+            Self::HostPointerMisaligned => "host_pointer_misaligned",
             Self::SubresourceAfterPlane => "subresource_after_plane",
             Self::BindOffsetMisaligned => "bind_offset_misaligned",
             Self::RowPitchMismatch => "row_pitch_mismatch",
             Self::AllocationTooShort => "allocation_too_short",
             Self::NoMemoryType => "no_memory_type",
+            Self::DedicatedBindingRequired => "dedicated_binding_required",
+            Self::CreateImage(_) => "create_failed",
+            Self::PointerProperties(_) => "pointer_properties_failed",
+            Self::AllocateMemory(_) => "allocate_failed",
+            Self::BindImage(_) => "bind_failed",
+        }
+    }
+
+    pub(super) fn result(self) -> Option<vk::Result> {
+        match self {
+            Self::CreateImage(result)
+            | Self::PointerProperties(result)
+            | Self::AllocateMemory(result)
+            | Self::BindImage(result) => Some(result),
+            _ => None,
         }
     }
 }
 
+impl crate::observe::Decline for WindowRefusal {
+    fn slug(&self) -> &'static str {
+        (*self).slug()
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        self.result()
+            .map(|result| vec![("result", format!("{result:?}"))])
+            .unwrap_or_default()
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the planner checks one independently reported value per term of the image-binding equation"
+)]
 fn plan_window(
     layout: vk::SubresourceLayout,
     requirements: vk::MemoryRequirements,
@@ -44,6 +88,8 @@ fn plan_window(
     plane_offset: u64,
     guest_row_pitch: u64,
     pointer_memory_type_bits: u32,
+    memory_type_index: Option<u32>,
+    requires_dedicated: bool,
 ) -> Result<WindowPlan, WindowRefusal> {
     let bind_offset = plane_offset
         .checked_sub(layout.offset)
@@ -63,7 +109,143 @@ fn plan_window(
     if requirements.memory_type_bits & pointer_memory_type_bits == 0 {
         return Err(WindowRefusal::NoMemoryType);
     }
-    Ok(WindowPlan { bind_offset })
+    let memory_type_index = memory_type_index.ok_or(WindowRefusal::NoMemoryType)?;
+    if requires_dedicated && bind_offset != 0 {
+        return Err(WindowRefusal::DedicatedBindingRequired);
+    }
+    Ok(WindowPlan {
+        bind_offset,
+        memory_type_index,
+    })
+}
+
+pub(super) struct ImportedTarget {
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+}
+
+/// Create a linear image whose storage is the guest surface allocation itself.
+///
+/// A refusal is an optional-rail answer: callers keep the ordinary optimal
+/// resident. Once this returns an image, its memory is a one-to-one import and
+/// must be freed directly rather than entering the resident recycle slab.
+pub(super) unsafe fn create(
+    ctx: &DeviceContext,
+    backing: GuestTargetBacking,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    mut usage: vk::ImageUsageFlags,
+) -> Result<ImportedTarget, WindowRefusal> {
+    use crate::backend::vulkan::caps::memory_topology::MemoryTopology;
+
+    if ctx.caps.memory.topology != MemoryTopology::Unified {
+        return Err(WindowRefusal::UnsupportedTopology);
+    }
+    let ext = ctx
+        .external_memory_host
+        .as_ref()
+        .ok_or(WindowRefusal::HostImportUnavailable)?;
+    let alignment = ctx.caps.host_pointer.min_alignment;
+    if alignment == 0
+        || !(backing.allocation_host_ptr as u64).is_multiple_of(alignment)
+        || !backing.allocation_len.is_multiple_of(alignment)
+    {
+        return Err(WindowRefusal::HostPointerMisaligned);
+    }
+    if ctx.features.attachment_feedback_loop_layout {
+        usage |= vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT;
+    }
+    let handle = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
+    let mut external = vk::ExternalMemoryImageCreateInfo::default().handle_types(handle);
+    let create = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::LINEAR)
+        .usage(usage)
+        .initial_layout(vk::ImageLayout::PREINITIALIZED)
+        .push_next(&mut external);
+    let image =
+        unsafe { ctx.device.create_image(&create, None) }.map_err(WindowRefusal::CreateImage)?;
+
+    let result = (|| {
+        let mut dedicated = vk::MemoryDedicatedRequirements::default();
+        let mut requirements = vk::MemoryRequirements2::default().push_next(&mut dedicated);
+        let info = vk::ImageMemoryRequirementsInfo2::default().image(image);
+        unsafe {
+            ctx.device
+                .get_image_memory_requirements2(&info, &mut requirements)
+        };
+        let layout = unsafe {
+            ctx.device.get_image_subresource_layout(
+                image,
+                vk::ImageSubresource {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    array_layer: 0,
+                },
+            )
+        };
+        let mut pointer = vk::MemoryHostPointerPropertiesEXT::default();
+        let pointer_result = unsafe {
+            (ext.fp().get_memory_host_pointer_properties_ext)(
+                ext.device(),
+                handle,
+                backing.allocation_host_ptr as *const std::ffi::c_void,
+                &mut pointer,
+            )
+        };
+        if pointer_result != vk::Result::SUCCESS {
+            return Err(WindowRefusal::PointerProperties(pointer_result));
+        }
+        let compatible =
+            pointer.memory_type_bits & requirements.memory_requirements.memory_type_bits;
+        let picked = ctx.memory_type_with(
+            compatible,
+            backing.allocation_len,
+            &ctx.caps
+                .memory_request(crate::backend::vulkan::caps::MemoryClass::Upload),
+        );
+        let plan = plan_window(
+            layout,
+            requirements.memory_requirements,
+            backing.allocation_len,
+            backing.plane_offset,
+            backing.row_pitch,
+            pointer.memory_type_bits,
+            picked.map(|pick| pick.index),
+            dedicated.requires_dedicated_allocation != 0,
+        )?;
+        let mut host_import = vk::ImportMemoryHostPointerInfoEXT::default()
+            .handle_type(handle)
+            .host_pointer(backing.allocation_host_ptr as *mut std::ffi::c_void);
+        let allocate = vk::MemoryAllocateInfo::default()
+            .allocation_size(backing.allocation_len)
+            .memory_type_index(plan.memory_type_index)
+            .push_next(&mut host_import);
+        let memory = unsafe { ctx.device.allocate_memory(&allocate, None) }
+            .map_err(WindowRefusal::AllocateMemory)?;
+        if let Err(result) = unsafe {
+            ctx.device
+                .bind_image_memory(image, memory, plan.bind_offset)
+        } {
+            unsafe { ctx.device.free_memory(memory, None) };
+            return Err(WindowRefusal::BindImage(result));
+        }
+        Ok(ImportedTarget { image, memory })
+    })();
+    if result.is_err() {
+        unsafe { ctx.device.destroy_image(image, None) };
+    }
+    result
 }
 
 /// Probe the complete binding equation for one live guest surface.
@@ -157,6 +339,13 @@ pub(super) unsafe fn probe_window(
     } else {
         0
     };
+    let compatible_bits = pointer_bits & requirements.memory_type_bits;
+    let picked = ctx.memory_type_with(
+        compatible_bits,
+        allocation_len,
+        &ctx.caps
+            .memory_request(crate::backend::vulkan::caps::MemoryClass::Upload),
+    );
     let plan = plan_window(
         layout,
         requirements,
@@ -164,13 +353,8 @@ pub(super) unsafe fn probe_window(
         plane_offset,
         guest_row_pitch,
         pointer_bits,
-    );
-    let compatible_bits = pointer_bits & requirements.memory_type_bits;
-    let picked = ctx.memory_type_with(
-        compatible_bits,
-        allocation_len,
-        &ctx.caps
-            .memory_request(crate::backend::vulkan::caps::MemoryClass::Upload),
+        picked.map(|pick| pick.index),
+        false,
     );
     let verdict = match (plan, picked) {
         (Ok(_), Some(_)) => "alias_exact",
@@ -222,8 +406,13 @@ mod tests {
                 4096,
                 7680,
                 0b010,
+                Some(1),
+                false,
             ),
-            Ok(WindowPlan { bind_offset: 4096 })
+            Ok(WindowPlan {
+                bind_offset: 4096,
+                memory_type_index: 1,
+            })
         );
     }
 
@@ -231,24 +420,46 @@ mod tests {
     fn every_part_of_the_binding_equation_can_refuse() {
         let req = requirements(8192, 4096, 0b010);
         assert_eq!(
-            plan_window(layout(8192, 256), req, 16384, 4096, 256, 0b010),
+            plan_window(
+                layout(8192, 256),
+                req,
+                16384,
+                4096,
+                256,
+                0b010,
+                Some(1),
+                false
+            ),
             Err(WindowRefusal::SubresourceAfterPlane)
         );
         assert_eq!(
-            plan_window(layout(0, 256), req, 16384, 2048, 256, 0b010),
+            plan_window(layout(0, 256), req, 16384, 2048, 256, 0b010, Some(1), false),
             Err(WindowRefusal::BindOffsetMisaligned)
         );
         assert_eq!(
-            plan_window(layout(0, 512), req, 16384, 4096, 256, 0b010),
+            plan_window(layout(0, 512), req, 16384, 4096, 256, 0b010, Some(1), false),
             Err(WindowRefusal::RowPitchMismatch)
         );
         assert_eq!(
-            plan_window(layout(0, 256), req, 8192, 4096, 256, 0b010),
+            plan_window(layout(0, 256), req, 8192, 4096, 256, 0b010, Some(1), false),
             Err(WindowRefusal::AllocationTooShort)
         );
         assert_eq!(
-            plan_window(layout(0, 256), req, 16384, 4096, 256, 0b100),
+            plan_window(layout(0, 256), req, 16384, 4096, 256, 0b100, None, false),
             Err(WindowRefusal::NoMemoryType)
+        );
+        assert_eq!(
+            plan_window(
+                layout(0, 256),
+                req,
+                16384,
+                4096,
+                256,
+                0b010,
+                Some(1),
+                true,
+            ),
+            Err(WindowRefusal::DedicatedBindingRequired)
         );
     }
 }

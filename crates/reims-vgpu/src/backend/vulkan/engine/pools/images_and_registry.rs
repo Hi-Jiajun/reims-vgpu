@@ -143,7 +143,7 @@ fn resident_resample_band(idle_ms: u64) -> &'static str {
 /// patch afterwards.
 struct NewResident {
     image: vk::Image,
-    memory: vk::DeviceMemory,
+    memory: ResidentMemory,
     view: vk::ImageView,
     /// `vk::Framebuffer::null()` for a resident that is never bound as a
     /// standalone single-RT target — see
@@ -827,6 +827,7 @@ impl ResourcePools {
     ///   not the map is a victim that frees nothing.
     fn register_resident(&mut self, identity: &TargetIdentity, new: NewResident) {
         let last_touch_ms = self.idle_clock_ms;
+        let guest_backed = new.memory.is_guest_imported();
         self.registry.insert(
             identity.clone(),
             ResidentTargetSlot {
@@ -838,9 +839,13 @@ impl ResourcePools {
                 width: new.width,
                 height: new.height,
                 generation: new.generation,
-                content_ready: false,
+                content_ready: guest_backed,
                 content_epoch: None,
-                access: ResidentAccess::Untouched,
+                access: if guest_backed {
+                    ResidentAccess::GuestBacking
+                } else {
+                    ResidentAccess::Untouched
+                },
                 color_format: new.color_format,
                 pin_count: 0,
                 // Nothing has drawn into it, so it holds no guest work to lose.
@@ -891,17 +896,22 @@ impl ResourcePools {
     ) -> Option<ResidentTargetSlot> {
         let old = self.unregister_resident(identity, why)?;
         self.dispose_owed_framebuffer(&ctx.device, old.owed_framebuffer());
-        self.dispose(
-            &ctx.device,
-            DeferredHandle::RecycleTarget(FreeTargetImage {
+        let retired = match old.memory {
+            ResidentMemory::Recyclable(memory) => DeferredHandle::RecycleTarget(FreeTargetImage {
                 image: old.image,
-                memory: old.memory,
+                memory,
                 view: old.view,
                 width: old.width,
                 height: old.height,
                 format: old.color_format,
             }),
-        );
+            ResidentMemory::GuestImported { memory, .. } => DeferredHandle::Image {
+                image: old.image,
+                memory,
+                view: old.view,
+            },
+        };
+        self.dispose(&ctx.device, retired);
         counters
             .target_evicts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -929,6 +939,7 @@ impl ResourcePools {
         render_pass: vk::RenderPass,
         generation: u64,
         format: vk::Format,
+        guest_backing: Option<crate::backend::vulkan::engine::GuestTargetBacking>,
         counters: &EngineCounters,
     ) -> Result<&ResidentTargetSlot, DrawError> {
         // The format arrives resolved rather than as a channel-order flag, and
@@ -1010,9 +1021,63 @@ impl ResourcePools {
         // The recycled contents are stale — the slot is inserted with
         // layout=UNDEFINED / content_ready=false, and a fresh framebuffer is
         // always built below (it binds this specific render_pass).
-        let (image, memory, view) = if let Some(free) = self.take_free_target(width, height, format)
-        {
-            (free.image, free.memory, free.view)
+        let imported = match guest_backing {
+            Some(backing) => match super::super::linear_target_import::create(
+                ctx, backing, width, height, format, usage,
+            ) {
+                Ok(imported) => Some(imported),
+                Err(reason) => {
+                    crate::runtime::drain::note_store_route("target_shared_declined");
+                    let key = crate::backend::hash::hash_u64(
+                        crate::backend::hash::hash_bytes(reason.slug().as_bytes()),
+                        format.as_raw() as u32 as u64,
+                    );
+                    crate::observe::Emit::decline("vk_guest_target", &reason)
+                        .field("format", format!("{format:?}"))
+                        .field("width", width)
+                        .field("height", height)
+                        .fail_once(key);
+                    None
+                }
+            },
+            None => None,
+        };
+        let (image, memory, view) = if let Some(imported) = imported {
+            counters.note_create();
+            counters.note_alloc();
+            let view = match ctx.device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(imported.image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(color_subresource_range()),
+                None,
+            ) {
+                Ok(view) => view,
+                Err(error) => {
+                    ctx.device.destroy_image(imported.image, None);
+                    ctx.device.free_memory(imported.memory, None);
+                    return Err(DrawError::VkCall(VkCall::new(
+                        VkOp::PoolsCreateRegistryView,
+                        error,
+                    )));
+                }
+            };
+            counters.note_create();
+            (
+                imported.image,
+                ResidentMemory::GuestImported {
+                    memory: imported.memory,
+                    backing: guest_backing.expect("an imported target has guest backing"),
+                },
+                view,
+            )
+        } else if let Some(free) = self.take_free_target(width, height, format) {
+            (
+                free.image,
+                ResidentMemory::Recyclable(free.memory),
+                free.view,
+            )
         } else {
             let image = ctx
                 .device
@@ -1102,7 +1167,7 @@ impl ResourcePools {
                 }
             };
             counters.note_create();
-            (image, memory, view)
+            (image, ResidentMemory::Recyclable(memory), view)
         };
         let attachments = [view];
         let framebuffer = match ctx.device.create_framebuffer(
@@ -1117,8 +1182,15 @@ impl ResourcePools {
             Ok(fb) => fb,
             Err(e) => {
                 ctx.device.destroy_image_view(view, None);
-                self.free_image_slab(&ctx.device, image);
                 ctx.device.destroy_image(image, None);
+                match memory {
+                    ResidentMemory::Recyclable(_) => {
+                        self.free_image_slab(&ctx.device, image);
+                    }
+                    ResidentMemory::GuestImported { memory, .. } => {
+                        ctx.device.free_memory(memory, None);
+                    }
+                }
                 return Err(DrawError::VkCall(VkCall::new(
                     VkOp::PoolsCreateRegistryFramebuffer,
                     e,
@@ -1272,7 +1344,7 @@ impl ResourcePools {
             &identity,
             NewResident {
                 image,
-                memory,
+                memory: ResidentMemory::Recyclable(memory),
                 view,
                 // No per-slot framebuffer and so no pass it was built against:
                 // this arm's residents are bound as attachment N of an ad-hoc
@@ -1530,12 +1602,16 @@ impl ResourcePools {
         identity: &TargetIdentity,
         access: ResidentAccess,
     ) {
+        let guest_backed = self
+            .registry
+            .get(identity)
+            .is_some_and(|slot| slot.memory.is_guest_imported());
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.content_ready = true;
             slot.content_epoch = None;
             slot.access = access;
         }
-        self.set_sole_copy(identity, true);
+        self.set_sole_copy(identity, !guest_backed);
     }
 
     /// Mark a depth resident as holding rendered contents, after a pass that
@@ -2263,7 +2339,7 @@ pub(super) mod pin_count_tests {
     fn dummy_slot(content_ready: bool) -> ResidentTargetSlot {
         ResidentTargetSlot {
             image: vk::Image::null(),
-            memory: vk::DeviceMemory::null(),
+            memory: ResidentMemory::Recyclable(vk::DeviceMemory::null()),
             view: vk::ImageView::null(),
             framebuffer: vk::Framebuffer::null(),
             render_pass: vk::RenderPass::null(),
@@ -2455,7 +2531,7 @@ pub(super) mod pin_count_tests {
     fn new_resident(framebuffer: vk::Framebuffer, render_pass: vk::RenderPass) -> NewResident {
         NewResident {
             image: vk::Image::null(),
-            memory: vk::DeviceMemory::null(),
+            memory: ResidentMemory::Recyclable(vk::DeviceMemory::null()),
             view: vk::ImageView::null(),
             framebuffer,
             render_pass,
@@ -2578,6 +2654,34 @@ pub(super) mod pin_count_tests {
             "nothing has touched it yet"
         );
         assert_eq!(slot.pin_count, 0, "no deferred window holds it yet");
+    }
+
+    #[test]
+    fn a_guest_import_is_born_with_shared_contents_and_never_becomes_sole_copy() {
+        let mut pools = ResourcePools::new();
+        let mut resident = new_resident(some_framebuffer(), vk::RenderPass::null());
+        resident.memory = ResidentMemory::GuestImported {
+            memory: vk::DeviceMemory::null(),
+            backing: crate::backend::vulkan::engine::GuestTargetBacking {
+                allocation_host_ptr: 0x1000,
+                allocation_len: 0x4000,
+                plane_offset: 0,
+                row_pitch: 64,
+            },
+        };
+        let identity = surf(1);
+        pools.register_resident(&identity, resident);
+
+        let slot = pools.registry.get(&identity).expect("registered");
+        assert!(slot.content_ready, "the allocation carries its prior texels");
+        assert_eq!(slot.access, ResidentAccess::GuestBacking);
+        assert!(!slot.gpu_only_content, "the guest allocation is the other copy");
+
+        pools.registry_mark_ready(&identity);
+        assert!(
+            !pools.registry.get(&identity).unwrap().gpu_only_content,
+            "rendering writes the shared allocation itself"
+        );
     }
 
     /// Registration writes the map and the order together.

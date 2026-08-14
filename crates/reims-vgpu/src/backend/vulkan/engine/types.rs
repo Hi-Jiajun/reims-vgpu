@@ -404,6 +404,24 @@ pub struct DrawRequest {
     pub color_write_mask: ColorWriteMask,
     /// Protocol-derived target identity for GPU residency (workstream D).
     pub target_identity: Option<TargetIdentity>,
+    /// Stable shared allocation that may back the primary resident image
+    /// directly.
+    ///
+    /// This is the retained backing named by the guest surface, not a staging
+    /// source. The runtime only constructs it after revalidating the mapping's
+    /// page ownership and obtaining a host alias whose lifetime covers the
+    /// device. The Vulkan engine still verifies the complete image-binding
+    /// equation (layout offset, row pitch, allocation extent and memory type)
+    /// before using it; any mismatch keeps the ordinary resident image.
+    pub guest_target_backing: Option<GuestTargetBacking>,
+    /// Load the primary attachment's prior contents from
+    /// [`Self::guest_target_backing`] when that backing is admitted.
+    ///
+    /// Separate from carrying the backing because CLEAR and DontCare Stores
+    /// should still render directly into guest memory while discarding its old
+    /// texels. This is true only when the guest's load source is that same
+    /// surface allocation, never for an explicit texture-derived seed.
+    pub load_guest_target_backing: bool,
     /// Load the live GPU image for [`DrawRequest::target_identity`] instead of
     /// seeding the attachment from the CPU. Requires that resident to exist.
     ///
@@ -1868,6 +1886,22 @@ pub struct GuestRunSource {
 pub struct GuestTargetSeed {
     pub source: GuestRunSource,
     pub format: ash::vk::Format,
+}
+
+/// One guest surface plane within a stable shared host allocation.
+///
+/// `allocation_host_ptr..allocation_len` is the object imported into Vulkan.
+/// `plane_offset` identifies the attachment's first texel within it, while
+/// `row_pitch` is the plane's declared physical stride. Keeping the whole
+/// allocation and the plane coordinates together is what lets the engine
+/// derive `vkBindImageMemory`'s offset without manufacturing a pointer before
+/// the plane or extending the import past its real bound.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuestTargetBacking {
+    pub allocation_host_ptr: usize,
+    pub allocation_len: u64,
+    pub plane_offset: u64,
+    pub row_pitch: u64,
 }
 
 /// Producer-assigned identity + generation for CPU-sourced sampled content.

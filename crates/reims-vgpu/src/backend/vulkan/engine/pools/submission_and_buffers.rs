@@ -636,7 +636,7 @@ impl ResourcePools {
                     DeferredHandle::Image {
                         image: old.image,
                         view: old.view,
-                        memory: old.memory,
+                        memory: old.memory.handle(),
                     },
                 );
             }

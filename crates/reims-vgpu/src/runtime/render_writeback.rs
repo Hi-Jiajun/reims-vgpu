@@ -1220,6 +1220,7 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
         width: c0.width,
         height: c0.height,
         format: want,
+        shared_backing: None,
     };
     // This device is about to write these guest pages, and the hypervisor's
     // dirty bitmap is defined not to see it. Without this record a reader

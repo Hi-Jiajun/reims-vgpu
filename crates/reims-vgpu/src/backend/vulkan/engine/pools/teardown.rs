@@ -164,6 +164,9 @@ impl ResourcePools {
             device.destroy_framebuffer(t.framebuffer, None);
             device.destroy_image_view(t.view, None);
             device.destroy_image(t.image, None);
+            if let super::ResidentMemory::GuestImported { memory, .. } = t.memory {
+                device.free_memory(memory, None);
+            }
         }
         self.registry_order.clear();
         // Every fence above was waited, so nothing can still be reading or

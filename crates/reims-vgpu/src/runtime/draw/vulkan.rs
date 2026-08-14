@@ -6690,6 +6690,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Resolved once and read by both the Load gate below and the
         // `target_identity` assignment further down, so the record that loads
         // from a resident is by construction the record that renders into it.
+        // Resolve and revalidate the shared allocation before minting the
+        // resident identity below. Revalidation may advance the mapping
+        // generation when the guest recycled a page, and the identity must
+        // name that new generation rather than the one paired with the retired
+        // alias.
+        let type11_guest_backing = type11_guest_target_backing(state, host, req);
         let type11_resident_target = type11_store_identity(state, req, writeback_guest);
         if req.chain_from_resident {
             if let Some(identity) = render_chain_identity(state, req) {
@@ -7202,6 +7208,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
             resources.load_from_target = true;
             resources.target_rgba8 = None;
+        }
+        // The backing belongs only to the type-11 surface identity it was
+        // resolved from. A GVA or render-chain namespace may legitimately own
+        // this draw's primary attachment instead, in which case handing it the
+        // surface allocation would bind two unrelated resources together.
+        if resources.target_identity == type11_render_identity(state, req) {
+            resources.guest_target_backing = type11_guest_backing;
+            resources.load_guest_target_backing = resources.guest_target_backing.is_some()
+                && req.colors.first().is_some_and(|color| {
+                    color.load_action == MTL_LOAD_ACTION_LOAD && color.target_seed_rgba.is_none()
+                });
         }
         // Type-11 Load used to have a GPU rail here — ~170 lines of front-frame
         // retention policy resolving which resident image held the frame the
@@ -7992,6 +8009,42 @@ fn type11_render_identity(
         return None;
     }
     render_chain_identity(state, req)
+}
+
+/// Stable shared allocation behind the type-11 primary attachment, if this
+/// host can retain the mapping view for the device lifetime.
+///
+/// The mapping revalidation inside `ensure_contig_view` is part of the answer:
+/// it retires an alias when the guest has recycled any of its pages, and that
+/// advances the generation carried by `type11_render_identity`. The engine is
+/// therefore handed a pointer and an identity derived from the same current
+/// page ownership, never a cached pointer paired with a newly rewired surface.
+fn type11_guest_target_backing<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    req: &DrawEncodeRequest,
+) -> Option<crate::backend::vulkan::engine::GuestTargetBacking> {
+    if !host.map_pages_stable() {
+        return None;
+    }
+    let c0 = req.colors.first()?;
+    type11_render_identity(state, req)?;
+    let (plane_offset, row_pitch, span_end) = {
+        let mapping = state.mappings.get(&c0.mapping_id)?;
+        let format = crate::runtime::mapping_write::mapping_store_format(mapping);
+        crate::runtime::mapping_write::type11_sample_window(mapping, c0.width, c0.height, format)?
+    };
+    let (allocation_host_ptr, allocation_len) =
+        crate::runtime::mapper::ensure_contig_view(state, host, c0.mapping_id)?;
+    if span_end > allocation_len as u64 {
+        return None;
+    }
+    Some(crate::backend::vulkan::engine::GuestTargetBacking {
+        allocation_host_ptr,
+        allocation_len: allocation_len as u64,
+        plane_offset,
+        row_pitch: u64::from(row_pitch),
+    })
 }
 
 /// Whether this record's color0 LOAD is one the resident could serve at all —

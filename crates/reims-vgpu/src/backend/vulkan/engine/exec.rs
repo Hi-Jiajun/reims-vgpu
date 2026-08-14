@@ -2612,7 +2612,7 @@ pub(crate) unsafe fn execute_draw_inner(
         bindings: layout_bindings,
     };
     // Resolve load action: resident > guest/host seed > Clear black.
-    let load_uses_gpu_content = req.load_from_target;
+    let mut load_uses_gpu_content = req.load_from_target;
     // output_bgra (computed with the batch decision above): BGRA output only
     // on the resident path (pooled targets stay RGBA); the whole
     // pass/pipeline/image chain then agrees on B8G8R8A8 so a raw image→buffer
@@ -3145,6 +3145,7 @@ pub(crate) unsafe fn execute_draw_inner(
             pools.registry_note_sampled_use(identity);
         }
     }
+    let mut target_loads_guest_backing = false;
     let (target_image, target_fb, target_access, target_view) =
         if let Some(identity) = &req.target_identity {
             let gen = identity.generation();
@@ -3156,8 +3157,19 @@ pub(crate) unsafe fn execute_draw_inner(
                 primary_pass,
                 gen,
                 color0_format,
+                req.guest_target_backing,
                 counters,
             )?;
+            let target_guest_backed = t.memory.is_guest_imported();
+            target_loads_guest_backing =
+                target_guest_backed && req.load_guest_target_backing;
+            if target_loads_guest_backing {
+                // The imported image *is* the guest seed. The pass key already
+                // uses LOAD whenever a seed was supplied; switching the source
+                // here preserves those bytes without recording an overlapping
+                // buffer-to-image copy through two aliases of the same memory.
+                load_uses_gpu_content = true;
+            }
             if load_uses_gpu_content && !t.content_ready {
                 return Err(DrawError::DrawExecution(
                     DrawExecutionDecline::LoadTargetContentNotReady {
@@ -3810,7 +3822,9 @@ pub(crate) unsafe fn execute_draw_inner(
     }
 
     // Seed upload (CPU import).
-    if let Some(seed) = &seed_slot {
+    if target_loads_guest_backing {
+        // The attachment already contains the shared allocation's bytes.
+    } else if let Some(seed) = &seed_slot {
         unsafe { outside_pass.before_record(PassObstacle::Seed, pools, &ctx.device, cb) };
         let (src_stage, src_access) =
             target_prior_access(target_snapshotted, target_access).source_scope();
@@ -4169,58 +4183,60 @@ pub(crate) unsafe fn execute_draw_inner(
     // the device-local result of the gather just recorded, or the exact CPU
     // fallback. All three expose one buffer range and therefore share the same
     // target transition and copy.
-    if let (Some(source), Some(seed)) = (&target_guest_texels, &req.target_guest_seed) {
-        unsafe { outside_pass.before_record(PassObstacle::Seed, pools, &ctx.device, cb) };
-        let (src_stage, src_access) =
-            target_prior_access(target_snapshotted, target_access).source_scope();
-        let barrier = [vk::ImageMemoryBarrier::default()
-            .src_access_mask(src_access)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .image(target_image)
-            .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            src_stage,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &barrier,
-        );
-        let copy = [vk::BufferImageCopy::default()
-            .buffer_offset(source.offset())
-            .buffer_row_length(seed.source.row_length_texels)
-            .image_subresource(super::color_subresource_layers())
-            .image_extent(vk::Extent3D {
-                width: req.width,
-                height: req.height,
-                depth: 1,
-            })];
-        ctx.device.cmd_copy_buffer_to_image(
-            cb,
-            source.buffer(),
-            target_image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &copy,
-        );
-        let barrier = [vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(target_dst_access)
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(target_pass_layout)
-            .image(target_image)
-            .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::TRANSFER,
-            target_dst_stage,
-            target_dependency,
-            &[],
-            &[],
-            &barrier,
-        );
+    if !target_loads_guest_backing {
+        if let (Some(source), Some(seed)) = (&target_guest_texels, &req.target_guest_seed) {
+            unsafe { outside_pass.before_record(PassObstacle::Seed, pools, &ctx.device, cb) };
+            let (src_stage, src_access) =
+                target_prior_access(target_snapshotted, target_access).source_scope();
+            let barrier = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(src_access)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .image(target_image)
+                .subresource_range(super::color_subresource_range())];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                src_stage,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &barrier,
+            );
+            let copy = [vk::BufferImageCopy::default()
+                .buffer_offset(source.offset())
+                .buffer_row_length(seed.source.row_length_texels)
+                .image_subresource(super::color_subresource_layers())
+                .image_extent(vk::Extent3D {
+                    width: req.width,
+                    height: req.height,
+                    depth: 1,
+                })];
+            ctx.device.cmd_copy_buffer_to_image(
+                cb,
+                source.buffer(),
+                target_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &copy,
+            );
+            let barrier = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(target_dst_access)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(target_pass_layout)
+                .image(target_image)
+                .subresource_range(super::color_subresource_range())];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::TRANSFER,
+                target_dst_stage,
+                target_dependency,
+                &[],
+                &[],
+                &barrier,
+            );
+        }
     }
 
     // Guest-sourced sampled uploads: one buffer→image copy over either the

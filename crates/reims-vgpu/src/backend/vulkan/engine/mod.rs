@@ -63,11 +63,11 @@ pub use types::{
     BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask, ComputeBufferResource,
     ComputeOutput, ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource,
     ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
-    DrawError, DrawOutput, DrawRequest, FillMode, GuestRun, GuestRunSource, GuestTargetSeed,
-    IndexType, IndexedDrawResource, PrimitiveTopology, SampledByteOrigin, SampledContentIdentity,
-    SampledImageResource, SampledSource, SamplerAddressMode, SamplerBorderColor,
-    SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource, ScissorResource,
-    SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
+    DrawError, DrawOutput, DrawRequest, FillMode, GuestRun, GuestRunSource, GuestTargetBacking,
+    GuestTargetSeed, IndexType, IndexedDrawResource, PrimitiveTopology, SampledByteOrigin,
+    SampledContentIdentity, SampledImageResource, SampledSource, SamplerAddressMode,
+    SamplerBorderColor, SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource,
+    ScissorResource, SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
     StorageBufferResource, StorageImageFormat, TargetIdentity, VertexAttributeFormat,
     VertexAttributeResource, VertexStepFunction, ViewportResource, VisibilityResultMode,
     WindowPresentSource, COLOR_INPUT_BINDING,
@@ -2457,6 +2457,10 @@ pub struct GuestPageTarget {
     /// written into each of them; a destination four bytes per texel wider
     /// would have had its rows overlap at half their true pitch.
     pub format: ash::vk::Format,
+    /// Exact shared allocation spelling of this destination, when the host can
+    /// retain one. A resident may settle synchronization without a copy only
+    /// when this equals the allocation it was created over.
+    pub shared_backing: Option<GuestTargetBacking>,
 }
 
 impl GuestPageTarget {
@@ -2631,6 +2635,11 @@ pub fn copy_target_to_guest_pages(
             GuestWriteDecline::WindowTooSmall { need, have },
         ));
     }
+    if shared_backing_settles(snap.guest_backing, dst.shared_backing) {
+        crate::runtime::drain::note_store_route("target_sync_shared_backing");
+        record_guest_write_debt(pools, identity, pages);
+        return Ok(());
+    }
     unsafe {
         // Dense rows are the common case and the cheap one; a padded pitch
         // falls to the rectangle path, which is the only form that can leave
@@ -2713,20 +2722,42 @@ pub fn copy_target_to_guest_pages(
     // than guarding every early return above, because the whole body runs under
     // the engine lock and a reclaim needs the same lock: nothing can take the
     // image while this function is running, only after it returns.
-    pools.note_guest_write_recorded(identity);
-    // Before the flag and under the same lock: a reader that observes the flag
-    // set must observe a footprint that already names this write, or it would be
-    // told "disjoint" about pages this copy is landing in.
-    arm_guest_write_pages(pages);
-    // Published after the ledger entry and while the engine lock is still held,
-    // so no thread can observe the flag clear while a copy is outstanding.
-    GUEST_WRITE_DEBT.store(true, std::sync::atomic::Ordering::Release);
+    record_guest_write_debt(pools, identity, pages);
     Ok(())
 }
 
-/// Measure whether one live packed guest surface can be the backing of its
-/// resident image. Observational only; creation and synchronization continue
-/// through the existing resident/copy rails.
+fn shared_backing_settles(
+    resident: Option<GuestTargetBacking>,
+    destination: Option<GuestTargetBacking>,
+) -> bool {
+    resident.is_some() && resident == destination
+}
+
+/// Publish one resident write to the fence/dependency ledger.
+///
+/// Both a queued image-to-buffer copy and rendering into shared backing owe the
+/// same completion rule: guest code must not observe its completion stamp until
+/// the queue has finished writing these pages.
+fn record_guest_write_debt(
+    pools: &mut pools::ResourcePools,
+    identity: &TargetIdentity,
+    pages: &[u64],
+) {
+    pools.note_guest_write_recorded(identity);
+    // Before the flag and under the same lock: a reader that observes the flag
+    // set must observe a footprint that already names this write, or it would be
+    // told "disjoint" about pages this write is landing in.
+    arm_guest_write_pages(pages);
+    // Published after the ledger entry and while the engine lock is still held,
+    // so no thread can observe the flag clear while a write is outstanding.
+    GUEST_WRITE_DEBT.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Report the exact binding equation for one live packed guest surface.
+///
+/// This remains an observation entry point; resident creation consumes the
+/// same planner independently so a probe cannot enable behavior that the live
+/// allocation did not itself prove.
 #[allow(clippy::too_many_arguments)]
 pub fn probe_guest_backed_target(
     host_ptr: usize,
@@ -3723,6 +3754,7 @@ struct ResidentReadSnapshot {
     /// this against the destination's format to decide whether a byte copy
     /// lands the right texel.
     format: ash::vk::Format,
+    guest_backing: Option<GuestTargetBacking>,
 }
 
 impl ResidentReadSnapshot {
@@ -3757,6 +3789,7 @@ fn resident_read_snapshot(
         height: slot.height,
         layout: slot.access.layout(),
         format: slot.color_format,
+        guest_backing: slot.memory.guest_backing(),
     })
 }
 
@@ -4389,6 +4422,25 @@ mod engine_lock_census_tests {
 mod guest_page_target_tests {
     use super::*;
 
+    #[test]
+    fn synchronization_settles_only_the_identical_shared_allocation() {
+        let backing = GuestTargetBacking {
+            allocation_host_ptr: 0x1000,
+            allocation_len: 0x8000,
+            plane_offset: 0x2000,
+            row_pitch: 256,
+        };
+        assert!(shared_backing_settles(Some(backing), Some(backing)));
+        assert!(!shared_backing_settles(Some(backing), None));
+        assert!(!shared_backing_settles(
+            Some(backing),
+            Some(GuestTargetBacking {
+                plane_offset: 0x3000,
+                ..backing
+            })
+        ));
+    }
+
     /// A target over a synthetic import large enough that the bound under test
     /// is the extent arithmetic and not the import's own length.
     fn target(width: u32, height: u32, row_length_texels: u32) -> GuestPageTarget {
@@ -4420,6 +4472,7 @@ mod guest_page_target_tests {
             // reaches a resident, so only its texel width matters — these cases
             // are all four-byte extent arithmetic.
             format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+            shared_backing: None,
         }
     }
 
