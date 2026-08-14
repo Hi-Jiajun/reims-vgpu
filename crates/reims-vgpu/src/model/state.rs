@@ -1223,6 +1223,11 @@ pub struct MappingEntry {
     /// readers against the GPU write without walking the mapping again at
     /// Store time.
     pub contig_gpas: std::sync::Arc<[u64]>,
+    /// Checked backend-import bound over `contig_ptr`, created once for this
+    /// mapping incarnation. Keeping it on the mapping makes every plane view a
+    /// slice of one resource-owned allocation instead of minting a new import
+    /// identity for each bind.
+    pub contig_import: Option<std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>>,
     /// `map_generation` whose page list the host refused to expose as one
     /// packed view. `None` = not asked for the current list.
     ///
@@ -2507,6 +2512,7 @@ impl DeviceState {
         e.contig_ptr = 0;
         e.contig_len = 0;
         e.contig_gpas = Default::default();
+        e.contig_import = None;
         Some(v)
     }
 

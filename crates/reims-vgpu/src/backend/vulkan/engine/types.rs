@@ -1933,6 +1933,8 @@ pub struct GuestTargetBacking {
 pub struct GuestSampledBacking {
     pub backing: GuestTargetBacking,
     pub import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
+    /// Resource family for accounting only; never an execution selector.
+    pub origin: SampledByteOrigin,
 }
 
 /// An importable guest allocation and the physical pages it owns.

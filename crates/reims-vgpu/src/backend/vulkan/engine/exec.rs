@@ -3609,6 +3609,16 @@ pub(crate) unsafe fn execute_draw_inner(
                         )?
                     } {
                         crate::runtime::drain::note_store_route("sampled_direct_bound");
+                        crate::runtime::drain::note_store_route(match direct.origin {
+                            super::SampledByteOrigin::LinearTexture => "sampled_direct_linear",
+                            super::SampledByteOrigin::SurfaceGuestFallback => {
+                                "sampled_direct_type11"
+                            }
+                            super::SampledByteOrigin::SerializedSurfaceView => {
+                                "sampled_direct_type5"
+                            }
+                            _ => "sampled_direct_other",
+                        });
                         sampled.push(PreparedSampled::GuestDirect {
                             binding: resource.binding,
                             array_element: resource.array_element,

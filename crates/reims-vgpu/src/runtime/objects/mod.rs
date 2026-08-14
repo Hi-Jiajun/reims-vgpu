@@ -2160,6 +2160,7 @@ fn apply_type4_backing<M: HostMemory>(
             m.contig_ptr = 0;
             m.contig_len = 0;
             m.contig_gpas = Default::default();
+            m.contig_import = None;
         }
     }
 

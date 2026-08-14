@@ -3023,7 +3023,108 @@ pub(super) fn sampled_backing_from_packed(
             row_pitch,
         },
         import: std::sync::Arc::clone(&packed.import),
+        origin: crate::backend::vulkan::engine::SampledByteOrigin::LinearTexture,
     })
+}
+
+/// Build one sampled plane and its copy fallback from the mapping's retained
+/// allocation. The exact page slice is used only by the freshness witness;
+/// both GPU dispositions retain the whole allocation because that is the
+/// resource whose plane offset and row pitch the descriptor names.
+struct MappedSamplePlane {
+    mapping_id: u32,
+    base_off: u64,
+    row_pitch: u64,
+    span: u64,
+    row_length_texels: u32,
+    rail: crate::runtime::gather_witness::GatherRail,
+    origin: crate::backend::vulkan::engine::SampledByteOrigin,
+}
+
+fn mapped_sampled_source<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    plane: MappedSamplePlane,
+) -> Option<(
+    crate::backend::vulkan::engine::GuestRunSource,
+    crate::runtime::gather_witness::GatherOutcome,
+)> {
+    use crate::backend::vulkan::engine::{GuestRun, GuestRunSource};
+    use crate::runtime::guest_ram::GuestRef;
+
+    let MappedSamplePlane {
+        mapping_id,
+        base_off,
+        row_pitch,
+        span,
+        row_length_texels,
+        rail,
+        origin,
+    } = plane;
+
+    let (import, gpas) =
+        crate::runtime::mapper::ensure_contig_import_with_pages(state, host, mapping_id)?;
+    let end = base_off.checked_add(span)?;
+    if end > import.len() {
+        return None;
+    }
+    let page = state.page_size();
+    let first_page = usize::try_from(base_off / page).ok()?;
+    let head = base_off % page;
+    let page_count = usize::try_from(head.checked_add(span)?.div_ceil(page)).ok()?;
+    let witness_gpas = gpas.get(first_page..first_page.checked_add(page_count)?)?;
+    let witness_runs = [GuestRun {
+        host_ptr: import
+            .host_base()
+            .checked_add(usize::try_from(base_off).ok()?)?,
+        len: span,
+    }];
+    let seen = crate::runtime::gather_witness::note_gather(
+        state,
+        host,
+        rail,
+        crate::runtime::gather_witness::GatherKey::Mapping {
+            mid: mapping_id,
+            base_off,
+        },
+        crate::runtime::gather_witness::GatherWindow {
+            gpas: witness_gpas,
+            runs: &witness_runs,
+            span,
+            page_size: page as usize,
+        },
+    );
+    let whole = import.slice(0, import.len()).ok()?;
+    let guest = GuestRef::new(std::sync::Arc::clone(&import), whole).ok()?;
+    let direct_image = Some(crate::backend::vulkan::engine::GuestSampledBacking {
+        backing: crate::backend::vulkan::engine::GuestTargetBacking {
+            allocation_host_ptr: import.host_base(),
+            allocation_len: import.len(),
+            plane_offset: base_off,
+            row_pitch,
+        },
+        import: std::sync::Arc::clone(&import),
+        origin,
+    });
+    Some((
+        GuestRunSource {
+            runs: std::sync::Arc::new(vec![GuestRun {
+                host_ptr: import.host_base(),
+                len: import.len(),
+            }]),
+            source_offset: base_off,
+            total_len: span,
+            row_length_texels,
+            pages: Some(std::sync::Arc::new(vec![
+                crate::runtime::guest_ram_map::GuestWindowRun {
+                    window_offset: 0,
+                    guest,
+                },
+            ])),
+            direct_image,
+        },
+        seen,
+    ))
 }
 
 /// The byte extent of a `w × h` image at `bpr` bytes per row and `bpp` bytes per
@@ -4179,6 +4280,27 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     // Free when nothing is owed — `pay_for_mapping` is one emptiness check on
     // the ledger, which is the answer on nearly every call.
     crate::runtime::writeback_debt::pay_for_mapping(state, host, mid);
+    if let Some((source, seen)) = mapped_sampled_source(
+        state,
+        host,
+        MappedSamplePlane {
+            mapping_id: mid,
+            base_off,
+            row_pitch: bpr,
+            span,
+            row_length_texels,
+            rail: crate::runtime::gather_witness::GatherRail::Type11,
+            origin: crate::backend::vulkan::engine::SampledByteOrigin::SurfaceGuestFallback,
+        },
+    ) {
+        return Some(SampledSourceRequest::GuestRuns(
+            source,
+            native,
+            LinearSampleIdentity::from(seen.identity),
+            seen.vouch,
+            pixel_format::swizzle_identity(),
+        ));
+    }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
     let page = state.page_size() as usize;
     let seen = crate::runtime::gather_witness::note_gather(
@@ -4220,7 +4342,7 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
 /// Mirrors `try_type11_sample_zero_copy`'s page coalescing over the plane
 /// window from `type5_sample_window` (which carries the wire plane index +
 /// biplanar offset); any gate miss falls back to the CPU byte path.
-fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
+pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mid: u32,
@@ -4280,6 +4402,27 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     // The owed frame, for the reason `try_type11_sample_zero_copy` states: a
     // debt is not a submitted writeback and queue order cannot order it.
     crate::runtime::writeback_debt::pay_for_mapping(state, host, mid);
+    if let Some((source, seen)) = mapped_sampled_source(
+        state,
+        host,
+        MappedSamplePlane {
+            mapping_id: mid,
+            base_off,
+            row_pitch: bpr,
+            span,
+            row_length_texels,
+            rail: crate::runtime::gather_witness::GatherRail::Type5,
+            origin: crate::backend::vulkan::engine::SampledByteOrigin::SerializedSurfaceView,
+        },
+    ) {
+        return Some(SampledSourceRequest::GuestRuns(
+            source,
+            native,
+            LinearSampleIdentity::from(seen.identity),
+            seen.vouch,
+            pixel_format::swizzle_identity(),
+        ));
+    }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
     let page = state.page_size() as usize;
     let seen = crate::runtime::gather_witness::note_gather(

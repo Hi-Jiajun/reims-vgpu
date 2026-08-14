@@ -233,6 +233,74 @@ fn type11_zero_copy_declines_transient_host_mappings() {
 }
 
 #[test]
+#[cfg(feature = "backend-vulkan")]
+fn mapping_sampled_planes_reuse_one_resource_owned_import() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+
+    let page = 1u64 << PAGE_SHIFT_X86;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    host.stable_map_pages = true;
+    let mid = 17u32;
+    let gpa0 = 0x4100_0000u64;
+    let pages = 16u32;
+    host.map_range(gpa0, (u64::from(pages) * page) as usize, 0);
+    assert!(state.map_surface(mid));
+    {
+        let mapping = state.mappings.get_mut(&mid).unwrap();
+        mapping.page_entries = (0..pages)
+            .map(|i| {
+                ((((gpa0 >> PAGE_SHIFT_X86) as u32) + i) << PAGE_ENTRY_PFN_SHIFT)
+                    | PAGE_ENTRY_VALID
+            })
+            .collect();
+    }
+    assert!(state.set_mapping_geom(mid, 128, 128, MTL_FORMAT_BGRA8_UNORM));
+    crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
+
+    let type11 = try_type11_sample_zero_copy(&mut state, &mut host, mid, 128, 128)
+        .expect("the mapping's color plane is sampleable");
+    let SampledSourceRequest::GuestRuns(type11, ..) = type11 else {
+        panic!("the mapping stays guest-backed")
+    };
+    let type11_import = type11.direct_image.expect("stable allocation binds directly").import;
+
+    let type5 = try_type5_sample_zero_copy(
+        &mut state,
+        &mut host,
+        mid,
+        objects::Type5TextureView {
+            pixel_format: MTL_FORMAT_BGRA8_UNORM,
+            width: 128,
+            height: 128,
+            depth: 1,
+            plane_index: 0,
+        },
+    )
+    .expect("the serialized plane view is sampleable");
+    let SampledSourceRequest::GuestRuns(type5, ..) = type5 else {
+        panic!("the plane view stays guest-backed")
+    };
+    let type5_import = type5.direct_image.expect("stable allocation binds directly").import;
+    crate::runtime::guest_ram::forget_import_limits();
+
+    assert_eq!(
+        type11_import.id(),
+        type5_import.id(),
+        "two views of one mapping must retain the mapping's one import"
+    );
+    assert!(std::sync::Arc::ptr_eq(&type11_import, &type5_import));
+    assert_eq!(
+        state.mappings[&mid]
+            .contig_import
+            .as_ref()
+            .map(|import| import.id()),
+        Some(type11_import.id())
+    );
+}
+
+#[test]
 fn cpu_portability_store_publishes_composite() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;

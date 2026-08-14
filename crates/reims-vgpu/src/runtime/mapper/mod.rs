@@ -601,6 +601,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
             m.contig_ptr = 0;
             m.contig_len = 0;
             m.contig_gpas = Default::default();
+            m.contig_import = None;
         }
         if pages_changed {
             DeviceState::bump_map_generation(m);
@@ -1465,9 +1466,12 @@ fn revalidate_timing_is_slow(elapsed_us: u64) -> bool {
     elapsed_us >= REVALIDATE_SLOW_US
 }
 
-/// Unmap contiguous views whose page tables changed. No GPU object can hold one
-/// of these views: nothing on either backend aliases guest pages any more, so
-/// the only readers are CPU copies that finish inside their own call.
+/// Release contiguous views whose page tables changed.
+///
+/// A GPU object can retain a view only when [`HostOps::map_pages_stable`]
+/// promises the address for the device lifetime; `unmap_pages` is a no-op on
+/// exactly that host. A transient view is never admitted to a backend import,
+/// so its only users are CPU copies that finish inside their own call.
 pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
     for (ptr, len) in state.retired_views.drain(..) {
         host.unmap_pages(ptr, len);
@@ -1969,6 +1973,48 @@ pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
     m.contig_len = len;
     m.contig_gpas = std::sync::Arc::clone(&gpas);
     Some((ptr, len, gpas))
+}
+
+/// The mapping's one checked backend import and its physical-page footprint.
+///
+/// A mapping is the allocation; planes and texture views are offsets inside
+/// it. The import therefore follows the mapping lifetime and is reused by all
+/// of those views. Hosts whose page aliases are transient or backends that did
+/// not publish host-pointer import limits retain the copy-backed paths.
+#[cfg(feature = "backend-vulkan")]
+pub fn ensure_contig_import_with_pages<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+) -> Option<(
+    std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
+    std::sync::Arc<[u64]>,
+)> {
+    if !host.map_pages_stable() {
+        return None;
+    }
+    let align = crate::runtime::guest_ram::granularity()?;
+    let span_max = crate::runtime::guest_ram::import_span_max()?;
+    let budget = crate::runtime::guest_ram::import_budget()?;
+    let (ptr, len, pages) = ensure_contig_view_with_pages(state, host, mapping_id)?;
+    let len = u64::try_from(len).ok()?;
+    if len > span_max || len > budget {
+        return None;
+    }
+    if let Some(import) = state
+        .mappings
+        .get(&mapping_id)
+        .and_then(|mapping| mapping.contig_import.as_ref())
+    {
+        if import.host_base() == ptr && import.len() == len && import.align() == align {
+            return Some((std::sync::Arc::clone(import), pages));
+        }
+    }
+    let import = std::sync::Arc::new(
+        crate::runtime::guest_ram::GuestRamImport::new_host_allocation(ptr, len, align).ok()?,
+    );
+    state.mappings.get_mut(&mapping_id)?.contig_import = Some(std::sync::Arc::clone(&import));
+    Some((import, pages))
 }
 
 /// Record the guest frames a mapping-rail write of `[off, off+len)` lands in.

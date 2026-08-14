@@ -256,12 +256,21 @@ fn invalidate_mapping_pages_bumps_map_generation_and_clears() {
         m.page_entries = vec![1];
         m.contig_ptr = 0xdead;
         m.contig_len = 4096;
+        m.contig_import = Some(std::sync::Arc::new(
+            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                0xdead_0000,
+                4096,
+                4096,
+            )
+            .expect("synthetic aligned import"),
+        ));
     }
     let gen0 = state.mappings.get(&5).unwrap().map_generation;
     assert!(state.invalidate_mapping_pages(5));
     let m = state.mappings.get(&5).unwrap();
     assert!(m.page_entries.is_empty());
     assert_eq!(m.contig_ptr, 0);
+    assert!(m.contig_import.is_none());
     assert!(m.map_generation != gen0);
     assert_eq!(state.retired_views, vec![(0xdead, 4096)]);
 }
