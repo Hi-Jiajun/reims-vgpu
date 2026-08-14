@@ -6796,11 +6796,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // pages. Honour that here, or put the seed back.
         let mut gva_load_identity =
             honour_gva_load_elision(state, host, req, &mut chain_load_from_target);
-        // Type-11 composite Load: when the resident this record is about to
-        // render into was stamped with the mapping's current
-        // `surface_content_epoch`, its image already holds exactly the bytes
-        // `resolve_type11_load_seed` would upload. Load from it and skip the
-        // upload.
+        // Type-11 composite Load. A retained guest-allocation target is the
+        // guest's texture resource itself, so its LOAD is authoritative without
+        // comparing two copies. A device-allocation target is a mirror: only
+        // when it was stamped with the mapping's current
+        // `surface_content_epoch` does it hold exactly the bytes
+        // `resolve_type11_load_seed` would upload.
         //
         // The epoch is the witness. `mark_mapping_written` advances it and every
         // guest-page writer *in this crate* calls it, so a blit or a compute
@@ -6886,13 +6887,37 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // skipped" from "this record was never a candidate", and the
                 // ratio of the two is a within-boot number — the only kind that
                 // survives the 1.8x `us_per_draw` drift between boots on this rig.
-                let resident_epoch =
-                    crate::backend::vulkan::engine::resident_content_epoch(&identity);
-                let mapping_id = req.colors.first().map(|c| c.mapping_id).unwrap_or(0);
-                let guest_wrote = type11_guest_wrote_since_store(state, host, mapping_id);
-                if type11_resident_is_current(mapping_epoch, resident_epoch) && !guest_wrote {
+                let backing = req.colors.first().and_then(|c0| {
+                    state
+                        .task_resources
+                        .get(req.task_id, c0.texture_ref)
+                        .filter(|resource| {
+                            resource_type_owns_surface_resident(resource.entry.object_type)
+                        })
+                        .map(|resource| resource.resident_target_backing(&identity))
+                });
+                let (resident_current, guest_wrote) =
+                    type11_load_resident_is_current(backing, || {
+                        let resident_epoch =
+                            crate::backend::vulkan::engine::resident_content_epoch(&identity);
+                        let mapping_id = req.colors.first().map(|c| c.mapping_id).unwrap_or(0);
+                        let guest_wrote = type11_guest_wrote_since_store(state, host, mapping_id);
+                        (
+                            type11_resident_is_current(mapping_epoch, resident_epoch)
+                                && !guest_wrote,
+                            guest_wrote,
+                        )
+                    });
+                if resident_current {
                     chain_load_from_target = true;
                     crate::runtime::drain::note_store_route("type11_seed_elided");
+                    if backing
+                        == Some(
+                            crate::backend::vulkan::engine::ResidentContentBacking::GuestAllocation,
+                        )
+                    {
+                        crate::runtime::drain::note_store_route("type11_seed_guest_allocation");
+                    }
                     note_type11_elision_extent(w, h);
                 } else {
                     crate::runtime::drain::note_store_route("type11_seed_provided");
@@ -8167,15 +8192,15 @@ pub(super) fn type11_load_currency_query(
     Some((identity, mapping_epoch))
 }
 
-/// Has the guest written this surface's pages since the Store that produced
-/// the resident stamped them?
+/// Has the guest written this surface's pages since the Store that produced a
+/// copied resident stamped them?
 ///
 /// The device-side half of the currency test — the `surface_content_epoch`
 /// comparison one function up — can only witness writers inside this crate.
 /// A type-11 surface's pages are plain guest RAM, and the guest CPU stores
 /// into them with no device operation, so the epoch does not move and the
 /// resident silently stops matching what the seed would upload. This is the
-/// only witness for that, and it is the hypervisor's.
+/// only witness for that copied-allocation question, and it is the hypervisor's.
 ///
 /// Answers `true` — "written, do not reuse" — for every case that is not a
 /// live token whose current generation equals the one the Store recorded:
@@ -8522,6 +8547,24 @@ fn sample_rung_gw_route(rung: &str, guest_write: GuestWriteVerdict) -> Option<&'
 /// precisely the black-layer class. Absence on either side is a refusal.
 fn type11_resident_is_current(mapping_epoch: Option<u32>, resident_epoch: Option<u32>) -> bool {
     mapping_epoch.is_some() && mapping_epoch == resident_epoch
+}
+
+/// Decide whether a type-11 LOAD can use its retained target.
+///
+/// A guest allocation is the serialized texture's own storage, not a cached
+/// copy, so a host or guest write changes the allocation the next render pass
+/// loads. The copied-allocation currency query is supplied as a closure so the
+/// shared case cannot accidentally pay either engine lookup or guest-write
+/// lookup on a warm LOAD.
+fn type11_load_resident_is_current(
+    backing: Option<crate::backend::vulkan::engine::ResidentContentBacking>,
+    copied_currency: impl FnOnce() -> (bool, bool),
+) -> (bool, bool) {
+    if backing == Some(crate::backend::vulkan::engine::ResidentContentBacking::GuestAllocation) {
+        (true, false)
+    } else {
+        copied_currency()
+    }
 }
 
 /// Record that the resident this Store rendered into holds the mapping's
@@ -9553,6 +9596,32 @@ mod vulkan_split_tests {
         assert!(!type11_resident_is_current(None, None));
         assert!(!type11_resident_is_current(None, Some(0)));
         assert!(!type11_resident_is_current(Some(7), None));
+    }
+
+    #[test]
+    fn a_guest_allocation_load_never_queries_copy_currency() {
+        use crate::backend::vulkan::engine::ResidentContentBacking;
+
+        assert_eq!(
+            type11_load_resident_is_current(
+                Some(ResidentContentBacking::GuestAllocation),
+                || panic!("one allocation has no second copy whose currency can be queried"),
+            ),
+            (true, false)
+        );
+        for backing in [
+            Some(ResidentContentBacking::DeviceAllocation),
+            Some(ResidentContentBacking::NotReady),
+            None,
+        ] {
+            for copied_answer in [(false, true), (true, false)] {
+                assert_eq!(
+                    type11_load_resident_is_current(backing, || copied_answer),
+                    copied_answer,
+                    "{backing:?} must retain the copied-allocation currency test"
+                );
+            }
+        }
     }
 
     /// A sampled bind may only be served from a host-side copy of a type-4
