@@ -1091,9 +1091,11 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     //   type-4 Surface         — the ref *is* the surface id
     //   type-11 IOSurface      — resolves to the mapping id it was created on
     //
-    // `resolve_type11_ref` retrieves this same resource and returns `None` for every
-    // type but 11, so it can only ever fill a slot the classification above left
-    // empty. Hence an `Option`, not a list of candidates to choose between.
+    // The retained resource already carries the total typed decode. Type 11 can
+    // therefore fill the slot directly from that object rather than looking up
+    // and decoding the same reference a second time. It returns `None` for every
+    // other type, so it can only fill a slot the classification above left empty.
+    // Hence an `Option`, not a list of candidates to choose between.
     let mut is_linear_tex = false;
     let mut is_type5 = false;
     let mut type5_view: Option<objects::Type5TextureView> = None;
@@ -1128,12 +1130,11 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         // type-11 hit it can return: the resolve records the ref as live in the
         // task's object set and reports a typed failure when the descriptor is
         // unreadable. Both are wanted for any ref a draw sampled.
-        surface = surface.or(objects::resolve_type11_ref(
-            state,
-            host,
-            task_id,
-            texture_ref,
-        ));
+        surface = surface.or_else(|| {
+            resolved_resource.as_ref().and_then(|resource| {
+                objects::resolve_type11_resource(state, task_id, texture_ref, resource)
+            })
+        });
     }
 
     if let Some(mid) = surface {
@@ -1574,15 +1575,16 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         // the CPU host-cache/memo byte paths below for eligible formats (the
         // lin_memo full-window re-read + memcmp per bind was the dominant
         // per-draw cost under compositor load).
-        // Resolve + decode the texture descriptor ONCE for both linear loaders
-        // below. The zero-copy attempt (which returns None on the ~35k/session
-        // cache-fallback majority) and the host-cache fallback each read the same
-        // descriptor blob and run the identical `decode_texture_descriptor`; the
-        // object list is immutable for the draw, so one read+decode serves both.
-        // Both readers take only the decoded descriptor.
-        if let Some(tex) = resolved_resource
-            .as_ref()
-            .and_then(|resource| decode_texture_descriptor(&resource.descriptor).ok())
+        // The object map retains the typed construction descriptor for the
+        // resource lifetime. Both linear loaders consume that same object here;
+        // neither needs to revisit guest construction bytes.
+        if let Some(tex) =
+            resolved_resource
+                .as_ref()
+                .and_then(|resource| match resource.decoded() {
+                    Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) => Some(tex),
+                    _ => None,
+                })
         {
             // Above the gather: a span whose pages a render Store published and
             // nothing has written since is already an engine image, so there is
@@ -1590,18 +1592,18 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
             // wait for. See [`try_gva_resident_sample`].
             if may_bind_resident {
                 if let Some((w, h, src)) =
-                    try_gva_resident_sample(state, host, task_id, texture_ref, &tex)
+                    try_gva_resident_sample(state, host, task_id, texture_ref, tex)
                 {
                     return Some((w, h, 0, src));
                 }
             }
             if let Some((w, h, src)) =
-                try_linear_sample_zero_copy(state, host, task_id, texture_ref, &tex)
+                try_linear_sample_zero_copy(state, host, task_id, texture_ref, tex)
             {
                 return Some((w, h, 0, src));
             }
             if let Some((w, h, rgba, identity, byte_format)) =
-                load_linear_from_host_caches(state, host, task_id, texture_ref, &tex)
+                load_linear_from_host_caches(state, host, task_id, texture_ref, tex)
             {
                 return Some((
                     w,
@@ -6267,7 +6269,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // to the image view as a component mapping and the hardware
                     // applies it at sample time, so the texels stay untouched and
                     // the bind keeps whatever content rail it was already on.
-                    let view_swizzle = resolve_texture_view(state, host, req.task_id, texture_ref)
+                    let view_swizzle = texture_resource
+                        .as_ref()
+                        .filter(|resource| {
+                            resource.entry.object_type
+                                == crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VIEW
+                        })
+                        .and_then(|_| resolve_texture_view(state, host, req.task_id, texture_ref))
                         .and_then(|view| view.swizzle)
                         .filter(|plan| !pixel_format::swizzle_is_identity(plan));
                     (texture_resource, view_swizzle)

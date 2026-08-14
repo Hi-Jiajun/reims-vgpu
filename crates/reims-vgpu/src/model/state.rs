@@ -1,10 +1,12 @@
 //! Device-owned state: registers, rings, tasks, mapper, present, fail log.
 
 use crate::model::{LruBytesMemo, GFX_MMIO_SIZE, MAX_CHANNELS};
-use crate::runtime::decode::resource::ListObjectEntry;
+use crate::runtime::decode::resource::{
+    DecodeStatus as ResourceDecodeStatus, Descriptor, ListObjectEntry,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Opaque device instance id (QEMU handle).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -567,6 +569,35 @@ impl TaskTable {
 pub struct TaskResource {
     pub entry: ListObjectEntry,
     pub descriptor: Arc<[u8]>,
+    /// Typed form of the construction descriptor, decoded exactly once for
+    /// this resource lifetime.
+    ///
+    /// The serialized object map resolves a reference to an object, not to a
+    /// byte string that every bind is expected to parse again. Keep the bytes
+    /// because a few partial/legacy consumers deliberately accept shapes the
+    /// total decoder refuses, and keep that refusal too so those consumers do
+    /// not silently widen the total contract.
+    decoded: OnceLock<Result<Descriptor, ResourceDecodeStatus>>,
+}
+
+impl TaskResource {
+    pub fn new(entry: ListObjectEntry, descriptor: Arc<[u8]>) -> Self {
+        Self {
+            entry,
+            descriptor,
+            decoded: OnceLock::new(),
+        }
+    }
+
+    /// Resolve this resource's immutable construction descriptor once.
+    pub fn decoded(&self) -> &Result<Descriptor, ResourceDecodeStatus> {
+        self.decoded.get_or_init(|| {
+            crate::runtime::decode::resource::decode_descriptor(
+                self.entry.object_type,
+                &self.descriptor,
+            )
+        })
+    }
 }
 
 /// Per-task resource objects, keyed by the guest's `(task, reference)` pair.

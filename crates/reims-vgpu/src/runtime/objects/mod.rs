@@ -1583,8 +1583,7 @@ pub fn resolve_resource<M: HostMemory>(
         return Ok(resource);
     }
 
-    let entry = lookup_list_entry(state, host, task_id, obj_ref)
-        .ok_or(LadderRung::NoListEntry)?;
+    let entry = lookup_list_entry(state, host, task_id, obj_ref).ok_or(LadderRung::NoListEntry)?;
     if !object_type_is_resource(entry.object_type) {
         return Err(LadderRung::WrongType {
             got: entry.object_type,
@@ -1593,13 +1592,9 @@ pub fn resolve_resource<M: HostMemory>(
     let bytes = read_descriptor(state, host, task_id, &entry).ok_or(LadderRung::DescRead {
         declared_len: entry.descriptor_length,
     })?;
-    let resource = Arc::new(TaskResource {
-        entry,
-        descriptor: Arc::from(bytes),
-    });
-    Ok(state
-        .task_resources
-        .register(task_id, obj_ref, resource))
+    let descriptor: Arc<[u8]> = Arc::from(bytes);
+    let resource = Arc::new(TaskResource::new(entry, descriptor));
+    Ok(state.task_resources.register(task_id, obj_ref, resource))
 }
 
 /// Look `obj_ref` up in `task_id`'s list, require its type to be one of `want`,
@@ -1649,10 +1644,12 @@ pub fn resolve_descriptor<M: HostMemory>(
     if !object_type_is_resource(entry.object_type) {
         return Ok((entry, Arc::from(bytes)));
     }
-    let resource = state.task_resources.register(task_id, obj_ref, Arc::new(TaskResource {
-        entry,
-        descriptor: Arc::from(bytes),
-    }));
+    let descriptor: Arc<[u8]> = Arc::from(bytes);
+    let resource = state.task_resources.register(
+        task_id,
+        obj_ref,
+        Arc::new(TaskResource::new(entry, descriptor)),
+    );
     if !want.contains(&resource.entry.object_type) {
         return Err(LadderRung::WrongType {
             got: resource.entry.object_type,
@@ -1750,6 +1747,21 @@ pub fn resolve_type11_ref<M: HostMemory>(
         }
         Err(_) => return None,
     };
+    resolve_type11_resource(state, task_id, ref_, &resource)
+}
+
+/// Resolve an already-retained type-11 resource to its mapping.
+///
+/// Draw preparation resolves each bound reference once and threads the
+/// resulting object through all of its consumers. Keeping this half separate
+/// prevents the type-11 branch from looking the same reference up again and
+/// reparsing immutable construction bytes on every bind.
+pub fn resolve_type11_resource(
+    state: &mut DeviceState,
+    task_id: u32,
+    ref_: u32,
+    resource: &TaskResource,
+) -> Option<u32> {
     let entry = resource.entry;
     let desc = &resource.descriptor;
     // Record the ref as live so the explicit delete path retires its associated
@@ -1760,28 +1772,59 @@ pub fn resolve_type11_ref<M: HostMemory>(
         // control flow (resolve_type11_refs skips it) — never a failure.
         return None;
     }
-    if !texture::register_from_descriptor_bytes(state, OBJECT_TYPE_IOSURFACE, desc) {
-        // A confirmed IOSurface texture whose descriptor could not register —
-        // the draw then samples a missing/black texture.
-        note_type11_fail(
-            task_id,
-            ref_,
-            "type11_register",
-            format!(
-                "type11_resolve_fail reason=type11_register task={task_id} ref={ref_} desc_len={}",
-                desc.len()
-            ),
-        );
-        return None;
-    }
-    // mapping_id is first u32 of type-11 desc.
-    let mapping_id = u32::from_le_bytes(desc[0..4].try_into().ok()?);
+    let mapping_id = match resource.decoded() {
+        Ok(crate::runtime::decode::resource::Descriptor::IOSurfaceTexture {
+            mapping_id,
+            pixel_format,
+            width,
+            height,
+            ..
+        }) => {
+            if !texture::register_type11_geom(state, *mapping_id, *width, *height, *pixel_format) {
+                note_type11_fail(
+                    task_id,
+                    ref_,
+                    "type11_register",
+                    format!(
+                        "type11_resolve_fail reason=type11_register task={task_id} ref={ref_} desc_len={}",
+                        desc.len()
+                    ),
+                );
+                return None;
+            }
+            *mapping_id
+        }
+        // Preserve the older headerless decoder as a compatibility rung for
+        // descriptors the total object decoder cannot name. This is a cold
+        // refusal path; successfully constructed resources take the typed arm.
+        Err(_) => {
+            if !texture::register_from_descriptor_bytes(state, OBJECT_TYPE_IOSURFACE, desc) {
+                note_type11_fail(
+                    task_id,
+                    ref_,
+                    "type11_register",
+                    format!(
+                        "type11_resolve_fail reason=type11_register task={task_id} ref={ref_} desc_len={}",
+                        desc.len()
+                    ),
+                );
+                return None;
+            }
+            u32::from_le_bytes(desc.get(..4)?.try_into().ok()?)
+        }
+        Ok(_) => return None,
+    };
     if mapping_id == 0 {
+        // Defensive for a compatibility decoder that ever accepts the sentinel
+        // mapping id without registering it.
         note_type11_fail(
             task_id,
             ref_,
             "type11_mapping_zero",
-            format!("type11_resolve_fail reason=type11_mapping_zero task={task_id} ref={ref_} desc_len={}", desc.len()),
+            format!(
+                "type11_resolve_fail reason=type11_mapping_zero task={task_id} ref={ref_} desc_len={}",
+                desc.len()
+            ),
         );
         return None;
     }
