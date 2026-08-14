@@ -3079,8 +3079,18 @@ pub fn note_readback_gpu_us(barrier_us: u64, copy_us: u64) {
 /// deferred rail to take. Whether that is 2 Stores a second or 20 decides
 /// whether building one is worth it, and the route's own first-appearance line
 /// is deduplicated per process and cannot say.
-static STORE_ROUTES: std::sync::Mutex<Option<std::collections::BTreeMap<&'static str, u64>>> =
-    std::sync::Mutex::new(None);
+type StoreRouteCounter = std::sync::Arc<std::sync::atomic::AtomicU64>;
+
+static STORE_ROUTES: std::sync::Mutex<std::collections::BTreeMap<&'static str, StoreRouteCounter>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+thread_local! {
+    /// Routes repeat at render-command frequency. Keep their registry lookup
+    /// off the hot path; the registry remains sorted solely for census output.
+    static STORE_ROUTE_CACHE: std::cell::RefCell<
+        std::collections::HashMap<&'static str, StoreRouteCounter>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
 
 /// # This census cannot find the Finder icon defect, and that is now measured
 ///
@@ -3162,17 +3172,40 @@ pub fn note_store_route(route: &'static str) {
 /// Add `n` to a named count in the same per-second window as [`note_store_route`].
 ///
 /// For events that arrive in batches — one notify marking many cache entries —
-/// where the number that matters is the entries, not the notifies, and taking
-/// the lock once per entry would cost more than the census is worth.
+/// where the number that matters is the entries, not the notifies. The common
+/// path is a thread-local lookup and a relaxed atomic addition; the registry
+/// lock is taken only the first time one thread sees one route.
 pub fn note_store_route_n(route: &'static str, n: u64) {
     if n == 0 {
         return;
     }
-    if let Ok(mut g) = STORE_ROUTES.lock() {
-        *g.get_or_insert_with(Default::default)
-            .entry(route)
-            .or_default() += n;
-    }
+    STORE_ROUTE_CACHE.with(|cache| {
+        let hit = {
+            let cache = cache.borrow();
+            if let Some(counter) = cache.get(route) {
+                counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        };
+        if hit {
+            return;
+        }
+
+        let counter = {
+            let Ok(mut routes) = STORE_ROUTES.lock() else {
+                return;
+            };
+            std::sync::Arc::clone(
+                routes
+                    .entry(route)
+                    .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))),
+            )
+        };
+        counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        cache.borrow_mut().insert(route, counter);
+    });
 }
 
 /// Accumulate microseconds against a named cost, into the same per-second window
@@ -3188,11 +3221,7 @@ pub fn note_store_route_n(route: &'static str, n: u64) {
 /// `wait_us`). A phase table that sums to 72 % of the thing it decomposes
 /// cannot be used to choose what to fix.
 pub fn note_store_route_us(name: &'static str, us: u64) {
-    if let Ok(mut g) = STORE_ROUTES.lock() {
-        *g.get_or_insert_with(Default::default)
-            .entry(name)
-            .or_default() += us;
-    }
+    note_store_route_n(name, us);
 }
 
 /// Read one route's count out of the live window, for tests that assert a
@@ -3207,23 +3236,79 @@ pub(crate) fn store_route_count(route: &str) -> u64 {
     STORE_ROUTES
         .lock()
         .ok()
-        .and_then(|g| g.as_ref().and_then(|m| m.get(route).copied()))
+        .and_then(|routes| routes.get(route).cloned())
+        .map(|counter| counter.load(std::sync::atomic::Ordering::Relaxed))
         .unwrap_or(0)
 }
 
 /// Drain and format the window's route counts, or `None` if none were taken.
 fn take_store_routes() -> Option<String> {
-    let mut g = STORE_ROUTES.lock().ok()?;
-    let routes = g.as_mut()?;
-    if routes.is_empty() {
-        return None;
-    }
+    let routes = STORE_ROUTES.lock().ok()?;
     let mut out = String::from("store_routes");
-    for (route, n) in routes.iter() {
-        out.push_str(&format!(" {route}={n}"));
+    let mut any = false;
+    for (route, counter) in routes.iter() {
+        let n = counter.swap(0, std::sync::atomic::Ordering::Relaxed);
+        if n != 0 {
+            out.push_str(&format!(" {route}={n}"));
+            any = true;
+        }
     }
-    routes.clear();
-    Some(out)
+    any.then_some(out)
+}
+
+#[cfg(test)]
+mod store_route_tests {
+    use super::{
+        note_store_route, note_store_route_n, note_store_route_us, store_route_count,
+        take_store_routes,
+    };
+
+    fn clear_window() {
+        let _ = take_store_routes();
+    }
+
+    #[test]
+    fn counts_and_costs_share_the_window() {
+        clear_window();
+        note_store_route("test_route_count");
+        note_store_route_n("test_route_count", 4);
+        note_store_route_us("test_route_cost_us", 17);
+
+        assert_eq!(store_route_count("test_route_count"), 5);
+        assert_eq!(store_route_count("test_route_cost_us"), 17);
+    }
+
+    #[test]
+    fn counters_coalesce_across_threads() {
+        clear_window();
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..1_000 {
+                        note_store_route("test_route_threaded");
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(store_route_count("test_route_threaded"), 4_000);
+    }
+
+    #[test]
+    fn drain_is_sorted_and_does_not_repeat_values() {
+        clear_window();
+        note_store_route("test_route_zulu");
+        note_store_route("test_route_alpha");
+
+        let line = take_store_routes().unwrap();
+        let alpha = line.find(" test_route_alpha=1").unwrap();
+        let zulu = line.find(" test_route_zulu=1").unwrap();
+        assert!(alpha < zulu);
+        assert!(take_store_routes().is_none());
+    }
 }
 
 #[cfg(test)]
