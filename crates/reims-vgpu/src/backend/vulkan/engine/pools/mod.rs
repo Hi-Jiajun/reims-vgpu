@@ -303,6 +303,13 @@ pub(crate) struct ResourcePools {
     /// Transient sampled-image pool, keyed by exact image and view geometry.
     sampled_free: FreePool<SampledKey, SampledSlot>,
     sampled_live: Vec<SampledSlot>,
+    /// Attachment-feedback snapshots have a command-buffer working set rather
+    /// than a content-cache working set. Keeping them separate prevents the
+    /// general sampled cap from destroying the snapshots a full batch returns,
+    /// while preventing those large, contentless images from displacing upload
+    /// slots that are reusable for a different reason.
+    attachment_snapshot_free: FreePool<SampledKey, SampledSlot>,
+    attachment_snapshot_live: Vec<SampledSlot>,
     /// Exact-content sampled images retained across draw calls. Hash narrows
     /// candidates only; a hit always requires full byte equality.
     sampled_cache: Vec<ResidentSampledSlot>,
@@ -907,11 +914,12 @@ impl ResourcePools {
 /// descriptor set and every transient pool slot the CB references, moved out of
 /// the live lists at seal time so a concurrent entry cannot recycle them.
 ///
-/// **The sampled images this entry filled are not here.** They leave the seal in
+/// **The upload images this entry filled are not here.** They leave the seal in
 /// [`SealedEntry::admissions`] and enter the content cache at submit, not at
-/// retire — see [`ResourcePools::finish_entry_async`] for why, and note that the
-/// absence of a field is the enforcement: nothing that reaches this struct can
-/// still be owed to the cache.
+/// retire — see [`ResourcePools::finish_entry_async`] for why. Attachment
+/// snapshots are different: their contents expire with this command buffer, so
+/// they remain here until its fence retires and then return to their scratch
+/// pool.
 pub(crate) struct PendingGpuCleanup {
     dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
     /// The guest-scatter sets, kept apart from `dsets` because they recycle
@@ -921,6 +929,7 @@ pub(crate) struct PendingGpuCleanup {
     gather: Vec<BufferSlot>,
     readback: Vec<BufferSlot>,
     sampled: Vec<SampledSlot>,
+    attachment_snapshots: Vec<SampledSlot>,
     storage_images: Vec<StorageImageSlot>,
 }
 
@@ -961,6 +970,15 @@ pub(crate) struct SampledSlot {
     /// channels. Identity is the overwhelmingly common case and keeps its own
     /// free list, so a rare swizzled bind cannot fragment the hot one.
     pub swizzle: crate::contract::pixel_format::SwizzlePlan,
+}
+
+/// Which lifetime owns a newly acquired sampled image. Upload images may enter
+/// the exact-content cache; attachment snapshots are contentless command-buffer
+/// scratch and return only to their batch-sized pool after the fence retires.
+#[derive(Clone, Copy)]
+enum SampledTransientUse {
+    Upload,
+    AttachmentSnapshot,
 }
 
 /// Everything that has to match for one sampled image to stand in for another:
@@ -1005,6 +1023,20 @@ impl SampledKey {
             swizzle: r.swizzle,
         }
     }
+
+    /// Whether this key has the one ordinary attachment-view shape for which
+    /// distinct sources bound a draw's scratch population. Other view shapes
+    /// can multiply one attachment into several incompatible image/view keys
+    /// (most plainly through component swizzles), so they keep the general
+    /// sampled pool rather than entering the attachment-count-sized pool.
+    pub(crate) fn is_plain_2d_identity_view(self) -> bool {
+        self.layers == 1
+            && !self.volume
+            && !self.cube
+            && !self.arrayed
+            && !self.one_dim
+            && self.swizzle.is_identity()
+    }
 }
 
 impl SampledSlot {
@@ -1027,7 +1059,7 @@ impl SampledSlot {
     /// the slot and is responsible for recycling or destroying it, and a derive
     /// would make an ownership duplicate look like a copy of a value. Every
     /// caller is handing a binding something to sample.
-    fn handles(&self) -> Self {
+    pub(crate) fn handles(&self) -> Self {
         Self {
             image: self.image,
             memory: self.memory,
@@ -2094,6 +2126,20 @@ const SAMPLED_FREE_CAP_PER_KEY: usize = 4;
 /// global cap keeps the recycle pool from exceeding the working set; evictions
 /// past it are destroyed (freeing their slab range) instead of cached.
 const SAMPLED_FREE_CAP_TOTAL: usize = 64;
+/// A draw can feed back through at most the plain 2D identity views of the
+/// attachments its render pass carries: the decoded color table plus its one
+/// depth attachment. The producer shares duplicate binds of one attachment and
+/// routes every other view shape through the general sampled pool, making the
+/// largest dedicated snapshot population `draws × attachments` rather than
+/// `draws × texture-table width`.
+const ATTACHMENT_SNAPSHOT_BATCH_CAP: usize = BATCH_MAX_DRAWS as usize
+    * (crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS + 1);
+/// Every attachment may have the same geometry and view key, so the per-key
+/// bound is the whole batch population rather than only its draw count.
+const ATTACHMENT_SNAPSHOT_FREE_CAP_PER_KEY: usize = ATTACHMENT_SNAPSHOT_BATCH_CAP;
+/// A retired command buffer cannot return more snapshots than the batch bound,
+/// regardless of how many keys divide them.
+const ATTACHMENT_SNAPSHOT_FREE_CAP_TOTAL: usize = ATTACHMENT_SNAPSHOT_BATCH_CAP;
 /// Max recycled resident-target images retained per (geometry, format) key in
 /// `target_free`. A per-frame content-changing target only needs a few live at
 /// once (the CB ring is 3-deep plus the frame being acquired); beyond that a
@@ -2176,20 +2222,21 @@ const STORAGE_IMAGE_FREE_CAP_TOTAL: usize = 16;
 /// A bounded per-key free list of reusable GPU objects, with the census that
 /// says whether its own caps are what is limiting reuse.
 ///
-/// # One discipline, three pools
+/// # One discipline, several pools
 ///
-/// Resident targets, sampled images and transient compute storage all want the
-/// same thing: hand a retired object back keyed by the geometry that makes it
-/// reusable, take one back on the next create of that geometry, and bound the
-/// hoard two ways. That policy used to be written out three times, once per
-/// pool, each with its own four counters — a shape whose own doc comments said
-/// "mirrors `try_recycle_sampled`". It is written once here, and the pools
-/// differ only in their key type and their two caps.
+/// Resident targets, sampled images, attachment snapshots and transient
+/// compute storage all want the same thing: hand a retired object back keyed by
+/// the geometry that makes it reusable, take one back on the next create of
+/// that geometry, and bound the hoard two ways. That policy used to be written
+/// out repeatedly, once per pool, each with its own four counters — a shape
+/// whose own doc comments said "mirrors `try_recycle_sampled`". It is written
+/// once here, and the pools differ only in their key type and their two caps.
 ///
-/// It is also where a fourth pool joins. `create_transient_depth` is the one
-/// render target in this engine that never recycles, and it allocates the most
-/// by two orders of magnitude; its doc asks for exactly this — one discipline
-/// the depth path also uses, not a fourth pool beside the others.
+/// Transient depth joins the same discipline too. `create_transient_depth` is
+/// the one render target in this engine that never recycles, and it allocates
+/// the most by two orders of magnitude; its doc asks for exactly this — one
+/// discipline the depth path also uses, not another bespoke pool beside the
+/// others.
 ///
 /// # The two caps
 ///
@@ -2987,6 +3034,45 @@ mod sampled_key_tests {
         assert_eq!((k.width, k.height, k.layers), (7, 5, 3));
         assert_eq!(k.format, ash::vk::Format::R8G8B8A8_UNORM);
         assert_eq!(k.swizzle, SwizzlePlan::default());
+    }
+
+    /// Only one key can describe the plain view of one attachment. Every shape
+    /// dimension that could make a second incompatible view keeps that bind out
+    /// of the attachment-count-sized scratch pool.
+    #[test]
+    fn attachment_snapshot_pool_accepts_only_plain_2d_identity_views() {
+        let mut plain = SampledKey::of(&resource(false, false, false, false));
+        plain.layers = 1;
+        assert!(plain.is_plain_2d_identity_view());
+
+        let mut variants = Vec::new();
+        variants.push(SampledKey {
+            layers: 2,
+            ..plain
+        });
+        variants.push(SampledKey {
+            volume: true,
+            ..plain
+        });
+        variants.push(SampledKey {
+            cube: true,
+            ..plain
+        });
+        variants.push(SampledKey {
+            arrayed: true,
+            ..plain
+        });
+        variants.push(SampledKey {
+            one_dim: true,
+            ..plain
+        });
+        variants.push(SampledKey {
+            swizzle: crate::contract::pixel_format::swizzle_plan(&[4, 3, 2, 1]).unwrap(),
+            ..plain
+        });
+        assert!(variants
+            .into_iter()
+            .all(|key| !key.is_plain_2d_identity_view()));
     }
 }
 

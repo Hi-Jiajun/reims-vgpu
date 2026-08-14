@@ -3198,6 +3198,10 @@ pub(crate) unsafe fn execute_draw_inner(
     // capacity eviction cannot destroy an image already selected for this draw.
     phase.enter(super::draw_phase::Phase::AcquireSampled);
     let mut sampled = Vec::new();
+    let mut attachment_snapshots: std::collections::HashMap<
+        (super::types::TargetIdentity, SampledKey),
+        SampledSlot,
+    > = std::collections::HashMap::new();
     for resource in &req.sampled_images {
         match &resource.source {
             SampledSource::Bytes(bytes) => {
@@ -3314,16 +3318,34 @@ pub(crate) unsafe fn execute_draw_inner(
                             "sampled_resident_swizzle_snapshot",
                         ),
                     }
-                    let image = pools.acquire_sampled(
-                        ctx,
-                        SampledKey {
-                            // The snapshot binds the *resident's* format, not
-                            // the one the binding declared.
-                            format: super::super::translate::pixel::resident_color(source_bgra),
-                            ..SampledKey::of(resource)
-                        },
-                        counters,
-                    )?;
+                    let snapshot_key = SampledKey {
+                        // The snapshot binds the *resident's* format, not
+                        // the one the binding declared.
+                        format: super::super::translate::pixel::resident_color(source_bgra),
+                        ..SampledKey::of(resource)
+                    };
+                    let image = if self_slot.is_some()
+                        && snapshot_key.is_plain_2d_identity_view()
+                    {
+                        let name = (identity.clone(), snapshot_key);
+                        if let Some(existing) = attachment_snapshots.get(&name) {
+                            existing.handles()
+                        } else {
+                            let acquired = pools.acquire_attachment_snapshot(
+                                ctx,
+                                snapshot_key,
+                                counters,
+                            )?;
+                            attachment_snapshots.insert(name, acquired.handles());
+                            acquired
+                        }
+                    } else {
+                        // Swizzled/arrayed/volume attachment views can give one
+                        // source several incompatible keys, so an attachment-
+                        // count bound does not apply to them. Like a swizzled
+                        // non-attachment resident, they keep the general pool.
+                        pools.acquire_sampled(ctx, snapshot_key, counters)?
+                    };
                     sampled.push(PreparedSampled::Snapshot {
                         binding: resource.binding,
                         array_element: resource.array_element,
@@ -3572,6 +3594,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // the attachment. This preserves the old CPU snapshot semantics without a
     // readback or host upload.
     let mut snapshotted_targets = std::collections::HashSet::new();
+    let mut snapshotted_images = std::collections::HashSet::new();
     let mut target_snapshotted = false;
     for sampled_image in &sampled {
         let PreparedSampled::Snapshot {
@@ -3586,6 +3609,14 @@ pub(crate) unsafe fn execute_draw_inner(
         };
         target_snapshotted = true;
         unsafe { outside_pass.before_record(PassObstacle::Snapshot, pools, &ctx.device, cb) };
+        // Duplicate descriptor bindings of one attachment/key share one image.
+        // Its copy and two layout transitions are commands on the image, not on
+        // the binding, so recording them twice would transition
+        // SHADER_READ_ONLY as though it were UNDEFINED and copy the same pixels
+        // twice for no guest-visible difference.
+        if !snapshotted_images.insert(image.image) {
+            continue;
+        }
         // Once per distinct source: duplicate bindings of one target share the
         // image, so a second barrier for it would order nothing new. The
         // *first* is unconditional — the source is a registry resident this

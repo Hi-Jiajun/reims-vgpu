@@ -42,6 +42,8 @@ impl ResourcePools {
                 self.gather_live.extend(pending.gather);
                 self.readback_multi_live.extend(pending.readback);
                 self.sampled_live.extend(pending.sampled);
+                self.attachment_snapshot_live
+                    .extend(pending.attachment_snapshots);
                 self.storage_image_live.extend(pending.storage_images);
             }
         }
@@ -115,11 +117,19 @@ impl ResourcePools {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);
         }
+        for s in self.attachment_snapshot_free.drain() {
+            device.destroy_image_view(s.view, None);
+            device.destroy_image(s.image, None);
+        }
         for img in self.target_free.drain() {
             device.destroy_image_view(img.view, None);
             device.destroy_image(img.image, None);
         }
         for s in self.sampled_live.drain(..) {
+            device.destroy_image_view(s.view, None);
+            device.destroy_image(s.image, None);
+        }
+        for s in self.attachment_snapshot_live.drain(..) {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);
         }

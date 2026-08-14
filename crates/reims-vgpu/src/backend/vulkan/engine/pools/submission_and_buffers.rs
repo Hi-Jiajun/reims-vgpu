@@ -82,7 +82,11 @@ mod sampled_identity_switch {
 
 impl ResourcePools {
     pub(crate) fn guest_reset_counts(&self) -> (usize, usize, usize, usize) {
-        let sampled = self.sampled_live.len() + self.sampled_free.len() + self.sampled_cache.len();
+        let sampled = self.sampled_live.len()
+            + self.sampled_free.len()
+            + self.sampled_cache.len()
+            + self.attachment_snapshot_live.len()
+            + self.attachment_snapshot_free.len();
         let storage = self.storage_image_live.len()
             + self.storage_image_free.len()
             + self.compute_storage_registry.len();
@@ -153,6 +157,11 @@ impl ResourcePools {
             readback_leased: Vec::new(),
             sampled_free: FreePool::new(SAMPLED_FREE_CAP_PER_KEY, SAMPLED_FREE_CAP_TOTAL),
             sampled_live: Vec::new(),
+            attachment_snapshot_free: FreePool::new(
+                ATTACHMENT_SNAPSHOT_FREE_CAP_PER_KEY,
+                ATTACHMENT_SNAPSHOT_FREE_CAP_TOTAL,
+            ),
+            attachment_snapshot_live: Vec::new(),
             sampled_cache: Vec::new(),
             sampled_cache_bytes: 0,
             sampled_victims: std::collections::VecDeque::new(),
@@ -282,6 +291,13 @@ impl ResourcePools {
         trim_buffers: bool,
     ) -> usize {
         let mut trimmed = 0;
+        while trimmed < max {
+            let Some(slot) = self.attachment_snapshot_free.pop_any() else {
+                break;
+            };
+            self.destroy_deferred_handle(device, DeferredHandle::RecycleSampled(slot));
+            trimmed += 1;
+        }
         while trimmed < max {
             let Some(slot) = self.sampled_free.pop_any() else {
                 break;
@@ -648,11 +664,18 @@ impl ResourcePools {
         // one policy, one call site, so the two cannot drift apart again.
     }
 
-    /// Cumulative sampled-cache pool recycle diagnostics:
+    /// Cumulative transient sampled/snapshot pool recycle diagnostics:
     /// `(free_hits, free_allocs, recycle_admits, recycle_cap_drops)`.
     /// Merged into `CounterSnapshot` by `engine::counter_snapshot`.
     pub(crate) fn recycle_stats(&self) -> (u64, u64, u64, u64) {
-        self.sampled_free.stats()
+        let sampled = self.sampled_free.stats();
+        let snapshots = self.attachment_snapshot_free.stats();
+        (
+            sampled.0 + snapshots.0,
+            sampled.1 + snapshots.1,
+            sampled.2 + snapshots.2,
+            sampled.3 + snapshots.3,
+        )
     }
 
     pub(crate) unsafe fn ensure_init(
@@ -1565,6 +1588,7 @@ impl ResourcePools {
                 gather: std::mem::take(&mut self.gather_live),
                 readback,
                 sampled,
+                attachment_snapshots: std::mem::take(&mut self.attachment_snapshot_live),
                 storage_images: std::mem::take(&mut self.storage_image_live),
             },
             admissions,
@@ -2445,6 +2469,11 @@ impl ResourcePools {
                 self.destroy_deferred_handle(device, DeferredHandle::RecycleSampled(slot));
             }
         }
+        for slot in pending.attachment_snapshots.drain(..) {
+            if let Some(slot) = self.attachment_snapshot_free.admit(slot.key(), slot) {
+                self.destroy_deferred_handle(device, DeferredHandle::RecycleSampled(slot));
+            }
+        }
         for slot in pending.storage_images.drain(..) {
             // Respect the per-key + global cap (mirrors the sampled retire path
             // above). This path previously pushed unconditionally, so an all-new-
@@ -3300,6 +3329,32 @@ impl ResourcePools {
         sk: SampledKey,
         counters: &EngineCounters,
     ) -> Result<SampledSlot, DrawError> {
+        unsafe { self.acquire_sampled_for(ctx, sk, counters, SampledTransientUse::Upload) }
+    }
+
+    pub(crate) unsafe fn acquire_attachment_snapshot(
+        &mut self,
+        ctx: &DeviceContext,
+        sk: SampledKey,
+        counters: &EngineCounters,
+    ) -> Result<SampledSlot, DrawError> {
+        unsafe {
+            self.acquire_sampled_for(
+                ctx,
+                sk,
+                counters,
+                SampledTransientUse::AttachmentSnapshot,
+            )
+        }
+    }
+
+    unsafe fn acquire_sampled_for(
+        &mut self,
+        ctx: &DeviceContext,
+        sk: SampledKey,
+        counters: &EngineCounters,
+        use_: SampledTransientUse,
+    ) -> Result<SampledSlot, DrawError> {
         let SampledKey {
             width,
             height,
@@ -3315,9 +3370,18 @@ impl ResourcePools {
         // is counted here, at the empty free list, rather than after the create
         // succeeds: the census question is whether the pool had one, not whether
         // the fallback worked.
-        if let Some(slot) = self.sampled_free.take(&sk) {
+        let recycled = match use_ {
+            SampledTransientUse::Upload => self.sampled_free.take(&sk),
+            SampledTransientUse::AttachmentSnapshot => self.attachment_snapshot_free.take(&sk),
+        };
+        if let Some(slot) = recycled {
             let handles = slot.handles();
-            self.sampled_live.push(slot);
+            match use_ {
+                SampledTransientUse::Upload => self.sampled_live.push(slot),
+                SampledTransientUse::AttachmentSnapshot => {
+                    self.attachment_snapshot_live.push(slot)
+                }
+            }
             return Ok(handles);
         }
         let image_type = if one_dim {
@@ -3426,7 +3490,12 @@ impl ResourcePools {
             swizzle,
         };
         let handles = slot.handles();
-        self.sampled_live.push(slot);
+        match use_ {
+            SampledTransientUse::Upload => self.sampled_live.push(slot),
+            SampledTransientUse::AttachmentSnapshot => {
+                self.attachment_snapshot_live.push(slot)
+            }
+        }
         Ok(handles)
     }
 
@@ -3725,6 +3794,10 @@ impl ResourcePools {
         for slot in self.sampled_live.drain(..) {
             let sk = slot.key();
             self.sampled_free.push_uncapped(sk, slot);
+        }
+        for slot in self.attachment_snapshot_live.drain(..) {
+            let sk = slot.key();
+            self.attachment_snapshot_free.push_uncapped(sk, slot);
         }
     }
 }
@@ -4545,6 +4618,60 @@ mod recycle_tests {
         );
     }
 
+    /// Attachment feedback returns one scratch image per distinct attachment
+    /// and draw when a batch retires. All attachments may share one geometry,
+    /// so the dedicated pool must absorb the complete max-sized population
+    /// under one key without consuming the general sampled pool.
+    #[test]
+    fn attachment_snapshot_pool_holds_one_complete_batch_per_key() {
+        let mut pools = ResourcePools::new();
+        let key = null_slot(1920, 1080).key();
+        for draw in 0..ATTACHMENT_SNAPSHOT_FREE_CAP_PER_KEY {
+            assert!(
+                pools
+                    .attachment_snapshot_free
+                    .admit(key, null_slot(1920, 1080))
+                    .is_none(),
+                "draw {draw} of a complete batch must be retained"
+            );
+        }
+        assert_eq!(
+            pools.attachment_snapshot_free.count_for(&key),
+            BATCH_MAX_DRAWS as usize
+                * (crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS + 1)
+        );
+        assert!(
+            pools
+                .attachment_snapshot_free
+                .admit(key, null_slot(1920, 1080))
+                .is_some(),
+            "nothing beyond one command buffer can serve the next batch"
+        );
+        assert_eq!(pools.sampled_free.len(), 0, "lifecycles stay separate");
+    }
+
+    /// The total snapshot bound is the complete decoded attachment population
+    /// of one maximum batch, not a historical count. Distinct geometries drive
+    /// the global side so this would fail if only the per-key relation held.
+    #[test]
+    fn attachment_snapshot_pool_total_is_one_full_attachment_batch() {
+        let mut pool = FreePool::new(
+            ATTACHMENT_SNAPSHOT_FREE_CAP_PER_KEY,
+            ATTACHMENT_SNAPSHOT_FREE_CAP_TOTAL,
+        );
+        for i in 0..ATTACHMENT_SNAPSHOT_FREE_CAP_TOTAL {
+            let slot = null_slot(16 + i as u32, 16);
+            assert!(pool.admit(slot.key(), slot).is_none());
+        }
+        let over = null_slot(16 + ATTACHMENT_SNAPSHOT_FREE_CAP_TOTAL as u32, 16);
+        assert!(pool.admit(over.key(), over).is_some());
+        assert_eq!(
+            pool.len(),
+            BATCH_MAX_DRAWS as usize
+                * (crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS + 1)
+        );
+    }
+
     /// `target_free` has the same global cap for the same reason.
     #[test]
     fn target_free_global_cap_bounds_a_diverse_burst() {
@@ -5255,6 +5382,7 @@ mod recycle_tests {
                 gather: Vec::new(),
                 readback: Vec::new(),
                 sampled: Vec::new(),
+                attachment_snapshots: Vec::new(),
                 storage_images: Vec::new(),
             }),
             span: super::gpu_span::SlotSpan::Idle,

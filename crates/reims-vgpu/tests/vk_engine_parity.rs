@@ -1240,6 +1240,23 @@ fn resident_sample_alias_uses_gpu_snapshot_without_roundtrip() {
         volume: false,
         cube: false,
         one_dim: false,
+        source: SampledSource::Target(identity.clone()),
+        byte_origin: Default::default(),
+        format: ash::vk::Format::R8G8B8A8_UNORM,
+        identity: None,
+        swizzle: Default::default(),
+    });
+    alias.sampled_images.push(SampledImageResource {
+        binding: 2,
+        array_element: 0,
+        descriptor_count: 1,
+        width: 16,
+        height: 16,
+        layers: 1,
+        arrayed: false,
+        volume: false,
+        cube: false,
+        one_dim: false,
         source: SampledSource::Target(identity),
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
@@ -1251,7 +1268,11 @@ fn resident_sample_alias_uses_gpu_snapshot_without_roundtrip() {
     let out = engine::execute_draw_request(&alias).expect("resident alias GPU snapshot");
     assert_fullscreen_fragment_color("resident_sample_alias", &semantic_rgba(&out), 16, 16);
     let delta = engine::counter_snapshot().delta_since(&before);
-    assert_eq!(delta.sampled_gpu_binds, 1, "GPU snapshot proxy: {delta:?}");
+    assert_eq!(delta.sampled_gpu_binds, 2, "GPU snapshot proxy: {delta:?}");
+    assert_eq!(
+        delta.sampled_free_allocs, 1,
+        "two bindings of one attachment/key share one snapshot image: {delta:?}"
+    );
     assert_eq!(delta.sampled_reuploads, 0, "no host reupload: {delta:?}");
     assert_eq!(delta.readbacks, 1, "only target readback: {delta:?}");
 }
