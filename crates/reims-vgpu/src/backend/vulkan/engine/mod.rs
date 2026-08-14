@@ -319,7 +319,10 @@ const CAP_MAX_DIMENSION_BITS: u32 = u32::BITS;
 const CAP_LAYOUT_SHIFT: u32 = CAP_MAX_DIMENSION_BITS;
 const CAP_GPU_ONLY_BIT: u32 =
     CAP_LAYOUT_SHIFT + crate::contract::pixel_format::TexelLayout::ALL.len() as u32;
-const _: () = assert!(CAP_GPU_ONLY_BIT < u64::BITS);
+const CAP_SAMPLED_FILTER_SHIFT: u32 = CAP_GPU_ONLY_BIT + 1;
+const CAP_PUBLISHED_BIT: u32 =
+    CAP_SAMPLED_FILTER_SHIFT + crate::contract::pixel_format::TexelLayout::ALL.len() as u32;
+const _: () = assert!(CAP_PUBLISHED_BIT < u64::BITS);
 
 impl DeviceCapabilitySnapshot {
     const CONSERVATIVE: Self =
@@ -342,6 +345,12 @@ impl DeviceCapabilitySnapshot {
         if !quirks.guest_pages_stay_authoritative {
             word |= 1_u64 << CAP_GPU_ONLY_BIT;
         }
+        for (index, supported) in features.sampled_linear_filter.iter().enumerate() {
+            if *supported {
+                word |= 1_u64 << (CAP_SAMPLED_FILTER_SHIFT + index as u32);
+            }
+        }
+        word |= 1_u64 << CAP_PUBLISHED_BIT;
         Self(word)
     }
 
@@ -358,6 +367,14 @@ impl DeviceCapabilitySnapshot {
 
     fn deferred_gpu_only_content_allowed(self) -> bool {
         self.0 & (1_u64 << CAP_GPU_ONLY_BIT) != 0
+    }
+
+    fn sampled_layout_linear_filter_if_published(
+        self,
+        layout: crate::contract::pixel_format::TexelLayout,
+    ) -> Option<bool> {
+        (self.0 & (1_u64 << CAP_PUBLISHED_BIT) != 0)
+            .then_some(self.0 & (1_u64 << (CAP_SAMPLED_FILTER_SHIFT + layout.index() as u32)) != 0)
     }
 }
 
@@ -392,6 +409,10 @@ mod device_capability_snapshot_tests {
         );
         assert!(!snapshot.render_target_layout_supported(TexelLayout::Rgba16Float));
         assert!(!snapshot.deferred_gpu_only_content_allowed());
+        assert_eq!(
+            snapshot.sampled_layout_linear_filter_if_published(TexelLayout::Rgba16Float),
+            None
+        );
     }
 
     #[test]
@@ -399,6 +420,7 @@ mod device_capability_snapshot_tests {
         let mut features = crate::backend::vulkan::caps::device_features::DeviceFeatures::default();
         features.max_image_dimension_2d = 16_384;
         features.color_attachment_blend[TexelLayout::Rgba16Float.index()] = true;
+        features.sampled_linear_filter[TexelLayout::Rgba16Float.index()] = true;
 
         let snapshot = DeviceCapabilitySnapshot::from_parts(
             &features,
@@ -408,6 +430,14 @@ mod device_capability_snapshot_tests {
         assert!(snapshot.render_target_layout_supported(TexelLayout::Rgba16Float));
         assert!(!snapshot.render_target_layout_supported(TexelLayout::Rg16Float));
         assert!(snapshot.deferred_gpu_only_content_allowed());
+        assert_eq!(
+            snapshot.sampled_layout_linear_filter_if_published(TexelLayout::Rgba16Float),
+            Some(true)
+        );
+        assert_eq!(
+            snapshot.sampled_layout_linear_filter_if_published(TexelLayout::Rg16Float),
+            Some(false)
+        );
 
         let narrowed = DeviceCapabilitySnapshot::from_parts(
             &features,
@@ -2003,6 +2033,14 @@ pub fn supports_storage_image_write_without_format() -> bool {
 pub fn supports_sampled_layout_linear_filter(
     layout: crate::contract::pixel_format::TexelLayout,
 ) -> bool {
+    if let Some(supported) = device_capabilities().sampled_layout_linear_filter_if_published(layout)
+    {
+        return supported;
+    }
+
+    // The first query is allowed to create the device. Publication happens as
+    // part of that creation, so every later query for its lifetime is the
+    // lock-free immutable answer above.
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,

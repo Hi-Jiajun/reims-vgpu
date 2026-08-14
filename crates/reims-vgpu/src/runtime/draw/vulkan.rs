@@ -4270,11 +4270,10 @@ fn native_scratch_to_upload(
 /// `SAMPLED_IMAGE_FILTER_LINEAR` on every Vulkan implementation by mandate, and
 /// the rail that first took it argues the same.
 ///
-/// **Keyed on the format so the common one never takes the engine lock.**
-/// `supports_sampled_layout_linear_filter` locks the engine and this sits on
-/// the rung carrying essentially all of the pathway's sampled traffic; asking
-/// it unconditionally would put two lock acquisitions on every memo miss to
-/// answer a question only two guest formats can make use of.
+/// **Keyed on the format so the common one never asks an irrelevant question.**
+/// The host capability is a lock-free device-lifetime snapshot, but this sits
+/// on the rung carrying essentially all of the pathway's sampled traffic and
+/// only two guest formats can make use of the answer.
 /// [`pixel_format::narrows_to_unorm8`] is exactly the set of formats whose CPU
 /// arm is lossy, which is exactly the set the half-float flag can change the
 /// answer for — so keying on it is the same rule stated once, not a fast path
