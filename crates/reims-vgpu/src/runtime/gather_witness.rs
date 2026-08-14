@@ -600,51 +600,23 @@ impl GatherWitness {
 /// permutation of a window unchanged, and a scrolled tile atlas is exactly a
 /// permutation of itself.
 ///
-/// Shared with [`super::buffer_gather_freshness`], which audits the buffer rail
-/// against the guest's declarations rather than against this witness. One fold
-/// and not two: a second implementation would be a second place for "the bytes
-/// did not move" to mean something slightly different, in the one direction
-/// where being wrong serves a stale frame.
-///
 /// # Safety
 /// Every run's `host_ptr` must be a live mapping of at least `len` bytes — the
 /// same precondition the gather itself relies on, read at the same point in the
 /// draw.
 pub(crate) unsafe fn fold_runs(runs: &[crate::backend::vulkan::engine::GuestRun], span: u64) -> u128 {
-    // SAFETY: forwarded from this function's own precondition.
-    unsafe { fold_runs_from(runs, 0, span) }
-}
-
-/// [`fold_runs`] over a subrange of one retained source.
-///
-/// # Safety
-/// Same as [`fold_runs`]. `offset + span` must fit in the runs.
-pub(crate) unsafe fn fold_runs_from(
-    runs: &[crate::backend::vulkan::engine::GuestRun],
-    offset: u64,
-    span: u64,
-) -> u128 {
     let mut a: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut b: u64 = 0xc2b2_ae3d_27d4_eb4f;
     let mut remaining = span;
-    let mut skip = offset;
     for run in runs {
         if remaining == 0 {
             break;
         }
-        if skip >= run.len {
-            skip -= run.len;
-            continue;
-        }
-        let within = skip as usize;
-        skip = 0;
-        let n = (run.len - within as u64).min(remaining) as usize;
+        let n = run.len.min(remaining) as usize;
         remaining -= n as u64;
         // SAFETY: caller's precondition — `host_ptr` is a stable RAMBlock alias
         // valid for at least `run.len` bytes, and `n <= run.len`.
-        let bytes = unsafe {
-            std::slice::from_raw_parts((run.host_ptr as *const u8).add(within), n)
-        };
+        let bytes = unsafe { std::slice::from_raw_parts(run.host_ptr as *const u8, n) };
         let (words, tail) = bytes.split_at(n & !7);
         for chunk in words.chunks_exact(8) {
             let w = u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8) yields 8 bytes"));
@@ -2026,15 +1998,5 @@ mod tests {
         let short = unsafe { fold_runs(&[run_over(&buf)], 64) };
         let head = vec![3u8; 64];
         assert_eq!(short, unsafe { fold_runs(&[run_over(&head)], 64) });
-    }
-
-    #[test]
-    fn the_fold_can_start_inside_a_retained_source() {
-        let buf: Vec<u8> = (0..128).collect();
-        let suffix = buf[48..80].to_vec();
-        assert_eq!(
-            unsafe { fold_runs_from(&[run_over(&buf)], 48, 32) },
-            unsafe { fold_runs(&[run_over(&suffix)], 32) }
-        );
     }
 }

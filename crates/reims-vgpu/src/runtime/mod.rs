@@ -11,12 +11,7 @@ pub mod blit_exec;
 /// guest moves the addresses under them.
 #[cfg(feature = "backend-vulkan")]
 pub mod bound_buffers;
-/// Whether the gathers the buffer rail repeats land on bytes the guest declared
-/// it changed. Gated with the rail it measures: it folds a
-/// `backend::vulkan::engine::GuestRun`, which the Metal arm has no equivalent
-/// of, and the producer it charges is the Vulkan draw path.
-#[cfg(feature = "backend-vulkan")]
-pub mod buffer_gather_freshness;
+/// Guest-declared write generations for task-local GVA resources.
 pub mod buffer_write_gen;
 /// Always-on proxies and censuses, one per measured bug class.
 pub mod census;
