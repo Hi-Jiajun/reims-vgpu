@@ -185,11 +185,14 @@ fn batched_draws_compose_and_flush_on_read() {
     }
 }
 
-/// Two LOAD draws from one decoded Metal render encoder retain one Vulkan pass
-/// instance. The priming draw gives the resident defined contents so both test
-/// draws use the same LOAD render-pass object; the continuation counter makes
-/// this fail if they regress to two begin/end pairs while the pixel check keeps
-/// the optimized recording honest.
+/// The first and second draws from one decoded Metal render encoder retain one
+/// Vulkan pass instance even though the serialized continuation forces the
+/// second record's load action to LOAD. Load/store actions describe how a pass
+/// instance begins and ends; they do not make otherwise-identical render passes
+/// incompatible, and the second record never begins a pass when the first one
+/// remains open. The continuation counter makes this fail if the load-action
+/// rewrite regresses to two begin/end pairs, while the pixel check keeps the
+/// optimized recording honest.
 #[test]
 fn one_metal_encoder_continues_one_vulkan_render_pass() {
     let _guard = engine_test_lock().lock().unwrap();
@@ -202,8 +205,10 @@ fn one_metal_encoder_continues_one_vulkan_render_pass() {
         format: SURFACE_TEST_FORMAT,
     };
 
-    let prime = batch_req(&vert, &frag, &identity, false, half_scissor(true));
-    match engine::execute_draw_request(&prime) {
+    let before = engine::counter_snapshot();
+    let mut first = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    first.render_pass_continues = true;
+    match engine::execute_draw_request(&first) {
         Ok(_) => {}
         Err(e) => {
             let msg = e.to_string();
@@ -211,15 +216,9 @@ fn one_metal_encoder_continues_one_vulkan_render_pass() {
                 eprintln!("skipping: {msg}");
                 return;
             }
-            panic!("priming draw: {msg}");
+            panic!("encoder first draw: {msg}");
         }
     }
-    engine::read_target(&identity).expect("prime resident");
-
-    let before = engine::counter_snapshot();
-    let mut first = batch_req(&vert, &frag, &identity, true, half_scissor(true));
-    first.render_pass_continues = true;
-    engine::execute_draw_request(&first).expect("encoder first draw");
 
     let mut second = batch_req(&vert, &frag, &identity, true, half_scissor(false));
     second.continues_render_pass = true;

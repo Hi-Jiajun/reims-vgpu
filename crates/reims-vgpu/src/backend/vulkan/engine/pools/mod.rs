@@ -10,6 +10,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use super::buffer_slab::{BufferSlabToken, BUFFER_SLAB_IDLE_KEEP_EMPTY};
+use super::caches::PassCompatibilityKey;
 use super::compute_execution::ComputeExecutionDecline;
 use super::context::{DeviceContext, DrawSpanProbe, TimestampProbe, FENCE_TIMEOUT_NS};
 use super::counters::EngineCounters;
@@ -662,10 +663,11 @@ pub(crate) enum BatchFit {
 ///
 /// A draw in the same decoded Metal render encoder can stay inside this pass
 /// when its predecessor left it open and no Vulkan command that must be outside
-/// a pass intervened. `pass` and `fb` are what make two passes the same instance
-/// — a `CLEAR` joiner gets a different `pass` from a `LOAD` one, which is why the
-/// handle is compared rather than the target identity that decides batching.
-/// `area` is the render area, which must agree for the same reason.
+/// a pass intervened. `compatibility` and `fb` are what make two requests name
+/// the same instance. Load/store actions are excluded: they apply only when an
+/// instance begins or ends, and Vulkan explicitly permits a pipeline and
+/// framebuffer created against any compatible render pass. `area` is the
+/// render area, which must agree for the same reason.
 ///
 /// `cb` is carried because a command buffer handle is recycled: an echo left
 /// behind by the previous user of this handle names a pass that was ended and
@@ -674,7 +676,7 @@ pub(crate) enum BatchFit {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PassEcho {
     pub(crate) cb: vk::CommandBuffer,
-    pub(crate) pass: vk::RenderPass,
+    pub(crate) compatibility: PassCompatibilityKey,
     pub(crate) fb: vk::Framebuffer,
     pub(crate) area: (u32, u32),
 }
@@ -1563,6 +1565,7 @@ pub(crate) struct ResidentTargetSlot {
     pub view: vk::ImageView,
     pub framebuffer: vk::Framebuffer,
     pub render_pass: vk::RenderPass,
+    pub framebuffer_compatibility: Option<PassCompatibilityKey>,
     pub width: u32,
     pub height: u32,
     pub generation: u64,
@@ -3910,6 +3913,7 @@ mod resident_reuse_tests {
             view: vk::ImageView::null(),
             framebuffer: vk::Framebuffer::null(),
             render_pass: vk::RenderPass::null(),
+            framebuffer_compatibility: None,
             width,
             height,
             generation,

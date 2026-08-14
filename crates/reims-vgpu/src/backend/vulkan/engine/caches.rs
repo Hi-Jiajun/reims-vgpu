@@ -204,6 +204,27 @@ impl PassKey {
         index < u8::BITS as usize && self.feedback_colors & (1u8 << index) != 0
     }
 
+    /// The part of a render pass that Vulkan requires to agree for pipeline,
+    /// framebuffer, and in-instance compatibility.
+    ///
+    /// Load actions describe how a newly begun pass obtains attachment
+    /// contents; they are deliberately excluded. A serialized render encoder
+    /// rewrites a continuation segment to LOAD, but an uninterrupted segment
+    /// remains inside the pass begun with the encoder's original action. Store
+    /// actions and initial/final layouts are functions of these same fields in
+    /// this backend, so there is no second compatibility spelling to normalize.
+    pub(crate) fn compatibility(self) -> PassCompatibilityKey {
+        let mut key = self;
+        key.load_seed = false;
+        for secondary in &mut key.secondary {
+            secondary.load = false;
+        }
+        if let Some(depth) = &mut key.depth {
+            depth.load = false;
+        }
+        PassCompatibilityKey(key)
+    }
+
     pub(crate) fn color_layout(self, index: usize) -> vk::ImageLayout {
         if self.color_feedback(index) {
             vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
@@ -222,6 +243,26 @@ impl PassKey {
         } else {
             COLOR0_PASS_EXIT_LAYOUT
         }
+    }
+}
+
+/// A normalized [`PassKey`] containing exactly Vulkan render-pass
+/// compatibility state. Construction is private to [`PassKey::compatibility`]
+/// so a load action cannot accidentally enter a pipeline or framebuffer key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct PassCompatibilityKey(PassKey);
+
+impl PassCompatibilityKey {
+    pub(crate) fn secondary_count(self) -> usize {
+        self.0.secondary_count as usize
+    }
+
+    pub(crate) fn feedback_colors(self) -> u8 {
+        self.0.feedback_colors
+    }
+
+    pub(crate) fn has_depth(self) -> bool {
+        self.0.depth.is_some()
     }
 }
 
@@ -249,7 +290,7 @@ pub(crate) struct PipelineKey {
     /// pipelines. Vulkan's write mask is pipeline state with no dynamic
     /// spelling below `VK_EXT_extended_dynamic_state3`.
     pub color_write_mask: [ColorWriteMask; 1 + MAX_SECONDARY_ATTACH],
-    pub pass: PassKey,
+    pub pass: PassCompatibilityKey,
     /// Face culling. `None` (the 2D UI default) keeps the raster state at
     /// `CULL_NONE`, byte-identical to the pre-cull engine; the key still
     /// participates in hashing so a later culled draw with the same shaders gets
@@ -1848,7 +1889,7 @@ impl ObjectCaches {
             }
         };
         let mut blend_att = vec![attachment_blend(key.blend, key.color_write_mask[0])];
-        for slot in 0..key.pass.secondary_count as usize {
+        for slot in 0..key.pass.secondary_count() {
             blend_att.push(attachment_blend(
                 key.secondary_blend[slot],
                 key.color_write_mask[slot + 1],
@@ -1900,10 +1941,10 @@ impl ObjectCaches {
             .layout(pipeline_layout)
             .render_pass(render_pass)
             .subpass(0);
-        if key.pass.feedback_colors != 0 {
+        if key.pass.feedback_colors() != 0 {
             gpci = gpci.flags(vk::PipelineCreateFlags::COLOR_ATTACHMENT_FEEDBACK_LOOP_EXT);
         }
-        if key.pass.depth.is_some() {
+        if key.pass.has_depth() {
             gpci = gpci.depth_stencil_state(&depth_stencil);
         }
         // The third call that compiles a module this device assembled, and the
@@ -2018,6 +2059,42 @@ impl ObjectCaches {
 #[cfg(test)]
 mod object_cache_tests {
     use super::*;
+
+    /// Vulkan render-pass compatibility excludes load/store actions but retains
+    /// attachment formats and subpass shape. This is the relation shared by
+    /// pipeline caching, framebuffer reuse, and an encoder continuation; if one
+    /// consumer grows its own approximation, the three disagree again.
+    #[test]
+    fn pass_compatibility_ignores_only_load_actions() {
+        let mut clear = PassKey::single(false, vk::Format::B8G8R8A8_UNORM);
+        clear.secondary_count = 1;
+        clear.secondary[0] = SecondaryAttachKey {
+            format: vk::Format::R16G16_SFLOAT,
+            load: false,
+        };
+        clear.depth = Some(DepthAttachKey {
+            load: false,
+            stencil: true,
+        });
+
+        let mut load = clear;
+        load.load_seed = true;
+        load.secondary[0].load = true;
+        load.depth.as_mut().unwrap().load = true;
+        assert_eq!(clear.compatibility(), load.compatibility());
+
+        let mut different_format = load;
+        different_format.secondary[0].format = vk::Format::R32_SFLOAT;
+        assert_ne!(clear.compatibility(), different_format.compatibility());
+
+        let mut different_subpass = load;
+        different_subpass.color_input = true;
+        assert_ne!(clear.compatibility(), different_subpass.compatibility());
+
+        let mut different_depth = load;
+        different_depth.depth.as_mut().unwrap().stencil = false;
+        assert_ne!(clear.compatibility(), different_depth.compatibility());
+    }
 
     #[test]
     fn layout_bindings_coalesce_array_elements_and_refuse_conflicting_shapes() {

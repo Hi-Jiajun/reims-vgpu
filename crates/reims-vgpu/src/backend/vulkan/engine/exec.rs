@@ -2892,7 +2892,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 }
                 per_slot
             },
-            pass: pass_key,
+            pass: pass_key.compatibility(),
             cull_mode: req.cull_mode,
             front_face_ccw: req.front_face_ccw,
             fill_mode: req.fill_mode,
@@ -3159,12 +3159,15 @@ pub(crate) unsafe fn execute_draw_inner(
     // two answers it feeds have to agree: which pass the slot is ensured under,
     // and whether the draw builds (and later disposes) a framebuffer of its own.
     let ad_hoc_framebuffer = is_mrt || req.depth.is_some() || req.color_input;
-    let primary_pass = if ad_hoc_framebuffer {
+    let (primary_pass, primary_pass_compatibility) = if ad_hoc_framebuffer {
         let mut color_only = PassKey::single(pass_key.load_seed, pass_key.color0_format);
         color_only.host_accessible_color0 = pass_key.host_accessible_color0;
-        caches.get_or_create_pass(ctx, color_only, counters, pools)?
+        (
+            caches.get_or_create_pass(ctx, color_only, counters, pools)?,
+            color_only.compatibility(),
+        )
     } else {
-        render_pass
+        (render_pass, pass_key.compatibility())
     };
     phase.enter(super::draw_phase::Phase::Acquire);
     // (identity, image, tracked-layout-before-this-draw) per secondary — used
@@ -3202,6 +3205,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 req.width,
                 req.height,
                 primary_pass,
+                primary_pass_compatibility,
                 gen,
                 color0_format,
                 req.guest_target_memory.clone(),
@@ -3857,7 +3861,7 @@ pub(crate) unsafe fn execute_draw_inner(
     let mut outside_pass = PassObstacles::default();
     let echo = super::pools::PassEcho {
         cb,
-        pass: render_pass,
+        compatibility: pass_key.compatibility(),
         fb: target_fb,
         area: (req.width, req.height),
     };

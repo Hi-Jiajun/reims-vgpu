@@ -150,10 +150,13 @@ struct NewResident {
     /// [`ResidentTargetSlot::owed_framebuffer`], which is what every destroy
     /// path asks instead of testing this field itself.
     framebuffer: vk::Framebuffer,
-    /// Null exactly when `framebuffer` is: the pass a per-slot framebuffer was
-    /// built against, and the thing `registry_ensure` compares to decide
-    /// whether a reused image needs its framebuffer rebuilt.
+    /// Null exactly when `framebuffer` is: the pass handle used to create the
+    /// per-slot framebuffer. Compatibility, not handle identity, decides reuse.
     render_pass: vk::RenderPass,
+    /// `None` exactly when `framebuffer` is null. Unlike the creation handle,
+    /// this is the Vulkan compatibility identity: a load-action-only change can
+    /// reuse the framebuffer rather than replacing it between encoder records.
+    framebuffer_compatibility: Option<PassCompatibilityKey>,
     width: u32,
     height: u32,
     generation: u64,
@@ -836,6 +839,7 @@ impl ResourcePools {
                 view: new.view,
                 framebuffer: new.framebuffer,
                 render_pass: new.render_pass,
+                framebuffer_compatibility: new.framebuffer_compatibility,
                 width: new.width,
                 height: new.height,
                 generation: new.generation,
@@ -919,8 +923,9 @@ impl ResourcePools {
     }
 
     /// Ensure a resident target exists for `identity` with the given geometry + pass.
-    /// Image/memory persist across Load vs Clear render-pass changes; only the
-    /// framebuffer is rebuilt when the pass handle differs.
+    /// Image, memory, and framebuffer persist across compatible render-pass
+    /// changes. In particular, LOAD versus CLEAR does not rebuild a framebuffer;
+    /// formats and subpass attachment shape still partition it.
     ///
     /// This used to take a `protect` identity — a same-draw GPU seed source to
     /// shield from the capacity sweep the admission ran. Nothing is swept on
@@ -937,6 +942,7 @@ impl ResourcePools {
         width: u32,
         height: u32,
         render_pass: vk::RenderPass,
+        framebuffer_compatibility: PassCompatibilityKey,
         generation: u64,
         format: vk::Format,
         guest_memory: Option<crate::backend::vulkan::engine::GuestTargetMemory>,
@@ -947,12 +953,13 @@ impl ResourcePools {
         // the pass it is attached to must name one format, and deriving it
         // twice from a shared input is how they drift apart.
         //
-        // Compatible geometry + gen + format: reuse image; rebuild FB if pass
-        // changed. A format change must recreate the image, not just the
-        // framebuffer — an RGBA image under a BGRA pass is invalid.
+        // Compatible geometry + gen + format: reuse image; rebuild the FB only
+        // if Vulkan render-pass compatibility changed. A format change must
+        // recreate the image, not just the framebuffer — an RGBA image under a
+        // BGRA pass is invalid.
         if let Some(slot) = self.registry.get(&identity) {
             if slot.reusable_for(width, height, generation, format) {
-                if slot.render_pass == render_pass {
+                if slot.framebuffer_compatibility == Some(framebuffer_compatibility) {
                     counters
                         .gpu_load_hits
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -984,6 +991,7 @@ impl ResourcePools {
                 let slot = self.registry.get_mut(&identity).unwrap();
                 slot.framebuffer = framebuffer;
                 slot.render_pass = render_pass;
+                slot.framebuffer_compatibility = Some(framebuffer_compatibility);
                 counters
                     .gpu_load_hits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1211,6 +1219,7 @@ impl ResourcePools {
                 view,
                 framebuffer,
                 render_pass,
+                framebuffer_compatibility: Some(framebuffer_compatibility),
                 width,
                 height,
                 generation,
@@ -1356,6 +1365,7 @@ impl ResourcePools {
                 // MRT framebuffer, or sampled through the view.
                 framebuffer: vk::Framebuffer::null(),
                 render_pass: vk::RenderPass::null(),
+                framebuffer_compatibility: None,
                 width,
                 height,
                 generation,
@@ -2361,6 +2371,7 @@ pub(super) mod pin_count_tests {
             view: vk::ImageView::null(),
             framebuffer: vk::Framebuffer::null(),
             render_pass: vk::RenderPass::null(),
+            framebuffer_compatibility: None,
             width: 16,
             height: 16,
             generation: 1,
@@ -2576,12 +2587,20 @@ pub(super) mod pin_count_tests {
     /// parameters: `registry_ensure` passes a real framebuffer and the pass it
     /// was built against, `registry_ensure_attachment` passes neither.
     fn new_resident(framebuffer: vk::Framebuffer, render_pass: vk::RenderPass) -> NewResident {
+        let framebuffer_compatibility = (framebuffer != vk::Framebuffer::null()).then(|| {
+            crate::backend::vulkan::engine::caches::PassKey::single(
+                false,
+                translate::pixel::SCANOUT_FORMAT,
+            )
+            .compatibility()
+        });
         NewResident {
             image: vk::Image::null(),
             memory: ResidentMemory::Recyclable(vk::DeviceMemory::null()),
             view: vk::ImageView::null(),
             framebuffer,
             render_pass,
+            framebuffer_compatibility,
             width: 16,
             height: 16,
             generation: 1,
