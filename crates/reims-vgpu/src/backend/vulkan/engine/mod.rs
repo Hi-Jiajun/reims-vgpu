@@ -268,6 +268,7 @@ impl EngineState {
     /// takes it and publishes that it is gone, and
     /// `host_window::present::App::reattach_engine` is what builds it again.
     fn flush_device_derived(&mut self) {
+        clear_device_capabilities();
         RESIDENT_RESOURCE_EPOCH.fetch_add(1, Ordering::Release);
         // Taken and published unconditionally, before anything fallible. The
         // presenter's swapchain, surface and semaphores were made against the
@@ -300,6 +301,127 @@ impl EngineState {
 }
 
 static ENGINE: Lazy<Mutex<EngineState>> = Lazy::new(|| Mutex::new(EngineState::new()));
+
+/// Lock-free publication of the immutable answers attached to the current
+/// Vulkan device.
+///
+/// These values are read while a draw request is being assembled, before the
+/// request enters [`execute_draw_request`]'s engine transaction. Taking the
+/// global engine lock for each answer serialized ordinary CPU preparation with
+/// presentation even though none of the answers can change while that device
+/// exists. One packed word makes publication atomic across device replacement:
+/// readers see either the old device, the conservative no-device snapshot, or
+/// the newly created device, never a mixture of their fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeviceCapabilitySnapshot(u64);
+
+const CAP_MAX_DIMENSION_BITS: u32 = u32::BITS;
+const CAP_LAYOUT_SHIFT: u32 = CAP_MAX_DIMENSION_BITS;
+const CAP_GPU_ONLY_BIT: u32 =
+    CAP_LAYOUT_SHIFT + crate::contract::pixel_format::TexelLayout::ALL.len() as u32;
+const _: () = assert!(CAP_GPU_ONLY_BIT < u64::BITS);
+
+impl DeviceCapabilitySnapshot {
+    const CONSERVATIVE: Self = Self(
+        crate::backend::vulkan::caps::device_features::VULKAN_MIN_IMAGE_DIMENSION_2D as u64,
+    );
+
+    fn from_device(ctx: &context::DeviceContext) -> Self {
+        Self::from_parts(&ctx.features, ctx.caps.quirks)
+    }
+
+    fn from_parts(
+        features: &crate::backend::vulkan::caps::device_features::DeviceFeatures,
+        quirks: crate::backend::vulkan::caps::DriverQuirk,
+    ) -> Self {
+        let mut word = u64::from(features.max_image_dimension_2d);
+        for (index, supported) in features.color_attachment_blend.iter().enumerate() {
+            if *supported {
+                word |= 1_u64 << (CAP_LAYOUT_SHIFT + index as u32);
+            }
+        }
+        if !quirks.guest_pages_stay_authoritative {
+            word |= 1_u64 << CAP_GPU_ONLY_BIT;
+        }
+        Self(word)
+    }
+
+    fn max_render_target_dimension(self) -> u32 {
+        self.0 as u32
+    }
+
+    fn render_target_layout_supported(
+        self,
+        layout: crate::contract::pixel_format::TexelLayout,
+    ) -> bool {
+        self.0 & (1_u64 << (CAP_LAYOUT_SHIFT + layout.index() as u32)) != 0
+    }
+
+    fn deferred_gpu_only_content_allowed(self) -> bool {
+        self.0 & (1_u64 << CAP_GPU_ONLY_BIT) != 0
+    }
+}
+
+static DEVICE_CAPABILITIES: AtomicU64 =
+    AtomicU64::new(DeviceCapabilitySnapshot::CONSERVATIVE.0);
+
+fn device_capabilities() -> DeviceCapabilitySnapshot {
+    DeviceCapabilitySnapshot(DEVICE_CAPABILITIES.load(Ordering::Acquire))
+}
+
+pub(super) fn publish_device_capabilities(ctx: &context::DeviceContext) {
+    DEVICE_CAPABILITIES.store(DeviceCapabilitySnapshot::from_device(ctx).0, Ordering::Release);
+}
+
+fn clear_device_capabilities() {
+    DEVICE_CAPABILITIES.store(
+        DeviceCapabilitySnapshot::CONSERVATIVE.0,
+        Ordering::Release,
+    );
+}
+
+#[cfg(test)]
+mod device_capability_snapshot_tests {
+    use super::*;
+    use crate::contract::pixel_format::TexelLayout;
+
+    #[test]
+    fn the_no_device_snapshot_is_the_conservative_contract() {
+        let snapshot = DeviceCapabilitySnapshot::CONSERVATIVE;
+        assert_eq!(
+            snapshot.max_render_target_dimension(),
+            crate::backend::vulkan::caps::device_features::VULKAN_MIN_IMAGE_DIMENSION_2D
+        );
+        assert!(!snapshot.render_target_layout_supported(TexelLayout::Rgba16Float));
+        assert!(!snapshot.deferred_gpu_only_content_allowed());
+    }
+
+    #[test]
+    fn one_word_preserves_every_published_device_answer() {
+        let mut features =
+            crate::backend::vulkan::caps::device_features::DeviceFeatures::default();
+        features.max_image_dimension_2d = 16_384;
+        features.color_attachment_blend[TexelLayout::Rgba16Float.index()] = true;
+
+        let snapshot = DeviceCapabilitySnapshot::from_parts(
+            &features,
+            crate::backend::vulkan::caps::DriverQuirk::default(),
+        );
+        assert_eq!(snapshot.max_render_target_dimension(), 16_384);
+        assert!(snapshot.render_target_layout_supported(TexelLayout::Rgba16Float));
+        assert!(!snapshot.render_target_layout_supported(TexelLayout::Rg16Float));
+        assert!(snapshot.deferred_gpu_only_content_allowed());
+
+        let narrowed = DeviceCapabilitySnapshot::from_parts(
+            &features,
+            crate::backend::vulkan::caps::DriverQuirk {
+                guest_pages_stay_authoritative: true,
+                ..Default::default()
+            },
+        );
+        assert!(!narrowed.deferred_gpu_only_content_allowed());
+    }
+}
 
 /// Generation of the resident registry resource handles refer into.
 ///
@@ -1637,31 +1759,18 @@ pub fn render_target_layout_supported(layout: crate::contract::pixel_format::Tex
     if matches!(layout, TexelLayout::Rgba8 | TexelLayout::Bgra8) {
         return true;
     }
-    lock_engine()
-        .owner
-        .ctx
-        .as_ref()
-        .is_some_and(|ctx| ctx.features.color_attachment_blend[layout.index()])
+    device_capabilities().render_target_layout_supported(layout)
 }
 
 pub fn deferred_gpu_only_content_allowed() -> bool {
-    lock_engine()
-        .owner
-        .ctx
-        .as_ref()
-        .is_some_and(|ctx| !ctx.caps.quirks.guest_pages_stay_authoritative)
+    device_capabilities().deferred_gpu_only_content_allowed()
 }
 
 /// The largest render-target edge this host can create, from the device's own
 /// `maxImageDimension2D`. Before a device is resolved this is the Vulkan 1.2
 /// required minimum — the most any implementation is guaranteed to accept.
 pub fn max_render_target_dimension() -> u32 {
-    lock_engine()
-        .owner
-        .ctx
-        .as_ref()
-        .map(|ctx| ctx.features.max_image_dimension_2d)
-        .unwrap_or(crate::backend::vulkan::caps::device_features::VULKAN_MIN_IMAGE_DIMENSION_2D)
+    device_capabilities().max_render_target_dimension()
 }
 
 /// What this Vulkan device can execute, for the GPU-dependent half of the

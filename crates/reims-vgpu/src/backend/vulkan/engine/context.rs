@@ -1578,7 +1578,10 @@ impl ContextOwner {
         }
         if self.ctx.is_none() {
             match unsafe { DeviceContext::create() } {
-                Ok(c) => self.ctx = Some(c),
+                Ok(c) => {
+                    super::publish_device_capabilities(&c);
+                    self.ctx = Some(c);
+                }
                 Err(e) => {
                     self.note_init_failure(&e);
                     return Err(e);
@@ -1630,6 +1633,7 @@ impl ContextOwner {
         counters.recreates.fetch_add(1, Ordering::Relaxed);
         match unsafe { DeviceContext::create() } {
             Ok(c) => {
+                super::publish_device_capabilities(&c);
                 self.ctx = Some(c);
                 self.poisoned = false;
                 Ok(())
