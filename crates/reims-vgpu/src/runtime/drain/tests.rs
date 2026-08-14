@@ -513,21 +513,13 @@ fn replace_physical_drops_the_cached_page_list() {
         let m = state.mappings.get_mut(&7).unwrap();
         m.mapped = true;
         m.page_entries = vec![0x11, 0x22, 0x33];
+        m.type4_walk = Some(crate::model::Type4Walk {
+            task_id: 0,
+            backing_pfn: 0x20,
+            map_generation: m.map_generation,
+        });
     }
     let generation_before = state.mappings.get(&7).unwrap().map_generation;
-
-    // A type-11 texture registered under object-list *ref* 7 of the same task,
-    // naming a different mapping. Surface ids and object-list refs are separate
-    // id spaces that collide, so resolving this packet through the ref-keyed map
-    // would land on mapping 99 — invalidating a surface the guest never named
-    // and leaving stale the one it did.
-    state.map_surface(99);
-    {
-        let m = state.mappings.get_mut(&99).unwrap();
-        m.mapped = true;
-        m.page_entries = vec![0xaa];
-    }
-    state.texture_to_mapping.insert((0, 7), 99);
 
     let mut payload = vec![0u8; 8];
     payload[4..8].copy_from_slice(&7u32.to_le_bytes()); // {task 0, object 7}
@@ -558,26 +550,13 @@ fn replace_physical_drops_the_cached_page_list() {
         "dropping the list must bump the incarnation, which is what retires the \
          type-4 walk latch and any state keyed on it"
     );
-    assert_eq!(
-        state.mappings.get(&99).unwrap().page_entries,
-        vec![0xaa],
-        "the object id is a mapping id, not an object-list ref: a mapping that \
-         merely shares the ref must be left alone"
-    );
 }
 
-/// A re-point naming an object this device holds no *mapping* for still names
-/// something: a type-11 texture, through the object-list ref its task registered
-/// it under. That fallback is the packet family the arm used to drop entirely —
+/// A re-point naming a type-11 resource reaches the mapping associated with its
+/// task-local ref. This is the packet family the arm used to drop entirely —
 /// 57 % of the re-points on a driven boot found no mapping under `object_id` —
 /// and dropping it leaves the texture's page list trusted while it names pages
 /// that back something else.
-///
-/// The fallback is safe here and only here, because the direct reading found
-/// nothing: there is no surface under this id to misroute the packet away from.
-/// [`replace_physical_drops_the_cached_page_list`] holds the other half — when
-/// the direct reading *does* answer, the ref-keyed map must not be consulted at
-/// all.
 #[test]
 fn replace_physical_routes_through_the_texture_ref_when_no_mapping_owns_the_id() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -618,15 +597,24 @@ fn replace_physical_routes_through_the_texture_ref_when_no_mapping_owns_the_id()
     );
 }
 
-/// The ref-keyed fallback must not fire when the direct reading found a mapping
-/// but that mapping happened to have no resolved pages. "Nothing to drop" is not
-/// "nobody owns this id", and treating it as one would walk into exactly the
-/// misroute [`replace_physical_drops_the_cached_page_list`] guards.
+/// A same-number mapping owned by another task must not capture a task-local
+/// resource re-point. The association names mapping 99; mapping 7 merely shares
+/// its integer and has independent type-4 provenance.
 #[test]
-fn replace_physical_does_not_fall_back_when_the_named_mapping_is_merely_empty() {
+fn replace_physical_does_not_confuse_another_tasks_mapping_for_the_resource() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    state.map_surface(7); // exists, no page_entries
+    state.map_surface(7);
+    {
+        let m = state.mappings.get_mut(&7).unwrap();
+        m.mapped = true;
+        m.page_entries = vec![0x77];
+        m.type4_walk = Some(crate::model::Type4Walk {
+            task_id: 1,
+            backing_pfn: 0x20,
+            map_generation: m.map_generation,
+        });
+    }
     state.map_surface(99);
     {
         let m = state.mappings.get_mut(&99).unwrap();
@@ -648,9 +636,13 @@ fn replace_physical_does_not_fall_back_when_the_named_mapping_is_merely_empty() 
     process_child_packet(&mut state, &mut host, 2, &pkt);
 
     assert_eq!(
-        state.mappings.get(&99).unwrap().page_entries,
-        vec![0xaa],
-        "an empty mapping still owns its id; the ref-keyed map must stay unread"
+        state.mappings.get(&7).unwrap().page_entries,
+        vec![0x77],
+        "task 1's surface 7 is unrelated to task 0's resource 7"
+    );
+    assert!(
+        state.mappings.get(&99).unwrap().page_entries.is_empty(),
+        "the task-local association names mapping 99"
     );
 }
 

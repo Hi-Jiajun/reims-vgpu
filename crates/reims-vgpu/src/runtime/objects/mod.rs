@@ -2236,36 +2236,27 @@ fn record_type4_owner(state: &mut DeviceState, surface_id: u32, task_id: u32) {
 /// disqualified it. Clearing fails closed on the packet that says the pages
 /// moved; on this rail that is the direction every ambiguity resolves toward.
 ///
-/// # Two id spaces reach one packet
+/// # The packet names a task-local resource
 ///
-/// `object_id` is read as a mapping id first, and that reading is never
-/// replaced: a ref and a surface id are different id spaces that collide —
-/// `blit_exec`'s type-5 resolve states the rule ("never the task object-list ref
-/// — those id spaces collide") — so a ref-keyed lookup taken *ahead* of the
-/// direct one would misroute a packet naming surface `n` onto whatever mapping
-/// the same task registered under ref `n`, invalidating a surface the guest
-/// never named and leaving stale the one it did.
+/// The task and object fields are obtained from the same resource object. The
+/// object is therefore resolved in the task's namespace; its integer must never
+/// be tried as a global mapping id first. Surface ids and resource refs overlap
+/// numerically. Treating a ref in task B as mapping `n` can retire the pages of
+/// an unrelated type-4 surface `n` owned by task A, after which a compositor
+/// draw sees an unbound texture until that surface happens to be mapped again.
 ///
-/// The ref-keyed reading is taken only when the direct one names no mapping at
-/// all. There is nothing to misroute in that case — the device holds no surface
-/// under that id — and it is the only route this device has to a re-pointed
-/// type-11 texture.
-///
-/// **It has never answered.** Three driven x86/Vulkan boots read
-/// `replace_physical_routed_ref` at 0 while three quarters of the re-points
-/// named an id no mapping owned, and `exec`'s resource-table census reports
-/// the same of the sibling packet's ids ("`texture_to_mapping` answered for
-/// exactly none"). So the ref id space these packets use is not the one that map
-/// is keyed on, and finding the route that does reach it is open work. The arm
-/// stays because it costs one lookup on a lifecycle packet and it is the only
-/// candidate route in the tree; it is not evidence that the id space is covered.
+/// A latched type-4 walk is the exact provenance of a direct surface mapping.
+/// Type-11 resources carry the task/ref-to-mapping association established at
+/// construction. Both routes require the packet's task; a bare integer match is
+/// not ownership.
 ///
 /// What the *unreached* re-points turn out to be is measured rather than
 /// assumed, and it is mostly benign: 44 of 46 on a driven boot were
 /// `replace_physical_unmapped_no_state` — this device holds nothing at all for
 /// the object, so the first resolve of that ref reads the page table the guest
 /// has already rewritten. Two held a ref-keyed host copy.
-/// [`note_replace_physical_unmapped`] is what separates those, and it exists
+/// [`note_replace_physical_unmapped_after_invalidation`] is what separates
+/// those, and it exists
 /// because a bare "reached nothing" cannot: an announcement with nothing to
 /// apply it to and an announcement that missed a live host copy read the same.
 pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
@@ -2274,17 +2265,41 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
     task_id: u32,
     object_id: u32,
 ) {
-    let mut target = object_id;
-    if !state.mappings.contains_key(&target) {
-        if let Some(&mid) = state.texture_to_mapping.get(&(task_id, object_id)) {
-            target = mid;
-            crate::runtime::drain::note_store_route("replace_physical_routed_ref");
-        }
-    }
-    if !state.mappings.contains_key(&target) {
-        note_replace_physical_unmapped(state, host, task_id, object_id);
+    let target = state
+        .mappings
+        .get(&object_id)
+        .and_then(|mapping| {
+            mapping
+                .type4_walk
+                .filter(|walk| walk.task_id == task_id)
+                .map(|_| object_id)
+        })
+        .or_else(|| {
+            state
+                .texture_to_mapping
+                .get(&(task_id, object_id))
+                .copied()
+                .filter(|mid| state.mappings.contains_key(mid))
+                .inspect(|_| crate::runtime::drain::note_store_route("replace_physical_routed_ref"))
+        });
+
+    // A re-point changes every host representation of this resource, whether
+    // or not it also owns a mapping. Mapping and ref-keyed caches are different
+    // indexes over the same resource lifetime; reaching one does not excuse
+    // leaving the other stale.
+    let (texture_cache, linear_cache) = state.invalidate_object_host_copies(task_id, object_id);
+
+    let Some(target) = target else {
+        note_replace_physical_unmapped_after_invalidation(
+            state,
+            host,
+            task_id,
+            object_id,
+            texture_cache,
+            linear_cache,
+        );
         return;
-    }
+    };
     // A deferred window still owed on this mapping is riding the page plan the
     // guest has just replaced. The generation bump below would refuse it anyway,
     // so taking it here changes no outcome — it changes whether the loss has a
@@ -2309,15 +2324,15 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
     }
 }
 
-/// Say what a re-point named when no mapping owns the id, and whether this
+/// Say what a re-point named when no mapping belongs to the resource, and whether this
 /// device is holding anything else for it.
 ///
 /// A mapping is not the only place a resource's bytes can be cached. The type-2/3
 /// rails key their host copies by object-list ref (`host_texture_surfaces`,
 /// `host_linear_textures`) rather than by mapping id, and neither carries a page
-/// list to notice a move — so "no mapping under this id" does not settle whether
-/// the re-point had anything to invalidate. It only settles that the *mapping*
-/// rail had nothing.
+/// list to notice a move — so "no mapping for this task-local resource" does
+/// not settle whether the re-point had anything to invalidate. It only settles
+/// that the *mapping* rail had nothing.
 ///
 /// The counters split three ways. `_unmapped_no_state` is a re-point of a
 /// resource this device holds nothing for, which is genuinely a no-op — the
@@ -2378,16 +2393,15 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
 /// caches no copy of it. The type is on the line rather than in a counter
 /// because the interesting reading is which types show up at all, and that is a
 /// small set a boot enumerates in a handful of lines.
-fn note_replace_physical_unmapped<M: HostMemory>(
-    state: &mut DeviceState,
+fn note_replace_physical_unmapped_after_invalidation<M: HostMemory>(
+    state: &DeviceState,
     host: &M,
     task_id: u32,
     object_id: u32,
+    texture_cache: bool,
+    linear_cache: bool,
 ) {
     let object_type = lookup_list_entry(state, host, task_id, object_id).map(|e| e.object_type);
-    // Read by taking, not by asking: the re-point says these pages are no longer
-    // the object's, so a copy read from them cannot go on answering for it.
-    let (texture_cache, linear_cache) = state.invalidate_object_host_copies(task_id, object_id);
     crate::runtime::drain::note_store_route("replace_physical_unknown_object");
     if texture_cache {
         crate::runtime::drain::note_store_route("replace_physical_unmapped_texture_invalidated");
@@ -2410,7 +2424,7 @@ fn note_replace_physical_unmapped<M: HostMemory>(
         crate::observe::fail(format!(
             "replace_physical_unknown_object task={task_id} object={object_id} \
              obj_type={kind} tex_dropped={} lin_dropped={} \
-             (no mapping owns this id; ref-keyed host copies dropped)",
+             (no mapping belongs to this task-local resource; ref-keyed host copies dropped)",
             texture_cache as u8, linear_cache as u8
         ));
     }

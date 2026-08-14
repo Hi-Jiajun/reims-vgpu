@@ -1901,7 +1901,7 @@ fn the_shared_ladder_names_the_rung_that_refused() {
 /// `invalidate_mapping_pages`, but `host_texture_surfaces` and
 /// `host_linear_textures` are keyed by object-list ref and carry no page list,
 /// so nothing in them can notice — and this device holds a copy under exactly
-/// those keys for ids no mapping owns. Measured on a driven x86/PCI boot under
+/// those keys for resources that own no mapping. Measured on a driven x86/PCI boot under
 /// `web-content-probe`: 7 texture and 1 linear against 32 that held nothing, so
 /// the guest was being served stale content on an ordinary browsing workload.
 ///
@@ -1952,6 +1952,86 @@ fn a_repoint_drops_the_ref_keyed_host_copies_of_the_object() {
     assert!(
         !state.host_linear_textures.contains_key(&(task, object)),
         "the ref-keyed linear copy was read from pages the guest has re-pointed"
+    );
+}
+
+/// ReplacePhysical's object id is local to the task carried beside it. A
+/// mapping id is a different namespace even when the integers happen to be
+/// equal.
+///
+/// This is the compositor failure class: task 0 owns type-4 surface 1 while
+/// task 1 owns type-11 resource 1, which resolves to mapping 9. Re-pointing the
+/// latter must retire mapping 9 and leave task 0's surface intact. The old
+/// global-id-first route did the opposite.
+#[test]
+fn a_repoint_resolves_the_resource_in_its_task_before_touching_a_mapping() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    setup_task_with_list(&mut host, &mut state);
+
+    assert_eq!(resolve_type11_ref(&mut state, &host, 1, 1), Some(9));
+
+    assert!(state.map_surface(1));
+    {
+        let surface = state.mappings.get_mut(&1).expect("surface mapping");
+        surface.mapped = true;
+        surface.page_entries = vec![0x1234_5001];
+        surface.type4_walk = Some(crate::model::Type4Walk {
+            task_id: 0,
+            backing_pfn: 0x20,
+            map_generation: surface.map_generation,
+        });
+    }
+    {
+        let resource = state.mappings.get_mut(&9).expect("type-11 mapping");
+        resource.mapped = true;
+        resource.page_entries = vec![0x6789_a001];
+    }
+
+    super::replace_physical(&mut state, &mut host, 1, 1);
+
+    assert_eq!(
+        state.mappings[&1].page_entries,
+        vec![0x1234_5001],
+        "a same-number resource in another task does not own this surface"
+    );
+    assert!(
+        state.mappings[&9].page_entries.is_empty(),
+        "the task-local type-11 association names the mapping to invalidate"
+    );
+}
+
+/// A direct type-4 resource is routed by the task provenance latched with its
+/// page walk, so tightening the namespace must not suppress genuine surface
+/// re-points.
+#[test]
+fn a_repoint_retires_a_type4_mapping_owned_by_the_packet_task() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    assert!(state.map_surface(7));
+    let prior_generation = {
+        let surface = state.mappings.get_mut(&7).expect("surface mapping");
+        surface.mapped = true;
+        surface.page_entries = vec![0x1234_5001];
+        surface.type4_walk = Some(crate::model::Type4Walk {
+            task_id: 3,
+            backing_pfn: 0x20,
+            map_generation: surface.map_generation,
+        });
+        surface.map_generation
+    };
+
+    super::replace_physical(&mut state, &mut host, 3, 7);
+
+    assert!(state.mappings[&7].page_entries.is_empty());
+    assert_ne!(state.mappings[&7].map_generation, prior_generation);
+    assert_ne!(
+        state.mappings[&7]
+            .type4_walk
+            .expect("the old walk remains only as provenance")
+            .map_generation,
+        state.mappings[&7].map_generation,
+        "the generation bump makes the retired walk unusable as currency"
     );
 }
 
