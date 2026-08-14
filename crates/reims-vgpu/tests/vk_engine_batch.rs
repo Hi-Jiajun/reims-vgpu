@@ -449,6 +449,7 @@ fn batched_guest_runs_buffer_snapshots_at_record() {
                 host_ptr: backing.as_ptr() as usize,
                 len: backing.len() as u64,
             }]),
+            source_offset: 0,
             total_len: backing.len() as u64,
             row_length_texels: 0,
             pages: None,
@@ -606,6 +607,7 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
                         len: 8,
                     },
                 ]),
+                source_offset: 0,
                 total_len: 16,
                 row_length_texels: 0,
                 pages: None,
@@ -764,6 +766,7 @@ fn a_scattered_guest_buffer_window_is_gathered_by_the_gpu_in_one_region_per_stre
         binding: 0,
         content: BufferContent::GuestRuns(GuestRunSource {
             runs: std::sync::Arc::new(runs),
+            source_offset: 0,
             total_len: STRETCH * 3,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
@@ -992,6 +995,7 @@ void main() {{
         binding: 0,
         content: BufferContent::GuestRuns(GuestRunSource {
             runs: std::sync::Arc::new(runs),
+            source_offset: 0,
             total_len: STRETCH * 3,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
@@ -1170,6 +1174,7 @@ void main() {{
         binding: 0,
         content: BufferContent::GuestRuns(GuestRunSource {
             runs: std::sync::Arc::new(runs),
+            source_offset: 0,
             total_len: STRETCH * RUNS,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
@@ -1331,6 +1336,7 @@ void main() {{
         binding: 0,
         content: BufferContent::GuestRuns(GuestRunSource {
             runs: std::sync::Arc::new(runs),
+            source_offset: 0,
             total_len: WINDOW,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),

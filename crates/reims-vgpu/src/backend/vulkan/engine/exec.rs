@@ -92,7 +92,7 @@ pub(super) enum BufferGatherRole {
 
 fn buffer_gather_roles(
     req: &DrawRequest,
-) -> std::collections::BTreeMap<(usize, u64), BufferGatherRole> {
+) -> std::collections::BTreeMap<(usize, u64, u64), BufferGatherRole> {
     let mut roles = std::collections::BTreeMap::new();
     for content in req.vertex_attributes.iter().map(|r| &r.content) {
         roles.insert(CbBind::of(content).key(), BufferGatherRole::Vertex);
@@ -621,7 +621,7 @@ unsafe fn stage_buffer_content(
                 // already computed above as this draw's dedup key — the same
                 // identity one scope wider. See
                 // [`super::pools::buffer_gather_working_set`].
-                super::pools::buffer_gather_working_set::note_gathered(key.0, key.1);
+                super::pools::buffer_gather_working_set::note_gathered(key.0, key.2);
                 gathers.push(pending);
                 // The slot this returns is recycled and still holds the previous
                 // tenant's bytes; what fills it is `pending`, and `pending` is
@@ -641,7 +641,13 @@ unsafe fn stage_buffer_content(
                     pools.acquire_staging(ctx, src.total_len, usage, counters)?
                 };
                 let _s = stage_phase::Span::moving(stage_phase::Part::Runs, src.total_len);
-                pools.write_staging_from_runs(ctx, &slot, &src.runs, src.total_len)?;
+                pools.write_staging_from_runs(
+                    ctx,
+                    &slot,
+                    &src.runs,
+                    src.source_offset,
+                    src.total_len,
+                )?;
                 drop(_s);
                 if snapshot_volatile {
                     counters
@@ -678,6 +684,10 @@ unsafe fn import_guest_buffer_window(
         return None;
     }
     let guest_ref = single_run(src.pages.as_ref()?)?;
+    let source_end = src.source_offset.checked_add(src.total_len)?;
+    if source_end > guest_ref.requested() {
+        return None;
+    }
     let bound = match unsafe { pools.bind_guest_ram(ctx, guest_ref) } {
         Ok(bound) => bound,
         Err(inner) => {
@@ -688,7 +698,7 @@ unsafe fn import_guest_buffer_window(
     // The imported buffer spans the whole RAMBlock, so the span's first byte is
     // the bound range's start plus whatever widening it to the device's import
     // granularity added at the front.
-    let offset = bound.offset + bound.head;
+    let offset = bound.offset + bound.head + src.source_offset;
     // Storage descriptors carry the device's queried offset alignment. Vertex
     // buffers do not: Vulkan only requires their offsets to lie inside the
     // buffer. Applying the storage limit to a vertex-only bind needlessly turns
@@ -800,7 +810,9 @@ unsafe fn gather_guest_buffer_window(
                 return Ok(None);
             }
         };
-        let copy = gather_region(&bound, run);
+        let Some(copy) = gather_region_window(&bound, run, src.source_offset, src.total_len) else {
+            continue;
+        };
         covered = covered.saturating_add(copy.size);
         super::group_by_buffer(&mut sources, bound.buffer, copy);
     }
@@ -853,6 +865,30 @@ fn gather_region(
         .src_offset(bound.offset + bound.head)
         .dst_offset(run.window_offset)
         .size(run.guest.requested())
+}
+
+/// The portion of one source run intersecting a sub-window of the retained
+/// source. Packed task buffers use this to bind arbitrary guest offsets while
+/// keeping one resource-shaped run list.
+fn gather_region_window(
+    bound: &super::host_ram::BoundGuestRam,
+    run: &crate::runtime::guest_ram_map::GuestWindowRun,
+    source_offset: u64,
+    total_len: u64,
+) -> Option<vk::BufferCopy> {
+    let wanted_end = source_offset.checked_add(total_len)?;
+    let run_end = run.window_offset.checked_add(run.guest.requested())?;
+    let start = run.window_offset.max(source_offset);
+    let end = run_end.min(wanted_end);
+    if start >= end {
+        return None;
+    }
+    Some(
+        vk::BufferCopy::default()
+            .src_offset(bound.offset + bound.head + (start - run.window_offset))
+            .dst_offset(start - source_offset)
+            .size(end - start),
+    )
 }
 
 /// A check that sent a guest buffer span back to the CPU gather.
@@ -1215,7 +1251,7 @@ impl crate::observe::Decline for SampledImportDecline {
 crate::observe::decline::decline_display!(SampledImportDecline);
 
 /// Shared validation for a draw-time buffer's content source. A `GuestRuns`
-/// span must be internally consistent: the run lengths sum to `total_len`,
+/// span must be internally consistent: the requested subrange fits in `runs`,
 /// the span is non-empty, and `row_length_texels` is 0 (row strides are a
 /// texture concept — buffers gather a flat byte span).
 #[derive(Clone, Copy)]
@@ -1246,7 +1282,8 @@ fn validate_buffer_content(
         return Err(DrawError::DrawValidation(decline));
     }
     let sum: u64 = src.runs.iter().map(|r| r.len).sum();
-    if sum != src.total_len || src.total_len == 0 {
+    let covered = src.source_offset.checked_add(src.total_len);
+    if src.total_len == 0 || covered.is_none_or(|end| end > sum) {
         let decline = match role {
             BufferValidationRole::Vertex => DrawValidationDecline::VertexGuestRunsCoverage {
                 location: resource_index,
@@ -3027,6 +3064,7 @@ pub(crate) unsafe fn execute_draw_inner(
                         ctx,
                         &slot,
                         &seed.source.runs,
+                        seed.source.source_offset,
                         seed.source.total_len,
                     )?;
                 }
@@ -3495,7 +3533,13 @@ pub(crate) unsafe fn execute_draw_inner(
                             vk::BufferUsageFlags::TRANSFER_SRC,
                             counters,
                         )?;
-                        pools.write_staging_from_runs(ctx, &scratch, &src.runs, src.total_len)?;
+                        pools.write_staging_from_runs(
+                            ctx,
+                            &scratch,
+                            &src.runs,
+                            src.source_offset,
+                            src.total_len,
+                        )?;
                         // The only arm of this loop that moves bytes, and until
                         // now the only one that reported nothing — which is what
                         // let the whole of `acquire_sampled` sit unattributed.
@@ -5537,6 +5581,47 @@ mod tests {
         assert!(single_run(&window_runs(&[])).is_none());
     }
 
+    /// Two offsets into one retained resource are distinct command-buffer
+    /// binds, while still sharing the allocation identity that keeps the
+    /// source alive. This is the engine half of buffer-plus-offset semantics.
+    #[test]
+    fn one_run_source_at_two_offsets_has_two_bind_keys() {
+        let runs = std::sync::Arc::new(vec![GuestRun {
+            host_ptr: 0x1000,
+            len: 0x4000,
+        }]);
+        let content = |source_offset| {
+            BufferContent::GuestRuns(GuestRunSource {
+                runs: std::sync::Arc::clone(&runs),
+                source_offset,
+                total_len: 0x1000,
+                row_length_texels: 0,
+                pages: None,
+            })
+        };
+        let a = CbBind::of(&content(0));
+        let b = CbBind::of(&content(0x1000));
+        assert_ne!(a.key(), b.key(), "the bind offset is part of the identity");
+        assert_eq!(a.key().0, b.key().0, "both keys retain one run allocation");
+    }
+
+    /// A fallback copy from a whole-resource import must crop and rebase the
+    /// requested subrange rather than copying from byte zero.
+    #[test]
+    fn gather_region_crops_a_retained_resource_to_the_bind_offset() {
+        let run = &window_runs(&[(0, 0x2000, 0x4000)])[0];
+        let bound = crate::backend::vulkan::engine::host_ram::BoundGuestRam {
+            buffer: ash::vk::Buffer::null(),
+            offset: 0x8000,
+            len: 0x4000,
+            head: 0x20,
+        };
+        let copy = gather_region_window(&bound, run, 0x1000, 0x800).unwrap();
+        assert_eq!(copy.src_offset, 0x9020);
+        assert_eq!(copy.dst_offset, 0);
+        assert_eq!(copy.size, 0x800);
+    }
+
     /// The role split is over physical gathers, not logical bindings. One
     /// interleaved allocation used by fixed-function fetch and by a shader is
     /// therefore one `Shared` window rather than one vertex plus one storage
@@ -5551,6 +5636,7 @@ mod tests {
         let content = |host_ptr| {
             BufferContent::GuestRuns(GuestRunSource {
                 runs: std::sync::Arc::new(vec![GuestRun { host_ptr, len: 16 }]),
+                source_offset: 0,
                 total_len: 16,
                 row_length_texels: 0,
                 pages: None,
@@ -5786,6 +5872,7 @@ mod tests {
                             host_ptr: 0x1000,
                             len: total_len,
                         }]),
+                        source_offset: 0,
                         total_len,
                         row_length_texels,
                         // A fixture over a dummy host address names no guest
@@ -5825,6 +5912,7 @@ mod tests {
                         host_ptr: 0x1000,
                         len: covered,
                     }]),
+                    source_offset: 0,
                     total_len: declared,
                     row_length_texels,
                     pages: None,
@@ -6270,6 +6358,7 @@ mod tests {
                     })
                     .collect(),
             ),
+            source_offset: 0,
             total_len,
             row_length_texels,
             // A fixture over a dummy host address has no guest pages.
@@ -6445,15 +6534,16 @@ mod tests {
         ];
         let content = BufferContent::GuestRuns(super::super::types::GuestRunSource {
             runs: std::sync::Arc::new(runs),
-            total_len: 156,
+            source_offset: 90,
+            total_len: 20,
             row_length_texels: 0,
             // A fixture over a host `Vec` has no guest pages.
             pages: None,
         });
-        assert_eq!(content.len(), 156);
+        assert_eq!(content.len(), 20);
         let bytes = content.cpu_bytes();
-        assert_eq!(&bytes[..100], &backing[..100]);
-        assert_eq!(&bytes[100..156], &backing[200..256]);
+        assert_eq!(&bytes[..10], &backing[90..100]);
+        assert_eq!(&bytes[10..20], &backing[200..210]);
     }
 }
 

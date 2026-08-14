@@ -261,6 +261,7 @@ impl Window {
         key: WindowKey,
         stamp: BufferWriteStamp,
         bytes: u64,
+        source_offset: u64,
         runs: &[crate::backend::vulkan::engine::GuestRun],
     ) {
         let kb = bytes / 1024;
@@ -294,7 +295,7 @@ impl Window {
         entry.stamp = stamp;
         entry.wrote_since_fold |= !quiet;
         // SAFETY: forwarded from this function's own precondition.
-        match unsafe { self.audit(key, &mut entry, bytes, runs) } {
+        match unsafe { self.audit(key, &mut entry, bytes, source_offset, runs) } {
             Audit::Skipped => {}
             Audit::Seeded => self.audit_seed += 1,
             Audit::Restarted => self.audit_restart += 1,
@@ -314,13 +315,14 @@ impl Window {
         key: WindowKey,
         entry: &mut Entry,
         bytes: u64,
+        source_offset: u64,
         runs: &[crate::backend::vulkan::engine::GuestRun],
     ) -> Audit {
         if !Self::audited(key) {
             return Audit::Skipped;
         }
         // SAFETY: forwarded from the caller's precondition.
-        let fold = unsafe { super::gather_witness::fold_runs(runs, bytes) };
+        let fold = unsafe { super::gather_witness::fold_runs_from(runs, source_offset, bytes) };
         self.audit_kb = self.audit_kb.saturating_add(bytes / 1024);
         let verdict = match entry.fold {
             None => Audit::Seeded,
@@ -404,6 +406,10 @@ fn window() -> &'static std::sync::Mutex<Window> {
 /// every `host_ptr` a live mapping of at least `len` bytes. That is the same
 /// precondition the gather itself relies on, and this is called at the same
 /// point in the draw.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the audit key, write stamp, and retained source range are independent evidence"
+)]
 pub unsafe fn note_bind(
     task_id: u32,
     buffer_ref: u32,
@@ -411,6 +417,7 @@ pub unsafe fn note_bind(
     extent_cap: Option<u64>,
     stamp: BufferWriteStamp,
     bytes: u64,
+    source_offset: u64,
     runs: &[crate::backend::vulkan::engine::GuestRun],
 ) {
     // SAFETY: forwarded from this function's own precondition.
@@ -419,6 +426,7 @@ pub unsafe fn note_bind(
             (task_id, buffer_ref, offset, extent_cap),
             stamp,
             bytes,
+            source_offset,
             runs,
         )
     };
@@ -463,7 +471,7 @@ mod tests {
     /// `note` with no bytes to fold — for the tests that are about the split.
     fn note(w: &mut Window, key: WindowKey, stamp: BufferWriteStamp, bytes: u64) {
         // SAFETY: an empty run slice reads nothing.
-        unsafe { w.note(key, stamp, bytes, &[]) };
+        unsafe { w.note(key, stamp, bytes, 0, &[]) };
     }
 
     /// The first sight of a window is a compulsory miss and must not be counted
@@ -592,9 +600,9 @@ mod tests {
         let mut bytes = vec![7u8; 4096];
         // SAFETY: `bytes` outlives both calls and the run covers exactly it.
         unsafe {
-            w.note(k, g.stamp(1, 2), 4096, &runs_over(&bytes));
+            w.note(k, g.stamp(1, 2), 4096, 0, &runs_over(&bytes));
             bytes[0] = 9;
-            w.note(k, g.stamp(1, 2), 4096, &runs_over(&bytes));
+            w.note(k, g.stamp(1, 2), 4096, 0, &runs_over(&bytes));
         }
         let line = w.take().expect("binds happened");
         assert!(line.contains("audit_moved=1"), "{line}");
@@ -612,8 +620,8 @@ mod tests {
         let bytes = vec![7u8; 4096];
         // SAFETY: `bytes` outlives both calls and the run covers exactly it.
         unsafe {
-            w.note(k, g.stamp(1, 2), 4096, &runs_over(&bytes));
-            w.note(k, g.stamp(1, 2), 4096, &runs_over(&bytes));
+            w.note(k, g.stamp(1, 2), 4096, 0, &runs_over(&bytes));
+            w.note(k, g.stamp(1, 2), 4096, 0, &runs_over(&bytes));
         }
         let line = w.take().expect("binds happened");
         assert!(line.contains("audit_ok=1"), "{line}");
@@ -631,10 +639,10 @@ mod tests {
         let mut bytes = vec![7u8; 4096];
         // SAFETY: `bytes` outlives every call and the run covers exactly it.
         unsafe {
-            w.note(k, g.stamp(1, 2), 4096, &runs_over(&bytes));
+            w.note(k, g.stamp(1, 2), 4096, 0, &runs_over(&bytes));
             g.note_write(1, 2);
             bytes[0] = 9;
-            w.note(k, g.stamp(1, 2), 4096, &runs_over(&bytes));
+            w.note(k, g.stamp(1, 2), 4096, 0, &runs_over(&bytes));
         }
         let line = w.take().expect("binds happened");
         assert!(line.contains("audit_restart=1"), "{line}");
@@ -652,12 +660,12 @@ mod tests {
         let mut bytes = vec![7u8; 4096];
         // SAFETY: `bytes` outlives every call and the run covers exactly it.
         unsafe {
-            w.note(k, g.stamp(1, 2), 4096, &runs_over(&bytes));
+            w.note(k, g.stamp(1, 2), 4096, 0, &runs_over(&bytes));
             g.note_write(1, 2);
             bytes[0] = 9;
-            w.note(k, g.stamp(1, 2), 4096, &runs_over(&bytes));
+            w.note(k, g.stamp(1, 2), 4096, 0, &runs_over(&bytes));
             bytes[1] = 11;
-            w.note(k, g.stamp(1, 2), 4096, &runs_over(&bytes));
+            w.note(k, g.stamp(1, 2), 4096, 0, &runs_over(&bytes));
         }
         let line = w.take().expect("binds happened");
         assert!(line.contains("audit_restart=1"), "{line}");

@@ -2068,7 +2068,7 @@ impl ResourcePools {
     /// Called from the one arm of `stage_buffer_content` that hands back a slot
     /// it has not filled. Everything published without this call is answerable
     /// the moment it is published.
-    pub(crate) fn note_cb_bind_owes_gather(&mut self, key: (usize, u64)) {
+    pub(crate) fn note_cb_bind_owes_gather(&mut self, key: (usize, u64, u64)) {
         self.cb_gather_owed.push(key);
     }
 
@@ -2906,6 +2906,7 @@ impl ResourcePools {
         ctx: &DeviceContext,
         slot: &BufferSlot,
         runs: &[types::GuestRun],
+        source_offset: u64,
         total_len: u64,
     ) -> Result<(), DrawError> {
         let _slow = SlowStagingWrite::watch("guest_runs", total_len, runs.len());
@@ -2913,17 +2914,29 @@ impl ResourcePools {
         let ptr = staging_write_ptr(ctx, slot, size)?;
         let total = total_len as usize;
         let mut off = 0usize;
+        let mut skip = source_offset;
         unsafe {
             for run in runs {
                 if off >= total {
                     break;
                 }
-                let n = (run.len as usize).min(total - off);
+                if skip >= run.len {
+                    skip -= run.len;
+                    continue;
+                }
+                let within = skip as usize;
+                skip = 0;
+                let available = (run.len as usize).saturating_sub(within);
+                let n = available.min(total - off);
                 // SAFETY: `host_ptr` is a stable RAMBlock alias from
                 // `HostOps::map_pages`, valid for the VM lifetime; `ptr` is the
                 // mapped staging span of `size >= total` bytes and `off + n <=
                 // total`, so the destination stays in bounds.
-                std::ptr::copy_nonoverlapping(run.host_ptr as *const u8, ptr.add(off), n);
+                std::ptr::copy_nonoverlapping(
+                    (run.host_ptr as *const u8).add(within),
+                    ptr.add(off),
+                    n,
+                );
                 off += n;
             }
             // Runs underfilled the span (short read) or the 4-byte minimum tail:

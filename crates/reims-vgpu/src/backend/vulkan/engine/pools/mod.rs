@@ -251,7 +251,7 @@ pub(crate) struct ResourcePools {
     /// pages** ([`ResourcePools::note_guest_write_recorded`]). That last one is
     /// the correctness edge: a bind after a Store into the same pages must see
     /// what the Store wrote, and reusing a copy taken before it would not.
-    cb_bound_buffers: HashMap<(usize, u64), (super::exec::BoundBuffer, CbBindOwner)>,
+    cb_bound_buffers: HashMap<(usize, u64, u64), (super::exec::BoundBuffer, CbBindOwner)>,
     /// Keys in `cb_bound_buffers` whose slot is **not yet filled**: a GPU gather
     /// was planned for them and the copy or dispatch that lands it has not been
     /// recorded into the command buffer.
@@ -270,7 +270,7 @@ pub(crate) struct ResourcePools {
     /// Tracked rather than solved by clearing the whole memo, because the entries
     /// published by draws that did complete are still correct and this rail is
     /// ~4.8 binds a draw.
-    cb_gather_owed: Vec<(usize, u64)>,
+    cb_gather_owed: Vec<(usize, u64, u64)>,
     /// Graphics state the command buffer now recording already carries — see
     /// [`CbGraphicsState`].
     cb_graphics: CbGraphicsState,
@@ -2678,14 +2678,14 @@ pub(crate) enum CbBindOwner {
 /// it **by value**: there is no way to record an entry without handing over the
 /// `Arc` that keeps the key's address unique, so the defect described on
 /// `ResourcePools::cb_bound_buffers` cannot be reintroduced by a new call site.
-/// A raw `(usize, u64)` never reaches the map's API.
+/// A raw `(usize, u64, u64)` never reaches the map's API.
 ///
 /// Constructing one costs a single `Arc` clone, paid on hits as well as misses.
 /// That is two atomics against a bind that already hashes and probes a map, and
 /// it buys an invariant a reviewer would otherwise have to re-derive.
 #[derive(Clone, Debug)]
 pub(crate) struct CbBind {
-    key: (usize, u64),
+    key: (usize, u64, u64),
     owner: CbBindOwner,
 }
 
@@ -2695,12 +2695,13 @@ impl CbBind {
     pub(crate) fn of(content: &super::types::BufferContent) -> Self {
         match content {
             super::types::BufferContent::Bytes(b) => Self {
-                key: (std::sync::Arc::as_ptr(b) as usize, b.len() as u64),
+                key: (std::sync::Arc::as_ptr(b) as usize, 0, b.len() as u64),
                 owner: CbBindOwner::Bytes(std::sync::Arc::clone(b)),
             },
             super::types::BufferContent::GuestRuns(src) => Self {
                 key: (
                     std::sync::Arc::as_ptr(&src.runs) as *const () as usize,
+                    src.source_offset,
                     src.total_len,
                 ),
                 owner: CbBindOwner::Runs(std::sync::Arc::clone(&src.runs)),
@@ -2708,14 +2709,15 @@ impl CbBind {
         }
     }
 
-    /// The `(address, length)` pair, for the callers that key something else on
-    /// the same identity — [`buffer_gather_working_set`] is the only one.
-    pub(crate) fn key(&self) -> (usize, u64) {
+    /// The `(allocation address, source offset, length)` identity. The working
+    /// set census consumes the allocation and length fields for gathered
+    /// exact-window sources; command-buffer reuse consumes all three.
+    pub(crate) fn key(&self) -> (usize, u64, u64) {
         self.key
     }
 
     /// Split into what the map stores under it.
-    fn into_parts(self) -> ((usize, u64), CbBindOwner) {
+    fn into_parts(self) -> ((usize, u64, u64), CbBindOwner) {
         (self.key, self.owner)
     }
 }

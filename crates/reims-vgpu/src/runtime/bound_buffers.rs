@@ -46,29 +46,28 @@
 //! to the references that resolved through it, which is machinery bought with
 //! nothing.
 //!
-//! # Why the key carries the offset
+//! # Why the fallback key carries the offset
 //!
 //! Apple keys purely by reference, because their buffer covers the whole
-//! allocation and the offset rides to Metal beside it. A resolution here covers
-//! `[gva + offset, gva + size)` — the span the bind actually asked for — so two
-//! binds of one reference at different offsets are two resolutions.
+//! allocation and the offset rides to Metal beside it. An exact-window fallback
+//! resolution here covers `[gva + offset, gva + size)` — the span the bind
+//! actually asked for — so two binds of one reference at different offsets are
+//! two resolutions.
 //!
-//! The packed-alias rail does resolve the whole allocation once and slice it,
-//! which is what Apple does. It is an optional answer beside this narrower
-//! registry: if an unmapped tail prevents the whole allocation from being
-//! reconstructed, the exact offset/cap window still resolves here and gathers.
-//! That preserves the wider admission while collapsing the common fully-mapped
-//! case to one host allocation and one Vulkan import per reference.
+//! The packed-alias rail resolves the whole allocation once and supplies the
+//! offset beside that retained source. It bypasses this map entirely, which is
+//! what keeps resource-shaped state resource-shaped. It is an optional answer
+//! beside the narrower fallback: if an unmapped tail prevents the whole
+//! allocation from being reconstructed, the exact offset/cap window still
+//! resolves here and gathers.
 //!
-//! **This used to say the two keys agree in practice, because a reference is
-//! bound at one offset. That was never counted, and it is false.** A driven x86
-//! boot under a window-drag probe holds 704 resolutions across **22** distinct
-//! `(task, reference)` pairs — an average of 32 offsets per reference and 233
-//! at the widest ([`note_registry_levels`]). The offset is not an inert field
-//! that happens to be in the key; it is the dominant axis, and keying by it
-//! costs one page-table walk per offset where Apple's key costs one per
-//! reference. Anyone weighing the rekey should read `bound_buffers` levels from
-//! a driven boot rather than this paragraph.
+//! The distinction is measured rather than aesthetic. Before packed resources
+//! bypassed this map, one driven x86 window-drag run reached 33,828 fallback
+//! entries over 48 `(task, reference)` pairs, with one reference accounting for
+//! 3,080 offsets. The same workload with buffer-plus-offset binding held zero
+//! fallback entries while the packed resources remained live. The offset is
+//! therefore required for correctness only on the exact-window fallback; it is
+//! not a sound identity for the normal resource registry.
 //!
 //! # Why the key also carries the shader's extent cap
 //!
@@ -82,13 +81,13 @@
 //!
 //! # No capacity
 //!
-//! There is no cap and no eviction. The population is one entry per live
-//! `(task, reference, offset, extent cap)` a draw has actually bound, which the
-//! guest bounds by its own working set, and every entry leaves through one of
-//! the retirement rules above or through [`BoundBuffers::clear`] at device
-//! reset. A capacity here would be a second, invisible reason for a resolution
-//! to disappear, and the miss it caused would read as a mapping change that
-//! never happened.
+//! There is no cap and no eviction. The fallback population is one entry per
+//! live `(task, reference, offset, extent cap)` whose whole resource could not
+//! be reconstructed; the normal population is one packed entry per
+//! `(task, reference)`. Every entry leaves through one of the retirement rules
+//! above or through [`BoundBuffers::clear`] at device reset. A capacity here
+//! would be a second, invisible reason for a resolution to disappear, and the
+//! miss it caused would read as a mapping change that never happened.
 //!
 //! The extent cap widens that population only where two shaders declare
 //! different extents over one bind; the retirement rules are all keyed on task
@@ -112,6 +111,9 @@ pub struct PackedBuffer {
     /// Offset of `gva` inside the page-aligned host allocation.
     pub head: u64,
     pub import: Arc<crate::runtime::guest_ram::GuestRamImport>,
+    /// Persistent whole-buffer sources shared by every offset bind.
+    pub runs: Arc<Vec<GuestRun>>,
+    pub pages: Arc<Vec<GuestWindowRun>>,
 }
 
 #[derive(Clone, Debug)]
@@ -148,6 +150,11 @@ pub struct BoundBuffer {
     pub gva: u64,
     /// Byte length the runs cover, and the bind's `total_len`.
     pub span: u64,
+    /// First byte of this bind inside `runs` / `pages`.
+    ///
+    /// Exact-window resolutions use zero. A packed resource shares its one
+    /// whole-buffer source and carries the guest's bind offset here.
+    pub source_offset: u64,
     /// Host-pointer spans the CPU gather walks.
     pub runs: Arc<Vec<GuestRun>>,
     /// The same bytes as bounded references into this process's import, when
@@ -410,6 +417,7 @@ mod tests {
         BoundBuffer {
             gva,
             span,
+            source_offset: 0,
             runs: Arc::new(Vec::new()),
             pages: None,
         }
@@ -527,6 +535,8 @@ mod tests {
                 size: 0x7000,
                 head: 0x800,
                 import,
+                runs: Arc::new(Vec::new()),
+                pages: Arc::new(Vec::new()),
             }),
         );
         let PackedBufferResolution::Available(packed) = b.packed(3, 9).unwrap() else {

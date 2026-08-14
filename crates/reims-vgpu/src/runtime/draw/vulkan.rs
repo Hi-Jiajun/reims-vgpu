@@ -2093,6 +2093,7 @@ fn try_type11_target_guest_seed<M: HostMemory + HostOps>(
     Some(GuestTargetSeed {
         source: GuestRunSource {
             runs: std::sync::Arc::new(runs),
+            source_offset: 0,
             total_len: span,
             row_length_texels,
             pages: guest_page_window(host, gpas, page, base_off % page, span),
@@ -2499,11 +2500,12 @@ pub(super) const ZERO_COPY_BUFFER_MIN_BYTES: u64 = 16 * 1024;
 /// disappearing is not something a reader should have to infer from an absence,
 /// so the first refusal of the process says so by name.
 ///
-/// This is where the arm64 pathway now diverges: its MMIO shim can return a
+/// This is where the arm64 pathway diverges: its MMIO shim can return a
 /// `mach_vm_remap` view for a fragmented page list, and since that view is
 /// released on `unmap_pages` rather than retained until teardown, the shim
-/// answers 0. The x86 PCI shim never allocates — it refuses anything that is
-/// not a packed host-contiguous run — so it still answers 1.
+/// answers 0. The x86 PCI shim can assemble scattered file-backed guest pages
+/// into one packed alias and retains every such address until teardown, so it
+/// answers 1.
 fn guest_run_alias_available<M: HostOps>(host: &M) -> bool {
     if host.map_pages_stable() {
         return true;
@@ -2807,11 +2809,28 @@ pub(super) fn packed_buffer_resolution<M: HostMemory + HostOps>(
             host_base, map_len, align,
         )
         .ok()?;
+        let import = std::sync::Arc::new(import);
+        let whole = import.slice(head, backing.size).ok()?;
+        let guest = crate::runtime::guest_ram::GuestRef::new(
+            std::sync::Arc::clone(&import),
+            whole,
+        )
+        .ok()?;
         Some(PackedBufferResolution::Available(PackedBuffer {
             gva: backing.gva,
             size: backing.size,
             head,
-            import: std::sync::Arc::new(import),
+            import,
+            runs: std::sync::Arc::new(vec![crate::backend::vulkan::engine::GuestRun {
+                host_ptr: host_base.checked_add(head as usize)?,
+                len: backing.size,
+            }]),
+            pages: std::sync::Arc::new(vec![
+                crate::runtime::guest_ram_map::GuestWindowRun {
+                    window_offset: 0,
+                    guest,
+                },
+            ]),
         }))
     })()
     .unwrap_or_else(unavailable);
@@ -2831,25 +2850,13 @@ pub(super) fn slice_packed_buffer(
     offset: u64,
     span: u64,
 ) -> Option<crate::runtime::bound_buffers::BoundBuffer> {
-    let relative = packed.head.checked_add(offset)?;
-    let slice = packed.import.slice(relative, span).ok()?;
-    let guest =
-        crate::runtime::guest_ram::GuestRef::new(std::sync::Arc::clone(&packed.import), slice)
-            .ok()?;
-    let host_ptr = packed.import.host_base().checked_add(relative as usize)?;
+    offset.checked_add(span).filter(|&end| end <= packed.size)?;
     Some(crate::runtime::bound_buffers::BoundBuffer {
         gva: packed.gva.checked_add(offset)?,
         span,
-        runs: std::sync::Arc::new(vec![crate::backend::vulkan::engine::GuestRun {
-            host_ptr,
-            len: span,
-        }]),
-        pages: Some(std::sync::Arc::new(vec![
-            crate::runtime::guest_ram_map::GuestWindowRun {
-                window_offset: 0,
-                guest,
-            },
-        ])),
+        source_offset: offset,
+        runs: std::sync::Arc::clone(&packed.runs),
+        pages: Some(std::sync::Arc::clone(&packed.pages)),
     })
 }
 
@@ -3027,6 +3034,7 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     Some(crate::runtime::bound_buffers::BoundBuffer {
         gva: gva + offset,
         span,
+        source_offset: 0,
         runs: std::sync::Arc::new(runs),
         pages,
     })
@@ -3065,6 +3073,7 @@ fn note_gather_freshness(
             extent_cap,
             state.buffer_write_gen.stamp(task_id, buffer_ref),
             bound.span,
+            bound.source_offset,
             &bound.runs,
         );
     }
@@ -3080,6 +3089,7 @@ fn bound_buffer_content(
     use crate::backend::vulkan::engine;
     engine::BufferContent::GuestRuns(engine::GuestRunSource {
         runs: std::sync::Arc::clone(&bound.runs),
+        source_offset: bound.source_offset,
         total_len: bound.span,
         row_length_texels: 0,
         pages: bound.pages.clone(),
@@ -3139,7 +3149,7 @@ pub(super) fn gather_span_if_eligible(full: u64, extent_cap: Option<u64>) -> Opt
     (full >= ZERO_COPY_BUFFER_MIN_BYTES).then(|| extent_cap.map_or(full, |cap| full.min(cap)))
 }
 
-fn load_buffer_content<M: HostMemory + HostOps>(
+pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
@@ -3148,6 +3158,37 @@ fn load_buffer_content<M: HostMemory + HostOps>(
     allow_zero_copy: bool,
     extent_cap: Option<u64>,
 ) -> Option<crate::backend::vulkan::engine::BufferContent> {
+    // The guest contract is buffer-plus-offset. Once the whole resource has a
+    // packed alias, derive the bind directly from that one retained object:
+    // neither the object descriptor nor the task page table changes between
+    // offsets, and both announce the events that retire this entry.
+    if allow_zero_copy {
+        let packed = match state.bound_buffers.packed(task_id, buffer_ref) {
+            Some(crate::runtime::bound_buffers::PackedBufferResolution::Available(packed)) => {
+                Some(packed.clone())
+            }
+            _ => None,
+        };
+        if let Some(packed) = packed {
+            if offset < packed.size {
+                let full = packed.size - offset;
+                if let Some(span) = gather_span_if_eligible(full, extent_cap) {
+                    if let Some(bound) = slice_packed_buffer(&packed, offset, span) {
+                        crate::runtime::drain::note_store_route("zc_buffer_held");
+                        note_gather_freshness(
+                            state,
+                            task_id,
+                            buffer_ref,
+                            offset,
+                            extent_cap,
+                            &bound,
+                        );
+                        return Some(bound_buffer_content(&bound));
+                    }
+                }
+            }
+        }
+    }
     // The registry is keyed on the same cap the walk uses, or a lookup could
     // answer with a shorter span than this shader needs.
     // A held resolution answers before anything is resolved at all: the walk
@@ -3177,9 +3218,19 @@ fn load_buffer_content<M: HostMemory + HostOps>(
             let content = bound_buffer_content(&bound);
             // Before the insert, which takes `state` mutably and moves `bound`.
             note_gather_freshness(state, task_id, buffer_ref, offset, extent_cap, &bound);
-            state
-                .bound_buffers
-                .insert(task_id, buffer_ref, offset, extent_cap, bound);
+            // A packed resource is already retained by `(task, reference)` and
+            // the content above shares its whole-buffer source. Holding this
+            // offset as a second entry would recreate the per-offset registry
+            // the packed representation exists to remove.
+            let packed = matches!(
+                state.bound_buffers.packed(task_id, buffer_ref),
+                Some(crate::runtime::bound_buffers::PackedBufferResolution::Available(_))
+            );
+            if !packed {
+                state
+                    .bound_buffers
+                    .insert(task_id, buffer_ref, offset, extent_cap, bound);
+            }
             return Some(content);
         }
     }
@@ -3761,6 +3812,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
         SampledSourceRequest::GuestRuns(
             engine::GuestRunSource {
                 runs: std::sync::Arc::new(runs),
+                source_offset: 0,
                 total_len: span,
                 row_length_texels,
                 pages: guest_page_window(host, gpas, page as u64, gva % page as u64, span),
@@ -3864,6 +3916,7 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     Some(SampledSourceRequest::GuestRuns(
         engine::GuestRunSource {
             runs: std::sync::Arc::new(runs),
+            source_offset: 0,
             total_len: span,
             row_length_texels,
             pages: guest_page_window(host, gpas, page as u64, base_off % page as u64, span),
@@ -3963,6 +4016,7 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     Some(SampledSourceRequest::GuestRuns(
         engine::GuestRunSource {
             runs: std::sync::Arc::new(runs),
+            source_offset: 0,
             total_len: span,
             row_length_texels,
             pages: guest_page_window(host, gpas, page as u64, base_off % page as u64, span),

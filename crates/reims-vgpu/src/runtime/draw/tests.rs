@@ -5000,14 +5000,15 @@ fn packed_buffer_alias_is_reused_across_offsets() {
     let (dir_gpa, root_gpa, data_gpa) = (2 * page, 3 * page, 4 * page);
     host.map_range(dir_gpa, page as usize, 0);
     host.map_range(root_gpa, page as usize, 0);
-    host.map_range(data_gpa, (2 * page) as usize, 0);
+    host.map_range(data_gpa, (6 * page) as usize, 0);
     let mut directory = [0u8; 8];
     st32(&mut directory[DIRECTORY_ROOT_PFN as usize..], 3);
     st32(&mut directory[DIRECTORY_DEPTH as usize..], 1);
     host.write_gpa(dir_gpa, &directory).unwrap();
-    let mut ptes = [0u8; 8];
-    st32(&mut ptes[0..4], 4);
-    st32(&mut ptes[4..8], 5);
+    let mut ptes = [0u8; 24];
+    for (i, pte) in ptes.chunks_exact_mut(4).enumerate() {
+        st32(pte, 4 + i as u32);
+    }
     host.write_gpa(root_gpa, &ptes).unwrap();
 
     crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
@@ -5015,7 +5016,7 @@ fn packed_buffer_alias_is_reused_across_offsets() {
     state.define_task(1, page, 2);
     let backing = super::BufferBacking {
         gva: 0x800,
-        size: 0x1800,
+        size: 0x4800,
     };
     let first = super::vulkan::packed_buffer_resolution(&mut state, &mut host, 1, 7, &backing);
     let calls = host.map_pages_calls;
@@ -5041,6 +5042,37 @@ fn packed_buffer_alias_is_reused_across_offsets() {
     assert_eq!(
         b.pages.as_ref().unwrap()[0].guest.import().id(),
         first.import.id()
+    );
+    assert_eq!(a.source_offset, 0);
+    assert_eq!(b.source_offset, 0x1000);
+    assert!(
+        std::sync::Arc::ptr_eq(&a.runs, &b.runs),
+        "offset binds share the resource's one run list"
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(a.pages.as_ref().unwrap(), b.pages.as_ref().unwrap()),
+        "offset binds share the resource's one bounded import reference"
+    );
+
+    let content = super::vulkan::load_buffer_content(
+        &mut state,
+        &mut host,
+        1,
+        7,
+        0x800,
+        true,
+        Some(0x800),
+    )
+    .expect("the retained resource serves a later offset directly");
+    let crate::backend::vulkan::engine::BufferContent::GuestRuns(source) = content else {
+        panic!("the packed resource stays on the guest-memory rail")
+    };
+    assert_eq!(source.source_offset, 0x800);
+    assert_eq!(source.total_len, 0x800);
+    assert_eq!(
+        state.bound_buffers.len(),
+        0,
+        "a packed resource does not grow the per-offset resolution registry"
     );
 }
 

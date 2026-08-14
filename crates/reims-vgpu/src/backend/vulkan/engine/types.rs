@@ -939,18 +939,28 @@ impl BufferContent {
             Self::Bytes(b) => std::borrow::Cow::Borrowed(b.as_slice()),
             Self::GuestRuns(src) => {
                 let mut out = Vec::with_capacity(src.total_len as usize);
+                let mut skip = src.source_offset;
                 for run in src.runs.iter() {
                     let take = (src.total_len as usize).saturating_sub(out.len());
                     if take == 0 {
                         break;
                     }
-                    let n = (run.len as usize).min(take);
+                    if skip >= run.len {
+                        skip -= run.len;
+                        continue;
+                    }
+                    let within = skip as usize;
+                    skip = 0;
+                    let n = (run.len as usize).saturating_sub(within).min(take);
                     // SAFETY: `host_ptr` is a stable RAMBlock alias from
                     // `HostOps::map_pages`, valid for the VM lifetime; the
                     // read races guest CPU writes exactly like the staging
                     // path's `read_task_gva_by_id` copy does.
                     unsafe {
-                        let slice = std::slice::from_raw_parts(run.host_ptr as *const u8, n);
+                        let slice = std::slice::from_raw_parts(
+                            (run.host_ptr as *const u8).add(within),
+                            n,
+                        );
                         out.extend_from_slice(slice);
                     }
                 }
@@ -1806,6 +1816,12 @@ pub struct GuestRun {
 #[derive(Clone, Debug)]
 pub struct GuestRunSource {
     pub runs: std::sync::Arc<Vec<GuestRun>>,
+    /// First byte of the requested window inside `runs` and `pages`.
+    ///
+    /// Normally zero. Task buffers reconstructed as one stable allocation keep
+    /// one source per resource and vary this offset at bind time, just as the
+    /// guest command carries one buffer reference plus an offset.
+    pub source_offset: u64,
     pub total_len: u64,
     /// Guest row stride in texels for the buffer→image copy
     /// (`bufferRowLength`); 0 = tight rows.
