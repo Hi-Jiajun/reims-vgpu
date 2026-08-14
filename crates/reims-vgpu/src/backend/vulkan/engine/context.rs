@@ -1076,6 +1076,11 @@ impl DeviceContext {
         // Reported and never branched on — see the module doc for why a positive
         // answer here is necessary and not sufficient.
         crate::backend::vulkan::caps::linear_sampled::report(&instance, pd);
+        // Whether a resident colour image can use imported guest storage as
+        // its backing. Like the sampled report, this is necessary but not
+        // sufficient: alias stability, memory requirements and row pitch are
+        // per-target questions.
+        crate::backend::vulkan::caps::linear_target::report(&instance, pd);
         // Fine-grained capabilities that do change what a draw can express.
         crate::observe::off(format!(
             "vk_device_select name={device_name:?} type={:?} depth_stencil_format={:?} bgra_storage_composite={} compute_capable={} quirks_no_deferred_batching={} quirks_guest_pages_authoritative={}",

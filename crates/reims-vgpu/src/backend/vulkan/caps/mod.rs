@@ -48,6 +48,7 @@ pub mod device_features;
 pub mod device_select;
 pub mod host_pointer;
 pub mod linear_sampled;
+pub mod linear_target;
 pub mod memory_topology;
 
 pub(crate) use host_pointer::{HostPointerCaps, HostPointerImport};
