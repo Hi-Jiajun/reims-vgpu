@@ -821,6 +821,44 @@ impl GuestRef {
     pub fn requested(&self) -> u64 {
         self.slice.requested()
     }
+
+    /// Store one guest-visible word through this reference's checked host
+    /// mapping.
+    ///
+    /// Completion handling uses this only after the queue point governing the
+    /// reference has completed. Keeping the address derivation here preserves
+    /// the module's central invariant: callers never receive a raw host pointer
+    /// or reconstruct `host_base + offset` themselves.
+    #[cfg(feature = "backend-vulkan")]
+    pub(crate) fn store_u32_release(&self, value: u32) -> bool {
+        if self.requested() < std::mem::size_of::<u32>() as u64 {
+            return false;
+        }
+        let Ok(bound) = self.bound() else {
+            return false;
+        };
+        let Some(byte_offset) = bound.offset.checked_add(self.head()) else {
+            return false;
+        };
+        let Some(address) = self.import.host_base().checked_add(byte_offset as usize) else {
+            return false;
+        };
+        if !address.is_multiple_of(std::mem::align_of::<std::sync::atomic::AtomicU32>()) {
+            return false;
+        }
+        // SAFETY: `GuestRamImport::new` validates the RAMBlock mapping and
+        // `bound()` proves this four-byte word is inside it. The Arc held by
+        // `GuestRef` keeps the import identity live through the store. The
+        // guest polls the aligned word concurrently, so an atomic release store
+        // prevents a torn value and orders the write before its interrupt.
+        unsafe {
+            (address as *const std::sync::atomic::AtomicU32)
+                .as_ref()
+                .expect("validated guest RAM address")
+                .store(value.to_le(), std::sync::atomic::Ordering::Release);
+        }
+        true
+    }
 }
 
 /// What a backend binds: a byte range inside one import, already checked.
@@ -1140,6 +1178,30 @@ mod tests {
             import.slice(0x1000, 1),
             Err(GuestRamError::SliceEndPastImport { .. })
         ));
+    }
+
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn a_guest_reference_stores_only_inside_its_checked_word() {
+        let mut words = [0u32; 4];
+        let import = std::sync::Arc::new(
+            GuestRamImport::new_host_allocation(
+                words.as_mut_ptr() as usize,
+                std::mem::size_of_val(&words) as u64,
+                std::mem::align_of_val(&words) as u64,
+            )
+            .expect("aligned test allocation"),
+        );
+        let slice = import
+            .slice(
+                std::mem::size_of::<u32>() as u64,
+                std::mem::size_of::<u32>() as u64,
+            )
+            .expect("second word");
+        let guest = GuestRef::new(import, slice).expect("matching import");
+
+        assert!(guest.store_u32_release(0x1234_5678));
+        assert_eq!(words, [0, 0x1234_5678u32.to_le(), 0, 0]);
     }
 
     /// One slug per check. Two checks sharing a slug is the defect the decline

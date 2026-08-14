@@ -116,8 +116,8 @@ pub enum VkOp {
     ContextPipelineCacheGetData,
     /// `vkCreateQueryPool` for the readback's two-slot timestamp probe.
     ContextCreateQueryPool,
-    /// The timeline semaphore a GPU-written completion stamp signals, so the
-    /// completion thread can wait it without owning a ring fence.
+    /// The timeline semaphore FIFO-owned submissions signal, so the completion
+    /// thread can wait them without owning a ring fence.
     ContextCreateSemaphore,
     /// `vkGetQueryPoolResults` reading that probe after its fence signalled.
     ContextGetQueryPoolResults,

@@ -1,4 +1,4 @@
-//! Announcing a completion stamp the GPU wrote, off the drain worker.
+//! Publishing and announcing FIFO completion stamps off the drain worker.
 //!
 //! # What the guest is actually waiting on
 //!
@@ -8,20 +8,19 @@
 //! reached it builds a **one-second** deadline, sleeps on the stamp word's own
 //! address as the wait channel, and re-reads the word on every wake.
 //!
-//! Two things follow, and the second is the one that cost a rebuild:
+//! Two things follow:
 //!
-//! * The word is the authority. Writing it from the GPU, ordered behind the
-//!   writeback copies by a barrier, is a sound way to move a fence — the guest
-//!   never asks this device whether the value is real.
+//! * The word is the authority. This module stores it only after the timeline
+//!   point of the FIFO work it represents has completed.
 //! * **The interrupt is the wakeup, not a hint.** Nothing re-checks the word
 //!   until something wakes the thread, so a late interrupt is not a late
 //!   notification, it is up to a full second of guest stall. An earlier attempt
 //!   deferred the announcement to the drain worker's next tranche and measured
 //!   exactly that: draws/s 3237 -> 2, presents/s 45 -> 1.
 //!
-//! So the stamp word may be handed to the GPU, and the interrupt may not be
-//! handed to anything that runs on a schedule. It has to be raised the moment
-//! the submission completes, which is what this module is.
+//! The completion thread therefore waits the queue's monotonic timeline,
+//! release-stores the shared word, and immediately raises the interrupt. The
+//! drain worker only enqueues the checked word and returns.
 //!
 //! # Why a thread, and why it needs nothing from the device lock
 //!
@@ -37,37 +36,12 @@
 //! This module owns none of that. It takes an [`AnnounceStamp`] hook the device
 //! layer installs, so the engine keeps knowing nothing about `BoundDevice`.
 //!
-//! # What it measured
-//!
-//! Back-to-back on one machine against the parent commit, testufo animating,
-//! 30 census windows each:
-//!
-//! ```text
-//!                      before     after
-//! presents/s             44.0      64.0     +45%
-//! draws/s              3206.0    3346.5
-//! busy_us/s          909958.5  830495.0      -9%
-//! max_tranche_us      37250.5   25458.0     -32%
-//! ```
-//!
-//! The presents ranges do not overlap — 41-47 against 54-69 — which is what
-//! makes this readable at all, because the same config measured across an hour
-//! of other work read 51, 53 and 63. Take a reading from this rail only against
-//! a run of its own parent on the same quiet machine.
-//!
-//! **The drain worker's block did not go away, and the gain is not from its
-//! removal.** `fence/s` still tracks `flushes/s` (399 -> 421), because root slot
-//! 0 stays on the blocking rail. What changed is what that block costs: by the
-//! time a root stamp quiesces, the child stamps ahead of it have already ordered
-//! the same copies on the queue, so the wait finds them done. The worker does 9%
-//! less work and delivers 45% more frames.
-//!
 //! # Why a timeline semaphore rather than a fence
 //!
 //! A second waiter cannot use the ring's fences. `ResourcePools` owns every one
 //! of them and resets each at retire, so a thread waiting on a ring fence races
 //! the reset and a submission that signalled once can read as unsignalled
-//! forever. Giving the stamp submission its own fence instead breaks the ring
+//! forever. Giving completion tracking its own fence instead breaks the ring
 //! the other way: `vkQueueSubmit` takes exactly one fence, so the slot's fence
 //! would never signal and its cleanup would never retire.
 //!
@@ -131,13 +105,17 @@ fn announce(index: u32) {
     }
 }
 
-/// One stamp waiting on the GPU, in submission order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One stamp waiting for its queue point, in FIFO order.
+#[derive(Clone, Debug)]
 struct Waiting {
-    /// Timeline value the submission carrying this stamp's word will signal.
-    value: u64,
+    /// Timeline value the FIFO submission preceding this stamp signals.
+    timeline: u64,
     /// Stamp slot index, for the interrupt-status bit.
     index: u32,
+    /// The checked shared-memory word written before the interrupt is raised.
+    word: crate::runtime::guest_ram::GuestRef,
+    /// The FIFO completion value published into `word`.
+    stamp: u32,
 }
 
 /// The queue the drain worker pushes to and the completion thread drains.
@@ -151,6 +129,8 @@ struct Shared {
     /// Highest value handed out. The drain worker reserves with `fetch_add`
     /// under the engine lock, so reservation order is submission order.
     next_value: AtomicU64,
+    /// Highest timeline point belonging to a successful queue submission.
+    latest_submitted: AtomicU64,
 }
 
 /// A running completion thread, owned by the device context.
@@ -185,6 +165,7 @@ impl StampCompletion {
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
             next_value: AtomicU64::new(0),
+            latest_submitted: AtomicU64::new(0),
         });
         let thread_shared = Arc::clone(&shared);
         let thread_device = device.clone();
@@ -199,47 +180,47 @@ impl StampCompletion {
         })
     }
 
-    /// The semaphore a stamp submission signals, and the value to signal.
+    /// Reserve the timeline point for one FIFO-owned queue submission.
     ///
     /// Reserved under the engine lock, so the values are handed out in
     /// submission order — which is what makes a single-threaded drain of the
     /// queue announce stamps in that same order without any further ordering
     /// machinery.
-    pub(crate) fn reserve(&self, index: u32) -> (vk::Semaphore, u64) {
+    pub(crate) fn reserve_submission(&self) -> (vk::Semaphore, u64) {
         let value = self.shared.next_value.fetch_add(1, Ordering::AcqRel) + 1;
+        (self.semaphore, value)
+    }
+
+    /// Publish a successfully submitted queue point.
+    pub(crate) fn note_submitted(&self, value: u64) {
+        self.shared.latest_submitted.store(value, Ordering::Release);
+    }
+
+    /// The newest successfully submitted queue point.
+    pub(crate) fn latest_submitted(&self) -> Option<(vk::Semaphore, u64)> {
+        let value = self.shared.latest_submitted.load(Ordering::Acquire);
+        (value != 0).then_some((self.semaphore, value))
+    }
+
+    /// Retire one FIFO completion after `timeline` completes.
+    pub(crate) fn wait_for_stamp(
+        &self,
+        timeline: u64,
+        index: u32,
+        word: crate::runtime::guest_ram::GuestRef,
+        stamp: u32,
+    ) {
         self.shared
             .queue
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push_back(Waiting { value, index });
+            .push_back(Waiting {
+                timeline,
+                index,
+                word,
+                stamp,
+            });
         self.shared.wake.notify_one();
-        (self.semaphore, value)
-    }
-
-    /// Drop a reservation whose submission never happened.
-    ///
-    /// A submit that fails after [`Self::reserve`] leaves a value nothing will
-    /// ever signal, and the thread would then block on it until the deadline and
-    /// hold every later stamp behind it. Signalling the value from the host is
-    /// the repair: it is exactly what the queue would have done, so the thread's
-    /// wait completes and the announcement still reaches the guest — which is
-    /// the safe direction, because the alternative is a guest asleep on a fence
-    /// with a one-second deadline and nothing coming.
-    ///
-    /// # Safety
-    ///
-    /// `device` must be the device this was started with.
-    pub(crate) unsafe fn abandon(&self, device: &ash::Device, value: u64) {
-        let signal = vk::SemaphoreSignalInfo::default()
-            .semaphore(self.semaphore)
-            .value(value);
-        if let Err(e) = unsafe { device.signal_semaphore(&signal) } {
-            crate::observe::fail(format!(
-                "stamp_signal_abandon_failed reason=stamp_signal_abandon_failed value={value} \
-                 err={e:?} (a stamp submission failed and the host could not stand in for it; \
-                 the guest waiting on this stamp will sleep to its deadline)"
-            ));
-        }
     }
 
     /// Stop the thread and destroy the semaphore.
@@ -255,9 +236,8 @@ impl StampCompletion {
         self.shared.stop.store(true, Ordering::Release);
         // Signal past every reserved value so a thread blocked in
         // `vkWaitSemaphores` returns rather than sitting out its deadline. The
-        // stamps it then announces are ones whose bytes may not have landed —
-        // deliberately, and for the reason `abandon` gives: this device is going
-        // away, so a withheld announcement is a guest that never wakes.
+        // thread observes `stop` after the wait and never publishes a word for
+        // work this host signal merely skipped over.
         let past_everything = self.shared.next_value.load(Ordering::Acquire) + 1;
         let signal = vk::SemaphoreSignalInfo::default()
             .semaphore(self.semaphore)
@@ -284,7 +264,7 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
                 if shared.stop.load(Ordering::Acquire) {
                     return;
                 }
-                if let Some(front) = queue.front().copied() {
+                if let Some(front) = queue.front().cloned() {
                     break Some(front);
                 }
                 let (guard, _) = shared
@@ -298,7 +278,7 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
             return;
         };
         let semaphores = [semaphore];
-        let values = [waiting.value];
+        let values = [waiting.timeline];
         let info = vk::SemaphoreWaitInfo::default()
             .semaphores(&semaphores)
             .values(&values);
@@ -307,31 +287,44 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
         // fault rather than a slow frame — announce anyway and say so, because
         // the guest's own deadline is one second and a withheld stamp costs it
         // that whether the GPU is wedged or not.
-        match unsafe { device.wait_semaphores(&info, super::context::FENCE_TIMEOUT_NS) } {
-            Ok(()) => {}
-            Err(vk::Result::TIMEOUT) => crate::observe::fail(format!(
-                "stamp_wait_timeout reason=stamp_wait_timeout index={} value={} \
-                 (the submission carrying this stamp's word has not executed within the \
-                 fence deadline; announcing it anyway so the guest is not left asleep)",
-                waiting.index, waiting.value
-            )),
-            Err(e) => {
-                crate::observe::fail(format!(
-                    "stamp_wait_failed reason=stamp_wait_failed index={} value={} err={e:?} \
-                     (announcing regardless, for the reason a timeout does)",
-                    waiting.index, waiting.value
-                ));
-                // Announcing is not recovering. This thread may not take the
-                // engine lock — it exists to announce guest fences while the
-                // drain worker holds it — so it latches the loss and the drain's
-                // end-of-tranche flush runs the recovery. Without this, a boot
-                // whose device dies *here* never rebuilds it: the guest stops
-                // drawing because its work stopped completing, and "the next
-                // draw will surface it" then waits forever.
-                if e == vk::Result::ERROR_DEVICE_LOST {
-                    super::device_lost::note_device_lost_seen();
+        let completed =
+            match unsafe { device.wait_semaphores(&info, super::context::FENCE_TIMEOUT_NS) } {
+                Ok(()) => true,
+                Err(vk::Result::TIMEOUT) => {
+                    crate::observe::fail(format!(
+                        "stamp_wait_timeout reason=stamp_wait_timeout index={} value={} \
+                     (the submission carrying this stamp's word has not executed within the \
+                     fence deadline; announcing it anyway so the guest is not left asleep)",
+                        waiting.index, waiting.timeline
+                    ));
+                    false
                 }
-            }
+                Err(e) => {
+                    crate::observe::fail(format!(
+                        "stamp_wait_failed reason=stamp_wait_failed index={} value={} err={e:?} \
+                     (announcing regardless, for the reason a timeout does)",
+                        waiting.index, waiting.timeline
+                    ));
+                    // Announcing is not recovering. This thread may not take the
+                    // engine lock — it exists to announce guest fences while the
+                    // drain worker holds it — so it latches the loss and the drain's
+                    // end-of-tranche flush runs the recovery. Without this, a boot
+                    // whose device dies *here* never rebuilds it: the guest stops
+                    // drawing because its work stopped completing, and "the next
+                    // draw will surface it" then waits forever.
+                    if e == vk::Result::ERROR_DEVICE_LOST {
+                        super::device_lost::note_device_lost_seen();
+                    }
+                    false
+                }
+            };
+        let stopping = shared.stop.load(Ordering::Acquire);
+        if should_publish(completed, stopping) && !publish_stamp_word(&waiting) {
+            crate::observe::fail(format!(
+                "stamp_cpu_store_failed reason=stamp_cpu_store_failed index={} value={:#x} \
+                 (the completed queue point could not publish its checked shared word)",
+                waiting.index, waiting.stamp
+            ));
         }
         shared
             .queue
@@ -339,46 +332,42 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
             .unwrap_or_else(|e| e.into_inner())
             .pop_front();
         announce(waiting.index);
+        if stopping {
+            return;
+        }
     }
+}
+
+fn should_publish(completed: bool, stopping: bool) -> bool {
+    completed && !stopping
+}
+
+fn publish_stamp_word(waiting: &Waiting) -> bool {
+    waiting.word.store_u32_release(waiting.stamp)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Reservation order is submission order, and the queue keeps it. A single
-    /// thread draining a FIFO is the whole of this rail's ordering guarantee —
-    /// a stamp announced out of order moves a guest fence past a completion it
-    /// has not been told about.
-    ///
-    /// Device-free: drives the ledger, not the wait.
+    /// Reservation order is submission order, and only successful submissions
+    /// become attachable completion points.
     #[test]
-    fn reservations_are_monotonic_and_queue_in_submission_order() {
+    fn reservations_are_monotonic_and_success_is_published_separately() {
         let shared = Shared {
             queue: Mutex::new(std::collections::VecDeque::new()),
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
             next_value: AtomicU64::new(0),
+            latest_submitted: AtomicU64::new(0),
         };
-        for (n, index) in [(1u64, 3u32), (2, 0), (3, 3)] {
+        for n in 1u64..=3 {
             let value = shared.next_value.fetch_add(1, Ordering::AcqRel) + 1;
             assert_eq!(value, n, "timeline values start at 1 and never repeat");
-            shared
-                .queue
-                .lock()
-                .unwrap()
-                .push_back(Waiting { value, index });
         }
-        let queue = shared.queue.lock().unwrap();
-        assert_eq!(
-            queue.iter().copied().collect::<Vec<_>>(),
-            vec![
-                Waiting { value: 1, index: 3 },
-                Waiting { value: 2, index: 0 },
-                Waiting { value: 3, index: 3 },
-            ],
-            "the same slot may be stamped twice and both must be announced, in order"
-        );
+        assert_eq!(shared.latest_submitted.load(Ordering::Acquire), 0);
+        shared.latest_submitted.store(3, Ordering::Release);
+        assert_eq!(shared.latest_submitted.load(Ordering::Acquire), 3);
     }
 
     /// The initial value is 0 and the first reservation is 1, so no submission
@@ -389,5 +378,36 @@ mod tests {
     fn no_reservation_can_collide_with_the_semaphores_initial_value() {
         let next = AtomicU64::new(0);
         assert_eq!(next.fetch_add(1, Ordering::AcqRel) + 1, 1);
+    }
+
+    #[test]
+    fn completed_waiting_entry_publishes_its_word() {
+        let mut words = [0u32; 2];
+        let import = Arc::new(
+            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                words.as_mut_ptr() as usize,
+                std::mem::size_of_val(&words) as u64,
+                std::mem::align_of_val(&words) as u64,
+            )
+            .expect("test import"),
+        );
+        let slice = import.slice(4, 4).expect("second word");
+        let word = crate::runtime::guest_ram::GuestRef::new(import, slice).expect("guest word");
+        let waiting = Waiting {
+            timeline: 7,
+            index: 2,
+            word,
+            stamp: 0x89ab_cdef,
+        };
+
+        assert!(publish_stamp_word(&waiting));
+        assert_eq!(words, [0, 0x89ab_cdefu32.to_le()]);
+    }
+
+    #[test]
+    fn teardown_wakeup_never_publishes_unfinished_work() {
+        assert!(should_publish(true, false));
+        assert!(!should_publish(false, false));
+        assert!(!should_publish(true, true));
     }
 }

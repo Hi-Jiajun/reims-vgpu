@@ -548,8 +548,8 @@ pub(crate) struct DeviceContext {
     /// while a draw's pair belongs to the ring slot whose fence will make it
     /// readable. See [`super::gpu_span`].
     pub draw_spans: Option<DrawSpanProbe>,
-    /// The thread that announces a GPU-written completion stamp, and the
-    /// timeline semaphore its submissions signal.
+    /// The thread that publishes and announces FIFO completion stamps, and the
+    /// timeline semaphore FIFO-owned submissions signal.
     ///
     /// `None` when the device does not advertise `timelineSemaphore` or the
     /// thread would not start — the stamp rail then falls back to blocking the
@@ -1396,6 +1396,35 @@ impl DeviceContext {
 
     pub(crate) fn queue(&self) -> vk::Queue {
         unsafe { self.device.get_device_queue(self.gq, 0) }
+    }
+
+    /// Submit FIFO-owned GPU work and publish its monotonic completion point.
+    ///
+    /// The caller supplies no signal semaphores; this method owns that part of
+    /// the submission so every guest-memory access participates in the same
+    /// completion timeline. A failed submit publishes nothing, and a later
+    /// successful value may legally skip the unused reservation.
+    pub(crate) unsafe fn submit_guest_work(
+        &self,
+        command_buffers: &[vk::CommandBuffer],
+        fence: vk::Fence,
+    ) -> Result<(), vk::Result> {
+        let plain = vk::SubmitInfo::default().command_buffers(command_buffers);
+        let Some(completion) = self.stamp_completion.as_ref() else {
+            return unsafe { self.device.queue_submit(self.queue(), &[plain], fence) };
+        };
+        let (semaphore, timeline) = completion.reserve_submission();
+        let semaphores = [semaphore];
+        let values = [timeline];
+        let mut timeline_info =
+            vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&values);
+        let info = vk::SubmitInfo::default()
+            .command_buffers(command_buffers)
+            .signal_semaphores(&semaphores)
+            .push_next(&mut timeline_info);
+        unsafe { self.device.queue_submit(self.queue(), &[info], fence) }?;
+        completion.note_submitted(timeline);
+        Ok(())
     }
 }
 

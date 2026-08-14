@@ -604,6 +604,12 @@ engine_counters! {
         /// through `begin_entry` would put a diagnostic in the signature of the
         /// device's hottest slot claim.
         batch_readback_joins,
+        /// Completion stamps whose ordering point came from flushing an open
+        /// draw batch.
+        gpu_stamp_batch_points,
+        /// Completion stamps that reused the newest successful FIFO submission
+        /// because no draw batch remained open.
+        gpu_stamp_reused_points,
         /// Guest-page writebacks that detiled through the device-local scratch
         /// and scattered with plain buffer copies — one region per guest
         /// stretch instead of up to three rectangles per stretch.

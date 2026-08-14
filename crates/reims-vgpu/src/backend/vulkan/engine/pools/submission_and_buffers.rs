@@ -1778,38 +1778,13 @@ impl ResourcePools {
         ctx: &DeviceContext,
         counters: &EngineCounters,
     ) -> Result<(), DrawError> {
-        unsafe { self.batch_flush_inner(ctx, counters, None) }
-    }
-
-    /// [`Self::batch_flush`], additionally signalling `(semaphore, value)` on
-    /// the timeline when the batch completes.
-    ///
-    /// For the stamp rail, which appends its word to an open batch rather than
-    /// submitting behind it and so needs *that* submission to carry the signal.
-    /// An empty batch is not a no-op here the way it is for a plain flush: the
-    /// caller has already reserved the value and something must signal it, so
-    /// the absence of a batch is an error the caller turns into an abandon.
-    pub(crate) unsafe fn batch_flush_signalling(
-        &mut self,
-        ctx: &DeviceContext,
-        counters: &EngineCounters,
-        semaphore: vk::Semaphore,
-        value: u64,
-    ) -> Result<(), DrawError> {
-        if self.open_batch.is_none() {
-            return Err(DrawError::VkCall(VkCall::new(
-                VkOp::PoolsSubmitBatch,
-                vk::Result::ERROR_UNKNOWN,
-            )));
-        }
-        unsafe { self.batch_flush_inner(ctx, counters, Some((semaphore, value))) }
+        unsafe { self.batch_flush_inner(ctx, counters) }
     }
 
     unsafe fn batch_flush_inner(
         &mut self,
         ctx: &DeviceContext,
         counters: &EngineCounters,
-        signal: Option<(vk::Semaphore, u64)>,
     ) -> Result<(), DrawError> {
         let Some(mut batch) = self.take_open_batch() else {
             return Ok(());
@@ -1834,15 +1809,7 @@ impl ResourcePools {
                 .end_command_buffer(batch.cb)
                 .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsEndCbBatch, e)))?;
             let cbs = [batch.cb];
-            let sems = signal.map(|(s, _)| [s]).unwrap_or([vk::Semaphore::null()]);
-            let vals = signal.map(|(_, v)| [v]).unwrap_or([0]);
-            let mut timeline_info =
-                vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&vals);
-            let mut si = vk::SubmitInfo::default().command_buffers(&cbs);
-            if signal.is_some() {
-                si = si.signal_semaphores(&sems).push_next(&mut timeline_info);
-            }
-            match ctx.device.queue_submit(ctx.queue(), &[si], batch.fence) {
+            match ctx.submit_guest_work(&cbs, batch.fence) {
                 Ok(()) => Ok(()),
                 Err(e) if e == vk::Result::ERROR_DEVICE_LOST => {
                     Err(DrawError::DeviceLost(DeviceLostDecline::Driver {

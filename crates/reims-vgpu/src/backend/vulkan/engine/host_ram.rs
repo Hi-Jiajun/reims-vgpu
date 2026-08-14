@@ -539,8 +539,8 @@ unsafe fn import_ramblock(
     bound
 }
 
-/// A check that stopped a resident's frame from being copied straight into the
-/// guest's own pages, so the flush took the CPU route instead.
+/// A check that stopped GPU-ordered access to the guest's own pages, so the
+/// operation took its blocking CPU route instead.
 ///
 /// Every one of these is a *routing* answer rather than a loss — the copying
 /// rail still lands the frame — but each is a whole flush's worth of memcpy that
@@ -556,6 +556,10 @@ pub enum GuestWriteDecline {
     Unsupported {
         rung: crate::backend::vulkan::caps::HostPointerImport,
     },
+    /// Guest-memory work is outstanding, but no successful FIFO submission
+    /// published a completion point for it. This is an ownership invariant
+    /// failure rather than a missing host capability.
+    NoCompletionPoint,
     /// The resident's physical channel order is not the order the destination
     /// stores, so landing it would need an R/B exchange — which an image→buffer
     /// copy cannot perform. The copying rail's per-row conversion is where that
@@ -601,6 +605,7 @@ impl Decline for GuestWriteDecline {
         match self {
             Self::NoSharedBacking => "gpu_writeback_no_shared_backing",
             Self::Unsupported { .. } => "gpu_writeback_unsupported",
+            Self::NoCompletionPoint => "gpu_completion_point_missing",
             Self::ResidentFormatMismatch { .. } => "gpu_writeback_resident_format_mismatch",
             Self::GeometryMoved { .. } => "gpu_writeback_geometry_moved",
             Self::WindowTooSmall { .. } => "gpu_writeback_window_too_small",
@@ -615,6 +620,7 @@ impl Decline for GuestWriteDecline {
         match self {
             Self::NoSharedBacking => Vec::new(),
             Self::Unsupported { rung } => vec![("rung", rung.slug().to_string())],
+            Self::NoCompletionPoint => Vec::new(),
             Self::ResidentFormatMismatch { held, want } => vec![
                 ("resident", format!("{held:?}")),
                 ("want", format!("{want:?}")),
@@ -767,6 +773,14 @@ mod tests {
         assert_eq!(
             GuestWriteDecline::NoSharedBacking.slug(),
             "gpu_writeback_no_shared_backing"
+        );
+    }
+
+    #[test]
+    fn a_missing_fifo_completion_point_has_its_own_refusal() {
+        assert_eq!(
+            GuestWriteDecline::NoCompletionPoint.slug(),
+            "gpu_completion_point_missing"
         );
     }
 

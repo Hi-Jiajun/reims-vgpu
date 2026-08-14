@@ -1270,40 +1270,84 @@ pub fn guest_access_outstanding() -> bool {
     GUEST_READ_DEBT.load(std::sync::atomic::Ordering::Acquire) || guest_writes_outstanding()
 }
 
-/// Record the completion stamp's word into the GPU queue behind the work this
-/// device has accepted, and return without waiting for any of it.
+/// Where one FIFO completion stamp obtained its ordering point.
+///
+/// A batched stamp closes work that already needed submitting; otherwise the
+/// stamp reuses the newest successful FIFO submission. Keeping it as a type
+/// makes the counter choice exhaustive and gives the rule a device-free
+/// behavioural test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StampPointSource {
+    Batch,
+    Reused,
+}
+
+impl StampPointSource {
+    fn from_open_batch(open: bool) -> Self {
+        if open {
+            Self::Batch
+        } else {
+            Self::Reused
+        }
+    }
+
+    fn count(self, counters: &EngineCounters) {
+        let counter = match self {
+            Self::Batch => &counters.gpu_stamp_batch_points,
+            Self::Reused => &counters.gpu_stamp_reused_points,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod stamp_point_source_tests {
+    use super::*;
+
+    #[test]
+    fn a_flushed_batch_and_a_reused_point_are_counted_apart() {
+        let counters = EngineCounters::default();
+        StampPointSource::from_open_batch(true).count(&counters);
+        StampPointSource::from_open_batch(false).count(&counters);
+        StampPointSource::from_open_batch(false).count(&counters);
+
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.gpu_stamp_batch_points, 1);
+        assert_eq!(snapshot.gpu_stamp_reused_points, 2);
+        assert_eq!(
+            snapshot.gpu_stamp_batch_points + snapshot.gpu_stamp_reused_points,
+            3,
+            "every successful GPU stamp has exactly one completion-point source"
+        );
+    }
+}
+
+/// Queue a completion stamp behind the FIFO work this device accepted, without
+/// blocking the drain worker.
 ///
 /// # The ordering this buys, and the one it does not
 ///
 /// A completion stamp is a queue fence: the guest may not observe it until the
 /// commands preceding it have completed. That includes writes into guest pages
 /// and reads from guest pages the guest may reuse after observing the stamp.
-/// The blocking rail enforces the memory-lifetime half by retiring the queue and
-/// then storing the word from the CPU. This rail records the word as a transfer
-/// into the imported RAMBlock, behind a barrier that names every command
-/// submitted before it.
-///
-/// The barrier is the whole argument. A pipeline barrier applies to all commands
-/// submitted earlier in submission order on the same queue, not merely to the
-/// rest of its own command buffer — the property `copy_image_level0_to_buffer`'s
-/// image barrier already relies on to order a copy after draws recorded in an
-/// earlier submission. So `ALL_COMMANDS -> TRANSFER` here waits out every
-/// outstanding writeback *and* every outstanding guest read, which is what makes
-/// this rail subsume [`quiesce_guest_reads`] as well.
+/// The blocking rail retires the queue and then stores the word from the CPU.
+/// This rail gives every FIFO-owned submission a monotonic timeline point. The
+/// completion thread waits the newest point, release-stores the word through its
+/// checked [`crate::runtime::guest_ram::GuestRef`], and raises the interrupt.
+/// Queue order makes that one point cover every earlier guest-memory read and
+/// write without manufacturing a submission for the four-byte stamp.
 ///
 /// **It does not order the interrupt**, and that is not an oversight. The guest
 /// reads the stamp word directly and sleeps on it with a one-second deadline, so
-/// the interrupt is its wakeup rather than a hint. The submission signals a
-/// timeline value and `stamp_completion`'s thread raises the interrupt the
-/// moment it lands — see that module for what happens when this is deferred
-/// instead.
+/// the interrupt is its wakeup rather than a hint. The FIFO submission signals
+/// a timeline value and `stamp_completion`'s thread publishes and announces the
+/// stamp the moment it completes.
 ///
 /// # Errors
 ///
 /// Every error is a routing answer: the caller still owes the stamp and settles
-/// it the blocking way. Nothing is recorded and no timeline value is left
-/// outstanding — a reservation whose submit fails is signalled from the host so
-/// the completion thread does not block behind it.
+/// it the blocking way. Nothing is enqueued unless a successful FIFO submission
+/// has published the completion point being waited.
 pub fn write_completion_stamp(
     guest_ref: &crate::runtime::guest_ram::GuestRef,
     index: u32,
@@ -1328,123 +1372,22 @@ pub fn write_completion_stamp(
             rung: ctx.caps.host_pointer.rung,
         }));
     };
-    unsafe { pools.ensure_init(ctx, counters)? };
-    let bound = unsafe { pools.bind_guest_ram(ctx, guest_ref) }
-        .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
-    // Claimed before the reservation, because `begin_entry` can flush an open
-    // batch and a reservation held across that would be ordered behind work it
-    // does not describe.
-    let appended = pools.batch_open_recording();
-    let (cb, fence) = match appended {
-        Some(pair) => pair,
-        None => unsafe { pools.begin_entry(ctx, counters)? },
-    };
-    // `mut` because the recording now arms the slot's GPU timestamp pair, which is
-    // state on `pools`. The closure is called once, immediately below, and never
-    // held across the submit that follows.
-    let mut record = || -> Result<(), DrawError> {
-        unsafe {
-            if appended.is_none() {
-                pools.begin_slot_recording(
-                    ctx,
-                    cb,
-                    gpu_span::Kind::Stamp,
-                    VkOp::GuestWriteResetCb,
-                    VkOp::GuestWriteBeginCb,
-                )?;
-            }
-            // `ALL_COMMANDS` on the source side is not caution: what this must
-            // follow is the writeback copies (TRANSFER) *and* any draw still
-            // sourcing guest pages, and only the widest source stage covers both
-            // without this site having to know which are outstanding.
-            let owed = [ash::vk::MemoryBarrier::default()
-                .src_access_mask(
-                    ash::vk::AccessFlags::MEMORY_WRITE | ash::vk::AccessFlags::MEMORY_READ,
-                )
-                .dst_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)];
-            ctx.device.cmd_pipeline_barrier(
-                cb,
-                ash::vk::PipelineStageFlags::ALL_COMMANDS,
-                ash::vk::PipelineStageFlags::TRANSFER,
-                ash::vk::DependencyFlags::empty(),
-                &owed,
-                &[],
-                &[],
-            );
-            // Little-endian because `gpa_map::write_u32` is, and the guest reads
-            // one word either way this device writes it. `head` is the
-            // granularity rounding in front of the byte asked for, re-based
-            // exactly as the copy planners re-base.
-            ctx.device.cmd_update_buffer(
-                cb,
-                bound.buffer,
-                bound.offset + bound.head,
-                &value.to_le_bytes(),
-            );
-            // Released to the host so the vCPU's read of this word sees it.
-            // Guest RAM is ordinary system memory this process already has
-            // mapped and a PCIe write to it is snooped, so nothing is owed
-            // beyond the release.
-            let visible = [ash::vk::MemoryBarrier::default()
-                .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(ash::vk::AccessFlags::HOST_READ)];
-            ctx.device.cmd_pipeline_barrier(
-                cb,
-                ash::vk::PipelineStageFlags::TRANSFER,
-                ash::vk::PipelineStageFlags::HOST,
-                ash::vk::DependencyFlags::empty(),
-                &visible,
-                &[],
-                &[],
-            );
-            Ok(())
-        }
-    };
-    record()?;
-    // Reserved after everything fallible that precedes the submit, so the only
-    // way to hold a value is to be about to submit it.
-    let (semaphore, timeline) = completion.reserve(index);
-    let submitted = unsafe {
-        if appended.is_some() {
-            pools.batch_flush_signalling(ctx, counters, semaphore, timeline)
-        } else {
-            pools.gpu_span_seal_current(ctx, cb);
-            ctx.device
-                .end_command_buffer(cb)
-                .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteEndCb, e)))
-                .and_then(|()| {
-                    let cbs = [cb];
-                    let sems = [semaphore];
-                    let vals = [timeline];
-                    let mut timeline_info = ash::vk::TimelineSemaphoreSubmitInfo::default()
-                        .signal_semaphore_values(&vals);
-                    let si = ash::vk::SubmitInfo::default()
-                        .command_buffers(&cbs)
-                        .signal_semaphores(&sems)
-                        .push_next(&mut timeline_info);
-                    ctx.device
-                        .queue_submit(ctx.queue(), &[si], fence)
-                        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteSubmit, e)))
-                })
-                .map(|()| {
-                    let sealed = pools.seal_entry(Vec::new(), Vec::new());
-                    pools.finish_entry_async(&ctx.device, sealed);
-                })
-        }
-    };
-    if let Err(e) = submitted {
-        // The value will never be signalled by the queue, and the completion
-        // thread is already waiting on it. Stand in for the submission so it
-        // does not block behind a value that is not coming — and with it, every
-        // later stamp.
-        unsafe { completion.abandon(&ctx.device, timeline) };
-        return Err(e);
+    let had_batch = pools.batch_open_recording().is_some();
+    if had_batch {
+        unsafe { pools.batch_flush(ctx, counters)? };
     }
+    let Some((_, timeline)) = completion.latest_submitted() else {
+        let decline = GuestWriteDecline::NoCompletionPoint;
+        crate::observe::Emit::decline("gpu_completion_stamp", &decline).fail();
+        return Err(DrawError::GuestPageWrite(decline));
+    };
+    completion.wait_for_stamp(timeline, index, guest_ref.clone(), value);
     // The queued stamp now carries the ordering for every guest read recorded
     // before this submission. A later read records a fresh debt; retaining this
     // one would submit an otherwise empty stamp for every later CPU-only packet.
     pools.take_guest_read_debt();
     counters.gpu_stamps.fetch_add(1, Ordering::Relaxed);
+    StampPointSource::from_open_batch(had_batch).count(counters);
     Ok(())
 }
 
@@ -3876,9 +3819,7 @@ unsafe fn copy_image_level0_to_buffer(
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteEndCb, e)))?;
         let cbs = [cb];
-        let si = ash::vk::SubmitInfo::default().command_buffers(&cbs);
-        ctx.device
-            .queue_submit(ctx.queue(), &[si], fence)
+        ctx.submit_guest_work(&cbs, fence)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteSubmit, e)))?;
         let sealed = pools.seal_entry(Vec::new(), Vec::new());
         pools.finish_entry_async(&ctx.device, sealed);

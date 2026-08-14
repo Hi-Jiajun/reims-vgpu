@@ -842,9 +842,9 @@ impl StampWait {
 /// only through its greatest value unless the guest samples between the writes,
 /// and writing only that value discharges every wait the run would have.
 ///
-/// That matters because a stamp is not a word write. On the Vulkan arm
-/// `write_stamp` submits a command buffer, measured at **12.3 us a packet**
-/// against 59 ns for the tail read beside it.
+/// That matters because a stamp is a FIFO completion, not merely a word write.
+/// Coalescing avoids one completion record per packet while preserving the
+/// greatest value the guest can observe from the drain.
 ///
 /// # What it bought, six driven macos-13 boots, one binary, both arms
 ///
@@ -1554,8 +1554,8 @@ fn note_stamp_direction<H: HostMemory + HostOps>(host: &H, gpa: u64, index: u32,
     }
 }
 
-/// Record this stamp's word into the GPU queue behind the writebacks it
-/// follows, so the drain worker never blocks on them.
+/// Queue this stamp behind the FIFO completion point of the guest-memory work
+/// it follows, so the drain worker never blocks on that work.
 ///
 /// `false` means the caller still owes the stamp and must settle it the blocking
 /// way. Four things answer `false`, and only the last is a fault: the operator
@@ -1568,7 +1568,7 @@ fn note_stamp_direction<H: HostMemory + HostOps>(host: &H, gpa: u64, index: u32,
 /// rather than assumed, because a stamp page outside an imported RAMBlock is
 /// exactly the case that must fall back rather than be written blind.
 #[cfg(feature = "backend-vulkan")]
-fn stamp_word_ordered_on_gpu<H: HostMemory + HostOps>(
+fn stamp_word_ordered_on_fifo<H: HostMemory + HostOps>(
     state: &DeviceState,
     host: &mut H,
     index: u32,
@@ -1596,8 +1596,8 @@ fn stamp_word_ordered_on_gpu<H: HostMemory + HostOps>(
         return false;
     };
     // The direction check the CPU rail gets from `note_stamp_direction`. Taken
-    // before the submit, because after it the word is the GPU's and reading it
-    // back says nothing about what this device promised.
+    // before enqueueing because the completion thread owns the next write and
+    // reading the word afterward says nothing about what this device promised.
     note_stamp_direction(host, gpa, index, value);
     crate::backend::vulkan::engine::write_completion_stamp(&guest_ref, index, value).is_ok()
 }
@@ -1620,7 +1620,7 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     // which is why the page-set guard passed on 810 of 810 landings and the heap
     // corruption continued.
     //
-    // **Nothing may settle those writes before the GPU rail below is offered
+    // **Nothing may settle those writes before the ordered rail below is offered
     // one.** That rail's first question is whether anything is still
     // outstanding, because ordering behind nothing is a submission and a thread
     // hop for an ordering that already holds. A settle here answers that
@@ -1629,17 +1629,17 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     // beside a `readback_split` `fence` that tracks the flush count exactly.
     // Both quiesces below are reached only when the rail declines, and there
     // they are the settle this comment used to describe.
-    // The stamp word ordered behind the copies by the GPU rather than by this
-    // thread blocking. Tried before either quiesce because when it takes,
-    // neither is owed: its leading barrier names every command submitted before
-    // it, which covers the writebacks and the guest reads alike.
+    // The completion thread waits the newest FIFO submission and then stores
+    // the stamp, rather than making this thread block. Tried before either
+    // quiesce because the timeline point covers the preceding guest reads and
+    // writes alike.
     //
     // Nothing about the *interrupt* is deferred by this — the completion thread
-    // raises it the moment the submission lands. See
+    // raises it immediately after publishing the word. See
     // `backend::vulkan::engine::stamp_completion` for the measurement that says
     // it cannot be deferred to anything slower.
     #[cfg(feature = "backend-vulkan")]
-    if stamp_word_ordered_on_gpu(state, host, index, stamp_value) {
+    if stamp_word_ordered_on_fifo(state, host, index, stamp_value) {
         // Advanced at submit, not at completion. From here the guest may see the
         // word at any moment, so a window still armed has already outlived this
         // fence — which is what `armed_stamp_seq` is compared against, and
@@ -2405,16 +2405,18 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                         //
                         // Root slot 0 stays on the blocking rail, and the
                         // measurement is the reason rather than caution. Routing
-                        // it through the GPU rail as well was booted and scored
-                        // worse on the thing the guest sees: presents/s 63 -> 53
+                        // it through the asynchronous rail as well was booted
+                        // and scored worse on the thing the guest sees:
+                        // presents/s 63 -> 53
                         // against an otherwise identical tree, with draws/s
-                        // 3320 -> 3141. The child slots keep the fast rail
-                        // because there it pays; this is a submission and a
-                        // thread hop for a stamp the guest is already waiting on.
+                        // 3320 -> 3141. That experiment used the old per-stamp
+                        // submission shape; the submission-reusing completion
+                        // model must be measured independently before this
+                        // blocking root rule changes.
                         //
                         // The first attempt at it was also outright broken, and
                         // that shape is worth keeping: `completed` raises slot
-                        // 0's interrupt *after* this loop, so a GPU-ordered root
+                        // 0's interrupt *after* this loop, so an asynchronous root
                         // stamp that still set it announced the completion before
                         // the word moved. The guest treats an interrupt as its
                         // wakeup, re-read the old value, and slept out its

@@ -983,10 +983,8 @@ pub(crate) unsafe fn execute_compute_inner(
         return Err(DrawError::DeviceLost(DeviceLostDecline::ForcedCompute));
     }
 
-    let queue = ctx.queue();
     let cbs = [cb];
-    let si = vk::SubmitInfo::default().command_buffers(&cbs);
-    match ctx.device.queue_submit(queue, &[si], fence) {
+    match ctx.submit_guest_work(&cbs, fence) {
         Ok(()) => {}
         Err(e) if e == vk::Result::ERROR_DEVICE_LOST => {
             return Err(DrawError::DeviceLost(DeviceLostDecline::Driver {
