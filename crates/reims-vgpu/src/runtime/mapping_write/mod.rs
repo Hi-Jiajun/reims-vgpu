@@ -924,6 +924,29 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
             format,
         });
     };
+    // One live window per physical format is enough to answer the remaining
+    // device-level question: whether the driver's actual linear layout and
+    // memory requirements agree with a guest plane on this host. The packed
+    // view is the allocation a direct image would retain; no behavior branches
+    // on this report yet.
+    let probe_key = dst_format.as_raw() as u32 as u64;
+    if crate::observe::first_sight("vk_linear_target_window_probe", probe_key) {
+        if let Some((ptr, len)) = mapper::ensure_contig_view(state, host, mapping_id) {
+            crate::backend::vulkan::engine::probe_guest_backed_target(
+                ptr,
+                len as u64,
+                base_off,
+                u64::from(bpr),
+                mw,
+                mh,
+                dst_format,
+            );
+        } else {
+            crate::observe::off(format!(
+                "vk_linear_target_window verdict=no_packed_alias format={dst_format:?} {mw}x{mh} plane_offset={base_off} guest_row_pitch={bpr}"
+            ));
+        }
+    }
     // No settle here, and the twin rail is why. `render_writeback::store_gva_frame`
     // does exactly this for a GVA-addressed destination — vouch, resolve runs,
     // submit a buffer copy — and takes no settle at all, because nothing between

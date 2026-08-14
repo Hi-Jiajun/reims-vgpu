@@ -26,6 +26,7 @@ mod exec_compute;
 mod facade_decline;
 mod guest_scatter;
 mod host_ram;
+mod linear_target_import;
 pub mod init_decline;
 mod pools;
 mod scatter_shader;
@@ -2721,6 +2722,46 @@ pub fn copy_target_to_guest_pages(
     // so no thread can observe the flag clear while a copy is outstanding.
     GUEST_WRITE_DEBT.store(true, std::sync::atomic::Ordering::Release);
     Ok(())
+}
+
+/// Measure whether one live packed guest surface can be the backing of its
+/// resident image. Observational only; creation and synchronization continue
+/// through the existing resident/copy rails.
+#[allow(clippy::too_many_arguments)]
+pub fn probe_guest_backed_target(
+    host_ptr: usize,
+    allocation_len: u64,
+    plane_offset: u64,
+    guest_row_pitch: u64,
+    width: u32,
+    height: u32,
+    format: ash::vk::Format,
+) {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let Ok(ctx) = owner.ensure(counters) else {
+        crate::observe::off(format!(
+            "vk_linear_target_window verdict=no_context format={format:?} {width}x{height}"
+        ));
+        return;
+    };
+    unsafe {
+        linear_target_import::probe_window(
+            ctx,
+            host_ptr,
+            allocation_len,
+            plane_offset,
+            guest_row_pitch,
+            width,
+            height,
+            format,
+            registry_target_usage(format),
+        )
+    };
 }
 
 /// How one frame gets from a resident image into the guest's stretches.
