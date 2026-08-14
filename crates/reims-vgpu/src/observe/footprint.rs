@@ -162,20 +162,39 @@ impl Footprint {
         }
     }
 
-    fn mark(&self, frame: u64) {
-        if frame >= MAX_FRAME {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-            return;
+    fn mark_range(&self, first: u64, last: u64) {
+        if first < MAX_FRAME {
+            let bounded_last = last.min(MAX_FRAME - 1);
+            let first_word = first / 64;
+            let last_word = bounded_last / 64;
+            for word in first_word..=last_word {
+                let lo = if word == first_word { first % 64 } else { 0 };
+                let hi = if word == last_word {
+                    bounded_last % 64 + 1
+                } else {
+                    64
+                };
+                let width = hi - lo;
+                let mask = if width == 64 {
+                    u64::MAX
+                } else {
+                    ((1u64 << width) - 1) << lo
+                };
+                // A contiguous range updates each bitmap word once. The
+                // returned old word also names every 0 -> 1 transition, so the
+                // distinct-page level remains exact without one atomic pair per
+                // 4 KiB frame.
+                let prev = self.bits[word as usize].fetch_or(mask, Ordering::Relaxed);
+                let added = (mask & !prev).count_ones();
+                if added != 0 {
+                    self.pages.fetch_add(u64::from(added), Ordering::Relaxed);
+                }
+            }
         }
-        let word = (frame / 64) as usize;
-        let bit = 1u64 << (frame % 64);
-        // `fetch_or` hands back the previous word, so the 0 → 1 transition is
-        // detectable without a second load and without a lock. Every rail that
-        // writes guest RAM calls this, some of them per row, so marking has to
-        // stay at one relaxed read-modify-write.
-        let prev = self.bits[word].fetch_or(bit, Ordering::Relaxed);
-        if prev & bit == 0 {
-            self.pages.fetch_add(1, Ordering::Relaxed);
+        let dropped_first = first.max(MAX_FRAME);
+        if dropped_first <= last {
+            self.dropped
+                .fetch_add(last - dropped_first + 1, Ordering::Relaxed);
         }
     }
 
@@ -292,10 +311,7 @@ pub fn note_written_range(gpa: u64, len: u64) {
     }
     let first = gpa >> FRAME_SHIFT;
     let last = gpa.saturating_add(len - 1) >> FRAME_SHIFT;
-    let fp = &*FOOTPRINT;
-    for frame in first..=last {
-        fp.mark(frame);
-    }
+    FOOTPRINT.mark_range(first, last);
 }
 
 /// Whether this device has written the frame containing `gpa` at any point in
@@ -473,6 +489,15 @@ mod tests {
             "a dropped mark has to reach the log, or the miss it causes reads as \
              an exoneration: {line}"
         );
+    }
+
+    #[test]
+    fn every_out_of_range_frame_is_counted_when_one_range_crosses_the_bound() {
+        let _g = fresh();
+        let start = (MAX_FRAME - 1) << FRAME_SHIFT;
+        note_written_range(start, 4 << FRAME_SHIFT);
+        assert_eq!(counts(), (1, 3));
+        assert!(wrote_gpa(start));
     }
 
     #[test]

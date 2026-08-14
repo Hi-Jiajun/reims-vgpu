@@ -2062,6 +2062,7 @@ pub(crate) fn note_mapping_write_footprint(
     let end = off.saturating_add(len);
     let first = off / page_size;
     let last = (end - 1) / page_size;
+    let mut physical_run: Option<(u64, u64)> = None;
     for i in first..=last {
         let Some(&entry) = m.page_entries.get(i as usize) else {
             // A short page list is a refusal the caller reports; there is no
@@ -2075,8 +2076,21 @@ pub(crate) fn note_mapping_write_footprint(
         let lo = off.max(page_lo);
         let hi = end.min(page_lo.saturating_add(page_size));
         if lo < hi {
-            crate::observe::footprint::note_written_range(gpa + (lo - page_lo), hi - lo);
+            let segment = (gpa + (lo - page_lo), gpa + (hi - page_lo));
+            match physical_run {
+                Some((start, run_end)) if run_end == segment.0 => {
+                    physical_run = Some((start, segment.1));
+                }
+                Some((start, run_end)) => {
+                    crate::observe::footprint::note_written_range(start, run_end - start);
+                    physical_run = Some(segment);
+                }
+                None => physical_run = Some(segment),
+            }
         }
+    }
+    if let Some((start, run_end)) = physical_run {
+        crate::observe::footprint::note_written_range(start, run_end - start);
     }
 }
 
