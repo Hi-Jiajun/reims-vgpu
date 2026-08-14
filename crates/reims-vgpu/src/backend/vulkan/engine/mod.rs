@@ -1353,12 +1353,67 @@ pub fn resident_present_decline_route(
     }
 }
 
-pub fn resident_content_ready(identity: &TargetIdentity) -> bool {
+/// What storage owns a ready resident's pixels.
+///
+/// A guest-backed resident is the guest allocation itself. A recyclable
+/// resident is a device allocation holding a copy, so callers deciding whether
+/// guest CPU writes can make the resident stale must keep the two distinct.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidentContentBacking {
+    NotReady,
+    GuestAllocation,
+    DeviceAllocation,
+}
+
+fn classify_resident_content(
+    content_ready: bool,
+    guest_imported: bool,
+) -> ResidentContentBacking {
+    match (content_ready, guest_imported) {
+        (false, _) => ResidentContentBacking::NotReady,
+        (true, true) => ResidentContentBacking::GuestAllocation,
+        (true, false) => ResidentContentBacking::DeviceAllocation,
+    }
+}
+
+pub fn resident_content_backing(identity: &TargetIdentity) -> ResidentContentBacking {
     let guard = lock_engine();
     guard
         .pools
         .registry_get(identity)
-        .is_some_and(|s| s.content_ready)
+        .map(|slot| {
+            classify_resident_content(slot.content_ready, slot.memory.is_guest_imported())
+        })
+        .unwrap_or(ResidentContentBacking::NotReady)
+}
+
+pub fn resident_content_ready(identity: &TargetIdentity) -> bool {
+    resident_content_backing(identity) != ResidentContentBacking::NotReady
+}
+
+#[cfg(test)]
+mod resident_content_backing_tests {
+    use super::*;
+
+    #[test]
+    fn ready_content_preserves_whether_it_is_the_guest_allocation() {
+        assert_eq!(
+            classify_resident_content(true, true),
+            ResidentContentBacking::GuestAllocation
+        );
+        assert_eq!(
+            classify_resident_content(true, false),
+            ResidentContentBacking::DeviceAllocation
+        );
+        assert_eq!(
+            classify_resident_content(false, true),
+            ResidentContentBacking::NotReady
+        );
+        assert_eq!(
+            classify_resident_content(false, false),
+            ResidentContentBacking::NotReady
+        );
+    }
 }
 
 /// Why this identity has no resident, when the reason is that this device

@@ -1036,6 +1036,14 @@ pub(super) fn sampled_texture_descriptor<M: HostMemory>(
 ///   both page-reading rungs, so nothing below would have corrected it. Two
 ///   uncorrected stale binds on a repainted surface is the "renders correctly
 ///   for a few frames, then stays corrupted" report.
+///
+/// On a unified host, an admitted guest-backed target changes the first fact:
+/// the resident is not a copy of the pages, it is the guest allocation itself.
+/// Sampling it binds the same resource the render pass attached, so guest CPU
+/// writes cannot make a second copy stale and the guest-write currency ladder
+/// has no question to answer. `t11sample_ready_guest_allocation` and
+/// `t11sample_ready_device_allocation` keep that population measurable. The
+/// copied resident retains every rung and witness below.
 pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1212,8 +1220,38 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // change. What guards this rung today is the guest-write witness
                 // below, which is the witness the LOAD elision's epoch pair
                 // cannot supply anyway.
-                let resident_ready =
-                    crate::backend::vulkan::engine::resident_content_ready(&resident_id);
+                let resident_backing =
+                    crate::backend::vulkan::engine::resident_content_backing(&resident_id);
+                let resident_ready = resident_backing
+                    != crate::backend::vulkan::engine::ResidentContentBacking::NotReady;
+                if resident_ready {
+                    crate::runtime::drain::note_store_route(match resident_backing {
+                        crate::backend::vulkan::engine::ResidentContentBacking::GuestAllocation => {
+                            "t11sample_ready_guest_allocation"
+                        }
+                        crate::backend::vulkan::engine::ResidentContentBacking::DeviceAllocation => {
+                            "t11sample_ready_device_allocation"
+                        }
+                        crate::backend::vulkan::engine::ResidentContentBacking::NotReady => {
+                            unreachable!("resident_ready excludes this arm")
+                        }
+                    });
+                }
+                // A render attachment and a sampled binding name the same
+                // texture resource. When that resource's storage is the guest
+                // allocation itself, a guest CPU write changes the resource;
+                // it cannot make a second resident copy stale because there is
+                // no second copy. Bind it directly before entering the currency
+                // ladder, which exists for device-allocation mirrors.
+                //
+                // A non-identity view still falls through. The target bind
+                // cannot carry that view's channel remap yet, so treating it as
+                // direct would preserve the bytes and sample the wrong logical
+                // channels.
+                if guest_allocation_sample_is_direct(resident_backing, may_bind_resident) {
+                    crate::runtime::drain::note_store_route("t11rung_resident");
+                    return Some((w, h, mid, SampledSourceRequest::Target(resident_id)));
+                }
 
                 // What the hypervisor can say about the guest's own stores into
                 // this surface since the Store that produced our copies of it.
@@ -8410,6 +8448,14 @@ fn note_type11_sample_rung(rung: &'static str, guest_write: GuestWriteVerdict) {
     }
 }
 
+fn guest_allocation_sample_is_direct(
+    backing: crate::backend::vulkan::engine::ResidentContentBacking,
+    may_bind_resident: bool,
+) -> bool {
+    backing == crate::backend::vulkan::engine::ResidentContentBacking::GuestAllocation
+        && may_bind_resident
+}
+
 /// The census column for a rung's guest-write verdict, or `None` for a rung the
 /// verdict says nothing about.
 fn sample_rung_gw_route(rung: &str, guest_write: GuestWriteVerdict) -> Option<&'static str> {
@@ -8939,6 +8985,28 @@ mod vulkan_split_tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
+
+    #[test]
+    fn a_sampled_guest_allocation_does_not_enter_copy_currency_checks() {
+        use crate::backend::vulkan::engine::ResidentContentBacking;
+
+        assert!(guest_allocation_sample_is_direct(
+            ResidentContentBacking::GuestAllocation,
+            true
+        ));
+        assert!(!guest_allocation_sample_is_direct(
+            ResidentContentBacking::DeviceAllocation,
+            true
+        ));
+        assert!(!guest_allocation_sample_is_direct(
+            ResidentContentBacking::NotReady,
+            true
+        ));
+        assert!(!guest_allocation_sample_is_direct(
+            ResidentContentBacking::GuestAllocation,
+            false
+        ));
+    }
 
     #[test]
     fn a_guest_backed_store_is_never_turned_into_a_future_copy() {
