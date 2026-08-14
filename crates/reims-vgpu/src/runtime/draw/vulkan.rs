@@ -313,7 +313,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     ));
                 }
             }
-            Ok(M2vDrawSpan::ResidentSurfaceStore { guest_backed }) => {
+            Ok(M2vDrawSpan::ResidentSurfaceStore { guest_store }) => {
                 // Into the same `t11_store_us` bucket the synchronous and `Owned`
                 // routes report, because the whole claim of this rail is that the
                 // bucket shrinks. Leaving it unbracketed would move the arm's cost
@@ -327,7 +327,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     .map(|c0| (c0.mapping_id, c0.width, c0.height, c0.format));
                 let stored = c0_store
                     .map(|(mid, cw, ch, _)| {
-                        store_surface_resident(state, host, req, mid, cw, ch, guest_backed)
+                        store_surface_resident(state, host, req, mid, cw, ch, guest_store)
                     })
                     .unwrap_or(false);
                 match (stored, c0_store) {
@@ -5210,7 +5210,13 @@ enum M2vDrawSpan {
     /// different routes. Distinct from [`Self::Pixels`] because there are no
     /// pixels — a caller that treated an empty frame as one would write a blank
     /// framebuffer into guest memory.
-    ResidentSurfaceStore { guest_backed: bool },
+    ResidentSurfaceStore { guest_store: GuestStoreStatus },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GuestStoreStatus {
+    guest_backed: bool,
+    recorded: bool,
 }
 
 /// Name the guest-Store route this record actually took, once per distinct
@@ -7280,6 +7286,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             resources.skip_readback = true;
             surface_resident_store = true;
         }
+        resources.record_guest_store = surface_resident_store;
         // A first-failure classifier for a composite Store that still reads
         // back used to sit here. Its outer gate was never once true — none of
         // its four counters, nor its `else` arm, appears anywhere in the
@@ -7939,7 +7946,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         }
         if surface_resident_store {
             return Ok(M2vDrawSpan::ResidentSurfaceStore {
-                guest_backed: out.target_guest_backed,
+                guest_store: GuestStoreStatus {
+                    guest_backed: out.target_guest_backed,
+                    recorded: out.guest_store_recorded,
+                },
             });
         }
         Ok(M2vDrawSpan::Pixels {
@@ -8870,7 +8880,7 @@ fn store_surface_resident<M: HostMemory + HostOps>(
     mapping_id: u32,
     width: u32,
     height: u32,
-    guest_backed: bool,
+    guest_store: GuestStoreStatus,
 ) -> bool {
     // The union belongs to the draws that just ran whether or not the write
     // below succeeds, and leaving it un-reset on a refused write would fold this
@@ -8886,7 +8896,7 @@ fn store_surface_resident<M: HostMemory + HostOps>(
     // command that synchronized it. Publish the existing alias eagerly and let
     // the completion stamp carry its queue ordering.
     let lazy = crate::runtime::writeback_debt::lazy_writeback_enabled();
-    let plan = surface_store_plan(lazy, guest_backed);
+    let plan = surface_store_plan(lazy, guest_store.guest_backed);
     if plan == SurfaceStorePlan::DeferCopy
         && arm_surface_writeback_debt(state, host, mapping_id, &identity, width, height)
     {
@@ -8898,7 +8908,12 @@ fn store_surface_resident<M: HostMemory + HostOps>(
             crate::runtime::drain::note_store_route("target_store_shared_eager");
         }
         match crate::runtime::render_writeback::store_guest_backed_frame(
-            state, mapping_id, &identity, width, height,
+            state,
+            mapping_id,
+            &identity,
+            width,
+            height,
+            guest_store.recorded,
         ) {
             Ok(()) => return true,
             Err(decline) => {

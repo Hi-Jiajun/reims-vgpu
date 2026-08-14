@@ -982,11 +982,17 @@ pub fn store_guest_backed_frame(
     identity: &crate::backend::vulkan::engine::TargetIdentity,
     width: u32,
     height: u32,
+    guest_store_recorded: bool,
 ) -> Result<(), crate::runtime::mapping_write::GpuWritebackDecline> {
     let started = std::time::Instant::now();
     crate::runtime::drain::note_store_route("surface_flush");
     let bytes = crate::runtime::mapping_write::synchronize_guest_backed_resident(
-        state, mapping_id, identity, width, height,
+        state,
+        mapping_id,
+        identity,
+        width,
+        height,
+        guest_store_recorded,
     )?;
     crate::runtime::drain::note_store_route("render_flush_gpu_direct");
     finish(state, mapping_id, identity, bytes as usize, started);

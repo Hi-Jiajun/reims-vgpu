@@ -1109,6 +1109,7 @@ pub fn synchronize_guest_backed_resident(
     identity: &crate::backend::vulkan::engine::TargetIdentity,
     width: u32,
     height: u32,
+    guest_store_recorded: bool,
 ) -> Result<u64, GpuWritebackDecline> {
     if !scanout_extent_ok(width, height) {
         return Err(GpuWritebackDecline::NotWritable);
@@ -1135,8 +1136,10 @@ pub fn synchronize_guest_backed_resident(
             format,
         });
     };
-    crate::backend::vulkan::engine::synchronize_guest_backed_target(identity)
-        .map_err(|inner| GpuWritebackDecline::Engine { inner })?;
+    if guest_store_needs_separate_sync(guest_store_recorded) {
+        crate::backend::vulkan::engine::synchronize_guest_backed_target(identity)
+            .map_err(|inner| GpuWritebackDecline::Engine { inner })?;
+    }
 
     mapper::note_mapping_write_footprint(state, mapping_id, base_off, span_end - base_off);
     state.note_host_wrote_mapping(mapping_id);
@@ -1144,6 +1147,11 @@ pub fn synchronize_guest_backed_resident(
     let _ = state.mark_mapping_written(mapping_id);
     crate::runtime::surface_cache::forget(state, mapping_id);
     Ok(span_end - base_off)
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn guest_store_needs_separate_sync(recorded_in_draw: bool) -> bool {
+    !recorded_in_draw
 }
 
 /// The geometry and pixel format a writeback to this mapping must land in.

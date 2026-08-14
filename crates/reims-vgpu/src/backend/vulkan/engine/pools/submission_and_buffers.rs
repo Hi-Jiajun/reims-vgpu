@@ -2038,7 +2038,7 @@ impl ResourcePools {
 
     /// The buffer this command buffer already staged or gathered for `bind`, if
     /// it still holds one. See `ResourcePools::cb_bound_buffers`.
-    pub(crate) fn cb_bound_buffer(
+    pub(in crate::backend::vulkan::engine) fn cb_bound_buffer(
         &self,
         bind: &super::CbBind,
     ) -> Option<super::super::exec::BoundBuffer> {
@@ -2053,7 +2053,7 @@ impl ResourcePools {
     /// address whose allocation has been freed is one the next unrelated bind of
     /// the same length can be handed. Holding it is what makes the key unique
     /// for as long as it is answerable.
-    pub(crate) fn note_cb_bound_buffer(
+    pub(in crate::backend::vulkan::engine) fn note_cb_bound_buffer(
         &mut self,
         bind: super::CbBind,
         bound: super::super::exec::BoundBuffer,

@@ -2343,6 +2343,23 @@ fn validate_sampled_resident(
     Ok(())
 }
 
+/// Select the physical-page footprint a render Store publishes in this draw's
+/// engine transaction.
+///
+/// The request states the guest Store, while `guest_backed` states what target
+/// the engine actually admitted. Keeping both gates here makes an import
+/// refusal a performance fallback: an ordinary resident never claims that its
+/// render pass wrote guest RAM. The pages come from the admitted resident, not
+/// from the request, so a warm resource reuse publishes the allocation that is
+/// actually bound.
+fn guest_store_pages_to_record(
+    requested: bool,
+    guest_backed: bool,
+    pages: Option<std::sync::Arc<[u64]>>,
+) -> Option<std::sync::Arc<[u64]>> {
+    (requested && guest_backed).then_some(pages).flatten()
+}
+
 pub(crate) unsafe fn execute_draw_inner(
     owner: &mut ContextOwner,
     caches: &mut ObjectCaches,
@@ -3156,6 +3173,7 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     let mut target_guest_backed = false;
     let mut target_loads_guest_backing = false;
+    let mut target_guest_pages: Option<std::sync::Arc<[u64]>> = None;
     let (target_image, target_fb, target_access, target_view) =
         if let Some(identity) = &req.target_identity {
             let gen = identity.generation();
@@ -3171,6 +3189,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 counters,
             )?;
             target_guest_backed = t.memory.is_guest_imported();
+            target_guest_pages = t.memory.guest_pages();
             target_loads_guest_backing = target_guest_backed && req.load_guest_target_backing;
             if target_loads_guest_backing {
                 // The imported image *is* the guest seed. The pass key already
@@ -4913,6 +4932,21 @@ pub(crate) unsafe fn execute_draw_inner(
             pools.registry_mark_ready_at(identity, pass_key.color_final_layout(0));
         }
     }
+    let guest_store_recorded = match (
+        req.target_identity.as_ref(),
+        guest_store_pages_to_record(
+            req.record_guest_store,
+            target_guest_backed,
+            target_guest_pages,
+        ),
+    ) {
+        (Some(identity), Some(pages)) => {
+            super::record_guest_write_debt(pools, identity, &pages);
+            crate::runtime::drain::note_store_route("target_store_shared_recorded");
+            true
+        }
+        _ => false,
+    };
     // MRT secondary attachments settle at COLOR_ATTACHMENT_OPTIMAL (the pass
     // final layout) and become sampleable residents; the consumer's
     // resident-sample barrier then transitions COLOR_ATTACHMENT→SHADER_READ,
@@ -5029,6 +5063,7 @@ pub(crate) unsafe fn execute_draw_inner(
         return Ok(DrawOutput {
             pixels: Vec::new(),
             target_guest_backed,
+            guest_store_recorded,
             pixels_bgra: output_bgra,
             // Unreachable with a query armed: `batch_eligible` excludes one, so
             // `defer_submit` is false for every queried draw. Stated as `None`
@@ -5115,6 +5150,7 @@ pub(crate) unsafe fn execute_draw_inner(
             return Ok(DrawOutput {
                 pixels: Vec::new(),
                 target_guest_backed,
+                guest_store_recorded,
                 pixels_bgra: output_bgra,
                 occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
             });
@@ -5125,6 +5161,7 @@ pub(crate) unsafe fn execute_draw_inner(
         return Ok(DrawOutput {
             pixels: Vec::new(),
             target_guest_backed,
+            guest_store_recorded,
             pixels_bgra: output_bgra,
             occlusion_samples: None,
         });
@@ -5171,6 +5208,7 @@ pub(crate) unsafe fn execute_draw_inner(
     Ok(DrawOutput {
         pixels,
         target_guest_backed,
+        guest_store_recorded,
         pixels_bgra,
         occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
     })
@@ -6302,6 +6340,22 @@ mod tests {
             ResidentAccess::transfer_read(false).layout(),
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL
         );
+    }
+
+    #[test]
+    fn only_an_admitted_shared_store_publishes_guest_pages() {
+        let pages: std::sync::Arc<[u64]> = std::sync::Arc::from([0x1000, 0x5000]);
+        assert_eq!(
+            guest_store_pages_to_record(true, true, Some(std::sync::Arc::clone(&pages))),
+            Some(pages)
+        );
+        assert!(
+            guest_store_pages_to_record(false, true, Some(std::sync::Arc::from([1]))).is_none()
+        );
+        assert!(
+            guest_store_pages_to_record(true, false, Some(std::sync::Arc::from([1]))).is_none()
+        );
+        assert!(guest_store_pages_to_record(true, true, None).is_none());
     }
 
     #[test]

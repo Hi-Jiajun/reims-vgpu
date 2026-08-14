@@ -2995,7 +2995,7 @@ fn shared_backing_settles(
 /// Both a queued image-to-buffer copy and rendering into shared backing owe the
 /// same completion rule: guest code must not observe its completion stamp until
 /// the queue has finished writing these pages.
-fn record_guest_write_debt(
+pub(super) fn record_guest_write_debt(
     pools: &mut pools::ResourcePools,
     identity: &TargetIdentity,
     pages: &[u64],

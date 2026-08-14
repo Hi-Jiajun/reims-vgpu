@@ -451,6 +451,13 @@ pub struct DrawRequest {
     /// When true, skip full-frame readback (non-Store / ticket path). Content
     /// remains on the GPU under `target_identity` when provided.
     pub skip_readback: bool,
+    /// Publish a Store into an admitted guest-backed primary attachment to the
+    /// guest-write completion ledger in this draw's engine transaction.
+    ///
+    /// This is meaningful only when the resolved target is actually backed by
+    /// [`Self::guest_target_memory`]. An ordinary resident ignores it and keeps
+    /// the copied-resource writeback path.
+    pub record_guest_store: bool,
     /// Present-boundary GPU seed: copy this READY resident target's content
     /// into the draw target before the pass (which then runs with LOAD),
     /// eliding the CPU front-frame read + full-frame seed upload. Requires
@@ -670,6 +677,9 @@ pub struct DrawOutput {
     /// ordinary resident fallback, and only the engine knows which image the
     /// draw actually encoded against.
     pub target_guest_backed: bool,
+    /// Whether this draw recorded its guest-backed Store in the completion
+    /// ledger before releasing the engine transaction.
+    pub guest_store_recorded: bool,
     /// Physical channel order of `pixels`: BGRA8 when true, semantic RGBA8
     /// otherwise. Empty when `skip_readback`, in which case this states the
     /// order the attachment *would* have read back in.

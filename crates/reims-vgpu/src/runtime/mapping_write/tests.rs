@@ -10,6 +10,16 @@ use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
 use crate::runtime::host::FakeHost;
 
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_store_recorded_by_its_draw_needs_no_second_engine_sync() {
+    assert!(!guest_store_needs_separate_sync(true));
+    assert!(
+        guest_store_needs_separate_sync(false),
+        "an older or fallback engine result must retain the synchronization transaction"
+    );
+}
+
 /// `mapping_geom_window` puts each measurement in the field of its own name.
 ///
 /// `SurfaceWindow`'s four fields are two `u64`s and two `u32`s, so
