@@ -90,6 +90,14 @@ pub(super) enum BufferGatherRole {
     Shared,
 }
 
+/// The offset alignment imposed by the consumer that will bind this source.
+fn buffer_bind_offset_alignment(role: BufferGatherRole, storage_align: u64) -> u64 {
+    match role {
+        BufferGatherRole::Vertex => 1,
+        BufferGatherRole::Storage | BufferGatherRole::Shared => storage_align,
+    }
+}
+
 fn buffer_gather_roles(
     req: &DrawRequest,
 ) -> std::collections::BTreeMap<(usize, u64, u64), BufferGatherRole> {
@@ -373,7 +381,7 @@ unsafe fn plan_buffer_gather_dispatches(
                 .collect();
             match build_gather_run_tables(
                 &runs,
-                ctx.guest_bind_offset_align,
+                ctx.storage_buffer_offset_align,
                 ctx.max_storage_buffer_range,
                 dst_have,
             ) {
@@ -704,10 +712,7 @@ unsafe fn import_guest_buffer_window(
     // buffer. Applying the storage limit to a vertex-only bind needlessly turns
     // valid offsets into gathers. A source used by both roles keeps the stricter
     // rule because its one `BoundBuffer` is shared by both consumers.
-    let align = match role {
-        BufferGatherRole::Vertex => 1,
-        BufferGatherRole::Storage | BufferGatherRole::Shared => ctx.guest_bind_offset_align,
-    };
+    let align = buffer_bind_offset_alignment(role, ctx.storage_buffer_offset_align);
     if !offset.is_multiple_of(align) {
         crate::observe::Emit::decline(
             "vk_buffer_import",
@@ -895,7 +900,8 @@ fn gather_region_window(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BufferImportDecline {
     /// The span does not start at an offset this device will bind a vertex or
-    /// storage buffer at. See [`super::context::DeviceContext::guest_bind_offset_align`].
+    /// storage buffer at. See
+    /// [`super::context::DeviceContext::storage_buffer_offset_align`].
     BindOffsetAlignment { offset: u64, align: u64 },
     /// The window's stretches did not add up to the window. A healthy zero:
     /// `references_for_runs` tiles exactly, so a firing means the runs and the
@@ -5691,6 +5697,20 @@ mod tests {
         assert_eq!(roles[&keys[0]], BufferGatherRole::Vertex);
         assert_eq!(roles[&keys[1]], BufferGatherRole::Storage);
         assert_eq!(roles[&keys[2]], BufferGatherRole::Shared);
+    }
+
+    /// Direct imports obey the limit of the descriptor actually written. A
+    /// source shared with vertex fetch still has a storage descriptor, while a
+    /// vertex-only source has no Vulkan offset-alignment limit.
+    #[test]
+    fn direct_import_alignment_follows_the_actual_consumer() {
+        assert_eq!(buffer_bind_offset_alignment(BufferGatherRole::Vertex, 4), 1);
+        assert_eq!(buffer_bind_offset_alignment(BufferGatherRole::Storage, 4), 4);
+        assert_eq!(buffer_bind_offset_alignment(BufferGatherRole::Shared, 4), 4);
+        assert!(96u64.is_multiple_of(buffer_bind_offset_alignment(
+            BufferGatherRole::Storage,
+            4,
+        )));
     }
 
     /// The two re-basings a gather region does, at the values that make them

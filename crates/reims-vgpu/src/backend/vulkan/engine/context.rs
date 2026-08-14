@@ -423,6 +423,17 @@ impl DrawSpanProbe {
     }
 }
 
+/// The Vulkan limit governing every shader-visible buffer offset this engine
+/// emits.
+///
+/// Guest shader buffers and the internal scatter tables are all
+/// `STORAGE_BUFFER` descriptors. Uniform-buffer alignment is a different
+/// contract and vertex offsets are checked on their own path, so neither may
+/// widen this answer.
+fn storage_buffer_offset_alignment(limits: &vk::PhysicalDeviceLimits) -> u64 {
+    limits.min_storage_buffer_offset_alignment
+}
+
 pub(crate) struct DeviceContext {
     pub _entry: ash::Entry,
     pub instance: ash::Instance,
@@ -476,19 +487,14 @@ pub(crate) struct DeviceContext {
     pub sampled_linear_filter: [bool; TexelLayout::ALL.len()],
     pub pipeline_cache: vk::PipelineCache,
     pub vertex_divisor: VertexDivisorCapabilities,
-    /// Offset alignment a guest-window import must satisfy before a draw may
-    /// bind it directly as a vertex or storage buffer, taken from
-    /// `VkPhysicalDeviceLimits`.
+    /// Offset alignment for every storage-buffer descriptor this engine writes,
+    /// taken directly from `minStorageBufferOffsetAlignment`.
     ///
-    /// One number for both because the dedup in `stage_buffer_content` shares a
-    /// bound buffer between a stream that feeds vertex fetch and one that feeds
-    /// a storage binding, so a value legal for only one of them would be a
-    /// valid-usage violation the moment the same guest span is used twice.
-    /// `min*BufferOffsetAlignment` are the device's own answers; the 16 floor
-    /// covers vertex fetch, which the spec gives no queryable limit for and
-    /// which implementations may require to be component-aligned — 16 bytes is
-    /// the largest component-size any vertex format has.
-    pub guest_bind_offset_align: u64,
+    /// Vertex-buffer offsets have no corresponding device limit and the engine
+    /// checks them separately. Uniform-buffer alignment does not participate:
+    /// guest shader buffers and the scatter kernel's run tables are storage
+    /// descriptors, so imposing the uniform limit would reject legal offsets.
+    pub storage_buffer_offset_align: u64,
     /// The widest span this device will bind as one storage buffer, from
     /// `VkPhysicalDeviceLimits::maxStorageBufferRange`.
     ///
@@ -554,6 +560,36 @@ pub(crate) struct DeviceContext {
     /// `VK_KHR_swapchain` was enabled for the engine-owned host window.
     #[cfg(feature = "host-window")]
     pub swapchain: bool,
+}
+
+#[cfg(test)]
+mod storage_buffer_alignment_tests {
+    use super::*;
+
+    /// A host may require a wider offset for uniform descriptors than for
+    /// storage descriptors. Guest shader buffers use the latter, so the
+    /// unrelated limit must not turn a legal direct bind into a gather.
+    #[test]
+    fn uniform_buffer_alignment_does_not_constrain_storage_bindings() {
+        let limits = vk::PhysicalDeviceLimits {
+            min_storage_buffer_offset_alignment: 4,
+            min_uniform_buffer_offset_alignment: 64,
+            ..Default::default()
+        };
+        assert_eq!(storage_buffer_offset_alignment(&limits), 4);
+    }
+
+    /// The selected value is still the device's exact storage requirement; it
+    /// is not a fixed floor derived from one host.
+    #[test]
+    fn a_wider_storage_requirement_is_preserved() {
+        let limits = vk::PhysicalDeviceLimits {
+            min_storage_buffer_offset_alignment: 256,
+            min_uniform_buffer_offset_alignment: 16,
+            ..Default::default()
+        };
+        assert_eq!(storage_buffer_offset_alignment(&limits), 256);
+    }
 }
 
 // SAFETY: ash handles; only accessed under engine mutex.
@@ -1120,11 +1156,7 @@ impl DeviceContext {
             sampled_linear_filter,
             pipeline_cache,
             vertex_divisor,
-            guest_bind_offset_align: props
-                .limits
-                .min_storage_buffer_offset_alignment
-                .max(props.limits.min_uniform_buffer_offset_alignment)
-                .max(16),
+            storage_buffer_offset_align: storage_buffer_offset_alignment(&props.limits),
             max_storage_buffer_range: u64::from(props.limits.max_storage_buffer_range),
             vertex_formats,
             max_sampler_anisotropy: features.max_sampler_anisotropy,

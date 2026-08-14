@@ -192,7 +192,7 @@ pub(crate) struct RunTable {
 /// is a wrong *byte* in guest RAM rather than a crash.
 ///
 /// `bind_align` is the device's storage-buffer offset alignment
-/// ([`DeviceContext::guest_bind_offset_align`]) and `max_range` its
+/// ([`DeviceContext::storage_buffer_offset_align`]) and `max_range` its
 /// `maxStorageBufferRange`. `src_have` is what the detile actually wrote.
 ///
 /// # Why this returns a list and not one table

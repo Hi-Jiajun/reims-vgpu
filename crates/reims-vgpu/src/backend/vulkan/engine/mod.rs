@@ -2968,7 +2968,7 @@ unsafe fn plan_guest_scatter_dispatches(
     for (buffer, runs) in &grouped {
         match build_run_tables(
             runs,
-            ctx.guest_bind_offset_align,
+            ctx.storage_buffer_offset_align,
             ctx.max_storage_buffer_range,
             // The window's own byte count and not the slot's, which is rounded
             // up to a power-of-two bucket. Both bound the memory soundly; this
@@ -3112,7 +3112,7 @@ unsafe fn stage_run_tables(
     // takes one `write_staging`. A whole command buffer's tables come to a few
     // kilobytes, which is why this is cheaper than the per-table slots it
     // replaces even with the extra copy.
-    let (packed, places) = pack_run_tables(tables, ctx.guest_bind_offset_align);
+    let (packed, places) = pack_run_tables(tables, ctx.storage_buffer_offset_align);
     let slot = unsafe {
         pools.acquire_staging(
             ctx,
