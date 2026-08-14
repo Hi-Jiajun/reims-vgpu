@@ -805,8 +805,8 @@ pub const LAYOUT_CHURN: &str = "REIMS_VGPU_LAYOUT_CHURN";
 pub const PASS_CHURN: &str = "REIMS_VGPU_PASS_CHURN";
 
 /// **A count, not a switch.** How many draws one command buffer may carry,
-/// narrowing the compiled `BATCH_MAX_DRAWS`. Read through [`count`], so a value
-/// above the compiled cap is refused rather than obeyed.
+/// narrowing the active memory-topology batch policy. Read through [`count`],
+/// so a value above that device's default is refused rather than obeyed.
 ///
 /// It exists because the host kernel, not this device, owns the deadline a
 /// submission has to meet. i915 resets any context that holds `rcs0` past its

@@ -200,7 +200,7 @@ impl ResourcePools {
             graveyard: Vec::new(),
             target_free: FreePool::new(TARGET_FREE_CAP_PER_KEY, TARGET_FREE_CAP_TOTAL),
             open_batch: None,
-            batch_max_draws: super::batch_max_draws(),
+            batch_max_draws: BATCH_MAX_DRAWS,
             last_pass: None,
             open_pass: None,
             slab: slab::SlabPool::new(),
@@ -717,6 +717,7 @@ impl ResourcePools {
         if self.initialized {
             return Ok(());
         }
+        self.configure_batch_capacity(super::batch_max_draws(ctx.caps.memory.topology));
         let cmd_pool = ctx
             .device
             .create_command_pool(
@@ -782,6 +783,23 @@ impl ResourcePools {
         self.in_flight = 0;
         self.initialized = true;
         Ok(())
+    }
+
+    /// Install one device's submission capacity before the Vulkan-owned pool
+    /// objects are created. Attachment snapshots have the same command-buffer
+    /// lifetime, so their recycle budget is derived here rather than retaining
+    /// the largest topology's population on every host.
+    fn configure_batch_capacity(&mut self, draws: u64) {
+        debug_assert!(self.attachment_snapshot_live.is_empty());
+        debug_assert_eq!(self.attachment_snapshot_free.len(), 0);
+        self.batch_max_draws = draws;
+        let snapshot_cap = attachment_snapshot_batch_cap(draws);
+        self.attachment_snapshot_free = FreePool::new(snapshot_cap, snapshot_cap);
+    }
+
+    /// The capacity installed for this pool's physical device.
+    pub(crate) fn batch_capacity(&self) -> u64 {
+        self.batch_max_draws
     }
 
     /// Allocate one descriptor set for `dsl` from the arena, growing a new pool
@@ -6344,14 +6362,51 @@ mod scatter_descriptor_sets_do_not_alias {
         ));
     }
 
-    /// The default cap is the compiled one, so a boot that sets nothing batches
-    /// exactly as every measurement behind [`super::BATCH_MAX_DRAWS`] did.
+    /// Before a pool sees a device it carries the largest supported capacity;
+    /// `ensure_init` replaces this with that device's topology policy.
     #[test]
     fn a_pool_that_was_told_nothing_carries_the_compiled_cap() {
         assert_eq!(
             ResourcePools::new().batch_max_draws,
             super::BATCH_MAX_DRAWS,
-            "an unset REIMS_VGPU_BATCH_DRAWS must leave the measured cap alone"
+            "a device-free pool carries enough capacity for either topology"
         );
+    }
+
+    /// Topology changes only submission granularity: both arms execute the
+    /// same draws, while a unified host preserves more of the serialized
+    /// command-buffer unit before the Vulkan scheduling bound cuts it.
+    #[test]
+    fn batch_defaults_follow_structural_memory_topology() {
+        use crate::backend::vulkan::caps::memory_topology::MemoryTopology;
+
+        assert_eq!(
+            super::batch_default_draws(MemoryTopology::Discrete),
+            super::DISCRETE_BATCH_MAX_DRAWS
+        );
+        assert_eq!(
+            super::batch_default_draws(MemoryTopology::Unified),
+            super::BATCH_MAX_DRAWS
+        );
+        assert!(
+            super::batch_default_draws(MemoryTopology::Discrete)
+                < super::batch_default_draws(MemoryTopology::Unified)
+        );
+    }
+
+    /// The device policy and the transient objects whose lifetime spans that
+    /// policy are installed together; widening only the join test would let a
+    /// complete unified-memory batch overflow its snapshot recycle budget.
+    #[test]
+    fn configuring_batch_capacity_resizes_its_snapshot_budget() {
+        let mut pools = ResourcePools::new();
+        pools.configure_batch_capacity(super::DISCRETE_BATCH_MAX_DRAWS);
+
+        let expected = super::attachment_snapshot_batch_cap(
+            super::DISCRETE_BATCH_MAX_DRAWS,
+        );
+        assert_eq!(pools.batch_max_draws, super::DISCRETE_BATCH_MAX_DRAWS);
+        assert_eq!(pools.attachment_snapshot_free.per_key, expected);
+        assert_eq!(pools.attachment_snapshot_free.total, expected);
     }
 }

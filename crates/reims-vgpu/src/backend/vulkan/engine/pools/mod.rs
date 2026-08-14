@@ -523,8 +523,8 @@ pub(crate) struct ResourcePools {
     /// treat it as in flight; every path that claims a slot or quiesces the
     /// ring flushes it first ([`Self::batch_flush`]).
     open_batch: Option<OpenBatch>,
-    /// How many draws one command buffer may carry: [`BATCH_MAX_DRAWS`] unless
-    /// [`crate::env::BATCH_DRAWS`] narrowed it.
+    /// How many draws one command buffer may carry: the topology policy from
+    /// [`batch_default_draws`] unless [`crate::env::BATCH_DRAWS`] narrowed it.
     ///
     /// A field rather than a read inside [`Self::batch_fit`], because that
     /// function's doc promises it is pure and testable without a device and a
@@ -2260,8 +2260,11 @@ const SAMPLED_FREE_CAP_TOTAL: usize = 64;
 /// routes every other view shape through the general sampled pool, making the
 /// largest dedicated snapshot population `draws × attachments` rather than
 /// `draws × texture-table width`.
-const ATTACHMENT_SNAPSHOT_BATCH_CAP: usize =
-    BATCH_MAX_DRAWS as usize * (crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS + 1);
+const fn attachment_snapshot_batch_cap(draws: u64) -> usize {
+    draws as usize * (crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS + 1)
+}
+
+const ATTACHMENT_SNAPSHOT_BATCH_CAP: usize = attachment_snapshot_batch_cap(BATCH_MAX_DRAWS);
 /// Every attachment may have the same geometry and view key, so the per-key
 /// bound is the whole batch population rather than only its draw count.
 const ATTACHMENT_SNAPSHOT_FREE_CAP_PER_KEY: usize = ATTACHMENT_SNAPSHOT_BATCH_CAP;
@@ -2612,9 +2615,10 @@ pub(crate) const STAGING_BUCKET_BINS: usize = 32;
 /// One `staging_pool` line per this many misses.
 const STAGING_MISS_EMIT_EVERY: u64 = 512;
 
-/// Max draws per deferred-submit batch before `batch_slot` refuses joiners
-/// and the run flushes + reopens. Bounds GPU-idle latency and staging-slot
-/// hoarding (see `batch_slot`) while amortizing per-draw submit overhead.
+/// Largest supported draw count for one deferred-submit command buffer.
+///
+/// The live default is topology-dependent; see [`batch_default_draws`]. This
+/// constant is the allocation and test ceiling shared by both policies.
 ///
 /// # This ceiling is not what binds, and the census says what does
 ///
@@ -2720,48 +2724,89 @@ const STAGING_MISS_EMIT_EVERY: u64 = 512;
 /// in what any draw observes, because a command buffer executes as one unit and
 /// two draws in it have always read guest RAM at the same instant.
 ///
-/// **64 is past the cliff** the paragraph above describes, and it fails exactly
-/// as predicted: it keeps saving bytes and loses 14 % of the frames. 32 is
-/// chosen over 24 for the byte saving and over 64 for that. `desc_pool_grow`
-/// stayed 0 and creates-per-frame stayed flat (39.40 -> 39.16) at 32, so
-/// neither the descriptor arena nor the staging free lists is the next thing to
-/// give.
-pub(crate) const BATCH_MAX_DRAWS: u64 = 32;
+/// **64 is past the cliff on that discrete host**: it keeps saving bytes and
+/// loses 14 % of the frames. 32 is therefore the discrete policy, not a
+/// protocol bound.
+///
+/// # Unified memory has a different optimum
+///
+/// The serialized API contract grows a command buffer by byte capacity and
+/// uses continuation segments; it does not end one at a fixed draw ordinal.
+/// A backend still needs a scheduling bound because one Vulkan submission is a
+/// non-preemptible-enough unit on some kernels, but applying the discrete
+/// transfer optimum to unified memory needlessly fragments that API unit.
+///
+/// A macos-13 x86/Vulkan vibrancy drive on the Intel unified-memory pathway,
+/// with identical 35-second TestUFO/window-motion phases, swept the cap:
+///
+/// ```text
+/// cap   draws      submissions   draws/CB   slot us/draw   record us/draw
+///  32   242 035       10 746       22.52          4.96             4.10
+///  64   243 223        6 876       35.37          2.88             3.76
+/// 128   305 909        6 805       44.95          1.85             3.16
+/// 256    94 536        1 894       49.91          1.07             3.61
+/// ```
+///
+/// Boot-selected display cadence makes absolute draw totals across rows an
+/// invalid frame-rate comparison. The normalized phases and within-run
+/// cadence settle the choice: 128 had no stalls, four ring waits, and only
+/// 0.21 % of draws reached the ceiling. At 256 GPU time per draw rose by about
+/// 35 % and presentation repeatedly fell into 5--24 Hz windows. The wider arm
+/// crossed the scheduling cliff for negligible extra batching
+/// (44.95 -> 49.91 draws/CB).
+///
+/// Thus 128 is the unified policy and the largest capacity any topology may
+/// request. The decision uses the existing structural memory-topology
+/// classification, never a vendor or driver name; misclassification can change
+/// performance only.
+pub(crate) const BATCH_MAX_DRAWS: u64 = 128;
+const DISCRETE_BATCH_MAX_DRAWS: u64 = 32;
 
-/// The draws-per-command-buffer cap this process runs with.
+const fn batch_default_draws(
+    topology: crate::backend::vulkan::caps::memory_topology::MemoryTopology,
+) -> u64 {
+    use crate::backend::vulkan::caps::memory_topology::MemoryTopology;
+    match topology {
+        MemoryTopology::Unified => BATCH_MAX_DRAWS,
+        MemoryTopology::Discrete => DISCRETE_BATCH_MAX_DRAWS,
+    }
+}
+
+/// The draws-per-command-buffer cap this device runs with.
 ///
-/// [`BATCH_MAX_DRAWS`] is what the measurement above chose against a discrete
-/// NVIDIA host. It is not a bound on GPU *time*, and the host kernel imposes one
-/// of those whether or not this device has an opinion: i915 resets a context
-/// that holds its engine past `preempt_timeout_ms`. So the cap is narrowable
-/// from the environment — see [`crate::env::BATCH_DRAWS`] for why that is the
-/// lever and what a cap of one buys as an instrument.
+/// The topology default is not a bound on GPU *time*, and the host kernel
+/// imposes one of those whether or not this device has an opinion: i915 resets
+/// a context that holds its engine past `preempt_timeout_ms`. So the cap is
+/// narrowable from the environment — see [`crate::env::BATCH_DRAWS`] for why
+/// that is the lever and what a cap of one buys as an instrument.
 ///
-/// Read once per process. The two arms differ in how many submissions a workload
-/// makes, so a boot that flipped it midway would be two devices in one log — the
-/// same reason [`slab_retain_enabled`] latches.
-fn batch_max_draws() -> u64 {
-    use std::sync::OnceLock;
-    static CAP: OnceLock<u64> = OnceLock::new();
-    *CAP.get_or_init(|| {
-        let cap = match crate::env::count(crate::env::BATCH_DRAWS, BATCH_MAX_DRAWS) {
-            crate::env::Count::Narrowed(n) => n,
-            crate::env::Count::Unset => BATCH_MAX_DRAWS,
-            // Fail-visible: a bound the operator asked for and did not get is a
-            // silent difference between what a bisect thinks it measured and
-            // what ran, which is the one thing an arm must never be.
-            crate::env::Count::Refused(raw) => {
-                crate::observe::fail(format!(
-                    "batch_draws_refused value={raw} ceiling={BATCH_MAX_DRAWS} \
+/// Called only while an uninitialized pool is being attached to its device.
+/// The chosen cap is then a field on that pool, so neither the environment nor
+/// topology is re-read on the draw path.
+fn batch_max_draws(
+    topology: crate::backend::vulkan::caps::memory_topology::MemoryTopology,
+) -> u64 {
+    let default = batch_default_draws(topology);
+    let cap = match crate::env::count(crate::env::BATCH_DRAWS, default) {
+        crate::env::Count::Narrowed(n) => n,
+        crate::env::Count::Unset => default,
+        // Fail-visible: a bound the operator asked for and did not get is a
+        // silent difference between what a bisect thinks it measured and
+        // what ran, which is the one thing an arm must never be.
+        crate::env::Count::Refused(raw) => {
+            crate::observe::fail(format!(
+                "batch_draws_refused value={raw} ceiling={default} \
                      (a count from 1 to the ceiling narrows the cap; anything \
                       else would widen it or stop every batch)"
-                ));
-                BATCH_MAX_DRAWS
-            }
-        };
-        crate::observe::off(format!("batch_draws cap={cap} compiled={BATCH_MAX_DRAWS}"));
-        cap
-    })
+            ));
+            default
+        }
+    };
+    crate::observe::off(format!(
+        "batch_draws cap={cap} topology={} default={default} ceiling={BATCH_MAX_DRAWS}",
+        topology.slug()
+    ));
+    cap
 }
 
 /// The allocation a `cb_bound_buffers` key names, held so the key cannot be

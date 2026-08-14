@@ -366,10 +366,9 @@ fn prefetch_arm_flushes_open_batch() {
 /// the GPU fed and the staging pool recycling instead of hoarding a whole run
 /// in one pending ring entry.
 ///
-/// The cap is read from the engine rather than written here. It is chosen by a
-/// live sweep and has moved once already (8 -> 32); a test carrying its own
-/// copy asserts the sweep's old answer against its new one and fails as though
-/// the device had broken.
+/// The cap is read from the live engine rather than written here. It is chosen
+/// from the physical device's memory topology and may be narrowed by the test
+/// environment; a copied constant would test the wrong boundary on one arm.
 #[test]
 fn batch_length_cap_flushes_and_reopens() {
     let _guard = engine_test_lock().lock().unwrap();

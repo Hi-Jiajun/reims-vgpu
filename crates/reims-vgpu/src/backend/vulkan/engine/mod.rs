@@ -4249,15 +4249,14 @@ pub fn object_cache_levels() -> [usize; 6] {
     lock_engine().caches.levels()
 }
 
-/// How many draws one deferred-submit command buffer accepts before it refuses
-/// joiners — [`pools::BATCH_MAX_DRAWS`], for the integration test that drives
-/// past it.
+/// Active topology policy for one deferred-submit command buffer, for the
+/// integration test that drives past it.
 ///
-/// Exported rather than restated in the test: the number is chosen by a live
-/// sweep and has already moved once, and a test carrying its own copy asserts
-/// the sweep's old answer against the new one and fails as if the device broke.
+/// Exported from the live pool rather than restated in the test: unified and
+/// discrete devices intentionally carry different capacities, and the
+/// environment may narrow either one.
 pub fn batch_max_draws() -> u64 {
-    pools::BATCH_MAX_DRAWS
+    lock_engine().pools.batch_capacity()
 }
 
 /// Whether the live Vulkan device can execute colour-attachment self-sampling
