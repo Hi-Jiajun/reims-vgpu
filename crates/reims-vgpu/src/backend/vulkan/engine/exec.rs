@@ -982,6 +982,29 @@ impl GuestTexels {
     }
 }
 
+/// The source of a guest-page attachment LOAD after target admission.
+///
+/// Admission is the decision point: the same declared seed is either already
+/// the attachment's memory or is fallback material for an ordinary resident.
+/// Carrying the seed only on these two arms prevents callers from preparing it
+/// before the resource has answered that question.
+enum GuestTargetLoad<'a> {
+    SharedBacking(&'a super::types::GuestTargetSeed),
+    PrepareSeed(&'a super::types::GuestTargetSeed),
+    None,
+}
+
+fn guest_target_load(
+    target_loads_guest_backing: bool,
+    seed: Option<&super::types::GuestTargetSeed>,
+) -> GuestTargetLoad<'_> {
+    match (target_loads_guest_backing, seed) {
+        (true, Some(seed)) => GuestTargetLoad::SharedBacking(seed),
+        (false, Some(seed)) => GuestTargetLoad::PrepareSeed(seed),
+        (_, None) => GuestTargetLoad::None,
+    }
+}
+
 enum PreparedSampled {
     Upload {
         binding: u32,
@@ -3035,54 +3058,6 @@ pub(crate) unsafe fn execute_draw_inner(
     } else {
         None
     };
-    // Guest-page LOAD seed. This is the same source abstraction sampled images
-    // use: bounded import references for the native rail and host aliases for
-    // its exact fallback. Fragmented imports append a gather owed by this
-    // command buffer; the copy into the attachment is deliberately recorded
-    // only after the shared gather block below has filled it.
-    let target_guest_texels = if let Some(seed) = &req.target_guest_seed {
-        match unsafe {
-            import_sampled_guest_window(ctx, pools, counters, &seed.source, &mut guest_gathers)?
-        } {
-            Some(source) => {
-                pools.note_guest_read_recorded();
-                crate::runtime::drain::note_store_route("target_seed_guest_import");
-                crate::runtime::drain::note_store_route_n(
-                    "target_seed_guest_import_bytes",
-                    seed.source.total_len,
-                );
-                Some(source)
-            }
-            None => {
-                let slot = {
-                    let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-                    pools.acquire_staging(
-                        ctx,
-                        seed.source.total_len,
-                        vk::BufferUsageFlags::TRANSFER_SRC,
-                        counters,
-                    )?
-                };
-                {
-                    let _s =
-                        stage_phase::Span::moving(stage_phase::Part::Runs, seed.source.total_len);
-                    pools.write_staging_from_runs(
-                        ctx,
-                        &slot,
-                        &seed.source.runs,
-                        seed.source.source_offset,
-                        seed.source.total_len,
-                    )?;
-                }
-                counters.note_seed_upload(seed.source.total_len);
-                crate::runtime::drain::note_store_route("target_seed_guest_cpu_fallback");
-                Some(GuestTexels::Scratch(slot))
-            }
-        }
-    } else {
-        None
-    };
-
     // A secondary MRT attachment is bound + rendered as attachment N of an
     // ad-hoc framebuffer built here. The primary slot 0 keeps its own single-RT
     // framebuffer (consistent with single-RT draws to the same target), so the
@@ -3253,6 +3228,70 @@ pub(crate) unsafe fn execute_draw_inner(
                 )
             }
         };
+    // A guest-page LOAD is fallback material for an ordinary resident, not a
+    // second source beside an imported attachment. Target admission has to run
+    // first because only the admitted resource can answer which one this draw
+    // owns. When it owns the guest allocation, the render-pass LOAD reads that
+    // image directly and no buffer import, gather, or copy is part of the
+    // operation.
+    //
+    // On the fallback arm this is the same source abstraction sampled images
+    // use: bounded import references for the native rail and host aliases for
+    // its exact CPU fallback. Fragmented imports append a gather owed by this
+    // command buffer; the copy into the attachment is deliberately recorded
+    // only after the shared gather block below has filled it.
+    let target_guest_texels = match guest_target_load(
+        target_loads_guest_backing,
+        req.target_guest_seed.as_ref(),
+    ) {
+        GuestTargetLoad::SharedBacking(seed) => {
+            crate::runtime::drain::note_store_route("target_load_shared_backing");
+            crate::runtime::drain::note_store_route_n(
+                "target_load_shared_backing_bytes",
+                seed.source.total_len,
+            );
+            None
+        }
+        GuestTargetLoad::PrepareSeed(seed) => match unsafe {
+            import_sampled_guest_window(ctx, pools, counters, &seed.source, &mut guest_gathers)?
+        } {
+            Some(source) => {
+                pools.note_guest_read_recorded();
+                crate::runtime::drain::note_store_route("target_seed_guest_import");
+                crate::runtime::drain::note_store_route_n(
+                    "target_seed_guest_import_bytes",
+                    seed.source.total_len,
+                );
+                Some(source)
+            }
+            None => {
+                let slot = {
+                    let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
+                    pools.acquire_staging(
+                        ctx,
+                        seed.source.total_len,
+                        vk::BufferUsageFlags::TRANSFER_SRC,
+                        counters,
+                    )?
+                };
+                {
+                    let _s =
+                        stage_phase::Span::moving(stage_phase::Part::Runs, seed.source.total_len);
+                    pools.write_staging_from_runs(
+                        ctx,
+                        &slot,
+                        &seed.source.runs,
+                        seed.source.source_offset,
+                        seed.source.total_len,
+                    )?;
+                }
+                counters.note_seed_upload(seed.source.total_len);
+                crate::runtime::drain::note_store_route("target_seed_guest_cpu_fallback");
+                Some(GuestTexels::Scratch(slot))
+            }
+        },
+        GuestTargetLoad::None => None,
+    };
     // GPU seed source: resolved after registry_ensure (which protects it from
     // the capacity sweep) so the handle cannot be destroyed under this draw.
     // Every rejection is a distinct named error — the runtime pre-checks
@@ -5961,6 +6000,24 @@ mod tests {
             }),
             ..DrawRequest::default()
         }
+    }
+
+    #[test]
+    fn an_admitted_guest_attachment_is_the_load_source_not_a_seed_to_prepare() {
+        let req = guest_target_seed_req(16, 16, 1024, 1024, 16);
+        let seed = req.target_guest_seed.as_ref();
+        assert!(matches!(
+            guest_target_load(true, seed),
+            GuestTargetLoad::SharedBacking(_)
+        ));
+        assert!(matches!(
+            guest_target_load(false, seed),
+            GuestTargetLoad::PrepareSeed(_)
+        ));
+        assert!(matches!(
+            guest_target_load(true, None),
+            GuestTargetLoad::None
+        ));
     }
 
     /// Every variant a resident can be in, so the tests below enumerate rather

@@ -4577,7 +4577,7 @@ pub(super) fn sync_store_allowed_pages<M: HostMemory>(
 ///
 /// ```text
 /// type11_seed_elided      41389      t11elide_le_64x64          5
-/// type11_seed_uploaded      242      t11elide_le_256x256        4
+/// type11_seed_provided      242      t11elide_le_256x256        4
 ///                                    t11elide_le_512x512      903
 ///                                    t11elide_le_1024x1024  15641
 ///                                    t11elide_display       24836
@@ -4589,7 +4589,7 @@ pub(super) fn sync_store_allowed_pages<M: HostMemory>(
 /// **An unconditional revalidation is not affordable.** At RGBA8 the elided
 /// extent is ~237 GB of guest reads per session. The rail is not a micro-
 /// optimisation to be traded away for correctness; it is carrying essentially
-/// all of the composite seed traffic, and `type11_seed_uploaded` at 242 against
+/// all of the composite seed traffic, and `type11_seed_provided` at 242 against
 /// 41 389 says what the un-elided rate would be.
 ///
 /// **The latch is not on the icon target.** Nine elisions in the entire session
@@ -4607,7 +4607,7 @@ pub(super) fn sync_store_allowed_pages<M: HostMemory>(
 /// [`type11_guest_wrote_since_store`] is that witness, over
 /// `HostOps::guest_write_gen`: O(pages) at the harvest instead of O(bytes) at
 /// every LOAD, with the 237 GB left saved. One driven boot after it landed
-/// measured `type11_seed_elided` 283 against `type11_seed_uploaded` 23, so the
+/// measured `type11_seed_elided` 283 against `type11_seed_provided` 23, so the
 /// reuse survived the soundness.
 fn note_type11_elision_extent(w: u32, h: u32) {
     let texels = (w as u64).saturating_mul(h as u64);
@@ -6803,7 +6803,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Why not the sibling rail's shape — `load_linear_guest_memoized`
         // re-reads the guest's native rows on every call and byte-compares
         // before reusing its `Arc`. Priced on one boot: `type11_seed_elided`
-        // 41 389 against `type11_seed_uploaded` 242, at a mean 1.43 M texels per
+        // 41 389 against `type11_seed_provided` 242, at a mean 1.43 M texels per
         // elision, so revalidating by re-reading would move ~237 GB of guest
         // memory a session. The bitmap answers the same question in a word.
         if !chain_load_from_target {
@@ -6822,7 +6822,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     crate::runtime::drain::note_store_route("type11_seed_elided");
                     note_type11_elision_extent(w, h);
                 } else {
-                    crate::runtime::drain::note_store_route("type11_seed_uploaded");
+                    crate::runtime::drain::note_store_route("type11_seed_provided");
                     // Separated from the epoch's refusal so a boot can say which
                     // half refused. The two answer different questions and a
                     // single counter would hide a rail that never fires.
