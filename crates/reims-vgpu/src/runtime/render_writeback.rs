@@ -854,7 +854,7 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
     ) {
         Ok(bytes) => {
             crate::runtime::drain::note_store_route("render_flush_gpu_direct");
-            finish(state, mapping_id, identity, bytes as usize, started);
+            finish(state, mapping_id, identity, bytes as usize, started, false);
             return true;
         }
         Err(decline) => {
@@ -970,7 +970,7 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
         ));
         return false;
     }
-    finish(state, mapping_id, identity, frame_len, started);
+    finish(state, mapping_id, identity, frame_len, started, false);
     true
 }
 
@@ -995,8 +995,13 @@ pub fn store_guest_backed_frame(
         guest_store_recorded,
     )?;
     crate::runtime::drain::note_store_route("render_flush_gpu_direct");
-    finish(state, mapping_id, identity, bytes as usize, started);
+    finish(state, mapping_id, identity, bytes as usize, started, true);
     Ok(())
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn finish_needs_registry_handoff(guest_backed: bool) -> bool {
+    !guest_backed
 }
 
 /// Hand the currency witness back to the image the frame came out of, and score
@@ -1015,17 +1020,26 @@ fn finish(
     identity: &crate::backend::vulkan::engine::TargetIdentity,
     frame_len: usize,
     started: std::time::Instant,
+    guest_backed: bool,
 ) {
-    if let Some(epoch) = state
-        .mappings
-        .get(&mapping_id)
-        .map(|m| m.surface_content_epoch)
-    {
-        crate::backend::vulkan::engine::stamp_resident_content_epoch(identity, epoch);
+    // A copied resident needs two pieces of registry state handed back: the
+    // mapping epoch says its mirror is current, and clearing sole-copy permits
+    // reclaim now that the guest pages hold the pixels. An imported resident is
+    // the guest allocation itself. It has no mirror epoch to stamp, and draw
+    // completion already leaves it non-sole-copy, so neither registry mutation
+    // applies.
+    if finish_needs_registry_handoff(guest_backed) {
+        if let Some(epoch) = state
+            .mappings
+            .get(&mapping_id)
+            .map(|m| m.surface_content_epoch)
+        {
+            crate::backend::vulkan::engine::stamp_resident_content_epoch(identity, epoch);
+        }
+        crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
+    } else {
+        crate::runtime::drain::note_store_route("shared_store_registry_handoff_elided");
     }
-    // The copy above means this image has stopped being the only place these
-    // pixels exist, so the reclaim paths may take it.
-    crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
     crate::runtime::drain::note_drain_phase(
         crate::runtime::drain::DrainPhase::Flush(crate::runtime::drain::FlushRail::Render),
         started,
@@ -1034,6 +1048,20 @@ fn finish(
         "render_store mapping={mapping_id} bytes={frame_len} us={}",
         started.elapsed().as_micros()
     ));
+}
+
+#[cfg(all(test, feature = "backend-vulkan"))]
+mod guest_backed_finish_tests {
+    use super::finish_needs_registry_handoff;
+
+    #[test]
+    fn shared_storage_has_no_mirror_or_sole_copy_handoff() {
+        assert!(!finish_needs_registry_handoff(true));
+        assert!(
+            finish_needs_registry_handoff(false),
+            "a copied resident still needs its epoch and reclaimability published"
+        );
+    }
 }
 
 /// Why a GVA render Store could not hand its resident straight to the guest's
