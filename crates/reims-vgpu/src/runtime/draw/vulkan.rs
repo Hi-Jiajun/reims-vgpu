@@ -1692,6 +1692,21 @@ fn resource_type_owns_surface_resident(object_type: u8) -> bool {
     )
 }
 
+/// Whether a decoded resource object owns a linear GVA texture resident.
+///
+/// Normal textures and their serialized variants carry one stable resource
+/// reference from construction until deletion. Their level-zero GVA identity
+/// may therefore retain the engine allocation for that same lifetime. Surface
+/// texture forms use [`resource_type_owns_surface_resident`] instead, while an
+/// anonymous attachment keeps the registry-query fallback.
+fn resource_type_owns_gva_resident(object_type: u8) -> bool {
+    matches!(
+        object_type,
+        crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE
+            | crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VARIANT
+    )
+}
+
 #[cfg(test)]
 mod resource_resident_ownership_tests {
     use super::*;
@@ -1711,6 +1726,24 @@ mod resource_resident_ownership_tests {
             crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VARIANT,
         ] {
             assert!(!resource_type_owns_surface_resident(object_type));
+        }
+    }
+
+    #[test]
+    fn linear_texture_construction_forms_own_their_gva_resident() {
+        for object_type in [
+            crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE,
+            crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VARIANT,
+        ] {
+            assert!(resource_type_owns_gva_resident(object_type));
+        }
+        for object_type in [
+            objects::OBJECT_TYPE_SURFACE,
+            objects::OBJECT_TYPE_REF_TEXTURE,
+            crate::runtime::decode::resource::OBJECT_TYPE_IOSURFACE,
+            crate::runtime::decode::resource::OBJECT_TYPE_BUFFER,
+        ] {
+            assert!(!resource_type_owns_gva_resident(object_type));
         }
     }
 }
@@ -3413,6 +3446,51 @@ pub(super) enum GvaResidentRefusal {
     NoResident,
 }
 
+fn retained_resident_is_ready(
+    backing: Option<crate::backend::vulkan::engine::ResidentContentBacking>,
+    registry_query: impl FnOnce() -> bool,
+) -> bool {
+    use crate::backend::vulkan::engine::ResidentContentBacking;
+
+    match backing {
+        Some(
+            ResidentContentBacking::GuestAllocation | ResidentContentBacking::DeviceAllocation,
+        ) => true,
+        Some(ResidentContentBacking::NotReady) => false,
+        None => registry_query(),
+    }
+}
+
+/// Whether the resident named by a GVA texture is still usable.
+///
+/// A named texture owns a retained allocation lease, so warm binds answer from
+/// the texture object without re-entering the global engine. Anonymous and
+/// unclassified spans have no protocol lifetime to hold such a lease and keep
+/// the fail-closed registry query.
+fn gva_resident_ready(
+    state: &DeviceState,
+    task_id: u32,
+    texture_ref: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+) -> bool {
+    let backing = (texture_ref != 0)
+        .then(|| state.task_resources.get(task_id, texture_ref))
+        .flatten()
+        .filter(|resource| resource_type_owns_gva_resident(resource.entry.object_type))
+        .map(|resource| resource.resident_target_backing(identity));
+    let retained = backing.is_some();
+    let ready = retained_resident_is_ready(backing, || {
+        crate::backend::vulkan::engine::resident_content_ready(identity)
+    });
+    crate::runtime::drain::note_store_route(match (retained, ready) {
+        (true, true) => "gva_ready_resource",
+        (true, false) => "gva_not_ready_resource",
+        (false, true) => "gva_ready_registry",
+        (false, false) => "gva_not_ready_registry",
+    });
+    ready
+}
+
 /// The one currency test behind every GVA resident shortcut: does the engine
 /// still hold, under this span's own identity, what the render Store published
 /// into these guest pages?
@@ -3475,7 +3553,7 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
     // those states distinct prevents a skipped copy from masquerading as a
     // statement about bytes that were never written.
     if crate::runtime::writeback_debt::gva_resident_authoritative(state, &identity) {
-        return crate::backend::vulkan::engine::resident_content_ready(&identity)
+        return gva_resident_ready(state, task_id, texture_ref, &identity)
             .then_some(identity)
             .ok_or(GvaResidentRefusal::NoResident);
     }
@@ -3493,9 +3571,42 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
     if !verdict.is_quiet() {
         return Err(GvaResidentRefusal::Wrote(verdict));
     }
-    crate::backend::vulkan::engine::resident_content_ready(&identity)
+    gva_resident_ready(state, task_id, texture_ref, &identity)
         .then_some(identity)
         .ok_or(GvaResidentRefusal::NoResident)
+}
+
+#[cfg(test)]
+mod gva_resident_ownership_tests {
+    use super::*;
+    use crate::backend::vulkan::engine::ResidentContentBacking;
+    use std::cell::Cell;
+
+    #[test]
+    fn a_retained_texture_answers_readiness_without_a_registry_query() {
+        for backing in [
+            ResidentContentBacking::GuestAllocation,
+            ResidentContentBacking::DeviceAllocation,
+        ] {
+            assert!(retained_resident_is_ready(Some(backing), || {
+                panic!("a retained allocation must not query the registry")
+            }));
+        }
+        assert!(!retained_resident_is_ready(
+            Some(ResidentContentBacking::NotReady),
+            || panic!("a named resource's failed retain is already authoritative")
+        ));
+    }
+
+    #[test]
+    fn an_anonymous_gva_span_keeps_the_registry_fallback() {
+        let queries = Cell::new(0_u32);
+        assert!(retained_resident_is_ready(None, || {
+            queries.set(queries.get() + 1);
+            true
+        }));
+        assert_eq!(queries.get(), 1);
+    }
 }
 
 /// May the colour LOAD seed at this GVA attachment be skipped, because the
@@ -5651,8 +5762,10 @@ pub(super) fn honour_gva_load_elision<M: HostMemory + HostOps>(
     if !req.gva_load_from_resident || *chain_load_from_target {
         return None;
     }
-    let ready =
-        gva_chain_identity(req).filter(crate::backend::vulkan::engine::resident_content_ready);
+    let ready = gva_chain_identity(req).filter(|identity| {
+        let texture_ref = req.colors.first().map(|c0| c0.texture_ref).unwrap_or(0);
+        gva_resident_ready(state, req.task_id, texture_ref, identity)
+    });
     match ready {
         Some(identity) => {
             crate::runtime::drain::note_store_route("gvaseed_chained");
