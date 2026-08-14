@@ -2059,17 +2059,50 @@ pub(crate) fn note_mapping_write_footprint(
     };
     let page_size = state.page_size();
     let page_shift = state.page_shift;
+    note_page_write_footprint(page_size, off, len, |i| {
+        m.page_entries.get(i).map(|&entry| {
+            crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift)
+        })
+    });
+}
+
+/// Record a write through a retained allocation footprint.
+///
+/// These are the pages admitted with a guest-backed GPU resource. Consuming
+/// them directly keeps Store publication tied to the allocation that actually
+/// rendered, even if mutable mapping state changes after admission.
+#[cfg(any(feature = "backend-vulkan", test))]
+pub(crate) fn note_physical_page_write_footprint(
+    pages: &[u64],
+    page_size: u64,
+    off: u64,
+    len: u64,
+) {
+    note_page_write_footprint(page_size, off, len, |i| {
+        pages.get(i).copied().map(Some)
+    });
+}
+
+fn note_page_write_footprint(
+    page_size: u64,
+    off: u64,
+    len: u64,
+    mut page_at: impl FnMut(usize) -> Option<Option<u64>>,
+) {
+    if len == 0 {
+        return;
+    }
     let end = off.saturating_add(len);
     let first = off / page_size;
     let last = (end - 1) / page_size;
     let mut physical_run: Option<(u64, u64)> = None;
     for i in first..=last {
-        let Some(&entry) = m.page_entries.get(i as usize) else {
+        let Some(gpa) = page_at(i as usize) else {
             // A short page list is a refusal the caller reports; there is no
             // frame to name for a page the list does not have.
             break;
         };
-        let Some(gpa) = crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift) else {
+        let Some(gpa) = gpa else {
             continue;
         };
         let page_lo = i.saturating_mul(page_size);

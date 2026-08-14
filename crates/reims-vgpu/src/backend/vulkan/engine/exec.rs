@@ -5031,7 +5031,7 @@ pub(crate) unsafe fn execute_draw_inner(
             pools.registry_mark_ready_at(identity, pass_key.color_final_layout(0));
         }
     }
-    let guest_store_recorded = match (
+    let guest_store_pages = match (
         req.target_identity.as_ref(),
         guest_store_pages_to_record(
             req.record_guest_store,
@@ -5042,10 +5042,11 @@ pub(crate) unsafe fn execute_draw_inner(
         (Some(identity), Some(pages)) => {
             super::record_guest_write_debt(pools, identity, &pages);
             crate::runtime::drain::note_store_route("target_store_shared_recorded");
-            true
+            Some(pages)
         }
-        _ => false,
+        _ => None,
     };
+    let guest_store_recorded = guest_store_pages.is_some();
     // MRT secondary attachments settle at COLOR_ATTACHMENT_OPTIMAL (the pass
     // final layout) and become sampleable residents; the consumer's
     // resident-sample barrier then transitions COLOR_ATTACHMENT→SHADER_READ,
@@ -5163,6 +5164,7 @@ pub(crate) unsafe fn execute_draw_inner(
             pixels: Vec::new(),
             target_guest_backed,
             guest_store_recorded,
+            guest_store_pages: guest_store_pages.clone(),
             pixels_bgra: output_bgra,
             // Unreachable with a query armed: `batch_eligible` excludes one, so
             // `defer_submit` is false for every queried draw. Stated as `None`
@@ -5250,6 +5252,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 pixels: Vec::new(),
                 target_guest_backed,
                 guest_store_recorded,
+                guest_store_pages: guest_store_pages.clone(),
                 pixels_bgra: output_bgra,
                 occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
             });
@@ -5261,6 +5264,7 @@ pub(crate) unsafe fn execute_draw_inner(
             pixels: Vec::new(),
             target_guest_backed,
             guest_store_recorded,
+            guest_store_pages: guest_store_pages.clone(),
             pixels_bgra: output_bgra,
             occlusion_samples: None,
         });
@@ -5308,6 +5312,7 @@ pub(crate) unsafe fn execute_draw_inner(
         pixels,
         target_guest_backed,
         guest_store_recorded,
+        guest_store_pages,
         pixels_bgra,
         occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
     })

@@ -600,3 +600,24 @@ fn a_contiguous_mapping_write_marks_only_the_pages_its_offset_reaches() {
     );
     assert_eq!(footprint::counts(), (1, 0));
 }
+
+/// A guest-backed resident publishes the page footprint retained at admission,
+/// not a second decode of the mapping that happened to carry the same identity
+/// earlier. The byte window must still select within that retained scatter.
+#[test]
+fn an_admitted_page_footprint_marks_its_window_without_filling_scatter_gaps() {
+    use crate::observe::footprint;
+
+    let _fp = footprint::exclusive_for_tests();
+    let page = 1u64 << PAGE_SHIFT_X86;
+    let pages = [0x1200_0000u64, 0x3200_0000u64];
+    note_physical_page_write_footprint(&pages, page, page - 8, 16);
+
+    assert!(footprint::wrote_gpa(pages[0] + page - 8));
+    assert!(footprint::wrote_gpa(pages[1]));
+    assert!(
+        !footprint::wrote_gpa((pages[0] + pages[1]) / 2),
+        "the retained allocation is still a scatter, never its physical hull"
+    );
+    assert_eq!(footprint::counts(), (2, 0));
+}

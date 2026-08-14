@@ -57,6 +57,7 @@ pub(crate) use counters::{CounterSnapshot, EngineCounters};
 pub(crate) use draw_phase::take_window as draw_phase_window;
 pub(crate) use draw_preparation::DrawPreparationDecline;
 pub(crate) use facade_decline::EngineFacadeDecline;
+pub(crate) use host_ram::GuestWriteDecline;
 pub use types::viewport_slot_count;
 pub use types::{
     BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask, ComputeBufferResource,
@@ -3039,7 +3040,9 @@ pub fn copy_target_to_guest_pages(
 /// retained when that binding was admitted. Synchronization therefore names
 /// only the resource: it publishes the existing GPU write to the completion
 /// ledger and performs no destination reconstruction or copy.
-pub fn synchronize_guest_backed_target(identity: &TargetIdentity) -> Result<(), DrawError> {
+pub fn synchronize_guest_backed_target(
+    identity: &TargetIdentity,
+) -> Result<std::sync::Arc<[u64]>, DrawError> {
     use host_ram::GuestWriteDecline;
     let mut guard = lock_engine();
     let pools = &mut guard.pools;
@@ -3054,7 +3057,7 @@ pub fn synchronize_guest_backed_target(identity: &TargetIdentity) -> Result<(), 
     ))?;
     crate::runtime::drain::note_store_route("target_sync_shared_backing");
     record_guest_write_debt(pools, identity, &pages);
-    Ok(())
+    Ok(pages)
 }
 
 fn shared_backing_settles(

@@ -680,6 +680,11 @@ pub struct DrawOutput {
     /// Whether this draw recorded its guest-backed Store in the completion
     /// ledger before releasing the engine transaction.
     pub guest_store_recorded: bool,
+    /// Exact physical pages retained by the guest-backed target whose Store was
+    /// recorded. The runtime publishes this same admitted footprint to its
+    /// coherence ledgers instead of reconstructing it from mutable mapping
+    /// state after the engine transaction.
+    pub guest_store_pages: Option<std::sync::Arc<[u64]>>,
     /// Physical channel order of `pixels`: BGRA8 when true, semantic RGBA8
     /// otherwise. Empty when `skip_readback`, in which case this states the
     /// order the attachment *would* have read back in.

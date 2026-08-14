@@ -980,6 +980,7 @@ pub fn store_guest_backed_frame(
     width: u32,
     height: u32,
     guest_store_recorded: bool,
+    guest_store_pages: Option<std::sync::Arc<[u64]>>,
 ) -> Result<(), crate::runtime::mapping_write::GpuWritebackDecline> {
     let started = std::time::Instant::now();
     crate::runtime::drain::note_store_route("surface_flush");
@@ -990,6 +991,7 @@ pub fn store_guest_backed_frame(
         width,
         height,
         guest_store_recorded,
+        guest_store_pages,
     )?;
     crate::runtime::drain::note_store_route("render_flush_gpu_direct");
     finish(state, mapping_id, identity, bytes as usize, started, true);

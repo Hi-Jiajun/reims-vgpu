@@ -5621,10 +5621,11 @@ enum M2vDrawSpan {
     ResidentSurfaceStore { guest_store: GuestStoreStatus },
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct GuestStoreStatus {
     guest_backed: bool,
     recorded: bool,
+    pages: Option<std::sync::Arc<[u64]>>,
 }
 
 /// Name the guest-Store route this record actually took, once per distinct
@@ -8379,6 +8380,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 guest_store: GuestStoreStatus {
                     guest_backed: out.target_guest_backed,
                     recorded: out.guest_store_recorded,
+                    pages: out.guest_store_pages,
                 },
             });
         }
@@ -9345,6 +9347,7 @@ fn store_surface_resident<M: HostMemory + HostOps>(
             width,
             height,
             guest_store.recorded,
+            guest_store.pages,
         ) {
             Ok(()) => return true,
             Err(decline) => {
