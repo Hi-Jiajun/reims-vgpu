@@ -597,6 +597,60 @@ fn replace_physical_routes_through_the_texture_ref_when_no_mapping_owns_the_id()
     );
 }
 
+/// ReplacePhysical is one resource's lifecycle transition, not a task reset.
+/// Retiring every GVA resident on the task loses unrelated host-authoritative
+/// frames when the compositor re-points several short-lived resources quickly.
+#[test]
+fn replace_physical_retires_only_the_named_resource() {
+    use crate::runtime::writeback_debt::{GvaResourceKey, GvaWritebackDebt};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let key = |texture_ref| GvaResourceKey {
+        task_id: 3,
+        texture_ref,
+    };
+    let debt = |gva, generation| GvaWritebackDebt {
+        gva,
+        row_stride: 256,
+        width: 64,
+        height: 64,
+        format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        generation,
+        guest_write: Default::default(),
+        seq: 0,
+    };
+    assert_eq!(state.pending_writebacks.arm_gva(key(12), debt(0x4000, 1)), None);
+    assert_eq!(state.pending_writebacks.arm_gva(key(13), debt(0x8000, 2)), None);
+
+    let mut payload = vec![0u8; 8];
+    payload[0..4].copy_from_slice(&3u32.to_le_bytes());
+    payload[4..8].copy_from_slice(&12u32.to_le_bytes());
+    process_child_packet(
+        &mut state,
+        &mut host,
+        2,
+        &Packet {
+            opcode: CHILD_OP_REPLACE_PHYSICAL,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + 8,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        },
+    );
+
+    assert!(state.pending_writebacks.get_gva(key(12)).is_none());
+    assert_eq!(
+        state
+            .pending_writebacks
+            .get_gva(key(13))
+            .map(|debt| debt.generation),
+        Some(2),
+        "an unrelated resource on the task keeps its authoritative frame"
+    );
+}
+
 /// A same-number mapping owned by another task must not capture a task-local
 /// resource re-point. The association names mapping 99; mapping 7 merely shares
 /// its integer and has independent type-4 provenance.

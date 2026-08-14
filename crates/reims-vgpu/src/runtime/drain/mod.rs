@@ -4329,15 +4329,20 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 if let Some(cmd) =
                     crate::runtime::decode::fifo::decode_replace_physical(&packet.payload)
                 {
-                    // The GPA behind this object's GVAs changes here, so any
-                    // held bind resolution on the task names the old frames.
-                    // The packet names an object, not a range, and which
-                    // references resolved through it is not recorded — so the
-                    // task's resolutions go together.
-                    crate::runtime::writeback_debt::retire_gva_for_task(state, cmd.task_id);
+                    // The GPA behind this resource changes here. The command is
+                    // scoped to one task-local resource id, so unrelated
+                    // resources on the same task keep both their authoritative
+                    // frame and their held address resolution.
+                    if crate::runtime::writeback_debt::retire_gva_resource(
+                        state,
+                        cmd.task_id,
+                        cmd.object_id,
+                    ) {
+                        note_store_route("gva_resource_retired");
+                    }
                     note_bb_retired(
                         "bb_retire_replace_physical",
-                        state.retire_bound_buffers_for_task(cmd.task_id),
+                        state.retire_bound_buffers_for_ref(cmd.task_id, cmd.object_id),
                     );
                     crate::runtime::objects::replace_physical(
                         state,

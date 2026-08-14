@@ -45,11 +45,9 @@
 //! * `CmdDefineTask2` / `CmdDeleteTask` — the page table root changed or the
 //!   task is gone.
 //!
-//! The last four retire the whole task rather than a range. They are rare —
-//! a driven boot sees single-digit `replace_physical` events against thousands
-//! of draws a second — and a narrower rule would have to map an object id back
-//! to the references that resolved through it, which is machinery bought with
-//! nothing.
+//! `CmdReplacePhysical` and `CmdDeleteObject` carry the task-local resource
+//! reference and retire that reference. `CmdSetObjectList`, `CmdDefineTask2`
+//! and `CmdDeleteTask` replace task-wide naming state and retire the whole task.
 //!
 //! # Why the fallback key carries the offset
 //!
@@ -315,9 +313,8 @@ impl BoundBuffers {
 
     /// Drop everything held for one task.
     ///
-    /// The answer for a page-table root change, a new object list, a deleted
-    /// object and a deleted task: in every one of them a reference may now name
-    /// different bytes, and which references is not knowable from the packet.
+    /// The answer for a page-table root change, a new object list, or a deleted
+    /// task: in each case every reference may now name different bytes.
     pub fn retire_task(&mut self, task_id: u32) -> usize {
         let before = self.held.len();
         self.held.retain(|k, _| k.task != task_id);
