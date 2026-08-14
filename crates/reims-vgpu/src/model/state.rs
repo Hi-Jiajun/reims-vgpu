@@ -1304,7 +1304,7 @@ pub struct MappingEntry {
     /// this footprint with an imported attachment and uses it to order host
     /// readers against the GPU write without walking the mapping again at
     /// Store time.
-    pub contig_gpas: std::sync::Arc<[u64]>,
+    pub contig_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint>,
     /// Checked backend-import bound over `contig_ptr`, created once for this
     /// mapping incarnation. Keeping it on the mapping makes every plane view a
     /// slice of one resource-owned allocation instead of minting a new import
@@ -2608,7 +2608,7 @@ impl DeviceState {
         let view = (e.contig_ptr != 0).then_some((e.contig_ptr, e.contig_len));
         e.contig_ptr = 0;
         e.contig_len = 0;
-        e.contig_gpas = Default::default();
+        e.contig_footprint = None;
         (view, import)
     }
 

@@ -684,7 +684,7 @@ pub struct DrawOutput {
     /// recorded. The runtime publishes this same admitted footprint to its
     /// coherence ledgers instead of reconstructing it from mutable mapping
     /// state after the engine transaction.
-    pub guest_store_pages: Option<std::sync::Arc<[u64]>>,
+    pub guest_store_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint>,
     /// Physical channel order of `pixels`: BGRA8 when true, semantic RGBA8
     /// otherwise. Empty when `skip_readback`, in which case this states the
     /// order the attachment *would* have read back in.
@@ -1955,7 +1955,7 @@ pub struct GuestTargetMemory {
     pub backing: GuestTargetBacking,
     /// The parent allocation whose one backend import all child views share.
     pub import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
-    pub pages: std::sync::Arc<[u64]>,
+    pub footprint: crate::runtime::guest_ram::GuestPageFootprint,
 }
 
 /// Producer-assigned identity + generation for CPU-sourced sampled content.

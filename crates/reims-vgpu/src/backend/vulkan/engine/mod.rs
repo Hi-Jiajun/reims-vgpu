@@ -3042,7 +3042,7 @@ pub fn copy_target_to_guest_pages(
 /// ledger and performs no destination reconstruction or copy.
 pub fn synchronize_guest_backed_target(
     identity: &TargetIdentity,
-) -> Result<std::sync::Arc<[u64]>, DrawError> {
+) -> Result<crate::runtime::guest_ram::GuestPageFootprint, DrawError> {
     use host_ram::GuestWriteDecline;
     let mut guard = lock_engine();
     let pools = &mut guard.pools;
@@ -3052,12 +3052,12 @@ pub fn synchronize_guest_backed_target(
             GuestWriteDecline::NoSharedBacking,
         ));
     }
-    let pages = snap.guest_pages.ok_or(DrawError::GuestPageWrite(
+    let footprint = snap.guest_footprint.ok_or(DrawError::GuestPageWrite(
         GuestWriteDecline::NoSharedBacking,
     ))?;
     crate::runtime::drain::note_store_route("target_sync_shared_backing");
-    record_guest_write_debt(pools, identity, &pages);
-    Ok(pages)
+    record_guest_write_debt(pools, identity, footprint.pages());
+    Ok(footprint)
 }
 
 fn shared_backing_settles(
@@ -4088,7 +4088,7 @@ struct ResidentReadSnapshot {
     /// lands the right texel.
     format: ash::vk::Format,
     guest_backing: Option<GuestTargetBacking>,
-    guest_pages: Option<std::sync::Arc<[u64]>>,
+    guest_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint>,
 }
 
 impl ResidentReadSnapshot {
@@ -4124,7 +4124,7 @@ fn resident_read_snapshot(
         layout: slot.access.layout(),
         format: slot.color_format,
         guest_backing: slot.memory.guest_backing(),
-        guest_pages: slot.memory.guest_pages(),
+        guest_footprint: slot.memory.guest_footprint(),
     })
 }
 

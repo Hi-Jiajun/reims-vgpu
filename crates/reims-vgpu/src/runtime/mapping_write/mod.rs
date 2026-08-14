@@ -1110,7 +1110,7 @@ pub fn synchronize_guest_backed_resident(
     width: u32,
     height: u32,
     guest_store_recorded: bool,
-    guest_store_pages: Option<std::sync::Arc<[u64]>>,
+    guest_store_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint>,
 ) -> Result<u64, GpuWritebackDecline> {
     if !scanout_extent_ok(width, height) {
         return Err(GpuWritebackDecline::NotWritable);
@@ -1137,11 +1137,11 @@ pub fn synchronize_guest_backed_resident(
             format,
         });
     };
-    let pages = if guest_store_needs_separate_sync(guest_store_recorded) {
+    let footprint = if guest_store_needs_separate_sync(guest_store_recorded) {
         crate::backend::vulkan::engine::synchronize_guest_backed_target(identity)
             .map_err(|inner| GpuWritebackDecline::Engine { inner })?
     } else {
-        guest_store_pages.ok_or_else(|| GpuWritebackDecline::Engine {
+        guest_store_footprint.ok_or_else(|| GpuWritebackDecline::Engine {
             inner: crate::backend::vulkan::engine::DrawError::GuestPageWrite(
                 crate::backend::vulkan::engine::GuestWriteDecline::NoSharedBacking,
             ),
@@ -1149,12 +1149,11 @@ pub fn synchronize_guest_backed_resident(
     };
 
     mapper::note_physical_page_write_footprint(
-        &pages,
-        state.page_size(),
+        &footprint,
         base_off,
         span_end - base_off,
     );
-    state.host_writes.note_page_iter(pages.iter().copied());
+    state.host_writes.note_footprint(&footprint);
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
     crate::runtime::surface_cache::forget(state, mapping_id);

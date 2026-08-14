@@ -2160,7 +2160,7 @@ fn apply_type4_backing<M: HostMemory>(
             state.retired_views.push((m.contig_ptr, m.contig_len));
             m.contig_ptr = 0;
             m.contig_len = 0;
-            m.contig_gpas = Default::default();
+            m.contig_footprint = None;
             retired_import = m.contig_import.take().map(|import| {
                 import.retire();
                 import.id()

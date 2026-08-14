@@ -2499,7 +2499,11 @@ pub(super) mod pin_count_tests {
                     )
                     .unwrap(),
                 ),
-                pages: std::sync::Arc::from([1_u64]),
+                footprint: crate::runtime::guest_ram::GuestPageFootprint::new(
+                    std::sync::Arc::from([0x1000_u64]),
+                    0x1000,
+                )
+                .expect("page footprint"),
             },
         };
         pools.registry.insert(imported_id.clone(), imported);
@@ -2726,7 +2730,11 @@ pub(super) mod pin_count_tests {
                     )
                     .unwrap(),
                 ),
-                pages: std::sync::Arc::from([0x2000, 0x3000]),
+                footprint: crate::runtime::guest_ram::GuestPageFootprint::new(
+                    std::sync::Arc::from([0x2000, 0x3000]),
+                    0x1000,
+                )
+                .expect("page footprint"),
             },
         };
         let identity = surf(1);

@@ -3059,8 +3059,8 @@ fn mapped_sampled_source<M: HostMemory + HostOps>(
         owner,
     } = plane;
 
-    let (import, _gpas) =
-        crate::runtime::mapper::ensure_contig_import_with_pages(state, host, mapping_id)?;
+    let (import, _footprint) =
+        crate::runtime::mapper::ensure_contig_import_with_footprint(state, host, mapping_id)?;
     let end = base_off.checked_add(span)?;
     if end > import.len() {
         return None;
@@ -5625,7 +5625,7 @@ enum M2vDrawSpan {
 struct GuestStoreStatus {
     guest_backed: bool,
     recorded: bool,
-    pages: Option<std::sync::Arc<[u64]>>,
+    footprint: Option<crate::runtime::guest_ram::GuestPageFootprint>,
 }
 
 /// Name the guest-Store route this record actually took, once per distinct
@@ -8380,7 +8380,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 guest_store: GuestStoreStatus {
                     guest_backed: out.target_guest_backed,
                     recorded: out.guest_store_recorded,
-                    pages: out.guest_store_pages,
+                    footprint: out.guest_store_footprint,
                 },
             });
         }
@@ -8580,8 +8580,8 @@ fn type11_guest_target_backing<H: HostMemory + HostOps>(
         let format = crate::runtime::mapping_write::mapping_store_format(mapping);
         crate::runtime::mapping_write::type11_sample_window(mapping, c0.width, c0.height, format)?
     };
-    let (import, pages) =
-        crate::runtime::mapper::ensure_contig_import_with_pages(state, host, c0.mapping_id)?;
+    let (import, footprint) =
+        crate::runtime::mapper::ensure_contig_import_with_footprint(state, host, c0.mapping_id)?;
     if span_end > import.len() {
         return None;
     }
@@ -8593,7 +8593,7 @@ fn type11_guest_target_backing<H: HostMemory + HostOps>(
             row_pitch: u64::from(row_pitch),
         },
         import,
-        pages,
+        footprint,
     })
 }
 
@@ -9347,7 +9347,7 @@ fn store_surface_resident<M: HostMemory + HostOps>(
             width,
             height,
             guest_store.recorded,
-            guest_store.pages,
+            guest_store.footprint,
         ) {
             Ok(()) => return true,
             Err(decline) => {

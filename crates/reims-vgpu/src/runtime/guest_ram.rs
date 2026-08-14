@@ -72,6 +72,74 @@
 use crate::contract::checked::align_up_u64;
 use crate::observe::{Decline, Emit};
 
+/// Exact physical footprint retained with one imported guest allocation.
+///
+/// `pages` is the allocation order required by alias and ownership checks;
+/// `runs` is the same set partitioned into physically contiguous stretches.
+/// Deriving the partition once makes a resource—not each Store consumer—the
+/// authority on how its scattered pages fit together.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuestPageFootprint {
+    pages: std::sync::Arc<[u64]>,
+    runs: std::sync::Arc<[std::ops::Range<usize>]>,
+    page_size: u64,
+}
+
+impl GuestPageFootprint {
+    pub(crate) fn new(pages: std::sync::Arc<[u64]>, page_size: u64) -> Option<Self> {
+        if pages.is_empty() || !page_size.is_power_of_two() {
+            return None;
+        }
+        let runs = reims_vgpu_paging::runs::contig_page_runs(&pages, page_size).into();
+        Some(Self {
+            pages,
+            runs,
+            page_size,
+        })
+    }
+
+    pub fn pages(&self) -> &[u64] {
+        &self.pages
+    }
+
+    pub fn runs(&self) -> &[std::ops::Range<usize>] {
+        &self.runs
+    }
+
+    pub fn page_size(&self) -> u64 {
+        self.page_size
+    }
+
+    pub(crate) fn pages_arc(&self) -> std::sync::Arc<[u64]> {
+        std::sync::Arc::clone(&self.pages)
+    }
+
+    /// Visit the exact physical byte runs reached by an allocation-relative
+    /// byte window. Scatter gaps are never joined.
+    pub fn visit_window(&self, off: u64, len: u64, mut visit: impl FnMut(u64, u64)) {
+        if len == 0 {
+            return;
+        }
+        let end = off.saturating_add(len);
+        let first_page = off / self.page_size;
+        let last_page_exclusive = ((end - 1) / self.page_size).saturating_add(1);
+        for run in self.runs.iter() {
+            let start = run.start.max(first_page as usize);
+            let stop = run.end.min(last_page_exclusive as usize);
+            if start >= stop {
+                continue;
+            }
+            let logical_base = (run.start as u64).saturating_mul(self.page_size);
+            let logical_lo = off.max((start as u64).saturating_mul(self.page_size));
+            let logical_hi = end.min((stop as u64).saturating_mul(self.page_size));
+            let physical_lo = self.pages[run.start].saturating_add(logical_lo - logical_base);
+            if logical_lo < logical_hi {
+                visit(physical_lo, logical_hi - logical_lo);
+            }
+        }
+    }
+}
+
 /// One RAMBlock as the host shim describes it: where it starts in guest physical
 /// address space, where QEMU mapped it, and how long it is.
 ///
@@ -890,6 +958,29 @@ mod tests {
             align,
         )
         .expect("region is aligned and non-empty")
+    }
+
+    #[test]
+    fn a_page_footprint_derives_physical_runs_once_and_windows_them_exactly() {
+        let pages: std::sync::Arc<[u64]> =
+            [0x1000, 0x2000, 0x9000, 0xa000, 0xb000].into();
+        let footprint = GuestPageFootprint::new(pages, 0x1000).expect("valid footprint");
+        assert_eq!(footprint.runs(), &[0..2, 2..5]);
+
+        let mut visited = Vec::new();
+        footprint.visit_window(0x1800, 0x3000, |gpa, len| visited.push((gpa, len)));
+        assert_eq!(
+            visited,
+            vec![(0x2800, 0x800), (0x9000, 0x2800)],
+            "the allocation window follows physical runs without filling their gap"
+        );
+    }
+
+    #[test]
+    fn a_page_footprint_rejects_an_empty_or_non_page_geometry() {
+        assert!(GuestPageFootprint::new(std::sync::Arc::from([]), 0x1000).is_none());
+        assert!(GuestPageFootprint::new(std::sync::Arc::from([0x1000]), 0).is_none());
+        assert!(GuestPageFootprint::new(std::sync::Arc::from([0x1000]), 0x1800).is_none());
     }
 
     #[test]

@@ -2368,12 +2368,12 @@ fn validate_sampled_resident(
 /// render pass wrote guest RAM. The pages come from the admitted resident, not
 /// from the request, so a warm resource reuse publishes the allocation that is
 /// actually bound.
-fn guest_store_pages_to_record(
+fn guest_store_footprint_to_record(
     requested: bool,
     guest_backed: bool,
-    pages: Option<std::sync::Arc<[u64]>>,
-) -> Option<std::sync::Arc<[u64]>> {
-    (requested && guest_backed).then_some(pages).flatten()
+    footprint: Option<crate::runtime::guest_ram::GuestPageFootprint>,
+) -> Option<crate::runtime::guest_ram::GuestPageFootprint> {
+    (requested && guest_backed).then_some(footprint).flatten()
 }
 
 pub(crate) unsafe fn execute_draw_inner(
@@ -3192,7 +3192,7 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     let mut target_guest_backed = false;
     let mut target_loads_guest_backing = false;
-    let mut target_guest_pages: Option<std::sync::Arc<[u64]>> = None;
+    let mut target_guest_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint> = None;
     let (target_image, target_fb, target_access, target_view) =
         if let Some(identity) = &req.target_identity {
             let gen = identity.generation();
@@ -3209,7 +3209,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 counters,
             )?;
             target_guest_backed = t.memory.is_guest_imported();
-            target_guest_pages = t.memory.guest_pages();
+            target_guest_footprint = t.memory.guest_footprint();
             target_loads_guest_backing = target_guest_backed && req.load_guest_target_backing;
             if target_loads_guest_backing {
                 // The imported image *is* the guest seed. The pass key already
@@ -5031,22 +5031,22 @@ pub(crate) unsafe fn execute_draw_inner(
             pools.registry_mark_ready_at(identity, pass_key.color_final_layout(0));
         }
     }
-    let guest_store_pages = match (
+    let guest_store_footprint = match (
         req.target_identity.as_ref(),
-        guest_store_pages_to_record(
+        guest_store_footprint_to_record(
             req.record_guest_store,
             target_guest_backed,
-            target_guest_pages,
+            target_guest_footprint,
         ),
     ) {
-        (Some(identity), Some(pages)) => {
-            super::record_guest_write_debt(pools, identity, &pages);
+        (Some(identity), Some(footprint)) => {
+            super::record_guest_write_debt(pools, identity, footprint.pages());
             crate::runtime::drain::note_store_route("target_store_shared_recorded");
-            Some(pages)
+            Some(footprint)
         }
         _ => None,
     };
-    let guest_store_recorded = guest_store_pages.is_some();
+    let guest_store_recorded = guest_store_footprint.is_some();
     // MRT secondary attachments settle at COLOR_ATTACHMENT_OPTIMAL (the pass
     // final layout) and become sampleable residents; the consumer's
     // resident-sample barrier then transitions COLOR_ATTACHMENT→SHADER_READ,
@@ -5164,7 +5164,7 @@ pub(crate) unsafe fn execute_draw_inner(
             pixels: Vec::new(),
             target_guest_backed,
             guest_store_recorded,
-            guest_store_pages: guest_store_pages.clone(),
+            guest_store_footprint: guest_store_footprint.clone(),
             pixels_bgra: output_bgra,
             // Unreachable with a query armed: `batch_eligible` excludes one, so
             // `defer_submit` is false for every queried draw. Stated as `None`
@@ -5252,7 +5252,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 pixels: Vec::new(),
                 target_guest_backed,
                 guest_store_recorded,
-                guest_store_pages: guest_store_pages.clone(),
+                guest_store_footprint: guest_store_footprint.clone(),
                 pixels_bgra: output_bgra,
                 occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
             });
@@ -5264,7 +5264,7 @@ pub(crate) unsafe fn execute_draw_inner(
             pixels: Vec::new(),
             target_guest_backed,
             guest_store_recorded,
-            guest_store_pages: guest_store_pages.clone(),
+            guest_store_footprint: guest_store_footprint.clone(),
             pixels_bgra: output_bgra,
             occlusion_samples: None,
         });
@@ -5312,7 +5312,7 @@ pub(crate) unsafe fn execute_draw_inner(
         pixels,
         target_guest_backed,
         guest_store_recorded,
-        guest_store_pages,
+        guest_store_footprint,
         pixels_bgra,
         occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
     })
@@ -6453,17 +6453,25 @@ mod tests {
     #[test]
     fn only_an_admitted_shared_store_publishes_guest_pages() {
         let pages: std::sync::Arc<[u64]> = std::sync::Arc::from([0x1000, 0x5000]);
+        let footprint = crate::runtime::guest_ram::GuestPageFootprint::new(
+            std::sync::Arc::clone(&pages),
+            0x1000,
+        )
+        .expect("page footprint");
         assert_eq!(
-            guest_store_pages_to_record(true, true, Some(std::sync::Arc::clone(&pages))),
-            Some(pages)
+            guest_store_footprint_to_record(true, true, Some(footprint.clone())),
+            Some(footprint)
         );
-        assert!(
-            guest_store_pages_to_record(false, true, Some(std::sync::Arc::from([1]))).is_none()
-        );
-        assert!(
-            guest_store_pages_to_record(true, false, Some(std::sync::Arc::from([1]))).is_none()
-        );
-        assert!(guest_store_pages_to_record(true, true, None).is_none());
+        let one = || {
+            crate::runtime::guest_ram::GuestPageFootprint::new(
+                std::sync::Arc::from([0x1000]),
+                0x1000,
+            )
+            .expect("page footprint")
+        };
+        assert!(guest_store_footprint_to_record(false, true, Some(one())).is_none());
+        assert!(guest_store_footprint_to_record(true, false, Some(one())).is_none());
+        assert!(guest_store_footprint_to_record(true, true, None).is_none());
     }
 
     #[test]

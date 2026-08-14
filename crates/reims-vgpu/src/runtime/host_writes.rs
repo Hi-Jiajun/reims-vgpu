@@ -144,7 +144,7 @@ impl HostWriteVerdict {
 struct PageEpochs {
     /// Last epoch at which this device wrote each guest page. The page number
     /// itself selects a chunk and a cell; only populated chunks are allocated.
-    chunks: std::collections::HashMap<u64, Box<[u64; EPOCHS_PER_CHUNK]>>,
+    chunks: std::collections::HashMap<u64, Box<EpochChunk>>,
     /// Newest write that could not name its pages. Fail-closed for any reader
     /// older than it, exactly as the ring's `Unknown` entry is.
     unnamed_at: u64,
@@ -156,6 +156,23 @@ const EPOCH_CHUNK_BYTES: usize = 1usize << crate::model::PAGE_SHIFT_X86;
 const EPOCHS_PER_CHUNK: usize = EPOCH_CHUNK_BYTES / std::mem::size_of::<u64>();
 const _: () = assert!(EPOCHS_PER_CHUNK.is_power_of_two());
 
+#[derive(Debug)]
+struct EpochChunk {
+    /// Epoch that covers every cell. A later partial write lives in `cells`;
+    /// readers take whichever is newer.
+    all_at: u64,
+    cells: [u64; EPOCHS_PER_CHUNK],
+}
+
+impl Default for EpochChunk {
+    fn default() -> Self {
+        Self {
+            all_at: 0,
+            cells: [0; EPOCHS_PER_CHUNK],
+        }
+    }
+}
+
 impl Default for PageEpochs {
     fn default() -> Self {
         Self {
@@ -166,6 +183,25 @@ impl Default for PageEpochs {
 }
 
 impl PageEpochs {
+    fn note_page_range(&mut self, mut page: u64, mut count: usize, epoch: u64) {
+        while count != 0 {
+            let chunk_key = page / EPOCHS_PER_CHUNK as u64;
+            let slot = (page % EPOCHS_PER_CHUNK as u64) as usize;
+            let take = count.min(EPOCHS_PER_CHUNK - slot);
+            let chunk = self
+                .chunks
+                .entry(chunk_key)
+                .or_insert_with(|| Box::new(EpochChunk::default()));
+            if slot == 0 && take == EPOCHS_PER_CHUNK {
+                chunk.all_at = epoch;
+            } else {
+                chunk.cells[slot..slot + take].fill(epoch);
+            }
+            page += take as u64;
+            count -= take;
+        }
+    }
+
     fn note_pages<I>(&mut self, pages: I, epoch: u64, page_shift: u32)
     where
         I: IntoIterator<Item = u64>,
@@ -177,16 +213,16 @@ impl PageEpochs {
             let chunk = self
                 .chunks
                 .entry(chunk_key)
-                .or_insert_with(|| Box::new([0; EPOCHS_PER_CHUNK]));
+                .or_insert_with(|| Box::new(EpochChunk::default()));
             let slot = (page % EPOCHS_PER_CHUNK as u64) as usize;
-            chunk[slot] = epoch;
+            chunk.cells[slot] = epoch;
             while pages
                 .peek()
                 .is_some_and(|&next| (next >> page_shift) / EPOCHS_PER_CHUNK as u64 == chunk_key)
             {
                 let gpa = pages.next().expect("peeked page");
                 let slot = ((gpa >> page_shift) % EPOCHS_PER_CHUNK as u64) as usize;
-                chunk[slot] = epoch;
+                chunk.cells[slot] = epoch;
             }
         }
     }
@@ -211,9 +247,12 @@ impl PageEpochs {
                 end += 1;
             }
             if let Some(chunk) = self.chunks.get(&chunk_key) {
+                if chunk.all_at > since {
+                    return HostWriteVerdict::Overlap;
+                }
                 for &gpa in &pages[first..end] {
                     let slot = ((gpa >> page_shift) % EPOCHS_PER_CHUNK as u64) as usize;
-                    if chunk[slot] > since {
+                    if chunk.cells[slot] > since {
                         return HostWriteVerdict::Overlap;
                     }
                 }
@@ -227,7 +266,13 @@ impl PageEpochs {
     fn recorded_pages(&self) -> usize {
         self.chunks
             .values()
-            .map(|chunk| chunk.iter().filter(|&&epoch| epoch != 0).count())
+            .map(|chunk| {
+                if chunk.all_at != 0 {
+                    EPOCHS_PER_CHUNK
+                } else {
+                    chunk.cells.iter().filter(|&&epoch| epoch != 0).count()
+                }
+            })
             .sum()
     }
 }
@@ -302,6 +347,25 @@ impl HostWrites {
     {
         self.epoch = self.epoch.wrapping_add(1);
         self.pages.note_pages(pages, self.epoch, self.page_shift);
+    }
+
+    /// Record the exact page runs retained with an admitted guest allocation.
+    /// The run partition was derived once with the resource, so a repeated
+    /// Store updates slices rather than rebuilding adjacency page by page.
+    pub fn note_footprint(
+        &mut self,
+        footprint: &crate::runtime::guest_ram::GuestPageFootprint,
+    ) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if footprint.page_size() != (1u64 << self.page_shift) {
+            self.pages.note_unknown(self.epoch);
+            return;
+        }
+        for run in footprint.runs() {
+            let first_page = footprint.pages()[run.start] >> self.page_shift;
+            self.pages
+                .note_page_range(first_page, run.end - run.start, self.epoch);
+        }
     }
 
     /// Record a write whose pages are not known. Invalidates every reader older
@@ -436,6 +500,54 @@ mod tests {
         assert_eq!(w.wrote_any_since(mark, &[3 * P]), HostWriteVerdict::Overlap);
         assert_eq!(w.wrote_any_since(mark, &[far]), HostWriteVerdict::Overlap);
         assert_eq!(w.pages.recorded_pages(), 2);
+    }
+
+    #[test]
+    fn a_retained_full_chunk_is_one_epoch_then_partial_writes_stay_page_exact() {
+        let pages: std::sync::Arc<[u64]> = (0..EPOCHS_PER_CHUNK as u64)
+            .map(|page| page * P)
+            .collect::<Vec<_>>()
+            .into();
+        let footprint = crate::runtime::guest_ram::GuestPageFootprint::new(pages, P)
+            .expect("one contiguous allocation chunk");
+        let mut w = HostWrites::default();
+        let before = w.epoch();
+        w.note_footprint(&footprint);
+        let after_full = w.epoch();
+        assert_eq!(w.pages.recorded_pages(), EPOCHS_PER_CHUNK);
+        assert_eq!(
+            w.wrote_any_since(before, &[(EPOCHS_PER_CHUNK as u64 - 1) * P]),
+            HostWriteVerdict::Overlap
+        );
+        assert_eq!(
+            w.wrote_any_since(after_full, &[7 * P]),
+            HostWriteVerdict::Quiet
+        );
+
+        w.note_pages(vec![7 * P]);
+        assert_eq!(
+            w.wrote_any_since(after_full, &[7 * P]),
+            HostWriteVerdict::Overlap
+        );
+        assert_eq!(
+            w.wrote_any_since(after_full, &[8 * P]),
+            HostWriteVerdict::Quiet,
+            "a later partial write must not refresh the chunk-wide epoch"
+        );
+    }
+
+    #[test]
+    fn a_retained_footprint_with_other_page_geometry_fails_closed() {
+        let pages: std::sync::Arc<[u64]> = [0x4000].into();
+        let footprint = crate::runtime::guest_ram::GuestPageFootprint::new(pages, 1 << 14)
+            .expect("arm64 footprint");
+        let mut w = HostWrites::default();
+        let mark = w.epoch();
+        w.note_footprint(&footprint);
+        assert_eq!(
+            w.wrote_any_since(mark, &[0x9000]),
+            HostWriteVerdict::Unnamed
+        );
     }
 
     /// The page index follows the guest geometry carried by `DeviceState`.

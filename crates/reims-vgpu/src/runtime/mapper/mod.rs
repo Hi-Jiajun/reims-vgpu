@@ -601,7 +601,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
             retired = Some((m.contig_ptr, m.contig_len));
             m.contig_ptr = 0;
             m.contig_len = 0;
-            m.contig_gpas = Default::default();
+            m.contig_footprint = None;
             retired_import = m.contig_import.take().map(|import| {
                 import.retire();
                 import.id()
@@ -1947,13 +1947,13 @@ pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
     {
         let m = state.mappings.get(&mapping_id)?;
         if m.contig_ptr != 0 {
-            if m.contig_gpas.is_empty() {
+            let Some(footprint) = &m.contig_footprint else {
                 return None;
-            }
+            };
             return Some((
                 m.contig_ptr,
                 m.contig_len,
-                std::sync::Arc::clone(&m.contig_gpas),
+                footprint.pages_arc(),
             ));
         }
         // The negative verdict caches on exactly the key that makes the
@@ -1968,7 +1968,7 @@ pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
     }
     let gpas = mapping_page_gpas(state, host, mapping_id)?;
     let page_sz = crate::contract::iosurface_pages::page_size_of(state.page_shift) as usize;
-    let runs = reims_vgpu_paging::runs::contig_run_count(&gpas, page_sz as u64);
+    let physical_runs = reims_vgpu_paging::runs::contig_run_count(&gpas, page_sz as u64);
     let Some(ptr) = host.map_pages(&gpas, page_sz) else {
         let served = CONTIG_REFUSED_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let m = state.mappings.get_mut(&mapping_id)?;
@@ -1978,17 +1978,21 @@ pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
         // count remains diagnosis: it distinguishes a host that declined even
         // a direct run from one that cannot reconstruct a scattered list.
         crate::observe::off(format!(
-            "contig_view_refused mid={mapping_id} pages={} physical_runs={runs} generation={generation} served={served}",
+            "contig_view_refused mid={mapping_id} pages={} physical_runs={physical_runs} generation={generation} served={served}",
             gpas.len(),
         ));
         return None;
     };
     let len = gpas.len() * page_sz;
     let gpas: std::sync::Arc<[u64]> = gpas.into();
+    let footprint = crate::runtime::guest_ram::GuestPageFootprint::new(
+        std::sync::Arc::clone(&gpas),
+        page_sz as u64,
+    )?;
     let m = state.mappings.get_mut(&mapping_id)?;
     m.contig_ptr = ptr;
     m.contig_len = len;
-    m.contig_gpas = std::sync::Arc::clone(&gpas);
+    m.contig_footprint = Some(footprint);
     Some((ptr, len, gpas))
 }
 
@@ -1999,13 +2003,13 @@ pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
 /// of those views. Hosts whose page aliases are transient or backends that did
 /// not publish host-pointer import limits retain the copy-backed paths.
 #[cfg(feature = "backend-vulkan")]
-pub fn ensure_contig_import_with_pages<H: HostMemory + HostOps>(
+pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     mapping_id: u32,
 ) -> Option<(
     std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
-    std::sync::Arc<[u64]>,
+    crate::runtime::guest_ram::GuestPageFootprint,
 )> {
     if !host.map_pages_stable() {
         return None;
@@ -2013,7 +2017,8 @@ pub fn ensure_contig_import_with_pages<H: HostMemory + HostOps>(
     let align = crate::runtime::guest_ram::granularity()?;
     let span_max = crate::runtime::guest_ram::import_span_max()?;
     let budget = crate::runtime::guest_ram::import_budget()?;
-    let (ptr, len, pages) = ensure_contig_view_with_pages(state, host, mapping_id)?;
+    let (ptr, len, _pages) = ensure_contig_view_with_pages(state, host, mapping_id)?;
+    let footprint = state.mappings.get(&mapping_id)?.contig_footprint.clone()?;
     let len = u64::try_from(len).ok()?;
     if len > span_max || len > budget {
         return None;
@@ -2024,14 +2029,14 @@ pub fn ensure_contig_import_with_pages<H: HostMemory + HostOps>(
         .and_then(|mapping| mapping.contig_import.as_ref())
     {
         if import.host_base() == ptr && import.len() == len && import.align() == align {
-            return Some((std::sync::Arc::clone(import), pages));
+            return Some((std::sync::Arc::clone(import), footprint));
         }
     }
     let import = std::sync::Arc::new(
         crate::runtime::guest_ram::GuestRamImport::new_host_allocation(ptr, len, align).ok()?,
     );
     state.mappings.get_mut(&mapping_id)?.contig_import = Some(std::sync::Arc::clone(&import));
-    Some((import, pages))
+    Some((import, footprint))
 }
 
 /// Record the guest frames a mapping-rail write of `[off, off+len)` lands in.
@@ -2073,14 +2078,11 @@ pub(crate) fn note_mapping_write_footprint(
 /// rendered, even if mutable mapping state changes after admission.
 #[cfg(any(feature = "backend-vulkan", test))]
 pub(crate) fn note_physical_page_write_footprint(
-    pages: &[u64],
-    page_size: u64,
+    footprint: &crate::runtime::guest_ram::GuestPageFootprint,
     off: u64,
     len: u64,
 ) {
-    note_page_write_footprint(page_size, off, len, |i| {
-        pages.get(i).copied().map(Some)
-    });
+    footprint.visit_window(off, len, crate::observe::footprint::note_written_range);
 }
 
 fn note_page_write_footprint(

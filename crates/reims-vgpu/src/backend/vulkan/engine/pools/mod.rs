@@ -1533,9 +1533,11 @@ impl ResidentMemory {
         }
     }
 
-    pub(crate) fn guest_pages(&self) -> Option<std::sync::Arc<[u64]>> {
+    pub(crate) fn guest_footprint(
+        &self,
+    ) -> Option<crate::runtime::guest_ram::GuestPageFootprint> {
         match self {
-            Self::GuestImported { guest, .. } => Some(std::sync::Arc::clone(&guest.pages)),
+            Self::GuestImported { guest, .. } => Some(guest.footprint.clone()),
             Self::Recyclable(_) => None,
         }
     }
