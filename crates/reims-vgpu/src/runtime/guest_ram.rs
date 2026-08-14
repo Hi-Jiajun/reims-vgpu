@@ -110,6 +110,38 @@ impl GuestPageFootprint {
         self.page_size
     }
 
+    /// Whether both values retain the same admitted allocation.
+    ///
+    /// Physical-page equality is not allocation identity: a recycled page list
+    /// can describe a later allocation. Resource-owned clones retain the same
+    /// `Arc`, so pointer identity gives the outstanding-write ledger an O(1)
+    /// deduplication key without inventing a second allocation id.
+    #[cfg(feature = "backend-vulkan")]
+    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+        self.page_size == other.page_size && std::sync::Arc::ptr_eq(&self.pages, &other.pages)
+    }
+
+    /// Whether this allocation contains one page-aligned physical address.
+    /// The contiguous-run partition makes a scattered footprint an O(runs)
+    /// query without sorting or copying its allocation-order page list.
+    #[cfg(feature = "backend-vulkan")]
+    pub(crate) fn contains_page(&self, gpa: u64) -> bool {
+        self.runs.iter().any(|run| {
+            let first = self.pages[run.start];
+            let Some(bytes) = (run.end - run.start)
+                .try_into()
+                .ok()
+                .and_then(|pages: u64| pages.checked_mul(self.page_size))
+            else {
+                return false;
+            };
+            let Some(end) = first.checked_add(bytes) else {
+                return false;
+            };
+            gpa >= first && gpa < end && (gpa - first) % self.page_size == 0
+        })
+    }
+
     pub(crate) fn pages_arc(&self) -> std::sync::Arc<[u64]> {
         std::sync::Arc::clone(&self.pages)
     }
@@ -973,6 +1005,26 @@ mod tests {
             visited,
             vec![(0x2800, 0x800), (0x9000, 0x2800)],
             "the allocation window follows physical runs without filling their gap"
+        );
+    }
+
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn a_page_footprint_answers_membership_without_filling_scatter_gaps() {
+        let pages: std::sync::Arc<[u64]> = [0x1000, 0x2000, 0x9000, 0xa000].into();
+        let footprint = GuestPageFootprint::new(pages, 0x1000).expect("valid footprint");
+        assert!(footprint.contains_page(0x1000));
+        assert!(footprint.contains_page(0xa000));
+        assert!(!footprint.contains_page(0x5000));
+        assert!(!footprint.contains_page(0x9800), "only whole guest pages belong");
+
+        let clone = footprint.clone();
+        assert!(footprint.same_allocation(&clone));
+        let recycled = GuestPageFootprint::new(footprint.pages().into(), 0x1000)
+            .expect("same addresses can describe a later allocation");
+        assert!(
+            !footprint.same_allocation(&recycled),
+            "equal addresses are not allocation lifetime identity"
         );
     }
 

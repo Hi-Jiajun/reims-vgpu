@@ -1099,7 +1099,10 @@ pub(super) static GUEST_READ_DEBT: std::sync::atomic::AtomicBool =
 /// take only this mutex and never the engine lock — taking that at every guest
 /// read is the cost the flag exists to avoid.
 static GUEST_WRITE_PAGES: std::sync::Mutex<GuestWriteFootprint> =
-    std::sync::Mutex::new(GuestWriteFootprint { armed: Vec::new() });
+    std::sync::Mutex::new(GuestWriteFootprint {
+        armed: Vec::new(),
+        allocations: Vec::new(),
+    });
 
 /// The page lists behind [`GUEST_WRITE_PAGES`].
 struct GuestWriteFootprint {
@@ -1119,6 +1122,12 @@ struct GuestWriteFootprint {
     /// ledger — a poisoned mutex — already answers `Unnamed` at every ask
     /// without one.
     armed: Vec<Vec<u64>>,
+    /// Resource-owned allocation footprints. A repeated Store into the same
+    /// admitted resident retains one immutable identity here rather than
+    /// copying and sorting its full page list again. These need no artificial
+    /// entry cap: each is a small `Arc`-backed handle, and the same global
+    /// settle that clears `armed` clears them all.
+    allocations: Vec<crate::runtime::guest_ram::GuestPageFootprint>,
 }
 
 /// What the ledger can say about a reader's window.
@@ -1164,11 +1173,29 @@ fn arm_guest_write_pages(pages: &[u64]) {
     f.armed.push(sorted);
 }
 
+/// Record one resource-owned allocation that an outstanding GPU Store writes.
+/// Repeated writes through the same admitted resource add no ledger work.
+fn arm_guest_write_footprint(
+    footprint: &crate::runtime::guest_ram::GuestPageFootprint,
+) {
+    let Ok(mut f) = GUEST_WRITE_PAGES.lock() else {
+        return;
+    };
+    if f.allocations
+        .iter()
+        .any(|held| held.same_allocation(footprint))
+    {
+        return;
+    }
+    f.allocations.push(footprint.clone());
+}
+
 /// Forget the outstanding writebacks' pages. Called under the engine lock, after
 /// the wait has landed and [`GUEST_WRITE_DEBT`] is cleared.
 fn clear_guest_write_pages() {
     if let Ok(mut f) = GUEST_WRITE_PAGES.lock() {
         f.armed.clear();
+        f.allocations.clear();
     }
 }
 
@@ -1184,7 +1211,7 @@ pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
     let Ok(f) = GUEST_WRITE_PAGES.lock() else {
         return GuestWriteReach::Unnamed;
     };
-    if f.armed.is_empty() {
+    if f.armed.is_empty() && f.allocations.is_empty() {
         // The flag said something was outstanding and the ledger names nothing:
         // the settle that cleared it raced this ask. Nothing to rule out
         // against, so nothing may be ruled out.
@@ -1192,7 +1219,10 @@ pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
     }
     let hit = pages
         .iter()
-        .any(|p| f.armed.iter().any(|a| a.binary_search(p).is_ok()));
+        .any(|p| {
+            f.armed.iter().any(|a| a.binary_search(p).is_ok())
+                || f.allocations.iter().any(|a| a.contains_page(*p))
+        });
     if hit {
         GuestWriteReach::Overlap
     } else {
@@ -3056,7 +3086,7 @@ pub fn synchronize_guest_backed_target(
         GuestWriteDecline::NoSharedBacking,
     ))?;
     crate::runtime::drain::note_store_route("target_sync_shared_backing");
-    record_guest_write_debt(pools, identity, footprint.pages());
+    record_guest_write_footprint_debt(pools, identity, &footprint);
     Ok(footprint)
 }
 
@@ -3084,6 +3114,18 @@ pub(super) fn record_guest_write_debt(
     arm_guest_write_pages(pages);
     // Published after the ledger entry and while the engine lock is still held,
     // so no thread can observe the flag clear while a write is outstanding.
+    GUEST_WRITE_DEBT.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Publish a write through the immutable footprint retained by the admitted
+/// resident. This is the resource-owned form of [`record_guest_write_debt`].
+pub(super) fn record_guest_write_footprint_debt(
+    pools: &mut pools::ResourcePools,
+    identity: &TargetIdentity,
+    footprint: &crate::runtime::guest_ram::GuestPageFootprint,
+) {
+    pools.note_guest_write_recorded(identity);
+    arm_guest_write_footprint(footprint);
     GUEST_WRITE_DEBT.store(true, std::sync::atomic::Ordering::Release);
 }
 
@@ -4533,6 +4575,14 @@ mod group_by_buffer_tests {
 mod guest_write_footprint_tests {
     use super::*;
 
+    fn footprint() -> crate::runtime::guest_ram::GuestPageFootprint {
+        crate::runtime::guest_ram::GuestPageFootprint::new(
+            std::sync::Arc::from([0x1000, 0x2000, 0x9000]),
+            0x1000,
+        )
+        .expect("valid footprint")
+    }
+
     /// The whole point: a reader whose window shares no page with the
     /// outstanding writeback is let through, and one that shares a single page
     /// is not. The wrong answer here is a stale frame, so the overlapping case
@@ -4551,6 +4601,26 @@ mod guest_write_footprint_tests {
         assert_eq!(reach(&[0x2000]), GuestWriteReach::Overlap);
         // Unsorted input on both sides: the arm sorts, the ask does not have to.
         assert_eq!(reach(&[0xf000, 0x4000, 0x1000]), GuestWriteReach::Overlap);
+        clear_guest_write_pages();
+    }
+
+    #[test]
+    fn a_resource_footprint_is_retained_once_and_keeps_scatter_gaps_disjoint() {
+        clear_guest_write_pages();
+        let allocation = footprint();
+        arm_guest_write_footprint(&allocation);
+        arm_guest_write_footprint(&allocation.clone());
+        {
+            let held = GUEST_WRITE_PAGES.lock().expect("ledger lock");
+            assert_eq!(held.allocations.len(), 1, "one admitted allocation identity");
+            assert!(held.armed.is_empty(), "no copied page-list shadow");
+        }
+        assert_eq!(guest_writes_reaching(&[0x9000]), GuestWriteReach::Overlap);
+        assert_eq!(
+            guest_writes_reaching(&[0x5000]),
+            GuestWriteReach::Disjoint,
+            "the physical gap is not part of the allocation"
+        );
         clear_guest_write_pages();
     }
 

@@ -4986,6 +4986,10 @@ pub(crate) unsafe fn execute_draw_inner(
             Err(e) => return Err(DrawError::VkCall(VkCall::new(VkOp::ExecSubmit, e))),
         }
     }
+    // Submission ends here. Everything below is CPU-side publication and
+    // retention work, and needs its own bar: charging it to `submit_us` makes
+    // a slow registry or Store-footprint update look like driver queue cost.
+    phase.enter(super::draw_phase::Phase::PostTarget);
     // CPU-side bookkeeping: the retained target's content is queue-ordered
     // (mark ready), resident sampled layouts advance to the recorded
     // post-draw layout, and the sampled images this CB fills are named for the
@@ -5031,6 +5035,7 @@ pub(crate) unsafe fn execute_draw_inner(
             pools.registry_mark_ready_at(identity, pass_key.color_final_layout(0));
         }
     }
+    phase.enter(super::draw_phase::Phase::PostStore);
     let guest_store_footprint = match (
         req.target_identity.as_ref(),
         guest_store_footprint_to_record(
@@ -5040,13 +5045,14 @@ pub(crate) unsafe fn execute_draw_inner(
         ),
     ) {
         (Some(identity), Some(footprint)) => {
-            super::record_guest_write_debt(pools, identity, footprint.pages());
+            super::record_guest_write_footprint_debt(pools, identity, &footprint);
             crate::runtime::drain::note_store_route("target_store_shared_recorded");
             Some(footprint)
         }
         _ => None,
     };
     let guest_store_recorded = guest_store_footprint.is_some();
+    phase.enter(super::draw_phase::Phase::PostTarget);
     // MRT secondary attachments settle at COLOR_ATTACHMENT_OPTIMAL (the pass
     // final layout) and become sampleable residents; the consumer's
     // resident-sample barrier then transitions COLOR_ATTACHMENT→SHADER_READ,
@@ -5077,6 +5083,7 @@ pub(crate) unsafe fn execute_draw_inner(
     if let Some(identity) = depth_attachment.as_ref().and_then(|d| d.identity.as_ref()) {
         pools.registry_mark_depth_ready(identity);
     }
+    phase.enter(super::draw_phase::Phase::PostSampled);
     let mut sampled_retains: Vec<super::pools::SampledRetain> = Vec::new();
     for prepared in &sampled {
         match prepared {
@@ -5147,6 +5154,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // GPU. The cache admission happens inside `batch_append` rather than at the
     // flush precisely so the *next* draw of this batch can find these windows;
     // see its doc.
+    phase.enter(super::draw_phase::Phase::PostPark);
     if defer_submit {
         let target = batch_target.expect("batch_eligible requires target identity");
         pools.batch_append(

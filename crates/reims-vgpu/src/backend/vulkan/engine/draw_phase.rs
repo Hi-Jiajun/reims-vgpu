@@ -36,6 +36,10 @@
 //! | `descriptors` | there | the descriptor set is written |
 //! | `record` | there | the CB is ended |
 //! | `submit` | there | `queue_submit` returns |
+//! | `post_target` | there | target state is published |
+//! | `post_store` | inside it | exact guest Store bookkeeping is published |
+//! | `post_sampled` | there | sampled-resource state and retains are prepared |
+//! | `post_park` | there | cache admission and async cleanup are parked |
 //! | `wait` | there | this draw's fence signals |
 //! | `readback` | there | the mapped buffer is copied out |
 //!
@@ -382,6 +386,15 @@ pub(crate) enum Phase {
     PipelineCompile = 17,
     /// The per-sampler `get_or_create_sampler` loop.
     PipelineSampler = 18,
+    /// Target resident-state publication after submission (or after choosing
+    /// deferred submit).
+    PostTarget = 19,
+    /// Exact guest Store-footprint publication.
+    PostStore = 20,
+    /// Sampled-resource state publication and retained-image preparation.
+    PostSampled = 21,
+    /// Cache admission and parking asynchronous cleanup on the submission slot.
+    PostPark = 22,
     Stage = 3,
     StagePass = 4,
     Acquire = 5,
@@ -402,7 +415,7 @@ impl Phase {
     /// The pipeline sub-phases were appended after `Readback` rather than
     /// inserted next to `Pipeline`, so that every existing ordinal kept its
     /// value and this stayed the only place the count is written.
-    const LAST: Phase = Phase::PipelineSampler;
+    const LAST: Phase = Phase::PostPark;
 }
 
 const PHASES: usize = Phase::LAST as usize + 1;
@@ -464,6 +477,10 @@ pub struct DrawPhaseWindow {
     pub descriptors_us: u64,
     pub record_us: u64,
     pub submit_us: u64,
+    pub post_target_us: u64,
+    pub post_store_us: u64,
+    pub post_sampled_us: u64,
+    pub post_park_us: u64,
     pub wait_us: u64,
     pub readback_us: u64,
     pub draws: u64,
@@ -495,6 +512,10 @@ pub fn take_window() -> Option<DrawPhaseWindow> {
         descriptors_us: to_us(ACC[Phase::Descriptors as usize].swap(0, Ordering::Relaxed)),
         record_us: to_us(ACC[Phase::Record as usize].swap(0, Ordering::Relaxed)),
         submit_us: to_us(ACC[Phase::Submit as usize].swap(0, Ordering::Relaxed)),
+        post_target_us: to_us(ACC[Phase::PostTarget as usize].swap(0, Ordering::Relaxed)),
+        post_store_us: to_us(ACC[Phase::PostStore as usize].swap(0, Ordering::Relaxed)),
+        post_sampled_us: to_us(ACC[Phase::PostSampled as usize].swap(0, Ordering::Relaxed)),
+        post_park_us: to_us(ACC[Phase::PostPark as usize].swap(0, Ordering::Relaxed)),
         wait_us: to_us(ACC[Phase::Wait as usize].swap(0, Ordering::Relaxed)),
         readback_us: to_us(ACC[Phase::Readback as usize].swap(0, Ordering::Relaxed)),
         draws,
@@ -576,7 +597,8 @@ impl Drop for DrawTimer {
             "draw_stall us={} prep_us={} slot_us={} pipeline_us={} stage_us={} stage_pass_us={} \
              acquire_us={} acquire_sampled_us={} sampled_upload_us={} acquire_readback_us={} \
              descriptors_us={} \
-             record_us={} submit_us={} wait_us={} readback_us={} geom={w}x{h} \
+             record_us={} submit_us={} post_target_us={} post_store_us={} post_sampled_us={} \
+             post_park_us={} wait_us={} readback_us={} geom={w}x{h} \
              readback_bytes={} exit={:?}{latched}",
             to_us(total),
             to_us(self.ns[Phase::Prep as usize]),
@@ -591,6 +613,10 @@ impl Drop for DrawTimer {
             to_us(self.ns[Phase::Descriptors as usize]),
             to_us(self.ns[Phase::Record as usize]),
             to_us(self.ns[Phase::Submit as usize]),
+            to_us(self.ns[Phase::PostTarget as usize]),
+            to_us(self.ns[Phase::PostStore as usize]),
+            to_us(self.ns[Phase::PostSampled as usize]),
+            to_us(self.ns[Phase::PostPark as usize]),
             to_us(self.ns[Phase::Wait as usize]),
             to_us(self.ns[Phase::Readback as usize]),
             self.readback_bytes,
@@ -677,6 +703,10 @@ mod tests {
             Phase::PipelineLayoutPass,
             Phase::PipelineCompile,
             Phase::PipelineSampler,
+            Phase::PostTarget,
+            Phase::PostStore,
+            Phase::PostSampled,
+            Phase::PostPark,
         ];
         assert_eq!(all.len(), PHASES);
         for (want, phase) in all.iter().enumerate() {
@@ -748,6 +778,30 @@ mod tests {
         assert_eq!(w.descriptors_us, 0);
         assert_eq!(w.record_us, 0);
         assert_eq!(w.readback_us, 0);
+    }
+
+    /// Store publication must not be charged to the driver submit bar. The
+    /// split exists because the two require different fixes, and a swapped
+    /// readout would send a real-traffic profile back toward queue batching.
+    #[test]
+    fn post_submit_store_work_has_its_own_bar() {
+        let _ = take_window();
+        {
+            let mut t = DrawTimer::start();
+            t.enter(Phase::Submit);
+            t.enter(Phase::PostTarget);
+            t.enter(Phase::PostStore);
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            t.enter(Phase::PostTarget);
+        }
+        let w = take_window().expect("a dropped timer counts a draw");
+        assert!(w.post_store_us >= 2_000, "Store bar lost its work: {w:?}");
+        assert!(
+            w.submit_us < 1_500,
+            "Store bookkeeping was charged to queue submission: {w:?}"
+        );
+        assert_eq!(w.post_sampled_us, 0);
+        assert_eq!(w.post_park_us, 0);
     }
 
     /// An idle second must produce no line at all: the census divides against
