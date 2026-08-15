@@ -86,6 +86,9 @@ END=$(( $(date +%s) + SECS ))
 # motion. Repeating the invocation per segment instead would put a process
 # spawn between every pair of points and turn a sustained pan into a bursty one.
 export QMP_DRAG_STEPS=6 QMP_DRAG_HOLD_S=0.012
+# Fixed, not tunable per run: two boots whose phase mix differs are not two
+# measurements of the same workload. Change it deliberately, and re-baseline.
+ZOOM_TICKS=12
 
 pan_box() {  # a closed rectangular circuit, so the map returns to where it began
   "$Q" drag $((CX - R)) $((CY - R)) $((CX + R)) $((CY - R)) \
@@ -105,13 +108,18 @@ while [ "$(date +%s)" -lt "$END" ]; do
     # `wheel` sends its ticks over one connection, dt apart, which is the only
     # sustained zoom available -- a keyboard zoom is one discrete step per
     # invocation and would spend the phase in process spawns.
-    1) "$Q" wheel up 40 0.05 >/dev/null 2>&1 ;;
+    1) "$Q" wheel up "$ZOOM_TICKS" 0.05 >/dev/null 2>&1 ;;
     2) pan_diag ;;
-    # Zoom back out by as much as phase 1 zoomed in, so the circuit is closed on
-    # the zoom axis too and every round starts from the same scale. Without this
-    # the probe walks monotonically to one zoom limit and the last half of a long
-    # window measures a clamped map.
-    3) "$Q" wheel down 40 0.05 >/dev/null 2>&1 ;;
+    # Equal and opposite, which bounds the drift but does NOT cancel it: Maps
+    # clamps at the world view long before it clamps at street level, so from a
+    # regional start the out-ticks hit the clamp and are discarded while the
+    # in-ticks all land, and every circuit nets a little further in. A 45 s run
+    # of nine circuits at 40 ticks was measured walking the scale bar from
+    # 37,5 km to 10 m -- i.e. to the far clamp, where the back half of the
+    # window measured a map that could not zoom any further. `ZOOM_TICKS` is
+    # sized to keep the excursion inside both clamps for a window of this
+    # length; a much longer run still needs a mid-zoom start.
+    3) "$Q" wheel down "$ZOOM_TICKS" 0.05 >/dev/null 2>&1 ;;
   esac
   phase=$((phase + 1))
 done
