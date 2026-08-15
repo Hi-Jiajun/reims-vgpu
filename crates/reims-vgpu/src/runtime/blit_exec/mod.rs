@@ -526,6 +526,37 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     if view_depth as usize > crate::runtime::draw::MAX_TEXTURE_VIEW_CHAIN {
         return Err(br(BlitStatus::Unsupported, "tex_view_depth_cap"));
     }
+    // **This function is the whole blit rail's definition of "the guest bytes of
+    // a texture", and guest bytes are only a resource's content once everything
+    // this device rendered into it has landed.** Every endpoint of every blit —
+    // source and destination, texture-to-texture, texture-to-buffer and back —
+    // arrives here, so this is the one place the rail has to state that.
+    //
+    // A render pass whose colour attachment is an ordinary private `MTLTexture`
+    // resolves on `render_target`'s fourth rung to a linear guest VA, and
+    // `writeback_debt::arm_gva` then keeps the result in the engine's resident
+    // and arms a debt against `(task_id, texture_ref)` instead of copying it
+    // out. Nothing lands until a **guest-byte reader** names the resource. The
+    // two readers that did name it are `draw::texture_view` and `compute_exec`;
+    // a blit is exactly as much a guest-byte reader as either, and it was
+    // silent. Its copy read whatever the pages held before the pass — which for
+    // a freshly allocated private target is zeros, at scale, with no error, the
+    // "Never Fail Silently" class in its worst form.
+    //
+    // `pay_for_texture` is the call that covers both spellings a debt can have
+    // (the task-local GVA resource and the surface mapping), and it early-returns
+    // on an empty ledger, so the cost on a rail with nothing owed is one
+    // `is_empty`. Paying here rather than at the copy also covers the view chain:
+    // the recursion below re-enters with the base ref, and the debt may be armed
+    // against either spelling of the pair.
+    //
+    // Paying a *destination*'s debt before overwriting it is deliberate, not
+    // waste. The blit writes a rect, not the plane, so the pixels outside that
+    // rect are the resource's content and must be real; and leaving the debt
+    // armed would let it land the pre-blit resident over the blit's own bytes
+    // later.
+    note_blit_endpoint_debt(state, task_id, texture_ref);
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
     let Some(entry) = objects::lookup_list_entry(state, host, task_id, texture_ref) else {
         return Err(br(
             BlitStatus::MissingResource,
@@ -1165,6 +1196,44 @@ fn write_texture_row<M: HostMemory + HostOps>(
 /// GPU, which is the reading that decides whether the blit rail needs the
 /// sampled rail's ladder. `_not_ready` beside it is the denominator, so a zero
 /// can be told from an arm that never ran.
+/// Whether a blit endpoint arrived owing this device a writeback, split by which
+/// spelling of the debt named it.
+///
+/// The payment itself is unconditional and silent — `pay_for_texture` early-exits
+/// on an empty ledger — so without this the repair is unattributable: a rail that
+/// never had a debt to pay and a rail that pays thousands look identical from
+/// outside, and the screen cannot tell them apart either.
+///
+/// `gva` is the interesting one. It counts blit endpoints whose real content was
+/// sitting in an engine resident behind an armed [`crate::runtime::writeback_debt::GvaWritebackDebt`],
+/// i.e. copies that read guest pages the render never reached. `surface` is the
+/// type-11/type-4 spelling, which `mapping_write`'s own settle already covered
+/// from the other side, so a large `surface` next to a zero `gva` says this
+/// change bought nothing new.
+fn note_blit_endpoint_debt(state: &DeviceState, task_id: u32, texture_ref: u32) {
+    if state.pending_writebacks.is_empty() {
+        return;
+    }
+    if state
+        .pending_writebacks
+        .has_gva(crate::runtime::writeback_debt::GvaResourceKey {
+            task_id,
+            texture_ref,
+        })
+    {
+        crate::runtime::drain::note_store_route("blit_endpoint_owed_gva");
+    }
+    let mapped = state
+        .texture_to_mapping
+        .get(&(task_id, texture_ref))
+        .copied();
+    if state.pending_writebacks.get(texture_ref).is_some()
+        || mapped.is_some_and(|id| state.pending_writebacks.get(id).is_some())
+    {
+        crate::runtime::drain::note_store_route("blit_endpoint_owed_surface");
+    }
+}
+
 fn note_blit_t11_resident(state: &DeviceState, mapping_id: u32) {
     #[cfg(feature = "backend-vulkan")]
     {

@@ -1708,6 +1708,64 @@ fn install_linear_rgba(
     write_task_gva_arm64e(host, &state.tasks[1], off, &list_entry);
 }
 
+/// A blit endpoint is a guest-byte reader, so resolving one must land whatever
+/// this device still owes that resource's pages.
+///
+/// A render pass into an ordinary private `MTLTexture` resolves on
+/// `render_target`'s linear rung, and `writeback_debt::arm_gva` leaves the result
+/// in the engine's resident with a debt armed against `(task_id, texture_ref)`
+/// rather than copying it into guest memory. `draw::texture_view` and
+/// `compute_exec` named that resource before touching its bytes; the blit rail
+/// did not, and every `copyFromTexture:` out of such a target copied the bytes
+/// the pages held before the pass — zeros for a freshly allocated one.
+///
+/// The ledger is what this can assert on both backend arms: `pay_gva` itself is
+/// `backend-vulkan`-only, but `take_gva` is not, so a resolve that named the debt
+/// leaves the ledger empty and a resolve that did not leaves it holding one.
+#[test]
+fn a_blit_endpoint_lands_the_writeback_its_texture_still_owes() {
+    use crate::runtime::writeback_debt::{GvaResourceKey, GvaWritebackDebt};
+
+    const STRIDE: u32 = 64;
+    let (mut host, mut state) = blit_device();
+    install_linear_rgba(&mut host, &mut state, 2, 2, 16, 8, STRIDE);
+
+    let key = GvaResourceKey {
+        task_id: 1,
+        texture_ref: 2,
+    };
+    let guest_write = state.buffer_write_gen.stamp(key.task_id, key.texture_ref);
+    assert_eq!(
+        state.pending_writebacks.arm_gva(
+            key,
+            GvaWritebackDebt {
+                gva: 0x4000,
+                row_stride: STRIDE,
+                width: 16,
+                height: 8,
+                format: MTL_FORMAT_RGBA8_UNORM,
+                generation: 3,
+                guest_write,
+                seq: 0,
+            },
+        ),
+        None,
+        "the resource owes exactly one frame going in"
+    );
+    assert!(state.pending_writebacks.has_gva(key));
+
+    let backing = resolve_texture_backing(&mut state, &mut host, 1, 2, 0, 0)
+        .expect("a linear RGBA8 texture resolves as a blit endpoint");
+    assert!(
+        matches!(backing, TextureBacking::Linear(_)),
+        "this is the private-texture rung, not a surface"
+    );
+    assert!(
+        !state.pending_writebacks.has_gva(key),
+        "resolving a blit endpoint must land what the texture owed, not read around it"
+    );
+}
+
 /// Overwrite an installed texture descriptor's `allocation_size` in place.
 /// The `install_linear_*` helpers floor it at 0x1000, and a bounds test
 /// needs an allocation sized to the image and nothing more.
