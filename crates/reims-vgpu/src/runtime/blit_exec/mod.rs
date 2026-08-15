@@ -1173,6 +1173,216 @@ fn write_texture_row<M: HostMemory + HostOps>(
     }
 }
 
+/// Read a whole `row_bytes`-wide, `row_count`-tall rectangle at `origin` into
+/// `buf`, rows packed `row_bytes` apart.
+///
+/// # A rect is the unit the mapping rail is built for, and a row is not
+///
+/// [`mapping_write::read_rect_raw_at`] takes a height because every per-call
+/// cost it carries is per *rect*, not per row: a writeback settle, a mapping
+/// lookup, a window revalidation, and — on a fragmented mapping, which is the
+/// arm a driven x86 boot takes — a fresh QEMU memory-region import per guest
+/// page run. Handing it `height: 1` in a loop pays all of that `row_count`
+/// times to move one row of texels.
+///
+/// That is not a small constant. A driven macos-13 Maps leg measured the
+/// slice/level copy's row loop at **30.15 s of a 30.28 s blit rail** while
+/// moving 14.6 MB — 0.48 MB/s, against 0.22 s for every strided guest-RAM copy
+/// in the device put together. The bytes were never the cost; the per-row
+/// re-entry into the mapping rail was.
+///
+/// The linear arm keeps its row loop, because there the per-row call is a bare
+/// guest-RAM read with none of that preamble, and rows of a strided level are
+/// genuinely discontiguous.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the rect helper names the same geometry its row counterpart does"
+)]
+fn read_texture_rect<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    tex: &TextureBacking,
+    origin: Point,
+    row_bytes: u64,
+    row_count: u64,
+    buf: &mut [u8],
+) -> Result<(), BlitStatus> {
+    let need = row_bytes
+        .checked_mul(row_count)
+        .ok_or_else(|| br(BlitStatus::Capacity, "rd_rect_span_overflow"))?;
+    if need as usize > buf.len() {
+        return Err(br(BlitStatus::Capacity, "rd_rect_buf_cap"));
+    }
+    match tex {
+        TextureBacking::Linear(_) => {
+            for y in 0..row_count {
+                let at = (y * row_bytes) as usize;
+                read_texture_row(
+                    state,
+                    host,
+                    task_id,
+                    tex,
+                    origin,
+                    y,
+                    row_bytes,
+                    &mut buf[at..at + row_bytes as usize],
+                )?;
+            }
+            Ok(())
+        }
+        TextureBacking::Type11(t) => {
+            let (pixels, height, origin_x, origin_y) =
+                t11_rect_extent(t, origin, row_bytes, row_count)?;
+            if !mapping_write::read_rect_raw_at(
+                state,
+                host,
+                t.mapping_id,
+                t11_window(t),
+                mapping_write::Rect {
+                    origin_x,
+                    origin_y,
+                    width: pixels,
+                    height,
+                },
+                &mut buf[..need as usize],
+                row_bytes as u32,
+            ) {
+                return Err(br(BlitStatus::GuestIo, "rd_rect_t11_io"));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Write a whole `row_bytes`-wide, `row_count`-tall rectangle at `origin` from
+/// `buf`, rows packed `row_bytes` apart. The rect counterpart of
+/// [`write_texture_row`]; see [`read_texture_rect`] for why the rect is the
+/// unit.
+///
+/// A rect that covers a type-11 plane entirely goes through
+/// [`mapping_write::write_full_rect_raw_at`], whose fragmented arm imports each
+/// maximal packed GPA run once instead of once per row. The two calls address
+/// identical guest bytes; only the fragmented staging differs.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the rect helper names the same geometry its row counterpart does"
+)]
+fn write_texture_rect<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    tex: &TextureBacking,
+    origin: Point,
+    row_bytes: u64,
+    row_count: u64,
+    buf: &[u8],
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
+) -> Result<(), BlitStatus> {
+    let need = row_bytes
+        .checked_mul(row_count)
+        .ok_or_else(|| br(BlitStatus::Capacity, "wr_rect_span_overflow"))?;
+    if need as usize > buf.len() {
+        return Err(br(BlitStatus::Capacity, "wr_rect_buf_cap"));
+    }
+    match tex {
+        TextureBacking::Linear(_) => {
+            for y in 0..row_count {
+                let at = (y * row_bytes) as usize;
+                write_texture_row(
+                    state,
+                    host,
+                    task_id,
+                    tex,
+                    origin,
+                    y,
+                    row_bytes,
+                    &buf[at..at + row_bytes as usize],
+                    allowed,
+                )?;
+            }
+            Ok(())
+        }
+        TextureBacking::Type11(t) => {
+            let (pixels, height, origin_x, origin_y) =
+                t11_rect_extent(t, origin, row_bytes, row_count)?;
+            let src = &buf[..need as usize];
+            let ok = if origin_x == 0 && origin_y == 0 && pixels == t.width && height == t.height {
+                mapping_write::write_full_rect_raw_at(
+                    state,
+                    host,
+                    t.mapping_id,
+                    t.surface_offset,
+                    t.row_stride,
+                    t.span_end,
+                    pixels,
+                    height,
+                    t.bpp,
+                    src,
+                    row_bytes as u32,
+                )
+            } else {
+                mapping_write::write_rect_raw_at(
+                    state,
+                    host,
+                    t.mapping_id,
+                    t11_window(t),
+                    mapping_write::Rect {
+                        origin_x,
+                        origin_y,
+                        width: pixels,
+                        height,
+                    },
+                    src,
+                    row_bytes as u32,
+                )
+            };
+            if !ok {
+                return Err(br(BlitStatus::GuestIo, "wr_rect_t11_io"));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The mapping-rail sample window a type-11 texture backing names.
+///
+/// Spelled once so the four rect/row call sites cannot drift on which of the
+/// four fields a copy presents.
+fn t11_window(t: &Type11Texture) -> mapping_write::SurfaceWindow {
+    mapping_write::SurfaceWindow {
+        base_off: t.surface_offset,
+        bpr: t.row_stride,
+        span_end: t.span_end,
+        bpp: t.bpp,
+    }
+}
+
+/// Narrow a rect's texel geometry to the `u32` the mapping rail's [`mapping_write::Rect`]
+/// is expressed in, refusing by name rather than truncating.
+fn t11_rect_extent(
+    t: &Type11Texture,
+    origin: Point,
+    row_bytes: u64,
+    row_count: u64,
+) -> Result<(u32, u32, u32, u32), BlitStatus> {
+    if origin.z != 0 {
+        return Err(br(BlitStatus::Unsupported, "rect_t11_z"));
+    }
+    if t.bpp == 0 {
+        return Err(br(BlitStatus::Bounds, "rect_t11_bpp_zero"));
+    }
+    let origin_x =
+        u32::try_from(origin.x).map_err(|_| br(BlitStatus::Bounds, "rect_t11_x_range"))?;
+    let origin_y =
+        u32::try_from(origin.y).map_err(|_| br(BlitStatus::Bounds, "rect_t11_y_range"))?;
+    let height =
+        u32::try_from(row_count).map_err(|_| br(BlitStatus::Bounds, "rect_t11_height_range"))?;
+    let pixels = u32::try_from(row_bytes / t.bpp as u64)
+        .map_err(|_| br(BlitStatus::Bounds, "rect_t11_width_range"))?;
+    Ok((pixels, height, origin_x, origin_y))
+}
+
 /// Census: does the surface this blit is about to copy through its **guest
 /// pages** have live GPU-resident content instead?
 ///
@@ -3406,12 +3616,14 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
         if is_volume {
             return br(BlitStatus::Unsupported, "sl_volume_mixed");
         }
-        // The slice/level form's type-11 arm: `blit_kind_t2t_sl_us` charges this
-        // whole function 28.8 s of a 29.1 s rail while `blit_rows_us` — which
-        // covers its linear arm's `copy_row_region` — reads 0.275 s. Everything
-        // unaccounted for is below, and it is two things per slice: a pair of
-        // `resolve_texture_backing` calls, and a staged row loop.
+        // The slice/level form's type-11 arm. It used to stage one row at a
+        // time, and a driven Maps leg charged that loop 30.15 s of a 30.28 s
+        // blit rail to move 14.6 MB, against 0.12 s for the resolves beside it
+        // and 0.22 s for every strided guest-RAM copy in the device. The bytes
+        // were never the cost — re-entering the mapping rail per row was. It
+        // stages the slice whole now; see [`read_texture_rect`].
         let sl_mixed_started = std::time::Instant::now();
+        let mut staged = vec![0u8; (row_bytes.saturating_mul(h as u64)) as usize];
         for si in 0..cmd.slice_count {
             let ss = match cmd.source_slice.checked_add(si) {
                 Some(v) => v,
@@ -3435,7 +3647,6 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
             if src.width() != w || src.height() != h || dst.width() != w || dst.height() != h {
                 return br(BlitStatus::Bounds, "sl_inner_dim_mismatch");
             }
-            let mut row = vec![0u8; row_bytes as usize];
             let allowed = match texture_region_window(
                 state,
                 host,
@@ -3450,32 +3661,30 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
                 Ok(v) => v,
                 Err(st) => return st,
             };
-            for y in 0..h as u64 {
-                if let Err(st) = read_texture_row(
-                    state,
-                    host,
-                    task_id,
-                    &src,
-                    Point { x: 0, y: 0, z: 0 },
-                    y,
-                    row_bytes,
-                    &mut row,
-                ) {
-                    return st;
-                }
-                if let Err(st) = write_texture_row(
-                    state,
-                    host,
-                    task_id,
-                    &dst,
-                    Point { x: 0, y: 0, z: 0 },
-                    y,
-                    row_bytes,
-                    &row,
-                    allowed.as_ref(),
-                ) {
-                    return st;
-                }
+            if let Err(st) = read_texture_rect(
+                state,
+                host,
+                task_id,
+                &src,
+                Point { x: 0, y: 0, z: 0 },
+                row_bytes,
+                h as u64,
+                &mut staged,
+            ) {
+                return st;
+            }
+            if let Err(st) = write_texture_rect(
+                state,
+                host,
+                task_id,
+                &dst,
+                Point { x: 0, y: 0, z: 0 },
+                row_bytes,
+                h as u64,
+                &staged,
+                allowed.as_ref(),
+            ) {
+                return st;
             }
         }
         crate::runtime::drain::note_store_route_us(

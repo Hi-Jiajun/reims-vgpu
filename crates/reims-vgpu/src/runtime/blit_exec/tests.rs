@@ -1866,6 +1866,73 @@ fn whole_surface_0x13e_single_level_copy() {
     assert_eq!(&back[16..32], &pat[16..32]);
 }
 
+/// A type-11 whole-surface `0x13e` moves every row, in order.
+///
+/// This arm stages the slice whole rather than a row at a time, because a
+/// per-row call into the mapping rail re-pays that rail's per-*rect* costs —
+/// settle, vouch, window revalidation, and a fresh import per guest page run —
+/// once for every row. A driven Maps leg charged the old row loop 30.15 s of a
+/// 30.28 s blit rail to move 14.6 MB.
+///
+/// The failure the whole-slice form can have that the row loop could not is a
+/// stride one: the staging buffer is packed `row_bytes` apart while the surface
+/// is `row_stride` apart, and the mapping rail is told both. Get that pair
+/// backwards and rows land shifted or on top of each other. So the source rows
+/// here are made distinguishable and the assertion is per row, not on the
+/// buffer entire — a whole-buffer compare of a uniform fill would pass on a
+/// copy that wrote row 0 twice.
+#[test]
+fn a_type11_whole_surface_copy_lands_every_row_in_order() {
+    let (mut host, mut state) = blit_device();
+    install_type11(&mut host, &mut state, 2, 20, 0x40);
+    install_type11(&mut host, &mut state, 3, 21, 0x50);
+
+    // 2×2 BGRA: two rows of 8 bytes, each row its own byte value.
+    let src_pixels: [u8; 16] = [
+        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // row 0
+        0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, // row 1
+    ];
+    assert!(mapping_write::write_rect_raw(
+        &mut state,
+        &mut host,
+        20,
+        mapping_write::Rect {
+            origin_x: 0,
+            origin_y: 0,
+            width: 2,
+            height: 2
+        },
+        &src_pixels,
+        8
+    ));
+
+    let mut cmd = copy_cmd(CopyKind::TextureToTextureSliceLevel, 2, 3);
+    cmd.slice_count = 1;
+    cmd.level_count = 1;
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &cmd),
+        BlitStatus::Ok,
+        "a type-11 to type-11 whole-surface copy must execute"
+    );
+
+    let mut back = [0u8; 16];
+    assert!(mapping_write::read_rect_raw(
+        &mut state,
+        &mut host,
+        21,
+        mapping_write::Rect {
+            origin_x: 0,
+            origin_y: 0,
+            width: 2,
+            height: 2
+        },
+        &mut back,
+        8
+    ));
+    assert_eq!(&back[0..8], &src_pixels[0..8], "row 0 did not land");
+    assert_eq!(&back[8..16], &src_pixels[8..16], "row 1 did not land");
+}
+
 /// Regression guard for the identity self-copy no-op: the guest issues
 /// copyFromTexture:X toTexture:X with matching origin (observed live on
 /// Ventura x86 media apps: src_ref==dst_ref, src_off==dst_off). This copies
