@@ -3347,43 +3347,46 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     // The last untimed loop on the rail: a texture-to-texture copy with a
     // type-11 or type-5 end on either side stages through here rather than
     // through `copy_row_region`, so `blit_rows_us` reports nothing for it.
+    //
+    // A plane at a time, not a row at a time: this is the same staging shape the
+    // slice/level form carried, and there a driven Maps leg charged the row loop
+    // 30.15 s of a 30.28 s rail. See [`read_texture_rect`] for what a per-row
+    // call into the mapping rail re-pays.
     let t2t_stage_started = std::time::Instant::now();
-    let mut row = vec![0u8; row_bytes as usize];
+    let mut staged = vec![0u8; row_bytes.saturating_mul(copy_h) as usize];
     for z in 0..copy_d {
-        for y in 0..copy_h {
-            if let Err(st) = read_texture_row(
-                state,
-                host,
-                task_id,
-                &src,
-                Point {
-                    x: sox,
-                    y: soy,
-                    z: soz + z,
-                },
-                y,
-                row_bytes,
-                &mut row,
-            ) {
-                return st;
-            }
-            if let Err(st) = write_texture_row(
-                state,
-                host,
-                task_id,
-                &dst,
-                Point {
-                    x: dox,
-                    y: doy,
-                    z: doz + z,
-                },
-                y,
-                row_bytes,
-                &row,
-                allowed.as_ref(),
-            ) {
-                return st;
-            }
+        if let Err(st) = read_texture_rect(
+            state,
+            host,
+            task_id,
+            &src,
+            Point {
+                x: sox,
+                y: soy,
+                z: soz + z,
+            },
+            row_bytes,
+            copy_h,
+            &mut staged,
+        ) {
+            return st;
+        }
+        if let Err(st) = write_texture_rect(
+            state,
+            host,
+            task_id,
+            &dst,
+            Point {
+                x: dox,
+                y: doy,
+                z: doz + z,
+            },
+            row_bytes,
+            copy_h,
+            &staged,
+            allowed.as_ref(),
+        ) {
+            return st;
         }
     }
     crate::runtime::drain::note_store_route_us(

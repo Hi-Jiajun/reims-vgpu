@@ -2185,11 +2185,16 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     // `flush_intersecting` returns immediately when nothing is armed, so this
     // costs a map-empty check per read. It must also precede `contig_for_span`:
     // the flush writes through the mapping and can retire the cached view.
+    let settle_started = std::time::Instant::now();
     crate::runtime::writeback_debt::settle_for_mapping(
         state,
         host,
         mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingRectRead,
+    );
+    crate::runtime::drain::note_store_route_us(
+        "rectrd_settle_us",
+        settle_started.elapsed().as_micros() as u64,
     );
     let Some(m) = state.mappings.get(&mapping_id) else {
         return false;
@@ -2233,7 +2238,20 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
         ));
         return false;
     }
-    if let Some((ptr, _)) = contig_for_span(state, host, mapping_id, span_end) {
+    // The rail's remaining cost is per *call*, so every phase of a call is
+    // charged and the arms are disjoint: `rectrd_contig_us` covers the view
+    // revalidation both arms need, then exactly one of `rectrd_copy_us` (the
+    // packed arm's memcpy) and `rectrd_window_us` (the fragmented arm, which
+    // materialises the whole sample window however small the rect) runs. With
+    // `rectrd_settle_us` above them, the four sum to the call.
+    let contig_started = std::time::Instant::now();
+    let contig = contig_for_span(state, host, mapping_id, span_end);
+    crate::runtime::drain::note_store_route_us(
+        "rectrd_contig_us",
+        contig_started.elapsed().as_micros() as u64,
+    );
+    if let Some((ptr, _)) = contig {
+        let copy_started = std::time::Instant::now();
         // SAFETY: contig covers span_end, and read_end ≤ span_end (checked).
         let base = unsafe { (ptr as *const u8).add(base_off as usize) };
         if x_off == 0 && rb == bpr && dst_stride as usize == rb {
@@ -2255,7 +2273,14 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
                 }
             }
         }
+        crate::runtime::drain::note_store_route_us(
+            "rectrd_copy_us",
+            copy_started.elapsed().as_micros() as u64,
+        );
+        crate::runtime::drain::note_store_route("rectrd_contig_n");
     } else {
+        crate::runtime::drain::note_store_route("rectrd_frag_n");
+        let window_started = std::time::Instant::now();
         // Exact full-plane row layout: the tight texture bytes are already the
         // mapping byte window. Import fragmented GPA runs directly into the
         // caller's Vulkan staging vector instead of allocating another
@@ -2275,13 +2300,18 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
             crate::observe::off(format!(
                 "mapping_read full_tight_direct mid={mapping_id} bytes={direct_len} bpr={surface_bpr} rows={height}"
             ));
-            return mapper::read_mapping_bytes(
+            let ok = mapper::read_mapping_bytes(
                 state,
                 host,
                 mapping_id,
                 base_off,
                 &mut dst[..direct_len],
             );
+            crate::runtime::drain::note_store_route_us(
+                "rectrd_window_us",
+                window_started.elapsed().as_micros() as u64,
+            );
+            return ok;
         }
         // Materialize the fragmented sample window once. Calling
         // read_mapping_bytes for every row revalidates every page and rebuilds
@@ -2306,6 +2336,10 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
             };
             dst[dst_off..dst_off + rb].copy_from_slice(row);
         }
+        crate::runtime::drain::note_store_route_us(
+            "rectrd_window_us",
+            window_started.elapsed().as_micros() as u64,
+        );
     }
     true
 }
@@ -2498,16 +2532,37 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     // surfaces only. Safe to call from inside a flush — the storage rail reaches
     // this function through `write_full_rect_raw_at`, and `flush_intersecting`
     // removes intersecting windows up front so the nested call finds nothing.
+    // Charged in the same partition as the read side above: settle, vouch, and
+    // view revalidation are per *call*, and this rail's remaining cost is per
+    // call rather than per byte. See `rectrd_contig_us`.
+    let settle_started = std::time::Instant::now();
     crate::runtime::writeback_debt::settle_for_mapping(
         state,
         host,
         mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingRectWrite,
     );
-    let Some(vouched) = vouch_for_write(state, host, mapping_id, "rect_raw") else {
+    crate::runtime::drain::note_store_route_us(
+        "rectwr_settle_us",
+        settle_started.elapsed().as_micros() as u64,
+    );
+    let vouch_started = std::time::Instant::now();
+    let vouched = vouch_for_write(state, host, mapping_id, "rect_raw");
+    crate::runtime::drain::note_store_route_us(
+        "rectwr_vouch_us",
+        vouch_started.elapsed().as_micros() as u64,
+    );
+    let Some(vouched) = vouched else {
         return false;
     };
-    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched) {
+    let contig_started = std::time::Instant::now();
+    let contig = contig_for_write(state, host, mapping_id, span_end, &vouched);
+    crate::runtime::drain::note_store_route_us(
+        "rectwr_contig_us",
+        contig_started.elapsed().as_micros() as u64,
+    );
+    if let Some((ptr, _)) = contig {
+        crate::runtime::drain::note_store_route("rectwr_contig_n");
         // SAFETY: contig covers span_end, and write_end ≤ span_end (checked).
         let base = unsafe { (ptr as *mut u8).add(base_off as usize) };
         if x_off == 0 && rb == bpr && src_stride as usize == rb {
@@ -2530,6 +2585,7 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
             }
         }
     } else if full_plane {
+        crate::runtime::drain::note_store_route("rectwr_frag_full_n");
         // Fragmented full-plane write: stage the native row layout and import
         // each maximal packed GPA run once. Calling write_mapping_bytes once
         // per row turns a 1928-row storage-texture writeback into thousands of
