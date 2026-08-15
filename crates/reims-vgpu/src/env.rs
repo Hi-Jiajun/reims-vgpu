@@ -907,52 +907,56 @@ pub const PASS_CHURN: &str = "REIMS_VGPU_PASS_CHURN";
 /// whose failure mode is wrong pixels with nothing reported.
 pub const PASS_EXIT_NARROW: &str = "REIMS_VGPU_PASS_EXIT_NARROW";
 
-/// **Default off.** `on` puts every colour attachment this device renders into
-/// in `VK_IMAGE_LAYOUT_GENERAL` for its whole life, instead of
-/// `COLOR_ATTACHMENT_OPTIMAL`. A probe that prices one layout, and changes
-/// nothing else — no barrier is added, none is removed, and the pass census is
-/// unmoved.
+/// **Default on.** `off` splits a colour target's layout back in two:
+/// `COLOR_ATTACHMENT_OPTIMAL` while it is an attachment and
+/// `SHADER_READ_ONLY_OPTIMAL` when a draw samples it. A narrowing, because it
+/// restores a transition this device otherwise does not record.
 ///
-/// # The question it exists to answer
+/// # What the split cost, and why Apple never pays it
 ///
-/// Two of this device's own render pass boundaries have the same root, and both
-/// repairs need the same thing to be affordable. `passmerge_outside_resident_layout`
-/// (25 344 of 176 914 pass begins on a driven macos-13 Maps boot) is a draw
-/// sampling a resident that a previous pass left in `COLOR_ATTACHMENT_OPTIMAL`
-/// while a sampled read needs `SHADER_READ_ONLY_OPTIMAL`; Vulkan forbids that
-/// transition inside a render pass instance, so the pass closes.
-/// `passcompat_feedback` (16 130) is the same shape one level up — a draw that
-/// samples its own attachment moves the attachment to
-/// `ATTACHMENT_FEEDBACK_LOOP_OPTIMAL`, which is part of render pass
-/// compatibility, so the pass closes going in and again coming out.
+/// A `MTLTexture` a render encoder writes is the same object a later fragment
+/// shader samples, and nothing in Metal marks the crossing. In Vulkan the
+/// crossing is an image layout, and every layout optimal for one of the two uses
+/// is illegal for the other — so a device that picks the optimal one has to
+/// transition on every sample, and a transition is exactly what a render pass
+/// instance may not contain. The pass closes.
 ///
-/// Both disappear if a colour target has **one** layout that is legal as an
-/// attachment and as a sampled read at the same time. That is the shape Metal
-/// has: a `MTLTexture` has no layout, and a render target a shader samples is
-/// an ordinary texture. Vulkan spells it `GENERAL`, which this device already
-/// uses for `host_accessible_color0` targets.
+/// That is `passmerge_outside_resident_layout`: **25 344 of 176 914 pass begins**
+/// on a driven macos-13 Maps boot, each ending a pass instance measured at
+/// ~100 µs of GPU and ~18 µs of CPU on this iGPU.
 ///
-/// What is not known is the price. On a GPU with framebuffer compression —
-/// every Intel iGPU (CCS), every AMD part (DCC), every tiler — `GENERAL` is the
-/// layout a driver is least able to compress in, and this device draws into its
-/// colour target ~52 000 times a second. So the trade is a bandwidth cost on
-/// every draw against ~23 % of the pass boundaries, and the boundary is measured
-/// at ~100 µs of GPU here. Nothing in the specification says which wins, and
-/// nothing but a boot can.
+/// `GENERAL` is legal for both uses, so the crossing is not a transition, and
+/// with the pass's own incoming `VK_SUBPASS_EXTERNAL` dependency naming shader
+/// reads, it is not a barrier either — see
+/// `pools::ResidentAccess::covered_by_pass_entry`.
 ///
-/// # Why it is a probe and not a change
+/// # The layout was priced on its own before anything was built on it
 ///
-/// On its own it is pure cost: the resident-sample barrier still fires (the read
-/// layout is unchanged), the feedback pass still differs, and no boundary is
-/// removed. That is deliberate — it isolates the layout from the two repairs it
-/// would enable, so a boot reads the price alone. If `sum us/draw` is flat, the
-/// repairs are worth building; if it rises materially, they are not, and the
-/// answer cost two boots instead of a week.
+/// What `GENERAL` gives up is framebuffer compression, which on this host is real
+/// hardware. Six interleaved driven macos-13 Maps boots of one binary
+/// (`/tmp/wb-outC0..C5`) moved the layout and **nothing else** — every transition
+/// still recorded, the pass census unmoved — so the arms differ by the layout
+/// alone:
 ///
-/// It is safe in the sense that matters: `GENERAL` preserves contents, every
-/// spelling of the layout is derived from
-/// [`crate::backend::vulkan::engine::caches::color0_pass_exit_layout`] rather
-/// than repeated, and no image needs a usage bit it is not already created with.
+/// ```text
+///                    sum us/draw              gpu us/draw
+/// split (off)        22.95, 22.73, 25.50      13.00, 11.70, 13.82
+/// one layout (on)    21.43, 22.33, 21.93      11.94, 11.67, 11.24
+/// ```
+///
+/// **Disjoint on the sum** — the worst `on` boot beats the best `off` one — at
+/// −7.7 %, with the three position-matched pairs agreeing one by one. So the
+/// compression is worth less than the full-attachment transitions it buys, and
+/// that was true before a single pass boundary had been saved.
+///
+/// # What `off` is for
+///
+/// A host whose compression is worth more than this one's would read the other
+/// way, and there is no capability to ask. `off` is how that host is measured,
+/// and how a suspected content bug is bisected against the layout — both sides
+/// move together through
+/// `caches::color0_pass_exit_layout`, so the
+/// arm is one switch and not a family of them.
 pub const COLOR_GENERAL: &str = "REIMS_VGPU_COLOR_GENERAL";
 
 /// **A count, not a switch.** How many draws one command buffer may carry,

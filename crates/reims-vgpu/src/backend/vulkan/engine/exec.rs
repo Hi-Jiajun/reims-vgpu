@@ -4566,7 +4566,23 @@ pub(crate) unsafe fn execute_draw_inner(
         // and it is sound because the *access* says so — the identically-shaped
         // skip keyed on the layout alone is what `ResidentAccess` exists to
         // stop, since a layout can be reached by a write that shares its name.
-        if !transitioned_resident.insert(identity.clone()) || access == next_access {
+        //
+        // The second skip is the layout one, and it is sound only because both
+        // halves are asked. `layout() == layout()` says there is nothing to
+        // *place*, which is true for every resident once a colour target rests
+        // in one layout; `covered_by_pass_entry` says the pass's own incoming
+        // external dependency already makes the prior access *visible* to this
+        // draw's sampled read, which is a separate question and the one that
+        // carries the hazard. Asking only the first is exactly the mistake
+        // `ResidentAccess` exists to stop — a layout can be reached by a write
+        // that shares its name.
+        //
+        // This is what retires `passmerge_outside_resident_layout`: the barrier
+        // it charged is not moved earlier or made cheaper, it stops being owed.
+        if !transitioned_resident.insert(identity.clone())
+            || access == next_access
+            || (access.layout() == next_access.layout() && access.covered_by_pass_entry())
+        {
             continue;
         }
         unsafe { outside_pass.before_record(PassObstacle::ResidentLayout, pools, &ctx.device, cb) };
@@ -6863,14 +6879,14 @@ mod tests {
     /// than sample. A new variant that nothing here mentions fails to compile,
     /// which is the point: each one is a rail that can leave a resident in a
     /// state some barrier has to name.
-    const EVERY_ACCESS: [ResidentAccess; 6] = [
+    fn every_access() -> [ResidentAccess; 6] { [
         ResidentAccess::Untouched,
         ResidentAccess::ColorWrite(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
         ResidentAccess::ColorWrite(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
         ResidentAccess::ColorFeedback(vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT),
         ResidentAccess::shader_read(false),
         ResidentAccess::transfer_read(false),
-    ];
+    ] }
 
     fn target_sample(identity: super::super::types::TargetIdentity) -> SampledImageResource {
         SampledImageResource {
@@ -7006,14 +7022,66 @@ mod tests {
             ResidentAccess::transfer_read(true).layout(),
             vk::ImageLayout::GENERAL
         );
-        assert_eq!(
-            ResidentAccess::shader_read(false).layout(),
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-        );
+        // A transfer read is a genuine second layout: nothing renders in
+        // TRANSFER_SRC_OPTIMAL, so the transition is owed and the pass has to be
+        // closed for it. That is the ~1 200-a-second population the exit layout
+        // was moved *towards*, and it stays.
         assert_eq!(
             ResidentAccess::transfer_read(false).layout(),
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL
         );
+    }
+
+    /// The whole of the resident-sample repair, as one relation: a colour target
+    /// this device rendered into is already in the layout a sampled read wants,
+    /// and the pass's own entry already makes the write visible — so the draw
+    /// owes nothing.
+    ///
+    /// Asserted against [`super::super::caches::color0_pass_exit_layout`] rather
+    /// than against `GENERAL`, so it states the relation and holds under
+    /// `REIMS_VGPU_COLOR_GENERAL=off` too, where both sides move back together.
+    /// Written this way because the failure it guards is the two sides moving
+    /// *apart*: a sampled read that keeps its own layout brings back 25 344 pass
+    /// breaks a boot, and nothing but this would say so.
+    #[test]
+    fn a_rendered_resident_is_already_where_a_sampled_read_wants_it() {
+        let resting = super::super::caches::color0_pass_exit_layout();
+        let after_a_pass = ResidentAccess::ColorWrite(resting);
+        let for_a_sample = ResidentAccess::shader_read(false);
+
+        if super::super::caches::unified_color_layout() {
+            assert_eq!(for_a_sample.layout(), resting);
+            assert!(after_a_pass.covered_by_pass_entry());
+        } else {
+            assert_ne!(for_a_sample.layout(), resting);
+        }
+    }
+
+    /// Only an access a pass's incoming external dependency genuinely names may
+    /// let a sampled read skip its barrier.
+    ///
+    /// Written over `every_access` rather than as two assertions so a new
+    /// [`ResidentAccess`] variant has to be classified here rather than silently
+    /// joining the skipping side. A wrong `true` is a sampled read racing the
+    /// write that produced its pixels — a stale frame, reported nowhere.
+    #[test]
+    fn nothing_untouched_or_host_written_is_covered_by_the_pass_entry() {
+        for tracked in every_access() {
+            let covered = !matches!(
+                tracked,
+                ResidentAccess::Untouched | ResidentAccess::GuestBacking
+            );
+            assert_eq!(tracked.covered_by_pass_entry(), covered, "{tracked:?}");
+            // A covered access must still name a real prior scope, or "covered"
+            // would be covering nothing.
+            if covered {
+                assert_ne!(
+                    tracked.source_scope().0,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    "{tracked:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -7061,7 +7129,7 @@ mod tests {
     /// site's condition would pass whichever way the skip went.
     #[test]
     fn untouched_is_the_only_state_with_no_prior_access() {
-        for access in EVERY_ACCESS {
+        for access in every_access() {
             let (stage, flags) = access.source_scope();
             if access == ResidentAccess::Untouched {
                 assert_eq!(stage, vk::PipelineStageFlags::TOP_OF_PIPE);
@@ -7168,7 +7236,7 @@ mod tests {
     /// read, so it names the newer touch and outranks whatever was there.
     #[test]
     fn a_snapshotted_target_waits_for_its_own_snapshot() {
-        for tracked in EVERY_ACCESS {
+        for tracked in every_access() {
             assert_eq!(
                 target_prior_access(true, tracked, false),
                 ResidentAccess::transfer_read(false),
@@ -7181,13 +7249,13 @@ mod tests {
     /// Exactly one prior access lets a `LOAD` pass skip its own barrier, and it
     /// is the one the pass's `VK_SUBPASS_EXTERNAL` dependency already covers.
     ///
-    /// Written over `EVERY_ACCESS` rather than as two assertions so a new
+    /// Written over `every_access` rather than as two assertions so a new
     /// `ResidentAccess` variant has to be classified here rather than silently
     /// joining the skipping side. A wrong `true` costs a missing layout
     /// transition, which is undefined behaviour and not an error.
     #[test]
     fn only_a_target_left_where_the_next_pass_wants_it_may_skip_its_barrier() {
-        for tracked in EVERY_ACCESS {
+        for tracked in every_access() {
             let skippable = tracked
                 == ResidentAccess::ColorWrite(super::super::caches::color0_pass_exit_layout());
             assert_eq!(

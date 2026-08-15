@@ -1663,15 +1663,71 @@ pub(crate) enum ResidentAccess {
 }
 
 impl ResidentAccess {
-    /// Layout for a sampled read. Imported linear images stay host-accessible
-    /// between device operations; ordinary images use the dedicated read-only
-    /// layout.
-    pub(crate) const fn shader_read(host_accessible: bool) -> Self {
-        Self::ShaderRead(if host_accessible {
-            vk::ImageLayout::GENERAL
-        } else {
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-        })
+    /// Layout for a sampled read.
+    ///
+    /// It is the layout the colour target already rests in, so a resident this
+    /// device rendered into and now samples needs **no transition** — see
+    /// [`crate::backend::vulkan::engine::caches::color0_pass_exit_layout`] for why one layout
+    /// serves both uses and what it measured. Imported linear images stay
+    /// host-accessible between device operations, which is the same `GENERAL`,
+    /// so the parameter only matters under the ablation arm.
+    ///
+    /// The dedicated read-only layout is what the ablation restores, and it is
+    /// what makes the transition — and therefore the pass break — come back.
+    pub(crate) fn shader_read(host_accessible: bool) -> Self {
+        Self::ShaderRead(
+            if host_accessible || crate::backend::vulkan::engine::caches::unified_color_layout() {
+                vk::ImageLayout::GENERAL
+            } else {
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+            },
+        )
+    }
+
+    /// Whether a render pass's own incoming `VK_SUBPASS_EXTERNAL` dependency
+    /// already makes this prior access visible to a sampled read inside the
+    /// pass, so a draw sampling the image needs no barrier of its own.
+    ///
+    /// This is the sampled-image twin of
+    /// [`crate::backend::vulkan::engine::exec::pass_exit_needs_no_barrier`], and it is only ever
+    /// consulted once the layouts already match — it answers **visibility**, not
+    /// placement. Both halves are required and the caller checks the other.
+    ///
+    /// `VK_SUBPASS_EXTERNAL` as `srcSubpass` scopes every command submitted
+    /// before the render pass instance in submission order, and a subpass
+    /// dependency is a memory dependency over its whole scope rather than over
+    /// the attachment alone — which is what lets it cover an image that is not an
+    /// attachment of this pass at all.
+    /// [`crate::backend::vulkan::engine::caches::external_dependencies`] names
+    /// `COLOR_ATTACHMENT_OUTPUT | TRANSFER` with the attachment writes and
+    /// `TRANSFER_WRITE` in its source scope, and `VERTEX_SHADER |
+    /// FRAGMENT_SHADER` with `SHADER_READ` in its destination scope.
+    ///
+    /// So, variant by variant:
+    ///
+    /// - `ColorWrite` and `ColorFeedback` are a colour attachment write, which is
+    ///   the source scope exactly. Feedback also names a shader read, and a read
+    ///   before a read is not a hazard.
+    /// - `ShaderRead` and `TransferRead` are reads. Read-after-read needs no
+    ///   availability operation.
+    /// - `Untouched` is `UNDEFINED`: there is a real transition and the layouts
+    ///   cannot match, so this never decides it — it answers `false` anyway,
+    ///   because "nothing has touched it" must never read as "covered".
+    /// - `GuestBacking` is a host write to `PREINITIALIZED`. The submission's
+    ///   implicit host-memory dependency does make it visible, but the layout is
+    ///   not the resting one and the transition out of `PREINITIALIZED` is the
+    ///   one thing that preserves those bytes. Never skippable.
+    ///
+    /// A wrong `true` is a sampled read racing the write that produced its
+    /// pixels: a stale frame, with nothing reported anywhere.
+    pub(crate) fn covered_by_pass_entry(self) -> bool {
+        match self {
+            Self::Untouched | Self::GuestBacking => false,
+            Self::ColorWrite(_)
+            | Self::ColorFeedback(_)
+            | Self::ShaderRead(_)
+            | Self::TransferRead(_) => true,
+        }
     }
 
     /// Layout for a transfer read, preserving host access for imported linear

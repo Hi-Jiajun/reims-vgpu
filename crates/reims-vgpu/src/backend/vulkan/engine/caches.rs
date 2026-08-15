@@ -918,35 +918,75 @@ impl<K: Clone + Eq, V: Copy> ObjectVariantIndex<K, V> {
 /// need for it. So those ~1 200 reads a second gain a real transition each and
 /// the ~24 000 draws lose one, which is the whole change.
 ///
-/// # It is a function because one probe may move it
+/// # And it is `GENERAL`, because a colour target here is also a texture
 ///
-/// [`crate::env::COLOR_GENERAL`] answers a question this device cannot answer
-/// from the specification: what a colour target resting in `GENERAL` costs on a
-/// host that compresses its framebuffers. Turning it on moves this layout, and
-/// **every** spelling of the layout has to move with it — the pass's
-/// `finalLayout`, the `initialLayout` a `LOAD` pass names, the registry's record
-/// of where the pass left the image, and the comparison
-/// [`super::exec::pass_exit_needs_no_barrier`] makes. A `const` plus a probe read
-/// beside it would be that second spelling, and the failure mode of the two
+/// The layout above is where a pass *leaves* the attachment. This one is where
+/// the attachment **lives**, and it is `GENERAL` for the reason Metal has no
+/// layouts at all: a `MTLTexture` a render encoder writes is the same object a
+/// later fragment shader samples, and nothing in that API marks the crossing. In
+/// Vulkan the crossing is an image layout, and every layout that is optimal for
+/// one of the two uses is illegal for the other — so a device that picks
+/// `COLOR_ATTACHMENT_OPTIMAL` has to transition on every sample, and a
+/// transition is exactly what a render pass instance may not contain. That is
+/// `passmerge_outside_resident_layout`, 25 344 of 176 914 pass begins on a driven
+/// macos-13 Maps boot, each closing a pass worth ~100 µs of GPU.
+///
+/// `GENERAL` is legal for both, so the crossing disappears and the resident is
+/// where the next user wants it whichever user that is. What it gives up is
+/// framebuffer compression, which on this host is real hardware —
+/// Intel Arrow Lake CCS.
+///
+/// **Measured, because the specification cannot rank those.** Six interleaved
+/// driven macos-13 Maps boots of one binary, `/tmp/wb-outC0..C5`, scored by
+/// `scripts/boot-score`, with the layout moved and **nothing else** — the
+/// transitions still recorded, the pass census unmoved, so the reading is the
+/// layout alone:
+///
+/// ```text
+///                    sum us/draw              gpu us/draw
+/// COLOR_ATTACHMENT   22.95, 22.73, 25.50      13.00, 11.70, 13.82
+/// GENERAL            21.43, 22.33, 21.93      11.94, 11.67, 11.24
+/// ```
+///
+/// The arms are **disjoint on the sum** — the worst `GENERAL` boot beats the best
+/// `COLOR_ATTACHMENT` one — at −7.7 %, and the position-matched pairs agree one
+/// by one. So on this part the compression `GENERAL` gives up is worth less than
+/// the full-attachment transitions it removes, and that was true *before* any
+/// pass boundary was saved.
+///
+/// # It is a function, and [`crate::env::COLOR_GENERAL`] is the ablation
+///
+/// **Every** spelling of the layout has to move together — the pass's
+/// `finalLayout`, the `initialLayout` a `LOAD` pass names, the subpass
+/// reference, the registry's record of where the pass left the image, the layout
+/// a sampled descriptor declares, and the comparisons
+/// [`super::exec::pass_exit_needs_no_barrier`] and
+/// [`super::pools::ResidentAccess::covered_by_pass_entry`] make. A `const` plus a
+/// switch read beside it would be that second spelling, and two of them
 /// disagreeing is a barrier naming an `oldLayout` the image is not in, which is
 /// undefined behaviour and not an error. So there is one function and no
-/// constant.
+/// constant, and `REIMS_VGPU_COLOR_GENERAL=off` moves all of them back at once —
+/// a narrowing, since it restores a transition rather than removing one.
 pub(crate) fn color0_pass_exit_layout() -> vk::ImageLayout {
-    if color_general_probe_enabled() {
+    if unified_color_layout() {
         vk::ImageLayout::GENERAL
     } else {
         vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
     }
 }
 
-/// Whether the colour-attachment `GENERAL` probe is on. **Default off**; see
-/// [`crate::env::COLOR_GENERAL`] for what it prices and why it removes nothing.
-fn color_general_probe_enabled() -> bool {
+/// Whether a colour target rests in one layout for its whole life. **Default
+/// on**; `REIMS_VGPU_COLOR_GENERAL=off` is the ablation arm.
+///
+/// Read once. This decides the content of cached `VkRenderPass` objects and of
+/// registry records that outlive them, so an answer that changed mid-boot would
+/// leave both built under two layouts in one cache.
+pub(crate) fn unified_color_layout() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
+        !matches!(
             crate::env::read(crate::env::COLOR_GENERAL).0,
-            crate::env::Switch::On
+            crate::env::Switch::Off
         )
     })
 }
@@ -1023,9 +1063,20 @@ fn external_dependencies(
     // Framebuffer fetch reads attachment 0 through the fragment stage, so the
     // incoming transition has to be visible to that read too. The intra-subpass
     // ordering is the separate `BY_REGION` dependency; this is the entry.
-    let (mut in_dst_stages, mut in_dst_access) = (attach_stages, attach_writes | attach_reads);
+    //
+    // The shader stages are unconditional, and they are what
+    // [`super::pools::ResidentAccess::covered_by_pass_entry`] rests on. A draw
+    // inside this pass may sample a resident an *earlier* pass wrote, and with
+    // one resting layout there is no transition left for that draw to record —
+    // only a visibility request, which this entry then carries for every such
+    // draw at once instead of each of them closing the pass to state it.
+    // Weakening this to the attachment stages makes that skip a missing
+    // dependency, which is a stale frame and no error.
+    let (in_dst_stages, mut in_dst_access) = (
+        attach_stages | vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+        attach_writes | attach_reads | vk::AccessFlags::SHADER_READ,
+    );
     if color_input {
-        in_dst_stages |= vk::PipelineStageFlags::FRAGMENT_SHADER;
         in_dst_access |= vk::AccessFlags::INPUT_ATTACHMENT_READ;
     }
     let mut source_stages = attach_stages | vk::PipelineStageFlags::TRANSFER;
@@ -3285,10 +3336,9 @@ mod object_cache_tests {
                 assert_eq!(key.color_final_layout(0), vk::ImageLayout::GENERAL);
             }
         }
-        assert_eq!(
-            key.color_layout(1),
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
-        );
+        // Host accessibility is a property of slot 0 only, so a secondary is an
+        // ordinary colour slot and rests where every ordinary colour slot does.
+        assert_eq!(key.color_layout(1), color0_pass_exit_layout());
     }
 
     /// The pass key is the single source of truth for every place that names an
