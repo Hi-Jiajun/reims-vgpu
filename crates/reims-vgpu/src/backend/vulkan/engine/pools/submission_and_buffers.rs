@@ -87,43 +87,47 @@ mod pass_echo_delta_order {
     use ash::vk;
     use ash::vk::Handle as _;
 
-    fn echo(fb: u64, host_accessible: bool) -> PassEcho {
+    /// One echo. `fb` is derived from the pair the way the real framebuffer
+    /// cache derives it — `AdHocFramebufferKey` is `(render pass, views,
+    /// extent)` — so a shape change brings a new handle with it exactly as it
+    /// does on the draw path, which is the whole condition under test.
+    fn echo(image: u64, host_accessible: bool) -> PassEcho {
         let mut key = PassKey::single(true, vk::Format::B8G8R8A8_UNORM);
         key.host_accessible_color0 = host_accessible;
         PassEcho {
             cb: vk::CommandBuffer::null(),
             compatibility: key.compatibility(),
-            fb: vk::Framebuffer::from_raw(fb),
+            fb: vk::Framebuffer::from_raw(image * 2 + host_accessible as u64),
+            target_image: vk::Image::from_raw(image),
             area: (1920, 1080),
         }
     }
 
-    /// A break that is both a different render target *and* a different
-    /// attachment shape is a target switch, and must be charged as one.
+    /// One image described two ways must be charged to the shape, and a second
+    /// image to the target — even though both also carry a new framebuffer.
     ///
-    /// This is the whole reason the ladder asks the framebuffer first. With the
-    /// shape asked first, every draw into a guest-backed surface following a
-    /// draw into an ordinary resident landed in `passcompat_host_accessible` —
-    /// 59 365 of them on one driven Maps boot, the largest bucket in the census
-    /// — and read as this device describing one image two ways, which is a
-    /// defect, rather than as the guest changing target, which is not.
+    /// This is why the framebuffer cannot be the first question. It is a
+    /// function of the render pass as well as the views, so a shape flip on one
+    /// image produces a new handle too; asking `fb` first would empty
+    /// `passdiff_compat` — the bucket that names a defect — into `passdiff_fb`,
+    /// which names a guest action. At ~100 µs of GPU per pass instance that is
+    /// the ranking question for the largest cost in the device.
     #[test]
-    fn a_target_switch_is_not_reported_as_a_shape_flip() {
+    fn one_image_described_two_ways_is_not_charged_as_a_target_switch() {
         let mut pools = ResourcePools::new();
         pools.note_pass_opened(echo(1, false));
-        assert_eq!(
-            pools.pass_echo_delta(&echo(2, true)),
-            Some(PassEchoField::Framebuffer),
-            "a different framebuffer is a target switch however else the two differ"
-        );
-        // And the shape rung still fires when the framebuffer agrees, which is
-        // the case the split exists to isolate.
         assert!(
             matches!(
                 pools.pass_echo_delta(&echo(1, true)),
                 Some(PassEchoField::Compatibility(_))
             ),
-            "one framebuffer described two ways is what `passdiff_compat` now means"
+            "the same image with a different declared shape is a shape flip, \
+             despite the framebuffer the shape change brings with it"
+        );
+        assert_eq!(
+            pools.pass_echo_delta(&echo(2, false)),
+            Some(PassEchoField::Target),
+            "a different image at the same shape is the guest changing target"
         );
         assert_eq!(
             pools.pass_echo_delta(&echo(1, false)),
@@ -1708,25 +1712,30 @@ impl ResourcePools {
     /// `true` there, which is what makes the split a partition of
     /// `passmerge_pass_differs` rather than a second opinion about it.
     ///
-    /// # The framebuffer is asked before the shape, because they answer different
-    /// questions
+    /// # The framebuffer cannot be the first question, because it answers three
     ///
     /// Every rung here forces a new pass instance, so the order carries no
-    /// correctness weight and only decides which bucket a break lands in. That
-    /// makes it an instrument decision, and there is a right answer: **a
-    /// framebuffer difference is the guest changing render target, and a shape
-    /// difference on the same framebuffer is this device describing one target
-    /// two ways.** The first is a guest action nothing here can remove; the
-    /// second is a defect.
+    /// correctness weight and decides only which bucket a break is charged to.
+    /// That makes it an instrument decision, and it has a right answer: **the
+    /// guest rendering somewhere else is a guest action nothing here can remove,
+    /// and this device describing one target two ways is a defect.** They must
+    /// not share a bucket.
     ///
-    /// Asking the shape first conflates them, and it conflated them at scale: on
-    /// a driven macos-13 Maps boot `passcompat_host_accessible` was the largest
-    /// bucket of all at 59 365 breaks, and nothing said whether that was one
-    /// image whose host-accessibility this device kept changing its mind about —
-    /// which would be worth a full-surface layout resolve every time — or simply
-    /// a draw into a guest-backed surface following a draw into an ordinary
-    /// resident. With the framebuffer asked first, whatever remains under
-    /// `passdiff_compat` is the second thing and only the second thing.
+    /// A framebuffer handle cannot separate them. [`super::AdHocFramebufferKey`]
+    /// is `(render pass, views, extent)`, so a shape change *implies* a new
+    /// framebuffer over the very same attachments — asking `fb` first would put
+    /// every shape flip in `passdiff_fb` and leave `passdiff_compat` reading
+    /// zero, which is the informative bucket emptied into the uninformative one.
+    /// So the ladder asks the shape first, and [`PassEcho::target_image`] —
+    /// which decides nothing and exists only for this — separates what is left.
+    ///
+    /// Why it matters: a per-window regression of `gpu_span busy_us` on
+    /// `(draws, pass begins)` over three driven Maps boots puts a **pass
+    /// instance at ~100 µs of GPU against ~2 µs for a draw**, which is two
+    /// thirds of this iGPU's whole GPU time and the largest single cost in the
+    /// device. Which of these five reasons the 169 345 pass begins of a boot
+    /// belong to is therefore the ranking question, and each one names a
+    /// different repair.
     pub(crate) fn pass_echo_delta(&self, echo: &PassEcho) -> Option<PassEchoField> {
         let Some(last) = self.last_pass.as_ref() else {
             return Some(PassEchoField::Nothing);
@@ -1734,11 +1743,14 @@ impl ResourcePools {
         if last.cb != echo.cb {
             return Some(PassEchoField::Cb);
         }
-        if last.fb != echo.fb {
-            return Some(PassEchoField::Framebuffer);
-        }
         if let Some(field) = last.compatibility.first_difference(echo.compatibility) {
             return Some(PassEchoField::Compatibility(field));
+        }
+        if last.target_image != echo.target_image {
+            return Some(PassEchoField::Target);
+        }
+        if last.fb != echo.fb {
+            return Some(PassEchoField::Framebuffer);
         }
         if last.area != echo.area {
             return Some(PassEchoField::Area);

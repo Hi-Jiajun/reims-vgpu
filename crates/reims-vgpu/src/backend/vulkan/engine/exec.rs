@@ -4185,6 +4185,10 @@ pub(crate) unsafe fn execute_draw_inner(
         cb,
         compatibility: pass_key.compatibility(),
         fb: target_fb,
+        // Decides nothing — `fb` is a function of the views and already covers
+        // it. It is here so the census can tell a target switch apart from one
+        // target described two ways; see `ResourcePools::pass_echo_delta`.
+        target_image,
         area: (req.width, req.height),
     };
     let target_feedback = pass_key.color_feedback(0);

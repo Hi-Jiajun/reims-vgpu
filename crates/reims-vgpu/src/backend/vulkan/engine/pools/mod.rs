@@ -700,11 +700,19 @@ pub(crate) enum BatchFit {
 /// behind by the previous user of this handle names a pass that was ended and
 /// submitted. Every path that resets or submits a CB clears the echo, and the
 /// handle comparison is the second lock on the same door.
+/// `target_image` decides nothing — `fb` already covers it, because a
+/// framebuffer is a function of the views it was built over. It is carried so
+/// the census can tell the two reasons a framebuffer changes apart: the guest
+/// rendering somewhere else, and this device building a second framebuffer for
+/// the same attachments because it described the pass differently. Only the
+/// second is a defect, and without this field they were one number. See
+/// [`ResourcePools::pass_echo_delta`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PassEcho {
     pub(crate) cb: vk::CommandBuffer,
     pub(crate) compatibility: PassCompatibilityKey,
     pub(crate) fb: vk::Framebuffer,
+    pub(crate) target_image: vk::Image,
     pub(crate) area: (u32, u32),
 }
 
@@ -753,7 +761,15 @@ pub(crate) enum PassEchoField {
     /// for separately, so nothing can charge `passdiff_compat` without also
     /// saying which of the nine things moved.
     Compatibility(super::caches::PassCompatField),
-    /// Same pass shape, different framebuffer object.
+    /// A different primary render target: the guest is drawing somewhere else.
+    ///
+    /// Asked before [`Self::Compatibility`] would be wrong — a target switch and
+    /// a shape change are both real and the shape is the actionable one — so it
+    /// is asked *after*, and [`Self::Framebuffer`] below is then the residue.
+    Target,
+    /// Same pass shape and same primary target, and still a different
+    /// framebuffer object: a secondary or depth attachment moved, or this device
+    /// built a second framebuffer over one set of views.
     Framebuffer,
     /// Same framebuffer, different render area.
     Area,
@@ -765,6 +781,7 @@ impl PassEchoField {
             Self::Nothing => "passdiff_nothing",
             Self::Cb => "passdiff_cb",
             Self::Compatibility(_) => "passdiff_compat",
+            Self::Target => "passdiff_target",
             Self::Framebuffer => "passdiff_fb",
             Self::Area => "passdiff_area",
         }
@@ -777,7 +794,7 @@ impl PassEchoField {
     pub(crate) fn detail_route(self) -> Option<&'static str> {
         match self {
             Self::Compatibility(field) => Some(field.route()),
-            Self::Nothing | Self::Cb | Self::Framebuffer | Self::Area => None,
+            Self::Nothing | Self::Cb | Self::Target | Self::Framebuffer | Self::Area => None,
         }
     }
 }
