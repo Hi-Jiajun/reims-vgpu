@@ -8063,6 +8063,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // import is gone, so the only way a Store's pixels reach the guest is
         // the CPU writeback, and that needs them read back.
         resources.skip_readback = !store_is_store;
+        crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::AssembleTarget);
         // Ephemeral resident render-pass rail: intermediate Store records render
         // into a protocol-keyed RGBA target on every Vulkan backend. This does
         // not leave guest-visible content GPU-only: portability devices read the
@@ -8198,6 +8199,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // unblended attachment with a mask still leaves its unwritten channels
         // alone, so gating the mask on blending would drop it exactly where the
         // guest is replacing rather than compositing.
+        crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         resources.color_write_mask = pd.color0.write_mask;
         if pd.color0.blending_enabled {
             let constants = req.blend_color.unwrap_or([0.0; 4]);
@@ -8260,6 +8262,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Still-unrepresented sub-cases (guest depth LOAD, stencil test,
         // out-of-contract compare) are dropped fail-visibly, deduped per
         // (pipe,slug) so 3D content cannot flood the log.
+        crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::AssembleDepth);
         if req.depth_stencil_ref != 0 {
             let ds = match load_depth_stencil_descriptor(
                 state,
@@ -8425,6 +8428,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
             }
         }
+        crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         // The `fixed_gap` anomaly — decoded fixed-function state the Vulkan
         // request cannot represent — is the one thing here the always-on log
         // wants. It is deduped per (pipe, w, h, gap) so recurring depth/stencil
@@ -8512,6 +8516,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             ));
         }
 
+        crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::AssembleTrail);
         // Asked of the module rather than of m2v's reflection, which is the
         // whole point: the render path's existing unbound guard walks
         // `f_shader.reflection.bindings`, so a binding the translated SPIR-V
@@ -8645,6 +8650,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             frag_gap: frag_gap.0,
             frag_gap_lo: frag_gap.1,
         });
+        crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         resources.vert_spirv = v_words;
         resources.frag_spirv = f_words;
         resources.width = w;

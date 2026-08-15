@@ -2793,7 +2793,7 @@ fn emit_chain_phase() {
         "chain_phase chains={} prep_us={} pipeline_us={} pl_gen_us={} pl_desc_us={} \
          pl_mtlb_us={} pl_air_us={} pl_xlate_us={} binds_us={} sampled_us={} \
          seed_us={} assemble_us={} engine_us={} store_us={} prep_seed_us={} \
-         prep_pages_us={} max_us={}",
+         prep_pages_us={} asm_target_us={} asm_depth_us={} asm_trail_us={} max_us={}",
         w.chains,
         w.prep_us,
         w.pipeline_us,
@@ -2810,6 +2810,9 @@ fn emit_chain_phase() {
         w.store_us,
         w.prep_seed_us,
         w.prep_pages_us,
+        w.assemble_target_us,
+        w.assemble_depth_us,
+        w.assemble_trail_us,
         w.max_us,
     ));
     // Under `chain_phase`, dividing its largest column the same way

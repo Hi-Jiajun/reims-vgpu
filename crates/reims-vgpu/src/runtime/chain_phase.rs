@@ -156,12 +156,44 @@ pub enum Phase {
     /// `sync_store_allowed_pages` — the page-table walk that bounds the eager
     /// GVA fallback, taken before any GPU work so the set predates the submit.
     PrepPages = 14,
+    /// The four target-identity rails: resident render chain, GVA deferred
+    /// store, type-11 surface resident, and the Load-from-target identity.
+    ///
+    /// # Why the assemble span is split at all
+    ///
+    /// Once the framebuffer cache and the per-resource RAM re-import were fixed
+    /// (`38442dac`, `16be4a59`), `assemble_us` became the **largest non-engine
+    /// bar on the line** — 1.20 µs of an 11.4 µs Maps chain, ahead of `binds`
+    /// at 1.07 and `prep` at 0.89. Its doc named "allocation churn in request
+    /// assembly" as the lever, but the span is 900 lines and builds the struct
+    /// in only the first eighty of them. The rest is work with entirely
+    /// different fixes, and three candidates are structural rather than
+    /// churn-shaped: these identity rails, the depth/stencil descriptor load,
+    /// and a whole-module SPIR-V walk.
+    ///
+    /// These three tile the span rather than nominate a part of it, and
+    /// [`Self::Assemble`] stays the leftover — the same method `ExecPhase` used
+    /// on the exec packet, after nominating a part of the child-FIFO loop twice
+    /// did not work.
+    AssembleTarget = 15,
+    /// `load_depth_stencil_descriptor` and the depth/stencil state translation
+    /// under it: a guest object-list read plus a descriptor read per draw, on
+    /// every draw that binds any depth state at all.
+    AssembleDepth = 16,
+    /// The GPU hang trail and the fragment binding-gap check that feeds it.
+    ///
+    /// `declared_binding_numbers` is a **linear walk of the whole fragment
+    /// module**, run per draw against words behind an `Arc` that cannot change
+    /// — the same shape as the `pl_shader_us` finding, which was 63 ms of every
+    /// second spent deriving a key for a module already in hand. Charged apart
+    /// so the walk can be sized before it is memoized.
+    AssembleTrail = 17,
 }
 
 impl Phase {
     /// Highest ordinal, so [`PHASES`] is derived from the enum rather than
     /// hand-counted beside it.
-    const LAST: Phase = Phase::PrepPages;
+    const LAST: Phase = Phase::AssembleTrail;
 }
 
 const PHASES: usize = Phase::LAST as usize + 1;
@@ -203,6 +235,11 @@ pub struct ChainPhaseWindow {
     /// `prep_us` used to be alone.
     pub prep_seed_us: u64,
     pub prep_pages_us: u64,
+    /// The three spans carved out of `assemble_us`; the four together are what
+    /// `assemble_us` used to be alone.
+    pub assemble_target_us: u64,
+    pub assemble_depth_us: u64,
+    pub assemble_trail_us: u64,
     pub chains: u64,
     pub max_us: u64,
 }
@@ -227,6 +264,9 @@ pub fn take_window() -> Option<ChainPhaseWindow> {
         store_us: to_us(ACC[Phase::Store as usize].swap(0, Ordering::Relaxed)),
         prep_seed_us: to_us(ACC[Phase::PrepSeed as usize].swap(0, Ordering::Relaxed)),
         prep_pages_us: to_us(ACC[Phase::PrepPages as usize].swap(0, Ordering::Relaxed)),
+        assemble_target_us: to_us(ACC[Phase::AssembleTarget as usize].swap(0, Ordering::Relaxed)),
+        assemble_depth_us: to_us(ACC[Phase::AssembleDepth as usize].swap(0, Ordering::Relaxed)),
+        assemble_trail_us: to_us(ACC[Phase::AssembleTrail as usize].swap(0, Ordering::Relaxed)),
         chains,
         max_us: to_us(MAX_NS.swap(0, Ordering::Relaxed)),
     };
@@ -357,6 +397,47 @@ mod tests {
             "the sleep charged the sub-phase: {w:?}"
         );
         assert!(w.pipeline_us < 1_000, "and not the residue as well: {w:?}");
+    }
+
+    /// The three assemble sub-phases are carved out of `assemble_us` on the
+    /// same terms as the pipeline ones, and each lands in its own field.
+    ///
+    /// Both halves matter. A sub-phase whose charge also reached the residue
+    /// would double-count and read as the largest bar on the line; a sub-phase
+    /// wired to the wrong `ACC` slot would report one part's time under
+    /// another's name, which is worse than not splitting at all because it
+    /// still looks like an answer. The three sleeps are different lengths so a
+    /// crossed pair cannot pass.
+    #[test]
+    fn each_assemble_sub_phase_is_carved_out_and_lands_in_its_own_field() {
+        let _ = take_window();
+        {
+            let _t = ChainTimer::start();
+            enter(Phase::AssembleTarget);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            enter(Phase::AssembleDepth);
+            std::thread::sleep(std::time::Duration::from_millis(4));
+            enter(Phase::AssembleTrail);
+            std::thread::sleep(std::time::Duration::from_millis(6));
+            enter(Phase::Store);
+        }
+        let w = take_window().expect("one chain ran");
+        assert!(
+            (1_000..3_500).contains(&w.assemble_target_us),
+            "the 2 ms sleep charged the target rails and only them: {w:?}"
+        );
+        assert!(
+            (3_000..5_500).contains(&w.assemble_depth_us),
+            "the 4 ms sleep charged the depth load and only it: {w:?}"
+        );
+        assert!(
+            (5_000..7_500).contains(&w.assemble_trail_us),
+            "the 6 ms sleep charged the trail and only it: {w:?}"
+        );
+        assert!(
+            w.assemble_us < 1_000,
+            "and none of the three reached the residue: {w:?}"
+        );
     }
 
     /// A phase change with no timer live must not charge anything, or a stray
