@@ -1102,7 +1102,7 @@ fn the_pass_extent_census_scores_either_resolve_arm() {
     let _ = state.set_mapping_geom(7, 1920, 1080, 0);
 
     let before = store_route_count("pass_extent_le25");
-    note_pass_extent_for_slot(&state, 0, 7, &cmd);
+    note_pass_extent_for_slot(&state, 1, 0, 7, &cmd);
     assert_eq!(
         store_route_count("pass_extent_le25"),
         before + 1,
@@ -1114,8 +1114,8 @@ fn the_pass_extent_census_scores_either_resolve_arm() {
     // the census is defined on slot 0, the second because there is no
     // fraction to take.
     let before: u64 = PASS_EXTENT_SLUGS.iter().map(|s| store_route_count(s)).sum();
-    note_pass_extent_for_slot(&state, 1, 7, &cmd);
-    note_pass_extent_for_slot(&state, 0, 4242, &cmd);
+    note_pass_extent_for_slot(&state, 1, 1, 7, &cmd);
+    note_pass_extent_for_slot(&state, 1, 0, 4242, &cmd);
     assert_eq!(
         PASS_EXTENT_SLUGS
             .iter()

@@ -2040,7 +2040,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     if let Some(m) =
                         objects::resolve_type11_ref(state, host, task_id, published_ref)
                     {
-                        note_pass_extent_for_slot(state, slot, m, &cmd);
+                        note_pass_extent_for_slot(state, task_id, slot, m, &cmd);
                         if !out.type11_mappings.contains(&m) {
                             out.type11_mappings.push(m);
                         }
@@ -2048,7 +2048,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         // A type-4 attachment is its own mapping id — the arm
                         // below pushes `att.texture_ref` where the type-11 arm
                         // pushes the id it resolved to.
-                        note_pass_extent_for_slot(state, slot, published_ref, &cmd);
+                        note_pass_extent_for_slot(state, task_id, slot, published_ref, &cmd);
                         if !out.type11_mappings.contains(&published_ref) {
                             out.type11_mappings.push(published_ref);
                         }

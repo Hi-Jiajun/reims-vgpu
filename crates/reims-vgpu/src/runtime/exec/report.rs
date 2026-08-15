@@ -288,6 +288,7 @@ pub(super) const PASS_EXTENT_SLUGS: [&str; 7] = [
 /// the hottest record in the device.
 pub(super) fn note_pass_extent_for_slot(
     state: &crate::model::DeviceState,
+    task_id: u32,
     slot: u32,
     mapping_id: u32,
     cmd: &crate::runtime::decode::render::Command,
@@ -295,13 +296,59 @@ pub(super) fn note_pass_extent_for_slot(
     if slot != 0 {
         return;
     }
-    if let Some(e) = state.mappings.get(&mapping_id) {
-        note_pass_extent_coverage(
-            cmd.pass_render_target_width,
-            cmd.pass_render_target_height,
-            e.width,
-            e.height,
-        );
+    // Named whether or not the mapping resolves. The extent score below cannot
+    // run without the attachment's geometry, and on a driven boot that is most
+    // passes — `render_pass_target_extent_unapplied` counted 9 762 where the
+    // bands scored 2 952 — so a census that shared the scorer's guard would
+    // report a handful of tiny surfaces and read as if that were the whole
+    // population. The pass names its target either way; the geometry is the part
+    // that may be missing, and `?x?` says which.
+    match state.mappings.get(&mapping_id) {
+        Some(e) => {
+            note_pass_target(task_id, mapping_id, Some((e.width, e.height)));
+            note_pass_extent_coverage(
+                cmd.pass_render_target_width,
+                cmd.pass_render_target_height,
+                e.width,
+                e.height,
+            );
+        }
+        None => note_pass_target(task_id, mapping_id, None),
+    }
+}
+
+/// Name every distinct `(task, attachment surface, geometry)` this boot renders
+/// into, once each.
+///
+/// This device can say how many draws it executed, how they batched and what
+/// each pass's extent covered, and it could not say **which surface a given
+/// guest process was drawing into**. That gap is why a whole application's
+/// content going missing is hard to localise: an app whose window is black is
+/// either not rendering, rendering into a surface nothing composites, or
+/// rendering into one whose pixels are lost afterwards, and those three want
+/// completely different repairs. The composite side is already named — every
+/// present logs `present_page_identity mid=… kind=Composite` — so pairing that
+/// with this says whether the app's target is a surface the compositor ever
+/// reads.
+///
+/// Bounded by construction rather than by a cap: the key is the tuple, and a
+/// process renders into a handful of distinct surfaces, so a boot emits tens of
+/// lines and not one per pass. It is on the off channel because a render pass
+/// naming its own target is not a failure.
+fn note_pass_target(task_id: u32, mapping_id: u32, geom: Option<(u32, u32)>) {
+    let (w, h) = geom.unwrap_or((0, 0));
+    let key = (u64::from(task_id) << 48)
+        | (u64::from(mapping_id) << 32)
+        | (u64::from(w & 0xffff) << 16)
+        | u64::from(h & 0xffff);
+    if crate::observe::first_sight("pass_target", key) {
+        let geom = match geom {
+            Some((w, h)) => format!("{w}x{h}"),
+            None => "?x?".to_string(),
+        };
+        crate::observe::off(format!(
+            "pass_target task={task_id} mid={mapping_id} {geom}"
+        ));
     }
 }
 
