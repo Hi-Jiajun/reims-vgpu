@@ -849,11 +849,26 @@ pub fn settle_for_mapping<M: HostMemory + HostOps>(
     mapping_id: u32,
     site: crate::runtime::render_writeback::SettleSite,
 ) {
+    // Charged apart because subtracting the wait cannot tell them apart, and
+    // after the wait went away the remainder was still 4.9 s on a driven leg:
+    // that is either the payment doing work the quiesce used to have already
+    // landed, or the reach walk itself, and those want opposite repairs.
+    let pay_started = std::time::Instant::now();
     pay_for_mapping(state, host, mapping_id);
+    crate::runtime::drain::note_store_route_us(
+        "wbdebt_pay_us",
+        pay_started.elapsed().as_micros() as u64,
+    );
+    let reach_started = std::time::Instant::now();
     let s = &*state;
     crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(site, || {
+        crate::runtime::drain::note_store_route("wbdebt_reach_walk_n");
         s.mapping_reach_pages(mapping_id)
     });
+    crate::runtime::drain::note_store_route_us(
+        "wbdebt_reach_us",
+        reach_started.elapsed().as_micros() as u64,
+    );
 }
 
 /// [`settle_for_mapping`] for a caller that is **about to land the owed frame
