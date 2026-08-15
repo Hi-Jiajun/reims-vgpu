@@ -200,6 +200,51 @@ fn plain_triangle_known_color() {
     }
 }
 
+/// Four-sample rasterization with a matching resident depth attachment resolves
+/// coverage into the single-sample target.
+///
+/// The fixture covers its viewport. Moving the viewport's left edge into pixel
+/// zero leaves three standard 4x sample locations inside and one outside, so
+/// the resolved red channel must lie strictly between clear black and the
+/// fragment's red value. A one-sample redirect can only produce an endpoint.
+#[test]
+fn multisample_resolve_preserves_subpixel_coverage() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let mut req = engine_req(&v, &f, 32, 16);
+    req.raster_sample_count = 4;
+    req.color_sample_count = 4;
+    req.multisample_resolve = true;
+    req.depth = Some(DepthState {
+        identity: None,
+        test_enable: true,
+        write_enable: true,
+        compare: SamplerCompareFunction::Always,
+        clear_value: 1.0,
+        load: false,
+        stencil: None,
+    });
+    req.viewports = vec![ViewportResource {
+        x: 0.3,
+        y: 0.0,
+        width: 31.7,
+        height: 16.0,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    }];
+    if let Some(px) = draw_or_skip("multisample_resolve", &req) {
+        let red = px[(8 * 32) * 4];
+        assert!(
+            red > 0 && red < 64,
+            "resolved edge must carry partial coverage, got red={red}"
+        );
+        assert!(near(px[(8 * 32 + 1) * 4], 64));
+        let second = draw_or_skip("multisample_resolve_second", &req)
+            .expect("the second transient-depth framebuffer must not reuse the first one's view");
+        assert_eq!(second, px);
+    }
+}
+
 /// The whole `DrawOutput`, for a case whose answer is not pixels.
 ///
 /// [`draw_or_skip`] returns only the normalized colour bytes, which is right
@@ -567,6 +612,7 @@ fn depth_test_honored_compare_and_clear_wired() {
             volume: false,
             cube: false,
             one_dim: false,
+            multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
             byte_origin: Default::default(),
             format: ash::vk::Format::R8G8B8A8_UNORM,
@@ -699,6 +745,7 @@ fn depth_test_honored_on_resident_target_path() {
             volume: false,
             cube: false,
             one_dim: false,
+            multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
             byte_origin: Default::default(),
             format: ash::vk::Format::R8G8B8A8_UNORM,
@@ -838,6 +885,7 @@ fn stencil_test_honored_compare_ref_and_clear_wired() {
             volume: false,
             cube: false,
             one_dim: false,
+            multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
             byte_origin: Default::default(),
             format: ash::vk::Format::R8G8B8A8_UNORM,
@@ -990,6 +1038,7 @@ fn sampled_and_sampler_still_renders() {
         volume: false,
         cube: false,
         one_dim: false,
+        multisampled: false,
         source: SampledSource::Bytes(std::sync::Arc::new(vec![
             255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
         ])),
@@ -1093,6 +1142,7 @@ fn sampled_upload_happens_once_across_more_draws_than_the_ring_is_deep() {
         volume: false,
         cube: false,
         one_dim: false,
+        multisampled: false,
         source: SampledSource::Bytes(std::sync::Arc::new(vec![
             255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
         ])),
@@ -1172,6 +1222,7 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
         volume: false,
         cube: false,
         one_dim: false,
+        multisampled: false,
         source: SampledSource::Target(source.clone()),
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
@@ -1200,6 +1251,97 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
     load_again.load_from_target = true;
     let loaded = engine::execute_draw_request(&load_again).expect("load after direct sample");
     assert_fullscreen_fragment_color("resident_sample_reloaded", &semantic_rgba(&loaded), 16, 16);
+}
+
+/// A resident allocation may be written through a linear attachment view and
+/// sampled through its sRGB sibling. The sample must use the binding's view
+/// format: binding the attachment's cached linear view instead leaves the
+/// original (64,128,191) values instead of decoding them.
+#[test]
+fn resident_sample_uses_the_bindings_compatible_format_view() {
+    let _g = engine_test_session();
+    let (source_v, source_f) = triangle_spirv();
+    let source = TargetIdentity::Surface {
+        id: 0x53,
+        width: 16,
+        height: 16,
+        generation: 1,
+        format: ash::vk::Format::B8G8R8A8_UNORM,
+    };
+    let mut produce = engine_req(&source_v, &source_f, 16, 16);
+    produce.target_identity = Some(source.clone());
+    produce.skip_readback = true;
+    match engine::execute_draw_request(&produce) {
+        Ok(_) => {}
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {
+            eprintln!("SKIP resident compatible-format view: {e}");
+            return;
+        }
+        Err(e) => panic!("resident compatible-format source: {e}"),
+    }
+
+    let vert = translate_words("textured_quad.air", Stage::Vertex);
+    let frag = translate_words("textured_quad.air", Stage::Fragment);
+    let mut consume = engine_req(&vert, &frag, 16, 16);
+    consume.vertex_count = 6;
+    let positions: [[f32; 4]; 6] = [
+        [-1.0, -1.0, 0.0, 1.0],
+        [1.0, -1.0, 0.0, 1.0],
+        [-1.0, 1.0, 0.0, 1.0],
+        [-1.0, 1.0, 0.0, 1.0],
+        [1.0, -1.0, 0.0, 1.0],
+        [1.0, 1.0, 0.0, 1.0],
+    ];
+    let uvs: [[f32; 2]; 6] = [
+        [0.0, 1.0],
+        [1.0, 1.0],
+        [0.0, 0.0],
+        [0.0, 0.0],
+        [1.0, 1.0],
+        [1.0, 0.0],
+    ];
+    let encode_f32 = |values: &[f32]| {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>()
+    };
+    consume.storage_buffers.push(StorageBufferResource {
+        binding: 0,
+        content: encode_f32(&positions.into_iter().flatten().collect::<Vec<_>>()).into(),
+    });
+    consume.storage_buffers.push(StorageBufferResource {
+        binding: 1,
+        content: encode_f32(&uvs.into_iter().flatten().collect::<Vec<_>>()).into(),
+    });
+    consume.sampled_images.push(SampledImageResource {
+        binding: 32,
+        array_element: 0,
+        descriptor_count: 1,
+        width: 16,
+        height: 16,
+        layers: 1,
+        arrayed: false,
+        volume: false,
+        cube: false,
+        one_dim: false,
+        multisampled: false,
+        source: SampledSource::Target(source),
+        byte_origin: Default::default(),
+        format: ash::vk::Format::B8G8R8A8_SRGB,
+        identity: None,
+        swizzle: Default::default(),
+    });
+    consume
+        .samplers
+        .push(SamplerResource::normalized_default(sampler_binding(0)));
+    let out = engine::execute_draw_request(&consume).expect("sample compatible sRGB view");
+    let center = ((16 / 2) * 16 + 16 / 2) as usize * 4;
+    let px = &out.pixels[center..center + 4];
+    assert!(
+        near(px[0], 13) && near(px[1], 55) && near(px[2], 133) && near(px[3], 255),
+        "sRGB view must decode stored UNORM bytes, got {px:?}"
+    );
 }
 
 /// Attachment feedback binds the resident in place when the host exposes the
@@ -1242,6 +1384,7 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
         volume: false,
         cube: false,
         one_dim: false,
+        multisampled: false,
         source: SampledSource::Target(identity.clone()),
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
@@ -1259,6 +1402,7 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
         volume: false,
         cube: false,
         one_dim: false,
+        multisampled: false,
         source: SampledSource::Target(identity.clone()),
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
@@ -1354,6 +1498,7 @@ fn sampled_identity_fast_path_skips_content_compare() {
         volume: false,
         cube: false,
         one_dim: false,
+        multisampled: false,
         source: SampledSource::Bytes(std::sync::Arc::new(vec![
             255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
         ])),
@@ -1902,6 +2047,7 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
         volume: false,
         cube: false,
         one_dim: false,
+        multisampled: false,
         source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
@@ -2063,6 +2209,7 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         volume: false,
         cube: false,
         one_dim: false,
+        multisampled: false,
         source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
@@ -2193,6 +2340,7 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
             volume: false,
             cube: false,
             one_dim: false,
+            multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(bytes)),
             byte_origin: Default::default(),
             format,
@@ -2318,6 +2466,7 @@ fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
             volume: false,
             cube: false,
             one_dim: false,
+            multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(source.repeat(4))),
             byte_origin: Default::default(),
             format: ash::vk::Format::R8G8B8A8_UNORM,
@@ -3356,6 +3505,7 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
         volume: false,
         cube: false,
         one_dim: false,
+        multisampled: false,
         source: SampledSource::Target(secondary.clone()),
         byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,

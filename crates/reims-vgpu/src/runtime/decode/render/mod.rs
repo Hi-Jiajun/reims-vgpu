@@ -604,8 +604,8 @@ pub enum LevelSupport {
 
 /// Whether this device can honour an attachment's subresource as decoded.
 ///
-/// Slice 0, plane 0, no multisample resolve, and a level the caller's rail can
-/// reach. `slice` and `depth_plane` joined the test when they became decodable:
+/// Slice 0, plane 0, no multisample resolve for callers using this predicate,
+/// and a level the caller's rail can reach. `slice` and `depth_plane` joined the test when they became decodable:
 /// a depth buffer bound at slice 5 was previously read as slice 0 and silently
 /// accepted.
 ///
@@ -629,6 +629,17 @@ pub fn attachment_subresource_is_bindable(s: AttachSubresource, levels: LevelSup
         LevelSupport::AnyLevel => true,
     };
     level_ok && s.slice == 0 && s.depth_plane == 0 && s.resolve_texture_ref == 0
+}
+
+/// Whether a colour attachment's directly-addressed coordinates are bindable.
+///
+/// A resolve texture is a second attachment and an end-of-pass operation, not
+/// a coordinate of the multisample source. Keep it intact so the backend can
+/// encode or precisely refuse that operation. Depth and stencil continue to
+/// use [`attachment_subresource_is_bindable`] because their backend request
+/// types do not yet carry resolve destinations.
+pub fn color_attachment_subresource_is_bindable(s: AttachSubresource) -> bool {
+    s.slice == 0 && s.depth_plane == 0
 }
 
 /// Stencil attachment from a render-pass descriptor (slot @0x28).

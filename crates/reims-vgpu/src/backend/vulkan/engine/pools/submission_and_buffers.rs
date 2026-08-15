@@ -173,6 +173,7 @@ impl ResourcePools {
             settled_staging_mark: 0,
             targets: HashMap::new(),
             target_order: Vec::new(),
+            multisample_target: None,
             readback_free: HashMap::new(),
             readback_live: None,
             readback_multi_live: Vec::new(),
@@ -903,11 +904,13 @@ impl ResourcePools {
         &mut self,
         width: u32,
         height: u32,
+        sample_count: u32,
         format: vk::Format,
     ) -> Option<FreeTargetImage> {
         let key = TargetRecycleKey {
             width,
             height,
+            sample_count,
             format,
         };
         self.target_free.take(&key)
@@ -3314,6 +3317,116 @@ impl ResourcePools {
         Ok(self.targets.get(&map_key).unwrap())
     }
 
+    /// Acquire the discard-only source of a multisample resolve pass.
+    ///
+    /// One slot is sufficient: Metal's resolve-only store action makes the
+    /// source unobservable after the encoder ends. Replacing its shape does not
+    /// evict guest data; the displaced handles remain alive behind every ring
+    /// slot that could still reference them.
+    pub(crate) unsafe fn acquire_multisample_target(
+        &mut self,
+        ctx: &DeviceContext,
+        key: MultisampleTargetKey,
+        render_pass: vk::RenderPass,
+        counters: &EngineCounters,
+    ) -> Result<(vk::Image, vk::ImageView, vk::Framebuffer), DrawError> {
+        if let Some(slot) = self.multisample_target.as_ref() {
+            if slot.key == key && !key.transient_depth {
+                return Ok((slot.image, slot.view, slot.framebuffer));
+            }
+        }
+        if let Some(old) = self.multisample_target.take() {
+            self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
+            self.dispose(
+                &ctx.device,
+                DeferredHandle::Image {
+                    image: old.image,
+                    view: old.view,
+                    memory: old.memory,
+                },
+            );
+        }
+        let image = ctx
+            .device
+            .create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(key.format)
+                    .extent(vk::Extent3D {
+                        width: key.width,
+                        height: key.height,
+                        depth: 1,
+                    })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(super::super::caches::vk_sample_count(key.samples))
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+                    .initial_layout(vk::ImageLayout::UNDEFINED),
+                None,
+            )
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateTargetImage, e)))?;
+        counters.note_create(CreateSite::TargetImage);
+        let requirements = ctx.device.get_image_memory_requirements(image);
+        let memory = match self.bind_image_slab(
+            ctx,
+            image,
+            &requirements,
+            VkOp::PoolsBindTarget,
+            counters,
+        ) {
+            Ok(memory) => memory,
+            Err(error) => {
+                ctx.device.destroy_image(image, None);
+                return Err(error);
+            }
+        };
+        let view = ctx
+            .device
+            .create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(key.format)
+                    .subresource_range(super::super::color_subresource_range()),
+                None,
+            )
+            .map_err(|e| {
+                ctx.device.destroy_image(image, None);
+                self.free_image_slab(&ctx.device, image);
+                DrawError::VkCall(VkCall::new(VkOp::PoolsCreateTargetView, e))
+            })?;
+        counters.note_create(CreateSite::TargetImageView);
+        let mut attachments = vec![view, key.resolve_view];
+        attachments.extend(key.depth_view);
+        let framebuffer = ctx
+            .device
+            .create_framebuffer(
+                &vk::FramebufferCreateInfo::default()
+                    .render_pass(render_pass)
+                    .attachments(&attachments)
+                    .width(key.width)
+                    .height(key.height)
+                    .layers(1),
+                None,
+            )
+            .map_err(|e| {
+                ctx.device.destroy_image_view(view, None);
+                ctx.device.destroy_image(image, None);
+                self.free_image_slab(&ctx.device, image);
+                DrawError::VkCall(VkCall::new(VkOp::PoolsCreateFramebuffer, e))
+            })?;
+        counters.note_create(CreateSite::TargetFramebuffer);
+        self.multisample_target = Some(MultisampleTargetSlot {
+            image,
+            memory,
+            view,
+            framebuffer,
+            key,
+        });
+        Ok((image, view, framebuffer))
+    }
+
     pub(crate) unsafe fn acquire_sampled(
         &mut self,
         ctx: &DeviceContext,
@@ -5387,6 +5500,7 @@ mod recycle_tests {
             view: vk::ImageView::null(),
             width: w,
             height: h,
+            sample_count: 1,
             format,
         }
     }
@@ -5445,7 +5559,7 @@ mod recycle_tests {
         let fmt = translate::pixel::SCANOUT_FORMAT;
 
         // Frame 0: cold — no free image, so it counts as an alloc (miss).
-        assert!(pools.take_free_target(1920, 1080, fmt).is_none());
+        assert!(pools.take_free_target(1920, 1080, 1, fmt).is_none());
         // Its predecessor image is displaced (a new generation replaced it) and
         // recycled.
         assert!(pools
@@ -5456,7 +5570,7 @@ mod recycle_tests {
         // it replaces — steady state is hit-per-frame, alloc-once.
         for f in 0..8 {
             assert!(
-                pools.take_free_target(1920, 1080, fmt).is_some(),
+                pools.take_free_target(1920, 1080, 1, fmt).is_some(),
                 "frame {f} must reuse the recycled image"
             );
             assert!(pools

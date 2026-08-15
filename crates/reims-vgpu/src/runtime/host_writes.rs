@@ -140,7 +140,7 @@ impl HostWriteVerdict {
 /// run** before this record — it needs 64 consecutive vouched binds and the
 /// ring's refusal rate meant the run never happened — and it now completes ~950
 /// times across three boots with `gw_audit_unsound` at zero.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct PageEpochs {
     /// Last epoch at which this device wrote each guest page. The page number
     /// itself selects a chunk and a cell; only populated chunks are allocated.
@@ -169,15 +169,6 @@ impl Default for EpochChunk {
         Self {
             all_at: 0,
             cells: [0; EPOCHS_PER_CHUNK],
-        }
-    }
-}
-
-impl Default for PageEpochs {
-    fn default() -> Self {
-        Self {
-            chunks: std::collections::HashMap::new(),
-            unnamed_at: 0,
         }
     }
 }

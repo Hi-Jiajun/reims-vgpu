@@ -3465,6 +3465,26 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     let Some(pipeline) = load_compute_pipeline(state, host, task_id, acc.pipeline_ref) else {
         return ComputeStatus::MissingPipeline("compute_vk_pipeline_load");
     };
+    if let Some(stage_input) = pipeline.stage_input.as_ref() {
+        if crate::observe::first_sight("compute_stage_input_contract", u64::from(acc.pipeline_ref))
+        {
+            crate::observe::off(format!(
+                "compute_stage_input_contract pipe={} attrs={:?} layouts={:?} index_type={} \
+                 index_buffer={}",
+                acc.pipeline_ref,
+                stage_input.attributes,
+                stage_input.layouts,
+                stage_input.index_type,
+                stage_input.index_buffer_index,
+            ));
+        }
+    }
+    // A stage-in region this rail proceeds past — see
+    // `linux_stage_input_or_imageblock_unsupported`, which explains why that is
+    // lossless on a pipeline with no stage input. Counted rather than assumed.
+    if acc.stage_in_region.is_some() || acc.stage_in_region_indirect.is_some() {
+        crate::runtime::drain::note_store_route("compute_stage_in_region_unused");
+    }
     if linux_stage_input_or_imageblock_unsupported(pipeline.stage_input.is_some(), acc) {
         crate::observe::fail(format!(
             "compute_linux unsupported pipe={} stage_in_desc={} stage_in_direct={} \
@@ -4233,15 +4253,26 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     ComputeStatus::Ok
 }
 
+/// Whether this dispatch asks for something the Vulkan compute rail cannot do.
+///
+/// Only two things refuse: a pipeline carrying a stage-input descriptor, and an
+/// imageblock. Both name storage this rail has no representation for, so the
+/// dispatch would compute against memory that does not exist.
+///
+/// **`stage_in_region` and `stage_in_region_indirect` deliberately do not
+/// refuse.** They bound the stage-in grid a stage-input pipeline walks, so on a
+/// pipeline that declares no stage input there is nothing for them to bound and
+/// executing the dispatch loses no guest work. That is a claim about the
+/// contract rather than a measurement, which is why the caller counts the case
+/// (`compute_stage_in_region_unused`) instead of staying silent about it: if a
+/// guest ever pairs a region with a stage-input-free pipeline *and* depends on
+/// it, the counter is what says so.
 #[cfg(feature = "backend-vulkan")]
 pub(crate) fn linux_stage_input_or_imageblock_unsupported(
     pipeline_stage_input: bool,
     acc: &ComputeAccum,
 ) -> bool {
-    pipeline_stage_input
-        || acc.imageblock.is_some()
-        || acc.stage_in_region.is_some()
-        || acc.stage_in_region_indirect.is_some()
+    pipeline_stage_input || acc.imageblock.is_some()
 }
 
 #[cfg(feature = "backend-vulkan")]

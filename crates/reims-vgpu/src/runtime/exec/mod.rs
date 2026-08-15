@@ -7,7 +7,9 @@
 use crate::contract::draw::DrawArgs;
 use crate::contract::endian::{ld32, ld64};
 use crate::contract::pass_action::{
-    MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD, MTL_STORE_ACTION_STORE,
+    store_action_publishes_single_sample, MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD,
+    MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, MTL_STORE_ACTION_STORE,
+    MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
 };
 use crate::contract::pixel_format::{
     f64_to_unorm8, solid_rgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
@@ -26,10 +28,10 @@ use crate::runtime::decode::fifo::{
     CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN, CHILD_EXEC_INDIRECT_TASK_ID,
 };
 use crate::runtime::decode::render::{
-    self, attachment_subresource_is_bindable, decode_color_attachment, decode_depth_attachment,
-    LevelSupport,
-    decode_stencil_attachment, ColorAttachment, DepthAttachment, Kind as RenderKind, ScissorRect,
-    Stage, StencilAttachment, PASS_MAX_COLOR_ATTACHMENTS,
+    self, attachment_subresource_is_bindable, color_attachment_subresource_is_bindable,
+    decode_color_attachment, decode_depth_attachment, decode_stencil_attachment, ColorAttachment,
+    DepthAttachment, Kind as RenderKind, LevelSupport, ScissorRect, Stage, StencilAttachment,
+    PASS_MAX_COLOR_ATTACHMENTS,
 };
 use crate::runtime::decode::stream::{
     self, decode_first_record, decode_next_record, SEGMENT_TYPE_BLIT, SEGMENT_TYPE_COMPUTE,
@@ -216,7 +218,7 @@ impl StreamAccum {
     fn clears_reaching_guest_pages(&self) -> impl Iterator<Item = &ColorAttachment> {
         self.clears
             .iter()
-            .filter(|att| att.store_action == MTL_STORE_ACTION_STORE)
+            .filter(|att| store_action_publishes_single_sample(att.store_action))
     }
 
     /// The stream's bind state as a `PendingDraw`, or what makes it
@@ -1937,8 +1939,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         continue;
                     }
                     let slot = i as u32;
-                    // A slice, a depth plane or a multisample resolve target is
-                    // rendered past rather than into, and the pass is refused
+                    // A slice or depth plane is rendered past rather than into,
+                    // and the pass is refused
                     // for it. This used to be reported and then rendered anyway,
                     // on the argument that dropping the pass "would trade wrong
                     // pixels for none, which is worse". That argument does not
@@ -1958,14 +1960,10 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     // renders a blur pyramid level by level and every one of
                     // those passes was being dropped here.
                     //
-                    // Through the shared predicate rather than terms written out
-                    // here, which is what this arm used to carry and is how
-                    // `resolve_texture_ref` went untested: a colour attachment
-                    // with `resolveTexture` set is a multisample colour pass, and
-                    // this device rendered it single-sampled into the attachment
-                    // and never wrote the resolve target the guest goes on to
-                    // read.
-                    if !attachment_subresource_is_bindable(att.into(), LevelSupport::AnyLevel) {
+                    // A resolve destination is not a source coordinate. It stays
+                    // on the attachment so the backend can perform the
+                    // end-of-pass resolve or refuse that exact operation.
+                    if !color_attachment_subresource_is_bindable(att.into()) {
                         let drop = note_color_subresource_unsupported(task_id, slot, &att);
                         acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
                     }
@@ -1979,26 +1977,36 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     {
                         entry.1 = att;
                     }
-                    if !acc.color_targets.contains(&att.texture_ref) {
-                        acc.color_targets.push(att.texture_ref);
+                    let published_ref = if att.resolve_texture_ref != 0 {
+                        att.resolve_texture_ref
+                    } else {
+                        att.texture_ref
+                    };
+                    if !acc.color_targets.contains(&published_ref) {
+                        acc.color_targets.push(published_ref);
                     }
                     if !out.texture_refs.contains(&att.texture_ref) {
                         out.texture_refs.push(att.texture_ref);
                     }
+                    if att.resolve_texture_ref != 0
+                        && !out.texture_refs.contains(&att.resolve_texture_ref)
+                    {
+                        out.texture_refs.push(att.resolve_texture_ref);
+                    }
                     if let Some(m) =
-                        objects::resolve_type11_ref(state, host, task_id, att.texture_ref)
+                        objects::resolve_type11_ref(state, host, task_id, published_ref)
                     {
                         note_pass_extent_for_slot(state, slot, m, &cmd);
                         if !out.type11_mappings.contains(&m) {
                             out.type11_mappings.push(m);
                         }
-                    } else if objects::resolve_type4_surface(state, host, att.texture_ref) {
+                    } else if objects::resolve_type4_surface(state, host, published_ref) {
                         // A type-4 attachment is its own mapping id — the arm
                         // below pushes `att.texture_ref` where the type-11 arm
                         // pushes the id it resolved to.
-                        note_pass_extent_for_slot(state, slot, att.texture_ref, &cmd);
-                        if !out.type11_mappings.contains(&att.texture_ref) {
-                            out.type11_mappings.push(att.texture_ref);
+                        note_pass_extent_for_slot(state, slot, published_ref, &cmd);
+                        if !out.type11_mappings.contains(&published_ref) {
+                            out.type11_mappings.push(published_ref);
                         }
                     }
                     // The load action decides this, and only the load action.
@@ -2026,7 +2034,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // Also keep color0 from command for convenience.
             if cmd.color0.texture_ref != 0
                 && cmd.color0.load_action == MTL_LOAD_ACTION_CLEAR
-                && cmd.color0.store_action == MTL_STORE_ACTION_STORE
+                && store_action_publishes_single_sample(cmd.color0.store_action)
                 && !acc
                     .clears
                     .iter()
@@ -3691,10 +3699,12 @@ fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::Dra
             width: c.width,
             height: c.height,
             format: c.format,
+            sample_count: c.sample_count,
             load_action: MTL_LOAD_ACTION_LOAD,
             store_action: c.store_action,
             clear_color: c.clear_color,
             target_seed_rgba: None,
+            multisample_source_ref: c.multisample_source_ref,
         })
         .collect();
     draw::DrawEncodeRequest {
@@ -4006,14 +4016,42 @@ fn apply_clear<M: HostMemory + HostOps>(
     task_id: u32,
     att: &ColorAttachment,
 ) -> bool {
-    if att.texture_ref == 0 || att.store_action != MTL_STORE_ACTION_STORE {
+    if att.texture_ref == 0 || !store_action_publishes_single_sample(att.store_action) {
         return false;
     }
+    if att.store_action == MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE {
+        crate::observe::fail(format!(
+            "render_clear reason=clear_store_and_multisample_resolve_unsupported \
+             source={} resolve={}",
+            att.texture_ref, att.resolve_texture_ref
+        ));
+        return false;
+    }
+    if att.store_action == MTL_STORE_ACTION_MULTISAMPLE_RESOLVE
+        && att.resolve_texture_ref == 0
+    {
+        crate::observe::fail(format!(
+            "render_clear reason=clear_multisample_resolve_target_missing source={}",
+            att.texture_ref
+        ));
+        return false;
+    }
+    let target = if att.resolve_texture_ref != 0 {
+        ColorAttachment {
+            texture_ref: att.resolve_texture_ref,
+            resolve_texture_ref: 0,
+            level: 0,
+            store_action: MTL_STORE_ACTION_STORE,
+            ..*att
+        }
+    } else {
+        *att
+    };
     // Prefer full draw-path resolve (type-11 or type-2/3 GVA wallpaper targets).
     let Some(req) =
         // A clear-only pass: no pipeline and no geometry, so every draw
         // argument including the base instance is zero by construction.
-        draw::color_target_request(state, host, task_id, *att, 0, 0, 1, 0, 0, 0)
+        draw::color_target_request(state, host, task_id, target, 0, 0, 1, 0, 0, 0)
     else {
         // A clear whose color target cannot resolve (mapping unresolved, geometry
         // missing) is dropped here with no other trace — the "background didn't

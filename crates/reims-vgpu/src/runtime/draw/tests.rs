@@ -222,7 +222,12 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
             })
             .collect();
     }
-    assert!(state.set_mapping_geom(mid, 128, 128, MTL_FORMAT_BGRA8_UNORM));
+    assert!(state.set_mapping_geom(
+        mid,
+        128,
+        128,
+        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB,
+    ));
     crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
     let type11_witnesses = crate::runtime::drain::store_route_count("gw_rail_t11");
     let type5_witnesses = crate::runtime::drain::store_route_count("gw_rail_t5");
@@ -240,9 +245,18 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
         type11_resource.lifetime_ref(),
     )
     .expect("the mapping's color plane is sampleable");
-    let SampledSourceRequest::GuestRuns(type11, _, _, type11_identity, ..) = type11 else {
+    let SampledSourceRequest::GuestRuns(
+        type11,
+        _,
+        type11_format,
+        _,
+        type11_identity,
+        ..
+    ) = type11
+    else {
         panic!("the mapping stays guest-backed")
     };
+    assert_eq!(type11_format, ash::vk::Format::B8G8R8A8_SRGB);
     assert_eq!(type11_identity, None);
     assert_eq!(
         crate::runtime::drain::store_route_count("gw_rail_t11"),
@@ -268,9 +282,10 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
         type5_resource.lifetime_ref(),
     )
     .expect("the serialized plane view is sampleable");
-    let SampledSourceRequest::GuestRuns(type5, _, _, type5_identity, ..) = type5 else {
+    let SampledSourceRequest::GuestRuns(type5, _, type5_format, _, type5_identity, ..) = type5 else {
         panic!("the plane view stays guest-backed")
     };
+    assert_eq!(type5_format, ash::vk::Format::B8G8R8A8_UNORM);
     assert_eq!(type5_identity, None);
     assert_eq!(
         crate::runtime::drain::store_route_count("gw_rail_t5"),
@@ -1732,8 +1747,7 @@ fn gva_attachment_alias_samples_the_in_process_chain() {
             load_action: MTL_LOAD_ACTION_LOAD,
             target_seed_rgba: Some(seed.clone()),
             ..Default::default()
-        }]
-        .into(),
+        }],
         ..Default::default()
     };
 
@@ -2090,8 +2104,7 @@ fn missing_pipeline_is_soft() {
             format: MTL_FORMAT_BGRA8_UNORM,
             store_action: MTL_STORE_ACTION_STORE,
             ..Default::default()
-        }]
-        .into(),
+        }],
         ..Default::default()
     };
     let mut req = req;
@@ -2618,6 +2631,108 @@ fn mrt_draw_request_load_seed_miss_still_encodes() {
         "seed miss leaves seed None (Metal Clear invent, full Store)"
     );
     assert_eq!(req.colors[0].load_action, MTL_LOAD_ACTION_LOAD);
+}
+
+#[test]
+fn mrt_draw_request_keeps_multisample_source_and_resolve_destination_distinct() {
+    use crate::contract::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.define_task(1, 0x1000, 2);
+    for (texture_ref, mapping_id) in [(42, 9), (43, 10)] {
+        assert!(state.map_surface(mapping_id));
+        assert!(state.set_mapping_geom(mapping_id, 64, 64, MTL_FORMAT_BGRA8_UNORM));
+        state
+            .texture_to_mapping
+            .insert((1, texture_ref), mapping_id);
+    }
+    let mut att = clear_black_attachment(42);
+    att.resolve_texture_ref = 43;
+    att.store_action = MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
+
+    let req = single_rt_draw_request(&mut state, &mut host, 7, att)
+        .expect("matching source and resolve geometry is representable");
+    assert_eq!(req.colors.len(), 1);
+    assert_eq!(req.colors[0].texture_ref, 43, "the published target");
+    assert_eq!(
+        req.colors[0].multisample_source_ref, 42,
+        "the raster attachment remains separately named"
+    );
+    assert_eq!(
+        req.colors[0].store_action,
+        MTL_STORE_ACTION_MULTISAMPLE_RESOLVE
+    );
+}
+
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn mrt_draw_request_gets_attachment_samples_from_the_bound_pipeline_before_encode() {
+    use crate::contract::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::RenderPipelineDescriptor;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.define_task(1, 0x1000, 2);
+    for (texture_ref, mapping_id) in [(42, 9), (43, 10)] {
+        assert!(state.map_surface(mapping_id));
+        assert!(state.set_mapping_geom(mapping_id, 64, 64, MTL_FORMAT_BGRA8_UNORM));
+        state
+            .texture_to_mapping
+            .insert((1, texture_ref), mapping_id);
+    }
+    state.task_render_pipeline_states.register(
+        1,
+        7,
+        crate::runtime::pipeline_resolve::retained_pipeline_with_desc_for_test(
+            RenderPipelineDescriptor {
+                raster_sample_count: 4,
+                ..RenderPipelineDescriptor::default()
+            },
+        ),
+    );
+    let mut att = clear_black_attachment(42);
+    att.resolve_texture_ref = 43;
+    att.store_action = MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
+
+    let req = single_rt_draw_request(&mut state, &mut host, 7, att)
+        .expect("matching source and resolve geometry is representable");
+    assert_eq!(req.colors[0].sample_count, 4);
+    assert_eq!(req.colors[0].texture_ref, 43, "the published resolve target");
+    assert_eq!(
+        req.colors[0].multisample_source_ref, 42,
+        "the multisample source retains its own identity"
+    );
+}
+
+#[test]
+fn mrt_draw_request_refuses_a_resolve_destination_with_different_geometry() {
+    use crate::contract::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.define_task(1, 0x1000, 2);
+    for (texture_ref, mapping_id, width) in [(42, 9, 64), (43, 10, 32)] {
+        assert!(state.map_surface(mapping_id));
+        assert!(state.set_mapping_geom(mapping_id, width, 64, MTL_FORMAT_BGRA8_UNORM));
+        state
+            .texture_to_mapping
+            .insert((1, texture_ref), mapping_id);
+    }
+    let mut att = clear_black_attachment(42);
+    att.resolve_texture_ref = 43;
+    att.store_action = MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
+    let cap = crate::observe::FailCapture::start();
+
+    assert!(single_rt_draw_request(&mut state, &mut host, 7, att).is_none());
+    assert!(cap.lines().iter().any(|line| {
+        line.contains("render_resolve_target_mismatch")
+            && line.contains("source_geom=64x64")
+            && line.contains("resolve_geom=32x64")
+    }));
 }
 
 /// qemu-shim: type-8 view of type-11 is a valid color RT (archive
@@ -5377,11 +5492,12 @@ fn sampled_plane_keeps_the_packed_allocation_and_checks_its_extent() {
         0x2000,
         128,
         crate::contract::pixel_format::TexelLayout::Rgba8,
+        ash::vk::Format::R8G8B8A8_UNORM,
         crate::contract::pixel_format::SwizzlePlan::default(),
         resource.lifetime_ref(),
     )
     .expect("the retained allocation directly supplies this plane");
-    let super::vulkan::SampledSourceRequest::GuestRuns(source, _, 1, None, _, _) = request else {
+    let super::vulkan::SampledSourceRequest::GuestRuns(source, _, _, 1, None, _, _) = request else {
         panic!("a direct single plane has no copied-content identity")
     };
     assert_eq!(
@@ -5619,14 +5735,23 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
         width: 64,
         height: 64,
         format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        sample_count: 1,
         load_action: MTL_LOAD_ACTION_LOAD,
         store_action: MTL_STORE_ACTION_STORE,
         clear_color: [0.0; 4],
         target_seed_rgba: None,
+        multisample_source_ref: 0,
     };
 
     let armed = sync_store_allowed_pages(&state, &host, 1, Some(&c0), true)
         .expect("a resolvable GVA target must be bounded");
+    let mut resolve = c0.clone();
+    resolve.store_action =
+        crate::contract::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
+    assert!(
+        sync_store_allowed_pages(&state, &host, 1, Some(&resolve), true).is_some(),
+        "a resolve publishes into the same guest destination and needs the same bound"
+    );
     assert_eq!(
         armed.membership().len(),
         1,
@@ -5817,10 +5942,12 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
         width: W,
         height: H,
         format: fmt,
+        sample_count: 1,
         load_action: MTL_LOAD_ACTION_LOAD,
         store_action: MTL_STORE_ACTION_STORE,
         clear_color: [0.0; 4],
         target_seed_rgba: None,
+        multisample_source_ref: 0,
     };
     // Full height, left half only: the partial store the Load seed forces, and
     // it crosses the page boundary at row 64.

@@ -1141,7 +1141,7 @@ pub fn synchronize_guest_backed_resident(
         crate::backend::vulkan::engine::synchronize_guest_backed_target(identity)
             .map_err(|inner| GpuWritebackDecline::Engine { inner })?
     } else {
-        guest_store_footprint.ok_or_else(|| GpuWritebackDecline::Engine {
+        guest_store_footprint.ok_or(GpuWritebackDecline::Engine {
             inner: crate::backend::vulkan::engine::DrawError::GuestPageWrite(
                 crate::backend::vulkan::engine::GuestWriteDecline::NoSharedBacking,
             ),

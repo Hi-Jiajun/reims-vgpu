@@ -50,7 +50,9 @@ use crate::contract::pass_action::{is_declared_load_action, is_declared_store_ac
 use crate::contract::pass_action::{
     MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD, MTL_STORE_ACTION_STORE,
 };
-use crate::runtime::decode::render::{DepthAttachment, ScissorRect, StencilAttachment};
+use crate::runtime::decode::render::{
+    ColorAttachment, DepthAttachment, ScissorRect, StencilAttachment,
+};
 #[cfg(feature = "backend-vulkan")]
 use crate::runtime::decode::resource::TextureDescriptor;
 use crate::runtime::decode::resource::{
@@ -787,10 +789,16 @@ pub struct ColorRtRequest {
     pub width: u32,
     pub height: u32,
     pub format: u16,
+    /// Sample count of the attachment texture (the multisample source when a
+    /// separate resolve texture is present).
+    pub sample_count: u32,
     pub load_action: u16,
     pub store_action: u16,
     pub clear_color: [f64; 4],
     pub target_seed_rgba: Option<Vec<u8>>,
+    /// Multisample attachment discarded into this request's single-sample
+    /// target at pass end. Zero for an ordinary colour attachment.
+    pub multisample_source_ref: u32,
 }
 
 /// One `setVisibilityResultMode:offset:`, as the encoder state it is.
@@ -1904,6 +1912,24 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
 
     if req.colors.is_empty() {
         return (EncodeStatus::BadArgs("draw_mtl_no_color_target"), None);
+    }
+    if let Some(color) = req
+        .colors
+        .iter()
+        .find(|color| color.multisample_source_ref != 0)
+    {
+        crate::observe::fail(format!(
+            "metal_draw reason=draw_mtl_multisample_resolve_unsupported pipe={} \
+             source={} resolve={} store_action={}",
+            req.pipeline_ref,
+            color.multisample_source_ref,
+            color.texture_ref,
+            color.store_action
+        ));
+        return (
+            EncodeStatus::BadArgs("draw_mtl_multisample_resolve_unsupported"),
+            None,
+        );
     }
     // Before anything is resolved or staged: a bind naming a slot past its
     // argument table refuses the draw, once, for all three classes and both
@@ -3022,31 +3048,18 @@ pub(crate) fn note_load_action_dont_care(pipeline_ref: u32, width: u32, height: 
     }
 }
 
-/// Whether a decoded store action is one of the two `MTLStoreAction` values
-/// this device implements, reporting the one case where it is not.
+/// Whether a decoded store action is one of the named values this wire form
+/// carries, reporting an unknown value.
 ///
 /// The sibling of [`load_action_in_contract`], and it was missing while that one
 /// existed — the two fields are decoded from adjacent words of the same
 /// attachment prefix, so a decode that misreads one misreads the other, and only
 /// half of that was visible.
 ///
-/// A third value discards the attachment's result. `MTLStoreAction` really does
-/// have more than two (`MultisampleResolve` and friends), so unlike the load
-/// case an out-of-contract value here is not necessarily our misread — it can be
-/// a guest asking for something this device does not implement. Either way the
-/// frame the guest drew is dropped, which is exactly the loss the ground rules
-/// say must not be silent. Nothing about the decision changes: every caller
-/// already treats not-STORE as no-store, and picking a different answer needs a
-/// boot on the arm that would show it.
-///
-/// # The two consumers do not agree, and that is not settled here
-///
-/// `draw::vulkan`'s store gate asks `!= STORE`, so an out-of-contract value
-/// stores nothing. The writeback loop in this module asks `== DONT_CARE`, so the
-/// same value falls through and *does* store. One wire word, two opposite
-/// answers, and neither site said so. Left as it is on purpose — changing either
-/// is a behaviour change on a pathway this host cannot boot, and the first thing
-/// needed is a reading of whether a guest ever sends one.
+/// Recognizing a value is not backend authorization. The Vulkan request builder
+/// implements resolve-only for the supported shape and names every other
+/// resolve action as a typed refusal; the direct-Metal path likewise refuses
+/// before encoding until it carries the corresponding attachment lifecycle.
 #[cfg(any(
     feature = "backend-vulkan",
     all(feature = "backend-metal", target_os = "macos")
@@ -3059,7 +3072,8 @@ pub(crate) fn store_action_in_contract(pipeline_ref: u32, store_action: u16) -> 
         crate::observe::fail(format!(
             "pass_state_degraded reason=store_action_unmapped \
              pipe={pipeline_ref} store_action={store_action} \
-             (not one of MTLStoreAction 0/1; attachment result may be dropped)"
+             (not one of the represented MTLStoreAction values 0/1/2/3; \
+              attachment result may be dropped)"
         ));
     }
     false
@@ -4225,6 +4239,7 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
         height: h,
         row_stride: bpr,
         format: fmt,
+        sample_count: _,
     }) = lookup_render_target(state, host, task_id, *att)
     else {
         return lost("render_target_unresolved");
@@ -4320,6 +4335,16 @@ pub fn color_target_request<M: HostMemory + HostOps>(
 ) -> Option<DrawEncodeRequest> {
     let color_texture_ref = color.texture_ref;
     let rt = lookup_render_target(state, host, task_id, color)?;
+    #[cfg(feature = "backend-vulkan")]
+    let attachment_sample_count = crate::runtime::pipeline_resolve::attachment_sample_count(
+        state,
+        host,
+        task_id,
+        pipeline_ref,
+    )
+    .unwrap_or(rt.sample_count);
+    #[cfg(not(feature = "backend-vulkan"))]
+    let attachment_sample_count = rt.sample_count;
     let c0 = ColorRtRequest {
         slot: 0,
         texture_ref: color_texture_ref,
@@ -4329,10 +4354,12 @@ pub fn color_target_request<M: HostMemory + HostOps>(
         width: rt.width,
         height: rt.height,
         format: rt.format,
+        sample_count: attachment_sample_count,
         load_action: 0,
         store_action: MTL_STORE_ACTION_STORE,
         clear_color: [0.0; 4],
         target_seed_rgba: None,
+        multisample_source_ref: 0,
     };
     Some(DrawEncodeRequest {
         task_id,
@@ -4364,6 +4391,18 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
     if color_slots.is_empty() {
         return None;
     }
+    // Linear allocation dimensions expose mip and array geometry, but do not
+    // repeat a texture's immutable creation sample count. At render time the
+    // bound pipeline supplies the missing contract: every color attachment
+    // must match its raster sample count. Resolve that before LOAD/CLEAR seed
+    // policy and before this request is cloned by either encoder.
+    #[cfg(feature = "backend-vulkan")]
+    let pipeline_sample_count = crate::runtime::pipeline_resolve::attachment_sample_count(
+        state,
+        host,
+        task_id,
+        pipeline_ref,
+    );
     let mut colors = Vec::new();
     let mut base_w = 0u32;
     let mut base_h = 0u32;
@@ -4380,40 +4419,88 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             continue;
         }
         crate::runtime::drain::note_store_route("mrt_slot_attached");
-        let Some(ResolvedRenderTarget {
+        // Resolve both sides independently. The source proves the multisample
+        // attachment's shape; the destination becomes the guest-visible target
+        // that the backend stores and reads back.
+        let Some(source_target) = lookup_render_target(state, host, task_id, att) else {
+            crate::runtime::drain::note_store_route("mrt_slot_unresolved");
+            return None;
+        };
+        let (target_ref, multisample_source_ref, target) = if att.resolve_texture_ref != 0 {
+            let resolve_attachment = ColorAttachment {
+                texture_ref: att.resolve_texture_ref,
+                resolve_texture_ref: 0,
+                level: 0,
+                ..att
+            };
+            let Some(resolve_target) =
+                lookup_render_target(state, host, task_id, resolve_attachment)
+            else {
+                crate::runtime::drain::note_store_route("mrt_resolve_target_unresolved");
+                return None;
+            };
+            #[cfg(feature = "backend-vulkan")]
+            if crate::observe::first_sight(
+                "render_resolve_contract",
+                (u64::from(att.texture_ref) << 32) | u64::from(att.resolve_texture_ref),
+            ) {
+                crate::observe::off(format!(
+                    "render_resolve_contract task={task_id} pipe={pipeline_ref} \
+                     source_ref={} source_mid={} source_gva={:#x} source={}x{} \
+                     source_fmt={:#x} resolve_ref={} resolve_mid={} resolve_gva={:#x} \
+                     resolve={}x{} resolve_fmt={:#x} load={} store={} raster_samples={}",
+                    att.texture_ref,
+                    source_target.mapping_id,
+                    source_target.target_gva,
+                    source_target.width,
+                    source_target.height,
+                    source_target.format,
+                    att.resolve_texture_ref,
+                    resolve_target.mapping_id,
+                    resolve_target.target_gva,
+                    resolve_target.width,
+                    resolve_target.height,
+                    resolve_target.format,
+                    att.load_action,
+                    att.store_action,
+                    pipeline_sample_count.unwrap_or(1),
+                ));
+            }
+            if source_target.width != resolve_target.width
+                || source_target.height != resolve_target.height
+                || source_target.format != resolve_target.format
+            {
+                crate::observe::fail(format!(
+                    "render_resolve_target_mismatch source={} resolve={} source_geom={}x{} \
+                     resolve_geom={}x{} source_fmt={:#x} resolve_fmt={:#x}",
+                    att.texture_ref,
+                    att.resolve_texture_ref,
+                    source_target.width,
+                    source_target.height,
+                    resolve_target.width,
+                    resolve_target.height,
+                    source_target.format,
+                    resolve_target.format
+                ));
+                return None;
+            }
+            (att.resolve_texture_ref, att.texture_ref, resolve_target)
+        } else {
+            (att.texture_ref, 0, source_target)
+        };
+        let ResolvedRenderTarget {
             mapping_id,
             target_gva: gva,
             width: mw,
             height: mh,
             row_stride: bpr,
             format: mfmt,
-        }) = lookup_render_target(state, host, task_id, att)
-        else {
-            // One unresolvable color attachment drops the whole pass (Metal
-            // would not form the encoder with a null RT).
-            //
-            // The *reason* is deliberately not restated here. This used to call
-            // `sample_miss_detail`, which walks the object list a second time
-            // and guesses at why the resolve failed — a second implementation
-            // of a question `lookup_render_target` had just answered, in the
-            // *sampled*-texture vocabulary (`reason=ref_texture_view`,
-            // `reason=type11_resolve`), attached to a render-target failure. It
-            // could disagree with the resolve it was explaining and nothing
-            // compared them. The resolve now emits its own typed refusal naming
-            // the check that refused, on the line immediately above this one.
-            //
-            // Nor is a third line spent on the loss itself. Both callers
-            // already report this `None` with a reason of their own —
-            // `render_icb fail reason=mrt_request` and `metal_draw mrt_request
-            // fail … slots=[…]`, the latter listing every attachment ref in the
-            // pass — so between them and the `rt_resolve` line above, the check,
-            // the ref and the pass are all named. What none of them carried is
-            // *magnitude*: both caller lines are undeduped, and neither
-            // separates "a slot would not resolve" from the other ways this
-            // builder returns nothing. That is a counter's job.
-            crate::runtime::drain::note_store_route("mrt_slot_unresolved");
-            return None;
-        };
+            sample_count: target_sample_count,
+        } = target;
+        #[cfg(feature = "backend-vulkan")]
+        let attachment_sample_count = pipeline_sample_count.unwrap_or(target_sample_count);
+        #[cfg(not(feature = "backend-vulkan"))]
+        let attachment_sample_count = target_sample_count;
         if base_w == 0 {
             base_w = mw;
             base_h = mh;
@@ -4518,17 +4605,19 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
         }
         colors.push(ColorRtRequest {
             slot,
-            texture_ref: att.texture_ref,
+            texture_ref: target_ref,
             mapping_id,
             target_gva: gva,
             row_stride: bpr,
             width: mw,
             height: mh,
             format: mfmt,
+            sample_count: attachment_sample_count,
             load_action,
             store_action: att.store_action,
             clear_color,
             target_seed_rgba: seed,
+            multisample_source_ref,
         });
     }
     if colors.is_empty() {
@@ -4638,7 +4727,7 @@ pub(crate) fn sync_store_target_pages<M: HostMemory>(
     c: &ColorRtRequest,
 ) -> Option<StoreTargetPages> {
     if c.target_gva == 0
-        || c.store_action != MTL_STORE_ACTION_STORE
+        || !crate::contract::pass_action::store_action_publishes_single_sample(c.store_action)
         || c.width == 0
         || c.height == 0
     {
@@ -5651,7 +5740,10 @@ mod load_action_contract_tests {
 #[cfg(all(test, feature = "backend-vulkan"))]
 mod store_action_contract_tests {
     use super::store_action_in_contract;
-    use crate::contract::pass_action::{MTL_STORE_ACTION_DONT_CARE, MTL_STORE_ACTION_STORE};
+    use crate::contract::pass_action::{
+        MTL_STORE_ACTION_DONT_CARE, MTL_STORE_ACTION_MULTISAMPLE_RESOLVE,
+        MTL_STORE_ACTION_STORE, MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
+    };
 
     /// The sibling of `a_load_action_outside_mtlloadaction_is_named_not_swallowed`,
     /// and it did not exist while that one did.
@@ -5666,6 +5758,11 @@ mod store_action_contract_tests {
         for (name, action) in [
             ("DontCare", MTL_STORE_ACTION_DONT_CARE),
             ("Store", MTL_STORE_ACTION_STORE),
+            ("MultisampleResolve", MTL_STORE_ACTION_MULTISAMPLE_RESOLVE),
+            (
+                "StoreAndMultisampleResolve",
+                MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
+            ),
         ] {
             assert!(
                 store_action_in_contract(0x570E, action),
@@ -5676,7 +5773,7 @@ mod store_action_contract_tests {
         // (pipeline, slug) and a second call on one ref would report nothing.
         assert!(!store_action_in_contract(
             0xF101,
-            MTL_STORE_ACTION_STORE + 1
+            MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE + 1
         ));
         assert!(!store_action_in_contract(0xF102, u16::MAX));
 

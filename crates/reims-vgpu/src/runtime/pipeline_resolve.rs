@@ -171,7 +171,9 @@ pub struct ResolvedRenderPipeline {
 }
 
 #[cfg(test)]
-pub(crate) fn retained_pipeline_for_test() -> Arc<ResolvedRenderPipeline> {
+pub(crate) fn retained_pipeline_with_desc_for_test(
+    desc: RenderPipelineDescriptor,
+) -> Arc<ResolvedRenderPipeline> {
     use metal2vulkan::reflect::{ShaderReflection, ShaderStage, REFLECTION_VERSION};
 
     let reflection = |stage| {
@@ -197,7 +199,7 @@ pub(crate) fn retained_pipeline_for_test() -> Arc<ResolvedRenderPipeline> {
             function_constants: vec![],
         })
     };
-    let desc = Arc::new(RenderPipelineDescriptor::default());
+    let desc = Arc::new(desc);
     Arc::new(ResolvedRenderPipeline {
         pipeline_object: Some(crate::backend::vulkan::engine::PipelineObjectIdentity::new()),
         bind_plan: Arc::new(VertexBindPlan::build(&desc)),
@@ -208,6 +210,11 @@ pub(crate) fn retained_pipeline_for_test() -> Arc<ResolvedRenderPipeline> {
             reflection(ShaderStage::Fragment),
         )),
     })
+}
+
+#[cfg(test)]
+pub(crate) fn retained_pipeline_for_test() -> Arc<ResolvedRenderPipeline> {
+    retained_pipeline_with_desc_for_test(RenderPipelineDescriptor::default())
 }
 
 /// Whether retained pipeline states are on. See [`crate::env::PIPELINE_MEMO`].
@@ -302,6 +309,33 @@ pub fn resolve<M: HostMemory + HostOps>(
         pipeline_ref,
         resolved,
     ))
+}
+
+/// The sample count an attachment bound with this pipeline must carry.
+///
+/// The serialized allocation dimensions available while resolving a linear
+/// texture do not repeat the immutable texture-creation sample count. The
+/// render contract still supplies a total answer: every attached render target
+/// must match the bound pipeline's `rasterSampleCount`, while a distinct resolve
+/// destination is single-sampled. Ask retained pipeline state first; on its
+/// first draw, decode only the pipeline descriptor and let [`resolve`] retain
+/// the complete translated state when encoding begins.
+pub fn attachment_sample_count<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    pipeline_ref: u32,
+) -> Option<u32> {
+    if memo_enabled() {
+        if let Some(resolved) = state
+            .task_render_pipeline_states
+            .get(task_id, pipeline_ref)
+        {
+            return Some(resolved.desc.raster_sample_count.max(1));
+        }
+    }
+    crate::runtime::draw::load_render_pipeline(state, host, task_id, pipeline_ref)
+        .map(|desc| desc.raster_sample_count.max(1))
 }
 
 /// The full path: object list → descriptor → decode → MTLB → AIR → SPIR-V, for

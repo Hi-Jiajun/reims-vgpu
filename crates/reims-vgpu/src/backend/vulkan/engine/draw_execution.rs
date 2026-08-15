@@ -104,6 +104,12 @@ pub enum DrawExecutionDecline {
         resource_width: u32,
         resource_height: u32,
     },
+    SampledResidentSampleCountMismatch {
+        binding: u32,
+        identity: TargetIdentity,
+        resident_samples: u32,
+        shader_multisampled: bool,
+    },
     /// A staging write asked for more bytes than the slot it is writing into
     /// holds.
     ///
@@ -176,6 +182,9 @@ impl Decline for DrawExecutionDecline {
             Self::SampledResidentNotReady { .. } => "vk_draw_exec_sampled_resident_not_ready",
             Self::SampledResidentGeometryMismatch { .. } => {
                 "vk_draw_exec_sampled_resident_geometry_mismatch"
+            }
+            Self::SampledResidentSampleCountMismatch { .. } => {
+                "vk_draw_exec_sampled_resident_sample_count_mismatch"
             }
             Self::StagingWriteBeyondSlot { .. } => "vk_draw_exec_staging_write_beyond_slot",
             Self::ReadBackBeyondSlot { .. } => "vk_draw_exec_read_back_beyond_slot",
@@ -267,6 +276,20 @@ impl Decline for DrawExecutionDecline {
                     ("resident_height", resident_height.to_string()),
                     ("resource_width", resource_width.to_string()),
                     ("resource_height", resource_height.to_string()),
+                ]);
+                fields
+            }
+            Self::SampledResidentSampleCountMismatch {
+                binding,
+                identity,
+                resident_samples,
+                shader_multisampled,
+            } => {
+                let mut fields = vec![("binding", binding.to_string())];
+                fields.extend(identity_fields(identity));
+                fields.extend([
+                    ("resident_samples", resident_samples.to_string()),
+                    ("shader_multisampled", shader_multisampled.to_string()),
                 ]);
                 fields
             }

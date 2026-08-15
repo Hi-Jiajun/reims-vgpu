@@ -164,8 +164,16 @@ impl ResourcePools {
             device.destroy_image(t.image, None);
         }
         self.target_order.clear();
+        if let Some(t) = self.multisample_target.take() {
+            device.destroy_framebuffer(t.framebuffer, None);
+            device.destroy_image_view(t.view, None);
+            device.destroy_image(t.image, None);
+        }
         for (_, t) in self.registry.drain() {
             device.destroy_framebuffer(t.framebuffer, None);
+            for (_, view) in t.alternate_views {
+                device.destroy_image_view(view, None);
+            }
             device.destroy_image_view(t.view, None);
             device.destroy_image(t.image, None);
         }

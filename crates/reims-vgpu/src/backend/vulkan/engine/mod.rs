@@ -507,8 +507,10 @@ mod device_capability_snapshot_tests {
 
     #[test]
     fn one_word_preserves_every_published_device_answer() {
-        let mut features = crate::backend::vulkan::caps::device_features::DeviceFeatures::default();
-        features.max_image_dimension_2d = 16_384;
+        let mut features = crate::backend::vulkan::caps::device_features::DeviceFeatures {
+            max_image_dimension_2d: 16_384,
+            ..Default::default()
+        };
         features.color_attachment_blend[TexelLayout::Rgba16Float.index()] = true;
         features.sampled_linear_filter[TexelLayout::Rgba16Float.index()] = true;
 
@@ -4294,6 +4296,13 @@ fn resident_read_snapshot(
     if !slot.content_ready {
         return Err(DrawError::TargetRead(
             reason::TargetReadDecline::NoReadyContent,
+        ));
+    }
+    if slot.sample_count != 1 {
+        return Err(DrawError::TargetRead(
+            reason::TargetReadDecline::MultisampleImage {
+                sample_count: slot.sample_count,
+            },
         ));
     }
     Ok(ResidentReadSnapshot {

@@ -390,6 +390,15 @@ pub struct DrawRequest {
     /// Metal baseInstance / Vulkan firstInstance. Constant step-function shift uses this.
     pub base_instance: u32,
     pub primitive_topology: PrimitiveTopology,
+    /// Pipeline rasterization sample count.
+    pub raster_sample_count: u32,
+    /// Sample count of the colour attachment the fragment pipeline writes.
+    /// An explicit resolve still names its multisample source here; the
+    /// single-sample destination is represented by [`Self::multisample_resolve`].
+    pub color_sample_count: u32,
+    /// Rasterize into an N-sample attachment and resolve into the ordinary
+    /// primary target at render-pass end.
+    pub multisample_resolve: bool,
     /// Every viewport the guest bound, in its order. Empty takes the
     /// full-target default, and so does any slot past the end of this list when
     /// [`Self::scissors`] is longer — the two counts are independent in Metal
@@ -451,6 +460,13 @@ pub struct DrawRequest {
     pub color_write_mask: ColorWriteMask,
     /// Protocol-derived target identity for GPU residency (workstream D).
     pub target_identity: Option<TargetIdentity>,
+    /// Format of colour attachment zero's texture view.
+    ///
+    /// This can differ from [`TargetIdentity::resident_format`] without naming
+    /// another allocation. Metal texture views over one surface commonly use
+    /// the linear and sRGB members of one format-compatibility class; Vulkan
+    /// represents that distinction on the image view and render pass.
+    pub color_attachment_format: Option<vk::Format>,
     /// Stable shared allocation that may back the primary resident image
     /// directly.
     ///
@@ -1061,6 +1077,10 @@ pub struct SampledImageResource {
     /// shader's declared 1D image. `height` is 1; `arrayed` selects
     /// `TYPE_1D_ARRAY`. Mutually exclusive with `volume` and `cube`.
     pub one_dim: bool,
+    /// The shader declares a multisampled 2D image at this binding. Such an
+    /// image can only come from a retained multisample target; linear bytes
+    /// cannot be uploaded into one with a buffer-to-image copy.
+    pub multisampled: bool,
     pub source: SampledSource,
     /// API resource family that produced [`SampledSource::Bytes`].
     ///
@@ -1772,7 +1792,7 @@ impl TargetIdentity {
     /// disagree, and every readback reports the order it copied. The identity
     /// is the only place the answer was pinned to a namespace.
     pub fn is_bgra(&self) -> bool {
-        self.resident_format() == translate::pixel::SCANOUT_FORMAT
+        translate::pixel::has_bgra_order(self.resident_format())
     }
 
     /// Whether these two identities name the same destination, whatever format
@@ -2221,6 +2241,8 @@ mod tests {
         for (format, bgra) in [
             (translate::pixel::RESIDENT_RGBA_FORMAT, false),
             (translate::pixel::SCANOUT_FORMAT, true),
+            (ash::vk::Format::R8G8B8A8_SRGB, false),
+            (ash::vk::Format::B8G8R8A8_SRGB, true),
         ] {
             let gva = TargetIdentity::Gva {
                 gva: 0x1000,

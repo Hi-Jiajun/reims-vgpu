@@ -121,6 +121,28 @@ pub(crate) struct TargetSlot {
     pub framebuffer: vk::Framebuffer,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MultisampleTargetKey {
+    pub width: u32,
+    pub height: u32,
+    pub format: vk::Format,
+    pub samples: u32,
+    pub compatibility: FramebufferCompatibilityKey,
+    pub resolve_view: vk::ImageView,
+    pub depth_view: Option<vk::ImageView>,
+    /// The depth view dies with this draw and therefore cannot make the cached
+    /// framebuffer reusable, even if the driver later recycles its raw handle.
+    pub transient_depth: bool,
+}
+
+pub(crate) struct MultisampleTargetSlot {
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub view: vk::ImageView,
+    pub framebuffer: vk::Framebuffer,
+    pub key: MultisampleTargetKey,
+}
+
 /// A readback slot checked out of the pool, and the token its holder returns.
 pub(crate) struct LeasedReadback {
     pub token: u64,
@@ -287,6 +309,10 @@ pub(crate) struct ResourcePools {
     /// Target images + framebuffers keyed by geometry + render_pass identity.
     targets: HashMap<(TargetKey, u64), TargetSlot>, // u64 = render_pass as u64
     target_order: Vec<(TargetKey, u64)>,
+    /// One discard-only multisample attachment. Its framebuffer includes the
+    /// current single-sample resolve view; a shape change safely retires it
+    /// behind the command-buffer ring rather than retaining guest content.
+    multisample_target: Option<MultisampleTargetSlot>,
     /// Readback buffers by size.
     readback_free: HashMap<u64, Vec<BufferSlot>>,
     readback_live: Option<BufferSlot>,
@@ -921,6 +947,7 @@ pub(crate) enum DeferredHandle {
     /// still reference the displaced image, so it only rejoins the free list
     /// once `in_flight == 0`.
     RecycleTarget(FreeTargetImage),
+    ImageView(vk::ImageView),
     Framebuffer(vk::Framebuffer),
     Pipeline(vk::Pipeline),
     PipelineLayout(vk::PipelineLayout),
@@ -985,6 +1012,7 @@ impl ResourcePools {
                     device.free_memory(img.memory, None);
                 }
             }
+            DeferredHandle::ImageView(view) => device.destroy_image_view(view, None),
             DeferredHandle::Framebuffer(fb) => device.destroy_framebuffer(fb, None),
             DeferredHandle::Pipeline(p) => device.destroy_pipeline(p, None),
             DeferredHandle::PipelineLayout(pl) => device.destroy_pipeline_layout(pl, None),
@@ -1616,11 +1644,17 @@ pub(crate) struct ResidentTargetSlot {
     pub image: vk::Image,
     pub memory: ResidentMemory,
     pub view: vk::ImageView,
+    /// Additional compatible-format views over `image`, retained for the
+    /// resident's lifetime. A texture view changes interpretation, not storage;
+    /// keeping these beside the allocation avoids copying pixels or rebuilding
+    /// a view on every draw.
+    pub alternate_views: Vec<(vk::Format, vk::ImageView)>,
     pub framebuffer: vk::Framebuffer,
     pub render_pass: vk::RenderPass,
     pub framebuffer_compatibility: Option<FramebufferCompatibilityKey>,
     pub width: u32,
     pub height: u32,
+    pub sample_count: u32,
     pub generation: u64,
     pub content_ready: bool,
     /// The mapping-level `surface_content_epoch` this image's pixels were last
@@ -1787,7 +1821,7 @@ impl ResidentTargetSlot {
     /// one slot. `resident_color` maps the two `bgra` values onto two distinct
     /// formats, so this test answers both arms identically.
     pub(crate) fn scanout_order(&self) -> bool {
-        self.color_format == translate::pixel::SCANOUT_FORMAT
+        translate::pixel::has_bgra_order(self.color_format)
     }
 
     /// The framebuffer this slot owes the deferred-destroy path, or `None` when
@@ -1857,11 +1891,13 @@ impl ResidentTargetSlot {
         &self,
         width: u32,
         height: u32,
+        sample_count: u32,
         generation: u64,
         format: vk::Format,
     ) -> bool {
         self.width == width
             && self.height == height
+            && self.sample_count == sample_count
             && self.generation == generation
             && self.color_format == format
     }
@@ -1879,6 +1915,7 @@ impl ResidentTargetSlot {
 struct TargetRecycleKey {
     width: u32,
     height: u32,
+    sample_count: u32,
     format: vk::Format,
 }
 
@@ -1894,6 +1931,7 @@ pub(crate) struct FreeTargetImage {
     view: vk::ImageView,
     width: u32,
     height: u32,
+    sample_count: u32,
     format: vk::Format,
 }
 
@@ -1902,6 +1940,7 @@ impl FreeTargetImage {
         TargetRecycleKey {
             width: self.width,
             height: self.height,
+            sample_count: self.sample_count,
             format: self.format,
         }
     }
@@ -2982,6 +3021,7 @@ mod sampled_key_tests {
             volume,
             cube,
             one_dim,
+            multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(Vec::new())),
             byte_origin: Default::default(),
             format: ash::vk::Format::R8G8B8A8_UNORM,
@@ -3053,28 +3093,29 @@ mod sampled_key_tests {
         plain.layers = 1;
         assert!(plain.is_plain_2d_identity_view());
 
-        let mut variants = Vec::new();
-        variants.push(SampledKey { layers: 2, ..plain });
-        variants.push(SampledKey {
-            volume: true,
-            ..plain
-        });
-        variants.push(SampledKey {
-            cube: true,
-            ..plain
-        });
-        variants.push(SampledKey {
-            arrayed: true,
-            ..plain
-        });
-        variants.push(SampledKey {
-            one_dim: true,
-            ..plain
-        });
-        variants.push(SampledKey {
-            swizzle: crate::contract::pixel_format::swizzle_plan(&[4, 3, 2, 1]).unwrap(),
-            ..plain
-        });
+        let variants = vec![
+            SampledKey { layers: 2, ..plain },
+            SampledKey {
+                volume: true,
+                ..plain
+            },
+            SampledKey {
+                cube: true,
+                ..plain
+            },
+            SampledKey {
+                arrayed: true,
+                ..plain
+            },
+            SampledKey {
+                one_dim: true,
+                ..plain
+            },
+            SampledKey {
+                swizzle: crate::contract::pixel_format::swizzle_plan(&[4, 3, 2, 1]).unwrap(),
+                ..plain
+            },
+        ];
         assert!(variants
             .into_iter()
             .all(|key| !key.is_plain_2d_identity_view()));
@@ -3741,11 +3782,13 @@ mod resident_reuse_tests {
             image: vk::Image::null(),
             memory: ResidentMemory::Recyclable(vk::DeviceMemory::null()),
             view: vk::ImageView::null(),
+            alternate_views: Vec::new(),
             framebuffer: vk::Framebuffer::null(),
             render_pass: vk::RenderPass::null(),
             framebuffer_compatibility: None,
             width,
             height,
+            sample_count: 1,
             generation,
             content_ready: false,
             content_epoch: None,
@@ -3785,12 +3828,12 @@ mod resident_reuse_tests {
              is what made the one-bit test match"
         );
         assert!(
-            !secondary.reusable_for(64, 32, 7, rgba),
+            !secondary.reusable_for(64, 32, 1, 7, rgba),
             "an RG16Float image must not be handed to an RGBA8 attachment"
         );
-        assert!(!secondary.reusable_for(64, 32, 7, bgra));
+        assert!(!secondary.reusable_for(64, 32, 1, 7, bgra));
         assert!(
-            secondary.reusable_for(64, 32, 7, vk::Format::R16G16_SFLOAT),
+            secondary.reusable_for(64, 32, 1, 7, vk::Format::R16G16_SFLOAT),
             "the secondary path must still get its own slot back"
         );
     }
@@ -3802,12 +3845,13 @@ mod resident_reuse_tests {
     fn geometry_generation_and_format_all_still_decide_reuse() {
         let rgba = translate::pixel::resident_color(false);
         let s = slot(64, 32, 7, rgba);
-        assert!(s.reusable_for(64, 32, 7, rgba));
-        assert!(!s.reusable_for(65, 32, 7, rgba), "width");
-        assert!(!s.reusable_for(64, 33, 7, rgba), "height");
-        assert!(!s.reusable_for(64, 32, 8, rgba), "generation");
+        assert!(s.reusable_for(64, 32, 1, 7, rgba));
+        assert!(!s.reusable_for(65, 32, 1, 7, rgba), "width");
+        assert!(!s.reusable_for(64, 33, 1, 7, rgba), "height");
+        assert!(!s.reusable_for(64, 32, 1, 8, rgba), "generation");
+        assert!(!s.reusable_for(64, 32, 2, 7, rgba), "sample count");
         assert!(
-            !s.reusable_for(64, 32, 7, translate::pixel::resident_color(true)),
+            !s.reusable_for(64, 32, 1, 7, translate::pixel::resident_color(true)),
             "format still separates the two bgra orders"
         );
     }

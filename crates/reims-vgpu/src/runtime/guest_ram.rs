@@ -138,7 +138,7 @@ impl GuestPageFootprint {
             let Some(end) = first.checked_add(bytes) else {
                 return false;
             };
-            gpa >= first && gpa < end && (gpa - first) % self.page_size == 0
+            gpa >= first && gpa < end && (gpa - first).is_multiple_of(self.page_size)
         })
     }
 

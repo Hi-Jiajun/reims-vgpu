@@ -22,6 +22,7 @@ struct SampledImageShape {
     volume: bool,
     cube: bool,
     one_dim: bool,
+    multisampled: bool,
     layers: u32,
 }
 
@@ -41,6 +42,7 @@ fn sampled_image_shape(
         volume: false,
         cube: false,
         one_dim: false,
+        multisampled: false,
         layers: 1,
     };
     Some(match kind {
@@ -54,6 +56,10 @@ fn sampled_image_shape(
             ..d2
         },
         SampledImageKind::D2 => d2,
+        SampledImageKind::D2Multisample => SampledImageShape {
+            multisampled: true,
+            ..d2
+        },
         SampledImageKind::D2Array => SampledImageShape {
             arrayed: true,
             ..d2
@@ -123,7 +129,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             // it is the site that disagrees with this module's writeback loop
             // about what such a value means. See `super::store_action_in_contract`.
             let _ = super::store_action_in_contract(req.pipeline_ref, c.store_action);
-            if c.store_action != MTL_STORE_ACTION_STORE {
+            if !crate::contract::pass_action::store_action_publishes_single_sample(c.store_action) {
                 continue;
             }
             if c.load_action != MTL_LOAD_ACTION_CLEAR && c.load_action != MTL_LOAD_ACTION_DONT_CARE
@@ -788,7 +794,13 @@ pub(super) enum SampledSourceRequest {
         TexelLayout,
         crate::backend::vulkan::engine::SampledByteOrigin,
     ),
-    Target(crate::backend::vulkan::engine::TargetIdentity),
+    /// Engine-resident allocation plus the exact view format this sampled
+    /// texture declared. Allocation identity and view interpretation are
+    /// separate parts of the texture contract.
+    Target(
+        crate::backend::vulkan::engine::TargetIdentity,
+        ash::vk::Format,
+    ),
     /// Zero-copy guest gather: the engine copies the texel bytes from
     /// imported guest RAM inside the draw CB — no CPU read, no memo, no
     /// hash. Carries the native texel layout the image is created with.
@@ -810,6 +822,10 @@ pub(super) enum SampledSourceRequest {
     GuestRuns(
         crate::backend::vulkan::engine::GuestRunSource,
         TexelLayout,
+        /// Exact Vulkan image/view format. This is distinct from the texel
+        /// layout because linear and sRGB formats carry the same bytes while
+        /// applying different fixed-function sampling conversions.
+        ash::vk::Format,
         /// Consecutive depth planes carried by the source window.
         u32,
         Option<LinearSampleIdentity>,
@@ -1258,7 +1274,13 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // channels.
                 if guest_allocation_sample_is_direct(resident_backing, may_bind_resident) {
                     crate::runtime::drain::note_store_route("t11rung_resident");
-                    return Some((w, h, mid, SampledSourceRequest::Target(resident_id)));
+                    let format = resident_id.resident_format();
+                    return Some((
+                        w,
+                        h,
+                        mid,
+                        SampledSourceRequest::Target(resident_id, format),
+                    ));
                 }
 
                 // What the hypervisor can say about the guest's own stores into
@@ -1327,7 +1349,13 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 } else if resident_ready {
                     if !guest_replaced {
                         note_type11_sample_rung("t11rung_resident", guest_write);
-                        return Some((w, h, mid, SampledSourceRequest::Target(resident_id)));
+                        let format = resident_id.resident_format();
+                        return Some((
+                            w,
+                            h,
+                            mid,
+                            SampledSourceRequest::Target(resident_id, format),
+                        ));
                     }
                     note_type11_sample_rung("t11rung_resident_refused", guest_write);
                     match guest_owned {
@@ -3025,6 +3053,9 @@ pub(super) fn sampled_backing_from_packed(
 /// Build the single-plane direct sampled request from a borrowed retained
 /// allocation. Only the execution payloads take new strong references; the
 /// allocation geometry and physical construction list stay with the resource.
+// Each argument is an independently decoded piece of the guest's sampled-source
+// contract; grouping them into a struct would only move the same fields.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn direct_linear_sample_from_packed(
     packed: &crate::runtime::bound_buffers::PackedBuffer,
     level_offset: u64,
@@ -3032,6 +3063,7 @@ pub(super) fn direct_linear_sample_from_packed(
     span: u64,
     row_length_texels: u32,
     native: TexelLayout,
+    format: ash::vk::Format,
     native_components: pixel_format::SwizzlePlan,
     owner: crate::model::TaskResourceLifetimeRef,
 ) -> Option<SampledSourceRequest> {
@@ -3052,6 +3084,7 @@ pub(super) fn direct_linear_sample_from_packed(
             direct_image: Some(direct_image),
         },
         native,
+        format,
         1,
         None,
         crate::runtime::gather_witness::GatherVouch::Fresh,
@@ -3454,6 +3487,10 @@ fn held_buffer_content(
 
 /// Resolve a previously validated backing through the zero-copy ladder, with
 /// the CPU read as the capability fallback.
+// Hot buffer-load path: the arguments are the decoded bind plus the host and
+// device state it resolves against, and threading a struct through would only
+// rename them.
+#[allow(clippy::too_many_arguments)]
 fn load_buffer_content_resolved<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -3493,6 +3530,8 @@ fn load_buffer_content_resolved<M: HostMemory + HostOps>(
     Some(crate::backend::vulkan::engine::BufferContent::from(bytes))
 }
 
+// Same shape as `load_buffer_content_resolved`, which this forwards to.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -3977,8 +4016,10 @@ pub(super) fn try_gva_resident_sample<M: HostMemory + HostOps>(
             return None;
         }
     };
+    let declared_format = tex.declared_pixel_format()?;
+    let format = translate::pixel::translate(declared_format).ok()?.vk;
     note_store_route("gvarung_resident");
-    Some((w, h, SampledSourceRequest::Target(identity)))
+    Some((w, h, SampledSourceRequest::Target(identity, format)))
 }
 
 /// Which repair would let the linear zero-copy rung carry this format, as a
@@ -4054,7 +4095,8 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // for all but `A8Unorm`, whose byte rides in `R8_UNORM`. It is composed with
     // the guest's type-8 view swizzle where the image view is built, so this
     // rail no longer has to refuse a format for having one.
-    let (native, native_components) = match translate::pixel::sampled_pixels(declared_format) {
+    let (native, sampled_vk_format, native_components) =
+        match translate::pixel::sampled_pixels(declared_format) {
         // Deduped per declared format, which is a handful of values a boot
         // enumerates in a handful of lines. The number is the guest's own
         // `MTLPixelFormat` ordinal, so it names the format without this device
@@ -4079,7 +4121,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             }
             return None;
         }
-        Ok((layout, decline, components)) => {
+        Ok((layout, _decline, components)) => {
             // Every layout is asked about, not just the one that was known to
             // be optional. This rail hands the guest's bytes to a sampler that
             // interpolates them, so "can this host filter this format" is a
@@ -4089,13 +4131,8 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 crate::runtime::drain::note_store_route("zc_lin_layout_unfilterable");
                 return None;
             }
-            if decline.is_some() {
-                srgb_census::note_downgrade(
-                    srgb_census::site::LINEAR_SAMPLE_ZERO_COPY,
-                    declared_format,
-                );
-            }
-            (layout, components)
+            let format = translate::pixel::translate(declared_format).ok()?.vk;
+            (layout, format, components)
         }
     };
     let bpp = native.bytes_per_texel();
@@ -4187,6 +4224,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 span,
                 row_length_texels,
                 native,
+                sampled_vk_format,
                 native_components,
                 owner.clone(),
             ) {
@@ -4254,6 +4292,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                         direct_image: None,
                     },
                     native,
+                    sampled_vk_format,
                     planes,
                     Some(LinearSampleIdentity::from(seen.identity)),
                     seen.vouch,
@@ -4317,6 +4356,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 direct_image: None,
             },
             native,
+            sampled_vk_format,
             planes,
             Some(LinearSampleIdentity::from(seen.identity)),
             seen.vouch,
@@ -4345,7 +4385,7 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     if w == 0 || h == 0 {
         return None;
     }
-    let (native, base_off, bpr) = {
+    let (native, sampled_vk_format, base_off, bpr) = {
         let m = state.mappings.get(&mid)?;
         if !m.mapped || m.page_entries.is_empty() {
             return None;
@@ -4361,20 +4401,18 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
         // format (`A8Unorm` is a single byte), but that is a coincidence of
         // widths and not the rule this line depends on.
         let native = match translate::pixel::sampled_pixels(format) {
-            Ok((layout, decline, components)) if layout.is_four_byte_color() => {
+            Ok((layout, _decline, components)) if layout.is_four_byte_color() => {
                 if !pixel_format::swizzle_is_identity(&components) {
                     crate::runtime::drain::note_store_route("zc_t11_needs_swizzle");
                     return None;
-                }
-                if decline.is_some() {
-                    srgb_census::note_downgrade(srgb_census::site::TYPE11_SAMPLE_ZERO_COPY, format);
                 }
                 layout
             }
             _ => return None,
         };
+        let sampled_vk_format = translate::pixel::translate(format).ok()?.vk;
         let (base_off, bpr_u32, _span_end) = type11_sample_window(m, w, h, format)?;
-        (native, base_off, bpr_u32 as u64)
+        (native, sampled_vk_format, base_off, bpr_u32 as u64)
     };
     // From the layout the translation chose, as the type-5 rail does, so the
     // texel size cannot disagree with the image the engine creates. The
@@ -4416,6 +4454,7 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
         return Some(SampledSourceRequest::GuestRuns(
             source,
             native,
+            sampled_vk_format,
             1,
             None,
             crate::runtime::gather_witness::GatherVouch::Fresh,
@@ -4449,6 +4488,7 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
             direct_image: None,
         },
         native,
+        sampled_vk_format,
         1,
         Some(LinearSampleIdentity::from(seen.identity)),
         seen.vouch,
@@ -4484,7 +4524,7 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     if !mapper::ensure_resolved_for_scanout(state, host, mid) {
         return None;
     }
-    let (native, bpp, base_off, bpr) = {
+    let (native, sampled_vk_format, bpp, base_off, bpr) = {
         let m = state.mappings.get(&mid)?;
         if !m.mapped || m.page_entries.is_empty() {
             return None;
@@ -4498,16 +4538,10 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
         // which sit identically on their Vulkan spellings. Required rather than
         // assumed, for the reason the type-11 rail states.
         let (native, bpp) = match translate::pixel::sampled_pixels(view.pixel_format) {
-            Ok((layout, decline, components)) => {
+            Ok((layout, _decline, components)) => {
                 if !pixel_format::swizzle_is_identity(&components) {
                     crate::runtime::drain::note_store_route("zc_t5_needs_swizzle");
                     return None;
-                }
-                if decline.is_some() {
-                    srgb_census::note_downgrade(
-                        srgb_census::site::TYPE5_PLANE_ZERO_COPY,
-                        view.pixel_format,
-                    );
                 }
                 (layout, layout.bytes_per_texel())
             }
@@ -4515,7 +4549,8 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
         };
         let (base_off, bpr_u32, _span_end) =
             type5_sample_window(m, view.plane_index, w, h, view.pixel_format)?;
-        (native, bpp, base_off, bpr_u32 as u64)
+        let sampled_vk_format = translate::pixel::translate(view.pixel_format).ok()?.vk;
+        (native, sampled_vk_format, bpp, base_off, bpr_u32 as u64)
     };
     let (span, row_length_texels) = strided_window_extent(w, h, bpp as u64, bpr)?;
     // Same rule as the linear rail's floor: a cost threshold may only turn a
@@ -4544,6 +4579,7 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
         return Some(SampledSourceRequest::GuestRuns(
             source,
             native,
+            sampled_vk_format,
             1,
             None,
             crate::runtime::gather_witness::GatherVouch::Fresh,
@@ -4577,6 +4613,7 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
             direct_image: None,
         },
         native,
+        sampled_vk_format,
         1,
         Some(LinearSampleIdentity::from(seen.identity)),
         seen.vouch,
@@ -6260,6 +6297,50 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     let v_shader = resolved.vertex.clone();
     let f_shader = resolved.fragment.clone();
 
+    // Request construction obtains the attachment count from this immutable
+    // pipeline before LOAD/CLEAR and Store policy can inspect it. Keep the
+    // equality explicit at the backend boundary: reaching here with a different
+    // count is an internal contract violation, not a shape Vulkan may repair.
+    let pipeline_sample_count = pd.raster_sample_count.max(1);
+    if pipeline_sample_count > 1 {
+        let color = req.colors.first();
+        let key = (u64::from(req.pipeline_ref) << 32)
+            | u64::from(color.map_or(0, |color| color.texture_ref));
+        if crate::observe::first_sight("render_multisample_contract", key) {
+            crate::observe::off(format!(
+                "render_multisample_contract task={} pipe={} raster_samples={} \
+                 colors={} color_ref={} source_ref={} mid={} gva={:#x} {}x{} \
+                 fmt={:#x} load={} store={} depth_ref={}",
+                req.task_id,
+                req.pipeline_ref,
+                pipeline_sample_count,
+                req.colors.len(),
+                color.map_or(0, |color| color.texture_ref),
+                color.map_or(0, |color| color.multisample_source_ref),
+                color.map_or(0, |color| color.mapping_id),
+                color.map_or(0, |color| color.target_gva),
+                color.map_or(0, |color| color.width),
+                color.map_or(0, |color| color.height),
+                color.map_or(0, |color| color.format),
+                color.map_or(0, |color| color.load_action),
+                color.map_or(0, |color| color.store_action),
+                req.depth_attach.as_ref().map_or(0, |depth| depth.texture_ref),
+            ));
+        }
+    }
+    if let Some(color) = req
+        .colors
+        .iter()
+        .find(|color| color.sample_count != pipeline_sample_count)
+    {
+        return Err(DrawError::Unsupported(
+            crate::backend::vulkan::engine::reason::DrawReason::MultisampleAttachmentSampleCountMismatch {
+                attachment: color.sample_count,
+                raster: pipeline_sample_count,
+            },
+        ));
+    }
+
     for (stage, shader, textures) in [
         ("vertex", &v_shader, &req.vertex_textures),
         ("fragment", &f_shader, &req.fragment_textures),
@@ -6919,7 +7000,21 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 (
                                     identity.width(),
                                     identity.height(),
-                                    SampledSourceRequest::Target(identity),
+                                    SampledSourceRequest::Target(
+                                        identity.clone(),
+                                        req.colors
+                                            .iter()
+                                            .find(|color| {
+                                                color.slot == index
+                                                    && color.texture_ref == texture_ref
+                                            })
+                                            .and_then(|color| {
+                                                translate::pixel::color_attachment(color.format)
+                                                    .ok()
+                                                    .map(|resolved| resolved.0)
+                                            })
+                                            .unwrap_or_else(|| identity.resident_format()),
+                                    ),
                                 )
                             }
                         }
@@ -6957,7 +7052,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // BGRA8 from the type-4 scanout cache, a native single/dual-channel
                 // video plane — and the host spelling is applied once, where the
                 // engine resource is built (`vk_texel_layout` below).
-                let mut sampled_format = TexelLayout::Rgba8;
+                let sampled_vk_format;
                 // How the bound texels' channels sit on the host format, from
                 // the rail that produced them. Identity for every CPU-origin
                 // bind, because those loaders have already put the channels
@@ -6965,29 +7060,24 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // handed the guest's own bytes over untouched.
                 let mut sampled_components = pixel_format::swizzle_identity();
                 let mut source_planes = 1;
+                let source_is_target = matches!(&loaded, SampledSourceRequest::Target(_, _));
                 let source = match loaded {
                     SampledSourceRequest::Bytes(rgba, identity, byte_format, origin) => {
                         bytes_identity = identity;
-                        sampled_format = byte_format;
+                        sampled_vk_format = translate::pixel::vk_texel_layout(byte_format);
                         byte_origin = origin;
                         crate::backend::vulkan::engine::SampledSource::Bytes(rgba)
                     }
-                    SampledSourceRequest::Target(identity) => {
-                        // A resident bound *directly* reuses the registry's own
-                        // image view, which the engine creates once per target
-                        // and cannot re-decorate per bind — so the channels a
-                        // type-8 view asked for have nowhere to go on that arm.
+                    SampledSourceRequest::Target(identity, format) => {
+                        sampled_vk_format = format;
+                        // The source resolver carries the sampled texture's
+                        // exact view format beside the allocation identity. A
+                        // resident attachment view is not necessarily the view
+                        // this bind names; collapsing the two loses both sRGB
+                        // interpretation and physical channel order.
                         //
-                        // The plan travels anyway. The engine reads it, sees a
-                        // non-identity plan, and takes the snapshot arm instead,
-                        // whose view it creates per bind from this very plan. So
-                        // the swizzle is honoured by a copy rather than dropped.
-                        //
-                        // Nothing to do here: the resource's `swizzle` field
-                        // below already folds `view_swizzle` in unconditionally,
-                        // and that is the field the engine reads. Setting the
-                        // format's own plan from it as well would apply the same
-                        // remap twice.
+                        // The resource's `swizzle` below remains independent and
+                        // is composed once with the format's component plan.
                         //
                         // This arm used to `return Ok(())` — no resource pushed
                         // at all. That was not a decline: the unbound scan had
@@ -7001,13 +7091,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     }
                     SampledSourceRequest::GuestRuns(
                         src,
-                        native,
+                        _native,
+                        format,
                         planes,
                         identity,
                         vouch,
                         components,
                     ) => {
-                        sampled_format = native;
+                        sampled_vk_format = format;
                         sampled_components = components;
                         source_planes = planes;
                         bytes_identity = identity;
@@ -7061,8 +7152,20 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     volume,
                     cube,
                     one_dim,
+                    multisampled,
                     mut layers,
                 } = shape;
+                if multisampled && !source_is_target {
+                    return Err(DrawError::DrawPreparation(
+                        DrawPreparationDecline::TextureDimensionUnsupported {
+                            stage: if frag_stage { "fragment" } else { "vertex" },
+                            index,
+                            texture_ref,
+                            binding: img_bind,
+                            kind: format!("{image_kind:?}"),
+                        },
+                    ));
+                }
                 if volume {
                     layers = texture_resource
                         .as_ref()
@@ -7094,9 +7197,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     volume,
                     cube,
                     one_dim,
+                    multisampled,
                     source,
                     byte_origin,
-                    format: translate::pixel::vk_texel_layout(sampled_format),
+                    format: sampled_vk_format,
                     identity: bytes_identity.map(|i| {
                         crate::backend::vulkan::engine::SampledContentIdentity {
                             key: i.key,
@@ -7173,6 +7277,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 ));
                 continue;
             };
+            if shape.multisampled {
+                crate::observe::fail(format!(
+                    "shader_resource_declared_unbound \
+                     reason=frag_neutral_texture_multisample_unrepresentable \
+                     pipe={} idx={index} binding={img_bind} kind={kind:?}",
+                    req.pipeline_ref
+                ));
+                continue;
+            }
             // A repair that succeeded, not a success: the shader samples a
             // texture whose contents this device invented, so it stays on the
             // fail channel and the reliance stays measurable.
@@ -7193,6 +7306,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 volume: shape.volume,
                 cube: shape.cube,
                 one_dim: shape.one_dim,
+                multisampled: false,
                 source: crate::backend::vulkan::engine::SampledSource::Bytes(std::sync::Arc::new(
                     crate::contract::pixel_format::solid_rgba8(1, 1, &[0.0; 4]),
                 )),
@@ -7645,8 +7759,55 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 req.pipeline_ref,
                 "primitive_type_unmapped",
             ),
+            raster_sample_count: pd.raster_sample_count.max(1),
+            color_sample_count: req
+                .colors
+                .first()
+                .map(|color| color.sample_count.max(1))
+                .unwrap_or(1),
+            multisample_resolve: req
+                .colors
+                .first()
+                .is_some_and(|color| color.multisample_source_ref != 0),
             ..crate::backend::vulkan::engine::DrawRequest::default()
         };
+        let resolving_colors = req
+            .colors
+            .iter()
+            .filter(|color| color.multisample_source_ref != 0)
+            .count();
+        if resolving_colors != 0
+            && (resolving_colors != 1
+                || req
+                    .colors
+                    .first()
+                    .is_none_or(|color| color.multisample_source_ref == 0))
+        {
+            return Err(DrawError::Unsupported(
+                crate::backend::vulkan::engine::reason::DrawReason::MultisampleResolveShapeUnsupported {
+                    color_targets: req.colors.len() as u32,
+                    depth: req.depth_attach.is_some(),
+                    color_input: false,
+                },
+            ));
+        }
+        if let Some(color) = req.colors.first().filter(|color| color.multisample_source_ref != 0) {
+            use crate::contract::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
+            if color.store_action != MTL_STORE_ACTION_MULTISAMPLE_RESOLVE {
+                return Err(DrawError::Unsupported(
+                    crate::backend::vulkan::engine::reason::DrawReason::MultisampleStoreActionUnsupported {
+                        store_action: color.store_action,
+                    },
+                ));
+            }
+            if color.load_action == MTL_LOAD_ACTION_LOAD {
+                return Err(DrawError::Unsupported(
+                    crate::backend::vulkan::engine::reason::DrawReason::MultisampleLoadActionUnsupported {
+                        load_action: color.load_action,
+                    },
+                ));
+            }
+        }
         resources.viewports = req
             .viewports
             .iter()
@@ -7744,7 +7905,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let store_is_store = req
             .colors
             .first()
-            .map(|c| c.store_action == MTL_STORE_ACTION_STORE)
+            .map(|c| crate::contract::pass_action::store_action_publishes_single_sample(c.store_action))
             .unwrap_or(true);
         resources.target_rgba8 = target_rgba8;
         resources.target_guest_seed = target_guest_seed;
@@ -8346,6 +8507,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         resources.width = w;
         resources.height = h;
         resources.vertex_count = vertex_count;
+        if let Some(c0) = req.colors.first() {
+            resources.color_attachment_format = Some(
+                translate::pixel::color_attachment(c0.format)
+                    .map_err(|reason| {
+                        DrawError::Unsupported(
+                            crate::backend::vulkan::engine::reason::DrawReason::ColorAttachmentFormat(reason),
+                        )
+                    })?
+                    .0,
+            );
+        }
         // Attachment-count census, taken before the MRT gate rather than inside
         // it. `build_secondary_targets` returns empty for a single-attachment
         // draw without emitting, and every MRT counter below it therefore reads
@@ -8671,7 +8843,9 @@ fn type11_render_identity(
     req: &DrawEncodeRequest,
 ) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
     let c0 = req.colors.first()?;
-    if c0.mapping_id == 0 || c0.store_action != MTL_STORE_ACTION_STORE {
+    if c0.mapping_id == 0
+        || !crate::contract::pass_action::store_action_publishes_single_sample(c0.store_action)
+    {
         return None;
     }
     render_chain_identity(state, req)
@@ -9624,7 +9798,9 @@ fn gva_store_defer_eligible(req: &DrawEncodeRequest) -> bool {
     if identity.width() != c0.width || identity.height() != c0.height {
         return false;
     }
-    pixel_format::tight_row_bytes(c0.width, c0.format).is_some_and(|t| c0.row_stride >= t)
+    pixel_format::tight_row_bytes(c0.width, c0.format)
+        .and_then(|bytes| bytes.checked_mul(c0.sample_count.max(1)))
+        .is_some_and(|tight| c0.row_stride >= tight)
 }
 
 #[cfg(all(test, feature = "backend-vulkan"))]
@@ -10077,8 +10253,7 @@ mod vulkan_split_tests {
                 width: 8,
                 height: 8,
                 ..Default::default()
-            }]
-            .into(),
+            }],
             ..DrawEncodeRequest::default()
         }
     }

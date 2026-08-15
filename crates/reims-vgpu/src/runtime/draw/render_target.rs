@@ -244,6 +244,11 @@ pub(super) struct ResolvedRenderTarget {
     /// Bytes per row of the target (archive `bpr`).
     pub(super) row_stride: u32,
     pub(super) format: u16,
+    /// Attachment samples requested for this encode. Linear texture resource
+    /// dimensions do not retain the creation descriptor's sample count, so the
+    /// Vulkan encode replaces this provisional single-sample value with the
+    /// bound pipeline's raster sample count before constructing an image.
+    pub(super) sample_count: u32,
 }
 
 /// Why a colour attachment's `texture_ref` could not be turned into somewhere
@@ -766,6 +771,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             height: m.height,
             row_stride: 0,
             format: fmt,
+            sample_count: 1,
         });
     }
     // x86 Ventura/Tahoe type-4 surface/backing (present IOSurface). Object-list
@@ -828,6 +834,28 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             }
             .at(resolved_ref),
         )?;
+        // A type-5 object is a texture view over the surface allocation, and its
+        // format is attachment state: UNORM and sRGB views name identical stored
+        // bytes but different fixed-function conversion on render writes. So
+        // honouring it is a real repair — and it is not this line's to make.
+        //
+        // Resolving through the *view* format forks the resident, because the
+        // engine keys a colour resident on the format it is asked for
+        // (`ResidentTargetSlot::reusable_for`) and the guest binds one surface
+        // through both spellings. The second spelling misses, retires the
+        // resident and recreates it empty, so the two interpretations alternate
+        // frame to frame and each carries half the content — a content defect
+        // traded for a colour one. `note_rt_type5_view`'s doc names the reading
+        // that licenses the repair (`rt_type5_view_sid_both_ways` at zero) and
+        // it has never been taken.
+        //
+        // The repair this is waiting on is one allocation with a view per
+        // interpretation, which is what Metal's contract describes and what
+        // `translate::pixel::storage_format` and `Pools::registry_sample_view`
+        // already express for the attachment and sampled rails. Until the
+        // primary single-RT resident can swap its attachment view without
+        // recreating its image, resolve through the base mapping and let
+        // `rt_type5_view_differs_format_only` keep reporting the loss.
         let fmt = effective_view_sample_format(base_fmt, view_fmt_override).unwrap_or(base_fmt);
         if pixel_format::render_target_bpp(fmt).is_none() {
             return Err(C::Type4Format { surface_id, fmt }.at(resolved_ref));
@@ -840,6 +868,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             height: m.height,
             row_stride: 0,
             format: fmt,
+            sample_count: 1,
         });
     }
     // type-2/3 linear GVA (wallpaper/background layers, UI intermediate RTs).
@@ -986,6 +1015,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         height: h,
         row_stride: bpr,
         format: fmt,
+        sample_count: 1,
     })
 }
 

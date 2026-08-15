@@ -80,6 +80,20 @@ pub enum DrawReason {
     /// `PRECISE` would answer a counting guest with a number that is neither
     /// the count nor recognisably wrong.
     VisibilityCountingUnsupported { occlusion_query_precise: bool },
+    MultisampleAttachmentSampleCountMismatch { attachment: u32, raster: u32 },
+    MultisampleResidentTargetMissing { sample_count: u32 },
+    MultisampleLinearTransferUnsupported { sample_count: u32 },
+    MultisampleSampleCountUnsupported { requested: u32, limit: u32 },
+    MultisampleStoreActionUnsupported { store_action: u16 },
+    /// A multisample source asks to load prior contents. The current scratch
+    /// rail can preserve an already-open encoder, but cannot import a
+    /// multisample image from guest linear storage at encoder start.
+    MultisampleLoadActionUnsupported { load_action: u16 },
+    MultisampleResolveShapeUnsupported {
+        color_targets: u32,
+        depth: bool,
+        color_input: bool,
+    },
     /// Same for a zero-copy guest-run sampled bind.
     GuestRunSampledNot2d { binding: u32 },
     /// More MRT secondary attachments than the render pass can carry.
@@ -140,6 +154,9 @@ pub enum DrawReason {
     /// near and far planes, which is missing geometry rather than shifted
     /// geometry — the sibling of the fill-mode refusal above.
     DepthClampUnsupported,
+    /// The primary colour attachment has no faithful Vulkan format on this
+    /// backend. Carries the translation reason so the refusal keeps one name.
+    ColorAttachmentFormat(TranslateReason),
     /// The device declines this vertex attribute format and no portable
     /// substitute fits. Carries the translation-layer reason so the two log
     /// lines agree on why.
@@ -262,6 +279,27 @@ impl crate::observe::Decline for DrawReason {
             Self::SecondaryAttachmentCap { .. } => "secondary_attachment_cap",
             Self::ViewportSlotsUnsupported { .. } => "viewport_slots_unsupported",
             Self::VisibilityCountingUnsupported { .. } => "visibility_counting_unsupported",
+            Self::MultisampleAttachmentSampleCountMismatch { .. } => {
+                "multisample_attachment_sample_count_mismatch"
+            }
+            Self::MultisampleResidentTargetMissing { .. } => {
+                "multisample_resident_target_missing"
+            }
+            Self::MultisampleLinearTransferUnsupported { .. } => {
+                "multisample_linear_transfer_unsupported"
+            }
+            Self::MultisampleSampleCountUnsupported { .. } => {
+                "multisample_sample_count_unsupported"
+            }
+            Self::MultisampleStoreActionUnsupported { .. } => {
+                "multisample_store_action_unsupported"
+            }
+            Self::MultisampleLoadActionUnsupported { .. } => {
+                "multisample_load_action_unsupported"
+            }
+            Self::MultisampleResolveShapeUnsupported { .. } => {
+                "multisample_resolve_shape_unsupported"
+            }
             Self::SamplerAnisotropyUnsupported => "sampler_anisotropy_unsupported",
             Self::SamplerMirrorClampToEdgeUnsupported => "sampler_mirror_clamp_to_edge_unsupported",
             Self::SamplerUnnormalizedCompare => "sampler_unnormalized_compare",
@@ -271,7 +309,9 @@ impl crate::observe::Decline for DrawReason {
             // Deliberately delegates: the translation layer already named the
             // exact format problem, and inventing a second slug here would make
             // the two log lines disagree about one event.
-            Self::VertexFormat(reason) | Self::VisibilityResultMode(reason) => reason.slug(),
+            Self::ColorAttachmentFormat(reason)
+            | Self::VertexFormat(reason)
+            | Self::VisibilityResultMode(reason) => reason.slug(),
             Self::ConstantVertexAttribute => "constant_vertex_attribute",
             Self::InstanceRateDivisorUnsupported { .. } => "instance_rate_divisor_unsupported",
             Self::InstanceRateDivisorOverLimit { .. } => "instance_rate_divisor_over_limit",
@@ -334,7 +374,35 @@ impl std::fmt::Display for DrawReason {
                 " occlusion_query_precise={}",
                 u8::from(*occlusion_query_precise)
             ),
-            Self::VertexFormat(reason) | Self::VisibilityResultMode(reason) => {
+            Self::MultisampleAttachmentSampleCountMismatch { attachment, raster } => {
+                write!(f, " attachment={attachment} raster={raster}")
+            }
+            Self::MultisampleResidentTargetMissing { sample_count }
+            | Self::MultisampleLinearTransferUnsupported { sample_count } => {
+                write!(f, " sample_count={sample_count}")
+            }
+            Self::MultisampleSampleCountUnsupported { requested, limit } => {
+                write!(f, " requested={requested} limit={limit}")
+            }
+            Self::MultisampleStoreActionUnsupported { store_action } => {
+                write!(f, " store_action={store_action}")
+            }
+            Self::MultisampleLoadActionUnsupported { load_action } => {
+                write!(f, " load_action={load_action}")
+            }
+            Self::MultisampleResolveShapeUnsupported {
+                color_targets,
+                depth,
+                color_input,
+            } => write!(
+                f,
+                " color_targets={color_targets} depth={} color_input={}",
+                u8::from(*depth),
+                u8::from(*color_input)
+            ),
+            Self::ColorAttachmentFormat(reason)
+            | Self::VertexFormat(reason)
+            | Self::VisibilityResultMode(reason) => {
                 write!(f, " value={}", reason.value())
             }
             Self::InstanceRateDivisorUnsupported { step_rate } => write!(f, " rate={step_rate}"),
@@ -407,6 +475,10 @@ pub enum TargetReadDecline {
     UnknownIdentity,
     /// The readback's resident has never had content written.
     NoReadyContent,
+    /// Vulkan cannot copy a multisample image directly to a buffer. The image
+    /// remains usable by GPU consumers; a host serialization needs an explicit
+    /// shader resolve chosen by the caller's sample semantics.
+    MultisampleImage { sample_count: u32 },
     /// The readback's resident does not hold four-byte texels.
     ///
     /// Every consumer of a [`super::TargetReadback`] speaks RGBA8 —
@@ -428,6 +500,7 @@ impl Decline for TargetReadDecline {
         match self {
             Self::UnknownIdentity => "read_target_unknown_identity",
             Self::NoReadyContent => "read_target_no_ready_content",
+            Self::MultisampleImage { .. } => "read_target_multisample_image",
             Self::TexelNotFourBytes { .. } => "read_target_texel_not_four_bytes",
         }
     }
@@ -435,6 +508,9 @@ impl Decline for TargetReadDecline {
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::UnknownIdentity | Self::NoReadyContent => Vec::new(),
+            Self::MultisampleImage { sample_count } => {
+                vec![("sample_count", sample_count.to_string())]
+            }
             Self::TexelNotFourBytes { format } => vec![("format", format!("{format:?}"))],
         }
     }
@@ -464,6 +540,23 @@ mod tests {
         },
         DrawReason::VisibilityCountingUnsupported {
             occlusion_query_precise: false,
+        },
+        DrawReason::MultisampleAttachmentSampleCountMismatch {
+            attachment: 4,
+            raster: 2,
+        },
+        DrawReason::MultisampleResidentTargetMissing { sample_count: 4 },
+        DrawReason::MultisampleLinearTransferUnsupported { sample_count: 4 },
+        DrawReason::MultisampleSampleCountUnsupported {
+            requested: 4,
+            limit: 1,
+        },
+        DrawReason::MultisampleStoreActionUnsupported { store_action: 3 },
+        DrawReason::MultisampleLoadActionUnsupported { load_action: 1 },
+        DrawReason::MultisampleResolveShapeUnsupported {
+            color_targets: 2,
+            depth: false,
+            color_input: false,
         },
         DrawReason::VisibilityResultMode(TranslateReason::UnknownVisibilityResultMode(0)),
         DrawReason::SamplerAnisotropyUnsupported,
@@ -647,6 +740,7 @@ mod tests {
         const ALL: &[TargetReadDecline] = &[
             TargetReadDecline::UnknownIdentity,
             TargetReadDecline::NoReadyContent,
+            TargetReadDecline::MultisampleImage { sample_count: 2 },
         ];
         let mut slugs: Vec<&str> = ALL.iter().map(|r| r.slug()).collect();
         slugs.sort_unstable();
@@ -655,7 +749,9 @@ mod tests {
         assert_eq!(before, slugs.len(), "duplicate TargetReadDecline slug");
         for r in ALL {
             assert_eq!(r.to_string(), format!("reason={}", r.slug()));
-            assert!(r.fields().is_empty(), "{r:?} carries no payload");
+            if !matches!(r, TargetReadDecline::MultisampleImage { .. }) {
+                assert!(r.fields().is_empty(), "{r:?} carries no payload");
+            }
         }
     }
 

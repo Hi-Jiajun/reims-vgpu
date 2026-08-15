@@ -872,8 +872,8 @@ fn a_pass_declaring_a_raster_sample_count_this_device_cannot_rasterize_refuses_t
     );
 }
 
-/// A colour attachment naming a mip, a slice or a depth plane refuses the
-/// stream's draws.
+/// A colour attachment naming a slice or a depth plane refuses the stream's
+/// draws, while a resolve target becomes the direct single-sample target.
 ///
 /// Every consumer binds the texture whole, so a pass this device ran would go
 /// into level 0 slice 0 plane 0 regardless — a guest drawing a cube face
@@ -892,12 +892,6 @@ fn a_pass_declaring_a_raster_sample_count_this_device_cannot_rasterize_refuses_t
 /// written before: those fields did not exist, because the decoder read
 /// `level` thirty-two bits wide and swallowed the slice into it.
 ///
-/// The `resolve` arm is the one this check did not make at all. Its depth and
-/// stencil siblings have tested it since they were written; the colour arm
-/// spelled its own three-term copy of the rule instead of the shared predicate
-/// — so a multisample colour pass, which names its resolve target here and
-/// nowhere else, was admitted and rendered at one sample into the attachment
-/// with the resolve target never written.
 #[test]
 fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_refuses_the_draws() {
     use crate::contract::endian::st32;
@@ -984,22 +978,16 @@ fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_refuses_the_
         );
     }
 
-    // The base subresource with a resolve target named: every coordinate is 0,
-    // so the three-term check this arm used to carry admitted it. What the guest
-    // asked for is a multisample colour pass whose single-sampled result lands
-    // in texture 0x99, and this device writes nothing there.
+    // The source and resolve destination stay distinct through stream decode.
+    // Collapsing them here turns a resolve operation into single-sample drawing
+    // and loses coverage before either backend sees the request.
     let acc = run(&pass_resolving(0, 0, 0, 0x99));
     assert_eq!(acc.color_slots.len(), 1);
+    assert_eq!(acc.color_slots[0].1.texture_ref, 77);
+    assert_eq!(acc.color_slots[0].1.resolve_texture_ref, 0x99);
     assert!(
-        matches!(
-            acc.bind_snapshot(),
-            Err(StreamRefusal::Pass(
-                StreamDrawDrop::ColorSubresourceUnsupported { .. }
-            ))
-        ),
-        "a colour attachment naming a multisample resolve target must refuse \
-         the stream's draws: rendering it at one sample leaves the texture the \
-         guest reads from holding whatever it held before"
+        acc.bind_snapshot().is_ok(),
+        "a base-subresource resolve is representable by the stream"
     );
 
     let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
@@ -1015,12 +1003,6 @@ fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_refuses_the_
     assert!(
         log.contains("plane=2"),
         "the line must carry the depth plane"
-    );
-    assert!(
-        log.contains("resolve=0x99"),
-        "the line must name the resolve target, the way its depth and stencil \
-         siblings do: without it the reader cannot tell a multisample pass from \
-         a mip-bound one, and they are refused under the same slug"
     );
 }
 
@@ -2287,10 +2269,12 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
             width: 1920,
             height: 1080,
             format: 0x50,
+            sample_count: 1,
             load_action: MTL_LOAD_ACTION_CLEAR,
             store_action: MTL_STORE_ACTION_STORE,
             clear_color: [0.1, 0.2, 0.3, 1.0],
             target_seed_rgba: Some(vec![0xbb; 16]),
+            multisample_source_ref: 0,
         }],
         ..Default::default()
     };

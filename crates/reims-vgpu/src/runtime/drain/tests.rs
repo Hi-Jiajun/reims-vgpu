@@ -5404,6 +5404,13 @@ fn a_delete_object_record_must_fit_the_payload_that_carries_it() {
 /// records may retire their separate typed registries, but even then must leave
 /// the resource table alone. Conversely, resource deletion must not cross into
 /// the pipeline registry.
+///
+/// The retained render-pipeline registry is a Vulkan-arm structure
+/// ([`crate::model::state::DeviceState::task_render_pipeline_states`] and
+/// [`crate::runtime::pipeline_resolve`] are both gated on it), so the statements
+/// that populate and interrogate it are gated the same way. Everything else —
+/// including that the pipeline destroy opcode leaves the object table alone on
+/// an arm where it falls through to the unimplemented path — runs on both.
 #[test]
 fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     use reims_vgpu_wire::ops::destroy::{
@@ -5440,16 +5447,19 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
             descriptor: Default::default(),
         }),
     );
-    state.task_render_pipeline_states.register(
-        2,
-        13,
-        crate::runtime::pipeline_resolve::retained_pipeline_for_test(),
-    );
-    state.task_render_pipeline_states.register(
-        2,
-        15,
-        crate::runtime::pipeline_resolve::retained_pipeline_for_test(),
-    );
+    #[cfg(feature = "backend-vulkan")]
+    {
+        state.task_render_pipeline_states.register(
+            2,
+            13,
+            crate::runtime::pipeline_resolve::retained_pipeline_for_test(),
+        );
+        state.task_render_pipeline_states.register(
+            2,
+            15,
+            crate::runtime::pipeline_resolve::retained_pipeline_for_test(),
+        );
+    }
 
     // Same task, same number, well-formed record: the collision that an arm
     // keying the object table would act on.
@@ -5490,6 +5500,7 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         4,
         &destroy_packet(2, OPCODE_DELETE_RENDER_PIPELINE_STATE, 13),
     );
+    #[cfg(feature = "backend-vulkan")]
     assert!(
         state.task_render_pipeline_states.get(2, 13).is_none(),
         "the render-pipeline destroy opcode retires its own retained state"
@@ -5503,6 +5514,7 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         state.delete_object(2, 15),
         "the colliding resource-list object exists"
     );
+    #[cfg(feature = "backend-vulkan")]
     assert!(
         state.task_render_pipeline_states.contains(2, 15),
         "resource-list deletion must not cross into the pipeline ref space"

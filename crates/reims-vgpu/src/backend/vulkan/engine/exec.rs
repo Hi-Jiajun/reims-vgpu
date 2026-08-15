@@ -2295,6 +2295,7 @@ unsafe fn acquire_depth_view(
     counters: &EngineCounters,
 ) -> Result<AcquiredDepth, DrawError> {
     let with_stencil = req.depth.as_ref().and_then(|d| d.stencil).is_some();
+    let sample_count = req.raster_sample_count.max(1);
     if let Some(identity) = req.depth.as_ref().and_then(|d| d.identity.clone()) {
         // Asked before `registry_ensure_depth`, because that call creates the
         // slot when it is absent and a fresh slot is `content_ready == false`.
@@ -2306,6 +2307,7 @@ unsafe fn acquire_depth_view(
             identity.clone(),
             req.width,
             req.height,
+            sample_count,
             with_stencil,
             counters,
         )?;
@@ -2319,8 +2321,14 @@ unsafe fn acquire_depth_view(
             content_ready,
         });
     }
-    let (dimg, dmem, dview) =
-        pools.create_transient_depth(ctx, req.width, req.height, with_stencil, counters)?;
+    let (dimg, dmem, dview) = pools.create_transient_depth(
+        ctx,
+        req.width,
+        req.height,
+        sample_count,
+        with_stencil,
+        counters,
+    )?;
     Ok(AcquiredDepth {
         view: dview,
         owned: Some((dimg, dmem, dview)),
@@ -2365,10 +2373,11 @@ fn validate_sampled_resident(
     identity: &TargetIdentity,
     resource_width: u32,
     resource_height: u32,
-    held: Option<(bool, u32, u32)>,
+    shader_multisampled: bool,
+    held: Option<(bool, u32, u32, u32)>,
     prior: Option<ResidentReclaim>,
 ) -> Result<(), DrawExecutionDecline> {
-    let Some((content_ready, resident_width, resident_height)) = held else {
+    let Some((content_ready, resident_width, resident_height, resident_samples)) = held else {
         return Err(DrawExecutionDecline::SampledResidentMissing {
             binding,
             identity: identity.clone(),
@@ -2389,6 +2398,14 @@ fn validate_sampled_resident(
             resident_height,
             resource_width,
             resource_height,
+        });
+    }
+    if (resident_samples > 1) != shader_multisampled {
+        return Err(DrawExecutionDecline::SampledResidentSampleCountMismatch {
+            binding,
+            identity: identity.clone(),
+            resident_samples,
+            shader_multisampled,
         });
     }
     Ok(())
@@ -2455,20 +2472,15 @@ pub(crate) unsafe fn execute_draw_inner(
     // spelled as a feature. No runtime caller ever set it, and the six parity
     // tests that did were all already rendering into a `Surface` identity.
     let output_bgra = req.target_identity.as_ref().is_some_and(|id| id.is_bgra());
-    // Slot 0's attachment format, read from the identity that owns it.
-    //
-    // Two things have to agree about it — the render pass (and so the pipeline)
-    // this draw is compiled against, and the resident image it renders into —
-    // and they used to agree only because both called `resident_color` on the
-    // same flag. Now the identity answers, once, and both take it from here.
-    //
-    // A draw with no target identity renders into a pooled target, which
-    // `acquire_target` creates at the engine's neutral resident colour format.
-    let color0_format = req
-        .target_identity
-        .as_ref()
-        .map(|id| id.resident_format())
-        .unwrap_or(crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT);
+    // Slot 0's view supplies the attachment format. The identity names the
+    // allocation behind it; treating those as the same question loses Metal's
+    // compatible-format texture views (most visibly UNORM versus sRGB).
+    let color0_format = req.color_attachment_format.unwrap_or_else(|| {
+        req.target_identity
+            .as_ref()
+            .map(|id| id.resident_format())
+            .unwrap_or(crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT)
+    });
     // A guest-sourced sampled bind used to force the immediate-submit path.
     // Its read of guest RAM happens when the CB *executes*, and this device
     // acked the packet as soon as it was consumed, so deferred submit stretched
@@ -2832,6 +2844,67 @@ pub(crate) unsafe fn execute_draw_inner(
             stencil: d.stencil.is_some(),
         });
     }
+    let raster_sample_count = req.raster_sample_count.max(1);
+    let color_sample_count = req.color_sample_count.max(1);
+    if color_sample_count != raster_sample_count {
+        return Err(DrawError::Unsupported(
+            super::reason::DrawReason::MultisampleAttachmentSampleCountMismatch {
+                attachment: color_sample_count,
+                raster: raster_sample_count,
+            },
+        ));
+    }
+    if req.multisample_resolve && raster_sample_count == 1 {
+        return Err(DrawError::Unsupported(
+            super::reason::DrawReason::MultisampleSampleCountUnsupported {
+                requested: raster_sample_count,
+                limit: ctx.features.max_sample_count,
+            },
+        ));
+    }
+    if raster_sample_count > 1 {
+        if !raster_sample_count.is_power_of_two()
+            || raster_sample_count > ctx.features.max_sample_count
+        {
+            return Err(DrawError::Unsupported(
+                super::reason::DrawReason::MultisampleSampleCountUnsupported {
+                    requested: raster_sample_count,
+                    limit: ctx.features.max_sample_count,
+                },
+            ));
+        }
+        if !req.secondary_targets.is_empty() || req.color_input {
+            return Err(DrawError::Unsupported(
+                super::reason::DrawReason::MultisampleResolveShapeUnsupported {
+                    color_targets: 1u32.saturating_add(req.secondary_targets.len() as u32),
+                    depth: req.depth.is_some(),
+                    color_input: req.color_input,
+                },
+            ));
+        }
+        if !req.multisample_resolve {
+            if req.target_identity.is_none() {
+                return Err(DrawError::Unsupported(
+                    super::reason::DrawReason::MultisampleResidentTargetMissing {
+                        sample_count: raster_sample_count,
+                    },
+                ));
+            }
+            if !req.skip_readback
+                || req.target_rgba8.is_some()
+                || req.target_guest_seed.is_some()
+                || req.load_guest_target_backing
+            {
+                return Err(DrawError::Unsupported(
+                    super::reason::DrawReason::MultisampleLinearTransferUnsupported {
+                        sample_count: raster_sample_count,
+                    },
+                ));
+            }
+        }
+    }
+    pass_key.sample_count = raster_sample_count;
+    pass_key.multisample_resolve = req.multisample_resolve;
     let attr_keys: Vec<AttrKey> = req
         .vertex_attributes
         .iter()
@@ -3194,7 +3267,8 @@ pub(crate) unsafe fn execute_draw_inner(
     // slot's cached framebuffer was built against. One predicate, because the
     // two answers it feeds have to agree: which pass the slot is ensured under,
     // and whether the draw builds (and later disposes) a framebuffer of its own.
-    let ad_hoc_framebuffer = is_mrt || req.depth.is_some() || req.color_input;
+    let ordinary_ad_hoc_framebuffer = is_mrt || req.depth.is_some() || req.color_input;
+    let ad_hoc_framebuffer = ordinary_ad_hoc_framebuffer || req.multisample_resolve;
     let (primary_pass, primary_pass_compatibility) = if ad_hoc_framebuffer {
         let mut color_only = PassKey::single(pass_key.load_seed, pass_key.color0_format);
         color_only.host_accessible_color0 = pass_key.host_accessible_color0;
@@ -3232,14 +3306,20 @@ pub(crate) unsafe fn execute_draw_inner(
     let mut target_guest_backed = false;
     let mut target_loads_guest_backing = false;
     let mut target_guest_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint> = None;
-    let (target_image, target_fb, target_access, target_view) =
+    let (target_image, mut target_fb, target_access, target_view) =
         if let Some(identity) = &req.target_identity {
             let gen = identity.generation();
+            let target_sample_count = if req.multisample_resolve {
+                1
+            } else {
+                color_sample_count
+            };
             let t = pools.registry_ensure(
                 ctx,
                 identity.clone(),
                 req.width,
                 req.height,
+                target_sample_count,
                 primary_pass,
                 primary_pass_compatibility,
                 gen,
@@ -3268,7 +3348,7 @@ pub(crate) unsafe fn execute_draw_inner(
             let primary_view = t.view;
             let primary_access = t.access;
             let primary_slot_fb = t.framebuffer;
-            if ad_hoc_framebuffer {
+            if ordinary_ad_hoc_framebuffer {
                 let views = ad_hoc_attachment_views(
                     ctx,
                     pools,
@@ -3304,7 +3384,7 @@ pub(crate) unsafe fn execute_draw_inner(
             // `render_pass` whenever the two pass shapes differ.
             let t = pools.acquire_target(ctx, target_key, primary_pass, counters)?;
             let (pool_image, pool_view, pool_fb) = (t.image, t.view, t.framebuffer);
-            if ad_hoc_framebuffer {
+            if ordinary_ad_hoc_framebuffer {
                 let views = ad_hoc_attachment_views(
                     ctx,
                     pools,
@@ -3340,6 +3420,29 @@ pub(crate) unsafe fn execute_draw_inner(
                 )
             }
         };
+    let _multisample_source_image = if req.multisample_resolve {
+        let (image, _view, framebuffer) = pools.acquire_multisample_target(
+            ctx,
+            super::pools::MultisampleTargetKey {
+                width: req.width,
+                height: req.height,
+                format: color0_format,
+                samples: raster_sample_count,
+                compatibility: pass_key.framebuffer_compatibility(),
+                resolve_view: target_view,
+                depth_view: depth_attachment.as_ref().map(|depth| depth.view),
+                transient_depth: depth_attachment
+                    .as_ref()
+                    .is_some_and(|depth| depth.owned.is_some()),
+            },
+            render_pass,
+            counters,
+        )?;
+        target_fb = framebuffer;
+        Some(image)
+    } else {
+        None
+    };
     // A guest-page LOAD is fallback material for an ordinary resident, not a
     // second source beside an imported attachment. Target admission has to run
     // first because only the admitted resource can answer which one this draw
@@ -3513,6 +3616,7 @@ pub(crate) unsafe fn execute_draw_inner(
                         slot.content_ready,
                         slot.width,
                         slot.height,
+                        slot.sample_count,
                         slot.memory.is_guest_imported(),
                     )
                 });
@@ -3520,25 +3624,48 @@ pub(crate) unsafe fn execute_draw_inner(
                     .is_none()
                     .then(|| pools.prior_reclaim(identity))
                     .flatten();
+                if let Some((_, _, _, _, ready, width, height, samples, _)) = held.as_ref() {
+                    if *samples > 1 {
+                        crate::runtime::drain::note_store_route("sampled_resident_multisample");
+                        let key = (u64::from(resource.binding) << 32) | u64::from(*samples);
+                        if crate::observe::first_sight("sampled_resident_multisample", key) {
+                            crate::observe::off(format!(
+                                "sampled_resident_multisample binding={} shader_ms={} \
+                                 resident_samples={} resident={}x{} ready={} identity={identity:?}",
+                                resource.binding,
+                                resource.multisampled,
+                                samples,
+                                width,
+                                height,
+                                ready,
+                            ));
+                        }
+                    }
+                }
                 validate_sampled_resident(
                     resource.binding,
                     identity,
                     resource.width,
                     resource.height,
-                    held.as_ref().map(|held| (held.4, held.5, held.6)),
+                    resource.multisampled,
+                    held.as_ref().map(|held| (held.4, held.5, held.6, held.7)),
                     prior,
                 )
                 .map_err(DrawError::DrawExecution)?;
                 let (
                     source_image,
-                    source_view,
+                    _source_attachment_view,
                     source_layout,
-                    source_bgra,
+                    _source_bgra,
                     _source_ready,
                     _resident_width,
                     _resident_height,
+                    _resident_samples,
                     source_host_accessible,
                 ) = held.expect("validated resident is held");
+                let source_view = pools
+                    .registry_sample_view(ctx, identity, resource.format, counters)?
+                    .expect("validated resident is held");
                 // Two reasons a resident cannot be bound through its own view.
                 //
                 // The first is the draw sampling an attachment it also renders
@@ -3583,12 +3710,7 @@ pub(crate) unsafe fn execute_draw_inner(
                             "sampled_resident_swizzle_snapshot",
                         ),
                     }
-                    let snapshot_key = SampledKey {
-                        // The snapshot binds the *resident's* format, not
-                        // the one the binding declared.
-                        format: super::super::translate::pixel::resident_color(source_bgra),
-                        ..SampledKey::of(resource)
-                    };
+                    let snapshot_key = SampledKey::of(resource);
                     let image = if self_slot.is_some() && snapshot_key.is_plain_2d_identity_view() {
                         let name = (identity.clone(), snapshot_key);
                         if let Some(existing) = attachment_snapshots.get(&name) {
@@ -5308,7 +5430,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // the two arms below are exclusive by that test rather than by re-deriving
     // which features are in play — a depth MRT draw has one framebuffer and must
     // dispose it once.
-    if ad_hoc_framebuffer && transient_depth.is_none() {
+    if ordinary_ad_hoc_framebuffer && transient_depth.is_none() {
         pools.dispose(
             &ctx.device,
             super::pools::DeferredHandle::Framebuffer(target_fb),
@@ -5527,6 +5649,7 @@ unsafe fn ad_hoc_attachment_views(
             sec.identity.clone(),
             sec.width,
             sec.height,
+            1,
             sec.identity.generation(),
             sec.format,
             counters,
@@ -5786,7 +5909,7 @@ mod tests {
     fn sampled_resident_state_is_validated_at_execution() {
         let identity = sampled_identity();
         assert!(matches!(
-            validate_sampled_resident(34, &identity, 64, 32, None, None),
+            validate_sampled_resident(34, &identity, 64, 32, false, None, None),
             Err(DrawExecutionDecline::SampledResidentMissing {
                 binding: 34,
                 prior: None,
@@ -5794,11 +5917,11 @@ mod tests {
             })
         ));
         assert!(matches!(
-            validate_sampled_resident(34, &identity, 64, 32, Some((false, 64, 32)), None),
+            validate_sampled_resident(34, &identity, 64, 32, false, Some((false, 64, 32, 1)), None),
             Err(DrawExecutionDecline::SampledResidentNotReady { binding: 34, .. })
         ));
         assert!(matches!(
-            validate_sampled_resident(34, &identity, 64, 32, Some((true, 63, 32)), None),
+            validate_sampled_resident(34, &identity, 64, 32, false, Some((true, 63, 32, 1)), None),
             Err(DrawExecutionDecline::SampledResidentGeometryMismatch {
                 binding: 34,
                 resident_width: 63,
@@ -5807,7 +5930,7 @@ mod tests {
             })
         ));
         assert_eq!(
-            validate_sampled_resident(34, &identity, 64, 32, Some((true, 64, 32)), None),
+            validate_sampled_resident(34, &identity, 64, 32, false, Some((true, 64, 32, 1)), None),
             Ok(())
         );
     }
@@ -6356,6 +6479,7 @@ mod tests {
                 volume: false,
                 cube: false,
                 one_dim: false,
+                multisampled: false,
                 source: SampledSource::GuestRuns(
                     GuestRunSource {
                         runs: std::sync::Arc::new(vec![GuestRun {
@@ -6458,6 +6582,7 @@ mod tests {
             volume: false,
             cube: false,
             one_dim: false,
+            multisampled: false,
             source: SampledSource::Target(identity),
             byte_origin: Default::default(),
             format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,

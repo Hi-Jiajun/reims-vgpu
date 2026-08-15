@@ -12,9 +12,10 @@
 
 use metal2vulkan::passes::Stage;
 use reims_vgpu::backend::vulkan::engine::{
-    self, BufferContent, DrawRequest, GuestRun, GuestRunSource, IndexType, IndexedDrawResource,
-    PrimitiveTopology, SampledImageResource, SampledSource, SamplerResource, ScissorResource,
-    StorageBufferResource, TargetIdentity,
+    self, BufferContent, DepthState, DrawRequest, GuestRun, GuestRunSource, IndexType,
+    IndexedDrawResource, PrimitiveTopology, SampledImageResource, SampledSource,
+    SamplerCompareFunction, SamplerResource, ScissorResource, StorageBufferResource,
+    TargetIdentity,
 };
 /// The resident format every `TargetIdentity::Surface` in this file is built at.
 ///
@@ -246,6 +247,130 @@ fn one_metal_encoder_continues_one_vulkan_render_pass() {
             );
         }
     }
+}
+
+/// A resolve-only attachment keeps its multisample source alive for the whole
+/// guest encoder. The first draw cannot resolve and discard that source before
+/// the second draw: both halves must be present when the encoder-ending read
+/// finally closes the Vulkan pass and resolves it.
+#[test]
+fn one_multisample_encoder_resolves_after_its_last_draw() {
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_103,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+
+    let before = engine::counter_snapshot();
+    let mut first = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    first.raster_sample_count = 4;
+    first.color_sample_count = 4;
+    first.multisample_resolve = true;
+    first.render_pass_continues = true;
+    match engine::execute_draw_request(&first) {
+        Ok(_) => {}
+        Err(e) => {
+            let msg = e.to_string();
+            if skip_if_no_gpu(&msg) {
+                eprintln!("skipping: {msg}");
+                return;
+            }
+            panic!("multisample encoder first draw: {msg}");
+        }
+    }
+
+    let mut second = batch_req(&vert, &frag, &identity, true, half_scissor(false));
+    second.raster_sample_count = 4;
+    second.color_sample_count = 4;
+    second.multisample_resolve = true;
+    second.continues_render_pass = true;
+    engine::execute_draw_request(&second).expect("multisample encoder second draw");
+
+    let px = engine::read_target(&identity)
+        .expect("close and resolve the multisample encoder")
+        .into_rgba8();
+    let delta = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        delta.render_pass_continuations, 1,
+        "the resolve must occur after both draws in one pass: {delta:?}"
+    );
+    for y in [0u32, H / 2, H - 1] {
+        for x in [W / 4, 3 * W / 4] {
+            let i = ((y * W + x) * 4) as usize;
+            assert!(
+                is_frag_color(&px[i..i + 4]),
+                "resolved encoder at ({x},{y}) = {:?}",
+                &px[i..i + 4]
+            );
+        }
+    }
+}
+
+/// A stored multisample texture is itself the resource. It remains resident
+/// between encoders; the second encoder loads that image instead of requiring
+/// an implicit resolve or a linear image-to-buffer copy.
+#[test]
+fn stored_multisample_target_survives_for_a_later_encoder() {
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_104,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let depth_identity = TargetIdentity::Texture {
+        ref_: 990_105,
+        width: W,
+        height: H,
+        generation: 0,
+        stencil: false,
+    };
+
+    let mut first = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    first.raster_sample_count = 2;
+    first.color_sample_count = 2;
+    first.depth = Some(DepthState {
+        identity: Some(depth_identity.clone()),
+        test_enable: true,
+        write_enable: true,
+        compare: SamplerCompareFunction::Always,
+        clear_value: 1.0,
+        load: false,
+        stencil: None,
+    });
+    match engine::execute_draw_request(&first) {
+        Ok(out) => assert!(out.pixels.is_empty(), "stored multisample target stays GPU-resident"),
+        Err(e) => {
+            let msg = e.to_string();
+            if skip_if_no_gpu(&msg) {
+                eprintln!("skipping: {msg}");
+                return;
+            }
+            panic!("stored multisample opener: {msg}");
+        }
+    }
+    assert!(engine::resident_content_ready(&identity));
+
+    let mut second = batch_req(&vert, &frag, &identity, true, half_scissor(false));
+    second.raster_sample_count = 2;
+    second.color_sample_count = 2;
+    second.depth = Some(DepthState {
+        identity: Some(depth_identity),
+        test_enable: true,
+        write_enable: true,
+        compare: SamplerCompareFunction::Always,
+        clear_value: 1.0,
+        load: true,
+        stencil: None,
+    });
+    engine::execute_draw_request(&second).expect("later encoder loads multisample resident");
+    assert!(engine::resident_content_ready(&identity));
 }
 
 /// A draw to a DIFFERENT target joins the open batch, and both targets still
@@ -598,6 +723,7 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
         volume: false,
         cube: false,
         one_dim: false,
+        multisampled: false,
         source: SampledSource::GuestRuns(
             GuestRunSource {
                 runs: std::sync::Arc::new(vec![

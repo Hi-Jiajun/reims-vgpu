@@ -231,6 +231,7 @@ pub enum SampledImageKind {
     D1,
     D1Array,
     D2,
+    D2Multisample,
     D2Array,
     D3,
     Cube,
@@ -2093,14 +2094,15 @@ use metal2vulkan::reflect::{
 /// `Buffer`, or a 3D array) — those are legitimate reflection shapes the sampled
 /// render path does not support and rejects fail-visibly at the call site.
 fn sampled_image_kind_from_shape(shape: &TextureShape) -> Option<SampledImageKind> {
-    match (shape.dimension, shape.arrayed) {
-        (TextureDimension::D1, false) => Some(SampledImageKind::D1),
-        (TextureDimension::D1, true) => Some(SampledImageKind::D1Array),
-        (TextureDimension::D2, false) => Some(SampledImageKind::D2),
-        (TextureDimension::D2, true) => Some(SampledImageKind::D2Array),
-        (TextureDimension::D3, false) => Some(SampledImageKind::D3),
-        (TextureDimension::Cube, false) => Some(SampledImageKind::Cube),
-        (TextureDimension::Cube, true) => Some(SampledImageKind::CubeArray),
+    match (shape.dimension, shape.arrayed, shape.multisampled) {
+        (TextureDimension::D1, false, false) => Some(SampledImageKind::D1),
+        (TextureDimension::D1, true, false) => Some(SampledImageKind::D1Array),
+        (TextureDimension::D2, false, false) => Some(SampledImageKind::D2),
+        (TextureDimension::D2, false, true) => Some(SampledImageKind::D2Multisample),
+        (TextureDimension::D2, true, false) => Some(SampledImageKind::D2Array),
+        (TextureDimension::D3, false, false) => Some(SampledImageKind::D3),
+        (TextureDimension::Cube, false, false) => Some(SampledImageKind::Cube),
+        (TextureDimension::Cube, true, false) => Some(SampledImageKind::CubeArray),
         _ => None,
     }
 }

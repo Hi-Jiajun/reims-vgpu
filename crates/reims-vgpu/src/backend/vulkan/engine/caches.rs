@@ -18,6 +18,18 @@ use super::types::{
 };
 use super::vk_call::{VkCall, VkOp};
 
+pub(crate) fn vk_sample_count(count: u32) -> vk::SampleCountFlags {
+    match count {
+        2 => vk::SampleCountFlags::TYPE_2,
+        4 => vk::SampleCountFlags::TYPE_4,
+        8 => vk::SampleCountFlags::TYPE_8,
+        16 => vk::SampleCountFlags::TYPE_16,
+        32 => vk::SampleCountFlags::TYPE_32,
+        64 => vk::SampleCountFlags::TYPE_64,
+        _ => vk::SampleCountFlags::TYPE_1,
+    }
+}
+
 /// A device-specific widening of an optional three-component vertex format.
 ///
 /// The draw remains executable, but the pipeline is not byte-for-byte what the
@@ -195,6 +207,11 @@ pub(crate) struct PassKey {
     /// most eight colour attachments, so the wire-derived attachment table is
     /// the bound and one byte carries the whole set.
     pub feedback_colors: u8,
+    /// Sample count of the colour attachment pipelines rasterize into.
+    pub sample_count: u32,
+    /// Attachment zero resolves into a single-sample attachment appended
+    /// immediately after it.
+    pub multisample_resolve: bool,
 }
 
 impl PassKey {
@@ -209,6 +226,8 @@ impl PassKey {
             depth: None,
             color_input: false,
             feedback_colors: 0,
+            sample_count: 1,
+            multisample_resolve: false,
         }
     }
 
@@ -1369,8 +1388,12 @@ impl ObjectCaches {
         // registry tracks this layout.
         let mut attachments = vec![vk::AttachmentDescription::default()
             .format(target_format)
-            .samples(vk::SampleCountFlags::TYPE_1)
+            .samples(vk_sample_count(key.sample_count))
             .load_op(load_op)
+            // Vulkan render-pass splits are an implementation detail inside one
+            // guest encoder. Preserve the scratch source across such a split;
+            // the guest's resolve-only store action still exposes only the
+            // single-sample destination.
             .store_op(vk::AttachmentStoreOp::STORE)
             .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
@@ -1411,6 +1434,31 @@ impl ObjectCaches {
                     .layout(key.color_layout(attachment_index)),
             );
         }
+        let mut resolve_ref = Vec::new();
+        if key.multisample_resolve {
+            let resolve_index = attachments.len() as u32;
+            attachments.push(
+                vk::AttachmentDescription::default()
+                    .format(target_format)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .initial_layout(color0_layout)
+                    .final_layout(color0_final),
+            );
+            resolve_ref.push(
+                vk::AttachmentReference::default()
+                    .attachment(resolve_index)
+                    .layout(color0_layout),
+            );
+            resolve_ref.extend((1..color_ref.len()).map(|_| {
+                vk::AttachmentReference::default()
+                    .attachment(vk::ATTACHMENT_UNUSED)
+                    .layout(vk::ImageLayout::UNDEFINED)
+            }));
+        }
         // Depth attachment is appended LAST (after color + secondaries), so its
         // index is the current attachment count and color slot 0 is untouched.
         let depth_ref = key.depth.map(|d| {
@@ -1442,7 +1490,7 @@ impl ObjectCaches {
             attachments.push(
                 vk::AttachmentDescription::default()
                     .format(dformat)
-                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .samples(vk_sample_count(key.sample_count))
                     .load_op(dload)
                     .store_op(vk::AttachmentStoreOp::STORE)
                     .stencil_load_op(sload)
@@ -1460,6 +1508,9 @@ impl ObjectCaches {
         let mut subpass_desc = vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(&color_ref);
+        if !resolve_ref.is_empty() {
+            subpass_desc = subpass_desc.resolve_attachments(&resolve_ref);
+        }
         if key.color_input {
             subpass_desc = subpass_desc.input_attachments(&input_ref);
         }
@@ -1993,26 +2044,14 @@ impl ObjectCaches {
             .cull_mode(translate::raster::vk_cull_mode(key.cull_mode))
             .front_face(translate::raster::vk_front_face(key.front_face_ccw))
             .line_width(1.0);
-        // Pinned rather than unknown, and every render target this backend
-        // allocates is single-sampled, so honouring a count would need the
-        // attachment path to carry one too.
-        //
         // `rasterSampleCount` is a property of `MTLRenderPipelineDescriptor`,
         // so it reaches this device inside the type-7 pipeline's own
-        // compact-TLV block, which is the *only* route to it: the render-pass
-        // attachment record on the wire carries a resolve ref and no count, and
-        // the texture objects are met through the kernel's object list, whose
-        // descriptor has no such field either. That tag is now read —
-        // `PIPELINE_TAG_RASTER_SAMPLE_COUNT` — and a count this line cannot
-        // meet is named as `pipeline_raster_sample_count_degraded` rather than
-        // defaulted in silence. So the demand for multisampled attachments is
-        // now measurable, which is what widening this would need first.
-        //
-        // A pass that states a sample count *without* an attachment carrying
-        // one — `defaultRasterSampleCount` — is refused rather than rasterized
-        // here, as `StreamDrawDrop::PassRasterSampleCountUnsupported`.
+        // compact-TLV block. The pass key carries that decoded count, and the
+        // render-pass attachment is created with the same value; unsupported
+        // count/attachment combinations are refused before either object is
+        // built.
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            .rasterization_samples(vk_sample_count(key.pass.0.sample_count));
         // One blend attachment state per color attachment; Vulkan requires the
         // count to match the render pass. Every slot uses its own decoded
         // blend, slot 0 from `key.blend` and slot n from

@@ -280,22 +280,51 @@ pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
 /// disagree with the forward map and a new layout is covered the moment it is
 /// added to `ALL`.
 pub fn texel_layout_of(format: vk::Format) -> Option<TexelLayout> {
+    // A layout describes stored bytes, and the transfer function does not change
+    // them, so the fold is [`storage_format`]'s and is not spelled twice.
+    let format = storage_format(format);
     TexelLayout::ALL
         .iter()
         .copied()
         .find(|&l| vk_texel_layout(l) == format)
 }
 
+/// The format an image is *allocated* in, for a requested view format.
+///
+/// A Metal texture view over an `IOSurface` is a second interpretation of one
+/// allocation, never a second allocation. `BGRA8Unorm` and `BGRA8Unorm_sRGB`
+/// name the same stored bytes and differ only in the fixed-function conversion
+/// applied on render writes and sampled reads. Vulkan expresses exactly that
+/// with one `VkImage` created `MUTABLE_FORMAT` and one `VkImageView` per
+/// interpretation, so the allocation is keyed on this format and the transfer
+/// function rides on the view.
+///
+/// **Folding here is what keeps one surface to one resident.** Keying an
+/// allocation on the view format instead forks the resident the moment a guest
+/// binds one surface through both spellings — which the guest does — and the two
+/// images then alternate frame to frame, each holding half the content. That is
+/// a content defect, not a colour one, and it is why this fold is not optional.
+pub fn storage_format(format: vk::Format) -> vk::Format {
+    match format {
+        vk::Format::R8G8B8A8_SRGB => vk::Format::R8G8B8A8_UNORM,
+        vk::Format::B8G8R8A8_SRGB => vk::Format::B8G8R8A8_UNORM,
+        other => other,
+    }
+}
+
+/// Whether a Vulkan colour format stores its first and third channels in BGRA
+/// order. The transfer function is deliberately irrelevant: UNORM and sRGB
+/// views interpret the same four stored bytes.
+pub fn has_bgra_order(format: vk::Format) -> bool {
+    matches!(texel_layout_of(format), Some(TexelLayout::Bgra8))
+}
+
 /// Every Vulkan format a colour attachment may take, and the decline for a
 /// format the rail does not render to.
 ///
 /// The result is the resolved [`vk::Format`] rather than an engine enum, so an
-/// sRGB target is *expressible* here — the render pass, the pipeline key and
-/// the image all carry a real format now. It is still [`PixelFormat::linear_vk`]
-/// that is returned, with the [`TranslateReason::SrgbDowngraded`] that loss
-/// owes: flipping the rail is a separate, measurable change, because the crate
-/// currently ignores the transfer function *consistently* and a target written
-/// unencoded then sampled undecoded cancels out.
+/// sRGB target reaches an sRGB attachment and gets Vulkan's fixed-function
+/// linear-to-sRGB conversion on writes.
 ///
 /// The narrowing is deliberate and stays. Metal renders to far more formats
 /// than this device carries; admitting one the rest of the pass machinery has
@@ -320,7 +349,7 @@ pub fn color_attachment(
     if pixel_format::render_target_bpp(mtl).is_none() {
         return Err(TranslateReason::NoColorAttachmentFormat(mtl));
     }
-    Ok((f.linear_vk, srgb_decline(&f, mtl)))
+    Ok((f.vk, None))
 }
 
 /// The engine's storage-image format for a contract [`StorageImageSelector`].
@@ -1034,10 +1063,8 @@ mod tests {
         }
     }
 
-    /// **The phase-2 regression gate.** An sRGB Metal format may reach a linear
-    /// engine format only together with a recorded decline — that is the whole
-    /// difference between a downgrade and the silent fold this refactor exists
-    /// to remove. Asserted over every entry point that can lose the qualifier.
+    /// Sampled uploads still expose their downgrade until their byte-layout
+    /// carrier retains a transfer function. Colour attachments must keep sRGB.
     #[test]
     fn an_srgb_format_never_reaches_a_linear_one_silently() {
         for mtl in [
@@ -1051,12 +1078,12 @@ mod tests {
                 "sampled rail dropped sRGB with no decline"
             );
 
-            let (_, decline) = color_attachment(mtl).unwrap();
-            assert_eq!(
-                decline,
-                Some(TranslateReason::SrgbDowngraded(mtl)),
-                "colour attachment dropped sRGB with no decline"
-            );
+            let (format, decline) = color_attachment(mtl).unwrap();
+            assert!(matches!(
+                format,
+                vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
+            ));
+            assert_eq!(decline, None, "colour attachment must preserve sRGB");
         }
         // The converse: a linear format must never produce the decline, or the
         // proxy floods and stops meaning anything.
@@ -1073,13 +1100,73 @@ mod tests {
         }
     }
 
-    /// An sRGB format resolves to the same byte layout, and to its linear
-    /// sibling's Vulkan format, on both rails that hold the transfer function.
+    /// The storage fold changes the transfer function and **never** the channel
+    /// order.
     ///
-    /// This is the *held* state, not a limitation of the vocabulary: the
-    /// colour-attachment rail now answers a real `VkFormat`, so the day the
-    /// crate flips, `B8G8R8A8_SRGB` is one word away — and the equalities below
-    /// are what will change, deliberately and visibly.
+    /// This is the property that makes [`storage_format`] safe to key an
+    /// allocation on. A fold that swapped `B8G8R8A8_SRGB` onto an `R8G8B8A8`
+    /// storage format would put every texel's red and blue in each other's
+    /// bytes, which reaches the screen as a hue rotation and nothing in the
+    /// engine would refuse it — an image and a view in the same compatibility
+    /// class are both valid Vulkan.
+    #[test]
+    fn the_storage_fold_never_changes_channel_order() {
+        for &format in &[
+            vk::Format::R8G8B8A8_SRGB,
+            vk::Format::B8G8R8A8_SRGB,
+            vk::Format::R8G8B8A8_UNORM,
+            vk::Format::B8G8R8A8_UNORM,
+        ] {
+            let storage = storage_format(format);
+            assert_eq!(
+                has_bgra_order(storage),
+                has_bgra_order(format),
+                "{format:?} changed channel order on the way to {storage:?}"
+            );
+            assert_eq!(
+                texel_layout_of(storage),
+                texel_layout_of(format),
+                "{format:?} changed byte layout on the way to {storage:?}"
+            );
+        }
+        assert_eq!(
+            storage_format(vk::Format::B8G8R8A8_SRGB),
+            vk::Format::B8G8R8A8_UNORM
+        );
+        assert_eq!(
+            storage_format(vk::Format::R8G8B8A8_SRGB),
+            vk::Format::R8G8B8A8_UNORM
+        );
+    }
+
+    /// Every format the forward map produces is already a storage format, and
+    /// the fold is idempotent.
+    ///
+    /// Together these say an allocation keyed on [`storage_format`] has exactly
+    /// one spelling per compatibility class, which is what stops one surface
+    /// from being resident twice.
+    #[test]
+    fn the_storage_fold_is_idempotent_and_closed_over_the_forward_map() {
+        for &layout in TexelLayout::ALL {
+            let format = vk_texel_layout(layout);
+            assert_eq!(
+                storage_format(format),
+                format,
+                "{layout:?} maps to {format:?}, which is not its own storage format"
+            );
+        }
+        for &format in &[
+            vk::Format::R8G8B8A8_SRGB,
+            vk::Format::B8G8R8A8_SRGB,
+            vk::Format::R16G16B16A16_SFLOAT,
+        ] {
+            let once = storage_format(format);
+            assert_eq!(storage_format(once), once, "{format:?} folds twice");
+        }
+    }
+
+    /// Sampled byte layouts remain linear while colour attachments retain the
+    /// transfer function in their Vulkan format.
     #[test]
     fn the_srgb_rails_still_answer_their_linear_sibling() {
         assert_eq!(
@@ -1092,11 +1179,11 @@ mod tests {
         );
         assert_eq!(
             color_attachment(p::MTL_FORMAT_BGRA8_UNORM_SRGB).unwrap().0,
-            vk::Format::B8G8R8A8_UNORM
+            vk::Format::B8G8R8A8_SRGB
         );
         assert_eq!(
             color_attachment(p::MTL_FORMAT_RGBA8_UNORM_SRGB).unwrap().0,
-            vk::Format::R8G8B8A8_UNORM
+            vk::Format::R8G8B8A8_SRGB
         );
         // …and each one hands back the decline that loss owes, so the hold is
         // measured rather than assumed.
@@ -1108,10 +1195,7 @@ mod tests {
                 sampled_pixels(mtl).unwrap().1,
                 Some(TranslateReason::SrgbDowngraded(mtl))
             );
-            assert_eq!(
-                color_attachment(mtl).unwrap().1,
-                Some(TranslateReason::SrgbDowngraded(mtl))
-            );
+            assert_eq!(color_attachment(mtl).unwrap().1, None);
             // The faithful format is one field away and costs the same bytes.
             let f = translate(mtl).unwrap();
             assert_ne!(f.vk, f.linear_vk);
@@ -1444,7 +1528,11 @@ mod tests {
                 continue;
             }
             let format = color_attachment(mtl).unwrap().0;
-            let layout = texel_layout_of(format).unwrap_or_else(|| {
+            // Readback moves stored texels and therefore reasons about the
+            // linear sibling's byte layout; an sRGB image view changes the
+            // shader conversion, not those bytes.
+            let storage_format = translate(mtl).unwrap().linear_vk;
+            let layout = texel_layout_of(storage_format).unwrap_or_else(|| {
                 panic!("{mtl:#x}: renderable as {format:?} with no guest texel layout")
             });
             // Four pixels of each, through both directions. The functions check

@@ -38,6 +38,11 @@ pub const MTL_LOAD_ACTION_CLEAR: u16 = 2;
 pub const MTL_STORE_ACTION_DONT_CARE: u16 = 0;
 /// `MTLStoreActionStore` — the pass's result is written back to the attachment.
 pub const MTL_STORE_ACTION_STORE: u16 = 1;
+/// `MTLStoreActionMultisampleResolve` — resolve into the attachment's
+/// single-sample destination and discard the multisample source.
+pub const MTL_STORE_ACTION_MULTISAMPLE_RESOLVE: u16 = 2;
+/// `MTLStoreActionStoreAndMultisampleResolve` — preserve both images.
+pub const MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE: u16 = 3;
 
 /// Whether `raw` is one of the three `MTLLoadAction` values.
 ///
@@ -50,18 +55,26 @@ pub fn is_declared_load_action(raw: u16) -> bool {
     raw <= MTL_LOAD_ACTION_CLEAR
 }
 
-/// Whether `raw` is one of the two `MTLStoreAction` values this device implements.
+/// Whether `raw` is one of the four store actions this device decodes by name.
 ///
-/// Unlike the load set this one is *not* closed by the SDK — `MTLStoreAction`
-/// also has `MultisampleResolve`, `StoreAndMultisampleResolve`, `Unknown` and
-/// `CustomSampleDepthStore`. So a rejection here has two possible causes that
-/// this predicate cannot tell apart: a misread field, or a guest asking for a
-/// resolve this device does not implement. Either way the pass's result for that
-/// attachment is dropped, which is why the callers that report say so rather
-/// than naming a cause.
+/// The remaining SDK values require additional state not represented by this
+/// wire form. Backend capability is a separate question: recognizing an action
+/// here does not authorize a backend to approximate it.
 #[must_use]
 pub fn is_declared_store_action(raw: u16) -> bool {
-    raw <= MTL_STORE_ACTION_STORE
+    raw <= MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE
+}
+
+/// Whether the action publishes a single-sample destination the guest may
+/// subsequently read.
+#[must_use]
+pub fn store_action_publishes_single_sample(raw: u16) -> bool {
+    matches!(
+        raw,
+        MTL_STORE_ACTION_STORE
+            | MTL_STORE_ACTION_MULTISAMPLE_RESOLVE
+            | MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE
+    )
 }
 
 #[cfg(test)]
@@ -88,32 +101,50 @@ mod tests {
         assert!(!is_declared_load_action(u16::MAX));
     }
 
-    /// The accepted store set is exactly the two this device implements.
+    /// The recognized store set is exactly the four actions represented here.
     #[test]
-    fn only_the_two_implemented_store_actions_are_accepted() {
+    fn only_the_four_named_store_actions_are_accepted() {
         assert!(is_declared_store_action(MTL_STORE_ACTION_DONT_CARE));
         assert!(is_declared_store_action(MTL_STORE_ACTION_STORE));
-        for raw in (MTL_STORE_ACTION_STORE + 1)..=64u16 {
+        assert!(is_declared_store_action(MTL_STORE_ACTION_MULTISAMPLE_RESOLVE));
+        assert!(is_declared_store_action(
+            MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE
+        ));
+        for raw in (MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE + 1)..=64u16 {
             assert!(
                 !is_declared_store_action(raw),
-                "{raw} is not an implemented MTLStoreAction"
+                "{raw} is not a named MTLStoreAction"
             );
         }
         assert!(!is_declared_store_action(u16::MAX));
     }
 
+    #[test]
+    fn only_actions_with_a_single_sample_result_publish_one() {
+        assert!(!store_action_publishes_single_sample(
+            MTL_STORE_ACTION_DONT_CARE
+        ));
+        for action in [
+            MTL_STORE_ACTION_STORE,
+            MTL_STORE_ACTION_MULTISAMPLE_RESOLVE,
+            MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
+        ] {
+            assert!(store_action_publishes_single_sample(action));
+        }
+        assert!(!store_action_publishes_single_sample(u16::MAX));
+    }
+
     /// Neither predicate can see the two adjacent words swapped.
     ///
-    /// The store set is a strict subset of the load set — `{0, 1}` inside
-    /// `{0, 1, 2}` — and the attachment prefix carries the two in adjacent
-    /// words. So a decode that reads the store word as the load word produces a
-    /// value both predicates accept, every time, and the only reading that can
-    /// escape is a load of CLEAR landing where a store was expected. Pinned
+    /// The load set is a strict subset of the store set — `{0, 1, 2}` inside
+    /// `{0, 1, 2, 3}` — and the attachment prefix carries the two in adjacent
+    /// words. So a decode that swaps the words can still produce values both
+    /// predicates accept. Pinned
     /// because it bounds what these two can be asked to prove: they narrow a
     /// value to its own contract, and no arrangement of them detects a field
     /// offset that is two bytes out.
     #[test]
-    fn the_store_set_is_a_strict_subset_of_the_load_set() {
+    fn the_load_set_is_a_strict_subset_of_the_store_set() {
         let load: Vec<u16> = (0..=u16::MAX)
             .filter(|&r| is_declared_load_action(r))
             .collect();
@@ -121,14 +152,14 @@ mod tests {
             .filter(|&r| is_declared_store_action(r))
             .collect();
         assert!(
-            store.iter().all(|r| load.contains(r)),
-            "a store ordinal outside the load set would make a swap detectable"
+            load.iter().all(|r| store.contains(r)),
+            "a load ordinal outside the store set would make a swap detectable"
         );
         assert_eq!(
-            load.iter()
-                .filter(|r| !store.contains(r))
+            store.iter()
+                .filter(|r| !load.contains(r))
                 .collect::<Vec<_>>(),
-            vec![&MTL_LOAD_ACTION_CLEAR]
+            vec![&MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE]
         );
     }
 }

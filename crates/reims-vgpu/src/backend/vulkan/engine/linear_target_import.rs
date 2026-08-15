@@ -419,7 +419,7 @@ unsafe fn create_with_layout(
     let handle = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
     let mut external = vk::ExternalMemoryImageCreateInfo::default().handle_types(handle);
     let base = vk::ImageCreateInfo::default()
-        .flags(vk::ImageCreateFlags::ALIAS)
+        .flags(vk::ImageCreateFlags::ALIAS | vk::ImageCreateFlags::MUTABLE_FORMAT)
         .image_type(vk::ImageType::TYPE_2D)
         .format(format)
         .extent(vk::Extent3D {

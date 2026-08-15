@@ -928,7 +928,7 @@ impl EngineCounters {
         self.creates.fetch_add(1, Ordering::Relaxed);
         CREATE_SITE_COUNTS[site.index()].fetch_add(1, Ordering::Relaxed);
         let count = CREATE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if count % CREATE_EMIT_EVERY == 0 {
+        if count.is_multiple_of(CREATE_EMIT_EVERY) {
             emit_create_site_census();
         }
     }

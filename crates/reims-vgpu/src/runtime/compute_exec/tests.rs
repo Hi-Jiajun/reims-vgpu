@@ -500,7 +500,7 @@ fn accum_stage_in_tg_imageblock_and_control_fail_closed() {
 
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn vulkan_refuses_both_direct_and_indirect_stage_input_regions() {
+fn vulkan_ignores_stage_input_regions_without_a_stage_input_descriptor() {
     let mut acc = ComputeAccum::default();
     assert!(!super::linux_stage_input_or_imageblock_unsupported(
         false, &acc
@@ -517,14 +517,17 @@ fn vulkan_refuses_both_direct_and_indirect_stage_input_regions() {
         size_y: 1,
         size_z: 1,
     });
-    assert!(super::linux_stage_input_or_imageblock_unsupported(
+    assert!(!super::linux_stage_input_or_imageblock_unsupported(
         false, &acc
     ));
 
     acc.set_stage_in_region_indirect(3, 16);
     assert!(acc.stage_in_region.is_none());
-    assert!(super::linux_stage_input_or_imageblock_unsupported(
+    assert!(!super::linux_stage_input_or_imageblock_unsupported(
         false, &acc
+    ));
+    assert!(super::linux_stage_input_or_imageblock_unsupported(
+        true, &acc
     ));
 }
 
