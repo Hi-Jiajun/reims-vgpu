@@ -212,6 +212,16 @@ struct Shared {
 }
 
 impl Shared {
+    /// Point an open batch will receive when it is handed to the queue.
+    fn next_submission(&self) -> u64 {
+        self.next_value.load(Ordering::Acquire) + 1
+    }
+
+    /// Reserve the point previously advertised by [`Self::next_submission`].
+    fn reserve_submission(&self) -> u64 {
+        self.next_value.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
     fn latest_queued(&self) -> Option<u64> {
         let value = self.latest_queued.load(Ordering::Acquire);
         (value != 0).then_some(value)
@@ -331,7 +341,7 @@ impl StampCompletion {
     /// queue announce stamps in that same order without any further ordering
     /// machinery.
     pub(crate) fn reserve_submission(&self) -> (vk::Semaphore, u64, SubmissionNote) {
-        let value = self.shared.next_value.fetch_add(1, Ordering::AcqRel) + 1;
+        let value = self.shared.reserve_submission();
         (
             self.semaphore,
             value,
@@ -416,7 +426,7 @@ impl StampCompletion {
         // The engine lock serializes this read with reservation. No other
         // FIFO-owned submission can reserve between recording this stamp and
         // flushing its open batch, so this is the batch's exact future point.
-        let target = self.shared.next_value.load(Ordering::Acquire) + 1;
+        let target = self.shared.next_submission();
         queue.push(Waiting {
             point: CompletionPoint::NextSubmission(target),
             index,
@@ -609,6 +619,33 @@ mod tests {
         }
     }
 
+    fn deferred(index: u32, stamp: u32, submission: u64) -> Waiting {
+        let mut waiting = waiting(index, stamp);
+        waiting.point = CompletionPoint::NextSubmission(submission);
+        waiting
+    }
+
+    fn test_shared(next_value: u64) -> Arc<Shared> {
+        Arc::new(Shared {
+            queue: Mutex::new(PendingQueue::default()),
+            wake: Condvar::new(),
+            stop: AtomicBool::new(false),
+            next_value: AtomicU64::new(next_value),
+            latest_queued: AtomicU64::new(0),
+        })
+    }
+
+    fn points(shared: &Shared) -> Vec<CompletionPoint> {
+        shared
+            .queue
+            .lock()
+            .expect("pending queue")
+            .waiting
+            .iter()
+            .map(|waiting| waiting.point)
+            .collect()
+    }
+
     #[test]
     fn pending_capacity_is_per_fifo_and_fifo_order_is_preserved() {
         let mut queue = PendingQueue::default();
@@ -641,9 +678,13 @@ mod tests {
             next_value: AtomicU64::new(0),
             latest_queued: AtomicU64::new(0),
         };
-        for n in 1u64..=3 {
-            let value = shared.next_value.fetch_add(1, Ordering::AcqRel) + 1;
-            assert_eq!(value, n, "timeline values start at 1 and never repeat");
+        for n in 1u64..=100 {
+            assert_eq!(shared.next_submission(), n);
+            assert_eq!(
+                shared.reserve_submission(),
+                n,
+                "the point recorded into an open-batch stamp is exactly the point subsequently reserved"
+            );
         }
         assert_eq!(shared.latest_queued.load(Ordering::Acquire), 0);
     }
@@ -806,6 +847,119 @@ mod tests {
             .collect();
         assert_eq!(
             points,
+            vec![
+                CompletionPoint::Submitted(1),
+                CompletionPoint::NextSubmission(2),
+            ]
+        );
+    }
+
+    /// Exercise the ownership relation as a matrix rather than one observed
+    /// pair: every batch has stamps on several FIFOs, and each successful
+    /// submission may transition exactly its own cells.
+    #[test]
+    fn every_submission_binds_exactly_its_stamps_across_batches_and_fifos() {
+        const BATCHES: u64 = 8;
+        const FIFOS: u32 = 4;
+        let mut queue = PendingQueue::default();
+        let mut owners = Vec::new();
+
+        // A concrete pressure-path point is mixed into the same queue. No
+        // open-batch submission notification may rewrite it.
+        queue.push(waiting(FIFOS, 0xf000));
+        owners.push(None);
+        for batch in 1..=BATCHES {
+            for fifo in 0..FIFOS {
+                queue.push(deferred(fifo, (batch as u32) * 16 + fifo, batch));
+                owners.push(Some(batch));
+            }
+        }
+        let fifo_levels = queue.per_fifo;
+
+        for submitted in 1..=BATCHES {
+            assert_eq!(
+                queue.bind_submission(submitted),
+                FIFOS as usize,
+                "one notification binds every FIFO stamp in its batch and no other"
+            );
+            for (waiting, owner) in queue.waiting.iter().zip(&owners) {
+                let expected = match owner {
+                    None => CompletionPoint::Submitted(0xf001),
+                    Some(batch) if *batch <= submitted => CompletionPoint::Submitted(*batch),
+                    Some(batch) => CompletionPoint::NextSubmission(*batch),
+                };
+                assert_eq!(waiting.point, expected, "owner={owner:?} after={submitted}");
+            }
+            assert_eq!(
+                queue.bind_submission(submitted),
+                0,
+                "a duplicate driver-success notification is idempotent"
+            );
+            assert_eq!(
+                queue.per_fifo, fifo_levels,
+                "binding changes state, never FIFO occupancy"
+            );
+        }
+    }
+
+    /// Exact identity, rather than arrival order, owns a stamp. The real queue
+    /// owner is ordered, but keeping this true under an adversarial call order
+    /// prevents a future refactor from quietly restoring bind-all semantics.
+    #[test]
+    fn out_of_order_notifications_still_cannot_cross_batch_ownership() {
+        let mut queue = PendingQueue::default();
+        queue.push(deferred(0, 1, 1));
+        queue.push(deferred(0, 2, 2));
+        queue.push(deferred(0, 3, 3));
+
+        assert_eq!(queue.bind_submission(2), 1);
+        assert_eq!(
+            queue.waiting.iter().map(|w| w.point).collect::<Vec<_>>(),
+            vec![
+                CompletionPoint::NextSubmission(1),
+                CompletionPoint::Submitted(2),
+                CompletionPoint::NextSubmission(3),
+            ]
+        );
+        assert_eq!(queue.bind_submission(1), 1);
+        assert_eq!(queue.bind_submission(3), 1);
+        assert!(queue
+            .waiting
+            .iter()
+            .all(|waiting| matches!(waiting.point, CompletionPoint::Submitted(_))));
+    }
+
+    /// Reproduce the actual two-thread shape deterministically: the queue
+    /// worker is held inside the older submit while the drain side records a
+    /// newer stamp, then the older driver call returns.
+    #[test]
+    fn queue_worker_return_cannot_claim_a_stamp_recorded_during_its_driver_call() {
+        let shared = test_shared(0);
+        shared
+            .queue
+            .lock()
+            .expect("pending queue")
+            .push(deferred(0, 1, 1));
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let worker_gate = Arc::clone(&gate);
+        let note = SubmissionNote {
+            shared: Arc::clone(&shared),
+        };
+        let worker = std::thread::spawn(move || {
+            worker_gate.wait();
+            note.submitted(1);
+        });
+
+        shared
+            .queue
+            .lock()
+            .expect("pending queue")
+            .push(deferred(1, 2, 2));
+        gate.wait();
+        worker.join().expect("queue worker");
+
+        assert_eq!(
+            points(&shared),
             vec![
                 CompletionPoint::Submitted(1),
                 CompletionPoint::NextSubmission(2),
