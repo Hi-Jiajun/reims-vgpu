@@ -2642,14 +2642,6 @@ pub struct DeviceState {
     /// answer to the one question its page-set guard cannot ask: was the guest
     /// told this render was done before we wrote its bytes?
     pub completion_stamp_seq: u64,
-    /// Per stamp slot, the greatest completion value this device has finished —
-    /// including the ones its coalescing and queued publication rails have not
-    /// put in the guest's stamp page yet.
-    ///
-    /// This is what a stamp wait is decided against, ahead of the page. See
-    /// [`crate::runtime::drain::CompletedStamps`] for why the page alone was the
-    /// wrong question for this device to ask itself, and what asking it cost.
-    pub completed_stamps: crate::runtime::drain::CompletedStamps,
     /// Total stale views the reuse verify caught (fail-logged as
     /// `gva_view_stale`; the view self-heals via retire + rebuild).
     pub view_stale_reads: u64,
@@ -2742,7 +2734,6 @@ impl DeviceState {
             retired_linear_residents: Vec::new(),
             pending_writebacks: crate::runtime::writeback_debt::PendingWritebacks::default(),
             completion_stamp_seq: 0,
-            completed_stamps: Default::default(),
             gva_resident_backing: std::collections::BTreeMap::new(),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             #[cfg(feature = "backend-vulkan")]
