@@ -2795,3 +2795,104 @@ fn the_gpu_whole_plane_arm_refuses_a_plane_the_rail_would_not_write() {
         "including the format the guest will read the landed bytes back as"
     );
 }
+
+/// The transfer function is not part of a stored texel, so it cannot decide a
+/// copy that converts nothing.
+///
+/// This is the shape a driven macos-13 Maps leg actually presents, and it was
+/// **1 609 of 1 609** records — the whole arm. The triple reads
+/// `src=81 dst=81 mapping=80`: the guest declares its render target
+/// `BGRA8Unorm_sRGB`, both endpoints of the copy agree with each other, and the
+/// IOSurface mapping declares plain `BGRA8Unorm` for the very same four stored
+/// bytes. Format equality calls that a disagreement forever, so the arm refused
+/// every record it was written for while every real precondition passed.
+///
+/// `store_texel_order` is the fold, and its own doc states the rule: the sRGB
+/// qualifier says how a sampler interprets bytes, not how they are stored.
+/// What must still separate — channel order and texel width — survives it, which
+/// is what the assertions below pin.
+#[test]
+fn the_gpu_whole_plane_arm_compares_stored_texels_and_not_transfer_functions() {
+    use crate::contract::pixel_format::{
+        MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_R32_FLOAT, MTL_FORMAT_RGBA8_UNORM_SRGB,
+    };
+    use GpuPlaneRefusal::*;
+
+    let dst = GpuPlane {
+        width: 1024,
+        height: 768,
+        surface_offset: 0,
+        row_stride: 4096,
+        pixel_format: MTL_FORMAT_BGRA8_UNORM_SRGB,
+    };
+    let window = GpuMappingWindow {
+        surface_offset: 0,
+        row_stride: 4096,
+        pixel_format: MTL_FORMAT_BGRA8_UNORM,
+    };
+    let src = GpuResidentSource {
+        width: 1024,
+        height: 768,
+        pixel_format: MTL_FORMAT_BGRA8_UNORM_SRGB,
+    };
+
+    assert_eq!(
+        gpu_whole_plane_destination(Some(dst), Some(window), src),
+        Ok(()),
+        "81/81/80 is one stored texel three times, which is what a copy moves"
+    );
+
+    // The fold is onto the sibling, not onto "any four-byte colour": channel
+    // order still decides, from either side.
+    assert_eq!(
+        gpu_whole_plane_destination(
+            Some(dst),
+            Some(GpuMappingWindow {
+                pixel_format: MTL_FORMAT_RGBA8_UNORM_SRGB,
+                ..window
+            }),
+            src
+        ),
+        Err(FormatDiffers),
+        "BGRA and RGBA are the same width and the same transfer function, and \
+         still not the same bytes"
+    );
+    assert_eq!(
+        gpu_whole_plane_destination(
+            Some(GpuPlane {
+                pixel_format: MTL_FORMAT_RGBA8_UNORM,
+                ..dst
+            }),
+            Some(GpuMappingWindow {
+                pixel_format: MTL_FORMAT_RGBA8_UNORM,
+                ..window
+            }),
+            src
+        ),
+        Err(FormatDiffers),
+        "and the resident's own order is compared against the folded destination"
+    );
+
+    // A format with no byte-copy layout is one the copy would have to convert,
+    // which this arm does not do. It must refuse rather than fold to `None ==
+    // None` and read as agreement.
+    let unlayed = GpuPlane {
+        pixel_format: MTL_FORMAT_R32_FLOAT,
+        ..dst
+    };
+    assert_eq!(
+        gpu_whole_plane_destination(
+            Some(unlayed),
+            Some(GpuMappingWindow {
+                pixel_format: MTL_FORMAT_R32_FLOAT,
+                ..window
+            }),
+            GpuResidentSource {
+                pixel_format: MTL_FORMAT_R32_FLOAT,
+                ..src
+            }
+        ),
+        Err(FormatDiffers),
+        "three agreeing formats with no stored-texel layout are still not a byte copy"
+    );
+}

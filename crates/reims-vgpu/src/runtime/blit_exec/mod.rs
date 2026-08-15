@@ -3559,12 +3559,32 @@ fn gpu_whole_plane_destination(
     if src.width != dst.width || src.height != dst.height {
         return Err(GpuPlaneRefusal::GeometryDiffers);
     }
-    // All three, not two. The engine refuses a resident whose format is not the
+    // All three, not two. The engine refuses a resident whose texel is not the
     // destination's (`copy_target_to_guest_pages`), and the mapping's declared
     // format is what the guest will read these bytes back as — a chain that
     // agrees pairwise but not as a whole would land a converted-looking frame
     // with nothing having converted anything.
-    if src.pixel_format != dst.pixel_format || window.pixel_format != dst.pixel_format {
+    //
+    // **Stored texels, not declared formats.** A copy converts nothing, so what
+    // has to agree is what the bytes *are*, and the transfer function is not part
+    // of that: it says how a sampler reads a texel, not how one is stored.
+    // `store_texel_order` is this crate's single answer to that question and its
+    // own doc states the fold ("only the storage matters to a copy"), which is
+    // also what `translate::pixel::stored_bytes_agree` encodes one layer down for
+    // the Vulkan spelling of the same comparison.
+    //
+    // Equality here is not a stricter version of that rule, it is a different and
+    // wrong one, and it cost this arm every record it was written for: a guest
+    // render target declared `BGRA8Unorm_sRGB` meets an IOSurface mapping that
+    // declares plain `BGRA8Unorm` for the same four stored bytes, so the triple
+    // reads 81/81/80 and equality calls that a disagreement forever. A `None`
+    // still refuses — a format with no byte-copy layout is one where the copy
+    // would have to convert, which this arm does not do.
+    let texel = crate::contract::pixel_format::store_texel_order(dst.pixel_format);
+    if texel.is_none()
+        || crate::contract::pixel_format::store_texel_order(src.pixel_format) != texel
+        || crate::contract::pixel_format::store_texel_order(window.pixel_format) != texel
+    {
         return Err(GpuPlaneRefusal::FormatDiffers);
     }
     Ok(())
@@ -3674,6 +3694,28 @@ fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
     };
     if let Err(refusal) = gpu_whole_plane_destination(Some(plane), window, src) {
         note_store_route(refusal.route());
+        // "The formats differ" does not say which of the three does, and the
+        // three have different answers: a source that disagrees is a converting
+        // copy the contract does not describe, while a *mapping* that disagrees
+        // with a destination the source already matches is this device's own
+        // declaration being narrower than the texture it describes. Name all
+        // three once per distinct triple so the reading is the diagnosis.
+        if refusal == GpuPlaneRefusal::FormatDiffers {
+            let discriminant = (u64::from(src.pixel_format) << 32)
+                | (u64::from(plane.pixel_format) << 16)
+                | u64::from(window.map_or(u16::MAX, |w| w.pixel_format));
+            if crate::observe::first_sight("sl_gpu_format_differs", discriminant) {
+                crate::observe::fail(format!(
+                    "blit_gpu_plane reason=sl_gpu_format_differs src_format={} \
+                     dst_format={} mapping_format={} width={} height={}",
+                    src.pixel_format,
+                    plane.pixel_format,
+                    window.map_or(u16::MAX, |w| w.pixel_format),
+                    plane.width,
+                    plane.height
+                ));
+            }
+        }
         return None;
     }
     let identity = crate::runtime::writeback_debt::gva_identity(debt);
