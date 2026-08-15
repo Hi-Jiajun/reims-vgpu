@@ -831,23 +831,28 @@ impl<K, V> Default for ObjectVariantIndex<K, V> {
 }
 
 impl<K: Clone + Eq, V: Copy> ObjectVariantIndex<K, V> {
+    /// The variant this object last resolved to, if the object is still alive
+    /// and still asks for the same one.
+    ///
+    /// One probe, and `strong_count` rather than `upgrade`: this answers 96 % of
+    /// every draw's pipeline lookups on a driven Maps boot, so the second
+    /// `HashMap::get` and the `Arc` that `upgrade` creates only to drop —
+    /// two more atomics on the hottest path in the engine — were both paid per
+    /// draw for nothing. A `Weak` reads `strong_count() == 0` exactly when its
+    /// value has been dropped, which is the same question `upgrade().is_none()`
+    /// asked.
     fn get(
         &mut self,
         identity: &super::types::PipelineObjectIdentity,
         key: &K,
     ) -> Option<V> {
         let id = identity.id();
-        let expired = self
-            .map
-            .get(&id)
-            .is_some_and(|(life, _, _)| life.upgrade().is_none());
-        if expired {
+        let (life, held_key, pipeline) = self.map.get(&id)?;
+        if life.strong_count() == 0 {
             self.map.remove(&id);
             return None;
         }
-        self.map
-            .get(&id)
-            .and_then(|(_, held_key, pipeline)| (held_key == key).then_some(*pipeline))
+        (held_key == key).then_some(*pipeline)
     }
 
     fn remember(

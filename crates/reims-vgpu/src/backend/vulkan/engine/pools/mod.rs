@@ -2854,17 +2854,40 @@ impl CbBind {
     pub(crate) fn of(content: &super::types::BufferContent) -> Self {
         match content {
             super::types::BufferContent::Bytes(b) => Self {
-                key: (std::sync::Arc::as_ptr(b) as usize, 0, b.len() as u64),
+                key: Self::key_of(content),
                 owner: CbBindOwner::Bytes(std::sync::Arc::clone(b)),
             },
             super::types::BufferContent::GuestRuns(src) => Self {
-                key: (
-                    std::sync::Arc::as_ptr(&src.runs) as *const () as usize,
-                    src.source_offset,
-                    src.total_len,
-                ),
+                key: Self::key_of(content),
                 owner: CbBindOwner::Runs(std::sync::Arc::clone(&src.runs)),
             },
+        }
+    }
+
+    /// The identity on its own, without taking a reference to what it names.
+    ///
+    /// [`Self::of`] exists so that no entry can be recorded in
+    /// `cb_bound_buffers` without the `Arc` that keeps the key's address
+    /// unique, and it pays two atomics for that guarantee. A caller that only
+    /// *compares* two binds within one draw — the gather-role partition, which
+    /// lives and dies inside a single `execute_draw_request` — holds the
+    /// `DrawRequest` and therefore the allocations for the whole comparison, so
+    /// it needs no reference of its own and should not pay for one.
+    ///
+    /// This reaches no map. The invariant on [`ResourcePools::cb_bound_buffers`]
+    /// is that a raw key never reaches *that* map's API, and it is enforced by
+    /// [`ResourcePools::note_cb_bound_buffer`] taking a [`CbBind`] by value —
+    /// which this cannot produce.
+    pub(crate) fn key_of(content: &super::types::BufferContent) -> (usize, u64, u64) {
+        match content {
+            super::types::BufferContent::Bytes(b) => {
+                (std::sync::Arc::as_ptr(b) as usize, 0, b.len() as u64)
+            }
+            super::types::BufferContent::GuestRuns(src) => (
+                std::sync::Arc::as_ptr(&src.runs) as *const () as usize,
+                src.source_offset,
+                src.total_len,
+            ),
         }
     }
 

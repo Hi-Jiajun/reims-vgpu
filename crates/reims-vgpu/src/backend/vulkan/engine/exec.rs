@@ -122,34 +122,81 @@ fn buffer_bind_offset_alignment(role: BufferGatherRole, storage_align: u64) -> u
     storage.max(role.index_alignment.unwrap_or(1))
 }
 
-fn buffer_gather_roles(
-    req: &DrawRequest,
-) -> std::collections::BTreeMap<(usize, u64, u64), BufferGatherRole> {
-    let mut roles = std::collections::BTreeMap::new();
-    for content in req.vertex_attributes.iter().map(|r| &r.content) {
-        roles
-            .entry(CbBind::of(content).key())
-            .and_modify(|role: &mut BufferGatherRole| role.vertex = true)
-            .or_insert(BufferGatherRole::VERTEX);
-    }
-    for content in req.storage_buffers.iter().map(|r| &r.content) {
-        roles
-            .entry(CbBind::of(content).key())
-            .and_modify(|role| role.storage = true)
-            .or_insert(BufferGatherRole::STORAGE);
-    }
-    if let Some(indexed) = &req.indexed {
-        let alignment = indexed.index_type.byte_size() as u64;
-        roles
-            .entry(CbBind::of(&indexed.content).key())
-            .and_modify(|role| role.index_alignment = Some(alignment))
-            .or_insert(BufferGatherRole {
+/// One draw's buffer binds partitioned by the consumer(s) each physical content
+/// allocation serves.
+///
+/// A flat table and not a map. The population is a handful — a driven Maps boot
+/// reads 2.9 vertex attributes and about six buffer binds a draw — and the
+/// question asked of it is three bits wide, so an ordered map cost a node
+/// allocation per *distinct* allocation on every draw plus a pointer-chasing
+/// probe per bind, to answer something a linear scan over one contiguous
+/// allocation answers in a few compares. `sg_roles_us` was 0.15 µs of a 9.3 µs
+/// chain before this and the probes were charged to `sg_vertex`/`sg_index`/
+/// `sg_storage` beside it.
+///
+/// Built from key derivations that take no reference to what they name — see
+/// [`CbBind::key_of`] — because the `DrawRequest` this borrows outlives the
+/// table, so the allocations cannot go anywhere while it is being read.
+struct BufferGatherRoles {
+    entries: Vec<((usize, u64, u64), BufferGatherRole)>,
+}
+
+impl BufferGatherRoles {
+    fn of(req: &DrawRequest) -> Self {
+        let mut entries: Vec<((usize, u64, u64), BufferGatherRole)> = Vec::with_capacity(
+            req.vertex_attributes.len() + req.storage_buffers.len() + req.indexed.is_some() as usize,
+        );
+        // `entry`-shaped, so a content allocation named twice in one draw stays
+        // one physical operation carrying both roles.
+        let mut merge = |key, seed: BufferGatherRole, add: fn(&mut BufferGatherRole)| {
+            match entries.iter_mut().find(|(held, _)| *held == key) {
+                Some((_, role)) => add(role),
+                None => entries.push((key, seed)),
+            }
+        };
+        for content in req.vertex_attributes.iter().map(|r| &r.content) {
+            merge(CbBind::key_of(content), BufferGatherRole::VERTEX, |role| {
+                role.vertex = true
+            });
+        }
+        for content in req.storage_buffers.iter().map(|r| &r.content) {
+            merge(CbBind::key_of(content), BufferGatherRole::STORAGE, |role| {
+                role.storage = true
+            });
+        }
+        if let Some(indexed) = &req.indexed {
+            let alignment = indexed.index_type.byte_size() as u64;
+            let key = CbBind::key_of(&indexed.content);
+            let seed = BufferGatherRole {
                 vertex: false,
                 storage: false,
                 index_alignment: Some(alignment),
-            });
+            };
+            match entries.iter_mut().find(|(held, _)| *held == key) {
+                Some((_, role)) => role.index_alignment = Some(alignment),
+                None => entries.push((key, seed)),
+            }
+        }
+        Self { entries }
     }
-    roles
+
+    /// The role of the bind this key names. Every bind was classified by
+    /// [`Self::of`] from the same `DrawRequest`, so an absent key is a caller
+    /// asking about a bind that is not in this draw.
+    fn role(&self, key: (usize, u64, u64)) -> Option<BufferGatherRole> {
+        self.entries
+            .iter()
+            .find(|(held, _)| *held == key)
+            .map(|(_, role)| *role)
+    }
+
+    /// How many *physical* operations the draw's binds partition into, which is
+    /// the property the role split exists to preserve. Nothing on the draw path
+    /// asks; the partition test does.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 impl PendingGuestGather {
@@ -2780,8 +2827,16 @@ pub(crate) unsafe fn execute_draw_inner(
     };
     phase.enter(super::draw_phase::Phase::Pipeline);
 
-    // Build layout key from storage / sampled / sampler bindings.
-    let mut layout_bindings = Vec::new();
+    // Build layout key from storage / sampled / sampler bindings. Sized up
+    // front: this grew from empty on every draw, so a draw with the eight or so
+    // descriptors a Maps chain binds paid three reallocations to reach a width
+    // its inputs already state.
+    let mut layout_bindings = Vec::with_capacity(
+        req.storage_buffers.len()
+            + req.sampled_images.len()
+            + req.samplers.len()
+            + req.color_input as usize,
+    );
     for b in &req.storage_buffers {
         layout_bindings.push(BindingSig {
             binding: b.binding,
@@ -3149,7 +3204,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // this command buffer is copied once.
     let mut guest_gathers: Vec<PendingGuestGather> = Vec::new();
     phase.enter(super::draw_phase::Phase::StageRoles);
-    let gather_roles = buffer_gather_roles(req);
+    let gather_roles = BufferGatherRoles::of(req);
     phase.enter(super::draw_phase::Phase::StageVertex);
     let mut vertex_bufs = Vec::new();
     for resource in &req.vertex_attributes {
@@ -3210,8 +3265,8 @@ pub(crate) unsafe fn execute_draw_inner(
                 StageBufferUse {
                     usage: vk::BufferUsageFlags::VERTEX_BUFFER,
                     snapshot_volatile: batch_eligible,
-                    gather_role: *gather_roles
-                        .get(&CbBind::of(&resource.content).key())
+                    gather_role: gather_roles
+                        .role(CbBind::key_of(&resource.content))
                         .expect("every vertex buffer was classified"),
                 },
                 &mut guest_gathers,
@@ -3233,8 +3288,8 @@ pub(crate) unsafe fn execute_draw_inner(
             StageBufferUse {
                 usage: vk::BufferUsageFlags::INDEX_BUFFER,
                 snapshot_volatile: batch_eligible,
-                gather_role: *gather_roles
-                    .get(&CbBind::of(&indexed.content).key())
+                gather_role: gather_roles
+                    .role(CbBind::key_of(&indexed.content))
                     .expect("the index buffer was classified"),
             },
             &mut guest_gathers,
@@ -3256,8 +3311,8 @@ pub(crate) unsafe fn execute_draw_inner(
             StageBufferUse {
                 usage: vk::BufferUsageFlags::STORAGE_BUFFER,
                 snapshot_volatile: batch_eligible,
-                gather_role: *gather_roles
-                    .get(&CbBind::of(&resource.content).key())
+                gather_role: gather_roles
+                    .role(CbBind::key_of(&resource.content))
                     .expect("every storage buffer was classified"),
             },
             &mut guest_gathers,
@@ -6420,13 +6475,18 @@ mod tests {
             ..DrawRequest::default()
         };
 
-        let roles = buffer_gather_roles(&req);
+        let roles = BufferGatherRoles::of(&req);
         assert_eq!(roles.len(), 4, "shared content must stay one operation");
-        assert_eq!(roles[&keys[0]], BufferGatherRole::VERTEX);
-        assert_eq!(roles[&keys[1]], BufferGatherRole::STORAGE);
-        assert!(roles[&keys[2]].is_shared());
-        assert!(roles[&keys[3]].includes_index());
-        assert_eq!(roles[&keys[3]].index_alignment, Some(2));
+        assert_eq!(roles.role(keys[0]), Some(BufferGatherRole::VERTEX));
+        assert_eq!(roles.role(keys[1]), Some(BufferGatherRole::STORAGE));
+        assert!(roles.role(keys[2]).expect("shared was classified").is_shared());
+        let index = roles.role(keys[3]).expect("the index buffer was classified");
+        assert!(index.includes_index());
+        assert_eq!(index.index_alignment, Some(2));
+        // The table answers only about this draw's binds. An unclassified key
+        // must be `None` and not the role of whichever entry a scan happened to
+        // stop on — the three call sites `expect()` on exactly this.
+        assert_eq!(roles.role((0xdead_beef, 0, 16)), None);
     }
 
     /// Direct imports obey the limit of the descriptor actually written. A
