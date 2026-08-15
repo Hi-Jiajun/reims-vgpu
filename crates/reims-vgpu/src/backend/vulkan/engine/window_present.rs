@@ -393,6 +393,51 @@ pub enum WindowPresentOutcome {
     },
 }
 
+/// Result of the lock-held half of a display transaction.
+pub(crate) enum WindowPresentDispatch {
+    Complete(WindowPresentOutcome),
+    Pending(PendingWindowPresent),
+}
+
+/// Queue-owner completion plus the immutable facts needed to classify it.
+///
+/// No engine or pool reference crosses this boundary.  The resident was pinned
+/// and its next access recorded before the transaction entered the ordered
+/// queue; only the host driver's result remains outstanding.
+pub(crate) struct PendingWindowPresent {
+    wait: super::queue_owner::PendingPresent,
+    acquire_suboptimal: bool,
+    direct: bool,
+    width: u32,
+    height: u32,
+    swapchain_images: usize,
+}
+
+pub(crate) struct FinishedWindowPresent {
+    result: Result<bool, vk::Result>,
+    acquire_suboptimal: bool,
+    direct: bool,
+    width: u32,
+    height: u32,
+    swapchain_images: usize,
+}
+
+impl PendingWindowPresent {
+    /// Wait only for the display transaction's own completion.  This method
+    /// carries no engine reference and is therefore safe to call after the
+    /// global engine guard has been dropped.
+    pub(crate) fn wait(self) -> FinishedWindowPresent {
+        FinishedWindowPresent {
+            result: self.wait.wait(),
+            acquire_suboptimal: self.acquire_suboptimal,
+            direct: self.direct,
+            width: self.width,
+            height: self.height,
+            swapchain_images: self.swapchain_images,
+        }
+    }
+}
+
 /// MAILBOX where the surface offers it, FIFO where it does not.
 ///
 /// FIFO is the only mode Vulkan guarantees, so it is the fallback — including
@@ -1083,14 +1128,14 @@ impl WindowPresenter {
         Ok(())
     }
 
-    pub(crate) unsafe fn present(
+    pub(crate) unsafe fn begin_present(
         &mut self,
         ctx: &DeviceContext,
         pools: &mut ResourcePools,
         counters: &EngineCounters,
         source: Option<&WindowPresentSource>,
         cpu: Option<WindowCpuFrame<'_>>,
-    ) -> Result<WindowPresentOutcome, DrawError> {
+    ) -> Result<WindowPresentDispatch, DrawError> {
         if let Some(seq) = cpu.map(|frame| frame.seq) {
             if self.cadence_last_offered != Some(seq) {
                 self.cadence_last_offered = Some(seq);
@@ -1100,7 +1145,7 @@ impl WindowPresenter {
         if !self.retire(ctx, pools)? {
             self.cadence_busy_fence = self.cadence_busy_fence.saturating_add(1);
             self.note_cadence(false, false);
-            return Ok(WindowPresentOutcome::Busy);
+            return Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy));
         }
         if self.swapchain == vk::SwapchainKHR::null() || self.recreate_pending {
             self.recreate_swapchain(ctx)?;
@@ -1120,14 +1165,14 @@ impl WindowPresenter {
             Err(vk::Result::NOT_READY) | Err(vk::Result::TIMEOUT) => {
                 self.cadence_busy_acquire = self.cadence_busy_acquire.saturating_add(1);
                 self.note_cadence(false, false);
-                return Ok(WindowPresentOutcome::Busy);
+                return Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy));
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.recreate_pending = true;
                 self.recreate_reason = "acquire_out_of_date";
                 self.cadence_busy_acquire = self.cadence_busy_acquire.saturating_add(1);
                 self.note_cadence(false, false);
-                return Ok(WindowPresentOutcome::Busy);
+                return Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy));
             }
             Err(error) => {
                 return Err(DrawError::VkCall(VkCall::new(
@@ -1356,15 +1401,28 @@ impl WindowPresenter {
             let wait_stages = [ACQUIRE_WAIT_STAGE];
             let signals = [frame_render_finished];
             let commands = [frame_cmd];
-            ctx.submit_queue_work(&commands, &waits, &wait_stages, &signals, frame_in_flight)
-                .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowSubmitPresent, error)))
+            ctx.submit_present_transaction(super::context::PresentTransaction {
+                command_buffers: &commands,
+                wait_semaphores: &waits,
+                wait_stages: &wait_stages,
+                signal_semaphores: &signals,
+                fence: frame_in_flight,
+                loader: self.swapchain_loader.clone(),
+                present_wait: frame_render_finished,
+                swapchain: self.swapchain,
+                image_index,
+            })
+            .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowSubmitPresent, error)))
         })();
-        if let Err(error) = submit_result {
-            for identity in pinned.drain(..) {
-                let _ = pools.pin_resident_target(&identity, false);
+        let submission = match submit_result {
+            Ok(submission) => submission,
+            Err(error) => {
+                for identity in pinned.drain(..) {
+                    let _ = pools.pin_resident_target(&identity, false);
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
         self.frames[frame_ix].pinned = pinned;
         self.frames[frame_ix].submitted = true;
         // Only a successful submit advances the ring; a `Busy` return above
@@ -1380,15 +1438,36 @@ impl WindowPresenter {
             }
         }
 
-        let swapchains = [self.swapchain];
-        let indices = [image_index];
-        let waits = [frame_render_finished];
-        match ctx.queue_present(
-            self.swapchain_loader.clone(),
-            waits[0],
-            swapchains[0],
-            indices[0],
-        ) {
+        let direct = selected.is_some();
+        match submission {
+            super::context::PresentSubmission::Complete(result) => self.finish_present(
+                FinishedWindowPresent {
+                    result,
+                    acquire_suboptimal,
+                    direct,
+                    width: self.extent.width,
+                    height: self.extent.height,
+                    swapchain_images: self.images.len(),
+                },
+            ),
+            super::context::PresentSubmission::Pending(wait) => {
+                Ok(WindowPresentDispatch::Pending(PendingWindowPresent {
+                    wait,
+                    acquire_suboptimal,
+                    direct,
+                    width: self.extent.width,
+                    height: self.extent.height,
+                    swapchain_images: self.images.len(),
+                }))
+            }
+        }
+    }
+
+    pub(crate) fn finish_present(
+        &mut self,
+        finished: FinishedWindowPresent,
+    ) -> Result<WindowPresentDispatch, DrawError> {
+        match finished.result {
             Ok(present_suboptimal) => {
                 // ash reports VK_SUBOPTIMAL_KHR as `Ok(true)` (a success code),
                 // never through the `Err` arm. MoltenVK returns it from both
@@ -1397,7 +1476,7 @@ impl WindowPresenter {
                 // including after a retired swapchain clobbered the layer's
                 // drawableSize — so ignoring the flag leaves an invisible
                 // window that still counts successful presents.
-                let suboptimal = acquire_suboptimal || present_suboptimal;
+                let suboptimal = finished.acquire_suboptimal || present_suboptimal;
                 if suboptimal {
                     self.recreate_pending = true;
                     self.recreate_reason = "suboptimal";
@@ -1413,21 +1492,20 @@ impl WindowPresenter {
                 } else {
                     self.suboptimal_streak = 0;
                 }
-                let direct = selected.is_some();
-                self.note_cadence(true, direct);
-                Ok(WindowPresentOutcome::Presented {
-                    direct,
-                    width: self.extent.width,
-                    height: self.extent.height,
-                    swapchain_images: self.images.len(),
+                self.note_cadence(true, finished.direct);
+                Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Presented {
+                    direct: finished.direct,
+                    width: finished.width,
+                    height: finished.height,
+                    swapchain_images: finished.swapchain_images,
                     suboptimal,
-                })
+                }))
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.recreate_pending = true;
                 self.recreate_reason = "present_out_of_date";
                 self.note_cadence(false, false);
-                Ok(WindowPresentOutcome::Busy)
+                Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy))
             }
             Err(error) => Err(DrawError::VkCall(VkCall::new(
                 VkOp::WindowQueuePresent,

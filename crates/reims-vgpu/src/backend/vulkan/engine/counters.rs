@@ -706,6 +706,13 @@ engine_counters! {
         queue_async_submits,
         queue_async_queue_us,
         queue_async_driver_us,
+        /// Ordered window display transactions, time queued behind earlier GPU
+        /// work, and time in their submit-plus-present host driver calls.  The
+        /// queue and driver times are deliberately separate from
+        /// `engine_lock`: neither is paid while the resource registry is held.
+        queue_present_transactions,
+        queue_present_queue_us,
+        queue_present_driver_us,
         /// Sampled-cache pool recycle diagnostics (workstream D lag tail). These
         /// four come from `ResourcePools`, not the atomic counters — merged in by
         /// `engine::counter_snapshot`. `free_hits` = `acquire_sampled` reused a

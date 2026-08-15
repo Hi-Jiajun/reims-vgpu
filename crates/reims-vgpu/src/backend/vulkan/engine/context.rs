@@ -575,6 +575,32 @@ pub(crate) struct DeviceContext {
     pub swapchain: bool,
 }
 
+/// Whether a display transaction completed inline on the raw-queue fallback or
+/// was handed to the ordered queue owner.
+#[cfg(feature = "host-window")]
+pub(crate) enum PresentSubmission {
+    Complete(Result<bool, vk::Result>),
+    Pending(super::queue_owner::PendingPresent),
+}
+
+/// The two host queue operations that make one display transaction.
+///
+/// Keeping the submission and presentation operands in one value prevents a
+/// caller from handing them to the ordered queue as separately interleavable
+/// requests.
+#[cfg(feature = "host-window")]
+pub(crate) struct PresentTransaction<'a> {
+    pub command_buffers: &'a [vk::CommandBuffer],
+    pub wait_semaphores: &'a [vk::Semaphore],
+    pub wait_stages: &'a [vk::PipelineStageFlags],
+    pub signal_semaphores: &'a [vk::Semaphore],
+    pub fence: vk::Fence,
+    pub loader: ash::khr::swapchain::Device,
+    pub present_wait: vk::Semaphore,
+    pub swapchain: vk::SwapchainKHR,
+    pub image_index: u32,
+}
+
 #[cfg(test)]
 mod storage_buffer_alignment_tests {
     use super::*;
@@ -1523,7 +1549,7 @@ impl DeviceContext {
         fence: vk::Fence,
     ) -> Result<(), vk::Result> {
         if let Some(owner) = self.queue_owner.as_ref() {
-            return owner.submit_present_blit(
+            return owner.submit_sync_ordered(
                 command_buffers,
                 wait_semaphores,
                 wait_stages,
@@ -1539,31 +1565,41 @@ impl DeviceContext {
         unsafe { self.device.queue_submit(self.queue(), &[info], fence) }
     }
 
+    /// Submit one window blit and present the image it signals as a single
+    /// ordered display transaction.
+    ///
+    /// The queue-owner arm returns after enqueue.  Its completion may be waited
+    /// without holding the engine lock; the fallback remains synchronous because
+    /// that lock is the only external synchronization around the raw queue.
     #[cfg(feature = "host-window")]
-    pub(crate) fn queue_present(
+    pub(crate) unsafe fn submit_present_transaction(
         &self,
-        loader: ash::khr::swapchain::Device,
-        wait: vk::Semaphore,
-        swapchain: vk::SwapchainKHR,
-        image_index: u32,
-    ) -> Result<bool, vk::Result> {
-        match self.queue_owner.as_ref() {
-            Some(owner) => owner.present(loader, wait, swapchain, image_index),
-            None => {
-                let waits = [wait];
-                let swapchains = [swapchain];
-                let indices = [image_index];
-                unsafe {
-                    loader.queue_present(
-                        self.queue(),
-                        &vk::PresentInfoKHR::default()
-                            .wait_semaphores(&waits)
-                            .swapchains(&swapchains)
-                            .image_indices(&indices),
-                    )
-                }
-            }
+        transaction: PresentTransaction<'_>,
+    ) -> Result<PresentSubmission, vk::Result> {
+        if let Some(owner) = self.queue_owner.as_ref() {
+            return owner
+                .enqueue_present(transaction)
+                .map(PresentSubmission::Pending);
         }
+        let info = vk::SubmitInfo::default()
+            .wait_semaphores(transaction.wait_semaphores)
+            .wait_dst_stage_mask(transaction.wait_stages)
+            .command_buffers(transaction.command_buffers)
+            .signal_semaphores(transaction.signal_semaphores);
+        unsafe { self.device.queue_submit(self.queue(), &[info], transaction.fence) }?;
+        let waits = [transaction.present_wait];
+        let swapchains = [transaction.swapchain];
+        let indices = [transaction.image_index];
+        let result = unsafe {
+            transaction.loader.queue_present(
+                self.queue(),
+                &vk::PresentInfoKHR::default()
+                    .wait_semaphores(&waits)
+                    .swapchains(&swapchains)
+                    .image_indices(&indices),
+            )
+        };
+        Ok(PresentSubmission::Complete(result))
     }
 }
 

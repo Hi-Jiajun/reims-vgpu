@@ -14,11 +14,11 @@ use std::sync::{mpsc, Arc, Mutex};
 use super::stamp_completion::SubmissionNote;
 
 type Reply = mpsc::SyncSender<Result<QueueOutcome, vk::Result>>;
+type PresentReply = mpsc::SyncSender<Result<bool, vk::Result>>;
 
 #[derive(Clone, Copy, Debug)]
 enum QueueOutcome {
     Unit,
-    Present(bool),
 }
 
 struct OwnedSubmit {
@@ -31,17 +31,37 @@ struct OwnedSubmit {
     async_queued_at: Option<std::time::Instant>,
 }
 
+/// Completion of one ordered submit-plus-present transaction.
+///
+/// The transaction is enqueued while the engine still owns the resource-state
+/// ordering point, then waited after that lock is released.  Keeping the
+/// receiver as a value makes the split explicit: accepting the transaction and
+/// completing the host driver calls are two different events.
+pub(crate) struct PendingPresent {
+    receiver: mpsc::Receiver<Result<bool, vk::Result>>,
+}
+
+impl PendingPresent {
+    pub(crate) fn wait(self) -> Result<bool, vk::Result> {
+        self.receiver
+            .recv()
+            .unwrap_or(Err(vk::Result::ERROR_DEVICE_LOST))
+    }
+}
+
 enum Request {
     Submit {
         submit: OwnedSubmit,
         reply: Option<Reply>,
     },
-    Present {
+    PresentTransaction {
+        submit: OwnedSubmit,
         loader: ash::khr::swapchain::Device,
         wait: vk::Semaphore,
         swapchain: vk::SwapchainKHR,
         image_index: u32,
-        reply: Reply,
+        queued_at: std::time::Instant,
+        reply: PresentReply,
     },
     WaitIdle {
         reply: Reply,
@@ -63,6 +83,9 @@ struct QueueStats {
     async_submits: AtomicU64,
     async_queue_us: AtomicU64,
     async_driver_us: AtomicU64,
+    present_transactions: AtomicU64,
+    present_queue_us: AtomicU64,
+    present_driver_us: AtomicU64,
 }
 
 impl FailureLatch {
@@ -197,7 +220,7 @@ impl QueueOwner {
         Ok(())
     }
 
-    pub(crate) fn submit_present_blit(
+    pub(crate) fn submit_sync_ordered(
         &self,
         command_buffers: &[vk::CommandBuffer],
         wait_semaphores: &[vk::Semaphore],
@@ -221,23 +244,42 @@ impl QueueOwner {
         .map(|_| ())
     }
 
-    pub(crate) fn present(
+    /// Enqueue the blit submission and its presentation as one ordered display
+    /// transaction, returning before either host call runs.
+    ///
+    /// A separate submit followed later by a separate present has an observable
+    /// gap in the queue-owner FIFO.  Packaging the pair is what lets the caller
+    /// release the engine lock after enqueue without allowing guest work to
+    /// appear between the semaphore signal and its consumer.
+    pub(crate) fn enqueue_present(
         &self,
-        loader: ash::khr::swapchain::Device,
-        wait: vk::Semaphore,
-        swapchain: vk::SwapchainKHR,
-        image_index: u32,
-    ) -> Result<bool, vk::Result> {
-        match self.send_sync(|reply| Request::Present {
-            loader,
-            wait,
-            swapchain,
-            image_index,
-            reply,
-        })? {
-            QueueOutcome::Present(suboptimal) => Ok(suboptimal),
-            QueueOutcome::Unit => unreachable!("present request returned unit"),
+        transaction: super::context::PresentTransaction<'_>,
+    ) -> Result<PendingPresent, vk::Result> {
+        if let Some(result) = self.failure.get() {
+            return Err(result);
         }
+        let submit = OwnedSubmit {
+            command_buffers: transaction.command_buffers.to_vec(),
+            wait_semaphores: transaction.wait_semaphores.to_vec(),
+            wait_stages: transaction.wait_stages.to_vec(),
+            signal_semaphores: transaction.signal_semaphores.to_vec(),
+            fence: transaction.fence,
+            timeline: None,
+            async_queued_at: None,
+        };
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.sender
+            .send(Request::PresentTransaction {
+                submit,
+                loader: transaction.loader,
+                wait: transaction.present_wait,
+                swapchain: transaction.swapchain,
+                image_index: transaction.image_index,
+                queued_at: std::time::Instant::now(),
+                reply,
+            })
+            .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
+        Ok(PendingPresent { receiver })
     }
 
     pub(crate) fn wait_idle(&self) -> Result<(), vk::Result> {
@@ -267,11 +309,14 @@ impl QueueOwner {
         self.failure.get()
     }
 
-    pub(crate) fn stats(&self) -> (u64, u64, u64) {
+    pub(crate) fn stats(&self) -> (u64, u64, u64, u64, u64, u64) {
         (
             self.stats.async_submits.load(Ordering::Relaxed),
             self.stats.async_queue_us.load(Ordering::Relaxed),
             self.stats.async_driver_us.load(Ordering::Relaxed),
+            self.stats.present_transactions.load(Ordering::Relaxed),
+            self.stats.present_queue_us.load(Ordering::Relaxed),
+            self.stats.present_driver_us.load(Ordering::Relaxed),
         )
     }
 
@@ -318,30 +363,43 @@ fn run(
                     let _ = reply.send(result.map(|_| QueueOutcome::Unit));
                 }
             }
-            Request::Present {
+            Request::PresentTransaction {
+                submit,
                 loader,
                 wait,
                 swapchain,
                 image_index,
+                queued_at,
                 reply,
             } => {
-                let result = if let Some(result) = failure.get() {
-                    Err(result)
-                } else {
-                    let waits = [wait];
-                    let swapchains = [swapchain];
-                    let indices = [image_index];
-                    unsafe {
-                        loader.queue_present(
-                            queue,
-                            &vk::PresentInfoKHR::default()
-                                .wait_semaphores(&waits)
-                                .swapchains(&swapchains)
-                                .image_indices(&indices),
-                        )
-                    }
-                    .map(QueueOutcome::Present)
-                };
+                let driver_started = std::time::Instant::now();
+                let result = complete_present_transaction(
+                    failure,
+                    || unsafe { execute_submit(device, queue, submit) },
+                    || {
+                        let waits = [wait];
+                        let swapchains = [swapchain];
+                        let indices = [image_index];
+                        unsafe {
+                            loader.queue_present(
+                                queue,
+                                &vk::PresentInfoKHR::default()
+                                    .wait_semaphores(&waits)
+                                    .swapchains(&swapchains)
+                                    .image_indices(&indices),
+                            )
+                        }
+                    },
+                );
+                stats.present_transactions.fetch_add(1, Ordering::Relaxed);
+                stats.present_queue_us.fetch_add(
+                    driver_started.duration_since(queued_at).as_micros() as u64,
+                    Ordering::Relaxed,
+                );
+                stats.present_driver_us.fetch_add(
+                    driver_started.elapsed().as_micros() as u64,
+                    Ordering::Relaxed,
+                );
                 let _ = reply.send(result);
             }
             Request::WaitIdle { reply } => {
@@ -362,6 +420,29 @@ fn run(
             Request::Stop => return,
         }
     }
+}
+
+fn complete_present_transaction(
+    failure: &FailureLatch,
+    submit: impl FnOnce() -> Result<(), vk::Result>,
+    present: impl FnOnce() -> Result<bool, vk::Result>,
+) -> Result<bool, vk::Result> {
+    if let Some(result) = failure.get() {
+        return Err(result);
+    }
+    if let Err(result) = submit() {
+        // The transaction has no submission point. Later queue work may not
+        // run past that missing point.
+        failure.set(result);
+        return Err(result);
+    }
+    let result = present();
+    // An out-of-date surface invalidates this display transaction, not the
+    // ordered graphics queue. A lost device does invalidate later queue work.
+    if result == Err(vk::Result::ERROR_DEVICE_LOST) {
+        failure.set(vk::Result::ERROR_DEVICE_LOST);
+    }
+    result
 }
 
 unsafe fn execute_submit(
@@ -454,5 +535,76 @@ mod tests {
             Err(vk::Result::ERROR_DEVICE_LOST)
         );
         assert_eq!(probe.latest_queued(), None);
+    }
+
+    #[test]
+    fn a_pending_display_transaction_returns_its_exact_completion() {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        let pending = PendingPresent { receiver };
+        let sender = std::thread::spawn(move || reply.send(Ok(true)).unwrap());
+
+        assert_eq!(pending.wait(), Ok(true));
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn a_lost_display_transaction_owner_cannot_look_successful() {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        drop(reply);
+        let pending = PendingPresent { receiver };
+
+        assert_eq!(pending.wait(), Err(vk::Result::ERROR_DEVICE_LOST));
+    }
+
+    #[test]
+    fn a_display_submission_failure_skips_present_and_stops_later_queue_work() {
+        let _ = super::super::device_lost::take_device_lost_seen();
+        let latch = FailureLatch::default();
+        let presented = std::cell::Cell::new(false);
+
+        let result = complete_present_transaction(
+            &latch,
+            || Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY),
+            || {
+                presented.set(true);
+                Ok(false)
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+        );
+        assert!(!presented.get());
+        assert_eq!(latch.get(), Some(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
+        assert!(super::super::device_lost::take_device_lost_seen());
+    }
+
+    #[test]
+    fn an_out_of_date_display_transaction_does_not_poison_the_queue() {
+        let latch = FailureLatch::default();
+        let result = complete_present_transaction(
+            &latch,
+            || Ok(()),
+            || Err(vk::Result::ERROR_OUT_OF_DATE_KHR),
+        );
+
+        assert_eq!(result, Err(vk::Result::ERROR_OUT_OF_DATE_KHR));
+        assert_eq!(latch.get(), None);
+    }
+
+    #[test]
+    fn device_loss_during_present_stops_later_queue_work() {
+        let _ = super::super::device_lost::take_device_lost_seen();
+        let latch = FailureLatch::default();
+        let result = complete_present_transaction(
+            &latch,
+            || Ok(()),
+            || Err(vk::Result::ERROR_DEVICE_LOST),
+        );
+
+        assert_eq!(result, Err(vk::Result::ERROR_DEVICE_LOST));
+        assert_eq!(latch.get(), Some(vk::Result::ERROR_DEVICE_LOST));
+        assert!(super::super::device_lost::take_device_lost_seen());
     }
 }

@@ -934,19 +934,44 @@ pub fn window_present_frame(
     source: Option<&WindowPresentSource>,
     cpu: Option<WindowCpuFrame<'_>>,
 ) -> Result<WindowPresentOutcome, DrawError> {
-    let mut guard = lock_engine_at(EngineLockSite::Window);
-    let EngineState {
-        ref mut owner,
-        ref mut pools,
-        ref counters,
-        ref mut window_presenter,
-        ..
-    } = &mut *guard;
-    let ctx = owner.ensure(counters)?;
-    let presenter = window_presenter.as_mut().ok_or(DrawError::Facade(
-        EngineFacadeDecline::WindowPresenterNotAttached,
-    ))?;
-    let out = unsafe { presenter.present(ctx, pools, counters, source, cpu) };
+    let dispatch = {
+        let mut guard = lock_engine_at(EngineLockSite::Window);
+        let EngineState {
+            ref mut owner,
+            ref mut pools,
+            ref counters,
+            ref mut window_presenter,
+            ..
+        } = &mut *guard;
+        let ctx = owner.ensure(counters)?;
+        let presenter = window_presenter.as_mut().ok_or(DrawError::Facade(
+            EngineFacadeDecline::WindowPresenterNotAttached,
+        ))?;
+        unsafe { presenter.begin_present(ctx, pools, counters, source, cpu) }?
+    };
+    let out = match dispatch {
+        window_present::WindowPresentDispatch::Complete(out) => Ok(out),
+        window_present::WindowPresentDispatch::Pending(pending) => {
+            // The display transaction is already ordered behind every guest
+            // batch accepted above and owns its resident pin.  Waiting for the
+            // host driver while holding ENGINE would only stop the drain from
+            // preparing later work; no resource-state decision remains here.
+            let finished = pending.wait();
+            let mut guard = lock_engine_at(EngineLockSite::Window);
+            match guard.window_presenter.as_mut() {
+                None => Err(DrawError::Facade(
+                    EngineFacadeDecline::WindowPresenterNotAttached,
+                )),
+                Some(presenter) => match presenter.finish_present(finished) {
+                    Ok(window_present::WindowPresentDispatch::Complete(out)) => Ok(out),
+                    Ok(window_present::WindowPresentDispatch::Pending(_)) => unreachable!(
+                        "finishing a display transaction cannot enqueue another transaction"
+                    ),
+                    Err(error) => Err(error),
+                },
+            }
+        }
+    };
     // The window thread cannot run the recovery from inside this borrow, so a
     // loss seen here is latched for the drain's end-of-tranche flush. This is
     // the observer that matters most when the guest has already stopped drawing:
@@ -4415,10 +4440,20 @@ pub fn counter_snapshot() -> CounterSnapshot {
         .as_ref()
         .and_then(|ctx| ctx.queue_owner.as_ref())
     {
-        let (submits, queue_us, driver_us) = owner.stats();
+        let (
+            submits,
+            queue_us,
+            driver_us,
+            present_transactions,
+            present_queue_us,
+            present_driver_us,
+        ) = owner.stats();
         snap.queue_async_submits = submits;
         snap.queue_async_queue_us = queue_us;
         snap.queue_async_driver_us = driver_us;
+        snap.queue_present_transactions = present_transactions;
+        snap.queue_present_queue_us = present_queue_us;
+        snap.queue_present_driver_us = present_driver_us;
     }
     // Sampled-cache recycle diagnostics live on ResourcePools (single-threaded
     // under this lock), not the atomic counters; merge them in here.
