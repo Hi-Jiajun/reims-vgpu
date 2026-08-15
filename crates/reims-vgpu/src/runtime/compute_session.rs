@@ -576,14 +576,10 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
     use crate::backend::metal::runtime::new_buffer_from_host;
     use crate::backend::metal::samplers::make_explicit_sampler;
     use crate::backend::metal::util::valid_buffer_binding;
-    use crate::contract::endian::ld32;
     use crate::contract::extent::tight_image_bytes;
     use crate::runtime::compute_exec::{
         load_compute_pipeline, nested_job_from_icb_resources, split_staged_textures, stage_buffer,
         stage_texture_raw,
-    };
-    use crate::runtime::decode::resource::{
-        decode_sampler_descriptor, OBJECT_TYPE_TYPE7, TYPE7_OBJECT_SAMPLER,
     };
     use crate::runtime::icb::new_icb_compute_pso;
     use crate::runtime::mtlb::{load_mtlb, AirLoadRail};
@@ -813,33 +809,19 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
             // Samplers for AB.
             let mut mtl_samps: Vec<metal::SamplerState> = Vec::new();
             for s in &stream_samp {
-                let (_entry, desc_bytes) = objects::resolve_descriptor(
-                    state,
-                    host,
-                    task_id,
-                    s.sampler_ref,
-                    &[OBJECT_TYPE_TYPE7],
-                )
-                .map_err(|rung| {
-                    ComputeStatus::MissingSampler(crate::observe::ladder_slugs!(
-                        "compute_icb_inherit_ab_sampler"
-                    )(rung))
-                })?;
-                if desc_bytes.len() < 4 || ld32(&desc_bytes) != TYPE7_OBJECT_SAMPLER {
-                    return Err(ComputeStatus::MissingSampler(
-                        "compute_icb_inherit_ab_sampler_bad_tag",
-                    ));
-                }
-                let sd = decode_sampler_descriptor(&desc_bytes).map_err(|_| {
-                    ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
-                        "compute_icb_inherit_ab_sampler",
-                        desc_decode
-                    ))
+                let sampler = objects::resolve_sampler_state(state, host, task_id, s.sampler_ref)
+                    .map_err(|failure| match failure {
+                    objects::SamplerResolveError::Rung(rung) => ComputeStatus::MissingSampler(
+                        crate::observe::ladder_slugs!("compute_icb_inherit_ab_sampler")(rung),
+                    ),
+                    objects::SamplerResolveError::Decode { .. } => ComputeStatus::MissingSampler(
+                        crate::observe::ladder_slug!("compute_icb_inherit_ab_sampler", desc_decode),
+                    ),
                 })?;
                 // AB-resident samplers must support argument buffers.
                 let reims_vgpu = crate::runtime::draw::sampler_record(
                     REIMS_VGPU_BINDING_SAMPLER_BASE + s.index,
-                    &sd,
+                    &sampler.descriptor,
                     s.has_lod_clamp.then_some((s.lod_min_bits, s.lod_max_bits)),
                     true,
                 );
@@ -987,32 +969,26 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                     if s.sampler_ref == 0 {
                         continue;
                     }
-                    let (_entry, desc_bytes) = objects::resolve_descriptor(
-                        state,
-                        host,
-                        task_id,
-                        s.sampler_ref,
-                        &[OBJECT_TYPE_TYPE7],
-                    )
-                    .map_err(|rung| {
-                        ComputeStatus::MissingSampler(crate::observe::ladder_slugs!(
-                            "compute_icb_inherit_sampler"
-                        )(rung))
-                    })?;
-                    if desc_bytes.len() < 4 || ld32(&desc_bytes) != TYPE7_OBJECT_SAMPLER {
-                        return Err(ComputeStatus::MissingSampler(
-                            "compute_icb_inherit_sampler_bad_tag",
-                        ));
-                    }
-                    let sd = decode_sampler_descriptor(&desc_bytes).map_err(|_| {
-                        ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
-                            "compute_icb_inherit_sampler",
-                            desc_decode
-                        ))
-                    })?;
+                    let sampler =
+                        objects::resolve_sampler_state(state, host, task_id, s.sampler_ref)
+                            .map_err(|failure| match failure {
+                                objects::SamplerResolveError::Rung(rung) => {
+                                    ComputeStatus::MissingSampler(crate::observe::ladder_slugs!(
+                                        "compute_icb_inherit_sampler"
+                                    )(
+                                        rung
+                                    ))
+                                }
+                                objects::SamplerResolveError::Decode { .. } => {
+                                    ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
+                                        "compute_icb_inherit_sampler",
+                                        desc_decode
+                                    ))
+                                }
+                            })?;
                     reims_vgpu_samplers.push(crate::runtime::draw::sampler_record(
                         REIMS_VGPU_BINDING_SAMPLER_BASE + s.index,
-                        &sd,
+                        &sampler.descriptor,
                         s.has_lod_clamp.then_some((s.lod_min_bits, s.lod_max_bits)),
                         false,
                     ));

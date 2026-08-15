@@ -37,8 +37,6 @@ use crate::runtime::decode::resource::{
     OBJECT_TYPE_TEXTURE_VIEW, OBJECT_TYPE_TYPE7, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
     TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
 };
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use crate::runtime::decode::resource::{decode_sampler_descriptor, TYPE7_OBJECT_SAMPLER};
 use crate::runtime::draw::host_alloc_len;
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
@@ -4767,36 +4765,14 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
     // Samplers.
     let mut reims_vgpu_samplers: Vec<ReimsVgpuSampler> = Vec::new();
     for s in &acc.samplers {
-        let entry = match objects::lookup_list_entry(state, host, task_id, s.sampler_ref) {
-            Some(e) => e,
-            None => {
-                return ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
-                    "compute_mtl_sampler",
-                    no_list_entry
-                ))
+        let sampler = match objects::resolve_sampler_state(state, host, task_id, s.sampler_ref) {
+            Ok(sampler) => sampler,
+            Err(objects::SamplerResolveError::Rung(rung)) => {
+                return ComputeStatus::MissingSampler(crate::observe::ladder_slugs!(
+                    "compute_mtl_sampler"
+                )(rung))
             }
-        };
-        if entry.object_type != OBJECT_TYPE_TYPE7 {
-            return ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
-                "compute_mtl_sampler",
-                wrong_type
-            ));
-        }
-        let desc = match objects::read_descriptor(state, host, task_id, &entry) {
-            Some(d) => d,
-            None => {
-                return ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
-                    "compute_mtl_sampler",
-                    desc_read
-                ))
-            }
-        };
-        if desc.len() < 4 || ld32(&desc) != TYPE7_OBJECT_SAMPLER {
-            return ComputeStatus::MissingSampler("compute_mtl_sampler_bad_tag");
-        }
-        let sd = match decode_sampler_descriptor(&desc) {
-            Ok(v) => v,
-            Err(_) => {
+            Err(objects::SamplerResolveError::Decode { .. }) => {
                 return ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
                     "compute_mtl_sampler",
                     desc_decode
@@ -4805,7 +4781,7 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
         };
         reims_vgpu_samplers.push(crate::runtime::draw::sampler_record(
             REIMS_VGPU_BINDING_SAMPLER_BASE + s.index,
-            &sd,
+            &sampler.descriptor,
             s.has_lod_clamp.then_some((s.lod_min_bits, s.lod_max_bits)),
             false,
         ));

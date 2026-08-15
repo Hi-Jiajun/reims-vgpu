@@ -5214,7 +5214,7 @@ fn a_dispatched_command_this_device_declines_names_itself() {
         st32(&mut payload[0..], 0x11);
         st32(
             &mut payload[4..],
-            reims_vgpu_wire::ops::destroy::OPCODE_DELETE_SAMPLER_STATE,
+            reims_vgpu_wire::ops::destroy::OPCODE_DELETE_TEXTURE,
         );
         st32(
             &mut payload[8..],
@@ -5400,9 +5400,8 @@ fn a_delete_object_record_must_fit_the_payload_that_carries_it() {
 /// that keys the table with the record's ref passes nothing here; it deletes all
 /// four and fails on the first assertion.
 ///
-/// The kinds are exercised across the family — a texture record and a
-/// sampler-state record — because the kind lives in the record's opcode and an
-/// arm that branched on kind could be safe for one and not the other.
+/// The kinds are exercised across the family. A sampler record may retire the
+/// separate sampler registry, but even then must leave the resource table alone.
 #[test]
 fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     use reims_vgpu_wire::ops::destroy::{
@@ -5431,6 +5430,13 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     for ref_ in [10, 11, 12, 14] {
         assert!(state.insert_object(2, ref_));
     }
+    state.task_sampler_states.register(
+        2,
+        11,
+        std::sync::Arc::new(crate::model::TaskSamplerState {
+            descriptor: Default::default(),
+        }),
+    );
 
     // Same task, same number, well-formed record: the collision that an arm
     // keying the object table would act on.
@@ -5458,7 +5464,11 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     );
     assert!(
         state.objects.contains(&(2, 11)),
-        "a second kind must be declined the same way"
+        "sampler deletion must not cross into the resource-list ref space"
+    );
+    assert!(
+        state.task_sampler_states.get(2, 11).is_none(),
+        "the sampler opcode retires the same integer only in its own ref space"
     );
 
     // The unclaimed number inside the destroy span is refused before the ref is

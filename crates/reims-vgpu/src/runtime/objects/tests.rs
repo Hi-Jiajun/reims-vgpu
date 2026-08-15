@@ -5,6 +5,7 @@ use crate::contract::endian::{ld32, st16, st32, st64};
 use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 use crate::contract::iosurface_pages::DEVICE_DESC_PLANE_COUNT;
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+use crate::runtime::decode::resource::TYPE7_OBJECT_SAMPLER;
 use crate::runtime::host::FakeHost;
 
 #[test]
@@ -181,6 +182,95 @@ fn non_resource_descriptors_are_read_again() {
         .expect("updated serializer descriptor");
     assert_eq!(ld32(&second), 2);
     assert!(state.task_resources.get(1, 2).is_none());
+}
+
+fn put_sampler_object(host: &mut FakeHost, ref_: u32, descriptor_gva: u64, lod_min: f32) {
+    use crate::runtime::decode::resource::OBJECT_TYPE_TYPE7;
+    use reims_vgpu_wire::ops::sampler::NEW_SAMPLER_TOTAL_LEN;
+
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut entry,
+        u32::from(OBJECT_TYPE_TYPE7) | (NEW_SAMPLER_TOTAL_LEN << 8),
+    );
+    st64(&mut entry[4..], descriptor_gva);
+    let _ = host.write_gpa(
+        data_gpa + u64::from(ref_) * OBJECT_LIST_ENTRY_LEN as u64,
+        &entry,
+    );
+
+    let mut descriptor = vec![0u8; NEW_SAMPLER_TOTAL_LEN as usize];
+    st32(&mut descriptor, TYPE7_OBJECT_SAMPLER);
+    st32(&mut descriptor[4..], NEW_SAMPLER_TOTAL_LEN);
+    st32(&mut descriptor[8..], ref_);
+    st32(&mut descriptor[12..], 0x8400_0000);
+    st32(&mut descriptor[20..], lod_min.to_bits());
+    let _ = host.write_gpa(data_gpa + descriptor_gva, &descriptor);
+}
+
+#[test]
+fn sampler_construction_is_retained_until_its_own_explicit_delete() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    put_sampler_object(&mut host, 2, 0x80, 1.25);
+
+    let first = resolve_sampler_state(&state, &host, 1, 2).expect("first sampler");
+    assert_eq!(first.descriptor.lod_min_clamp, 1.25);
+
+    // Neither mutable descriptor bytes nor a moved object-list pointer mutate
+    // an already-constructed sampler object.
+    put_sampler_object(&mut host, 2, 0x80, 7.5);
+    assert!(state.set_object_list(1, 0xdead, 8));
+    let retained = resolve_sampler_state(&state, &host, 1, 2).expect("retained sampler");
+    assert!(Arc::ptr_eq(&first, &retained));
+    assert_eq!(retained.descriptor.lod_min_clamp, 1.25);
+
+    // The sampler API's delete edge, not resource deletion, permits ref reuse.
+    assert!(state.task_sampler_states.delete(1, 2));
+    assert!(state.set_object_list(1, 0, 8));
+    let replacement = resolve_sampler_state(&state, &host, 1, 2).expect("replacement sampler");
+    assert!(!Arc::ptr_eq(&first, &replacement));
+    assert_eq!(replacement.descriptor.lod_min_clamp, 7.5);
+}
+
+#[test]
+fn failed_sampler_construction_is_not_retained_and_can_retry() {
+    use crate::runtime::decode::resource::OBJECT_TYPE_TYPE7;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let mut short_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(&mut short_entry, u32::from(OBJECT_TYPE_TYPE7) | (4 << 8));
+    st64(&mut short_entry[4..], 0x80);
+    let _ = host.write_gpa(data_gpa + 24, &short_entry);
+    let _ = host.write_gpa(data_gpa + 0x80, &TYPE7_OBJECT_SAMPLER.to_le_bytes());
+
+    assert!(matches!(
+        resolve_sampler_state(&state, &host, 1, 2),
+        Err(SamplerResolveError::Decode { .. })
+    ));
+    assert!(state.task_sampler_states.get(1, 2).is_none());
+
+    put_sampler_object(&mut host, 2, 0x80, 3.0);
+    let sampler = resolve_sampler_state(&state, &host, 1, 2).expect("published retry");
+    assert_eq!(sampler.descriptor.lod_min_clamp, 3.0);
+}
+
+#[test]
+fn task_teardown_retires_sampler_objects_without_touching_outstanding_owners() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    put_sampler_object(&mut host, 2, 0x80, 2.0);
+    let sampler = resolve_sampler_state(&state, &host, 1, 2).expect("sampler");
+
+    assert!(state.delete_task(1));
+    assert!(state.task_sampler_states.get(1, 2).is_none());
+    assert_eq!(sampler.descriptor.lod_min_clamp, 2.0);
 }
 
 /// The type-4 decoder refuses a descriptor it cannot decode as declared, and

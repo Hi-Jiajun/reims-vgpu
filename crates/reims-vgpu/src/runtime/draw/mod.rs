@@ -29,8 +29,6 @@
 use crate::backend::vulkan::engine::{DrawError, DrawPreparationDecline};
 #[cfg(feature = "backend-vulkan")]
 use crate::backend::vulkan::translate;
-#[cfg(feature = "backend-vulkan")]
-use crate::contract::endian::ld32;
 use crate::contract::pixel_format::{
     self, solid_rgba8, TexelLayout, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
 };
@@ -57,11 +55,10 @@ use crate::runtime::decode::render::{DepthAttachment, ScissorRect, StencilAttach
 use crate::runtime::decode::resource::TextureDescriptor;
 use crate::runtime::decode::resource::{
     decode_buffer_texture_descriptor, decode_depth_stencil_descriptor,
-    decode_render_pipeline_descriptor, decode_sampler_descriptor, decode_texture_descriptor,
-    texture_type8_opcode, BufferTextureDescriptor, DecodeStatus, RenderPipelineDescriptor,
-    OBJECT_TYPE_IOSURFACE, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
-    OBJECT_TYPE_TEXTURE_VIEW, OBJECT_TYPE_TYPE7, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
-    TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
+    decode_render_pipeline_descriptor, decode_texture_descriptor, texture_type8_opcode,
+    BufferTextureDescriptor, DecodeStatus, RenderPipelineDescriptor, OBJECT_TYPE_IOSURFACE,
+    OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT, OBJECT_TYPE_TEXTURE_VIEW, OBJECT_TYPE_TYPE7,
+    TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
 };
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
@@ -3492,7 +3489,8 @@ mod sampler_record_tests {
     }
 
     /// The record binds the descriptor's anisotropy through, because
-    /// `decode_sampler_descriptor` is where the floor lives and this type has
+    /// [`crate::runtime::decode::resource::decode_sampler_descriptor`] is where
+    /// the floor lives and this type has
     /// no other producer.
     #[test]
     fn anisotropy_is_carried_from_the_descriptor() {
@@ -3809,34 +3807,40 @@ fn load_sampler<M: HostMemory + HostOps>(
     slot: u32,
 ) -> Result<crate::backend::metal::abi::ReimsVgpuSampler, MetalStateDecline> {
     use crate::backend::metal::abi::REIMS_VGPU_BINDING_SAMPLER_BASE;
-    let (_entry, desc) =
-        objects::resolve_descriptor(state, host, task_id, sampler_ref, &[OBJECT_TYPE_TYPE7])
-            .map_err(|rung| match rung {
-                objects::LadderRung::NoListEntry => MetalStateDecline::SamplerEntryMissing {
-                    sampler_ref,
-                    index: slot,
-                },
-                objects::LadderRung::WrongType { got } => MetalStateDecline::SamplerObjectType {
-                    sampler_ref,
-                    index: slot,
-                    object_type: got,
-                },
-                objects::LadderRung::DescRead { .. } => {
-                    MetalStateDecline::SamplerDescriptorMissing {
+    let sampler =
+        objects::resolve_sampler_state(state, host, task_id, sampler_ref).map_err(|failure| {
+            match failure {
+                objects::SamplerResolveError::Rung(rung) => match rung {
+                    objects::LadderRung::NoListEntry => MetalStateDecline::SamplerEntryMissing {
                         sampler_ref,
                         index: slot,
+                    },
+                    objects::LadderRung::WrongType { got } => {
+                        MetalStateDecline::SamplerObjectType {
+                            sampler_ref,
+                            index: slot,
+                            object_type: got,
+                        }
+                    }
+                    objects::LadderRung::DescRead { .. } => {
+                        MetalStateDecline::SamplerDescriptorMissing {
+                            sampler_ref,
+                            index: slot,
+                        }
+                    }
+                },
+                objects::SamplerResolveError::Decode { status, .. } => {
+                    MetalStateDecline::SamplerDecode {
+                        sampler_ref,
+                        index: slot,
+                        reason: status,
                     }
                 }
-            })?;
-    let s =
-        decode_sampler_descriptor(&desc).map_err(|reason| MetalStateDecline::SamplerDecode {
-            sampler_ref,
-            index: slot,
-            reason,
+            }
         })?;
     Ok(sampler_record(
         REIMS_VGPU_BINDING_SAMPLER_BASE + slot,
-        &s,
+        &sampler.descriptor,
         None,
         false,
     ))
@@ -4013,51 +4017,62 @@ pub(crate) fn load_vulkan_sampler<M: HostMemory + HostOps>(
     sampler_ref: u32,
     binding: u32,
 ) -> Result<crate::backend::vulkan::engine::SamplerResource, DrawPreparationDecline> {
-    let (_entry, desc) =
-        objects::resolve_descriptor(state, host, task_id, sampler_ref, &[OBJECT_TYPE_TYPE7])
-            .map_err(|rung| match rung {
-                objects::LadderRung::NoListEntry => DrawPreparationDecline::SamplerEntryMissing {
-                    sampler_ref,
-                    binding,
+    let sampler =
+        objects::resolve_sampler_state(state, host, task_id, sampler_ref).map_err(|failure| {
+            match failure {
+                objects::SamplerResolveError::Rung(rung) => match rung {
+                    objects::LadderRung::NoListEntry => {
+                        DrawPreparationDecline::SamplerEntryMissing {
+                            sampler_ref,
+                            binding,
+                        }
+                    }
+                    objects::LadderRung::WrongType { got } => {
+                        DrawPreparationDecline::SamplerObjectType {
+                            sampler_ref,
+                            binding,
+                            object_type: got,
+                        }
+                    }
+                    objects::LadderRung::DescRead { .. } => {
+                        DrawPreparationDecline::SamplerDescriptorMissing {
+                            sampler_ref,
+                            binding,
+                        }
+                    }
                 },
-                objects::LadderRung::WrongType { got } => {
-                    DrawPreparationDecline::SamplerObjectType {
+                objects::SamplerResolveError::Decode {
+                    status,
+                    descriptor_len,
+                    tag,
+                    declared_len,
+                } => match status {
+                    DecodeStatus::ErrShort(_) => DrawPreparationDecline::SamplerDescriptorShort {
                         sampler_ref,
                         binding,
-                        object_type: got,
+                        descriptor_len,
+                    },
+                    DecodeStatus::ErrUnknownType(_) => {
+                        DrawPreparationDecline::SamplerDescriptorUnknownType {
+                            sampler_ref,
+                            binding,
+                            descriptor_len,
+                            tag,
+                        }
                     }
-                }
-                objects::LadderRung::DescRead { .. } => {
-                    DrawPreparationDecline::SamplerDescriptorMissing {
-                        sampler_ref,
-                        binding,
+                    DecodeStatus::ErrUnsupported(_) => {
+                        DrawPreparationDecline::SamplerDescriptorUnsupported {
+                            sampler_ref,
+                            binding,
+                            descriptor_len,
+                            tag,
+                            declared_len,
+                        }
                     }
-                }
-            })?;
-    let descriptor_len = desc.len();
-    let tag = desc.get(..4).map(ld32);
-    let declared_len = desc.get(4..8).map(ld32);
-    let sampler = decode_sampler_descriptor(&desc).map_err(|status| match status {
-        DecodeStatus::ErrShort(_) => DrawPreparationDecline::SamplerDescriptorShort {
-            sampler_ref,
-            binding,
-            descriptor_len,
-        },
-        DecodeStatus::ErrUnknownType(_) => DrawPreparationDecline::SamplerDescriptorUnknownType {
-            sampler_ref,
-            binding,
-            descriptor_len,
-            tag,
-        },
-        DecodeStatus::ErrUnsupported(_) => DrawPreparationDecline::SamplerDescriptorUnsupported {
-            sampler_ref,
-            binding,
-            descriptor_len,
-            tag,
-            declared_len,
-        },
-    })?;
-    vulkan_sampler_resource(sampler_ref, binding, &sampler)
+                },
+            }
+        })?;
+    vulkan_sampler_resource(sampler_ref, binding, &sampler.descriptor)
 }
 
 /// Store encode RGBA8 into **texture_ref** host cache as BGRA (not surface_id).

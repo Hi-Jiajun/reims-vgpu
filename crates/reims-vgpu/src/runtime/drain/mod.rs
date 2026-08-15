@@ -228,21 +228,20 @@ fn delete_object_kind_route(opcode: u32) -> &'static str {
     }
 }
 
-/// `CmdDeleteObject` (`0x28`): decode the record, name the kind, retire nothing.
+/// `CmdDeleteObject` (`0x28`): decode the serializer object and retire its kind.
 ///
 /// The payload is `{u32 task}` then one serializer destroy record. Every kind in
 /// that family writes the identical twelve-byte body — a single object ref — and
 /// carries the kind in the record's own opcode.
 ///
-/// # Why the ref is decoded and then not acted on
+/// # Separate reference spaces stay separate
 ///
-/// The ref is in the **serializer's per-kind ref space**, which this device does
-/// not track. Nothing here is a matter of taste: the object table is keyed by
-/// the *kernel object-list* ref, established by `0x33 CmdSetObjectList` and
-/// populated when a decoded command resolves an entry out of that list, and the
-/// caches holding the kinds this command actually names — samplers and pipeline
-/// states — are keyed by the object's own **state**, not by a ref, so they have
-/// no ref to retire by even in principle.
+/// The ref is in the **serializer's per-kind ref space**. The object table is
+/// keyed by the *kernel object-list* ref, established by `0x33 CmdSetObjectList` and
+/// populated when a decoded command resolves an entry out of that list, so this
+/// command must never call `DeviceState::delete_object`: equal integers across
+/// those spaces are unrelated. Samplers have their own task-local retained
+/// registry and their destroy opcode retires exactly that registry entry.
 ///
 /// Keying the object table with a number from the other namespace was measured
 /// and is worse than declining. On a driven boot the guest sent 1 988 of these
@@ -254,20 +253,8 @@ fn delete_object_kind_route(opcode: u32) -> &'static str {
 /// call could ever have had is destroying an unrelated object that happened to
 /// share the integer.
 ///
-/// This costs the guest nothing. The kinds named are content-keyed and
-/// deduplicated, so there is no per-object allocation to leak; what is lost is
-/// the chance to drop a cache entry slightly earlier, which is why the decline
-/// is a decline and not a loss.
-///
-/// The per-kind counters are what would justify revisiting it: a kind this
-/// device *does* hold by ref appearing here is the finding, and nothing else is.
-/// There is exactly one such kind today. `DeviceState::fence_generations` is
-/// keyed `(task, domain, fence_ref)` and nothing ever removes an entry, so a
-/// `child_delete_object_fence` reading above zero would be both a real leak and
-/// the one place this command has something to retire. The driven boot measured
-/// it at zero — every sampled record was a sampler state — so wiring it now
-/// would be building a handler for traffic no boot has produced. Read that
-/// counter before deciding otherwise.
+/// Other kinds remain fail-visible until this device owns a corresponding
+/// per-kind object registry. Their counters say which contract gap is active.
 fn apply_delete_object(state: &mut DeviceState, channel_id: u32, payload: &[u8], packet: &Packet) {
     let task_id = ld32(&payload[0..]);
     let record = &payload[4..];
@@ -307,11 +294,17 @@ fn apply_delete_object(state: &mut DeviceState, channel_id: u32, payload: &[u8],
         .fail();
         return;
     };
-    // Read so the record is proved decodable and the kind is countable. It is
-    // deliberately not used as a key: see this function's doc for the boot that
-    // measured what keying the object table with it would have done.
-    let _object_ref = rec.object_ref.get();
+    let object_ref = rec.object_ref.get();
     note_store_route(delete_object_kind_route(op.opcode()));
+    if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_SAMPLER_STATE {
+        let retired = state.task_sampler_states.delete(task_id, object_ref);
+        note_store_route(if retired {
+            "sampler_state_deleted"
+        } else {
+            "sampler_state_delete_absent"
+        });
+        return;
+    }
     note_unimplemented(
         state,
         channel_id,

@@ -12,7 +12,7 @@
 //! [`reims_vgpu_wire::device_desc`], which states it once with `offset_of!`
 //! rather than as the eight literal offsets that used to sit in this module.
 
-use crate::contract::endian::{st16, st32, st64};
+use crate::contract::endian::{ld32, st16, st32, st64};
 use crate::contract::iosurface_pages::{
     entry_gpa_shift, page_size_of, DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BASE_OFFSET,
     DEVICE_DESC_BPE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS, DEVICE_DESC_LEN, DEVICE_DESC_PIXEL_FORMAT,
@@ -1549,6 +1549,68 @@ pub enum LadderRung {
     /// rung — "the entry said this many bytes at that GVA and they could not be
     /// read" — and the entry it came from is gone by the time a caller reports.
     DescRead { declared_len: u32 },
+}
+
+/// Why construction of a retained sampler object did not complete.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SamplerResolveError {
+    Rung(LadderRung),
+    Decode {
+        status: crate::runtime::decode::resource::DecodeStatus,
+        descriptor_len: usize,
+        tag: Option<u32>,
+        declared_len: Option<u32>,
+    },
+}
+
+/// Retrieve or construct the sampler named by `task_id` / `sampler_ref`.
+///
+/// A sampler is an immutable object in its own task-local reference space.
+/// Successful construction snapshots and decodes its descriptor once; failed
+/// construction remains retryable because nothing is registered until every
+/// rung, including decode, succeeds. Its explicit sampler-delete command and
+/// task teardown are the only events that retire this entry.
+pub fn resolve_sampler_state<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    sampler_ref: u32,
+) -> Result<Arc<crate::model::TaskSamplerState>, SamplerResolveError> {
+    use crate::runtime::decode::resource::{decode_sampler_descriptor, OBJECT_TYPE_TYPE7};
+
+    if let Some(sampler) = state.task_sampler_states.get(task_id, sampler_ref) {
+        return Ok(sampler);
+    }
+
+    let entry = lookup_list_entry(state, host, task_id, sampler_ref)
+        .ok_or(SamplerResolveError::Rung(LadderRung::NoListEntry))?;
+    if entry.object_type != OBJECT_TYPE_TYPE7 {
+        return Err(SamplerResolveError::Rung(LadderRung::WrongType {
+            got: entry.object_type,
+        }));
+    }
+    let bytes = read_descriptor(state, host, task_id, &entry).ok_or(SamplerResolveError::Rung(
+        LadderRung::DescRead {
+            declared_len: entry.descriptor_length,
+        },
+    ))?;
+    let descriptor_len = bytes.len();
+    let tag = bytes.get(..4).map(ld32);
+    let declared_len = bytes.get(4..8).map(ld32);
+    let descriptor =
+        decode_sampler_descriptor(&bytes).map_err(|status| SamplerResolveError::Decode {
+            status,
+            descriptor_len,
+            tag,
+            declared_len,
+        })?;
+    let sampler = state.task_sampler_states.register(
+        task_id,
+        sampler_ref,
+        Arc::new(crate::model::TaskSamplerState { descriptor }),
+    );
+    crate::runtime::drain::note_store_route("sampler_state_constructed");
+    Ok(sampler)
 }
 
 /// Object tags constructed through the task's resource registry.

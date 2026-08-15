@@ -2,7 +2,7 @@
 
 use crate::model::{LruBytesMemo, GFX_MMIO_SIZE, MAX_CHANNELS};
 use crate::runtime::decode::resource::{
-    DecodeStatus as ResourceDecodeStatus, Descriptor, ListObjectEntry,
+    DecodeStatus as ResourceDecodeStatus, Descriptor, ListObjectEntry, SamplerDescriptor,
 };
 #[cfg(feature = "backend-vulkan")]
 use std::collections::HashMap;
@@ -891,6 +891,66 @@ impl TaskResources {
         let before = resources.len();
         resources.retain(|&(task, _), _| task != task_id);
         before - resources.len()
+    }
+}
+
+/// One immutable sampler object constructed in a task's sampler-reference space.
+///
+/// Sampler references are not resource-list ownership records. They have their
+/// own explicit delete command, so keeping them in [`TaskResources`] would let
+/// two distinct reference spaces destroy one another when their integers
+/// happen to collide. Construction snapshots the descriptor once; binds retain
+/// and retrieve this decoded state until that sampler or its task is deleted.
+#[derive(Debug)]
+pub struct TaskSamplerState {
+    pub descriptor: SamplerDescriptor,
+}
+
+/// Per-task sampler objects, keyed by the sampler API's `(task, reference)`.
+#[derive(Debug, Default)]
+pub struct TaskSamplerStates(Mutex<BTreeMap<(u32, u32), Arc<TaskSamplerState>>>);
+
+impl TaskSamplerStates {
+    pub fn get(&self, task_id: u32, ref_: u32) -> Option<Arc<TaskSamplerState>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(task_id, ref_))
+            .cloned()
+    }
+
+    /// Publish a fully decoded sampler unless another resolver won the race.
+    pub fn register(
+        &self,
+        task_id: u32,
+        ref_: u32,
+        sampler: Arc<TaskSamplerState>,
+    ) -> Arc<TaskSamplerState> {
+        Arc::clone(
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry((task_id, ref_))
+                .or_insert(sampler),
+        )
+    }
+
+    pub fn delete(&self, task_id: u32, ref_: u32) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&(task_id, ref_))
+            .is_some()
+    }
+
+    pub fn delete_task(&self, task_id: u32) -> usize {
+        let mut samplers = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before = samplers.len();
+        samplers.retain(|&(task, _), _| task != task_id);
+        before - samplers.len()
     }
 }
 
@@ -2196,6 +2256,8 @@ pub struct DeviceState {
     /// Retained resource objects, with the task/reference lifetime defined by
     /// [`TaskResources`].
     pub task_resources: TaskResources,
+    /// Immutable sampler objects in the sampler API's separate ref space.
+    pub task_sampler_states: TaskSamplerStates,
     /// Type-11 texture object ref → mapping_id: (task_id, ref) -> mapping_id.
     pub texture_to_mapping: BTreeMap<(u32, u32), u32>,
     pub mappings: BTreeMap<u32, MappingEntry>,
@@ -2542,6 +2604,7 @@ impl DeviceState {
             released_pages: crate::runtime::released_pages::ReleasedPages::default(),
             objects: std::collections::BTreeSet::new(),
             task_resources: TaskResources::default(),
+            task_sampler_states: TaskSamplerStates::default(),
             texture_to_mapping: BTreeMap::new(),
             mappings: BTreeMap::new(),
             host_surfaces: BTreeMap::new(),
@@ -2984,6 +3047,7 @@ impl DeviceState {
         // Drop objects for this task on redefine.
         self.objects.retain(|&(t, _)| t != task_id);
         self.task_resources.delete_task(task_id);
+        self.task_sampler_states.delete_task(task_id);
         // A deleted task's whole address space goes with it, so its live
         // mappings are not leaks and a reused id must not inherit them.
         self.map_audit.remove(&task_id);
@@ -3031,6 +3095,7 @@ impl DeviceState {
         }
         self.objects.retain(|&(t, _)| t != task_id);
         self.task_resources.delete_task(task_id);
+        self.task_sampler_states.delete_task(task_id);
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         self.host_texture_surfaces
