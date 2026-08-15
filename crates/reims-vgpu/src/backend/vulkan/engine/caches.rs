@@ -444,6 +444,10 @@ const NEGATIVE_CAP: usize = 1024;
 /// outlive the instant.
 struct ObjectCache<K, V> {
     map: HashMap<K, V>,
+    /// Last positive lookup, retained as the exact key and value. Render
+    /// encoders commonly repeat one pipeline for long runs; equality against
+    /// that key avoids hashing the same composite state on every draw.
+    front: Option<(K, V)>,
     negative: HashMap<K, DrawError>,
     /// FIFO order for `negative`, bounded by [`NEGATIVE_CAP`]. Negative entries
     /// are only added on create failures that a second identical attempt would
@@ -467,26 +471,57 @@ impl<K: Clone + Eq + std::hash::Hash, V> ObjectCache<K, V> {
     fn with_negative_cap(negative_cap: usize) -> Self {
         Self {
             map: HashMap::new(),
+            front: None,
             negative: HashMap::new(),
             negative_order: VecDeque::new(),
             negative_cap,
         }
     }
 
-    fn get(&self, k: &K) -> Option<&V> {
-        self.map.get(k)
+    fn get(&mut self, k: &K) -> Option<V>
+    where
+        V: Copy,
+    {
+        self.get_routed(k).map(|(value, _)| value)
+    }
+
+    /// Positive lookup and whether the one-entry front index answered it.
+    fn get_routed(&mut self, k: &K) -> Option<(V, bool)>
+    where
+        V: Copy,
+    {
+        if let Some((front_key, value)) = &self.front {
+            if front_key == k {
+                return Some((*value, true));
+            }
+        }
+        let value = *self.map.get(k)?;
+        self.front = Some((k.clone(), value));
+        Some((value, false))
     }
 
     fn get_negative(&self, k: &K) -> Option<DrawError> {
+        // The healthy hot path has never cached a refusal. Avoid hashing the
+        // full object key merely to ask an empty table; render pipeline keys in
+        // particular carry attribute, attachment and descriptor arrays, and a
+        // positive hit immediately hashes the same key again below.
+        if self.negative.is_empty() {
+            return None;
+        }
         self.negative.get(k).cloned()
     }
 
     /// Insert. Returns the value a *replace* displaced, so the caller can
     /// destroy the Vulkan object it owned; a fresh key returns `None`. Nothing
     /// is ever displaced for capacity.
-    fn insert(&mut self, k: K, v: V) -> Option<V> {
+    fn insert(&mut self, k: K, v: V) -> Option<V>
+    where
+        V: Copy,
+    {
         self.negative.remove(&k);
-        self.map.insert(k, v)
+        let old = self.map.insert(k.clone(), v);
+        self.front = Some((k, v));
+        old
     }
 
     /// Remember a create failure so the next identical ask replays it without
@@ -545,12 +580,14 @@ impl<K: Clone + Eq + std::hash::Hash, V> ObjectCache<K, V> {
     }
 
     fn clear(&mut self) {
+        self.front = None;
         self.map.clear();
         self.negative.clear();
         self.negative_order.clear();
     }
 
     fn take_all(&mut self) -> Vec<V> {
+        self.front = None;
         self.negative.clear();
         self.negative_order.clear();
         self.map.drain().map(|(_, v)| v).collect()
@@ -983,7 +1020,7 @@ impl ObjectCaches {
                 counters.shader_misses.fetch_add(1, Ordering::Relaxed);
                 return Err(err);
             }
-            if let Some(&module) = self.shaders.get(&key) {
+            if let Some(module) = self.shaders.get(&key) {
                 counters.shader_hits.fetch_add(1, Ordering::Relaxed);
                 counters.shader_digest_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok((key, module));
@@ -1070,7 +1107,7 @@ impl ObjectCaches {
             counters.shader_misses.fetch_add(1, Ordering::Relaxed);
             return Err(err);
         }
-        if let Some(&m) = self.shaders.get(&key) {
+        if let Some(m) = self.shaders.get(&key) {
             counters.shader_hits.fetch_add(1, Ordering::Relaxed);
             return Ok((key, m));
         }
@@ -1145,7 +1182,7 @@ impl ObjectCaches {
             counters.layout_misses.fetch_add(1, Ordering::Relaxed);
             return Err(err);
         }
-        if let Some(&(dsl, pl)) = self.layouts.get(key) {
+        if let Some((dsl, pl)) = self.layouts.get(key) {
             counters.layout_hits.fetch_add(1, Ordering::Relaxed);
             return Ok((dsl, pl));
         }
@@ -1236,7 +1273,7 @@ impl ObjectCaches {
             counters.pass_misses.fetch_add(1, Ordering::Relaxed);
             return Err(err);
         }
-        if let Some(&rp) = self.passes.get(&key) {
+        if let Some(rp) = self.passes.get(&key) {
             counters.pass_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(rp);
         }
@@ -1424,7 +1461,7 @@ impl ObjectCaches {
             counters.sampler_misses.fetch_add(1, Ordering::Relaxed);
             return Err(err);
         }
-        if let Some(&s) = self.samplers.get(key) {
+        if let Some(s) = self.samplers.get(key) {
             counters.sampler_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(s);
         }
@@ -1634,8 +1671,11 @@ impl ObjectCaches {
             counters.pipeline_misses.fetch_add(1, Ordering::Relaxed);
             return Err(err);
         }
-        if let Some(&p) = self.pipelines.get(key) {
+        if let Some((p, front)) = self.pipelines.get_routed(key) {
             counters.pipeline_hits.fetch_add(1, Ordering::Relaxed);
+            if front {
+                counters.pipeline_front_hits.fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(p);
         }
         counters.pipeline_misses.fetch_add(1, Ordering::Relaxed);
@@ -2037,7 +2077,7 @@ impl ObjectCaches {
                 .fetch_add(1, Ordering::Relaxed);
             return Err(err);
         }
-        if let Some(&p) = self.compute_pipelines.get(key) {
+        if let Some(p) = self.compute_pipelines.get(key) {
             counters
                 .compute_pipeline_hits
                 .fetch_add(1, Ordering::Relaxed);
@@ -2095,6 +2135,55 @@ impl ObjectCaches {
 #[cfg(test)]
 mod object_cache_tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct CountingKey {
+        value: u32,
+        hashes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PartialEq for CountingKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.value == other.value
+        }
+    }
+
+    impl Eq for CountingKey {}
+
+    impl std::hash::Hash for CountingKey {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.hashes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.value.hash(state);
+        }
+    }
+
+    #[test]
+    fn an_empty_negative_cache_does_not_hash_the_object_key() {
+        let hashes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let key = CountingKey {
+            value: 7,
+            hashes: std::sync::Arc::clone(&hashes),
+        };
+        let mut cache: ObjectCache<CountingKey, u32> = ObjectCache::new();
+
+        assert_eq!(cache.get_negative(&key), None);
+        assert_eq!(hashes.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        cache.insert_negative(
+            CountingKey {
+                value: 9,
+                hashes: std::sync::Arc::clone(&hashes),
+            },
+            DrawError::VkCall(VkCall::new(
+                VkOp::CachesCreateShaderModule,
+                vk::Result::ERROR_UNKNOWN,
+            )),
+        );
+        hashes.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(cache.get_negative(&key), None);
+        assert_eq!(hashes.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn push_layout_selection_uses_the_device_limit_and_keeps_the_fallback() {
@@ -2355,9 +2444,10 @@ mod object_cache_tests {
         }
         assert_eq!(
             c.get(&0),
-            Some(&0xC0FFEE),
+            Some(0xC0FFEE),
             "the hot first entry is still served after 4095 later ones"
         );
+        assert_eq!(c.get_routed(&0), Some((0xC0FFEE, true)));
         assert_eq!(c.map.len(), 4096, "every distinct key retained");
     }
 
@@ -2373,7 +2463,19 @@ mod object_cache_tests {
             Some(10),
             "the displaced handle comes back for disposal"
         );
-        assert_eq!(c.get(&1), Some(&20));
+        assert_eq!(c.get(&1), Some(20));
+    }
+
+    #[test]
+    fn clearing_the_cache_forgets_the_front_value_with_the_owned_object() {
+        let mut c: ObjectCache<u32, u32> = ObjectCache::new();
+        c.insert(1, 20);
+        assert_eq!(c.get_routed(&1), Some((20, true)));
+
+        c.clear();
+
+        assert_eq!(c.get_routed(&1), None);
+        assert!(c.front.is_none());
     }
 
     #[test]
@@ -2391,7 +2493,7 @@ mod object_cache_tests {
         assert!(c.get_negative(&7).is_some());
         c.insert(7, 42);
         assert!(c.get_negative(&7).is_none(), "promotion clears negative");
-        assert_eq!(c.get(&7), Some(&42));
+        assert_eq!(c.get(&7), Some(42));
     }
 
     #[test]
@@ -2494,7 +2596,7 @@ mod object_cache_tests {
 
         // The memory came back, so this time the create succeeds.
         c.insert(key, 0x5EED);
-        assert_eq!(c.get(&key), Some(&0x5EED));
+        assert_eq!(c.get(&key), Some(0x5EED));
     }
 
     /// The index is keyed on the *allocation*, not on the contents, and that is

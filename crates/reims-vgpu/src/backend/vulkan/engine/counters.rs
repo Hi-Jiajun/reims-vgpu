@@ -238,6 +238,9 @@ engine_counters! {
         pass_hits,
         pass_misses,
         pipeline_hits,
+        /// Positive render-pipeline lookups answered by the exact one-entry
+        /// front index without hashing the composite pipeline key.
+        pipeline_front_hits,
         pipeline_misses,
         sampler_hits,
         sampler_misses,
