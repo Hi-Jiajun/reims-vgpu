@@ -678,6 +678,10 @@ pub(crate) struct ObjectCaches {
     layouts: ObjectCache<LayoutKey, (vk::DescriptorSetLayout, vk::PipelineLayout)>,
     passes: ObjectCache<PassKey, vk::RenderPass>,
     pipelines: ObjectCache<PipelineKey, vk::Pipeline>,
+    /// Exact last Vulkan variant for each retained guest pipeline object.
+    /// Values are weakly tied to the runtime object's lifetime; the content
+    /// cache remains the authority and owns every Vulkan handle.
+    pipeline_objects: ObjectVariantIndex<PipelineKey, vk::Pipeline>,
     samplers: ObjectCache<SamplerStateKey, vk::Sampler>,
     /// Lc: compute pipelines (content digest + entry + layout).
     compute_pipelines: ObjectCache<ComputePipelineKey, vk::Pipeline>,
@@ -685,6 +689,67 @@ pub(crate) struct ObjectCaches {
     /// to, so a repeat bind of the same module does not walk it three times to
     /// find that out.
     shader_digests: ShaderDigestIndex,
+}
+
+struct ObjectVariantIndex<K, V> {
+    map: HashMap<
+        std::num::NonZeroU64,
+        (
+            std::sync::Weak<super::types::PipelineObjectLife>,
+            K,
+            V,
+        ),
+    >,
+}
+
+impl<K, V> Default for ObjectVariantIndex<K, V> {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+        }
+    }
+}
+
+impl<K: Clone + Eq, V: Copy> ObjectVariantIndex<K, V> {
+    fn get(
+        &mut self,
+        identity: &super::types::PipelineObjectIdentity,
+        key: &K,
+    ) -> Option<V> {
+        let id = identity.id();
+        let expired = self
+            .map
+            .get(&id)
+            .is_some_and(|(life, _, _)| life.upgrade().is_none());
+        if expired {
+            self.map.remove(&id);
+            return None;
+        }
+        self.map
+            .get(&id)
+            .and_then(|(_, held_key, pipeline)| (held_key == key).then_some(*pipeline))
+    }
+
+    fn remember(
+        &mut self,
+        identity: &super::types::PipelineObjectIdentity,
+        key: &K,
+        value: V,
+    ) {
+        let id = identity.id();
+        if !self.map.contains_key(&id) {
+            // Object construction is rare. Reap identities whose runtime
+            // object has gone before admitting the new one, so the index
+            // follows object lifetime without a capacity or eviction policy.
+            self.map.retain(|_, (life, _, _)| life.strong_count() != 0);
+        }
+        self.map
+            .insert(id, (identity.downgrade(), key.clone(), value));
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+    }
 }
 
 /// The layout every colour attachment of every render pass this device builds is
@@ -905,6 +970,7 @@ impl ObjectCaches {
             layouts: ObjectCache::new(),
             passes: ObjectCache::new(),
             pipelines: ObjectCache::new(),
+            pipeline_objects: ObjectVariantIndex::default(),
             samplers: ObjectCache::new(),
             compute_pipelines: ObjectCache::new(),
             shader_digests: ShaderDigestIndex::default(),
@@ -912,6 +978,9 @@ impl ObjectCaches {
     }
 
     pub(crate) unsafe fn destroy_all(&mut self, device: &ash::Device) {
+        // This index borrows handles owned by `pipelines`; forget those echoes
+        // before destroying the authoritative objects.
+        self.pipeline_objects.clear();
         for p in self.pipelines.take_all() {
             device.destroy_pipeline(p, None);
         }
@@ -962,6 +1031,7 @@ impl ObjectCaches {
         self.shaders.clear();
         self.layouts.clear();
         self.passes.clear();
+        self.pipeline_objects.clear();
         self.pipelines.clear();
         self.samplers.clear();
         self.compute_pipelines.clear();
@@ -1652,6 +1722,7 @@ impl ObjectCaches {
         &mut self,
         ctx: &DeviceContext,
         key: &PipelineKey,
+        pipeline_object: Option<&super::types::PipelineObjectIdentity>,
         vert_module: vk::ShaderModule,
         // The post-relocation words `vert_module` was built from. Read only to
         // answer how wide this shader's stage-in reads are, and only on a host
@@ -1667,6 +1738,15 @@ impl ObjectCaches {
         counters: &EngineCounters,
         pools: &mut ResourcePools,
     ) -> Result<vk::Pipeline, DrawError> {
+        if let Some(identity) = pipeline_object {
+            if let Some(pipeline) = self.pipeline_objects.get(identity, key) {
+                counters.pipeline_hits.fetch_add(1, Ordering::Relaxed);
+                counters
+                    .pipeline_object_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(pipeline);
+            }
+        }
         if let Some(err) = self.pipelines.get_negative(key) {
             counters.pipeline_misses.fetch_add(1, Ordering::Relaxed);
             return Err(err);
@@ -1675,6 +1755,9 @@ impl ObjectCaches {
             counters.pipeline_hits.fetch_add(1, Ordering::Relaxed);
             if front {
                 counters.pipeline_front_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(identity) = pipeline_object {
+                self.pipeline_objects.remember(identity, key, p);
             }
             return Ok(p);
         }
@@ -2058,6 +2141,9 @@ impl ObjectCaches {
         ctx.persist_pipeline_cache();
         if let Some(old) = self.pipelines.insert(key.clone(), pipe) {
             pools.dispose(&ctx.device, DeferredHandle::Pipeline(old));
+        }
+        if let Some(identity) = pipeline_object {
+            self.pipeline_objects.remember(identity, key, pipe);
         }
         Ok(pipe)
     }
@@ -2476,6 +2562,44 @@ mod object_cache_tests {
 
         assert_eq!(c.get_routed(&1), None);
         assert!(c.front.is_none());
+    }
+
+    #[test]
+    fn retained_object_front_requires_the_same_identity_and_exact_variant() {
+        let mut index: ObjectVariantIndex<u32, u32> = ObjectVariantIndex::default();
+        let first = super::super::types::PipelineObjectIdentity::new();
+        let second = super::super::types::PipelineObjectIdentity::new();
+
+        index.remember(&first, &7, 70);
+        assert_eq!(index.get(&first, &7), Some(70));
+        assert_eq!(index.get(&first, &8), None, "a Vulkan-only variant differs");
+        assert_eq!(
+            index.get(&second, &7),
+            None,
+            "equal content under another guest object is not this object's front"
+        );
+
+        index.remember(&first, &8, 80);
+        assert_eq!(index.get(&first, &7), None, "one exact last variant");
+        assert_eq!(index.get(&first, &8), Some(80));
+    }
+
+    #[test]
+    fn retained_object_front_reaps_dead_identities_without_capacity_eviction() {
+        let mut index: ObjectVariantIndex<u32, u32> = ObjectVariantIndex::default();
+        let first = super::super::types::PipelineObjectIdentity::new();
+        index.remember(&first, &1, 10);
+        assert_eq!(index.map.len(), 1);
+        drop(first);
+
+        let second = super::super::types::PipelineObjectIdentity::new();
+        index.remember(&second, &2, 20);
+        assert_eq!(index.map.len(), 1, "the expired object's weak entry went");
+        assert_eq!(index.get(&second, &2), Some(20));
+
+        index.clear();
+        assert!(index.map.is_empty());
+        assert_eq!(index.get(&second, &2), None);
     }
 
     #[test]

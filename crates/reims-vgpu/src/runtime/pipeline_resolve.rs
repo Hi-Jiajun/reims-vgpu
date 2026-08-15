@@ -159,6 +159,10 @@ impl VertexBindPlan {
 /// cloned per draw.
 #[derive(Clone)]
 pub struct ResolvedRenderPipeline {
+    /// Present only for a state registered under the guest pipeline object's
+    /// lifetime. The memo-off ablation reconstructs per draw and therefore has
+    /// no retained identity to publish to a backend cache.
+    pub pipeline_object: Option<crate::backend::vulkan::engine::PipelineObjectIdentity>,
     pub desc: Arc<RenderPipelineDescriptor>,
     pub vertex: Arc<CachedShader>,
     pub fragment: Arc<CachedShader>,
@@ -195,6 +199,7 @@ pub(crate) fn retained_pipeline_for_test() -> Arc<ResolvedRenderPipeline> {
     };
     let desc = Arc::new(RenderPipelineDescriptor::default());
     Arc::new(ResolvedRenderPipeline {
+        pipeline_object: Some(crate::backend::vulkan::engine::PipelineObjectIdentity::new()),
         bind_plan: Arc::new(VertexBindPlan::build(&desc)),
         desc,
         vertex: Arc::new(CachedShader::new(Vec::new(), reflection(ShaderStage::Vertex))),
@@ -289,7 +294,9 @@ pub fn resolve<M: HostMemory + HostOps>(
     }
     note_store_route("pipe_memo_miss");
 
-    let resolved = Arc::new(resolve_uncached(state, host, task_id, pipeline_ref)?);
+    let mut resolved = resolve_uncached(state, host, task_id, pipeline_ref)?;
+    resolved.pipeline_object = Some(crate::backend::vulkan::engine::PipelineObjectIdentity::new());
+    let resolved = Arc::new(resolved);
     Ok(state.task_render_pipeline_states.register(
         task_id,
         pipeline_ref,
@@ -377,6 +384,7 @@ fn resolve_uncached<M: HostMemory + HostOps>(
     })?;
     let bind_plan = Arc::new(VertexBindPlan::build(&desc));
     Ok(ResolvedRenderPipeline {
+        pipeline_object: None,
         desc: Arc::new(desc),
         vertex,
         fragment,
@@ -425,6 +433,11 @@ mod tests {
         let first = state
             .task_render_pipeline_states
             .register(3, 9, retained_pipeline_for_test());
+        let first_id = first
+            .pipeline_object
+            .as_ref()
+            .expect("a retained state has an object identity")
+            .id();
 
         assert!(state.set_object_list(3, 11, 64));
         assert!(Arc::ptr_eq(
@@ -435,9 +448,18 @@ mod tests {
         assert!(!state.task_render_pipeline_states.contains(3, 9));
         assert_eq!(Arc::strong_count(&first), 1, "the encoder owner remains valid");
 
-        state
+        let replacement = state
             .task_render_pipeline_states
             .register(3, 9, retained_pipeline_for_test());
+        assert_ne!(
+            replacement
+                .pipeline_object
+                .as_ref()
+                .expect("the replacement is retained")
+                .id(),
+            first_id,
+            "reusing a guest reference constructs a new pipeline object"
+        );
         state.define_task(3, 1 << 20, 8);
         assert!(
             !state.task_render_pipeline_states.contains(3, 9),

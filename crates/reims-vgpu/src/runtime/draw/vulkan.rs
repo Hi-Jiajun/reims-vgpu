@@ -7584,6 +7584,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         }
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         let mut resources = crate::backend::vulkan::engine::DrawRequest {
+            pipeline_object: resolved.pipeline_object.clone(),
             // Honor the guest's face-culling state, its winding, and its
             // primitive type. All three come from `translate::raster`, and all
             // three fall back to a Metal default when the guest bound nothing —

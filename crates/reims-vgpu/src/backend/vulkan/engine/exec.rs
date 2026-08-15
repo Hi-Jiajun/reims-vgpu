@@ -2951,6 +2951,7 @@ pub(crate) unsafe fn execute_draw_inner(
     let pipeline = caches.get_or_create_pipeline(
         ctx,
         &pipeline_key,
+        req.pipeline_object.as_ref(),
         vert_module,
         &req.vert_spirv,
         frag_module,
