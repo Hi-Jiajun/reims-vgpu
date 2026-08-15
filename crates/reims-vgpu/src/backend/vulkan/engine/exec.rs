@@ -116,6 +116,49 @@ impl BufferGatherRole {
     }
 }
 
+/// How many pixels the attachment a pass instance is about to begin over covers,
+/// as a band.
+///
+/// # Why a pass begin is banded at all
+///
+/// A render pass boundary is the largest single cost in this device on the
+/// x86/Vulkan iGPU pathway, and it is measured causally rather than inferred:
+/// `REIMS_VGPU_PASS_CHURN=on`, which adds one end/begin pair per merged loading
+/// draw and changes nothing else, moved GPU per draw from **9.25 to 67.64 µs**
+/// and drain CPU from 8.41 to 26.69 on interleaved driven macos-13 Maps boots
+/// (/tmp/wb-out70, 71). At 169 345 pass begins a boot that is roughly two thirds
+/// of the device's whole GPU second.
+///
+/// Two mechanisms would produce that number and they call for opposite work:
+///
+/// * a **full-surface operation** on the attachment — a `loadOp = CLEAR` the
+///   driver cannot fast-clear, or a compression resolve. 1920x1080x4 is 8.3 MB,
+///   which at this host's bandwidth is ~95 µs, and that is close enough to the
+///   measurement to be worth refuting rather than assuming. If this is it, the
+///   fix is to stop asking for the operation and every pass gets cheap.
+/// * a **GPU pipeline drain and cache flush**, which is what a Vulkan render
+///   pass boundary is on this driver whatever it is drawing into. If this is it,
+///   no pass can be made cheap and the only lever is opening fewer of them.
+///
+/// The bands separate the two, because only the first scales with the
+/// attachment. Regress a census window's `gpu_span busy_us` on the band counts:
+/// coefficients that climb with the band are a surface operation, coefficients
+/// that are flat across the bands are a drain. `passbegin_load` against
+/// `passbegin_clear` beside them says whether the load action is the term,
+/// which is the specific form of the first mechanism most likely to be true.
+///
+/// Boundaries are powers of four from 64 Ki pixels, so each band is four times
+/// the traffic of the one below it and a linear cost is unmistakable. A 1080p
+/// attachment is 2.07 M pixels and lands in the top band.
+fn pass_begin_area_band(width: u32, height: u32) -> &'static str {
+    match u64::from(width).saturating_mul(u64::from(height)) {
+        0..=65_535 => "passbegin_px_lt64k",
+        65_536..=262_143 => "passbegin_px_lt256k",
+        262_144..=1_048_575 => "passbegin_px_lt1m",
+        _ => "passbegin_px_ge1m",
+    }
+}
+
 /// The offset alignment imposed by the consumer that will bind this source.
 fn buffer_bind_offset_alignment(role: BufferGatherRole, storage_align: u64) -> u64 {
     let storage = if role.storage { storage_align } else { 1 };
@@ -4970,6 +5013,12 @@ pub(crate) unsafe fn execute_draw_inner(
         // An encoder boundary, a different pass instance, or an intervening
         // outside-pass command closes whatever the predecessor left open.
         unsafe { pools.close_open_pass(&ctx.device, cb) };
+        crate::runtime::drain::note_store_route(pass_begin_area_band(req.width, req.height));
+        crate::runtime::drain::note_store_route(if pass_key.load_seed {
+            "passbegin_load"
+        } else {
+            "passbegin_clear"
+        });
         ctx.device
             .cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
         pools.note_pass_opened(echo);
@@ -6491,6 +6540,37 @@ mod tests {
         // must be `None` and not the role of whichever entry a scan happened to
         // stop on — the three call sites `expect()` on exactly this.
         assert_eq!(roles.role((0xdead_beef, 0, 16)), None);
+    }
+
+    /// The bands tile every attachment size with no gap and no overlap, and a
+    /// 1080p target lands in the top one.
+    ///
+    /// A gap here would be silent: a pass begin charged to no band simply does
+    /// not appear, and the regression the bands exist for would then attribute
+    /// its cost to whichever band happened to move with it. The boundary values
+    /// are therefore walked rather than sampled in the middle of each band.
+    #[test]
+    fn the_pass_area_bands_tile_every_attachment_size() {
+        // One pixel either side of each boundary, plus the degenerate and the
+        // real target size.
+        let cases: [(u32, u32, &str); 9] = [
+            (0, 0, "passbegin_px_lt64k"),
+            (256, 255, "passbegin_px_lt64k"),
+            (256, 256, "passbegin_px_lt256k"),
+            (512, 511, "passbegin_px_lt256k"),
+            (512, 512, "passbegin_px_lt1m"),
+            (1024, 1023, "passbegin_px_lt1m"),
+            (1024, 1024, "passbegin_px_ge1m"),
+            (1920, 1080, "passbegin_px_ge1m"),
+            (u32::MAX, u32::MAX, "passbegin_px_ge1m"),
+        ];
+        for (w, h, want) in cases {
+            assert_eq!(
+                pass_begin_area_band(w, h),
+                want,
+                "{w}x{h} landed in the wrong band"
+            );
+        }
     }
 
     /// Direct imports obey the limit of the descriptor actually written. A

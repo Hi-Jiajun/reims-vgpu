@@ -103,17 +103,19 @@ mod pass_echo_delta_order {
         }
     }
 
-    /// One image described two ways must be charged to the shape, and a second
-    /// image to the target — even though both also carry a new framebuffer.
+    /// `passdiff_compat` must mean **one image described two ways** and nothing
+    /// else, which takes both of these arms to pin.
     ///
-    /// This is why the framebuffer cannot be the first question. It is a
-    /// function of the render pass as well as the views, so a shape flip on one
-    /// image produces a new handle too; asking `fb` first would empty
-    /// `passdiff_compat` — the bucket that names a defect — into `passdiff_fb`,
-    /// which names a guest action. At ~100 µs of GPU per pass instance that is
-    /// the ranking question for the largest cost in the device.
+    /// The target has to subsume, or a break where the guest also moved lands in
+    /// the defect bucket; and the framebuffer cannot be asked before either,
+    /// because it is a function of the render pass as well as the views, so a
+    /// shape flip on one image brings a new handle with it and would empty the
+    /// defect bucket into the guest-action one. At ~63 µs of GPU per pass
+    /// boundary — measured causally, `REIMS_VGPU_PASS_CHURN=on` moved GPU per
+    /// draw from 9.25 to 67.64 µs — this is the ranking question for the largest
+    /// cost in the device.
     #[test]
-    fn one_image_described_two_ways_is_not_charged_as_a_target_switch() {
+    fn passdiff_compat_means_one_image_described_two_ways() {
         let mut pools = ResourcePools::new();
         pools.note_pass_opened(echo(1, false));
         assert!(
@@ -121,13 +123,19 @@ mod pass_echo_delta_order {
                 pools.pass_echo_delta(&echo(1, true)),
                 Some(PassEchoField::Compatibility(_))
             ),
-            "the same image with a different declared shape is a shape flip, \
-             despite the framebuffer the shape change brings with it"
+            "the same image with a different declared shape is the defect this \
+             bucket exists to count, despite the framebuffer the shape brings"
+        );
+        assert_eq!(
+            pools.pass_echo_delta(&echo(2, true)),
+            Some(PassEchoField::Target),
+            "a break where the image also moved is the guest changing target, \
+             however the shape differs alongside it"
         );
         assert_eq!(
             pools.pass_echo_delta(&echo(2, false)),
             Some(PassEchoField::Target),
-            "a different image at the same shape is the guest changing target"
+            "and at an identical shape too"
         );
         assert_eq!(
             pools.pass_echo_delta(&echo(1, false)),
@@ -1726,8 +1734,17 @@ impl ResourcePools {
     /// framebuffer over the very same attachments — asking `fb` first would put
     /// every shape flip in `passdiff_fb` and leave `passdiff_compat` reading
     /// zero, which is the informative bucket emptied into the uninformative one.
-    /// So the ladder asks the shape first, and [`PassEcho::target_image`] —
-    /// which decides nothing and exists only for this — separates what is left.
+    /// [`PassEcho::target_image`] has no such coupling: it is what the guest
+    /// named, not what this device built from it. So the target is asked
+    /// **first**, and it subsumes — a break where the image also moved is a
+    /// target switch however the shape differs. What reaches
+    /// `Compatibility` is then one image this device described two ways, which
+    /// is the defect and nothing else.
+    ///
+    /// Asking the shape first does not do this, and the difference is not
+    /// academic: it leaves `passcompat_host_accessible` as the largest bucket in
+    /// the census (106 460 of 301 498 pass begins on /tmp/wb-out80) while saying
+    /// nothing about whether the image moved with it.
     ///
     /// Why it matters: a per-window regression of `gpu_span busy_us` on
     /// `(draws, pass begins)` over three driven Maps boots puts a **pass
@@ -1743,11 +1760,11 @@ impl ResourcePools {
         if last.cb != echo.cb {
             return Some(PassEchoField::Cb);
         }
-        if let Some(field) = last.compatibility.first_difference(echo.compatibility) {
-            return Some(PassEchoField::Compatibility(field));
-        }
         if last.target_image != echo.target_image {
             return Some(PassEchoField::Target);
+        }
+        if let Some(field) = last.compatibility.first_difference(echo.compatibility) {
+            return Some(PassEchoField::Compatibility(field));
         }
         if last.fb != echo.fb {
             return Some(PassEchoField::Framebuffer);
