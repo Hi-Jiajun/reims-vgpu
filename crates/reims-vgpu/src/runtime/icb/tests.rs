@@ -3440,6 +3440,7 @@ fn inherit_buffers_encoder_fragment_color() {
             buffer_ref: 13,
             offset: 0,
             attribute_stride: None,
+            ..Default::default()
         }]
         .into(),
         viewports: vec![[0.0, 0.0, 4.0, 4.0, 0.0, 1.0]],

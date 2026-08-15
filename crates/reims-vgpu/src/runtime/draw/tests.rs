@@ -2331,7 +2331,9 @@ fn the_metal_draw_arm_refuses_a_bind_past_its_table() {
         vertex_textures: vec![TextureBind {
             index: MAX_TEXTURE_BIND_SLOTS,
             texture_ref: 9,
-        }],
+            ..Default::default()
+        }]
+        .into(),
         ..Default::default()
     };
     let st = encode_draw_chain(&mut state, &mut host, &mut req, false, false).0;
