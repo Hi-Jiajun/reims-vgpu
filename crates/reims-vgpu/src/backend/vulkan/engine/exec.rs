@@ -2110,7 +2110,16 @@ struct JoinTerms {
     force_loss: bool,
     quirk: bool,
     is_mrt: bool,
-    has_depth: bool,
+    /// A depth draw whose submit may not be deferred.
+    ///
+    /// Depth itself is not the reason and never was. A depth pass builds a
+    /// per-draw framebuffer, and a deferred draw returns before the disposal
+    /// block, so batching one used to leak that framebuffer once per draw —
+    /// which is why this rung shared its condition with `is_mrt` and
+    /// `color_input`, the other two terms of `ordinary_ad_hoc_framebuffer`.
+    /// Both paths now dispose through [`dispose_ad_hoc_attachments`], so the
+    /// term is only what [`crate::env::BATCH_DEPTH`] restores for an A/B.
+    depth_barred: bool,
     reads_back: bool,
     has_query: bool,
     no_identity: bool,
@@ -2154,6 +2163,94 @@ fn batch_mixed_targets_disabled() -> bool {
     })
 }
 
+/// Whether [`crate::env::BATCH_DEPTH`] is switched off, read once per process.
+///
+/// Latched for the same reason [`batch_mixed_targets_disabled`] is: this sits on
+/// the per-draw path and `std::env::var_os` is a lock and an allocation.
+fn batch_depth_disabled() -> bool {
+    use std::sync::OnceLock;
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| {
+        let (state, value) = crate::env::read(crate::env::BATCH_DEPTH);
+        match state {
+            crate::env::Switch::Off => {
+                crate::observe::off("batch_depth reason=batch_depth_disabled_by_env");
+                true
+            }
+            // Named rather than silently read as the default. It still takes the
+            // default arm: this switch may only turn a rail off, and a value
+            // nobody can parse is not that.
+            crate::env::Switch::Unrecognized => {
+                crate::observe::fail(format!(
+                    "batch_depth reason=batch_depth_env_unrecognized value={}",
+                    value.unwrap_or_default()
+                ));
+                false
+            }
+            crate::env::Switch::On | crate::env::Switch::Unset => false,
+        }
+    })
+}
+
+/// The `depth_barred` term, as the draw path computes it.
+///
+/// A function rather than an expression at the one call site so a test can reach
+/// the *decision* and not just the field: a test that builds `JoinTerms` by hand
+/// asserts the ladder, which would stay green if this rung went back to barring
+/// every depth draw.
+fn depth_bars_batching(has_depth: bool) -> bool {
+    has_depth && batch_depth_disabled()
+}
+
+/// Hand this draw's ad-hoc attachment handles to the graveyard.
+///
+/// **Both submit paths call this and neither may inline it.** They differ only in
+/// *when* their slot enters [`super::pools::ResourcePools::open_slot_mask`] —
+/// `finish_entry_async` marks it pending on the submitting path, `batch_append`
+/// installs the open batch on the deferred one — and the rule that this call must
+/// follow that moment is the entire safety argument. Called before it, the mask
+/// is empty and `dispose` destroys immediately, under a command buffer that still
+/// names these handles. A second copy of the sequence is where one of the two
+/// would drift off that rule.
+///
+/// `transient_depth` carries the draw's framebuffer whenever it has depth, so the
+/// two arms are exclusive by that test rather than by re-deriving which features
+/// are in play — a depth MRT draw has one framebuffer and must dispose it once.
+unsafe fn dispose_ad_hoc_attachments(
+    ctx: &super::context::DeviceContext,
+    pools: &mut super::pools::ResourcePools,
+    ordinary_ad_hoc_framebuffer: bool,
+    target_fb: vk::Framebuffer,
+    transient_depth: Option<(Option<OwnedDepthImage>, vk::Framebuffer)>,
+) {
+    unsafe {
+        if ordinary_ad_hoc_framebuffer && transient_depth.is_none() {
+            pools.dispose(
+                &ctx.device,
+                super::pools::DeferredHandle::Framebuffer(target_fb),
+            );
+        }
+        if let Some((owned, dfb)) = transient_depth {
+            pools.dispose(&ctx.device, super::pools::DeferredHandle::Framebuffer(dfb));
+            // Only the unidentified case owns its image. A resident one belongs
+            // to the registry and to the guest texture it is keyed on; disposing
+            // it here would put the rail straight back to one allocation per
+            // draw, with the added defect that the next draw would find a
+            // destroyed handle.
+            if let Some((dimg, dmem, dview)) = owned {
+                pools.dispose(
+                    &ctx.device,
+                    super::pools::DeferredHandle::Image {
+                        image: dimg,
+                        view: dview,
+                        memory: dmem,
+                    },
+                );
+            }
+        }
+    }
+}
+
 /// What a [`JoinTerms`] rung is a statement about.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum JoinScope {
@@ -2182,7 +2279,7 @@ impl JoinTerms {
         (|t| t.force_loss, JoinScope::Draw, "nojoin_force_loss"),
         (|t| t.quirk, JoinScope::Draw, "nojoin_quirk"),
         (|t| t.is_mrt, JoinScope::Draw, "nojoin_mrt"),
-        (|t| t.has_depth, JoinScope::Draw, "nojoin_depth"),
+        (|t| t.depth_barred, JoinScope::Draw, "nojoin_depth"),
         (|t| t.reads_back, JoinScope::Draw, "nojoin_reads_back"),
         (|t| t.has_query, JoinScope::Draw, "nojoin_query"),
         (|t| t.no_identity, JoinScope::Draw, "nojoin_no_identity"),
@@ -2622,7 +2719,7 @@ pub(crate) unsafe fn execute_draw_inner(
         force_loss,
         quirk: ctx.caps.quirks.no_deferred_draw_batching,
         is_mrt,
-        has_depth: req.depth.is_some(),
+        depth_barred: depth_bars_batching(req.depth.is_some()),
         reads_back: !req.skip_readback,
         has_query: req.occlusion_query.is_some(),
         no_identity: req.target_identity.is_none(),
@@ -5394,6 +5491,18 @@ pub(crate) unsafe fn execute_draw_inner(
             sampled_retains,
             counters,
         );
+        // After the append, never before: installing the open batch is what puts
+        // this slot into `open_slot_mask`, so these handles wait for the batch's
+        // own work instead of being freed under a command buffer still recording
+        // them. This is the same ordering rule the submitting path meets through
+        // `finish_entry_async`, which is why both go through one function.
+        dispose_ad_hoc_attachments(
+            ctx,
+            pools,
+            ordinary_ad_hoc_framebuffer,
+            target_fb,
+            transient_depth,
+        );
         counters
             .render_post_wait_skips
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5430,29 +5539,13 @@ pub(crate) unsafe fn execute_draw_inner(
     // the two arms below are exclusive by that test rather than by re-deriving
     // which features are in play — a depth MRT draw has one framebuffer and must
     // dispose it once.
-    if ordinary_ad_hoc_framebuffer && transient_depth.is_none() {
-        pools.dispose(
-            &ctx.device,
-            super::pools::DeferredHandle::Framebuffer(target_fb),
-        );
-    }
-    if let Some((owned, dfb)) = transient_depth {
-        pools.dispose(&ctx.device, super::pools::DeferredHandle::Framebuffer(dfb));
-        // Only the unidentified case owns its image. A resident one belongs to
-        // the registry and to the guest texture it is keyed on; disposing it
-        // here would put the rail straight back to one allocation per draw, with
-        // the added defect that the next draw would find a destroyed handle.
-        if let Some((dimg, dmem, dview)) = owned {
-            pools.dispose(
-                &ctx.device,
-                super::pools::DeferredHandle::Image {
-                    image: dimg,
-                    view: dview,
-                    memory: dmem,
-                },
-            );
-        }
-    }
+    dispose_ad_hoc_attachments(
+        ctx,
+        pools,
+        ordinary_ad_hoc_framebuffer,
+        target_fb,
+        transient_depth,
+    );
 
     // A draw with no pixel readback (resident target, skip_readback) hands
     // the CPU nothing — skip the post-submit fence wait and return while the
@@ -6028,7 +6121,7 @@ mod tests {
             force_loss: b(0),
             quirk: b(1),
             is_mrt: b(2),
-            has_depth: b(3),
+            depth_barred: b(3),
             reads_back: b(4),
             has_query: b(5),
             no_identity: b(6),
@@ -6058,6 +6151,45 @@ mod tests {
             assert!(seen.insert(*name), "two rungs share the census name {name}");
         }
         assert_eq!(join_terms(0).refusal(), None, "no term set is a join");
+    }
+
+    /// A depth attachment on its own must not stop a draw deferring its submit.
+    ///
+    /// This pins the decision and not the disposal, which is the honest scope: no
+    /// test here can reach `dispose_ad_hoc_attachments`, so what it guards is the
+    /// rung, and the safety argument for the rung being relaxed lives in that
+    /// function's doc and in `open_slot_mask`'s.
+    ///
+    /// Worth a test rather than a reading of the ladder because the rung was
+    /// unconditional for as long as no measured workload presented depth. A
+    /// driven macos-13 Maps boot puts `nojoin_depth` at 49 014 in 45 s against 0
+    /// for the sustained-animation probe, and `passheld_no_join` at 50 368 —
+    /// i.e. depth was very nearly the *only* reason that workload's passes did
+    /// not merge. Re-adding `req.depth.is_some()` to a `JoinScope::Draw` rung
+    /// unconditionally puts that back and fails here.
+    #[test]
+    fn a_depth_attachment_alone_does_not_bar_batching() {
+        // Through the production predicate, not the field, or this stays green
+        // if the rung goes back to barring every depth draw. `BATCH_DEPTH` is
+        // unset in the test process, which is the shipping arm.
+        let depth_only = JoinTerms {
+            depth_barred: depth_bars_batching(true),
+            ..join_terms(0)
+        };
+        assert!(
+            depth_only.batch_eligible(),
+            "a draw carrying depth must be able to open or join a batch"
+        );
+        assert_eq!(depth_only.refusal(), None);
+
+        // And the env switch still restores the old bar, under its own name, so
+        // the two arms of an A/B remain distinguishable in the census.
+        let barred = JoinTerms {
+            depth_barred: true,
+            ..join_terms(0)
+        };
+        assert!(!barred.batch_eligible());
+        assert_eq!(barred.refusal(), Some("nojoin_depth"));
     }
 
     // There is deliberately no test that `batch_eligible` and `refusal` agree

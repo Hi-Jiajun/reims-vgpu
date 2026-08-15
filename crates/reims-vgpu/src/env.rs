@@ -225,6 +225,23 @@ pub const BUFFER_EXTENT: &str = "REIMS_VGPU_BUFFER_EXTENT";
 /// refusal (`nojoin_target_switch`) and never a permission.
 pub const BATCH_MIXED_TARGETS: &str = "REIMS_VGPU_BATCH_MIXED_TARGETS";
 
+/// `off` bars a draw carrying a depth attachment from deferring its submit, the
+/// way every such draw was barred before its ad-hoc framebuffer was given to the
+/// graveyard on the deferred path as well as the submitting one.
+///
+/// The bar was never a statement about depth. It was a statement about the
+/// per-draw framebuffer a depth pass builds — a deferred draw returns before the
+/// disposal block, so batching one used to leak that framebuffer. Both paths now
+/// dispose through one function, and the ordering rule the graveyard needs is met
+/// on each: the slot is in `open_slot_mask` because `finish_entry_async` marked
+/// it pending, or because `batch_append` installed the open batch.
+///
+/// It exists as a switch for the same reason [`BATCH_MIXED_TARGETS`] does: the
+/// arms differ by one term in one process, so one driven boot of each attributes
+/// a change in submissions and frames to the join rule rather than to a rebuild.
+/// Off is a refusal (`nojoin_depth`) and never a permission.
+pub const BATCH_DEPTH: &str = "REIMS_VGPU_BATCH_DEPTH";
+
 /// `off` stages the guest bytes of a `[[buffer(n)]]` bind even when the stage's
 /// own reflection says the shader never dereferences it.
 ///
@@ -951,7 +968,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 23] = [
+pub const ALL: [&str; 24] = [
     LAZY_WRITEBACK,
     SLAB_RETAIN,
     // Both absent until 2026-08-12, for the same reason `COMPUTE_GATHER` was:
@@ -971,6 +988,7 @@ pub const ALL: [&str; 23] = [
     RANGE_COVERAGE,
     BUFFER_EXTENT,
     BATCH_MIXED_TARGETS,
+    BATCH_DEPTH,
     UNUSED_BINDS,
     PRESENT_DEPTH,
     STAMP_COALESCE,
