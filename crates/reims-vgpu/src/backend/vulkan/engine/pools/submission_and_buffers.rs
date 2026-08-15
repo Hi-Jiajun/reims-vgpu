@@ -1660,8 +1660,8 @@ impl ResourcePools {
         if last.cb != echo.cb {
             return Some(PassEchoField::Cb);
         }
-        if last.compatibility != echo.compatibility {
-            return Some(PassEchoField::Compatibility);
+        if let Some(field) = last.compatibility.first_difference(echo.compatibility) {
+            return Some(PassEchoField::Compatibility(field));
         }
         if last.fb != echo.fb {
             return Some(PassEchoField::Framebuffer);

@@ -315,6 +315,107 @@ impl PassCompatibilityKey {
     pub(crate) fn has_depth(self) -> bool {
         self.0.depth.is_some()
     }
+
+    /// Which field makes two compatibility keys disagree, or `None` when they
+    /// are equal.
+    ///
+    /// A `passdiff_compat` firing says a draw could not continue its
+    /// predecessor's render pass because Vulkan would not call the two passes
+    /// compatible, and on a driven Maps leg that is the dominant merge blocker
+    /// once the framebuffer identity one is fixed. On its own it names no
+    /// repair: this key carries nine independent things and a change in any of
+    /// them lands in the same bucket. A colour format change is the guest
+    /// drawing into a different target and is not repairable at all; a
+    /// `sample_count` or `feedback_colors` change might be this device's own
+    /// bookkeeping.
+    ///
+    /// The order is arbitrary — unlike [`super::pools::PassEchoField`]'s, where
+    /// an earlier field makes a later one unreachable — so an answer here is
+    /// *a* difference and not the only one. That is what the census needs: the
+    /// question is which field to look at first, and any field that ever
+    /// differs is worth a reading.
+    ///
+    /// The destructure is exhaustive on purpose. A tenth field added to
+    /// [`PassKey`] fails this function to compile rather than joining a bucket
+    /// that silently stops being a partition.
+    pub(crate) fn first_difference(self, other: Self) -> Option<PassCompatField> {
+        let PassKey {
+            // Load actions are erased by `PassKey::compatibility`, so they are
+            // equal here by construction and cannot be a difference.
+            load_seed: _,
+            host_accessible_color0,
+            color0_format,
+            secondary,
+            secondary_count,
+            depth,
+            color_input,
+            feedback_colors,
+            sample_count,
+            multisample_resolve,
+        } = self.0;
+        let them = other.0;
+        if color0_format != them.color0_format {
+            return Some(PassCompatField::Color0Format);
+        }
+        if secondary_count != them.secondary_count {
+            return Some(PassCompatField::SecondaryCount);
+        }
+        if secondary != them.secondary {
+            return Some(PassCompatField::SecondaryFormat);
+        }
+        if depth != them.depth {
+            return Some(PassCompatField::Depth);
+        }
+        if host_accessible_color0 != them.host_accessible_color0 {
+            return Some(PassCompatField::HostAccessibleColor0);
+        }
+        if color_input != them.color_input {
+            return Some(PassCompatField::ColorInput);
+        }
+        if feedback_colors != them.feedback_colors {
+            return Some(PassCompatField::FeedbackColors);
+        }
+        if sample_count != them.sample_count {
+            return Some(PassCompatField::SampleCount);
+        }
+        if multisample_resolve != them.multisample_resolve {
+            return Some(PassCompatField::MultisampleResolve);
+        }
+        None
+    }
+}
+
+/// Which field of a [`PassCompatibilityKey`] two draws disagreed about.
+///
+/// See [`PassCompatibilityKey::first_difference`] for why the split exists and
+/// why the order carries no meaning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PassCompatField {
+    Color0Format,
+    SecondaryCount,
+    SecondaryFormat,
+    Depth,
+    HostAccessibleColor0,
+    ColorInput,
+    FeedbackColors,
+    SampleCount,
+    MultisampleResolve,
+}
+
+impl PassCompatField {
+    pub(crate) fn route(self) -> &'static str {
+        match self {
+            Self::Color0Format => "passcompat_color0_format",
+            Self::SecondaryCount => "passcompat_secondary_count",
+            Self::SecondaryFormat => "passcompat_secondary_format",
+            Self::Depth => "passcompat_depth",
+            Self::HostAccessibleColor0 => "passcompat_host_accessible",
+            Self::ColorInput => "passcompat_color_input",
+            Self::FeedbackColors => "passcompat_feedback",
+            Self::SampleCount => "passcompat_sample_count",
+            Self::MultisampleResolve => "passcompat_ms_resolve",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -2364,6 +2465,77 @@ mod object_cache_tests {
         let mut different_depth = load;
         different_depth.depth.as_mut().unwrap().stencil = false;
         assert_ne!(clear.compatibility(), different_depth.compatibility());
+    }
+
+    /// `first_difference` answers `None` on exactly the pairs that compare
+    /// equal, which is what makes `passcompat_*` a partition of
+    /// `passdiff_compat` rather than a second opinion about it.
+    ///
+    /// This is the property that matters, and it is not the same as "every
+    /// field has a variant": a field the destructure names but the body forgets
+    /// to compare would still let two unequal keys answer `None`, and the caller
+    /// would then charge the *next* echo field — reporting a framebuffer change
+    /// where an attachment shape moved. So the assertion is over mutations, one
+    /// per field, and it is made in both directions.
+    #[test]
+    fn every_compatibility_difference_is_named_and_equal_keys_name_none() {
+        let mut base = PassKey::single(false, vk::Format::B8G8R8A8_UNORM);
+        base.secondary_count = 1;
+        base.secondary[0] = SecondaryAttachKey {
+            format: vk::Format::R16G16_SFLOAT,
+            load: false,
+        };
+        base.depth = Some(DepthAttachKey {
+            load: false,
+            stencil: true,
+        });
+        base.sample_count = 1;
+
+        assert_eq!(
+            base.compatibility().first_difference(base.compatibility()),
+            None
+        );
+
+        // A load action is erased by `compatibility`, so it is not a difference
+        // — the one mutation below that must answer `None`.
+        /// One named mutation of a [`PassKey`] and the difference it must
+        /// produce. `None` for a mutation `compatibility` erases.
+        type Mutation = (&'static str, fn(&mut PassKey), Option<PassCompatField>);
+        let mutations: &[Mutation] = &[
+            ("load actions", |k| {
+                k.load_seed = true;
+                k.secondary[0].load = true;
+                k.depth.as_mut().unwrap().load = true;
+            }, None),
+            ("color0 format", |k| k.color0_format = vk::Format::R8G8B8A8_UNORM,
+             Some(PassCompatField::Color0Format)),
+            ("secondary count", |k| k.secondary_count = 2,
+             Some(PassCompatField::SecondaryCount)),
+            ("secondary format", |k| k.secondary[0].format = vk::Format::R32_SFLOAT,
+             Some(PassCompatField::SecondaryFormat)),
+            ("depth", |k| k.depth = None, Some(PassCompatField::Depth)),
+            ("host accessible", |k| k.host_accessible_color0 = true,
+             Some(PassCompatField::HostAccessibleColor0)),
+            ("color input", |k| k.color_input = true, Some(PassCompatField::ColorInput)),
+            ("feedback", |k| k.feedback_colors = 1, Some(PassCompatField::FeedbackColors)),
+            ("sample count", |k| k.sample_count = 4, Some(PassCompatField::SampleCount)),
+            ("resolve", |k| k.multisample_resolve = true,
+             Some(PassCompatField::MultisampleResolve)),
+        ];
+
+        for (name, mutate, expected) in mutations {
+            let mut moved = base;
+            mutate(&mut moved);
+            let (a, b) = (base.compatibility(), moved.compatibility());
+            assert_eq!(a.first_difference(b), *expected, "{name}");
+            assert_eq!(b.first_difference(a), *expected, "{name}, reversed");
+            // The partition itself: `None` iff equal, on every input above.
+            assert_eq!(
+                a.first_difference(b).is_none(),
+                a == b,
+                "{name}: a named difference and key equality must agree"
+            );
+        }
     }
 
     /// Framebuffers bind attachment views, not load actions, layouts, or

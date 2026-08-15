@@ -4875,6 +4875,13 @@ pub(crate) unsafe fn execute_draw_inner(
     if joins && !continues {
         if let Some(field) = pools.pass_echo_delta(&echo) {
             crate::runtime::drain::note_store_route(field.route());
+            // `passdiff_compat` is itself one bucket over nine attachment-shape
+            // fields, and it became the dominant one when the framebuffer
+            // identity blocker was fixed. The finer route rides along with the
+            // coarse one so the two cannot be charged apart.
+            if let Some(detail) = field.detail_route() {
+                crate::runtime::drain::note_store_route(detail);
+            }
         }
     }
     crate::runtime::drain::note_store_route(if !joins {

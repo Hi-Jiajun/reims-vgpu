@@ -748,7 +748,11 @@ pub(crate) enum PassEchoField {
     /// Vulkan would not call the two passes compatible. Load and store actions
     /// are excluded from this key by construction, so a firing here names a
     /// genuine attachment-shape change.
-    Compatibility,
+    ///
+    /// The field that changed travels with the variant rather than being asked
+    /// for separately, so nothing can charge `passdiff_compat` without also
+    /// saying which of the nine things moved.
+    Compatibility(super::caches::PassCompatField),
     /// Same pass shape, different framebuffer object.
     Framebuffer,
     /// Same framebuffer, different render area.
@@ -760,9 +764,20 @@ impl PassEchoField {
         match self {
             Self::Nothing => "passdiff_nothing",
             Self::Cb => "passdiff_cb",
-            Self::Compatibility => "passdiff_compat",
+            Self::Compatibility(_) => "passdiff_compat",
             Self::Framebuffer => "passdiff_fb",
             Self::Area => "passdiff_area",
+        }
+    }
+
+    /// The second, finer route this answer also carries, where it has one.
+    ///
+    /// Only the compatibility bucket does: the other four name a whole reason
+    /// on their own.
+    pub(crate) fn detail_route(self) -> Option<&'static str> {
+        match self {
+            Self::Compatibility(field) => Some(field.route()),
+            Self::Nothing | Self::Cb | Self::Framebuffer | Self::Area => None,
         }
     }
 }
