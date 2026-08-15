@@ -125,6 +125,59 @@ fn a_small_reflected_object_stays_on_the_gather_rail_and_moves_only_its_extent()
     );
 }
 
+/// The scatter band names the run count the coalescer finds, not the page count.
+///
+/// The reading this census exists to take is "could this window have been served
+/// by N RAMBlock references instead of an allocation", and N is runs, not pages.
+/// A four-page window laid out as one 16 KiB granule is one run and the answer
+/// is one reference; the same four pages shuffled are four. Banding by page
+/// count would report the same number for both and rank the decision wrongly.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn the_packed_scatter_band_counts_runs_and_not_pages() {
+    use super::vulkan::packed_scatter_band;
+
+    const PAGE: u64 = 4096;
+    let four_pages_one_run = [0x1000u64, 0x2000, 0x3000, 0x4000];
+    let four_pages_two_runs = [0x1000u64, 0x2000, 0x9000, 0xa000];
+    let four_pages_four_runs = [0x1000u64, 0x3000, 0x5000, 0x7000];
+
+    assert_eq!(
+        packed_scatter_band(&four_pages_one_run, PAGE),
+        "zc_packed_scatter_runs_1"
+    );
+    assert_eq!(
+        packed_scatter_band(&four_pages_two_runs, PAGE),
+        "zc_packed_scatter_runs_2"
+    );
+    assert_eq!(
+        packed_scatter_band(&four_pages_four_runs, PAGE),
+        "zc_packed_scatter_runs_3_4"
+    );
+
+    // Every band boundary is the count the coalescer reports, so a window built
+    // to have exactly N runs must land in the band that contains N.
+    for runs in 1usize..=80 {
+        let gpas: Vec<u64> = (0..runs).map(|i| (i as u64 + 1) * 2 * PAGE).collect();
+        assert_eq!(
+            reims_vgpu_paging::runs::contig_run_count(&gpas, PAGE),
+            runs,
+            "the fixture itself must have {runs} runs"
+        );
+        let band = packed_scatter_band(&gpas, PAGE);
+        let expected = match runs {
+            1 => "zc_packed_scatter_runs_1",
+            2 => "zc_packed_scatter_runs_2",
+            3..=4 => "zc_packed_scatter_runs_3_4",
+            5..=8 => "zc_packed_scatter_runs_5_8",
+            9..=16 => "zc_packed_scatter_runs_9_16",
+            17..=64 => "zc_packed_scatter_runs_17_64",
+            _ => "zc_packed_scatter_runs_65_up",
+        };
+        assert_eq!(band, expected, "{runs} runs");
+    }
+}
+
 /// The zero-copy buffer floor may veto a gather and nothing else.
 ///
 /// `ZERO_COPY_BUFFER_MIN_BYTES` was measured against one outcome and its own doc

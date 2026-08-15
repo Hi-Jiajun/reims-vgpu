@@ -2904,6 +2904,29 @@ pub(super) enum PackedResourceRail {
     LinearSample,
 }
 
+/// Band a scattered packed window by how many maximal GPA runs it is made of.
+///
+/// A window that refuses [`crate::runtime::guest_ram_map::reference_for_pages`]
+/// costs a `vkAllocateMemory` and a host virtual alias, and the alternative —
+/// one RAMBlock reference per run, which `references_for_runs` already builds
+/// for the gather rail — is only cheaper while the run count is small. A two-run
+/// window is two binds against one allocation; a five-hundred-run window is not.
+/// Nothing measured the distribution, so the choice cannot be made from the run
+/// count without this, and a `Scattered` refusal's own `runs` field is deduped
+/// by `report_once` and so reports the first window of a boot rather than the
+/// population.
+pub(super) fn packed_scatter_band(gpas: &[u64], page: u64) -> &'static str {
+    match reims_vgpu_paging::runs::contig_run_count(gpas, page) {
+        0 | 1 => "zc_packed_scatter_runs_1",
+        2 => "zc_packed_scatter_runs_2",
+        3..=4 => "zc_packed_scatter_runs_3_4",
+        5..=8 => "zc_packed_scatter_runs_5_8",
+        9..=16 => "zc_packed_scatter_runs_9_16",
+        17..=64 => "zc_packed_scatter_runs_17_64",
+        _ => "zc_packed_scatter_runs_65_up",
+    }
+}
+
 pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -3005,6 +3028,7 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
             }
             None => {
                 crate::runtime::drain::note_store_route("zc_packed_alias_import");
+                crate::runtime::drain::note_store_route(packed_scatter_band(&gpas, page));
                 let import = std::sync::Arc::new(
                     crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
                         host_base, map_len, align,
