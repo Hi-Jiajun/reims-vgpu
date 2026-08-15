@@ -131,19 +131,26 @@ fn announce(index: u32) {
 /// One stamp waiting for its queue point, in FIFO order.
 #[derive(Clone, Debug)]
 struct Waiting {
-    /// Timeline value the FIFO submission preceding this stamp signals.
-    ///
-    /// `None` is a stamp recorded while a deferred draw batch is still open.
-    /// The next successful queue submission assigns its point to every such
-    /// record. Keeping the record pending before the submit is what preserves
-    /// FIFO chaining without making the stamp close the command buffer.
-    timeline: Option<u64>,
+    /// The exact submission this completion belongs to, before or after that
+    /// submission has reached `vkQueueSubmit`.
+    point: CompletionPoint,
     /// Stamp slot index, for the interrupt-status bit.
     index: u32,
     /// The checked shared-memory word written before the interrupt is raised.
     word: crate::runtime::guest_ram::GuestRef,
     /// The FIFO completion value published into `word`.
     stamp: u32,
+}
+
+/// Association between one guest stamp and one FIFO-owned submission.
+///
+/// A stamp recorded in an open batch already knows which monotonic point the
+/// next reservation will receive. Carrying that point here prevents an older,
+/// delayed `vkQueueSubmit` from claiming stamps recorded for a newer batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletionPoint {
+    NextSubmission(u64),
+    Submitted(u64),
 }
 
 #[derive(Default)]
@@ -172,11 +179,11 @@ impl PendingQueue {
         self.per_fifo[index] != 0
     }
 
-    fn bind_unsubmitted(&mut self, timeline: u64) -> usize {
+    fn bind_submission(&mut self, timeline: u64) -> usize {
         let mut bound = 0;
         for waiting in &mut self.waiting {
-            if waiting.timeline.is_none() {
-                waiting.timeline = Some(timeline);
+            if waiting.point == CompletionPoint::NextSubmission(timeline) {
+                waiting.point = CompletionPoint::Submitted(timeline);
                 bound += 1;
             }
         }
@@ -263,7 +270,7 @@ impl SubmissionNote {
             .queue
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .bind_unsubmitted(value);
+            .bind_submission(value);
         if bound != 0 {
             self.shared.wake.notify_all();
         }
@@ -371,7 +378,7 @@ impl StampCompletion {
             return;
         }
         queue.push(Waiting {
-            timeline: Some(timeline),
+            point: CompletionPoint::Submitted(timeline),
             index,
             word,
             stamp,
@@ -406,8 +413,12 @@ impl StampCompletion {
         if queue.is_full(slot) || self.shared.stop.load(Ordering::Acquire) {
             return false;
         }
+        // The engine lock serializes this read with reservation. No other
+        // FIFO-owned submission can reserve between recording this stamp and
+        // flushing its open batch, so this is the batch's exact future point.
+        let target = self.shared.next_value.load(Ordering::Acquire) + 1;
         queue.push(Waiting {
-            timeline: None,
+            point: CompletionPoint::NextSubmission(target),
             index,
             word,
             stamp,
@@ -482,7 +493,7 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
                     return;
                 }
                 if let Some(front) = queue.waiting.front().cloned() {
-                    if front.timeline.is_some() {
+                    if matches!(front.point, CompletionPoint::Submitted(_)) {
                         break Some(front);
                     }
                 }
@@ -497,7 +508,9 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
             return;
         };
         let semaphores = [semaphore];
-        let timeline = waiting.timeline.expect("front was checked as submitted");
+        let CompletionPoint::Submitted(timeline) = waiting.point else {
+            unreachable!("front was checked as submitted")
+        };
         let values = [timeline];
         let info = vk::SemaphoreWaitInfo::default()
             .semaphores(&semaphores)
@@ -589,7 +602,7 @@ mod tests {
         Box::leak(word);
         let slice = import.slice(0, 4).expect("stamp word");
         Waiting {
-            timeline: Some(u64::from(stamp) + 1),
+            point: CompletionPoint::Submitted(u64::from(stamp) + 1),
             index,
             word: crate::runtime::guest_ram::GuestRef::new(import, slice).expect("guest word"),
             stamp,
@@ -677,7 +690,7 @@ mod tests {
         let slice = import.slice(4, 4).expect("second word");
         let word = crate::runtime::guest_ram::GuestRef::new(import, slice).expect("guest word");
         let waiting = Waiting {
-            timeline: Some(7),
+            point: CompletionPoint::Submitted(7),
             index: 2,
             word,
             stamp: 0x89ab_cdef,
@@ -704,11 +717,11 @@ mod tests {
             latest_queued: AtomicU64::new(0),
         });
         let mut submitted = waiting(0, 1);
-        submitted.timeline = Some(7);
+        submitted.point = CompletionPoint::Submitted(7);
         let mut deferred_a = waiting(0, 2);
-        deferred_a.timeline = None;
+        deferred_a.point = CompletionPoint::NextSubmission(11);
         let mut deferred_b = waiting(1, 3);
-        deferred_b.timeline = None;
+        deferred_b.point = CompletionPoint::NextSubmission(11);
         {
             let mut queue = shared.queue.lock().expect("pending queue");
             queue.push(submitted);
@@ -720,26 +733,83 @@ mod tests {
         };
 
         note.queued(11);
-        let before_submit: Vec<Option<u64>> = shared
+        let before_submit: Vec<CompletionPoint> = shared
             .queue
             .lock()
             .expect("pending queue")
             .waiting
             .iter()
-            .map(|w| w.timeline)
+            .map(|w| w.point)
             .collect();
-        assert_eq!(before_submit, vec![Some(7), None, None]);
+        assert_eq!(
+            before_submit,
+            vec![
+                CompletionPoint::Submitted(7),
+                CompletionPoint::NextSubmission(11),
+                CompletionPoint::NextSubmission(11),
+            ]
+        );
 
         note.submitted(11);
 
-        let points: Vec<Option<u64>> = shared
+        let points: Vec<CompletionPoint> = shared
             .queue
             .lock()
             .expect("pending queue")
             .waiting
             .iter()
-            .map(|w| w.timeline)
+            .map(|w| w.point)
             .collect();
-        assert_eq!(points, vec![Some(7), Some(11), Some(11)]);
+        assert_eq!(
+            points,
+            vec![
+                CompletionPoint::Submitted(7),
+                CompletionPoint::Submitted(11),
+                CompletionPoint::Submitted(11),
+            ]
+        );
+    }
+
+    /// A delayed older submit must not claim stamps that the drain worker
+    /// recorded for a newer batch while the queue owner was inside the driver.
+    #[test]
+    fn delayed_submission_binds_only_its_own_open_batch_stamps() {
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(PendingQueue::default()),
+            wake: Condvar::new(),
+            stop: AtomicBool::new(false),
+            next_value: AtomicU64::new(0),
+            latest_queued: AtomicU64::new(0),
+        });
+        let mut older = waiting(0, 1);
+        older.point = CompletionPoint::NextSubmission(1);
+        let mut newer = waiting(0, 2);
+        newer.point = CompletionPoint::NextSubmission(2);
+        {
+            let mut queue = shared.queue.lock().expect("pending queue");
+            queue.push(older);
+            queue.push(newer);
+        }
+        let note = SubmissionNote {
+            shared: Arc::clone(&shared),
+        };
+
+        note.submitted(1);
+
+        let points: Vec<CompletionPoint> = shared
+            .queue
+            .lock()
+            .expect("pending queue")
+            .waiting
+            .iter()
+            .map(|w| w.point)
+            .collect();
+        assert_eq!(
+            points,
+            vec![
+                CompletionPoint::Submitted(1),
+                CompletionPoint::NextSubmission(2),
+            ]
+        );
     }
 }
