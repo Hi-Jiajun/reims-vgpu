@@ -1751,6 +1751,7 @@ impl ResourcePools {
                 counters.batch_joins.fetch_add(1, Ordering::Relaxed);
             }
             None => {
+                super::super::note_batch_open_after_tail(counters);
                 debug_assert!(
                     self.slots[self.cur].pending.is_none(),
                     "batch opener's slot already owes cleanup"
@@ -1790,6 +1791,7 @@ impl ResourcePools {
         let Some(mut batch) = self.take_open_batch() else {
             return Ok(());
         };
+        let close_started = std::time::Instant::now();
         // The CB is about to be ended and submitted, so no pass inside it is
         // still open to continue.
         unsafe { self.close_open_pass(&ctx.device, batch.cb) };
@@ -1805,12 +1807,25 @@ impl ResourcePools {
         // queries a different command buffer wrote.
         let slot = self.cur;
         unsafe { self.gpu_span_seal(ctx, batch.cb, slot) };
+        counters.batch_flush_close_us.fetch_add(
+            close_started.elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
         let submit = (|| -> Result<(), DrawError> {
-            ctx.device
-                .end_command_buffer(batch.cb)
-                .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsEndCbBatch, e)))?;
+            let end_started = std::time::Instant::now();
+            let end_result = ctx.device.end_command_buffer(batch.cb);
+            counters
+                .batch_flush_end_us
+                .fetch_add(end_started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            end_result.map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsEndCbBatch, e)))?;
             let cbs = [batch.cb];
-            match ctx.submit_guest_work(&cbs, batch.fence) {
+            let submit_started = std::time::Instant::now();
+            let result = ctx.submit_guest_work(&cbs, batch.fence);
+            counters.batch_flush_submit_us.fetch_add(
+                submit_started.elapsed().as_micros() as u64,
+                Ordering::Relaxed,
+            );
+            match result {
                 Ok(()) => Ok(()),
                 Err(e) if e == vk::Result::ERROR_DEVICE_LOST => {
                     Err(DrawError::DeviceLost(DeviceLostDecline::Driver {
@@ -1823,8 +1838,13 @@ impl ResourcePools {
         })();
         match submit {
             Ok(()) => {
+                let finish_started = std::time::Instant::now();
                 let sealed = self.seal_entry(std::mem::take(&mut batch.dsets), Vec::new());
                 self.finish_entry_async(&ctx.device, sealed);
+                counters.batch_flush_finish_us.fetch_add(
+                    finish_started.elapsed().as_micros() as u64,
+                    Ordering::Relaxed,
+                );
                 Ok(())
             }
             Err(e) => {

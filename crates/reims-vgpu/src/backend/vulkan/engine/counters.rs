@@ -580,6 +580,32 @@ engine_counters! {
         batch_joins,
         batch_flushes,
         batch_flush_draws,
+        /// End-of-drain-tranche batching cost, in microseconds. `lock` is time
+        /// spent acquiring the engine mutex and `call` is the complete
+        /// `ResourcePools::batch_flush` beneath it. Read their sum against
+        /// `drain_duty tail_us`; the remainder is the cheap latch/recovery
+        /// control flow around the call.
+        batch_tail_lock_us,
+        batch_tail_call_us,
+        /// Successful end-of-tranche flushes, and the elapsed-time band in
+        /// which the next draw batch opened. The five reopen bands partition
+        /// the tail-flush population that was followed by another batch.
+        batch_tail_flushes,
+        batch_tail_reopen_le100us,
+        batch_tail_reopen_le1ms,
+        batch_tail_reopen_le4ms,
+        batch_tail_reopen_le16ms,
+        batch_tail_reopen_gt16ms,
+        /// Phase attribution for every submitted draw batch, in microseconds.
+        /// Close includes ending the open render pass and sealing its GPU-span
+        /// query; end is `vkEndCommandBuffer`; submit is the queue call; finish
+        /// parks cleanup and publishes recorded sampled resources. Their sum
+        /// can be compared with `batch_tail_call_us` on a workload where
+        /// end-of-tranche flushes dominate.
+        batch_flush_close_us,
+        batch_flush_end_us,
+        batch_flush_submit_us,
+        batch_flush_finish_us,
         /// Draws recorded inside the render pass instance their preceding draw
         /// left open for the same decoded Metal render encoder.
         render_pass_continuations,

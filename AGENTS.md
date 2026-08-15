@@ -444,11 +444,16 @@ a revocation handle for a primitive that exists on all three hosts. If a host is
 migrating a page under a live import, that is a real defect with a measurement — it belongs in
 `kb/`, not in a retrofitted guarantee here.
 
-Guest RAM is not **fd-backed**: the import is over an ordinary mapping, so `vm/boot-x86.sh` uses a
-plain `-m` allocation. `memory-backend-memfd,share=on` outlived the dma-buf rail it was for, on the
-grounds that a shared memfd is what makes uffd minor-fault mode applicable; it is gone, because uffd
-needs a privilege QEMU does not have on the dev host anyway. Restoring the backing is a
-prerequisite for ever wanting uffd here, but it buys nothing alone.
+**The x86 RAM backing remains a shared memfd.** The base host-pointer imports still consume the
+ordinary RAMBlock pointers and do not import an fd. The fd serves a different contract: a linear
+guest virtual resource may name scattered guest-physical pages, while Vulkan host-pointer memory
+accepts one contiguous host virtual range. The PCI shim reserves that range and maps each shared
+page into its resource offset, producing a stable zero-copy alias which can be imported as one
+buffer or linear image. This is the Linux VM-remapping counterpart of the packed virtual views the
+macOS shim constructs. Removing `memory-backend-memfd,share=on` leaves the base RAMBlock imports
+working but makes every scattered packed view fail and pushes those resources onto multi-run
+gathers or copying paths. Do not remove it unless the replacement can express the same stable
+resource-shaped alias; uffd and the retired dma-buf rail are unrelated to this requirement.
 
 So the deferred-flush rail — the device's largest cost — is retired, by writing into guest pages
 directly. **`runtime/storage_flush/` went with it and no longer exists**; do not go looking for it,

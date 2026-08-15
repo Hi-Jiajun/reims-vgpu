@@ -311,8 +311,74 @@ static ENGINE: Lazy<Mutex<EngineState>> = Lazy::new(|| Mutex::new(EngineState::n
 /// and clears while removing it, so `false` never permits an open batch to idle.
 static BATCH_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Time of the last successful drain-tail batch submission, consumed by the
+/// next batch opener. This measures whether the host tranche boundary found a
+/// real idle gap or split a run that resumed immediately.
+static LAST_TAIL_BATCH_FLUSH_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TailReopenBand {
+    Le100Us,
+    Le1Ms,
+    Le4Ms,
+    Le16Ms,
+    Gt16Ms,
+}
+
+impl TailReopenBand {
+    fn of(gap_us: u64) -> Self {
+        match gap_us {
+            0..=100 => Self::Le100Us,
+            101..=1_000 => Self::Le1Ms,
+            1_001..=4_000 => Self::Le4Ms,
+            4_001..=16_000 => Self::Le16Ms,
+            _ => Self::Gt16Ms,
+        }
+    }
+
+    fn count(self, counters: &EngineCounters) {
+        let counter = match self {
+            Self::Le100Us => &counters.batch_tail_reopen_le100us,
+            Self::Le1Ms => &counters.batch_tail_reopen_le1ms,
+            Self::Le4Ms => &counters.batch_tail_reopen_le4ms,
+            Self::Le16Ms => &counters.batch_tail_reopen_le16ms,
+            Self::Gt16Ms => &counters.batch_tail_reopen_gt16ms,
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub(super) fn publish_batch_open(open: bool) {
     BATCH_OPEN.store(open, std::sync::atomic::Ordering::Release);
+}
+
+fn note_batch_open_after_tail(counters: &EngineCounters) {
+    let flushed_at = LAST_TAIL_BATCH_FLUSH_US.swap(0, std::sync::atomic::Ordering::AcqRel);
+    if flushed_at == 0 {
+        return;
+    }
+    let gap = crate::observe::elapsed_us().saturating_sub(flushed_at);
+    TailReopenBand::of(gap).count(counters);
+}
+
+#[cfg(test)]
+mod tail_reopen_band_tests {
+    use super::TailReopenBand;
+
+    #[test]
+    fn every_boundary_enters_exactly_one_elapsed_time_band() {
+        use TailReopenBand::*;
+        assert_eq!(TailReopenBand::of(0), Le100Us);
+        assert_eq!(TailReopenBand::of(100), Le100Us);
+        assert_eq!(TailReopenBand::of(101), Le1Ms);
+        assert_eq!(TailReopenBand::of(1_000), Le1Ms);
+        assert_eq!(TailReopenBand::of(1_001), Le4Ms);
+        assert_eq!(TailReopenBand::of(4_000), Le4Ms);
+        assert_eq!(TailReopenBand::of(4_001), Le16Ms);
+        assert_eq!(TailReopenBand::of(16_000), Le16Ms);
+        assert_eq!(TailReopenBand::of(16_001), Gt16Ms);
+    }
 }
 
 fn end_of_tranche_requires_engine(batch_open: bool, device_lost: bool) -> bool {
@@ -740,6 +806,7 @@ pub struct GuestResetStats {
 /// immutable content-keyed shader/pipeline caches.
 pub fn reset_guest_state() -> GuestResetStats {
     let mut guard = lock_engine();
+    LAST_TAIL_BATCH_FLUSH_US.store(0, std::sync::atomic::Ordering::Release);
     RESIDENT_RESOURCE_EPOCH.fetch_add(1, Ordering::Release);
     let (resident_targets, pooled_targets, sampled_images, storage_images) =
         guard.pools.guest_reset_counts();
@@ -959,9 +1026,14 @@ pub fn flush_batched_draws() {
     ) {
         return;
     }
+    let lock_started = std::time::Instant::now();
     let mut guard = lock_engine();
-    // This runs at the end of every drain tranche, which is about once a second
-    // whether or not the guest is still submitting — so it is where a loss
+    guard.counters.batch_tail_lock_us.fetch_add(
+        lock_started.elapsed().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    // This runs at the end of every drain tranche, including hundreds of short
+    // tranches per second under load, so it is where a loss
     // observed by a thread that cannot take the engine lock gets acted on. See
     // `device_lost::note_device_lost_seen` for the boot that needed it.
     if device_lost::take_device_lost_seen() {
@@ -978,7 +1050,27 @@ pub fn flush_batched_draws() {
         let Some(ctx) = owner.ctx.as_ref() else {
             return;
         };
-        match unsafe { pools.batch_flush(ctx, counters) } {
+        // The lock-free publication can race an in-engine consumer that
+        // flushes before this caller acquires the lock. Only a batch observed
+        // here belongs in the tail population.
+        let had_batch = pools.batch_open_recording().is_some();
+        let call_started = std::time::Instant::now();
+        let result = unsafe { pools.batch_flush(ctx, counters) };
+        counters.batch_tail_call_us.fetch_add(
+            call_started.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        match result {
+            Ok(()) if had_batch => {
+                counters
+                    .batch_tail_flushes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                LAST_TAIL_BATCH_FLUSH_US.store(
+                    crate::observe::elapsed_us(),
+                    std::sync::atomic::Ordering::Release,
+                );
+                false
+            }
             Ok(()) => false,
             Err(e) => {
                 let lost = matches!(e, DrawError::DeviceLost(_));
