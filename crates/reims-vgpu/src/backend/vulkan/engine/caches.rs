@@ -277,7 +277,11 @@ impl PassKey {
         } else if index == 0 && (self.color_input || self.host_accessible_color0) {
             vk::ImageLayout::GENERAL
         } else {
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+            // The same layout the pass exits at, so an ordinary pass performs no
+            // transition of its own at either end. Written as the exit rather
+            // than as `COLOR_ATTACHMENT_OPTIMAL` for the reason
+            // `color0_pass_exit_layout` gives: there is one spelling.
+            color0_pass_exit_layout()
         }
     }
 
@@ -287,7 +291,7 @@ impl PassKey {
         } else if self.color_feedback(index) {
             vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
         } else {
-            COLOR0_PASS_EXIT_LAYOUT
+            color0_pass_exit_layout()
         }
     }
 }
@@ -913,8 +917,39 @@ impl<K: Clone + Eq, V: Copy> ObjectVariantIndex<K, V> {
 /// carries the *dependency* and a matching layout would not have removed the
 /// need for it. So those ~1 200 reads a second gain a real transition each and
 /// the ~24 000 draws lose one, which is the whole change.
-pub(crate) const COLOR0_PASS_EXIT_LAYOUT: vk::ImageLayout =
-    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+///
+/// # It is a function because one probe may move it
+///
+/// [`crate::env::COLOR_GENERAL`] answers a question this device cannot answer
+/// from the specification: what a colour target resting in `GENERAL` costs on a
+/// host that compresses its framebuffers. Turning it on moves this layout, and
+/// **every** spelling of the layout has to move with it — the pass's
+/// `finalLayout`, the `initialLayout` a `LOAD` pass names, the registry's record
+/// of where the pass left the image, and the comparison
+/// [`super::exec::pass_exit_needs_no_barrier`] makes. A `const` plus a probe read
+/// beside it would be that second spelling, and the failure mode of the two
+/// disagreeing is a barrier naming an `oldLayout` the image is not in, which is
+/// undefined behaviour and not an error. So there is one function and no
+/// constant.
+pub(crate) fn color0_pass_exit_layout() -> vk::ImageLayout {
+    if color_general_probe_enabled() {
+        vk::ImageLayout::GENERAL
+    } else {
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+    }
+}
+
+/// Whether the colour-attachment `GENERAL` probe is on. **Default off**; see
+/// [`crate::env::COLOR_GENERAL`] for what it prices and why it removes nothing.
+fn color_general_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::env::read(crate::env::COLOR_GENERAL).0,
+            crate::env::Switch::On
+        )
+    })
+}
 
 /// The two `VK_SUBPASS_EXTERNAL` dependencies every render pass this device
 /// builds must carry, covering **every** attachment class the pass has.
@@ -950,7 +985,7 @@ pub(crate) const COLOR0_PASS_EXIT_LAYOUT: vk::ImageLayout =
 ///
 /// # The outgoing `dst` scope covers every way the attachment is read next
 ///
-/// Every slot now exits at [`COLOR0_PASS_EXIT_LAYOUT`], so the nearest consumer
+/// Every slot now exits at [`color0_pass_exit_layout`], so the nearest consumer
 /// is usually the next draw into the same target — which is why the attachment
 /// stages and accesses are in the destination scope, and why
 /// [`super::exec::pass_exit_needs_no_barrier`] may then drop that draw's own
@@ -1521,7 +1556,7 @@ impl ObjectCaches {
             (vk::AttachmentLoadOp::CLEAR, vk::ImageLayout::UNDEFINED)
         };
         // Slot 0 (primary) and the secondary attachments (slot 1..) now exit the
-        // same way, at [`COLOR0_PASS_EXIT_LAYOUT`], and for the same reason: a
+        // same way, at [`color0_pass_exit_layout`], and for the same reason: a
         // consumer's barrier is what establishes the dependency, so leaving the
         // mask at COLOR_ATTACHMENT_OPTIMAL forces that barrier to fire with a
         // colour-write source scope rather than being skipped as a no-op. The
@@ -3274,7 +3309,7 @@ mod object_cache_tests {
                 if feedback {
                     vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
                 } else {
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+                    color0_pass_exit_layout()
                 }
             );
             assert_eq!(
@@ -3282,10 +3317,35 @@ mod object_cache_tests {
                 if feedback {
                     vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
                 } else {
-                    COLOR0_PASS_EXIT_LAYOUT
+                    color0_pass_exit_layout()
                 }
             );
         }
         assert!(!key.color_feedback(u8::BITS as usize));
+    }
+
+    /// An ordinary colour slot names one layout at all three points a pass can
+    /// name one — the `initialLayout` a `LOAD` names, the subpass reference, and
+    /// the `finalLayout` — so the pass performs no transition of its own at
+    /// either end and the registry's record of where the image was left is the
+    /// layout it is actually in.
+    ///
+    /// This is the relation, not a restatement of a constant: it holds for
+    /// whatever [`color0_pass_exit_layout`] answers, including under
+    /// [`crate::env::COLOR_GENERAL`], which is the whole reason that answer is a
+    /// function. It fails if any of the three grows a second spelling — which is
+    /// how the MRT secondary arm in `exec` came to publish a hand-written
+    /// `COLOR_ATTACHMENT_OPTIMAL` beside a feedback arm that derived.
+    #[test]
+    fn an_ordinary_colour_slot_enters_and_leaves_a_pass_at_one_layout() {
+        let key = PassKey::single(true, vk::Format::B8G8R8A8_UNORM);
+        for index in 0..=MAX_SECONDARY_ATTACH {
+            assert_eq!(key.color_layout(index), color0_pass_exit_layout(), "{index}");
+            assert_eq!(
+                key.color_final_layout(index),
+                color0_pass_exit_layout(),
+                "{index}"
+            );
+        }
     }
 }

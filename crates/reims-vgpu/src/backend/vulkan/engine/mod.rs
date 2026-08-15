@@ -2656,7 +2656,7 @@ unsafe fn copy_image_level0_to_host_delivered(
     // `old_layout` is the caller's *tracked* layout, so this is a real
     // transition whenever the resident is not already a transfer source — which
     // is the common case, because a render pass leaves its attachment in
-    // [`caches::COLOR0_PASS_EXIT_LAYOUT`]. When the two do match the transition
+    // [`caches::color0_pass_exit_layout`]. When the two do match the transition
     // half is a legal no-op and the barrier is doing only its other job, which
     // is the job that was missing. Every caller records the move with
     // `registry_note_access(.., TransferRead)` so the tracked layout follows the
@@ -3960,7 +3960,7 @@ unsafe fn copy_image_level0_to_buffer(
     // Unconditional, for the reason `copy_image_level0_to_host_delivered` states
     // at length: the barrier is a layout transition *and* a dependency, and this
     // rail needs the dependency whether or not the layout already matches. A
-    // render pass leaves its attachment in [`caches::COLOR0_PASS_EXIT_LAYOUT`],
+    // render pass leaves its attachment in [`caches::color0_pass_exit_layout`],
     // so the common case is a real transition too, and it must still order this
     // copy after the draws that produced the pixels.
     let read_access = pools::ResidentAccess::transfer_read(snap.guest_backing.is_some());

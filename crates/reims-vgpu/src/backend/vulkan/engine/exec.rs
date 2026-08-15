@@ -5248,7 +5248,7 @@ pub(crate) unsafe fn execute_draw_inner(
         //
         // No layout transition rides along any more, which narrows what this
         // probe measures rather than weakening it: a pass now exits at
-        // [`super::caches::COLOR0_PASS_EXIT_LAYOUT`], which is what a `LOAD`
+        // [`super::caches::color0_pass_exit_layout`], which is what a `LOAD`
         // pass names as its `initial_layout`, so this barrier carries the
         // write-after-write dependency and nothing else. What separates the arms
         // is the pass instance alone. Use `REIMS_VGPU_LAYOUT_CHURN` to price a
@@ -5277,7 +5277,7 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     if layout_churn_probe_enabled() && !target_feedback && !target_guest_backed {
         // PROBE — `REIMS_VGPU_LAYOUT_CHURN=on`. One round trip of the colour
-        // attachment's layout, out of [`super::caches::COLOR0_PASS_EXIT_LAYOUT`]
+        // attachment's layout, out of [`super::caches::color0_pass_exit_layout`]
         // into `TRANSFER_SRC_OPTIMAL` and straight back, recorded where the pass
         // has just left it.
         //
@@ -5300,7 +5300,7 @@ pub(crate) unsafe fn execute_draw_inner(
         let out = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
             .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-            .old_layout(super::caches::COLOR0_PASS_EXIT_LAYOUT)
+            .old_layout(super::caches::color0_pass_exit_layout())
             .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
@@ -5317,7 +5317,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .src_access_mask(vk::AccessFlags::TRANSFER_READ)
             .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
             .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .new_layout(super::caches::COLOR0_PASS_EXIT_LAYOUT)
+            .new_layout(super::caches::color0_pass_exit_layout())
             .image(target_image)
             .subresource_range(super::color_subresource_range())];
         ctx.device.cmd_pipeline_barrier(
@@ -5349,7 +5349,7 @@ pub(crate) unsafe fn execute_draw_inner(
         // `TRANSFER_SRC_OPTIMAL` and this site could take it as read — a
         // `vkCmdCopyImageToBuffer` naming a `srcImageLayout` the image is not
         // actually in is undefined behaviour, not an error. It exits at
-        // [`super::caches::COLOR0_PASS_EXIT_LAYOUT`] now, so the transition is
+        // [`super::caches::color0_pass_exit_layout`] now, so the transition is
         // explicit, and it is put back afterwards so that
         // `registry_mark_ready_at`'s claim about this resident stays true — that
         // call runs below and records the pass's exit layout unconditionally.
@@ -5522,7 +5522,14 @@ pub(crate) unsafe fn execute_draw_inner(
                     ),
                 );
             } else {
-                pools.registry_mark_ready_at(identity, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+                // The pass's own `finalLayout` for this slot, asked of the key
+                // rather than respelled. The feedback arm beside it already
+                // derives; this one carried a hand-written
+                // `COLOR_ATTACHMENT_OPTIMAL`, which is the second spelling
+                // `color0_pass_exit_layout` exists to remove — a registry record
+                // naming a layout the pass did not leave the image in is a later
+                // barrier's wrong `oldLayout`.
+                pools.registry_mark_ready_at(identity, pass_key.color_final_layout(attachment_index));
             }
         }
     }
@@ -5998,7 +6005,7 @@ fn target_source_scope(
 ///
 /// `ColorWrite(COLOR_ATTACHMENT_OPTIMAL)` means the last thing to touch this
 /// image was a render pass leaving it at
-/// [`super::caches::COLOR0_PASS_EXIT_LAYOUT`], which is exactly the
+/// [`super::caches::color0_pass_exit_layout`], which is exactly the
 /// `initialLayout` a `LOAD` pass names. So there is **no layout transition to
 /// perform**, and the only remaining job a barrier could do is order the
 /// previous pass's colour store against this pass's load — which
@@ -6028,7 +6035,7 @@ fn target_source_scope(
 /// counter follows honestly — a draw that records no barrier is not charged an
 /// obstacle, so `passmerge_reachable` can be non-zero for the first time.
 fn pass_exit_needs_no_barrier(prior: super::pools::ResidentAccess) -> bool {
-    prior == super::pools::ResidentAccess::ColorWrite(super::caches::COLOR0_PASS_EXIT_LAYOUT)
+    prior == super::pools::ResidentAccess::ColorWrite(super::caches::color0_pass_exit_layout())
 }
 
 /// Record the barrier that makes a registry-resident image readable as a
@@ -6946,7 +6953,7 @@ mod tests {
     ///
     /// **The colliding pair is not currently reachable, and the test still
     /// earns its place.** Since passes exit at
-    /// [`super::caches::COLOR0_PASS_EXIT_LAYOUT`] no two *reachable* variants
+    /// [`super::caches::color0_pass_exit_layout`] no two *reachable* variants
     /// share a layout, so a `layout()`-derived scope would happen to be right
     /// today. That is a property of one constant, not of the design: the
     /// constructor still admits `ColorWrite` at any layout, and the last time
@@ -7182,7 +7189,7 @@ mod tests {
     fn only_a_target_left_where_the_next_pass_wants_it_may_skip_its_barrier() {
         for tracked in EVERY_ACCESS {
             let skippable = tracked
-                == ResidentAccess::ColorWrite(super::super::caches::COLOR0_PASS_EXIT_LAYOUT);
+                == ResidentAccess::ColorWrite(super::super::caches::color0_pass_exit_layout());
             assert_eq!(
                 pass_exit_needs_no_barrier(tracked),
                 skippable,

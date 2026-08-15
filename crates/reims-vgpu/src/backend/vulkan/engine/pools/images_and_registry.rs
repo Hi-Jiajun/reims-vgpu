@@ -1638,7 +1638,7 @@ impl ResourcePools {
     pub(crate) fn registry_mark_ready(&mut self, identity: &TargetIdentity) {
         self.registry_mark_ready_at(
             identity,
-            crate::backend::vulkan::engine::caches::COLOR0_PASS_EXIT_LAYOUT,
+            crate::backend::vulkan::engine::caches::color0_pass_exit_layout(),
         );
     }
 
@@ -2472,7 +2472,7 @@ pub(super) mod pin_count_tests {
             // constant it reads, so this fixture cannot drift into describing a
             // resident no pass produces.
             access: ResidentAccess::ColorWrite(
-                crate::backend::vulkan::engine::caches::COLOR0_PASS_EXIT_LAYOUT,
+                crate::backend::vulkan::engine::caches::color0_pass_exit_layout(),
             ),
             color_format: translate::pixel::SCANOUT_FORMAT,
             pin_count: 0,
