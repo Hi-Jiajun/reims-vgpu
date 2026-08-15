@@ -79,6 +79,60 @@ mod sampled_identity_switch {
     }
 }
 
+#[cfg(test)]
+mod pass_echo_delta_order {
+    use super::super::{PassEcho, ResourcePools};
+    use crate::backend::vulkan::engine::caches::PassKey;
+    use crate::backend::vulkan::engine::pools::PassEchoField;
+    use ash::vk;
+    use ash::vk::Handle as _;
+
+    fn echo(fb: u64, host_accessible: bool) -> PassEcho {
+        let mut key = PassKey::single(true, vk::Format::B8G8R8A8_UNORM);
+        key.host_accessible_color0 = host_accessible;
+        PassEcho {
+            cb: vk::CommandBuffer::null(),
+            compatibility: key.compatibility(),
+            fb: vk::Framebuffer::from_raw(fb),
+            area: (1920, 1080),
+        }
+    }
+
+    /// A break that is both a different render target *and* a different
+    /// attachment shape is a target switch, and must be charged as one.
+    ///
+    /// This is the whole reason the ladder asks the framebuffer first. With the
+    /// shape asked first, every draw into a guest-backed surface following a
+    /// draw into an ordinary resident landed in `passcompat_host_accessible` —
+    /// 59 365 of them on one driven Maps boot, the largest bucket in the census
+    /// — and read as this device describing one image two ways, which is a
+    /// defect, rather than as the guest changing target, which is not.
+    #[test]
+    fn a_target_switch_is_not_reported_as_a_shape_flip() {
+        let mut pools = ResourcePools::new();
+        pools.note_pass_opened(echo(1, false));
+        assert_eq!(
+            pools.pass_echo_delta(&echo(2, true)),
+            Some(PassEchoField::Framebuffer),
+            "a different framebuffer is a target switch however else the two differ"
+        );
+        // And the shape rung still fires when the framebuffer agrees, which is
+        // the case the split exists to isolate.
+        assert!(
+            matches!(
+                pools.pass_echo_delta(&echo(1, true)),
+                Some(PassEchoField::Compatibility(_))
+            ),
+            "one framebuffer described two ways is what `passdiff_compat` now means"
+        );
+        assert_eq!(
+            pools.pass_echo_delta(&echo(1, false)),
+            None,
+            "an identical echo continues the standing pass"
+        );
+    }
+}
+
 impl ResourcePools {
     /// End one guest parent allocation's backend lifetime. If child images are
     /// still live, their deferred destruction releases it after the last fence.
@@ -1653,6 +1707,26 @@ impl ResourcePools {
     /// two cannot disagree: this answers `None` on exactly the inputs that answer
     /// `true` there, which is what makes the split a partition of
     /// `passmerge_pass_differs` rather than a second opinion about it.
+    ///
+    /// # The framebuffer is asked before the shape, because they answer different
+    /// questions
+    ///
+    /// Every rung here forces a new pass instance, so the order carries no
+    /// correctness weight and only decides which bucket a break lands in. That
+    /// makes it an instrument decision, and there is a right answer: **a
+    /// framebuffer difference is the guest changing render target, and a shape
+    /// difference on the same framebuffer is this device describing one target
+    /// two ways.** The first is a guest action nothing here can remove; the
+    /// second is a defect.
+    ///
+    /// Asking the shape first conflates them, and it conflated them at scale: on
+    /// a driven macos-13 Maps boot `passcompat_host_accessible` was the largest
+    /// bucket of all at 59 365 breaks, and nothing said whether that was one
+    /// image whose host-accessibility this device kept changing its mind about —
+    /// which would be worth a full-surface layout resolve every time — or simply
+    /// a draw into a guest-backed surface following a draw into an ordinary
+    /// resident. With the framebuffer asked first, whatever remains under
+    /// `passdiff_compat` is the second thing and only the second thing.
     pub(crate) fn pass_echo_delta(&self, echo: &PassEcho) -> Option<PassEchoField> {
         let Some(last) = self.last_pass.as_ref() else {
             return Some(PassEchoField::Nothing);
@@ -1660,11 +1734,11 @@ impl ResourcePools {
         if last.cb != echo.cb {
             return Some(PassEchoField::Cb);
         }
-        if let Some(field) = last.compatibility.first_difference(echo.compatibility) {
-            return Some(PassEchoField::Compatibility(field));
-        }
         if last.fb != echo.fb {
             return Some(PassEchoField::Framebuffer);
+        }
+        if let Some(field) = last.compatibility.first_difference(echo.compatibility) {
+            return Some(PassEchoField::Compatibility(field));
         }
         if last.area != echo.area {
             return Some(PassEchoField::Area);
