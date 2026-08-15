@@ -1616,9 +1616,12 @@ pub fn resolve_sampler_state<M: HostMemory>(
 /// Object tags constructed through the task's resource registry.
 ///
 /// Bit `n` names object type `n + 1`. The resource constructor accepts exactly
-/// types 1, 2, 3, 4, 5, 8, 9, 11, 12, 13, 14, and 15. Function (6), serializer
-/// state (7), and type 10 have separate registries and lifetimes, so retaining
-/// their descriptors until `DeleteResource` would conflate distinct APIs.
+/// types 1, 2, 3, 4, 5, 8, 9, 11, 12, 13, 14, and 15. Function (6), mutable
+/// serializer state (7), and type 10 have separate registries and lifetimes, so
+/// retaining their descriptors until `DeleteResource` would conflate distinct
+/// APIs. An immutable render pipeline constructed from a type-7 descriptor is
+/// retained separately in `DeviceState::task_render_pipeline_states`; the
+/// serializer bytes themselves remain outside this resource registry.
 const RESOURCE_CONSTRUCTOR_TYPE_MASK: u16 = 0x7d9f;
 
 fn object_type_is_resource(object_type: u8) -> bool {

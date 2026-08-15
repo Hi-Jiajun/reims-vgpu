@@ -920,12 +920,41 @@ pub struct TaskSamplerState {
     pub descriptor: SamplerDescriptor,
 }
 
-/// Per-task sampler objects, keyed by the sampler API's `(task, reference)`.
-#[derive(Debug, Default)]
-pub struct TaskSamplerStates(Mutex<BTreeMap<(u32, u32), Arc<TaskSamplerState>>>);
+/// Immutable objects in an API-specific task/reference namespace.
+///
+/// The map has no capacity or eviction policy. Its entries are object
+/// lifetimes: an explicit delete removes one reference and task teardown removes
+/// the namespace. A capacity would invent a third lifetime event that the guest
+/// never sent.
+pub struct TaskReferenceStates<T>(Mutex<BTreeMap<(u32, u32), Arc<T>>>);
 
-impl TaskSamplerStates {
-    pub fn get(&self, task_id: u32, ref_: u32) -> Option<Arc<TaskSamplerState>> {
+impl<T> Default for TaskReferenceStates<T> {
+    fn default() -> Self {
+        Self(Mutex::new(BTreeMap::new()))
+    }
+}
+
+impl<T> std::fmt::Debug for TaskReferenceStates<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let states = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        f.debug_struct("TaskReferenceStates")
+            .field("entries", &states.len())
+            .finish()
+    }
+}
+
+impl<T> TaskReferenceStates<T> {
+    pub fn contains(&self, task_id: u32, ref_: u32) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&(task_id, ref_))
+    }
+
+    pub fn get(&self, task_id: u32, ref_: u32) -> Option<Arc<T>> {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -933,19 +962,14 @@ impl TaskSamplerStates {
             .cloned()
     }
 
-    /// Publish a fully decoded sampler unless another resolver won the race.
-    pub fn register(
-        &self,
-        task_id: u32,
-        ref_: u32,
-        sampler: Arc<TaskSamplerState>,
-    ) -> Arc<TaskSamplerState> {
+    /// Publish a fully constructed object unless another resolver won the race.
+    pub fn register(&self, task_id: u32, ref_: u32, state: Arc<T>) -> Arc<T> {
         Arc::clone(
             self.0
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .entry((task_id, ref_))
-                .or_insert(sampler),
+                .or_insert(state),
         )
     }
 
@@ -958,13 +982,64 @@ impl TaskSamplerStates {
     }
 
     pub fn delete_task(&self, task_id: u32) -> usize {
-        let mut samplers = self
+        let mut states = self
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let before = samplers.len();
-        samplers.retain(|&(task, _), _| task != task_id);
-        before - samplers.len()
+        let before = states.len();
+        states.retain(|&(task, _), _| task != task_id);
+        before - states.len()
+    }
+}
+
+/// Per-task sampler objects, keyed by the sampler API's reference space.
+pub type TaskSamplerStates = TaskReferenceStates<TaskSamplerState>;
+
+/// Per-task render pipeline states, keyed by the pipeline API's reference
+/// space. A state owns its decoded descriptor, translated functions and derived
+/// bind plan exactly as one native pipeline state owns its construction.
+#[cfg(feature = "backend-vulkan")]
+pub type TaskRenderPipelineStates =
+    TaskReferenceStates<crate::runtime::pipeline_resolve::ResolvedRenderPipeline>;
+
+#[cfg(test)]
+mod task_reference_state_tests {
+    use super::TaskReferenceStates;
+    use std::sync::Arc;
+
+    #[test]
+    fn explicit_reference_and_task_deletion_are_the_only_retirement_events() {
+        let states = TaskReferenceStates::default();
+        let first = states.register(1, 7, Arc::new(10u32));
+        let raced = states.register(1, 7, Arc::new(11u32));
+        states.register(1, 8, Arc::new(12u32));
+        states.register(2, 7, Arc::new(13u32));
+
+        assert!(Arc::ptr_eq(&first, &raced), "the first construction wins");
+        assert_eq!(*states.get(1, 7).unwrap(), 10);
+        assert!(states.delete(1, 7));
+        assert!(!states.contains(1, 7));
+        assert!(states.contains(1, 8));
+        assert!(states.contains(2, 7));
+
+        assert_eq!(states.delete_task(1), 1);
+        assert!(!states.contains(1, 8));
+        assert!(states.contains(2, 7));
+        assert_eq!(
+            *first, 10,
+            "an encoder owner remains valid after registry deletion"
+        );
+    }
+
+    #[test]
+    fn a_live_reference_population_has_no_capacity_eviction() {
+        let states = TaskReferenceStates::default();
+        for ref_ in 0..2048 {
+            states.register(3, ref_, Arc::new(ref_));
+        }
+        for ref_ in 0..2048 {
+            assert_eq!(*states.get(3, ref_).unwrap(), ref_);
+        }
     }
 }
 
@@ -2272,6 +2347,11 @@ pub struct DeviceState {
     pub task_resources: TaskResources,
     /// Immutable sampler objects in the sampler API's separate ref space.
     pub task_sampler_states: TaskSamplerStates,
+    /// Immutable render pipeline states in the pipeline API's separate ref
+    /// space. The guest binds these by reference after construction and ends
+    /// them with resource deletion or task teardown.
+    #[cfg(feature = "backend-vulkan")]
+    pub task_render_pipeline_states: TaskRenderPipelineStates,
     /// Type-11 texture object ref → mapping_id: (task_id, ref) -> mapping_id.
     pub texture_to_mapping: BTreeMap<(u32, u32), u32>,
     pub mappings: BTreeMap<u32, MappingEntry>,
@@ -2619,6 +2699,8 @@ impl DeviceState {
             objects: std::collections::BTreeSet::new(),
             task_resources: TaskResources::default(),
             task_sampler_states: TaskSamplerStates::default(),
+            #[cfg(feature = "backend-vulkan")]
+            task_render_pipeline_states: TaskRenderPipelineStates::default(),
             texture_to_mapping: BTreeMap::new(),
             mappings: BTreeMap::new(),
             host_surfaces: BTreeMap::new(),
@@ -3062,6 +3144,11 @@ impl DeviceState {
         self.objects.retain(|&(t, _)| t != task_id);
         self.task_resources.delete_task(task_id);
         self.task_sampler_states.delete_task(task_id);
+        #[cfg(feature = "backend-vulkan")]
+        crate::runtime::drain::note_store_route_n(
+            "pipeline_state_task_deleted",
+            self.task_render_pipeline_states.delete_task(task_id) as u64,
+        );
         // A deleted task's whole address space goes with it, so its live
         // mappings are not leaks and a reused id must not inherit them.
         self.map_audit.remove(&task_id);
@@ -3110,6 +3197,11 @@ impl DeviceState {
         self.objects.retain(|&(t, _)| t != task_id);
         self.task_resources.delete_task(task_id);
         self.task_sampler_states.delete_task(task_id);
+        #[cfg(feature = "backend-vulkan")]
+        crate::runtime::drain::note_store_route_n(
+            "pipeline_state_task_deleted",
+            self.task_render_pipeline_states.delete_task(task_id) as u64,
+        );
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         self.host_texture_surfaces

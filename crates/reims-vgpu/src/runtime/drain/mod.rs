@@ -240,8 +240,9 @@ fn delete_object_kind_route(opcode: u32) -> &'static str {
 /// keyed by the *kernel object-list* ref, established by `0x33 CmdSetObjectList` and
 /// populated when a decoded command resolves an entry out of that list, so this
 /// command must never call `DeviceState::delete_object`: equal integers across
-/// those spaces are unrelated. Samplers have their own task-local retained
-/// registry and their destroy opcode retires exactly that registry entry.
+/// those spaces are unrelated. Samplers and render pipeline states have their
+/// own task-local retained registries, and each destroy opcode retires exactly
+/// its kind's registry entry.
 ///
 /// Keying the object table with a number from the other namespace was measured
 /// and is worse than declining. On a driven boot the guest sent 1 988 of these
@@ -302,6 +303,18 @@ fn apply_delete_object(state: &mut DeviceState, channel_id: u32, payload: &[u8],
             "sampler_state_deleted"
         } else {
             "sampler_state_delete_absent"
+        });
+        return;
+    }
+    #[cfg(feature = "backend-vulkan")]
+    if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_RENDER_PIPELINE_STATE {
+        let retired = state
+            .task_render_pipeline_states
+            .delete(task_id, object_ref);
+        note_store_route(if retired {
+            "pipeline_state_deleted"
+        } else {
+            "pipeline_state_delete_absent"
         });
         return;
     }
@@ -463,8 +476,12 @@ fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Optio
     let task_id = ld32(&payload[SET_OBJECT_LIST_TASK_ID..]);
     let pfn = ld32(&payload[SET_OBJECT_LIST_PFN..]);
     let count = ld32(&payload[SET_OBJECT_LIST_COUNT..]);
-    // A new object list re-points every reference on this task, so no
-    // resolution keyed by reference survives it. Both FIFOs reach this.
+    // A new object list changes the construction input for references this
+    // device has not constructed yet. Exact-window buffer resolutions are not
+    // object states and therefore retire here. Typed objects already
+    // constructed in the task's resource, sampler, and pipeline namespaces keep
+    // their explicit delete/task lifetime; this packet does not destroy them.
+    // Both FIFOs reach this.
     crate::runtime::writeback_debt::retire_gva_for_task(state, task_id);
     note_bb_retired(
         "bb_retire_set_object_list",

@@ -5398,14 +5398,17 @@ fn a_delete_object_record_must_fit_the_payload_that_carries_it() {
 /// The test therefore rigs the collision deliberately: every ref the packets
 /// name is also a live object-table entry under the same task. An implementation
 /// that keys the table with the record's ref passes nothing here; it deletes all
-/// four and fails on the first assertion.
+/// every one and fails on the first assertion.
 ///
-/// The kinds are exercised across the family. A sampler record may retire the
-/// separate sampler registry, but even then must leave the resource table alone.
+/// The kinds are exercised across the family. Sampler and render-pipeline
+/// records may retire their separate typed registries, but even then must leave
+/// the resource table alone. Conversely, resource deletion must not cross into
+/// the pipeline registry.
 #[test]
 fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     use reims_vgpu_wire::ops::destroy::{
-        DELETE_TOTAL_LEN, OPCODE_DELETE_SAMPLER_STATE, OPCODE_DELETE_TEXTURE,
+        DELETE_TOTAL_LEN, OPCODE_DELETE_RENDER_PIPELINE_STATE, OPCODE_DELETE_SAMPLER_STATE,
+        OPCODE_DELETE_TEXTURE,
     };
     let mut host = FakeHost::new();
     let destroy_packet = |task: u32, record_opcode: u32, object_ref: u32| {
@@ -5427,7 +5430,7 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
     state.define_task(2, 0x2000, 9);
     assert!(state.set_object_list(2, 3, 64));
-    for ref_ in [10, 11, 12, 14] {
+    for ref_ in [10, 11, 12, 13, 14, 15] {
         assert!(state.insert_object(2, ref_));
     }
     state.task_sampler_states.register(
@@ -5436,6 +5439,16 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         std::sync::Arc::new(crate::model::TaskSamplerState {
             descriptor: Default::default(),
         }),
+    );
+    state.task_render_pipeline_states.register(
+        2,
+        13,
+        crate::runtime::pipeline_resolve::retained_pipeline_for_test(),
+    );
+    state.task_render_pipeline_states.register(
+        2,
+        15,
+        crate::runtime::pipeline_resolve::retained_pipeline_for_test(),
     );
 
     // Same task, same number, well-formed record: the collision that an arm
@@ -5469,6 +5482,30 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     assert!(
         state.task_sampler_states.get(2, 11).is_none(),
         "the sampler opcode retires the same integer only in its own ref space"
+    );
+
+    process_child_packet(
+        &mut state,
+        &mut host,
+        4,
+        &destroy_packet(2, OPCODE_DELETE_RENDER_PIPELINE_STATE, 13),
+    );
+    assert!(
+        state.task_render_pipeline_states.get(2, 13).is_none(),
+        "the render-pipeline destroy opcode retires its own retained state"
+    );
+    assert!(
+        state.objects.contains(&(2, 13)),
+        "pipeline deletion must not cross into the resource-list ref space"
+    );
+
+    assert!(
+        state.delete_object(2, 15),
+        "the colliding resource-list object exists"
+    );
+    assert!(
+        state.task_render_pipeline_states.contains(2, 15),
+        "resource-list deletion must not cross into the pipeline ref space"
     );
 
     // The unclaimed number inside the destroy span is refused before the ref is

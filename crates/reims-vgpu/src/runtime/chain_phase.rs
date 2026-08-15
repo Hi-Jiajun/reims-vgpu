@@ -110,8 +110,10 @@ pub enum Phase {
     /// per chain because two walks of one address across a submit are two
     /// answers.
     PipelineGen = 8,
-    /// `load_render_pipeline`: one object-list lookup, one descriptor read out
-    /// of guest memory, and the decode of the bytes it read.
+    /// The task's render-pipeline-state lookup. On first construction this also
+    /// includes the object-list lookup, descriptor read and decode; warm encoder
+    /// binds retrieve the retained state by reference and do not consult guest
+    /// memory.
     PipelineDesc = 9,
     /// Both `load_mtlb` calls.
     ///
