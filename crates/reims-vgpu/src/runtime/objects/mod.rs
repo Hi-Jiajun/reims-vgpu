@@ -1766,16 +1766,30 @@ pub fn resolve_buffer_span<M: HostMemory>(
     task_id: u32,
     buffer_ref: u32,
 ) -> Result<(u64, u64), BufferSpanRefusal> {
-    let (_entry, desc_bytes) = resolve_descriptor(
-        state,
-        host,
-        task_id,
-        buffer_ref,
-        &[crate::runtime::decode::resource::OBJECT_TYPE_BUFFER],
-    )
-    .map_err(BufferSpanRefusal::Rung)?;
-    let desc = crate::runtime::decode::resource::decode_buffer_descriptor(&desc_bytes)
-        .map_err(|_| BufferSpanRefusal::Decode)?;
+    let resource = resolve_resource(state, host, task_id, buffer_ref)
+        .map_err(BufferSpanRefusal::Rung)?;
+    resolve_buffer_span_from_resource(state, &resource)
+}
+
+/// Resolve the backing carried by an encoder-retained buffer object.
+pub fn resolve_buffer_span_from_resource(
+    state: &DeviceState,
+    resource: &crate::model::TaskResource,
+) -> Result<(u64, u64), BufferSpanRefusal> {
+    if resource.entry.object_type != crate::runtime::decode::resource::OBJECT_TYPE_BUFFER {
+        return Err(BufferSpanRefusal::Rung(LadderRung::WrongType {
+            got: resource.entry.object_type,
+        }));
+    }
+    let desc = match resource.decoded() {
+        Ok(crate::runtime::decode::resource::Descriptor::Buffer(desc)) => desc,
+        Ok(_) => {
+            return Err(BufferSpanRefusal::Rung(LadderRung::WrongType {
+                got: resource.entry.object_type,
+            }));
+        }
+        Err(_) => return Err(BufferSpanRefusal::Decode),
+    };
     desc.backing_gva_size(state.page_shift)
         .ok_or(BufferSpanRefusal::NoBacking)
 }

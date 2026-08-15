@@ -1653,6 +1653,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     (b.buffer_ref != 0).then_some(BufferBind {
                         index,
                         buffer_ref: b.buffer_ref,
+                        resource: objects::resolve_resource(state, host, task_id, b.buffer_ref)
+                            .ok(),
                         offset: b.offset,
                         attribute_stride: b.attribute_stride,
                     })
@@ -1753,7 +1755,12 @@ fn handle_render_record<M: HostMemory + HostOps>(
                             out.type11_mappings.push(texture_ref);
                         }
                     }
-                    Some(TextureBind { index, texture_ref })
+                    Some(TextureBind {
+                        index,
+                        texture_ref,
+                        resource: objects::resolve_resource(state, host, task_id, texture_ref)
+                            .ok(),
+                    })
                 },
             );
             out.texture_unbinds = out.texture_unbinds.saturating_add(cleared);

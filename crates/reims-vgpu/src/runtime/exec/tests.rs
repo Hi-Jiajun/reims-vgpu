@@ -1448,6 +1448,7 @@ fn draws_sharing_a_bind_table_share_its_allocation() {
             buffer_ref: 9,
             offset: 0,
             attribute_stride: None,
+            ..Default::default()
         }]),
         ..Default::default()
     };
@@ -1483,12 +1484,14 @@ fn draw_preparation_keeps_every_recorded_bind_table_allocation() {
             buffer_ref: 9,
             offset: 16,
             attribute_stride: None,
+            ..Default::default()
         }])
     };
     let texture = || {
         Arc::new(vec![TextureBind {
             index: 1,
             texture_ref: 10,
+            ..Default::default()
         }])
     };
     let sampler = || {
@@ -1542,6 +1545,7 @@ fn a_bind_after_a_draw_does_not_rewrite_that_draws_snapshot() {
             buffer_ref: 9,
             offset: 0,
             attribute_stride: None,
+            ..Default::default()
         }]),
         ..Default::default()
     };
@@ -1577,6 +1581,7 @@ fn a_bind_after_a_draw_does_not_rewrite_that_draws_snapshot() {
                 buffer_ref: b.buffer_ref,
                 offset: b.offset,
                 attribute_stride: b.attribute_stride,
+                ..Default::default()
             })
         },
     );
@@ -1586,6 +1591,110 @@ fn a_bind_after_a_draw_does_not_rewrite_that_draws_snapshot() {
         "the committed draw kept the buffer it was encoded with"
     );
     assert_eq!(acc.vertex_buffers[0].buffer_ref, 77);
+}
+
+#[test]
+fn a_recorded_buffer_bind_retains_its_object_across_offset_change_and_ref_reuse() {
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER,
+    };
+    use crate::runtime::gva_mem::{define_task_pages_arm64e, write_task_gva_arm64e};
+    use crate::runtime::objects;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
+    let put_buffer = |host: &mut FakeHost, state: &DeviceState, handle: u32, size: u64| {
+        let descriptor_gva = 0x180;
+        let mut descriptor = [0u8; 16];
+        st64(&mut descriptor, size);
+        st32(&mut descriptor[8..], handle);
+        write_task_gva_arm64e(host, &state.tasks[1], descriptor_gva, &descriptor);
+        let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(&mut entry, u32::from(OBJECT_TYPE_BUFFER) | (16 << 8));
+        st64(&mut entry[4..], descriptor_gva);
+        write_task_gva_arm64e(
+            host,
+            &state.tasks[1],
+            list_object_entry_offset(7, 32).unwrap(),
+            &entry,
+        );
+    };
+    put_buffer(&mut host, &state, 5, 0x1000);
+
+    let total = OP_HEADER_LEN + render::BIND_ENTRIES + render::BUFFER_BIND_ENTRY_SIZE;
+    let mut bind = vec![0u8; total];
+    st32(&mut bind, wire_render::OPCODE_SET_VERTEX_BUFFER);
+    st32(&mut bind[4..], total as u32);
+    st32(&mut bind[OP_HEADER_LEN + render::BIND_COUNT..], 1);
+    st32(&mut bind[OP_HEADER_LEN + render::BIND_ENTRIES..], 7);
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum { pipeline_ref: 61, ..Default::default() };
+    handle_render_record(&mut state, &host, 1, wire_render::OPCODE_SET_VERTEX_BUFFER, &bind, &mut out, &mut acc);
+    let first = acc.vertex_buffers[0].resource.clone().expect("setter retain");
+
+    let offset_total = OP_HEADER_LEN + render::BUFFER_OFFSET_PAYLOAD_LEN;
+    let mut offset = vec![0u8; offset_total];
+    st32(&mut offset, wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET);
+    st32(&mut offset[4..], offset_total as u32);
+    st64(&mut offset[OP_HEADER_LEN + render::BUFFER_OFFSET_VALUE..], 0x80);
+    handle_render_record(&mut state, &host, 1, wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET, &offset, &mut out, &mut acc);
+    assert_eq!(acc.vertex_buffers[0].offset, 0x80);
+    assert!(Arc::ptr_eq(&first, acc.vertex_buffers[0].resource.as_ref().unwrap()));
+
+    let mut draw = vec![0u8; 0x20];
+    let draw_op = wire_render::OPCODE_DRAW_INDEXED_WIDE;
+    st32(&mut draw, draw_op);
+    st32(&mut draw[4..], 0x20);
+    st16(&mut draw[8..], 3);
+    st32(&mut draw[12..], 0x3e);
+    st32(&mut draw[16..], 6);
+    handle_render_record(&mut state, &host, 1, draw_op, &draw, &mut out, &mut acc);
+    assert!(state.delete_object(1, 7));
+    put_buffer(&mut host, &state, 6, 0x2000);
+    let replacement = objects::resolve_resource(&state, &host, 1, 7).unwrap();
+    assert!(!Arc::ptr_eq(&first, &replacement));
+    let recorded = acc.draws[0].vertex_buffers[0].resource.as_ref().unwrap();
+    assert!(Arc::ptr_eq(recorded, &first));
+    assert_eq!(
+        objects::resolve_buffer_span_from_resource(&state, recorded),
+        Ok((5u64 << PAGE_SHIFT_ARM64E, 0x1000))
+    );
+}
+
+#[test]
+fn a_texture_slot_replaces_object_identity_only_on_a_later_setter() {
+    use crate::model::TaskResource;
+    use crate::runtime::decode::resource::ListObjectEntry;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let first = state.task_resources.register(
+        1,
+        9,
+        Arc::new(TaskResource::new(ListObjectEntry::default(), Arc::from([]))),
+    );
+    let total = OP_HEADER_LEN + render::BIND_ENTRIES + 4;
+    let mut command = vec![0u8; total];
+    st32(&mut command, wire_render::OPCODE_SET_FRAGMENT_TEXTURE);
+    st32(&mut command[4..], total as u32);
+    st32(&mut command[OP_HEADER_LEN + render::BIND_COUNT..], 1);
+    st32(&mut command[OP_HEADER_LEN + render::BIND_ENTRIES..], 9);
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    handle_render_record(&mut state, &host, 1, wire_render::OPCODE_SET_FRAGMENT_TEXTURE, &command, &mut out, &mut acc);
+    assert!(Arc::ptr_eq(acc.fragment_textures[0].resource.as_ref().unwrap(), &first));
+
+    assert!(state.task_resources.delete(1, 9));
+    let replacement = state.task_resources.register(
+        1,
+        9,
+        Arc::new(TaskResource::new(ListObjectEntry::default(), Arc::from([]))),
+    );
+    assert!(Arc::ptr_eq(acc.fragment_textures[0].resource.as_ref().unwrap(), &first));
+    handle_render_record(&mut state, &host, 1, wire_render::OPCODE_SET_FRAGMENT_TEXTURE, &command, &mut out, &mut acc);
+    assert!(Arc::ptr_eq(acc.fragment_textures[0].resource.as_ref().unwrap(), &replacement));
 }
 
 #[test]
@@ -1948,6 +2057,7 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
             buffer_ref: 1,
             offset: 0,
             attribute_stride: None,
+            ..Default::default()
         }]),
         fragment_buffers: Arc::default(),
         vertex_textures: Arc::default(),
@@ -2055,6 +2165,7 @@ fn nometal_draw_falls_back_to_type4_clear() {
             buffer_ref: 1,
             offset: 0,
             attribute_stride: None,
+            ..Default::default()
         }]),
         fragment_buffers: Arc::default(),
         vertex_textures: Arc::default(),

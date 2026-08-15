@@ -2185,11 +2185,13 @@ fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
             buffer_ref: 7,
             offset: 0,
             attribute_stride: None,
+            ..Default::default()
         }]
         .into(),
         fragment_textures: vec![TextureBind {
             index: MAX_TEXTURE_BIND_SLOTS - 1,
             texture_ref: 9,
+            ..Default::default()
         }]
         .into(),
         vertex_samplers: vec![SamplerBind {
@@ -2212,6 +2214,7 @@ fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
                     buffer_ref: 7,
                     offset: 0,
                     attribute_stride: None,
+                    ..Default::default()
                 }]
                 .into(),
                 ..Default::default()
@@ -2226,6 +2229,7 @@ fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
                 vertex_textures: vec![TextureBind {
                     index: MAX_TEXTURE_BIND_SLOTS,
                     texture_ref: 9,
+                    ..Default::default()
                 }]
                 .into(),
                 ..Default::default()
@@ -2272,11 +2276,13 @@ fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
             buffer_ref: 0,
             offset: 0,
             attribute_stride: None,
+            ..Default::default()
         }]
         .into(),
         fragment_textures: vec![TextureBind {
             index: MAX_TEXTURE_BIND_SLOTS + 4,
             texture_ref: 0,
+            ..Default::default()
         }]
         .into(),
         vertex_samplers: vec![SamplerBind {
@@ -5276,6 +5282,7 @@ fn packed_buffer_alias_is_reused_across_offsets() {
         &mut host,
         1,
         7,
+        None,
         0x800,
         true,
         Some(0x800),
@@ -6273,6 +6280,7 @@ fn a_bind_stride_overrides_the_pipeline_stride_only_where_it_exists() {
         buffer_ref: 1,
         offset: 0,
         attribute_stride,
+        ..Default::default()
     };
 
     // No bind at this index: the pipeline's stride stands.

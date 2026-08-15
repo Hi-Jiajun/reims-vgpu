@@ -705,6 +705,14 @@ fn load_depth_stencil_descriptor<M: HostMemory + HostOps>(
 pub struct BufferBind {
     pub index: u32,
     pub buffer_ref: u32,
+    /// The resource this encoder slot named when it was bound.
+    ///
+    /// Object references may be deleted and reused after commands have been
+    /// recorded. The binding is an object lifetime, not a deferred lookup of
+    /// that integer, so draw preparation consumes this retained identity when
+    /// it is available. `None` keeps synthetic requests and a construction
+    /// that was not ready at setter time retryable through the numeric ref.
+    pub resource: Option<std::sync::Arc<crate::model::TaskResource>>,
     pub offset: u64,
     /// The vertex fetch stride this bind declares, from
     /// `setVertexBuffer:offset:attributeStride:atIndex:` and its plural and
@@ -726,6 +734,9 @@ pub struct BufferBind {
 pub struct TextureBind {
     pub index: u32,
     pub texture_ref: u32,
+    /// The object identity retained by this encoder slot. See
+    /// [`BufferBind::resource`].
+    pub resource: Option<std::sync::Arc<crate::model::TaskResource>>,
 }
 
 /// One slot of a render encoder's vertex or fragment sampler table. The stage
@@ -1480,11 +1491,16 @@ fn resolve_buffer_backing<M: HostMemory>(
     host: &M,
     task_id: u32,
     buffer_ref: u32,
+    resource: Option<&crate::model::TaskResource>,
 ) -> Option<BufferBacking> {
     if buffer_ref == 0 {
         return None;
     }
-    match objects::resolve_buffer_span(state, host, task_id, buffer_ref) {
+    let resolved = match resource {
+        Some(resource) => objects::resolve_buffer_span_from_resource(state, resource),
+        None => objects::resolve_buffer_span(state, host, task_id, buffer_ref),
+    };
+    match resolved {
         Ok((gva, size)) => Some(BufferBacking { gva, size }),
         Err(refusal) => {
             crate::observe::fail(format!(
@@ -1594,7 +1610,7 @@ fn load_buffer_bytes<M: HostMemory>(
     buffer_ref: u32,
     offset: u64,
 ) -> Option<Vec<u8>> {
-    let backing = resolve_buffer_backing(state, host, task_id, buffer_ref)?;
+    let backing = resolve_buffer_backing(state, host, task_id, buffer_ref, None)?;
     // No shader in scope here — these callers read a buffer outside a draw's
     // bind set, so there is no reflection to bound them and the whole span is
     // the only answer.

@@ -3498,6 +3498,7 @@ pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     buffer_ref: u32,
+    resource: Option<&crate::model::TaskResource>,
     offset: u64,
     allow_zero_copy: bool,
     extent_cap: Option<u64>,
@@ -3513,7 +3514,7 @@ pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
     // between the zero-copy attempt and the CPU fallback. Sub-floor binds used
     // to walk the task PT twice — once in the failed ZC attempt, once in the
     // CPU read.
-    let backing = resolve_buffer_backing(state, host, task_id, buffer_ref)?;
+    let backing = resolve_buffer_backing(state, host, task_id, buffer_ref, resource)?;
     load_buffer_content_resolved(
         state,
         host,
@@ -6427,6 +6428,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     host,
                     req.task_id,
                     b.buffer_ref,
+                    b.resource.as_deref(),
                     b.offset,
                     allow_zc,
                     cap,
@@ -6479,6 +6481,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     host,
                     req.task_id,
                     b.buffer_ref,
+                    b.resource.as_deref(),
                     b.offset,
                     true,
                     cap,
@@ -6794,6 +6797,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         {
             let mut push_tex = |index: u32,
                                 texture_ref: u32,
+                                retained: Option<&std::sync::Arc<crate::model::TaskResource>>,
                                 frag_stage: bool|
              -> Result<(), DrawError> {
                 if texture_ref == 0 {
@@ -6842,8 +6846,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     let _s = crate::runtime::sampled_phase::Span::open(
                         crate::runtime::sampled_phase::Part::Lookup,
                     );
-                    let texture_resource =
-                        objects::resolve_resource(state, host, req.task_id, texture_ref).ok();
+                    let texture_resource = retained.cloned().or_else(|| {
+                        objects::resolve_resource(state, host, req.task_id, texture_ref).ok()
+                    });
                     // A type-8 view's channel remap. Resolved here rather than in
                     // the loaders because it describes how the bind READS the
                     // texture, not what the texture contains: the engine hands it
@@ -7109,10 +7114,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 Ok(())
             };
             for t in req.vertex_textures.iter() {
-                push_tex(t.index, t.texture_ref, false)?;
+                push_tex(t.index, t.texture_ref, t.resource.as_ref(), false)?;
             }
             for t in req.fragment_textures.iter() {
-                push_tex(t.index, t.texture_ref, true)?;
+                push_tex(t.index, t.texture_ref, t.resource.as_ref(), true)?;
             }
         }
         // Repair the gaps the guard found. A fragment texture the module
@@ -10598,6 +10603,7 @@ mod vulkan_split_tests {
         let tex = |texture_ref| TextureBind {
             index: 0,
             texture_ref,
+            ..Default::default()
         };
         let smp = |sampler_ref| SamplerBind {
             index: 0,
@@ -11066,6 +11072,7 @@ mod vulkan_split_tests {
             fragment_textures: vec![TextureBind {
                 index: MAX_TEXTURE_BIND_SLOTS,
                 texture_ref: 9,
+                ..Default::default()
             }]
             .into(),
             ..DrawEncodeRequest::default()
