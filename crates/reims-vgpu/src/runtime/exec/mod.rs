@@ -1448,6 +1448,17 @@ fn handle_blit_record<M: HostMemory + HostOps>(
     opcode: u32,
     cmd_bytes: &[u8],
 ) {
+    // `walk_blit_us` charges this rail 33.3 s of a 45 s driven Maps window and
+    // every clock inside `execute_blit` accounts for 0.14 s of it. The gap has
+    // to be in this function, and only two things here are outside that call:
+    // the decode above, and the `Fence` arm, which reaches
+    // `execute_blit_fence` directly rather than through `execute_blit`. A
+    // blocking fence wait costs exactly what is missing and does no work while
+    // it costs it, which is why no copy clock can see it.
+    //
+    // Timed at the closure `walk_segment_records` calls, so decode is inside the
+    // span and no arm can leave without being charged.
+    let record_started = std::time::Instant::now();
     let cmd = match blit::decode(cmd_bytes) {
         Ok(c) => c,
         // Was `Err(_) => return`: a decoded blit record dropped with no line at
@@ -1615,6 +1626,23 @@ fn handle_blit_record<M: HostMemory + HostOps>(
             ));
         }
     }
+    crate::runtime::drain::note_store_route_us(
+        match cmd.kind {
+            BlitKind::Fence => "blitrec_fence_us",
+            BlitKind::Copy => "blitrec_copy_us",
+            BlitKind::FillBuffer | BlitKind::FillBufferPattern4 => "blitrec_fill_us",
+            BlitKind::Resource | BlitKind::Image => "blitrec_noop_us",
+            _ => "blitrec_other_us",
+        },
+        record_started.elapsed().as_micros() as u64,
+    );
+    crate::runtime::drain::note_store_route(match cmd.kind {
+        BlitKind::Fence => "blitrec_fence_n",
+        BlitKind::Copy => "blitrec_copy_n",
+        BlitKind::FillBuffer | BlitKind::FillBufferPattern4 => "blitrec_fill_n",
+        BlitKind::Resource | BlitKind::Image => "blitrec_noop_n",
+        _ => "blitrec_other_n",
+    });
 }
 
 fn handle_render_record<M: HostMemory + HostOps>(

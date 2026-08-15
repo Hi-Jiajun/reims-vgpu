@@ -3507,7 +3507,32 @@ pub fn execute_blit<M: HostMemory + HostOps>(
     // Fresh reason channel per command: an uninstrumented failure reports empty
     // rather than a stale slug left by a prior blit (see `br` / `blit_fail_reason`).
     clear_blit_fail_reason();
-    match cmd.kind {
+    // One clock over the whole dispatch, attributed by the arm that ran.
+    //
+    // The per-loop clocks added alongside this are the ones that say *why* an
+    // arm is slow, but each of them had to be placed by hand and between them
+    // they accounted for 0.7 % of `walk_blit_us`. Being exhaustive by
+    // construction is what this one buys: every record entering `execute_blit`
+    // leaves through exactly one arm and is charged to it, so the sum of
+    // `blit_kind_*_us` cannot be less than the rail's cost the way a hand-placed
+    // set can. A family that turns out to hold the wall clock and has no inner
+    // clock yet is then a known gap rather than an invisible one.
+    let kind_started = std::time::Instant::now();
+    let kind_route = match cmd.kind {
+        Kind::FillBuffer => "blit_kind_fill_us",
+        Kind::FillBufferPattern4 => "blit_kind_fill4_us",
+        Kind::Copy => match cmd.copy_kind {
+            CopyKind::BufferToBuffer => "blit_kind_b2b_us",
+            CopyKind::BufferToTexture => "blit_kind_b2t_us",
+            CopyKind::TextureToBuffer => "blit_kind_t2b_us",
+            CopyKind::TextureToTexture => "blit_kind_t2t_us",
+            CopyKind::TextureToTextureSliceLevel => "blit_kind_t2t_sl_us",
+            CopyKind::None => "blit_kind_none_us",
+        },
+        Kind::Fence => "blit_kind_fence_us",
+        _ => "blit_kind_other_us",
+    };
+    let status = match cmd.kind {
         Kind::FillBuffer => exec_fill_buffer(state, host, task_id, cmd),
         Kind::FillBufferPattern4 => exec_fill_buffer_pattern4(state, host, task_id, cmd),
         Kind::Copy => match cmd.copy_kind {
@@ -3539,7 +3564,12 @@ pub fn execute_blit<M: HostMemory + HostOps>(
         Kind::FillTexture | Kind::InvalidateCompressedTexture => {
             br(BlitStatus::Unsupported, "blit_kind_spi_misrouted")
         }
-    }
+    };
+    crate::runtime::drain::note_store_route_us(
+        kind_route,
+        kind_started.elapsed().as_micros() as u64,
+    );
+    status
 }
 
 #[cfg(test)]
