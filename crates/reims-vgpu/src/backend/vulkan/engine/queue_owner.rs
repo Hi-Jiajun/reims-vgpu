@@ -394,6 +394,16 @@ unsafe fn execute_submit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ash::vk::Handle;
+
+    fn owner_with_sender(sender: mpsc::Sender<Request>) -> QueueOwner {
+        QueueOwner {
+            sender,
+            failure: Arc::new(FailureLatch::default()),
+            stats: Arc::new(QueueStats::default()),
+            join: None,
+        }
+    }
 
     #[test]
     fn first_async_failure_is_sticky() {
@@ -403,5 +413,46 @@ mod tests {
         latch.set(vk::Result::ERROR_DEVICE_LOST);
         assert_eq!(latch.get(), Some(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
         assert!(super::super::device_lost::take_device_lost_seen());
+    }
+
+    #[test]
+    fn async_handoff_publishes_its_point_before_driver_submission() {
+        let (sender, receiver) = mpsc::channel();
+        let owner = owner_with_sender(sender);
+        let probe = super::super::stamp_completion::SubmissionProbe::new();
+
+        owner
+            .submit_async(
+                &[vk::CommandBuffer::from_raw(1)],
+                vk::Fence::from_raw(2),
+                Some((vk::Semaphore::from_raw(3), 7, probe.note())),
+            )
+            .expect("owner accepted submission");
+
+        assert_eq!(probe.latest_queued(), Some(7));
+        let request = receiver.try_recv().expect("submission remains in host FIFO");
+        let Request::Submit { submit, reply } = request else {
+            panic!("async handoff queued a non-submit request");
+        };
+        assert!(reply.is_none());
+        assert_eq!(submit.timeline.as_ref().map(|(_, value, _)| *value), Some(7));
+    }
+
+    #[test]
+    fn failed_async_handoff_does_not_publish_its_point() {
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+        let owner = owner_with_sender(sender);
+        let probe = super::super::stamp_completion::SubmissionProbe::new();
+
+        assert_eq!(
+            owner.submit_async(
+                &[vk::CommandBuffer::from_raw(1)],
+                vk::Fence::from_raw(2),
+                Some((vk::Semaphore::from_raw(3), 7, probe.note())),
+            ),
+            Err(vk::Result::ERROR_DEVICE_LOST)
+        );
+        assert_eq!(probe.latest_queued(), None);
     }
 }

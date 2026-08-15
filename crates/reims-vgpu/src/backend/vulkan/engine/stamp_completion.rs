@@ -204,12 +204,49 @@ struct Shared {
     latest_queued: AtomicU64,
 }
 
+impl Shared {
+    fn latest_queued(&self) -> Option<u64> {
+        let value = self.latest_queued.load(Ordering::Acquire);
+        (value != 0).then_some(value)
+    }
+}
+
 /// Cloneable publication half handed to the queue owner with one submission.
 /// It cannot stop the completion thread or destroy its semaphore; it can only
 /// bind pending guest stamps after `vkQueueSubmit` has actually succeeded.
 #[derive(Clone)]
 pub(crate) struct SubmissionNote {
     shared: Arc<Shared>,
+}
+
+#[cfg(test)]
+pub(super) struct SubmissionProbe {
+    shared: Arc<Shared>,
+}
+
+#[cfg(test)]
+impl SubmissionProbe {
+    pub(super) fn new() -> Self {
+        Self {
+            shared: Arc::new(Shared {
+                queue: Mutex::new(PendingQueue::default()),
+                wake: Condvar::new(),
+                stop: AtomicBool::new(false),
+                next_value: AtomicU64::new(0),
+                latest_queued: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    pub(super) fn note(&self) -> SubmissionNote {
+        SubmissionNote {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
+    pub(super) fn latest_queued(&self) -> Option<u64> {
+        self.shared.latest_queued()
+    }
 }
 
 impl SubmissionNote {
@@ -300,8 +337,9 @@ impl StampCompletion {
     /// The newest queue point this device has accepted, including work waiting
     /// in the ordered owner's host FIFO.
     pub(crate) fn latest_queued(&self) -> Option<(vk::Semaphore, u64)> {
-        let value = self.shared.latest_queued.load(Ordering::Acquire);
-        (value != 0).then_some((self.semaphore, value))
+        self.shared
+            .latest_queued()
+            .map(|value| (self.semaphore, value))
     }
 
     /// Retire one FIFO completion after `timeline` completes.
@@ -658,19 +696,50 @@ mod tests {
 
     #[test]
     fn an_open_batch_stamp_binds_only_when_submission_succeeds() {
-        let mut queue = PendingQueue::default();
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(PendingQueue::default()),
+            wake: Condvar::new(),
+            stop: AtomicBool::new(false),
+            next_value: AtomicU64::new(0),
+            latest_queued: AtomicU64::new(0),
+        });
         let mut submitted = waiting(0, 1);
         submitted.timeline = Some(7);
         let mut deferred_a = waiting(0, 2);
         deferred_a.timeline = None;
         let mut deferred_b = waiting(1, 3);
         deferred_b.timeline = None;
-        queue.push(submitted);
-        queue.push(deferred_a);
-        queue.push(deferred_b);
+        {
+            let mut queue = shared.queue.lock().expect("pending queue");
+            queue.push(submitted);
+            queue.push(deferred_a);
+            queue.push(deferred_b);
+        }
+        let note = SubmissionNote {
+            shared: Arc::clone(&shared),
+        };
 
-        assert_eq!(queue.bind_unsubmitted(11), 2);
-        let points: Vec<Option<u64>> = queue.waiting.iter().map(|w| w.timeline).collect();
+        note.queued(11);
+        let before_submit: Vec<Option<u64>> = shared
+            .queue
+            .lock()
+            .expect("pending queue")
+            .waiting
+            .iter()
+            .map(|w| w.timeline)
+            .collect();
+        assert_eq!(before_submit, vec![Some(7), None, None]);
+
+        note.submitted(11);
+
+        let points: Vec<Option<u64>> = shared
+            .queue
+            .lock()
+            .expect("pending queue")
+            .waiting
+            .iter()
+            .map(|w| w.timeline)
+            .collect();
         assert_eq!(points, vec![Some(7), Some(11), Some(11)]);
     }
 }
