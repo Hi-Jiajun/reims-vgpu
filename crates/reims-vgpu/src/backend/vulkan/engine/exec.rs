@@ -3148,7 +3148,9 @@ pub(crate) unsafe fn execute_draw_inner(
     // without reaching the gather again, so a window bound twice anywhere in
     // this command buffer is copied once.
     let mut guest_gathers: Vec<PendingGuestGather> = Vec::new();
+    phase.enter(super::draw_phase::Phase::StageRoles);
     let gather_roles = buffer_gather_roles(req);
+    phase.enter(super::draw_phase::Phase::StageVertex);
     let mut vertex_bufs = Vec::new();
     for resource in &req.vertex_attributes {
         let needs_shift = !no_vertex_fetch
@@ -3221,6 +3223,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // Index data follows the same retained resource path as vertex/storage
     // data. A direct import binds the guest's pages; a scattered window is
     // gathered once by this command buffer; only incapable hosts CPU-stage it.
+    phase.enter(super::draw_phase::Phase::StageIndex);
     let index_slot = match &req.indexed {
         Some(indexed) => Some(stage_buffer_content(
             ctx,
@@ -3242,6 +3245,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // Storage buffers (deduplicated by content with the vertex streams: a
     // stage-in buffer doubling as a storage bind reuses the same slot —
     // staging slots always carry the full usage superset).
+    phase.enter(super::draw_phase::Phase::StageStorage);
     let mut storage_slots = Vec::new();
     for resource in &req.storage_buffers {
         let slot = stage_buffer_content(
@@ -3270,6 +3274,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // below restates the seed as the attachment's texels first; the four-byte
     // arm is unchanged, which is every attachment this device had until render
     // targets began following the guest's declared format.
+    phase.enter(super::draw_phase::Phase::StageSeed);
     let seed_wide = seed_bytes.and_then(|rgba8| {
         let layout = crate::backend::vulkan::translate::pixel::texel_layout_of(color0_format)?;
         if layout.bytes_per_texel() == crate::contract::pixel_format::RGBA8_BPP {

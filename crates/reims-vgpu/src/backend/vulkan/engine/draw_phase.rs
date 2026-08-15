@@ -395,6 +395,29 @@ pub(crate) enum Phase {
     PostSampled = 21,
     /// Cache admission and parking asynchronous cleanup on the submission slot.
     PostPark = 22,
+    /// `buffer_gather_roles` — the pre-pass that classifies every bind before
+    /// any of them is resolved.
+    StageRoles = 23,
+    /// The vertex-attribute bind loop.
+    StageVertex = 24,
+    /// The index buffer bind.
+    StageIndex = 25,
+    /// The storage-buffer bind loop.
+    StageStorage = 26,
+    /// Resolving the colour Load seed into a staging slot.
+    StageSeed = 27,
+    /// What is left of [`Phase::Stage`] once the five above are taken out of it.
+    ///
+    /// Carved out rather than added beside, exactly as the pipeline split is, so
+    /// the six together are what `stage_us` used to be alone and the total still
+    /// divides against `chain_phase`'s `engine_us`.
+    ///
+    /// This split exists because `stage_us` is the largest bar in the slow half
+    /// of a Maps boot — 17.29 µs/draw against 1.57 in the fast half — while
+    /// `stage_phase`, which tiles the actual staging *work*, reports under
+    /// 100 µs of a whole census second for it, with `gather_us` and `runs_us` at
+    /// zero. So almost none of the bar is the byte movement anyone would assume,
+    /// and no field named what the rest is.
     Stage = 3,
     StagePass = 4,
     Acquire = 5,
@@ -415,7 +438,7 @@ impl Phase {
     /// The pipeline sub-phases were appended after `Readback` rather than
     /// inserted next to `Pipeline`, so that every existing ordinal kept its
     /// value and this stayed the only place the count is written.
-    const LAST: Phase = Phase::PostPark;
+    const LAST: Phase = Phase::StageSeed;
 }
 
 const PHASES: usize = Phase::LAST as usize + 1;
@@ -469,6 +492,13 @@ pub struct DrawPhaseWindow {
     pub pipeline_compile_us: u64,
     pub pipeline_sampler_us: u64,
     pub stage_us: u64,
+    /// The five below are carved out of `stage_us`; the six together are what it
+    /// used to be alone.
+    pub stage_roles_us: u64,
+    pub stage_vertex_us: u64,
+    pub stage_index_us: u64,
+    pub stage_storage_us: u64,
+    pub stage_seed_us: u64,
     pub stage_pass_us: u64,
     pub acquire_us: u64,
     pub acquire_sampled_us: u64,
@@ -504,6 +534,11 @@ pub fn take_window() -> Option<DrawPhaseWindow> {
         pipeline_compile_us: to_us(ACC[Phase::PipelineCompile as usize].swap(0, Ordering::Relaxed)),
         pipeline_sampler_us: to_us(ACC[Phase::PipelineSampler as usize].swap(0, Ordering::Relaxed)),
         stage_us: to_us(ACC[Phase::Stage as usize].swap(0, Ordering::Relaxed)),
+        stage_roles_us: to_us(ACC[Phase::StageRoles as usize].swap(0, Ordering::Relaxed)),
+        stage_vertex_us: to_us(ACC[Phase::StageVertex as usize].swap(0, Ordering::Relaxed)),
+        stage_index_us: to_us(ACC[Phase::StageIndex as usize].swap(0, Ordering::Relaxed)),
+        stage_storage_us: to_us(ACC[Phase::StageStorage as usize].swap(0, Ordering::Relaxed)),
+        stage_seed_us: to_us(ACC[Phase::StageSeed as usize].swap(0, Ordering::Relaxed)),
         stage_pass_us: to_us(ACC[Phase::StagePass as usize].swap(0, Ordering::Relaxed)),
         acquire_us: to_us(ACC[Phase::Acquire as usize].swap(0, Ordering::Relaxed)),
         acquire_sampled_us: to_us(ACC[Phase::AcquireSampled as usize].swap(0, Ordering::Relaxed)),
@@ -707,6 +742,13 @@ mod tests {
             Phase::PostStore,
             Phase::PostSampled,
             Phase::PostPark,
+            // The staging split, appended for the same reason the pipeline one
+            // was: every ordinal above keeps its value.
+            Phase::StageRoles,
+            Phase::StageVertex,
+            Phase::StageIndex,
+            Phase::StageStorage,
+            Phase::StageSeed,
         ];
         assert_eq!(all.len(), PHASES);
         for (want, phase) in all.iter().enumerate() {

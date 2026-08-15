@@ -2853,7 +2853,8 @@ fn emit_draw_phase() {
     crate::observe::off(format!(
         "draw_phase draws={} prep_us={} slot_us={} pipeline_us={} \
          pl_depth_us={} pl_shader_us={} pl_layoutpass_us={} pl_compile_us={} pl_sampler_us={} \
-         stage_us={} stage_pass_us={} \
+         stage_us={} sg_roles_us={} sg_vertex_us={} sg_index_us={} sg_storage_us={} \
+         sg_seed_us={} stage_pass_us={} \
          acquire_us={} acquire_sampled_us={} sampled_upload_us={} acquire_readback_us={} \
          descriptors_us={} \
          record_us={} submit_us={} post_target_us={} post_store_us={} post_sampled_us={} \
@@ -2868,6 +2869,11 @@ fn emit_draw_phase() {
         w.pipeline_compile_us,
         w.pipeline_sampler_us,
         w.stage_us,
+        w.stage_roles_us,
+        w.stage_vertex_us,
+        w.stage_index_us,
+        w.stage_storage_us,
+        w.stage_seed_us,
         w.stage_pass_us,
         w.acquire_us,
         w.acquire_sampled_us,
