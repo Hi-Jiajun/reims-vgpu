@@ -3299,15 +3299,34 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     // and the shader disagreeing, and the allocation is the side that bounds
     // what this device may read.
     let full = span;
-    let Some(span) = gather_span_if_eligible(full, extent_cap) else {
-        // Eligibility belongs to the guest's full bind window. The reflected
-        // extent controls only how many bytes this draw walks and moves; using
-        // it for admission would push the small bounded objects this
-        // optimization serves off the held-resolution registry and onto a
-        // repeated CPU read.
-        crate::runtime::drain::note_store_route("zc_buffer_below_floor");
-        return None;
-    };
+    // The floor gates the **gather**, not the rail.
+    //
+    // `ZERO_COPY_BUFFER_MIN_BYTES` earns its keep against one outcome and its
+    // own doc says which: removing it moved `submit_us` by 13 % because "every
+    // gathered bind is a recorded GPU gather", while `stage_us` — the CPU read
+    // it was once believed to be saving — barely moved. But it used to refuse
+    // here, at the top of the rail, which also refused the two outcomes below
+    // that record no gather at all: `zc_buffer_imported`, an offset into the
+    // RAMBlock import this device already holds for the VM's lifetime, and the
+    // retained packed alias. Neither costs a submit, and neither was ever what
+    // the measurement was about.
+    //
+    // What that cost is the sentence the route family's own doc opens with: **a
+    // resolution is cached; a refusal is not.** An admitted bind lands in the
+    // held-resolution registry and answers `zc_buffer_held` on every later draw;
+    // a refused one re-resolves its backing and re-reads its bytes on the CPU
+    // every draw for as long as the guest keeps binding it. A driven macos-13
+    // Maps leg scored `zc_buffer_below_floor` 2 909 326 against
+    // `zc_buffer_held` 1 820 542 — the refusal was the *majority* route, and
+    // `binds_us` was 31 % of per-chain cost with two thirds of it in the vertex
+    // loads. The floor's own table was measured where it governed one bind in
+    // eight, on a different workload; `AGENTS.md`'s rule against generalising
+    // across workloads applies to it as much as to a pathway.
+    //
+    // So the span is computed unconditionally and the floor is asked again at
+    // the one place a gather is what would actually be recorded.
+    let span = extent_cap.map_or(full, |cap| full.min(cap));
+    let gather_eligible = gather_span_if_eligible(full, extent_cap).is_some();
     // Counted only once the rail has actually taken the bind. Counting at the
     // narrowing instead credited this rail with bytes the bind then went and
     // read on the CPU path anyway, which is a saving that did not happen.
@@ -3315,14 +3334,21 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("zc_buffer_extent_narrowed");
         crate::runtime::drain::note_store_route_n("zc_buffer_extent_saved_bytes", full - span);
     }
-    if ensure_packed_resource(
-        state,
-        host,
-        task_id,
-        buffer_ref,
-        backing,
-        PackedResourceRail::Buffer,
-    ) {
+    // Packed-resource construction stays behind the floor. It retains a new
+    // alias for the whole resource, so admitting every small bind to it would
+    // trade a repeated CPU read for a growing set of retained imports — a
+    // different cost, not a smaller one. The direct window below retains
+    // nothing the registry does not already key.
+    if gather_eligible
+        && ensure_packed_resource(
+            state,
+            host,
+            task_id,
+            buffer_ref,
+            backing,
+            PackedResourceRail::Buffer,
+        )
+    {
         let packed = state.bound_buffers.packed_available(
             task_id,
             buffer_ref,
@@ -3357,6 +3383,18 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     };
     let page = state.page_size();
     let pages = guest_page_window(host, gpas, page, (gva + offset) % page, span);
+    // Here, and only here, is it known whether this bind would record a gather,
+    // which is the one thing the floor governs. See [`window_binds_zero_copy`].
+    //
+    // The walk above is spent either way and is not cached on this exit, so the
+    // refusing arm is a real new cost for a *scattered* sub-floor buffer. It is
+    // counted apart from the binds that never reached the walk, so a boot can
+    // say how much of the family that is.
+    if !window_binds_zero_copy(pages.is_none(), gather_eligible) {
+        crate::runtime::drain::note_store_route("zc_buffer_below_floor");
+        crate::runtime::drain::note_store_route("zc_buffer_below_floor_walked");
+        return None;
+    }
     crate::runtime::drain::note_store_route(if pages.is_some() {
         "zc_buffer_imported"
     } else {
@@ -3440,6 +3478,23 @@ fn bound_buffer_content(
 /// object off the gather rail and its held-resolution registry.
 pub(super) fn gather_span_if_eligible(full: u64, extent_cap: Option<u64>) -> Option<u64> {
     (full >= ZERO_COPY_BUFFER_MIN_BYTES).then(|| extent_cap.map_or(full, |cap| full.min(cap)))
+}
+
+/// Whether a walked guest window may bind zero-copy, once it is known whether
+/// binding it would record a GPU gather.
+///
+/// The whole of what [`ZERO_COPY_BUFFER_MIN_BYTES`] governs, in one place. That
+/// floor was measured against exactly one outcome — a recorded gather, which
+/// costs a submit — and it used to be asked before the window was walked, where
+/// "would this gather?" is not yet answerable. Asking it there refused two
+/// outcomes that record no gather: a window resolving to pages is an offset into
+/// an import this device already holds for the VM's lifetime, and costs nothing
+/// a submit would notice.
+///
+/// The asymmetry is the point, so the truth table is the test: size may only
+/// ever veto a *gather*.
+pub(super) fn window_binds_zero_copy(needs_gather: bool, gather_eligible: bool) -> bool {
+    !needs_gather || gather_eligible
 }
 
 /// Answer a retained zero-copy resolution without touching the object table or

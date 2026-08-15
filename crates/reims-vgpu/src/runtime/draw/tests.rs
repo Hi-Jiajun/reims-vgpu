@@ -125,6 +125,51 @@ fn a_small_reflected_object_stays_on_the_gather_rail_and_moves_only_its_extent()
     );
 }
 
+/// The zero-copy buffer floor may veto a gather and nothing else.
+///
+/// `ZERO_COPY_BUFFER_MIN_BYTES` was measured against one outcome and its own doc
+/// says which: removing it moved `submit_us` by 13 % because every gathered bind
+/// is a recorded GPU gather, while `stage_us` — the CPU read it was believed to
+/// be saving — barely moved. It was nevertheless asked at the top of the rail,
+/// before the window is walked, which is before "would this gather?" can be
+/// answered at all. So it also refused windows that resolve to pages, which are
+/// an offset into an import this device already holds for the VM's lifetime and
+/// cost no submit.
+///
+/// That refusal was not free, because a resolution is cached and a refusal is
+/// not: a refused bind re-resolves its backing and re-reads its bytes on the CPU
+/// on every later draw. A driven macos-13 Maps leg scored `zc_buffer_below_floor`
+/// 2 909 326 against `zc_buffer_held` 1 820 542.
+///
+/// The asymmetry is the whole rule, so this is a truth table and not a
+/// threshold check. The first row is the one that regressed to a repeated CPU
+/// read, and a change that reinstates "sub-floor never binds" fails on it.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn the_zero_copy_buffer_floor_vetoes_a_gather_and_nothing_else() {
+    use super::vulkan::window_binds_zero_copy;
+
+    assert!(
+        window_binds_zero_copy(false, false),
+        "a sub-floor window that resolved to pages needs no gather, so the \
+         floor has nothing to say about it — this is the bind that otherwise \
+         takes a fresh CPU read on every draw forever"
+    );
+    assert!(
+        !window_binds_zero_copy(true, false),
+        "a sub-floor window that would be gathered is exactly what the floor \
+         was measured against"
+    );
+    assert!(
+        window_binds_zero_copy(true, true),
+        "an eligible window still gathers"
+    );
+    assert!(
+        window_binds_zero_copy(false, true),
+        "an eligible window that needs no gather binds directly"
+    );
+}
+
 /// The window math the three sampled zero-copy rails now share.
 ///
 /// Each rail used to carry its own copy, so each could have drifted alone. The
