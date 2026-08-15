@@ -10,8 +10,8 @@
 
 use metal2vulkan::passes::Stage;
 use reims_vgpu::backend::vulkan::engine::{
-    self, BlendFactor, BlendOp, BlendStateResource, CullMode, DepthState, DrawRequest, IndexType,
-    IndexedDrawResource, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
+    self, BlendFactor, BlendOp, BlendStateResource, BufferContent, CullMode, DepthState, DrawRequest,
+    IndexType, IndexedDrawResource, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
     SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
     StencilFaceOps, StencilOp, StencilState, StorageBufferResource, TargetIdentity,
     VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
@@ -937,13 +937,13 @@ fn indexed_u16_known_color() {
         index_type: IndexType::U16,
         index_count: 3,
         vertex_offset: 0,
-        indices: {
+        content: BufferContent::Bytes(std::sync::Arc::new({
             let mut b = Vec::new();
             for i in [0u16, 1, 2] {
                 b.extend_from_slice(&i.to_le_bytes());
             }
             b
-        },
+        })),
     });
     if let Some(px) = draw_or_skip("indexed_u16", &req) {
         assert_fullscreen_fragment_color("indexed_u16", &px, 16, 16);

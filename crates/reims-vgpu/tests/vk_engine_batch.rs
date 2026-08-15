@@ -12,9 +12,9 @@
 
 use metal2vulkan::passes::Stage;
 use reims_vgpu::backend::vulkan::engine::{
-    self, BufferContent, DrawRequest, GuestRun, GuestRunSource, PrimitiveTopology,
-    SampledImageResource, SampledSource, SamplerResource, ScissorResource, StorageBufferResource,
-    TargetIdentity,
+    self, BufferContent, DrawRequest, GuestRun, GuestRunSource, IndexType, IndexedDrawResource,
+    PrimitiveTopology, SampledImageResource, SampledSource, SamplerResource, ScissorResource,
+    StorageBufferResource, TargetIdentity,
 };
 /// The resident format every `TargetIdentity::Surface` in this file is built at.
 ///
@@ -1379,5 +1379,107 @@ void main() {{
         FILL[1],
         FILL[0],
     );
+    engine::test_quiesce_ring();
+}
+
+/// An indexed draw retains the guest buffer window through execution. This is
+/// the fixed-function counterpart of the storage-buffer test above: the index
+/// bytes never become a host `Vec` or a staging upload, and a nonzero resource
+/// offset reaches `vkCmdBindIndexBuffer` unchanged.
+#[test]
+fn an_index_window_is_bound_in_place_without_a_cpu_copy() {
+    use reims_vgpu::runtime::guest_ram::{granularity, GuestRamImport, GuestRamRegion, GuestRef};
+    use reims_vgpu::runtime::guest_ram_map::GuestWindowRun;
+
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_411,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+
+    let warm = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    if let Err(e) = engine::execute_draw_request(&warm) {
+        let msg = e.to_string();
+        if skip_if_no_gpu(&msg) {
+            eprintln!("skipping: {msg}");
+            return;
+        }
+        panic!("warm-up draw: {msg}");
+    }
+    let Some(align) = granularity() else {
+        eprintln!("skipping: this host cannot import guest RAM");
+        engine::test_quiesce_ring();
+        return;
+    };
+
+    const SOURCE_OFFSET: u64 = 14;
+    const INDEX_BYTES: u64 = 6;
+    let block_len = align * 2;
+    let mut backing = vec![0u8; (block_len + align) as usize];
+    let pad = (backing.as_ptr() as u64).next_multiple_of(align) - backing.as_ptr() as u64;
+    let base = backing.as_ptr() as u64 + pad;
+    let start = (pad + SOURCE_OFFSET) as usize;
+    for (slot, index) in [0u16, 1, 2].into_iter().enumerate() {
+        backing[start + slot * 2..start + slot * 2 + 2]
+            .copy_from_slice(&index.to_le_bytes());
+    }
+
+    let import = std::sync::Arc::new(
+        GuestRamImport::new(
+            GuestRamRegion {
+                gpa_base: 0x1_1000_0000,
+                host_va: base,
+                len: block_len,
+            },
+            align,
+        )
+        .expect("an aligned, non-empty region"),
+    );
+    let pages = vec![GuestWindowRun {
+        window_offset: 0,
+        guest: GuestRef::new(
+            std::sync::Arc::clone(&import),
+            import.slice(0, block_len).expect("inside the import"),
+        )
+        .expect("the slice came from this import"),
+    }];
+    let source = GuestRunSource {
+        runs: std::sync::Arc::new(vec![GuestRun {
+            host_ptr: base as usize,
+            len: block_len,
+        }]),
+        source_offset: SOURCE_OFFSET,
+        total_len: INDEX_BYTES,
+        row_length_texels: 0,
+        pages: Some(std::sync::Arc::new(pages)),
+        direct_image: None,
+    };
+
+    let before = engine::counter_snapshot();
+    let mut req = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    req.indexed = Some(IndexedDrawResource {
+        index_type: IndexType::U16,
+        index_count: 3,
+        vertex_offset: 0,
+        content: BufferContent::GuestRuns(source),
+    });
+    engine::execute_draw_request(&req).expect("indexed draw");
+    engine::execute_draw_request(&req).expect("repeated indexed draw");
+    let px = engine::read_target(&identity)
+        .expect("read_target flushes the indexed draw")
+        .into_rgba8();
+
+    let d = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(d.buffer_guest_index_imports, 1, "index source: {d:?}");
+    assert_eq!(d.buffer_guest_index_import_bytes, INDEX_BYTES, "index source: {d:?}");
+    assert_eq!(d.buffer_index_bind_reuses, 1, "index source: {d:?}");
+    assert_eq!(d.buffer_guest_gathers, 0, "index source: {d:?}");
+    assert_eq!(d.buffer_snapshot_binds, 0, "index source: {d:?}");
+    let i = (((H / 2) * W + W / 4) * 4) as usize;
+    assert!(is_frag_color(&px[i..i + 4]), "indexed pixel = {:?}", &px[i..i + 4]);
     engine::test_quiesce_ring();
 }

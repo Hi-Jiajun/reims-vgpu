@@ -770,30 +770,8 @@ pub struct IndexedDrawResource {
     pub index_type: IndexType,
     pub index_count: u32,
     pub vertex_offset: i32,
-    pub indices: Vec<u8>,
-}
-
-impl IndexedDrawResource {
-    pub(crate) fn index_range(&self) -> (u32, u32) {
-        let mut min = u32::MAX;
-        let mut max = 0u32;
-        for i in 0..self.index_count as usize {
-            let v = match self.index_type {
-                IndexType::U16 => {
-                    u16::from_le_bytes([self.indices[i * 2], self.indices[i * 2 + 1]]) as u32
-                }
-                IndexType::U32 => u32::from_le_bytes([
-                    self.indices[i * 4],
-                    self.indices[i * 4 + 1],
-                    self.indices[i * 4 + 2],
-                    self.indices[i * 4 + 3],
-                ]),
-            };
-            min = min.min(v);
-            max = max.max(v);
-        }
-        (min, max)
-    }
+    /// Exact resource window consumed by the fixed-function index fetch.
+    pub content: BufferContent,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -916,7 +894,7 @@ pub struct StorageBufferResource {
     pub content: BufferContent,
 }
 
-/// Where a draw-time buffer's bytes come from (vertex attribute streams and
+/// Where a draw-time buffer's bytes come from (vertex streams, index input and
 /// storage/SSBO binds).
 ///
 /// `Bytes` is the CPU staging origin: the runtime read the guest span at
@@ -2070,28 +2048,7 @@ mod tests {
     }
 
     #[test]
-    fn indexed_draw_range_decodes_both_wire_index_widths() {
-        let u16_draw = IndexedDrawResource {
-            index_type: IndexType::U16,
-            index_count: 4,
-            vertex_offset: 0,
-            indices: [9u16, 2, 17, 4]
-                .into_iter()
-                .flat_map(u16::to_le_bytes)
-                .collect(),
-        };
-        assert_eq!(u16_draw.index_range(), (2, 17));
-
-        let u32_draw = IndexedDrawResource {
-            index_type: IndexType::U32,
-            index_count: 3,
-            vertex_offset: 0,
-            indices: [u32::MAX, 7, 99]
-                .into_iter()
-                .flat_map(u32::to_le_bytes)
-                .collect(),
-        };
-        assert_eq!(u32_draw.index_range(), (7, u32::MAX));
+    fn indexed_draw_widths_are_the_fixed_function_element_widths() {
         assert_eq!(IndexType::U16.byte_size(), 2);
         assert_eq!(IndexType::U32.byte_size(), 4);
     }

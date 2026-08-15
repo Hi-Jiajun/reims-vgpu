@@ -56,10 +56,10 @@ use crate::runtime::decode::render::{DepthAttachment, ScissorRect, StencilAttach
 #[cfg(feature = "backend-vulkan")]
 use crate::runtime::decode::resource::TextureDescriptor;
 use crate::runtime::decode::resource::{
-    decode_buffer_descriptor, decode_buffer_texture_descriptor, decode_depth_stencil_descriptor,
+    decode_buffer_texture_descriptor, decode_depth_stencil_descriptor,
     decode_render_pipeline_descriptor, decode_sampler_descriptor, decode_texture_descriptor,
     texture_type8_opcode, BufferTextureDescriptor, DecodeStatus, RenderPipelineDescriptor,
-    OBJECT_TYPE_BUFFER, OBJECT_TYPE_IOSURFACE, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
+    OBJECT_TYPE_IOSURFACE, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
     OBJECT_TYPE_TEXTURE_VIEW, OBJECT_TYPE_TYPE7, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
     TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
 };
@@ -1759,17 +1759,16 @@ fn index_elem_size(index_type: u32) -> Option<usize> {
     }
 }
 
-/// Load the index bytes a bound indexed draw references, returning the **specific**
-/// reason on failure. Metal emits it directly; Vulkan delegates it through
-/// `DrawPreparationDecline::IndexLoad`, so both rails keep one reason vocabulary.
-/// Runs on the drain worker (off main core); only reached when `req.indexed` is
-/// set, so it cannot flood a 2D-UI boot.
-fn load_index_bytes_reason<M: HostMemory + HostOps>(
+/// Resolve an indexed draw to the guest allocation and exact byte window its
+/// index count names. Reading those bytes is a backend choice: Metal's copied
+/// upload path consumes them on the CPU, while Vulkan retains this resource
+/// window and lets vertex input consume it when the command executes.
+fn resolve_index_window_reason<M: HostMemory>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
     info: &IndexedDrawInfo,
-) -> Result<Vec<u8>, IndexLoadReason> {
+) -> Result<(BufferBacking, usize), IndexLoadReason> {
     use IndexLoadReason as R;
     let elem = index_elem_size(info.index_type).ok_or(R::TypeUnsupported)?;
     let need = (info.index_count as usize)
@@ -1778,24 +1777,16 @@ fn load_index_bytes_reason<M: HostMemory + HostOps>(
     if need == 0 {
         return Err(R::CountZero);
     }
-    // The rung this rail's own enum already mirrored, one-to-one, in the order
-    // it can only be asked in.
-    let (_entry, desc_bytes) = objects::resolve_descriptor(
-        state,
-        host,
-        task_id,
-        info.index_buffer_ref,
-        &[OBJECT_TYPE_BUFFER],
-    )
-    .map_err(|rung| match rung {
-        objects::LadderRung::NoListEntry => R::EntryMissing,
-        objects::LadderRung::WrongType { .. } => R::ObjectType,
-        objects::LadderRung::DescRead { .. } => R::DescRead,
-    })?;
-    let desc = decode_buffer_descriptor(&desc_bytes).map_err(|_| R::DescDecode)?;
-    let (gva, size) = desc
-        .backing_gva_size(state.page_shift)
-        .ok_or(R::BackingMissing)?;
+    let (gva, size) = objects::resolve_buffer_span(state, host, task_id, info.index_buffer_ref)
+        .map_err(|refusal| match refusal {
+            objects::BufferSpanRefusal::Rung(objects::LadderRung::NoListEntry) => R::EntryMissing,
+            objects::BufferSpanRefusal::Rung(objects::LadderRung::WrongType { .. }) => {
+                R::ObjectType
+            }
+            objects::BufferSpanRefusal::Rung(objects::LadderRung::DescRead { .. }) => R::DescRead,
+            objects::BufferSpanRefusal::Decode => R::DescDecode,
+            objects::BufferSpanRefusal::NoBacking => R::BackingMissing,
+        })?;
     let end = info
         .index_buffer_offset
         .checked_add(need as u64)
@@ -1803,12 +1794,29 @@ fn load_index_bytes_reason<M: HostMemory + HostOps>(
     if end > size {
         return Err(R::OutOfBounds);
     }
+    Ok((BufferBacking { gva, size }, need))
+}
+
+/// Load the index bytes a bound indexed draw references, returning the **specific**
+/// reason on failure. Metal emits it directly; Vulkan delegates it through
+/// `DrawPreparationDecline::IndexLoad`, so both rails keep one reason vocabulary.
+/// Runs on the drain worker (off main core); only reached when `req.indexed` is
+/// set, so it cannot flood a 2D-UI boot.
+#[cfg(any(test, all(feature = "backend-metal", target_os = "macos")))]
+fn load_index_bytes_reason<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    info: &IndexedDrawInfo,
+) -> Result<Vec<u8>, IndexLoadReason> {
+    use IndexLoadReason as R;
+    let (backing, need) = resolve_index_window_reason(state, host, task_id, info)?;
     let mut buf = vec![0u8; need];
     gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
-        gva + info.index_buffer_offset,
+        backing.gva + info.index_buffer_offset,
         &mut buf,
         state.page_shift,
     )

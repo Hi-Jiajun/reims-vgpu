@@ -461,12 +461,17 @@ engine_counters! {
         draw_cover_full,
         draw_cover_loaded_full_scissor,
         draw_cover_loaded_partial_scissor,
-        /// Vertex/storage buffer binds the draw pointed straight at the guest's
-        /// own pages through the imported RAMBlock, with no copy in either
-        /// direction. Ranked against `buffer_snapshot_binds` and the
+        /// Vertex/storage/index buffer binds the draw pointed straight at the
+        /// guest's own pages through the imported RAMBlock, with no copy in
+        /// either direction. Ranked against `buffer_snapshot_binds` and the
         /// `stage_phase` `runs_*` bars, which are what the CPU still gathers.
         buffer_guest_imports,
         buffer_guest_import_bytes,
+        /// Index-buffer subset of the direct-import totals above. Kept apart
+        /// because indexed draws previously copied this resource through a CPU
+        /// `Vec` and therefore appeared in neither zero-copy disposition.
+        buffer_guest_index_imports,
+        buffer_guest_index_import_bytes,
         /// Vertex/storage buffer binds the GPU assembled out of the guest's own
         /// pages, one `VkBufferCopy` per GPA-contiguous stretch, into a
         /// device-local destination the draw then binds.
@@ -493,6 +498,8 @@ engine_counters! {
         /// Gathered windows consumed by both fixed-function vertex fetch and a
         /// shader storage-buffer bind. Counted once, like the physical gather.
         buffer_guest_gather_shared_bytes,
+        /// Gather bytes consumed only by fixed-function index fetch.
+        buffer_guest_gather_index_bytes,
         /// Compute dispatches the buffer gather issued in place of those
         /// regions, and the plans that could not become one.
         ///
@@ -524,6 +531,8 @@ engine_counters! {
         /// buffer if it is taken against a boot's `batch_flush_draws /
         /// batch_flushes`, which says how many draws there were to reuse over.
         buffer_bind_reuses,
+        /// Reuses above whose consumer is the indexed-draw input.
+        buffer_index_bind_reuses,
         /// Graphics state a draw did **not** record because the command buffer
         /// it joined was already carrying exactly it — see
         /// `ResourcePools::CbGraphicsState`.
@@ -961,14 +970,28 @@ impl EngineCounters {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub fn note_buffer_bind_reused(&self) {
+    pub(super) fn note_buffer_bind_reused(&self, role: super::exec::BufferGatherRole) {
         self.buffer_bind_reuses.fetch_add(1, Ordering::Relaxed);
+        if role.includes_index() {
+            self.buffer_index_bind_reuses
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
-    pub fn note_buffer_guest_import(&self, bytes: u64) {
+    pub(super) fn note_buffer_guest_import(
+        &self,
+        bytes: u64,
+        role: super::exec::BufferGatherRole,
+    ) {
         self.buffer_guest_imports.fetch_add(1, Ordering::Relaxed);
         self.buffer_guest_import_bytes
             .fetch_add(bytes, Ordering::Relaxed);
+        if role.includes_index() {
+            self.buffer_guest_index_imports
+                .fetch_add(1, Ordering::Relaxed);
+            self.buffer_guest_index_import_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
     }
 
     pub(super) fn note_buffer_guest_gather(
@@ -982,10 +1005,14 @@ impl EngineCounters {
             .fetch_add(bytes, Ordering::Relaxed);
         self.buffer_guest_gather_regions
             .fetch_add(regions, Ordering::Relaxed);
-        let counter = match role {
-            super::exec::BufferGatherRole::Vertex => &self.buffer_guest_gather_vertex_bytes,
-            super::exec::BufferGatherRole::Storage => &self.buffer_guest_gather_storage_bytes,
-            super::exec::BufferGatherRole::Shared => &self.buffer_guest_gather_shared_bytes,
+        let counter = if role.is_shared() {
+            &self.buffer_guest_gather_shared_bytes
+        } else if role.includes_index() {
+            &self.buffer_guest_gather_index_bytes
+        } else if role.is_storage_only() {
+            &self.buffer_guest_gather_storage_bytes
+        } else {
+            &self.buffer_guest_gather_vertex_bytes
         };
         counter.fetch_add(bytes, Ordering::Relaxed);
     }

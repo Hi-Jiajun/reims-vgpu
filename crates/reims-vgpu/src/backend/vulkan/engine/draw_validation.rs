@@ -21,6 +21,9 @@ pub enum DrawValidationDecline {
         binding: u32,
         row_length_texels: u32,
     },
+    IndexGuestRunsRowStride {
+        row_length_texels: u32,
+    },
     VertexGuestRunsCoverage {
         location: u32,
         covered: u64,
@@ -28,6 +31,10 @@ pub enum DrawValidationDecline {
     },
     StorageGuestRunsCoverage {
         binding: u32,
+        covered: u64,
+        declared: u64,
+    },
+    IndexGuestRunsCoverage {
         covered: u64,
         declared: u64,
     },
@@ -72,11 +79,6 @@ pub enum DrawValidationDecline {
     IndexBytesShort {
         actual: usize,
         expected: usize,
-    },
-    IndexedVertexRange {
-        min_index: u32,
-        max_index: u32,
-        vertex_offset: i32,
     },
     DuplicateVertexLocation {
         location: u32,
@@ -237,7 +239,12 @@ impl Decline for DrawValidationDecline {
             Self::SeedEqualsTarget => "vk_draw_validate_seed_equals_target",
             Self::SeedAlsoSampled => "vk_draw_validate_seed_also_sampled",
             Self::IndexBytesShort { .. } => "vk_draw_validate_index_bytes_short",
-            Self::IndexedVertexRange { .. } => "vk_draw_validate_indexed_vertex_range",
+            Self::IndexGuestRunsRowStride { .. } => {
+                "vk_draw_validate_index_guest_runs_row_stride"
+            }
+            Self::IndexGuestRunsCoverage { .. } => {
+                "vk_draw_validate_index_guest_runs_coverage"
+            }
             Self::DuplicateVertexLocation { .. } => "vk_draw_validate_duplicate_vertex_location",
             Self::DuplicateVertexBinding { .. } => "vk_draw_validate_duplicate_vertex_binding",
             Self::ZeroVertexStepRate { .. } => "vk_draw_validate_zero_vertex_step_rate",
@@ -316,6 +323,13 @@ impl Decline for DrawValidationDecline {
                 ("covered", covered.to_string()),
                 ("declared", declared.to_string()),
             ],
+            Self::IndexGuestRunsRowStride { row_length_texels } => {
+                vec![("row_length_texels", row_length_texels.to_string())]
+            }
+            Self::IndexGuestRunsCoverage { covered, declared } => vec![
+                ("covered", covered.to_string()),
+                ("declared", declared.to_string()),
+            ],
             Self::ZeroTargetGeometry { width, height } => {
                 vec![("width", width.to_string()), ("height", height.to_string())]
             }
@@ -346,15 +360,6 @@ impl Decline for DrawValidationDecline {
             Self::TargetGuestSeedCoverage { covered, declared } => vec![
                 ("covered", covered.to_string()),
                 ("declared", declared.to_string()),
-            ],
-            Self::IndexedVertexRange {
-                min_index,
-                max_index,
-                vertex_offset,
-            } => vec![
-                ("min_index", min_index.to_string()),
-                ("max_index", max_index.to_string()),
-                ("vertex_offset", vertex_offset.to_string()),
             ],
             Self::DuplicateVertexLocation { location }
             | Self::ZeroVertexStepRate { location }
@@ -536,6 +541,9 @@ mod tests {
                 binding: 1,
                 row_length_texels: 16,
             },
+            DrawValidationDecline::IndexGuestRunsRowStride {
+                row_length_texels: 16,
+            },
             DrawValidationDecline::VertexGuestRunsCoverage {
                 location: 0,
                 covered: 3,
@@ -543,6 +551,10 @@ mod tests {
             },
             DrawValidationDecline::StorageGuestRunsCoverage {
                 binding: 1,
+                covered: 3,
+                declared: 4,
+            },
+            DrawValidationDecline::IndexGuestRunsCoverage {
                 covered: 3,
                 declared: 4,
             },
@@ -587,11 +599,6 @@ mod tests {
             DrawValidationDecline::IndexBytesShort {
                 actual: 3,
                 expected: 4,
-            },
-            DrawValidationDecline::IndexedVertexRange {
-                min_index: 0,
-                max_index: 3,
-                vertex_offset: -1,
             },
             DrawValidationDecline::DuplicateVertexLocation { location: 0 },
             DrawValidationDecline::DuplicateVertexBinding { binding: 0 },
@@ -704,7 +711,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 50, "the validator's reason census moved");
+        assert_eq!(before, 51, "the validator's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-validation slug");
     }
 

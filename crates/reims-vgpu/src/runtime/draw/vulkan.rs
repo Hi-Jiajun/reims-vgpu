@@ -3373,34 +3373,32 @@ pub(super) fn gather_span_if_eligible(full: u64, extent_cap: Option<u64>) -> Opt
     (full >= ZERO_COPY_BUFFER_MIN_BYTES).then(|| extent_cap.map_or(full, |cap| full.min(cap)))
 }
 
-pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
+/// Answer a retained zero-copy resolution without touching the object table or
+/// walking the task page table.
+fn held_buffer_content(
     state: &mut DeviceState,
-    host: &mut M,
     task_id: u32,
     buffer_ref: u32,
     offset: u64,
-    allow_zero_copy: bool,
     extent_cap: Option<u64>,
 ) -> Option<crate::backend::vulkan::engine::BufferContent> {
     // The guest contract is buffer-plus-offset. Once the whole resource has a
     // packed alias, derive the bind directly from that one retained object:
     // neither the object descriptor nor the task page table changes between
     // offsets, and both announce the events that retire this entry.
-    if allow_zero_copy {
-        let packed = match state.bound_buffers.packed(task_id, buffer_ref) {
-            Some(crate::runtime::bound_buffers::PackedBufferResolution::Available(packed)) => {
-                Some(packed.clone())
-            }
-            _ => None,
-        };
-        if let Some(packed) = packed {
-            if offset < packed.size {
-                let full = packed.size - offset;
-                if let Some(span) = gather_span_if_eligible(full, extent_cap) {
-                    if let Some(bound) = slice_packed_buffer(&packed, offset, span) {
-                        crate::runtime::drain::note_store_route("zc_buffer_held");
-                        return Some(bound_buffer_content(&bound));
-                    }
+    let packed = match state.bound_buffers.packed(task_id, buffer_ref) {
+        Some(crate::runtime::bound_buffers::PackedBufferResolution::Available(packed)) => {
+            Some(packed.clone())
+        }
+        _ => None,
+    };
+    if let Some(packed) = packed {
+        if offset < packed.size {
+            let full = packed.size - offset;
+            if let Some(span) = gather_span_if_eligible(full, extent_cap) {
+                if let Some(bound) = slice_packed_buffer(&packed, offset, span) {
+                    crate::runtime::drain::note_store_route("zc_buffer_held");
+                    return Some(bound_buffer_content(&bound));
                 }
             }
         }
@@ -3411,24 +3409,36 @@ pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
     // below produces the same runs until the guest moves the addresses, and it
     // announces every such move. This is the whole point of the registry — see
     // `crate::runtime::bound_buffers`.
-    if allow_zero_copy {
-        if let Some(bound) = state
-            .bound_buffers
-            .get(task_id, buffer_ref, offset, extent_cap)
-        {
-            let content = bound_buffer_content(bound);
-            crate::runtime::drain::note_store_route("zc_buffer_held");
-            return Some(content);
-        }
+    if let Some(bound) = state
+        .bound_buffers
+        .get(task_id, buffer_ref, offset, extent_cap)
+    {
+        let content = bound_buffer_content(bound);
+        crate::runtime::drain::note_store_route("zc_buffer_held");
+        return Some(content);
     }
+    None
+}
+
+/// Resolve a previously validated backing through the zero-copy ladder, with
+/// the CPU read as the capability fallback.
+fn load_buffer_content_resolved<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    buffer_ref: u32,
+    offset: u64,
+    allow_zero_copy: bool,
+    extent_cap: Option<u64>,
+    backing: &BufferBacking,
+) -> Option<crate::backend::vulkan::engine::BufferContent> {
     // Resolve the backing (object-list entry + descriptor) ONCE and share it
     // between the zero-copy attempt and the CPU fallback. Sub-floor binds used
     // to walk the task PT twice — once in the failed ZC attempt, once in the
     // CPU read.
-    let backing = resolve_buffer_backing(state, host, task_id, buffer_ref)?;
     if allow_zero_copy {
         if let Some(bound) = try_buffer_zero_copy_resolved(
-            state, host, task_id, buffer_ref, &backing, offset, extent_cap,
+            state, host, task_id, buffer_ref, backing, offset, extent_cap,
         ) {
             let content = bound_buffer_content(&bound);
             // A packed resource is already retained by `(task, reference)` and
@@ -3447,8 +3457,75 @@ pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
             return Some(content);
         }
     }
-    let bytes = read_buffer_bytes_resolved(state, host, task_id, &backing, offset, extent_cap)?;
+    let bytes = read_buffer_bytes_resolved(state, host, task_id, backing, offset, extent_cap)?;
     Some(crate::backend::vulkan::engine::BufferContent::from(bytes))
+}
+
+pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    buffer_ref: u32,
+    offset: u64,
+    allow_zero_copy: bool,
+    extent_cap: Option<u64>,
+) -> Option<crate::backend::vulkan::engine::BufferContent> {
+    if allow_zero_copy {
+        if let Some(content) =
+            held_buffer_content(state, task_id, buffer_ref, offset, extent_cap)
+        {
+            return Some(content);
+        }
+    }
+    // Resolve the backing (object-list entry + descriptor) ONCE and share it
+    // between the zero-copy attempt and the CPU fallback. Sub-floor binds used
+    // to walk the task PT twice — once in the failed ZC attempt, once in the
+    // CPU read.
+    let backing = resolve_buffer_backing(state, host, task_id, buffer_ref)?;
+    load_buffer_content_resolved(
+        state,
+        host,
+        task_id,
+        buffer_ref,
+        offset,
+        allow_zero_copy,
+        extent_cap,
+        &backing,
+    )
+}
+
+/// Retain an indexed draw's exact guest-buffer window for the Vulkan vertex
+/// input stage. Unlike the Metal fallback, this does not materialize the index
+/// array on the CPU: Vulkan consumes the bounded resource directly when the
+/// command buffer executes.
+fn load_index_content_reason<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    info: &IndexedDrawInfo,
+) -> Result<crate::backend::vulkan::engine::BufferContent, IndexLoadReason> {
+    let (backing, need) = resolve_index_window_reason(state, host, task_id, info)?;
+    let extent = Some(need as u64);
+    if let Some(content) = held_buffer_content(
+        state,
+        task_id,
+        info.index_buffer_ref,
+        info.index_buffer_offset,
+        extent,
+    ) {
+        return Ok(content);
+    }
+    load_buffer_content_resolved(
+        state,
+        host,
+        task_id,
+        info.index_buffer_ref,
+        info.index_buffer_offset,
+        true,
+        extent,
+        &backing,
+    )
+    .ok_or(IndexLoadReason::ReadFail)
 }
 
 /// Zero-copy linear sampled bind: resolve the texture's tight level-0 GVA
@@ -7583,8 +7660,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     reason: IndexLoadReason::TypeUnsupported,
                 })
             })?;
-            let indices =
-                load_index_bytes_reason(state, host, req.task_id, idx).map_err(|reason| {
+            let content =
+                load_index_content_reason(state, host, req.task_id, idx).map_err(|reason| {
                     DrawError::DrawPreparation(DrawPreparationDecline::IndexLoad { reason })
                 })?;
             resources.indexed = Some(crate::backend::vulkan::engine::IndexedDrawResource {
@@ -7601,7 +7678,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         reason: crate::runtime::draw::IndexLoadReason::BaseVertexOutOfRange,
                     })
                 })?,
-                indices,
+                content,
             });
         }
         // Vulkan's `firstInstance` is Metal's `baseInstance`. The field has

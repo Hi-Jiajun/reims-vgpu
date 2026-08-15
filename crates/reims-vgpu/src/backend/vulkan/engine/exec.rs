@@ -85,19 +85,41 @@ struct PendingGuestGather {
 /// byte counters partition `buffer_guest_gather_bytes`; counting logical binds
 /// would double-charge the shared case and could choose the wrong zero-copy
 /// rail.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum BufferGatherRole {
-    Vertex,
-    Storage,
-    Shared,
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct BufferGatherRole {
+    vertex: bool,
+    storage: bool,
+    index_alignment: Option<u64>,
+}
+
+impl BufferGatherRole {
+    const VERTEX: Self = Self {
+        vertex: true,
+        storage: false,
+        index_alignment: None,
+    };
+    const STORAGE: Self = Self {
+        vertex: false,
+        storage: true,
+        index_alignment: None,
+    };
+    pub(super) fn is_shared(self) -> bool {
+        self.vertex as u8 + self.storage as u8 + self.index_alignment.is_some() as u8 > 1
+    }
+
+    pub(super) fn includes_index(self) -> bool {
+        self.index_alignment.is_some()
+    }
+
+    pub(super) fn is_storage_only(self) -> bool {
+        self.storage && !self.vertex && self.index_alignment.is_none()
+    }
 }
 
 /// The offset alignment imposed by the consumer that will bind this source.
 fn buffer_bind_offset_alignment(role: BufferGatherRole, storage_align: u64) -> u64 {
-    match role {
-        BufferGatherRole::Vertex => 1,
-        BufferGatherRole::Storage | BufferGatherRole::Shared => storage_align,
-    }
+    let storage = if role.storage { storage_align } else { 1 };
+    storage.max(role.index_alignment.unwrap_or(1))
 }
 
 fn buffer_gather_roles(
@@ -105,13 +127,27 @@ fn buffer_gather_roles(
 ) -> std::collections::BTreeMap<(usize, u64, u64), BufferGatherRole> {
     let mut roles = std::collections::BTreeMap::new();
     for content in req.vertex_attributes.iter().map(|r| &r.content) {
-        roles.insert(CbBind::of(content).key(), BufferGatherRole::Vertex);
+        roles
+            .entry(CbBind::of(content).key())
+            .and_modify(|role: &mut BufferGatherRole| role.vertex = true)
+            .or_insert(BufferGatherRole::VERTEX);
     }
     for content in req.storage_buffers.iter().map(|r| &r.content) {
         roles
             .entry(CbBind::of(content).key())
-            .and_modify(|role| *role = BufferGatherRole::Shared)
-            .or_insert(BufferGatherRole::Storage);
+            .and_modify(|role| role.storage = true)
+            .or_insert(BufferGatherRole::STORAGE);
+    }
+    if let Some(indexed) = &req.indexed {
+        let alignment = indexed.index_type.byte_size() as u64;
+        roles
+            .entry(CbBind::of(&indexed.content).key())
+            .and_modify(|role| role.index_alignment = Some(alignment))
+            .or_insert(BufferGatherRole {
+                vertex: false,
+                storage: false,
+                index_alignment: Some(alignment),
+            });
     }
     roles
 }
@@ -586,7 +622,7 @@ unsafe fn stage_buffer_content(
     let bind = super::pools::CbBind::of(content);
     let key = bind.key();
     if let Some(bound) = pools.cb_bound_buffer(&bind) {
-        counters.note_buffer_bind_reused();
+        counters.note_buffer_bind_reused(gather_role);
         return Ok(bound);
     }
     // Set by the one arm that returns a slot it has not filled. Read after the
@@ -616,7 +652,7 @@ unsafe fn stage_buffer_content(
             if let Some(bound) = unsafe { import_guest_buffer_window(ctx, pools, src, gather_role) }
             {
                 pools.note_guest_read_recorded();
-                counters.note_buffer_guest_import(src.total_len);
+                counters.note_buffer_guest_import(src.total_len, gather_role);
                 bound
             } else if let Some((bound, pending)) =
                 unsafe { gather_guest_buffer_window(ctx, pools, counters, src, usage)? }
@@ -1309,6 +1345,7 @@ crate::observe::decline::decline_display!(SampledImportDecline);
 enum BufferValidationRole {
     Vertex,
     Storage,
+    Index,
 }
 
 fn validate_buffer_content(
@@ -1329,6 +1366,9 @@ fn validate_buffer_content(
                 binding: resource_index,
                 row_length_texels: src.row_length_texels,
             },
+            BufferValidationRole::Index => DrawValidationDecline::IndexGuestRunsRowStride {
+                row_length_texels: src.row_length_texels,
+            },
         };
         return Err(DrawError::DrawValidation(decline));
     }
@@ -1343,6 +1383,10 @@ fn validate_buffer_content(
             },
             BufferValidationRole::Storage => DrawValidationDecline::StorageGuestRunsCoverage {
                 binding: resource_index,
+                covered: sum,
+                declared: src.total_len,
+            },
+            BufferValidationRole::Index => DrawValidationDecline::IndexGuestRunsCoverage {
                 covered: sum,
                 declared: src.total_len,
             },
@@ -1553,31 +1597,21 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
     let last_record: u32 = match &req.indexed {
         Some(indexed) => {
             let need = indexed.index_count as usize * indexed.index_type.byte_size();
-            if indexed.indices.len() < need {
+            if indexed.content.len() < need {
                 return Err(DrawError::DrawValidation(
                     DrawValidationDecline::IndexBytesShort {
-                        actual: indexed.indices.len(),
+                        actual: indexed.content.len(),
                         expected: need,
                     },
                 ));
             }
-            if no_vertex_fetch {
-                0
-            } else {
-                let (min_index, max_index) = indexed.index_range();
-                let first = i64::from(min_index) + i64::from(indexed.vertex_offset);
-                let last = i64::from(max_index) + i64::from(indexed.vertex_offset);
-                if first < 0 || last < 0 || last > u32::MAX as i64 {
-                    return Err(DrawError::DrawValidation(
-                        DrawValidationDecline::IndexedVertexRange {
-                            min_index,
-                            max_index,
-                            vertex_offset: indexed.vertex_offset,
-                        },
-                    ));
-                }
-                last as u32
-            }
+            validate_buffer_content(&indexed.content, BufferValidationRole::Index, 0)?;
+            // Indexed vertex addresses are data-dependent and the API does not
+            // require a CPU scan before submission. The enabled Vulkan robust
+            // buffer contract bounds any vertex fetch outside the retained
+            // buffer; zero is enough here to validate the first element's
+            // structural offset and stride without reading the index resource.
+            0
         }
         None => req.vertex_count.saturating_sub(1),
     };
@@ -3015,23 +3049,26 @@ pub(crate) unsafe fn execute_draw_inner(
         vertex_bufs.push((resource.binding, slot));
     }
 
-    // Index buffer
-    let mut index_slot = None;
-    if let Some(indexed) = &req.indexed {
-        let slot = {
-            let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-            pools.acquire_staging(
-                ctx,
-                indexed.indices.len() as u64,
-                vk::BufferUsageFlags::INDEX_BUFFER,
-                counters,
-            )?
-        };
-        let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, indexed.indices.len() as u64);
-        pools.write_staging(ctx, &slot, &indexed.indices)?;
-        drop(_s);
-        index_slot = Some(slot);
-    }
+    // Index data follows the same retained resource path as vertex/storage
+    // data. A direct import binds the guest's pages; a scattered window is
+    // gathered once by this command buffer; only incapable hosts CPU-stage it.
+    let index_slot = match &req.indexed {
+        Some(indexed) => Some(stage_buffer_content(
+            ctx,
+            pools,
+            counters,
+            &indexed.content,
+            StageBufferUse {
+                usage: vk::BufferUsageFlags::INDEX_BUFFER,
+                snapshot_volatile: batch_eligible,
+                gather_role: *gather_roles
+                    .get(&CbBind::of(&indexed.content).key())
+                    .expect("the index buffer was classified"),
+            },
+            &mut guest_gathers,
+        )?),
+        None => None,
+    };
 
     // Storage buffers (deduplicated by content with the vertex streams: a
     // stage-in buffer doubling as a storage bind reuses the same slot —
@@ -4816,7 +4853,7 @@ pub(crate) unsafe fn execute_draw_inner(
     match (&req.indexed, &index_slot) {
         (Some(indexed), Some(ibuf)) => {
             ctx.device
-                .cmd_bind_index_buffer(cb, ibuf.buffer, 0, indexed.index_type.vk());
+                .cmd_bind_index_buffer(cb, ibuf.buffer, ibuf.offset, indexed.index_type.vk());
             ctx.device.cmd_draw_indexed(
                 cb,
                 indexed.index_count,
@@ -6045,8 +6082,8 @@ mod tests {
     #[test]
     fn buffer_gather_roles_partition_physical_content_allocations() {
         use super::super::types::{
-            GuestRun, GuestRunSource, StorageBufferResource, VertexAttributeFormat,
-            VertexAttributeResource,
+            GuestRun, GuestRunSource, IndexType, IndexedDrawResource, StorageBufferResource,
+            VertexAttributeFormat, VertexAttributeResource,
         };
 
         let content = |host_ptr| {
@@ -6062,10 +6099,12 @@ mod tests {
         let vertex_only = content(0x1000);
         let storage_only = content(0x2000);
         let shared = content(0x3000);
+        let index_only = content(0x4000);
         let keys = [
             CbBind::of(&vertex_only).key(),
             CbBind::of(&storage_only).key(),
             CbBind::of(&shared).key(),
+            CbBind::of(&index_only).key(),
         ];
         let req = DrawRequest {
             vertex_attributes: vec![
@@ -6100,14 +6139,22 @@ mod tests {
                     content: shared,
                 },
             ],
+            indexed: Some(IndexedDrawResource {
+                index_type: IndexType::U16,
+                index_count: 8,
+                vertex_offset: 0,
+                content: index_only,
+            }),
             ..DrawRequest::default()
         };
 
         let roles = buffer_gather_roles(&req);
-        assert_eq!(roles.len(), 3, "shared content must stay one operation");
-        assert_eq!(roles[&keys[0]], BufferGatherRole::Vertex);
-        assert_eq!(roles[&keys[1]], BufferGatherRole::Storage);
-        assert_eq!(roles[&keys[2]], BufferGatherRole::Shared);
+        assert_eq!(roles.len(), 4, "shared content must stay one operation");
+        assert_eq!(roles[&keys[0]], BufferGatherRole::VERTEX);
+        assert_eq!(roles[&keys[1]], BufferGatherRole::STORAGE);
+        assert!(roles[&keys[2]].is_shared());
+        assert!(roles[&keys[3]].includes_index());
+        assert_eq!(roles[&keys[3]].index_alignment, Some(2));
     }
 
     /// Direct imports obey the limit of the descriptor actually written. A
@@ -6115,13 +6162,27 @@ mod tests {
     /// vertex-only source has no Vulkan offset-alignment limit.
     #[test]
     fn direct_import_alignment_follows_the_actual_consumer() {
-        assert_eq!(buffer_bind_offset_alignment(BufferGatherRole::Vertex, 4), 1);
+        assert_eq!(buffer_bind_offset_alignment(BufferGatherRole::VERTEX, 4), 1);
         assert_eq!(
-            buffer_bind_offset_alignment(BufferGatherRole::Storage, 4),
+            buffer_bind_offset_alignment(BufferGatherRole::STORAGE, 4),
             4
         );
-        assert_eq!(buffer_bind_offset_alignment(BufferGatherRole::Shared, 4), 4);
-        assert!(96u64.is_multiple_of(buffer_bind_offset_alignment(BufferGatherRole::Storage, 4,)));
+        let index = BufferGatherRole {
+            vertex: false,
+            storage: false,
+            index_alignment: Some(2),
+        };
+        assert_eq!(buffer_bind_offset_alignment(index, 4), 2);
+        let shared = BufferGatherRole {
+            vertex: true,
+            storage: true,
+            index_alignment: None,
+        };
+        assert_eq!(buffer_bind_offset_alignment(shared, 4), 4);
+        assert!(96u64.is_multiple_of(buffer_bind_offset_alignment(
+            BufferGatherRole::STORAGE,
+            4,
+        )));
     }
 
     /// The two re-basings a gather region does, at the values that make them
@@ -6947,6 +7008,22 @@ mod tests {
         }
     }
 
+    fn index_buffer_req(content: BufferContent) -> DrawRequest {
+        DrawRequest {
+            width: 8,
+            height: 8,
+            vert_spirv: std::sync::Arc::new(vec![0]),
+            frag_spirv: std::sync::Arc::new(vec![0]),
+            indexed: Some(super::super::types::IndexedDrawResource {
+                index_type: super::super::types::IndexType::U16,
+                index_count: 3,
+                vertex_offset: 0,
+                content,
+            }),
+            ..DrawRequest::default()
+        }
+    }
+
     #[test]
     fn buffer_guest_runs_consistent_span_validates() {
         let req = storage_buffer_req(buffer_guest_runs(&[0x3000, 0x1000], 0x4000, 0));
@@ -6977,6 +7054,27 @@ mod tests {
         assert_eq!(
             validation_slug(&req),
             "vk_draw_validate_storage_guest_runs_coverage"
+        );
+    }
+
+    #[test]
+    fn index_guest_runs_validate_the_resource_window_without_reading_it() {
+        let req = index_buffer_req(buffer_guest_runs(&[6], 6, 0));
+        assert!(validate_v1(&req).is_ok());
+
+        let short = index_buffer_req(buffer_guest_runs(&[5], 5, 0));
+        assert_eq!(validation_slug(&short), "vk_draw_validate_index_bytes_short");
+
+        let uncovered = index_buffer_req(buffer_guest_runs(&[5], 6, 0));
+        assert_eq!(
+            validation_slug(&uncovered),
+            "vk_draw_validate_index_guest_runs_coverage"
+        );
+
+        let strided = index_buffer_req(buffer_guest_runs(&[6], 6, 1));
+        assert_eq!(
+            validation_slug(&strided),
+            "vk_draw_validate_index_guest_runs_row_stride"
         );
     }
 
