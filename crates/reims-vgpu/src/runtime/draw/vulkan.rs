@@ -2863,25 +2863,27 @@ fn coalesce_pages_to_runs<M: HostOps>(
     Some(runs)
 }
 
-/// Resolve one linear resource to the packed host allocation shared by all of
-/// its buffer offsets or texture planes. A negative result is held under the
-/// same retirement rules as a positive one: mappings do not become complete
-/// without a map/object notification, and those notifications remove the
-/// entry.
+/// Ensure one linear resource has the packed host allocation shared by all of
+/// its buffer offsets or texture planes, returning whether that allocation is
+/// available. The caller then borrows it from
+/// [`crate::runtime::bound_buffers::BoundBuffers`]. A negative result is held
+/// under the same retirement rules as a positive one: mappings do not become
+/// complete without a map/object notification, and those notifications remove
+/// the entry.
 #[derive(Clone, Copy)]
 pub(super) enum PackedResourceRail {
     Buffer,
     LinearSample,
 }
 
-pub(super) fn packed_resource_resolution<M: HostMemory + HostOps>(
+pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     resource_ref: u32,
     backing: &BufferBacking,
     rail: PackedResourceRail,
-) -> crate::runtime::bound_buffers::PackedBufferResolution {
+) -> bool {
     use crate::runtime::bound_buffers::{PackedBuffer, PackedBufferResolution};
 
     if let Some(held) = state.bound_buffers.packed(task_id, resource_ref) {
@@ -2894,7 +2896,7 @@ pub(super) fn packed_resource_resolution<M: HostMemory + HostOps>(
             }
         };
         if matches {
-            return held.clone();
+            return matches!(held, PackedBufferResolution::Available(_));
         }
     }
 
@@ -2974,10 +2976,11 @@ pub(super) fn packed_resource_resolution<M: HostMemory + HostOps>(
             "zc_lin_packed_unavailable"
         }
     });
+    let available = matches!(made, PackedBufferResolution::Available(_));
     state
         .bound_buffers
-        .insert_packed(task_id, resource_ref, made.clone());
-    made
+        .insert_packed(task_id, resource_ref, made);
+    available
 }
 
 pub(super) fn slice_packed_buffer(
@@ -3017,6 +3020,43 @@ pub(super) fn sampled_backing_from_packed(
         owner,
         origin: crate::backend::vulkan::engine::SampledByteOrigin::LinearTexture,
     })
+}
+
+/// Build the single-plane direct sampled request from a borrowed retained
+/// allocation. Only the execution payloads take new strong references; the
+/// allocation geometry and physical construction list stay with the resource.
+pub(super) fn direct_linear_sample_from_packed(
+    packed: &crate::runtime::bound_buffers::PackedBuffer,
+    level_offset: u64,
+    row_pitch: u64,
+    span: u64,
+    row_length_texels: u32,
+    native: TexelLayout,
+    native_components: pixel_format::SwizzlePlan,
+    owner: crate::model::TaskResourceLifetimeRef,
+) -> Option<SampledSourceRequest> {
+    let direct_image = sampled_backing_from_packed(
+        packed,
+        level_offset,
+        row_pitch,
+        span,
+        owner,
+    )?;
+    Some(SampledSourceRequest::GuestRuns(
+        crate::backend::vulkan::engine::GuestRunSource {
+            runs: std::sync::Arc::clone(&packed.runs),
+            source_offset: level_offset,
+            total_len: span,
+            row_length_texels,
+            pages: Some(std::sync::Arc::clone(&packed.pages)),
+            direct_image: Some(direct_image),
+        },
+        native,
+        1,
+        None,
+        crate::runtime::gather_witness::GatherVouch::Fresh,
+        native_components,
+    ))
 }
 
 /// Build one directly sampled plane from the mapping's retained allocation.
@@ -3242,17 +3282,21 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("zc_buffer_extent_narrowed");
         crate::runtime::drain::note_store_route_n("zc_buffer_extent_saved_bytes", full - span);
     }
-    if let crate::runtime::bound_buffers::PackedBufferResolution::Available(packed) =
-        packed_resource_resolution(
-            state,
-            host,
+    if ensure_packed_resource(
+        state,
+        host,
+        task_id,
+        buffer_ref,
+        backing,
+        PackedResourceRail::Buffer,
+    ) {
+        let packed = state.bound_buffers.packed_available(
             task_id,
             buffer_ref,
-            backing,
-            PackedResourceRail::Buffer,
-        )
-    {
-        if let Some(bound) = slice_packed_buffer(&packed, offset, span) {
+            backing.gva,
+            backing.size,
+        )?;
+        if let Some(bound) = slice_packed_buffer(packed, offset, span) {
             crate::runtime::drain::note_store_route("zc_buffer_imported");
             return Some(bound);
         }
@@ -4104,65 +4148,70 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // Retain the texture's complete allocation once. A sampled image needs the
     // allocation base, level offset and row pitch together; reducing it to the
     // level's page runs would throw away the resource shape and force a copy.
-    let packed = tex
+    let allocation = tex
         .allocation_base_gva(state.page_shift)
         .filter(|_| tex.allocation_size != 0)
-        .and_then(|allocation_gva| {
-            let backing = BufferBacking {
-                gva: allocation_gva,
-                size: tex.allocation_size,
-            };
-            match packed_resource_resolution(
-                state,
-                host,
-                task_id,
-                texture_ref,
-                &backing,
-                PackedResourceRail::LinearSample,
-            ) {
-                crate::runtime::bound_buffers::PackedBufferResolution::Available(packed) => {
-                    Some(packed)
-                }
-                crate::runtime::bound_buffers::PackedBufferResolution::Unavailable { .. } => None,
-            }
+        .map(|allocation_gva| BufferBacking {
+            gva: allocation_gva,
+            size: tex.allocation_size,
         });
 
+    let available = allocation.as_ref().is_some_and(|backing| {
+        ensure_packed_resource(
+            state,
+            host,
+            task_id,
+            texture_ref,
+            backing,
+            PackedResourceRail::LinearSample,
+        )
+    });
+
+    // A warm resource bind borrows the retained allocation directly. The
+    // single-plane request retains only the import/run payloads execution
+    // needs; allocation geometry and the physical construction list remain on
+    // the task resource.
+    if available && planes == 1 {
+        let backing = allocation.as_ref()?;
+        if let Some(packed) = state.bound_buffers.packed_available(
+            task_id,
+            texture_ref,
+            backing.gva,
+            backing.size,
+        ) {
+            if let Some(request) = direct_linear_sample_from_packed(
+                packed,
+                layout.offset,
+                layout.row_stride,
+                span,
+                row_length_texels,
+                native,
+                native_components,
+                owner.clone(),
+            ) {
+                if span < SAMPLED_GATHER_MIN_BYTES {
+                    crate::runtime::drain::note_store_route("zc_lin_direct_below_gather_floor");
+                }
+                return Some((w, h, request));
+            }
+        }
+    }
+
+    // The witness recorder mutably borrows `state`, so the multi-plane arm
+    // owns its resource state across that call. Single-plane binds return above
+    // and never pay this construction-state clone.
+    let packed = if available && planes != 1 {
+        allocation.as_ref().and_then(|backing| {
+            state
+                .bound_buffers
+                .packed_available(task_id, texture_ref, backing.gva, backing.size)
+                .cloned()
+        })
+    } else {
+        None
+    };
+
     if let Some(packed) = packed {
-        let direct_image = (planes == 1)
-            .then(|| {
-                sampled_backing_from_packed(
-                    &packed,
-                    layout.offset,
-                    layout.row_stride,
-                    span,
-                    owner.clone(),
-                )
-            })
-            .flatten();
-        if direct_image.is_some() && span < SAMPLED_GATHER_MIN_BYTES {
-            crate::runtime::drain::note_store_route("zc_lin_direct_below_gather_floor");
-        }
-        if direct_image.is_some() {
-            return Some((
-                w,
-                h,
-                SampledSourceRequest::GuestRuns(
-                    engine::GuestRunSource {
-                        runs: std::sync::Arc::clone(&packed.runs),
-                        source_offset: layout.offset,
-                        total_len: span,
-                        row_length_texels,
-                        pages: Some(std::sync::Arc::clone(&packed.pages)),
-                        direct_image,
-                    },
-                    native,
-                    planes,
-                    None,
-                    crate::runtime::gather_witness::GatherVouch::Fresh,
-                    native_components,
-                ),
-            ));
-        }
         if !native.a_cost_floor_may_decline() || span >= SAMPLED_GATHER_MIN_BYTES {
             let page = state.page_size();
             let packed_offset = packed.head.checked_add(layout.offset)?;
@@ -4201,7 +4250,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                         total_len: span,
                         row_length_texels,
                         pages: Some(std::sync::Arc::clone(&packed.pages)),
-                        direct_image,
+                        direct_image: None,
                     },
                     native,
                     planes,

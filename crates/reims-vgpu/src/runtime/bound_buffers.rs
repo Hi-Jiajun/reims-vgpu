@@ -307,6 +307,34 @@ impl BoundBuffers {
         self.packed.get(&(task_id, buffer_ref))
     }
 
+    /// Borrow the retained allocation when it still describes exactly this
+    /// resource construction.
+    ///
+    /// The geometry check matters on the narrow window between a descriptor
+    /// changing and its retirement packet being consumed: returning the old
+    /// allocation there would make a warm lookup observably different from a
+    /// fresh resolution. Returning a reference is equally deliberate. A warm
+    /// encoder bind borrows its resource object and retains only the execution
+    /// payload it hands onward; it does not acquire all of the construction
+    /// state merely to inspect it.
+    pub fn packed_available(
+        &self,
+        task_id: u32,
+        resource_ref: u32,
+        gva: u64,
+        size: u64,
+    ) -> Option<&PackedBuffer> {
+        match self.packed(task_id, resource_ref)? {
+            PackedBufferResolution::Available(packed)
+                if packed.gva == gva && packed.size == size =>
+            {
+                Some(packed)
+            }
+            PackedBufferResolution::Available(_)
+            | PackedBufferResolution::Unavailable { .. } => None,
+        }
+    }
+
     pub fn insert_packed(&mut self, task_id: u32, buffer_ref: u32, packed: PackedBufferResolution) {
         self.packed.insert((task_id, buffer_ref), packed);
     }
@@ -539,7 +567,7 @@ mod tests {
                 gva: 0x10800,
                 size: 0x7000,
                 head: 0x800,
-                import,
+                import: Arc::clone(&import),
                 gpas: Arc::new(Vec::new()),
                 runs: Arc::new(Vec::new()),
                 pages: Arc::new(Vec::new()),
@@ -555,6 +583,25 @@ mod tests {
                 .expect("each bind lies in the one allocation");
             assert_eq!(slice.import(), id);
         }
+        let owners = Arc::strong_count(&import);
+        assert!(b.packed_available(3, 9, 0x10800, 0x7000).is_some());
+        assert_eq!(
+            Arc::strong_count(&import),
+            owners,
+            "a warm lookup borrows the resource rather than acquiring it"
+        );
+        assert!(
+            b.packed_available(3, 9, 0x11800, 0x7000).is_none(),
+            "a changed base cannot reuse the prior construction"
+        );
+        assert!(
+            b.packed_available(3, 9, 0x10800, 0x6000).is_none(),
+            "a changed allocation size cannot reuse the prior construction"
+        );
+        assert!(
+            b.packed_available(4, 9, 0x10800, 0x7000).is_none(),
+            "the same reference in another task is a different resource"
+        );
     }
 
     /// A range retire is scoped to its task: the same GVA under another task is

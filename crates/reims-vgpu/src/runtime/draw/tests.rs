@@ -5165,7 +5165,6 @@ fn guest_runs_decline_on_unstable_host_mappings() {
 fn packed_buffer_alias_is_reused_across_offsets() {
     use crate::contract::endian::st32;
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::runtime::bound_buffers::PackedBufferResolution;
 
     let page_shift = PAGE_SHIFT_X86;
     let page = 1u64 << page_shift;
@@ -5192,44 +5191,64 @@ fn packed_buffer_alias_is_reused_across_offsets() {
         gva: 0x800,
         size: 0x4800,
     };
-    let first = super::vulkan::packed_resource_resolution(
+    assert!(super::vulkan::ensure_packed_resource(
         &mut state,
         &mut host,
         1,
         7,
         &backing,
         super::vulkan::PackedResourceRail::Buffer,
-    );
+    ));
     let calls = host.map_pages_calls;
-    let second = super::vulkan::packed_resource_resolution(
+    let owners_before = {
+        let packed = state
+            .bound_buffers
+            .packed_available(1, 7, backing.gva, backing.size)
+            .expect("the fully mapped allocation must pack");
+        (
+            std::sync::Arc::strong_count(&packed.import),
+            std::sync::Arc::strong_count(&packed.gpas),
+            std::sync::Arc::strong_count(&packed.runs),
+            std::sync::Arc::strong_count(&packed.pages),
+        )
+    };
+    assert!(super::vulkan::ensure_packed_resource(
         &mut state,
         &mut host,
         1,
         7,
         &backing,
         super::vulkan::PackedResourceRail::Buffer,
-    );
+    ));
     crate::runtime::guest_ram::forget_import_limits();
 
-    let (PackedBufferResolution::Available(first), PackedBufferResolution::Available(second)) =
-        (first, second)
-    else {
-        panic!("the fully mapped allocation must pack")
-    };
     assert_eq!(
         host.map_pages_calls, calls,
         "the second offset reuses the alias"
     );
-    assert_eq!(first.import.id(), second.import.id());
-    let a = super::vulkan::slice_packed_buffer(&first, 0, 0x800).unwrap();
-    let b = super::vulkan::slice_packed_buffer(&first, 0x1000, 0x800).unwrap();
+    let packed = state
+        .bound_buffers
+        .packed_available(1, 7, backing.gva, backing.size)
+        .expect("the retained allocation remains available");
+    assert_eq!(
+        owners_before,
+        (
+            std::sync::Arc::strong_count(&packed.import),
+            std::sync::Arc::strong_count(&packed.gpas),
+            std::sync::Arc::strong_count(&packed.runs),
+            std::sync::Arc::strong_count(&packed.pages),
+        ),
+        "ensuring a warm resource borrows every retained payload"
+    );
+    let a = super::vulkan::slice_packed_buffer(packed, 0, 0x800).unwrap();
+    let b = super::vulkan::slice_packed_buffer(packed, 0x1000, 0x800).unwrap();
     assert_eq!(
         a.pages.as_ref().unwrap()[0].guest.import().id(),
-        first.import.id()
+        packed.import.id()
     );
     assert_eq!(
         b.pages.as_ref().unwrap()[0].guest.import().id(),
-        first.import.id()
+        packed.import.id()
     );
     assert_eq!(a.source_offset, 0);
     assert_eq!(b.source_offset, 0x1000);
@@ -5241,13 +5260,16 @@ fn packed_buffer_alias_is_reused_across_offsets() {
         std::sync::Arc::ptr_eq(a.pages.as_ref().unwrap(), b.pages.as_ref().unwrap()),
         "offset binds share the resource's one bounded import reference"
     );
-    drop(second);
     drop(a);
     drop(b);
-    let import_owners = std::sync::Arc::strong_count(&first.import);
-    let page_list_owners = std::sync::Arc::strong_count(&first.gpas);
-    let run_owners = std::sync::Arc::strong_count(&first.runs);
-    let guest_ref_owners = std::sync::Arc::strong_count(&first.pages);
+    let import = std::sync::Arc::clone(&packed.import);
+    let gpas = std::sync::Arc::clone(&packed.gpas);
+    let runs = std::sync::Arc::clone(&packed.runs);
+    let pages = std::sync::Arc::clone(&packed.pages);
+    let import_owners = std::sync::Arc::strong_count(&import);
+    let page_list_owners = std::sync::Arc::strong_count(&gpas);
+    let run_owners = std::sync::Arc::strong_count(&runs);
+    let guest_ref_owners = std::sync::Arc::strong_count(&pages);
 
     let content = super::vulkan::load_buffer_content(
         &mut state,
@@ -5265,22 +5287,22 @@ fn packed_buffer_alias_is_reused_across_offsets() {
     assert_eq!(source.source_offset, 0x800);
     assert_eq!(source.total_len, 0x800);
     assert_eq!(
-        std::sync::Arc::strong_count(&first.import),
+        std::sync::Arc::strong_count(&import),
         import_owners,
         "a warm bind borrows the retained resource instead of cloning its allocation"
     );
     assert_eq!(
-        std::sync::Arc::strong_count(&first.gpas),
+        std::sync::Arc::strong_count(&gpas),
         page_list_owners,
         "the physical construction list does not travel to execution"
     );
     assert_eq!(
-        std::sync::Arc::strong_count(&first.runs),
+        std::sync::Arc::strong_count(&runs),
         run_owners + 1,
         "execution owns exactly the run source it consumes"
     );
     assert_eq!(
-        std::sync::Arc::strong_count(&first.pages),
+        std::sync::Arc::strong_count(&pages),
         guest_ref_owners + 1,
         "execution owns exactly the bounded guest references it consumes"
     );
@@ -5335,6 +5357,47 @@ fn sampled_plane_keeps_the_packed_allocation_and_checks_its_extent() {
         .is_none(),
         "a plane may not extend the imported allocation to fit"
     );
+    drop(sampled);
+
+    let import_owners = std::sync::Arc::strong_count(&packed.import);
+    let page_list_owners = std::sync::Arc::strong_count(&packed.gpas);
+    let run_owners = std::sync::Arc::strong_count(&packed.runs);
+    let guest_ref_owners = std::sync::Arc::strong_count(&packed.pages);
+    let request = super::vulkan::direct_linear_sample_from_packed(
+        &packed,
+        0x1000,
+        512,
+        0x2000,
+        128,
+        crate::contract::pixel_format::TexelLayout::Rgba8,
+        crate::contract::pixel_format::SwizzlePlan::default(),
+        resource.lifetime_ref(),
+    )
+    .expect("the retained allocation directly supplies this plane");
+    let super::vulkan::SampledSourceRequest::GuestRuns(source, _, 1, None, _, _) = request else {
+        panic!("a direct single plane has no copied-content identity")
+    };
+    assert_eq!(
+        std::sync::Arc::strong_count(&packed.import),
+        import_owners + 1,
+        "execution retains the allocation its direct image consumes"
+    );
+    assert_eq!(
+        std::sync::Arc::strong_count(&packed.gpas),
+        page_list_owners,
+        "the physical construction list does not travel to execution"
+    );
+    assert_eq!(
+        std::sync::Arc::strong_count(&packed.runs),
+        run_owners + 1,
+        "execution retains the run source it consumes"
+    );
+    assert_eq!(
+        std::sync::Arc::strong_count(&packed.pages),
+        guest_ref_owners + 1,
+        "execution retains the bounded guest reference it consumes"
+    );
+    assert!(source.direct_image.is_some());
 }
 
 /// The window refusals name **which** check refused, because the census that
