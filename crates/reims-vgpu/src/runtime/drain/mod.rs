@@ -938,61 +938,111 @@ impl PendingStamp {
         self.value
     }
 
-    /// Whether `wait` is already discharged by what this drain has latched but
-    /// not yet written.
+}
+
+/// The greatest completion stamp this device has **finished** for each slot,
+/// whether or not the guest can see it yet.
+///
+/// # Why a device-side record exists at all
+///
+/// A stamp wait asks "has slot `s` reached `v`", and this device used to answer
+/// it from one place only: the word in the guest's stamp page. That word is the
+/// guest's fence and it is authoritative *for the guest*. It is the wrong thing
+/// for this device to ask itself, because **this device publishes it late on
+/// purpose**, by two separate rails it added for throughput:
+///
+/// * [`PendingStamp`] coalesces a drain's stamps and writes only the greatest,
+///   at the end of the drain. Everything latched before that is finished work
+///   the page does not name yet.
+/// * [`write_stamp`] hands the word to the engine's completion thread
+///   ([`StampOrder::Queued`]), so even a written stamp reaches guest RAM after
+///   a submission retires rather than when the drain decided it.
+///
+/// So the device asked the slowest of the three copies of a fact it already
+/// held, and held its own packets against the answer.
+///
+/// # What that cost, measured
+///
+/// A 45 s driven Maps probe on macos-13, x86/Vulkan:
+///
+/// ```text
+/// packet_stamp_wait_met          30 462
+/// packet_stamp_wait_unmet        23 658     44 % of every wait the guest sent
+/// packet_stamp_wait_held         23 467     every unmet wait broke the drain
+/// packet_stamp_wait_met_pending       0     the per-frame guard never matched
+/// ```
+///
+/// Each hold abandons the drain, sets the channel's pending bit and re-enters
+/// later, so this is ~520 re-drain round trips a second on the frame's critical
+/// path. The boot's own `packet_stamp_wait_unmet` lines say what the waits were
+/// waiting for, and it is not a queue that was genuinely behind:
+///
+/// ```text
+/// packet_stamp_wait_unmet opcode=0x33 root index=2 awaited=0x398f current=0x398e behind=1
+/// packet_stamp_wait_unmet opcode=0x20 root index=2 awaited=0x207  current=0x206  behind=1
+/// packet_stamp_wait_unmet opcode=0x37 ch1  index=4 ... behind=1
+/// packet_stamp_wait_unmet opcode=0x22 ch2  index=4 ... behind=1
+/// ```
+///
+/// **`behind=1`** is the signature: the awaited value is the very next stamp for
+/// that slot — one this device had already finished and was carrying in a latch
+/// or a queued write. The two `root` lines are the same defect from the far
+/// side, since the main FIFO latches nothing and so had no local answer to give.
+///
+/// # Why answering from here is sound
+///
+/// A value is recorded only once the work it stamps is **done**: the drain is
+/// sync-per-packet, so control reaching the latch means the packet executed, and
+/// the queued rail orders the word behind the submission that carries it. So
+/// this record never claims completion this device has not reached.
+///
+/// It is consulted for *this device's own execution ordering* and nothing else.
+/// The guest still reads the page, [`write_stamp`] still publishes there on the
+/// same schedule, and no wait is answered from here that the page would refuse
+/// forever — the page catches up to every value recorded here. The
+/// [`stamp_slot_offset`] gate in [`Self::latch`] is what bounds this map: a slot
+/// the stamp page cannot hold is one no drain could write, so it is never
+/// recorded and the map cannot outgrow [`stamp_slot_count`].
+#[derive(Clone, Default, Debug)]
+pub struct CompletedStamps {
+    /// Slot index (already masked by [`stamp_slot_index`]) → greatest value
+    /// completed for it, in the wrapping-signed order [`StampWait::satisfied_by`]
+    /// compares in.
+    slots: std::collections::BTreeMap<u32, u32>,
+}
+
+impl CompletedStamps {
+    /// Record that slot `slot` has completed `value`, keeping the later of the
+    /// two in wrapping-signed order.
     ///
-    /// Without this a packet waiting on the slot an earlier packet in the same
-    /// drain stamped would read the stale word out of guest RAM, return
-    /// [`StampVerdict::Hold`], and park the channel against a stamp this device
-    /// is itself holding. `slot` is the drain's own stamp index; a wait naming
-    /// any other slot is not ours to answer.
+    /// Refuses — and records nothing — for a slot the stamp page of `page_bytes`
+    /// cannot hold, which is the same refusal [`write_stamp`] makes. Returns
+    /// whether the slot was real, so a caller that wants to know can ask.
+    pub fn latch(&mut self, slot: u32, value: u32, page_bytes: u64) -> bool {
+        let slot = stamp_slot_index(slot);
+        if stamp_slot_offset(slot, page_bytes).is_none() {
+            return false;
+        }
+        self.slots
+            .entry(slot)
+            .and_modify(|held| {
+                if (value.wrapping_sub(*held) as i32) > 0 {
+                    *held = value;
+                }
+            })
+            .or_insert(value);
+        true
+    }
+
+    /// Whether `wait` is already discharged by work this device has completed.
     ///
-    /// # It fires zero times, and the hazard it guards is real
-    ///
-    /// The A/B above is the same six boots. `packet_stamp_wait_met_pending` is
-    /// **0** on the coalesced arm while `packet_stamp_wait_held` **more than
-    /// doubled**, 5 073 against 2 237, taking `setup_calls` up 47 % with it in
-    /// re-drains. Those two readings together say this comparison never matches:
-    /// the packets that should have been answered here fall through to the stale
-    /// word instead.
-    ///
-    /// It is not a correctness failure — every `break` flushes the pending
-    /// stamp, so a held packet's retry finds the word — but it is ~2 800
-    /// avoidable round trips a boot behind a guard that reads as working.
-    ///
-    /// # Why, measured rather than guessed
-    ///
-    /// It is **not** an encoding mismatch, which was the first suspicion. The
-    /// boot's own `packet_stamp_wait_unmet` lines name both sides, and they
-    /// disagree about the *channel*, not the spelling:
-    ///
-    /// ```text
-    /// packet_stamp_wait_unmet opcode=0x37 ch1 index=2 awaited=0xe  current=0xa
-    /// packet_stamp_wait_unmet opcode=0x6  ch5 index=1 awaited=0x5  current=0x3
-    /// packet_stamp_wait_unmet opcode=0x22 ch2 index=4 awaited=0x1  current=0x0
-    /// ```
-    ///
-    /// Channel 1 waits on slot 2, channel 5 on slot 1, channel 2 on slot 4.
-    /// **Every one of them is waiting on a slot some other channel writes**, and
-    /// this guard answers only the drain's own slot — by construction, as its
-    /// last line above says. So it is not broken; it covers a case this workload
-    /// does not produce, while the case the workload does produce is the one it
-    /// declines.
-    ///
-    /// The mechanism is nesting: `process_child_packet` can reach `drain_other`,
-    /// so channel B's drain runs inside channel A's, and A's latched stamps are
-    /// sitting in A's stack frame where B cannot see them. Answering from them
-    /// would be correct for the same reason it is correct here — the drain
-    /// thread is single-threaded, so a latched stamp is work that finished
-    /// before the waiting packet was decoded — but it needs the latch to live in
-    /// `DeviceState` keyed by channel rather than in a local.
-    ///
-    /// **That is worth ~0.2 ms/s and no more**: 2 836 extra holds over a 45 s
-    /// boot, each costing a re-drain, against a change that bought 88 ms/s. It
-    /// is recorded because a guard that fires zero times should say why, not
-    /// because it is the next thing to fix.
-    fn discharges(self, slot: u32, wait: StampWait) -> bool {
-        stamp_slot_index(wait.index) == slot && self.value.is_some_and(|v| wait.satisfied_by(v))
+    /// Unlike the per-drain latch this replaced, a wait naming *any* slot is
+    /// answerable — which is the whole point, because every unmet wait this
+    /// workload produces names a slot some other timeline stamps.
+    pub fn discharges(&self, wait: StampWait) -> bool {
+        self.slots
+            .get(&stamp_slot_index(wait.index))
+            .is_some_and(|held| wait.satisfied_by(*held))
     }
 }
 
@@ -1303,12 +1353,17 @@ impl StampVerdict {
     }
 }
 
-/// Evaluate a packet's stamp waits against the slots this device has published.
+/// Evaluate a packet's stamp waits against the work this device has completed.
 ///
-/// The current value is read back out of the stamp page rather than cached
-/// beside [`write_stamp`]. The page is where the guest reads it, so it is the
-/// only copy whose staleness cannot be this device's own bug, and a cache keyed
-/// by slot would be one more bounded structure to keep honest for four bytes.
+/// Two sources, asked in that order. [`DeviceState::completed_stamps`] is what
+/// this device has finished, including the values its coalescing and queued
+/// publication rails have not put in guest RAM yet; the stamp page is what the
+/// guest can see. The page alone was the old answer and it is the *lagging* one
+/// by construction — see [`CompletedStamps`] for the 23 467 held packets a boot
+/// that cost, and why answering from the device's own record is sound.
+///
+/// The page is still read, and still authoritative for any slot this device has
+/// not itself completed, so nothing here depends on the record being complete.
 ///
 /// Every wait in the packet is evaluated even once one is known unsatisfied.
 /// The verdict would not change, but the census would: a packet carrying two
@@ -1319,7 +1374,6 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
     host: &H,
     channel: Option<u32>,
     packet: &Packet,
-    pending: Option<(u32, PendingStamp)>,
 ) -> StampVerdict {
     if packet.stamp_waits.is_empty() {
         return StampVerdict::Ready;
@@ -1327,12 +1381,13 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
     let mut verdict = StampVerdict::Ready;
     for wait in &packet.stamp_waits {
         let index = stamp_slot_index(wait.index);
-        // Answered from the drain's own latch before guest RAM, because the word
-        // in guest RAM is stale by exactly the stamps this drain is holding. The
-        // ordering the wait asks about already holds: packets are processed in
-        // order on this thread, so a stamp latched here is work that finished
-        // before the packet doing the waiting was decoded.
-        if pending.is_some_and(|(slot, held)| held.discharges(slot, *wait)) {
+        // Asked before guest RAM, because the word there is stale by exactly the
+        // stamps this device is still carrying — a drain's coalesced latch and
+        // every write the completion thread has not retired. The ordering the
+        // wait asks about already holds for anything recorded here: the value is
+        // recorded once its packet has executed, and the drain is single
+        // threaded, so it finished before the waiting packet was decoded.
+        if state.completed_stamps.discharges(*wait) {
             note_store_route("packet_stamp_wait_met_pending");
             continue;
         }
@@ -1688,6 +1743,15 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     if state.gfx.fifo_base_page == 0 {
         return;
     }
+    // Recorded before the word is published, not after, because every rail below
+    // this line publishes late — the queued one hands the write to the engine's
+    // completion thread and returns. From here on this device knows slot `index`
+    // has reached `stamp_value`, and a wait it decides for itself may say so
+    // without waiting to be told by guest RAM it wrote itself.
+    let page_bytes = state.page_size();
+    state
+        .completed_stamps
+        .latch(index, stamp_value, page_bytes);
     // Before the guest is told anything finished, everything this device still
     // owes guest RAM has to be in guest RAM. After this write the guest may free
     // the render targets and its allocator may hand those pages to anything, and
@@ -2450,9 +2514,7 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
             ring_size,
         ) {
             Ok(packet) => {
-                // The main FIFO stamps per packet and latches nothing, so there is
-                // no pending value here for a wait to be answered from.
-                if note_packet_stamp_waits(state, host, None, &packet, None) == StampVerdict::Hold {
+                if note_packet_stamp_waits(state, host, None, &packet) == StampVerdict::Hold {
                     // Same hold as the child drain, and this is the timeline
                     // where it matters most: the measured root wait is a
                     // `DELETE_TASK` ordered behind a child FIFO's stamp, so
@@ -2473,6 +2535,18 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                 // Root stamp = slot 0.
                 if state.gfx.fifo_base_page != 0 {
                     if let Some(off) = stamp_slot_offset(0, state.page_size()) {
+                        // Same record `write_stamp` keeps, for the same reason:
+                        // the root packet has executed, and every publication
+                        // rail below this line reaches guest RAM later than
+                        // this. The main FIFO carries no coalescing latch, so
+                        // before this line it had nothing to answer a wait on
+                        // slot 0 from but the page it publishes late itself.
+                        let page_bytes = state.page_size();
+                        state.completed_stamps.latch(
+                            0,
+                            packet.completion_stamp,
+                            page_bytes,
+                        );
                         // Root and child FIFOs own the same bounded pending-stamp
                         // queue contract. Slot 0 therefore takes the same
                         // submission-attached completion rail: the completion
@@ -4787,13 +4861,8 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
         }
         match decode_packet(&snap, head, available, ring_length) {
             Ok(packet) => {
-                if note_packet_stamp_waits(
-                    state,
-                    host,
-                    Some(channel_id),
-                    &packet,
-                    Some((stamp_index_slot, pending)),
-                ) == StampVerdict::Hold
+                if note_packet_stamp_waits(state, host, Some(channel_id), &packet)
+                    == StampVerdict::Hold
                 {
                     // The guest ordered this packet behind work that has not
                     // reached its stamp. Hold it: head and completion stamp stay
@@ -4857,6 +4926,17 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     // the submit, and folding a value into a latch is not one.
                     // The submit it defers to is timed where it happens, below.
                     pending.latch(packet.completion_stamp);
+                    // The packet has executed, so the slot has reached this
+                    // value whatever the page still says. Recording it here
+                    // rather than only at the deferred write is what lets a
+                    // *sibling* channel's wait be answered — the case that
+                    // produced every held packet this workload measured.
+                    let page_bytes = state.page_size();
+                    state.completed_stamps.latch(
+                        stamp_index_slot,
+                        packet.completion_stamp,
+                        page_bytes,
+                    );
                 } else {
                     let stamp_started = std::time::Instant::now();
                     write_stamp(state, host, stamp_index, packet.completion_stamp);

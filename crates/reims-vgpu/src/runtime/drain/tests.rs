@@ -4997,10 +4997,79 @@ fn a_stamp_wait_naming_a_slot_that_cannot_exist_runs_rather_than_parking() {
     );
     let decoded = decode_packet(&both, 0, both.len() as u32, RING).expect("two records decode");
     assert_eq!(
-        note_packet_stamp_waits(&state, &host, None, &decoded, None),
+        note_packet_stamp_waits(&state, &host, None, &decoded),
         StampVerdict::Unevaluable,
         "Unevaluable outranks Hold, or the packet parks forever on the wait that \
          cannot clear while waiting for the one that could"
+    );
+}
+
+/// A wait is decided against work this device has completed, not against the
+/// word it has not published yet.
+///
+/// This is the integration point behind `CompletedStamps`. The stamp page here
+/// says slot 2 is at 0 — which is true, and is what the guest sees — while the
+/// device has finished 0x398f for it, because the coalescing latch holds the
+/// value until the drain ends and the queued rail publishes later still. Asking
+/// the page alone returns `Hold`, which is how a driven Maps boot came to hold
+/// 23 467 packets, nearly all of them `behind=1` on a value already in hand.
+#[test]
+fn a_wait_is_answered_from_what_this_device_completed_not_from_the_stale_page() {
+    use crate::model::DeviceId;
+    use crate::runtime::host::FakeHost;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page_size = 1usize << PAGE_SHIFT_X86;
+
+    let fifo_pfn = 0x40u32;
+    let fifo_gpa = (fifo_pfn as u64) << PAGE_SHIFT_X86;
+    host.map_range(fifo_gpa, 3 * page_size, 0);
+    state.gfx.fifo_base_page = fifo_pfn;
+
+    const SLOT: u32 = 2;
+    const AWAITED: u32 = 0x398f;
+
+    // One record: "do not run until slot 2 reaches AWAITED".
+    let total = PACKET_HEADER_LEN + PACKET_STAMP_LEN;
+    let mut bytes = vec![0u8; total as usize];
+    st16(&mut bytes[PACKET_OPCODE..], 0x33);
+    st16(&mut bytes[PACKET_STAMP_COUNT..], 1);
+    st32(&mut bytes[PACKET_TOTAL_SIZE..], total);
+    st32(&mut bytes[PACKET_HEADER_LEN as usize..], SLOT);
+    st32(&mut bytes[PACKET_HEADER_LEN as usize + 4..], AWAITED);
+    let packet = decode_packet(&bytes, 0, total, RING).expect("one record decodes");
+
+    // The page is where the guest reads, and it is behind — nothing has written
+    // slot 2 yet. That is exactly the state the publication rails leave it in.
+    let slot_gpa = fifo_gpa + stamp_slot_offset(SLOT, page_size as u64).expect("slot 2 fits");
+    assert_eq!(
+        crate::runtime::host::read_u32(&host, slot_gpa).expect("the slot reads"),
+        0,
+        "the test's premise: the guest cannot see this stamp yet"
+    );
+    assert_eq!(
+        note_packet_stamp_waits(&state, &host, None, &packet),
+        StampVerdict::Hold,
+        "with nothing completed the page is the only answer, and it says hold"
+    );
+
+    // Now the device finishes the work the wait names, without publishing it.
+    state
+        .completed_stamps
+        .latch(SLOT, AWAITED, page_size as u64);
+
+    assert_eq!(
+        note_packet_stamp_waits(&state, &host, None, &packet),
+        StampVerdict::Ready,
+        "the ordering the wait asks for holds: the work is done, so the packet \
+         runs rather than costing a re-drain round trip waiting to be told so"
+    );
+    assert_eq!(
+        crate::runtime::host::read_u32(&host, slot_gpa).expect("the slot reads"),
+        0,
+        "and answering it published nothing — the guest's fence is still the \
+         page, on the same schedule write_stamp always kept"
     );
 }
 
@@ -6248,57 +6317,85 @@ fn a_coalesced_stamp_keeps_the_latest_value_across_the_u32_wrap() {
     );
 }
 
-/// A wait on the slot the drain is holding is answered from the latch.
+/// A wait is answered from what this device has completed, on **any** slot.
 ///
-/// Without this the packet reads the stale word out of guest RAM, returns
-/// `Hold`, and parks the channel against a stamp this device is itself sitting
-/// on — a deadlock introduced by the coalescing rather than by the guest.
+/// The per-drain latch this replaced could answer only the drain's own slot, and
+/// every unmet wait a driven Maps boot produced named a slot some *other*
+/// timeline stamps — so it matched zero times. See `CompletedStamps`.
 #[test]
-fn a_pending_stamp_discharges_a_wait_on_its_own_slot_and_no_other() {
-    const SLOT: u32 = 3;
-    let mut pending = PendingStamp::default();
-    pending.latch(20);
+fn completed_stamps_discharge_a_wait_on_any_slot_this_device_has_finished() {
+    let page = 1u64 << PAGE_SHIFT_X86;
+    let mut done = CompletedStamps::default();
 
-    let met = StampWait {
-        index: SLOT,
-        value: 20,
-    };
     assert!(
-        pending.discharges(SLOT, met),
-        "a wait at exactly the latched value is discharged"
+        !done.discharges(StampWait { index: 3, value: 1 }),
+        "a device that has completed nothing discharges nothing"
+    );
+
+    assert!(done.latch(3, 20, page), "slot 3 fits in a 4 KiB stamp page");
+    assert!(
+        done.discharges(StampWait {
+            index: 3,
+            value: 20
+        }),
+        "a wait at exactly the completed value is discharged"
     );
     assert!(
-        pending.discharges(
-            SLOT,
-            StampWait {
-                index: SLOT,
-                value: 12
-            }
-        ),
+        done.discharges(StampWait {
+            index: 3,
+            value: 12
+        }),
         "and so is one behind it"
     );
     assert!(
-        !pending.discharges(
-            SLOT,
-            StampWait {
-                index: SLOT,
-                value: 21
-            }
-        ),
-        "a wait past the latched value is not discharged by it"
+        !done.discharges(StampWait {
+            index: 3,
+            value: 21
+        }),
+        "but not one past it — that work has not been done"
+    );
+
+    // The property the per-drain latch could not have: a second slot, written by
+    // a different timeline, answered from the same record.
+    assert!(done.latch(5, 7, page));
+    assert!(
+        done.discharges(StampWait { index: 5, value: 7 }),
+        "a wait on a sibling channel's slot is answerable, which is the whole point"
     );
     assert!(
-        !pending.discharges(
-            SLOT,
-            StampWait {
-                index: SLOT + 1,
-                value: 1
-            }
-        ),
-        "a wait on another slot is not this drain's to answer"
+        !done.discharges(StampWait { index: 4, value: 1 }),
+        "a slot nothing has completed is still not discharged"
+    );
+
+    // Wrapping order, matching `StampWait::satisfied_by` and `PendingStamp`.
+    assert!(done.latch(9, 0xffff_fff0, page));
+    assert!(done.latch(9, 4, page));
+    assert!(
+        done.discharges(StampWait { index: 9, value: 4 }),
+        "across the wrap 4 is later than 0xffff_fff0, by signed difference"
+    );
+    assert!(done.latch(9, 0xffff_fff8, page));
+    assert!(
+        done.discharges(StampWait { index: 9, value: 4 }),
+        "and a value behind the one held must not pull the slot backwards"
+    );
+
+    // The bound: a slot the stamp page cannot hold is one no drain could write,
+    // so it is refused rather than recorded, and the map cannot outgrow the page.
+    let bad = stamp_slot_count(page);
+    assert!(
+        stamp_slot_offset(bad, page).is_none(),
+        "the test's premise: this slot has no offset in the stamp page"
     );
     assert!(
-        !PendingStamp::default().discharges(SLOT, met),
-        "a drain that has latched nothing discharges nothing"
+        !done.latch(bad, 1, page),
+        "a slot outside the stamp page is refused, not recorded"
+    );
+    assert!(
+        !done.discharges(StampWait {
+            index: bad,
+            value: 1
+        }),
+        "and so it stays undecidable here, which is what routes it to Unevaluable"
     );
 }
