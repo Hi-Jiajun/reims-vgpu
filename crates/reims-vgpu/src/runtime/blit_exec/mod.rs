@@ -1196,6 +1196,51 @@ fn write_texture_row<M: HostMemory + HostOps>(
 /// GPU, which is the reading that decides whether the blit rail needs the
 /// sampled rail's ladder. `_not_ready` beside it is the denominator, so a zero
 /// can be told from an arm that never ran.
+/// What a texture-to-texture copy is actually made of: which pair of backings it
+/// joins, and how many bytes it moves through the host.
+///
+/// `walk_blit_us` says this rail costs 33.6 s of a 45 s driven Maps window
+/// against 0.45 s for 1.49 M render records, and a per-record average cannot say
+/// whether that is a few enormous copies or many small ones, nor which pair of
+/// endpoint kinds is paying it. A GPU-side rail can only serve pairs whose
+/// **both** ends this device can hold as images, so the pair split is what
+/// decides whether such a rail would serve the workload or a corner of it.
+///
+/// `blit_t2t_bytes` is the denominator for every later claim about this rail: a
+/// copy that is genuinely moving a gigabyte a second through `memcpy` is a
+/// bandwidth problem, and one that is not is a per-row overhead problem, and the
+/// two have opposite repairs. The two reverted attempts in `09a45414` and
+/// `81f99f4f` were both aimed at granularity without this number in hand.
+fn note_t2t_shape(
+    src: &TextureBacking,
+    dst: &TextureBacking,
+    copy_w: u64,
+    copy_h: u64,
+    copy_d: u64,
+    copy_bpp: u32,
+) {
+    use crate::runtime::drain::{note_store_route, note_store_route_n};
+    note_store_route(match (src.is_type11(), dst.is_type11()) {
+        (false, false) => "blit_t2t_linear_linear",
+        (false, true) => "blit_t2t_linear_t11",
+        (true, false) => "blit_t2t_t11_linear",
+        (true, true) => "blit_t2t_t11_t11",
+    });
+    let bytes = copy_w
+        .saturating_mul(copy_h)
+        .saturating_mul(copy_d)
+        .saturating_mul(u64::from(copy_bpp));
+    note_store_route_n("blit_t2t_bytes", bytes);
+    // Banded rather than averaged, because the mean of a full-window copy and a
+    // 16x16 icon says nothing about either and this rail issues both.
+    note_store_route(match bytes {
+        0..=4_095 => "blit_t2t_band_tiny",
+        4_096..=262_143 => "blit_t2t_band_small",
+        262_144..=4_194_303 => "blit_t2t_band_medium",
+        _ => "blit_t2t_band_large",
+    });
+}
+
 /// Whether a blit endpoint arrived owing this device a writeback, split by which
 /// spelling of the debt named it.
 ///
@@ -2713,6 +2758,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     if copy_w == 0 || copy_h == 0 || copy_d == 0 {
         return BlitStatus::ZeroExtent;
     }
+    note_t2t_shape(&src, &dst, copy_w, copy_h, copy_d, copy_bpp);
     let row_bytes = match copy_w.checked_mul(copy_bpp as u64) {
         Some(v) => v,
         None => return br(BlitStatus::Capacity, "t2t_row_bytes_overflow"),
