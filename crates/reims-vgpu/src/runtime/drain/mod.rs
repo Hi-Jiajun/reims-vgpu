@@ -923,6 +923,122 @@ pub struct PendingStamp {
     value: Option<u32>,
 }
 
+/// Why a stamp wait was unmet, partitioned by what this device could have done
+/// about it. Census only — see [`StampLedger`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnmetSource {
+    /// This device has executed the packet that stamps the awaited value but has
+    /// **not called [`write_stamp`] yet** — the coalescing latch is holding it
+    /// until the drain ends. Publishing early would discharge this wait, and the
+    /// settle on the publication path makes that ordering-safe.
+    Coalesced,
+    /// [`write_stamp`] has been called with a satisfying value, so the settle has
+    /// run and the word is with the engine's completion thread, awaiting the GPU
+    /// submission that carries it. **Nothing this device can do makes it ready
+    /// sooner**; the work is genuinely still in flight, and holding is correct.
+    Queued,
+    /// No satisfying value exists anywhere in this device. The guest is waiting
+    /// on work it has not yet given us, or that we have not yet executed.
+    Absent,
+}
+
+/// What this device has stamped, split by whether the value is still *owed* or
+/// already handed to the publication rail.
+///
+/// # Why this exists
+///
+/// A driven Maps boot leaves 44 % of every stamp wait the guest sends unmet, and
+/// each unmet wait abandons a drain for a later re-entry — ~520 round trips a
+/// second on the frame's critical path. The question that decides whether any
+/// repair is available is *which* unmet waits this device was in a position to
+/// answer, and the two cases have opposite answers:
+///
+/// * [`UnmetSource::Coalesced`] is a value we have and have not published. The
+///   coalescing latch defers the write to the end of the drain, and
+///   `max_tranche_us` runs 42-91 ms, so the guest can wait tens of milliseconds
+///   for a word already sitting in a local. Paying it on demand is a real repair
+///   and an ordering-safe one, because the payment goes through [`write_stamp`]
+///   and takes its settle with it.
+/// * [`UnmetSource::Queued`] is a value already through [`write_stamp`], settled,
+///   and waiting on the GPU submission that carries it. There is nothing to
+///   publish early. Holding is the correct behavior and the wait is honest.
+///
+/// An earlier attempt (reverted) answered *both* out of a device-side record.
+/// That was unsound for the second: it released packets ahead of the settle,
+/// against a fence whose meaning is "guest RAM debts have landed, you may
+/// reclaim". This type exists to size the first case before repairing it, rather
+/// than to answer anything.
+///
+/// **This is census only.** Nothing here feeds a verdict; [`note_packet_stamp_waits`]
+/// decides exactly as it did before, from the stamp page.
+///
+/// The three counters partition the unmet total, so
+/// `stamp_unmet_coalesced + stamp_unmet_queued + stamp_unmet_absent ==
+/// packet_stamp_wait_unmet` is the identity that catches a miscount.
+#[derive(Clone, Default, Debug)]
+pub struct StampLedger {
+    /// Slot → greatest value latched by the coalescing rail and not yet passed
+    /// to [`write_stamp`].
+    owed: std::collections::BTreeMap<u32, u32>,
+    /// Slot → greatest value ever passed to [`write_stamp`], whether or not the
+    /// completion thread has put it in the page yet.
+    written: std::collections::BTreeMap<u32, u32>,
+}
+
+impl StampLedger {
+    /// Record that the coalescing rail is holding `value` for `slot`.
+    ///
+    /// Refuses a slot the stamp page of `page_bytes` cannot hold — the same
+    /// refusal [`write_stamp`] makes — which is what bounds both maps by
+    /// [`stamp_slot_count`] with nothing to scan for.
+    pub fn owe(&mut self, slot: u32, value: u32, page_bytes: u64) {
+        Self::fold(&mut self.owed, slot, value, page_bytes);
+    }
+
+    /// Record that [`write_stamp`] has been called for `slot` with `value`, and
+    /// drop anything the coalescing rail was owing at or below it.
+    pub fn wrote(&mut self, slot: u32, value: u32, page_bytes: u64) {
+        let slot = stamp_slot_index(slot);
+        if stamp_slot_offset(slot, page_bytes).is_none() {
+            return;
+        }
+        Self::fold(&mut self.written, slot, value, page_bytes);
+        if self
+            .owed
+            .get(&slot)
+            .is_some_and(|held| (held.wrapping_sub(value) as i32) <= 0)
+        {
+            self.owed.remove(&slot);
+        }
+    }
+
+    /// Which of the three cases an unmet `wait` falls in.
+    pub fn classify(&self, wait: StampWait) -> UnmetSource {
+        let slot = stamp_slot_index(wait.index);
+        if self.owed.get(&slot).is_some_and(|v| wait.satisfied_by(*v)) {
+            return UnmetSource::Coalesced;
+        }
+        if self.written.get(&slot).is_some_and(|v| wait.satisfied_by(*v)) {
+            return UnmetSource::Queued;
+        }
+        UnmetSource::Absent
+    }
+
+    fn fold(map: &mut std::collections::BTreeMap<u32, u32>, slot: u32, value: u32, page_bytes: u64) {
+        let slot = stamp_slot_index(slot);
+        if stamp_slot_offset(slot, page_bytes).is_none() {
+            return;
+        }
+        map.entry(slot)
+            .and_modify(|held| {
+                if (value.wrapping_sub(*held) as i32) > 0 {
+                    *held = value;
+                }
+            })
+            .or_insert(value);
+    }
+}
+
 impl PendingStamp {
     /// Fold one packet's completion stamp in, keeping the later of the two in
     /// the same wrapping-signed order [`StampWait::satisfied_by`] compares in.
@@ -1376,6 +1492,15 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
             continue;
         }
         note_store_route("packet_stamp_wait_unmet");
+        // Census only, and it does not change the verdict below. Says whether
+        // this device was holding the awaited word (publishable early, and
+        // ordering-safe because publication carries the settle), had already
+        // handed it to the GPU-ordered rail (nothing to do), or never had it.
+        note_store_route(match state.stamp_ledger.classify(*wait) {
+            UnmetSource::Coalesced => "stamp_unmet_coalesced",
+            UnmetSource::Queued => "stamp_unmet_queued",
+            UnmetSource::Absent => "stamp_unmet_absent",
+        });
         verdict = verdict.and(StampVerdict::Hold);
         if crate::observe::first_sight(
             "packet_stamp_wait_unmet",
@@ -1688,6 +1813,11 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     if state.gfx.fifo_base_page == 0 {
         return;
     }
+    // Census: from here the value is no longer owed by the coalescing rail, it
+    // is with the publication rail below. Recorded before that rail runs so the
+    // ledger never reports as still-owed a word already being settled.
+    let page_bytes = state.page_size();
+    state.stamp_ledger.wrote(index, stamp_value, page_bytes);
     // Before the guest is told anything finished, everything this device still
     // owes guest RAM has to be in guest RAM. After this write the guest may free
     // the render targets and its allocator may hand those pages to anything, and
@@ -2473,6 +2603,13 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                 // Root stamp = slot 0.
                 if state.gfx.fifo_base_page != 0 {
                     if let Some(off) = stamp_slot_offset(0, state.page_size()) {
+                        // Census: the root FIFO publishes slot 0 inline rather
+                        // than through `write_stamp`, so it records here or the
+                        // ledger would never see slot 0 leave the owed state.
+                        let page_bytes = state.page_size();
+                        state
+                            .stamp_ledger
+                            .wrote(0, packet.completion_stamp, page_bytes);
                         // Root and child FIFOs own the same bounded pending-stamp
                         // queue contract. Slot 0 therefore takes the same
                         // submission-attached completion rail: the completion
@@ -4857,6 +4994,15 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     // the submit, and folding a value into a latch is not one.
                     // The submit it defers to is timed where it happens, below.
                     pending.latch(packet.completion_stamp);
+                    // Census: the packet has executed and the word is held in
+                    // the latch above until this drain ends. That window is the
+                    // only one a repair could shorten.
+                    let page_bytes = state.page_size();
+                    state.stamp_ledger.owe(
+                        stamp_index_slot,
+                        packet.completion_stamp,
+                        page_bytes,
+                    );
                 } else {
                     let stamp_started = std::time::Instant::now();
                     write_stamp(state, host, stamp_index, packet.completion_stamp);

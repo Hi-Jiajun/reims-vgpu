@@ -2642,6 +2642,13 @@ pub struct DeviceState {
     /// answer to the one question its page-set guard cannot ask: was the guest
     /// told this render was done before we wrote its bytes?
     pub completion_stamp_seq: u64,
+    /// Census only: what this device has stamped, split by whether the value is
+    /// still owed by the coalescing rail or already handed to publication.
+    ///
+    /// Sizes the one repair available for the held-packet cost, and says which
+    /// unmet waits are honest. Feeds no verdict — see
+    /// [`crate::runtime::drain::StampLedger`].
+    pub stamp_ledger: crate::runtime::drain::StampLedger,
     /// Total stale views the reuse verify caught (fail-logged as
     /// `gva_view_stale`; the view self-heals via retire + rebuild).
     pub view_stale_reads: u64,
@@ -2734,6 +2741,7 @@ impl DeviceState {
             retired_linear_residents: Vec::new(),
             pending_writebacks: crate::runtime::writeback_debt::PendingWritebacks::default(),
             completion_stamp_seq: 0,
+            stamp_ledger: Default::default(),
             gva_resident_backing: std::collections::BTreeMap::new(),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             #[cfg(feature = "backend-vulkan")]

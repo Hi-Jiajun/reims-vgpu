@@ -5004,6 +5004,85 @@ fn a_stamp_wait_naming_a_slot_that_cannot_exist_runs_rather_than_parking() {
     );
 }
 
+/// The ledger separates a word this device is *holding* from one it has already
+/// handed to the publication rail.
+///
+/// That split is the whole reason the type exists: only the first is publishable
+/// early, and a repair that treats the second the same way releases packets
+/// ahead of the settle `write_stamp` carries — which is the unsoundness that got
+/// an earlier attempt reverted.
+#[test]
+fn the_stamp_ledger_separates_a_held_word_from_one_already_published() {
+    let page = 1u64 << PAGE_SHIFT_X86;
+    let mut ledger = StampLedger::default();
+    let wait = |slot: u32, value: u32| StampWait { index: slot, value };
+
+    assert_eq!(
+        ledger.classify(wait(2, 1)),
+        UnmetSource::Absent,
+        "a slot nothing has stamped is work we have not been given"
+    );
+
+    // Coalescing holds a word: publishable early, and safe to publish.
+    ledger.owe(2, 0x398f, page);
+    assert_eq!(
+        ledger.classify(wait(2, 0x398f)),
+        UnmetSource::Coalesced,
+        "a value in the latch is one this device could pay now"
+    );
+    assert_eq!(
+        ledger.classify(wait(2, 0x3990)),
+        UnmetSource::Absent,
+        "but only up to the value actually latched"
+    );
+
+    // Publication moves it: nothing left to pay, the GPU has to retire it.
+    ledger.wrote(2, 0x398f, page);
+    assert_eq!(
+        ledger.classify(wait(2, 0x398f)),
+        UnmetSource::Queued,
+        "once write_stamp has it, holding is correct and there is nothing to flush"
+    );
+
+    // A later latch on the same slot is owed again, above what was published.
+    ledger.owe(2, 0x3995, page);
+    assert_eq!(
+        ledger.classify(wait(2, 0x3995)),
+        UnmetSource::Coalesced,
+        "the next coalesced run is owed even though an older value was published"
+    );
+
+    // Publishing past an owed value clears it rather than leaving a stale debt.
+    ledger.wrote(2, 0x3999, page);
+    assert_eq!(
+        ledger.classify(wait(2, 0x3995)),
+        UnmetSource::Queued,
+        "a write past the latch drops the debt, or the ledger would offer to pay \
+         a word that has already gone"
+    );
+
+    // Wrapping order, matching `StampWait::satisfied_by`.
+    ledger.owe(6, 0xffff_fff0, page);
+    ledger.owe(6, 4, page);
+    assert_eq!(
+        ledger.classify(wait(6, 4)),
+        UnmetSource::Coalesced,
+        "across the wrap 4 is later than 0xffff_fff0, by signed difference"
+    );
+
+    // The bound: a slot the stamp page cannot hold is never recorded, so neither
+    // map can outgrow the page and there is nothing to scan for.
+    let bad = stamp_slot_count(page);
+    assert!(stamp_slot_offset(bad, page).is_none(), "test premise");
+    ledger.owe(bad, 1, page);
+    ledger.wrote(bad, 1, page);
+    assert_eq!(
+        ledger.classify(wait(bad, 1)),
+        UnmetSource::Absent,
+        "a slot outside the stamp page is refused by both recorders"
+    );
+}
+
 /// `retry_stamp_held_timelines` stops when a round publishes no stamp, so a wait
 /// nothing in the ring can satisfy costs one extra round and not a spin.
 ///
