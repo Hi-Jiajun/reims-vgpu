@@ -6790,3 +6790,54 @@ fn only_a_statically_used_texture_gap_is_given_a_neutral_image() {
     // Nothing flagged, nothing substituted — the hot path.
     assert!(frag_unbound_textures_to_neutralize(&[]).is_empty());
 }
+
+/// A retained depth-stencil state is served without consulting guest memory,
+/// and the delete opcode is what takes it away.
+///
+/// The point is the *absence* of the guest read, so the test removes the guest:
+/// the host has no object list and no descriptor bytes at all, which is exactly
+/// what `resolve_descriptor` needs and cannot get. A build that still walks
+/// guest memory per draw fails here with a ladder slug; the retaining one
+/// answers from the registry.
+///
+/// This is what makes the 0.43-0.47 us a chain go away — an object-list lookup,
+/// a descriptor read, an `Arc<[u8]>` allocation and a decode, on every draw that
+/// bound any depth state, for an immutable object the guest publishes once and
+/// deletes explicitly.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_retained_depth_stencil_state_is_served_without_reading_guest_memory() {
+    use crate::runtime::decode::resource::DepthStencilDescriptor;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let host = FakeHost::new();
+    state.define_task(2, 0x2000, 9);
+
+    // Nothing is published, so the only way to an answer is the registry.
+    assert!(
+        super::load_depth_stencil_descriptor(&state, &host, 2, 7).is_err(),
+        "with no retained state and no guest bytes there is no answer to give"
+    );
+
+    let retained = DepthStencilDescriptor {
+        depth_stencil_id: 7,
+        depth_compare_function: 3,
+        depth_write_enabled: true,
+        ..Default::default()
+    };
+    state
+        .task_depth_stencil_states
+        .register(2, 7, std::sync::Arc::new(retained.clone()));
+
+    assert_eq!(
+        super::load_depth_stencil_descriptor(&state, &host, 2, 7).ok(),
+        Some(retained),
+        "the retained state answers with no guest read available at all"
+    );
+
+    assert!(state.task_depth_stencil_states.delete(2, 7));
+    assert!(
+        super::load_depth_stencil_descriptor(&state, &host, 2, 7).is_err(),
+        "and the delete is a real invalidation, not a counter"
+    );
+}

@@ -5493,8 +5493,8 @@ fn a_delete_object_record_must_fit_the_payload_that_carries_it() {
 #[test]
 fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     use reims_vgpu_wire::ops::destroy::{
-        DELETE_TOTAL_LEN, OPCODE_DELETE_RENDER_PIPELINE_STATE, OPCODE_DELETE_SAMPLER_STATE,
-        OPCODE_DELETE_TEXTURE,
+        DELETE_TOTAL_LEN, OPCODE_DELETE_DEPTH_STENCIL_STATE, OPCODE_DELETE_RENDER_PIPELINE_STATE,
+        OPCODE_DELETE_SAMPLER_STATE, OPCODE_DELETE_TEXTURE,
     };
     let mut host = FakeHost::new();
     let destroy_packet = |task: u32, record_opcode: u32, object_ref: u32| {
@@ -5528,6 +5528,11 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     );
     #[cfg(feature = "backend-vulkan")]
     {
+        state.task_depth_stencil_states.register(
+            2,
+            12,
+            std::sync::Arc::new(Default::default()),
+        );
         state.task_render_pipeline_states.register(
             2,
             13,
@@ -5577,6 +5582,23 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         &mut state,
         &mut host,
         4,
+        &destroy_packet(2, OPCODE_DELETE_DEPTH_STENCIL_STATE, 12),
+    );
+    #[cfg(feature = "backend-vulkan")]
+    assert!(
+        state.task_depth_stencil_states.get(2, 12).is_none(),
+        "the depth-stencil destroy opcode retires its own retained state, which \
+         is the whole invalidation behind retaining it at all"
+    );
+    assert!(
+        state.objects.contains(&(2, 12)),
+        "depth-stencil deletion must not cross into the resource-list ref space"
+    );
+
+    process_child_packet(
+        &mut state,
+        &mut host,
+        4,
         &destroy_packet(2, OPCODE_DELETE_RENDER_PIPELINE_STATE, 13),
     );
     #[cfg(feature = "backend-vulkan")]
@@ -5607,10 +5629,6 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         "0x3ec is unclaimed inside the destroy span and names no destroy at all"
     );
 
-    assert!(
-        state.objects.contains(&(2, 12)),
-        "a ref no packet named must be untouched"
-    );
 }
 
 /// The kind is decoded off the record and counted per kind.

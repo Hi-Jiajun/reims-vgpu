@@ -1002,6 +1002,29 @@ pub type TaskSamplerStates = TaskReferenceStates<TaskSamplerState>;
 pub type TaskRenderPipelineStates =
     TaskReferenceStates<crate::runtime::pipeline_resolve::ResolvedRenderPipeline>;
 
+/// Per-task depth-stencil states, keyed by that API's reference space.
+///
+/// A depth-stencil state is an immutable object with its own explicit delete
+/// command (`OPCODE_DELETE_DEPTH_STENCIL_STATE`), exactly like a sampler state
+/// and a render pipeline state, so it belongs in this namespace and not in
+/// [`TaskResources`] — whose type mask deliberately excludes object type 7,
+/// because that tag is also worn by mutable serializer descriptors and two
+/// reference spaces sharing one map would destroy each other's entries when
+/// their integers collide.
+///
+/// It used to be resolved out of guest memory on **every draw that bound any
+/// depth state**: an object-list lookup, a descriptor read, an `Arc<[u8]>`
+/// allocation and a decode, measured at 0.43-0.47 µs of a 9.8 µs Maps chain.
+/// The census that licensed retaining it counted the bytes rather than assuming
+/// them — 1 878 843 reads of 32 distinct references over a driven boot, **every
+/// one of them byte-identical to the previous read of the same reference and not
+/// one changed**. The guest publishes the state once and binds it; the delete
+/// command is the invalidation, which is why this needs no capacity and no
+/// generation.
+#[cfg(feature = "backend-vulkan")]
+pub type TaskDepthStencilStates =
+    TaskReferenceStates<crate::runtime::decode::resource::DepthStencilDescriptor>;
+
 #[cfg(test)]
 mod task_reference_state_tests {
     use super::TaskReferenceStates;
@@ -2347,6 +2370,9 @@ pub struct DeviceState {
     pub task_resources: TaskResources,
     /// Immutable sampler objects in the sampler API's separate ref space.
     pub task_sampler_states: TaskSamplerStates,
+    /// Immutable depth-stencil objects in that API's separate ref space.
+    #[cfg(feature = "backend-vulkan")]
+    pub task_depth_stencil_states: TaskDepthStencilStates,
     /// Immutable render pipeline states in the pipeline API's separate ref
     /// space. The guest binds these by reference after construction and ends
     /// them with resource deletion or task teardown.
@@ -2706,6 +2732,8 @@ impl DeviceState {
             objects: std::collections::BTreeSet::new(),
             task_resources: TaskResources::default(),
             task_sampler_states: TaskSamplerStates::default(),
+            #[cfg(feature = "backend-vulkan")]
+            task_depth_stencil_states: TaskDepthStencilStates::default(),
             #[cfg(feature = "backend-vulkan")]
             task_render_pipeline_states: TaskRenderPipelineStates::default(),
             texture_to_mapping: BTreeMap::new(),
@@ -3154,6 +3182,11 @@ impl DeviceState {
         self.task_sampler_states.delete_task(task_id);
         #[cfg(feature = "backend-vulkan")]
         crate::runtime::drain::note_store_route_n(
+            "ds_state_task_deleted",
+            self.task_depth_stencil_states.delete_task(task_id) as u64,
+        );
+        #[cfg(feature = "backend-vulkan")]
+        crate::runtime::drain::note_store_route_n(
             "pipeline_state_task_deleted",
             self.task_render_pipeline_states.delete_task(task_id) as u64,
         );
@@ -3205,6 +3238,11 @@ impl DeviceState {
         self.objects.retain(|&(t, _)| t != task_id);
         self.task_resources.delete_task(task_id);
         self.task_sampler_states.delete_task(task_id);
+        #[cfg(feature = "backend-vulkan")]
+        crate::runtime::drain::note_store_route_n(
+            "ds_state_task_deleted",
+            self.task_depth_stencil_states.delete_task(task_id) as u64,
+        );
         #[cfg(feature = "backend-vulkan")]
         crate::runtime::drain::note_store_route_n(
             "pipeline_state_task_deleted",
