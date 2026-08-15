@@ -1280,6 +1280,13 @@ impl ResourcePools {
         if self.slots[index].pending.is_none() {
             return Ok(());
         }
+        if let Some(error) = ctx.queue_failure() {
+            return Err(Self::wait_error(
+                counters,
+                error,
+                DeviceLostOp::PoolsWaitFencesRetire,
+            ));
+        }
         let fence = self.slots[index].fence;
         ctx.device
             .wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS)
@@ -1820,7 +1827,7 @@ impl ResourcePools {
             end_result.map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsEndCbBatch, e)))?;
             let cbs = [batch.cb];
             let submit_started = std::time::Instant::now();
-            let result = ctx.submit_guest_work(&cbs, batch.fence);
+            let result = ctx.submit_guest_work_async(&cbs, batch.fence);
             counters.batch_flush_submit_us.fetch_add(
                 submit_started.elapsed().as_micros() as u64,
                 Ordering::Relaxed,
@@ -1882,6 +1889,13 @@ impl ResourcePools {
         counters: &EngineCounters,
         fence: vk::Fence,
     ) -> Result<(), DrawError> {
+        if let Some(error) = ctx.queue_failure() {
+            return Err(Self::wait_error(
+                counters,
+                error,
+                DeviceLostOp::PoolsWaitFencesEntry,
+            ));
+        }
         ctx.device
             .wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS)
             .map_err(|e| Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesEntry))

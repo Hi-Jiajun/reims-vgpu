@@ -598,10 +598,10 @@ engine_counters! {
         batch_tail_reopen_gt16ms,
         /// Phase attribution for every submitted draw batch, in microseconds.
         /// Close includes ending the open render pass and sealing its GPU-span
-        /// query; end is `vkEndCommandBuffer`; submit is the queue call; finish
-        /// parks cleanup and publishes recorded sampled resources. Their sum
-        /// can be compared with `batch_tail_call_us` on a workload where
-        /// end-of-tranche flushes dominate.
+        /// query; end is `vkEndCommandBuffer`; submit is the ordered-owner
+        /// handoff; finish parks cleanup and publishes recorded sampled
+        /// resources. `queue_async_driver_us` separately retains the host queue
+        /// call cost moved off the drain worker.
         batch_flush_close_us,
         batch_flush_end_us,
         batch_flush_submit_us,
@@ -689,6 +689,13 @@ engine_counters! {
     }
 
     pool_sourced {
+        /// Ended draw-batch submissions executed by the queue owner, time they
+        /// spent queued before its host call, and time spent inside that call.
+        /// `batch_flush_submit_us` is the drain worker's handoff cost; these
+        /// fields retain the driver cost moved off that worker.
+        queue_async_submits,
+        queue_async_queue_us,
+        queue_async_driver_us,
         /// Sampled-cache pool recycle diagnostics (workstream D lag tail). These
         /// four come from `ResourcePools`, not the atomic counters — merged in by
         /// `engine::counter_snapshot`. `free_hits` = `acquire_sampled` reused a

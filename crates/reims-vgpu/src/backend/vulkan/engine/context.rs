@@ -557,6 +557,10 @@ pub(crate) struct DeviceContext {
     /// [`super::stamp_completion`] for why the interrupt cannot be deferred to
     /// anything that runs on a schedule.
     pub stamp_completion: Option<super::stamp_completion::StampCompletion>,
+    /// Sole host-side owner of the graphics queue.  All submissions, presents,
+    /// and queue-idle waits pass through its FIFO so an asynchronous batch tail
+    /// cannot race a later synchronous consumer.
+    pub queue_owner: Option<super::queue_owner::QueueOwner>,
     /// On-disk VkPipelineCache blob for this device (keyed by
     /// pipelineCacheUUID), or None when persistence is unavailable.
     pub pipeline_cache_path: Option<std::path::PathBuf>,
@@ -1042,6 +1046,17 @@ impl DeviceContext {
             })
             .ok()
             .flatten();
+        let queue = device.get_device_queue(gq, 0);
+        let queue_owner = match super::queue_owner::QueueOwner::start(&device, queue) {
+            Ok(owner) => Some(owner),
+            Err(error) => {
+                crate::observe::fail(format!(
+                    "vk_queue_owner_start_failed reason=vk_queue_owner_start_failed error={error} \
+                     (queue submission remains synchronous)"
+                ));
+                None
+            }
+        };
         let memory_properties = instance.get_physical_device_memory_properties(pd);
         let caps = HostGpuCaps {
             memory: classify_memory(&memory_properties),
@@ -1178,6 +1193,7 @@ impl DeviceContext {
             timestamps,
             draw_spans,
             stamp_completion,
+            queue_owner,
             pipeline_cache_path: Some(pipeline_cache_path),
             pipeline_cache_saved_len: AtomicUsize::new(initial_len),
             #[cfg(feature = "host-window")]
@@ -1268,9 +1284,15 @@ impl DeviceContext {
     }
 
     pub(crate) unsafe fn destroy(&mut self) {
-        // First, and before anything else this function touches: the completion
-        // thread holds a clone of `self.device` and is blocked inside it. Every
-        // line below is a use-after-free if it is still running.
+        // The queue owner may still hold ended command buffers and a clone of
+        // the device. Drain it before stopping completion publication or
+        // destroying anything a queued submission names.
+        if let Some(mut owner) = self.queue_owner.take() {
+            owner.stop();
+        }
+        // The completion thread also holds a clone of `self.device` and may be
+        // blocked inside it. Every line below is a use-after-free if it is still
+        // running.
         if let Some(mut completion) = self.stamp_completion.take() {
             unsafe { completion.stop(&self.device) };
         }
@@ -1409,13 +1431,46 @@ impl DeviceContext {
         command_buffers: &[vk::CommandBuffer],
         fence: vk::Fence,
     ) -> Result<(), vk::Result> {
+        let timeline = self
+            .stamp_completion
+            .as_ref()
+            .map(|completion| completion.reserve_submission());
+        if let Some(owner) = self.queue_owner.as_ref() {
+            return owner.submit_sync(command_buffers, fence, timeline);
+        }
+        unsafe { self.submit_guest_work_reserved(command_buffers, fence, timeline) }
+    }
+
+    /// Hand an ended draw batch to the ordered queue owner without waiting for
+    /// the host driver's `vkQueueSubmit` call.  A host that could not start the
+    /// owner retains the synchronous contract.
+    pub(crate) unsafe fn submit_guest_work_async(
+        &self,
+        command_buffers: &[vk::CommandBuffer],
+        fence: vk::Fence,
+    ) -> Result<(), vk::Result> {
+        let timeline = self
+            .stamp_completion
+            .as_ref()
+            .map(|completion| completion.reserve_submission());
+        let Some(owner) = self.queue_owner.as_ref() else {
+            return unsafe { self.submit_guest_work_reserved(command_buffers, fence, timeline) };
+        };
+        owner.submit_async(command_buffers, fence, timeline)
+    }
+
+    unsafe fn submit_guest_work_reserved(
+        &self,
+        command_buffers: &[vk::CommandBuffer],
+        fence: vk::Fence,
+        timeline: Option<(vk::Semaphore, u64, super::stamp_completion::SubmissionNote)>,
+    ) -> Result<(), vk::Result> {
         let plain = vk::SubmitInfo::default().command_buffers(command_buffers);
-        let Some(completion) = self.stamp_completion.as_ref() else {
+        let Some((semaphore, value, note)) = timeline else {
             return unsafe { self.device.queue_submit(self.queue(), &[plain], fence) };
         };
-        let (semaphore, timeline) = completion.reserve_submission();
         let semaphores = [semaphore];
-        let values = [timeline];
+        let values = [value];
         let mut timeline_info =
             vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&values);
         let info = vk::SubmitInfo::default()
@@ -1423,8 +1478,77 @@ impl DeviceContext {
             .signal_semaphores(&semaphores)
             .push_next(&mut timeline_info);
         unsafe { self.device.queue_submit(self.queue(), &[info], fence) }?;
-        completion.note_submitted(timeline);
+        note.submitted(value);
         Ok(())
+    }
+
+    pub(crate) fn queue_failure(&self) -> Option<vk::Result> {
+        self.queue_owner.as_ref().and_then(|owner| owner.failure())
+    }
+
+    pub(crate) fn queue_wait_idle(&self) -> Result<(), vk::Result> {
+        match self.queue_owner.as_ref() {
+            Some(owner) => owner.wait_idle(),
+            None => unsafe { self.device.queue_wait_idle(self.queue()) },
+        }
+    }
+
+    pub(crate) fn queue_barrier(&self) {
+        if let Some(owner) = self.queue_owner.as_ref() {
+            owner.barrier();
+        }
+    }
+
+    pub(crate) unsafe fn submit_queue_work(
+        &self,
+        command_buffers: &[vk::CommandBuffer],
+        wait_semaphores: &[vk::Semaphore],
+        wait_stages: &[vk::PipelineStageFlags],
+        signal_semaphores: &[vk::Semaphore],
+        fence: vk::Fence,
+    ) -> Result<(), vk::Result> {
+        if let Some(owner) = self.queue_owner.as_ref() {
+            return owner.submit_present_blit(
+                command_buffers,
+                wait_semaphores,
+                wait_stages,
+                signal_semaphores,
+                fence,
+            );
+        }
+        let info = vk::SubmitInfo::default()
+            .wait_semaphores(wait_semaphores)
+            .wait_dst_stage_mask(wait_stages)
+            .command_buffers(command_buffers)
+            .signal_semaphores(signal_semaphores);
+        unsafe { self.device.queue_submit(self.queue(), &[info], fence) }
+    }
+
+    #[cfg(feature = "host-window")]
+    pub(crate) fn queue_present(
+        &self,
+        loader: ash::khr::swapchain::Device,
+        wait: vk::Semaphore,
+        swapchain: vk::SwapchainKHR,
+        image_index: u32,
+    ) -> Result<bool, vk::Result> {
+        match self.queue_owner.as_ref() {
+            Some(owner) => owner.present(loader, wait, swapchain, image_index),
+            None => {
+                let waits = [wait];
+                let swapchains = [swapchain];
+                let indices = [image_index];
+                unsafe {
+                    loader.queue_present(
+                        self.queue(),
+                        &vk::PresentInfoKHR::default()
+                            .wait_semaphores(&waits)
+                            .swapchains(&swapchains)
+                            .image_indices(&indices),
+                    )
+                }
+            }
+        }
     }
 }
 

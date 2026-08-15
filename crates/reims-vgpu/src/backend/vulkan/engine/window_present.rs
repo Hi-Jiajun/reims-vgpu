@@ -881,8 +881,7 @@ impl WindowPresenter {
     }
 
     unsafe fn recreate_swapchain(&mut self, ctx: &DeviceContext) -> Result<(), DrawError> {
-        ctx.device
-            .queue_wait_idle(ctx.queue())
+        ctx.queue_wait_idle()
             .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowQueueWaitIdle, error)))?;
         let caps = self
             .surface_loader
@@ -1357,16 +1356,7 @@ impl WindowPresenter {
             let wait_stages = [ACQUIRE_WAIT_STAGE];
             let signals = [frame_render_finished];
             let commands = [frame_cmd];
-            ctx.device
-                .queue_submit(
-                    ctx.queue(),
-                    &[vk::SubmitInfo::default()
-                        .wait_semaphores(&waits)
-                        .wait_dst_stage_mask(&wait_stages)
-                        .command_buffers(&commands)
-                        .signal_semaphores(&signals)],
-                    frame_in_flight,
-                )
+            ctx.submit_queue_work(&commands, &waits, &wait_stages, &signals, frame_in_flight)
                 .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowSubmitPresent, error)))
         })();
         if let Err(error) = submit_result {
@@ -1393,12 +1383,11 @@ impl WindowPresenter {
         let swapchains = [self.swapchain];
         let indices = [image_index];
         let waits = [frame_render_finished];
-        match self.swapchain_loader.queue_present(
-            ctx.queue(),
-            &vk::PresentInfoKHR::default()
-                .wait_semaphores(&waits)
-                .swapchains(&swapchains)
-                .image_indices(&indices),
+        match ctx.queue_present(
+            self.swapchain_loader.clone(),
+            waits[0],
+            swapchains[0],
+            indices[0],
         ) {
             Ok(present_suboptimal) => {
                 // ash reports VK_SUBOPTIMAL_KHR as `Ok(true)` (a success code),
@@ -1723,7 +1712,7 @@ impl WindowPresenter {
         ctx: &DeviceContext,
         pools: Option<&mut ResourcePools>,
     ) {
-        if let Err(error) = ctx.device.queue_wait_idle(ctx.queue()) {
+        if let Err(error) = ctx.queue_wait_idle() {
             let decline = VkCall::new(VkOp::WindowDestroyQueueWaitIdle, error);
             crate::observe::Emit::decline("host_window_destroy", &decline).fail_once(0);
         }

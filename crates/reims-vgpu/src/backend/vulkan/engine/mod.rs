@@ -29,6 +29,7 @@ mod host_ram;
 pub mod init_decline;
 mod linear_target_import;
 mod pools;
+mod queue_owner;
 mod scatter_shader;
 pub(crate) mod stamp_completion;
 /// The requested draw-time buffer-gather working set. Re-exported for the same
@@ -284,6 +285,11 @@ impl EngineState {
         #[cfg(feature = "host-window")]
         note_window_present_attached(false);
         if let Some(ctx) = self.owner.ctx.as_ref() {
+            // A device-loss observer can run while an ended batch is waiting in
+            // the submission owner's FIFO. The device is already unusable, so
+            // no GPU wait is owed, but the queue thread must release every
+            // request carrying pool handles before those pools are destroyed.
+            ctx.queue_barrier();
             unsafe {
                 #[cfg(feature = "host-window")]
                 if let Some(mut presenter) = presenter {
@@ -825,7 +831,7 @@ pub fn reset_guest_state() -> GuestResetStats {
         ..
     } = &mut *guard;
     if let Some(ctx) = owner.ctx.as_ref() {
-        if let Err(error) = unsafe { ctx.device.device_wait_idle() } {
+        if let Err(error) = ctx.queue_wait_idle() {
             let decline = VkCall::new(VkOp::GuestResetDeviceWaitIdle, error);
             crate::observe::Emit::decline("vulkan_guest_reset", &decline).fail_once(0);
         }
@@ -2616,11 +2622,8 @@ unsafe fn copy_image_level0_to_host_delivered(
         ctx.device
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))?;
-        let queue = ctx.queue();
         let cbs = [cb];
-        let si = ash::vk::SubmitInfo::default().command_buffers(&cbs);
-        ctx.device
-            .queue_submit(queue, &[si], fence)
+        ctx.submit_queue_work(&cbs, &[], &[], &[], fence)
             .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
         let sealed = pools.seal_entry(Vec::new(), Vec::new());
         pools.finish_entry_async(&ctx.device, sealed);
@@ -4406,6 +4409,17 @@ pub fn attachment_feedback_loop_active() -> bool {
 pub fn counter_snapshot() -> CounterSnapshot {
     let eng = lock_engine();
     let mut snap = eng.counters.snapshot();
+    if let Some(owner) = eng
+        .owner
+        .ctx
+        .as_ref()
+        .and_then(|ctx| ctx.queue_owner.as_ref())
+    {
+        let (submits, queue_us, driver_us) = owner.stats();
+        snap.queue_async_submits = submits;
+        snap.queue_async_queue_us = queue_us;
+        snap.queue_async_driver_us = driver_us;
+    }
     // Sampled-cache recycle diagnostics live on ResourcePools (single-threaded
     // under this lock), not the atomic counters; merge them in here.
     let (free_hits, free_allocs, recycle_admits, recycle_cap_drops) = eng.pools.recycle_stats();
@@ -4463,6 +4477,13 @@ pub fn test_reset_engine() {
     // replacement.
     let poisoned = g.owner.poisoned;
     if let Some(mut ctx) = g.owner.ctx.take() {
+        // A healthy test reset reuses the device after destroying every pool.
+        // Settle both the owner's FIFO and the GPU before those handles go.
+        if !poisoned {
+            let _ = ctx.queue_wait_idle();
+        } else {
+            ctx.queue_barrier();
+        }
         unsafe {
             g.caches.destroy_all(&ctx.device);
             g.pools.destroy_all(&ctx.device);

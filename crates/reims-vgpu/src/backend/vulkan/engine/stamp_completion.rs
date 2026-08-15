@@ -199,6 +199,29 @@ struct Shared {
     latest_submitted: AtomicU64,
 }
 
+/// Cloneable publication half handed to the queue owner with one submission.
+/// It cannot stop the completion thread or destroy its semaphore; it can only
+/// bind pending guest stamps after `vkQueueSubmit` has actually succeeded.
+#[derive(Clone)]
+pub(crate) struct SubmissionNote {
+    shared: Arc<Shared>,
+}
+
+impl SubmissionNote {
+    pub(crate) fn submitted(&self, value: u64) {
+        self.shared.latest_submitted.store(value, Ordering::Release);
+        let bound = self
+            .shared
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bind_unsubmitted(value);
+        if bound != 0 {
+            self.shared.wake.notify_all();
+        }
+    }
+}
+
 /// A running completion thread, owned by the device context.
 pub(crate) struct StampCompletion {
     shared: Arc<Shared>,
@@ -252,23 +275,15 @@ impl StampCompletion {
     /// submission order — which is what makes a single-threaded drain of the
     /// queue announce stamps in that same order without any further ordering
     /// machinery.
-    pub(crate) fn reserve_submission(&self) -> (vk::Semaphore, u64) {
+    pub(crate) fn reserve_submission(&self) -> (vk::Semaphore, u64, SubmissionNote) {
         let value = self.shared.next_value.fetch_add(1, Ordering::AcqRel) + 1;
-        (self.semaphore, value)
-    }
-
-    /// Publish a successfully submitted queue point.
-    pub(crate) fn note_submitted(&self, value: u64) {
-        self.shared.latest_submitted.store(value, Ordering::Release);
-        let bound = self
-            .shared
-            .queue
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .bind_unsubmitted(value);
-        if bound != 0 {
-            self.shared.wake.notify_all();
-        }
+        (
+            self.semaphore,
+            value,
+            SubmissionNote {
+                shared: Arc::clone(&self.shared),
+            },
+        )
     }
 
     /// The newest successfully submitted queue point.

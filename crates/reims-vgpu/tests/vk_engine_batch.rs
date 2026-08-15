@@ -171,6 +171,10 @@ fn batched_draws_compose_and_flush_on_read() {
         after.batch_flush_draws, 2,
         "the one submit carried both draws"
     );
+    assert_eq!(
+        after.queue_async_submits, 1,
+        "the ended batch must execute through the asynchronous queue owner"
+    );
 
     assert_eq!(px.len(), (W * H * 4) as usize);
     for y in [0u32, H / 2, H - 1] {
