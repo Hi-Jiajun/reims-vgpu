@@ -69,6 +69,34 @@ done
 
 mkdir -p "$OUT"
 say() { echo "perf-ab: $*"; }
+
+# Build once and pin, so every boot in the run is the same binary.
+#
+# Without this each boot rebuilds from whatever the Rust tree says at that
+# moment, so an edit landing mid-run silently splits the sweep into two arms
+# nobody declared — and the split is invisible in the results, which is what
+# makes it worth a dozen lines here. It also costs one build instead of
+# `rounds x arms` of them.
+#
+# The pin lives in the build tree because QEMU resolves its BIOS datadir
+# relative to its own path; a copy in /tmp fails to find `kvmvapic.bin` and the
+# guest never starts. And it crosses to the boot as an exported variable rather
+# than on a command line, because any argv naming `qemu-system-x86_64-...` is
+# matched by the `pkill -f 'qemu-system-x86_6[4].*reims-vgpu'` that the next boot
+# issues, which kills this runner instead of the previous VM.
+if [ -z "${QEMU_BIN:-}" ]; then
+  say "building QEMU once for the whole run ..."
+  if ! "$REPO/scripts/qemu-build/qemu-build.sh" --backend vulkan \
+       >"$OUT/qemu-build.log" 2>&1; then
+    say "qemu build failed; see $OUT/qemu-build.log"
+    exit 2
+  fi
+  PIN="$REPO/vendor/qemu/build/qemu-system-x86_64-perfab-$$"
+  cp "$REPO/vendor/qemu/build/qemu-system-x86_64" "$PIN" || exit 2
+  export QEMU_BIN="$PIN"
+fi
+say "pinned QEMU_BIN=$QEMU_BIN"
+
 RESULTS="$OUT/results.tsv"
 PROBE_NAME="$(basename "$PROBE" .sh)"
 printf 'round\tarm\tregime\tpresent_hz\toffered_hz\tdraws_s\tus_draw\tduty\tchain_us\tsampled_pct\tengine_pct\tstore_pct\tbinds_pct\tprobe\n' >"$RESULTS"
