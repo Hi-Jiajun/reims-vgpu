@@ -2074,6 +2074,12 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
         .ok_or(BlitStatus::Capacity)?;
         dest_window(state, host, task_id, buf_base_gva, span)
     };
+    // The half `blit_rows_us` cannot see. That counter sits in `copy_row_region`,
+    // which only the linear-to-linear fast path reaches; every type-11 and
+    // type-5 endpoint stages through this loop instead, and each of its rows
+    // re-vouches the mapping's guest page table. `mapw_pages_vouched` reads over
+    // a million on a driven Maps leg and nothing timed the loop that spends them.
+    let bt_rows_started = std::time::Instant::now();
     for z in 0..copy_d {
         for y in 0..copy_h {
             let buf_gva = buf_base_gva
@@ -2223,6 +2229,10 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
             }
         }
     }
+    crate::runtime::drain::note_store_route_us(
+        "blit_bt_rows_us",
+        bt_rows_started.elapsed().as_micros() as u64,
+    );
     Ok(())
 }
 
@@ -2657,6 +2667,11 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
         dst_base,
         dst_span.saturating_sub(cmd.destination_offset),
     );
+    // `blit_rows_us` lives in `copy_row_region`, which only the linear-to-linear
+    // fast path reaches. A texture-to-buffer copy stages every row through
+    // `read_texture_row` instead, and for a type-11 or type-5 source that
+    // re-vouches the mapping's guest page table per row.
+    let stage_rows_started = std::time::Instant::now();
     let mut row = vec![0u8; row_bytes as usize];
     for z in 0..copy_d {
         for y in 0..copy_h {
@@ -2697,6 +2712,14 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
             }
         }
     }
+    crate::runtime::drain::note_store_route_us(
+        "blit_t2b_stage_us",
+        stage_rows_started.elapsed().as_micros() as u64,
+    );
+    crate::runtime::drain::note_store_route_n(
+        "blit_t2b_stage_rows",
+        copy_h.saturating_mul(copy_d),
+    );
     BlitStatus::Ok
 }
 
@@ -3095,6 +3118,10 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         Ok(v) => v,
         Err(st) => return st,
     };
+    // The last untimed loop on the rail: a texture-to-texture copy with a
+    // type-11 or type-5 end on either side stages through here rather than
+    // through `copy_row_region`, so `blit_rows_us` reports nothing for it.
+    let t2t_stage_started = std::time::Instant::now();
     let mut row = vec![0u8; row_bytes as usize];
     for z in 0..copy_d {
         for y in 0..copy_h {
@@ -3133,6 +3160,14 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
             }
         }
     }
+    crate::runtime::drain::note_store_route_us(
+        "blit_t2t_stage_us",
+        t2t_stage_started.elapsed().as_micros() as u64,
+    );
+    crate::runtime::drain::note_store_route_n(
+        "blit_t2t_stage_rows",
+        copy_h.saturating_mul(copy_d),
+    );
     BlitStatus::Ok
 }
 
