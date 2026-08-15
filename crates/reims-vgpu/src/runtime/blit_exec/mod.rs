@@ -3409,6 +3409,317 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
 ///   destination slices 0; copies full `width×height×depth` of that mip with
 ///   depth planes strided by `bytes_per_image`. Linear type-2/3 only.
 ///
+/// One resolved blit endpoint, reduced to what the GPU whole-plane arm reads.
+///
+/// A [`TextureBacking`] says where a texture's *guest bytes* are, which is the
+/// question every other consumer in this module asks. This is the other one:
+/// which plane of which surface a GPU-side copy would land in.
+#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GpuPlane {
+    width: u32,
+    height: u32,
+    /// Byte offset of this texture's plane within its mapping's allocation.
+    surface_offset: u64,
+    row_stride: u32,
+    pixel_format: u16,
+}
+
+/// The plane `mapping_write::write_bgra8_from_resident_gpu` will address, from
+/// the destination mapping's own declaration rather than from the texture
+/// descriptor the blit named.
+///
+/// The two are independent derivations of one plane and the whole safety of the
+/// GPU arm is that they agree. See [`mapping_write::resident_gpu_plane`].
+#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GpuMappingWindow {
+    surface_offset: u64,
+    row_stride: u32,
+    pixel_format: u16,
+}
+
+/// The source's real content, as the engine holds it behind an armed
+/// [`crate::runtime::writeback_debt::GvaWritebackDebt`].
+#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GpuResidentSource {
+    width: u32,
+    height: u32,
+    pixel_format: u16,
+}
+
+/// Why one whole-surface texture-to-texture copy is not the GPU arm's.
+///
+/// Every variant is a **fall-through and not a loss**: the host path below runs
+/// unchanged and lands the same pixels. They are counters rather than fail-log
+/// records for that reason, and they partition the whole-surface population with
+/// `sl_gpu_landed`, so a census that does not add up is the bug.
+///
+/// There is deliberately no partial-rect variant. `0x13e` is the *whole-surface*
+/// form: its origins are (0,0,0) and its extent is the endpoints' full
+/// width/height by construction of the opcode, so a rect check here would be an
+/// arm no guest command can take.
+#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GpuPlaneRefusal {
+    /// More than one level or slice: the GPU arm copies one plane.
+    MultiLevel,
+    /// Source and destination are the same reference, so resolving the
+    /// destination would pay away the very debt holding the source's content.
+    SelfCopy,
+    /// The source's bytes are its guest pages' bytes already — nothing to copy
+    /// from a resident, and the host path is the cheap one.
+    SrcNotResident,
+    /// The destination is a linear guest allocation, which has no mapping for a
+    /// GPU-side copy to name.
+    DstNotType11,
+    /// The destination mapping declines a resident-to-guest-pages copy at this
+    /// extent, so there is no window to write.
+    DstWindowUnresolved,
+    /// The two derivations of the destination plane disagree. A type-5 view's
+    /// wire plane index lands here: it can name a plane the mapping's own
+    /// geometry scan does not resolve to, and the GPU rail takes no index.
+    PlaneOffset,
+    /// The resident is not the destination's size, so a full-plane copy would
+    /// be a resize.
+    GeometryDiffers,
+    /// A copy converts nothing, so all three of source, destination and mapping
+    /// must already agree on the texel.
+    FormatDiffers,
+}
+
+impl GpuPlaneRefusal {
+    #[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+    fn route(self) -> &'static str {
+        match self {
+            Self::MultiLevel => "sl_gpu_multi_level",
+            Self::SelfCopy => "sl_gpu_self_copy",
+            Self::SrcNotResident => "sl_gpu_src_not_resident",
+            Self::DstNotType11 => "sl_gpu_dst_not_t11",
+            Self::DstWindowUnresolved => "sl_gpu_dst_window",
+            Self::PlaneOffset => "sl_gpu_plane_offset",
+            Self::GeometryDiffers => "sl_gpu_geometry_differs",
+            Self::FormatDiffers => "sl_gpu_format_differs",
+        }
+    }
+}
+
+/// Everything the GPU arm can decide before resolving anything.
+///
+/// Split from [`gpu_whole_plane_destination`] because resolving the destination
+/// is the expensive half and it is also the half with the side effect: it pays
+/// the destination's own debt. This decides whether that is worth doing.
+#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+fn gpu_whole_plane_admissible(
+    level_count: u16,
+    slice_count: u16,
+    source_ref: u32,
+    destination_ref: u32,
+    source_is_resident: bool,
+) -> Result<(), GpuPlaneRefusal> {
+    if level_count != 1 || slice_count != 1 {
+        return Err(GpuPlaneRefusal::MultiLevel);
+    }
+    if source_ref == destination_ref {
+        return Err(GpuPlaneRefusal::SelfCopy);
+    }
+    if !source_is_resident {
+        return Err(GpuPlaneRefusal::SrcNotResident);
+    }
+    Ok(())
+}
+
+/// Whether the resolved destination is the plane the GPU rail will actually
+/// write, and whether the resident is a whole-plane copy into it.
+///
+/// `dst` is `None` for a linear endpoint and `window` is `None` when the mapping
+/// declines the extent, so the two `Option`s are the caller's two resolution
+/// steps and not defensive wrapping.
+#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+fn gpu_whole_plane_destination(
+    dst: Option<GpuPlane>,
+    window: Option<GpuMappingWindow>,
+    src: GpuResidentSource,
+) -> Result<(), GpuPlaneRefusal> {
+    let Some(dst) = dst else {
+        return Err(GpuPlaneRefusal::DstNotType11);
+    };
+    let Some(window) = window else {
+        return Err(GpuPlaneRefusal::DstWindowUnresolved);
+    };
+    // The plane the guest's descriptor named against the plane the rail will
+    // write. `mapping_write/mod.rs`'s own record of a bound error landing in the
+    // next plane's pixels of a multi-plane IOSurface is what this is here for:
+    // that failure is silent at every layer, so it has to be refused before the
+    // copy rather than detected after it.
+    if window.surface_offset != dst.surface_offset || window.row_stride != dst.row_stride {
+        return Err(GpuPlaneRefusal::PlaneOffset);
+    }
+    if src.width != dst.width || src.height != dst.height {
+        return Err(GpuPlaneRefusal::GeometryDiffers);
+    }
+    // All three, not two. The engine refuses a resident whose format is not the
+    // destination's (`copy_target_to_guest_pages`), and the mapping's declared
+    // format is what the guest will read these bytes back as — a chain that
+    // agrees pairwise but not as a whole would land a converted-looking frame
+    // with nothing having converted anything.
+    if src.pixel_format != dst.pixel_format || window.pixel_format != dst.pixel_format {
+        return Err(GpuPlaneRefusal::FormatDiffers);
+    }
+    Ok(())
+}
+
+/// Land the source's engine resident straight into the destination's guest pages
+/// with the GPU, for the one shape where that is exactly the copy the guest asked
+/// for.
+///
+/// # Why a blit is not a guest-byte reader here
+///
+/// `resolve_texture_backing` pays every endpoint's writeback debt, because its
+/// answer is "where are this texture's guest bytes" and guest bytes are only a
+/// resource's content once everything rendered into it has landed. That is right
+/// for every endpoint the host row loops read or write. It is wrong for *this*
+/// shape, and expensively so: a whole-plane copy out of a resident makes the
+/// device read the resident back into the source's guest pages, then memcpy those
+/// pages into the destination's — two crossings of a frame to move content the
+/// GPU already holds.
+///
+/// So this arm never resolves the source, and **never pays the source's debt**.
+/// The source's own guest pages stay stale and stay owed; the debt stays armed,
+/// and the next genuine guest-byte reader — a sample, a compute bind, a
+/// `CmdSynchronizeResources` — is what lands them. That is what the Metal
+/// contract says: `copyFromTexture:toTexture:` is a blit-encoder command with no
+/// host visibility, and `synchronizeResource:` is the separate call that means
+/// "make this CPU-visible".
+///
+/// The *destination*'s debt is still paid, by the resolve below, and must be:
+/// leaving it armed would let a pre-blit resident land over this copy's bytes
+/// later.
+///
+/// Returns `None` for every fall-through, having named it on a counter. The
+/// caller then runs the host path unchanged, so nothing here can lose a frame —
+/// only spend one.
+#[cfg(feature = "backend-vulkan")]
+fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    cmd: &Command,
+) -> Option<BlitStatus> {
+    use crate::runtime::drain::note_store_route;
+    let key = crate::runtime::writeback_debt::GvaResourceKey {
+        task_id,
+        texture_ref: cmd.source,
+    };
+    let debt = state.pending_writebacks.get_gva(key);
+    if let Err(refusal) = gpu_whole_plane_admissible(
+        cmd.level_count,
+        cmd.slice_count,
+        cmd.source,
+        cmd.destination,
+        debt.is_some(),
+    ) {
+        note_store_route(refusal.route());
+        return None;
+    }
+    let debt = debt?;
+    // Resolving the destination — and only the destination — is what pays its
+    // debt, and it is the reason this call sits here rather than after the loop
+    // below has resolved both endpoints.
+    let dst = match resolve_texture_backing(
+        state,
+        host,
+        task_id,
+        cmd.destination,
+        cmd.destination_level,
+        cmd.destination_slice,
+    ) {
+        Ok(t) => t,
+        Err(_) => {
+            // The host path re-resolves and returns this same refusal with its
+            // own reason, so saying anything more here would double-count one
+            // failure under two names.
+            note_store_route("sl_gpu_dst_unresolved");
+            return None;
+        }
+    };
+    let TextureBacking::Type11(t) = &dst else {
+        note_store_route(GpuPlaneRefusal::DstNotType11.route());
+        return None;
+    };
+    let plane = GpuPlane {
+        width: t.width,
+        height: t.height,
+        surface_offset: t.surface_offset,
+        row_stride: t.row_stride,
+        pixel_format: t.pixel_format,
+    };
+    let mapping_id = t.mapping_id;
+    let window = state
+        .mappings
+        .get(&mapping_id)
+        .and_then(|m| mapping_write::resident_gpu_plane(m, plane.width, plane.height))
+        .map(
+            |(surface_offset, row_stride, pixel_format)| GpuMappingWindow {
+                surface_offset,
+                row_stride,
+                pixel_format,
+            },
+        );
+    let src = GpuResidentSource {
+        width: debt.width,
+        height: debt.height,
+        pixel_format: debt.format,
+    };
+    if let Err(refusal) = gpu_whole_plane_destination(Some(plane), window, src) {
+        note_store_route(refusal.route());
+        return None;
+    }
+    let identity = crate::runtime::writeback_debt::gva_identity(debt);
+    match mapping_write::write_bgra8_from_resident_gpu(
+        state,
+        host,
+        mapping_id,
+        &identity,
+        plane.width,
+        plane.height,
+    ) {
+        Ok(_) => {
+            note_store_route("sl_gpu_landed");
+            Some(BlitStatus::Ok)
+        }
+        Err(decline) => {
+            // A decline is a routing answer, so the counter is the record and the
+            // off channel carries which check answered — the engine's format
+            // comparison in particular, which is the one that can refuse every
+            // payment on one texture and leave a canvas black.
+            note_store_route("sl_gpu_engine_declined");
+            crate::observe::off(format!(
+                "blit_gpu_plane mid={mapping_id} {}x{} decline={decline:?}",
+                plane.width, plane.height
+            ));
+            None
+        }
+    }
+}
+
+/// [`try_copy_whole_plane_on_gpu`] on an arm with no Vulkan engine.
+///
+/// A GVA debt is only ever armed by `draw::vulkan`, so this arm's ledger holds
+/// none and the fast path would refuse `SrcNotResident` on every record. It is
+/// spelled as a fall-through rather than as a `cfg` at the call site so the
+/// whole-surface form reads the same on both backends.
+#[cfg(not(feature = "backend-vulkan"))]
+fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
+    _state: &mut DeviceState,
+    _host: &mut M,
+    _task_id: u32,
+    _cmd: &Command,
+) -> Option<BlitStatus> {
+    None
+}
+
 /// Zero `slice_count` or `level_count` is a Metal no-op ([`BlitStatus::ZeroExtent`]).
 fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -3421,6 +3732,11 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
     }
     if cmd.source == 0 || cmd.destination == 0 {
         return br(BlitStatus::MissingResource, "sl_missing_ref");
+    }
+    // Before the loop, because the loop's first act is to resolve the source and
+    // resolving is what pays its debt. See [`try_copy_whole_plane_on_gpu`].
+    if let Some(status) = try_copy_whole_plane_on_gpu(state, host, task_id, cmd) {
+        return status;
     }
     for level_i in 0..cmd.level_count {
         let src_level = match cmd.source_level.checked_add(level_i) {

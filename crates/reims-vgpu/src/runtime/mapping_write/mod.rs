@@ -841,6 +841,33 @@ fn plan_guest_window(
     })
 }
 
+/// The plane of `m` that [`write_bgra8_from_resident_gpu`] would write a frame
+/// of this extent into, as `(surface_offset, row_stride, pixel_format)`.
+///
+/// # Why a caller has to ask
+///
+/// That rail takes a mapping id and an extent and nothing else: it resolves the
+/// plane itself, from the mapping's own declaration, through the same two steps
+/// this function performs. A caller that already holds its own idea of the
+/// destination plane — the blit rail resolves one out of the guest's texture
+/// descriptor, and a type-5 view carries a **wire plane index** this rail has no
+/// parameter for — must compare the two before routing a copy here, because a
+/// disagreement is not an error anywhere: the frame lands, in the wrong plane of
+/// the right surface, and the only symptom is the next plane's pixels.
+///
+/// `None` means the rail would decline, so a caller that gets it owes the frame
+/// to whatever path it was going to take anyway. The rail names *which* check
+/// declined, through [`GpuWritebackDecline`]; this collapses them, because a
+/// pre-question only needs to know that the answer is not "yes".
+pub fn resident_gpu_plane(m: &MappingEntry, width: u32, height: u32) -> Option<(u64, u32, u16)> {
+    let (mw, mh, format) = mapping_write_geometry(m, width, height);
+    if mw != width || mh != height {
+        return None;
+    }
+    let (base_off, bpr, _span_end) = type11_sample_window(m, mw, mh, format)?;
+    Some((base_off, bpr, format))
+}
+
 /// Copy a resident target straight into the guest's pages, with the frame never
 /// existing on the host.
 ///

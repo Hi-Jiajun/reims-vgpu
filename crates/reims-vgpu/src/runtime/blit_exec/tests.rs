@@ -2650,3 +2650,148 @@ fn a_copy_refuses_a_view_chain_the_sample_arm_also_refuses() {
         "the copy arm followed a chain the sample arm refused"
     );
 }
+
+/// The GPU whole-plane arm's cheap half, which decides whether resolving the
+/// destination — and paying its debt — is worth doing at all.
+///
+/// The interesting refusal is `SelfCopy`. Resolving the destination is what pays
+/// its writeback debt, so a command whose two endpoints are one reference would
+/// pay away the very resident this arm was about to copy *from* and then find
+/// nothing there. It is not a Metal restriction; it is a consequence of the order
+/// this arm has to do things in.
+#[test]
+fn the_gpu_whole_plane_arm_refuses_before_it_resolves_anything() {
+    use GpuPlaneRefusal::*;
+
+    assert_eq!(gpu_whole_plane_admissible(1, 1, 4, 5, true), Ok(()));
+    assert_eq!(
+        gpu_whole_plane_admissible(2, 1, 4, 5, true),
+        Err(MultiLevel),
+        "the arm copies one plane, not a mip chain"
+    );
+    assert_eq!(
+        gpu_whole_plane_admissible(1, 3, 4, 5, true),
+        Err(MultiLevel),
+        "nor an array slice run"
+    );
+    assert_eq!(
+        gpu_whole_plane_admissible(1, 1, 4, 4, true),
+        Err(SelfCopy),
+        "resolving the destination would pay away the source's own resident"
+    );
+    assert_eq!(
+        gpu_whole_plane_admissible(1, 1, 4, 5, false),
+        Err(SrcNotResident),
+        "with nothing owed the source's guest pages already hold its content"
+    );
+    assert_eq!(
+        gpu_whole_plane_admissible(1, 1, 4, 4, false),
+        Err(SelfCopy),
+        "the cheapest refusal that applies is the one reported, so the counters \
+         partition rather than overlap"
+    );
+}
+
+/// The GPU whole-plane arm's destination half, and specifically the plane check.
+///
+/// `write_bgra8_from_resident_gpu` resolves the plane itself, from the mapping's
+/// declaration, and takes no plane index. A type-5 view carries one on the wire
+/// and can therefore name a plane at a `surface_offset` that scan does not reach.
+/// Landing a frame there is silent at every layer — the pixels appear in the next
+/// plane of the same IOSurface — so the disagreement has to refuse before the
+/// copy, not be detected after it.
+#[test]
+fn the_gpu_whole_plane_arm_refuses_a_plane_the_rail_would_not_write() {
+    use GpuPlaneRefusal::*;
+
+    let dst = GpuPlane {
+        width: 64,
+        height: 32,
+        surface_offset: 0,
+        row_stride: 256,
+        pixel_format: MTL_FORMAT_BGRA8_UNORM,
+    };
+    let window = GpuMappingWindow {
+        surface_offset: 0,
+        row_stride: 256,
+        pixel_format: MTL_FORMAT_BGRA8_UNORM,
+    };
+    let src = GpuResidentSource {
+        width: 64,
+        height: 32,
+        pixel_format: MTL_FORMAT_BGRA8_UNORM,
+    };
+
+    assert_eq!(
+        gpu_whole_plane_destination(Some(dst), Some(window), src),
+        Ok(())
+    );
+    assert_eq!(
+        gpu_whole_plane_destination(None, Some(window), src),
+        Err(DstNotType11),
+        "a linear allocation has no mapping for the rail to name"
+    );
+    assert_eq!(
+        gpu_whole_plane_destination(Some(dst), None, src),
+        Err(DstWindowUnresolved),
+        "a mapping that declines the extent has no window to write"
+    );
+
+    // The type-5 plane hazard: the guest's descriptor names the second plane of a
+    // biplanar surface, the mapping's own geometry scan resolves the first.
+    let second_plane = GpuPlane {
+        surface_offset: 0x8000,
+        ..dst
+    };
+    assert_eq!(
+        gpu_whole_plane_destination(Some(second_plane), Some(window), src),
+        Err(PlaneOffset),
+        "a plane the rail would not write must never be written"
+    );
+    assert_eq!(
+        gpu_whole_plane_destination(
+            Some(dst),
+            Some(GpuMappingWindow {
+                row_stride: 512,
+                ..window
+            }),
+            src
+        ),
+        Err(PlaneOffset),
+        "and neither must a plane it would write at a different pitch"
+    );
+
+    assert_eq!(
+        gpu_whole_plane_destination(
+            Some(dst),
+            Some(window),
+            GpuResidentSource { height: 16, ..src }
+        ),
+        Err(GeometryDiffers),
+        "a full-plane copy is not a resize"
+    );
+    assert_eq!(
+        gpu_whole_plane_destination(
+            Some(dst),
+            Some(window),
+            GpuResidentSource {
+                pixel_format: MTL_FORMAT_RGBA8_UNORM,
+                ..src
+            }
+        ),
+        Err(FormatDiffers),
+        "a copy converts nothing, so the resident must already be the destination's texel"
+    );
+    assert_eq!(
+        gpu_whole_plane_destination(
+            Some(dst),
+            Some(GpuMappingWindow {
+                pixel_format: MTL_FORMAT_RGBA8_UNORM,
+                ..window
+            }),
+            src
+        ),
+        Err(FormatDiffers),
+        "including the format the guest will read the landed bytes back as"
+    );
+}

@@ -770,8 +770,17 @@ fn same_gva_identity(a: GvaWritebackDebt, b: GvaWritebackDebt) -> bool {
         && a.format == b.format
 }
 
+/// The engine resident one armed GVA debt names.
+///
+/// `pub(crate)` because a debt is not only something to pay: a reader that wants
+/// the *content* rather than the guest's copy of it — the blit rail's whole-plane
+/// GPU arm — needs exactly this identity, and deriving a second one from the same
+/// debt fields is how two spellings of one resident start disagreeing. There is
+/// one derivation and it is here.
 #[cfg(feature = "backend-vulkan")]
-fn gva_identity(debt: GvaWritebackDebt) -> crate::backend::vulkan::engine::TargetIdentity {
+pub(crate) fn gva_identity(
+    debt: GvaWritebackDebt,
+) -> crate::backend::vulkan::engine::TargetIdentity {
     crate::backend::vulkan::engine::TargetIdentity::Gva {
         gva: debt.gva,
         width: debt.width,
