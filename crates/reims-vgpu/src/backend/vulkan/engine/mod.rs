@@ -1520,7 +1520,7 @@ pub fn write_completion_stamp(
         if had_batch {
             unsafe { pools.batch_flush(ctx, counters)? };
         }
-        let Some((_, timeline)) = completion.latest_submitted() else {
+        let Some((_, timeline)) = completion.latest_queued() else {
             let decline = GuestWriteDecline::NoCompletionPoint;
             crate::observe::Emit::decline("gpu_completion_stamp", &decline).fail();
             return Err(DrawError::GuestPageWrite(decline));

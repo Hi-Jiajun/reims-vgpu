@@ -195,8 +195,13 @@ struct Shared {
     /// Highest value handed out. The drain worker reserves with `fetch_add`
     /// under the engine lock, so reservation order is submission order.
     next_value: AtomicU64,
-    /// Highest timeline point belonging to a successful queue submission.
-    latest_submitted: AtomicU64,
+    /// Highest timeline point successfully handed to the ordered queue owner.
+    ///
+    /// A completion stamp may be recorded after the handoff but before the
+    /// owner enters `vkQueueSubmit`. It must wait this point, not the preceding
+    /// submitted one, or the guest can reuse shared inputs while their reader
+    /// is still in the host FIFO.
+    latest_queued: AtomicU64,
 }
 
 /// Cloneable publication half handed to the queue owner with one submission.
@@ -208,8 +213,14 @@ pub(crate) struct SubmissionNote {
 }
 
 impl SubmissionNote {
+    pub(crate) fn queued(&self, value: u64) {
+        self.shared
+            .latest_queued
+            .fetch_max(value, Ordering::Release);
+    }
+
     pub(crate) fn submitted(&self, value: u64) {
-        self.shared.latest_submitted.store(value, Ordering::Release);
+        self.queued(value);
         let bound = self
             .shared
             .queue
@@ -254,7 +265,7 @@ impl StampCompletion {
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
             next_value: AtomicU64::new(0),
-            latest_submitted: AtomicU64::new(0),
+            latest_queued: AtomicU64::new(0),
         });
         let thread_shared = Arc::clone(&shared);
         let thread_device = device.clone();
@@ -286,9 +297,10 @@ impl StampCompletion {
         )
     }
 
-    /// The newest successfully submitted queue point.
-    pub(crate) fn latest_submitted(&self) -> Option<(vk::Semaphore, u64)> {
-        let value = self.shared.latest_submitted.load(Ordering::Acquire);
+    /// The newest queue point this device has accepted, including work waiting
+    /// in the ordered owner's host FIFO.
+    pub(crate) fn latest_queued(&self) -> Option<(vk::Semaphore, u64)> {
+        let value = self.shared.latest_queued.load(Ordering::Acquire);
         (value != 0).then_some((self.semaphore, value))
     }
 
@@ -567,24 +579,40 @@ mod tests {
         assert!(!queue.has_pending(1));
     }
 
-    /// Reservation order is submission order, and only successful submissions
-    /// become attachable completion points.
+    /// Reservation order is submission order; reserving alone does not publish
+    /// a point that a completion stamp could observe.
     #[test]
-    fn reservations_are_monotonic_and_success_is_published_separately() {
+    fn reservations_are_monotonic_and_handoff_is_published_separately() {
         let shared = Shared {
             queue: Mutex::new(PendingQueue::default()),
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
             next_value: AtomicU64::new(0),
-            latest_submitted: AtomicU64::new(0),
+            latest_queued: AtomicU64::new(0),
         };
         for n in 1u64..=3 {
             let value = shared.next_value.fetch_add(1, Ordering::AcqRel) + 1;
             assert_eq!(value, n, "timeline values start at 1 and never repeat");
         }
-        assert_eq!(shared.latest_submitted.load(Ordering::Acquire), 0);
-        shared.latest_submitted.store(3, Ordering::Release);
-        assert_eq!(shared.latest_submitted.load(Ordering::Acquire), 3);
+        assert_eq!(shared.latest_queued.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn queued_point_orders_a_stamp_before_driver_submission() {
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(PendingQueue::default()),
+            wake: Condvar::new(),
+            stop: AtomicBool::new(false),
+            next_value: AtomicU64::new(1),
+            latest_queued: AtomicU64::new(0),
+        });
+        let note = SubmissionNote {
+            shared: Arc::clone(&shared),
+        };
+
+        note.queued(1);
+
+        assert_eq!(shared.latest_queued.load(Ordering::Acquire), 1);
     }
 
     /// The initial value is 0 and the first reservation is 1, so no submission

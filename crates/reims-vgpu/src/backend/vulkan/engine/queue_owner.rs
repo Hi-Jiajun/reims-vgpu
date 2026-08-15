@@ -174,6 +174,9 @@ impl QueueOwner {
         if let Some(result) = self.failure.get() {
             return Err(result);
         }
+        let queued_point = timeline
+            .as_ref()
+            .map(|(_, value, note)| (*value, note.clone()));
         self.sender
             .send(Request::Submit {
                 submit: OwnedSubmit {
@@ -187,7 +190,11 @@ impl QueueOwner {
                 },
                 reply: None,
             })
-            .map_err(|_| vk::Result::ERROR_DEVICE_LOST)
+            .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
+        if let Some((value, note)) = queued_point {
+            note.queued(value);
+        }
+        Ok(())
     }
 
     pub(crate) fn submit_present_blit(
