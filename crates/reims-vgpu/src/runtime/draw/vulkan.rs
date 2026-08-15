@@ -402,6 +402,22 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         }
     }
 
+    // Everything below is Store routing, for both kinds of record, so charge it
+    // as Store for both.
+    //
+    // `Phase::Store` used to be entered only *inside* `try_metal2vulkan_draw`,
+    // which a record with no pipeline or no vertices never calls — so such a
+    // record kept `Prep` open through its whole guest writeback, and `prep_us`
+    // was the chain head for one class of record and the entire body for
+    // another. That is not a phase. It is also not a small error: `prep_us` read
+    // 0.89 µs a chain on one driven Maps boot and 4.69 on the next of the same
+    // binary, with `store_us` moving 0.53 → 0.96 beside it, which is the ratio
+    // of the two classes changing and nothing about the code.
+    //
+    // For a record that did draw, the open phase is already `Store` and this
+    // charges the same accumulator it reopens, so the drawing path is unchanged
+    // by construction rather than by a condition.
+    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
     // A resident render-pass chain intermediate: the exec loop reads
     // `chain_resident_established` and arms the next record's LoadFromTarget.
     if req.chain_resident_established {
@@ -8524,7 +8540,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // `descriptor_static_use` cannot close it either — it answers
         // `NotDeclared` for anything that is not a `UniformConstant`, which by
         // construction excludes every storage buffer.
-        let frag_declared_bindings = crate::runtime::spirv_bind::declared_binding_numbers(&f_words);
+        // Memoized on the `Arc`, because this is a per-draw walk of the whole
+        // module and the words behind an `Arc` cannot change.
+        let frag_declared_bindings =
+            crate::runtime::spirv_bind::declared_binding_numbers_memoized(&f_words);
         let frag_layout_bindings: Vec<u32> = resources
             .storage_buffers
             .iter()

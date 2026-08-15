@@ -1670,6 +1670,89 @@ pub(crate) fn test_module_with_samplers(bindings: &[u32]) -> Vec<u32> {
 /// that build the layout. Pair it with [`descriptor_static_use`], which answers
 /// `NotDeclared` for anything that is not a `UniformConstant` descriptor and so
 /// narrows this to the population that walk can reason about exactly.
+/// [`declared_binding_numbers`] for a module the caller holds behind an `Arc`,
+/// answered from a memo after the first walk.
+///
+/// # Why the walk had to go
+///
+/// The render path asks this once per draw, to check that the pipeline layout
+/// describes every binding the fragment module carries. It is a linear walk of
+/// the whole module plus a sort, a dedup and an allocation, and it cost
+/// **0.34 µs of an 11.8 µs Maps chain** — a fifteenth of the whole render path,
+/// spent re-deriving a property of words that had not changed since the guest
+/// compiled them.
+///
+/// That is the same shape as `pl_shader_us`, which was 63 ms of every second
+/// spent deriving a key for a module already in hand, and the answer is the same
+/// one: memoize on the allocation.
+///
+/// # Why an address is a sound key
+///
+/// Only because the entry holds the `Arc`. While it does, the allocation cannot
+/// be freed, so nothing else can be given that address and the key cannot come
+/// to mean a different module. The words behind an `Arc<Vec<u32>>` are immutable,
+/// so the memoized answer is the one a fresh walk would produce. Drop the `Arc`
+/// from the entry and this becomes a use-after-free dressed as a cache hit —
+/// the same rule, in the same words, as the engine's `ShaderDigestIndex`.
+///
+/// `usize` rather than a raw pointer because the memo is `static` and shared;
+/// the address is compared and never dereferenced.
+///
+/// # The bound
+///
+/// Past [`DECLARED_BINDING_ENTRIES`] the whole memo is dropped rather than one
+/// entry evicted, because there is no recency to evict *by*: every entry is
+/// equally cheap to rebuild, and a boot that reaches the bound is reporting
+/// something rather than asking for a policy. Same disposal, and the same
+/// reason, as the engine's index — and the drop releases the `Arc`s, so a memo
+/// that outlives its modules costs a bounded number of live allocations and not
+/// a leak.
+pub fn declared_binding_numbers_memoized(
+    words: &std::sync::Arc<Vec<u32>>,
+) -> std::sync::Arc<[u32]> {
+    let key = std::sync::Arc::as_ptr(words) as usize;
+    let mut guard = match DECLARED_BINDINGS.lock() {
+        Ok(guard) => guard,
+        // A poisoned memo is a cache, not state: answer from the walk rather
+        // than refusing a draw over it.
+        Err(_) => return std::sync::Arc::from(declared_binding_numbers(words)),
+    };
+    let memo = guard.get_or_insert_with(std::collections::HashMap::new);
+    if let Some((_, declared)) = memo.get(&key) {
+        return std::sync::Arc::clone(declared);
+    }
+    if memo.len() >= DECLARED_BINDING_ENTRIES {
+        crate::observe::off(format!(
+            "declared_binding_reset entries={} words={}",
+            memo.len(),
+            words.len()
+        ));
+        memo.clear();
+    }
+    let declared: std::sync::Arc<[u32]> = std::sync::Arc::from(declared_binding_numbers(words));
+    memo.insert(
+        key,
+        (std::sync::Arc::clone(words), std::sync::Arc::clone(&declared)),
+    );
+    declared
+}
+
+/// Modules the memo holds before it starts over. Sized as the engine's
+/// `SHADER_DIGEST_ENTRIES` is: a driven macos-13 boot binds a few hundred
+/// distinct modules, so this is an order of magnitude of headroom and
+/// `declared_binding_reset` firing is the boot saying otherwise.
+const DECLARED_BINDING_ENTRIES: usize = 4096;
+
+/// Allocation address → the `Arc` that keeps that address meaningful, and the
+/// declared-binding list walked out of it.
+type DeclaredBindingMemo =
+    std::collections::HashMap<usize, (std::sync::Arc<Vec<u32>>, std::sync::Arc<[u32]>)>;
+
+/// `None` until the first walk: `HashMap::new` is not a `const fn`, and a
+/// `OnceLock` beside the mutex would be a second thing to keep in step with it.
+static DECLARED_BINDINGS: std::sync::Mutex<Option<DeclaredBindingMemo>> =
+    std::sync::Mutex::new(None);
+
 pub fn declared_binding_numbers(words: &[u32]) -> Vec<u32> {
     let mut bindings = Vec::new();
     let mut i = HEADER_WORDS;
@@ -3573,6 +3656,36 @@ mod more_tests {
     fn a_sampled_image_format_does_not_demand_the_storage_capability() {
         let words = module_with(&op_type_image(10, 1, 7));
         assert!(!required_image_capabilities(&words).extended_formats);
+    }
+
+    /// The memo answers what the walk answers, for every module and not only
+    /// for the one it was first asked about.
+    ///
+    /// The hazard a memo keyed on an address carries is that a *second* module
+    /// gets a hit meant for the first, and the failure mode is silent: the draw
+    /// is checked against another shader's binding set, so a real layout gap
+    /// reads as clean. So the assertion is over two modules with disjoint
+    /// bindings, each asked twice and interleaved, against the walking form
+    /// taken on the same words.
+    #[test]
+    fn the_memoized_binding_sweep_answers_per_module_and_not_per_first_call() {
+        let a = std::sync::Arc::new(test_module_with_two_sampled_images(33, 34));
+        let b = std::sync::Arc::new(test_module_with_two_sampled_images(40, 41));
+        let walk = |m: &std::sync::Arc<Vec<u32>>| declared_binding_numbers(m);
+
+        for _ in 0..2 {
+            assert_eq!(
+                declared_binding_numbers_memoized(&a).to_vec(),
+                walk(&a),
+                "the first module keeps its own answer"
+            );
+            assert_eq!(
+                declared_binding_numbers_memoized(&b).to_vec(),
+                walk(&b),
+                "and the second is not served the first one's"
+            );
+        }
+        assert_ne!(walk(&a), walk(&b), "the fixture modules must differ at all");
     }
 
     /// The candidate list is class-blind and the use test is not, which is the
