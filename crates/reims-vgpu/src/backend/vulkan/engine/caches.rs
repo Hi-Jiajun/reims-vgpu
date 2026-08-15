@@ -970,6 +970,10 @@ fn external_dependencies(
     has_depth: bool,
     color_input: bool,
     host_accessible_color0: bool,
+    // Taken as an argument rather than read here, so both arms are reachable
+    // from a test. The switch is read once, at the one call site that builds a
+    // pass; see [`pass_exit_scope_narrow`].
+    exit_scope_narrow: bool,
 ) -> [vk::SubpassDependency; 2] {
     // Colour is unconditional: every pass this device builds has slot 0.
     let mut attach_stages = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT;
@@ -1005,23 +1009,53 @@ fn external_dependencies(
             .src_access_mask(source_access)
             .dst_stage_mask(in_dst_stages)
             .dst_access_mask(in_dst_access),
-        vk::SubpassDependency::default()
-            .src_subpass(0)
-            .dst_subpass(vk::SUBPASS_EXTERNAL)
-            .src_stage_mask(attach_stages)
-            .src_access_mask(attach_writes)
-            .dst_stage_mask(
-                vk::PipelineStageFlags::TRANSFER
-                    | vk::PipelineStageFlags::FRAGMENT_SHADER
-                    | attach_stages,
-            )
-            .dst_access_mask(
-                vk::AccessFlags::TRANSFER_READ
-                    | vk::AccessFlags::SHADER_READ
-                    | attach_writes
-                    | attach_reads,
-            ),
+        {
+            // Narrowing this to the attachment stages alone is the probe: see
+            // [`pass_exit_scope_narrow`] for what it is asking and what it must
+            // not break.
+            let (dst_stages, dst_access) = if exit_scope_narrow {
+                (attach_stages, attach_writes | attach_reads)
+            } else {
+                (
+                    vk::PipelineStageFlags::TRANSFER
+                        | vk::PipelineStageFlags::FRAGMENT_SHADER
+                        | attach_stages,
+                    vk::AccessFlags::TRANSFER_READ
+                        | vk::AccessFlags::SHADER_READ
+                        | attach_writes
+                        | attach_reads,
+                )
+            };
+            vk::SubpassDependency::default()
+                .src_subpass(0)
+                .dst_subpass(vk::SUBPASS_EXTERNAL)
+                .src_stage_mask(attach_stages)
+                .src_access_mask(attach_writes)
+                .dst_stage_mask(dst_stages)
+                .dst_access_mask(dst_access)
+        },
     ]
+}
+
+/// Whether the outgoing external dependency names only the attachment stages.
+///
+/// **Probe, default off.** See [`crate::env::PASS_EXIT_NARROW`] for the whole
+/// argument; in one line, the shipping scope names `TRANSFER | FRAGMENT_SHADER`
+/// with `TRANSFER_READ | SHADER_READ`, which asks this driver for a render-cache
+/// flush and a texture-cache invalidate at **every** `vkCmdEndRenderPass`, and a
+/// pass boundary is the single largest cost in this device on the iGPU pathway.
+///
+/// Read once. This decides the content of a cached `VkRenderPass`, so a value
+/// that changed mid-boot would leave passes built under both answers in one
+/// cache and make the arm unreadable.
+fn pass_exit_scope_narrow() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::env::read(crate::env::PASS_EXIT_NARROW).0,
+            crate::env::Switch::On
+        )
+    })
 }
 
 /// The guest's sampler request, made legal for `vkCreateSampler`.
@@ -1639,6 +1673,7 @@ impl ObjectCaches {
             key.depth.is_some(),
             key.color_input,
             key.host_accessible_color0,
+            pass_exit_scope_narrow(),
         )
         .to_vec();
         if key.color_input {
@@ -3038,14 +3073,84 @@ mod object_cache_tests {
     /// against nothing — which the synchronization validation layer reported at
     /// both `vkCmdBeginRenderPass` and `vkCmdEndRenderPass`. Asserting the
     /// colour terms across all four shapes is what stops a future edit adding a
+    /// The narrow probe removes the transfer and sampler destinations and
+    /// changes nothing else — in particular it keeps the colour-attachment
+    /// destination, which is the one consumer that deliberately issues no
+    /// barrier of its own.
+    ///
+    /// `super::exec::pass_exit_needs_no_barrier` drops the next draw's barrier
+    /// when it renders into the same target, and the only thing that then orders
+    /// that draw's writes after this pass's is the outgoing dependency. So a
+    /// narrowing that took `COLOR_ATTACHMENT_OUTPUT` out of the destination
+    /// scope would be a write-after-write hazard on the most common draw in the
+    /// device, and it would be silent. The source scope must not move either:
+    /// what is being priced is the *visibility* request, not the ordering one.
+    ///
+    /// See [`crate::env::PASS_EXIT_NARROW`] for what the probe is asking and for
+    /// the validation-layer run it owes before it could ever be a default.
+    #[test]
+    fn the_narrow_pass_exit_keeps_the_consumer_that_issues_no_barrier() {
+        for has_depth in [false, true] {
+            for color_input in [false, true] {
+                let wide = external_dependencies(has_depth, color_input, false, false)[1];
+                let narrow = external_dependencies(has_depth, color_input, false, true)[1];
+                let shape = format!("depth={has_depth} color_input={color_input}");
+
+                assert_eq!(
+                    (narrow.src_stage_mask, narrow.src_access_mask),
+                    (wide.src_stage_mask, wide.src_access_mask),
+                    "{shape}: the probe prices visibility and must not weaken ordering"
+                );
+                assert!(
+                    narrow
+                        .dst_stage_mask
+                        .contains(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                        && narrow
+                            .dst_access_mask
+                            .contains(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+                    "{shape}: the next draw into this target issues no barrier of \
+                     its own, so its stage must survive the narrowing"
+                );
+                assert!(
+                    !narrow
+                        .dst_stage_mask
+                        .contains(vk::PipelineStageFlags::TRANSFER)
+                        && !narrow
+                            .dst_stage_mask
+                            .contains(vk::PipelineStageFlags::FRAGMENT_SHADER),
+                    "{shape}: the probe removes exactly the two destinations whose \
+                     consumers barrier for themselves"
+                );
+                assert!(
+                    wide.dst_stage_mask
+                        .contains(vk::PipelineStageFlags::TRANSFER)
+                        && wide
+                            .dst_stage_mask
+                            .contains(vk::PipelineStageFlags::FRAGMENT_SHADER),
+                    "{shape}: and the shipping arm is unchanged, or the probe is \
+                     measuring against itself"
+                );
+                if has_depth {
+                    assert!(
+                        narrow
+                            .dst_stage_mask
+                            .contains(vk::PipelineStageFlags::LATE_FRAGMENT_TESTS),
+                        "{shape}: depth is an attachment stage and stays"
+                    );
+                }
+            }
+        }
+    }
+
     /// dependency for one attachment class and dropping the others again.
     #[test]
     fn both_external_dependencies_name_the_colour_scope_in_every_pass_shape() {
         for has_depth in [false, true] {
             for color_input in [false, true] {
                 for host_accessible in [false, true] {
+                    // The shipping scope. The probe arm has its own test.
                     let [incoming, outgoing] =
-                        external_dependencies(has_depth, color_input, host_accessible);
+                        external_dependencies(has_depth, color_input, host_accessible, false);
                     let shape = format!(
                         "depth={has_depth} color_input={color_input} host={host_accessible}"
                     );

@@ -831,6 +831,58 @@ pub const LAYOUT_CHURN: &str = "REIMS_VGPU_LAYOUT_CHURN";
 /// us/draw — excluded as slow, and a single such boot says nothing either.
 pub const PASS_CHURN: &str = "REIMS_VGPU_PASS_CHURN";
 
+/// **Probe, default off.** On, every render pass's outgoing `VK_SUBPASS_EXTERNAL`
+/// dependency names only the attachment stages, instead of also naming
+/// `TRANSFER | FRAGMENT_SHADER` with `TRANSFER_READ | SHADER_READ`.
+///
+/// # What it is asking
+///
+/// A render pass boundary is the largest single cost this device has on the
+/// x86/Vulkan iGPU pathway, and it is measured causally: [`PASS_CHURN`] on —
+/// one extra end/begin pair per merged loading draw, same draws, same pixels —
+/// moved GPU per draw from **9.25 to 67.64 µs** and drain CPU from 8.41 to 26.69
+/// on interleaved driven macos-13 Maps boots. At 165 731 pass begins a boot that
+/// is roughly two thirds of the device's whole GPU second.
+///
+/// It is **flat in attachment area**: banding pass begins by pixels and
+/// regressing a census window's `gpu_span busy_us` on the bands puts a
+/// `< 256x256` pass at 124-143 µs on three boots, at least as much as a
+/// full-screen one. So it is not a load, a clear or a resolve — it is a pipeline
+/// drain and a cache flush, and the interesting question becomes *who asked for
+/// the flush*.
+///
+/// A destination scope naming `FRAGMENT_SHADER`/`SHADER_READ` and
+/// `TRANSFER`/`TRANSFER_READ` is a request to make colour writes visible to the
+/// texture and transfer caches, which on this driver is a full stall plus a
+/// render-target flush plus a texture-cache invalidate — at every
+/// `vkCmdEndRenderPass`, whatever comes next. This probe removes that request and
+/// prices it.
+///
+/// # Why it is a probe and not the default
+///
+/// The scope is not decorative. `super::backend::vulkan::engine::caches`'
+/// `external_dependencies` records that this pass once declared its external
+/// dependencies only for depth, and the colour attachment silently lost the
+/// implicit ones — three `SYNC-HAZARD` findings from the Khronos synchronization
+/// validation layer followed. Narrowing the destination scope is the same *class*
+/// of change, and its failure mode is the same: a read that is not ordered
+/// against the pass's colour store, which is wrong pixels and no error anywhere.
+///
+/// The argument that it is safe is that every one of those consumers issues its
+/// own barrier — `barrier_resident_for_transfer_read` before a transfer read, and
+/// the `PassObstacle::ResidentLayout` transition before a sample — and the one
+/// consumer that deliberately does not, the next draw into the same target under
+/// `pass_exit_needs_no_barrier`, is a colour attachment write and stays in the
+/// scope. **That argument is not a measurement.** Before this becomes the
+/// default it needs a driven boot under the synchronization validation layer
+/// showing no new hazard, and the screenshots compared.
+///
+/// On is therefore a permission in the narrow sense this file otherwise forbids,
+/// and it is spelled as a probe for that reason: it is not reachable by accident,
+/// it is not on any shipping path, and it exists to put a number on a boundary
+/// nothing else can price.
+pub const PASS_EXIT_NARROW: &str = "REIMS_VGPU_PASS_EXIT_NARROW";
+
 /// **A count, not a switch.** How many draws one command buffer may carry,
 /// narrowing the active memory-topology batch policy. Read through [`count`],
 /// so a value above that device's default is refused rather than obeyed.
