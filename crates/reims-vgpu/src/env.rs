@@ -113,6 +113,16 @@
 /// comparable across compositing regimes and only one pair matched.
 pub const GUEST_IMPORT: &str = "REIMS_VGPU_GUEST_IMPORT";
 
+/// `off` keeps descriptor state on the allocated Vulkan 1.2 set path even when
+/// the device advertises `VK_KHR_push_descriptor` and the layout fits its
+/// reported limit.
+///
+/// This is a narrowing-only A/B control: it cannot enable an extension the
+/// device lacks, and it cannot make an over-limit layout use push descriptors.
+/// The two arms encode the same descriptor writes; only their Vulkan lifetime
+/// differs (command-buffer state versus an allocated set).
+pub const PUSH_DESCRIPTORS: &str = "REIMS_VGPU_PUSH_DESCRIPTORS";
+
 /// Verbose per-draw logging on top of the always-on fail sink.
 pub const DRAW_LOG: &str = "REIMS_VGPU_DRAW_LOG";
 
@@ -941,7 +951,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 22] = [
+pub const ALL: [&str; 23] = [
     LAZY_WRITEBACK,
     SLAB_RETAIN,
     // Both absent until 2026-08-12, for the same reason `COMPUTE_GATHER` was:
@@ -954,6 +964,7 @@ pub const ALL: [&str; 22] = [
     PIPELINE_MEMO,
     CLEAR_SEED,
     GUEST_IMPORT,
+    PUSH_DESCRIPTORS,
     DRAW_LOG,
     GPU_STAMP,
     PAGE_GUARDS,

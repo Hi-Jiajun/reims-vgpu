@@ -457,6 +457,9 @@ pub(crate) struct DeviceContext {
     /// `None` is the answer on every host without the extension, and the import
     /// site declines by name when it sees one.
     pub external_memory_host: Option<ash::ext::external_memory_host::Device>,
+    /// `VK_KHR_push_descriptor` entry points, present only when the extension
+    /// was advertised, queried, and enabled for this device.
+    pub push_descriptor: Option<ash::khr::push_descriptor::Device>,
     /// Queue family used for all engine submits (graphics draws + compute).
     pub gq: u32,
     /// True when `gq` supports both GRAPHICS and COMPUTE (required for engine compute).
@@ -856,6 +859,11 @@ impl DeviceContext {
         // extension string it requires.
         let host_pointer =
             crate::backend::vulkan::caps::host_pointer::query(&instance, pd, &has_device_extension);
+        let push_descriptor = crate::backend::vulkan::caps::push_descriptor::query(
+            &instance,
+            pd,
+            &has_device_extension,
+        );
         // Published for `runtime::guest_ram_map`, which builds the imports and
         // has no device context to read the granularity or the heap sizes from.
         // A negative rung withdraws them rather than publishing zeroes, so the
@@ -945,6 +953,7 @@ impl DeviceContext {
         // Only the `Supported` rung names `VK_EXT_external_memory_host`, so a
         // host without it gets a device rather than a failed `vkCreateDevice`.
         enabled_device_extensions.extend(host_pointer.rung.required_extensions());
+        enabled_device_extensions.extend(push_descriptor.required_extensions());
         // Built in `caps` too. Bound to a local here only because `push_next`
         // borrows it for the lifetime of `dci`.
         //
@@ -1062,6 +1071,7 @@ impl DeviceContext {
             memory: classify_memory(&memory_properties),
             quirks: DriverQuirk::for_portability_subset(portability_subset),
             host_pointer,
+            push_descriptor,
             portability_subset,
             device_api_version: props.api_version,
             device_type: props.device_type,
@@ -1072,6 +1082,10 @@ impl DeviceContext {
             .host_pointer
             .is_available()
             .then(|| ash::ext::external_memory_host::Device::new(&instance, &device));
+        let push_descriptor = caps
+            .push_descriptor
+            .is_available()
+            .then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
         let device_name = CStr::from_ptr(props.device_name.as_ptr())
             .to_string_lossy()
             .into_owned();
@@ -1173,6 +1187,7 @@ impl DeviceContext {
             caps,
             memory_properties,
             external_memory_host,
+            push_descriptor,
             gq,
             compute_capable,
             storage_image_write_without_format: storage_image_write_without_format_bgra,

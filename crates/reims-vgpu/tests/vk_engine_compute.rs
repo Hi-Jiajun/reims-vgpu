@@ -348,13 +348,20 @@ fn compute_readonly_ssbo_has_zero_readback() {
         samplers: vec![],
         storage_images: vec![],
     };
+    let before = engine::counter_snapshot();
     let Some(out) = engine_or_skip("compute readonly ssbo", &req) else {
         return;
     };
     assert!(out.buffers.is_empty());
-    let snap = engine::counter_snapshot();
+    let snap = engine::counter_snapshot().delta_since(&before);
     assert_eq!(snap.readbacks, 0);
     assert_eq!(snap.readback_bytes, 0);
+    assert_eq!(
+        snap.descriptor_pushes + snap.descriptor_set_updates,
+        1,
+        "one descriptor-bearing dispatch takes exactly one capability rung: {snap:?}"
+    );
+    assert_eq!(snap.descriptor_set_binds, snap.descriptor_set_updates);
 }
 
 /// 2D grid tiling: proves grid.y is not dropped (GlobalInvocationId.y varies).

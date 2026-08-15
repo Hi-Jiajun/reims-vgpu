@@ -50,9 +50,11 @@ pub mod host_pointer;
 pub mod linear_sampled;
 pub mod linear_target;
 pub mod memory_topology;
+pub mod push_descriptor;
 
 pub(crate) use host_pointer::{HostPointerCaps, HostPointerImport};
 pub(crate) use memory_topology::{MappedMemoryKind, MemoryClass, MemoryProfile};
+pub(crate) use push_descriptor::PushDescriptorCaps;
 
 use ash::vk;
 
@@ -94,6 +96,9 @@ pub struct HostGpuCaps {
     /// `runtime::guest_ram_map` through the granularity latch, by the import
     /// site, and by nothing else.
     pub host_pointer: HostPointerCaps,
+    /// Whether descriptor writes may be recorded directly into a command
+    /// buffer, and the maximum total descriptors in such a set layout.
+    pub push_descriptor: PushDescriptorCaps,
     /// `VK_KHR_portability_subset` was advertised. Kept for the selection log
     /// line and for constructing [`DriverQuirk`] — never gate behavior on it
     /// directly.
@@ -115,7 +120,7 @@ impl HostGpuCaps {
     /// something the device reported.
     pub fn selection_line(&self, device_name: &str) -> String {
         format!(
-            "vk_caps api={} baseline={} memory={} memory_signal={} device_local_mb={} host_visible_device_local_mb={} host_pointer_import={} host_pointer_align={} host_pointer_heap_mb={} portability_subset={} type={:?} name={device_name:?}",
+            "vk_caps api={} baseline={} memory={} memory_signal={} device_local_mb={} host_visible_device_local_mb={} host_pointer_import={} host_pointer_align={} host_pointer_heap_mb={} push_descriptors={} portability_subset={} type={:?} name={device_name:?}",
             api_floor::version_str(self.device_api_version),
             api_floor::version_str(api_floor::MIN_SUPPORTED_API),
             self.memory.topology.slug(),
@@ -125,6 +130,7 @@ impl HostGpuCaps {
             self.host_pointer.rung.slug(),
             self.host_pointer.min_alignment,
             self.host_pointer.heap_budget >> 20,
+            self.push_descriptor.max_descriptors,
             self.portability_subset,
             self.device_type,
         )
@@ -146,6 +152,7 @@ mod tests {
                 heap_budget: 8 << 30,
                 span_max: host_pointer::IMPORT_SPAN_CEILING,
             },
+            push_descriptor: PushDescriptorCaps::default(),
             portability_subset: false,
             device_api_version: api,
             device_type: vk::PhysicalDeviceType::DISCRETE_GPU,

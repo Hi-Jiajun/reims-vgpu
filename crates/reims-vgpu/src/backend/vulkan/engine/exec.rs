@@ -4,6 +4,7 @@
 
 use ash::vk;
 use std::collections::BTreeSet;
+use std::sync::atomic::Ordering;
 
 use super::caches::{
     canonicalize_layout_bindings, AttrKey, BindingSig, LayoutKey, ObjectCaches, PassKey,
@@ -3749,83 +3750,90 @@ pub(crate) unsafe fn execute_draw_inner(
     };
 
     phase.enter(super::draw_phase::Phase::Descriptors);
-    // Descriptor set
-    // Owning pool block travels alongside the set so the flush-time free routes
-    // back to the block it was allocated from (arena may grow past block 0).
+    // Push descriptors are the Vulkan spelling closest to Metal encoder
+    // binding state: the writes become commands in this command buffer, with no
+    // separately allocated object. The layout cache made the same decision.
+    let push_descriptors = layout_key.uses_push_descriptors(ctx.caps.push_descriptor);
+    // Owning pool block travels alongside an allocated set so the flush-time
+    // free routes back to the block it came from. A push layout owns neither.
     let mut dset_pool: Option<vk::DescriptorPool> = None;
-    let dset = if dsl != vk::DescriptorSetLayout::null() {
+    let dset = if dsl != vk::DescriptorSetLayout::null() && !push_descriptors {
         let (dset, pool) = pools.alloc_descriptor_set(&ctx.device, dsl, counters)?;
         dset_pool = Some(pool);
-        let buffer_infos: Vec<_> = storage_slots
-            .iter()
-            .map(|(_, bound, len)| {
-                vk::DescriptorBufferInfo::default()
-                    .buffer(bound.buffer)
-                    .offset(bound.offset)
-                    .range(descriptor_range(*len))
-            })
-            .collect();
-        let sampled_infos: Vec<_> = sampled
-            .iter()
-            .map(|image| {
-                vk::DescriptorImageInfo::default()
-                    .image_view(image.view())
-                    .image_layout(image.descriptor_layout())
-            })
-            .collect();
-        let sampler_infos: Vec<_> = sampler_handles
-            .iter()
-            .map(|(_, s)| vk::DescriptorImageInfo::default().sampler(*s))
-            .collect();
-        // Framebuffer fetch: the input attachment IS the color target's view;
-        // derive the same layout as the subpass reference. A draw that also
-        // samples the target upgrades both from GENERAL to the feedback layout.
-        let color_input_info = vk::DescriptorImageInfo::default()
-            .image_view(target_view)
-            .image_layout(pass_key.color_layout(0));
-        let mut writes = Vec::new();
-        for (i, (binding, _, _)) in storage_slots.iter().enumerate() {
-            writes.push(
-                vk::WriteDescriptorSet::default()
-                    .dst_set(dset)
-                    .dst_binding(*binding)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(std::slice::from_ref(&buffer_infos[i])),
-            );
-        }
-        for (i, image) in sampled.iter().enumerate() {
-            writes.push(
-                vk::WriteDescriptorSet::default()
-                    .dst_set(dset)
-                    .dst_binding(image.binding())
-                    .dst_array_element(image.array_element())
-                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                    .image_info(std::slice::from_ref(&sampled_infos[i])),
-            );
-        }
-        for (i, (binding, _)) in sampler_handles.iter().enumerate() {
-            writes.push(
-                vk::WriteDescriptorSet::default()
-                    .dst_set(dset)
-                    .dst_binding(*binding)
-                    .descriptor_type(vk::DescriptorType::SAMPLER)
-                    .image_info(std::slice::from_ref(&sampler_infos[i])),
-            );
-        }
-        if req.color_input {
-            writes.push(
-                vk::WriteDescriptorSet::default()
-                    .dst_set(dset)
-                    .dst_binding(super::types::COLOR_INPUT_BINDING)
-                    .descriptor_type(vk::DescriptorType::INPUT_ATTACHMENT)
-                    .image_info(std::slice::from_ref(&color_input_info)),
-            );
-        }
-        ctx.device.update_descriptor_sets(&writes, &[]);
         Some(dset)
     } else {
         None
     };
+    let buffer_infos: Vec<_> = storage_slots
+        .iter()
+        .map(|(_, bound, len)| {
+            vk::DescriptorBufferInfo::default()
+                .buffer(bound.buffer)
+                .offset(bound.offset)
+                .range(descriptor_range(*len))
+        })
+        .collect();
+    let sampled_infos: Vec<_> = sampled
+        .iter()
+        .map(|image| {
+            vk::DescriptorImageInfo::default()
+                .image_view(image.view())
+                .image_layout(image.descriptor_layout())
+        })
+        .collect();
+    let sampler_infos: Vec<_> = sampler_handles
+        .iter()
+        .map(|(_, s)| vk::DescriptorImageInfo::default().sampler(*s))
+        .collect();
+    // Framebuffer fetch: the input attachment IS the color target's view;
+    // derive the same layout as the subpass reference. A draw that also
+    // samples the target upgrades both from GENERAL to the feedback layout.
+    let color_input_info = vk::DescriptorImageInfo::default()
+        .image_view(target_view)
+        .image_layout(pass_key.color_layout(0));
+    let dst_set = dset.unwrap_or_default();
+    let mut descriptor_writes = Vec::new();
+    for (i, (binding, _, _)) in storage_slots.iter().enumerate() {
+        descriptor_writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(dst_set)
+                .dst_binding(*binding)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&buffer_infos[i])),
+        );
+    }
+    for (i, image) in sampled.iter().enumerate() {
+        descriptor_writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(dst_set)
+                .dst_binding(image.binding())
+                .dst_array_element(image.array_element())
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(std::slice::from_ref(&sampled_infos[i])),
+        );
+    }
+    for (i, (binding, _)) in sampler_handles.iter().enumerate() {
+        descriptor_writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(dst_set)
+                .dst_binding(*binding)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(std::slice::from_ref(&sampler_infos[i])),
+        );
+    }
+    if req.color_input {
+        descriptor_writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(dst_set)
+                .dst_binding(super::types::COLOR_INPUT_BINDING)
+                .descriptor_type(vk::DescriptorType::INPUT_ATTACHMENT)
+                .image_info(std::slice::from_ref(&color_input_info)),
+        );
+    }
+    if dset.is_some() {
+        ctx.device.update_descriptor_sets(&descriptor_writes, &[]);
+        counters.descriptor_set_updates.fetch_add(1, Ordering::Relaxed);
+    }
 
     phase.enter(super::draw_phase::Phase::Record);
     // The ring slot's CB retired at begin_entry and its fence is unsignaled —
@@ -4727,7 +4735,19 @@ pub(crate) unsafe fn execute_draw_inner(
         };
     }
 
-    if let Some(dset) = dset {
+    if push_descriptors {
+        ctx.push_descriptor
+            .as_ref()
+            .expect("push layout requires enabled entry points")
+            .cmd_push_descriptor_set(
+                cb,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_layout,
+                0,
+                &descriptor_writes,
+            );
+        counters.descriptor_pushes.fetch_add(1, Ordering::Relaxed);
+    } else if let Some(dset) = dset {
         ctx.device.cmd_bind_descriptor_sets(
             cb,
             vk::PipelineBindPoint::GRAPHICS,
@@ -4736,6 +4756,7 @@ pub(crate) unsafe fn execute_draw_inner(
             &[dset],
             &[],
         );
+        counters.descriptor_set_binds.fetch_add(1, Ordering::Relaxed);
     }
     for (binding, bound) in &vertex_bufs {
         ctx.device

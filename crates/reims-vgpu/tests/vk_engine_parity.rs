@@ -2067,9 +2067,21 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         .expect("map reflected static sampler"),
     );
 
+    let before = engine::counter_snapshot();
     let Some(pixels) = draw_or_skip("reflected static sampler", &req) else {
         return;
     };
+    let descriptors = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        descriptors.descriptor_pushes + descriptors.descriptor_set_updates,
+        1,
+        "one descriptor-bearing draw takes exactly one capability rung: {descriptors:?}"
+    );
+    assert_eq!(
+        descriptors.descriptor_set_binds,
+        descriptors.descriptor_set_updates,
+        "only separately updated sets require a bind: {descriptors:?}"
+    );
     for (index, pixel) in pixels.chunks_exact(4).enumerate() {
         assert_eq!(pixel, rgba, "static sampler pixel {index}");
     }

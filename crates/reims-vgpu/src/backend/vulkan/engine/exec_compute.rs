@@ -4,6 +4,7 @@
 
 use ash::vk;
 use std::collections::BTreeSet;
+use std::sync::atomic::Ordering;
 
 use super::caches::{
     canonicalize_layout_bindings, BindingSig, ComputePipelineKey, LayoutKey, ObjectCaches,
@@ -568,85 +569,90 @@ pub(crate) unsafe fn execute_compute_inner(
         });
     }
 
-    // Descriptor set
-    // Owning pool block travels with the set for a correctly-routed free.
+    let push_descriptors = layout_key.uses_push_descriptors(ctx.caps.push_descriptor);
+    // Owning pool block travels with an allocated set for a correctly-routed
+    // free. A push layout records its writes into the command buffer instead.
     let mut dset_pool: Option<vk::DescriptorPool> = None;
-    let dset = if dsl != vk::DescriptorSetLayout::null() {
+    let dset = if dsl != vk::DescriptorSetLayout::null() && !push_descriptors {
         let (dset, pool) = pools.alloc_descriptor_set(&ctx.device, dsl, counters)?;
         dset_pool = Some(pool);
-        let buffer_infos: Vec<_> = storage_slots
-            .iter()
-            .map(|(_, s, len, _)| {
-                vk::DescriptorBufferInfo::default()
-                    .buffer(s.buffer)
-                    .offset(0)
-                    .range(super::exec::descriptor_range(*len as u64))
-            })
-            .collect();
-        let sampled_infos: Vec<_> = sampled_slots
-            .iter()
-            .map(|prepared| {
-                vk::DescriptorImageInfo::default()
-                    .image_view(prepared.img.view)
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            })
-            .collect();
-        let sampler_infos: Vec<_> = sampler_handles
-            .iter()
-            .map(|(_, sampler)| vk::DescriptorImageInfo::default().sampler(*sampler))
-            .collect();
-        let image_infos: Vec<_> = simg_slots
-            .iter()
-            .map(|prepared| {
-                vk::DescriptorImageInfo::default()
-                    .image_view(prepared.slot.view)
-                    .image_layout(vk::ImageLayout::GENERAL)
-            })
-            .collect();
-        let mut writes = Vec::new();
-        for (i, (binding, _, _, _)) in storage_slots.iter().enumerate() {
-            writes.push(
-                vk::WriteDescriptorSet::default()
-                    .dst_set(dset)
-                    .dst_binding(*binding)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(std::slice::from_ref(&buffer_infos[i])),
-            );
-        }
-        for (i, prepared) in sampled_slots.iter().enumerate() {
-            writes.push(
-                vk::WriteDescriptorSet::default()
-                    .dst_set(dset)
-                    .dst_binding(prepared.binding)
-                    .dst_array_element(prepared.array_element)
-                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                    .image_info(std::slice::from_ref(&sampled_infos[i])),
-            );
-        }
-        for (i, (binding, _)) in sampler_handles.iter().enumerate() {
-            writes.push(
-                vk::WriteDescriptorSet::default()
-                    .dst_set(dset)
-                    .dst_binding(*binding)
-                    .descriptor_type(vk::DescriptorType::SAMPLER)
-                    .image_info(std::slice::from_ref(&sampler_infos[i])),
-            );
-        }
-        for (i, prepared) in simg_slots.iter().enumerate() {
-            writes.push(
-                vk::WriteDescriptorSet::default()
-                    .dst_set(dset)
-                    .dst_binding(prepared.binding)
-                    .dst_array_element(prepared.array_element)
-                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                    .image_info(std::slice::from_ref(&image_infos[i])),
-            );
-        }
-        ctx.device.update_descriptor_sets(&writes, &[]);
         Some(dset)
     } else {
         None
     };
+    let buffer_infos: Vec<_> = storage_slots
+        .iter()
+        .map(|(_, s, len, _)| {
+            vk::DescriptorBufferInfo::default()
+                .buffer(s.buffer)
+                .offset(0)
+                .range(super::exec::descriptor_range(*len as u64))
+        })
+        .collect();
+    let sampled_infos: Vec<_> = sampled_slots
+        .iter()
+        .map(|prepared| {
+            vk::DescriptorImageInfo::default()
+                .image_view(prepared.img.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        })
+        .collect();
+    let sampler_infos: Vec<_> = sampler_handles
+        .iter()
+        .map(|(_, sampler)| vk::DescriptorImageInfo::default().sampler(*sampler))
+        .collect();
+    let image_infos: Vec<_> = simg_slots
+        .iter()
+        .map(|prepared| {
+            vk::DescriptorImageInfo::default()
+                .image_view(prepared.slot.view)
+                .image_layout(vk::ImageLayout::GENERAL)
+        })
+        .collect();
+    let dst_set = dset.unwrap_or_default();
+    let mut descriptor_writes = Vec::new();
+    for (i, (binding, _, _, _)) in storage_slots.iter().enumerate() {
+        descriptor_writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(dst_set)
+                .dst_binding(*binding)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&buffer_infos[i])),
+        );
+    }
+    for (i, prepared) in sampled_slots.iter().enumerate() {
+        descriptor_writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(dst_set)
+                .dst_binding(prepared.binding)
+                .dst_array_element(prepared.array_element)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(std::slice::from_ref(&sampled_infos[i])),
+        );
+    }
+    for (i, (binding, _)) in sampler_handles.iter().enumerate() {
+        descriptor_writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(dst_set)
+                .dst_binding(*binding)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(std::slice::from_ref(&sampler_infos[i])),
+        );
+    }
+    for (i, prepared) in simg_slots.iter().enumerate() {
+        descriptor_writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(dst_set)
+                .dst_binding(prepared.binding)
+                .dst_array_element(prepared.array_element)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(&image_infos[i])),
+        );
+    }
+    if dset.is_some() {
+        ctx.device.update_descriptor_sets(&descriptor_writes, &[]);
+        counters.descriptor_set_updates.fetch_add(1, Ordering::Relaxed);
+    }
 
     // The ring slot's CB retired at begin_entry and its fence is unsignaled —
     // no pre-record wait remains (pre_record_wait_us stays 0 on this path).
@@ -872,7 +878,19 @@ pub(crate) unsafe fn execute_compute_inner(
 
     ctx.device
         .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline);
-    if let Some(dset) = dset {
+    if push_descriptors {
+        ctx.push_descriptor
+            .as_ref()
+            .expect("push layout requires enabled entry points")
+            .cmd_push_descriptor_set(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                pipeline_layout,
+                0,
+                &descriptor_writes,
+            );
+        counters.descriptor_pushes.fetch_add(1, Ordering::Relaxed);
+    } else if let Some(dset) = dset {
         ctx.device.cmd_bind_descriptor_sets(
             cb,
             vk::PipelineBindPoint::COMPUTE,
@@ -881,6 +899,7 @@ pub(crate) unsafe fn execute_compute_inner(
             &[dset],
             &[],
         );
+        counters.descriptor_set_binds.fetch_add(1, Ordering::Relaxed);
     }
     ctx.device
         .cmd_dispatch(cb, req.grid[0], req.grid[1], req.grid[2]);

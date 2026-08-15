@@ -543,6 +543,13 @@ engine_counters! {
         dynstate_viewport_held,
         dynstate_scissor_held,
         dynstate_stencil_held,
+        /// Draw/dispatch descriptor state recorded directly into the command
+        /// buffer through `VK_KHR_push_descriptor`.
+        descriptor_pushes,
+        /// Descriptor sets updated through the Vulkan 1.2 fallback path.
+        descriptor_set_updates,
+        /// Updated descriptor sets subsequently bound for execution.
+        descriptor_set_binds,
         sampled_cache_hits,
         sampled_identity_hits,
         sampled_cache_hit_bytes,

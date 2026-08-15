@@ -75,6 +75,18 @@ pub(crate) struct LayoutKey {
     pub bindings: Vec<BindingSig>,
 }
 
+impl LayoutKey {
+    /// Whether this layout is represented by command-buffer-local push
+    /// descriptors on this device. This same answer creates the layout and
+    /// chooses how every consumer writes it.
+    pub(crate) fn uses_push_descriptors(
+        &self,
+        caps: crate::backend::vulkan::caps::PushDescriptorCaps,
+    ) -> bool {
+        !self.bindings.is_empty() && caps.supports_counts(self.bindings.iter().map(|b| b.count))
+    }
+}
+
 pub(crate) fn canonicalize_layout_bindings(
     mut bindings: Vec<BindingSig>,
 ) -> Result<Vec<BindingSig>, super::DrawError> {
@@ -1165,9 +1177,13 @@ impl ObjectCaches {
                 .collect();
             let mut flags = vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
                 .binding_flags(&binding_flags);
-            let create_info = vk::DescriptorSetLayoutCreateInfo::default()
+            let mut create_info = vk::DescriptorSetLayoutCreateInfo::default()
                 .bindings(&bindings)
                 .push_next(&mut flags);
+            if key.uses_push_descriptors(ctx.caps.push_descriptor) {
+                create_info = create_info
+                    .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR);
+            }
             let d = ctx
                 .device
                 .create_descriptor_set_layout(&create_info, None)
@@ -2079,6 +2095,28 @@ impl ObjectCaches {
 #[cfg(test)]
 mod object_cache_tests {
     use super::*;
+
+    #[test]
+    fn push_layout_selection_uses_the_device_limit_and_keeps_the_fallback() {
+        let caps = crate::backend::vulkan::caps::PushDescriptorCaps {
+            max_descriptors: 32,
+        };
+        let layout = |counts: &[u32]| LayoutKey {
+            bindings: counts
+                .iter()
+                .enumerate()
+                .map(|(binding, &count)| BindingSig {
+                    binding: binding as u32,
+                    ty: vk::DescriptorType::STORAGE_BUFFER.as_raw() as u32,
+                    stages: vk::ShaderStageFlags::COMPUTE.as_raw(),
+                    count,
+                })
+                .collect(),
+        };
+        assert!(layout(&[16, 16]).uses_push_descriptors(caps));
+        assert!(!layout(&[16, 17]).uses_push_descriptors(caps));
+        assert!(!layout(&[]).uses_push_descriptors(caps));
+    }
 
     /// Pipeline and live-pass compatibility exclude load actions but retain
     /// attachment formats and subpass shape.
