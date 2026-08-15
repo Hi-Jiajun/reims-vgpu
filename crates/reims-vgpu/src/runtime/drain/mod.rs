@@ -1496,11 +1496,29 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
         // this device was holding the awaited word (publishable early, and
         // ordering-safe because publication carries the settle), had already
         // handed it to the GPU-ordered rail (nothing to do), or never had it.
-        note_store_route(match state.stamp_ledger.classify(*wait) {
+        let source = state.stamp_ledger.classify(*wait);
+        note_store_route(match source {
             UnmetSource::Coalesced => "stamp_unmet_coalesced",
             UnmetSource::Queued => "stamp_unmet_queued",
             UnmetSource::Absent => "stamp_unmet_absent",
         });
+        // A `Queued` wait is on a word already through `write_stamp`, so the
+        // settle has run and only the GPU is left — unless the submission it
+        // was registered against has not been made, because the batch carrying
+        // it is still recording. Then the guest is blocked on this device
+        // rather than on the GPU, and submitting ends it without changing any
+        // ordering. Counted both ways so the split stays visible: a flush that
+        // fires is a stall that was real.
+        #[cfg(feature = "backend-vulkan")]
+        if source == UnmetSource::Queued {
+            note_store_route(
+                if crate::backend::vulkan::engine::submit_batch_for_waiting_stamp(index) {
+                    "stamp_waiter_flushed_batch"
+                } else {
+                    "stamp_waiter_already_in_flight"
+                },
+            );
+        }
         verdict = verdict.and(StampVerdict::Hold);
         if crate::observe::first_sight(
             "packet_stamp_wait_unmet",

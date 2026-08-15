@@ -78,6 +78,25 @@ pub(crate) fn fifo_has_pending_stamp(index: u32) -> bool {
     index < u32::BITS && PENDING_FIFO_MASK.load(Ordering::Acquire) & (1u32 << index) != 0
 }
 
+/// The subset of [`PENDING_FIFO_MASK`] whose completion point is a submission
+/// **this device has not made yet** — a stamp registered against the open
+/// batch's future point by [`Completion::queue_for_next_submission`].
+///
+/// The distinction is the whole difference between a guest waiting on the GPU
+/// and a guest waiting on *us*. A `Submitted` stamp is in flight and nothing can
+/// make it land sooner. A `NextSubmission` stamp is a word we have promised and
+/// then parked in a command buffer that is still recording, and the batch has no
+/// time bound — it stays open until a draw claims a slot, a readback arrives, a
+/// present runs, or the pending ring fills. So a timeline blocked on one is
+/// blocked until unrelated work happens to arrive, which on a quiet channel can
+/// be tens of milliseconds.
+static UNSUBMITTED_FIFO_MASK: AtomicU32 = AtomicU32::new(0);
+
+/// Whether FIFO `index` is owed a stamp that is parked on an unsubmitted batch.
+pub(crate) fn fifo_has_unsubmitted_stamp(index: u32) -> bool {
+    index < u32::BITS && UNSUBMITTED_FIFO_MASK.load(Ordering::Acquire) & (1u32 << index) != 0
+}
+
 /// Raise the guest-visible interrupt for a completed stamp slot.
 ///
 /// Installed by the device layer, which owns the interrupt-status clone and the
@@ -187,7 +206,28 @@ impl PendingQueue {
                 bound += 1;
             }
         }
+        self.republish_unsubmitted();
         bound
+    }
+
+    /// Recompute the lock-free projection of which FIFOs still have a stamp
+    /// parked on an unsubmitted batch.
+    ///
+    /// Recomputed from the queue rather than decremented, because one
+    /// `bind_submission` can promote several of a FIFO's stamps at once while
+    /// leaving others — belonging to a *later* still-open batch — behind, and a
+    /// counter stepped per promotion would clear the bit while one of those is
+    /// still parked.
+    fn republish_unsubmitted(&self) {
+        let mut mask = 0u32;
+        for waiting in &self.waiting {
+            if matches!(waiting.point, CompletionPoint::NextSubmission(_))
+                && waiting.index < u32::BITS
+            {
+                mask |= 1u32 << waiting.index;
+            }
+        }
+        UNSUBMITTED_FIFO_MASK.store(mask, Ordering::Release);
     }
 }
 
@@ -434,6 +474,7 @@ impl StampCompletion {
             stamp,
         });
         PENDING_FIFO_MASK.fetch_or(1u32 << index, Ordering::Release);
+        UNSUBMITTED_FIFO_MASK.fetch_or(1u32 << index, Ordering::Release);
         drop(queue);
         self.shared.wake.notify_one();
         true
@@ -485,6 +526,7 @@ impl StampCompletion {
             let _ = join.join();
         }
         PENDING_FIFO_MASK.store(0, Ordering::Release);
+        UNSUBMITTED_FIFO_MASK.store(0, Ordering::Release);
         unsafe { device.destroy_semaphore(self.semaphore, None) };
     }
 }
@@ -665,6 +707,52 @@ mod tests {
         let child = queue.pop_front().expect("child completion");
         assert_eq!((child.index, child.stamp), (1, 0xfeed));
         assert!(!queue.has_pending(1));
+    }
+
+    /// The unsubmitted projection clears only when a FIFO has no stamp left on
+    /// an unmade submission — not merely when one of them is bound.
+    ///
+    /// A FIFO can hold stamps against two different open batches, and
+    /// `bind_submission` promotes only the one whose point matches. Stepping a
+    /// counter per promotion would clear the bit while the later batch's stamp
+    /// is still parked, and a timeline blocked on *that* one would then never
+    /// get its batch submitted. Hence the recompute.
+    #[test]
+    fn the_unsubmitted_projection_survives_a_partial_bind() {
+        let mut queue = PendingQueue::default();
+        UNSUBMITTED_FIFO_MASK.store(0, Ordering::Release);
+
+        // Two batches' worth of stamps on one FIFO, plus a sibling's.
+        let mut early = waiting(1, 0x10);
+        early.point = CompletionPoint::NextSubmission(7);
+        let mut late = waiting(1, 0x11);
+        late.point = CompletionPoint::NextSubmission(9);
+        let mut other = waiting(2, 0x20);
+        other.point = CompletionPoint::NextSubmission(9);
+        queue.push(early);
+        queue.push(late);
+        queue.push(other);
+        queue.republish_unsubmitted();
+        assert!(fifo_has_unsubmitted_stamp(1));
+        assert!(fifo_has_unsubmitted_stamp(2));
+
+        // Submitting batch 7 binds only the early one.
+        assert_eq!(queue.bind_submission(7), 1);
+        assert!(
+            fifo_has_unsubmitted_stamp(1),
+            "FIFO 1 still has a stamp on batch 9, so its batch must still be \
+             submittable on demand"
+        );
+        assert!(fifo_has_unsubmitted_stamp(2));
+
+        // Submitting batch 9 binds the rest, and both bits clear.
+        assert_eq!(queue.bind_submission(9), 2);
+        assert!(
+            !fifo_has_unsubmitted_stamp(1),
+            "with everything in flight there is nothing left to submit early"
+        );
+        assert!(!fifo_has_unsubmitted_stamp(2));
+        UNSUBMITTED_FIFO_MASK.store(0, Ordering::Release);
     }
 
     /// Reservation order is submission order; reserving alone does not publish

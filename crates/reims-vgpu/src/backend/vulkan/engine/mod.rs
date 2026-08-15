@@ -1564,6 +1564,60 @@ pub fn write_completion_stamp(
     Ok(())
 }
 
+/// Submit the open batch when FIFO `index` is owed a stamp parked in it.
+///
+/// Called when a guest packet is held on a stamp wait this device has already
+/// promised but not put in flight. `queue_for_next_submission` registers a stamp
+/// against the open batch's *future* submission point, and the batch has no time
+/// bound — it stays open until a draw claims a slot, a readback arrives, a
+/// present runs, or the pending ring fills. On a channel that has gone quiet
+/// none of those need happen soon, so a timeline can block for tens of
+/// milliseconds on a word whose only remaining obstacle is that this device has
+/// not submitted the work it belongs to.
+///
+/// That is a stall this device causes and can end, and ending it changes no
+/// ordering: submitting a batch earlier runs exactly the recorded work, in the
+/// same order, against the same completion point. It is the honest counterpart
+/// of answering the wait from a private record of executed work, which is
+/// unsound because a stamp means the settle has run and the memory is
+/// reclaimable.
+///
+/// Returns whether a batch was submitted, so the caller can count how often the
+/// stall was real.
+pub fn submit_batch_for_waiting_stamp(index: u32) -> bool {
+    // Lock-free, and false in the common case, so a held packet does not take
+    // the engine lock merely to discover there is nothing parked for it.
+    if !stamp_completion::fifo_has_unsubmitted_stamp(index) {
+        return false;
+    }
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    if pools.batch_open_recording().is_none() {
+        return false;
+    }
+    let Some(ctx) = owner.ctx.as_ref() else {
+        return false;
+    };
+    match unsafe { pools.batch_flush(ctx, counters) } {
+        Ok(()) => true,
+        Err(e) => {
+            // The stamp stays parked and the guest keeps waiting, so this is a
+            // real loss of forward progress rather than a missed optimisation.
+            crate::observe::fail(format!(
+                "stamp_waiter_flush_failed index={index} err={e:?} (a guest \
+                 timeline is blocked on a stamp parked in a batch this device \
+                 could not submit)"
+            ));
+            false
+        }
+    }
+}
+
 /// Let every older completion on `index` publish before a CPU fallback writes
 /// a newer value into that FIFO's shared stamp slot.
 pub fn quiesce_completion_stamps(index: u32) {
