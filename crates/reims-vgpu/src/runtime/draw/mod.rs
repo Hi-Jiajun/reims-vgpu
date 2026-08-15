@@ -693,8 +693,70 @@ fn load_depth_stencil_descriptor<M: HostMemory + HostOps>(
     let (_entry, desc) =
         objects::resolve_descriptor(state, host, task_id, ds_ref, &[OBJECT_TYPE_TYPE7])
             .map_err(crate::observe::ladder_slugs!("depth_stencil"))?;
+    note_depth_stencil_recurrence(task_id, ds_ref, &desc);
     decode_depth_stencil_descriptor(&desc)
         .map_err(|_| crate::observe::ladder_slug!("depth_stencil", desc_decode))
+}
+
+/// Whether a bound depth-stencil reference's descriptor bytes are the ones this
+/// device last read for it.
+///
+/// # Why this is measured before anything caches it
+///
+/// The read above costs **0.43 µs of a 9.8 µs Maps chain** (`asm_depth_us`,
+/// n=3): an object-list lookup, a descriptor read out of guest memory, an
+/// `Arc<[u8]>` allocation and a decode, on every draw that binds any depth
+/// state. A guest creates a `MTLDepthStencilState` once and binds it for
+/// thousands of draws, so the answer looks obviously cacheable — and it is not
+/// obviously sound, because object type 7 is deliberately outside
+/// `RESOURCE_CONSTRUCTOR_TYPE_MASK`: `objects`' own comment calls it "mutable
+/// serializer state", and retaining its bytes until `DeleteResource` would
+/// conflate distinct APIs. The precedent for retaining a *constructed* object
+/// from a type-7 descriptor sits beside that comment — `task_render_pipeline_states`
+/// does exactly that — but which of the two a bound `depth_stencil_ref` is, is a
+/// question about the guest and not about this code.
+///
+/// So this counts rather than caches, the way the buffer gather cache was sized
+/// and then measured shut: **recurrence and content are different numbers, and
+/// only the second one licenses a cache.** `dscache_same` against
+/// `dscache_changed` is the whole reading. A large `same` with a zero `changed`
+/// says the bytes behind a bound reference do not move and the read can be
+/// served from a memo; any `changed` at all says the reference names something
+/// mutable and a cache would bind stale depth state, which is a wrong frame
+/// rather than a slow one.
+///
+/// The comparison is bytes and not a digest: these descriptors are tens of
+/// bytes, so a hash would cost more than the memcmp it replaces and would trade
+/// an exact answer for a probabilistic one in the census whose whole job is to
+/// decide whether exactness is available.
+#[cfg(feature = "backend-vulkan")]
+fn note_depth_stencil_recurrence(task_id: u32, ds_ref: u32, desc: &std::sync::Arc<[u8]>) {
+    /// References the census holds before it starts over. A guest binds a
+    /// handful of depth-stencil states; a boot that reaches this is reporting
+    /// something rather than asking for an eviction policy.
+    const ENTRIES: usize = 1024;
+    /// `(task, reference)` → the descriptor bytes last read for it. `None`
+    /// until the first read, because `HashMap::new` is not a `const fn`.
+    type LastSeen = std::collections::HashMap<(u32, u32), Vec<u8>>;
+    static SEEN: std::sync::Mutex<Option<LastSeen>> = std::sync::Mutex::new(None);
+
+    let Ok(mut guard) = SEEN.lock() else {
+        return;
+    };
+    let seen = guard.get_or_insert_with(std::collections::HashMap::new);
+    match seen.get(&(task_id, ds_ref)) {
+        Some(previous) if previous.as_slice() == &desc[..] => {
+            crate::runtime::drain::note_store_route("dscache_same");
+            return;
+        }
+        Some(_) => crate::runtime::drain::note_store_route("dscache_changed"),
+        None => crate::runtime::drain::note_store_route("dscache_first"),
+    }
+    if seen.len() >= ENTRIES {
+        seen.clear();
+        crate::runtime::drain::note_store_route("dscache_reset");
+    }
+    seen.insert((task_id, ds_ref), desc.to_vec());
 }
 
 /// One slot of a render encoder's vertex or fragment buffer table.
