@@ -2016,6 +2016,31 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
     let storage_row = (copy_w as u64)
         .checked_mul(storage_bpp as u64)
         .ok_or(BlitStatus::Capacity)? as usize;
+    // The other half of the rail. `note_t2t_shape` covers texture-to-texture
+    // only, and that left 4 243 of a driven Maps leg's 26 234 blit records
+    // uncounted — a population big enough to hold the whole per-record cost if
+    // its copies are large, and invisible in a census that stops at one copy
+    // kind. Same three readings, so the two halves are comparable line for line.
+    {
+        use crate::runtime::drain::{note_store_route, note_store_route_n};
+        note_store_route(match (to_texture, tex.is_type11()) {
+            (true, false) => "blit_b2t_linear",
+            (true, true) => "blit_b2t_t11",
+            (false, false) => "blit_t2b_linear",
+            (false, true) => "blit_t2b_t11",
+        });
+        let bytes = (plane_row as u64)
+            .saturating_mul(copy_h)
+            .saturating_mul(copy_d);
+        note_store_route_n("blit_bt_bytes", bytes);
+        note_store_route_n("blit_bt_rows_n", copy_h.saturating_mul(copy_d));
+        note_store_route(match bytes {
+            0..=4_095 => "blit_bt_band_tiny",
+            4_096..=262_143 => "blit_bt_band_small",
+            262_144..=4_194_303 => "blit_bt_band_medium",
+            _ => "blit_bt_band_large",
+        });
+    }
     let mut plane = vec![0u8; plane_row];
     let mut packed = vec![0u8; storage_row.max(plane_row)];
     // Destination pages, taken before the loop below rather than per row. The
