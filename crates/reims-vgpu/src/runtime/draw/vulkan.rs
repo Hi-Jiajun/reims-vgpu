@@ -3521,11 +3521,19 @@ fn held_buffer_content(
     {
         if offset < packed.size {
             let full = packed.size - offset;
-            if let Some(span) = gather_span_if_eligible(full, extent_cap) {
-                if let Some(bound) = slice_packed_buffer(packed, offset, span) {
-                    crate::runtime::drain::note_store_route("zc_buffer_held");
-                    return Some(bound_buffer_content(&bound));
-                }
+            // No floor here. Slicing a retained packed alias records no gather —
+            // the alias is already imported and this hands back a sub-range of
+            // it — so `ZERO_COPY_BUFFER_MIN_BYTES`, which governs gathers alone,
+            // has nothing to say. It used to be asked, and that sent every
+            // sub-floor bind past the one branch that answers in O(1) and down
+            // the full resolve-and-reconstruct path on *every* draw: one driven
+            // Maps leg scored `zc_buffer_imported` 1 924 454 against
+            // `zc_buffer_held` 1 389 939, for binds whose alias was sitting
+            // right here the whole time.
+            let span = extent_cap.map_or(full, |cap| full.min(cap));
+            if let Some(bound) = slice_packed_buffer(packed, offset, span) {
+                crate::runtime::drain::note_store_route("zc_buffer_held");
+                return Some(bound_buffer_content(&bound));
             }
         }
     }
