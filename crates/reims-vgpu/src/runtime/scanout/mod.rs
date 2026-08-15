@@ -948,7 +948,7 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
     // the same field — literally, via `DeviceState::mapping_reach_pages`, which
     // is also what names the write. A mapping with no page list, or one holding
     // an entry that names no backing, cannot be ruled out and settles.
-    crate::runtime::writeback_debt::settle_for_mapping_unless_disjoint(
+    crate::runtime::writeback_debt::settle_for_mapping(
         state, host, mapping_id, site,
     );
 
