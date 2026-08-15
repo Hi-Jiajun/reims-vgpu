@@ -1595,7 +1595,22 @@ fn copy_row_region<M: HostMemory + HostOps>(
         image_count,
     )
     .ok_or_else(|| br(BlitStatus::Capacity, "copy_region_dst_span_overflow"))?;
+    // The window is built once and the rows run against it, so a single total
+    // over the pair cannot say which is the cost. `dest_window` walks the whole
+    // destination span's guest page table into a `HashSet`, which is per-record
+    // work that does not shrink with the copy; the row loop is per-row work that
+    // does. Timed apart because the repair differs.
+    let window_started = std::time::Instant::now();
     let allowed = dest_window(state, host, task_id, dst_base, dst_span);
+    crate::runtime::drain::note_store_route_us(
+        "blit_window_us",
+        window_started.elapsed().as_micros() as u64,
+    );
+    let rows_started = std::time::Instant::now();
+    crate::runtime::drain::note_store_route_n(
+        "blit_rows_n",
+        row_count.saturating_mul(image_count),
+    );
     let mut row_buf = vec![0u8; row_len];
     for z in 0..image_count {
         let src_plane = src_base
@@ -1651,6 +1666,10 @@ fn copy_row_region<M: HostMemory + HostOps>(
             }
         }
     }
+    crate::runtime::drain::note_store_route_us(
+        "blit_rows_us",
+        rows_started.elapsed().as_micros() as u64,
+    );
     Ok(())
 }
 
@@ -2662,6 +2681,12 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     task_id: u32,
     cmd: &Command,
 ) -> BlitStatus {
+    // `walk_blit_us` says this call costs ~1.1 ms and `blit_t2t_bytes` says it
+    // moves ~800 of them, so the cost is not in the copy and a single total
+    // cannot say where it is instead. The three phases below are the whole body:
+    // resolving both endpoints, arming the destination's page window, and the
+    // row loop. Whichever of them holds the millisecond is the one to repair.
+    let phase_started = std::time::Instant::now();
     let src = match resolve_texture_backing(
         state,
         host,
@@ -2759,6 +2784,10 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         return BlitStatus::ZeroExtent;
     }
     note_t2t_shape(&src, &dst, copy_w, copy_h, copy_d, copy_bpp);
+    crate::runtime::drain::note_store_route_us(
+        "blit_t2t_resolve_us",
+        phase_started.elapsed().as_micros() as u64,
+    );
     let row_bytes = match copy_w.checked_mul(copy_bpp as u64) {
         Some(v) => v,
         None => return br(BlitStatus::Capacity, "t2t_row_bytes_overflow"),
