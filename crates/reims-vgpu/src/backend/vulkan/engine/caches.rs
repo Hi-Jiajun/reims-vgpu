@@ -244,6 +244,21 @@ impl PassKey {
     /// remains inside the pass begun with the encoder's original action. Store
     /// actions and initial/final layouts are functions of these same fields in
     /// this backend, so there is no second compatibility spelling to normalize.
+    ///
+    /// `feedback_colors` is erased **exactly when it changes nothing about the
+    /// pass** — that is, when [`color_feedback_layout`] and
+    /// [`color0_pass_exit_layout`] are the same layout. The self-dependency is
+    /// declared on every pass, so once the layouts also coincide a feedback draw
+    /// and an ordinary one want a byte-identical `VkRenderPass` and there is
+    /// nothing left to keep them apart. Which is the point: whether a draw samples
+    /// the target it is writing is a property of the *draw*, exactly as it is in
+    /// Metal, and it stops closing the render pass.
+    ///
+    /// The condition is not decoration. Under [`crate::env::COLOR_GENERAL`]`=off`
+    /// the resting layout admits no feedback loop, the feedback slots really are
+    /// in a different layout, and erasing the field there would merge two draws
+    /// whose attachment is in two different layouts — a pass naming a layout its
+    /// image is not in.
     pub(crate) fn compatibility(self) -> PassCompatibilityKey {
         let mut key = self;
         key.load_seed = false;
@@ -252,6 +267,9 @@ impl PassKey {
         }
         if let Some(depth) = &mut key.depth {
             depth.load = false;
+        }
+        if color_feedback_layout() == color0_pass_exit_layout() {
+            key.feedback_colors = 0;
         }
         PassCompatibilityKey(key)
     }
@@ -362,10 +380,6 @@ pub(crate) struct FramebufferCompatibilityKey(PassKey);
 impl PassCompatibilityKey {
     pub(crate) fn secondary_count(self) -> usize {
         self.0.secondary_count as usize
-    }
-
-    pub(crate) fn feedback_colors(self) -> u8 {
-        self.0.feedback_colors
     }
 
     pub(crate) fn has_depth(self) -> bool {
@@ -499,6 +513,20 @@ pub(crate) struct PipelineKey {
     /// spelling below `VK_EXT_extended_dynamic_state3`.
     pub color_write_mask: [ColorWriteMask; 1 + MAX_SECONDARY_ATTACH],
     pub pass: PassCompatibilityKey,
+    /// Which colour attachments this draw samples while writing them.
+    ///
+    /// Pipeline state, not pass state. `VK_PIPELINE_CREATE_COLOR_ATTACHMENT_-
+    /// FEEDBACK_LOOP_BIT_EXT` is what "feedback loop is enabled" means for the
+    /// draw-time rules, and it is fixed at pipeline creation — so a feedback draw
+    /// and an ordinary one need two pipelines even when they share a render pass.
+    ///
+    /// It lives here rather than being read back out of [`Self::pass`] because
+    /// [`PassKey::compatibility`] erases it precisely when the render pass stops
+    /// depending on it, which is the shipping arm. Reading it from there would
+    /// silently drop the create flag off every feedback pipeline, and the result
+    /// is a draw sampling an attachment it is writing with no feedback loop
+    /// enabled — undefined behaviour, reported nowhere.
+    pub feedback_colors: u8,
     /// Face culling. `None` (the 2D UI default) keeps the raster state at
     /// `CULL_NONE`, byte-identical to the pre-cull engine; the key still
     /// participates in hashing so a later culled draw with the same shaders gets
@@ -2467,7 +2495,7 @@ impl ObjectCaches {
             .layout(pipeline_layout)
             .render_pass(render_pass)
             .subpass(0);
-        if key.pass.feedback_colors() != 0 {
+        if key.feedback_colors != 0 {
             gpci = gpci.flags(vk::PipelineCreateFlags::COLOR_ATTACHMENT_FEEDBACK_LOOP_EXT);
         }
         if key.pass.has_depth() {
@@ -2744,7 +2772,16 @@ mod object_cache_tests {
             ("host accessible", |k| k.host_accessible_color0 = true,
              Some(PassCompatField::HostAccessibleColor0)),
             ("color input", |k| k.color_input = true, Some(PassCompatField::ColorInput)),
-            ("feedback", |k| k.feedback_colors = 1, Some(PassCompatField::FeedbackColors)),
+            // Feedback is a property of the draw, and it makes two passes
+            // incompatible only on the arm where it still moves a layout. On the
+            // shipping arm `compatibility` erases it, which is what stops a
+            // feedback draw closing the render pass an ordinary one opened.
+            ("feedback", |k| k.feedback_colors = 1,
+             if color_feedback_layout() == color0_pass_exit_layout() {
+                 None
+             } else {
+                 Some(PassCompatField::FeedbackColors)
+             }),
             ("sample count", |k| k.sample_count = 4, Some(PassCompatField::SampleCount)),
             ("resolve", |k| k.multisample_resolve = true,
              Some(PassCompatField::MultisampleResolve)),
@@ -3545,6 +3582,36 @@ mod object_cache_tests {
         .len()
             + usize::from(key.color_input)
             + 1
+    }
+
+    /// Erasing feedback from the pass key must not erase it from the device.
+    ///
+    /// `compatibility()` drops `feedback_colors` on the shipping arm so a feedback
+    /// draw can continue an ordinary draw's render pass. The create flag
+    /// `VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT` is what makes
+    /// that draw legal, it is fixed at pipeline creation, and it is therefore the
+    /// one thing that must **not** follow the field out of the pass key. This
+    /// asserts the split: same pass compatibility, different pipeline key.
+    ///
+    /// Without it, the pass-merge win silently turns every feedback draw into a
+    /// sampled read of an attachment it is writing with no feedback loop enabled.
+    #[test]
+    fn feedback_leaves_pass_compatibility_without_leaving_the_pipeline() {
+        let plain = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
+        let mut feeds = plain;
+        feeds.feedback_colors = 1;
+
+        if color_feedback_layout() == color0_pass_exit_layout() {
+            assert_eq!(
+                plain.compatibility(),
+                feeds.compatibility(),
+                "a feedback draw must be able to continue an ordinary draw's pass"
+            );
+        }
+        // Whatever the pass key did, the draw's own answer is still reachable and
+        // is what the pipeline key is built from.
+        assert_eq!(plain.feedback_colors, 0);
+        assert_eq!(feeds.feedback_colors, 1);
     }
 
     /// A subpass self-dependency sourced in a framebuffer-space stage may name

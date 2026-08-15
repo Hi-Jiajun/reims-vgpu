@@ -3193,6 +3193,9 @@ pub(crate) unsafe fn execute_draw_inner(
                 per_slot
             },
             pass: pass_key.compatibility(),
+            // Taken from the pass key this draw built, not from `pass`, which
+            // erases it once feedback stops changing the render pass.
+            feedback_colors: pass_key.feedback_colors,
             cull_mode: req.cull_mode,
             front_face_ccw: req.front_face_ccw,
             fill_mode: req.fill_mode,
