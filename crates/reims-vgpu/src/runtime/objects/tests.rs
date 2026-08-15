@@ -85,6 +85,67 @@ fn resolve_type11_from_list() {
     assert_eq!((m.width, m.height, m.format), (64, 32, 0x50));
 }
 
+/// Registering a type-11 texture is construction, not bind-time repair.
+///
+/// Once the task owns the texture object, later binds retrieve that object and
+/// must not replay its serialized descriptor over mutable mapping state. A new
+/// descriptor can take effect only after the resource lifetime ends.
+#[test]
+fn a_retained_type11_texture_runs_construction_side_effects_once() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let resource = resolve_resource(&state, &host, 1, 1).expect("construction");
+
+    assert_eq!(
+        resolve_type11_resource(&mut state, 1, 1, &resource),
+        Some(9)
+    );
+    {
+        let mapping = state.mappings.get_mut(&9).expect("registered mapping");
+        mapping.width = 17;
+        mapping.height = 19;
+        mapping.format = 0x71;
+    }
+
+    assert_eq!(
+        resolve_type11_resource(&mut state, 1, 1, &resource),
+        Some(9)
+    );
+    let mapping = &state.mappings[&9];
+    assert_eq!(
+        (mapping.width, mapping.height, mapping.format),
+        (17, 19, 0x71),
+        "a warm bind must not replay immutable construction input"
+    );
+}
+
+/// Physical replacement is the event that re-arms backing resolution for a
+/// retained texture. A warm bind accepts the already-latched page plan; once
+/// invalidation clears that plan, the same bind must enter the resolver again
+/// rather than treating object retention as proof that old pages remain live.
+#[test]
+fn a_texture_bind_reuses_backing_until_physical_invalidation() {
+    let host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    assert!(state.map_surface(9));
+    {
+        let mapping = state.mappings.get_mut(&9).expect("surface mapping");
+        mapping.mapped = true;
+        mapping.has_geom = true;
+        mapping.width = 64;
+        mapping.height = 32;
+        mapping.page_entries = vec![0x1234_5001];
+    }
+
+    assert!(ensure_surface_for_texture_bind(&mut state, &host, 9));
+    assert!(state.invalidate_mapping_pages(9));
+    assert!(
+        !ensure_surface_for_texture_bind(&mut state, &host, 9),
+        "the invalidated page plan must be rebuilt before the texture binds"
+    );
+}
+
 /// A list entry and descriptor are construction input for a resource, not
 /// mutable bind-time state.
 ///
@@ -133,6 +194,11 @@ fn resources_keep_construction_input_until_explicit_delete() {
     let replacement = resolve_resource(&state, &host, 1, 1).expect("replacement construction");
     assert!(!Arc::ptr_eq(&first, &replacement));
     assert_eq!(ld32(&replacement.descriptor), 10);
+    assert_eq!(
+        resolve_type11_resource(&mut state, 1, 1, &replacement),
+        Some(10),
+        "the replacement lifetime runs its own construction side effects"
+    );
 }
 
 #[test]

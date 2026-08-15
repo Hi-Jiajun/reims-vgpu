@@ -580,6 +580,11 @@ pub struct TaskResource {
     /// total decoder refuses, and keep that refusal too so those consumers do
     /// not silently widen the total contract.
     decoded: OnceLock<Result<Descriptor, ResourceDecodeStatus>>,
+    /// Type-11 construction side effects, completed once for this resource
+    /// lifetime. The mapping id is immutable construction state; physical
+    /// backing replacement invalidates the mapping's pages without rebuilding
+    /// the texture object.
+    type11_mapping: OnceLock<u32>,
     /// Identity whose strong lifetime is exactly this serialized resource.
     /// Direct backend objects keep only a weak reference, so deletion—not an
     /// arbitrary idle timeout—makes them reclaimable.
@@ -605,6 +610,7 @@ impl TaskResource {
             entry,
             descriptor,
             decoded: OnceLock::new(),
+            type11_mapping: OnceLock::new(),
             lifetime: Arc::new(TaskResourceLifetime::new()),
             #[cfg(feature = "backend-vulkan")]
             resident_targets: Mutex::new(HashMap::new()),
@@ -626,6 +632,14 @@ impl TaskResource {
             id: self.lifetime.id,
             live: Arc::downgrade(&self.lifetime),
         }
+    }
+
+    pub(crate) fn registered_type11_mapping(&self) -> Option<u32> {
+        self.type11_mapping.get().copied()
+    }
+
+    pub(crate) fn register_type11_mapping(&self, mapping_id: u32) -> u32 {
+        *self.type11_mapping.get_or_init(|| mapping_id)
     }
 
     /// Retain and classify the engine target named by this resource.

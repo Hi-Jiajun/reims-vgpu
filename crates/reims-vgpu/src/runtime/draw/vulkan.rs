@@ -1142,7 +1142,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
 
     if let Some(mid) = surface {
         // Ensure type-4 pages exist for this surface id.
-        let _ = objects::ensure_surface_for_present(state, host, mid);
+        let _ = objects::ensure_surface_for_texture_bind(state, host, mid);
         // A type-5 serialized record is the exact Metal texture view over the
         // IOSurface bytes. Materialize it only when it differs from (or cannot
         // be inferred from) the base mapping. Exact base views keep the fast
@@ -1199,16 +1199,8 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         if let Some(m) = state.mappings.get(&mid) {
             if m.has_geom && m.width > 0 && m.height > 0 {
                 let (w, h) = (m.width, m.height);
-                // Attribute the resident-readiness/bind sub-slice of the resolve so
-                // the census can separate engine-lock cost (this block) from the
-                // object-list decode prelude. This block acquires the global engine
-                // lock (`resident_content_ready`), the suspected dock-hover-freeze
-                // contention site.
-                // Resident-surface identity: computed once and reused for both the
-                // readiness check and the direct bind. `surface_identity` locks a
-                // global dedup mutex and does an output-group lookup; this bind
-                // resolves the same (mid, w, h), so recomputing it per resident
-                // sample (the census shows ~29k/session) is pure waste.
+                // Compute the resident-surface identity once and reuse it for
+                // both the readiness check and the direct bind.
                 let resident_id =
                     crate::runtime::present_identity::surface_identity(state, mid, w, h);
                 // `content_ready` only. The obvious strengthening — also require

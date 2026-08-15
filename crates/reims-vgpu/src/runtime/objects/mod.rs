@@ -1826,14 +1826,17 @@ pub fn resolve_type11_resource(
 ) -> Option<u32> {
     let entry = resource.entry;
     let desc = &resource.descriptor;
-    // Record the ref as live so the explicit delete path retires its associated
-    // host-side content as well as the retained resource object.
-    let _ = state.insert_object(task_id, ref_);
     if entry.object_type != OBJECT_TYPE_IOSURFACE {
         // Legitimate: this ref is a different object type, not a texture. Normal
         // control flow (resolve_type11_refs skips it) — never a failure.
         return None;
     }
+    if let Some(mapping_id) = resource.registered_type11_mapping() {
+        return Some(mapping_id);
+    }
+    // Record the ref as live so the explicit delete path retires its associated
+    // host-side content as well as the retained resource object.
+    let _ = state.insert_object(task_id, ref_);
     let mapping_id = match resource.decoded() {
         Ok(crate::runtime::decode::resource::Descriptor::IOSurfaceTexture {
             mapping_id,
@@ -1891,9 +1894,29 @@ pub fn resolve_type11_resource(
         return None;
     }
     state.texture_to_mapping.insert((task_id, ref_), mapping_id);
+    let mapping_id = resource.register_type11_mapping(mapping_id);
     // Resolved: re-arm so a later genuine failure on this ref logs again.
     clear_type11_fail(task_id, ref_);
     Some(mapping_id)
+}
+
+/// Make the physical backing of a retained texture bindable.
+///
+/// A texture bind does not revalidate immutable surface construction input.
+/// The guest announces a physical re-point explicitly; that path clears the
+/// mapping's page entries and bumps its generation. Consequently a warm bind
+/// only checks the retained mapping, while the first bind and the first bind
+/// after a re-point rebuild the backing through the full resolver.
+pub fn ensure_surface_for_texture_bind<M: HostMemory + crate::runtime::host::HostOps>(
+    state: &mut DeviceState,
+    host: &M,
+    surface_id: u32,
+) -> bool {
+    let ready = state
+        .mappings
+        .get(&surface_id)
+        .is_some_and(|m| m.mapped && !m.page_entries.is_empty() && m.has_geom);
+    ready || ensure_surface_for_present(state, host, surface_id)
 }
 
 /// The detail line a refused page walk reports.
