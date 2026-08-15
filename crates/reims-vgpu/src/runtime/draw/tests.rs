@@ -5241,6 +5241,13 @@ fn packed_buffer_alias_is_reused_across_offsets() {
         std::sync::Arc::ptr_eq(a.pages.as_ref().unwrap(), b.pages.as_ref().unwrap()),
         "offset binds share the resource's one bounded import reference"
     );
+    drop(second);
+    drop(a);
+    drop(b);
+    let import_owners = std::sync::Arc::strong_count(&first.import);
+    let page_list_owners = std::sync::Arc::strong_count(&first.gpas);
+    let run_owners = std::sync::Arc::strong_count(&first.runs);
+    let guest_ref_owners = std::sync::Arc::strong_count(&first.pages);
 
     let content = super::vulkan::load_buffer_content(
         &mut state,
@@ -5257,6 +5264,26 @@ fn packed_buffer_alias_is_reused_across_offsets() {
     };
     assert_eq!(source.source_offset, 0x800);
     assert_eq!(source.total_len, 0x800);
+    assert_eq!(
+        std::sync::Arc::strong_count(&first.import),
+        import_owners,
+        "a warm bind borrows the retained resource instead of cloning its allocation"
+    );
+    assert_eq!(
+        std::sync::Arc::strong_count(&first.gpas),
+        page_list_owners,
+        "the physical construction list does not travel to execution"
+    );
+    assert_eq!(
+        std::sync::Arc::strong_count(&first.runs),
+        run_owners + 1,
+        "execution owns exactly the run source it consumes"
+    );
+    assert_eq!(
+        std::sync::Arc::strong_count(&first.pages),
+        guest_ref_owners + 1,
+        "execution owns exactly the bounded guest references it consumes"
+    );
     assert_eq!(
         state.bound_buffers.len(),
         0,

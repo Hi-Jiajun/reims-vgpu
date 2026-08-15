@@ -3378,17 +3378,13 @@ fn held_buffer_content(
     // packed alias, derive the bind directly from that one retained object:
     // neither the object descriptor nor the task page table changes between
     // offsets, and both announce the events that retire this entry.
-    let packed = match state.bound_buffers.packed(task_id, buffer_ref) {
-        Some(crate::runtime::bound_buffers::PackedBufferResolution::Available(packed)) => {
-            Some(packed.clone())
-        }
-        _ => None,
-    };
-    if let Some(packed) = packed {
+    if let Some(crate::runtime::bound_buffers::PackedBufferResolution::Available(packed)) =
+        state.bound_buffers.packed(task_id, buffer_ref)
+    {
         if offset < packed.size {
             let full = packed.size - offset;
             if let Some(span) = gather_span_if_eligible(full, extent_cap) {
-                if let Some(bound) = slice_packed_buffer(&packed, offset, span) {
+                if let Some(bound) = slice_packed_buffer(packed, offset, span) {
                     crate::runtime::drain::note_store_route("zc_buffer_held");
                     return Some(bound_buffer_content(&bound));
                 }
