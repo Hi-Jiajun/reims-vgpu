@@ -425,20 +425,56 @@ pub(crate) enum Phase {
     SampledUpload = 7,
     AcquireReadback = 8,
     Descriptors = 9,
+    /// What is left of the recording span once the five below are taken out of
+    /// it. See [`Phase::RecordBarrier`] for why the split exists.
     Record = 10,
     Submit = 11,
     Wait = 12,
     Readback = 13,
+    /// Opening the command buffer: `begin_slot_recording`. Zero for a batch
+    /// joiner, whose command buffer is already recording.
+    RecordBegin = 28,
+    /// Everything between the command buffer opening and the render pass
+    /// beginning: the guest-gather copies, the resident transitions, the sampled
+    /// transitions and the seed copies. **Twenty of this device's
+    /// `cmd_pipeline_barrier` call sites are inside this span.**
+    ///
+    /// # Why the recording span is split at all
+    ///
+    /// `record_us` is the largest phase this device has — 1.310 µs/draw summed
+    /// over 7 396 783 draws across three driven Maps boots, against
+    /// `sg_storage_us`'s 1.137 and nothing else above 0.5 — and it was one
+    /// undivided bar spanning roughly twelve hundred lines. No field named which
+    /// part of the encode it was, so every statement about it was a guess.
+    ///
+    /// This is the division the pipeline group and the `sg_*` group already got,
+    /// for the same reason and in the same shape: carved out of [`Phase::Record`]
+    /// rather than added beside it, appended after the existing ordinals so that
+    /// none of them moved, and summing back to what `record_us` was alone.
+    RecordBarrier = 29,
+    /// Deciding whether the predecessor's render pass can be continued, and
+    /// beginning one when it cannot. The pass-merge census is charged here, so
+    /// this is the bar to read against `passdiff_*`.
+    RecordPass = 30,
+    /// Pipeline bind, dynamic viewport/scissor/stencil, and the descriptor push
+    /// or bind — the state a draw needs that is not the draw.
+    RecordState = 31,
+    /// The vertex and index binds and the `cmd_draw`/`cmd_draw_indexed` itself.
+    ///
+    /// This is the floor. Whatever else this device stops doing, it still issues
+    /// one draw call per guest draw, exactly as Apple's driver does.
+    RecordDraw = 32,
 }
 
 impl Phase {
     /// Highest ordinal, so [`PHASES`] is derived from the enum rather than
     /// hand-counted beside it.
     ///
-    /// The pipeline sub-phases were appended after `Readback` rather than
-    /// inserted next to `Pipeline`, so that every existing ordinal kept its
-    /// value and this stayed the only place the count is written.
-    const LAST: Phase = Phase::StageSeed;
+    /// The pipeline, staging and recording sub-phases were each appended after
+    /// the ordinals that existed when they were added, rather than inserted next
+    /// to the phase they divide, so that every existing ordinal kept its value
+    /// and this stayed the only place the count is written.
+    const LAST: Phase = Phase::RecordDraw;
 }
 
 const PHASES: usize = Phase::LAST as usize + 1;
@@ -506,6 +542,11 @@ pub struct DrawPhaseWindow {
     pub acquire_readback_us: u64,
     pub descriptors_us: u64,
     pub record_us: u64,
+    pub rec_begin_us: u64,
+    pub rec_barrier_us: u64,
+    pub rec_pass_us: u64,
+    pub rec_state_us: u64,
+    pub rec_draw_us: u64,
     pub submit_us: u64,
     pub post_target_us: u64,
     pub post_store_us: u64,
@@ -546,6 +587,11 @@ pub fn take_window() -> Option<DrawPhaseWindow> {
         acquire_readback_us: to_us(ACC[Phase::AcquireReadback as usize].swap(0, Ordering::Relaxed)),
         descriptors_us: to_us(ACC[Phase::Descriptors as usize].swap(0, Ordering::Relaxed)),
         record_us: to_us(ACC[Phase::Record as usize].swap(0, Ordering::Relaxed)),
+        rec_begin_us: to_us(ACC[Phase::RecordBegin as usize].swap(0, Ordering::Relaxed)),
+        rec_barrier_us: to_us(ACC[Phase::RecordBarrier as usize].swap(0, Ordering::Relaxed)),
+        rec_pass_us: to_us(ACC[Phase::RecordPass as usize].swap(0, Ordering::Relaxed)),
+        rec_state_us: to_us(ACC[Phase::RecordState as usize].swap(0, Ordering::Relaxed)),
+        rec_draw_us: to_us(ACC[Phase::RecordDraw as usize].swap(0, Ordering::Relaxed)),
         submit_us: to_us(ACC[Phase::Submit as usize].swap(0, Ordering::Relaxed)),
         post_target_us: to_us(ACC[Phase::PostTarget as usize].swap(0, Ordering::Relaxed)),
         post_store_us: to_us(ACC[Phase::PostStore as usize].swap(0, Ordering::Relaxed)),
@@ -749,6 +795,13 @@ mod tests {
             Phase::StageIndex,
             Phase::StageStorage,
             Phase::StageSeed,
+            // The recording split, appended for the same reason the pipeline and
+            // staging ones were.
+            Phase::RecordBegin,
+            Phase::RecordBarrier,
+            Phase::RecordPass,
+            Phase::RecordState,
+            Phase::RecordDraw,
         ];
         assert_eq!(all.len(), PHASES);
         for (want, phase) in all.iter().enumerate() {

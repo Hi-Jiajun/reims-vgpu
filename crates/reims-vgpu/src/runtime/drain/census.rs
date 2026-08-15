@@ -2860,7 +2860,8 @@ fn emit_draw_phase() {
          sg_seed_us={} stage_pass_us={} \
          acquire_us={} acquire_sampled_us={} sampled_upload_us={} acquire_readback_us={} \
          descriptors_us={} \
-         record_us={} submit_us={} post_target_us={} post_store_us={} post_sampled_us={} \
+         record_us={} rec_begin_us={} rec_barrier_us={} rec_pass_us={} rec_state_us={} \
+         rec_draw_us={} submit_us={} post_target_us={} post_store_us={} post_sampled_us={} \
          post_park_us={} wait_us={} readback_us={} max_us={} stalls={}",
         w.draws,
         w.prep_us,
@@ -2884,6 +2885,11 @@ fn emit_draw_phase() {
         w.acquire_readback_us,
         w.descriptors_us,
         w.record_us,
+        w.rec_begin_us,
+        w.rec_barrier_us,
+        w.rec_pass_us,
+        w.rec_state_us,
+        w.rec_draw_us,
         w.submit_us,
         w.post_target_us,
         w.post_store_us,

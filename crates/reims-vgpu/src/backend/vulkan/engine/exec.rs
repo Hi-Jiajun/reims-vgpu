@@ -4204,7 +4204,7 @@ pub(crate) unsafe fn execute_draw_inner(
         counters.descriptor_set_updates.fetch_add(1, Ordering::Relaxed);
     }
 
-    phase.enter(super::draw_phase::Phase::Record);
+    phase.enter(super::draw_phase::Phase::RecordBegin);
     // The ring slot's CB retired at begin_entry and its fence is unsignaled —
     // no pre-record wait remains (pre_record_wait_us stays 0 on this path).
     // A batch joiner's CB is already recording (opened by the batch opener);
@@ -4221,6 +4221,7 @@ pub(crate) unsafe fn execute_draw_inner(
         };
     }
 
+    phase.enter(super::draw_phase::Phase::RecordBarrier);
     // What this draw records that a render pass instance cannot contain, on the
     // two ladders [`PassObstacles`] keeps.
     //
@@ -4932,6 +4933,7 @@ pub(crate) unsafe fn execute_draw_inner(
     }
 
     let clear = clear_values(req);
+    phase.enter(super::draw_phase::Phase::RecordPass);
     let rp_begin = vk::RenderPassBeginInfo::default()
         .render_pass(render_pass)
         .framebuffer(target_fb)
@@ -5076,6 +5078,7 @@ pub(crate) unsafe fn execute_draw_inner(
             &[],
         );
     }
+    phase.enter(super::draw_phase::Phase::RecordState);
     // Only if this command buffer is not already carrying it — the three
     // `dynstate_*` skips below hang off this one call, because a pipeline change
     // is what invalidates them. See `super::pools::CbGraphicsState`.
@@ -5228,6 +5231,7 @@ pub(crate) unsafe fn execute_draw_inner(
         );
         counters.descriptor_set_binds.fetch_add(1, Ordering::Relaxed);
     }
+    phase.enter(super::draw_phase::Phase::RecordDraw);
     unsafe { pools.bind_vertex_buffers(&ctx.device, cb, counters, &vertex_bufs) };
     match (&req.indexed, &index_slot) {
         (Some(indexed), Some(ibuf)) => {
@@ -5252,6 +5256,9 @@ pub(crate) unsafe fn execute_draw_inner(
             );
         }
     }
+    // Back to the remainder: the query end, the pass-close decision and
+    // everything after it are the part of recording no sub-phase names.
+    phase.enter(super::draw_phase::Phase::Record);
     if let Some((pool, _)) = occlusion {
         ctx.device.cmd_end_query(cb, pool, 0);
     }
