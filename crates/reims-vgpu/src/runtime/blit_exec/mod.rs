@@ -1282,6 +1282,22 @@ fn note_blit_endpoint_debt(state: &DeviceState, task_id: u32, texture_ref: u32) 
 fn note_blit_t11_resident(state: &DeviceState, mapping_id: u32) {
     #[cfg(feature = "backend-vulkan")]
     {
+        // This census asks the engine a question, and asking takes the engine
+        // lock — the same lock the draw rail holds while it encodes and submits.
+        // A probe that blocks is not a probe, so time it: if this reads anywhere
+        // near `walk_blit_us`, the blit rail's cost is this instrument waiting
+        // for the renderer rather than anything the blit itself does.
+        let probe_started = std::time::Instant::now();
+        let _probe = ProbeClock(probe_started);
+        struct ProbeClock(std::time::Instant);
+        impl Drop for ProbeClock {
+            fn drop(&mut self) {
+                crate::runtime::drain::note_store_route_us(
+                    "blit_resident_probe_us",
+                    self.0.elapsed().as_micros() as u64,
+                );
+            }
+        }
         let Some(m) = state.mappings.get(&mapping_id) else {
             return;
         };
@@ -3215,6 +3231,14 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
             None => return br(BlitStatus::Bounds, "sl_dst_slice_overflow"),
         };
 
+        // `blit_kind_t2t_sl_us` charges this function 28.8 s of a 29.1 s rail
+        // while `blit_rows_us` — its linear arm's whole copy — reads 0.275 s.
+        // Between those two numbers sit the resolves below, and this form runs
+        // them once per level and again per slice, so their count is the
+        // multiplier nobody has measured. `sl_levels_n` is the denominator that
+        // says whether a level loop of two or of twelve is being paid for.
+        crate::runtime::drain::note_store_route("sl_levels_n");
+        let sl_resolve_started = std::time::Instant::now();
         // Resolve the starting slice at this level for geometry / format.
         // Volume (depth>1) forms use slice 0 only; non-zero source_slice on a
         // depth-1 packing fails at resolve (Bounds). For volumes we require
@@ -3256,6 +3280,10 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
         if src0.depth() != dst0.depth() {
             return br(BlitStatus::Bounds, "sl_depth_mismatch");
         }
+        crate::runtime::drain::note_store_route_us(
+            "sl_resolve_us",
+            sl_resolve_started.elapsed().as_micros() as u64,
+        );
         let w = src0.width();
         let h = src0.height();
         let d = src0.depth();
@@ -3378,6 +3406,12 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
         if is_volume {
             return br(BlitStatus::Unsupported, "sl_volume_mixed");
         }
+        // The slice/level form's type-11 arm: `blit_kind_t2t_sl_us` charges this
+        // whole function 28.8 s of a 29.1 s rail while `blit_rows_us` — which
+        // covers its linear arm's `copy_row_region` — reads 0.275 s. Everything
+        // unaccounted for is below, and it is two things per slice: a pair of
+        // `resolve_texture_backing` calls, and a staged row loop.
+        let sl_mixed_started = std::time::Instant::now();
         for si in 0..cmd.slice_count {
             let ss = match cmd.source_slice.checked_add(si) {
                 Some(v) => v,
@@ -3444,6 +3478,10 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
                 }
             }
         }
+        crate::runtime::drain::note_store_route_us(
+            "sl_mixed_us",
+            sl_mixed_started.elapsed().as_micros() as u64,
+        );
     }
     BlitStatus::Ok
 }
