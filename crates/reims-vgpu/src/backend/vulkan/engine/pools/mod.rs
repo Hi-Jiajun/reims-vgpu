@@ -715,6 +715,36 @@ pub(crate) struct CbGraphicsState {
     vp_scratch: Vec<vk::Viewport>,
     sc_scratch: Vec<vk::Rect2D>,
     push_scratch: Vec<PushDescriptorBinding>,
+    vertex_scratch: Vec<VertexBufferBinding>,
+    vertex_buffers: Vec<vk::Buffer>,
+    vertex_offsets: Vec<vk::DeviceSize>,
+}
+
+/// One normalized fixed-function vertex-buffer binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VertexBufferBinding {
+    binding: u32,
+    buffer: vk::Buffer,
+    offset: vk::DeviceSize,
+}
+
+/// Order a bulk bind by binding number. Vertex attributes arrive ordered by
+/// shader location, while Vulkan requires consecutive *binding* numbers.
+/// Duplicate bindings have already been rejected by draw validation.
+fn normalize_vertex_bindings(wanted: &mut [VertexBufferBinding]) {
+    wanted.sort_unstable_by_key(|entry| entry.binding);
+    debug_assert!(wanted.windows(2).all(|pair| pair[0].binding != pair[1].binding));
+}
+
+/// End index of the maximal consecutive binding run beginning at `start`.
+fn vertex_binding_run_end(bindings: &[VertexBufferBinding], start: usize) -> usize {
+    let mut end = start + 1;
+    while end < bindings.len()
+        && bindings[end - 1].binding.checked_add(1) == Some(bindings[end].binding)
+    {
+        end += 1;
+    }
+    end
 }
 
 /// One descriptor value in the normalized order used by a push layout.
@@ -3816,6 +3846,61 @@ mod idle_slab_trim_tests {
             None,
             "an unsettled pass leaves the hot path's churn budget in place"
         );
+    }
+}
+
+#[cfg(test)]
+mod vertex_binding_bulk_tests {
+    use super::{normalize_vertex_bindings, vertex_binding_run_end, VertexBufferBinding};
+    use ash::vk;
+    use ash::vk::Handle;
+
+    fn binding(binding: u32, buffer: u64, offset: u64) -> VertexBufferBinding {
+        VertexBufferBinding {
+            binding,
+            buffer: vk::Buffer::from_raw(buffer),
+            offset,
+        }
+    }
+
+    #[test]
+    fn attributes_are_sorted_by_binding_without_losing_values() {
+        let mut wanted = vec![
+            binding(3, 30, 3),
+            binding(1, 10, 1),
+            binding(2, 20, 200),
+        ];
+
+        normalize_vertex_bindings(&mut wanted);
+
+        assert_eq!(
+            wanted,
+            vec![
+                binding(1, 10, 1),
+                binding(2, 20, 200),
+                binding(3, 30, 3),
+            ]
+        );
+        assert_eq!(vertex_binding_run_end(&wanted, 0), 3);
+    }
+
+    #[test]
+    fn gaps_split_the_request_into_maximal_consecutive_runs() {
+        let bindings = vec![
+            binding(1, 10, 0),
+            binding(2, 20, 0),
+            binding(4, 40, 0),
+            binding(5, 50, 0),
+            binding(u32::MAX, 60, 0),
+        ];
+        let mut starts_and_ends = Vec::new();
+        let mut start = 0;
+        while start < bindings.len() {
+            let end = vertex_binding_run_end(&bindings, start);
+            starts_and_ends.push((start, end));
+            start = end;
+        }
+        assert_eq!(starts_and_ends, vec![(0, 2), (2, 4), (4, 5)]);
     }
 }
 

@@ -1295,22 +1295,34 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
 }
 
 #[test]
-fn vertex_float2_attr_still_renders() {
+fn vertex_buffers_bind_in_one_bulk_call_without_losing_slots() {
     let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
-    req.vertex_attributes.push(VertexAttributeResource {
-        location: 0,
-        binding: 0,
-        format: VertexAttributeFormat::Float2,
-        offset: 0,
-        stride: 8,
-        step_function: VertexStepFunction::PerVertex,
-        step_rate: 1,
-        content: vec![0u8; 24].into(),
-    });
+    // Location order deliberately disagrees with binding order: the executor
+    // must normalize by binding before the contiguous Vulkan call without
+    // moving a buffer away from its declared slot.
+    for (location, binding) in [(0, 2), (1, 0), (2, 1)] {
+        req.vertex_attributes.push(VertexAttributeResource {
+            location,
+            binding,
+            format: VertexAttributeFormat::Float2,
+            offset: 0,
+            stride: 8,
+            step_function: VertexStepFunction::PerVertex,
+            step_rate: 1,
+            content: vec![0u8; 24].into(),
+        });
+    }
+    let before = engine::counter_snapshot();
     match engine::execute_draw_request(&req) {
-        Ok(o) => assert_fullscreen_fragment_color("attr", &semantic_rgba(&o), 8, 8),
+        Ok(o) => {
+            assert_fullscreen_fragment_color("attr", &semantic_rgba(&o), 8, 8);
+            let d = engine::counter_snapshot().delta_since(&before);
+            assert_eq!(d.vertex_buffer_bind_slots, 3, "requested slots: {d:?}");
+            assert_eq!(d.vertex_buffer_bind_emitted, 3, "emitted slots: {d:?}");
+            assert_eq!(d.vertex_buffer_bind_calls, 1, "bulk calls: {d:?}");
+        }
         Err(e) if skip_if_no_gpu(&e.to_string()) => eprintln!("SKIP attr: {e}"),
         Err(e) => {
             let s = e.to_string();

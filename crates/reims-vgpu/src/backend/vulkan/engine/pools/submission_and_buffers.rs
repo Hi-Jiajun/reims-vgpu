@@ -2133,6 +2133,70 @@ impl ResourcePools {
         &self.cb_graphics.scissors
     }
 
+    /// Record the draw's vertex buffers as maximal consecutive binding runs,
+    /// preserving every exact `(buffer, offset)` value in the request.
+    ///
+    /// The guest bulk operation is a pair of parallel buffer/offset arrays.
+    /// Vulkan has the same operation but requires consecutive binding numbers,
+    /// so gaps split the request into runs. All arrays live in the command
+    /// buffer's reusable graphics scratch; the hot path allocates nothing after
+    /// their first high-water.
+    ///
+    /// # Safety
+    ///
+    /// `cb` must be the recording command buffer most recently passed to
+    /// [`Self::bind_graphics_pipeline`]. Every buffer must remain alive through
+    /// submission, as required by `vkCmdBindVertexBuffers`.
+    pub(in crate::backend::vulkan::engine) unsafe fn bind_vertex_buffers(
+        &mut self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        counters: &EngineCounters,
+        requested: &[(u32, super::super::exec::BoundBuffer)],
+    ) {
+        let g = &mut self.cb_graphics;
+        counters
+            .vertex_buffer_bind_slots
+            .fetch_add(requested.len() as u64, Ordering::Relaxed);
+
+        g.vertex_scratch.clear();
+        g.vertex_scratch.extend(requested.iter().map(|(binding, bound)| {
+            super::VertexBufferBinding {
+                binding: *binding,
+                buffer: bound.buffer,
+                offset: bound.offset,
+            }
+        }));
+        super::normalize_vertex_bindings(&mut g.vertex_scratch);
+        counters
+            .vertex_buffer_bind_emitted
+            .fetch_add(g.vertex_scratch.len() as u64, Ordering::Relaxed);
+
+        g.vertex_buffers.clear();
+        g.vertex_offsets.clear();
+        g.vertex_buffers
+            .extend(g.vertex_scratch.iter().map(|entry| entry.buffer));
+        g.vertex_offsets
+            .extend(g.vertex_scratch.iter().map(|entry| entry.offset));
+
+        let mut start = 0;
+        while start < g.vertex_scratch.len() {
+            let end = super::vertex_binding_run_end(&g.vertex_scratch, start);
+            unsafe {
+                device.cmd_bind_vertex_buffers(
+                    cb,
+                    g.vertex_scratch[start].binding,
+                    &g.vertex_buffers[start..end],
+                    &g.vertex_offsets[start..end],
+                )
+            };
+            counters
+                .vertex_buffer_bind_calls
+                .fetch_add(1, Ordering::Relaxed);
+            start = end;
+        }
+    }
+
     /// Scratch in which the next draw normalizes its push-descriptor state.
     pub(crate) fn push_descriptor_scratch(
         &mut self,

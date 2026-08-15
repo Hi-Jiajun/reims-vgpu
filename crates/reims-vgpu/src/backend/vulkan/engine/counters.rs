@@ -552,6 +552,16 @@ engine_counters! {
         dynstate_viewport_held,
         dynstate_scissor_held,
         dynstate_stencil_held,
+        /// Vertex-buffer binding slots requested by draws. This must equal
+        /// `vertex_buffer_bind_emitted`; compare either with
+        /// `vertex_buffer_bind_calls` to measure contiguous bulk encoding.
+        vertex_buffer_bind_slots,
+        /// Requested vertex-buffer slots actually handed to Vulkan. Kept
+        /// separately so a future optimization cannot silently turn bulk
+        /// encoding into dropped guest state.
+        vertex_buffer_bind_emitted,
+        /// `vkCmdBindVertexBuffers` calls used to emit those slots.
+        vertex_buffer_bind_calls,
         /// Draw/dispatch descriptor state recorded directly into the command
         /// buffer through `VK_KHR_push_descriptor`.
         descriptor_pushes,

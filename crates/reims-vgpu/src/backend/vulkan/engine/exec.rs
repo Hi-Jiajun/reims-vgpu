@@ -4846,10 +4846,7 @@ pub(crate) unsafe fn execute_draw_inner(
         );
         counters.descriptor_set_binds.fetch_add(1, Ordering::Relaxed);
     }
-    for (binding, bound) in &vertex_bufs {
-        ctx.device
-            .cmd_bind_vertex_buffers(cb, *binding, &[bound.buffer], &[bound.offset]);
-    }
+    unsafe { pools.bind_vertex_buffers(&ctx.device, cb, counters, &vertex_bufs) };
     match (&req.indexed, &index_slot) {
         (Some(indexed), Some(ibuf)) => {
             ctx.device
