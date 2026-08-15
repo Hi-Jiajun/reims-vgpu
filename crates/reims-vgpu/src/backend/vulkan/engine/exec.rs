@@ -1247,7 +1247,9 @@ impl PreparedSampled {
 
     fn descriptor_layout(&self) -> vk::ImageLayout {
         match self {
-            Self::Feedback { .. } => vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT,
+            // Derived, never spelled: this descriptor and the subpass attachment
+            // reference name one image at one moment, so they are one answer.
+            Self::Feedback { .. } => super::caches::color_feedback_layout(),
             Self::Resident { next_access, .. } => next_access.layout(),
             Self::GuestDirect { .. } => vk::ImageLayout::GENERAL,
             _ => vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
@@ -5044,14 +5046,22 @@ pub(crate) unsafe fn execute_draw_inner(
         // This is deliberately a memory barrier inside the render pass: an
         // image transition here would be invalid, while closing the pass would
         // throw away the continuation this extension makes possible.
+        //
+        // A barrier inside a render pass may only name what one of that pass's
+        // own self-dependencies names, so every term here is taken from the
+        // constants the self-dependency is built from rather than spelled again.
+        // The two disagreeing is not a slow path, it is invalid usage.
+        let (src_stage, src_access) = super::caches::COLOR_FEEDBACK_SRC;
+        let (dst_stage, dst_access) = super::caches::COLOR_FEEDBACK_DST;
         let barrier = [vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)];
+            .src_access_mask(src_access)
+            .dst_access_mask(dst_access)];
         ctx.device.cmd_pipeline_barrier(
             cb,
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::DependencyFlags::BY_REGION | vk::DependencyFlags::FEEDBACK_LOOP_EXT,
+            src_stage,
+            dst_stage,
+            vk::DependencyFlags::BY_REGION
+                | super::feedback_transition_dependency(pass_key.color_layout(0)),
             &barrier,
             &[],
             &[],

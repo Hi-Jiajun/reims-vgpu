@@ -273,7 +273,7 @@ impl PassKey {
 
     pub(crate) fn color_layout(self, index: usize) -> vk::ImageLayout {
         if self.color_feedback(index) {
-            vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+            color_feedback_layout()
         } else if index == 0 && (self.color_input || self.host_accessible_color0) {
             vk::ImageLayout::GENERAL
         } else {
@@ -289,11 +289,63 @@ impl PassKey {
         if index == 0 && self.host_accessible_color0 {
             vk::ImageLayout::GENERAL
         } else if self.color_feedback(index) {
-            vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+            color_feedback_layout()
         } else {
             color0_pass_exit_layout()
         }
     }
+}
+
+/// The layout a colour attachment a draw also samples is placed in.
+///
+/// The resting layout itself whenever that admits a feedback loop, which is the
+/// shipping arm — so a slot the guest samples and a slot it does not are in the
+/// **same** layout, the pass declares no transition for either, and there is no
+/// second layout for a colour target anywhere in this device. Only the ablation
+/// arm, where the resting layout is `COLOR_ATTACHMENT_OPTIMAL` and admits
+/// nothing, reaches the extension's dedicated layout.
+///
+/// One function because four places name this: the subpass attachment reference,
+/// the `finalLayout`, the sampled descriptor
+/// ([`super::exec::PreparedSampled::descriptor_layout`]) and the registry record
+/// the pass leaves behind. A descriptor naming a layout the attachment reference
+/// does not is undefined behaviour, and it is not an error anywhere.
+pub(crate) fn color_feedback_layout() -> vk::ImageLayout {
+    let resting = color0_pass_exit_layout();
+    if layout_admits_color_feedback(resting) {
+        resting
+    } else {
+        vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+    }
+}
+
+/// Whether a colour attachment resting in `layout` may also be sampled by a draw
+/// inside the same render pass instance — a Vulkan *feedback loop*.
+///
+/// Two layouts admit one. `ATTACHMENT_FEEDBACK_LOOP_OPTIMAL` is the dedicated
+/// spelling `VK_EXT_attachment_feedback_loop_layout` adds, and `GENERAL` is the
+/// core one: a sampled-image descriptor may name `GENERAL`, and the core rule for
+/// an attachment written earlier in the subpass permits it to be accessed "as an
+/// attachment, storage image, or sampled image" by a later command. So the
+/// extension layout is an *optimisation over* `GENERAL`, never a requirement.
+///
+/// This is the whole reason feedback is not a second layout. While
+/// [`color0_pass_exit_layout`] answers `GENERAL`, a slot the guest samples and a
+/// slot it does not are in the same layout, so the render pass declares no
+/// transition for either and the registry's record is true for both.
+///
+/// It matters that this is a question about the layout and not a switch read.
+/// Under [`crate::env::COLOR_GENERAL`]`=off` the resting layout is
+/// `COLOR_ATTACHMENT_OPTIMAL`, which admits no feedback loop at all, and the
+/// extension layout has to come back — naming the resting layout there would be a
+/// sampled read of an attachment in a layout that forbids it, which is undefined
+/// behaviour rather than an error. The ablation therefore restores two layouts
+/// because the contract says it must, not because a flag says so.
+const fn layout_admits_color_feedback(layout: vk::ImageLayout) -> bool {
+    matches!(
+        layout,
+        vk::ImageLayout::GENERAL | vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+    )
 }
 
 /// A normalized [`PassKey`] containing exactly Vulkan render-pass
@@ -936,23 +988,33 @@ impl<K: Clone + Eq, V: Copy> ObjectVariantIndex<K, V> {
 /// framebuffer compression, which on this host is real hardware —
 /// Intel Arrow Lake CCS.
 ///
-/// **Measured, because the specification cannot rank those.** Six interleaved
-/// driven macos-13 Maps boots of one binary, `/tmp/wb-outC0..C5`, scored by
-/// `scripts/boot-score`, with the layout moved and **nothing else** — the
-/// transitions still recorded, the pass census unmoved, so the reading is the
-/// layout alone:
+/// **Measured twice, and the second chain refuted the first.** Both are
+/// interleaved driven macos-13 Maps boots of one binary with the layout moved and
+/// nothing else, scored by `scripts/boot-score` on `sum us/draw`, every boot at
+/// `throttle_ms=0`:
 ///
 /// ```text
-///                    sum us/draw              gpu us/draw
-/// COLOR_ATTACHMENT   22.95, 22.73, 25.50      13.00, 11.70, 13.82
-/// GENERAL            21.43, 22.33, 21.93      11.94, 11.67, 11.24
+///                    chain C (/tmp/wb-outC0..C5)   chain D (/tmp/wb-outD0..D5)
+/// COLOR_ATTACHMENT   22.95, 22.73, 25.50          17.44, 19.07, 18.05
+/// GENERAL            21.43, 22.33, 21.93          20.86, 20.38
 /// ```
 ///
-/// The arms are **disjoint on the sum** — the worst `GENERAL` boot beats the best
-/// `COLOR_ATTACHMENT` one — at −7.7 %, and the position-matched pairs agree one
-/// by one. So on this part the compression `GENERAL` gives up is worth less than
-/// the full-attachment transitions it removes, and that was true *before* any
-/// pass boundary was saved.
+/// Chain C alone reads as a disjoint −7.7 %. Chain D reads the *other way* by a
+/// similar margin, and pooled the two arms overlap completely — 21.39 mean for
+/// `GENERAL` against 20.96 for `COLOR_ATTACHMENT`. (Chain D also produced one boot
+/// at `sum` 52.04 with `d/frame` 225, a different workload regime, excluded from
+/// both means.)
+///
+/// So **this layout is perf-neutral as far as this host can measure**, and the
+/// three-boot disjointness in chain C was chain position, not the arm. It is worth
+/// stating why the earlier reading was believed: three position-matched pairs
+/// agreeing one by one looks like a controlled result and is not one, because the
+/// pairs share their position in a chain whose spread is larger than the effect.
+///
+/// The change stays, on **correctness** rather than on speed: one resting layout
+/// is what lets every spelling below be one function instead of six, and it is
+/// what makes a feedback colour slot legal (see [`PassKey::color_layout`]).
+/// Do not re-quote the −7.7 %.
 ///
 /// # It is a function, and [`crate::env::COLOR_GENERAL`] is the ablation
 ///
@@ -1121,6 +1183,61 @@ fn external_dependencies(
                 .dst_access_mask(dst_access)
         },
     ]
+}
+
+/// The colour write a feedback draw's own sampled read must be ordered after.
+pub(crate) const COLOR_FEEDBACK_SRC: (vk::PipelineStageFlags, vk::AccessFlags) = (
+    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+    vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+);
+
+/// The sampled read a feedback draw performs of the attachment it is writing.
+///
+/// `FRAGMENT_SHADER` alone, and that is a rule rather than a choice. A subpass
+/// self-dependency whose `srcStageMask` contains a framebuffer-space stage may
+/// name only framebuffer-space stages in its `dstStageMask`
+/// (`VUID-VkSubpassDependency-srcSubpass-06809`), and `VERTEX_SHADER` is not one.
+/// It was never right on its own terms either: a feedback loop is a fragment
+/// reading the pixel it is about to write, and `BY_REGION` below is that
+/// same-pixel claim. A vertex stage reading the attachment is not a feedback loop
+/// and could not be ordered by this dependency whatever it named.
+pub(crate) const COLOR_FEEDBACK_DST: (vk::PipelineStageFlags, vk::AccessFlags) = (
+    vk::PipelineStageFlags::FRAGMENT_SHADER,
+    vk::AccessFlags::SHADER_READ,
+);
+
+/// The subpass self-dependency that orders a feedback draw's sampled read after
+/// the colour writes of the draws before it in the same pass instance.
+///
+/// **Declared on every pass this device builds, whether or not any draw in it
+/// feeds back.** A self-dependency costs nothing until a
+/// `vkCmdPipelineBarrier` inside the pass invokes it — but its *presence* changes
+/// `dependencyCount`, and Vulkan render-pass compatibility spares initial/final
+/// layouts, attachment-reference layouts and load/store ops while sparing nothing
+/// about dependencies. So a pass built with this dependency and one built without
+/// it are **incompatible**, and a `VkFramebuffer` created against either cannot be
+/// used with the other. Declaring it conditionally is what produced
+/// `VUID-VkRenderPassBeginInfo-renderPass-00904` (`dependencyCount is
+/// incompatible`) on a driven Maps boot, on both layout arms.
+///
+/// The general rule, which is the one to keep: **a render pass may only vary in
+/// ways [`PassKey::framebuffer_compatibility`] preserves.** Anything that key
+/// erases must not reach the `VkRenderPassCreateInfo`.
+///
+/// `dependency_flags` derives the extension bit from the attachment layout via
+/// [`super::feedback_transition_dependency`], so the arm that has no feedback
+/// layout cannot ask for the extension's flag.
+fn color_feedback_self_dependency(color0_layout: vk::ImageLayout) -> vk::SubpassDependency {
+    vk::SubpassDependency::default()
+        .src_subpass(0)
+        .dst_subpass(0)
+        .src_stage_mask(COLOR_FEEDBACK_SRC.0)
+        .src_access_mask(COLOR_FEEDBACK_SRC.1)
+        .dst_stage_mask(COLOR_FEEDBACK_DST.0)
+        .dst_access_mask(COLOR_FEEDBACK_DST.1)
+        .dependency_flags(
+            vk::DependencyFlags::BY_REGION | super::feedback_transition_dependency(color0_layout),
+        )
 }
 
 /// Whether the outgoing external dependency names only the attachment stages.
@@ -1765,23 +1882,7 @@ impl ObjectCaches {
         if key.color_input {
             deps.push(fetch_dep);
         }
-        if key.feedback_colors != 0 {
-            deps.push(
-                vk::SubpassDependency::default()
-                    .src_subpass(0)
-                    .dst_subpass(0)
-                    .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                    .dst_stage_mask(
-                        vk::PipelineStageFlags::VERTEX_SHADER
-                            | vk::PipelineStageFlags::FRAGMENT_SHADER,
-                    )
-                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                    .dependency_flags(
-                        vk::DependencyFlags::BY_REGION | vk::DependencyFlags::FEEDBACK_LOOP_EXT,
-                    ),
-            );
-        }
+        deps.push(color_feedback_self_dependency(key.color_layout(0)));
         let rp_info = vk::RenderPassCreateInfo::default()
             .attachments(&attachments)
             .subpasses(&subpass)
@@ -3328,7 +3429,7 @@ mod object_cache_tests {
                 assert_eq!(
                     key.color_layout(0),
                     if feedback {
-                        vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+                        color_feedback_layout()
                     } else {
                         vk::ImageLayout::GENERAL
                     }
@@ -3342,9 +3443,16 @@ mod object_cache_tests {
     }
 
     /// The pass key is the single source of truth for every place that names an
-    /// attachment layout. Feedback wins over the older input-attachment shape
-    /// because a descriptor sampling the colour target cannot legally name
-    /// GENERAL while the subpass reference names the extension layout.
+    /// attachment layout, and a feedback slot names the one
+    /// [`color_feedback_layout`] answers at both ends of the pass.
+    ///
+    /// Asserted against that function rather than against a spelled layout, so it
+    /// states the relation on both arms: under the shipping layout every slot is
+    /// in the *same* layout feedback or not, and under
+    /// [`crate::env::COLOR_GENERAL`]`=off` the feedback slots separate because
+    /// `COLOR_ATTACHMENT_OPTIMAL` admits no feedback loop. The failure it guards
+    /// is a descriptor and a subpass reference naming one image differently,
+    /// which is undefined behaviour reported nowhere.
     #[test]
     fn feedback_attachment_layout_is_derived_consistently_from_the_mask() {
         let mut key = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
@@ -3354,24 +3462,114 @@ mod object_cache_tests {
         for index in 0..=MAX_SECONDARY_ATTACH {
             let feedback = index == 0 || index == 3;
             assert_eq!(key.color_feedback(index), feedback);
-            assert_eq!(
-                key.color_layout(index),
-                if feedback {
-                    vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
-                } else {
-                    color0_pass_exit_layout()
-                }
-            );
-            assert_eq!(
-                key.color_final_layout(index),
-                if feedback {
-                    vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
-                } else {
-                    color0_pass_exit_layout()
-                }
-            );
+            let want = if feedback {
+                color_feedback_layout()
+            } else {
+                color0_pass_exit_layout()
+            };
+            assert_eq!(key.color_layout(index), want);
+            assert_eq!(key.color_final_layout(index), want);
         }
         assert!(!key.color_feedback(u8::BITS as usize));
+
+        // Whatever the arm, the layout a feedback slot lands in must be one a
+        // feedback loop is legal in. This is the check that would have caught the
+        // shipping defect: with the resting layout moved to GENERAL, the slot was
+        // still being placed in the extension layout while the image sat in
+        // GENERAL.
+        assert!(layout_admits_color_feedback(color_feedback_layout()));
+    }
+
+    /// One layout for a colour target means one for a sampled one too.
+    ///
+    /// The whole point of the repair: while the resting layout admits a feedback
+    /// loop, a slot the guest samples and a slot it does not are in the *same*
+    /// layout, so the render pass declares no transition for either and a
+    /// framebuffer built for one serves the other.
+    #[test]
+    fn a_sampled_colour_slot_rests_where_every_other_colour_slot_rests() {
+        if layout_admits_color_feedback(color0_pass_exit_layout()) {
+            assert_eq!(color_feedback_layout(), color0_pass_exit_layout());
+        } else {
+            // The ablation arm, where the contract forces the second layout back.
+            assert_eq!(
+                color_feedback_layout(),
+                vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+            );
+        }
+    }
+
+    /// A render pass may only vary in ways
+    /// [`PassKey::framebuffer_compatibility`] preserves, and dependencies are not
+    /// among the things Vulkan's compatibility rule spares.
+    ///
+    /// `feedback_colors` is erased by that key, so the feedback self-dependency
+    /// must be declared on every pass rather than only on feedback ones — a
+    /// conditional one made `dependencyCount` differ between two passes the key
+    /// called interchangeable, which is what the validation layer reported as
+    /// `VUID-VkRenderPassBeginInfo-renderPass-00904` on a driven Maps boot.
+    #[test]
+    fn the_dependency_count_does_not_move_with_anything_the_framebuffer_key_erases() {
+        let base = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
+        for feedback in [0u8, 1, (1 << 0) | (1 << 3)] {
+            for host_accessible in [false, true] {
+                let mut key = base;
+                key.feedback_colors = feedback;
+                key.host_accessible_color0 = host_accessible;
+                assert_eq!(
+                    key.framebuffer_compatibility(),
+                    base.framebuffer_compatibility(),
+                    "the framebuffer key must erase these"
+                );
+                // Same framebuffer key ⇒ the passes must agree on dependency
+                // count, because a framebuffer built against one is used with the
+                // other.
+                assert_eq!(
+                    pass_dependency_count(key),
+                    pass_dependency_count(base),
+                    "feedback={feedback} host_accessible={host_accessible}"
+                );
+            }
+        }
+    }
+
+    /// The dependency list a pass of this shape is built with, counted without a
+    /// device. Mirrors the `deps` construction in `get_or_create_render_pass`.
+    fn pass_dependency_count(key: PassKey) -> usize {
+        external_dependencies(
+            key.depth.is_some(),
+            key.color_input,
+            key.host_accessible_color0,
+            pass_exit_scope_narrow(),
+        )
+        .len()
+            + usize::from(key.color_input)
+            + 1
+    }
+
+    /// A subpass self-dependency sourced in a framebuffer-space stage may name
+    /// only framebuffer-space stages as its destination
+    /// (`VUID-VkSubpassDependency-srcSubpass-06809`). `VERTEX_SHADER` is not one,
+    /// and naming it made every render pass this device created invalid.
+    #[test]
+    fn the_feedback_self_dependency_stays_in_framebuffer_space() {
+        const FRAMEBUFFER_SPACE: vk::PipelineStageFlags =
+            vk::PipelineStageFlags::from_raw(
+                vk::PipelineStageFlags::FRAGMENT_SHADER.as_raw()
+                    | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS.as_raw()
+                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS.as_raw()
+                    | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT.as_raw(),
+            );
+        assert!(FRAMEBUFFER_SPACE.contains(COLOR_FEEDBACK_SRC.0));
+        assert!(FRAMEBUFFER_SPACE.contains(COLOR_FEEDBACK_DST.0));
+
+        // The in-pass barrier in `exec` is built from these same two constants,
+        // which is what keeps it inside what the self-dependency declares.
+        let dep = color_feedback_self_dependency(color_feedback_layout());
+        assert_eq!(dep.src_stage_mask, COLOR_FEEDBACK_SRC.0);
+        assert_eq!(dep.dst_stage_mask, COLOR_FEEDBACK_DST.0);
+        assert!(dep.dependency_flags.contains(vk::DependencyFlags::BY_REGION));
+        assert_eq!(dep.src_subpass, dep.dst_subpass);
     }
 
     /// An ordinary colour slot names one layout at all three points a pass can
