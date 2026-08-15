@@ -3084,7 +3084,36 @@ pub fn copy_target_to_guest_pages(
     // bytes per texel apart once a render target may be wider than eight bits,
     // and this copy converts nothing — so an order comparison would admit a
     // half-float destination over an eight-bit resident.
-    if snap.format != dst.format {
+    //
+    // **Storage formats, though, and not view formats.** The two sides of this
+    // comparison answer two different questions and one of them is not about
+    // bytes. `snap.format` is `slot.color_format`, the format the *attachment*
+    // was created at, and `translate::pixel::color_attachment` deliberately
+    // keeps the guest's transfer function there so Vulkan performs the
+    // fixed-function linear-to-sRGB encode on write. `dst.format` comes from
+    // `vk_texel_layout`, which is the *stored texel* and has no transfer
+    // function by construction — as does `TargetIdentity::Gva`'s own format, via
+    // `draw::vulkan::gva_resident_format`.
+    //
+    // So a guest that declares `BGRA8Unorm_sRGB` for a private render target
+    // arrives here with `held=B8G8R8A8_SRGB` and `want=B8G8R8A8_UNORM`, forever,
+    // and this is the only place the two spellings meet. `storage_format` is
+    // this crate's existing name for the fold between them, and
+    // `has_bgra_order`'s doc already states the rule it encodes: "the transfer
+    // function is deliberately irrelevant: UNORM and sRGB views interpret the
+    // same four stored bytes". Vulkan agrees where it matters here —
+    // `vkCmdCopyImageToBuffer` performs no format conversion, and `dst.format`
+    // is read for nothing but `bytes_per_texel`.
+    //
+    // Every distinction the paragraph above defends survives the fold, because
+    // `storage_format` maps only sRGB onto its own UNORM sibling: `R8G8B8A8` and
+    // `B8G8R8A8` stay apart, and so do eight-bit and half-float.
+    //
+    // Measured: on a driven macos-13 Maps leg this refused **1 001 of 1 001**
+    // payments, all on one texture, so the app's whole canvas stayed the zeros
+    // its pages were allocated with. The declined fields keep the unfolded
+    // spellings so a future firing still says which side held what.
+    if !crate::backend::vulkan::translate::pixel::stored_bytes_agree(snap.format, dst.format) {
         return Err(DrawError::GuestPageWrite(
             GuestWriteDecline::ResidentFormatMismatch {
                 held: snap.format,

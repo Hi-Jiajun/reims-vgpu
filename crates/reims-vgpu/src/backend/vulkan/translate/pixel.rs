@@ -312,6 +312,29 @@ pub fn storage_format(format: vk::Format) -> vk::Format {
     }
 }
 
+/// Whether two Vulkan formats describe the same stored bytes for the same
+/// texel, so a transfer that converts nothing may move one into the other.
+///
+/// This is the question a `vkCmdCopyImageToBuffer` out of a render target into
+/// guest pages actually asks, and it is not format equality. The two sides
+/// reaching that copy answer two different questions by design: an attachment
+/// carries the guest's transfer function, because [`color_attachment`] keeps it
+/// so Vulkan performs the fixed-function linear-to-sRGB encode on write, while a
+/// guest destination is spelled as a [`TexelLayout`] via [`vk_texel_layout`] and
+/// has no transfer function to carry. A guest render target declared
+/// `BGRA8Unorm_sRGB` therefore meets itself as `B8G8R8A8_SRGB` against
+/// `B8G8R8A8_UNORM`, forever, and equality reads that as a disagreement.
+///
+/// Vulkan is explicit that it is not one: buffer/image copies perform no format
+/// conversion, so what crosses is the stored texel, and [`storage_format`] is
+/// this module's existing fold onto it. Everything a byte-level comparison must
+/// still separate survives that fold — channel order (`R8G8B8A8` against
+/// `B8G8R8A8`) and texel width (eight-bit against half-float) both differ in the
+/// storage format, not only in the view.
+pub fn stored_bytes_agree(held: vk::Format, want: vk::Format) -> bool {
+    storage_format(held) == storage_format(want)
+}
+
 /// Whether a Vulkan colour format stores its first and third channels in BGRA
 /// order. The transfer function is deliberately irrelevant: UNORM and sRGB
 /// views interpret the same four stored bytes.
@@ -664,6 +687,51 @@ mod tests {
     use super::*;
     use crate::observe::Decline;
     use pixel_format as p;
+
+    /// The copy out of a render target into guest pages converts nothing, so the
+    /// only thing the two sides must agree on is the stored texel.
+    ///
+    /// Every guest render target declared with an sRGB format meets itself
+    /// across this comparison — the attachment keeps the transfer function so
+    /// Vulkan encodes on write, and the guest destination is spelled as a bare
+    /// [`TexelLayout`] — so format equality here refuses a copy whose bytes are
+    /// identical. On a driven macos-13 Maps leg that was 1 001 refusals out of
+    /// 1 001, and the app's canvas kept the zeros its pages were allocated with.
+    #[test]
+    fn a_transfer_function_is_not_a_disagreement_about_stored_bytes() {
+        for (view, stored) in [
+            (vk::Format::B8G8R8A8_SRGB, vk::Format::B8G8R8A8_UNORM),
+            (vk::Format::R8G8B8A8_SRGB, vk::Format::R8G8B8A8_UNORM),
+        ] {
+            assert!(
+                stored_bytes_agree(view, stored),
+                "{view:?} and {stored:?} are one allocation seen two ways"
+            );
+            assert!(stored_bytes_agree(stored, view), "the rule is symmetric");
+            assert!(stored_bytes_agree(view, view));
+        }
+    }
+
+    /// What the comparison is *for* survives the fold. Channel order and texel
+    /// width are storage facts, not view facts, so folding the transfer function
+    /// cannot admit either — a BGRA resident under an RGBA destination would need
+    /// an exchange this copy cannot perform, and a half-float destination over an
+    /// eight-bit resident would overlap its rows at half their true pitch.
+    #[test]
+    fn channel_order_and_texel_width_still_disagree() {
+        for (a, b) in [
+            (vk::Format::B8G8R8A8_UNORM, vk::Format::R8G8B8A8_UNORM),
+            (vk::Format::B8G8R8A8_SRGB, vk::Format::R8G8B8A8_UNORM),
+            (vk::Format::B8G8R8A8_SRGB, vk::Format::R8G8B8A8_SRGB),
+            (vk::Format::B8G8R8A8_UNORM, vk::Format::R16G16B16A16_SFLOAT),
+            (vk::Format::B8G8R8A8_SRGB, vk::Format::R16G16B16A16_SFLOAT),
+        ] {
+            assert!(
+                !stored_bytes_agree(a, b),
+                "{a:?} and {b:?} do not store the same bytes for one texel"
+            );
+        }
+    }
 
     /// A guest texture the graphics rail will sample is one the compute rail
     /// will sample, for every `MTLPixelFormat` value there is.
