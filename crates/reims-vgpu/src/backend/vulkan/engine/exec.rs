@@ -705,16 +705,22 @@ unsafe fn stage_buffer_content(
         snapshot_volatile,
         gather_role,
     } = use_;
-    // The identity and a reference to what it names, taken together — see
-    // [`super::pools::CbBind`]. The map cannot be told about a bind without
-    // being handed this, which is what keeps the key's address from being
-    // recycled under a live entry.
-    let bind = super::pools::CbBind::of(content);
-    let key = bind.key();
-    if let Some(bound) = pools.cb_bound_buffer(&bind) {
+    // Probe on the identity alone. A Metal argument table persists across the
+    // draws of one encoder, so the guest re-presents the same buffers on every
+    // draw and this probe almost always hits — paying `CbBind::of`'s `Arc` clone
+    // before knowing that would be two atomics per bind per draw, on the path
+    // that does no work.
+    let key = super::pools::CbBind::key_of(content);
+    if let Some(bound) = pools.cb_bound_buffer(key) {
         counters.note_buffer_bind_reused(gather_role);
         return Ok(bound);
     }
+    // A miss, so this bind is about to be recorded. The identity and a reference
+    // to what it names are taken together here — see [`super::pools::CbBind`].
+    // The map cannot be told about a bind without being handed this, which is
+    // what keeps the key's address from being recycled under a live entry.
+    let bind = super::pools::CbBind::of(content);
+    debug_assert_eq!(bind.key(), key, "the probe and the record name one bind");
     // Set by the one arm that returns a slot it has not filled. Read after the
     // `match` so the flag and the `note_cb_bound_buffer` below it cannot be
     // separated by a future edit that adds an arm.

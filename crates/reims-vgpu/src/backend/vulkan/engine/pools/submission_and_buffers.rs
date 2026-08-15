@@ -2044,13 +2044,24 @@ impl ResourcePools {
         super::super::GUEST_READ_DEBT.store(true, Ordering::Release);
     }
 
-    /// The buffer this command buffer already staged or gathered for `bind`, if
-    /// it still holds one. See `ResourcePools::cb_bound_buffers`.
+    /// The buffer this command buffer already staged or gathered for the bind
+    /// `key` identifies, if it still holds one. See
+    /// `ResourcePools::cb_bound_buffers`.
+    ///
+    /// Takes the key and **not** a [`super::CbBind`], because a lookup needs the
+    /// identity and not the ownership. Building the `CbBind` first costs an `Arc`
+    /// clone — two atomics here and two more when it drops — and this is the hit
+    /// path: a Metal argument table is sticky across the draws of an encoder, so
+    /// the same buffers are re-presented on every draw and almost every probe
+    /// hits. The `Arc` is what keeps a recorded key's address from being reissued
+    /// under a live entry, and that guarantee belongs to
+    /// [`Self::note_cb_bound_buffer`], which still takes the `CbBind` by value.
+    /// So the invariant is unchanged and only the miss path pays for it.
     pub(in crate::backend::vulkan::engine) fn cb_bound_buffer(
         &self,
-        bind: &super::CbBind,
+        key: (usize, u64, u64),
     ) -> Option<super::super::exec::BoundBuffer> {
-        self.cb_bound_buffers.get(&bind.key()).map(|(b, _)| *b)
+        self.cb_bound_buffers.get(&key).map(|(b, _)| *b)
     }
 
     /// Remember that `bind`'s bytes are in `bound` for the rest of this command
@@ -4823,11 +4834,11 @@ mod recycle_tests {
             "exactly the unfilled bind is forgotten"
         );
         assert!(
-            pools.cb_bound_buffer(&owed_bind).is_none(),
+            pools.cb_bound_buffer(owed_bind.key()).is_none(),
             "binding this would hand the shader the recycled slot's previous tenant"
         );
         assert!(
-            pools.cb_bound_buffer(&filled_bind).is_some(),
+            pools.cb_bound_buffer(filled_bind.key()).is_some(),
             "a bind published by a draw that completed is still correct, and \
              re-staging it is a cost this rail pays 4.8 times a draw"
         );
@@ -4846,7 +4857,7 @@ mod recycle_tests {
         pools.note_cb_gathers_recorded();
         assert_eq!(pools.discard_cb_binds_owed_a_gather(), 0);
         assert!(
-            pools.cb_bound_buffer(&owed_bind).is_some(),
+            pools.cb_bound_buffer(owed_bind.key()).is_some(),
             "a gather that reached the command buffer leaves a bind the rest of \
              that command buffer may reuse"
         );
@@ -5825,12 +5836,12 @@ mod recycle_tests {
             let mut pools = ResourcePools::new();
             pools.note_cb_bound_buffer(bind.clone(), bound);
             assert!(
-                pools.cb_bound_buffer(&bind).is_some(),
+                pools.cb_bound_buffer(bind.key()).is_some(),
                 "a bind must be reusable before {what}"
             );
             end(&mut pools);
             assert!(
-                pools.cb_bound_buffer(&bind).is_none(),
+                pools.cb_bound_buffer(bind.key()).is_none(),
                 "a bind remembered across {what} names a slot no longer this command buffer's"
             );
         }
