@@ -703,6 +703,31 @@ None of them could have bought frames through a presenter already at its
 ceiling, and a per-draw saving measured before this fix is **owed a re-run**
 rather than believed to have been worthless.
 
+### Score a boot on CPU **plus** GPU per draw, and join the censuses by `t`
+
+Two rules, both learned by getting them wrong on the x86/Vulkan iGPU pathway.
+
+**Join by the timestamp, never by line ordinal.** `drain_duty`, `gpu_span`,
+`window_publish` and `store_routes` all carry `t=` and all skip different windows,
+so pairing them by position drifts and pulls idle-desktop samples into a driven
+band. A harness that did this read a driven Maps boot at ~31 fps where banding
+`window_publish` by its own `t` reads **47-52**. Every rate quoted from a bad join
+is wrong in the direction that looks like a device problem.
+
+**`gpu_span busy_us / draws` is half the score and on this pathway it is the
+larger half.** An iGPU boot that reads 9 µs of drain CPU a draw also reads 10-12
+µs of GPU, and `(cpu + gpu) x draws/s` comes to 95-100 % of every busy second —
+the device is saturated and the two halves barely overlap, so frames track their
+*sum* roughly linearly. Ranking a change on `us/draw` alone therefore scores half
+of it, and the standing 0.35-frames-per-unit elasticity note beside
+`VBL_REPORT_EARLY` was measured on a discrete host at 51 % GPU occupancy where
+nothing was bound: it does not describe a host where something is.
+
+`gpu us/draw` carries a ±12 % boot-to-boot spread against `cpu us/draw`'s ±4 %, so
+a GPU arm needs n≥3 where a CPU one may not. And do not rank on frames across
+boots at all unless draws-per-frame is quoted beside them: that is the workload,
+it drifts between boots of one binary, and `fps = 1e6 / (sum x draws_per_frame)`.
+
 ### An undriven boot measures an idle device
 
 A `--testing` boot reaches the desktop and then sits there. Reading its counters as this device's
