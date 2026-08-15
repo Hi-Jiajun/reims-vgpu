@@ -2959,17 +2959,67 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
             return None;
         }
         let host_base = host.map_pages(&gpas, page as usize)?;
-        let import = crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
-            host_base, map_len, align,
+        // A packed view answers a **scatter**: Vulkan host-pointer memory takes
+        // one contiguous host range, and a linear guest resource may name guest
+        // pages that are not contiguous. When this window's pages *are* one run
+        // there is no scatter to answer, and the bytes are already inside the
+        // RAMBlock import this device holds for the VM's lifetime — so importing
+        // them again allocates a second device memory over memory already
+        // imported, and pays the driver's page pinning for it.
+        //
+        // That was not a small cost. One driven Maps boot made **13 681**
+        // host-pointer imports totalling 5.05 s of `vkAllocateMemory`, and
+        // **12 380 of them were 4096 bytes** — a single page, which is one run by
+        // construction, so every one of those was answering a scatter that could
+        // not exist. `host_ram_import`'s own census doc states the invariant this
+        // broke: "one or two for a whole boot. A count that tracks the workload
+        // is a per-resource import".
+        //
+        // `reference_for_pages` is the existing resolver for exactly this
+        // question — it checks the run itself and refuses `Scattered` with a run
+        // count — so the contiguous case is routed to it rather than re-deciding
+        // contiguity here. `map_pages` above stays: on a contiguous window it
+        // hands back a direct RAMBlock alias, which is a lookup, and `runs` needs
+        // that host pointer either way.
+        let ramblock = crate::runtime::guest_ram_map::reference_for_pages(
+            host,
+            &gpas,
+            page,
+            head,
+            backing.size,
         )
-        .ok()?;
-        let import = std::sync::Arc::new(import);
-        let whole = import.slice(head, backing.size).ok()?;
-        let guest = crate::runtime::guest_ram::GuestRef::new(
-            std::sync::Arc::clone(&import),
-            whole,
-        )
-        .ok()?;
+        .ok()
+        .and_then(|guest| {
+            // `head` is an offset *into the import*, because every consumer
+            // spends it as `import.slice(head + offset, span)`. Against the
+            // RAMBlock import that is where this window's first byte sits in the
+            // block, not where it sits in a freshly mapped alias.
+            let base = guest.import().gpa_base()?;
+            let head_in_import = gpas.first()?.checked_add(head)?.checked_sub(base)?;
+            Some((std::sync::Arc::clone(guest.import()), head_in_import, guest))
+        });
+        let (import, head, guest) = match ramblock {
+            Some(resolved) => {
+                crate::runtime::drain::note_store_route("zc_packed_ramblock");
+                resolved
+            }
+            None => {
+                crate::runtime::drain::note_store_route("zc_packed_alias_import");
+                let import = std::sync::Arc::new(
+                    crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                        host_base, map_len, align,
+                    )
+                    .ok()?,
+                );
+                let whole = import.slice(head, backing.size).ok()?;
+                let guest = crate::runtime::guest_ram::GuestRef::new(
+                    std::sync::Arc::clone(&import),
+                    whole,
+                )
+                .ok()?;
+                (import, head, guest)
+            }
+        };
         Some(PackedBufferResolution::Available(PackedBuffer {
             gva: backing.gva,
             size: backing.size,
