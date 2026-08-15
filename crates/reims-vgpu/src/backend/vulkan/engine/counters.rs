@@ -546,6 +546,9 @@ engine_counters! {
         /// Draw/dispatch descriptor state recorded directly into the command
         /// buffer through `VK_KHR_push_descriptor`.
         descriptor_pushes,
+        /// Graphics pushes omitted because the exact layout and descriptor
+        /// values were already present in the recording command buffer.
+        descriptor_push_held,
         /// Descriptor sets updated through the Vulkan 1.2 fallback path.
         descriptor_set_updates,
         /// Updated descriptor sets subsequently bound for execution.

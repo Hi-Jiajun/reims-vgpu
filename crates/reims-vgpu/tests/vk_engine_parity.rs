@@ -2066,22 +2066,40 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         )
         .expect("map reflected static sampler"),
     );
+    let target = TargetIdentity::Surface {
+        id: 880_024,
+        width: w,
+        height: h,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    req.target_identity = Some(target.clone());
+    req.skip_readback = true;
 
     let before = engine::counter_snapshot();
-    let Some(pixels) = draw_or_skip("reflected static sampler", &req) else {
+    let Some(first) = draw_out_or_skip("reflected static sampler first", &req) else {
         return;
     };
+    assert!(first.pixels.is_empty());
+    req.load_from_target = true;
+    let second = engine::execute_draw_request(&req).expect("second static sampler draw");
+    assert!(second.pixels.is_empty());
+    let pixels = engine::read_target(&target)
+        .expect("read repeated static sampler target")
+        .into_rgba8();
     let descriptors = engine::counter_snapshot().delta_since(&before);
-    assert_eq!(
-        descriptors.descriptor_pushes + descriptors.descriptor_set_updates,
-        1,
-        "one descriptor-bearing draw takes exactly one capability rung: {descriptors:?}"
-    );
-    assert_eq!(
-        descriptors.descriptor_set_binds,
-        descriptors.descriptor_set_updates,
-        "only separately updated sets require a bind: {descriptors:?}"
-    );
+    if descriptors.descriptor_set_updates == 0 {
+        assert_eq!(descriptors.descriptor_pushes, 1, "first draw pushes: {descriptors:?}");
+        assert_eq!(
+            descriptors.descriptor_push_held, 1,
+            "the exact repeated state is retained by the command buffer: {descriptors:?}"
+        );
+    } else {
+        assert_eq!(descriptors.descriptor_set_updates, 2, "fallback updates: {descriptors:?}");
+        assert_eq!(descriptors.descriptor_set_binds, 2, "fallback binds: {descriptors:?}");
+        assert_eq!(descriptors.descriptor_pushes, 0);
+        assert_eq!(descriptors.descriptor_push_held, 0);
+    }
     for (index, pixel) in pixels.chunks_exact(4).enumerate() {
         assert_eq!(pixel, rgba, "static sampler pixel {index}");
     }

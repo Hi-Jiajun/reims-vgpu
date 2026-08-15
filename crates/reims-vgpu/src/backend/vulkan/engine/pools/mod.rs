@@ -697,16 +697,54 @@ pub(crate) struct CbGraphicsState {
     cb: Option<vk::CommandBuffer>,
     /// The graphics pipeline last bound into `cb`.
     pipeline: Option<vk::Pipeline>,
+    /// The layout of `pipeline`, tracked separately because an incompatible
+    /// bind disturbs push descriptors even if a later draw returns to the
+    /// earlier pipeline.
+    pipeline_layout: Option<vk::PipelineLayout>,
     /// The viewport array last handed to `vkCmdSetViewport`, and the scissor
     /// array last handed to `vkCmdSetScissor`.
     viewports: Vec<vk::Viewport>,
     scissors: Vec<vk::Rect2D>,
     /// The front/back references last handed to `vkCmdSetStencilReference`.
     stencil: Option<(u32, u32)>,
+    /// The push-descriptor layout and exact descriptor values last recorded.
+    push_layout: Option<vk::PipelineLayout>,
+    push_bindings: Vec<PushDescriptorBinding>,
     /// Scratch the next draw builds into, so the comparison costs no allocation.
     /// Swapped with the bound array when they differ rather than cloned.
     vp_scratch: Vec<vk::Viewport>,
     sc_scratch: Vec<vk::Rect2D>,
+    push_scratch: Vec<PushDescriptorBinding>,
+}
+
+/// One descriptor value in the normalized order used by a push layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PushDescriptorBinding {
+    Buffer {
+        binding: u32,
+        array_element: u32,
+        ty: vk::DescriptorType,
+        buffer: vk::Buffer,
+        offset: vk::DeviceSize,
+        range: vk::DeviceSize,
+    },
+    Image {
+        binding: u32,
+        array_element: u32,
+        ty: vk::DescriptorType,
+        sampler: vk::Sampler,
+        view: vk::ImageView,
+        layout: vk::ImageLayout,
+    },
+}
+
+fn push_descriptors_match(
+    bound_layout: Option<vk::PipelineLayout>,
+    bound: &[PushDescriptorBinding],
+    wanted_layout: vk::PipelineLayout,
+    wanted: &[PushDescriptorBinding],
+) -> bool {
+    bound_layout == Some(wanted_layout) && bound == wanted
 }
 
 /// Whether two viewport arrays are the value the driver already has.
@@ -3783,8 +3821,11 @@ mod idle_slab_trim_tests {
 
 #[cfg(test)]
 mod dynamic_state_match_tests {
-    use super::{scissors_match, viewports_match};
+    use super::{
+        push_descriptors_match, scissors_match, viewports_match, PushDescriptorBinding,
+    };
     use ash::vk;
+    use ash::vk::Handle;
 
     fn vp(x: f32, y: f32, w: f32, h: f32, near: f32, far: f32) -> vk::Viewport {
         vk::Viewport {
@@ -3877,5 +3918,39 @@ mod dynamic_state_match_tests {
     fn an_empty_cache_matches_only_an_empty_request() {
         assert!(viewports_match(&[], &[]));
         assert!(!viewports_match(&[vp(0.0, 0.0, 1.0, -1.0, 0.0, 1.0)], &[]));
+    }
+
+    #[test]
+    fn push_descriptor_match_requires_the_exact_layout_and_values() {
+        let layout = vk::PipelineLayout::from_raw(7);
+        let binding = PushDescriptorBinding::Buffer {
+            binding: 3,
+            array_element: 0,
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            buffer: vk::Buffer::from_raw(11),
+            offset: 64,
+            range: 128,
+        };
+        assert!(push_descriptors_match(Some(layout), &[binding], layout, &[binding]));
+        assert!(!push_descriptors_match(
+            Some(vk::PipelineLayout::from_raw(8)),
+            &[binding],
+            layout,
+            &[binding]
+        ));
+        let changed = PushDescriptorBinding::Buffer {
+            binding: 3,
+            array_element: 0,
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            buffer: vk::Buffer::from_raw(11),
+            offset: 80,
+            range: 128,
+        };
+        assert!(!push_descriptors_match(
+            Some(layout),
+            &[binding],
+            layout,
+            &[changed]
+        ));
     }
 }

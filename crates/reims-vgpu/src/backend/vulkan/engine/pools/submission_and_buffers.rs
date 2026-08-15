@@ -1687,9 +1687,12 @@ impl ResourcePools {
         self.last_pass = None;
         self.cb_graphics.cb = None;
         self.cb_graphics.pipeline = None;
+        self.cb_graphics.pipeline_layout = None;
         self.cb_graphics.viewports.clear();
         self.cb_graphics.scissors.clear();
         self.cb_graphics.stencil = None;
+        self.cb_graphics.push_layout = None;
+        self.cb_graphics.push_bindings.clear();
     }
 
     fn install_open_batch(&mut self, batch: OpenBatch) {
@@ -2037,6 +2040,7 @@ impl ResourcePools {
         cb: vk::CommandBuffer,
         counters: &EngineCounters,
         pipeline: vk::Pipeline,
+        pipeline_layout: vk::PipelineLayout,
     ) {
         let g = &mut self.cb_graphics;
         if g.cb != Some(cb) {
@@ -2044,9 +2048,12 @@ impl ResourcePools {
             // made undefined by the `vkBeginCommandBuffer` in between.
             g.cb = Some(cb);
             g.pipeline = None;
+            g.pipeline_layout = None;
             g.viewports.clear();
             g.scissors.clear();
             g.stencil = None;
+            g.push_layout = None;
+            g.push_bindings.clear();
         }
         if g.pipeline == Some(pipeline) {
             counters
@@ -2055,6 +2062,11 @@ impl ResourcePools {
             return;
         }
         g.pipeline = Some(pipeline);
+        if g.pipeline_layout != Some(pipeline_layout) {
+            g.pipeline_layout = Some(pipeline_layout);
+            g.push_layout = None;
+            g.push_bindings.clear();
+        }
         // Static state on the incoming pipeline may have replaced any of these,
         // so none of them is known any more.
         g.viewports.clear();
@@ -2119,6 +2131,39 @@ impl ResourcePools {
     /// that kept its own copy would be a second spelling of the same rects.
     pub(crate) fn bound_scissors(&self) -> &[vk::Rect2D] {
         &self.cb_graphics.scissors
+    }
+
+    /// Scratch in which the next draw normalizes its push-descriptor state.
+    pub(crate) fn push_descriptor_scratch(
+        &mut self,
+    ) -> &mut Vec<super::PushDescriptorBinding> {
+        self.cb_graphics.push_scratch.clear();
+        &mut self.cb_graphics.push_scratch
+    }
+
+    /// Return whether this draw must record its push descriptors, retaining a
+    /// byte-exact echo when it does.
+    pub(crate) fn push_descriptors_changed(
+        &mut self,
+        layout: vk::PipelineLayout,
+        counters: &EngineCounters,
+    ) -> bool {
+        let g = &mut self.cb_graphics;
+        if super::push_descriptors_match(
+            g.push_layout,
+            &g.push_bindings,
+            layout,
+            &g.push_scratch,
+        ) {
+            counters
+                .descriptor_push_held
+                .fetch_add(1, Ordering::Relaxed);
+            false
+        } else {
+            g.push_layout = Some(layout);
+            std::mem::swap(&mut g.push_bindings, &mut g.push_scratch);
+            true
+        }
     }
 
     /// Record both `vkCmdSetStencilReference` faces unless this command buffer

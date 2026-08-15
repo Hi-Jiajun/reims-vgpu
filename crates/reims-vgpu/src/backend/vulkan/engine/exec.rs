@@ -4660,7 +4660,15 @@ pub(crate) unsafe fn execute_draw_inner(
     // Only if this command buffer is not already carrying it — the three
     // `dynstate_*` skips below hang off this one call, because a pipeline change
     // is what invalidates them. See `super::pools::CbGraphicsState`.
-    unsafe { pools.bind_graphics_pipeline(&ctx.device, cb, counters, pipeline) };
+    unsafe {
+        pools.bind_graphics_pipeline(
+            &ctx.device,
+            cb,
+            counters,
+            pipeline,
+            pipeline_layout,
+        )
+    };
     if let Some((pool, flags)) = occlusion {
         ctx.device.cmd_begin_query(cb, pool, 0, flags);
     }
@@ -4736,17 +4744,60 @@ pub(crate) unsafe fn execute_draw_inner(
     }
 
     if push_descriptors {
-        ctx.push_descriptor
-            .as_ref()
-            .expect("push layout requires enabled entry points")
-            .cmd_push_descriptor_set(
-                cb,
-                vk::PipelineBindPoint::GRAPHICS,
-                pipeline_layout,
-                0,
-                &descriptor_writes,
-            );
-        counters.descriptor_pushes.fetch_add(1, Ordering::Relaxed);
+        let push_state = pools.push_descriptor_scratch();
+        push_state.extend(storage_slots.iter().zip(&buffer_infos).map(
+            |((binding, _, _), info)| super::pools::PushDescriptorBinding::Buffer {
+                binding: *binding,
+                array_element: 0,
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                buffer: info.buffer,
+                offset: info.offset,
+                range: info.range,
+            },
+        ));
+        push_state.extend(sampled.iter().zip(&sampled_infos).map(
+            |(image, info)| super::pools::PushDescriptorBinding::Image {
+                binding: image.binding(),
+                array_element: image.array_element(),
+                ty: vk::DescriptorType::SAMPLED_IMAGE,
+                sampler: info.sampler,
+                view: info.image_view,
+                layout: info.image_layout,
+            },
+        ));
+        push_state.extend(sampler_handles.iter().zip(&sampler_infos).map(
+            |((binding, _), info)| super::pools::PushDescriptorBinding::Image {
+                binding: *binding,
+                array_element: 0,
+                ty: vk::DescriptorType::SAMPLER,
+                sampler: info.sampler,
+                view: info.image_view,
+                layout: info.image_layout,
+            },
+        ));
+        if req.color_input {
+            push_state.push(super::pools::PushDescriptorBinding::Image {
+                binding: super::types::COLOR_INPUT_BINDING,
+                array_element: 0,
+                ty: vk::DescriptorType::INPUT_ATTACHMENT,
+                sampler: color_input_info.sampler,
+                view: color_input_info.image_view,
+                layout: color_input_info.image_layout,
+            });
+        }
+        if pools.push_descriptors_changed(pipeline_layout, counters) {
+            ctx.push_descriptor
+                .as_ref()
+                .expect("push layout requires enabled entry points")
+                .cmd_push_descriptor_set(
+                    cb,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline_layout,
+                    0,
+                    &descriptor_writes,
+                );
+            counters.descriptor_pushes.fetch_add(1, Ordering::Relaxed);
+        }
     } else if let Some(dset) = dset {
         ctx.device.cmd_bind_descriptor_sets(
             cb,
