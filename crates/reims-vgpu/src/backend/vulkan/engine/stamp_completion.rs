@@ -159,6 +159,16 @@ struct Waiting {
     word: crate::runtime::guest_ram::GuestRef,
     /// The FIFO completion value published into `word`.
     stamp: u32,
+    /// When this stamp was registered, for the publish-latency census.
+    ///
+    /// This is the clock the guest actually experiences: it is blocked from the
+    /// moment the packet is held on the wait until the word appears, and every
+    /// hop in between — the batch reaching `vkQueueSubmit`, the GPU retiring it,
+    /// the completion thread waking, the store, the interrupt — is inside this
+    /// span. Nothing else in this device measures it end to end, and the drain's
+    /// own censuses cannot: they are written by the drain thread, which is not
+    /// the thread that finishes the work.
+    queued_at: std::time::Instant,
 }
 
 /// Association between one guest stamp and one FIFO-owned submission.
@@ -432,6 +442,8 @@ impl StampCompletion {
             index,
             word,
             stamp,
+
+            queued_at: std::time::Instant::now(),
         });
         PENDING_FIFO_MASK.fetch_or(1u32 << index, Ordering::Release);
         drop(queue);
@@ -472,6 +484,8 @@ impl StampCompletion {
             index,
             word,
             stamp,
+
+            queued_at: std::time::Instant::now(),
         });
         PENDING_FIFO_MASK.fetch_or(1u32 << index, Ordering::Release);
         UNSUBMITTED_FIFO_MASK.fetch_or(1u32 << index, Ordering::Release);
@@ -632,7 +646,39 @@ fn should_publish(completed: bool, stopping: bool) -> bool {
 }
 
 fn publish_stamp_word(waiting: &Waiting) -> bool {
+    note_publish_latency(waiting.queued_at.elapsed());
     waiting.word.store_u32_release(waiting.stamp)
+}
+
+/// Band how long a guest stamp took to become visible, from registration to the
+/// word landing.
+///
+/// Banded rather than averaged because the question is a *distribution*: a mean
+/// hides whether the guest is losing a little on every stamp or a lot on a few,
+/// and those have different repairs. The bands straddle the frame period this
+/// rail is judged against (a macos-13 boot runs ~29 Hz, so ~34 ms), so a stamp
+/// landing in `lt64ms` has cost the guest most of a frame on its own.
+///
+/// The top two bands exist for one specific failure. The guest does not poll a
+/// stamp slot: it sleeps on the slot's address and is woken by this device's
+/// interrupt, with a **one-second deadline** as its only backstop. So a stamp
+/// whose interrupt is dropped, or whose word becomes visible *after* the
+/// interrupt rather than before it, is not slow by a little — the guest sleeps
+/// out the full second and wakes to re-read the page. Any weight at `ge500ms` is
+/// that signature and nothing else, and it would not be visible in a mean or in
+/// any band that stopped at "slower than a frame".
+fn note_publish_latency(elapsed: std::time::Duration) {
+    let us = elapsed.as_micros() as u64;
+    crate::runtime::drain::census::note_store_route(match us {
+        0..=99 => "stamp_publish_lt100us",
+        100..=999 => "stamp_publish_lt1ms",
+        1_000..=3_999 => "stamp_publish_lt4ms",
+        4_000..=15_999 => "stamp_publish_lt16ms",
+        16_000..=63_999 => "stamp_publish_lt64ms",
+        64_000..=499_999 => "stamp_publish_lt500ms",
+        _ => "stamp_publish_ge500ms",
+    });
+    crate::runtime::drain::census::note_store_route_us("stamp_publish_us", us);
 }
 
 #[cfg(test)]
@@ -658,6 +704,7 @@ mod tests {
             index,
             word: crate::runtime::guest_ram::GuestRef::new(import, slice).expect("guest word"),
             stamp,
+            queued_at: std::time::Instant::now(),
         }
     }
 
@@ -823,6 +870,7 @@ mod tests {
             index: 2,
             word,
             stamp: 0x89ab_cdef,
+            queued_at: std::time::Instant::now(),
         };
 
         assert!(publish_stamp_word(&waiting));
