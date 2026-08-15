@@ -1337,13 +1337,13 @@ fn every_decoded_draw_in_a_stream_reaches_the_draw_list() {
     }
 
     assert_eq!(acc.draws.len(), records, "no draw may be truncated away");
-    assert_eq!(acc.dropped_unbound, 0, "all of these had a pipeline bound");
+    assert_eq!(acc.dropped_no_pipeline, 0, "all of these had a pipeline bound");
 
     // With no pipeline latched the same record is the other arm: still not
     // a `PendingDraw`, but counted rather than vanishing.
     let mut unbound = StreamAccum::default();
     handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut unbound);
-    assert_eq!(unbound.dropped_unbound, 1);
+    assert_eq!(unbound.dropped_no_pipeline, 1);
     assert!(unbound.draws.is_empty());
 }
 
@@ -1353,11 +1353,11 @@ fn every_decoded_draw_in_a_stream_reaches_the_draw_list() {
 /// caught the failed guard is the match's bare `_ => {}`. So a zero ref left
 /// whatever pipeline was latched before it in place, and every following draw
 /// encoded against a pipeline the guest had stopped asking for — a wrong
-/// frame, silently, with `dropped_unbound` reading zero because the draws
+/// frame, silently, with `dropped_no_pipeline` reading zero because the draws
 /// were not dropped at all.
 ///
 /// This asserts the outcome rather than the field: after a zero ref, a draw
-/// that would otherwise have been kept lands in `dropped_unbound` and no
+/// that would otherwise have been kept lands in `dropped_no_pipeline` and no
 /// `PendingDraw` carries the stale ref. On the guarded code the draw is
 /// pushed with pipeline 61 and both assertions fail.
 #[test]
@@ -1401,7 +1401,7 @@ fn setting_the_render_pipeline_to_ref_zero_unbinds_it() {
     handle_render_record(&mut state, &host, 1, op, &draw, &mut out, &mut acc);
 
     assert_eq!(
-        acc.dropped_unbound, 1,
+        acc.dropped_no_pipeline, 1,
         "a draw after an unbind is declined by name, not encoded against the old pipeline"
     );
     assert!(

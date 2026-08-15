@@ -508,7 +508,7 @@ pub(super) fn note_color_subresource_unsupported(
 /// ceiling are what say whether removing it changed which streams complete.
 pub(super) fn note_stream_draw_drops(task_id: u32, acc: &StreamAccum) {
     let kept = acc.draws.len();
-    if kept == 0 && acc.dropped_unbound == 0 {
+    if kept == 0 && acc.dropped_no_pipeline == 0 && acc.dropped_zero_count == 0 {
         return;
     }
     crate::runtime::drain::note_store_route(match kept {
@@ -522,16 +522,30 @@ pub(super) fn note_stream_draw_drops(task_id: u32, acc: &StreamAccum) {
         64..=255 => "stream_draws_64_255",
         _ => "stream_draws_over_255",
     });
+    // The rates, which nothing recorded until now. The emitter below cannot
+    // stand in for them: its latch is per power-of-two magnitude, so a stream
+    // losing 133 draws every frame for a whole boot prints exactly once and
+    // every later loss of 65..128 prints never. Counted beside the kept bucket
+    // so all three are summed over the same windows and the loss can be read
+    // against the draws that survived it.
+    crate::runtime::drain::note_store_route_n(
+        "stream_draw_dropped_no_pipeline",
+        u64::from(acc.dropped_no_pipeline),
+    );
+    crate::runtime::drain::note_store_route_n(
+        "stream_draw_dropped_zero_count",
+        u64::from(acc.dropped_zero_count),
+    );
     // Latched on the *magnitude* of the loss, not on the task: the same stream
     // shape recurs every frame, so a per-task key would print once and hide a
     // loss that grew, while a bucket key prints again when it gets worse.
-    if acc.dropped_unbound > 0 {
+    if acc.dropped_no_pipeline > 0 {
         let d = StreamDrawDrop::Unbound {
-            dropped: acc.dropped_unbound,
+            dropped: acc.dropped_no_pipeline,
         };
         if crate::observe::first_sight(
             crate::observe::Decline::slug(&d),
-            u64::from(acc.dropped_unbound.next_power_of_two()),
+            u64::from(acc.dropped_no_pipeline.next_power_of_two()),
         ) {
             crate::observe::Emit::decline("stream_draw", &d)
                 .field("task", task_id)

@@ -175,9 +175,22 @@ struct StreamAccum {
     /// record genuinely replaces the first. What *accumulates* across draws is
     /// the count in the guest's buffer, not the arming.
     visibility: Option<draw::VisibilityArming>,
-    /// Draw records this stream decoded but did not keep. See
-    /// [`StreamDrawDrop`]; reported once per stream by [`note_stream_draw_drops`].
-    dropped_unbound: u32,
+    /// Draw records this stream decoded but did not keep because no pipeline was
+    /// latched. See [`StreamDrawDrop`]; reported once per stream by
+    /// [`note_stream_draw_drops`].
+    dropped_no_pipeline: u32,
+    /// Draw records this stream decoded but did not keep because they asked for
+    /// zero vertices.
+    ///
+    /// Split from [`Self::dropped_no_pipeline`] because the two are opposite
+    /// findings that were folded into one number for as long as the emitter has
+    /// existed: a zero count is a **legal empty draw** and nothing is lost, while
+    /// an unlatched pipeline is a **draw the guest asked for and this device
+    /// dropped**. [`StreamDrawDrop::Unbound`]'s own doc said to read the rate to
+    /// tell them apart, which cannot work when both increment the same field —
+    /// a workload emitting thousands of legal empty draws reads identically to
+    /// one losing thousands of real ones.
+    dropped_zero_count: u32,
     /// Something the guest asked this stream for that its state cannot carry.
     ///
     /// Every arm that sets this used to note its loss and carry on, and all of
@@ -285,12 +298,13 @@ impl StreamAccum {
 /// per-record cost at one pointer per stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StreamDrawDrop {
-    /// The record arrived with no pipeline bound or a zero primitive count.
+    /// The record arrived with no pipeline bound: a `SetPipeline` this decoder
+    /// failed to latch, and therefore a **lost draw**.
     ///
-    /// Either a genuinely empty draw — legal, and nothing is lost — or a
-    /// `SetPipeline` this decoder failed to latch, which is a lost draw. The
-    /// count is what separates the two: a rate that tracks the draw rate is the
-    /// second reading, an occasional one is the first.
+    /// This used to also carry the zero-primitive-count case, which is a legal
+    /// empty draw that loses nothing, and told the reader to separate the two by
+    /// the rate. That could not work — both incremented one field — so the two
+    /// now count apart at the check and only this one is a loss.
     Unbound { dropped: u32 },
     /// A depth or stencil attachment this device cannot honour as decoded.
     ///
@@ -1049,12 +1063,37 @@ fn compute_translation_inputs(stream: &[u8]) -> Vec<(u32, [u32; 3])> {
 /// refuses `command_end > bytes.len()`, so `bytes_offset + length` is inside
 /// `stream` by construction — the five copies of that same bounds check each
 /// had a silent `return` behind a branch none of them could take.
+///
+/// # The record count is the denominator for `exec_phase walk_us`
+///
+/// `walk_us` is the largest single span this device reports — 31.6 s of a 45.6 s
+/// driven macos-13 Maps window, against 6.4 s of actual drawing — and until this
+/// counter existed there was no way to tell which of two very different readings
+/// it was. 857 us per stream is either tens of microseconds spent on each of a
+/// few dozen records, which points at one expensive handler, or a fraction of a
+/// microsecond spent on each of tens of thousands, which points at the guest
+/// simply sending that many. Counted per segment family, because a blit record
+/// and a render record cost nothing like the same and the mix is what says which
+/// of the two the wall clock belongs to.
 fn walk_segment_records(stream: &[u8], seg: &stream::Segment, mut handle: impl FnMut(u32, &[u8])) {
     let mut cursor = 0usize;
+    let mut records = 0u64;
     let mut next = decode_first_record(stream, seg, &mut cursor);
+    let (route, route_us) = match seg.type_ {
+        SEGMENT_TYPE_RENDER => ("walk_records_render", "walk_render_us"),
+        SEGMENT_TYPE_BLIT => ("walk_records_blit", "walk_blit_us"),
+        SEGMENT_TYPE_COMPUTE => ("walk_records_compute", "walk_compute_us"),
+        _ => ("walk_records_other", "walk_other_us"),
+    };
+    // One clock pair per *segment*, not per record. A stream carries at most a
+    // handful of segments and tens of thousands of records, so this splits
+    // `exec_phase walk_us` by family for a cost that does not show up, where
+    // per-record timing would cost more than the handlers it measured.
+    let started = std::time::Instant::now();
     loop {
         match next {
             Ok(rec) => {
+                records += 1;
                 let start = rec.bytes_offset as usize;
                 handle(rec.opcode, &stream[start..start + rec.length as usize]);
                 next = decode_next_record(stream, seg, &mut cursor);
@@ -1062,6 +1101,11 @@ fn walk_segment_records(stream: &[u8], seg: &stream::Segment, mut handle: impl F
             // `Done` is end-of-segment and yields `None` here, so the normal exit
             // path stays silent; anything else names the check that refused.
             Err(status) => {
+                crate::runtime::drain::note_store_route_n(route, records);
+                crate::runtime::drain::note_store_route_us(
+                    route_us,
+                    started.elapsed().as_micros() as u64,
+                );
                 if let Some(e) = crate::observe::Emit::refusal("stream_record_fail", &status) {
                     // Latch per segment family: a guest re-submitting a malformed
                     // stream sends it on every frame and the second line carries
@@ -1607,7 +1651,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // and the next draw encoded against it — a wrong frame with nothing
             // on any channel. Dropping the record is not the neutral choice it
             // looks like: `acc.pipeline_ref == 0` is already a state the draw arm
-            // knows, where it declines as `dropped_unbound` and says so. Letting
+            // knows, where it declines as `dropped_no_pipeline` and says so. Letting
             // the zero through routes this into that named decline instead of
             // into a stale bind.
             //
@@ -1627,7 +1671,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 crate::observe::fail(
                     "stream_set_pipeline reason=render_set_pipeline_zero_ref \
                      (a render pipeline was set to ref 0; the pass is now unbound \
-                     and its draws decline as dropped_unbound)",
+                     and its draws decline as dropped_no_pipeline)",
                 );
             }
             acc.pipeline_ref = cmd.pipeline_ref;
@@ -2093,8 +2137,10 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 acc.indexed = None;
             }
             // Snapshot bind state for this draw (archive multi-draw job).
-            if acc.pipeline_ref == 0 || count == 0 {
-                acc.dropped_unbound = acc.dropped_unbound.saturating_add(1);
+            if acc.pipeline_ref == 0 {
+                acc.dropped_no_pipeline = acc.dropped_no_pipeline.saturating_add(1);
+            } else if count == 0 {
+                acc.dropped_zero_count = acc.dropped_zero_count.saturating_add(1);
             } else {
                 match acc.bind_snapshot() {
                     Ok(snapshot) => acc.draws.push(PendingDraw {
@@ -3826,12 +3872,15 @@ fn execute_indirect_draw<M: HostMemory + HostOps>(
     }
 
     // A zero count here is the guest's own, read from its own buffer, and it is
-    // a legal empty draw rather than a record this device failed to decode —
-    // so it takes `dropped_unbound` the way a zero-count direct draw does, and
-    // that counter's two readings ("an empty draw" / "a pipeline we failed to
-    // latch") are unchanged by this arm joining it.
-    if acc.pipeline_ref == 0 || args.vertex_count == 0 {
-        acc.dropped_unbound = acc.dropped_unbound.saturating_add(1);
+    // a legal empty draw rather than a record this device failed to decode — so
+    // it takes the zero-count counter the way a zero-count direct draw does, and
+    // the unlatched-pipeline reading beside it stays a loss on both arms.
+    if acc.pipeline_ref == 0 {
+        acc.dropped_no_pipeline = acc.dropped_no_pipeline.saturating_add(1);
+        return;
+    }
+    if args.vertex_count == 0 {
+        acc.dropped_zero_count = acc.dropped_zero_count.saturating_add(1);
         return;
     }
     match acc.bind_snapshot() {
