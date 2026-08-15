@@ -78,10 +78,16 @@ use crate::observe::{Decline, Emit};
 /// `runs` is the same set partitioned into physically contiguous stretches.
 /// Deriving the partition once makes a resource—not each Store consumer—the
 /// authority on how its scattered pages fit together.
+///
+/// `ascending` is that same set a third time, sorted and deduplicated, and it
+/// exists because [`Self::contains_page`] is asked far more often than a
+/// footprint is built. See that method for why the run partition is the wrong
+/// index for a membership question.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GuestPageFootprint {
     pages: std::sync::Arc<[u64]>,
     runs: std::sync::Arc<[std::ops::Range<usize>]>,
+    ascending: std::sync::Arc<[u64]>,
     page_size: u64,
 }
 
@@ -91,9 +97,13 @@ impl GuestPageFootprint {
             return None;
         }
         let runs = reims_vgpu_paging::runs::contig_page_runs(&pages, page_size).into();
+        let mut ascending = pages.to_vec();
+        ascending.sort_unstable();
+        ascending.dedup();
         Some(Self {
             pages,
             runs,
+            ascending: ascending.into(),
             page_size,
         })
     }
@@ -122,24 +132,37 @@ impl GuestPageFootprint {
     }
 
     /// Whether this allocation contains one page-aligned physical address.
-    /// The contiguous-run partition makes a scattered footprint an O(runs)
-    /// query without sorting or copying its allocation-order page list.
+    ///
+    /// A run holds exactly the pages `pages[run]`, contiguous by construction,
+    /// so "inside this run's byte range at page alignment" and "equal to one of
+    /// this run's pages" are the same predicate. The question is membership and
+    /// nothing else, so the index for it is the sorted page set, not the run
+    /// partition — the runs describe how the pages *abut*, which no membership
+    /// test needs to know.
+    ///
+    /// That distinction is worth a whole allocation. The scan this replaced was
+    /// O(runs) per page, and the runs are not few: a compositor mapping of 2040
+    /// pages lands in 511 of them. Read against a page list rather than a single
+    /// page — which is what the outstanding-write ledger does — the scan was
+    /// O(pages x runs) and measured 5.2 ms per ask on a driven Maps leg, 42 asks
+    /// a second. It is now a binary search.
     #[cfg(feature = "backend-vulkan")]
     pub(crate) fn contains_page(&self, gpa: u64) -> bool {
-        self.runs.iter().any(|run| {
-            let first = self.pages[run.start];
-            let Some(bytes) = (run.end - run.start)
-                .try_into()
-                .ok()
-                .and_then(|pages: u64| pages.checked_mul(self.page_size))
-            else {
-                return false;
-            };
-            let Some(end) = first.checked_add(bytes) else {
-                return false;
-            };
-            gpa >= first && gpa < end && (gpa - first).is_multiple_of(self.page_size)
-        })
+        self.ascending.binary_search(&gpa).is_ok()
+    }
+
+    /// The lowest and highest physical page this allocation holds, or `None` for
+    /// an empty footprint — which [`Self::new`] refuses, so this is `Some` for
+    /// every value that exists.
+    ///
+    /// Exposed so a caller comparing a whole page *list* against this footprint
+    /// can reject the common no-overlap case on two comparisons instead of one
+    /// binary search per page. A span test can only ever answer "cannot
+    /// overlap"; an overlap of spans still has to be settled by
+    /// [`Self::contains_page`], so this narrows work and never a verdict.
+    #[cfg(feature = "backend-vulkan")]
+    pub(crate) fn page_span(&self) -> Option<(u64, u64)> {
+        Some((*self.ascending.first()?, *self.ascending.last()?))
     }
 
     pub(crate) fn pages_arc(&self) -> std::sync::Arc<[u64]> {
@@ -1008,6 +1031,35 @@ mod tests {
         );
     }
 
+    /// Allocation order is the guest's, and it is not ascending: a page list
+    /// walks a resource's virtual pages, whose physical addresses arrive in
+    /// whatever order the guest allocator handed them out. The run partition
+    /// coped with that by construction — it never assumed an order — so the
+    /// sorted membership index beside it has to be built from a copy rather
+    /// than by asserting the list is already sorted.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn membership_holds_when_allocation_order_descends() {
+        let pages: std::sync::Arc<[u64]> = [0x9000, 0x3000, 0x8000, 0x1000, 0x2000].into();
+        let footprint = GuestPageFootprint::new(pages, 0x1000).expect("valid footprint");
+        for gpa in [0x1000, 0x2000, 0x3000, 0x8000, 0x9000] {
+            assert!(footprint.contains_page(gpa), "{gpa:#x} was allocated");
+        }
+        for gpa in [0x0, 0x4000, 0x7000, 0xa000] {
+            assert!(!footprint.contains_page(gpa), "{gpa:#x} was not");
+        }
+        assert_eq!(
+            footprint.page_span(),
+            Some((0x1000, 0x9000)),
+            "the span is of the addresses, not of the allocation order"
+        );
+        assert_eq!(
+            footprint.pages(),
+            [0x9000, 0x3000, 0x8000, 0x1000, 0x2000],
+            "the allocation order alias and ownership checks need is untouched"
+        );
+    }
+
     #[cfg(feature = "backend-vulkan")]
     #[test]
     fn a_page_footprint_answers_membership_without_filling_scatter_gaps() {
@@ -1017,6 +1069,7 @@ mod tests {
         assert!(footprint.contains_page(0xa000));
         assert!(!footprint.contains_page(0x5000));
         assert!(!footprint.contains_page(0x9800), "only whole guest pages belong");
+        assert_eq!(footprint.page_span(), Some((0x1000, 0xa000)));
 
         let clone = footprint.clone();
         assert!(footprint.same_allocation(&clone));

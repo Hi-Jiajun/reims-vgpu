@@ -1343,12 +1343,37 @@ pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
         // against, so nothing may be ruled out.
         return GuestWriteReach::Unnamed;
     }
-    let hit = pages
-        .iter()
-        .any(|p| {
-            f.armed.iter().any(|a| a.binary_search(p).is_ok())
-                || f.allocations.iter().any(|a| a.contains_page(*p))
-        });
+    // Span first, and the loop nesting is inverted for it. Asking "does any
+    // ledger entry hold page p" per page cannot short-circuit when the answer is
+    // `Disjoint`, so the verdict this test exists to produce is the one that
+    // pays the full product of both sides. Asking each entry "do you reach any
+    // of these pages" lets an entry whose span misses the reader's leave on two
+    // comparisons, and on this workload almost every entry does: a reader names
+    // one surface and the ledger holds unrelated ones.
+    //
+    // The span test is a narrowing of work and never of the verdict. Two spans
+    // that do not overlap cannot share a page, so a rejection here is exact; two
+    // that do overlap prove nothing and fall through to the per-page search.
+    let Some(lo) = pages.iter().min().copied() else {
+        // A reader naming no pages reads nothing, so nothing can reach it.
+        return GuestWriteReach::Disjoint;
+    };
+    let hi = pages.iter().max().copied().unwrap_or(lo);
+    let disjoint_span = |(a_lo, a_hi): (u64, u64)| a_hi < lo || a_lo > hi;
+    let hit = f.armed.iter().any(|a| {
+        // Ascending and deduplicated at arm time, so the span is the ends.
+        match (a.first(), a.last()) {
+            (Some(&a_lo), Some(&a_hi)) if !disjoint_span((a_lo, a_hi)) => {
+                pages.iter().any(|p| a.binary_search(p).is_ok())
+            }
+            _ => false,
+        }
+    }) || f.allocations.iter().any(|a| {
+        match a.page_span() {
+            Some(span) if !disjoint_span(span) => pages.iter().any(|p| a.contains_page(*p)),
+            _ => false,
+        }
+    });
     if hit {
         GuestWriteReach::Overlap
     } else {
@@ -4981,6 +5006,58 @@ mod guest_write_footprint_tests {
     fn an_unarmed_footprint_rules_nothing_out() {
         clear_guest_write_pages();
         assert_eq!(guest_writes_reaching(&[0x1000]), GuestWriteReach::Unnamed);
+    }
+
+    /// The span pre-test narrows work, never a verdict, and this is the case
+    /// that says so: two interleaved page sets whose spans overlap completely
+    /// while sharing no page at all. A span test that concluded anything from
+    /// the overlap would answer `Overlap` here and cost a wait nobody owes; one
+    /// that short-circuited the other way would answer `Disjoint` for the test
+    /// below and serve a stale frame.
+    #[test]
+    fn overlapping_spans_are_decided_page_by_page() {
+        clear_guest_write_pages();
+        let armed: Vec<u64> = (0..64).map(|i| 0x1000 + i * 0x2000).collect();
+        arm_guest_write_pages(&armed);
+
+        let interleaved: Vec<u64> = (0..64).map(|i| 0x2000 + i * 0x2000).collect();
+        assert_eq!(
+            guest_writes_reaching(&interleaved),
+            GuestWriteReach::Disjoint,
+            "same span, no shared page"
+        );
+
+        let mut sharing = interleaved.clone();
+        sharing.push(armed[40]);
+        assert_eq!(
+            guest_writes_reaching(&sharing),
+            GuestWriteReach::Overlap,
+            "one shared page in the middle of the span still overlaps"
+        );
+        clear_guest_write_pages();
+    }
+
+    /// A reader whose pages sit wholly below and wholly above the armed span.
+    /// Both are the rejection the span test is for, and the second one is the
+    /// direction an off-by-one would break: `hi` is the reader's last page, not
+    /// one past it.
+    #[test]
+    fn a_reader_clear_of_the_armed_span_is_disjoint_from_either_side() {
+        clear_guest_write_pages();
+        arm_guest_write_pages(&[0x8000, 0x9000, 0xa000]);
+        assert_eq!(guest_writes_reaching(&[0x6000, 0x7000]), GuestWriteReach::Disjoint);
+        assert_eq!(guest_writes_reaching(&[0xb000, 0xc000]), GuestWriteReach::Disjoint);
+        assert_eq!(
+            guest_writes_reaching(&[0x7000, 0x8000]),
+            GuestWriteReach::Overlap,
+            "abutting the low end shares its first page"
+        );
+        assert_eq!(
+            guest_writes_reaching(&[0xa000, 0xb000]),
+            GuestWriteReach::Overlap,
+            "abutting the high end shares its last page"
+        );
+        clear_guest_write_pages();
     }
 }
 
