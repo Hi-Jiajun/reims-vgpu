@@ -881,6 +881,30 @@ pub const PASS_CHURN: &str = "REIMS_VGPU_PASS_CHURN";
 /// and it is spelled as a probe for that reason: it is not reachable by accident,
 /// it is not on any shipping path, and it exists to put a number on a boundary
 /// nothing else can price.
+///
+/// # What it read: not the flush. Leave it off.
+///
+/// Four interleaved driven macos-13 Maps boots, one binary, quiesced
+/// (/tmp/wb-outA0..A3), scored by `scripts/boot-score`:
+///
+/// ```text
+///            gpu us/draw     sum us/draw
+/// off        11.34, 10.53    20.64, 19.26
+/// on         10.39, 10.24    19.38, 19.27
+/// ```
+///
+/// About **−6 % of the GPU half with the ranges overlapping** — 10.39 on sits
+/// inside 10.53..11.34 off — at two boots an arm against a ±12 % boot-to-boot
+/// spread on this column. A range built from two samples is not a noise estimate,
+/// so this establishes nothing except an upper bound, and the upper bound is the
+/// finding: **if the whole ~100 µs pass boundary were this visibility request,
+/// removing it would have taken most of it.** It took at most a fifteenth.
+///
+/// So the drain is somewhere else — the pass instance itself on this driver,
+/// not a scope this device chose — and the lever stays *fewer* pass boundaries
+/// rather than cheaper ones. Do not spend the synchronization-validation-layer
+/// run this would need to ship: a ≤6 % unestablished gain does not buy a change
+/// whose failure mode is wrong pixels with nothing reported.
 pub const PASS_EXIT_NARROW: &str = "REIMS_VGPU_PASS_EXIT_NARROW";
 
 /// **A count, not a switch.** How many draws one command buffer may carry,
