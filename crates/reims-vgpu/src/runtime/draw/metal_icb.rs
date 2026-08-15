@@ -394,7 +394,7 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
         || !req.vertex_buffers.is_empty()
         || !req.fragment_buffers.is_empty()
     {
-        for b in &req.vertex_buffers {
+        for b in req.vertex_buffers.iter() {
             if b.buffer_ref == 0 {
                 continue;
             }
@@ -410,7 +410,7 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
             enc.set_vertex_buffer(b.index as u64, Some(mtl.as_ref()), 0);
             keep.buffers.push(mtl);
         }
-        for b in &req.fragment_buffers {
+        for b in req.fragment_buffers.iter() {
             if b.buffer_ref == 0 {
                 continue;
             }
@@ -430,7 +430,7 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
 
     // Sampled textures — always encoder-side (not in IndirectRenderCommand).
     // Same gate as direct draws: unbound/missing textures must not sample garbage.
-    for t in &req.vertex_textures {
+    for t in req.vertex_textures.iter() {
         if t.texture_ref == 0 {
             continue;
         }
@@ -465,7 +465,7 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
         enc.set_vertex_texture(t.index as u64, Some(tex.as_ref()));
         keep.textures.push(tex);
     }
-    for t in &req.fragment_textures {
+    for t in req.fragment_textures.iter() {
         if t.texture_ref == 0 {
             continue;
         }
@@ -501,7 +501,7 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
         keep.textures.push(tex);
     }
 
-    for s in &req.vertex_samplers {
+    for s in req.vertex_samplers.iter() {
         if s.sampler_ref == 0 {
             continue;
         }
@@ -535,7 +535,7 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
         enc.set_vertex_sampler_state(s.index as u64, Some(mtl.as_ref()));
         keep.samplers.push(mtl);
     }
-    for s in &req.fragment_samplers {
+    for s in req.fragment_samplers.iter() {
         if s.sampler_ref == 0 {
             continue;
         }

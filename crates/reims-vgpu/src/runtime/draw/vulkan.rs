@@ -6354,7 +6354,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // the span it left from rather than losing the time.
         let vertex_span =
             crate::runtime::bind_phase::Span::open(crate::runtime::bind_phase::Part::VertexLoad);
-        for b in &req.vertex_buffers {
+        for b in req.vertex_buffers.iter() {
             if b.buffer_ref == 0 {
                 continue;
             }
@@ -6411,7 +6411,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             Vec::new();
         let fragment_span =
             crate::runtime::bind_phase::Span::open(crate::runtime::bind_phase::Part::FragmentLoad);
-        for b in &req.fragment_buffers {
+        for b in req.fragment_buffers.iter() {
             if b.buffer_ref == 0 {
                 continue;
             }
@@ -7071,10 +7071,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 });
                 Ok(())
             };
-            for t in &req.vertex_textures {
+            for t in req.vertex_textures.iter() {
                 push_tex(t.index, t.texture_ref, false)?;
             }
-            for t in &req.fragment_textures {
+            for t in req.fragment_textures.iter() {
                 push_tex(t.index, t.texture_ref, true)?;
             }
         }
@@ -7229,12 +7229,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             let _s = crate::runtime::sampled_phase::Span::open(
                 crate::runtime::sampled_phase::Part::Samplers,
             );
-            for s in &req.vertex_samplers {
+            for s in req.vertex_samplers.iter() {
                 if s.sampler_ref != 0 {
                     push_smp(s.index, s.sampler_ref, s.lod_clamp, false)?;
                 }
             }
-            for s in &req.fragment_samplers {
+            for s in req.fragment_samplers.iter() {
                 if s.sampler_ref != 0 {
                     push_smp(s.index, s.sampler_ref, s.lod_clamp, true)?;
                 }
@@ -10034,7 +10034,8 @@ mod vulkan_split_tests {
                 width: 8,
                 height: 8,
                 ..Default::default()
-            }],
+            }]
+            .into(),
             ..DrawEncodeRequest::default()
         }
     }
@@ -11027,7 +11028,8 @@ mod vulkan_split_tests {
             fragment_textures: vec![TextureBind {
                 index: MAX_TEXTURE_BIND_SLOTS,
                 texture_ref: 9,
-            }],
+            }]
+            .into(),
             ..DrawEncodeRequest::default()
         };
 
@@ -11051,7 +11053,7 @@ mod vulkan_split_tests {
         // The same request with the slot cleared reaches the pipeline resolve,
         // which is what says the refusal is about live guest work and not about
         // the index alone.
-        req.fragment_textures[0].texture_ref = 0;
+        std::sync::Arc::make_mut(&mut req.fragment_textures)[0].texture_ref = 0;
         let err = match try_metal2vulkan_draw(&mut state, &mut host, &mut req, true) {
             Err(err) => err,
             Ok(_) => panic!("an empty state cannot resolve pipeline 41"),

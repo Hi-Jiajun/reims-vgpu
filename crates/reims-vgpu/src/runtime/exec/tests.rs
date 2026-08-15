@@ -1471,6 +1471,59 @@ fn draws_sharing_a_bind_table_share_its_allocation() {
     }
 }
 
+/// Backend preparation consumes the same retained tables the recorded draw
+/// owns. Copying at this boundary would preserve pixels while putting one heap
+/// allocation and element copy back in front of every draw, so content equality
+/// is not a sufficient regression check.
+#[test]
+fn draw_preparation_keeps_every_recorded_bind_table_allocation() {
+    let buffer = || {
+        Arc::new(vec![BufferBind {
+            index: 0,
+            buffer_ref: 9,
+            offset: 16,
+            attribute_stride: None,
+        }])
+    };
+    let texture = || {
+        Arc::new(vec![TextureBind {
+            index: 1,
+            texture_ref: 10,
+        }])
+    };
+    let sampler = || {
+        Arc::new(vec![SamplerBind {
+            index: 2,
+            sampler_ref: 11,
+            lod_clamp: None,
+        }])
+    };
+    let pd = PendingDraw {
+        vertex_buffers: buffer(),
+        fragment_buffers: buffer(),
+        vertex_textures: texture(),
+        fragment_textures: texture(),
+        vertex_samplers: sampler(),
+        fragment_samplers: sampler(),
+        ..Default::default()
+    };
+    let mut req = crate::runtime::draw::DrawEncodeRequest::default();
+    fill_draw_binds_from_pending(&mut req, &pd);
+
+    assert!(Arc::ptr_eq(&req.vertex_buffers, &pd.vertex_buffers));
+    assert!(Arc::ptr_eq(&req.fragment_buffers, &pd.fragment_buffers));
+    assert!(Arc::ptr_eq(&req.vertex_textures, &pd.vertex_textures));
+    assert!(Arc::ptr_eq(
+        &req.fragment_textures,
+        &pd.fragment_textures
+    ));
+    assert!(Arc::ptr_eq(&req.vertex_samplers, &pd.vertex_samplers));
+    assert!(Arc::ptr_eq(
+        &req.fragment_samplers,
+        &pd.fragment_samplers
+    ));
+}
+
 /// A bind that changes after a draw must not reach back into that draw.
 ///
 /// The other half of the copy-on-write contract: sharing is only safe if a

@@ -1732,7 +1732,8 @@ fn gva_attachment_alias_samples_the_in_process_chain() {
             load_action: MTL_LOAD_ACTION_LOAD,
             target_seed_rgba: Some(seed.clone()),
             ..Default::default()
-        }],
+        }]
+        .into(),
         ..Default::default()
     };
 
@@ -2089,7 +2090,8 @@ fn missing_pipeline_is_soft() {
             format: MTL_FORMAT_BGRA8_UNORM,
             store_action: MTL_STORE_ACTION_STORE,
             ..Default::default()
-        }],
+        }]
+        .into(),
         ..Default::default()
     };
     let mut req = req;
@@ -2183,16 +2185,19 @@ fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
             buffer_ref: 7,
             offset: 0,
             attribute_stride: None,
-        }],
+        }]
+        .into(),
         fragment_textures: vec![TextureBind {
             index: MAX_TEXTURE_BIND_SLOTS - 1,
             texture_ref: 9,
-        }],
+        }]
+        .into(),
         vertex_samplers: vec![SamplerBind {
             index: MAX_SAMPLER_BIND_SLOTS - 1,
             sampler_ref: 11,
             lod_clamp: None,
-        }],
+        }]
+        .into(),
         ..Default::default()
     };
     assert_eq!(first_bind_past_table(&in_range), None);
@@ -2207,7 +2212,8 @@ fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
                     buffer_ref: 7,
                     offset: 0,
                     attribute_stride: None,
-                }],
+                }]
+                .into(),
                 ..Default::default()
             },
             BindTableClass::Buffer,
@@ -2220,7 +2226,8 @@ fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
                 vertex_textures: vec![TextureBind {
                     index: MAX_TEXTURE_BIND_SLOTS,
                     texture_ref: 9,
-                }],
+                }]
+                .into(),
                 ..Default::default()
             },
             BindTableClass::Texture,
@@ -2234,7 +2241,8 @@ fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
                     index: MAX_SAMPLER_BIND_SLOTS,
                     sampler_ref: 11,
                     lod_clamp: None,
-                }],
+                }]
+                .into(),
                 ..Default::default()
             },
             BindTableClass::Sampler,
@@ -2264,16 +2272,19 @@ fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
             buffer_ref: 0,
             offset: 0,
             attribute_stride: None,
-        }],
+        }]
+        .into(),
         fragment_textures: vec![TextureBind {
             index: MAX_TEXTURE_BIND_SLOTS + 4,
             texture_ref: 0,
-        }],
+        }]
+        .into(),
         vertex_samplers: vec![SamplerBind {
             index: MAX_SAMPLER_BIND_SLOTS + 4,
             sampler_ref: 0,
             lod_clamp: None,
-        }],
+        }]
+        .into(),
         ..Default::default()
     };
     assert_eq!(first_bind_past_table(&cleared), None);

@@ -36,7 +36,7 @@ use crate::runtime::decode::stream::{
     SEGMENT_TYPE_EVENT, SEGMENT_TYPE_INFO, SEGMENT_TYPE_RENDER,
 };
 use crate::runtime::draw::{
-    self, BufferBind, EncodeStatus, IndexedDrawInfo, SamplerBind, TextureBind,
+    self, BindTable, BufferBind, EncodeStatus, IndexedDrawInfo, SamplerBind, TextureBind,
     MAX_BUFFER_BIND_SLOTS, MAX_SAMPLER_BIND_SLOTS, MAX_TEXTURE_BIND_SLOTS,
 };
 use crate::runtime::fence_exec;
@@ -52,21 +52,6 @@ use reims_vgpu_wire::ops::render as wire_render;
 use reims_vgpu_wire::ops::render_pass as wire_pass;
 use reims_vgpu_wire::ops::tile as wire_tile;
 use std::sync::Arc;
-
-/// One stage's bind table as a draw sees it.
-///
-/// `Arc` rather than a plain `Vec` because a render stream's draws share their
-/// bind state: the guest sets a table once and then issues many draws against
-/// it, so snapshotting per draw copied the same entries over and over. The
-/// accumulator mutates through [`Arc::make_mut`], which copies only when a
-/// snapshot is actually outstanding — so a stream that binds once and draws 400
-/// times allocates one table and 400 pointers.
-///
-/// That is what makes an unbounded draw list affordable, and an unbounded draw
-/// list is what the protocol requires: the guest emits as many records as its
-/// encoder recorded and every one of them contributes to the same attachment
-/// set. See [`StreamDrawDrop`].
-type BindTable<T> = Arc<Vec<T>>;
 
 /// Pending render-pass ICB execute (range form or indirect range buffer).
 #[derive(Clone, Debug, Default)]
@@ -3919,12 +3904,12 @@ fn multi_draw_chain_source(resident_chain: bool, cpu_chain_ready: bool) -> Multi
 }
 
 fn fill_draw_binds_from_pending(req: &mut draw::DrawEncodeRequest, pd: &PendingDraw) {
-    req.vertex_buffers = pd.vertex_buffers.as_ref().clone();
-    req.fragment_buffers = pd.fragment_buffers.as_ref().clone();
-    req.vertex_textures = pd.vertex_textures.as_ref().clone();
-    req.fragment_textures = pd.fragment_textures.as_ref().clone();
-    req.vertex_samplers = pd.vertex_samplers.as_ref().clone();
-    req.fragment_samplers = pd.fragment_samplers.as_ref().clone();
+    req.vertex_buffers.clone_from(&pd.vertex_buffers);
+    req.fragment_buffers.clone_from(&pd.fragment_buffers);
+    req.vertex_textures.clone_from(&pd.vertex_textures);
+    req.fragment_textures.clone_from(&pd.fragment_textures);
+    req.vertex_samplers.clone_from(&pd.vertex_samplers);
+    req.fragment_samplers.clone_from(&pd.fragment_samplers);
     req.viewports.clone_from(&pd.viewports);
     req.scissors.clone_from(&pd.scissors);
     req.indexed = pd.indexed.clone();

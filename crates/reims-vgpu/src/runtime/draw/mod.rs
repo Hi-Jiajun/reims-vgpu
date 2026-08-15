@@ -805,6 +805,18 @@ pub struct VisibilityArming {
     pub offset: u64,
 }
 
+/// One stage's retained bind table as a draw consumes it.
+///
+/// Encoder setters replace entries in sticky tables; draws retain the table
+/// current at the point they were recorded. Sharing that immutable snapshot
+/// through backend preparation preserves that lifecycle and avoids copying the
+/// same entries again at the execution boundary. The accumulator mutates
+/// through [`std::sync::Arc::make_mut`], which copies only when an earlier draw
+/// still owns the previous snapshot: a stream that binds once and draws 400
+/// times therefore allocates one table and retains 400 pointers, including
+/// through backend preparation.
+pub type BindTable<T> = std::sync::Arc<Vec<T>>;
+
 #[derive(Clone, Debug, Default)]
 pub struct DrawEncodeRequest {
     pub task_id: u32,
@@ -822,12 +834,12 @@ pub struct DrawEncodeRequest {
     /// seed all live here and nowhere else, so no two fields of one request can
     /// disagree about the attachment.
     pub colors: Vec<ColorRtRequest>,
-    pub vertex_buffers: Vec<BufferBind>,
-    pub fragment_buffers: Vec<BufferBind>,
-    pub vertex_textures: Vec<TextureBind>,
-    pub fragment_textures: Vec<TextureBind>,
-    pub vertex_samplers: Vec<SamplerBind>,
-    pub fragment_samplers: Vec<SamplerBind>,
+    pub vertex_buffers: BindTable<BufferBind>,
+    pub fragment_buffers: BindTable<BufferBind>,
+    pub vertex_textures: BindTable<TextureBind>,
+    pub fragment_textures: BindTable<TextureBind>,
+    pub vertex_samplers: BindTable<SamplerBind>,
+    pub fragment_samplers: BindTable<SamplerBind>,
     /// Every viewport the pass bound, in the guest's order, as
     /// `[originX, originY, width, height, znear, zfar]`. Empty means the guest
     /// bound none and the backend's full-target default stands.
@@ -1986,7 +1998,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let mut frag_storage: Vec<Vec<u8>> = Vec::new();
     let mut vtx_bind_idx: Vec<u32> = Vec::new();
     let mut frag_bind_idx: Vec<u32> = Vec::new();
-    for b in &req.vertex_buffers {
+    for b in req.vertex_buffers.iter() {
         if b.buffer_ref == 0 {
             continue;
         }
@@ -2004,7 +2016,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         vtx_bind_idx.push(b.index);
         vtx_storage.push(bytes);
     }
-    for b in &req.fragment_buffers {
+    for b in req.fragment_buffers.iter() {
         if b.buffer_ref == 0 {
             continue;
         }
@@ -2128,7 +2140,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // draw (never samples black/garbage). Same for vertex-stage textures.
     let mut vtx_tex_items: Vec<TexItem> = Vec::new();
     let mut frag_tex_items: Vec<TexItem> = Vec::new();
-    for t in &req.vertex_textures {
+    for t in req.vertex_textures.iter() {
         if t.texture_ref == 0 {
             continue;
         }
@@ -2150,7 +2162,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             rgba,
         });
     }
-    for t in &req.fragment_textures {
+    for t in req.fragment_textures.iter() {
         if t.texture_ref == 0 {
             continue;
         }
@@ -2214,7 +2226,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // the degradation visible with the exact resolver reason.
     let mut vtx_samps: Vec<ReimsVgpuSampler> = Vec::new();
     let mut frag_samps: Vec<ReimsVgpuSampler> = Vec::new();
-    for s in &req.vertex_samplers {
+    for s in req.vertex_samplers.iter() {
         if s.sampler_ref != 0 {
             let sampler = load_sampler(state, host, req.task_id, s.sampler_ref, s.index)
                 .unwrap_or_else(|error| {
@@ -2230,7 +2242,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             vtx_samps.push(with_bind_lod_clamp(sampler, s.lod_clamp));
         }
     }
-    for s in &req.fragment_samplers {
+    for s in req.fragment_samplers.iter() {
         if s.sampler_ref != 0 {
             let sampler = load_sampler(state, host, req.task_id, s.sampler_ref, s.index)
                 .unwrap_or_else(|error| {
