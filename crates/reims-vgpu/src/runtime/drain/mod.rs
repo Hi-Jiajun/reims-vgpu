@@ -2508,7 +2508,6 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
     // Left sticky it would outlive the packet that set it and keep
     // `retry_stamp_held_timelines` re-entering a ring with nothing in it.
     state.stamp_deferred_mask &= !ROOT_FIFO_BIT;
-    republish_held_timelines(state);
     let ring_size = main_ring_data_size(state.gfx.fifo_length, state.gfx.fifo_start);
     if ring_size == 0 || state.gfx.fifo_base_page == 0 {
         state.pending.main_drain = false;
@@ -2611,7 +2610,6 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                     // packet with the same effects still owed.
                     note_store_route("packet_stamp_wait_held");
                     state.stamp_deferred_mask |= ROOT_FIFO_BIT;
-                    republish_held_timelines(state);
                     state.pending.main_drain = true;
                     break;
                 }
@@ -4845,7 +4843,6 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     // wait, so the bit always describes this drain rather than an older one.
     // See `drain_main_fifo`'s copy for what a sticky bit would cost.
     state.stamp_deferred_mask &= !bit;
-    republish_held_timelines(state);
 
     // Every packet below stamps `stamp_index`, which was read once above, so the
     // whole drain owes one slot one value. See [`PendingStamp`] for why that is
@@ -4962,7 +4959,6 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     // against the thing being waited for.
                     note_store_route("packet_stamp_wait_held");
                     state.stamp_deferred_mask |= bit;
-                    republish_held_timelines(state);
                     state.pending.child_mask |= bit;
                     break;
                 }
@@ -6190,38 +6186,6 @@ pub(crate) fn fold_rung_child_doorbells(state: &mut DeviceState) {
 /// would be a bound on how long ordering is honoured, and it would fire on the
 /// healthy case — a guest that simply has not submitted the producing work yet —
 /// long before it ever reached a wedged one.
-/// Lock-free projection of whether any timeline is parked on a stamp wait.
-///
-/// The engine's completion thread needs this and cannot have the device lock:
-/// the drain worker holds that for most of a busy second, and blocking the
-/// completion thread on it would put the wakeup behind the very work it is
-/// announcing. So the drain publishes the fact here and the completion thread
-/// reads it. Same shape, and same reason, as `PENDING_FIFO_MASK`.
-///
-/// A `u32` of channel bits rather than a bool because it costs nothing and says
-/// *which* timelines are parked, which is what a reader of a stall needs.
-pub static HELD_TIMELINE_MASK: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
-
-/// Whether any timeline is currently held on a stamp it is waiting for.
-pub fn any_timeline_held_on_stamp() -> bool {
-    HELD_TIMELINE_MASK.load(std::sync::atomic::Ordering::Acquire) != 0
-}
-
-/// Republish [`HELD_TIMELINE_MASK`] from the authoritative mask.
-///
-/// Called wherever `stamp_deferred_mask` changes. Kept as one function rather
-/// than a store at each site so the projection cannot drift from the thing it
-/// projects — the failure that would cause is a stamp landing with no retry
-/// scheduled, which is a stall that ends only when unrelated guest work happens
-/// to arrive.
-pub(crate) fn republish_held_timelines(state: &DeviceState) {
-    HELD_TIMELINE_MASK.store(
-        state.stamp_deferred_mask,
-        std::sync::atomic::Ordering::Release,
-    );
-}
-
 fn retry_stamp_held_timelines<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
     while state.stamp_deferred_mask != 0 {
         let seq_before = state.completion_stamp_seq;

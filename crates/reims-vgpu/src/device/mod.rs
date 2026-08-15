@@ -315,29 +315,7 @@ fn announce_stamp_interrupt(id: u64, index: u32) {
         return;
     };
     let mut scratch = VecDeque::new();
-    let mut host = QemuHost::new(&ops, &mut scratch, &slot.prompt_actions);
-    host.enqueue(HostAction::irq_gfx());
-    // Waking the *guest* is only half of a completion. This device may also be
-    // holding packets of its own on this very stamp: a wait that was unmet when
-    // the drain reached it parks that timeline, and `retry_stamp_held_timelines`
-    // hands the hold back once a round makes no progress. Nothing then re-reads
-    // the slot until unrelated guest work happens to schedule another drain, so
-    // the word can land here and the packet it unblocks sit untouched for the
-    // rest of the frame. A driven Maps boot handed back 6 684 times against 391
-    // productive retries — 94 % of rounds giving up on a stamp that this thread
-    // was about to publish.
-    //
-    // So the completion is announced in both directions: the interrupt for the
-    // guest, and a worker slice for the timelines this device parked. It changes
-    // no ordering — the retry re-evaluates the same wait against the same page
-    // and holds again if it is still unmet — it only stops the answer waiting
-    // for an unrelated event to carry it.
-    //
-    // Checked lock-free, and skipped entirely when nothing is parked, so a boot
-    // that never holds a packet schedules nothing extra.
-    if crate::runtime::drain::any_timeline_held_on_stamp() {
-        host.schedule_bh();
-    }
+    QemuHost::new(&ops, &mut scratch, &slot.prompt_actions).enqueue(HostAction::irq_gfx());
 }
 
 pub fn device_reset(id: u64) -> bool {
