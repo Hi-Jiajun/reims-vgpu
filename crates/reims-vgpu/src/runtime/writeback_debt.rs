@@ -802,9 +802,9 @@ pub(crate) fn pay_key<M: HostMemory + HostOps>(
     }
 }
 
-/// Pay `mapping_id`'s owed frame and then wait for every guest-page write this
-/// device has submitted — the whole obligation of a host-side reader or writer
-/// of one named mapping's bytes, in one call.
+/// Pay `mapping_id`'s owed frame and then wait for every submitted guest-page
+/// write **that can reach this mapping's pages** — the whole obligation of a
+/// host-side reader or writer of one named mapping's bytes, in one call.
 ///
 /// The two halves are one obligation and are spelled as one function so a new
 /// site cannot discharge half of it. A site that settles without paying reads
@@ -812,8 +812,37 @@ pub(crate) fn pay_key<M: HostMemory + HostOps>(
 /// pays without settling reads the frame it just submitted and has not waited
 /// for. Both are stale pixels and neither shows up as a refusal.
 ///
-/// Free when nothing is owed and nothing is outstanding, which is the answer on
-/// nearly every call: one emptiness check and one relaxed atomic load.
+/// # Naming a mapping is naming your reach
+///
+/// This used to wait on `settle_guest_writes`, which quiesces every outstanding
+/// guest write wherever it lands, and a disjointness-aware second spelling sat
+/// beside it for the two callers that had noticed. That split was the bug. A
+/// caller that can name the mapping it is about to touch has, by naming it,
+/// already said which pages it needs ordered; waiting for a writeback into some
+/// other surface is an ordering requirement it does not have. So there is one
+/// function again and the imprecise behaviour is unreachable rather than
+/// available.
+///
+/// It cost the largest single number this device has measured. A driven macos-13
+/// Maps leg took the quiesce on **2154 of 2154** `MappingRectWrite` calls for
+/// **17.02 s** — 79 % of the blit rail and 350x the next-largest settle site —
+/// while the payment beside it totalled 1.7 ms. The old doc here claimed "free
+/// when nothing is owed and nothing is outstanding, which is the answer on
+/// nearly every call"; on that site it was the answer on none of them.
+///
+/// The narrowing applies to the *wait* only, never the payment: an owed frame
+/// has not been submitted, so there is nothing outstanding for the test to find
+/// disjoint from, and a debt left unpaid here would be read straight past.
+///
+/// The page set is walked here rather than taken as a closure, and both of those
+/// are deliberate. Walked *here* because the payment needs `state` mutably and
+/// the disjointness test needs it shared, so a caller-supplied closure cannot
+/// hold `state` across both. [`DeviceState::mapping_reach_pages`] because that is
+/// the same function the writeback builds its own destination from, so the two
+/// ends of the comparison are one rule rather than two spellings of it. It stays
+/// lazy: `settle_guest_writes_unless_disjoint` runs the closure only when
+/// something is outstanding, and a mapping that cannot name its pages answers
+/// `None`, which waits.
 pub fn settle_for_mapping<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -821,7 +850,10 @@ pub fn settle_for_mapping<M: HostMemory + HostOps>(
     site: crate::runtime::render_writeback::SettleSite,
 ) {
     pay_for_mapping(state, host, mapping_id);
-    crate::runtime::render_writeback::settle_guest_writes(site);
+    let s = &*state;
+    crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(site, || {
+        s.mapping_reach_pages(mapping_id)
+    });
 }
 
 /// [`settle_for_mapping`] for a caller that is **about to land the owed frame
@@ -888,33 +920,6 @@ pub fn submit_for_resources<M: HostMemory + HostOps>(
     }
 }
 
-/// [`settle_for_mapping`] over
-/// [`crate::runtime::render_writeback::settle_guest_writes_unless_disjoint`].
-///
-/// The disjointness test narrows only the *wait*, never the payment: an owed
-/// frame has not been submitted, so there is nothing outstanding for the test to
-/// find disjoint from and a debt left unpaid here would be read straight past.
-///
-/// The page set is walked here rather than taken as a closure, and both of those
-/// are deliberate. Walked *here* because the payment needs `state` mutably and
-/// the disjointness test needs it shared, so a caller-supplied closure cannot
-/// hold `state` across both. `DeviceState::mapping_reach_pages` because that is
-/// the same function the writeback builds its own destination from, so the two
-/// ends of the comparison are one rule rather than two spellings of it. It stays
-/// lazy: `settle_guest_writes_unless_disjoint` runs the closure only when
-/// something is outstanding.
-pub fn settle_for_mapping_unless_disjoint<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    mapping_id: u32,
-    site: crate::runtime::render_writeback::SettleSite,
-) {
-    pay_for_mapping(state, host, mapping_id);
-    let s = &*state;
-    crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(site, || {
-        s.mapping_reach_pages(mapping_id)
-    });
-}
 
 /// Count a reader that reaches guest bytes while a frame is owed and cannot pay
 /// it, because it holds `DeviceState` immutably.

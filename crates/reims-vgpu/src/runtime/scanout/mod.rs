@@ -942,15 +942,13 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
     // raw contig view below, which bypasses the hooked readers — land any
     // resident-authoritative window (compute or render Store) first.
     //
-    // Narrowed on this mapping's own pages, which unlike every other narrowed
-    // site here costs no walk at all: `page_entries` already *is* the page list,
-    // and the writeback rail that lands in them built its own destination from
-    // the same field — literally, via `DeviceState::mapping_reach_pages`, which
-    // is also what names the write. A mapping with no page list, or one holding
-    // an entry that names no backing, cannot be ruled out and settles.
-    crate::runtime::writeback_debt::settle_for_mapping_unless_disjoint(
-        state, host, mapping_id, site,
-    );
+    // The wait narrows to this mapping's own pages, which `settle_for_mapping`
+    // does for every caller now. Here it costs no walk at all: `page_entries`
+    // already *is* the page list, and the writeback rail that lands in them
+    // built its own destination from the same field. A mapping with no page
+    // list, or one holding an entry that names no backing, cannot be ruled out
+    // and settles.
+    crate::runtime::writeback_debt::settle_for_mapping(state, host, mapping_id, site);
 
     let Some(m) = state.mappings.get(&mapping_id) else {
         return fail(CaptureDecline::NoMapping);
