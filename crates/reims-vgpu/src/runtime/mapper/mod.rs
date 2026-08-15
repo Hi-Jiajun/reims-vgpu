@@ -2486,7 +2486,7 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
     // an unnameable set (`None`) settles exactly as before. The page set comes
     // from the same `mapping_reach_pages` the writeback's own destination is
     // named with, so both ends of the comparison are one rule.
-    crate::runtime::writeback_debt::settle_for_mapping(
+    crate::runtime::writeback_debt::settle_for_mapping_unless_disjoint(
         state,
         host,
         mapping_id,
