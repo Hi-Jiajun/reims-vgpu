@@ -109,6 +109,12 @@ impl ResourcePools {
         for l in self.readback_leased.drain(..) {
             release_buffer_slot(device, &mut self.slabs, l.slot);
         }
+        // Ad-hoc framebuffers name views owned by the targets and residents
+        // destroyed below, and a framebuffer may not outlive its attachments —
+        // so they go first, before anything drains a view out from under one.
+        for (_, fb) in self.ad_hoc_framebuffers.drain() {
+            device.destroy_framebuffer(fb, None);
+        }
         // Sampled / target / registry images are slab-backed: destroy the image
         // + view handles here, but their memory belongs to shared blocks freed
         // once by `self.slab.destroy_all(device)` at the end — never a per-image

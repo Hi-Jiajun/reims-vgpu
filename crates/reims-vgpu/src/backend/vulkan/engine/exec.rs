@@ -2224,29 +2224,27 @@ unsafe fn dispose_ad_hoc_attachments(
     transient_depth: Option<(Option<OwnedDepthImage>, vk::Framebuffer)>,
 ) {
     unsafe {
-        if ordinary_ad_hoc_framebuffer && transient_depth.is_none() {
+        // The framebuffers are no longer this draw's to destroy. Both arms used
+        // to hand one to the graveyard, because both were built per draw; they
+        // now come from `ensure_ad_hoc_framebuffer` and are owned by that cache,
+        // which destroys an entry when the first view it names is destroyed.
+        // Disposing one here would leave later draws holding a freed handle —
+        // the same defect the resident-depth arm below already records for its
+        // image.
+        let _ = (ordinary_ad_hoc_framebuffer, target_fb);
+        // Only the unidentified depth case owns its image. A resident one belongs
+        // to the registry and to the guest texture it is keyed on; disposing it
+        // here would put the rail straight back to one allocation per draw, with
+        // the added defect that the next draw would find a destroyed handle.
+        if let Some((Some((dimg, dmem, dview)), _dfb)) = transient_depth {
             pools.dispose(
                 &ctx.device,
-                super::pools::DeferredHandle::Framebuffer(target_fb),
+                super::pools::DeferredHandle::Image {
+                    image: dimg,
+                    view: dview,
+                    memory: dmem,
+                },
             );
-        }
-        if let Some((owned, dfb)) = transient_depth {
-            pools.dispose(&ctx.device, super::pools::DeferredHandle::Framebuffer(dfb));
-            // Only the unidentified case owns its image. A resident one belongs
-            // to the registry and to the guest texture it is keyed on; disposing
-            // it here would put the rail straight back to one allocation per
-            // draw, with the added defect that the next draw would find a
-            // destroyed handle.
-            if let Some((dimg, dmem, dview)) = owned {
-                pools.dispose(
-                    &ctx.device,
-                    super::pools::DeferredHandle::Image {
-                        image: dimg,
-                        view: dview,
-                        memory: dmem,
-                    },
-                );
-            }
         }
     }
 }
@@ -3455,7 +3453,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     depth_attachment.as_ref().map(|d| d.view),
                     &mut mrt_secondaries,
                 )?;
-                let fb = pools.create_mrt_framebuffer(
+                let fb = pools.ensure_ad_hoc_framebuffer(
                     ctx,
                     render_pass,
                     &views,
@@ -3491,7 +3489,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     depth_attachment.as_ref().map(|d| d.view),
                     &mut mrt_secondaries,
                 )?;
-                let fb = pools.create_mrt_framebuffer(
+                let fb = pools.ensure_ad_hoc_framebuffer(
                     ctx,
                     render_pass,
                     &views,

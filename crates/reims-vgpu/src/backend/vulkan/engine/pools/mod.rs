@@ -313,6 +313,24 @@ pub(crate) struct ResourcePools {
     /// current single-sample resolve view; a shape change safely retires it
     /// behind the command-buffer ring rather than retaining guest content.
     multisample_target: Option<MultisampleTargetSlot>,
+    /// Framebuffers for passes whose attachment shape is not the target slot's
+    /// colour-only one — MRT, depth, and colour-input draws.
+    ///
+    /// The registry already owns a framebuffer for a colour-only pass, on the
+    /// resident slot. It owns none for a pass that combines that colour view
+    /// with a depth view or a secondary attachment, so those were built fresh
+    /// per draw. That is not merely an allocation: a framebuffer handle is what
+    /// [`PassEcho`] compares, so a new one each time makes every such draw open a
+    /// new render pass instance even when its predecessor left an identical one
+    /// standing. On a driven Maps leg that was **430 513 of 455 530** merge
+    /// refusals — 94.5 %, against a workload whose exec packets average nine
+    /// draws and should therefore continue on eight of every nine.
+    ///
+    /// Keyed by [`AdHocFramebufferKey`], which is the whole of what
+    /// `vkCreateFramebuffer` reads. Entries are owned here and destroyed when any
+    /// view they name is destroyed — see `destroy_deferred_handle`, which is the
+    /// single terminal destroy for every view this device frees at runtime.
+    ad_hoc_framebuffers: HashMap<AdHocFramebufferKey, vk::Framebuffer>,
     /// Readback buffers by size.
     readback_free: HashMap<u64, Vec<BufferSlot>>,
     readback_live: Option<BufferSlot>,
@@ -690,6 +708,25 @@ pub(crate) struct PassEcho {
     pub(crate) area: (u32, u32),
 }
 
+/// Exactly what a `VkFramebuffer` is a function of, and therefore what two
+/// draws must share to be handed the same one.
+///
+/// `vkCreateFramebuffer` takes a render pass, an attachment view list and an
+/// extent, and nothing else. So a framebuffer is a pure function of those, and
+/// building a second one for the same triple produces an object indistinguishable
+/// from the first — except that it is a *different handle*, which is precisely
+/// what [`PassEcho`] compares.
+///
+/// Handles are keyed by their raw `u64` rather than by the ash newtype, matching
+/// how `targets` already keys a render pass.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct AdHocFramebufferKey {
+    pub(crate) render_pass: u64,
+    pub(crate) views: Vec<u64>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
 /// Which field of a [`PassEcho`] stopped a draw continuing its predecessor's
 /// render pass.
 ///
@@ -997,6 +1034,33 @@ pub(crate) enum DeferredHandle {
     Sampler(vk::Sampler),
 }
 
+impl DeferredHandle {
+    /// The image view this handle destroys, if it destroys one.
+    ///
+    /// Exhaustive on purpose rather than a `_ => None` catch-all: a new variant
+    /// that frees a view has to answer here, and a wildcard would let it compile
+    /// while leaving a cached framebuffer naming a destroyed attachment. The
+    /// arms mirror `destroy_deferred_handle`'s `destroy_image_view` calls one for
+    /// one, which is the only thing that makes this total.
+    fn destroyed_view(&self) -> Option<vk::ImageView> {
+        match self {
+            Self::Image { view, .. } | Self::GuestImage { view, .. } => Some(*view),
+            Self::RecycleSampled(slot) => Some(slot.view),
+            Self::RecycleTarget(img) => Some(img.view),
+            Self::ImageView(view) => Some(*view),
+            Self::GuestAllocation(_)
+            | Self::GuestAllocationBarrier(_)
+            | Self::Framebuffer(_)
+            | Self::Pipeline(_)
+            | Self::PipelineLayout(_)
+            | Self::DescriptorSetLayout(_)
+            | Self::RenderPass(_)
+            | Self::ShaderModule(_)
+            | Self::Sampler(_) => None,
+        }
+    }
+}
+
 impl ResourcePools {
     /// Terminal destroy of a deferred handle. Image variants free their backing
     /// memory through the slab suballocator (`free_image` releases the
@@ -1004,6 +1068,13 @@ impl ResourcePools {
     /// slab/1:1 images both free correctly). Non-memory objects are destroyed
     /// directly.
     unsafe fn destroy_deferred_handle(&mut self, device: &ash::Device, handle: DeferredHandle) {
+        // A cached ad-hoc framebuffer names views, and Vulkan does not let one
+        // outlive its attachments. Every runtime path that destroys a view
+        // arrives here, so this is the one place that has to know — and it runs
+        // before the view is destroyed, not after.
+        if let Some(view) = handle.destroyed_view() {
+            unsafe { self.purge_ad_hoc_framebuffers_for_view(device, view) };
+        }
         match handle {
             DeferredHandle::Image {
                 image,

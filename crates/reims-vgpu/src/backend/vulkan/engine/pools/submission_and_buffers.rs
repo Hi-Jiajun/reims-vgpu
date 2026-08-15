@@ -174,6 +174,7 @@ impl ResourcePools {
             targets: HashMap::new(),
             target_order: Vec::new(),
             multisample_target: None,
+            ad_hoc_framebuffers: HashMap::new(),
             readback_free: HashMap::new(),
             readback_live: None,
             readback_multi_live: Vec::new(),
