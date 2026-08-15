@@ -4865,6 +4865,15 @@ pub(crate) unsafe fn execute_draw_inner(
     let continues = joins && pools.pass_echoes(&echo);
     let continues_open =
         continues_open_render_pass(req.continues_render_pass, pools.open_pass_echoes(&echo));
+    // `passmerge_pass_differs` is one bucket over four independent causes with
+    // four different repairs, and on a driven Maps leg it is the bucket that
+    // holds 82 % of the draws. Split it where it is charged, so the two stay a
+    // partition of each other rather than two counts of loosely the same thing.
+    if joins && !continues {
+        if let Some(field) = pools.pass_echo_delta(&echo) {
+            crate::runtime::drain::note_store_route(field.route());
+        }
+    }
     crate::runtime::drain::note_store_route(if !joins {
         "passmerge_no_join"
     } else if !continues {

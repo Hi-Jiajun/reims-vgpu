@@ -1645,6 +1645,32 @@ impl ResourcePools {
         self.last_pass.as_ref() == Some(echo)
     }
 
+    /// Which field of the echo stopped this draw continuing, or `None` when it
+    /// continues.
+    ///
+    /// Derived from the same `last_pass` [`Self::pass_echoes`] compares, so the
+    /// two cannot disagree: this answers `None` on exactly the inputs that answer
+    /// `true` there, which is what makes the split a partition of
+    /// `passmerge_pass_differs` rather than a second opinion about it.
+    pub(crate) fn pass_echo_delta(&self, echo: &PassEcho) -> Option<PassEchoField> {
+        let Some(last) = self.last_pass.as_ref() else {
+            return Some(PassEchoField::Nothing);
+        };
+        if last.cb != echo.cb {
+            return Some(PassEchoField::Cb);
+        }
+        if last.compatibility != echo.compatibility {
+            return Some(PassEchoField::Compatibility);
+        }
+        if last.fb != echo.fb {
+            return Some(PassEchoField::Framebuffer);
+        }
+        if last.area != echo.area {
+            return Some(PassEchoField::Area);
+        }
+        None
+    }
+
     /// Record the pass a draw just opened. Called at the `vkCmdBeginRenderPass`
     /// and nowhere else, so the echo always names a pass that is standing.
     pub(crate) fn note_pass_opened(&mut self, echo: PassEcho) {

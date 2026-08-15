@@ -690,6 +690,46 @@ pub(crate) struct PassEcho {
     pub(crate) area: (u32, u32),
 }
 
+/// Which field of a [`PassEcho`] stopped a draw continuing its predecessor's
+/// render pass.
+///
+/// `passmerge_pass_differs` is the largest bucket on a driven Maps leg by an
+/// order of magnitude, and on its own it names no repair: the echo is compared
+/// whole, so "differs" covers four independent reasons with four different
+/// fixes. This splits it.
+///
+/// The order is the order the fields are checked, and each answer is the
+/// *first* difference rather than the only one, for the reason the obstacle
+/// ladders beside it give: a draw recording into a different command buffer has
+/// no pass to continue whatever else is true of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PassEchoField {
+    /// No pass is echoed at all — the first draw of a command buffer.
+    Nothing,
+    /// A different command buffer, so the echoed pass is not reachable from here.
+    Cb,
+    /// Vulkan would not call the two passes compatible. Load and store actions
+    /// are excluded from this key by construction, so a firing here names a
+    /// genuine attachment-shape change.
+    Compatibility,
+    /// Same pass shape, different framebuffer object.
+    Framebuffer,
+    /// Same framebuffer, different render area.
+    Area,
+}
+
+impl PassEchoField {
+    pub(crate) fn route(self) -> &'static str {
+        match self {
+            Self::Nothing => "passdiff_nothing",
+            Self::Cb => "passdiff_cb",
+            Self::Compatibility => "passdiff_compat",
+            Self::Framebuffer => "passdiff_fb",
+            Self::Area => "passdiff_area",
+        }
+    }
+}
+
 /// Graphics state a recording command buffer already carries, so a draw that
 /// wants the state its predecessor left does not record the call again.
 ///
