@@ -3334,21 +3334,27 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("zc_buffer_extent_narrowed");
         crate::runtime::drain::note_store_route_n("zc_buffer_extent_saved_bytes", full - span);
     }
-    // Packed-resource construction stays behind the floor. It retains a new
-    // alias for the whole resource, so admitting every small bind to it would
-    // trade a repeated CPU read for a growing set of retained imports — a
-    // different cost, not a smaller one. The direct window below retains
-    // nothing the registry does not already key.
-    if gather_eligible
-        && ensure_packed_resource(
-            state,
-            host,
-            task_id,
-            buffer_ref,
-            backing,
-            PackedResourceRail::Buffer,
-        )
-    {
+    // Packed construction is not behind the floor, and the registry census is
+    // why. A packed alias is retained once per `(task, reference)` and every
+    // offset slices it, which is the representation this rail is built around —
+    // `load_buffer_content_resolved` explicitly declines to add a per-offset
+    // entry when one exists, "the per-offset registry the packed representation
+    // exists to remove".
+    //
+    // Admitting sub-floor binds while leaving this behind the floor sent them to
+    // the direct window instead, and that path *does* key per offset: one driven
+    // Maps leg took `bound_buffers` from `entries=0 peak=0` — the registry was
+    // not in use at all — to `entries=9770 peak=16723`, with 1926 pairs holding
+    // more than one offset and one holding 56. Against that, a retained alias
+    // per resource is ~2138 pairs total and each answers every offset in O(1).
+    if ensure_packed_resource(
+        state,
+        host,
+        task_id,
+        buffer_ref,
+        backing,
+        PackedResourceRail::Buffer,
+    ) {
         let packed = state.bound_buffers.packed_available(
             task_id,
             buffer_ref,
