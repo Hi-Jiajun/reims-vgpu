@@ -2017,7 +2017,7 @@ impl ResourcePools {
         Some(
             self.registry
                 .get(identity)
-                .is_some_and(|slot| slot.resource_released && slot.pin_count == 0),
+                .is_some_and(ResidentTargetSlot::released_and_collectable),
         )
     }
 
@@ -2025,9 +2025,9 @@ impl ResourcePools {
         self.registry_order
             .iter()
             .filter(|identity| {
-                self.registry.get(*identity).is_some_and(|slot| {
-                    slot.resource_released && slot.pin_count == 0
-                })
+                self.registry
+                    .get(*identity)
+                    .is_some_and(ResidentTargetSlot::released_and_collectable)
             })
             .take(max)
             .cloned()
@@ -2902,6 +2902,53 @@ pub(super) mod pin_count_tests {
 
         assert!(pools.pin_resident_target(&id, false));
         assert_eq!(pools.released_resident_keys(1), vec![id]);
+    }
+
+    /// A released resource whose resident still holds the only copy of a frame
+    /// survives the release, and is collected once that frame has been copied
+    /// out.
+    ///
+    /// This is [`ResidentTargetSlot::released_and_collectable`]'s third term.
+    /// Without it, a render Store that deferred its writeback into
+    /// `writeback_debt` and a guest that released the serialized resource
+    /// before the debt was paid destroy the frame between them — which is what
+    /// **135 of 135** `read_target_unknown_identity diverges=absent
+    /// prior=resource_released` refusals were, on one driven macos-13 boot of
+    /// the copying rail.
+    ///
+    /// The wait is on the copy-out and not on time: the second half asserts the
+    /// slot does not become uncollectable, only late.
+    #[test]
+    fn a_released_resource_holding_the_only_copy_of_a_frame_waits_for_the_copy_out() {
+        let mut pools = ResourcePools::new();
+        let id = pinned_identity();
+        pools.registry.insert(id.clone(), dummy_slot(true));
+        pools.registry_order.push_back(id.clone());
+
+        assert_eq!(pools.retain_resident_target(&id), Some(false));
+        pools.registry_mark_ready(&id);
+        assert!(
+            pools.registry[&id].gpu_only_content,
+            "a Store with no copy-out leaves the resident sole-copy"
+        );
+
+        assert_eq!(
+            pools.release_resident_ownership(&id),
+            Some(false),
+            "the guest ended the lifetime, but the frame is still only here"
+        );
+        assert!(pools.released_resident_keys(1).is_empty());
+        assert!(
+            pools.registry.contains_key(&id),
+            "the resident the owed writeback names is still findable"
+        );
+
+        assert!(pools.registry_note_content_copied_out(&id));
+        assert_eq!(
+            pools.released_resident_keys(1),
+            vec![id],
+            "once the frame is in the guest's pages the slot is collectable"
+        );
     }
 
     fn surf(id: u32) -> TargetIdentity {

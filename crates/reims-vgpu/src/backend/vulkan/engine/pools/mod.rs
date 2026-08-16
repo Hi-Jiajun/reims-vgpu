@@ -2065,6 +2065,39 @@ impl ResidentTargetSlot {
         (self.framebuffer != vk::Framebuffer::null()).then_some(self.framebuffer)
     }
 
+    /// Whether a released resource's resident may be destroyed now.
+    ///
+    /// Three terms, and the third is the one that was missing.
+    /// [`Self::gpu_only_content`]'s own doc states the rule this device works
+    /// to — *nothing may destroy an image holding pixels no other copy has* —
+    /// and says both reclaim predicates honour it. Resource release is not a
+    /// reclaim, it is the guest ending a lifetime, and it went straight to
+    /// `retire_resident` past that rule. So a render Store that deferred its
+    /// writeback into the ledger, followed by the guest releasing the
+    /// serialized resource before the debt was paid, destroyed the only copy of
+    /// the frame.
+    ///
+    /// That is not a rare ordering. On a driven undriven-desktop macos-13 boot
+    /// under `REIMS_VGPU_GUEST_IMPORT=off` — the copying rail, which is the
+    /// only render-target rail a discrete host or a host without
+    /// `VK_EXT_external_memory_host` has — **135 of 135**
+    /// `read_target_unknown_identity` refusals read `diverges=absent
+    /// prior=resource_released`, each one a `wbdebt_pay_lost` behind it.
+    ///
+    /// Deferring costs retained VRAM until the ledger pays, which is exactly
+    /// what `gpu_only_content`'s doc says the default should cost. Payment
+    /// clears the flag through `registry_note_content_copied_out`, and
+    /// `retire_released_residents` runs off idle maintenance, so the slot is
+    /// collected on a later pass rather than never.
+    ///
+    /// Apple's device has no such ordering to get wrong: its render target *is*
+    /// the guest's IOSurface pages, so releasing a texture object cannot lose a
+    /// frame. The window exists only because this device defers, and it closes
+    /// where the deferral is recorded.
+    pub(crate) fn released_and_collectable(&self) -> bool {
+        self.resource_released && self.pin_count == 0 && !self.gpu_only_content
+    }
+
     /// Whether this slot's image may be re-used for a request of this geometry,
     /// generation and attachment format.
     ///
