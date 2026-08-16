@@ -55,6 +55,62 @@ pub fn is_declared_load_action(raw: u16) -> bool {
     raw <= MTL_LOAD_ACTION_CLEAR
 }
 
+/// A colour attachment's load action in this device's own vocabulary rather than
+/// the guest's ordinal.
+///
+/// The ordinal is a guest value: arbitrary, and parsed once at the boundary into
+/// something **total**. Every value outside the closed set becomes
+/// [`Self::DontCare`], which is the substitution every caller already made by
+/// hand after asking [`is_declared_load_action`] — the *reporting* of an
+/// out-of-contract value stays with that caller, because only it knows which
+/// pipeline sent it, but the fold itself is written once here.
+///
+/// Total matters more than it looks. The three actions have repeatedly been
+/// consumed as `match raw { LOAD => .., CLEAR => .., _ => {} }`, where the
+/// catch-all silently carries both DontCare and a corrupt ordinal, and where
+/// `rustc` cannot say that a fourth arm is missing. Matching this enum is
+/// checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadAction {
+    /// The attachment's prior contents may be discarded.
+    DontCare,
+    /// The pass composites onto the attachment's contents.
+    Load,
+    /// The attachment starts at the record's clear value.
+    Clear,
+}
+
+impl LoadAction {
+    /// Fold a decoded ordinal, treating anything outside the closed set as
+    /// DontCare.
+    #[must_use]
+    pub fn from_declared(raw: u16) -> Self {
+        match raw {
+            MTL_LOAD_ACTION_LOAD => Self::Load,
+            MTL_LOAD_ACTION_CLEAR => Self::Clear,
+            _ => Self::DontCare,
+        }
+    }
+
+    /// The census pair for this action: how many records declared it, and how
+    /// many attachment pixels those records covered.
+    ///
+    /// Two counters and not one because the cost of getting an action wrong is
+    /// proportional to **area**, while the population is dominated by small
+    /// attachments — a boot's thousands of 64x64 passes would otherwise outrank
+    /// its dozens of full-screen ones. Named together here so the pair cannot
+    /// drift apart, and returned rather than emitted so this module keeps no
+    /// dependency on the census.
+    #[must_use]
+    pub fn census_routes(self) -> (&'static str, &'static str) {
+        match self {
+            Self::DontCare => ("color0_declared_dontcare", "color0_declared_dontcare_px"),
+            Self::Load => ("color0_declared_load", "color0_declared_load_px"),
+            Self::Clear => ("color0_declared_clear", "color0_declared_clear_px"),
+        }
+    }
+}
+
 /// Whether `raw` is one of the four store actions this device decodes by name.
 ///
 /// The remaining SDK values require additional state not represented by this
@@ -132,6 +188,58 @@ mod tests {
             assert!(store_action_publishes_single_sample(action));
         }
         assert!(!store_action_publishes_single_sample(u16::MAX));
+    }
+
+    /// The fold is total, agrees with the predicate on the closed set, and
+    /// sends everything else to DontCare.
+    ///
+    /// Swept past the top ordinal the same way the predicate's own test is,
+    /// because the two have to answer the same question: a value the predicate
+    /// rejects is exactly a value this must call DontCare, and a fourth arm
+    /// appearing in one and not the other is how the catch-all this enum exists
+    /// to remove would come back.
+    #[test]
+    fn the_load_action_fold_is_total_and_agrees_with_the_predicate() {
+        assert_eq!(
+            LoadAction::from_declared(MTL_LOAD_ACTION_DONT_CARE),
+            LoadAction::DontCare
+        );
+        assert_eq!(
+            LoadAction::from_declared(MTL_LOAD_ACTION_LOAD),
+            LoadAction::Load
+        );
+        assert_eq!(
+            LoadAction::from_declared(MTL_LOAD_ACTION_CLEAR),
+            LoadAction::Clear
+        );
+        for raw in 0..=u16::MAX {
+            let folded = LoadAction::from_declared(raw);
+            if !is_declared_load_action(raw) {
+                assert_eq!(
+                    folded,
+                    LoadAction::DontCare,
+                    "{raw} is out of contract and must fold to DontCare"
+                );
+            }
+        }
+    }
+
+    /// The six census route names are distinct, and each count is paired with
+    /// its own area counter.
+    ///
+    /// A copied line here reads as a working census and silently adds one
+    /// action's records to another's — the failure that makes a boot's ranking
+    /// wrong in the direction that looks like a finding.
+    #[test]
+    fn every_load_action_has_its_own_pair_of_census_routes() {
+        let mut seen = std::collections::BTreeSet::new();
+        for action in [LoadAction::DontCare, LoadAction::Load, LoadAction::Clear] {
+            let (n, px) = action.census_routes();
+            assert_eq!(px, format!("{n}_px"), "the area route names its own count");
+            assert!(seen.insert(n), "{n} is already another action's count");
+            assert!(seen.insert(px), "{px} is already another action's area");
+        }
+        assert_eq!(seen.len(), 6);
     }
 
     /// Neither predicate can see the two adjacent words swapped.

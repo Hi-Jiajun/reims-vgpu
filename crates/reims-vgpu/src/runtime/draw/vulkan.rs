@@ -7787,6 +7787,32 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             } else {
                 MTL_LOAD_ACTION_DONT_CARE
             };
+            // The declared load action of slot 0, as a population **and** as
+            // pixels, before the three-into-two collapse below erases the
+            // difference.
+            //
+            // `passbegin_load` / `passbegin_clear` are counted in the engine and
+            // cannot separate a Clear from a DontCare: by then both have become
+            // "no seed", which `caches::get_or_create_pass` spells
+            // `AttachmentLoadOp::CLEAR`. The two cost very different amounts —
+            // a CLEAR writes every texel of the attachment, and on this
+            // pathway a quarter of all attachments are `VK_IMAGE_TILING_LINEAR`
+            // over guest RAM with no fast clear and no colour compression, so
+            // the write is the full plane at memory bandwidth. A DontCare
+            // spelled `AttachmentLoadOp::DONT_CARE` writes none of it.
+            //
+            // Pixels rather than records because the price is proportional to
+            // area and the population is dominated by small attachments: a
+            // census of records would rank a boot's thousands of 64x64 passes
+            // above its dozens of full-screen ones.
+            let declared_px = u64::from(w).saturating_mul(u64::from(h));
+            // `load_action` was already folded to DontCare above for anything
+            // out of contract, so this fold is exact and the two spellings
+            // cannot disagree.
+            let (declared_n, declared_area) =
+                crate::contract::pass_action::LoadAction::from_declared(load_action).census_routes();
+            crate::runtime::drain::note_store_route(declared_n);
+            crate::runtime::drain::note_store_route_n(declared_area, declared_px);
             match load_action {
                 MTL_LOAD_ACTION_LOAD if chain_load_from_target => {
                     // Resident target carries the chain; no CPU seed bytes.
