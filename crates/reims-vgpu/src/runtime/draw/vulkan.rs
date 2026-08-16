@@ -3682,7 +3682,8 @@ fn load_buffer_content_resolved<M: HostMemory + HostOps>(
             return Some(content);
         }
     }
-    let bytes = read_buffer_bytes_resolved(state, host, task_id, backing, offset, extent_cap)?;
+    let bytes =
+        read_buffer_bytes_resolved(state, host, task_id, buffer_ref, backing, offset, extent_cap)?;
     Some(crate::backend::vulkan::engine::BufferContent::from(bytes))
 }
 

@@ -1059,26 +1059,6 @@ pub fn submit_for_resources<M: HostMemory + HostOps>(
 }
 
 
-/// Count a reader that reaches guest bytes while a frame is owed and cannot pay
-/// it, because it holds `DeviceState` immutably.
-///
-/// There is one — `draw::read_buffer_bytes_resolved`, the CPU
-/// read of a *buffer's* guest bytes. A buffer and a type-11 render surface are
-/// separate guest allocations, so this fires only where the two alias, and
-/// aliasing across id namespaces is real rather than theoretical (see
-/// [`crate::runtime::host_writes`]). The gap is therefore counted rather than
-/// argued away: a boot reading `wbdebt_unpaid_buffer_read` above zero is a boot
-/// where a buffer read *may* have seen a superseded surface frame, and that is
-/// the signal to thread `&mut DeviceState` down to it.
-///
-/// A driven macos-13 sustained-animation boot puts `settle_buffer_guest_read` at
-/// zero, which is the same call site counted for the waits it took.
-pub fn note_unpaid_buffer_read(state: &DeviceState) {
-    if !state.pending_writebacks.is_empty() {
-        crate::runtime::drain::note_store_route("wbdebt_unpaid_buffer_read");
-    }
-}
-
 /// Run the Store the debt stands for, now.
 ///
 /// Everything the copy needs is resolved here and not at the arm — the identity

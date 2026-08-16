@@ -1544,6 +1544,29 @@ fn resolve_buffer_backing<M: HostMemory>(
 /// pre-Store frame. The rail above it settled at a fork two calls up
 /// ([`seed_color_load`]) and the other three callers settled nowhere.
 ///
+/// # Settling is half the obligation and this arm carried only that half
+///
+/// Four rails in this crate read a resource's raw guest bytes on the CPU, and
+/// each owes the same three terms before it may believe them: the
+/// [`crate::runtime::writeback_debt::note_unnamed_reach`] census, a payment of
+/// whatever the reference names, and the disjointness-narrowed settle. Three of
+/// them — the linear sampled read, its memoized twin, and the texture-view read
+/// — spell all three. This one spelled the settle alone.
+///
+/// The difference is not academic. A settle waits for writes this device has
+/// already **submitted**; a writeback debt is a frame it rendered and
+/// deliberately did **not** submit, so there is nothing on any queue for the
+/// settle to find and it returns immediately with the owed frame still sitting
+/// in a host resident. The guest's own bytes are then one Store behind, and the
+/// bind that reads them is a sampled texture — an icon, a glyph atlas, a blurred
+/// backdrop — which is the shape this failure takes on screen.
+///
+/// `buffer_ref` is threaded down for exactly this: the payment is by name, and
+/// the name is the buffer whose bytes are about to be read.
+/// [`load_buffer_texture_rgba`] pays for its texture reference as well, because a
+/// buffer-backed texture is two contract references over one allocation and
+/// either may be the one a debt was armed under.
+///
 /// Narrowed on the buffer's own span, so the vertex and index reads that reach
 /// here — none of which a render Store ever writes — do not start paying for a
 /// wait they never owed.
@@ -1557,10 +1580,11 @@ fn resolve_buffer_backing<M: HostMemory>(
 /// measured at 11x the bind cost — `binds_us/chain` 2.79 us -> 31.33 us — for a
 /// rail whose point was to move fewer bytes. Both arms take the cap or neither
 /// does.
-fn read_buffer_bytes_resolved<M: HostMemory>(
-    state: &DeviceState,
-    host: &M,
+fn read_buffer_bytes_resolved<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
     task_id: u32,
+    buffer_ref: u32,
     backing: &BufferBacking,
     offset: u64,
     extent_cap: Option<u64>,
@@ -1586,11 +1610,24 @@ fn read_buffer_bytes_resolved<M: HostMemory>(
     }
     let want = host_alloc_len(avail).filter(|&n| n > 0)?;
     let (read_gva, read_span) = (gva + offset, want as u64);
-    // The one reader that holds `DeviceState` shared and so cannot pay an owed
-    // frame. It reads a *buffer*, which is a different guest allocation from a
-    // type-11 surface — counted rather than argued away; see
-    // `runtime::writeback_debt::note_unpaid_buffer_read`.
-    crate::runtime::writeback_debt::note_unpaid_buffer_read(state);
+    // The same three terms every other reader of raw task-GVA bytes carries, in
+    // the same order: census what the naming cannot see, pay what it can, then
+    // wait for what has already been submitted. This site used to carry only the
+    // third, because it held `DeviceState` shared and so *could* not pay — the
+    // gap was counted instead, and a boot reading it above zero is a boot where a
+    // buffer read may have seen a superseded frame. It is the payment now, and
+    // the counter is gone with the gap it stood for.
+    {
+        let (tasks, page_shift) = (&state.tasks, state.page_shift);
+        let page_size = state.page_size();
+        crate::runtime::writeback_debt::note_unnamed_reach(state, || {
+            let pages = reims_vgpu_paging::span::pages_spanned(read_gva, read_span, page_size);
+            let gpas =
+                gva_mem::task_gva_page_gpas(host, tasks, task_id, read_gva, read_span, page_shift);
+            (gpas.len() as u64 == pages).then_some(gpas)
+        });
+    }
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, buffer_ref);
     let (tasks, page_shift, page_size) = (&state.tasks, state.page_shift, state.page_size());
     crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
         crate::runtime::render_writeback::SettleSite::BufferGuestRead,
@@ -1623,9 +1660,9 @@ fn read_buffer_bytes_resolved<M: HostMemory>(
 }
 
 /// Standalone CPU buffer read (non-draw-setup callers): resolve + read.
-fn load_buffer_bytes<M: HostMemory>(
-    state: &DeviceState,
-    host: &M,
+fn load_buffer_bytes<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
     task_id: u32,
     buffer_ref: u32,
     offset: u64,
@@ -1634,7 +1671,7 @@ fn load_buffer_bytes<M: HostMemory>(
     // No shader in scope here — these callers read a buffer outside a draw's
     // bind set, so there is no reflection to bound them and the whole span is
     // the only answer.
-    read_buffer_bytes_resolved(state, host, task_id, &backing, offset, None)
+    read_buffer_bytes_resolved(state, host, task_id, buffer_ref, &backing, offset, None)
 }
 
 /// If `texture_ref` is a type-8 object whose descriptor is a buffer-backed
@@ -1726,8 +1763,8 @@ pub(crate) fn note_sampled_narrowing(
 /// the format is unknown, or the span overruns the buffer) — those are real
 /// dropped-draw causes, not speculative "not ready yet" polls.
 fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
-    state: &DeviceState,
-    host: &M,
+    state: &mut DeviceState,
+    host: &mut M,
     task_id: u32,
     texture_ref: u32,
     bt: &BufferTextureDescriptor,
@@ -1766,6 +1803,14 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
         return None;
     }
     let span = bpr.checked_mul(h as u64)?;
+    // A buffer-backed texture is two contract references over one allocation:
+    // the type-8 texture object the guest binds and samples, and the type-1
+    // buffer that owns the storage. A synchronize names the former and a debt
+    // may be armed under either, so both are paid. `load_buffer_bytes` below
+    // pays for `bt.buffer_ref`; this is the sibling call every other sampled
+    // rail makes, and its absence here is what let a rendered frame stay in a
+    // host resident while this read served the guest the frame before it.
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
     let raw = load_buffer_bytes(state, host, task_id, bt.buffer_ref, bt.offset)?;
     if (raw.len() as u64) < span {
         crate::observe::fail(format!(
