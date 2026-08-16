@@ -804,12 +804,21 @@ pub const DISPLAY_DESC_PRODUCT_NAME: u64 = 0x04;
 pub const DISPLAY_DESC_INDEX: u64 = 0x12;
 pub const DISPLAY_DESC_WIDTH_MM: u64 = 0x14;
 pub const DISPLAY_DESC_HEIGHT_MM: u64 = 0x16;
-/// The same physical size again, as IEEE binary32. Apple's host writes **both**
-/// encodings on every publish, unconditionally, and the `displayDimensionFloats`
-/// capability — which this device grants by negotiating a protocol version that
-/// carries it — is what licenses the guest to read this pair instead of the u16
-/// one. Publishing the integers alone therefore advertises a field and leaves it
-/// zero, which is a 0 x 0 mm panel to any guest that takes the licence.
+/// The same physical size again, as IEEE binary32.
+///
+/// Apple's host writes **both** encodings on every publish, unconditionally and
+/// with no version test — `movss` here and `movw` to the u16 pair — because the
+/// `displayDimensionFloats` capability is an advertisement to the *guest* about
+/// which fields it may trust, not a switch on what the host writes. The host
+/// never reads the flag at all.
+///
+/// **No guest on this device reads this pair today**, and that is worth stating
+/// so nobody reads a fix into it: the capability arrives at protocol rung 0x2a
+/// and [`version_reply`] clamps down and never up, so a stock guest asking for 4
+/// gets 4 and stays below it. What writing them buys is that the field is not a
+/// zero waiting for the first guest that does negotiate higher — a 0 x 0 mm panel
+/// — and that this device publishes what the reference implementation publishes
+/// rather than half of it.
 pub const DISPLAY_DESC_WIDTH_MM_F32: u64 = 0x24;
 pub const DISPLAY_DESC_HEIGHT_MM_F32: u64 = 0x28;
 pub const DISPLAY_DESC_FEATURES: u64 = 0x1c;

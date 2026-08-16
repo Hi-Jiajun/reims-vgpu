@@ -2896,11 +2896,13 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
         psz,
     );
     shared_w16(host, gpa, DISPLAY_DESC_INDEX, index as u16, psz);
-    // Both encodings of the physical size, from one value each, because the
-    // guest chooses which to read: the integer pair is what the EDID's
-    // centimetre fields come from, and `displayDimensionFloats` — carried by the
-    // protocol version this device negotiates — licenses the float pair. Writing
-    // only the integers advertises a field and leaves it zero.
+    // Both encodings of the physical size, from one value each, as the reference
+    // host does: it writes the pair and the float pair on every publish with no
+    // version test. The integer pair is what the guest's synthesised EDID takes
+    // its centimetre fields from and is the one a stock rung-4 guest reads; the
+    // float pair is what `displayDimensionFloats` licenses at rung 0x2a and
+    // above, and leaving it unwritten is a 0 x 0 mm panel to any guest that gets
+    // there.
     let (width_f32, width_mm) = display_dimension_mm(DISPLAY_WIDTH_MM);
     let (height_f32, height_mm) = display_dimension_mm(DISPLAY_HEIGHT_MM);
     shared_w16(host, gpa, DISPLAY_DESC_WIDTH_MM, width_mm, psz);
