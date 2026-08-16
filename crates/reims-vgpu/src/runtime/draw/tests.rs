@@ -2068,6 +2068,50 @@ fn tight_rgba_linear_load_preserves_native_bytes() {
 /// Both halves are asserted here because either alone is a bug: the layout must
 /// stay identical to the linear sibling's, *and* the transfer function must
 /// survive to the Vulkan format the bind uses.
+/// A mapping's declared format is a **colour-space** answer and must never be
+/// able to fail a bind.
+///
+/// This is the shape the first draft of `mapping_declared_format` got wrong: it
+/// ran the answer through `effective_view_sample_format` and inherited that
+/// function's `Option`, so a mapping declaring a format outside the
+/// bytes-per-pixel table would have dropped the sampled bind — losing guest work
+/// over a question that has a correct answer for every `u16`.
+#[test]
+fn a_mappings_declared_format_answers_for_every_mapping() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    // A mapping this device holds no entry for has declared nothing, and the
+    // store rule's own "nothing declared" answer is what comes back.
+    assert_eq!(
+        mapping_declared_format(&state, 7, None),
+        MTL_FORMAT_BGRA8_UNORM
+    );
+    // One that declares a format outside every table this crate carries still
+    // answers, and answers "not sRGB".
+    state.mappings.insert(
+        7,
+        crate::model::MappingEntry {
+            mapped: true,
+            has_geom: true,
+            width: 4,
+            height: 4,
+            format: 0xfffe,
+            ..Default::default()
+        },
+    );
+    assert_eq!(mapping_declared_format(&state, 7, None), 0xfffe);
+    assert!(!pixel_format::is_srgb(mapping_declared_format(&state, 7, None)));
+    // A declared sRGB surface reaches the bind as sRGB.
+    state.mappings.get_mut(&7).expect("just inserted").format =
+        pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB;
+    assert!(pixel_format::is_srgb(mapping_declared_format(&state, 7, None)));
+    // A type-8 view's format is what the guest says it is reading, so it wins
+    // over the mapping's own — including when it takes the sRGB back off.
+    assert_eq!(
+        mapping_declared_format(&state, 7, Some(MTL_FORMAT_BGRA8_UNORM)),
+        MTL_FORMAT_BGRA8_UNORM
+    );
+}
+
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn the_cpu_upload_rails_carry_the_srgb_transfer_function_to_the_bind() {

@@ -3756,6 +3756,50 @@ fn load_type11_rgba<M: HostMemory + HostOps>(
     load_type11_mapping_rgba(state, host, mapping_id, format_override)
 }
 
+/// What the guest says a type-11 mapping's texel **values** are, seen through an
+/// optional type-8 view format.
+///
+/// Distinct from the byte *order* its loaders hand back, and that distinction is
+/// the whole point. `scanout::read_mapping_bgra8` normalises a mapping's channel
+/// order to BGRA8 and touches no value, so those loaders key their convert on
+/// BGRA8 — correct for order, and silent about the transfer function. This is
+/// the answer that is not silent about it, and it is what a sampled bind pairs
+/// with the layout in a [`SampledByteFormat`].
+///
+/// # Total on purpose
+///
+/// It answers a `u16` and cannot decline, because the only question asked of the
+/// result is [`pixel_format::is_srgb`], which is total over `u16`. An earlier
+/// draft ran the answer through [`effective_view_sample_format`] and inherited
+/// its `Option`: a mapping declaring a format outside the bytes-per-pixel table
+/// would then have failed the *bind*, losing guest work over a colour-space
+/// question that has a correct answer for every value. Whether a view may
+/// reinterpret a base at all is a different question with a different refusal,
+/// and it belongs to the loaders that already ask it — asking it twice is how
+/// two copies of one rule come to disagree.
+///
+/// A mapping this device holds no entry for has declared nothing, and
+/// [`crate::runtime::mapping_write::mapping_store_format`] already owns what
+/// "nothing declared" resolves to; a default entry is handed to it rather than
+/// that answer being spelled a second time here.
+fn mapping_declared_format(
+    state: &DeviceState,
+    mapping_id: u32,
+    format_override: Option<u16>,
+) -> u16 {
+    use crate::runtime::mapping_write::mapping_store_format;
+    if let Some(view) = format_override {
+        return view;
+    }
+    match state.mappings.get(&mapping_id) {
+        Some(entry) => mapping_store_format(entry),
+        // Nothing declared. An entry that has latched no geometry is exactly
+        // that case, so the owning rule answers it rather than a default being
+        // named a second time here.
+        None => mapping_store_format(&crate::model::MappingEntry::default()),
+    }
+}
+
 /// Sample a type-11 mapping as tight RGBA8 from guest pages.
 ///
 /// Guest pages ARE the surface content: the CPU writeback lands Stores in them
@@ -3766,32 +3810,6 @@ fn load_type11_rgba<M: HostMemory + HostOps>(
 /// mapped with a live `MappingInternal` and no latched W×H yet; resolving first
 /// decodes the guest device-surface descriptor and latches the geometry, so the
 /// sample succeeds instead of bailing out on `!has_geom` and dropping the bind.
-/// What the guest says a type-11 mapping's texel **values** are, seen through an
-/// optional type-8 view format.
-///
-/// Distinct from the byte order its loaders hand back, and that distinction is
-/// the whole point. `scanout::read_mapping_bgra8` normalises a mapping's channel
-/// order to BGRA8 and touches no value, so the loaders below key their convert
-/// on BGRA8 — correct for order, and silent about the transfer function. This is
-/// the answer that is not silent about it, and it is what the sampled bind pairs
-/// with the layout in a [`SampledByteFormat`].
-///
-/// Composed from the two owners rather than restating either:
-/// [`crate::runtime::mapping_write::mapping_store_format`] is the single rule for
-/// a mapping's declared format, and [`effective_view_sample_format`] for how a
-/// view reinterprets one.
-fn mapping_declared_format(
-    state: &DeviceState,
-    mapping_id: u32,
-    format_override: Option<u16>,
-) -> Option<u16> {
-    let stored = state
-        .mappings
-        .get(&mapping_id)
-        .map(crate::runtime::mapping_write::mapping_store_format)?;
-    effective_view_sample_format(stored, format_override)
-}
-
 fn load_type11_mapping_rgba<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -5553,7 +5571,7 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
     }
     // Type-11 path via resolve.
     if let Some(mid) = objects::resolve_type11_ref(state, host, task_id, texture_ref) {
-        let source = mapping_declared_format(state, mid, None)?;
+        let source = mapping_declared_format(state, mid, None);
         return load_type11_mapping_rgba(state, host, mid, None)
             .map(|(_, _, r)| (r, SampledByteFormat::from_source(TexelLayout::Rgba8, source)));
     }
@@ -5573,7 +5591,7 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
         if level != 0 {
             return None;
         }
-        let source = mapping_declared_format(state, mid, fmt_override)?;
+        let source = mapping_declared_format(state, mid, fmt_override);
         return load_type11_mapping_rgba(state, host, mid, fmt_override)
             .map(|(_, _, r)| (r, SampledByteFormat::from_source(TexelLayout::Rgba8, source)));
     }

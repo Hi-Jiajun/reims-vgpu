@@ -1588,7 +1588,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     // filled from a writeback that reorders channels and decodes
                     // nothing. So the transfer function is the mapping's declared
                     // one, exactly as it is on the guest-page rungs below.
-                    let source = crate::runtime::draw::mapping_declared_format(state, mid, None)?;
+                    let source = crate::runtime::draw::mapping_declared_format(state, mid, None);
                     return Some((
                         w,
                         h,
@@ -1627,7 +1627,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                         SampledSourceRequest::Bytes(
                             rgba,
                             Some(identity),
-                            SampledByteFormat::from_source(TexelLayout::Rgba8, memo_source?),
+                            SampledByteFormat::from_source(TexelLayout::Rgba8, memo_source),
                             crate::backend::vulkan::engine::SampledByteOrigin::SurfaceGuestFallback,
                         ),
                     ));
