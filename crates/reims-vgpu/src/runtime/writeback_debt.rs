@@ -644,10 +644,12 @@ pub fn note_unnamed_reach(state: &DeviceState, pages: impl FnOnce() -> Option<Ve
 /// They are nameable because the guest names them. A debt is keyed by mapping
 /// id, and this device holds two ways from a texture reference to one:
 /// `DeviceState::texture_to_mapping` for the per-task registration, and the id
-/// itself where the guest uses one namespace for both —
+/// itself where the guest uses one namespace for both.
 /// [`crate::runtime::resource_validity::apply`] resolves a validity statement
-/// through exactly this pair, and this is the same question asked of the same
-/// two tables.
+/// through exactly this pair, so both now go through the one resolver that owns
+/// it, [`crate::model::DeviceState::mappings_named_by`] — this used to be the
+/// same question asked of the same two tables in two different spellings, and
+/// the divergence is in that method's doc.
 ///
 /// A reference that resolves to neither names no mapping this device holds, so
 /// no debt can be about it. That is a statement about the registries and not
@@ -675,19 +677,12 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
         named = true;
         let _ = pay_gva(state, host, gva_key, debt, GvaPaySite::Named);
     }
-    // Both surface spellings, in the order `resource_validity::apply` uses: a
-    // reference that is itself a mapping id, and the per-task registration.
-    // Paying one leaves the ledger holding the other, so asking twice costs a
-    // map lookup and cannot pay the wrong surface.
-    let mapped = state
-        .texture_to_mapping
-        .get(&(task_id, texture_ref))
-        .copied();
-    if state.pending_writebacks.get(texture_ref).is_some() {
-        named = true;
-        pay_for_mapping(state, host, texture_ref);
-    }
-    if let Some(mapping_id) = mapped.filter(|&id| id != texture_ref) {
+    // Both surface spellings, from the one resolver `resource_validity::apply`
+    // uses: a reference that is itself a mapping id, and the per-task
+    // registration. Paying one leaves the ledger holding the other, so asking
+    // for each costs a map lookup and cannot pay the wrong surface.
+    let targets = state.mappings_named_by(task_id, texture_ref);
+    for mapping_id in targets.iter() {
         if state.pending_writebacks.get(mapping_id).is_some() {
             named = true;
             pay_for_mapping(state, host, mapping_id);
@@ -699,18 +694,27 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
         // import, which is what made it read as a healthy zero.
         //
         // `_resolved` says the ledger genuinely holds no debt for a surface this
-        // reference does name. `_unresolved` says neither spelling named a
-        // surface at all: `texture_ref` is not itself a mapping id and
-        // `texture_to_mapping` holds no entry for `(task, ref)`. A debt owed by
-        // the surface behind such a reference cannot be found, so that arm is
-        // "we did not look", not "there was nothing there" — and a sampled bind
-        // proceeding past it reads the guest's pages while the newest frame is
-        // still in a resident.
+        // reference does name. `_unresolved` says neither spelling named a live
+        // surface at all: `texture_ref` is not a mapping this device holds and
+        // `texture_to_mapping` names none either. A debt owed by the surface
+        // behind such a reference cannot be found, so that arm is "we did not
+        // look", not "there was nothing there" — and a sampled bind proceeding
+        // past it reads the guest's pages while the newest frame is still in a
+        // resident.
+        //
+        // The split asks [`DeviceState::names_live_mapping`], not whether the
+        // per-task registration answered. It used to ask the latter, which the
+        // reference-is-the-mapping-id spelling never populates, so the census
+        // read 100 % `_unresolved` on both arms of a driven macos-13 boot —
+        // 74 816/74 816 with the guest import on and 185 674/185 674 with it
+        // off. A split whose two arms cannot both be reached measures nothing,
+        // and this one was read as evidence that the naming never resolves.
         //
         // The split is emitted beside the total, so
         // `_resolved + _unresolved == wbdebt_texture_owes_nothing` is checkable
         // on the census itself.
-        crate::runtime::drain::note_store_route(match mapped.is_some() {
+        crate::runtime::drain::note_store_route(match state.names_live_mapping(task_id, texture_ref)
+        {
             true => "wbdebt_texture_owes_nothing_resolved",
             false => "wbdebt_texture_owes_nothing_unresolved",
         });
@@ -1519,12 +1523,19 @@ mod tests {
     /// reference that named no surface at all.
     ///
     /// The second is not a reading about the ledger — it is a reading about the
-    /// lookup. `texture_to_mapping` held no entry, so a debt owed by the surface
-    /// behind that reference could not have been found whether or not one
-    /// existed, and a sampled bind proceeding past it reads the guest's pages
-    /// while the newest frame is still in a resident. One counter reported both
-    /// at 1.1 M a boot, which is every sampled guest import, and that volume is
-    /// what made it read as a healthy zero.
+    /// lookup. No spelling named a mapping this device holds, so a debt owed by
+    /// the surface behind that reference could not have been found whether or
+    /// not one existed, and a sampled bind proceeding past it reads the guest's
+    /// pages while the newest frame is still in a resident. One counter reported
+    /// both at 1.1 M a boot, which is every sampled guest import, and that
+    /// volume is what made it read as a healthy zero.
+    ///
+    /// The middle case is the one this test exists for. A reference that **is**
+    /// its own mapping id resolves perfectly and never populates
+    /// `texture_to_mapping`, so a split that asked only that registration
+    /// reported it as "we could not look" — and since that is the dominant
+    /// spelling, the split read 100 % `_unresolved` on both arms of a driven
+    /// boot and could not have read anything else.
     #[test]
     fn a_texture_that_owes_nothing_says_whether_it_named_a_surface_at_all() {
         use crate::runtime::drain::store_route_count;
@@ -1539,14 +1550,15 @@ mod tests {
         let mut host = crate::runtime::FakeHost::new();
         // The ledger has to be non-empty or `pay_for_texture` returns at its
         // emptiness check and neither counter is reached. Mapping 7 owes; the
-        // two references below are about other surfaces.
+        // three references below are about other surfaces.
         assert_eq!(
             state.pending_writebacks.arm(7, ident(7, 64, 64, 1), 64, 64, 1),
             None
         );
-        // Reference 21 names mapping 9, which owes nothing.
+        // Reference 21 names mapping 9 through the per-task registration, and
+        // this device holds mapping 9. It owes nothing.
+        state.mappings.entry(9).or_default().mapped = true;
         state.texture_to_mapping.insert((1, 21), 9);
-
         pay_for_texture(&mut state, &mut host, 1, 21);
         assert_eq!(
             store_route_count("wbdebt_texture_owes_nothing_resolved") - resolved0,
@@ -1557,12 +1569,26 @@ mod tests {
             0
         );
 
-        // Reference 22 names nothing: not a mapping id in the ledger, and no
+        // Reference 30 *is* a mapping this device holds. It owes nothing, and it
+        // resolves — through the spelling that never touches the registration.
+        state.mappings.entry(30).or_default().mapped = true;
+        pay_for_texture(&mut state, &mut host, 1, 30);
+        assert_eq!(
+            store_route_count("wbdebt_texture_owes_nothing_resolved") - resolved0,
+            2,
+            "a reference that is its own mapping id has resolved"
+        );
+        assert_eq!(
+            store_route_count("wbdebt_texture_owes_nothing_unresolved") - unresolved0,
+            0
+        );
+
+        // Reference 22 names nothing: not a mapping this device holds, and no
         // `texture_to_mapping` entry.
         pay_for_texture(&mut state, &mut host, 1, 22);
         assert_eq!(
             store_route_count("wbdebt_texture_owes_nothing_resolved") - resolved0,
-            1
+            2
         );
         assert_eq!(
             store_route_count("wbdebt_texture_owes_nothing_unresolved") - unresolved0,
@@ -1570,7 +1596,7 @@ mod tests {
         );
         assert_eq!(
             store_route_count("wbdebt_texture_owes_nothing") - total0,
-            2,
+            3,
             "the split has to add up to the total it divides"
         );
     }

@@ -2267,6 +2267,44 @@ pub struct GuestLinearMemo {
     pub generation: u64,
 }
 
+/// The mapping ids one object reference names, as
+/// [`DeviceState::mappings_named_by`] resolves them.
+///
+/// Two at most and that is a property of the contract rather than a capacity
+/// this device chose: a reference is its own mapping id or it is not, and the
+/// per-task registration holds exactly one entry per `(task, ref)`. Carrying
+/// the pair inline rather than in a `Vec` is what makes that statement, and it
+/// is why `push` past the second is unreachable rather than a bound to tune.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NamedMappings {
+    ids: [u32; 2],
+    len: u8,
+}
+
+impl NamedMappings {
+    /// Add `id` unless it is already named. Silently complete at two, which the
+    /// type's doc explains is unreachable rather than a truncation.
+    fn push(&mut self, id: u32) {
+        if self.iter().any(|held| held == id) {
+            return;
+        }
+        if let Some(slot) = self.ids.get_mut(self.len as usize) {
+            *slot = id;
+            self.len += 1;
+        }
+    }
+
+    /// The named ids, reference first.
+    pub fn iter(self) -> impl Iterator<Item = u32> {
+        (0..usize::from(self.len)).map(move |i| self.ids[i])
+    }
+
+    /// Whether this reference named no mapping at all.
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+}
+
 /// Full device model state (backend-independent).
 #[derive(Debug)]
 pub struct DeviceState {
@@ -3281,6 +3319,57 @@ impl DeviceState {
         task.object_list_pfn = pfn;
         task.object_list_count = count;
         true
+    }
+
+    /// Every mapping id one task-local object reference can name.
+    ///
+    /// This device carries two ways from a reference to a surface, because the
+    /// guest has two: on some paths the reference *is* the mapping id, and on
+    /// the rest [`Self::texture_to_mapping`] holds the per-task registration a
+    /// type-11 create recorded. A statement about the reference — a validity
+    /// quad, an owed render frame — is a statement about every mapping it
+    /// names, so the candidate set is one rule and lives here.
+    ///
+    /// It is one rule because it used to be two, spelled differently, and only
+    /// one of them was right about what "named nothing" means:
+    /// `resource_validity::apply` built both candidates and then asked
+    /// [`Self::mappings`] which of them exists, while
+    /// `writeback_debt::pay_for_texture` asked only whether the ledger held a
+    /// debt and then reported "this reference named no surface" whenever the
+    /// per-task registration was empty. The reference-is-the-mapping-id
+    /// spelling never populates that registration, so that report was `100 %`
+    /// of its own census on both arms of a driven macos-13 boot — a census
+    /// whose whole purpose was to separate "nothing was owed" from "we could
+    /// not look".
+    ///
+    /// Deduplicated, so a reference that is its own mapping id is one target
+    /// and not two. Ordered as the guest's own namespaces are asked: the
+    /// reference first, the registration second.
+    pub fn mappings_named_by(&self, task_id: u32, object_id: u32) -> NamedMappings {
+        let mut named = NamedMappings::default();
+        if object_id == 0 {
+            // `writeInvalidates` skips null resources and id 0; `pageBacking`
+            // never emits one. A zero id names nothing.
+            return named;
+        }
+        named.push(object_id);
+        if let Some(&mid) = self.texture_to_mapping.get(&(task_id, object_id)) {
+            named.push(mid);
+        }
+        named
+    }
+
+    /// Whether any mapping this reference names is one this device still holds.
+    ///
+    /// The question a reader asks before concluding that nothing was owed: a
+    /// reference naming no live mapping did not *look*, and a reference naming
+    /// one and finding no debt genuinely found nothing. Derived from
+    /// [`Self::mappings_named_by`] so the two cannot answer about different
+    /// candidate sets.
+    pub fn names_live_mapping(&self, task_id: u32, object_id: u32) -> bool {
+        self.mappings_named_by(task_id, object_id)
+            .iter()
+            .any(|id| self.mappings.contains_key(&id))
     }
 
     pub fn insert_object(&mut self, task_id: u32, ref_: u32) -> bool {

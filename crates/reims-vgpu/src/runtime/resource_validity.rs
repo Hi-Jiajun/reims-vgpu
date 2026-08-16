@@ -80,7 +80,9 @@ pub struct ValidityOutcome {
 /// `task_id` is needed because a table id may be a texture ref rather than a
 /// mapping id, and `texture_to_mapping` is per-task. Both are applied when both
 /// resolve — the crate carries two registries for one guest object and a
-/// statement about that object is a statement about both.
+/// statement about that object is a statement about both. That candidate set is
+/// [`DeviceState::mappings_named_by`], shared with the render-frame ledger so
+/// the two cannot disagree about which mappings a reference names.
 pub fn apply(
     state: &mut DeviceState,
     task_id: u32,
@@ -91,17 +93,16 @@ pub fn apply(
     let mut out = ValidityOutcome::default();
     if object_id == 0 {
         // `writeInvalidates` skips null resources and id 0; `pageBacking` never
-        // emits one. A zero id names nothing to apply to.
+        // emits one. A zero id names nothing to apply to — and is not a *miss*
+        // either, so it returns before the accounting below rather than through
+        // it. The resolver answers "nothing named" for it too; this is the
+        // difference between a record that named nothing and a record that was
+        // not a record.
         return out;
     }
-    let mut targets = vec![object_id];
-    if let Some(&mid) = state.texture_to_mapping.get(&(task_id, object_id)) {
-        if mid != object_id {
-            targets.push(mid);
-        }
-    }
+    let targets = state.mappings_named_by(task_id, object_id);
     let mut hit = false;
-    for id in targets {
+    for id in targets.iter() {
         if !state.mappings.contains_key(&id) {
             continue;
         }
