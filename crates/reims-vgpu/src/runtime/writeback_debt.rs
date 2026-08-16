@@ -57,21 +57,109 @@ use crate::runtime::host::{HostMemory, HostOps};
 /// cannot lose pixels. `wbdebt_evicted` reports when a workload reaches it.
 pub const MAX_DEBTS: usize = 32;
 
+/// The engine identity of the resident a debt's frame lives in.
+///
+/// This module is compiled on every backend arm and the ledger is backend-
+/// agnostic, but the identity of a resident is not: only the Vulkan engine has
+/// one. An alias rather than a `cfg` on the field, so [`WritebackDebt`] and
+/// [`PendingWritebacks::arm`] have **one** shape on every arm — two shapes is
+/// how a struct starts disagreeing with itself across a feature boundary, and
+/// nothing in the toolchain compares them.
+///
+/// Nothing arms a surface debt on a Metal build: the sole caller is
+/// `runtime::draw::vulkan`. The placeholder is what lets the ledger's own tests
+/// compile there anyway.
+#[cfg(feature = "backend-vulkan")]
+pub type ResidentIdentity = crate::backend::vulkan::engine::TargetIdentity;
+
+/// See the Vulkan spelling above. A named zero-sized type rather than `()`,
+/// because `()` as an argument is a clippy lint at every call site and a reader
+/// cannot tell a deliberate placeholder from a function that forgot to return.
+#[cfg(not(feature = "backend-vulkan"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoResidentIdentity;
+
+/// See [`NoResidentIdentity`].
+#[cfg(not(feature = "backend-vulkan"))]
+pub type ResidentIdentity = NoResidentIdentity;
+
+/// A synthetic resident identity, for tests that arm a debt without a device.
+///
+/// Here rather than in each test module because it is the one place that knows
+/// which arm [`ResidentIdentity`] is on — two spellings of it would be a
+/// divergence across a feature boundary, which is the thing the alias exists to
+/// prevent.
+#[cfg(test)]
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn test_resident_identity(
+    id: u32,
+    width: u32,
+    height: u32,
+    generation: u64,
+) -> ResidentIdentity {
+    crate::backend::vulkan::engine::TargetIdentity::Surface {
+        id,
+        width,
+        height,
+        generation,
+        format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+    }
+}
+
+/// The placeholder arm: every identity is the same value, which is exactly true
+/// — a Metal build arms no surface debt at all.
+#[cfg(test)]
+#[cfg(not(feature = "backend-vulkan"))]
+pub(crate) fn test_resident_identity(
+    _id: u32,
+    _width: u32,
+    _height: u32,
+    _generation: u64,
+) -> ResidentIdentity {
+    NoResidentIdentity
+}
+
 /// A frame owed to one type-11 mapping's guest pages.
 ///
-/// Deliberately four integers and no memory. See the module doc: the rail this
-/// replaces held resolved host pointers and corrupted the guest's page tables
-/// with them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Values only, and no memory. See the module doc: the rail this replaces held
+/// resolved host pointers and corrupted the guest's page tables with them. A
+/// [`crate::backend::vulkan::engine::TargetIdentity`] is `Copy` and every field
+/// of it is a scalar the protocol handed over, so holding one keeps that rule.
+///
+/// `Clone` and not `Copy`, which the identity's own doc explains: it is a value
+/// either way, and the debt is moved out of the ledger by `take` rather than
+/// copied out of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WritebackDebt {
+    /// The resident the frame is *in*.
+    ///
+    /// Carried rather than re-derived, and that is the whole of a defect that
+    /// lost every Apple Maps frame on the rail a discrete host has no
+    /// alternative to. `pay` used to rebuild the identity from
+    /// `present_identity::surface_identity`, which reads the mapping's
+    /// generation *now*; the arm site already holds the identity the draw
+    /// registered its resident under — it stamps that identity's content epoch
+    /// one statement earlier — and the two are not the same key when the
+    /// mapping's generation moved between the draw and the Store. A driven boot
+    /// under `REIMS_VGPU_SHARED_TARGET=off` read
+    /// `read_target_unknown_identity diverges=generation asked_gen=N held_gen=N-1`
+    /// on three of four mappings, and the frame was refused with the resident
+    /// holding it sitting in the registry.
+    ///
+    /// [`Self::map_generation`] beside it is a different question and both are
+    /// needed: this says *which image the pixels are in*, that says *whether the
+    /// pages are still the ones they were promised to*.
+    pub identity: ResidentIdentity,
     /// Geometry the Store was taken at, and the geometry the payment writes.
     pub width: u32,
     pub height: u32,
     /// `MappingEntry::map_generation` at the arm.
     ///
-    /// The identity the payment re-derives carries this, so a mapping the guest
-    /// has since remapped produces a different identity — a different resident —
-    /// and the debt is void rather than paid into the wrong pages.
+    /// The payment refuses when the mapping's generation has moved since, so a
+    /// surface the guest has remapped is void rather than paid into pages that
+    /// now back something else. This is about the *destination*; see
+    /// [`Self::identity`] for the source, which used to be inferred from this
+    /// and cannot be.
     pub map_generation: u32,
     /// Arm order, for choosing which debt an over-full ledger pays first.
     pub seq: u64,
@@ -149,7 +237,7 @@ impl PendingWritebacks {
 
     /// What `mapping_id` is owed, if anything.
     pub fn get(&self, mapping_id: u32) -> Option<WritebackDebt> {
-        self.debts.get(&mapping_id).copied()
+        self.debts.get(&mapping_id).cloned()
     }
 
     /// Take `mapping_id`'s debt, leaving it owed nothing.
@@ -188,6 +276,7 @@ impl PendingWritebacks {
     pub fn arm(
         &mut self,
         mapping_id: u32,
+        identity: ResidentIdentity,
         width: u32,
         height: u32,
         map_generation: u32,
@@ -201,6 +290,7 @@ impl PendingWritebacks {
         let previous = self.debts.insert(
             mapping_id,
             WritebackDebt {
+                identity,
                 width,
                 height,
                 map_generation,
@@ -1003,12 +1093,9 @@ fn pay<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("wbdebt_generation_moved");
         return;
     }
-    let identity = crate::runtime::present_identity::surface_identity(
-        state,
-        mapping_id,
-        debt.width,
-        debt.height,
-    );
+    // The resident the draw registered, not the one a fresh derivation would
+    // name today. See `WritebackDebt::identity`.
+    let identity = debt.identity;
     if crate::runtime::resource_validity::licence_of(validity)
         == crate::runtime::resource_validity::WritebackLicence::Superseded
     {
@@ -1165,16 +1252,58 @@ fn pay_gva<M: HostMemory + HostOps>(
 
 #[cfg(test)]
 mod tests {
+
+    /// A synthetic resident identity for a mapping, so the ledger's tests can
+    /// arm a debt without a device. The surface namespace and the mapping id
+    /// are what the ledger keys on; the rest is only carried.
+    use super::test_resident_identity as ident;
     use super::*;
 
     /// The coalescing the rail exists for, at the container: a second arm into
     /// one mapping replaces the first rather than queueing beside it, so N
     /// Stores between two reads cost one copy and not N.
+    /// The ledger hands back the resident the frame is **in**, verbatim, even
+    /// when the mapping's own generation has moved past it.
+    ///
+    /// This is the defect that lost every Apple Maps frame under
+    /// `REIMS_VGPU_SHARED_TARGET=off`, and it is the whole of it: `pay` rebuilt
+    /// the identity from `present_identity::surface_identity`, which reads the
+    /// mapping's generation *now*, while the draw had registered its resident
+    /// under the generation current when the stream started. A driven boot read
+    /// `read_target_unknown_identity diverges=generation asked_gen=N held_gen=N-1`
+    /// and refused the Store with the resident holding the pixels sitting in the
+    /// registry.
+    ///
+    /// So the identity is armed and taken and never derived, and the divergence
+    /// below is deliberate: `map_generation` is 9 and the resident is at 8,
+    /// which is exactly the state the boot was in.
+    #[test]
+    #[cfg(feature = "backend-vulkan")]
+    fn a_debt_remembers_the_resident_it_was_armed_with_and_not_the_mapping() {
+        let mut pending = PendingWritebacks::default();
+        let resident = ident(7, 1920, 1080, 8);
+        assert_eq!(pending.arm(7, resident.clone(), 1920, 1080, 9), None);
+        let debt = pending.take(7).expect("the debt was armed");
+        assert_eq!(
+            debt.identity, resident,
+            "the payment would read a resident the draw never wrote"
+        );
+        assert_eq!(
+            debt.identity.generation(),
+            8,
+            "the resident's generation, not the mapping's"
+        );
+        assert_eq!(
+            debt.map_generation, 9,
+            "the destination guard still watches the mapping"
+        );
+    }
+
     #[test]
     fn a_second_arm_into_one_mapping_replaces_the_first() {
         let mut pending = PendingWritebacks::default();
-        assert_eq!(pending.arm(7, 1920, 1080, 3), None);
-        assert_eq!(pending.arm(7, 1920, 1080, 3), None);
+        assert_eq!(pending.arm(7, ident(7, 1920, 1080, 3), 1920, 1080, 3), None);
+        assert_eq!(pending.arm(7, ident(7, 1920, 1080, 3), 1920, 1080, 3), None);
         assert_eq!(pending.len(), 1, "one mapping owes one frame");
         let debt = pending.take(7).expect("mapping 7 owes a frame");
         assert_eq!(debt.seq, 1, "the later Store is the one owed");
@@ -1187,7 +1316,7 @@ mod tests {
     #[test]
     fn a_debt_carries_the_geometry_its_store_was_taken_at() {
         let mut pending = PendingWritebacks::default();
-        assert_eq!(pending.arm(4, 800, 600, 11), None);
+        assert_eq!(pending.arm(4, ident(4, 800, 600, 11), 800, 600, 11), None);
         let debt = pending.get(4).expect("mapping 4 owes a frame");
         assert_eq!(
             (debt.width, debt.height, debt.map_generation),
@@ -1201,10 +1330,10 @@ mod tests {
     fn arming_past_the_bound_evicts_the_oldest_and_says_so() {
         let mut pending = PendingWritebacks::default();
         for id in 0..MAX_DEBTS as u32 {
-            assert_eq!(pending.arm(id, 64, 64, 1), None, "under the bound");
+            assert_eq!(pending.arm(id, ident(id, 64, 64, 1), 64, 64, 1), None, "under the bound");
         }
         assert_eq!(pending.len(), MAX_DEBTS);
-        let evicted = pending.arm(MAX_DEBTS as u32, 64, 64, 1);
+        let evicted = pending.arm(MAX_DEBTS as u32, ident(MAX_DEBTS as u32, 64, 64, 1), 64, 64, 1);
         assert_eq!(
             evicted,
             Some(WritebackKey::Mapping(0)),
@@ -1228,10 +1357,10 @@ mod tests {
     fn re_arming_a_held_mapping_never_evicts() {
         let mut pending = PendingWritebacks::default();
         for id in 0..MAX_DEBTS as u32 {
-            assert_eq!(pending.arm(id, 64, 64, 1), None);
+            assert_eq!(pending.arm(id, ident(id, 64, 64, 1), 64, 64, 1), None);
         }
         assert_eq!(
-            pending.arm(0, 64, 64, 1),
+            pending.arm(0, ident(0, 64, 64, 1), 64, 64, 1),
             None,
             "a replacement makes no room"
         );
@@ -1243,9 +1372,9 @@ mod tests {
     #[test]
     fn mappings_come_back_in_arm_order() {
         let mut pending = PendingWritebacks::default();
-        assert_eq!(pending.arm(9, 1, 1, 1), None);
-        assert_eq!(pending.arm(2, 1, 1, 1), None);
-        assert_eq!(pending.arm(5, 1, 1, 1), None);
+        assert_eq!(pending.arm(9, ident(9, 1, 1, 1), 1, 1, 1), None);
+        assert_eq!(pending.arm(2, ident(2, 1, 1, 1), 1, 1, 1), None);
+        assert_eq!(pending.arm(5, ident(5, 1, 1, 1), 1, 1, 1), None);
         assert_eq!(pending.mappings_by_age(), vec![9, 2, 5]);
     }
 
@@ -1372,8 +1501,8 @@ mod tests {
     fn asynchronous_resource_synchronization_submits_only_named_objects() {
         let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
         let mut host = crate::runtime::FakeHost::new();
-        assert_eq!(state.pending_writebacks.arm(7, 64, 64, 1), None);
-        assert_eq!(state.pending_writebacks.arm(8, 64, 64, 1), None);
+        assert_eq!(state.pending_writebacks.arm(7, ident(7, 64, 64, 1), 64, 64, 1), None);
+        assert_eq!(state.pending_writebacks.arm(8, ident(8, 64, 64, 1), 64, 64, 1), None);
         submit_for_resources(&mut state, &mut host, 1, &[7]);
         assert!(state.pending_writebacks.get(7).is_none());
         assert!(state.pending_writebacks.get(8).is_some());

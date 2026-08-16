@@ -767,7 +767,18 @@ fn a_skipping_write_supersedes_the_debt_instead_of_paying_it_over_the_skip() {
     assert!(
         state
             .pending_writebacks
-            .arm(7, W, H, map_generation)
+            .arm(
+                7,
+                crate::runtime::writeback_debt::test_resident_identity(
+                    7,
+                    W,
+                    H,
+                    u64::from(map_generation),
+                ),
+                W,
+                H,
+                map_generation,
+            )
             .is_none(),
         "one debt cannot overflow a ledger of 32"
     );
@@ -806,7 +817,18 @@ fn a_skipping_write_supersedes_the_debt_instead_of_paying_it_over_the_skip() {
     assert!(
         state
             .pending_writebacks
-            .arm(7, W, H, map_generation)
+            .arm(
+                7,
+                crate::runtime::writeback_debt::test_resident_identity(
+                    7,
+                    W,
+                    H,
+                    u64::from(map_generation),
+                ),
+                W,
+                H,
+                map_generation,
+            )
             .is_none()
     );
     assert!(write_bgra8(&mut state, &mut host, 7, &frame, W * 4, W, H));

@@ -9929,7 +9929,7 @@ fn arm_surface_writeback_debt<M: HostMemory + HostOps>(
     // one mapping and the payment below cannot be the one just armed.
     let evicted = state
         .pending_writebacks
-        .arm(mapping_id, width, height, map_generation);
+        .arm(mapping_id, identity.clone(), width, height, map_generation);
     if let Some(evicted) = evicted {
         crate::runtime::drain::note_store_route("wbdebt_evicted");
         if !crate::runtime::writeback_debt::pay_key(state, host, evicted) {
@@ -10916,7 +10916,18 @@ mod vulkan_split_tests {
         assert!(
             state
                 .pending_writebacks
-                .arm(mid, w, h, map_generation)
+                .arm(
+                    mid,
+                    crate::runtime::writeback_debt::test_resident_identity(
+                        mid,
+                        w,
+                        h,
+                        u64::from(map_generation),
+                    ),
+                    w,
+                    h,
+                    map_generation,
+                )
                 .is_none(),
             "an empty ledger evicts nobody"
         );
