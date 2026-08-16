@@ -1293,6 +1293,34 @@ impl HostMemory for FakeHost {
 
 #[cfg(test)]
 impl HostOps for FakeHost {
+    /// The real ranges this fixture has mapped, as RAMBlocks.
+    ///
+    /// The default trait impl answers `CallbackMissing`, which puts the guest-RAM
+    /// map in a standing refusal. That is the right default for a `NullHost`
+    /// and it was the wrong one here: `FakeHost` models a host that *does* have
+    /// guest RAM, and every test of a rail that imports had to latch the import
+    /// limits by hand and then run against a map that had refused. The rails
+    /// that ask only the latches ran anyway, so the fixture agreed with a bug
+    /// instead of catching it — see
+    /// [`crate::runtime::guest_ram_map::packed_alias_import_align`].
+    ///
+    /// Answering from `ranges` keeps the fixture honest in both directions: a
+    /// test that maps nothing still gets a refusing map, and one that maps guest
+    /// RAM gets a host that can import it.
+    fn guest_ram_regions(
+        &mut self,
+    ) -> Result<Vec<crate::runtime::guest_ram::GuestRamRegion>, GuestRamRegionsError> {
+        Ok(self
+            .ranges
+            .iter()
+            .map(|r| crate::runtime::guest_ram::GuestRamRegion {
+                gpa_base: r.gpa,
+                host_va: r.ptr as u64,
+                len: r.len as u64,
+            })
+            .collect())
+    }
+
     fn mono_ns(&self) -> u64 {
         self.mono_ns
     }

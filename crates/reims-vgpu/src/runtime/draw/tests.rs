@@ -299,6 +299,12 @@ fn type11_zero_copy_declines_transient_host_mappings() {
 #[test]
 #[cfg(feature = "backend-vulkan")]
 fn mapping_sampled_planes_reuse_one_resource_owned_import() {
+    // The guest-RAM map resolves once per process and every test in this binary
+    // shares it, so a fixture that maps its own RAM has to discard whatever an
+    // earlier test resolved. Without this the alias rail asks a map built from
+    // some other test's host and refuses — which is the right refusal against
+    // the wrong host.
+    crate::runtime::guest_ram_map::reset();
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
@@ -414,6 +420,12 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
 #[test]
 #[cfg(feature = "backend-vulkan")]
 fn small_mapping_sampled_plane_uses_its_direct_resource() {
+    // The guest-RAM map resolves once per process and every test in this binary
+    // shares it, so a fixture that maps its own RAM has to discard whatever an
+    // earlier test resolved. Without this the alias rail asks a map built from
+    // some other test's host and refuses — which is the right refusal against
+    // the wrong host.
+    crate::runtime::guest_ram_map::reset();
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
@@ -5378,12 +5390,62 @@ fn guest_runs_decline_on_unstable_host_mappings() {
     );
 }
 
+/// A host whose guest-RAM map is standing on a refusal may not import through
+/// the packed-alias rail either.
+///
+/// The rail builds its own host allocation rather than consuming a RAMBlock, so
+/// it used to ask only the three import *latches* — granularity, span max,
+/// budget — which are published once at device create from what the host
+/// supports and stay `Some` for the whole boot. The map's refusal is a later and
+/// different judgement, about what this guest fits into that host, and
+/// `standing_refusal`'s own doc says a caller must ask it rather than re-read a
+/// latch that "is the same answer for one of the four refusals and silence for
+/// the other three".
+///
+/// Silence is the defect. `ImportExceedsHeap`'s doc says refusing the whole map
+/// rather than the oversized block is what makes it safe, because "all or
+/// nothing keeps the boot on the one arm that is tested end to end" — and this
+/// rail kept importing on exactly the host that had been taken off that arm.
+#[test]
+#[cfg(feature = "backend-vulkan")]
+fn the_packed_alias_rail_refuses_on_a_host_whose_map_refused() {
+    let page_shift = PAGE_SHIFT_X86;
+    let page = 1u64 << page_shift;
+    // A host that reports no guest RAM at all: the map resolves to a standing
+    // refusal even though every latch below is set.
+    let mut host = FakeHost::new();
+    host.stable_map_pages = true;
+    crate::runtime::guest_ram_map::reset();
+    crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
+    assert!(
+        crate::runtime::guest_ram_map::standing_refusal(&mut host).is_some(),
+        "the premise is a map that refused"
+    );
+    assert_eq!(
+        crate::runtime::guest_ram_map::packed_alias_import_align(&mut host, page),
+        None,
+        "the latches all answer, and the rail must still refuse"
+    );
+    // And the latches really do all answer, which is why asking them alone was
+    // silent about this host.
+    assert!(crate::runtime::guest_ram::granularity().is_some());
+    assert!(crate::runtime::guest_ram::import_span_max().is_some());
+    assert!(crate::runtime::guest_ram::import_budget().is_some());
+    crate::runtime::guest_ram_map::reset();
+}
+
 /// One whole-buffer host allocation is made per task/reference and offset binds
 /// become slices of it. The second lookup must not ask the host to reconstruct
 /// the same virtual range again.
 #[test]
 #[cfg(feature = "backend-vulkan")]
 fn packed_buffer_alias_is_reused_across_offsets() {
+    // The guest-RAM map resolves once per process and every test in this binary
+    // shares it, so a fixture that maps its own RAM has to discard whatever an
+    // earlier test resolved. Without this the alias rail asks a map built from
+    // some other test's host and refuses — which is the right refusal against
+    // the wrong host.
+    crate::runtime::guest_ram_map::reset();
     use crate::contract::endian::st32;
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 

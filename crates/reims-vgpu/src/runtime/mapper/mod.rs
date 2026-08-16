@@ -2014,15 +2014,13 @@ pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
     if !host.map_pages_stable() {
         return None;
     }
-    let align = crate::runtime::guest_ram::granularity()?;
-    let span_max = crate::runtime::guest_ram::import_span_max()?;
-    let budget = crate::runtime::guest_ram::import_budget()?;
     let (ptr, len, _pages) = ensure_contig_view_with_pages(state, host, mapping_id)?;
     let footprint = state.mappings.get(&mapping_id)?.contig_footprint.clone()?;
     let len = u64::try_from(len).ok()?;
-    if len > span_max || len > budget {
-        return None;
-    }
+    // The one admission rule, which asks the map's standing refusal before the
+    // latches. This site used to ask the three latches directly and so kept
+    // importing on a host whose whole RAMBlock map had been refused.
+    let align = crate::runtime::guest_ram_map::packed_alias_import_align(host, len)?;
     if let Some(import) = state
         .mappings
         .get(&mapping_id)

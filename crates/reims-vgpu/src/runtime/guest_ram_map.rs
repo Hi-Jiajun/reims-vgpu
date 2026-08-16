@@ -431,6 +431,58 @@ pub fn standing_refusal<H: HostOps + ?Sized>(host: &mut H) -> Option<MapRefusal>
     with_map(host, |resolved| resolved.refusal)
 }
 
+/// The whole admission rule for a packed-alias import, in one place.
+///
+/// The alias rails do something the RAMBlock map does not: they build a *new*
+/// host-pointer import over a host allocation they arrange themselves, so that a
+/// guest resource whose pages are scattered can still be presented to Vulkan as
+/// one contiguous range. They are the only importers outside [`resolve`].
+///
+/// # Why they may not assemble this themselves
+///
+/// They did, and it was the same three latches written by hand twice —
+/// `granularity`, `import_span_max`, `import_budget` — with the term that
+/// matters missing from both copies: [`standing_refusal`]. That is precisely
+/// what that function's doc forbids, in the sentence saying a caller must ask it
+/// "rather than re-reading `guest_ram::granularity`, which is the same answer
+/// for one of the four refusals and silence for the other three".
+///
+/// The silence is the bug. The latches are published once at device create from
+/// what the *host* supports, and they stay `Some` for the whole boot. The map's
+/// refusal is a different judgement made later, about what this *guest* fits
+/// into that host — `ImportExceedsHeap` above all, where the guest's RAMBlocks
+/// sum past the roomiest heap an import can be charged to. On such a host the
+/// map is discarded and every RAMBlock reference declines, and these two rails
+/// went on importing anyway, because every latch they asked still answered
+/// `Some`.
+///
+/// That is the reported failure and not a theoretical one: an 8 GiB-or-larger
+/// guest on a host whose importable heap is smaller boots to a black screen or
+/// dies, while the same guest with `REIMS_VGPU_GUEST_IMPORT=off` works — and
+/// `off` is the one arm that also takes these rails' latches away, which is why
+/// it was the arm that worked.
+///
+/// So the rule is one function and the answer is the alignment to import at.
+/// `None` is a refusal already named on the fail channel by whoever owns it.
+pub fn packed_alias_import_align<H: HostOps + ?Sized>(host: &mut H, len: u64) -> Option<u64> {
+    if let Some(refusal) = standing_refusal(host) {
+        // Latched by the refusal, not per call: on a host standing on one,
+        // every alias attempt of every resource refuses for the same reason and
+        // a line each would drown the channel.
+        crate::observe::Emit::decline("packed_alias_refused", &refusal)
+            .fail_once(crate::observe::Decline::slug(&refusal).as_ptr() as u64);
+        crate::runtime::drain::note_store_route("zc_packed_alias_standing_refusal");
+        return None;
+    }
+    let align = crate::runtime::guest_ram::granularity()?;
+    if len > crate::runtime::guest_ram::import_span_max()?
+        || len > crate::runtime::guest_ram::import_budget()?
+    {
+        return None;
+    }
+    Some(align)
+}
+
 /// Turn a guest physical address and a length into a bindable reference.
 ///
 /// The whole guest-memory rail goes through here. Building the imports on the

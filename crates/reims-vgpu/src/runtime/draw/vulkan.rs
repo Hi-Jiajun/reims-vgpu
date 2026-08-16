@@ -2982,17 +2982,15 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
         if !guest_run_alias_available(host) {
             return None;
         }
-        let align = crate::runtime::guest_ram::granularity()?;
         let page = state.page_size();
         let page_base = backing.gva & !(page - 1);
         let head = backing.gva - page_base;
         let map_len =
             crate::contract::checked::align_up_u64(head.checked_add(backing.size)?, page)?;
-        if map_len > crate::runtime::guest_ram::import_span_max()?
-            || map_len > crate::runtime::guest_ram::import_budget()?
-        {
-            return None;
-        }
+        // The one admission rule, which asks the map's standing refusal before
+        // the latches. Assembling it here from the latches alone is what let
+        // this rail import on a host that had already refused the whole map.
+        let align = crate::runtime::guest_ram_map::packed_alias_import_align(host, map_len)?;
         let gpas = gva_mem::task_gva_page_gpas(
             host,
             &state.tasks,
