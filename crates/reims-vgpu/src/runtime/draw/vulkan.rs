@@ -2470,11 +2470,21 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     // measured a type-5 view arriving in one, and this rail is the video-plane
     // rail. `type5_view_narrowed` below is the measurement; add the arm when it
     // fires, not before.
+    //
+    // The packed 32-bit colour formats take the native rail for the same
+    // reason and a sharper one: their channel boundaries are not byte
+    // boundaries, so `TexelLayout::Rgba8` would not merely quantize them, it
+    // would read the word as four unrelated bytes. Four bytes wide is exactly
+    // what the default arm below tests for and exactly what makes that wrong,
+    // which is why they are named here rather than left to it.
     let byte_format = match view.pixel_format {
         pixel_format::MTL_FORMAT_R8_UNORM => TexelLayout::R8,
         pixel_format::MTL_FORMAT_RG8_UNORM => TexelLayout::Rg8,
         pixel_format::MTL_FORMAT_R16_UNORM => TexelLayout::R16Unorm,
         pixel_format::MTL_FORMAT_RG16_UNORM => TexelLayout::Rg16Unorm,
+        pixel_format::MTL_FORMAT_RGB10A2_UNORM => TexelLayout::Rgb10a2Unorm,
+        pixel_format::MTL_FORMAT_BGR10A2_UNORM => TexelLayout::Bgr10a2Unorm,
+        pixel_format::MTL_FORMAT_RG11B10_FLOAT => TexelLayout::Rg11b10Float,
         _ => TexelLayout::Rgba8,
     };
     let ok_line = |generation_source: &str, rgba: &[u8]| {

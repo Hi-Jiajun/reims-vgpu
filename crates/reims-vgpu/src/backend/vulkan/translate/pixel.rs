@@ -147,6 +147,18 @@ pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {
             srgb(vk::Format::B8G8R8A8_SRGB, vk::Format::B8G8R8A8_UNORM, 4)
         }
         p::MTL_FORMAT_RGB9E5_FLOAT => linear(vk::Format::E5B9G9R9_UFLOAT_PACK32, 4),
+        // The packed 32-bit colour family. Each Vulkan spelling is the same
+        // word cut the same way as its Metal one — `A2B10G10R10` puts red in
+        // the low bits as `RGB10A2Unorm` does, `A2R10G10B10` puts blue there as
+        // `BGR10A2Unorm` does, and `B10G11R11` is `RG11B10Float`'s word — so a
+        // guest texel is sampled unchanged rather than converted.
+        p::MTL_FORMAT_RGB10A2_UNORM => linear(vk::Format::A2B10G10R10_UNORM_PACK32, 4),
+        p::MTL_FORMAT_BGR10A2_UNORM => linear(vk::Format::A2R10G10B10_UNORM_PACK32, 4),
+        p::MTL_FORMAT_RG11B10_FLOAT => linear(vk::Format::B10G11R11_UFLOAT_PACK32, 4),
+        // `RGB10A2Uint` has no arm on purpose: an integer texel must not run
+        // through the unorm converters, so it is declared for its width in the
+        // decode contract and refused by name here, as `R8Uint` and `RG8Uint`
+        // are.
         p::MTL_FORMAT_RGBA16_UNORM => linear(vk::Format::R16G16B16A16_UNORM, 8),
         p::MTL_FORMAT_RGBA16_UINT => linear(vk::Format::R16G16B16A16_UINT, 8),
         p::MTL_FORMAT_RGBA16_FLOAT => linear(vk::Format::R16G16B16A16_SFLOAT, 8),
@@ -231,6 +243,13 @@ pub fn sampled_pixels(
         vk::Format::R16G16B16A16_UNORM => TexelLayout::Rgba16Unorm,
         vk::Format::R16G16B16A16_SFLOAT => TexelLayout::Rgba16Float,
         vk::Format::R16G16_SFLOAT => TexelLayout::Rg16Float,
+        // The packed 32-bit colour layouts, native for the reason the wide
+        // layouts above are: the word is the guest's, bit for bit, and no
+        // conversion to unorm8 could cut a ten- or eleven-bit channel without
+        // discarding what the guest picked the format for.
+        vk::Format::A2B10G10R10_UNORM_PACK32 => TexelLayout::Rgb10a2Unorm,
+        vk::Format::A2R10G10B10_UNORM_PACK32 => TexelLayout::Bgr10a2Unorm,
+        vk::Format::B10G11R11_UFLOAT_PACK32 => TexelLayout::Rg11b10Float,
         _ => return Err(TranslateReason::NoSampledLayout(mtl)),
     };
     // The format's own channel plan travels with the layout instead of being a
@@ -267,6 +286,9 @@ pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
         TexelLayout::Rgba16Unorm => vk::Format::R16G16B16A16_UNORM,
         TexelLayout::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
         TexelLayout::Rg16Float => vk::Format::R16G16_SFLOAT,
+        TexelLayout::Rgb10a2Unorm => vk::Format::A2B10G10R10_UNORM_PACK32,
+        TexelLayout::Bgr10a2Unorm => vk::Format::A2R10G10B10_UNORM_PACK32,
+        TexelLayout::Rg11b10Float => vk::Format::B10G11R11_UFLOAT_PACK32,
     }
 }
 
@@ -613,6 +635,9 @@ pub fn sampled_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
         pf::MTL_FORMAT_R16_UNORM => StorageImageFormat::R16Unorm,
         pf::MTL_FORMAT_RG16_UNORM => StorageImageFormat::Rg16Unorm,
         pf::MTL_FORMAT_RGBA16_UNORM => StorageImageFormat::Rgba16Unorm,
+        pf::MTL_FORMAT_RGB10A2_UNORM => StorageImageFormat::Rgb10a2Unorm,
+        pf::MTL_FORMAT_BGR10A2_UNORM => StorageImageFormat::Bgr10a2Unorm,
+        pf::MTL_FORMAT_RG11B10_FLOAT => StorageImageFormat::Rg11b10Float,
         _ => return storage_image(mtl),
     };
     translate(mtl)?;
@@ -718,6 +743,9 @@ pub fn vk_storage_image(format: StorageImageFormat) -> vk::Format {
         StorageImageFormat::R16Unorm => vk::Format::R16_UNORM,
         StorageImageFormat::Rg16Unorm => vk::Format::R16G16_UNORM,
         StorageImageFormat::Rgba16Unorm => vk::Format::R16G16B16A16_UNORM,
+        StorageImageFormat::Rgb10a2Unorm => vk::Format::A2B10G10R10_UNORM_PACK32,
+        StorageImageFormat::Bgr10a2Unorm => vk::Format::A2R10G10B10_UNORM_PACK32,
+        StorageImageFormat::Rg11b10Float => vk::Format::B10G11R11_UFLOAT_PACK32,
     }
 }
 
@@ -1126,6 +1154,24 @@ mod tests {
             vk::Format::B8G8R8A8_SRGB,
             4,
             TransferFunction::Srgb,
+        ),
+        (
+            p::MTL_FORMAT_RGB10A2_UNORM,
+            vk::Format::A2B10G10R10_UNORM_PACK32,
+            4,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_RG11B10_FLOAT,
+            vk::Format::B10G11R11_UFLOAT_PACK32,
+            4,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_BGR10A2_UNORM,
+            vk::Format::A2R10G10B10_UNORM_PACK32,
+            4,
+            TransferFunction::Linear,
         ),
         (
             p::MTL_FORMAT_RGB9E5_FLOAT,
@@ -1723,6 +1769,13 @@ mod tests {
                 p::MTL_FORMAT_RGBA8_UNORM_SRGB,
                 p::MTL_FORMAT_BGRA8_UNORM,
                 p::MTL_FORMAT_BGRA8_UNORM_SRGB,
+                // The packed 32-bit colour family, whose channel boundaries are
+                // not byte boundaries — so the CPU rung could not have served
+                // them at all and the refusal was the whole loss. `BGR10A2Unorm`
+                // is the member a guest was measured binding.
+                p::MTL_FORMAT_RGB10A2_UNORM,
+                p::MTL_FORMAT_RG11B10_FLOAT,
+                p::MTL_FORMAT_BGR10A2_UNORM,
                 // The ten-bit biplanar video planes and the four-channel
                 // sixteen-bit unorm. These three were carried by `translate`
                 // and by the layout table but were absent from `EXPECTED`, so

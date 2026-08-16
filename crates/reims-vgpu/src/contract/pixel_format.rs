@@ -81,8 +81,50 @@ pub const MTL_FORMAT_RGBA8_UINT: u16 = 0x49;
 pub const MTL_FORMAT_RGBA8_SINT: u16 = 0x4a;
 pub const MTL_FORMAT_BGRA8_UNORM: u16 = 0x50;
 pub const MTL_FORMAT_BGRA8_UNORM_SRGB: u16 = 0x51;
+/// `MTLPixelFormatRGB10A2Unorm`. Ten bits per colour channel and two of alpha,
+/// packed into one 32-bit word with red in the low bits.
+///
+/// # Why the packed family is declared together, and why it is native
+///
+/// Metal numbers `RGB10A2Unorm`, `RGB10A2Uint`, `RG11B10Float`, `RGB9E5Float`
+/// and `BGR10A2Unorm` consecutively from 90; this table carried the fourth of
+/// the five and none of the others, so a guest naming any of the rest was
+/// refused at the *width* gate — `bytes_per_pixel` answered `None`, and
+/// [`crate::runtime::draw::effective_view_sample_format`] asks that before
+/// anything else looks at the bind. The refusal reads as "the guest asked for an
+/// illegal reinterpretation" when what happened is that this crate had never
+/// heard of the format. That is the same gap [`MTL_FORMAT_R8_UINT`] records, one
+/// storage shape over.
+///
+/// Unlike that one, three of these have an *exact* Vulkan spelling, so they do
+/// not stop at being declared: `A2B10G10R10_UNORM_PACK32`,
+/// `A2R10G10B10_UNORM_PACK32` and `B10G11R11_UFLOAT_PACK32` are the same bits in
+/// the same order, so the guest's own word is sampled unchanged. Converting one
+/// to unorm8 instead would throw away the two bits of colour resolution the
+/// guest chose the format for, which is [`TexelLayout::R16Unorm`]'s argument at
+/// a different bit depth — and [`texel_to_rgba8`] has no arm that could do it
+/// anyway.
+///
+/// This device advertises `isRGB10A2GammaSupported` to the guest
+/// (`model::regs::DEVICE_INFO_KEY_RGB10A2_GAMMA`), so a guest taking it at its
+/// word and binding one of these was being refused by the device that invited it.
+pub const MTL_FORMAT_RGB10A2_UNORM: u16 = 0x5a;
+/// `MTLPixelFormatRGB10A2Uint`. The integer twin of
+/// [`MTL_FORMAT_RGB10A2_UNORM`], declared for its width and nothing more:
+/// integer texels must not run through the unorm converters, so it has no
+/// [`TexelLayout`] and no storage selector, and both decline it by name. Same
+/// rule as [`MTL_FORMAT_R8_UINT`].
+pub const MTL_FORMAT_RGB10A2_UINT: u16 = 0x5b;
+/// `MTLPixelFormatRG11B10Float`. Eleven bits of red and green, ten of blue, no
+/// alpha, in one 32-bit word — `VK_FORMAT_B10G11R11_UFLOAT_PACK32` exactly. An
+/// HDR-intermediate colour format; see [`MTL_FORMAT_RGB10A2_UNORM`].
+pub const MTL_FORMAT_RG11B10_FLOAT: u16 = 0x5c;
 /// Packed RGB9E5 shared-exponent float. 32-bit texels.
 pub const MTL_FORMAT_RGB9E5_FLOAT: u16 = 0x5d;
+/// `MTLPixelFormatBGR10A2Unorm`. [`MTL_FORMAT_RGB10A2_UNORM`] with the colour
+/// channels the other way round in the word — `VK_FORMAT_A2R10G10B10_UNORM_PACK32`
+/// exactly, as `BGRA8Unorm` is to `RGBA8Unorm` one storage shape up.
+pub const MTL_FORMAT_BGR10A2_UNORM: u16 = 0x5e;
 /// `MTLPixelFormatRGBA16Unorm`. Its ordinal sits between two this table
 /// already carries — `RGBA16Uint` at `0x71` and `RGBA16Float` at `0x73` — and
 /// its absence was a decode gap rather than a rail gap: `bytes_per_pixel`
@@ -242,6 +284,27 @@ pub enum TexelLayout {
     /// wide, so like [`Self::Rgba16Float`] it stays out of the four-byte colour
     /// rails despite being a colour order.
     Rgba16Unorm,
+    /// 4 bytes/texel — ten bits per colour channel and two of alpha in one
+    /// packed word, red in the low bits, sampled natively as
+    /// `A2B10G10R10_UNORM_PACK32`.
+    ///
+    /// `MTLPixelFormatRGB10A2Unorm` and that Vulkan format are the same bits in
+    /// the same order, so the guest's word is sampled unchanged. Native for
+    /// [`Self::R16Unorm`]'s reason two bits down: an unorm8 conversion would
+    /// discard the resolution the guest picked the format for, and
+    /// [`texel_to_rgba8`] has no arm that could cut a non-byte channel boundary
+    /// anyway. Four bytes wide and **not** a byte-order colour layout, so it
+    /// stays out of the RGBA8-shaped loaders and `is_four_byte_color`.
+    Rgb10a2Unorm,
+    /// 4 bytes/texel — [`Self::Rgb10a2Unorm`] with the colour channels the
+    /// other way round in the word, sampled natively as
+    /// `A2R10G10B10_UNORM_PACK32`. The same relation `Bgra8` has to `Rgba8`,
+    /// one storage shape up.
+    Bgr10a2Unorm,
+    /// 4 bytes/texel — eleven bits of red and green, ten of blue, no alpha,
+    /// sampled natively as `B10G11R11_UFLOAT_PACK32`. An HDR-intermediate
+    /// colour format, native for the same reason as its two neighbours.
+    Rg11b10Float,
 }
 
 impl TexelLayout {
@@ -265,6 +328,9 @@ impl TexelLayout {
         Self::Rgba16Float,
         Self::Rg16Float,
         Self::Rgba16Unorm,
+        Self::Rgb10a2Unorm,
+        Self::Bgr10a2Unorm,
+        Self::Rg11b10Float,
     ];
 
     /// This layout's position in [`Self::ALL`], so a host-side table can be an
@@ -288,6 +354,9 @@ impl TexelLayout {
             Self::Rgba16Float => 8,
             Self::Rg16Float => 9,
             Self::Rgba16Unorm => 10,
+            Self::Rgb10a2Unorm => 11,
+            Self::Bgr10a2Unorm => 12,
+            Self::Rg11b10Float => 13,
         }
     }
 
@@ -304,6 +373,7 @@ impl TexelLayout {
             Self::Rgba16Float => RGBA16F_BPP,
             Self::Rg16Float => RG16F_BPP,
             Self::Rgba16Unorm => RGBA16_BPP,
+            Self::Rgb10a2Unorm | Self::Bgr10a2Unorm | Self::Rg11b10Float => RGBA8_BPP,
         }
     }
 
@@ -348,11 +418,18 @@ impl TexelLayout {
             // the same reason and a different quantity: `texel_to_rgba8` has no
             // arm for them because an arm would have to narrow ten bits of video
             // luma to eight.
+            //
+            // The three packed 32-bit colour layouts answer `false` for a third
+            // reason: their channels do not sit on byte boundaries at all, so
+            // there is nothing for a byte-shaped loader to pick up.
             Self::R16Float
             | Self::R32Float
             | Self::R16Unorm
             | Self::Rg16Unorm
-            | Self::Rgba16Unorm => false,
+            | Self::Rgba16Unorm
+            | Self::Rgb10a2Unorm
+            | Self::Bgr10a2Unorm
+            | Self::Rg11b10Float => false,
         }
     }
 
@@ -381,7 +458,10 @@ impl TexelLayout {
             | Self::R32Float
             | Self::R16Unorm
             | Self::Rg16Unorm
-            | Self::Rgba16Unorm => false,
+            | Self::Rgba16Unorm
+            | Self::Rgb10a2Unorm
+            | Self::Bgr10a2Unorm
+            | Self::Rg11b10Float => false,
         }
     }
 
@@ -539,7 +619,15 @@ pub fn bytes_per_pixel(format: u16) -> Option<u32> {
         | MTL_FORMAT_R32_UINT
         | MTL_FORMAT_R32_SINT
         | MTL_FORMAT_R32_FLOAT
+        // The packed families are four bytes for the same reason the byte
+        // orders are: one 32-bit word per texel. What differs is where the
+        // channel boundaries fall inside it, which is the format code's answer
+        // and not the width's.
         | MTL_FORMAT_RGB9E5_FLOAT
+        | MTL_FORMAT_RGB10A2_UNORM
+        | MTL_FORMAT_RGB10A2_UINT
+        | MTL_FORMAT_RG11B10_FLOAT
+        | MTL_FORMAT_BGR10A2_UNORM
         | MTL_FORMAT_DEPTH32_FLOAT
         | MTL_FORMAT_DEPTH24_UNORM_STENCIL8
         | MTL_FORMAT_X24_STENCIL8 => RGBA8_BPP,
@@ -1447,11 +1535,21 @@ pub fn expand_rgba8_to_texel(
         // has been observed declaring a two-channel eight-bit render target, and
         // the arm is trivial to add when one is. Admitting a layout costs three
         // conversions and a census line, so they are added on measurement.
+        //
+        // The three packed 32-bit colour layouts are here because
+        // `render_target_bpp` does not admit their formats: no guest has been
+        // observed declaring a render target in one, so there is no seed to
+        // convert and an arm would be a conversion written against nothing. Add
+        // both halves together if one is ever measured — the obligation
+        // `render_target_bpp` states runs in that direction.
         TexelLayout::Rg8
         | TexelLayout::R32Float
         | TexelLayout::R16Unorm
         | TexelLayout::Rg16Unorm
-        | TexelLayout::Rgba16Unorm => return false,
+        | TexelLayout::Rgba16Unorm
+        | TexelLayout::Rgb10a2Unorm
+        | TexelLayout::Bgr10a2Unorm
+        | TexelLayout::Rg11b10Float => return false,
     }
     true
 }
@@ -1543,7 +1641,10 @@ pub fn narrow_texel_to_rgba8(
         | TexelLayout::R32Float
         | TexelLayout::R16Unorm
         | TexelLayout::Rg16Unorm
-        | TexelLayout::Rgba16Unorm => return false,
+        | TexelLayout::Rgba16Unorm
+        | TexelLayout::Rgb10a2Unorm
+        | TexelLayout::Bgr10a2Unorm
+        | TexelLayout::Rg11b10Float => return false,
     }
     true
 }
@@ -2500,6 +2601,9 @@ mod tests {
                 TexelLayout::Rgba16Float => MTL_FORMAT_RGBA16_FLOAT,
                 TexelLayout::Rg16Float => MTL_FORMAT_RG16_FLOAT,
                 TexelLayout::Rgba16Unorm => MTL_FORMAT_RGBA16_UNORM,
+                TexelLayout::Rgb10a2Unorm => MTL_FORMAT_RGB10A2_UNORM,
+                TexelLayout::Bgr10a2Unorm => MTL_FORMAT_BGR10A2_UNORM,
+                TexelLayout::Rg11b10Float => MTL_FORMAT_RG11B10_FLOAT,
             };
             assert_eq!(
                 Some(layout.bytes_per_texel()),

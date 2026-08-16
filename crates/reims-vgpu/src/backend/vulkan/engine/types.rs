@@ -1563,6 +1563,30 @@ pub enum StorageImageFormat {
     /// `R16G16B16A16_UNORM` and `STORAGE_IMAGE` is not, which is the whole of why
     /// it sits here rather than in the storage selector.
     Rgba16Unorm,
+    /// Ten bits per colour channel and two of alpha in one packed word, red in
+    /// the low bits (`MTLPixelFormatRGB10A2Unorm`); **sampled-image only**.
+    ///
+    /// Here for [`Self::R16Unorm`]'s reason: Vulkan mandates
+    /// `A2B10G10R10_UNORM_PACK32` for `SAMPLED_IMAGE` and
+    /// `SAMPLED_IMAGE_FILTER_LINEAR` and mandates nothing for `STORAGE_IMAGE`,
+    /// so it is reachable through `translate::pixel::sampled_image` and not
+    /// through `translate::pixel::storage_image`.
+    Rgb10a2Unorm,
+    /// [`Self::Rgb10a2Unorm`] with the colour channels the other way round in
+    /// the word (`MTLPixelFormatBGR10A2Unorm`); **sampled-image only**.
+    ///
+    /// One caveat its two neighbours do not carry:
+    /// `A2R10G10B10_UNORM_PACK32` is **not** in Vulkan's mandatory format
+    /// table at all, where `A2B10G10R10_UNORM_PACK32` and
+    /// `B10G11R11_UFLOAT_PACK32` are. A host without it fails image creation
+    /// and declines by name, which is the same work the guest lost when the
+    /// format was refused at decode — but a capability gate would say so before
+    /// the allocation rather than after it, and that gate is not written.
+    Bgr10a2Unorm,
+    /// Eleven bits of red and green, ten of blue, no alpha, in one packed word
+    /// (`MTLPixelFormatRG11B10Float`); **sampled-image only**, for
+    /// [`Self::Rgb10a2Unorm`]'s reason.
+    Rg11b10Float,
 }
 
 impl StorageImageFormat {
@@ -1586,7 +1610,10 @@ impl StorageImageFormat {
             | Self::R32Uint
             | Self::R32Sint
             | Self::R32Float
-            | Self::Rgb9e5Ufloat => 4,
+            | Self::Rgb9e5Ufloat
+            | Self::Rgb10a2Unorm
+            | Self::Bgr10a2Unorm
+            | Self::Rg11b10Float => 4,
         }
     }
 }

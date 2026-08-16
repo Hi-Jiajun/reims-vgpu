@@ -3,6 +3,28 @@
 use crate::contract::pixel_format::StorageImageSelector;
 use metal::MTLPixelFormat;
 
+/// The packed 32-bit colour family's wire codes are Apple's own ordinals.
+///
+/// The decode contract states that its `MTL_FORMAT_*` values *are*
+/// `MTLPixelFormat` discriminants, and for most of the table nothing checks it —
+/// a wrong constant would simply decline a format the guest sends, which reads
+/// as an unsupported guest rather than as a typo. These five sit in one
+/// consecutive run that this table carried only the middle of, so the run's
+/// numbering is the fact worth pinning: get one wrong and the neighbour's
+/// meaning is what the guest gets.
+///
+/// `rustc` evaluates these on every arm that compiles this file, including the
+/// cross-compiled `--target aarch64-apple-darwin` clippy run, so a Linux host
+/// checks them too.
+const _: () = {
+    use crate::contract::pixel_format as pf;
+    assert!(pf::MTL_FORMAT_RGB10A2_UNORM as u64 == MTLPixelFormat::RGB10A2Unorm as u64);
+    assert!(pf::MTL_FORMAT_RGB10A2_UINT as u64 == MTLPixelFormat::RGB10A2Uint as u64);
+    assert!(pf::MTL_FORMAT_RG11B10_FLOAT as u64 == MTLPixelFormat::RG11B10Float as u64);
+    assert!(pf::MTL_FORMAT_RGB9E5_FLOAT as u64 == MTLPixelFormat::RGB9E5Float as u64);
+    assert!(pf::MTL_FORMAT_BGR10A2_UNORM as u64 == MTLPixelFormat::BGR10A2Unorm as u64);
+};
+
 /// The Metal pixel format and texel width for a contract [`StorageImageSelector`].
 ///
 /// **Total, and it has to be.** This used to match the selector's `u32` ordinal
