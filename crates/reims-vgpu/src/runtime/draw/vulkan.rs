@@ -9750,13 +9750,33 @@ pub(crate) fn gva_chain_identity(
 /// rather than decline.
 pub(crate) fn gva_resident_format(format: u16) -> ash::vk::Format {
     use crate::backend::vulkan::translate::pixel;
-    let Some(layout) = pixel_format::store_texel_order(format) else {
+    // The declaration the *attachment* will be built from, folded onto its
+    // allocation family, which is what `registry_ensure` creates the image in.
+    //
+    // Asked of `color_attachment` and not of `store_texel_order`, which is what
+    // this used to ask and which is a different question — that one says whether
+    // a resident's texels can be byte-copied into guest pages, and it answers
+    // for three formats where `render_target_bpp` admits six. A guest render
+    // target declared `R8Unorm`, `R16Float` or `RG16Float` therefore built its
+    // image at one to four bytes a texel through `color_attachment` while its
+    // identity claimed `RESIDENT_RGBA_FORMAT` and four, so everything keyed off
+    // the identity — `bytes_per_texel`, the readback size, `stored_bytes_agree`
+    // — read the wrong width for the image it was describing. `R16Float` and
+    // `RG16Float` are both in the guest's vocabulary on boots on record.
+    let Ok((attachment, _)) = pixel::color_attachment(format) else {
         return pixel::RESIDENT_RGBA_FORMAT;
     };
-    if !crate::backend::vulkan::engine::render_target_layout_supported(layout) {
-        return pixel::RESIDENT_RGBA_FORMAT;
+    let allocation = pixel::ResidentFormat::of(attachment).allocation();
+    match pixel::texel_layout_of(allocation) {
+        // Capability, never an API-version assumption: the host is asked whether
+        // it renders to and blends this layout.
+        Some(layout)
+            if crate::backend::vulkan::engine::render_target_layout_supported(layout) =>
+        {
+            allocation
+        }
+        _ => pixel::RESIDENT_RGBA_FORMAT,
     }
-    pixel::vk_texel_layout(layout)
 }
 
 /// Read a resident render-pass chain back to host memory so the exec loop can

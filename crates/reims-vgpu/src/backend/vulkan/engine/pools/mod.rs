@@ -1870,11 +1870,17 @@ pub(crate) struct ResidentTargetSlot {
     /// What last touched this image, and where that left it. See
     /// [`ResidentAccess`] for why these are one field and not two.
     pub access: ResidentAccess,
-    /// Concrete Vulkan attachment format the image was created with. Every
-    /// question about this resident's channel order is asked of this field,
-    /// through [`ResidentTargetSlot::scanout_order`] — a format change forces an
-    /// image recreate, not just a framebuffer rebuild.
-    pub color_format: vk::Format,
+    /// The format the guest declared for this resident, and — through
+    /// [`translate::pixel::ResidentFormat`] — the allocation family that
+    /// declaration belongs to.
+    ///
+    /// One field for both because they are one fact asked two ways: the image
+    /// is created in `format.allocation()`, the render pass attaches
+    /// `format.declared()`, and a change of *allocation* forces a recreate while
+    /// a change of *declaration alone* is another view over the image already
+    /// there. Every question about this resident's channel order is asked of
+    /// this field, through [`ResidentTargetSlot::scanout_order`].
+    pub format: translate::pixel::ResidentFormat,
     /// Deferred render-Store pin count: this target's content exists only on
     /// the GPU (guest pages stale). The registry LRU sweep skips slots with a
     /// nonzero count. A count (not a bool) because a surface with several
@@ -2020,7 +2026,7 @@ impl ResidentTargetSlot {
     /// one slot. `resident_color` maps the two `bgra` values onto two distinct
     /// formats, so this test answers both arms identically.
     pub(crate) fn scanout_order(&self) -> bool {
-        translate::pixel::has_bgra_order(self.color_format)
+        translate::pixel::has_bgra_order(self.format.declared())
     }
 
     /// The framebuffer this slot owes the deferred-destroy path, or `None` when
@@ -2075,7 +2081,17 @@ impl ResidentTargetSlot {
     /// framebuffer with an RGBA8 render pass over an `RG16Float` view, which
     /// Vulkan does not allow the attachment formats to disagree on.
     ///
-    /// `color_format` decides it for both, and it subsumes the `bgra` test:
+    /// **It is the *allocation* the two arms must agree on, not the
+    /// declaration.** A guest surface bound once as `BGRA8Unorm` and once as
+    /// `BGRA8Unorm_sRGB` is one `MTLTexture` seen through two texture views, so
+    /// the second spelling must find the first's image and add a view — not miss
+    /// here, retire a live resident and recreate it empty. Comparing the
+    /// declaration is what made the two interpretations alternate frame to
+    /// frame with each holding half the content; the declaration itself rides on
+    /// the view `registry_ensure` hands back, and cannot be lost by matching on
+    /// the family.
+    ///
+    /// `format` decides it for both, and it subsumes the `bgra` test:
     /// `translate::pixel::resident_color` maps the two `bgra` values onto two
     /// distinct formats, so equal formats implies equal `bgra` for anything the
     /// primary arm created.
@@ -2092,13 +2108,13 @@ impl ResidentTargetSlot {
         height: u32,
         sample_count: u32,
         generation: u64,
-        format: vk::Format,
+        format: translate::pixel::ResidentFormat,
     ) -> bool {
         self.width == width
             && self.height == height
             && self.sample_count == sample_count
             && self.generation == generation
-            && self.color_format == format
+            && self.format.allocation() == format.allocation()
     }
 }
 
@@ -4015,7 +4031,7 @@ mod resident_reuse_tests {
             content_ready: false,
             content_epoch: None,
             access: ResidentAccess::Untouched,
-            color_format: format,
+            format: translate::pixel::ResidentFormat::of(format),
             pin_count: 0,
             resource_released: false,
             resource_owner_count: 0,
@@ -4050,14 +4066,61 @@ mod resident_reuse_tests {
              is what made the one-bit test match"
         );
         assert!(
-            !secondary.reusable_for(64, 32, 1, 7, rgba),
+            !secondary.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(rgba)),
             "an RG16Float image must not be handed to an RGBA8 attachment"
         );
-        assert!(!secondary.reusable_for(64, 32, 1, 7, bgra));
+        assert!(!secondary.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(bgra)));
         assert!(
-            secondary.reusable_for(64, 32, 1, 7, vk::Format::R16G16_SFLOAT),
+            secondary.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(vk::Format::R16G16_SFLOAT)),
             "the secondary path must still get its own slot back"
         );
+    }
+
+    /// One surface bound through both spellings of one format is one slot.
+    ///
+    /// This is the rule `registry_ensure_attachment`'s doc has always stated and
+    /// that `reusable_for` used to contradict: `BGRA8Unorm` and
+    /// `BGRA8Unorm_sRGB` name the same stored bytes, so a guest that renders
+    /// into a surface through one and then through the other is asking for a
+    /// second texture view of one allocation. Comparing the declaration here
+    /// made the second ask a miss, which retires the live resident and recreates
+    /// it empty — the two interpretations then alternate frame to frame and each
+    /// holds half the content.
+    ///
+    /// The declaration is not lost by matching on the family: it rides on the
+    /// view `registry_ensure` hands back beside the slot, and the framebuffer is
+    /// rebuilt over that view whenever it moves.
+    #[test]
+    fn the_two_spellings_of_one_surface_share_one_allocation() {
+        use translate::pixel::ResidentFormat;
+        for (unorm, srgb) in [
+            (vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB),
+            (vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_SRGB),
+        ] {
+            for held in [unorm, srgb] {
+                let s = slot(64, 32, 7, held);
+                for asked in [unorm, srgb] {
+                    assert!(
+                        s.reusable_for(64, 32, 1, 7, ResidentFormat::of(asked)),
+                        "{held:?} must serve a request for {asked:?}"
+                    );
+                }
+                // Everything a byte-level difference separates still separates.
+                for other in [
+                    vk::Format::R8G8B8A8_UNORM,
+                    vk::Format::B8G8R8A8_UNORM,
+                    vk::Format::R16G16B16A16_SFLOAT,
+                ]
+                .into_iter()
+                .filter(|f| *f != translate::pixel::storage_format(held))
+                {
+                    assert!(
+                        !s.reusable_for(64, 32, 1, 7, ResidentFormat::of(other)),
+                        "{held:?} must not serve {other:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// The format test is a strengthening, not a replacement: everything the
@@ -4067,13 +4130,13 @@ mod resident_reuse_tests {
     fn geometry_generation_and_format_all_still_decide_reuse() {
         let rgba = translate::pixel::resident_color(false);
         let s = slot(64, 32, 7, rgba);
-        assert!(s.reusable_for(64, 32, 1, 7, rgba));
-        assert!(!s.reusable_for(65, 32, 1, 7, rgba), "width");
-        assert!(!s.reusable_for(64, 33, 1, 7, rgba), "height");
-        assert!(!s.reusable_for(64, 32, 1, 8, rgba), "generation");
-        assert!(!s.reusable_for(64, 32, 2, 7, rgba), "sample count");
+        assert!(s.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(rgba)));
+        assert!(!s.reusable_for(65, 32, 1, 7, translate::pixel::ResidentFormat::of(rgba)), "width");
+        assert!(!s.reusable_for(64, 33, 1, 7, translate::pixel::ResidentFormat::of(rgba)), "height");
+        assert!(!s.reusable_for(64, 32, 1, 8, translate::pixel::ResidentFormat::of(rgba)), "generation");
+        assert!(!s.reusable_for(64, 32, 2, 7, translate::pixel::ResidentFormat::of(rgba)), "sample count");
         assert!(
-            !s.reusable_for(64, 32, 1, 7, translate::pixel::resident_color(true)),
+            !s.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(translate::pixel::resident_color(true))),
             "format still separates the two bgra orders"
         );
     }

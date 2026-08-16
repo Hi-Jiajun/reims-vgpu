@@ -312,6 +312,58 @@ pub fn storage_format(format: vk::Format) -> vk::Format {
     }
 }
 
+/// The two formats one resident image answers for, derived from the single
+/// format the guest declared so they cannot disagree.
+///
+/// A resident is asked its format by two kinds of caller and they want two
+/// different answers:
+///
+/// * **the allocation** — what `vkCreateImage` is given, what keys reuse of a
+///   live slot, and what buckets the image in the recycle pool. Two declarations
+///   that differ only in transfer function are one `MTLTexture` seen through two
+///   `newTextureViewWithPixelFormat:` views, so they must resolve to one image.
+///   That is [`storage_format`]'s rule, and this is where it is applied.
+/// * **the declaration** — what a render pass attaches, and the stronger of the
+///   two answers a sampled bind can be given, because it carries the transfer
+///   function Vulkan applies on write and on read.
+///
+/// Both were spelled `color_format`, one `vk::Format` doing both jobs, and the
+/// two `registry_ensure*` arms picked differently: the primary one keyed the
+/// allocation on the declaration, which forks one surface into two images the
+/// moment the guest binds it through both spellings; the secondary one keyed
+/// reuse on the allocation while registering, creating and recycling under the
+/// declaration, so an sRGB resident there was retired on every ensure and its
+/// recycled image went into a bucket nothing takes from. Carrying the pair as
+/// one value is what makes those two mistakes unspellable: neither answer can be
+/// reached without naming which one it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidentFormat(vk::Format);
+
+impl ResidentFormat {
+    /// The resident behind a guest declaration of `declared`.
+    pub fn of(declared: vk::Format) -> Self {
+        Self(declared)
+    }
+
+    /// What the guest declared: the render pass's attachment format, and the
+    /// interpretation a sampled view of this resident decodes through.
+    pub fn declared(self) -> vk::Format {
+        self.0
+    }
+
+    /// The allocation family. Keys `vkCreateImage`, live-slot reuse and the
+    /// recycle bucket — never the view.
+    pub fn allocation(self) -> vk::Format {
+        storage_format(self.0)
+    }
+
+    /// Whether the declaration adds a transfer function the allocation does not
+    /// carry, so the attachment needs a view of its own over the same image.
+    pub fn needs_own_view(self) -> bool {
+        self.declared() != self.allocation()
+    }
+}
+
 /// The format a **sampled** view of a resident must be created with, given the
 /// format the bind asked for and the format the resident itself holds.
 ///
@@ -337,12 +389,33 @@ pub fn storage_format(format: vk::Format) -> vk::Format {
 ///
 /// # Why it can only ever add the transfer function
 ///
-/// The fold is gated on [`stored_bytes_agree`], so it fires only where the two
-/// spellings differ in nothing but the transfer function. A bind whose channel
-/// order or texel width differs from the resident's is left exactly as it asked
-/// — that disagreement is a real one and this is not the place to resolve it.
+/// Two gates, and both are load-bearing.
+///
+/// [`stored_bytes_agree`] means it fires only where the two spellings differ in
+/// nothing but the transfer function. A bind whose channel order or texel width
+/// differs from the resident's is left exactly as it asked — that disagreement
+/// is a real one and this is not the place to resolve it.
+///
+/// **The bind must also have had nothing to say.** Only a `requested` that is
+/// already its own [`storage_format`] — a spelling with no transfer function on
+/// it — is one the resident may answer for. A bind naming `B8G8R8A8_SRGB` over a
+/// resident written through its linear view has stated an interpretation, and
+/// Metal's contract is that a texture view's pixel format *is* the
+/// interpretation for that bind; answering with the allocation's own spelling
+/// drops the decode the bind asked for. Without this gate the function does not
+/// add a transfer function, it replaces one side's with the other's, and it goes
+/// wrong in whichever direction the resident happens to hold — which is how
+/// `resident_sample_uses_the_bindings_compatible_format_view` caught it.
+///
+/// What is left unresolved, and said rather than hidden: a bind spelled through
+/// a `TexelLayout` is linear because that vocabulary has no other spelling, so
+/// this cannot tell it from a guest that genuinely asked for a linear view of an
+/// sRGB surface. The resident wins there, which is right for every rail that
+/// reaches here through a layout and would be wrong for a rail that could say
+/// linear and meant it. Closing that needs the sampled rails to carry the
+/// guest's `MTLPixelFormat` rather than a byte layout; it is not closable here.
 pub fn sample_view_format(requested: vk::Format, resident: vk::Format) -> vk::Format {
-    if stored_bytes_agree(requested, resident) {
+    if requested == storage_format(requested) && stored_bytes_agree(requested, resident) {
         resident
     } else {
         requested
@@ -762,9 +835,14 @@ mod tests {
             // Already agreed, either way round: nothing to restore.
             assert_eq!(sample_view_format(srgb, srgb), srgb);
             assert_eq!(sample_view_format(linear, linear), linear);
-            // A resident that carries no qualifier cannot lend one, and this
-            // must not become a downgrade of a bind that already spelled it.
-            assert_eq!(sample_view_format(srgb, linear), linear);
+            // A bind that spelled the qualifier itself keeps it. The comment
+            // beside this line already said so — "this must not become a
+            // downgrade of a bind that already spelled it" — while the assertion
+            // under it demanded the downgrade, and the engine obeyed the
+            // assertion: a resident written through its linear attachment view
+            // and sampled through its sRGB sibling was bound linear and decoded
+            // nothing.
+            assert_eq!(sample_view_format(srgb, linear), srgb);
         }
     }
 
@@ -1336,6 +1414,75 @@ mod tests {
         ] {
             let once = storage_format(format);
             assert_eq!(storage_format(once), once, "{format:?} folds twice");
+        }
+    }
+
+    /// Every renderable declaration's allocation is a [`TexelLayout`] this
+    /// device can name.
+    ///
+    /// `TargetIdentity::resident_format`'s doc calls itself "the answer
+    /// `registry_ensure` creates the image with", and
+    /// `draw::vulkan::gva_resident_format` is what has to make that true: it
+    /// takes the same `color_attachment` result the image is built from, folds
+    /// it here, and then asks the host about the resulting layout. That last
+    /// step is only total while this holds.
+    ///
+    /// It did not. `gva_resident_format` used to ask `store_texel_order`, which
+    /// is the *writeback* question — can these texels be byte-copied into guest
+    /// pages — and answers for three formats where `render_target_bpp` admits
+    /// six. `R8Unorm`, `R16Float` and `RG16Float` render targets therefore got
+    /// an identity claiming `RESIDENT_RGBA_FORMAT` over an image built at their
+    /// own width, and two of the three are in the guest's vocabulary on boots on
+    /// record. Two independently-maintained tables, so this is the relation
+    /// between them; walking every `u16` means a format added to one and not the
+    /// other cannot slip past by being absent from a hand-written list.
+    #[test]
+    fn every_renderable_declaration_folds_onto_a_layout_this_device_names() {
+        for mtl in 0..=u16::MAX {
+            let Ok((attachment, _)) = color_attachment(mtl) else {
+                continue;
+            };
+            let allocation = ResidentFormat::of(attachment).allocation();
+            assert!(
+                texel_layout_of(allocation).is_some(),
+                "renderable {mtl:#x} allocates as {allocation:?}, which no \
+                 TexelLayout names — its resident identity cannot describe it"
+            );
+            assert_eq!(
+                bytes_per_texel(allocation),
+                Some(p::render_target_bpp(mtl).expect("color_attachment admitted it")),
+                "{mtl:#x}: the allocation and the contract disagree on width"
+            );
+        }
+    }
+
+    /// A resident's two answers are the two questions the registry asks, and
+    /// only the sRGB pair may separate them.
+    ///
+    /// The second half is what makes the type cheap: on every format this
+    /// device renders to except the two sRGB spellings, the allocation and the
+    /// declaration are the same `vk::Format`, so no extra view is ever created
+    /// and `needs_own_view` answers false. A change that made some third format
+    /// fold would show up here as a new pair rather than as a silent extra view
+    /// per resident.
+    #[test]
+    fn a_residents_allocation_and_declaration_part_only_on_the_transfer_function() {
+        for (declared, allocation) in [
+            (vk::Format::B8G8R8A8_SRGB, vk::Format::B8G8R8A8_UNORM),
+            (vk::Format::R8G8B8A8_SRGB, vk::Format::R8G8B8A8_UNORM),
+        ] {
+            let f = ResidentFormat::of(declared);
+            assert_eq!(f.declared(), declared);
+            assert_eq!(f.allocation(), allocation);
+            assert!(f.needs_own_view(), "{declared:?}");
+            // The two spellings of one surface reach one allocation, which is
+            // the whole reason the pair exists.
+            assert_eq!(ResidentFormat::of(allocation).allocation(), allocation);
+        }
+        for layout in TexelLayout::ALL {
+            let f = ResidentFormat::of(vk_texel_layout(*layout));
+            assert_eq!(f.allocation(), f.declared(), "{layout:?}");
+            assert!(!f.needs_own_view(), "{layout:?}");
         }
     }
 

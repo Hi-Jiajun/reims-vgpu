@@ -52,7 +52,11 @@ struct NewResident {
     height: u32,
     sample_count: u32,
     generation: u64,
-    color_format: vk::Format,
+    format: translate::pixel::ResidentFormat,
+    /// The view in `format.declared()`, when the declaration needs one of its
+    /// own. `None` says the declaration and the allocation are one format and
+    /// `view` serves both, which is every format but the two sRGB spellings.
+    attachment_view: Option<vk::ImageView>,
 }
 
 impl ResourcePools {
@@ -693,29 +697,55 @@ impl ResourcePools {
         format: vk::Format,
         counters: &EngineCounters,
     ) -> Result<Option<vk::ImageView>, DrawError> {
+        let Some(slot) = self.registry.get(identity) else {
+            return Ok(None);
+        };
+        let format = translate::pixel::sample_view_format(format, slot.format.declared());
+        unsafe { self.registry_view(ctx, identity, format, counters) }
+    }
+
+    /// The view over this resident's allocation in exactly `format`, created and
+    /// retained on first ask.
+    ///
+    /// One home for every interpretation of one image, which is what lets
+    /// `slot.view` be the *allocation*-format view and nothing else. That
+    /// choice is load-bearing rather than arbitrary: the recycle pool is keyed
+    /// on the allocation format, so the view that travels with a retired image
+    /// must be the one in that format, and a slot whose stored view was the
+    /// guest's declaration instead would put an sRGB view into a bucket only
+    /// UNORM requests ever take from. Every other interpretation — the render
+    /// pass's attachment view included — is reached through here.
+    ///
+    /// A caller asking for the format the slot was allocated in gets
+    /// `slot.view` and no allocation happens, which is every format this device
+    /// renders to except the two sRGB spellings.
+    unsafe fn registry_view(
+        &mut self,
+        ctx: &DeviceContext,
+        identity: &TargetIdentity,
+        format: vk::Format,
+        counters: &EngineCounters,
+    ) -> Result<Option<vk::ImageView>, DrawError> {
         let Some(slot) = self.registry.get_mut(identity) else {
             return Ok(None);
         };
-        let format = translate::pixel::sample_view_format(format, slot.color_format);
-        if slot.color_format == format {
+        if slot.format.allocation() == format {
             return Ok(Some(slot.view));
         }
         if let Some((_, view)) = slot.alternate_views.iter().find(|(held, _)| *held == format) {
             return Ok(Some(*view));
         }
-        let view = ctx
-            .device
-            .create_image_view(
+        let view = unsafe {
+            ctx.device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
                     .image(slot.image)
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(format)
-                    .subresource_range(color_subresource_range()),
+                    .subresource_range(super::super::registry_subresource_range(format)),
                 None,
             )
-            .map_err(|error| {
-                DrawError::VkCall(VkCall::new(VkOp::PoolsCreateRegistryView, error))
-            })?;
+        }
+        .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateRegistryView, error)))?;
         counters.note_create(CreateSite::RegistryImageView);
         slot.alternate_views.push((format, view));
         Ok(Some(view))
@@ -809,7 +839,16 @@ impl ResourcePools {
                 image: new.image,
                 memory: new.memory,
                 view: new.view,
-                alternate_views: Vec::new(),
+                // Seeded rather than left empty: the declaration's view is one
+                // more interpretation of this allocation, and `alternate_views`
+                // is where every interpretation but the allocation's own lives,
+                // so putting it anywhere else would give `registry_view` a
+                // second place to look and `retire_resident` a view it does not
+                // dispose.
+                alternate_views: new
+                    .attachment_view
+                    .map(|v| vec![(new.format.declared(), v)])
+                    .unwrap_or_default(),
                 framebuffer: new.framebuffer,
                 render_pass: new.render_pass,
                 framebuffer_compatibility: new.framebuffer_compatibility,
@@ -824,7 +863,7 @@ impl ResourcePools {
                 } else {
                     ResidentAccess::Untouched
                 },
-                color_format: new.color_format,
+                format: new.format,
                 pin_count: 0,
                 resource_released: false,
                 resource_owner_count: 0,
@@ -883,7 +922,7 @@ impl ResourcePools {
                 width: old.width,
                 height: old.height,
                 sample_count: old.sample_count,
-                format: old.color_format,
+                format: old.format.allocation(),
             }),
             ResidentMemory::GuestImported { guest } => DeferredHandle::GuestImage {
                 image: old.image,
@@ -926,29 +965,48 @@ impl ResourcePools {
         format: vk::Format,
         guest_memory: Option<crate::backend::vulkan::engine::GuestTargetMemory>,
         counters: &EngineCounters,
-    ) -> Result<&ResidentTargetSlot, DrawError> {
+    ) -> Result<(&ResidentTargetSlot, vk::ImageView), DrawError> {
         // The format arrives resolved rather than as a channel-order flag, and
         // from the same variable that built `render_pass`'s key — an image and
         // the pass it is attached to must name one format, and deriving it
         // twice from a shared input is how they drift apart.
         //
-        // Compatible geometry + gen + format: reuse image; rebuild the FB only
-        // if Vulkan render-pass compatibility changed. A format change must
-        // recreate the image, not just the framebuffer — an RGBA image under a
-        // BGRA pass is invalid.
+        // It is the guest's *declaration*, so it carries the transfer function
+        // and the allocation behind it does not. The view handed back beside the
+        // slot is the attachment view, in that declaration; `slot.view` and the
+        // recycle bucket stay in the allocation format. See
+        // [`translate::pixel::ResidentFormat`].
+        let format = translate::pixel::ResidentFormat::of(format);
+        // Compatible geometry + gen + allocation: reuse image; rebuild the FB
+        // only if Vulkan render-pass compatibility changed. A change of
+        // allocation must recreate the image, not just the framebuffer — an RGBA
+        // image under a BGRA pass is invalid.
         if let Some(slot) = self.registry.get(&identity) {
             if slot.reusable_for(width, height, sample_count, generation, format) {
-                if slot.framebuffer_compatibility == Some(framebuffer_compatibility) {
+                // Resolved before the fast path rather than inside the rebuild,
+                // because a declaration that changed while the allocation did
+                // not is exactly the case the fast path must *not* take: the
+                // framebuffer it would hand back was built over the previous
+                // interpretation's view.
+                let attachment = unsafe {
+                    self.registry_view(ctx, &identity, format.declared(), counters)?
+                }
+                .expect("the slot reused on the line above is still registered");
+                let slot = self.registry.get(&identity).unwrap();
+                if slot.framebuffer_compatibility == Some(framebuffer_compatibility)
+                    && slot.format == format
+                {
                     counters
                         .gpu_load_hits
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let touch = self.idle_clock_ms;
                     let slot = self.registry.get_mut(&identity).unwrap();
                     slot.last_touch_ms = touch;
-                    return Ok(slot);
+                    return Ok((slot, attachment));
                 }
-                // Same image, new pass → recreate framebuffer only.
-                let view = slot.view;
+                // Same image, new pass or new interpretation → recreate
+                // framebuffer only.
+                let view = attachment;
                 let old_fb = slot.owed_framebuffer();
                 let attachments = [view];
                 let framebuffer = ctx
@@ -971,12 +1029,17 @@ impl ResourcePools {
                 slot.framebuffer = framebuffer;
                 slot.render_pass = render_pass;
                 slot.framebuffer_compatibility = Some(framebuffer_compatibility);
+                // The interpretation this framebuffer was just built over. The
+                // allocation is unchanged — `reusable_for` matched on it — so
+                // this is the one field a second texture view of one surface
+                // moves.
+                slot.format = format;
                 counters
                     .gpu_load_hits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Ok(self.registry.get(&identity).unwrap());
+                return Ok((self.registry.get(&identity).unwrap(), attachment));
             }
-            // Geometry/gen mismatch → destroy and recreate.
+            // Geometry/gen/allocation mismatch → destroy and recreate.
             if let Some(old) =
                 self.retire_resident(ctx, &identity, ResidentReclaim::Recreated, counters)
             {
@@ -1016,7 +1079,7 @@ impl ResourcePools {
                 memory.backing,
                 width,
                 height,
-                format,
+                format.allocation(),
                 usage,
             ) {
                 Ok(imported) => Some(imported),
@@ -1024,10 +1087,10 @@ impl ResourcePools {
                     crate::runtime::drain::note_store_route("target_shared_declined");
                     let key = crate::backend::hash::hash_u64(
                         crate::backend::hash::hash_bytes(reason.slug().as_bytes()),
-                        format.as_raw() as u32 as u64,
+                        format.allocation().as_raw() as u32 as u64,
                     );
                     crate::observe::Emit::decline("vk_guest_target", &reason)
-                        .field("format", format!("{format:?}"))
+                        .field("format", format!("{:?}", format.allocation()))
                         .field("width", width)
                         .field("height", height)
                         .fail_once(key);
@@ -1042,7 +1105,7 @@ impl ResourcePools {
                 &vk::ImageViewCreateInfo::default()
                     .image(imported.image)
                     .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(format)
+                    .format(format.allocation())
                     .subresource_range(color_subresource_range()),
                 None,
             ) {
@@ -1070,7 +1133,9 @@ impl ResourcePools {
                 },
                 view,
             )
-        } else if let Some(free) = self.take_free_target(width, height, sample_count, format) {
+        } else if let Some(free) =
+            self.take_free_target(width, height, sample_count, format.allocation())
+        {
             (
                 free.image,
                 ResidentMemory::Recyclable(free.memory),
@@ -1083,7 +1148,7 @@ impl ResourcePools {
                     &vk::ImageCreateInfo::default()
                         .flags(vk::ImageCreateFlags::MUTABLE_FORMAT)
                         .image_type(vk::ImageType::TYPE_2D)
-                        .format(format)
+                        .format(format.allocation())
                         .extent(vk::Extent3D {
                             width,
                             height,
@@ -1151,7 +1216,7 @@ impl ResourcePools {
                 &vk::ImageViewCreateInfo::default()
                     .image(image)
                     .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(format)
+                    .format(format.allocation())
                     .subresource_range(color_subresource_range()),
                 None,
             ) {
@@ -1168,7 +1233,49 @@ impl ResourcePools {
             counters.note_create(CreateSite::RegistryImageView);
             (image, ResidentMemory::Recyclable(memory), view)
         };
-        let attachments = [view];
+        // `view` is the allocation's; the render pass was built against the
+        // declaration, and Vulkan requires the framebuffer attachment to name
+        // that same format. They are one handle on every format that carries no
+        // transfer function, which is every format but the two sRGB spellings.
+        let attachment_view = if format.needs_own_view() {
+            match ctx.device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format.declared())
+                    .subresource_range(color_subresource_range()),
+                None,
+            ) {
+                Ok(v) => {
+                    counters.note_create(CreateSite::RegistryImageView);
+                    Some(v)
+                }
+                Err(e) => {
+                    ctx.device.destroy_image_view(view, None);
+                    match &memory {
+                        ResidentMemory::Recyclable(_) => {
+                            self.free_image_slab(&ctx.device, image);
+                            ctx.device.destroy_image(image, None);
+                        }
+                        ResidentMemory::GuestImported { guest } => {
+                            ctx.device.destroy_image(image, None);
+                            if let Some(parent) =
+                                self.host_ram_imports.release_child(&guest.import)
+                            {
+                                parent.destroy(&ctx.device);
+                            }
+                        }
+                    }
+                    return Err(DrawError::VkCall(VkCall::new(
+                        VkOp::PoolsCreateRegistryView,
+                        e,
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+        let attachments = [attachment_view.unwrap_or(view)];
         let framebuffer = match ctx.device.create_framebuffer(
             &vk::FramebufferCreateInfo::default()
                 .render_pass(render_pass)
@@ -1181,6 +1288,9 @@ impl ResourcePools {
             Ok(fb) => fb,
             Err(e) => {
                 ctx.device.destroy_image_view(view, None);
+                if let Some(extra) = attachment_view {
+                    ctx.device.destroy_image_view(extra, None);
+                }
                 ctx.device.destroy_image(image, None);
                 match &memory {
                     ResidentMemory::Recyclable(_) => {
@@ -1209,14 +1319,18 @@ impl ResourcePools {
                 framebuffer,
                 render_pass,
                 framebuffer_compatibility: Some(framebuffer_compatibility),
-            width,
-            height,
-            sample_count,
-            generation,
-                color_format: format,
+                width,
+                height,
+                sample_count,
+                generation,
+                format,
+                attachment_view,
             },
         );
-        Ok(self.registry.get(&identity).unwrap())
+        Ok((
+            self.registry.get(&identity).unwrap(),
+            attachment_view.unwrap_or(view),
+        ))
     }
 
     /// Ensure a resident attachment of an arbitrary Vulkan format — an MRT
@@ -1236,8 +1350,9 @@ impl ResourcePools {
     /// spelling miss `reusable_for`, retire the resident and recreate it empty,
     /// so the two interpretations alternate frame to frame and each shows half
     /// the content. The requested format is served by
-    /// [`Self::registry_sample_view`], which keeps `slot.view` the view in
-    /// `slot.color_format` and caches the rest alongside the allocation.
+    /// [`Self::registry_view`], which keeps `slot.view` the view in
+    /// `format.allocation()` and caches every other interpretation alongside the
+    /// allocation.
     ///
     /// **Colour and depth share this body rather than having one each.** The two
     /// differ only in image usage and view aspect, and both of those are
@@ -1258,25 +1373,28 @@ impl ResourcePools {
         format: vk::Format,
         counters: &EngineCounters,
     ) -> Result<(vk::Image, vk::ImageView), DrawError> {
-        // The allocation family; the requested `format` rides on a view over it.
-        let storage = translate::pixel::storage_format(format);
+        // The guest's declaration; `format.allocation()` is the family it
+        // belongs to and is what the image, the reuse test and the recycle
+        // bucket are keyed on.
+        let format = translate::pixel::ResidentFormat::of(format);
         if let Some(slot) = self.registry.get(&identity) {
-            if slot.reusable_for(width, height, sample_count, generation, storage) {
+            if slot.reusable_for(width, height, sample_count, generation, format) {
                 counters
                     .gpu_load_hits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let image = slot.image;
-                let view = self
-                    .registry_sample_view(ctx, &identity, format, counters)?
-                    .expect("the slot reused on the line above is still registered");
+                let view = unsafe {
+                    self.registry_view(ctx, &identity, format.declared(), counters)?
+                }
+                .expect("the slot reused on the line above is still registered");
                 return Ok((image, view));
             }
-            // Geometry / gen / storage-format mismatch → destroy and recreate.
+            // Geometry / gen / allocation mismatch → destroy and recreate.
             self.retire_resident(ctx, &identity, ResidentReclaim::Recreated, counters);
         }
         // Census only, as in the primary `registry_ensure`.
         self.note_registry_reach();
-        let usage = super::super::registry_target_usage(storage);
+        let usage = super::super::registry_target_usage(format.allocation());
         // Reuse a recycled image+memory+view of identical (geometry, format)
         // before allocating — same recycle discipline as the primary
         // `registry_ensure`. Usage is a function of the format
@@ -1286,7 +1404,7 @@ impl ResourcePools {
         // contents are stale, so the slot below is inserted layout=UNDEFINED /
         // content_ready=false.
         let (image, memory, view) = if let Some(free) =
-            self.take_free_target(width, height, sample_count, storage)
+            self.take_free_target(width, height, sample_count, format.allocation())
         {
             (free.image, free.memory, free.view)
         } else {
@@ -1296,7 +1414,7 @@ impl ResourcePools {
                     &vk::ImageCreateInfo::default()
                         .flags(vk::ImageCreateFlags::MUTABLE_FORMAT)
                         .image_type(vk::ImageType::TYPE_2D)
-                        .format(format)
+                        .format(format.allocation())
                         .extent(vk::Extent3D {
                             width,
                             height,
@@ -1328,7 +1446,7 @@ impl ResourcePools {
                 &vk::MemoryAllocateInfo::default()
                     .allocation_size(ireq.size)
                     .memory_type_index(imt),
-                if super::super::format_is_depth(storage) {
+                if super::super::format_is_depth(format.allocation()) {
                     AllocSite::DepthResident
                 } else {
                     AllocSite::MrtSecondary
@@ -1352,8 +1470,10 @@ impl ResourcePools {
                     &vk::ImageViewCreateInfo::default()
                         .image(image)
                         .view_type(vk::ImageViewType::TYPE_2D)
-                        .format(format)
-                        .subresource_range(super::super::registry_subresource_range(format)),
+                        .format(format.allocation())
+                        .subresource_range(super::super::registry_subresource_range(
+                            format.allocation(),
+                        )),
                     None,
                 )
                 .map_err(|e| {
@@ -1380,9 +1500,15 @@ impl ResourcePools {
                 height,
                 sample_count,
                 generation,
-                color_format: format,
+                format,
+                // Nothing here needs the declaration's view yet — this arm owns
+                // no framebuffer — so it is created on the first ask below,
+                // which is the same path a later sampled bind takes.
+                attachment_view: None,
             },
         );
+        let view = unsafe { self.registry_view(ctx, &identity, format.declared(), counters)? }
+            .expect("the resident registered on the line above is still there");
         Ok((image, view))
     }
 
@@ -2020,7 +2146,7 @@ impl ResourcePools {
     /// lower bound on VRAM, which is the safe direction for a figure that exists
     /// to decide whether a bound is too loose.
     fn slot_attachment_bytes(slot: &ResidentTargetSlot) -> u64 {
-        crate::backend::vulkan::translate::pixel::bytes_per_texel(slot.color_format)
+        crate::backend::vulkan::translate::pixel::bytes_per_texel(slot.format.declared())
             .map(|texel| {
                 u64::from(slot.width)
                     * u64::from(slot.height)
@@ -2529,7 +2655,7 @@ pub(super) mod pin_count_tests {
             access: ResidentAccess::ColorWrite(
                 crate::backend::vulkan::engine::caches::color0_pass_exit_layout(),
             ),
-            color_format: translate::pixel::SCANOUT_FORMAT,
+            format: translate::pixel::ResidentFormat::of(translate::pixel::SCANOUT_FORMAT),
             pin_count: 0,
             resource_released: false,
             resource_owner_count: 0,
@@ -2567,7 +2693,7 @@ pub(super) mod pin_count_tests {
         );
 
         let mut rgba = dummy_slot(true);
-        rgba.color_format = translate::pixel::RESIDENT_RGBA_FORMAT;
+        rgba.format = translate::pixel::ResidentFormat::of(translate::pixel::RESIDENT_RGBA_FORMAT);
         assert!(
             !slot_presentable(&rgba, 16, 16),
             "the blit does no channel swap; RGBA would present with red and blue exchanged"
@@ -2812,7 +2938,8 @@ pub(super) mod pin_count_tests {
             height: 16,
             sample_count: 1,
             generation: 1,
-            color_format: translate::pixel::SCANOUT_FORMAT,
+            format: translate::pixel::ResidentFormat::of(translate::pixel::SCANOUT_FORMAT),
+            attachment_view: None,
         }
     }
 

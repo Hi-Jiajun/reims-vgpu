@@ -3523,7 +3523,11 @@ pub(crate) unsafe fn execute_draw_inner(
             } else {
                 color_sample_count
             };
-            let t = pools.registry_ensure(
+            // The slot and the view the render pass attaches. They are two
+            // answers because they are two questions: the slot is the
+            // allocation, and the view is the interpretation `color0_format`
+            // declared over it. See `translate::pixel::ResidentFormat`.
+            let (t, attachment_view) = pools.registry_ensure(
                 ctx,
                 identity.clone(),
                 req.width,
@@ -3554,7 +3558,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 ));
             }
             let primary_image = t.image;
-            let primary_view = t.view;
+            let primary_view = attachment_view;
             let primary_access = t.access;
             let primary_slot_fb = t.framebuffer;
             if ordinary_ad_hoc_framebuffer {

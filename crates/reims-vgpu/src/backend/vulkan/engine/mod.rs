@@ -3166,8 +3166,8 @@ pub fn copy_target_to_guest_pages(
     //
     // **Storage formats, though, and not view formats.** The two sides of this
     // comparison answer two different questions and one of them is not about
-    // bytes. `snap.format` is `slot.color_format`, the format the *attachment*
-    // was created at, and `translate::pixel::color_attachment` deliberately
+    // bytes. `snap.format` is `slot.format.declared()`, the format the
+    // *attachment* was created at, and `translate::pixel::color_attachment` deliberately
     // keeps the guest's transfer function there so Vulkan performs the
     // fixed-function linear-to-sRGB encode on write. `dst.format` comes from
     // `vk_texel_layout`, which is the *stored texel* and has no transfer
@@ -4384,7 +4384,7 @@ impl ResidentReadSnapshot {
     /// Whether these texels are already in guest scanout order.
     ///
     /// **A channel-order question, and equality does not answer it.** `format`
-    /// is `slot.color_format`, which `translate::pixel::color_attachment` builds
+    /// is `slot.format.declared()`, which `translate::pixel::color_attachment` builds
     /// so that it *keeps* the guest's transfer function — Vulkan then performs
     /// the fixed-function linear-to-sRGB encode on attachment writes. So a guest
     /// render target declared `BGRA8Unorm_sRGB` is resident as
@@ -4559,7 +4559,7 @@ fn resident_read_snapshot(
         width: slot.width,
         height: slot.height,
         layout: slot.access.layout(),
-        format: slot.color_format,
+        format: slot.format.declared(),
         guest_backing: slot.memory.guest_backing(),
         guest_footprint: slot.memory.guest_footprint(),
     })
