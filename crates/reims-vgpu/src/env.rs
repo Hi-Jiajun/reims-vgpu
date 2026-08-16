@@ -860,13 +860,41 @@ pub const PASS_CHURN: &str = "REIMS_VGPU_PASS_CHURN";
 /// per Store, which is exactly the regime where the answer is not obvious from
 /// either side.
 ///
-/// # It is a policy switch and not a probe
+/// # It cannot price that yet, because `off` is broken and this is how we found out
 ///
-/// Both arms are shipping code that runs today on some host in the support
-/// matrix, both produce the same pixels, and neither weakens a synchronization
-/// scope — which is what separates this from [`PASS_EXIT_NARROW`]. Reading it
-/// costs a boot; guessing it has cost this project every ranking that assumed
-/// the GPU half was irreducible guest rasterisation.
+/// **On a driven macos-13 Maps boot, `off` loses the entire map.** The
+/// screenshot is Apple Maps with its sidebar, toolbar, scale bar and compass
+/// drawn and the map view flat ocean; `on` from the same probe minute is a map.
+/// The arms do **not** produce the same pixels, so no timing taken across them
+/// means anything until that is repaired.
+///
+/// That is the switch earning its keep on its first boot, because the arm it
+/// breaks is not hypothetical: `linear_target_import::create` refuses
+/// `UnsupportedTopology` on every discrete GPU and `HostImportUnavailable` on
+/// any host without `VK_EXT_external_memory_host`, so this is the shipping
+/// render-target rail for those hosts and it loses the guest's frame. It was
+/// invisible because this host always takes the shared rail.
+///
+/// What a driven boot says, once
+/// `backend::vulkan::engine::reason::TargetReadDecline::UnknownIdentity` was
+/// given fields:
+///
+/// ```text
+/// read_target_unknown_identity asked_gen=2 held_gen=none  mapping=7  1920x1080
+/// read_target_unknown_identity asked_gen=2 held_gen=1     mapping=3  1920x1080
+/// read_target_unknown_identity asked_gen=1 held_gen=none  mapping=33 1136x880
+/// ```
+///
+/// with `target_evicts=0`. So the dominant case is neither eviction nor the
+/// stale-key case the second line shows: the identity the writeback names was
+/// never in the registry at all. Everything else follows from it — the guest's
+/// pages stay stale, so the sampled rail re-uploads them
+/// (`passmerge_outside_sampled_upload` 609 378 against 590 on the default arm),
+/// and a sampled upload cannot happen inside a render pass, so the boot ends at
+/// 0.94 pass begins per draw and 42 us of GPU a draw against 10.8.
+///
+/// Repair that before quoting either arm's timing. Then the question above
+/// becomes answerable, and this switch is how it gets answered.
 pub const SHARED_TARGET: &str = "REIMS_VGPU_SHARED_TARGET";
 
 /// **Probe, default off.** On, every render pass's outgoing `VK_SUBPASS_EXTERNAL`
