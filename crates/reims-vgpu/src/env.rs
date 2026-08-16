@@ -831,6 +831,44 @@ pub const LAYOUT_CHURN: &str = "REIMS_VGPU_LAYOUT_CHURN";
 /// us/draw — excluded as slow, and a single such boot says nothing either.
 pub const PASS_CHURN: &str = "REIMS_VGPU_PASS_CHURN";
 
+/// **Default on.** `off` stops the primary colour attachment being a linear
+/// `VkImage` bound to the guest surface's own pages, so the render target is an
+/// ordinary optimally-tiled device-local resident and its Store copies out.
+///
+/// A narrowing in the strict sense this file requires: the copying arm is not a
+/// fallback anyone had to write for this switch. It is the only arm on a
+/// discrete host — `linear_target_import::create` refuses
+/// `UnsupportedTopology` there — and the only arm on a host without
+/// `VK_EXT_external_memory_host`. `off` makes a unified host take it.
+///
+/// # What it is asking
+///
+/// It prices the largest structural choice in this device, which had no
+/// instrument. Rendering into the guest's pages is the deepest zero-copy
+/// available: the Store is free because the pixels are already where the guest
+/// will read them. What it costs is the *tiling*. A `VkImage` over guest pages
+/// must be `VK_IMAGE_TILING_LINEAR`, because the guest declares a row pitch and
+/// a plane offset in bytes and only linear storage can honour them — and a
+/// linear colour attachment on this class of hardware gives up the render
+/// target's tiled layout, its lossless colour compression and its fast clear.
+/// Every fragment of every draw pays that; the copy it saves is paid once per
+/// Store.
+///
+/// So the two arms trade **per-draw rasterisation against per-Store bandwidth**,
+/// and which wins is a property of the workload's draw-to-Store ratio and of
+/// the host's memory system. On a driven Maps boot that ratio is about 65 draws
+/// per Store, which is exactly the regime where the answer is not obvious from
+/// either side.
+///
+/// # It is a policy switch and not a probe
+///
+/// Both arms are shipping code that runs today on some host in the support
+/// matrix, both produce the same pixels, and neither weakens a synchronization
+/// scope — which is what separates this from [`PASS_EXIT_NARROW`]. Reading it
+/// costs a boot; guessing it has cost this project every ranking that assumed
+/// the GPU half was irreducible guest rasterisation.
+pub const SHARED_TARGET: &str = "REIMS_VGPU_SHARED_TARGET";
+
 /// **Probe, default off.** On, every render pass's outgoing `VK_SUBPASS_EXTERNAL`
 /// dependency names only the attachment stages, instead of also naming
 /// `TRANSFER | FRAGMENT_SHADER` with `TRANSFER_READ | SHADER_READ`.
@@ -1096,7 +1134,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 25] = [
+pub const ALL: [&str; 26] = [
     COLOR_GENERAL,
     LAZY_WRITEBACK,
     SLAB_RETAIN,
@@ -1132,6 +1170,7 @@ pub const ALL: [&str; 25] = [
     GPU_SPANS,
     LAYOUT_CHURN,
     PASS_CHURN,
+    SHARED_TARGET,
 ];
 
 /// Every variable read as a [`count`] rather than as a [`Switch`].

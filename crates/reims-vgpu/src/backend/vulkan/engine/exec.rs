@@ -5048,6 +5048,22 @@ pub(crate) unsafe fn execute_draw_inner(
         } else {
             "passbegin_clear"
         });
+        // Whether this pass's colour0 names guest backing at all, which is the
+        // denominator every reading of `REIMS_VGPU_SHARED_TARGET` needs:
+        // `registry_imported_image` counts images created and
+        // `target_store_shared_recorded` counts Stores, and neither says how
+        // much *rendering* the rail carries.
+        //
+        // The key's own answer, so this is the backing the guest **declared**
+        // and not proof the import took: `linear_target_import::create` may
+        // still have refused, in which case the pass renders into an ordinary
+        // resident under a key that says otherwise. Read it against
+        // `target_shared_declined`, which counts exactly those.
+        crate::runtime::drain::note_store_route(if pass_key.host_accessible_color0 {
+            "passbegin_color0_guest_backed"
+        } else {
+            "passbegin_color0_resident"
+        });
         ctx.device
             .cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
         pools.note_pass_opened(echo);

@@ -42,6 +42,10 @@ fn subresource_aspect(mode: LayoutMode) -> vk::ImageAspectFlags {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WindowRefusal {
+    /// [`crate::env::SHARED_TARGET`] is `off`, so this host takes the arm a
+    /// discrete one has no choice about. First, because it is a policy answer
+    /// and every check below it is a measurement of the host.
+    DisabledByEnv,
     UnsupportedTopology,
     HostImportUnavailable,
     ParentAllocationMismatch,
@@ -61,6 +65,7 @@ pub(super) enum WindowRefusal {
 impl WindowRefusal {
     pub(super) fn slug(self) -> &'static str {
         match self {
+            Self::DisabledByEnv => "disabled_by_env",
             Self::UnsupportedTopology => "discrete_topology",
             Self::HostImportUnavailable => "no_host_import",
             Self::ParentAllocationMismatch => "parent_allocation_mismatch",
@@ -304,6 +309,25 @@ pub(super) struct ImportedTarget {
     pub image: vk::Image,
 }
 
+/// Whether the primary colour attachment may be the guest's own pages.
+/// **Default on**; [`crate::env::SHARED_TARGET`]`=off` is the ablation arm.
+///
+/// Read once. A target created under one answer outlives the draw that created
+/// it and is recycled by geometry and format alone, so an answer that changed
+/// mid-boot would put both kinds in one registry with nothing able to tell them
+/// apart.
+fn shared_target_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| shared_target_from(crate::env::read(crate::env::SHARED_TARGET).0))
+}
+
+/// The rail's answer for one parsed spelling, split out of the `OnceLock` above
+/// so both arms are reachable from a test — a latched answer can be asked only
+/// once per process, which is exactly one arm.
+fn shared_target_from(switch: crate::env::Switch) -> bool {
+    !matches!(switch, crate::env::Switch::Off)
+}
+
 /// Create a linear image whose storage is the guest surface allocation itself.
 ///
 /// A refusal is an optional-rail answer: callers keep the ordinary optimal
@@ -326,6 +350,9 @@ pub(super) unsafe fn create(
 ) -> Result<ImportedTarget, WindowRefusal> {
     use crate::backend::vulkan::caps::memory_topology::MemoryTopology;
 
+    if !shared_target_enabled() {
+        return Err(WindowRefusal::DisabledByEnv);
+    }
     if ctx.caps.memory.topology != MemoryTopology::Unified {
         return Err(WindowRefusal::UnsupportedTopology);
     }
@@ -836,5 +863,46 @@ mod tests {
             vk::ExternalMemoryFeatureFlags::IMPORTABLE
                 | vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY
         ));
+    }
+
+    /// Only the negative spelling turns the rail off. `Unset` is the shipping
+    /// arm, `On` cannot widen anything (the topology and extension gates below
+    /// it still decide), and `Unrecognized` is a typo — reading a typo as `off`
+    /// would silently move a host onto the copying rail and read as a device
+    /// regression rather than as an operator mistake.
+    #[test]
+    fn only_off_takes_this_host_to_the_copying_rail() {
+        use crate::env::Switch;
+        assert!(shared_target_from(Switch::Unset));
+        assert!(shared_target_from(Switch::On));
+        assert!(shared_target_from(Switch::Unrecognized));
+        assert!(!shared_target_from(Switch::Off));
+    }
+
+    /// Every refusal names itself. A slug copied from a sibling makes two
+    /// different reasons one line in the fail log, and the one that gets read is
+    /// whichever was written first — the copied-failure-line trap `AGENTS.md`
+    /// records. `DisabledByEnv` is the newest and the likeliest to have been
+    /// spelled as one of the host measurements beside it.
+    #[test]
+    fn no_two_refusals_share_a_slug() {
+        let all = [
+            WindowRefusal::DisabledByEnv,
+            WindowRefusal::UnsupportedTopology,
+            WindowRefusal::HostImportUnavailable,
+            WindowRefusal::ParentAllocationMismatch,
+            WindowRefusal::HostPointerMisaligned,
+            WindowRefusal::SubresourceAfterPlane,
+            WindowRefusal::BindOffsetMisaligned,
+            WindowRefusal::RowPitchMismatch,
+            WindowRefusal::AllocationTooShort,
+            WindowRefusal::NoMemoryType,
+            WindowRefusal::DedicatedBindingRequired,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a.slug(), b.slug(), "{a:?} and {b:?} report as one reason");
+            }
+        }
     }
 }
