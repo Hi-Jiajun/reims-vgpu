@@ -280,7 +280,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     req.colors.first().map(|c| c.target_gva).unwrap_or(0)
                 ));
             }
-            Ok(M2vDrawSpan::ResidentGvaStore) => {
+            Ok(M2vDrawSpan::ResidentGvaStore { identity }) => {
                 let _store_span = StoreCostSpan::new("gva_store_us");
                 note_type11_store_route("gva_flush");
                 // Metal Store preserves the attachment in host GPU memory. It
@@ -289,15 +289,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 // live resource retains its transfer backing until explicit
                 // discard or delete; the debt records only content ownership.
                 let landed = req.colors.first().is_some_and(|c0| {
-                    gva_chain_identity(req).is_some_and(|identity| {
-                        crate::runtime::writeback_debt::arm_gva(
-                            state,
-                            host,
-                            req.task_id,
-                            c0,
-                            &identity,
-                        )
-                    })
+                    crate::runtime::writeback_debt::arm_gva(state, host, req.task_id, c0, &identity)
                 });
                 if landed {
                     note_type11_store_route("gva_resident_authoritative");
@@ -308,7 +300,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     // run exactly as it does for a Store that never skipped its
                     // readback. `read_resident_chain` fail-logs a lost resident.
                     note_type11_store_route("gva_store_sync");
-                    draw_rgba = read_resident_chain(state, req);
+                    draw_rgba = read_resident_chain(req, &identity);
                     crate::observe::line(format!(
                         "linux_m2v_draw ok resident_gva_store pipe={} {}x{} gva={:#x} rgba={}",
                         req.pipeline_ref,
@@ -319,7 +311,10 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     ));
                 }
             }
-            Ok(M2vDrawSpan::ResidentSurfaceStore { guest_store }) => {
+            Ok(M2vDrawSpan::ResidentSurfaceStore {
+                identity,
+                guest_store,
+            }) => {
                 // Into the same `t11_store_us` bucket the synchronous and `Owned`
                 // routes report, because the whole claim of this rail is that the
                 // bucket shrinks. Leaving it unbracketed would move the arm's cost
@@ -333,7 +328,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     .map(|c0| (c0.mapping_id, c0.width, c0.height, c0.format));
                 let stored = c0_store
                     .map(|(mid, cw, ch, _)| {
-                        store_surface_resident(state, host, req, mid, cw, ch, guest_store)
+                        store_surface_resident(state, host, &identity, mid, cw, ch, guest_store)
                     })
                     .unwrap_or(false);
                 match (stored, c0_store) {
@@ -362,7 +357,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         // readback the rail exists to avoid, which is the point —
                         // the fallback is a cost, never a lost frame.
                         note_type11_store_route("surface_resident_sync");
-                        draw_rgba = read_resident_chain(state, req);
+                        draw_rgba = read_resident_chain(req, &identity);
                         crate::observe::line(format!(
                             "linux_m2v_draw ok resident_surface_store_sync_fallback pipe={} {}x{} mid={} rgba={}",
                             req.pipeline_ref,
@@ -5918,7 +5913,12 @@ enum M2vDrawSpan {
     /// resident with `skip_readback`: the caller lands the frame from that
     /// resident, which is where the pixels are — this record produced none on
     /// the host.
-    ResidentGvaStore,
+    ///
+    /// `identity` is the key the draw registered, carried rather than re-derived
+    /// — see [`Self::ResidentSurfaceStore`] for what a second derivation costs.
+    ResidentGvaStore {
+        identity: crate::backend::vulkan::engine::TargetIdentity,
+    },
     /// Type-11 composite Store executed into its registry resident with
     /// `skip_readback`: the caller copies that image into the mapping's guest
     /// pages through [`crate::runtime::render_writeback`], which never brings
@@ -5929,7 +5929,25 @@ enum M2vDrawSpan {
     /// different routes. Distinct from [`Self::Pixels`] because there are no
     /// pixels — a caller that treated an empty frame as one would write a blank
     /// framebuffer into guest memory.
-    ResidentSurfaceStore { guest_store: GuestStoreStatus },
+    ///
+    /// # Why the identity travels with the span
+    ///
+    /// `identity` is the exact key this record handed `registry_ensure`, so the
+    /// image the Store reads is the image the draw rendered into by
+    /// construction. The Store used to call `type11_store_identity` a second
+    /// time instead, on the grounds that it is the same function that produced
+    /// `DrawRequest::target_identity` — but it is not the same *value*. That
+    /// identity carries `MappingEntry::map_generation`, the draw mutates
+    /// `DeviceState` between the two calls, and any writer that revalidates the
+    /// mapping advances the generation. The Store then asked the registry for a
+    /// key one generation ahead of the one the draw registered, which is
+    /// `read_target_unknown_identity diverges=generation asked_gen=N
+    /// held_gen=N-1` — the whole Maps frame lost, on the only render-target
+    /// rail a host without `VK_EXT_external_memory_host` has.
+    ResidentSurfaceStore {
+        identity: crate::backend::vulkan::engine::TargetIdentity,
+        guest_store: GuestStoreStatus,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -8090,7 +8108,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // on the registry resident (skip_readback). The caller records the
         // resource declaration and transfers only when synchronization or an
         // actual guest-page reader makes that copy observable.
-        let mut gva_resident_store = false;
+        //
+        // The rail's own resident, not a bool: the span this returns has to name
+        // the key the draw registered, and a flag beside `resources` would let a
+        // caller derive a second one. See `M2vDrawSpan::ResidentSurfaceStore`.
+        let mut gva_resident_store: Option<crate::backend::vulkan::engine::TargetIdentity> = None;
         if req.chain_from_resident || (store_is_store && !writeback_guest) {
             if let Some(identity) = render_chain_identity(state, req) {
                 resources.target_identity = Some(identity);
@@ -8107,9 +8129,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // (The sibling rail above re-tests its pair for real, because
                 // its outer condition is an `||`.)
                 if gva_store_defer_eligible(req) {
-                    resources.target_identity = Some(identity);
+                    resources.target_identity = Some(identity.clone());
                     resources.skip_readback = true;
-                    gva_resident_store = true;
+                    gva_resident_store = Some(identity);
                 }
             }
         }
@@ -8129,7 +8151,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // asks again after the draw and falls back to a materializing read on any
         // refusal, which is what makes a stale answer here cost a readback rather
         // than a lost frame.
-        let mut surface_resident_store = false;
+        //
+        // The rail's own resident, not a bool, for the reason `gva_resident_store`
+        // states: the span carries this value out to the Store.
+        let mut surface_resident_store: Option<crate::backend::vulkan::engine::TargetIdentity> =
+            None;
         if resources.target_identity.is_none() {
             resources.target_identity = type11_resident_target.clone();
         }
@@ -8156,9 +8182,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // derived, because the derivation is a property of two other blocks.
         if renders_into_surface_identity && !resources.skip_readback {
             resources.skip_readback = true;
-            surface_resident_store = true;
+            // `resources.target_identity`, which the comparison just proved is
+            // this same value, and which is what `registry_ensure` will be
+            // handed. Taken from here rather than unwrapped from the `Option`
+            // above so the span cannot name a slot the draw did not register.
+            surface_resident_store = type11_resident_target.clone();
         }
-        resources.record_guest_store = surface_resident_store;
+        resources.record_guest_store = surface_resident_store.is_some();
         // A first-failure classifier for a composite Store that still reads
         // back used to sit here. Its outer gate was never once true — none of
         // its four counters, nor its `else` arm, appears anywhere in the
@@ -8832,11 +8862,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         if resident_render_chain {
             return Ok(M2vDrawSpan::ResidentChain);
         }
-        if gva_resident_store {
-            return Ok(M2vDrawSpan::ResidentGvaStore);
+        if let Some(identity) = gva_resident_store {
+            return Ok(M2vDrawSpan::ResidentGvaStore { identity });
         }
-        if surface_resident_store {
+        if let Some(identity) = surface_resident_store {
             return Ok(M2vDrawSpan::ResidentSurfaceStore {
+                identity,
                 guest_store: GuestStoreStatus {
                     guest_backed: out.target_guest_backed,
                     recorded: out.guest_store_recorded,
@@ -8923,7 +8954,7 @@ pub(super) fn depth_chain_identity(
     })
 }
 
-pub(super) fn render_chain_identity(
+pub(crate) fn render_chain_identity(
     state: &DeviceState,
     req: &DrawEncodeRequest,
 ) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
@@ -9709,9 +9740,17 @@ pub(crate) fn gva_resident_format(format: u16) -> ash::vk::Format {
 /// render target — see `is_bgra` on
 /// [`crate::backend::vulkan::engine::TargetIdentity`] for why it is keyed on the
 /// identity and what a change there has to keep true.
-pub(crate) fn read_resident_chain(state: &DeviceState, req: &DrawEncodeRequest) -> Option<Vec<u8>> {
-    let identity = render_chain_identity(state, req)?;
-    match crate::backend::vulkan::engine::read_target(&identity) {
+///
+/// The identity is the caller's, never re-derived here: both callers hold the
+/// key their own draw registered, carried out of `M2vDrawSpan`, and
+/// `render_chain_identity` asked again after the draw can answer at a newer
+/// mapping generation than the one the registry holds. See
+/// [`M2vDrawSpan::ResidentSurfaceStore`].
+pub(crate) fn read_resident_chain(
+    req: &DrawEncodeRequest,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+) -> Option<Vec<u8>> {
+    match crate::backend::vulkan::engine::read_target(identity) {
         // Every caller of this function — `writeback_chain_rgba` and the GVA
         // arm-refusal fallback — has an RGBA contract, so the exchange happens
         // here, once, rather than at three call sites that would each have to
@@ -9747,10 +9786,17 @@ pub(crate) fn read_resident_chain(state: &DeviceState, req: &DrawEncodeRequest) 
 /// materialize it the slow way — read the resident back and run the synchronous
 /// Store block. That is a cost, never a lost frame.
 ///
-/// The identity is [`type11_store_identity`] — the same call that produced the
-/// draw's `target_identity` — so the image read here is the image the draw
-/// rendered into. Deriving it a second way is how a writeback ends up
-/// publishing a frame the draw is not in.
+/// The identity is the caller's, carried out of the draw on
+/// [`M2vDrawSpan::ResidentSurfaceStore`], so the image read here is the image
+/// the draw rendered into by construction.
+///
+/// It used to be [`type11_store_identity`] called again here, on the argument
+/// that this is the same function that produced the draw's `target_identity`.
+/// The same function is not the same value: that identity carries
+/// `MappingEntry::map_generation`, and the draw mutates `DeviceState` between
+/// the two calls. Read that variant's doc before reintroducing a derivation
+/// anywhere on this path — deriving it a second *time* is as wrong as deriving
+/// it a second *way*.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SurfaceStorePlan {
     SynchronizeGuestBacking,
@@ -9771,7 +9817,7 @@ fn surface_store_plan(lazy_enabled: bool, guest_backed: bool) -> SurfaceStorePla
 fn store_surface_resident<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
-    req: &DrawEncodeRequest,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
     mapping_id: u32,
     width: u32,
     height: u32,
@@ -9781,9 +9827,6 @@ fn store_surface_resident<M: HostMemory + HostOps>(
     // below succeeds, and leaving it un-reset on a refused write would fold this
     // pass into the next Store's reading.
     note_pass_scissor_union(width, height);
-    let Some(identity) = type11_store_identity(state, req, true) else {
-        return false;
-    };
     // A copied resident may defer the transfer until something reads the
     // mapping. A guest-backed resident may not: its Store is already the draw
     // into that allocation, so deferring creates an invented second operation
@@ -9793,7 +9836,7 @@ fn store_surface_resident<M: HostMemory + HostOps>(
     let lazy = crate::runtime::writeback_debt::lazy_writeback_enabled();
     let plan = surface_store_plan(lazy, guest_store.guest_backed);
     if plan == SurfaceStorePlan::DeferCopy
-        && arm_surface_writeback_debt(state, host, mapping_id, &identity, width, height)
+        && arm_surface_writeback_debt(state, host, mapping_id, identity, width, height)
     {
         crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
         return true;
@@ -9805,7 +9848,7 @@ fn store_surface_resident<M: HostMemory + HostOps>(
         match crate::runtime::render_writeback::store_guest_backed_frame(
             state,
             mapping_id,
-            &identity,
+            identity,
             width,
             height,
             guest_store.recorded,
@@ -9822,7 +9865,7 @@ fn store_surface_resident<M: HostMemory + HostOps>(
         }
     }
     if !crate::runtime::render_writeback::store_render_frame(
-        state, host, mapping_id, &identity, width, height,
+        state, host, mapping_id, identity, width, height,
     ) {
         return false;
     }
@@ -10866,6 +10909,95 @@ mod vulkan_split_tests {
              next dispatch the earlier dispatch's storage image instead of the \
              render frame, and the two arms of LAZY_WRITEBACK then disagree \
              about what the GPU observes"
+        );
+    }
+
+    /// The Store lands the frame in the slot the *draw* registered, even when
+    /// the mapping's generation has moved since.
+    ///
+    /// `map_generation` is part of [`crate::backend::vulkan::engine::TargetIdentity::Surface`],
+    /// so a Store that re-derives its identity from `DeviceState` asks the
+    /// registry for a key one generation ahead of the one `registry_ensure`
+    /// was handed, and the registry answers `read_target_unknown_identity
+    /// diverges=generation asked_gen=N held_gen=N-1`. Every Maps frame went
+    /// that way on `REIMS_VGPU_SHARED_TARGET=off`, which is the only
+    /// render-target rail a host without `VK_EXT_external_memory_host` has.
+    ///
+    /// The repair is that the identity travels out of the draw on
+    /// [`M2vDrawSpan::ResidentSurfaceStore`] rather than being asked for twice,
+    /// so this test bumps the generation between the two points and asserts the
+    /// debt still names the draw's key. Before it, the ledger recorded the
+    /// generation this test bumps to.
+    #[test]
+    fn the_store_names_the_slot_the_draw_registered_after_the_mapping_generation_moves() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::runtime::mapping_write::write_bgra8;
+
+        if !crate::runtime::writeback_debt::lazy_writeback_enabled() {
+            // The eager arm stores through the engine instead of the ledger and
+            // has no debt to inspect. Reported rather than silently passing.
+            eprintln!("skipped: REIMS_VGPU_LAZY_WRITEBACK=off selects the eager Store");
+            return;
+        }
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let mid = 913u32;
+        let pfn = 0x37u32;
+        let gpa = (pfn as u64) << PAGE_SHIFT_X86;
+        host.map_range(gpa, 0x4000, 0);
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        let (w, h) = (4u32, 2u32);
+        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+        // Warms the host cache, so the cession inside the arm has something to
+        // cede and the arm is testing its own gate rather than an empty one.
+        assert!(write_bgra8(
+            &mut state,
+            &mut host,
+            mid,
+            &vec![0x22u8; (w * h * 4) as usize],
+            w * 4,
+            w,
+            h
+        ));
+
+        // The key the draw would have handed `registry_ensure`.
+        let drawn = crate::runtime::present_identity::surface_identity(&state, mid, w, h);
+        crate::model::DeviceState::bump_map_generation(state.mappings.get_mut(&mid).unwrap());
+        assert_ne!(
+            crate::runtime::present_identity::surface_identity(&state, mid, w, h),
+            drawn,
+            "the bump has to change what a second derivation answers or this \
+             test cannot see the defect"
+        );
+
+        assert!(
+            store_surface_resident(
+                &mut state,
+                &mut host,
+                &drawn,
+                mid,
+                w,
+                h,
+                GuestStoreStatus::default(),
+            ),
+            "a copied resident at a cacheable geometry defers"
+        );
+        assert_eq!(
+            state
+                .pending_writebacks
+                .get(mid)
+                .expect("the deferred plan arms a debt")
+                .identity,
+            drawn,
+            "the ledger has to name the image the draw rendered into"
         );
     }
 
