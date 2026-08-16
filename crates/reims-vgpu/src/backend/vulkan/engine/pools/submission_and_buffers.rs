@@ -4340,6 +4340,29 @@ fn note_readback_memory(
 /// Neither bounds the cache; a victim-ledger eviction costs a record, which is
 /// the class `AGENTS.md` exempts.
 ///
+/// # Measured, one driven boot an arm
+///
+/// Two macos-26 x86/Vulkan boots from one snapshot, both
+/// `REIMS_VGPU_GUEST_IMPORT=off` — the copying rail, which is the local
+/// reproduction of what every reporter's host runs — each driven by the same
+/// 25-second window-drag probe:
+///
+/// ```text
+///            evict_count_cap  evict_byte_cap  reach_lost_to_cap
+///   before              2067               0                 59
+///   after                  0            1003                 16
+/// ```
+///
+/// `reach_lost_to_cap` is the one that is guest work: a sampled bind that missed
+/// **because of** capacity, with the guest-write witness having vouched. It fell
+/// by 73 %. The byte cap now does the evicting, which is the point — it bounds
+/// the host memory this cache holds, and it was idle while the entry count threw
+/// entries away.
+///
+/// One boot an arm, so this is a count and not a rate; `AGENTS.md`'s rule about
+/// banding a verdict over several boots applies to anything read as a rate.
+/// Counts survive contention where timings do not, and no timing is quoted.
+///
 /// [`SAMPLED_CACHE_CAP`]: SAMPLED_REACH_BAND
 const SAMPLED_EVICT_BYTE_CAP: &str = "sampled_evict_byte_cap";
 
