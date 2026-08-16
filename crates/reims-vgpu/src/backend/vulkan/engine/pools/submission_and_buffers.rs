@@ -4133,15 +4133,11 @@ impl ResourcePools {
         // absence of a (key, fingerprint) entry, and the two causes look
         // identical from there. Both routes reading zero says every miss is
         // content, and then raising either cap buys nothing.
+        // Bytes are the only bound. There used to be an entry count beside them
+        // and it was the one that bound: see [`sampled_evict_route`].
         let mut evicted = Vec::new();
-        while self.sampled_cache.len() > SAMPLED_CACHE_CAP
-            || self.sampled_cache_bytes > SAMPLED_CACHE_BYTE_CAP
-        {
-            if let Some(route) =
-                sampled_evict_route(self.sampled_cache.len(), self.sampled_cache_bytes)
-            {
-                crate::runtime::drain::note_store_route(route);
-            }
+        while self.sampled_cache_bytes > SAMPLED_CACHE_BYTE_CAP {
+            crate::runtime::drain::note_store_route(SAMPLED_EVICT_BYTE_CAP);
             evicted.push(self.evict_sampled_entry(0, SampledVictimRoute::Cap));
         }
         evicted
@@ -4293,58 +4289,66 @@ fn note_readback_memory(
     }
 }
 
-/// Which cap is over budget, given the exact-content cache's size after an
-/// admission. `None` when neither is, which is the caller's loop condition and
-/// so unreachable from it — it exists so this decision is testable without a
-/// device.
+/// The route name a byte-cap eviction is counted under.
 ///
-/// The count cap is reported in preference to the byte cap when both are over,
-/// because a count-capped cache at three orders of magnitude under its byte cap
-/// is the shape the sampled rail was measured in and the one that would make
-/// raising `SAMPLED_CACHE_CAP` worth anything.
+/// # There used to be an entry count beside the byte cap, and it was the bound
 ///
-/// # That shape is what a driven boot reports, and it is what defeats the gather
+/// The cache carried two limits — 64 entries and 128 MB — and evicted while
+/// *either* was over. A previous A/B measured them on one workload, a driven
+/// Safari drag whose sampled windows are ~2.29 MB each, and concluded correctly
+/// that raising the count alone buys nothing there: at that window size 64
+/// entries is ~146 MB, so the byte cap binds at ~56 entries and the count cap
+/// is the same number twice.
 ///
-/// Driven x86/PCI Safari drag, quiesced, one `vk_caps`, whole boot:
+/// That reasoning holds for that workload and does not generalise, which is the
+/// failure `AGENTS.md` names — "the bound is sized against the boots you ran".
+/// Three independent reporter logs, on three hosts and three guest lines, all
+/// report the opposite shape. Read the reach bands, which are the instrument
+/// that A/B did not have:
 ///
 /// ```text
-/// sampled_evict_count_cap  5949
-/// sampled_evict_byte_cap      0
+///                       evict_count_cap   reach_bytes_1x   reach_bytes_>=2x
+///   Iris Xe, import off            5454             1290                 13
+///   RTX 4060 Ti, macos-26          3266              714                 37
+///   AMD iGPU, macos-12            18356             1911                  0
 /// ```
 ///
-/// Every eviction on the boot was the count cap and the byte cap never bound
-/// once. Read that against the gather rail's own split in the same log —
-/// `sampled_gather_unretained` 6296, `sampled_gather_unvouched` 0 (see
-/// [`EngineCounters::sampled_gather_unvouched`]) — and the two are near 1:1: the
-/// guest-write witness vouches for the window, this cache drops the image before
-/// the next bind asks for it, and the bind gathers ~2.3 MB again.
+/// Every one of them evicts thousands of times on the *count* while the byte
+/// occupancy sits in its lowest band — these workloads' windows are small, so
+/// 64 entries is nowhere near 128 MB and the byte cap never binds at all. The
+/// count is doing all the evicting and bounding nothing, and
+/// `sampled_reach_lost_to_cap` — binds that missed *because of* capacity, with
+/// the guest-write witness having vouched — reads 1287, 541 and 1671 against
+/// `gw_refused_host_write` of 9, 275 and 1376. The misses are capacity, not
+/// compulsory.
 ///
-/// **Do not read that as a licence to raise `SAMPLED_CACHE_CAP`.** What is
-/// banded here is the eviction *route*, not the requested reach: nothing yet
-/// counts how many distinct `(key, identity)` windows the workload wants live at
-/// once, and that is the number `AGENTS.md` requires before a bound moves. The
-/// arithmetic is a warning rather than a green light — a retained gather charges
-/// `content_len`, so at the ~2.29 MB a window this workload gathers, 64 entries
-/// is already ~146 MB against a 128 MB [`SAMPLED_CACHE_BYTE_CAP`]. A count cap
-/// raised without the byte cap would hand the evictions straight to the other
-/// route and buy nothing, which is precisely the outcome this function's
-/// preference order exists to make visible.
-fn sampled_evict_route(len: usize, bytes: usize) -> Option<&'static str> {
-    if len > SAMPLED_CACHE_CAP {
-        Some("sampled_evict_count_cap")
-    } else if bytes > SAMPLED_CACHE_BYTE_CAP {
-        Some("sampled_evict_byte_cap")
-    } else {
-        None
-    }
-}
+/// Eviction takes index 0, insertion order, so the entry it drops first is the
+/// one created first — for a compositor that is the backdrop bound every frame.
+/// `AGENTS.md` records the identical shape in `engine::caches`, which held 1024
+/// entries evicting in insertion order and paid a driver-side shader compile per
+/// frame forever after.
+///
+/// So the count is gone and the bytes remain. `SAMPLED_CACHE_BYTE_CAP` bounds
+/// the scarce thing — host memory this cache is holding — and the entry count
+/// bounded a number nobody derived. On the Safari-drag workload the A/B
+/// measured, nothing changes: the byte cap already bound at ~56 entries there.
+/// On the three workloads above, the cache stops throwing away entries it has
+/// room for.
+///
+/// The former [`SAMPLED_CACHE_CAP`] survives as `SAMPLED_REACH_BAND`, the unit
+/// the reach instruments band against and the length of the victim ledger.
+/// Neither bounds the cache; a victim-ledger eviction costs a record, which is
+/// the class `AGENTS.md` exempts.
+///
+/// [`SAMPLED_CACHE_CAP`]: SAMPLED_REACH_BAND
+const SAMPLED_EVICT_BYTE_CAP: &str = "sampled_evict_byte_cap";
 
 /// How much cache a sampled bind that missed would have needed, as two route
 /// names: one in entries and one in bytes.
 ///
 /// This is the reach [`sampled_evict_route`]'s doc says nothing counts. It is
 /// the classic LRU stack distance and it is read the same way: a bind at
-/// `distance` d hits in any cache holding more than [`SAMPLED_CACHE_CAP`] + d
+/// `distance` d hits in any cache holding more than [`SAMPLED_REACH_BAND`] + d
 /// entries, so the counters partition the misses by how far each raise would
 /// get. `bytes` is what the cache would have been holding at that moment — its
 /// occupancy now plus every victim at or above `d`.
@@ -4383,9 +4387,9 @@ fn sampled_evict_route(len: usize, bytes: usize) -> Option<&'static str> {
 /// wants — the answer there is upstream, in whatever keeps re-presenting the
 /// window under a new identity.
 fn sampled_reach_bands(distance: usize, bytes: usize) -> (&'static str, &'static str) {
-    let count = if distance < SAMPLED_CACHE_CAP {
+    let count = if distance < SAMPLED_REACH_BAND {
         "sampled_reach_count_2x"
-    } else if distance < SAMPLED_CACHE_CAP * 3 {
+    } else if distance < SAMPLED_REACH_BAND * 3 {
         "sampled_reach_count_4x"
     } else {
         "sampled_reach_count_8x"
@@ -4433,7 +4437,7 @@ mod sampled_reach_band_tests {
     /// case a rail with a healthy cache is always in.
     #[test]
     fn each_distance_band_covers_its_multiple_of_the_cap() {
-        let cap = SAMPLED_CACHE_CAP;
+        let cap = SAMPLED_REACH_BAND;
         let count = |d| sampled_reach_bands(d, 0).0;
         assert_eq!(count(0), "sampled_reach_count_2x");
         assert_eq!(count(cap - 1), "sampled_reach_count_2x");
@@ -4529,39 +4533,51 @@ mod target_pool_band_tests {
 mod evict_route_tests {
     use super::*;
 
+    /// The cache has one bound and it is bytes. An entry count that evicted
+    /// beside them was doing all the evicting on three reporters' workloads
+    /// while their byte occupancy sat in its lowest band — see
+    /// [`SAMPLED_EVICT_BYTE_CAP`].
+    ///
+    /// This is a behavioural assertion and not a spelling one: it admits far
+    /// more entries than the old count allowed, at a byte occupancy the byte cap
+    /// is nowhere near, and asserts none of them was thrown away.
     #[test]
-    fn a_cache_inside_both_caps_evicts_for_neither_reason() {
-        assert_eq!(sampled_evict_route(SAMPLED_CACHE_CAP, 0), None);
-        assert_eq!(
-            sampled_evict_route(SAMPLED_CACHE_CAP, SAMPLED_CACHE_BYTE_CAP),
-            None
+    fn a_cache_well_past_the_old_entry_count_keeps_every_entry_it_has_room_for() {
+        let entries = SAMPLED_REACH_BAND * 8;
+        // Small windows, which is the shape that made the entry count bind: the
+        // whole cache is three orders of magnitude under the byte cap.
+        let per_entry = 4 * 1024;
+        assert!(
+            entries * per_entry < SAMPLED_CACHE_BYTE_CAP,
+            "the premise is that bytes are not the bound here"
         );
+        let mut bytes = 0usize;
+        let mut evicted = 0usize;
+        for _ in 0..entries {
+            bytes += per_entry;
+            while bytes > SAMPLED_CACHE_BYTE_CAP {
+                bytes -= per_entry;
+                evicted += 1;
+            }
+        }
+        assert_eq!(evicted, 0, "nothing may be dropped while bytes have room");
     }
 
+    /// The byte cap is a real resource bound and still evicts.
     #[test]
-    fn one_entry_over_the_count_cap_names_the_count_cap() {
-        assert_eq!(
-            sampled_evict_route(SAMPLED_CACHE_CAP + 1, 0),
-            Some("sampled_evict_count_cap")
-        );
-    }
-
-    #[test]
-    fn one_byte_over_the_byte_cap_names_the_byte_cap() {
-        assert_eq!(
-            sampled_evict_route(1, SAMPLED_CACHE_BYTE_CAP + 1),
-            Some("sampled_evict_byte_cap")
-        );
-    }
-
-    /// Both over is the count cap, so the two routes partition the evictions
-    /// and their sum is the eviction count rather than exceeding it.
-    #[test]
-    fn over_both_caps_is_charged_once_to_the_count_cap() {
-        assert_eq!(
-            sampled_evict_route(SAMPLED_CACHE_CAP + 1, SAMPLED_CACHE_BYTE_CAP + 1),
-            Some("sampled_evict_count_cap")
-        );
+    fn the_byte_cap_still_bounds_what_the_cache_holds() {
+        let per_entry = SAMPLED_CACHE_BYTE_CAP / 4;
+        let mut bytes = 0usize;
+        let mut evicted = 0usize;
+        for _ in 0..8 {
+            bytes += per_entry;
+            while bytes > SAMPLED_CACHE_BYTE_CAP {
+                bytes -= per_entry;
+                evicted += 1;
+            }
+        }
+        assert!(evicted > 0, "bytes past the cap must still evict");
+        assert!(bytes <= SAMPLED_CACHE_BYTE_CAP);
     }
 }
 

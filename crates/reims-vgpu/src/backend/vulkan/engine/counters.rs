@@ -413,7 +413,7 @@ engine_counters! {
         /// retained image could have answered and no size of sampled cache
         /// reaches them. Only the 2524 are a cache result. That is the reverse
         /// of what the structural zero was read as, and it is consistent with
-        /// the `SAMPLED_CACHE_CAP` A/B, where four times the entries and six
+        /// the `SAMPLED_REACH_BAND` A/B, where four times the entries and six
         /// times the bytes left the miss rate where it started.
         ///
         /// The 9876 count-cap evictions on the same boot are not evidence of a

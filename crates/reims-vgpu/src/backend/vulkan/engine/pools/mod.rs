@@ -363,7 +363,7 @@ pub(crate) struct ResourcePools {
     /// allocations. Unlike upload slots these images never enter a recycle
     /// pool: their memory aliases one specific guest allocation.
     guest_sampled: HashMap<GuestSampledKey, GuestSampledSlot>,
-    /// What [`SAMPLED_CACHE_CAP`] and [`SAMPLED_CACHE_BYTE_CAP`] have thrown
+    /// What [`SAMPLED_REACH_BAND`] and [`SAMPLED_CACHE_BYTE_CAP`] have thrown
     /// away, most recently evicted at the front, carrying no images — see
     /// [`SampledVictim`].
     sampled_victims: std::collections::VecDeque<SampledVictim>,
@@ -2301,7 +2301,7 @@ const RECLAIM_HISTORY: usize = 256;
 /// `gw_refused_guest_store` 14 on that boot. See
 /// [`EngineCounters::sampled_gather_unvouched`] for the reading and its
 /// qualifiers, and prefer removing the write to enlarging the cache.
-const SAMPLED_CACHE_CAP: usize = 64;
+const SAMPLED_REACH_BAND: usize = 64;
 const SAMPLED_CACHE_BYTE_CAP: usize = 128 * 1024 * 1024;
 /// How far back the victim ledger remembers what the caps threw away.
 ///
@@ -2310,9 +2310,9 @@ const SAMPLED_CACHE_BYTE_CAP: usize = 128 * 1024 * 1024;
 /// "eight times" whatever the cap becomes. Eight times is the whole ledger, so
 /// there is no band past it — a miss the ledger cannot see reports
 /// `sampled_reach_beyond_ledger` and says so.
-const SAMPLED_VICTIM_LEDGER: usize = SAMPLED_CACHE_CAP * 8;
+const SAMPLED_VICTIM_LEDGER: usize = SAMPLED_REACH_BAND * 8;
 
-/// One entry [`SAMPLED_CACHE_CAP`] or [`SAMPLED_CACHE_BYTE_CAP`] evicted,
+/// One entry [`SAMPLED_REACH_BAND`] or [`SAMPLED_CACHE_BYTE_CAP`] evicted,
 /// remembered without its image.
 ///
 /// The eviction *route* has been banded for a while and it answers a different
@@ -2344,7 +2344,7 @@ struct SampledVictim {
 /// Why a sampled cache entry stopped being reusable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SampledVictimRoute {
-    /// [`SAMPLED_CACHE_CAP`] or [`SAMPLED_CACHE_BYTE_CAP`] was over budget.
+    /// [`SAMPLED_REACH_BAND`] or [`SAMPLED_CACHE_BYTE_CAP`] was over budget.
     Cap,
     /// The whole cache was discarded because a submission that had already
     /// published entries into it never reached the queue, so nothing in it could

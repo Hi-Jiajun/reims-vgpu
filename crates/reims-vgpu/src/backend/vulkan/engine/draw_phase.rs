@@ -125,7 +125,7 @@
 //!   `sampled_gpu_binds`.
 //! - No bind uploads or re-uploads bytes; the `Bytes` arm always hits cache.
 //! - The hit it takes is `find_cached_sampled`'s identity fast path, which
-//!   scans a `SAMPLED_CACHE_CAP`-bounded list of **64** entries and moves one to
+//!   scans a `SAMPLED_REACH_BAND`-bounded list of **64** entries and moves one to
 //!   the back. That cannot be the ~100 us per bind the arithmetic demands.
 //!
 //! **Do not read the third bullet as "the content path never fires".** A later
