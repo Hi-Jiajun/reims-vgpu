@@ -451,6 +451,32 @@ pub(crate) enum Phase {
     /// for the same reason and in the same shape: carved out of [`Phase::Record`]
     /// rather than added beside it, appended after the existing ordinals so that
     /// none of them moved, and summing back to what `record_us` was alone.
+    ///
+    /// # And the answer was not the barriers
+    ///
+    /// First reading, driven Maps boot F0, summed over 2 622 704 draws
+    /// (`throttle_ms=0`, `sum` 18.07 µs/draw, 52.2 fps at 1128 draws a frame):
+    ///
+    /// ```text
+    /// rec_draw_us     0.528     vertex/index binds and the draw call
+    /// rec_state_us    0.318     pipeline bind, dynamic state, descriptors
+    /// rec_pass_us     0.202     continue-or-begin, and cmd_begin_render_pass
+    /// rec_begin_us    0.155     begin_slot_recording
+    /// rec_barrier_us  0.104     all twenty barrier sites
+    /// record_us       0.044     the remainder
+    /// ```
+    ///
+    /// **The barrier region is 8 % of the span it was assumed to dominate**, and
+    /// the twenty `cmd_pipeline_barrier` sites that made it look expensive are
+    /// nearly free — most of them skip. Do not go hunting for barriers to remove
+    /// here; that theory is measured and dead.
+    ///
+    /// What is left is mostly a floor. `rec_draw` is 39 % of the span and is one
+    /// vertex bind plus one draw call per guest draw, which Apple's driver also
+    /// issues; `rec_state` is the pipeline and descriptor binds Vulkan requires.
+    /// So `record` as a whole is close to irreducible, and a per-draw CPU win has
+    /// to come from somewhere else — `sg_storage_us` (1.137 µs/draw) is now the
+    /// largest genuinely reducible item this device has.
     RecordBarrier = 29,
     /// Deciding whether the predecessor's render pass can be continued, and
     /// beginning one when it cannot. The pass-merge census is charged here, so
