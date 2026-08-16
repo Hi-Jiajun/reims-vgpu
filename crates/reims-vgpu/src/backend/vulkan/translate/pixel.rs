@@ -24,8 +24,8 @@ use ash::vk;
 use super::reason::TranslateReason;
 use crate::backend::vulkan::engine::StorageImageFormat;
 use crate::contract::pixel_format::{
-    self, StorageImageSelector, SwizzlePlan, SwizzleSource, TexelLayout, COMPONENT_A, COMPONENT_B,
-    COMPONENT_G, COMPONENT_R,
+    self, SampledByteFormat, StorageImageSelector, SwizzlePlan, SwizzleSource, TexelLayout,
+    COMPONENT_A, COMPONENT_B, COMPONENT_G, COMPONENT_R,
 };
 
 /// Whether a format's stored values carry the sRGB electro-optical transfer
@@ -289,6 +289,60 @@ pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
         TexelLayout::Rgb10a2Unorm => vk::Format::A2B10G10R10_UNORM_PACK32,
         TexelLayout::Bgr10a2Unorm => vk::Format::A2R10G10B10_UNORM_PACK32,
         TexelLayout::Rg11b10Float => vk::Format::B10G11R11_UFLOAT_PACK32,
+    }
+}
+
+/// The sRGB spelling of a guest [`TexelLayout`], for the layouts that have one.
+///
+/// The counterpart of [`vk_texel_layout`] for an image whose stored values are
+/// sRGB-encoded, so the hardware decodes on sample. `None` for every layout that
+/// cannot hold an sRGB image — see [`TexelLayout::has_srgb_encoding`], which
+/// this agrees with by a `const` assertion below rather than by a second list.
+///
+/// Written as the inverse of [`storage_format`] and held to it by
+/// `the_srgb_spelling_of_a_layout_stores_that_layout`: a pair that disagreed
+/// would key a resident allocation on one format and bind a view of the other.
+pub fn srgb_texel_layout(layout: TexelLayout) -> Option<vk::Format> {
+    match layout {
+        TexelLayout::Rgba8 => Some(vk::Format::R8G8B8A8_SRGB),
+        TexelLayout::Bgra8 => Some(vk::Format::B8G8R8A8_SRGB),
+        _ => None,
+    }
+}
+
+/// The Vulkan format for bytes a CPU loader produced.
+///
+/// The one crossing for the [`SampledSourceRequest::Bytes`-shaped rails][b], and
+/// the reason [`SampledByteFormat`] carries the source format: a
+/// [`TexelLayout`] alone is linear by construction, so every CPU upload of an
+/// sRGB guest texture used to reach the sampler through a `_UNORM` view while
+/// the zero-copy gather rails — which carry a resolved format — bound the
+/// `_SRGB` one. Same texture, same bytes, two colours, chosen by whichever rail
+/// the cost decision took.
+///
+/// A source that is sRGB-encoded in a layout with no sRGB spelling is the third
+/// case, and it is a real loss rather than an impossible one: a loader that
+/// converts an sRGB texture into a layout outside the eight-bit colour orders
+/// has moved the values out of the encoding's domain. That is reported on the
+/// census — the site the census's own doc said could not exist until the
+/// qualifier reached this far — and the linear spelling is bound, because the
+/// bytes are what they are.
+///
+/// [b]: crate::runtime::draw::vulkan
+pub fn vk_sampled_bytes(format: SampledByteFormat) -> vk::Format {
+    let linear = vk_texel_layout(format.layout());
+    let Some(mtl) = format.srgb_source() else {
+        return linear;
+    };
+    match srgb_texel_layout(format.layout()) {
+        Some(srgb) => srgb,
+        None => {
+            crate::runtime::census::srgb_census::note_downgrade(
+                crate::runtime::census::srgb_census::site::SAMPLED_BYTE_UPLOAD,
+                mtl,
+            );
+            linear
+        }
     }
 }
 
@@ -1361,8 +1415,11 @@ mod tests {
         }
     }
 
-    /// Sampled uploads still expose their downgrade until their byte-layout
-    /// carrier retains a transfer function. Colour attachments must keep sRGB.
+    /// [`sampled_pixels`] answers a bare [`TexelLayout`], which by construction
+    /// has no transfer function, so it still owes its caller the decline. What
+    /// changed is that the sampled *rails* no longer lose it: they pair the
+    /// layout with the source format in a [`SampledByteFormat`] and
+    /// [`vk_sampled_bytes`] applies it. Colour attachments keep sRGB outright.
     #[test]
     fn an_srgb_format_never_reaches_a_linear_one_silently() {
         for mtl in [
@@ -1396,6 +1453,90 @@ mod tests {
                 assert_eq!(decline, None, "MTL {mtl:#x}");
             }
         }
+    }
+
+    /// The sRGB spelling of a layout is the same allocation as its linear one,
+    /// and exists for exactly the layouts the contract says can hold an sRGB
+    /// image.
+    ///
+    /// Both halves matter and neither is a restatement. The first keeps
+    /// [`srgb_texel_layout`] the inverse of [`storage_format`]: a pair that
+    /// disagreed would key a resident allocation on one format while binding a
+    /// view of the other, which is the fork [`storage_format`]'s own doc
+    /// describes. The second keeps it in step with
+    /// [`TexelLayout::has_srgb_encoding`], which is what
+    /// [`vk_sampled_bytes`] consults to decide whether an sRGB source is
+    /// honourable or has to be reported — a layout answering `true` there with
+    /// no spelling here would report a downgrade it could have avoided, and one
+    /// answering `false` with a spelling here would hide a real one.
+    #[test]
+    fn the_srgb_spelling_of_a_layout_stores_that_layout() {
+        for layout in TexelLayout::ALL.iter().copied() {
+            match srgb_texel_layout(layout) {
+                Some(srgb) => {
+                    assert_eq!(
+                        storage_format(srgb),
+                        vk_texel_layout(layout),
+                        "{layout:?}: the sRGB view must store the linear allocation"
+                    );
+                    assert!(
+                        layout.has_srgb_encoding(),
+                        "{layout:?}: spelled sRGB but the contract says it cannot hold one"
+                    );
+                }
+                None => assert!(
+                    !layout.has_srgb_encoding(),
+                    "{layout:?}: can hold an sRGB image and has no spelling for it"
+                ),
+            }
+        }
+    }
+
+    /// The two ends of the CPU sampled rail meet: a source the contract calls
+    /// sRGB reaches an `_SRGB` Vulkan format, and a linear one does not.
+    ///
+    /// This is the divergence the type exists to close. The zero-copy gather
+    /// rails resolve `translate(declared).vk` and decode; the CPU rung reaches
+    /// [`vk_sampled_bytes`] and must land on the same colour space, or one guest
+    /// texture gets two different colours and a cost threshold picks which.
+    #[test]
+    fn the_cpu_sampled_rail_lands_where_the_zero_copy_rail_does() {
+        for (mtl, expected) in [
+            (
+                p::MTL_FORMAT_RGBA8_UNORM_SRGB,
+                vk::Format::R8G8B8A8_SRGB,
+            ),
+            (
+                p::MTL_FORMAT_BGRA8_UNORM_SRGB,
+                vk::Format::B8G8R8A8_SRGB,
+            ),
+        ] {
+            let (layout, _, _) = sampled_pixels(mtl).expect("both sRGB orders sample");
+            let bytes = SampledByteFormat::from_source(layout, mtl);
+            assert_eq!(bytes.srgb_source(), Some(mtl));
+            assert_eq!(
+                vk_sampled_bytes(bytes),
+                expected,
+                "MTL {mtl:#x}: the CPU rung must decode where the gather rail does"
+            );
+            // And that is the format the zero-copy rail resolves independently.
+            assert_eq!(translate(mtl).unwrap().vk, expected);
+        }
+        // Bytes with no guest format behind them stay linear: a clear colour is
+        // stated in the space the attachment decodes to, so encoding it here
+        // would apply a transfer function the guest never asked for.
+        assert_eq!(
+            vk_sampled_bytes(SampledByteFormat::synthesised(TexelLayout::Rgba8)),
+            vk::Format::R8G8B8A8_UNORM
+        );
+        // A linear guest source likewise.
+        assert_eq!(
+            vk_sampled_bytes(SampledByteFormat::from_source(
+                TexelLayout::Bgra8,
+                p::MTL_FORMAT_BGRA8_UNORM
+            )),
+            vk::Format::B8G8R8A8_UNORM
+        );
     }
 
     /// The storage fold changes the transfer function and **never** the channel

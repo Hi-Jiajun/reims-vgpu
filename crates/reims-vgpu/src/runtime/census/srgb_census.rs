@@ -22,22 +22,22 @@
 //! before that, so the census was answering for a population it no longer
 //! watched.
 //!
-//! What it still does not watch is the rail where the qualifier is dropped
-//! today: the **CPU sampled upload rung**, `runtime::draw::vulkan`'s
-//! `SampledSourceRequest::Bytes` arm, which reaches
-//! `translate::pixel::vk_texel_layout` and is linear by construction — that
-//! function's own doc says a `TexelLayout` carries no transfer function. There
-//! is no site constant for it because a site needs the guest's declared format
-//! at the moment of the fold, and that variant does not carry one: it carries a
-//! `TexelLayout`, into which the qualifier has already been narrowed away by
-//! the producer.
+//! The rail that used to be missing here was the **CPU sampled upload rung**,
+//! `runtime::draw::vulkan`'s `SampledSourceRequest::Bytes` arm. It could not be
+//! given a site constant, because a site needs the guest's declared format at
+//! the moment of the fold and that variant carried a bare `TexelLayout` — into
+//! which the qualifier had already been narrowed away by the producer. So the
+//! rung downgraded every sRGB CPU upload silently, while the zero-copy rails
+//! beside it bound the `_SRGB` view and decoded, and which of the two a bind
+//! took was a cost decision.
 //!
-//! So the missing site is not an oversight to add a constant for. It is the
-//! same defect the census exists to report, one layer down — the fold happens
-//! where nothing can name it. Widening that variant to carry the transfer
-//! function beside the layout is what makes both the fix and the census site
-//! possible, and it is written up in
-//! `kb/the-cpu-sampled-rung-drops-the-srgb-decode-the-zero-copy-rail-honours.md`.
+//! That variant now carries [`crate::contract::pixel_format::SampledByteFormat`],
+//! which pairs the layout with the source format, so the rung *honours* the
+//! qualifier and there is nothing left to report for the eight-bit colour
+//! orders. What remains is [`site::SAMPLED_BYTE_UPLOAD`]: a loader that
+//! converted an sRGB texture into a layout with no sRGB spelling has moved the
+//! values out of the encoding's domain, and that is a genuine loss this can
+//! finally name.
 //!
 //! # Reading it
 //!
@@ -69,19 +69,18 @@ pub const SRGB_DOWNGRADED_SLUG: &str = "srgb_downgraded";
 pub mod site {
     /// `build_secondary_targets` — MRT colour attachment beyond slot 0.
     pub const SECONDARY_COLOR_TARGET: &str = "secondary_color_target";
-    /// `linear_native_upload_format` — guest bytes uploaded in their native
-    /// order with no convert pass.
-    pub const LINEAR_NATIVE_UPLOAD: &str = "linear_native_upload";
-    /// `load_tight_linear_rgba_with` — tight-row CPU load of a linear texture.
-    pub const TIGHT_LINEAR_LOAD: &str = "tight_linear_load";
+    /// `translate::pixel::vk_sampled_bytes` — a CPU loader handed back bytes
+    /// that are still sRGB-encoded in a layout with no sRGB spelling, so the
+    /// linear one is bound and the hardware will not decode.
+    ///
+    /// The CPU upload rails do not otherwise appear here any more: they carry
+    /// the source format alongside the layout and the fold honours it. This
+    /// fires only where honouring it is not expressible.
+    pub const SAMPLED_BYTE_UPLOAD: &str = "sampled_byte_upload";
 
     /// Every site, for the completeness test. A new site constant that is not
     /// listed here is one the census cannot report on.
-    pub const ALL: &[&str] = &[
-        SECONDARY_COLOR_TARGET,
-        LINEAR_NATIVE_UPLOAD,
-        TIGHT_LINEAR_LOAD,
-    ];
+    pub const ALL: &[&str] = &[SECONDARY_COLOR_TARGET, SAMPLED_BYTE_UPLOAD];
 }
 
 /// `(site, MTLPixelFormat)` pairs already reported, so a per-draw rail costs one
@@ -128,12 +127,12 @@ mod tests {
         assert!(SEEN
             .lock()
             .unwrap()
-            .insert((site::LINEAR_NATIVE_UPLOAD, MTL_FORMAT_BGRA8_UNORM_SRGB)));
+            .insert((site::SAMPLED_BYTE_UPLOAD, MTL_FORMAT_BGRA8_UNORM_SRGB)));
         for _ in 0..64 {
-            note_downgrade(site::LINEAR_NATIVE_UPLOAD, MTL_FORMAT_BGRA8_UNORM_SRGB);
+            note_downgrade(site::SAMPLED_BYTE_UPLOAD, MTL_FORMAT_BGRA8_UNORM_SRGB);
         }
         assert_eq!(SEEN.lock().unwrap().len(), 1, "64 binds, one pair");
-        note_downgrade(site::LINEAR_NATIVE_UPLOAD, MTL_FORMAT_RGBA8_UNORM_SRGB);
+        note_downgrade(site::SAMPLED_BYTE_UPLOAD, MTL_FORMAT_RGBA8_UNORM_SRGB);
         note_downgrade(site::SECONDARY_COLOR_TARGET, MTL_FORMAT_RGBA8_UNORM_SRGB);
         assert_eq!(
             SEEN.lock().unwrap().len(),

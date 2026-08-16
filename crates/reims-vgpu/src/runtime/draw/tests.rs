@@ -504,7 +504,7 @@ fn tight_linear_cpu_fallback_reads_every_depth_plane() {
         },
     )
     .unwrap();
-    assert_eq!(format, TexelLayout::Bgra8);
+    assert_eq!(format.layout(), TexelLayout::Bgra8);
     assert_eq!(bytes, native);
 }
 
@@ -1832,7 +1832,7 @@ fn attachment_alias_resident_chain_selection() {
     req.colors[0].target_seed_rgba = Some(seed);
     assert!(matches!(
         fragment_attachment_alias_sample(&req, 0, 42),
-        Some((8, 8, AttachmentAliasSample::Seed(_)))
+        Some((8, 8, AttachmentAliasSample::Seed(_, _)))
     ));
 }
 
@@ -1864,7 +1864,7 @@ fn gva_attachment_alias_samples_the_in_process_chain() {
     let (width, height, sample) =
         fragment_attachment_alias_sample(&req, 0, texture_ref).expect("GVA alias");
     assert_eq!((width, height), (2, 1));
-    let AttachmentAliasSample::Seed(actual) = sample else {
+    let AttachmentAliasSample::Seed(actual, _) = sample else {
         panic!("Load alias must use the chained seed");
     };
     assert_eq!(actual, seed);
@@ -1904,7 +1904,7 @@ fn tight_linear_load_uses_one_bulk_read_and_converts_rows() {
     .expect("tight sample loads");
 
     assert_eq!(calls, 1);
-    assert_eq!(fmt, TexelLayout::Rgba8);
+    assert_eq!(fmt.layout(), TexelLayout::Rgba8);
     assert_eq!(
         rgba,
         [1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255,]
@@ -1933,7 +1933,7 @@ fn tight_linear_native_bgra8_keeps_bytes_and_reports_bgra8() {
     )
     .expect("tight native sample loads");
     assert_eq!(calls, 1);
-    assert_eq!(fmt, TexelLayout::Bgra8);
+    assert_eq!(fmt.layout(), TexelLayout::Bgra8);
     assert_eq!(bytes, bgra, "native BGRA8 upload must not swizzle");
 }
 
@@ -1967,7 +1967,7 @@ fn a_half_float_sampled_texture_keeps_its_bytes_when_the_caller_takes_native_lay
         },
     )
     .expect("half-float sample loads");
-    assert_eq!(fmt, TexelLayout::Rgba16Float);
+    assert_eq!(fmt.layout(), TexelLayout::Rgba16Float);
     assert_eq!(bytes, guest, "a half-float upload must not convert");
 
     // The same source through the lossy arm, so the gate states what it is
@@ -1985,7 +1985,7 @@ fn a_half_float_sampled_texture_keeps_its_bytes_when_the_caller_takes_native_lay
         },
     )
     .expect("half-float sample loads through the convert arm too");
-    assert_eq!(narrowed_fmt, TexelLayout::Rgba8);
+    assert_eq!(narrowed_fmt.layout(), TexelLayout::Rgba8);
     assert_eq!(narrowed.len(), 8, "converted to four bytes a texel");
     assert_eq!(
         narrowed[0], narrowed[4],
@@ -2013,7 +2013,7 @@ fn a_two_channel_half_float_sampled_texture_reports_rg16_float() {
         },
     )
     .expect("two-channel half-float sample loads");
-    assert_eq!(fmt, TexelLayout::Rg16Float);
+    assert_eq!(fmt.layout(), TexelLayout::Rg16Float);
     assert_eq!(bytes, guest);
 }
 
@@ -2055,36 +2055,26 @@ fn tight_rgba_linear_load_preserves_native_bytes() {
         },
     )
     .expect("tight RGBA sample loads");
-    assert_eq!(fmt, TexelLayout::Rgba8);
+    assert_eq!(fmt.layout(), TexelLayout::Rgba8);
     assert_eq!(rgba, native);
 }
 
-/// **The sRGB-fold regression gate for the CPU upload rails.** These two
-/// paths reach a linear byte layout from an sRGB Metal format, which is the
-/// right layout — the two share one — but silently lost the transfer
-/// function until the census was wired in. The layout must stay identical
-/// to the linear sibling's *and* the loss must be counted; either half
-/// alone is the old bug.
+/// **The sRGB regression gate for the CPU upload rails.** These paths reach a
+/// linear byte *layout* from an sRGB Metal format, which is the right layout —
+/// the two share one — and for a long time that was all they carried, so every
+/// CPU-uploaded sRGB texture was bound through a `_UNORM` view and never
+/// decoded, while the zero-copy rails beside them bound `_SRGB` and were.
+///
+/// Both halves are asserted here because either alone is a bug: the layout must
+/// stay identical to the linear sibling's, *and* the transfer function must
+/// survive to the Vulkan format the bind uses.
+#[cfg(feature = "backend-vulkan")]
 #[test]
-fn the_cpu_upload_rails_count_every_srgb_downgrade() {
-    use crate::runtime::census::srgb_census;
-    srgb_census::reset_for_tests();
-    // The sink is append-only and shared with every other test in the binary,
-    // so this asserts a delta, not an absolute count.
-    // Count LINES, not substring hits: the slug appears twice per line, once as
-    // the event prefix and once as `reason=`.
-    let downgrade_lines = || {
-        std::fs::read_to_string(crate::observe::fail_log_path())
-            .map(|l| {
-                l.lines()
-                    .filter(|l| l.starts_with("srgb_downgraded "))
-                    .count()
-            })
-            .unwrap_or(0)
-    };
-    let before = downgrade_lines();
+fn the_cpu_upload_rails_carry_the_srgb_transfer_function_to_the_bind() {
+    use crate::backend::vulkan::translate::pixel::{vk_sampled_bytes, vk_texel_layout};
 
-    // Native-upload rail: sRGB resolves exactly as its linear sibling.
+    // Native-upload rail: an sRGB format resolves to exactly its linear
+    // sibling's layout. That fold is correct and is not what was lost.
     assert_eq!(
         linear_native_upload_format(
             pixel_format::MTL_FORMAT_RGBA8_UNORM_SRGB,
@@ -2099,8 +2089,11 @@ fn the_cpu_upload_rails_count_every_srgb_downgrade() {
         ),
         Some(TexelLayout::Bgra8),
     );
-    // Tight-load rail: same layout, and the BGRA swap still happens when
-    // the caller did not opt into a native BGRA8 upload.
+
+    // Tight-load rail, converting arm: the BGRA swap still happens when the
+    // caller did not opt into a native BGRA8 upload, and the qualifier rides
+    // through the channel exchange — a swap moves no value across the transfer
+    // function.
     let native = [1u8, 2, 3, 4, 5, 6, 7, 8];
     let (bytes, fmt) = load_tight_linear_rgba_with(
         2,
@@ -2115,31 +2108,48 @@ fn the_cpu_upload_rails_count_every_srgb_downgrade() {
         },
     )
     .expect("tight sRGB BGRA sample loads");
-    assert_eq!(fmt, TexelLayout::Rgba8);
+    assert_eq!(fmt.layout(), TexelLayout::Rgba8, "layout is the sibling's");
     assert_eq!(
         bytes,
         [3, 2, 1, 4, 7, 6, 5, 8],
         "channel swap still applied"
     );
-
-    // Three distinct (site, format) pairs were downgraded above — two on the
-    // native-upload rail (RGBA8 and BGRA8 sRGB) and one on the tight-load rail
-    // — so the sink must carry three lines and name both rails. Read off the
-    // log rather than a counter: the line is what a boot has to show.
-    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
     assert_eq!(
-        downgrade_lines() - before,
-        3,
-        "every downgrade named, none swallowed"
+        fmt.srgb_source(),
+        Some(pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB),
+        "the source's transfer function survives the reorder"
     );
-    assert!(log.contains(&format!("site={}", srgb_census::site::LINEAR_NATIVE_UPLOAD)));
-    assert!(log.contains(&format!("site={}", srgb_census::site::TIGHT_LINEAR_LOAD)));
+    // The whole point: the bind decodes. Bound as RGBA because that is the
+    // order the swap produced, and sRGB because that is what the guest stored.
+    assert_eq!(
+        vk_sampled_bytes(fmt),
+        ash::vk::Format::R8G8B8A8_SRGB,
+        "the CPU rung must bind the same colour space the zero-copy rail does"
+    );
 
-    // A linear source must never touch the census, or the proxy floods and
-    // stops distinguishing anything.
-    srgb_census::reset_for_tests();
-    let _ = linear_native_upload_format(pixel_format::MTL_FORMAT_RGBA8_UNORM, NativeUploads::NONE);
-    let _ = load_tight_linear_rgba_with(
+    // Tight-load rail, native arm: no conversion at all, qualifier still there.
+    let (_, native_fmt) = load_tight_linear_rgba_with(
+        2,
+        1,
+        1,
+        pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB,
+        NativeUploads::BGRA8,
+        "test_tight_load",
+        |dst| {
+            dst.copy_from_slice(&native);
+            true
+        },
+    )
+    .expect("native sRGB BGRA sample loads");
+    assert_eq!(native_fmt.layout(), TexelLayout::Bgra8);
+    assert_eq!(
+        vk_sampled_bytes(native_fmt),
+        ash::vk::Format::B8G8R8A8_SRGB
+    );
+
+    // A linear source must reach the linear spelling, or every bind decodes
+    // twice and the fix is worse than the bug it replaced.
+    let (_, linear_fmt) = load_tight_linear_rgba_with(
         2,
         1,
         1,
@@ -2150,13 +2160,13 @@ fn the_cpu_upload_rails_count_every_srgb_downgrade() {
             dst.copy_from_slice(&native);
             true
         },
-    );
+    )
+    .expect("native linear BGRA sample loads");
+    assert_eq!(linear_fmt.srgb_source(), None);
     assert_eq!(
-        downgrade_lines() - before,
-        3,
-        "a linear source must add no line"
+        vk_sampled_bytes(linear_fmt),
+        vk_texel_layout(TexelLayout::Bgra8)
     );
-    srgb_census::reset_for_tests();
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -2661,7 +2671,7 @@ fn a8_sample_preserves_alpha_coverage() {
     )
     .expect("A8 sample loads");
     assert_eq!(
-        fmt,
+        fmt.layout(),
         TexelLayout::Rgba8,
         "A8 needs a real convert; native flag does not apply"
     );
@@ -3734,7 +3744,7 @@ fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
             .expect("guest tight linear must load");
     assert_eq!((w, h), (4, 2));
     assert_eq!(
-        fmt1,
+        fmt1.layout(),
         TexelLayout::Bgra8,
         "the tight guest-memo path uploads native BGRA8 (no CPU swizzle)"
     );
@@ -3855,7 +3865,7 @@ fn padded_bgra8_memoized_uploads_native_without_swizzle() {
             .expect("padded BGRA8 must load via the memo");
     assert_eq!((gw, gh), (w, h));
     assert_eq!(
-        fmt,
+        fmt.layout(),
         TexelLayout::Bgra8,
         "padded BGRA8 must upload native (no CPU swizzle)"
     );
@@ -3882,7 +3892,7 @@ fn padded_bgra8_memoized_uploads_native_without_swizzle() {
         std::sync::Arc::ptr_eq(&rgba, &rgba2),
         "unchanged padded bytes must reuse the memoized Arc"
     );
-    assert_eq!(fmt2, TexelLayout::Bgra8);
+    assert_eq!(fmt2.layout(), TexelLayout::Bgra8);
     assert_eq!(id2.expect("identity").generation, id.generation);
 }
 
@@ -4248,7 +4258,7 @@ fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
     // surface still fails here. Asserting the layout beside the bytes is what
     // keeps the pair honest — bytes alone would also pass if the layout drifted
     // to RGBA8 and every sampled frame came out channel-swapped.
-    assert_eq!(layout, TexelLayout::Bgra8);
+    assert_eq!(layout.layout(), TexelLayout::Bgra8);
     assert_eq!(&sampled[..4], &[255, 0, 0, 255]);
 
     // Threading the caller-resolved resource must produce a byte-identical
@@ -4377,7 +4387,7 @@ fn type11_host_cache_rung_identity_tracks_the_cached_frame() {
         // up untouched. Asserting the pair together is the point: either one
         // alone permits the channel-swapped frame that the other rules out.
         assert_eq!(
-            layout,
+            layout.layout(),
             TexelLayout::Bgra8,
             "the scanout cache's bytes are BGRA8; declaring RGBA8 samples R and B swapped"
         );
@@ -4579,7 +4589,7 @@ fn type5_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
     // Native RG8 upload: two bytes per texel, tight rows (an R8G8_UNORM
     // Vulkan image samples these identically to the old CPU (r,g,0,255)
     // RGBA8 expansion).
-    assert_eq!(byte_format, TexelLayout::Rg8);
+    assert_eq!(byte_format.layout(), TexelLayout::Rg8);
     assert_eq!(sampled.len(), (width * height * 2) as usize);
     assert_eq!(&sampled[..4], &[1, 1, 2, 1]);
     let last = ((height - 1) as usize * width as usize + (width - 1) as usize) * 2;
@@ -4660,7 +4670,7 @@ fn type5_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
             .expect("first materialization");
     assert_eq!((w1, h1), (width, height));
     assert_eq!(
-        fmt1,
+        fmt1.layout(),
         TexelLayout::Rg8,
         "an RG8 chroma plane uploads at native footprint, not CPU-expanded to RGBA8"
     );

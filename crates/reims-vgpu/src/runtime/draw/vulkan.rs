@@ -798,13 +798,22 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
 /// Sampled texture source + geometry for an engine draw.
 pub(super) enum SampledSourceRequest {
     /// Shared texel bytes + optional producer identity (see
-    /// [`LinearSampleIdentity`]) + the byte layout of those texels; the Arc lets
-    /// memoized repeat binds skip the per-draw copy and the engine skip
-    /// re-hashing.
+    /// [`LinearSampleIdentity`]) + what those texels are; the Arc lets memoized
+    /// repeat binds skip the per-draw copy and the engine skip re-hashing.
+    ///
+    /// The third field is a [`SampledByteFormat`] and not a bare `TexelLayout`
+    /// because a layout is linear by construction. While it was one, every CPU
+    /// upload of an sRGB guest texture reached the sampler through a `_UNORM`
+    /// view and was never decoded, while the zero-copy rails beside it — which
+    /// carry a resolved host format — bound the `_SRGB` spelling and were. One
+    /// guest texture, two colours, and which one it got decided by a cost
+    /// threshold. Each producer answers from the format it *loaded from*, so a
+    /// convert that reorders channels keeps the transfer function it never
+    /// touched.
     Bytes(
         std::sync::Arc<Vec<u8>>,
         Option<LinearSampleIdentity>,
-        TexelLayout,
+        SampledByteFormat,
         crate::backend::vulkan::engine::SampledByteOrigin,
     ),
     /// Engine-resident allocation plus the exact view format this sampled
@@ -893,14 +902,14 @@ type LoadedType5View = (
     u32,
     std::sync::Arc<Vec<u8>>,
     LinearSampleIdentity,
-    TexelLayout,
+    SampledByteFormat,
 );
 type LoadedLinearSample = (
     u32,
     u32,
     std::sync::Arc<Vec<u8>>,
     Option<LinearSampleIdentity>,
-    TexelLayout,
+    SampledByteFormat,
 );
 
 /// Authoritative contents when a fragment texture aliases a GVA color target.
@@ -912,8 +921,21 @@ type LoadedLinearSample = (
 /// chained image.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum AttachmentAliasSample<'a> {
+    /// The attachment's `MTLClearColor`, which the guest states in the colour
+    /// space the attachment decodes *to*. Metal encodes it on the way into an
+    /// sRGB attachment and decodes it back on sample, so the value a shader
+    /// reads is the one written here — this device stores that value directly
+    /// and binds it linear. No attachment format is carried because none is
+    /// needed: the round trip cancels.
     Clear([f64; 4]),
-    Seed(&'a [u8]),
+    /// The attachment's prior contents, read back out of its guest pages, plus
+    /// the format they were **stored** in.
+    ///
+    /// The format is here and not on [`Self::Clear`] because a seed is stored
+    /// bytes rather than a decoded value: an sRGB attachment holds encoded ones,
+    /// and a bind that samples them linear hands the shader an undecoded value
+    /// the next attachment write then encodes a second time.
+    Seed(&'a [u8], u16),
     /// Records 2+ of a resident GVA chain: the prior record's content lives
     /// on the engine-resident target, not in a CPU seed. Bound as a resident
     /// sampled source (the engine snapshots on self-alias).
@@ -946,7 +968,11 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
                 .as_deref()
                 .filter(|seed| seed.len() == need)
             {
-                return Some((color.width, color.height, AttachmentAliasSample::Seed(seed)));
+                return Some((
+                    color.width,
+                    color.height,
+                    AttachmentAliasSample::Seed(seed, color.format),
+                ));
             }
             if req.chain_from_resident {
                 return Some((
@@ -1100,6 +1126,10 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         texture_ref,
         resource.as_deref(),
     ) {
+        // The opcode-9 descriptor's own pixel format. The loader converts to
+        // RGBA8 order and decodes nothing, so the transfer function the guest
+        // declared is still the one these bytes carry.
+        let source = bt.desc.pixel_format;
         let (w, h, rgba) = load_buffer_texture_rgba(state, host, task_id, texture_ref, &bt)?;
         return Some((
             w,
@@ -1108,7 +1138,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
             SampledSourceRequest::Bytes(
                 std::sync::Arc::new(rgba),
                 None,
-                TexelLayout::Rgba8,
+                SampledByteFormat::from_source(TexelLayout::Rgba8, source),
                 crate::backend::vulkan::engine::SampledByteOrigin::BufferBackedTexture,
             ),
         ));
@@ -1553,6 +1583,12 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                         generation: host_gen,
                     });
                     note_type11_sample_rung("t11rung_host_cache", guest_write);
+                    // BGRA8 by construction — it is a type-4 scanout cache — but
+                    // the *values* in it are the surface's, and this cache is
+                    // filled from a writeback that reorders channels and decodes
+                    // nothing. So the transfer function is the mapping's declared
+                    // one, exactly as it is on the guest-page rungs below.
+                    let source = crate::runtime::draw::mapping_declared_format(state, mid, None)?;
                     return Some((
                         w,
                         h,
@@ -1560,7 +1596,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                         SampledSourceRequest::Bytes(
                             bgra,
                             identity,
-                            TexelLayout::Bgra8,
+                            SampledByteFormat::from_source(TexelLayout::Bgra8, source),
                             crate::backend::vulkan::engine::SampledByteOrigin::SurfaceHostCache,
                         ),
                     ));
@@ -1581,6 +1617,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // The memo skips the convert/alloc on unchanged content and
                 // returns a content identity so the engine skips re-hash+upload;
                 // its census (T11Memo hit / T11Guest fill) is emitted internally.
+                let memo_source = crate::runtime::draw::mapping_declared_format(state, mid, None);
                 if let Some((rgba, identity)) = load_type11_rgba_memoized(state, host, mid) {
                     note_type11_sample_rung("t11rung_guest_memo", guest_write);
                     return Some((
@@ -1590,7 +1627,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                         SampledSourceRequest::Bytes(
                             rgba,
                             Some(identity),
-                            TexelLayout::Rgba8,
+                            SampledByteFormat::from_source(TexelLayout::Rgba8, memo_source?),
                             crate::backend::vulkan::engine::SampledByteOrigin::SurfaceGuestFallback,
                         ),
                     ));
@@ -1703,7 +1740,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     let need = (w as usize)
         .saturating_mul(h as usize)
         .saturating_mul(planes as usize)
-        .saturating_mul(layout.bytes_per_texel() as usize);
+        .saturating_mul(layout.layout().bytes_per_texel() as usize);
     if bytes.len() < need {
         return None;
     }
@@ -2477,16 +2514,20 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     // would read the word as four unrelated bytes. Four bytes wide is exactly
     // what the default arm below tests for and exactly what makes that wrong,
     // which is why they are named here rather than left to it.
-    let byte_format = match view.pixel_format {
-        pixel_format::MTL_FORMAT_R8_UNORM => TexelLayout::R8,
-        pixel_format::MTL_FORMAT_RG8_UNORM => TexelLayout::Rg8,
-        pixel_format::MTL_FORMAT_R16_UNORM => TexelLayout::R16Unorm,
-        pixel_format::MTL_FORMAT_RG16_UNORM => TexelLayout::Rg16Unorm,
-        pixel_format::MTL_FORMAT_RGB10A2_UNORM => TexelLayout::Rgb10a2Unorm,
-        pixel_format::MTL_FORMAT_BGR10A2_UNORM => TexelLayout::Bgr10a2Unorm,
-        pixel_format::MTL_FORMAT_RG11B10_FLOAT => TexelLayout::Rg11b10Float,
-        _ => TexelLayout::Rgba8,
-    };
+    // The layout is the view's own; the transfer function travels with it,
+    // because the default arm below converts to RGBA8 order and decodes nothing.
+    let byte_format = SampledByteFormat::from_source(
+        match view.pixel_format {
+            pixel_format::MTL_FORMAT_RG8_UNORM => TexelLayout::Rg8,
+            pixel_format::MTL_FORMAT_R16_UNORM => TexelLayout::R16Unorm,
+            pixel_format::MTL_FORMAT_RG16_UNORM => TexelLayout::Rg16Unorm,
+            pixel_format::MTL_FORMAT_RGB10A2_UNORM => TexelLayout::Rgb10a2Unorm,
+            pixel_format::MTL_FORMAT_BGR10A2_UNORM => TexelLayout::Bgr10a2Unorm,
+            pixel_format::MTL_FORMAT_RG11B10_FLOAT => TexelLayout::Rg11b10Float,
+            _ => TexelLayout::Rgba8,
+        },
+        view.pixel_format,
+    );
     let ok_line = |generation_source: &str, rgba: &[u8]| {
         // Per-draw success echo — fires on EVERY type-5 plane bind (thousands/sec
         // under video → ~36k lines/boot, 61% of the fail log), burying real
@@ -2526,7 +2567,7 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     // RGBA8 formats expand per-pixel into a fresh RGBA8 buffer; native R8/RG8
     // upload the plane bytes verbatim (the memo stores those bytes as both the
     // memcmp key and the upload payload).
-    let rgba: std::sync::Arc<Vec<u8>> = if byte_format == TexelLayout::Rgba8 {
+    let rgba: std::sync::Arc<Vec<u8>> = if byte_format.layout() == TexelLayout::Rgba8 {
         let Some(rgba_stride) = view.width.checked_mul(RGBA8_BPP) else {
             return fail(Type5ViewDecline::RgbaStride);
         };
@@ -2577,7 +2618,7 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
             // The type-5 view path re-derives this from the view's own pixel
             // format on every call, hit or miss, so storing it is a statement of
             // what the bytes are rather than the source anything reads.
-            layout: byte_format,
+            layout: byte_format.layout(),
             generation,
         },
         entry_bytes,
@@ -4955,7 +4996,7 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 ) -> Option<(
     std::sync::Arc<Vec<u8>>,
     Option<LinearSampleIdentity>,
-    TexelLayout,
+    SampledByteFormat,
 )> {
     let declared_format = tex.declared_pixel_format()?;
     let sample_fmt = effective_view_sample_format(declared_format, None)?;
@@ -5078,7 +5119,10 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
                 key: gva,
                 generation,
             }),
-            fmt,
+            // The memo stores the layout it converted to; the transfer function
+            // is `sample_fmt`'s and is re-derived on hit and miss alike, so a
+            // retained entry cannot carry a stale one.
+            SampledByteFormat::from_source(fmt, sample_fmt),
         ));
     }
     // First sight or native bytes changed: convert fresh, new generation.
@@ -5107,7 +5151,7 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
             key: gva,
             generation,
         }),
-        fmt,
+        SampledByteFormat::from_source(fmt, sample_fmt),
     ))
 }
 
@@ -5196,7 +5240,7 @@ fn note_guest_rung_blank<H: HostMemory>(
     texture_ref: u32,
     span: (u64, u32, u32),
     rgba: &[u8],
-    byte_format: TexelLayout,
+    byte_format: SampledByteFormat,
 ) {
     let (gva, w, h) = span;
     crate::runtime::drain::note_store_route("lin_rung_guest_memo");
@@ -7169,17 +7213,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 SampledSourceRequest::Bytes(
                                     std::sync::Arc::new(solid_rgba8(aw, ah, &clear)),
                                     None,
-                                    TexelLayout::Rgba8,
+                                    SampledByteFormat::synthesised(TexelLayout::Rgba8),
                                     crate::backend::vulkan::engine::SampledByteOrigin::AttachmentAlias,
                                 ),
                             ),
-                            AttachmentAliasSample::Seed(seed) => (
+                            AttachmentAliasSample::Seed(seed, stored) => (
                                 aw,
                                 ah,
                                 SampledSourceRequest::Bytes(
                                     std::sync::Arc::new(seed.to_vec()),
                                     None,
-                                    TexelLayout::Rgba8,
+                                    SampledByteFormat::from_source(TexelLayout::Rgba8, stored),
                                     crate::backend::vulkan::engine::SampledByteOrigin::AttachmentAlias,
                                 ),
                             ),
@@ -7259,7 +7303,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 let source = match loaded {
                     SampledSourceRequest::Bytes(rgba, identity, byte_format, origin) => {
                         bytes_identity = identity;
-                        sampled_vk_format = translate::pixel::vk_texel_layout(byte_format);
+                        sampled_vk_format = translate::pixel::vk_sampled_bytes(byte_format);
                         byte_origin = origin;
                         crate::backend::vulkan::engine::SampledSource::Bytes(rgba)
                     }
@@ -10170,7 +10214,7 @@ mod vulkan_split_tests {
             9,
             (gva, w, h),
             &content,
-            TexelLayout::Rgba8,
+            SampledByteFormat::synthesised(TexelLayout::Rgba8),
         );
         assert_eq!(
             store_route_count("lin_rung_host_entry"),
@@ -10186,7 +10230,7 @@ mod vulkan_split_tests {
         // All zeroes over the same cached span: the loss, and still a member of
         // the population it is a subset of.
         let blank = vec![0u8; (w * h * 4) as usize];
-        note_guest_rung_blank(&state, &host, 1, 9, (gva, w, h), &blank, TexelLayout::Rgba8);
+        note_guest_rung_blank(&state, &host, 1, 9, (gva, w, h), &blank, SampledByteFormat::synthesised(TexelLayout::Rgba8));
         assert_eq!(store_route_count("lin_rung_host_entry"), entries + 2);
         assert_eq!(
             store_route_count("lin_rung_blank_with_host_entry"),
@@ -10202,7 +10246,7 @@ mod vulkan_split_tests {
             9,
             (gva + 0x10_0000, w, h),
             &blank,
-            TexelLayout::Rgba8,
+            SampledByteFormat::synthesised(TexelLayout::Rgba8),
         );
         assert_eq!(store_route_count("lin_rung_host_entry"), entries + 2);
         assert_eq!(
@@ -10460,7 +10504,7 @@ mod vulkan_split_tests {
             9,
             (content_gva, w, h),
             &blank,
-            TexelLayout::Rgba8,
+            SampledByteFormat::synthesised(TexelLayout::Rgba8),
         );
         assert_eq!(
             store_route_count("lin_rung_blank_host_content"),
@@ -10480,7 +10524,7 @@ mod vulkan_split_tests {
             9,
             (blank_gva, w, h),
             &blank,
-            TexelLayout::Rgba8,
+            SampledByteFormat::synthesised(TexelLayout::Rgba8),
         );
         assert_eq!(
             store_route_count("lin_rung_blank_host_agrees"),

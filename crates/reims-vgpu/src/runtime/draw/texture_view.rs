@@ -627,7 +627,7 @@ pub(crate) fn load_linear_texture_host<M: HostMemory + HostOps>(
     format_override: Option<u16>,
     native: NativeUploads,
     site: crate::runtime::render_writeback::SettleSite,
-) -> Option<(Vec<u8>, TexelLayout)> {
+) -> Option<(Vec<u8>, SampledByteFormat)> {
     load_linear_texture_impl(
         state,
         host,
@@ -721,26 +721,17 @@ pub(crate) fn linear_native_upload_format(
     use pixel_format::SampledClass;
     // The decode contract's sampled class is the one rule for "which channel
     // order and width is this"; it folds each sRGB format onto its linear
-    // sibling's layout, which is right — they share a layout — but loses the
-    // qualifier, so the census records what the fold cost.
-    let upload = match pixel_format::sampled_class(sample_format)? {
+    // sibling's layout, which is right — they share a layout. The qualifier is
+    // no longer lost by that fold: every caller pairs the layout it gets here
+    // with `sample_format` into a [`SampledByteFormat`], and the bind applies
+    // the transfer function from there.
+    Some(match pixel_format::sampled_class(sample_format)? {
         SampledClass::Rgba8Unorm => TexelLayout::Rgba8,
         SampledClass::Bgra8Unorm if native.bgra8 => TexelLayout::Bgra8,
         SampledClass::Rgba16Float if native.float16 => TexelLayout::Rgba16Float,
         SampledClass::Rg16Float if native.float16 => TexelLayout::Rg16Float,
         _ => return None,
-    };
-    note_srgb_upload_downgrade(srgb_census::site::LINEAR_NATIVE_UPLOAD, sample_format);
-    Some(upload)
-}
-
-/// Record an sRGB downgrade on a byte-layout rail, if this format had a
-/// qualifier to lose. One helper so the two CPU upload paths cannot drift on
-/// when they report.
-fn note_srgb_upload_downgrade(site: &'static str, sample_format: u16) {
-    if pixel_format::is_srgb(sample_format) {
-        srgb_census::note_downgrade(site, sample_format);
-    }
+    })
 }
 
 // Eight, because the last one is the caller's identity and the whole point of
@@ -757,7 +748,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     format_override: Option<u16>,
     native: NativeUploads,
     site: crate::runtime::render_writeback::SettleSite,
-) -> Result<(Vec<u8>, TexelLayout), LinearLoadRefusal> {
+) -> Result<(Vec<u8>, SampledByteFormat), LinearLoadRefusal> {
     use LinearLoadRefusal as R;
     let (_entry, desc_bytes) = objects::resolve_descriptor(
         state,
@@ -895,7 +886,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
                 row: u32::try_from(row_index).unwrap_or(u32::MAX),
             })?;
         }
-        return Ok((rgba, fmt));
+        return Ok((rgba, SampledByteFormat::from_source(fmt, sample_fmt)));
     }
     let mut rgba = vec![0u8; need_rgba];
     let mut row = vec![0u8; tight as usize];
@@ -920,7 +911,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
             return Err(R::RowConvertUnsupported { format: sample_fmt });
         }
     }
-    Ok((rgba, TexelLayout::Rgba8))
+    Ok((rgba, SampledByteFormat::from_source(TexelLayout::Rgba8, sample_fmt)))
 }
 
 ///
@@ -935,7 +926,7 @@ pub(crate) fn load_tight_linear_rgba_with<F>(
     native: NativeUploads,
     site: &'static str,
     mut read: F,
-) -> Result<(Vec<u8>, TexelLayout), LinearLoadRefusal>
+) -> Result<(Vec<u8>, SampledByteFormat), LinearLoadRefusal>
 where
     F: FnMut(&mut [u8]) -> bool,
 {
@@ -969,17 +960,20 @@ where
     // take a native BGRA8 image, which is free of a second display-sized
     // allocation precisely because the two lengths agree there.
     if let Some(layout) = linear_native_upload_format(sample_format, native) {
-        note_srgb_upload_downgrade(srgb_census::site::TIGHT_LINEAR_LOAD, sample_format);
-        return Ok((bytes, layout));
+        return Ok((bytes, SampledByteFormat::from_source(layout, sample_format)));
     }
     if native_len == rgba_len
         && pixel_format::sampled_class(sample_format) == Some(pixel_format::SampledClass::Bgra8Unorm)
     {
-        note_srgb_upload_downgrade(srgb_census::site::TIGHT_LINEAR_LOAD, sample_format);
+        // A channel exchange, which moves no value across the transfer
+        // function: the bytes stay encoded exactly as the guest stored them.
         for pixel in bytes.chunks_exact_mut(RGBA8_BPP as usize) {
             pixel.swap(0, 2);
         }
-        return Ok((bytes, TexelLayout::Rgba8));
+        return Ok((
+            bytes,
+            SampledByteFormat::from_source(TexelLayout::Rgba8, sample_format),
+        ));
     }
     // Keyed by the calling rung, not by "tight rows". Which rung narrowed is
     // the question a boot's census leaves open otherwise: the colour LOAD seed
@@ -1002,7 +996,10 @@ where
             });
         }
     }
-    Ok((rgba, TexelLayout::Rgba8))
+    Ok((
+        rgba,
+        SampledByteFormat::from_source(TexelLayout::Rgba8, sample_format),
+    ))
 }
 
 #[cfg(test)]

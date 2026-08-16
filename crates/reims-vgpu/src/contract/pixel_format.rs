@@ -485,6 +485,103 @@ impl TexelLayout {
     pub fn a_cost_floor_may_decline(self) -> bool {
         self.has_cpu_loader_arm() && !self.cpu_loader_arm_is_lossy()
     }
+
+    /// Whether an sRGB-encoded image can be *stored* in this layout, so a host
+    /// sampled view of it can carry the transfer function.
+    ///
+    /// sRGB is defined on eight-bit unsigned normalized colour channels and
+    /// nowhere else, which is also why [`is_srgb`] names exactly two Metal
+    /// formats. A layout that answers `false` here cannot hold an sRGB image at
+    /// all, so a [`SampledByteFormat`] pairing one with an sRGB source is a
+    /// loader that converted the values *out* of the encoding's domain — the
+    /// one case the fold has to report rather than honour.
+    ///
+    /// Deliberately equal to [`Self::is_four_byte_color`] rather than written as
+    /// it: the two agree today because the eight-bit colour orders are both the
+    /// four-byte ones, and they answer different questions. A three-byte
+    /// `RGB8_SRGB` layout would separate them.
+    pub fn has_srgb_encoding(self) -> bool {
+        matches!(self, Self::Rgba8 | Self::Bgra8)
+    }
+}
+
+/// What a CPU loader produced for a sampled bind: the channel layout the bytes
+/// are in, and the guest format whose transfer function they still carry.
+///
+/// # Why this is two facts and not one
+///
+/// [`TexelLayout`] is linear by construction — it names a channel order and a
+/// width, and nothing in it can say that the stored values are sRGB-encoded.
+/// For as long as the sampled byte rails carried a bare layout, every CPU
+/// upload of an `MTLPixelFormatBGRA8Unorm_sRGB` texture was bound through a
+/// `_UNORM` view: the hardware never decoded, and the next sRGB attachment
+/// write encoded values that had never been decoded. Meanwhile the *zero-copy*
+/// rails, which carry a resolved host format, bound the `_SRGB` spelling and
+/// decoded correctly — so one guest texture got two different colours depending
+/// on which rail won, and which rail wins is a cost decision.
+///
+/// The two axes are genuinely independent: a loader may reorder channels
+/// (BGRA to RGBA) without touching the transfer function, so the layout it
+/// wrote and the encoding it preserved are separate answers and pairing them is
+/// not a flag threaded past a resolver. The source format is kept rather than
+/// boiled down to a `bool` so the fail log can name what was traded away when
+/// the fold cannot be honoured.
+///
+/// # Construct it where the source format is known
+///
+/// [`Self::from_source`] is the only way to say "these bytes came from a guest
+/// texture", and it takes that texture's `MTLPixelFormat`. A loader that has to
+/// reach for [`Self::synthesised`] is saying there is no guest format behind
+/// the values at all — a solid clear colour, for instance, which the guest
+/// specified in the attachment's decoded space. Choosing `synthesised` for
+/// bytes that *do* have a source format is the same silent loss this type
+/// exists to end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SampledByteFormat {
+    layout: TexelLayout,
+    /// The guest format the values were loaded from, when there is one. Held
+    /// privately because the layout above is what the bytes are *in*: deriving
+    /// one of these from the other is exactly the confusion this type ends.
+    source: Option<u16>,
+}
+
+impl SampledByteFormat {
+    /// Bytes a loader read out of a guest texture declared as `source`.
+    ///
+    /// `layout` is what the loader wrote, which may differ from `source`'s own
+    /// order; the transfer function is `source`'s and survives any reordering.
+    pub fn from_source(layout: TexelLayout, source: u16) -> Self {
+        Self {
+            layout,
+            source: Some(source),
+        }
+    }
+
+    /// Bytes this device built itself, with no guest texture behind them.
+    ///
+    /// Linear by construction and by contract, not by omission: the values are
+    /// whatever this device computed, in the space the guest named them in.
+    pub const fn synthesised(layout: TexelLayout) -> Self {
+        Self {
+            layout,
+            source: None,
+        }
+    }
+
+    /// The channel order and width the bytes are in.
+    pub const fn layout(self) -> TexelLayout {
+        self.layout
+    }
+
+    /// The guest format these values are sRGB-encoded by, or `None` when they
+    /// are linear.
+    ///
+    /// The format, not a `bool`, because the only caller that acts on a `Some`
+    /// either honours it — where the answer is the layout's sRGB spelling — or
+    /// reports it, where naming the guest format is the whole value of the line.
+    pub fn srgb_source(self) -> Option<u16> {
+        self.source.filter(|&source| is_srgb(source))
+    }
 }
 
 #[repr(u8)]

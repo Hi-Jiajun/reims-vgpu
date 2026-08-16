@@ -30,13 +30,17 @@ use crate::backend::vulkan::engine::{DrawError, DrawPreparationDecline};
 #[cfg(feature = "backend-vulkan")]
 use crate::backend::vulkan::translate;
 use crate::contract::pixel_format::{
-    self, solid_rgba8, TexelLayout, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
+    self, solid_rgba8, SampledByteFormat, TexelLayout, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
 };
 use crate::model::DeviceState;
 // `Decline::slug` on typed draw, coverage, and translation reasons.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
 use crate::observe::Decline;
+// The one downgrade site left in this tree is the secondary colour attachment,
+// which is Vulkan-only. The CPU upload rails used to report here too and no
+// longer downgrade at all: they carry the source format through to the bind.
+#[cfg(feature = "backend-vulkan")]
 use crate::runtime::census::srgb_census;
 // Only `vulkan` and the tests read it, through this module's `use super::*`;
 // the Metal arm tests the band instead (`load_action_in_contract`).
@@ -3762,6 +3766,32 @@ fn load_type11_rgba<M: HostMemory + HostOps>(
 /// mapped with a live `MappingInternal` and no latched W×H yet; resolving first
 /// decodes the guest device-surface descriptor and latches the geometry, so the
 /// sample succeeds instead of bailing out on `!has_geom` and dropping the bind.
+/// What the guest says a type-11 mapping's texel **values** are, seen through an
+/// optional type-8 view format.
+///
+/// Distinct from the byte order its loaders hand back, and that distinction is
+/// the whole point. `scanout::read_mapping_bgra8` normalises a mapping's channel
+/// order to BGRA8 and touches no value, so the loaders below key their convert
+/// on BGRA8 — correct for order, and silent about the transfer function. This is
+/// the answer that is not silent about it, and it is what the sampled bind pairs
+/// with the layout in a [`SampledByteFormat`].
+///
+/// Composed from the two owners rather than restating either:
+/// [`crate::runtime::mapping_write::mapping_store_format`] is the single rule for
+/// a mapping's declared format, and [`effective_view_sample_format`] for how a
+/// view reinterprets one.
+fn mapping_declared_format(
+    state: &DeviceState,
+    mapping_id: u32,
+    format_override: Option<u16>,
+) -> Option<u16> {
+    let stored = state
+        .mappings
+        .get(&mapping_id)
+        .map(crate::runtime::mapping_write::mapping_store_format)?;
+    effective_view_sample_format(stored, format_override)
+}
+
 fn load_type11_mapping_rgba<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -5514,16 +5544,18 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
     texture_ref: u32,
     native: NativeUploads,
     site: crate::runtime::render_writeback::SettleSite,
-) -> Option<(Vec<u8>, TexelLayout)> {
+) -> Option<(Vec<u8>, SampledByteFormat)> {
     // Opcode-9 buffer-backed texture (type-8): sample the source buffer directly.
     if let Some(bt) = buffer_texture_descriptor(state, host, task_id, texture_ref, None) {
+        let source = bt.desc.pixel_format;
         return load_buffer_texture_rgba(state, host, task_id, texture_ref, &bt)
-            .map(|(_, _, r)| (r, TexelLayout::Rgba8));
+            .map(|(_, _, r)| (r, SampledByteFormat::from_source(TexelLayout::Rgba8, source)));
     }
     // Type-11 path via resolve.
     if let Some(mid) = objects::resolve_type11_ref(state, host, task_id, texture_ref) {
+        let source = mapping_declared_format(state, mid, None)?;
         return load_type11_mapping_rgba(state, host, mid, None)
-            .map(|(_, _, r)| (r, TexelLayout::Rgba8));
+            .map(|(_, _, r)| (r, SampledByteFormat::from_source(TexelLayout::Rgba8, source)));
     }
     // Type-8 view → base texture + mip + format. The view's SWIZZLE is
     // deliberately not consulted here: it is a property of the view, not of the
@@ -5541,13 +5573,16 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
         if level != 0 {
             return None;
         }
+        let source = mapping_declared_format(state, mid, fmt_override)?;
         return load_type11_mapping_rgba(state, host, mid, fmt_override)
-            .map(|(_, _, r)| (r, TexelLayout::Rgba8));
+            .map(|(_, _, r)| (r, SampledByteFormat::from_source(TexelLayout::Rgba8, source)));
     }
     // The only rung here that can answer in anything but RGBA8. The three above
     // convert unconditionally — `load_buffer_texture_rgba` and
     // `load_type11_mapping_rgba` have no native arm — so they state the layout
     // they always produced rather than being handed a choice they cannot make.
+    // All four still name the guest format their values were read from, because
+    // a convert to RGBA8 reorders channels and does not decode.
     load_linear_texture_host(
         state,
         host,
