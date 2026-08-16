@@ -694,6 +694,26 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
         }
     }
     if !named {
+        // "Nothing was owed" is two opposite findings, and this counter reported
+        // them as one at 1.1 M a boot — the same volume as every sampled guest
+        // import, which is what made it read as a healthy zero.
+        //
+        // `_resolved` says the ledger genuinely holds no debt for a surface this
+        // reference does name. `_unresolved` says neither spelling named a
+        // surface at all: `texture_ref` is not itself a mapping id and
+        // `texture_to_mapping` holds no entry for `(task, ref)`. A debt owed by
+        // the surface behind such a reference cannot be found, so that arm is
+        // "we did not look", not "there was nothing there" — and a sampled bind
+        // proceeding past it reads the guest's pages while the newest frame is
+        // still in a resident.
+        //
+        // The split is emitted beside the total, so
+        // `_resolved + _unresolved == wbdebt_texture_owes_nothing` is checkable
+        // on the census itself.
+        crate::runtime::drain::note_store_route(match mapped.is_some() {
+            true => "wbdebt_texture_owes_nothing_resolved",
+            false => "wbdebt_texture_owes_nothing_unresolved",
+        });
         crate::runtime::drain::note_store_route("wbdebt_texture_owes_nothing");
     }
 }
@@ -1493,6 +1513,66 @@ mod tests {
             .note_write(key.task_id, key.texture_ref);
         assert!(!gva_resident_authoritative(&state, &identity));
         assert!(state.pending_writebacks.get_gva(key).is_some());
+    }
+
+    /// "This texture owes nothing" splits into a surface with no debt and a
+    /// reference that named no surface at all.
+    ///
+    /// The second is not a reading about the ledger — it is a reading about the
+    /// lookup. `texture_to_mapping` held no entry, so a debt owed by the surface
+    /// behind that reference could not have been found whether or not one
+    /// existed, and a sampled bind proceeding past it reads the guest's pages
+    /// while the newest frame is still in a resident. One counter reported both
+    /// at 1.1 M a boot, which is every sampled guest import, and that volume is
+    /// what made it read as a healthy zero.
+    #[test]
+    fn a_texture_that_owes_nothing_says_whether_it_named_a_surface_at_all() {
+        use crate::runtime::drain::store_route_count;
+
+        // Baselines rather than a clear: these counters are process-global and
+        // another test in this binary may have moved them.
+        let resolved0 = store_route_count("wbdebt_texture_owes_nothing_resolved");
+        let unresolved0 = store_route_count("wbdebt_texture_owes_nothing_unresolved");
+        let total0 = store_route_count("wbdebt_texture_owes_nothing");
+
+        let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
+        let mut host = crate::runtime::FakeHost::new();
+        // The ledger has to be non-empty or `pay_for_texture` returns at its
+        // emptiness check and neither counter is reached. Mapping 7 owes; the
+        // two references below are about other surfaces.
+        assert_eq!(
+            state.pending_writebacks.arm(7, ident(7, 64, 64, 1), 64, 64, 1),
+            None
+        );
+        // Reference 21 names mapping 9, which owes nothing.
+        state.texture_to_mapping.insert((1, 21), 9);
+
+        pay_for_texture(&mut state, &mut host, 1, 21);
+        assert_eq!(
+            store_route_count("wbdebt_texture_owes_nothing_resolved") - resolved0,
+            1
+        );
+        assert_eq!(
+            store_route_count("wbdebt_texture_owes_nothing_unresolved") - unresolved0,
+            0
+        );
+
+        // Reference 22 names nothing: not a mapping id in the ledger, and no
+        // `texture_to_mapping` entry.
+        pay_for_texture(&mut state, &mut host, 1, 22);
+        assert_eq!(
+            store_route_count("wbdebt_texture_owes_nothing_resolved") - resolved0,
+            1
+        );
+        assert_eq!(
+            store_route_count("wbdebt_texture_owes_nothing_unresolved") - unresolved0,
+            1
+        );
+        assert_eq!(
+            store_route_count("wbdebt_texture_owes_nothing") - total0,
+            2,
+            "the split has to add up to the total it divides"
+        );
     }
 
     /// A synchronize list is a scope, not merely a trigger. Publishing one
