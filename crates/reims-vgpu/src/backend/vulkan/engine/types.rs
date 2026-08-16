@@ -2084,6 +2084,80 @@ pub struct GuestRunSource {
     pub direct_image: Option<GuestSampledBacking>,
 }
 
+/// One stretch of a [`GuestRunSource`]'s window, already clipped to it.
+///
+/// `skip` is the distance from the stretch's own first requested byte to the
+/// first byte of the window that lands in it, and `window_offset` is where those
+/// bytes belong in the assembled window. Neither is the number nearest to hand:
+/// a [`crate::runtime::guest_ram_map::GuestWindowRun`] is positioned against the
+/// whole allocation its `pages` list describes, while the window is
+/// `source_offset..source_offset + total_len` inside that.
+#[derive(Debug)]
+pub struct WindowStretch<'a> {
+    pub guest: &'a crate::runtime::guest_ram::GuestRef,
+    pub skip: u64,
+    pub window_offset: u64,
+    pub len: u64,
+}
+
+impl GuestRunSource {
+    /// This source's window as the single guest stretch holding it, when it is
+    /// one — the arm that binds the import in place with nothing copied.
+    ///
+    /// A single run starting at allocation byte zero *is* the whole allocation:
+    /// [`crate::runtime::guest_ram_map::references_for_runs`] guarantees the runs
+    /// ascend and tile it exactly, so one of them covering byte zero leaves
+    /// nothing else to name. Anything longer has to be gathered, because a
+    /// vertex, index, storage or copy source names one contiguous range.
+    ///
+    /// The window still need not start at that stretch's first byte: a mapped
+    /// sampled plane names the whole allocation as its one stretch and puts the
+    /// plane's own offset in `source_offset`, which is what [`WindowStretch::skip`]
+    /// carries. `None` when the window is scattered, or when it does not fit
+    /// inside the one stretch named, which is a malformed source rather than a
+    /// slow one.
+    pub fn single_stretch(&self) -> Option<WindowStretch<'_>> {
+        let [only] = self.pages.as_ref()?.as_slice() else {
+            return None;
+        };
+        if only.window_offset != 0 {
+            return None;
+        }
+        let end = self.source_offset.checked_add(self.total_len)?;
+        if end > only.guest.requested() {
+            return None;
+        }
+        Some(WindowStretch {
+            guest: &only.guest,
+            skip: self.source_offset,
+            window_offset: 0,
+            len: self.total_len,
+        })
+    }
+
+    /// Every stretch this source's window touches, in window order, each
+    /// clipped to the window. Stretches the window does not reach are absent
+    /// rather than empty, so the lengths sum to [`Self::total_len`] exactly.
+    pub fn window_stretches(&self) -> Option<impl Iterator<Item = WindowStretch<'_>> + '_> {
+        let pages = self.pages.as_ref()?;
+        let wanted_end = self.source_offset.checked_add(self.total_len)?;
+        Some(pages.iter().filter_map(move |run| {
+            let run_end = run.window_offset.checked_add(run.guest.requested())?;
+            let start = run.window_offset.max(self.source_offset);
+            let end = run_end.min(wanted_end);
+            if start >= end {
+                return None;
+            }
+            Some(WindowStretch {
+                guest: &run.guest,
+                skip: start - run.window_offset,
+                window_offset: start - self.source_offset,
+                len: end - start,
+            })
+        }))
+    }
+}
+
 /// A render attachment's prior contents, read from the surface's own guest
 /// pages rather than materialized as a host framebuffer.
 ///

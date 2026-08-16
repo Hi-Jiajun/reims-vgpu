@@ -560,22 +560,6 @@ unsafe fn plan_buffer_gather_dispatches(
     Ok(Some(out))
 }
 
-/// The one bind range a window's stretches amount to, when they amount to one.
-///
-/// A single run starting at window byte zero *is* the whole window:
-/// [`crate::runtime::guest_ram_map::references_for_runs`] guarantees the runs
-/// ascend and tile the window exactly, so one of them covering byte zero leaves
-/// nothing else to name. Anything longer has to be gathered, because a vertex,
-/// index or storage bind names one contiguous range.
-fn single_run(
-    runs: &[crate::runtime::guest_ram_map::GuestWindowRun],
-) -> Option<&crate::runtime::guest_ram::GuestRef> {
-    match runs {
-        [only] if only.window_offset == 0 => Some(&only.guest),
-        _ => None,
-    }
-}
-
 /// Stage one draw-time buffer content into something the draw can bind,
 /// deduplicating within the draw: several binds sharing one content (an `Arc`'d
 /// byte allocation, or the same guest span) resolve to ONE buffer and at most
@@ -825,12 +809,8 @@ unsafe fn import_guest_buffer_window(
     if !ctx.caps.host_pointer.is_available() {
         return None;
     }
-    let guest_ref = single_run(src.pages.as_ref()?)?;
-    let source_end = src.source_offset.checked_add(src.total_len)?;
-    if source_end > guest_ref.requested() {
-        return None;
-    }
-    let bound = match unsafe { pools.bind_guest_ram(ctx, guest_ref) } {
+    let stretch = src.single_stretch()?;
+    let bound = match unsafe { pools.bind_guest_ram(ctx, stretch.guest) } {
         Ok(bound) => bound,
         Err(inner) => {
             crate::observe::Emit::decline("vk_buffer_import", &inner).fail_once(0);
@@ -838,9 +818,10 @@ unsafe fn import_guest_buffer_window(
         }
     };
     // The imported buffer spans the whole RAMBlock, so the span's first byte is
-    // the bound range's start plus whatever widening it to the device's import
-    // granularity added at the front.
-    let offset = bound.offset + bound.head + src.source_offset;
+    // the bound range's start, plus whatever widening it to the device's import
+    // granularity added at the front, plus the window's own offset inside the
+    // stretch.
+    let offset = bound.offset + bound.head + stretch.skip;
     // Storage descriptors carry the device's queried offset alignment. Vertex
     // buffers do not: Vulkan only requires their offsets to lie inside the
     // buffer. Applying the storage limit to a vertex-only bind needlessly turns
@@ -926,7 +907,7 @@ unsafe fn gather_guest_buffer_window(
     if !ctx.caps.host_pointer.is_available() {
         return Ok(None);
     }
-    let Some(runs) = src.pages.as_ref() else {
+    let Some(stretches) = src.window_stretches() else {
         return Ok(None);
     };
     // From here on this window costs something, so from here on it is charged.
@@ -941,17 +922,15 @@ unsafe fn gather_guest_buffer_window(
     // does not take a destination slot out of the pool to abandon it.
     let mut sources: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
     let mut covered = 0u64;
-    for run in runs.iter() {
-        let bound = match unsafe { pools.bind_guest_ram(ctx, &run.guest) } {
+    for stretch in stretches {
+        let bound = match unsafe { pools.bind_guest_ram(ctx, stretch.guest) } {
             Ok(bound) => bound,
             Err(inner) => {
                 crate::observe::Emit::decline("vk_buffer_gather", &inner).fail_once(0);
                 return Ok(None);
             }
         };
-        let Some(copy) = gather_region_window(&bound, run, src.source_offset, src.total_len) else {
-            continue;
-        };
+        let copy = gather_region(&bound, &stretch);
         covered = covered.saturating_add(copy.size);
         super::group_by_buffer(&mut sources, bound.buffer, copy);
     }
@@ -980,54 +959,35 @@ unsafe fn gather_guest_buffer_window(
     )))
 }
 
-/// The copy one stretch of a scattered window contributes.
+/// The copy one stretch of a window contributes.
 ///
-/// Both offsets are re-based and neither is the number nearest to hand, which is
-/// what makes this worth its own function:
+/// Every term is re-based and none is the number nearest to hand, which is what
+/// makes this worth its own function:
 ///
-/// * The **source** is `offset + head`, not `offset`. A bound range is rounded
-///   out to the import's granularity, and `head` is what that rounding added in
-///   front of the byte the guest actually named. Reading from `offset` would
-///   start the stretch up to a granule early — the whole window shifted, which
-///   is a wrong draw and not a failed one.
-/// * The **size** is `requested()`, not `bound_len()`. The bound length is the
-///   same rounding at the other end, so copying it would read guest bytes past
-///   the window and write them past the destination's own end.
+/// * The **source** starts at `offset + head`, not `offset`. A bound range is
+///   rounded out to the import's granularity, and `head` is what that rounding
+///   added in front of the byte the guest actually named. Reading from `offset`
+///   would start the stretch up to a granule early — the whole window shifted,
+///   which is a wrong draw and not a failed one.
+/// * `skip` then walks from that byte to the window's own first byte inside this
+///   stretch, because a stretch is positioned against the whole allocation and
+///   the window is a sub-range of it.
+/// * The **size** is the clipped length, never `bound_len()`, which is the
+///   granularity rounding at the other end: copying it would read guest bytes
+///   past the window and write them past the destination's own end.
 /// * The **destination** is the stretch's offset *within the window*, which is
-///   the one thing a consumer may not compute for itself and the reason
-///   [`crate::runtime::guest_ram_map::GuestWindowRun`] carries it.
+///   the one thing a consumer may not compute for itself.
+///
+/// [`super::types::WindowStretch`] is the only producer of the last three, so
+/// there is no second spelling of this arithmetic to drift from it.
 fn gather_region(
     bound: &super::host_ram::BoundGuestRam,
-    run: &crate::runtime::guest_ram_map::GuestWindowRun,
+    stretch: &super::types::WindowStretch<'_>,
 ) -> vk::BufferCopy {
     vk::BufferCopy::default()
-        .src_offset(bound.offset + bound.head)
-        .dst_offset(run.window_offset)
-        .size(run.guest.requested())
-}
-
-/// The portion of one source run intersecting a sub-window of the retained
-/// source. Packed task buffers use this to bind arbitrary guest offsets while
-/// keeping one resource-shaped run list.
-fn gather_region_window(
-    bound: &super::host_ram::BoundGuestRam,
-    run: &crate::runtime::guest_ram_map::GuestWindowRun,
-    source_offset: u64,
-    total_len: u64,
-) -> Option<vk::BufferCopy> {
-    let wanted_end = source_offset.checked_add(total_len)?;
-    let run_end = run.window_offset.checked_add(run.guest.requested())?;
-    let start = run.window_offset.max(source_offset);
-    let end = run_end.min(wanted_end);
-    if start >= end {
-        return None;
-    }
-    Some(
-        vk::BufferCopy::default()
-            .src_offset(bound.offset + bound.head + (start - run.window_offset))
-            .dst_offset(start - source_offset)
-            .size(end - start),
-    )
+        .src_offset(bound.offset + bound.head + stretch.skip)
+        .dst_offset(stretch.window_offset)
+        .size(stretch.len)
 }
 
 /// A check that sent a guest buffer span back to the CPU gather.
@@ -1312,9 +1272,6 @@ unsafe fn import_sampled_guest_window(
     if !ctx.caps.host_pointer.is_available() {
         return Ok(None);
     }
-    let Some(runs) = src.pages.as_ref() else {
-        return Ok(None);
-    };
     // One stretch binds in place; anything longer is assembled by the GPU, the
     // same two arms the buffer rail has.
     //
@@ -1327,8 +1284,8 @@ unsafe fn import_sampled_guest_window(
     // gathers moving 10.8 GB, while the buffer rail on the same boot imported
     // 322 303 windows and gathered none on the CPU. It is not a small rail; it
     // was a rail whose only zero-copy arm could not be taken.
-    if let Some(guest_ref) = single_run(runs) {
-        let bound = match unsafe { pools.bind_guest_ram(ctx, guest_ref) } {
+    if let Some(stretch) = src.single_stretch() {
+        let bound = match unsafe { pools.bind_guest_ram(ctx, stretch.guest) } {
             Ok(bound) => bound,
             Err(inner) => {
                 crate::observe::Emit::decline("vk_sampled_import", &inner).fail_once(0);
@@ -1336,8 +1293,12 @@ unsafe fn import_sampled_guest_window(
             }
         };
         // As on the buffer rail: the buffer spans the RAMBlock, so the first
-        // texel sits at the bound range's start plus the granularity widening.
-        let offset = bound.offset + bound.head;
+        // texel sits at the bound range's start, plus the granularity widening,
+        // plus the plane's own offset inside the allocation. A mapped sampled
+        // plane names the whole allocation as its one stretch and carries the
+        // plane offset in `source_offset`, so dropping that term reads every
+        // such texture from the start of the allocation.
+        let offset = bound.offset + bound.head + stretch.skip;
         if !offset.is_multiple_of(GUEST_IMPORT_COPY_OFFSET_ALIGN) {
             crate::observe::Emit::decline(
                 "vk_sampled_import",
@@ -1353,17 +1314,20 @@ unsafe fn import_sampled_guest_window(
     }
     // Plan before acquiring, so a window that turns out not to be gatherable
     // does not take a destination slot out of the pool to abandon it.
+    let Some(stretches) = src.window_stretches() else {
+        return Ok(None);
+    };
     let mut sources: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
     let mut covered = 0u64;
-    for run in runs.iter() {
-        let bound = match unsafe { pools.bind_guest_ram(ctx, &run.guest) } {
+    for stretch in stretches {
+        let bound = match unsafe { pools.bind_guest_ram(ctx, stretch.guest) } {
             Ok(bound) => bound,
             Err(inner) => {
                 crate::observe::Emit::decline("vk_sampled_import", &inner).fail_once(0);
                 return Ok(None);
             }
         };
-        let copy = gather_region(&bound, run);
+        let copy = gather_region(&bound, &stretch);
         covered = covered.saturating_add(copy.size);
         super::group_by_buffer(&mut sources, bound.buffer, copy);
     }
@@ -6460,6 +6424,24 @@ mod tests {
             .collect()
     }
 
+    /// A source whose window is `source_offset..source_offset + total_len` inside
+    /// `pages`. `runs` is the CPU gather's view of the same bytes and is not
+    /// consulted by anything under test here.
+    fn source_over(
+        pages: Vec<crate::runtime::guest_ram_map::GuestWindowRun>,
+        source_offset: u64,
+        total_len: u64,
+    ) -> super::super::types::GuestRunSource {
+        super::super::types::GuestRunSource {
+            runs: std::sync::Arc::new(Vec::new()),
+            source_offset,
+            total_len,
+            row_length_texels: 0,
+            pages: Some(std::sync::Arc::new(pages)),
+            direct_image: None,
+        }
+    }
+
     /// A one-stretch window starting at window byte zero is the whole window, so
     /// it binds in place. Anything else has to be assembled.
     ///
@@ -6470,16 +6452,53 @@ mod tests {
     /// shape, and this is what keeps the reliance on that written down.
     #[test]
     fn only_a_lone_stretch_covering_byte_zero_binds_in_place() {
-        assert!(single_run(&window_runs(&[(0, 0, 64)])).is_some());
+        assert!(source_over(window_runs(&[(0, 0, 64)]), 0, 64)
+            .single_stretch()
+            .is_some());
         assert!(
-            single_run(&window_runs(&[(16, 16, 48)])).is_none(),
+            source_over(window_runs(&[(16, 16, 48)]), 0, 48)
+                .single_stretch()
+                .is_none(),
             "a lone run starting past window byte zero is a suffix, not a window"
         );
         assert!(
-            single_run(&window_runs(&[(0, 0, 32), (32, 4096, 32)])).is_none(),
+            source_over(window_runs(&[(0, 0, 32), (32, 4096, 32)]), 0, 64)
+                .single_stretch()
+                .is_none(),
             "two stretches are two ranges and a bind names one"
         );
-        assert!(single_run(&window_runs(&[])).is_none());
+        assert!(source_over(window_runs(&[]), 0, 0).single_stretch().is_none());
+    }
+
+    /// A window inside a lone stretch binds at the window's first byte, not at
+    /// the stretch's.
+    ///
+    /// This is the shape every mapped sampled plane has:
+    /// `runtime::draw::vulkan::mapped_sampled_source` names the whole allocation
+    /// as one stretch and carries the plane's own offset in `source_offset`. The
+    /// sampled rail used to bind the stretch and drop that offset, so on any host
+    /// that imports guest RAM but cannot alias it as a linear image — every
+    /// discrete GPU — each texture was read `source_offset` bytes early and came
+    /// out shifted along its rows. The buffer rail always applied the term, which
+    /// is why one wire form had two answers.
+    #[test]
+    fn a_window_inside_a_lone_stretch_skips_to_its_own_first_byte() {
+        let src = source_over(window_runs(&[(0, 0, 0x8000)]), 0x100, 0x4000);
+        let stretch = src.single_stretch().expect("one stretch holds the window");
+        assert_eq!(stretch.skip, 0x100, "the plane offset inside the allocation");
+        assert_eq!(stretch.window_offset, 0);
+        assert_eq!(stretch.len, 0x4000, "the window, not the whole stretch");
+    }
+
+    /// A window that does not fit the stretch it names is malformed, and the
+    /// bind is refused rather than reading past the allocation.
+    #[test]
+    fn a_window_past_the_end_of_its_lone_stretch_does_not_bind() {
+        assert!(
+            source_over(window_runs(&[(0, 0, 0x1000)]), 0xf00, 0x200)
+                .single_stretch()
+                .is_none()
+        );
     }
 
     /// Two offsets into one retained resource are distinct command-buffer
@@ -6511,17 +6530,54 @@ mod tests {
     /// requested subrange rather than copying from byte zero.
     #[test]
     fn gather_region_crops_a_retained_resource_to_the_bind_offset() {
-        let run = &window_runs(&[(0, 0x2000, 0x4000)])[0];
+        let src = source_over(window_runs(&[(0, 0x2000, 0x4000)]), 0x1000, 0x800);
+        let stretch = src
+            .window_stretches()
+            .expect("the source names its pages")
+            .next()
+            .expect("the window intersects the one stretch");
         let bound = crate::backend::vulkan::engine::host_ram::BoundGuestRam {
             buffer: ash::vk::Buffer::null(),
             offset: 0x8000,
             len: 0x4000,
             head: 0x20,
         };
-        let copy = gather_region_window(&bound, run, 0x1000, 0x800).unwrap();
+        let copy = gather_region(&bound, &stretch);
         assert_eq!(copy.src_offset, 0x9020);
         assert_eq!(copy.dst_offset, 0);
         assert_eq!(copy.size, 0x800);
+    }
+
+    /// The stretches of a window tile it exactly and nothing else: the lengths
+    /// sum to `total_len`, the first lands at window byte zero, and stretches the
+    /// window does not reach contribute nothing.
+    ///
+    /// The gather rails check `covered == total_len` before they take a
+    /// destination slot, so a clipping mistake here is a decline rather than a
+    /// wrong image — but only because the two agree about what the window is.
+    #[test]
+    fn window_stretches_tile_the_window_and_skip_what_it_does_not_reach() {
+        let src = source_over(
+            window_runs(&[(0, 0, 0x1000), (0x1000, 0x2000, 0x1000), (0x2000, 0x4000, 0x1000)]),
+            0x800,
+            0x1000,
+        );
+        let got: Vec<_> = src
+            .window_stretches()
+            .expect("the source names its pages")
+            .map(|s| (s.skip, s.window_offset, s.len))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(0x800, 0, 0x800), (0, 0x800, 0x800)],
+            "the window starts mid-stretch, spans into the next, and never \
+             reaches the third"
+        );
+        assert_eq!(
+            got.iter().map(|s| s.2).sum::<u64>(),
+            src.total_len,
+            "the stretches tile the window exactly"
+        );
     }
 
     /// The role split is over physical gathers, not logical bindings. One
@@ -6699,11 +6755,20 @@ mod tests {
         assert_eq!(slice.requested(), 100);
         assert_eq!(slice.bound_len(), 4096, "and out to the granule at the end");
 
-        let run = crate::runtime::guest_ram_map::GuestWindowRun {
-            window_offset: 512,
-            guest: GuestRef::new(std::sync::Arc::clone(&import), slice)
-                .expect("the slice came from this import"),
-        };
+        let src = source_over(
+            vec![crate::runtime::guest_ram_map::GuestWindowRun {
+                window_offset: 512,
+                guest: GuestRef::new(std::sync::Arc::clone(&import), slice)
+                    .expect("the slice came from this import"),
+            }],
+            0,
+            512 + 100,
+        );
+        let stretch = src
+            .window_stretches()
+            .expect("the source names its pages")
+            .next()
+            .expect("the window reaches this stretch");
         let bound = super::super::host_ram::BoundGuestRam {
             buffer: {
                 use ash::vk::Handle;
@@ -6713,7 +6778,7 @@ mod tests {
             len: 4096,
             head: 24,
         };
-        let copy = gather_region(&bound, &run);
+        let copy = gather_region(&bound, &stretch);
         assert_eq!(
             copy.src_offset, 4120,
             "the copy must start at the byte the guest named, not at the granule \
