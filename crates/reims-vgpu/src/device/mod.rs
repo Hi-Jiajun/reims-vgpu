@@ -601,24 +601,33 @@ pub fn device_drain(id: u64) -> bool {
     // sweeps below run on the worker's own wall clock and are outside both
     // `drain_us` and `publish_us`, so `duty` cannot see them.
     let busy_end_us = crate::observe::elapsed_us();
+    use crate::runtime::drain::{PostSweep, post_sweep};
     // Same one-second cadence, so the cache trend lines up row-for-row with
     // `store_routes` and `drain_duty`. Measure-only; see `note_cache_levels`.
-    crate::runtime::surface_cache::note_cache_levels(&device.state, &host);
+    post_sweep(PostSweep::CacheLevels, || {
+        crate::runtime::surface_cache::note_cache_levels(&device.state, &host)
+    });
     // Per tranche rather than per census window, unlike the levels above: this
     // measures how long a slot the guest named takes to appear, so the sampling
     // interval is the resolution of the answer. Returns immediately when nothing
     // is watched, which is every tranche on every rail but macos-26.
-    crate::runtime::objects::slot_recheck::sweep(&device.state, &host);
+    post_sweep(PostSweep::SlotRecheck, || {
+        crate::runtime::objects::slot_recheck::sweep(&device.state, &host)
+    });
     // Beside it and on the same cadence: a page the guest released is judged
     // against the write census, which only moves when this device writes. Also
     // returns immediately when nothing is watched.
-    crate::runtime::released_pages::sweep(&mut device.state);
-    crate::runtime::released_pages::note_levels(&device.state);
+    post_sweep(PostSweep::ReleasedPages, || {
+        crate::runtime::released_pages::sweep(&mut device.state);
+        crate::runtime::released_pages::note_levels(&device.state);
+    });
     // The bind registry's own levels, on that same cadence and read against the
     // `bb_retire_*` routes: what the retirements dropped, and what the survivors
     // look like.
     #[cfg(feature = "backend-vulkan")]
-    crate::runtime::bound_buffers::note_registry_levels(&device.state);
+    post_sweep(PostSweep::BindLevels, || {
+        crate::runtime::bound_buffers::note_registry_levels(&device.state)
+    });
     // The present-completion ack, re-homed off the QEMU paint — ONLY while the
     // host window is the display. With the window live no per-present
     // `ScanoutUpdate` is enqueued, so `display_surface::device_scanout_copy` —
