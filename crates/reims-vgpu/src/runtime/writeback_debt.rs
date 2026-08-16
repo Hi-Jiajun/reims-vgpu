@@ -1290,10 +1290,15 @@ fn pay_gva<M: HostMemory + HostOps>(
         key.texture_ref,
         Some(&pages),
     ) {
-        crate::observe::fail(format!(
-            "gvadebt_pay_lost task={} texture={} reason={reason}",
-            key.task_id, key.texture_ref
-        ));
+        // Through the builder rather than by interpolating the decline, which
+        // renders its own `reason=` and produced `reason=reason=<slug>` — a line
+        // the standard ranking grep drops. The builder also carries the
+        // decline's own fields, so the `via=` that says which check inside the
+        // store refused now reaches the log instead of being formatted away.
+        crate::observe::Emit::decline("gvadebt_pay_lost", &reason)
+            .field("task", key.task_id)
+            .field("texture", key.texture_ref)
+            .fail();
         release_gva(debt);
     }
     true
