@@ -197,7 +197,117 @@ Never special-case behavior for a screenshot, boot stage, pixel dimension, resou
 function name, pipeline ref, or observed content pattern. Implement the decoded API contract.
 
 Temporary probes are fine when they collect evidence. Remove probe-only behavior before claiming the
-fix. Do not turn observations into product heuristics.
+fix. Do not turn observations into product heuristics. The three rules below say what to do when the
+contract is not in reach, which is the situation that produces every heuristic anyone has written
+here.
+
+### The Contract Is The Only Input
+
+This device implements a decoded API contract. Every branch it takes must be justified by something
+the contract states: a decoded guest field, a header constant, a `sizeof`/`offsetof`, a documented
+serializer output, or a capability the host reported about itself. Nothing else is an input.
+
+**"It works" is not a justification.** A rule that reproduces the right answer on the boots you ran
+is a coincidence until you can name the contract term it implements. The distinction is not how
+confident you are, it is whether the sentence you would write in the code comment names a field or
+names an observation — "`page_shift` is 14 on this attach" is the contract; "the guest always sends
+these in ascending order" is a heuristic wearing the same clothes.
+
+**When the contract is not in reach, the answer is a typed refusal, not a guess.** Reading the
+interface back out of a binary is legitimate and is how most of this contract was learned; guessing
+is not the same activity, and a guess that lands is worse than one that does not, because it stops
+anyone looking. An unimplemented case that refuses by name costs the guest one command and tells the
+next session exactly what to go and learn. A case that guesses costs it silently and forever.
+
+### No Side Channels
+
+A side channel is a guess with an observation attached, and it is the specific failure this file has
+had to name most often. When the contract does not carry the answer, you may not reconstruct it from
+anything correlated with it. Not from timing, arrival order, or the gap between two commands. Not
+from an allocation's size, alignment, or address range. Not from a name string, an object id, a
+pipeline ref, or a function name. Not from pixel content, frame counts, or what the last frame did.
+Not from how many times something has already happened.
+
+The reason is not purity. A side channel is a rule the other side never agreed to, so it holds for
+exactly as long as the guest's incidental behavior does — and the day it stops holding, it stops
+silently, on one rail, on one guest version, with no counter that reports it and nothing in the log
+to read. That is the same failure the `stat -f%Su /dev/console` reading produced under `## A login
+window means WindowServer crashed`: a signal that correlates with the answer, quoted as the answer,
+wrong on four boots that all read green.
+
+Two things that look like side channels and are not. **Host capability is measured, not inferred**:
+asking the device what it supports is the contract, which is why `caps::memory_topology` reads two
+structural signals and why gating on a vendor or driver name — a correlate — is banned in the same
+breath. And **an instrument may observe whatever it likes**, because it changes nothing the guest
+sees; a probe, a census, or an audit is not bound by this rule. The line is whether the observation
+reaches a decision the guest's work depends on.
+
+### It Fits Or It Does Not Belong
+
+New behavior goes through the type, state machine, or resolver that already owns the concern. It
+does not sit beside one. A flag threaded past a resolver, a second lookup bolted after the first, a
+fixup pass that corrects what the layer above produced, a `if let Some(x) = special_case` ahead of
+the general path — each is a seam, and every one of them is a place where two rules disagree and the
+one that runs is decided by ordering.
+
+The test is whether the addition can be removed by deleting your lines and nothing else has to
+change. If it can, it was tacked on. The seam is not a style complaint: `## Before A Broad Sweep`
+already records what it costs — a four-term admission rule written by hand three times with two
+copies short a different term, a `reims_vgpu_qemu_scanout_may_paint` reassembled shim-side from two
+other queries. Both of those started as one small thing added next to the thing that owned it.
+
+So when the owning type cannot express what you need, the work is to change that type. That is more
+edit than a branch at the call site and it is the whole point: after it, the next site cannot get it
+wrong, and there is no second rule to keep in sync.
+
+### A Bounded Cache Is Fake Performance
+
+**No capacity limits, no eviction policies, no sampling strides, no LRU, no ring buffer standing in
+for a map.** A bounded cache does not make this device fast; it makes it fast on workloads that fit
+and slow on workloads that do not, and nothing tells you which one you measured. The bound is a
+number nobody derived from the contract — the host API has no such bound — so it is a magic number
+under `## No Magic Numbers` and a heuristic under the rule above, and it fails as both.
+
+Three specific costs, in the order they bite:
+
+- **It overflows on the workload that matters.** The bound is sized against the boots you ran, which
+  are the small ones. A guest that opens more windows, binds more textures, or compiles more
+  pipelines crosses it, and past that point the cache is a cost with no benefit — every lookup pays
+  the insert and the eviction and misses anyway.
+- **It makes performance unpredictable in the direction that reads as noise.** Two boots of one
+  binary, one under and one over the bound, differ by more than any change ever measured here, and
+  the census records nothing that says which happened. Every ranking rule in `## Verification`
+  assumes the two arms did the same work; a bound that one arm crossed silently breaks that
+  assumption and the number that comes out looks like a result.
+- **An eviction is lost state.** Under `## Before A Broad Sweep`, "an entry evicted" is the first of
+  the four ways a bound costs guest work, and a cache is the one place it is *policy* rather than an
+  oversight.
+
+What to do instead. A cache keyed by something the contract owns, whose entries live and die with
+that thing, is not bounded by a number — it is bounded by the guest's own lifetimes, which is the
+correct bound and the only one that is always right. Tie an entry to the resource, the pipeline, or
+the mapping it describes and drop it when the guest drops that. If the guest holds a million live
+objects then a million entries is what correctness costs, and the memory pressure is a real reading
+about a real workload rather than a number you chose.
+
+The rule's subject is anything whose loss the guest pays for. A bound over a purely derived thing
+that costs nothing but recomputation — `ObjectCache`'s `NEGATIVE_CAP`, which remembers creates
+already measured to fail, or `ShaderDigestIndex`'s entry limit, which drops the whole index and says
+so on the `OFF` channel — is a different object and is fine. Ask what an eviction costs the guest: a
+re-derivation, or a record.
+
+If a real bound cannot be avoided, it stops being a cache decision: the excess must be a typed
+refusal on the fail channel naming what was dropped, so the overflow is visible as loss rather than
+absorbed as a slow path. A silent eviction and a `reason=` line cost the same microseconds and only
+one of them can be found.
+
+**Both worked examples are already in the tree, and they are precedent rather than debt.**
+`backend::vulkan::engine::caches` held 1024 entries (64 for render passes) evicting in insertion
+order, which discards the compositor's pipeline — created first, bound every frame — and pays a
+driver-side shader compile per frame forever after. `model::content_cache` held 96/64/64/64/32/16
+and overwrote a rotating slot; a boot that settles at 92 distinct render pipelines against 64 slots
+is how that cap was shown to be binding. Both are unbounded now, keyed by content, and both module
+docs carry the argument. Read one before adding a bound anywhere.
 
 ### No Magic Numbers
 
@@ -328,7 +438,11 @@ number, so a rename fails the build.
 
 Their output is a map, not a kill list. And one trap they teach: **an `Ok` from `render::decode` is
 not a decode** — `Kind::OtherAccepted` is the catch-all for "no arm claimed this", and reading it as
-success hides a whole family of lost records behind a green run.
+success hides a whole family of lost records behind a green run. That is a trap for a *reader* of
+the decode result, not a silent loss: execution reports every one of them as
+`render_unimplemented reason=accepted_without_executor`, deduped to one line per distinct opcode
+with the raw wire captured on first sighting (`runtime/exec/report.rs`). A test that stops at
+`decode` sees the `Ok` and not the report, which is why the fixture test counts the two separately.
 
 ### Reading the fail log
 
@@ -481,7 +595,11 @@ Two matter for verification rather than for ablation:
 - `REIMS_VGPU_GUEST_IMPORT=off` takes a capable host down to the `disabled_by_env` rung, which is
   how the copying rails get exercised without hunting for hardware that lacks the extension.
 - `REIMS_VGPU_GATHER_AUDIT_ALL=on` makes the zero-copy sampled cache's content audit judge **every**
-  vouched bind instead of one in sixty-four. That cache is the only place in this device where an
+  vouched bind instead of one in sixty-four. The stride is the alarm's sampling rate and nothing the
+  guest observes depends on it — the bind itself is vouched by two witnesses covering disjoint
+  writers, the hypervisor dirty bitmap and this device's own page-exact write record, which is why
+  it is a contract rail and not a guess; read `runtime/gather_witness.rs` before touching either.
+  That cache is the only place in this device where an
   image is bound with nothing read and nothing compared, and a stale bind's failure mode is content,
   which no counter reports — the audit is the sole instrument, and at the shipping stride it samples
   about 1.6 % of the binds it could judge. Run a rail sweep under it and read `gw_audit_unsound`
