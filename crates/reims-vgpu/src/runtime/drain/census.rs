@@ -1510,6 +1510,35 @@ impl ResidentArmCensus {
 pub(crate) struct DrainDutyCensus {
     tranches: std::sync::atomic::AtomicU64,
     skipped: std::sync::atomic::AtomicU64,
+    /// The wall clock this worker spent **not** in a tranche, split four ways so
+    /// that `idle + lock + skip + post + busy` tiles the census window.
+    ///
+    /// `duty` says how much of the window the worker was busy. What the other
+    /// `1 - duty` was has never been named, and on a driven Maps boot it is
+    /// **31 %** of the one thread every guest packet serializes through — worth
+    /// more than another microsecond off any phase, because at `duty` 1.0 and
+    /// today's per-draw cost this device would run ~65 fps where it runs ~51.
+    ///
+    /// The four are the only things the worker can be doing. It waits on a
+    /// condvar for the doorbell (`idle`); it takes the device lock, which the
+    /// vCPU thread also holds (`lock`); it bails before the lock when the action
+    /// BH owes a present (`skip`); and it runs the per-tranche sweeps after
+    /// `publish_us` is taken (`post`). A reading concentrated in `idle` says the
+    /// guest is upstream of us and no device change moves it; one in `lock` says
+    /// the vCPU is the contender; one in `post` says a sweep on the worker's own
+    /// path is the cost.
+    ///
+    /// Kept as separate accumulators rather than derived from a residue: a
+    /// residue absorbs every mistake in the other three and always tiles.
+    gap_idle_us: std::sync::atomic::AtomicU64,
+    gap_lock_us: std::sync::atomic::AtomicU64,
+    gap_skip_us: std::sync::atomic::AtomicU64,
+    gap_post_us: std::sync::atomic::AtomicU64,
+    /// `observe::elapsed_us()` when this worker last returned from a drain
+    /// entry point, skipped or not. Zero before the first, which is the one
+    /// entry whose `idle` cannot be measured and is dropped rather than
+    /// attributed to a zero origin.
+    gap_last_exit_us: std::sync::atomic::AtomicU64,
     drain_us: std::sync::atomic::AtomicU64,
     publish_us: std::sync::atomic::AtomicU64,
     draw_us: std::sync::atomic::AtomicU64,
@@ -1671,6 +1700,41 @@ impl DrainDutyCensus {
     pub(crate) fn note_skipped(&self) {
         self.skipped
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Open a drain entry at `entry_us`, banking the condvar wait that preceded
+    /// it, and hand back the same instant for the caller to time its lock from.
+    ///
+    /// The wait is measured from the *previous* exit rather than by bracketing
+    /// `qemu_cond_wait`, because that wait is in the C shim and this crate does
+    /// not get to hold a timer across it. The difference is the shim's own few
+    /// instructions, which is below this line's resolution.
+    pub(crate) fn note_gap_entry(&self, entry_us: u64) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let last = self.gap_last_exit_us.load(Relaxed);
+        if last != 0 {
+            self.gap_idle_us
+                .fetch_add(entry_us.saturating_sub(last), Relaxed);
+        }
+        entry_us
+    }
+
+    /// Bank the device-lock wait of an entry that went on to run a tranche.
+    pub(crate) fn note_gap_lock(&self, us: u64) {
+        self.gap_lock_us
+            .fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Close a drain entry at `exit_us`, banking everything since `busy_end_us`
+    /// as post-tranche work — or as a skip, when the entry never ran one.
+    pub(crate) fn note_gap_exit(&self, exit_us: u64, busy_end_us: u64, skipped: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let bucket = match skipped {
+            true => &self.gap_skip_us,
+            false => &self.gap_post_us,
+        };
+        bucket.fetch_add(exit_us.saturating_sub(busy_end_us), Relaxed);
+        self.gap_last_exit_us.store(exit_us, Relaxed);
     }
 
     /// Attribute `us` of the current tranche's `drain_us` to one phase.
@@ -2030,11 +2094,23 @@ impl DrainDutyCensus {
             regs_split.push_str(&format!(" {label}_us={us} {label}_n={n}"));
         }
         let slow = self.slow_tranches.swap(0, Relaxed);
+        // The four buckets that tile `1 - duty`. Emitted beside the total they
+        // divide, so `idle + lock + skip + post + busy == win_ms * 1000` is
+        // checkable on the line itself — the same rule `regs_split` follows.
+        // They will not tile exactly: each is banked at a different instant of
+        // the window and the swap below races the worker, so a few hundred
+        // microseconds either way is sampling, not a lost bucket.
+        let gap_idle = self.gap_idle_us.swap(0, Relaxed);
+        let gap_lock = self.gap_lock_us.swap(0, Relaxed);
+        let gap_skip = self.gap_skip_us.swap(0, Relaxed);
+        let gap_post = self.gap_post_us.swap(0, Relaxed);
         let busy = drain.saturating_add(publish);
         let duty = busy as f64 / (win_ms as f64 * 1000.0);
         Some(format!(
             "drain_duty win_ms={win_ms} tranches={tranches} skipped={skipped} busy_us={busy} \
              duty={duty:.3} drain_us={drain} publish_us={publish} max_tranche_us={max} \
+             gap_idle_us={gap_idle} gap_lock_us={gap_lock} gap_skip_us={gap_skip} \
+             gap_post_us={gap_post} \
              draw_us={draw} draws={draws} compute_us={compute} computes={computes} \
              flush_us={flush} flushes={flushes} max_flush_us={max_flush} \
              tail_us={tail} boundary_us={boundary} \
@@ -3206,6 +3282,28 @@ pub fn note_drain_skipped() {
     DRAIN_DUTY.note_skipped();
 }
 
+/// Open a drain entry, banking the condvar wait that preceded it. Returns the
+/// entry instant, which the caller times its device-lock wait from.
+pub fn note_drain_entry() -> u64 {
+    DRAIN_DUTY.note_gap_entry(crate::observe::elapsed_us())
+}
+
+/// Bank the device-lock wait of an entry that went on to run a tranche.
+pub fn note_drain_lock_wait(us: u64) {
+    DRAIN_DUTY.note_gap_lock(us);
+}
+
+/// Close a drain entry: everything since `busy_end_us` is post-tranche work, or
+/// the whole entry is a skip when it never took the lock.
+///
+/// Must be called on **every** return path out of the entry point, including the
+/// ones that bail after taking the lock — an unclosed entry leaves
+/// `gap_last_exit_us` stale and folds this entry's whole duration into the next
+/// one's `gap_idle_us`, which reads as an idle worker rather than as a bug here.
+pub fn note_drain_exit(busy_end_us: u64, skipped: bool) {
+    DRAIN_DUTY.note_gap_exit(crate::observe::elapsed_us(), busy_end_us, skipped);
+}
+
 /// Attribute elapsed time since `started` to one phase of the current tranche.
 pub fn note_drain_phase(phase: DrainPhase, started: std::time::Instant) {
     DRAIN_DUTY.note_phase(phase, started.elapsed().as_micros() as u64);
@@ -3414,6 +3512,82 @@ fn take_store_routes() -> Option<String> {
         }
     }
     any.then_some(out)
+}
+
+#[cfg(test)]
+mod drain_gap_tests {
+    use super::{DRAIN_DUTY_REPORT_MS, DrainDutyCensus};
+
+    /// The four gap buckets plus `busy_us` account for the whole window.
+    ///
+    /// `duty` has always said what fraction of a second the worker was busy and
+    /// nothing has ever said what the rest was — 31 % of the one thread every
+    /// guest packet serializes through, on a driven Maps boot. These four are
+    /// the only things it can be doing, so the check that they are the right
+    /// four is that they tile: a bucket that is really two, or a span banked
+    /// into no bucket at all, shows up here as a shortfall.
+    #[test]
+    fn the_gap_buckets_and_the_busy_time_tile_the_window() {
+        let c = DrainDutyCensus::default();
+        // Arms the window at t=1ms. The first `note` never reports — it would
+        // divide the whole process lifetime into one tranche — so the window
+        // under test has to be opened before anything is accumulated into it.
+        assert!(c.note(0, 0, 1).is_none(), "the first call arms the window");
+        // Six entries on a fixed stride, each: 40 idle, 10 lock, 30 drain, 5
+        // publish, 15 post. Times are microseconds on the crate clock. The
+        // first entry's idle is the one span that cannot be measured — there is
+        // no previous exit to measure it from — so it lies before `t0` and is
+        // not part of what has to tile.
+        let (idle, lock, drain, publish, post) = (40u64, 10u64, 30u64, 5u64, 15u64);
+        let stride = idle + lock + drain + publish + post;
+        let entries = 6u64;
+        let t0 = 1_000u64;
+        for i in 0..entries {
+            let entry = t0 + i * stride;
+            c.note_gap_entry(entry);
+            c.note_gap_lock(lock);
+            let busy_end = entry + lock + drain + publish;
+            assert!(c.note(drain, publish, 1).is_none(), "the window is not due");
+            c.note_gap_exit(busy_end + post, busy_end, false);
+        }
+        // One skipped entry on the same stride: no lock, no tranche, the whole
+        // call is a skip.
+        let skip_entry = t0 + entries * stride;
+        let skip_us = 7u64;
+        c.note_gap_entry(skip_entry);
+        c.note_skipped();
+        c.note_gap_exit(skip_entry + skip_us, skip_entry, true);
+        let last_exit = skip_entry + skip_us;
+
+        let line = c
+            .note(0, 0, 1 + DRAIN_DUTY_REPORT_MS)
+            .expect("the window is due");
+        let field = |name: &str| -> u64 {
+            line.split_whitespace()
+                .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+                .unwrap_or_else(|| panic!("{name} is on the line: {line}"))
+                .parse()
+                .expect("a microsecond count")
+        };
+        // `entries` idle gaps, not `entries + 1`: the first entry contributes
+        // none and the skipped one contributes the last.
+        assert_eq!(field("gap_idle_us"), idle * entries);
+        assert_eq!(field("gap_lock_us"), lock * entries);
+        assert_eq!(field("gap_post_us"), post * entries);
+        assert_eq!(field("gap_skip_us"), skip_us);
+        assert_eq!(field("busy_us"), (drain + publish) * entries);
+        // The whole point: nothing the worker did between `t0` and its last
+        // exit is outside these five.
+        assert_eq!(
+            field("gap_idle_us")
+                + field("gap_lock_us")
+                + field("gap_post_us")
+                + field("gap_skip_us")
+                + field("busy_us"),
+            last_exit - t0,
+            "a span banked into no bucket reads as a shortfall here: {line}"
+        );
+    }
 }
 
 #[cfg(test)]

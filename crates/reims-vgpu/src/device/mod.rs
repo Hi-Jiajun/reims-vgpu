@@ -521,16 +521,28 @@ pub fn device_drain(id: u64) -> bool {
     let Some(slot) = device_slot(id) else {
         return false;
     };
+    // Opens this worker's wall-clock accounting: everything since the previous
+    // exit was the condvar wait the C shim parks in, and everything from here to
+    // the lock is contention with the vCPU thread. `duty` says how much of a
+    // second the worker was busy; these say what the rest of it was.
+    let entry_us = crate::runtime::drain::note_drain_entry();
     // The action BH needs the same device state to copy +0x188. A doorbell may
     // wake this worker before that BH runs; do not reacquire the lock and hide
     // the queued scanout behind another synchronous render/compute tranche.
     if slot.present_action_pending.load(Ordering::Acquire) {
         crate::runtime::drain::note_drain_skipped();
+        crate::runtime::drain::note_drain_exit(entry_us, true);
         return true;
     }
     let mut d = lock_for_drain(&slot);
+    crate::runtime::drain::note_drain_lock_wait(
+        crate::observe::elapsed_us().saturating_sub(entry_us),
+    );
     let Some(ops) = slot.ops else {
-        // No host services — nothing to resolve from guest RAM.
+        // No host services — nothing to resolve from guest RAM. The lock wait is
+        // already banked, so this closes with no post-tranche span rather than
+        // leaving the entry open for the next one to absorb.
+        crate::runtime::drain::note_drain_exit(crate::observe::elapsed_us(), false);
         return true;
     };
     let DeviceInner { device, actions } = &mut *d;
@@ -585,6 +597,10 @@ pub fn device_drain(id: u64) -> bool {
         drain_us,
         publish_started.elapsed().as_micros() as u64,
     );
+    // Everything from here to the return is `gap_post_us`: the per-tranche
+    // sweeps below run on the worker's own wall clock and are outside both
+    // `drain_us` and `publish_us`, so `duty` cannot see them.
+    let busy_end_us = crate::observe::elapsed_us();
     // Same one-second cadence, so the cache trend lines up row-for-row with
     // `store_routes` and `drain_duty`. Measure-only; see `note_cache_levels`.
     crate::runtime::surface_cache::note_cache_levels(&device.state, &host);
@@ -631,6 +647,7 @@ pub fn device_drain(id: u64) -> bool {
     if device.state.pending.host_action_yield {
         slot.present_action_pending.store(true, Ordering::Release);
     }
+    crate::runtime::drain::note_drain_exit(busy_end_us, false);
     true
 }
 
