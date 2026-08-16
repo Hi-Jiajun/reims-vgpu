@@ -95,6 +95,21 @@ pub enum MapRefusal {
     /// The comparison is against the sum, because every import is live at once
     /// for the VM's lifetime and a submission may name any of them.
     ///
+    /// # Its relationship to the per-import check, which is the exact one
+    ///
+    /// The backend publishes this budget as the roomiest heap an import can be
+    /// *charged to* — the same population of memory types
+    /// `caps::memory_topology::select_memory_type` will choose from, since every
+    /// import goes through it carrying one class's required flags. So a sum that
+    /// passes here has a heap that each individual chunk fits, and the exact
+    /// per-allocation check at the pick — which refuses rather than making a
+    /// call Vulkan declares invalid — agrees with this one by construction
+    /// rather than by coincidence. Publishing the maximum over *every* heap
+    /// instead, which this once did, breaks that: a part whose device-local heap
+    /// is twice its host-visible heap passes here with room to spare and then
+    /// refuses at every pick, which is the partial import this refusal exists to
+    /// prevent.
+    ///
     /// This is a heap-*capacity* test and not a residency one, so it is a lower
     /// bound: a host that passes it can still be too full to import. It catches
     /// the direction that has been seen to kill a guest.

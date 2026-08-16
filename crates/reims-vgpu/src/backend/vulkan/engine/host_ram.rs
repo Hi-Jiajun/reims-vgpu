@@ -155,8 +155,15 @@ impl Decline for HostRamDecline {
                         fields.push(("check", "pointer_declined".to_string()));
                         fields.push(("result", format!("{result:?}")));
                     }
-                    ImportTypeRefusal::NoTypeMeetsRequest { pointer_types } => {
-                        fields.push(("check", "no_type_meets_request".to_string()));
+                    ImportTypeRefusal::NoTypeMeetsRequest {
+                        pointer_types,
+                        refusal,
+                    } => {
+                        // The selector's own check, not just "no type": a guest
+                        // this host has nowhere to put and a host that offers no
+                        // importable memory at all are different reports.
+                        fields.push(("check", refusal.slug().to_string()));
+                        fields.push(("detail", refusal.to_string()));
                         fields.push(("pointer_types", format!("{pointer_types:#x}")));
                     }
                 }
@@ -496,18 +503,19 @@ unsafe fn import_ramblock(
             host_base as *const std::ffi::c_void,
             &req,
             size,
+            ctx.caps.max_allocation_size,
         )
     };
     let probe_us = probe_started.elapsed().as_micros() as u64;
+    // A refusal here is the whole of the heap and allocation-size admission for
+    // this rail. It reaches the caller as a decline, the copying rails take the
+    // guest's bytes instead, and no `vkAllocateMemory` the specification forbids
+    // is ever issued — which is the difference between the two drivers this was
+    // reported on, one of which returns success and then loses the device.
     let pick = picked.map_err(|refusal| HostRamDecline::NoImportableMemoryType {
         host_base,
         refusal,
     })?;
-    ctx.report_oversized_allocation(
-        crate::backend::vulkan::caps::MemoryClass::Upload,
-        size,
-        pick,
-    );
     let memory_type_index = pick.index;
     let alloc_started = Instant::now();
 
@@ -572,15 +580,16 @@ unsafe fn import_ramblock(
     }
     // The heap is on this line and not just the type index, because "which type"
     // is not answerable from the index alone on an unfamiliar device and the
-    // heap is what a report of a slow host turns on. `fits=0` here is the whole
-    // diagnosis for a guest larger than the pool its import was charged to.
+    // heap is what a report of a slow host turns on. There is no `fits=` field
+    // any more and there cannot be one: a pick whose heap could not hold the
+    // import is a refusal now, so every line here is an import the device was
+    // allowed to make.
     crate::observe::off(format!(
         "host_ram_import id={} bytes={size} mtype={memory_type_index} heap={} heap_mb={} \
-         fits={} probe_us={probe_us} alloc_us={} ok={}",
+         probe_us={probe_us} alloc_us={} ok={}",
         import.id().get(),
         pick.heap_index,
         pick.heap_bytes >> 20,
-        pick.fits,
         alloc_started.elapsed().as_micros() as u64,
         bound.is_ok(),
     ));
@@ -695,6 +704,7 @@ crate::observe::decline::decline_display!(GuestWriteDecline);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::vulkan::caps::memory_topology::MemoryTypeRefusal;
     use crate::backend::vulkan::caps::HostPointerImport;
 
     /// One slug per check. Two sharing one would mean watching a slug fire and
@@ -709,7 +719,10 @@ mod tests {
             HostRamDecline::Retired { import_id: 1 },
             HostRamDecline::NoImportableMemoryType {
                 host_base: 0,
-                refusal: ImportTypeRefusal::NoTypeMeetsRequest { pointer_types: 0 },
+                refusal: ImportTypeRefusal::NoTypeMeetsRequest {
+                    pointer_types: 0,
+                    refusal: MemoryTypeRefusal::NoTypeWithRequiredFlags { type_bits: 0 },
+                },
             },
             HostRamDecline::BufferExcludesMemoryType {
                 host_base: 0,
@@ -761,6 +774,10 @@ mod tests {
             host_base: 0x7ff5f7e00000,
             refusal: ImportTypeRefusal::NoTypeMeetsRequest {
                 pointer_types: 0b1010,
+                refusal: MemoryTypeRefusal::EveryHeapTooSmall {
+                    bytes: 6 << 30,
+                    roomiest_heap: 2 << 30,
+                },
             },
         };
         assert_eq!(declined.slug(), unmet.slug(), "one check, one slug");
@@ -771,7 +788,14 @@ mod tests {
                 .map(|(_, value)| value)
         };
         assert_eq!(check(&declined).as_deref(), Some("pointer_declined"));
-        assert_eq!(check(&unmet).as_deref(), Some("no_type_meets_request"));
+        // The selector's own check, which is what separates "this host offers
+        // no importable memory" from "this host has nowhere to put six
+        // gigabytes" — one is a capability report and the other is a capacity
+        // one, and only the second says the guest is too big for the machine.
+        assert_eq!(
+            check(&unmet).as_deref(),
+            Some("vk_memory_every_heap_too_small")
+        );
         // The mask rides along so an empty one — the driver accepting the
         // pointer for no type at all — is separable from an incompatible one
         // without a second boot.

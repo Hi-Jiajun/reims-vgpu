@@ -646,6 +646,9 @@ pub(super) unsafe fn probe_window(
         &ctx.caps
             .memory_request(crate::backend::vulkan::caps::MemoryClass::Upload),
     );
+    // This is a probe and the refusal detail is the selector's own; all the
+    // window plan needs is whether a type was named.
+    let picked = picked.ok();
     let plan = plan_window(
         layout,
         requirements,

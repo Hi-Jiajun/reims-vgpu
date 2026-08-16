@@ -883,8 +883,18 @@ impl DeviceContext {
         // whole RAMBlocks, and at what granularity. Same shape as the query
         // above and for the same reason: the answer is the only producer of the
         // extension string it requires.
-        let host_pointer =
-            crate::backend::vulkan::caps::host_pointer::query(&instance, pd, &has_device_extension);
+        //
+        // `maxMemoryAllocationSize` is read before it, because it bounds every
+        // allocation on the device and not only an import: the import's own
+        // span ceiling is the minimum of it and two other limits.
+        let max_allocation_size =
+            crate::backend::vulkan::caps::memory_topology::max_allocation_size(&instance, pd);
+        let host_pointer = crate::backend::vulkan::caps::host_pointer::query(
+            &instance,
+            pd,
+            &has_device_extension,
+            max_allocation_size,
+        );
         let push_descriptor = crate::backend::vulkan::caps::push_descriptor::query(
             &instance,
             pd,
@@ -1095,6 +1105,7 @@ impl DeviceContext {
         let memory_properties = instance.get_physical_device_memory_properties(pd);
         let caps = HostGpuCaps {
             memory: classify_memory(&memory_properties),
+            max_allocation_size,
             quirks: DriverQuirk::for_portability_subset(portability_subset),
             host_pointer,
             push_descriptor,
@@ -1357,13 +1368,16 @@ impl DeviceContext {
     /// skip a staging hop and a discrete host can avoid burning its BAR window
     /// without either decision being duplicated at an allocation site.
     ///
-    /// Returns `None` only when no type in `type_bits` carries the class's
-    /// *required* flags — the caller must then decline with a named reason.
+    /// Returns `None` when no memory type on this device may legally carry the
+    /// allocation — the caller must then decline with a named reason. Which of
+    /// the three checks refused is on the fail channel, once per (class,
+    /// reason), because a caller's own decline cannot say whether this device
+    /// has no such memory or merely nowhere to put this much of it.
     ///
     /// `bytes` is the allocation this pick is for, and every caller has it in the
     /// `VkMemoryRequirements` it just queried. It is what keeps a large
     /// allocation out of a heap that could not hold it — see
-    /// [`select_memory_type`].
+    /// [`select_memory_type`], which refuses rather than nominating one.
     pub(crate) fn memory_type_for(
         &self,
         type_bits: u32,
@@ -1380,22 +1394,50 @@ impl DeviceContext {
         // size is a difference in which heap the pick landed in. Naming the
         // index and its flags is what turns that from an inference into a
         // reading.
-        if let Some(pick) = picked {
-            // Keyed on the class and the index together, so a device whose
-            // table makes the pick differ between call sites says so instead of
-            // latching the first answer for the boot.
-            let key = ((class as u64) << 32) | pick.index as u64;
-            if crate::observe::first_sight("vk_memory_type_pick", key) {
-                let t = self.memory_properties.memory_types[pick.index as usize];
-                crate::observe::off(format!(
-                    "vk_memory_type_pick class={class:?} index={} heap={} flags={:?} \
-                     heap_bytes={} bytes={bytes} fits={}",
-                    pick.index, pick.heap_index, t.property_flags, pick.heap_bytes, pick.fits,
-                ));
+        match picked {
+            Ok(pick) => {
+                // Keyed on the class and the index together, so a device whose
+                // table makes the pick differ between call sites says so instead
+                // of latching the first answer for the boot.
+                let key = ((class as u64) << 32) | pick.index as u64;
+                if crate::observe::first_sight("vk_memory_type_pick", key) {
+                    let t = self.memory_properties.memory_types[pick.index as usize];
+                    crate::observe::off(format!(
+                        "vk_memory_type_pick class={class:?} index={} heap={} flags={:?} \
+                         heap_bytes={} bytes={bytes}",
+                        pick.index, pick.heap_index, t.property_flags, pick.heap_bytes,
+                    ));
+                }
+                Some(pick.index)
             }
-            self.report_oversized_allocation(class, bytes, pick);
+            Err(refusal) => {
+                self.report_memory_type_refusal(class, refusal);
+                None
+            }
         }
-        picked.map(|p| p.index)
+    }
+
+    /// Report, once per (class, check), an allocation this device may not make.
+    ///
+    /// Fail-visible and a real loss: the caller declines and whatever it was
+    /// allocating for does not happen. The line is here rather than at each
+    /// caller because the caller knows what it wanted the memory for and this
+    /// knows why the device cannot supply it, and a report from a machine nobody
+    /// here owns needs both halves.
+    fn report_memory_type_refusal(
+        &self,
+        class: MemoryClass,
+        refusal: crate::backend::vulkan::caps::memory_topology::MemoryTypeRefusal,
+    ) {
+        // The tag is the refusing check and the key is the class, so the two
+        // together are the (class, check) pair without a hand-packed word.
+        if !crate::observe::first_sight(refusal.slug(), class as u64) {
+            return;
+        }
+        crate::observe::fail(format!(
+            "vk_memory_type_refused reason={} class={class:?}",
+            refusal
+        ));
     }
 
     /// Escape hatch for a caller that has already built a [`MemoryRequest`]
@@ -1406,46 +1448,17 @@ impl DeviceContext {
         type_bits: u32,
         bytes: u64,
         req: &MemoryRequest,
-    ) -> Option<crate::backend::vulkan::caps::memory_topology::MemoryTypePick> {
-        select_memory_type(&self.memory_properties, type_bits, req, bytes)
-    }
-
-    /// Report, once per (class, heap), an allocation charged to a heap that could
-    /// not hold it even empty.
-    ///
-    /// Fail-visible rather than off-channel, and it is not a loss of guest work:
-    /// the allocation is still attempted and usually succeeds. What it says is
-    /// that this device has asked its driver to keep something resident in a pool
-    /// with no room for it, which is the condition under which a driver's
-    /// residency manager evicts the rest of the working set on every submission.
-    /// That reads from the outside as "the whole machine got slow", and until
-    /// this line existed there was nothing in a boot's log that named it.
-    ///
-    /// [`MemoryTypePick::fits`] is a heap-capacity test and not a residency one,
-    /// so this is a lower bound: a heap large enough to hold the allocation can
-    /// still be too full to. The direction it does catch is unambiguous.
-    pub(crate) fn report_oversized_allocation(
-        &self,
-        class: MemoryClass,
-        bytes: u64,
-        pick: crate::backend::vulkan::caps::memory_topology::MemoryTypePick,
-    ) {
-        if pick.fits {
-            return;
-        }
-        let key = ((class as u64) << 32) | pick.heap_index as u64;
-        if !crate::observe::first_sight("vk_memory_heap_too_small", key) {
-            return;
-        }
-        crate::observe::fail(format!(
-            "vk_memory_heap_too_small reason=vk_memory_heap_too_small class={class:?} \
-             index={} heap={} heap_mb={} bytes_mb={} (the allocation is charged to a heap that \
-             could not hold it empty; expect driver-side eviction of the working set)",
-            pick.index,
-            pick.heap_index,
-            pick.heap_bytes >> 20,
-            bytes >> 20,
-        ));
+    ) -> Result<
+        crate::backend::vulkan::caps::memory_topology::MemoryTypePick,
+        crate::backend::vulkan::caps::memory_topology::MemoryTypeRefusal,
+    > {
+        select_memory_type(
+            &self.memory_properties,
+            type_bits,
+            req,
+            bytes,
+            self.caps.max_allocation_size,
+        )
     }
 
     /// Whether a selected memory type is host-cached and whether it is coherent.
