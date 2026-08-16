@@ -4404,6 +4404,19 @@ impl ResidentReadSnapshot {
     /// question, is what [`TargetIdentity::is_bgra`] already asks, and states
     /// the rule in its own doc: the transfer function is irrelevant because
     /// UNORM and sRGB views interpret the same four stored bytes.
+    ///
+    /// # What the boot pair reads now
+    ///
+    /// Two undriven macos-13 boots from one snapshot, the gate confirmed at
+    /// `host_pointer_import=supported` and `=disabled_by_env` respectively, with
+    /// the copying arm confirmed to have run (26 `gva_flush_copied`, 87
+    /// `render_flush_copied`, 172 `render_flush_leased`, and 259 declines that
+    /// all landed): the restored Maps window's map strip reads mean R,G,B
+    /// **182.4, 218.8, 230.4 on both arms** and zero black pixels on both. The
+    /// exchange showed as R and B transposed in that mean — the map layer
+    /// yellow rather than pale blue — so the three numbers being equal across
+    /// the arms *and* ordered R &lt; G &lt; B is the reading, not the equality
+    /// alone.
     fn bgra(&self) -> bool {
         crate::backend::vulkan::translate::pixel::has_bgra_order(self.format)
     }
