@@ -821,32 +821,60 @@ pub const DISPLAY_DESC_HEIGHT_MM: u64 = 0x16;
 /// rather than half of it.
 pub const DISPLAY_DESC_WIDTH_MM_F32: u64 = 0x24;
 pub const DISPLAY_DESC_HEIGHT_MM_F32: u64 = 0x28;
-/// The display pipe's capability word, and **the switch that decides whether the
-/// guest ever sends its gamma table**.
+/// The pipe's **gamma channel table entry count**, and — because the guest tests
+/// it against zero — the switch that decides whether the guest ever sends its
+/// gamma table.
+///
+/// It is a count, not a bitmask. This doc used to say the opposite: that the bit
+/// meanings were an unrecovered userland contract and that setting one would be a
+/// guess. The caution was right and the model was wrong — there are no bits.
 ///
 /// The guest reads it once, while setting up the pipe's shared state, on the
-/// straight-line path with no version test — so unlike the float pair above it is
-/// live at the rung this device grants. It then has two consumers. The pipe tests
-/// it as a *boolean*: non-zero selects the current present-transaction form, which
-/// prepares and ships the gamma table, and zero selects the deprecated form, which
-/// carries no gamma at all. The raw word is separately handed to the framebuffer
-/// and returned verbatim to userland through a device-attribute query.
+/// straight-line path with no version test, so unlike the float pair above it is
+/// live at the rung this device grants. It then has exactly two consumers:
 ///
-/// **This device writes zero, so every guest on it presents through the deprecated
-/// form and never sends gamma.** That is a known gap rather than a decision. It is
-/// not fixed by writing 1: the kernel side only tests `!= 0`, but the value it
-/// exports is the whole word, and which bit means what is a userland contract that
-/// has not been recovered. Setting a bit whose meaning is unknown is the guess
-/// `AGENTS.md` forbids; the work is to learn the bit first.
+/// - the pipe compares it to zero. Non-zero selects the present-transaction form
+///   that prepares and ships the gamma table; zero selects the older form, which
+///   carries no gamma at all.
+/// - the framebuffer stashes the raw word and returns it verbatim to userland
+///   through a device-attribute query. That query is an AGDC extended-capability
+///   read, and the gamma capability's entry takes `type = (word != 0)` and
+///   **`count` = the word**. Its userland reader is CoreDisplay, whose accessor
+///   for the pair is named `GammaChannelTableEntryCountAndType` — which is the
+///   contract written down.
+///
+/// A trap this field invites: the AGDC *capability selector* is a one-hot bit
+/// (CSC, Gamma, Linearization, scalers, cursor …). Those are bits of the query,
+/// not of this word, and mistaking one for the other is what made this look like
+/// a flags field.
+///
+/// **The reference host writes 1024** — an unconditional straight-line store at
+/// display-nub creation, in the same instruction run that writes the pipe index,
+/// with no branch and no capability test behind it. Nothing in the guest is
+/// *sized* from it: the gamma table's own entry count comes from the transaction
+/// object, so a wrong value here misinforms CoreDisplay rather than overflowing
+/// anything.
+///
+/// **This device writes zero, so every guest on it presents through the older
+/// form and never sends gamma.** That is now a routing decision rather than an
+/// unrecovered contract: writing 1024 is writing what the reference writes, and
+/// what stands in the way is whether this crate executes the gamma-carrying
+/// present form, not whether the value is known.
 ///
 /// # Two neighbouring fields this device also leaves unwritten
 ///
 /// Named in prose rather than as constants, because a constant nothing writes is
 /// dead code and the useful part is the contract, not the offset.
 ///
-/// **`+0x200`, a `u32`.** The guest's online handler reads it and echoes it back as
-/// the second word of the online acknowledgement, beside the pipe index. This device
-/// never writes it, so the guest acknowledges zero. What belongs there is unknown.
+/// **`+0x200`, a `u32` — a configuration generation counter the host
+/// *increments*.** The reference host does exactly that at the end of every
+/// descriptor refill, after writing the timing count at `+0x208` and the timing
+/// array from `+0x210`. The guest's online handler reads it and echoes it back as
+/// the second word of the online acknowledgement, beside the pipe index, which is
+/// how the host learns which generation the guest acked. This device never writes
+/// it, so the guest acknowledges zero and every publish looks like the same
+/// generation. Writing a *constant* here would be wrong for the same reason;
+/// what the contract asks for is an increment per publish.
 ///
 /// **`+0x2c … +0x48`, eight `f32`.** The panel's CIE xy chromaticities — red, green,
 /// blue, white — which newer guests pass straight into the EDID they synthesise, and
