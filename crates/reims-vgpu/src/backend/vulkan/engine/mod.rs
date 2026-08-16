@@ -4539,6 +4539,11 @@ fn resident_read_snapshot(
                 asked: identity.generation(),
                 held,
                 how,
+                // Asked on the refusal only, and asked of the same history the
+                // sampled rail's `prior=` reads: an absent resident this device
+                // reclaimed and one the guest never created are opposite
+                // defects, and only this record can tell them apart.
+                prior: pools.prior_reclaim(identity),
             },
         ));
     };

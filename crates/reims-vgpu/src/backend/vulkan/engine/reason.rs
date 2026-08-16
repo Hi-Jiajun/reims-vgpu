@@ -487,10 +487,22 @@ pub enum TargetReadDecline {
     /// stated rather than inferred — which is what the bare variant made
     /// impossible when `REIMS_VGPU_SHARED_TARGET=off` lost every Maps frame to
     /// it.
+    ///
+    /// `prior` closes the first finding the same way. `how == Absent` says the
+    /// registry names this surface under no key at all, which is still two
+    /// findings — the guest never rendered into it, or **this device took its
+    /// resident away** — and `ResourcePools::prior_reclaim` has held the answer
+    /// to the second the whole time. The sampled rail already quotes it as
+    /// `prior=`; the readback did not, so 132 latched refusals on one driven
+    /// import-off macos-13 boot said a resident was gone and none of them said
+    /// who removed it. `None` is the honest "no record", which covers both
+    /// "never held one" and "reclaimed longer ago than the history window
+    /// reaches" — that method deliberately does not guess between them.
     UnknownIdentity {
         asked: u64,
         held: Option<u64>,
         how: super::types::TargetKeyDivergence,
+        prior: Option<super::types::ResidentReclaim>,
     },
     /// The readback's resident has never had content written.
     NoReadyContent,
@@ -526,12 +538,21 @@ impl Decline for TargetReadDecline {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::UnknownIdentity { asked, held, how } => vec![
+            Self::UnknownIdentity {
+                asked,
+                held,
+                how,
+                prior,
+            } => vec![
                 ("diverges", how.label().to_string()),
                 ("asked_gen", asked.to_string()),
                 (
                     "held_gen",
                     held.map_or_else(|| "none".to_string(), |g| g.to_string()),
+                ),
+                (
+                    "prior",
+                    prior.map_or("none", |why| why.slug()).to_string(),
                 ),
             ],
             Self::NoReadyContent => Vec::new(),
@@ -769,6 +790,7 @@ mod tests {
                 asked: 7,
                 held: None,
                 how: crate::backend::vulkan::engine::TargetKeyDivergence::Absent,
+                prior: None,
             },
             TargetReadDecline::NoReadyContent,
             TargetReadDecline::MultisampleImage { sample_count: 2 },
@@ -790,6 +812,11 @@ mod tests {
     /// on the line. They were one word until a driven boot lost every Maps
     /// frame to this refusal and nothing in the log could say which of them it
     /// was.
+    ///
+    /// `prior` is the third: `diverges=absent` is itself two findings, and this
+    /// is the one where **this device** took the resident away rather than the
+    /// guest never having created it. A `none` there is a real "no record" and
+    /// not a claim that nothing was reclaimed.
     #[test]
     fn an_absent_resident_says_whether_the_target_exists_under_another_key() {
         use crate::backend::vulkan::engine::TargetKeyDivergence;
@@ -797,11 +824,13 @@ mod tests {
             asked: 4,
             held: None,
             how: TargetKeyDivergence::Absent,
+            prior: Some(crate::backend::vulkan::engine::types::ResidentReclaim::ResourceReleased),
         };
         let stale = TargetReadDecline::UnknownIdentity {
             asked: 4,
             held: Some(5),
             how: TargetKeyDivergence::Generation,
+            prior: None,
         };
         // One slug, because it is one check. What separates them is the
         // payload, which is what `Emit::decline` puts on the line — `Display`
@@ -813,7 +842,8 @@ mod tests {
             vec![
                 ("diverges", "absent".to_string()),
                 ("asked_gen", "4".to_string()),
-                ("held_gen", "none".to_string())
+                ("held_gen", "none".to_string()),
+                ("prior", "resource_released".to_string())
             ]
         );
         assert_eq!(
@@ -821,7 +851,8 @@ mod tests {
             vec![
                 ("diverges", "generation".to_string()),
                 ("asked_gen", "4".to_string()),
-                ("held_gen", "5".to_string())
+                ("held_gen", "5".to_string()),
+                ("prior", "none".to_string())
             ]
         );
     }
