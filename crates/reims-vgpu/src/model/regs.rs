@@ -821,8 +821,58 @@ pub const DISPLAY_DESC_HEIGHT_MM: u64 = 0x16;
 /// rather than half of it.
 pub const DISPLAY_DESC_WIDTH_MM_F32: u64 = 0x24;
 pub const DISPLAY_DESC_HEIGHT_MM_F32: u64 = 0x28;
+/// The display pipe's capability word, and **the switch that decides whether the
+/// guest ever sends its gamma table**.
+///
+/// The guest reads it once, while setting up the pipe's shared state, on the
+/// straight-line path with no version test — so unlike the float pair above it is
+/// live at the rung this device grants. It then has two consumers. The pipe tests
+/// it as a *boolean*: non-zero selects the current present-transaction form, which
+/// prepares and ships the gamma table, and zero selects the deprecated form, which
+/// carries no gamma at all. The raw word is separately handed to the framebuffer
+/// and returned verbatim to userland through a device-attribute query.
+///
+/// **This device writes zero, so every guest on it presents through the deprecated
+/// form and never sends gamma.** That is a known gap rather than a decision. It is
+/// not fixed by writing 1: the kernel side only tests `!= 0`, but the value it
+/// exports is the whole word, and which bit means what is a userland contract that
+/// has not been recovered. Setting a bit whose meaning is unknown is the guess
+/// `AGENTS.md` forbids; the work is to learn the bit first.
+///
+/// # Two neighbouring fields this device also leaves unwritten
+///
+/// Named in prose rather than as constants, because a constant nothing writes is
+/// dead code and the useful part is the contract, not the offset.
+///
+/// **`+0x200`, a `u32`.** The guest's online handler reads it and echoes it back as
+/// the second word of the online acknowledgement, beside the pipe index. This device
+/// never writes it, so the guest acknowledges zero. What belongs there is unknown.
+///
+/// **`+0x2c … +0x48`, eight `f32`.** The panel's CIE xy chromaticities — red, green,
+/// blue, white — which newer guests pass straight into the EDID they synthesise, and
+/// which their colour management then treats as the display's primaries. Older guests
+/// do not read the block. The guest seeds it *itself* with the sRGB primaries and a
+/// D65 white before asking the host to fill the page, so leaving it alone and writing
+/// zeroes over it are opposite outcomes: an sRGB display, or one whose primaries are
+/// black. This device writes neither value, so the seed should survive — but that is a
+/// deduction about a page this device does not clear rather than a measurement, and
+/// the instrument that settles it is the guest's own EDID, decoded on a boot of a
+/// guest new enough to read the block.
 pub const DISPLAY_DESC_FEATURES: u64 = 0x1c;
 /// Timing-element **count** (not a pixel width — large values hang the guest).
+///
+/// Each element is width `u16`, height `u16`, refresh as 16.16 fixed `u32`, and then
+/// eight bytes no guest driver read at either version examined — so `tail0`/`tail1`
+/// are dead rather than unimplemented, and there is **no per-mode flags word** here
+/// to leave unset.
+///
+/// The count is also not a limit on what the guest may run. The guest's framebuffer
+/// publishes a programmable timing range with one-pixel granularity and accepts a
+/// detailed timing the OS installs, replacing this list wholesale — so these entries
+/// seed the mode list rather than bound it. The guest driver reads none of the
+/// scaling terms out of an installed timing, reporting a mode by its active pixels
+/// only, which is the thing to hold on to when reading a report about a *scaled*
+/// resolution.
 pub const DISPLAY_DESC_TIMING_COUNT: u64 = 0x208;
 
 /// Modes advertised to AppleParavirtDisplay (archive apple_pv_gpu_display_setup).
