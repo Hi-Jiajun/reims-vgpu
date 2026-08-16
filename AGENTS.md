@@ -750,6 +750,15 @@ change touching guest-memory upload, writeback or bind needs the boot a second t
 appears once. Nothing may then report a bound import — a non-zero import count means a bind ran past
 a closed gate.
 
+**Compare the two boots on their pixels, not only on their counters.** The gate check above says the
+arm ran; it does not say the arm is correct, and the two are not the same question. Take both boots
+from the same snapshot, let each reach the Dock, drive nothing, and screenshot — the restored windows
+are identical by construction, so any difference is this device's. A whole window's content has been
+observed rendering on one arm and solid black on the other with every counter self-consistent and the
+gate correctly closed, which is a shape no counter in the tree reports. That comparison is also the
+only local reproduction of what a discrete host, a small-heap host and an `ImportExceedsHeap` host
+run all the time, so a change to guest-memory upload, writeback or bind is not verified without it.
+
 ### `present_hz` tracks `offered_hz` exactly, so read the pair and never one alone
 
 The x86/Vulkan host window presenter used to clamp at **~41 frames a second
