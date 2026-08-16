@@ -51,6 +51,50 @@
 //! `VK_FORMAT_*_SRGB` would pay. The pair is the unit because a rail hit twice
 //! with the same format has nothing more to say the second time.
 //!
+//! # It watches one direction, and the open report is in the other
+//!
+//! Every site here reports the guest asking for sRGB and this device binding the
+//! linear sibling — a *lost* encode. Nothing in this crate watches the opposite:
+//! this device applying the transfer function where the guest did not ask for
+//! it, or failing to decode on a read so an already-encoded value is encoded
+//! again downstream. Both spell the same thing in the frame — a value lighter
+//! than it should be — and neither can produce a line here.
+//!
+//! That is not hypothetical. `bugs/bug-03` is the macos-13 System Settings
+//! sidebar icons, dark mode only, and it reproduces at `418eb35b` with **zero**
+//! lines from this census. One driven macos-13 boot, System Settings
+//! photographed in both appearances from the same window position, sampling the
+//! peak-saturation pixel of each icon badge (17 patches, 51 channels), fitting
+//! the dark reading against the light one:
+//!
+//! ```text
+//! model                        RMS levels
+//! no transfer function              99.68
+//! sRGB encode applied once          48.49
+//! sRGB encode applied twice          6.95
+//! sRGB encode applied three times   20.72
+//! best-fit single power law         54.94   (gamma 1.99)
+//! ```
+//!
+//! So the dark frame is the light one with the sRGB encode applied **twice**,
+//! and no single gamma reproduces it. Two things follow. The exponent count is
+//! *two*, where `kb/the-settings-icons-are-one-extra-srgb-encode-…` fitted one —
+//! that kb averaged a patch per badge, which pulls in antialiased edges and
+//! flattens the curve, so the peak-pixel fit is the sharper of the two and the
+//! search is for two sites or for one value going round twice. And a defect of
+//! this size lives entirely outside this census's field of view, which is the
+//! more useful half: a zero here excludes the downgrade direction and nothing
+//! else.
+//!
+//! What *is* excluded, measured on the same boot: the scanout, present and
+//! host-window path is colour-exact. The guest's own `screencapture` and this
+//! device's host-window capture, taken seconds apart, agree to within two
+//! levels on every desktop-wallpaper point no window covers — in both
+//! appearances. (`screencapture` from an ssh session has no Screen Recording
+//! consent, so it returns the desktop and menu bar and no window contents; the
+//! wallpaper is what makes it a usable control rather than a failed probe.) The
+//! extra encodes are applied to that window's own content, upstream of present.
+//!
 //! Measure-only: nothing here gates decode, execute or present.
 
 use std::collections::BTreeSet;
