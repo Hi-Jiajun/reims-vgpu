@@ -312,6 +312,43 @@ pub fn storage_format(format: vk::Format) -> vk::Format {
     }
 }
 
+/// The format a **sampled** view of a resident must be created with, given the
+/// format the bind asked for and the format the resident itself holds.
+///
+/// # Why the bind's own answer is not enough
+///
+/// A sampled bind's format is resolved from a [`TexelLayout`] — see
+/// `engine::SampledResource::format` — and a layout names stored bytes and so
+/// carries no transfer function at all. That is the right vocabulary for the
+/// rails that upload guest bytes, because there the layout *is* everything the
+/// device knows. It is not enough for the one source that has a second,
+/// stronger declaration available: a `SampledSource::Target`, whose resident was
+/// created by [`color_attachment`] from the guest's own `MTLPixelFormat` and
+/// therefore does carry the transfer function.
+///
+/// Without this fold a resident the guest declared `BGRA8Unorm_sRGB` is written
+/// through a `B8G8R8A8_SRGB` attachment — Vulkan encodes linear to sRGB, as
+/// Metal does — and then sampled through a `B8G8R8A8_UNORM` view, which decodes
+/// nothing. The still-encoded value is composited and encoded a second time by
+/// the next attachment write, so the frame carries **exactly one sRGB encode too
+/// many**. That is a colour defect with no counter behind it: every rail
+/// succeeds, nothing declines, and the picture is washed out in the direction
+/// `1.055 x^(1/2.4) - 0.055` describes.
+///
+/// # Why it can only ever add the transfer function
+///
+/// The fold is gated on [`stored_bytes_agree`], so it fires only where the two
+/// spellings differ in nothing but the transfer function. A bind whose channel
+/// order or texel width differs from the resident's is left exactly as it asked
+/// — that disagreement is a real one and this is not the place to resolve it.
+pub fn sample_view_format(requested: vk::Format, resident: vk::Format) -> vk::Format {
+    if stored_bytes_agree(requested, resident) {
+        resident
+    } else {
+        requested
+    }
+}
+
 /// Whether two Vulkan formats describe the same stored bytes for the same
 /// texel, so a transfer that converts nothing may move one into the other.
 ///
@@ -706,6 +743,54 @@ mod tests {
             let f = vk_texel_layout(layout);
             assert_eq!(storage_format(f), f, "{layout:?}");
             assert_eq!(has_bgra_order(f), f == SCANOUT_FORMAT, "{layout:?}");
+        }
+    }
+
+    /// A sampled bind can only ever spell a stored-byte format, so every
+    /// resident the guest declared with an sRGB format would be sampled without
+    /// its decode if the bind's own answer were taken. `sample_view_format`
+    /// restores it, for both channel orders and both spellings of the bind.
+    #[test]
+    fn a_sampled_view_takes_the_transfer_function_from_the_resident() {
+        for (linear, srgb) in [
+            (SCANOUT_FORMAT, vk::Format::B8G8R8A8_SRGB),
+            (RESIDENT_RGBA_FORMAT, vk::Format::R8G8B8A8_SRGB),
+        ] {
+            // The defect: the bind names stored bytes, the resident carries the
+            // qualifier, and the view has to be the resident's.
+            assert_eq!(sample_view_format(linear, srgb), srgb);
+            // Already agreed, either way round: nothing to restore.
+            assert_eq!(sample_view_format(srgb, srgb), srgb);
+            assert_eq!(sample_view_format(linear, linear), linear);
+            // A resident that carries no qualifier cannot lend one, and this
+            // must not become a downgrade of a bind that already spelled it.
+            assert_eq!(sample_view_format(srgb, linear), linear);
+        }
+    }
+
+    /// The fold may add a transfer function and nothing else. A bind whose
+    /// channel order or texel width disagrees with the resident is a real
+    /// disagreement and is left exactly as it asked — resolving it here would
+    /// silently rewrite what the shader samples.
+    #[test]
+    fn a_sampled_view_never_changes_the_stored_bytes_the_bind_asked_for() {
+        for &layout in TexelLayout::ALL {
+            let requested = vk_texel_layout(layout);
+            for &resident in TexelLayout::ALL {
+                for resident in [
+                    vk_texel_layout(resident),
+                    // Both sRGB spellings a resident can hold, so the case that
+                    // matters is exercised against every requested layout.
+                    vk::Format::B8G8R8A8_SRGB,
+                    vk::Format::R8G8B8A8_SRGB,
+                ] {
+                    let got = sample_view_format(requested, resident);
+                    assert!(
+                        stored_bytes_agree(got, requested),
+                        "{requested:?} against {resident:?} became {got:?}"
+                    );
+                }
+            }
         }
     }
 

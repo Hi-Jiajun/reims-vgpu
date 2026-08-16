@@ -670,12 +670,22 @@ impl ResourcePools {
             .unwrap_or((TargetKeyDivergence::Absent, None))
     }
 
-    /// Return the exact-format sampled view requested for a resident image.
+    /// Return the sampled view for a resident image, at the format the guest's
+    /// declaration reaches rather than at the one the bind could spell.
     ///
     /// The image allocation is shared by every compatible texture view. Views
     /// are retained with that allocation because their lifetime is the resource
     /// lifetime, not one draw, and the finite translated format vocabulary is
     /// the natural bound on this collection.
+    ///
+    /// **The transfer function comes from the resident and the channel order
+    /// from the bind**, which is [`translate::pixel::sample_view_format`]'s whole
+    /// job — read its doc before changing what is passed in. A sampled bind
+    /// names its format through a `TexelLayout`, which describes stored bytes and
+    /// cannot carry a transfer function, so asking it alone drops the sRGB
+    /// qualifier off every resident that has one. This is the single place that
+    /// decides which view a bind gets, so it is the single place the fold
+    /// belongs; a caller doing it for itself would be the second spelling.
     pub(crate) unsafe fn registry_sample_view(
         &mut self,
         ctx: &DeviceContext,
@@ -686,6 +696,7 @@ impl ResourcePools {
         let Some(slot) = self.registry.get_mut(identity) else {
             return Ok(None);
         };
+        let format = translate::pixel::sample_view_format(format, slot.color_format);
         if slot.color_format == format {
             return Ok(Some(slot.view));
         }
