@@ -387,8 +387,29 @@ pub const IMPORT_SPAN_CEILING: u64 = 2 * 1024 * 1024 * 1024;
 /// `minImportedHostPointerAlignment` a driver can report.
 const _: () = assert!(IMPORT_SPAN_CEILING.is_power_of_two());
 
-/// Which memory type an import of `bytes` at `host_ptr` must use, or `None` when
-/// the device accepts none that also meet `req`.
+/// Why an import could not be given a memory type.
+///
+/// The two arms are different findings about different halves of the call and a
+/// reader has to be able to tell them apart: [`Self::PointerDeclined`] is the
+/// driver refusing the *mapping* — not a kind of memory it can take a reference
+/// on — while [`Self::NoTypeMeetsRequest`] is the driver naming types this
+/// device's own [`super::memory_topology::MemoryRequest`] then rejected. The
+/// first is a property of the host allocation and the second is a property of
+/// this device's policy, and only the second is ours to change. The mask the
+/// driver named rides along so the two sub-cases of the second — an empty mask
+/// and an incompatible one — are also separable without another boot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportTypeRefusal {
+    /// `vkGetMemoryHostPointerPropertiesEXT` returned a non-success result.
+    PointerDeclined { result: vk::Result },
+    /// The query succeeded and named `pointer_types`; no type in it satisfies
+    /// the request. An empty mask means the driver accepts the pointer for no
+    /// type at all.
+    NoTypeMeetsRequest { pointer_types: u32 },
+}
+
+/// Which memory type an import of `bytes` at `host_ptr` must use, or which check
+/// refused to name one.
 ///
 /// `vkGetMemoryHostPointerPropertiesEXT` answers with a `memoryTypeBits` mask
 /// that is a property of the *pointer*, not of the device, so it cannot be
@@ -414,7 +435,7 @@ pub unsafe fn import_memory_type(
     host_ptr: *const std::ffi::c_void,
     req: &super::memory_topology::MemoryRequest,
     bytes: u64,
-) -> Option<super::memory_topology::MemoryTypePick> {
+) -> Result<super::memory_topology::MemoryTypePick, ImportTypeRefusal> {
     let mut ptr_props = vk::MemoryHostPointerPropertiesEXT::default();
     // `ash` 0.38 wraps this extension as raw function pointers only, so the
     // call goes through `fp()` rather than a checked method.
@@ -431,9 +452,11 @@ pub unsafe fn import_memory_type(
         )
     };
     if rc != vk::Result::SUCCESS {
-        return None;
+        return Err(ImportTypeRefusal::PointerDeclined { result: rc });
     }
-    super::memory_topology::select_memory_type(memory_props, ptr_props.memory_type_bits, req, bytes)
+    let pointer_types = ptr_props.memory_type_bits;
+    super::memory_topology::select_memory_type(memory_props, pointer_types, req, bytes)
+        .ok_or(ImportTypeRefusal::NoTypeMeetsRequest { pointer_types })
 }
 
 #[cfg(test)]

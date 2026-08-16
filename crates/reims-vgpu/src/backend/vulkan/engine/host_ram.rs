@@ -33,6 +33,7 @@ use std::collections::HashMap;
 
 use ash::vk;
 
+use crate::backend::vulkan::caps::host_pointer::ImportTypeRefusal;
 use crate::observe::Decline;
 use crate::runtime::guest_ram::{GuestRamError, GuestRamImport, GuestRef};
 
@@ -87,9 +88,28 @@ pub enum HostRamDecline {
     /// The guest ended this parent allocation's lifetime. Old child objects
     /// may finish retiring, but no new view may resurrect its import identity.
     Retired { import_id: u64 },
-    /// `vkGetMemoryHostPointerPropertiesEXT` declined the pointer, or no memory
-    /// type it named also satisfies what this device wants for guest memory.
-    NoImportableMemoryType { host_base: usize },
+    /// No memory type could be named for the pointer. Carries which of the two
+    /// checks refused — see [`ImportTypeRefusal`], whose doc says why they are
+    /// not one finding.
+    NoImportableMemoryType {
+        host_base: usize,
+        refusal: ImportTypeRefusal,
+    },
+    /// A memory type was named for the pointer and the *buffer* over the same
+    /// span excludes it.
+    ///
+    /// A separate variant rather than a second use of the one above, which is
+    /// what it was. The two are asked of different objects — the first of the
+    /// host allocation, this one of `vkGetBufferMemoryRequirements` — and they
+    /// have different repairs: the first is a request this device chose, and
+    /// this one is two driver answers that do not intersect, which no policy
+    /// here can widen. Sharing a slug meant a log line could not say which, and
+    /// `bugs/bug-06` is a hundred of exactly that line.
+    BufferExcludesMemoryType {
+        host_base: usize,
+        picked: u32,
+        buffer_types: u32,
+    },
     /// `vkCreateBuffer` over the whole span failed.
     CreateBuffer { result: vk::Result },
     /// The buffer the driver made needs more bytes than the span has. The import
@@ -113,6 +133,7 @@ impl Decline for HostRamDecline {
             Self::Unsupported { .. } => "host_ram_import_unsupported",
             Self::Retired { .. } => "host_ram_import_retired",
             Self::NoImportableMemoryType { .. } => "host_ram_import_no_importable_memory_type",
+            Self::BufferExcludesMemoryType { .. } => "host_ram_import_buffer_excludes_memory_type",
             Self::CreateBuffer { .. } => "host_ram_import_create_buffer",
             Self::TooSmall { .. } => "host_ram_import_too_small",
             Self::AllocateMemory { .. } => "host_ram_import_allocate_memory",
@@ -127,9 +148,29 @@ impl Decline for HostRamDecline {
         match self {
             Self::Unsupported { rung } => vec![("rung", rung.slug().to_string())],
             Self::Retired { import_id } => vec![("import_id", import_id.to_string())],
-            Self::NoImportableMemoryType { host_base } => {
-                vec![("host_base", format!("{host_base:#x}"))]
+            Self::NoImportableMemoryType { host_base, refusal } => {
+                let mut fields = vec![("host_base", format!("{host_base:#x}"))];
+                match refusal {
+                    ImportTypeRefusal::PointerDeclined { result } => {
+                        fields.push(("check", "pointer_declined".to_string()));
+                        fields.push(("result", format!("{result:?}")));
+                    }
+                    ImportTypeRefusal::NoTypeMeetsRequest { pointer_types } => {
+                        fields.push(("check", "no_type_meets_request".to_string()));
+                        fields.push(("pointer_types", format!("{pointer_types:#x}")));
+                    }
+                }
+                fields
             }
+            Self::BufferExcludesMemoryType {
+                host_base,
+                picked,
+                buffer_types,
+            } => vec![
+                ("host_base", format!("{host_base:#x}")),
+                ("picked", picked.to_string()),
+                ("buffer_types", format!("{buffer_types:#x}")),
+            ],
             Self::CreateBuffer { result }
             | Self::AllocateMemory { result }
             | Self::BindBuffer { result } => vec![("result", format!("{result:?}"))],
@@ -458,7 +499,10 @@ unsafe fn import_ramblock(
         )
     };
     let probe_us = probe_started.elapsed().as_micros() as u64;
-    let pick = picked.ok_or(HostRamDecline::NoImportableMemoryType { host_base })?;
+    let pick = picked.map_err(|refusal| HostRamDecline::NoImportableMemoryType {
+        host_base,
+        refusal,
+    })?;
     ctx.report_oversized_allocation(
         crate::backend::vulkan::caps::MemoryClass::Upload,
         size,
@@ -490,7 +534,11 @@ unsafe fn import_ramblock(
             });
         }
         if reqs.memory_type_bits & (1u32 << memory_type_index) == 0 {
-            return Err(HostRamDecline::NoImportableMemoryType { host_base });
+            return Err(HostRamDecline::BufferExcludesMemoryType {
+                host_base,
+                picked: memory_type_index,
+                buffer_types: reqs.memory_type_bits,
+            });
         }
 
         let mut host_import = vk::ImportMemoryHostPointerInfoEXT::default()
@@ -659,7 +707,15 @@ mod tests {
                 rung: HostPointerImport::Unqueried,
             },
             HostRamDecline::Retired { import_id: 1 },
-            HostRamDecline::NoImportableMemoryType { host_base: 0 },
+            HostRamDecline::NoImportableMemoryType {
+                host_base: 0,
+                refusal: ImportTypeRefusal::NoTypeMeetsRequest { pointer_types: 0 },
+            },
+            HostRamDecline::BufferExcludesMemoryType {
+                host_base: 0,
+                picked: 0,
+                buffer_types: 0,
+            },
             HostRamDecline::CreateBuffer {
                 result: vk::Result::ERROR_UNKNOWN,
             },
@@ -682,6 +738,47 @@ mod tests {
         for slug in slugs {
             assert!(slug.starts_with("host_ram_import_"), "{slug}");
         }
+    }
+
+    /// A refusal that cannot say which check refused is a log line nobody can
+    /// act on. `bugs/bug-06` is a hundred `no_importable_memory_type` lines at
+    /// one `host_base` and no way to tell the driver declining the mapping from
+    /// this device's own memory request excluding every type the driver named —
+    /// the first is the host's, the second is ours, and only one of them has a
+    /// repair here.
+    ///
+    /// Asserted on the emitted fields rather than on the variant, because the
+    /// fields are what a reader greps.
+    #[test]
+    fn the_memory_type_refusal_names_the_check_that_refused() {
+        let declined = HostRamDecline::NoImportableMemoryType {
+            host_base: 0x7ff5f7e00000,
+            refusal: ImportTypeRefusal::PointerDeclined {
+                result: vk::Result::ERROR_INVALID_EXTERNAL_HANDLE,
+            },
+        };
+        let unmet = HostRamDecline::NoImportableMemoryType {
+            host_base: 0x7ff5f7e00000,
+            refusal: ImportTypeRefusal::NoTypeMeetsRequest {
+                pointer_types: 0b1010,
+            },
+        };
+        assert_eq!(declined.slug(), unmet.slug(), "one check, one slug");
+        let check = |d: &HostRamDecline| {
+            d.fields()
+                .into_iter()
+                .find(|(name, _)| *name == "check")
+                .map(|(_, value)| value)
+        };
+        assert_eq!(check(&declined).as_deref(), Some("pointer_declined"));
+        assert_eq!(check(&unmet).as_deref(), Some("no_type_meets_request"));
+        // The mask rides along so an empty one — the driver accepting the
+        // pointer for no type at all — is separable from an incompatible one
+        // without a second boot.
+        assert!(unmet
+            .fields()
+            .iter()
+            .any(|(name, value)| *name == "pointer_types" && value == "0xa"));
     }
 
     #[test]
