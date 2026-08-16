@@ -2896,8 +2896,17 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
         psz,
     );
     shared_w16(host, gpa, DISPLAY_DESC_INDEX, index as u16, psz);
-    shared_w16(host, gpa, DISPLAY_DESC_WIDTH_MM, DISPLAY_WIDTH_MM, psz);
-    shared_w16(host, gpa, DISPLAY_DESC_HEIGHT_MM, DISPLAY_HEIGHT_MM, psz);
+    // Both encodings of the physical size, from one value each, because the
+    // guest chooses which to read: the integer pair is what the EDID's
+    // centimetre fields come from, and `displayDimensionFloats` — carried by the
+    // protocol version this device negotiates — licenses the float pair. Writing
+    // only the integers advertises a field and leaves it zero.
+    let (width_f32, width_mm) = display_dimension_mm(DISPLAY_WIDTH_MM);
+    let (height_f32, height_mm) = display_dimension_mm(DISPLAY_HEIGHT_MM);
+    shared_w16(host, gpa, DISPLAY_DESC_WIDTH_MM, width_mm, psz);
+    shared_w16(host, gpa, DISPLAY_DESC_HEIGHT_MM, height_mm, psz);
+    shared_w32(host, gpa, DISPLAY_DESC_WIDTH_MM_F32, width_f32.to_bits(), psz);
+    shared_w32(host, gpa, DISPLAY_DESC_HEIGHT_MM_F32, height_f32.to_bits(), psz);
     shared_w32(host, gpa, DISPLAY_DESC_FEATURES, 0, psz);
 
     // HW cursor capability so the guest doorbells glyph/show/move.

@@ -804,6 +804,14 @@ pub const DISPLAY_DESC_PRODUCT_NAME: u64 = 0x04;
 pub const DISPLAY_DESC_INDEX: u64 = 0x12;
 pub const DISPLAY_DESC_WIDTH_MM: u64 = 0x14;
 pub const DISPLAY_DESC_HEIGHT_MM: u64 = 0x16;
+/// The same physical size again, as IEEE binary32. Apple's host writes **both**
+/// encodings on every publish, unconditionally, and the `displayDimensionFloats`
+/// capability — which this device grants by negotiating a protocol version that
+/// carries it — is what licenses the guest to read this pair instead of the u16
+/// one. Publishing the integers alone therefore advertises a field and leaves it
+/// zero, which is a 0 x 0 mm panel to any guest that takes the licence.
+pub const DISPLAY_DESC_WIDTH_MM_F32: u64 = 0x24;
+pub const DISPLAY_DESC_HEIGHT_MM_F32: u64 = 0x28;
 pub const DISPLAY_DESC_FEATURES: u64 = 0x1c;
 /// Timing-element **count** (not a pixel width — large values hang the guest).
 pub const DISPLAY_DESC_TIMING_COUNT: u64 = 0x208;
@@ -823,8 +831,75 @@ pub const DISPLAY_MODE2_H: u16 = 1024;
 pub const DISPLAY_MODE3_W: u16 = 3840;
 pub const DISPLAY_MODE3_H: u16 = 2160;
 pub const DISPLAY_SERIAL_NUMBER: u32 = 1;
-pub const DISPLAY_WIDTH_MM: u16 = 400;
-pub const DISPLAY_HEIGHT_MM: u16 = 300;
+
+/// The panel's physical size, which the guest turns into an EDID and a DPI.
+///
+/// # These are millimetres, and that was measured rather than assumed
+///
+/// The two u16s at `DISPLAY_DESC_WIDTH_MM`/`_HEIGHT_MM` sit where a static read
+/// of the guest driver puts "display width/height", and reading that as *pixels*
+/// is the obvious mistake — it would make this device announce a 400x300 screen.
+/// A driven macos-13 boot settles it: the guest's synthesised EDID carries
+/// `max horizontal image size = 40 cm` and `max vertical = 30 cm`, which is these
+/// two constants divided by ten. Apple's host reaches the same field from
+/// `_PGDisplay`'s `{CGSize=dd}` accessor over its own `_sizeInMillimeters`.
+///
+/// So the units were right. The *values* were a 4:3 panel announced beside a 16:9
+/// native mode, which tells the guest its pixels are non-square by a third — and
+/// nothing derived them. macOS builds its scaled-resolution list from this DPI, so
+/// a display whose physical aspect contradicts its native mode is a contradiction
+/// the guest resolves somewhere, on every resolution that is not one of the four
+/// this device advertises.
+///
+/// # Where 48 x 27 cm comes from
+///
+/// The guest's EDID stores whole **centimetres**, so the pair has to be a whole-
+/// centimetre multiple of the native mode's aspect or the ratio it announces is
+/// not the ratio meant. 16:9 in whole centimetres is `16k x 9k`, and `k` is
+/// picked by density rather than taste:
+///
+/// | k | size | DPI at 1920x1080 |
+/// |---|---|---|
+/// | 2 | 32 x 18 cm | 152.4 — inside the band where macOS starts offering HiDPI |
+/// | **3** | **48 x 27 cm** | **101.6 — an ordinary desktop monitor** |
+/// | 4 | 64 x 36 cm | 76.2 |
+///
+/// `k = 3` is the only one that is both square-pixelled and unremarkable, so it
+/// is the value, and the assertion below is what keeps it honest: the ratio is
+/// tied to [`DISPLAY_MODE_EFI_W`]/[`DISPLAY_MODE_EFI_H`], so changing the native
+/// mode without changing the panel fails the build rather than shipping a second
+/// self-contradiction.
+pub const DISPLAY_WIDTH_MM: u16 = 480;
+pub const DISPLAY_HEIGHT_MM: u16 = 270;
+
+/// The panel's aspect is the native mode's aspect, exactly. Cross-multiplied so
+/// it is integer arithmetic and holds without a rounding argument.
+const _: () = assert!(
+    DISPLAY_WIDTH_MM as u64 * DISPLAY_MODE_EFI_H as u64
+        == DISPLAY_HEIGHT_MM as u64 * DISPLAY_MODE_EFI_W as u64,
+    "the announced panel must have the native mode's aspect, or the guest is told \
+     its pixels are not square"
+);
+
+/// The EDID the guest synthesises stores the size in whole centimetres, so a
+/// millimetre value that is not a multiple of ten loses its low digit on the way
+/// out and the aspect asserted above is not the aspect the guest sees.
+const _: () = assert!(
+    (DISPLAY_WIDTH_MM as u64).is_multiple_of(10) && (DISPLAY_HEIGHT_MM as u64).is_multiple_of(10)
+);
+
+/// One physical dimension in the two encodings the shared page carries, from one
+/// value, in the host's own order: narrow to `f32` first, then round the
+/// *narrowed* value half-up to the integer. Doing it the other way rounds a
+/// precision the guest never sees.
+///
+/// Returned as a pair rather than written by two call sites, because the whole
+/// point is that the two spellings cannot disagree — a caller that could write
+/// one without the other is the drift this exists to prevent.
+pub fn display_dimension_mm(millimetres: u16) -> (f32, u16) {
+    let narrowed = millimetres as f32;
+    (narrowed, (narrowed as f64 + 0.5) as u16)
+}
 /// Advertised refresh of every timing element. macOS paces CoreAnimation /
 /// rAF to the display's advertised rate, so 60 here caps the guest at 60 fps
 /// regardless of how fast VBL is signalled. 120 requests ProMotion-class
@@ -1620,6 +1695,50 @@ mod tests {
     /// own value for key 12; using it keeps this test about the host reduction
     /// and nothing else.
     const VERSION_WITH_DUAL_PLANE: u32 = 31;
+
+    /// The two encodings of one physical dimension have to agree, and the order
+    /// they are derived in is the host's: narrow to `f32`, then round the
+    /// narrowed value. The `const` assertions beside the constants already tie
+    /// the aspect to the native mode and pin the centimetre granularity, so what
+    /// is left to check here is the arithmetic and the round direction.
+    #[test]
+    fn one_physical_dimension_produces_two_encodings_that_agree() {
+        for mm in [DISPLAY_WIDTH_MM, DISPLAY_HEIGHT_MM] {
+            let (as_f32, as_u16) = display_dimension_mm(mm);
+            assert_eq!(as_u16, mm, "the integer must survive the round trip");
+            assert_eq!(as_f32, mm as f32);
+        }
+        // Half-up, not truncation: the host adds 0.5 before narrowing to int, so
+        // a value that is a hair under an integer still reports that integer.
+        // This is the arithmetic behind the standing 1920x1080 -> 1921x1079
+        // window oddity, so the direction is worth pinning even though every
+        // value this device publishes today is exact.
+        let (_, rounded) = display_dimension_mm(271);
+        assert_eq!(rounded, 271);
+        assert_eq!((269.6f32 as f64 + 0.5) as u16, 270);
+        assert_eq!((269.4f32 as f64 + 0.5) as u16, 269);
+    }
+
+    /// The announced panel is 16:9 because the native mode is, and the DPI it
+    /// implies is an ordinary desktop one.
+    ///
+    /// The aspect itself is a `const` assertion at the declaration and cannot
+    /// reach here. What this adds is the density, which is the reason `k = 3`
+    /// was chosen over `k = 2`: 2 lands at 152 DPI, inside the band where macOS
+    /// starts offering HiDPI modes, and this device has no HiDPI rail.
+    #[test]
+    fn the_announced_panel_is_an_ordinary_desktop_density() {
+        // Tenths of a DPI, to stay in integer arithmetic.
+        let dpi_x10 = |px: u16, mm: u16| (px as u64 * 254 * 10) / (mm as u64 * 10);
+        let horizontal = dpi_x10(DISPLAY_MODE_EFI_W, DISPLAY_WIDTH_MM);
+        let vertical = dpi_x10(DISPLAY_MODE_EFI_H, DISPLAY_HEIGHT_MM);
+        assert_eq!(horizontal, vertical, "square pixels, or the guest is misled");
+        assert!(
+            (900..1440).contains(&horizontal),
+            "{horizontal} tenths of a DPI is outside the ordinary desktop band; \
+             1440 is where macOS begins treating a display as HiDPI"
+        );
+    }
 
     #[test]
     fn a_more_capable_host_never_raises_a_device_info_answer() {
