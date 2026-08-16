@@ -25,17 +25,38 @@
 //! out as [`FinishPhase::Prelude`] rather than added beside it, so the parts sum
 //! to `finish_us` by construction and the identity is checkable on the line.
 //!
-//! # What the parts are for
+//! # What it measured, and what that rules out
 //!
-//! The residue is per-*record* work around an encode the guest asked for once.
-//! A `MTLRenderCommandEncoder` holds its attachment set for its life and its
-//! argument tables are sticky across the draws issued on it, so a serialized
-//! stream states them once and then issues N draw records. This device turns
-//! each of those records back into a whole `DrawRequest`:
-//! [`FinishPhase::Retarget`] rebuilds the pass description from a template and
-//! [`FinishPhase::Binds`] refills the bind lists. If the residue lives there,
-//! it is this device re-materializing state the guest sent once — which is a
-//! shape to fix, not a constant to pay.
+//! Driven Maps boot G0, same rail and host, `throttle_ms=0`, 44 driven windows
+//! over 2 143 436 draws (`sum` 19.80 µs/draw, 47.6 fps at 1024 draws a frame):
+//!
+//! ```text
+//! fin_encode_us    9.475   `encode_draw_chain`, which `draw_us` also spans
+//! fin_prelude_us   0.547   per *stream*: 11.0 µs each, at 20.1 draws a stream
+//! fin_binds_us     0.136
+//! fin_result_us    0.079
+//! fin_retarget_us  0.065
+//! fin_tail_us      0.007
+//! ```
+//!
+//! They sum to 10.309 against `finish_us` 10.314, so the tiling holds on a real
+//! boot and not only in the test.
+//!
+//! **The residue is not the per-record request materialization**, which is what
+//! the split was built expecting. A `MTLRenderCommandEncoder` holds its
+//! attachment set for its life and its argument tables are sticky across the
+//! draws issued on it, so a stream states them once and issues N draw records —
+//! and this device turns each record back into a whole `DrawRequest` by cloning
+//! a template ([`FinishPhase::Retarget`]) and refilling the bind lists
+//! ([`FinishPhase::Binds`]). Together that is **0.20 µs a draw, 1 % of the
+//! frame**. It is cheap because [`crate::runtime::draw::BindTable`] is an `Arc`,
+//! so refilling six sticky tables is twelve atomics and not six copies — the
+//! sticky-table model is already paid for at the accumulator, one layer up.
+//!
+//! Do not go looking here again. What is left is [`FinishPhase::Prelude`], and
+//! it is a **per-pass** cost rather than a per-draw one: 11.0 µs per stream,
+//! almost all of it the one `mrt_draw_request` that resolves the colour slots
+//! for record 0. Halving it would buy 0.27 µs of a 19.80 µs draw.
 //!
 //! # What the census costs
 //!
