@@ -330,6 +330,26 @@ impl PendingWritebacks {
     /// `pages` is accepted only on the first resolution after construction or
     /// explicit discard. Repeated draws and ordinary task unmaps keep the
     /// retained physical backing and the same host-texture generation.
+    ///
+    /// # A second declaration under one reference is a second resource
+    ///
+    /// A resource's guest storage is fixed for its life: the declaration lives
+    /// in the creation descriptor and nothing in the protocol retargets it.
+    /// So a draw that names this reference at a different `(gva, span)` is not
+    /// this resource at all — the guest retired the object and its object-list
+    /// slot now holds another one, without the `CmdDeleteResource` that would
+    /// have said so.
+    ///
+    /// That makes the new declaration a **lifetime boundary**, and the entry is
+    /// replaced with a fresh generation rather than kept. Keeping it is what a
+    /// caller cannot do anything correct with: the old generation names an image
+    /// holding the old object's pixels, and the new declaration's image must not
+    /// be that one.
+    ///
+    /// The surface rail has always worked this way — [`Self::arm`] replaces a
+    /// debt and counts `wbdebt_superseded` — and this is the same rule spelled
+    /// for the resource half of the ledger. The caller owns releasing whatever
+    /// the old generation held; see [`gva_resource_generation`].
     pub fn ensure_gva_resource(
         &mut self,
         key: GvaResourceKey,
@@ -338,10 +358,12 @@ impl PendingWritebacks {
         pages: Option<Vec<u64>>,
     ) -> u64 {
         if let Some(resource) = self.gva_resources.get_mut(&key) {
-            if resource.gva == gva && resource.span == span && resource.pages.is_none() {
-                resource.pages = pages.map(std::sync::Arc::from);
+            if resource.gva == gva && resource.span == span {
+                if resource.pages.is_none() {
+                    resource.pages = pages.map(std::sync::Arc::from);
+                }
+                return resource.generation;
             }
-            return resource.generation;
         }
         self.next_gva_generation = self.next_gva_generation.wrapping_add(1);
         if self.next_gva_generation == 0 {
@@ -358,6 +380,31 @@ impl PendingWritebacks {
             },
         );
         generation
+    }
+
+    /// Give a live resource back the transfer backing an explicit discard took,
+    /// without touching its declaration or its generation.
+    ///
+    /// This is what the payment path needs and all it may have. Payment names a
+    /// resource it did not declare — the declaration it holds is the debt's,
+    /// recorded when the frame was armed — so letting it reach
+    /// [`Self::ensure_gva_resource`] gives a stale debt the power to resurrect a
+    /// retired resource or to re-declare a live one out from under the draw that
+    /// owns it. Asking here instead makes that unrepresentable: absent the
+    /// resource, there is nothing to reback and nothing is created.
+    ///
+    /// `pages` is adopted only into a resource that has none, exactly as on the
+    /// establishing path. Returns the resource's own declaration and generation
+    /// so the caller can check the debt against it.
+    #[cfg(feature = "backend-vulkan")]
+    fn reback_gva_resource(&mut self, key: GvaResourceKey, pages: Option<Vec<u64>>) -> bool {
+        let Some(resource) = self.gva_resources.get_mut(&key) else {
+            return false;
+        };
+        if resource.pages.is_none() {
+            resource.pages = pages.map(std::sync::Arc::from);
+        }
+        true
     }
 
     #[cfg(any(feature = "backend-vulkan", test))]
@@ -727,13 +774,47 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
     }
 }
 
-/// The stable host-texture identity for one task-local GVA resource.
+/// The stable host-texture identity for the GVA resource a draw is declaring.
 ///
 /// The first successful resolution retains the ordered physical pages that the
 /// resource's transfer buffer names. Later calls return the same generation and
 /// backing even if the task removes its virtual mapping. After explicit
 /// discard, the next call may establish a replacement transfer backing while
 /// preserving the host texture's generation.
+///
+/// # A changed declaration ends one lifetime and begins the next
+///
+/// This used to answer `0` and emit `gva_resource_refused
+/// reason=declaration_changed` when the draw's `(gva, span)` differed from the
+/// one the entry was established with, on the reading that a live resource
+/// cannot move. The reading is right and the response was not: the resource did
+/// not move, the *reference* was reused, and the entry describing the retired
+/// object is the thing that has to go.
+///
+/// Answering `0` never recovered. The entry stayed, so every later draw into
+/// that reference compared against the same dead declaration and refused again —
+/// one macos-26 report carried 5 197 of these lines over 280 references, one of
+/// them refused 803 times in a single boot. What `0` costs depends on which
+/// caller asked: `draw::vulkan`'s resident resolve turns it into
+/// `GvaResidentRefusal::NoGeneration` and loses the frame, while the secondary
+/// MRT builder puts it straight into [`TargetIdentity::Gva`], where generation
+/// zero is the one value that cannot distinguish two allocations — the
+/// wrong-content class that identity exists to close.
+///
+/// So a differing declaration is handled as what it is, a lifetime boundary,
+/// through the same [`retire_gva_resource`] that `CmdDeleteResource` uses: the
+/// old generation's unpaid frame is released rather than written into storage
+/// the retired object no longer owns — the rule [`retire_gva_for_task`] already
+/// states for task teardown — and [`PendingWritebacks::ensure_gva_resource`]
+/// then establishes the new object's own generation.
+///
+/// It stays fail-visible, because a *frequent* redeclaration would say something
+/// different: that some producer in this device describes one live resource two
+/// ways, in which case each draw would mint a generation and no resident could
+/// ever be reused. The line names both declarations so that reading can be made
+/// from a log rather than from a rebuild.
+///
+/// [`TargetIdentity::Gva`]: crate::backend::vulkan::engine::TargetIdentity::Gva
 #[cfg(feature = "backend-vulkan")]
 pub fn gva_resource_generation<M: HostMemory>(
     state: &mut DeviceState,
@@ -745,15 +826,24 @@ pub fn gva_resource_generation<M: HostMemory>(
     if let Some((generation, declared_gva, declared_span, has_pages)) =
         state.pending_writebacks.gva_resource_status(key)
     {
-        if declared_gva != gva || declared_span != span {
-            crate::observe::fail(format!(
-                "gva_resource_refused task={} texture={} reason=declaration_changed",
-                key.task_id, key.texture_ref
-            ));
-            return 0;
-        }
-        if has_pages {
-            return generation;
+        if declared_gva == gva && declared_span == span {
+            if has_pages {
+                return generation;
+            }
+        } else {
+            crate::observe::Emit::decline(
+                "gva_resource_redeclared",
+                &GvaResourceRedeclared {
+                    was_gva: declared_gva,
+                    was_span: declared_span,
+                    now_gva: gva,
+                    now_span: span,
+                },
+            )
+            .field("task", key.task_id)
+            .field("texture", key.texture_ref)
+            .fail();
+            retire_gva_resource(state, key.task_id, key.texture_ref);
         }
     }
     let page_size = state.page_size();
@@ -770,6 +860,75 @@ pub fn gva_resource_generation<M: HostMemory>(
     state
         .pending_writebacks
         .ensure_gva_resource(key, gva, span, pages)
+}
+
+/// One task-local reference observed naming two different guest regions.
+///
+/// Carries both declarations because neither alone says anything: the question a
+/// reader has is whether the two are *stable* — a reference reused for a second
+/// object, which is ordinary guest lifetime — or whether they alternate, which
+/// would be this device describing one resource two ways.
+#[cfg(feature = "backend-vulkan")]
+struct GvaResourceRedeclared {
+    was_gva: u64,
+    was_span: u64,
+    now_gva: u64,
+    now_span: u64,
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl crate::observe::Decline for GvaResourceRedeclared {
+    fn slug(&self) -> &'static str {
+        "gva_resource_declaration_changed"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("was_gva", format!("{:#x}", self.was_gva)),
+            ("was_span", self.was_span.to_string()),
+            ("now_gva", format!("{:#x}", self.now_gva)),
+            ("now_span", self.now_span.to_string()),
+        ]
+    }
+}
+
+#[cfg(feature = "backend-vulkan")]
+crate::observe::decline_display!(GvaResourceRedeclared);
+
+/// Re-establish the transfer backing of the resource a debt names, without any
+/// power to declare one.
+///
+/// The payment path's counterpart to [`gva_resource_generation`]. It asks only
+/// the question payment has standing to ask — "does this resource still exist,
+/// and does it still have its pages" — using the resource's *own* declaration,
+/// never the debt's. A debt that outlived its resource therefore finds nothing
+/// here and is released by the caller, where before it reached
+/// [`PendingWritebacks::ensure_gva_resource`] and could re-create the retired
+/// object at the dead declaration it was carrying.
+#[cfg(feature = "backend-vulkan")]
+fn reback_gva_resource<M: HostMemory>(
+    state: &mut DeviceState,
+    host: &M,
+    key: GvaResourceKey,
+) -> bool {
+    let Some((_, gva, span, has_pages)) = state.pending_writebacks.gva_resource_status(key) else {
+        return false;
+    };
+    if has_pages {
+        return true;
+    }
+    let page_size = state.page_size();
+    let ordered = crate::runtime::gva_mem::task_gva_page_gpas(
+        host,
+        &state.tasks,
+        key.task_id,
+        gva,
+        span,
+        state.page_shift,
+    );
+    let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
+    let pages = (ordered.len() as u64 == want).then_some(ordered);
+    state.pending_writebacks.reback_gva_resource(key, pages)
 }
 
 /// Record a GVA render result as host-authoritative without touching guest
@@ -1243,7 +1402,16 @@ fn pay_gva<M: HostMemory + HostOps>(
         release_gva(debt);
         return true;
     };
-    let generation = gva_resource_generation(state, host, key, debt.gva, span);
+    // The resource's own declaration decides whether its pages come back, not
+    // this debt's — see [`reback_gva_resource`]. A debt whose resource is gone
+    // names storage that object no longer owns, so it is released here rather
+    // than restored: restoring one would park it in the ledger forever, since
+    // nothing retired can grow pages back.
+    if !reback_gva_resource(state, host, key) {
+        crate::runtime::drain::note_store_route("gvadebt_resource_retired");
+        release_gva(debt);
+        return true;
+    }
     let Some((backing_generation, backing_gva, backing_span, ordered)) =
         state.pending_writebacks.gva_resource_backing(key)
     else {
@@ -1260,8 +1428,7 @@ fn pay_gva<M: HostMemory + HostOps>(
         }
         return false;
     };
-    if generation == 0
-        || backing_generation != debt.generation
+    if backing_generation != debt.generation
         || backing_gva != debt.gva
         || backing_span != span
     {
@@ -1553,6 +1720,39 @@ mod tests {
         assert!(pending.retire_gva_resource(key).0);
         let second = pending.ensure_gva_resource(key, 0x4000, 4096, Some(vec![0xa000]));
         assert_ne!(first, second);
+    }
+
+    /// Delete is the *announced* lifetime boundary; a changed declaration is the
+    /// same boundary observed instead of announced. A resource's guest storage
+    /// is fixed for its life, so a reference naming a different `(gva, span)`
+    /// names a different object, and it must get a different host texture.
+    ///
+    /// This is the case a macos-26 report spent 5 197 lines on. The entry used
+    /// to survive the mismatch, so the reference was pinned to the retired
+    /// object's declaration and every later draw into it compared against a dead
+    /// value — one reference refused 803 times in one boot, with no route back.
+    /// Asserting the third call is what makes that visible: a fix that only
+    /// stopped refusing, without replacing the entry, still fails here.
+    #[test]
+    fn a_reference_redeclared_at_new_storage_is_a_new_resource() {
+        let mut pending = PendingWritebacks::default();
+        let key = GvaResourceKey {
+            task_id: 3,
+            texture_ref: 19,
+        };
+        let first = pending.ensure_gva_resource(key, 0x4000, 4096, Some(vec![0x9000]));
+        let second = pending.ensure_gva_resource(key, 0x8000, 8192, Some(vec![0xa000, 0xb000]));
+        assert_ne!(first, second, "new storage is a new host texture");
+        assert_eq!(
+            &*pending.gva_resource_backing(key).unwrap().3,
+            &[0xa000, 0xb000],
+            "the new object's pages replace the retired one's"
+        );
+        assert_eq!(
+            pending.ensure_gva_resource(key, 0x8000, 8192, None),
+            second,
+            "the new declaration is the live one, so it is stable"
+        );
     }
 
     /// A guest validity transition after the Store makes guest memory newer
