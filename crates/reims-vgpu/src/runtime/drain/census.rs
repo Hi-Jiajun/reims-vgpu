@@ -948,6 +948,92 @@ impl PreflightPart {
     }
 }
 
+/// Which part of `finish_stream` a span was spent in.
+///
+/// [`ExecPhase::Finish`] is the largest phase in this device — 9.61 µs a draw of
+/// an 11.72 µs `proc_us` on a driven Maps boot — and it *contains* `draw_us`,
+/// which names itself at 8.36. So 1.25 µs a draw, 15 % of the whole draw path
+/// and larger than any single bar in `draw_phase`, sits between the two with no
+/// field naming it. This divides that residue, in the same shape and for the
+/// same reason as the `Record` and `Stage` splits inside the engine.
+///
+/// The parts tile `finish_us` by construction: every one of them is a lexical
+/// span in `finish_stream` and [`Prelude`](Self::Prelude) is what is left, so
+/// the sum is checkable on the line rather than assumed.
+///
+/// Read [`Encode`](Self::Encode) against `drain_duty`'s own `draw_us`: they
+/// measure the same call from two places, so a divergence between them is a
+/// census bug and not a finding.
+#[derive(Clone, Copy)]
+pub enum FinishPhase {
+    /// Everything outside the other parts: the clear-only prelude, the ICB
+    /// executes, the `draw_list` collect, `mrt_draw_request` for the first
+    /// record, and the attachment template it is turned into. Derived rather
+    /// than measured directly, so the parts sum to the whole by construction.
+    Prelude,
+    /// `retarget_render_pass_draw` — rebuilding record N's `DrawRequest` from
+    /// the pass template.
+    ///
+    /// Entered once per record so `fin_retarget_n` is the loop's own trip count
+    /// and every other part has a denominator; record 0 only moves the request
+    /// the prelude already built, and charges near nothing.
+    ///
+    /// A `MTLRenderCommandEncoder`'s attachment set is fixed for its life and
+    /// the guest never re-states it, so anything this costs is this device
+    /// re-materializing state the guest sent once.
+    Retarget,
+    /// `fill_draw_binds_from_pending` and the per-record request fixups around
+    /// it: the chain position, the records-2+ load-action rewrite, and choosing
+    /// the chain source.
+    Binds,
+    /// `encode_draw_chain`, which is also what `drain_duty`'s `draw_us` spans.
+    Encode,
+    /// Reading the encode's result: the visibility-count bookkeeping and the
+    /// status match, including the abandon paths.
+    Result,
+    /// After the per-draw loop: `write_visibility_results` and the
+    /// draw-failed clear fallback.
+    Tail,
+}
+
+impl FinishPhase {
+    /// How many parts there are. The census arrays are sized from this, so a new
+    /// variant that forgets to bump it fails to build [`Self::ALL`] rather than
+    /// overflowing an array at report time.
+    pub(crate) const COUNT: usize = 6;
+
+    pub(crate) const ALL: [FinishPhase; Self::COUNT] = [
+        FinishPhase::Prelude,
+        FinishPhase::Retarget,
+        FinishPhase::Binds,
+        FinishPhase::Encode,
+        FinishPhase::Result,
+        FinishPhase::Tail,
+    ];
+
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            FinishPhase::Prelude => 0,
+            FinishPhase::Retarget => 1,
+            FinishPhase::Binds => 2,
+            FinishPhase::Encode => 3,
+            FinishPhase::Result => 4,
+            FinishPhase::Tail => 5,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            FinishPhase::Prelude => "fin_prelude",
+            FinishPhase::Retarget => "fin_retarget",
+            FinishPhase::Binds => "fin_binds",
+            FinishPhase::Encode => "fin_encode",
+            FinishPhase::Result => "fin_result",
+            FinishPhase::Tail => "fin_tail",
+        }
+    }
+}
+
 /// The per-opcode split of `proc_ns`, indexed by the opcode itself.
 ///
 /// Sized from the contract rather than from a count of the arms
@@ -1527,6 +1613,11 @@ pub(crate) struct DrainDutyCensus {
     pre_ns: [std::sync::atomic::AtomicU64; PreflightPart::COUNT],
     pre_count: [std::sync::atomic::AtomicU64; PreflightPart::COUNT],
     pre_pipes: std::sync::atomic::AtomicU64,
+    /// The inside of [`ExecPhase::Finish`], indexed by [`FinishPhase::index`].
+    /// Sums to `finish_us` on the `exec_phase` line, and its `fin_encode` is
+    /// `drain_duty`'s own `draw_us` measured a second time.
+    fin_ns: [std::sync::atomic::AtomicU64; FinishPhase::COUNT],
+    fin_count: [std::sync::atomic::AtomicU64; FinishPhase::COUNT],
     max_tranche_us: std::sync::atomic::AtomicU64,
     /// Longest single Flush in the window. `flush_us/flushes` is a mean, and a
     /// mean cannot tell "every flush costs 7.7 ms" from "most are free and one
@@ -1819,6 +1910,41 @@ impl DrainDutyCensus {
             body.push_str(&format!(" {label}_us={us} {label}_n={n}"));
         }
         any.then(|| format!("exec_phase win_ms={win_ms}{body}"))
+    }
+
+    /// One stream's spans in one part of `finish_stream`: the nanoseconds it
+    /// spent there and how many times it entered.
+    ///
+    /// Both at once because the caller accumulates a whole stream locally — a
+    /// packet of ninety draws enters `Encode` ninety times and pays two atomics
+    /// for all of them.
+    pub(crate) fn note_finish(&self, phase: FinishPhase, ns: u64, entries: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let i = phase.index();
+        self.fin_ns[i].fetch_add(ns, Relaxed);
+        self.fin_count[i].fetch_add(entries, Relaxed);
+    }
+
+    /// The inside of [`ExecPhase::Finish`] over the window [`Self::note`] just
+    /// reported.
+    ///
+    /// Read against `exec_phase`: these six sum to its `finish_us`, and
+    /// `fin_encode_us` is `drain_duty`'s `draw_us` measured from the other side
+    /// of the same call.
+    pub(crate) fn take_finish_phases(&self) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let win_ms = self.last_win_ms.load(Relaxed);
+        let mut body = String::new();
+        let mut any = false;
+        for phase in FinishPhase::ALL {
+            let i = phase.index();
+            let us = self.fin_ns[i].swap(0, Relaxed) / 1000;
+            let n = self.fin_count[i].swap(0, Relaxed);
+            any |= n != 0;
+            let label = phase.label();
+            body.push_str(&format!(" {label}_us={us} {label}_n={n}"));
+        }
+        any.then(|| format!("finish_phase win_ms={win_ms}{body}"))
     }
 
     /// One access around a packet, in nanoseconds, into both the total and the
@@ -2423,6 +2549,15 @@ pub fn note_exec_phase(phase: ExecPhase, ns: u64) {
     DRAIN_DUTY.note_exec(phase, ns);
 }
 
+/// Attribute one span inside `finish_stream`, in nanoseconds.
+///
+/// The caller is [`crate::runtime::exec::finish_phase::FinishTimer`], which
+/// accumulates a whole stream's spans locally and flushes them here once, so a
+/// packet of a hundred draws costs twelve atomics rather than twelve hundred.
+pub fn note_finish_phase(phase: FinishPhase, ns: u64, entries: u64) {
+    DRAIN_DUTY.note_finish(phase, ns, entries);
+}
+
 /// Attribute one span inside the translation preflight, in nanoseconds.
 pub fn note_preflight_part(part: PreflightPart, ns: u64) {
     DRAIN_DUTY.note_preflight(part, ns);
@@ -2466,6 +2601,11 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         // Under `exec_phase`, dividing its `preflight_us`.
         if let Some(pre) = DRAIN_DUTY.take_preflight_parts() {
             crate::observe::off(pre);
+        }
+        // Also under `exec_phase`, dividing its `finish_us` — the phase that
+        // holds `draw_us` and 1.25 µs a draw of unnamed work around it.
+        if let Some(fin) = DRAIN_DUTY.take_finish_phases() {
+            crate::observe::off(fin);
         }
         // Under `flush_rails`, dividing its `render_us`.
         if let Some(split) = DRAIN_DUTY.take_readback_split() {
