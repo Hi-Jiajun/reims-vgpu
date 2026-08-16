@@ -7,8 +7,37 @@
 //! function, so blending and sampling happen in the wrong colour space. The
 //! defect is not that the fold exists — several rails genuinely carry raw bytes
 //! and cannot encode — it is that the fold used to be **silent**: a lost format
-//! qualifier looked exactly like a supported format, at twelve independent
-//! sites, with nothing in the fail log.
+//! qualifier looked exactly like a supported format, with nothing in the fail
+//! log.
+//!
+//! # A zero here does not mean no rail dropped a qualifier
+//!
+//! Read this before excluding the sRGB family on the strength of an empty
+//! census, because a session already did and was wrong.
+//!
+//! This census reports the sites listed in [`site`] and nothing else. It once
+//! carried three more — the linear, type-11 and type-5 **zero-copy** sampled
+//! rails — which were removed when those rails were changed to bind the
+//! `_SRGB` view and honour the qualifier. They had no emitter for some time
+//! before that, so the census was answering for a population it no longer
+//! watched.
+//!
+//! What it still does not watch is the rail where the qualifier is dropped
+//! today: the **CPU sampled upload rung**, `runtime::draw::vulkan`'s
+//! `SampledSourceRequest::Bytes` arm, which reaches
+//! `translate::pixel::vk_texel_layout` and is linear by construction — that
+//! function's own doc says a `TexelLayout` carries no transfer function. There
+//! is no site constant for it because a site needs the guest's declared format
+//! at the moment of the fold, and that variant does not carry one: it carries a
+//! `TexelLayout`, into which the qualifier has already been narrowed away by
+//! the producer.
+//!
+//! So the missing site is not an oversight to add a constant for. It is the
+//! same defect the census exists to report, one layer down — the fold happens
+//! where nothing can name it. Widening that variant to carry the transfer
+//! function beside the layout is what makes both the fix and the census site
+//! possible, and it is written up in
+//! `kb/the-cpu-sampled-rung-drops-the-srgb-decode-the-zero-copy-rail-honours.md`.
 //!
 //! # Reading it
 //!
@@ -38,13 +67,6 @@ pub const SRGB_DOWNGRADED_SLUG: &str = "srgb_downgraded";
 /// reader would open. One constant per site so a log line points somewhere
 /// specific rather than at "the sampled path".
 pub mod site {
-    /// `try_linear_sample_zero_copy` — type-2/3 linear texture gathered from
-    /// guest RAM straight into a sampled image.
-    pub const LINEAR_SAMPLE_ZERO_COPY: &str = "linear_sample_zero_copy";
-    /// `try_type11_sample_zero_copy` — type-11 surface window sampled in place.
-    pub const TYPE11_SAMPLE_ZERO_COPY: &str = "type11_sample_zero_copy";
-    /// `try_type5_plane_zero_copy` — type-5 multiplanar view sampled in place.
-    pub const TYPE5_PLANE_ZERO_COPY: &str = "type5_plane_zero_copy";
     /// `build_secondary_targets` — MRT colour attachment beyond slot 0.
     pub const SECONDARY_COLOR_TARGET: &str = "secondary_color_target";
     /// `linear_native_upload_format` — guest bytes uploaded in their native
@@ -56,9 +78,6 @@ pub mod site {
     /// Every site, for the completeness test. A new site constant that is not
     /// listed here is one the census cannot report on.
     pub const ALL: &[&str] = &[
-        LINEAR_SAMPLE_ZERO_COPY,
-        TYPE11_SAMPLE_ZERO_COPY,
-        TYPE5_PLANE_ZERO_COPY,
         SECONDARY_COLOR_TARGET,
         LINEAR_NATIVE_UPLOAD,
         TIGHT_LINEAR_LOAD,
@@ -109,12 +128,12 @@ mod tests {
         assert!(SEEN
             .lock()
             .unwrap()
-            .insert((site::LINEAR_SAMPLE_ZERO_COPY, MTL_FORMAT_BGRA8_UNORM_SRGB)));
+            .insert((site::LINEAR_NATIVE_UPLOAD, MTL_FORMAT_BGRA8_UNORM_SRGB)));
         for _ in 0..64 {
-            note_downgrade(site::LINEAR_SAMPLE_ZERO_COPY, MTL_FORMAT_BGRA8_UNORM_SRGB);
+            note_downgrade(site::LINEAR_NATIVE_UPLOAD, MTL_FORMAT_BGRA8_UNORM_SRGB);
         }
         assert_eq!(SEEN.lock().unwrap().len(), 1, "64 binds, one pair");
-        note_downgrade(site::LINEAR_SAMPLE_ZERO_COPY, MTL_FORMAT_RGBA8_UNORM_SRGB);
+        note_downgrade(site::LINEAR_NATIVE_UPLOAD, MTL_FORMAT_RGBA8_UNORM_SRGB);
         note_downgrade(site::SECONDARY_COLOR_TARGET, MTL_FORMAT_RGBA8_UNORM_SRGB);
         assert_eq!(
             SEEN.lock().unwrap().len(),
