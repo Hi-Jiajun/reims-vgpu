@@ -121,13 +121,19 @@ impl GvaTargetKey {
                 width,
                 height,
                 generation,
-                format,
+                format: _,
             } if generation != 0 && gva != 0 => Some(Self {
                 gva,
                 generation,
                 width,
                 height,
-                bgra: format == crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+                // Asked of the identity rather than spelled here. A channel
+                // order is one question with one owner, and a second
+                // hand-written copy of it is the divergence that put an
+                // R/B-exchanged frame in guest memory once already — see
+                // `engine::ResidentReadSnapshot::bgra`. The pattern still names
+                // the field so a new one cannot be added without meeting it.
+                bgra: identity.is_bgra(),
             }),
             _ => None,
         }

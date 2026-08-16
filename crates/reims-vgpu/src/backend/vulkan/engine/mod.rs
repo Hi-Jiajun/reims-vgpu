@@ -4382,8 +4382,126 @@ struct ResidentReadSnapshot {
 
 impl ResidentReadSnapshot {
     /// Whether these texels are already in guest scanout order.
+    ///
+    /// **A channel-order question, and equality does not answer it.** `format`
+    /// is `slot.color_format`, which `translate::pixel::color_attachment` builds
+    /// so that it *keeps* the guest's transfer function — Vulkan then performs
+    /// the fixed-function linear-to-sRGB encode on attachment writes. So a guest
+    /// render target declared `BGRA8Unorm_sRGB` is resident as
+    /// `B8G8R8A8_SRGB`, and comparing that against the single `SCANOUT_FORMAT`
+    /// spelling answers "not BGRA" about four bytes stored B, G, R, A.
+    ///
+    /// This is the same confusion `copy_target_to_guest_pages` carries
+    /// `stored_bytes_agree` for, one rail over, and it failed the same way in
+    /// both directions: [`TargetReadback::into_rgba8`] then left BGRA bytes
+    /// alone and the CPU Store converter exchanged them a second time, so the
+    /// copying rails wrote every sRGB-declared target's frame into guest memory
+    /// with R and B swapped — measured as a yellow Maps map layer on
+    /// `REIMS_VGPU_GUEST_IMPORT=off`, against a correct one on the GPU-direct
+    /// rail that never asks this question.
+    ///
+    /// [`translate::pixel::has_bgra_order`] is the crate's name for the
+    /// question, is what [`TargetIdentity::is_bgra`] already asks, and states
+    /// the rule in its own doc: the transfer function is irrelevant because
+    /// UNORM and sRGB views interpret the same four stored bytes.
     fn bgra(&self) -> bool {
-        self.format == crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT
+        crate::backend::vulkan::translate::pixel::has_bgra_order(self.format)
+    }
+}
+
+#[cfg(test)]
+mod resident_read_order_tests {
+    use super::*;
+    use crate::backend::vulkan::translate::pixel;
+
+    fn snapshot(format: ash::vk::Format) -> ResidentReadSnapshot {
+        ResidentReadSnapshot {
+            image: ash::vk::Image::null(),
+            width: 4,
+            height: 2,
+            layout: ash::vk::ImageLayout::UNDEFINED,
+            format,
+            guest_backing: None,
+            guest_footprint: None,
+        }
+    }
+
+    /// The sRGB sibling of the scanout format stores B, G, R, A, and a readback
+    /// of it owes the same exchange the UNORM spelling does. Reported as RGBA
+    /// instead, both copying Store rails exchange R and B exactly once on their
+    /// way into the guest's pages — the only rails a host without
+    /// `VK_EXT_external_memory_host` has.
+    #[test]
+    fn an_srgb_resident_reports_the_channel_order_its_unorm_sibling_does() {
+        assert!(snapshot(pixel::SCANOUT_FORMAT).bgra());
+        assert!(snapshot(ash::vk::Format::B8G8R8A8_SRGB).bgra());
+        assert!(!snapshot(pixel::RESIDENT_RGBA_FORMAT).bgra());
+        assert!(!snapshot(ash::vk::Format::R8G8B8A8_SRGB).bgra());
+    }
+
+    /// The order the engine reports for a resident and the order the identity
+    /// declares for it must be one answer: the copying rails read the first and
+    /// the GPU-direct rail is built against the second, and they land the same
+    /// guest bytes only while the two agree. Both spellings a guest may declare
+    /// for one render target are checked, because it is exactly the pair that
+    /// `color_attachment` keeps apart and `vk_texel_layout` folds together.
+    #[test]
+    fn the_reported_order_agrees_with_the_identity_that_named_the_resident() {
+        for declared in [pixel::SCANOUT_FORMAT, ash::vk::Format::B8G8R8A8_SRGB] {
+            let identity = TargetIdentity::Gva {
+                gva: 0x4000,
+                width: 4,
+                height: 2,
+                generation: 1,
+                format: pixel::storage_format(declared),
+            };
+            assert_eq!(
+                snapshot(declared).bgra(),
+                identity.is_bgra(),
+                "{declared:?}"
+            );
+        }
+    }
+
+    /// The whole invariant the copying Store rails owe, end to end and in the
+    /// guest's own vocabulary: a host that cannot write guest pages from the GPU
+    /// must land byte-for-byte what `copy_target_to_guest_pages` would have.
+    ///
+    /// Both rails do it the same way — read the resident, `into_rgba8`, then
+    /// `convert_rgba8_to_row` at the format the guest declared — so the pair has
+    /// to compose to the identity over the resident's stored bytes. The resident
+    /// format is taken from `color_attachment`, which is what the draw actually
+    /// creates the attachment with, rather than named here; that is the step
+    /// that keeps the guest's transfer function and so the step that made the
+    /// two spellings of one declaration behave differently.
+    #[test]
+    fn a_copied_store_lands_the_bytes_the_gpu_direct_store_would_have() {
+        use crate::contract::pixel_format as pf;
+        const PIXELS: u32 = 3;
+        // Deliberately asymmetric per channel, so an exchange of any two of them
+        // is visible and an all-grey frame cannot pass.
+        let stored: Vec<u8> = (0..PIXELS * 4).map(|i| (i as u8) * 7 + 1).collect();
+        for format in [
+            pf::MTL_FORMAT_BGRA8_UNORM,
+            pf::MTL_FORMAT_BGRA8_UNORM_SRGB,
+            pf::MTL_FORMAT_RGBA8_UNORM,
+            pf::MTL_FORMAT_RGBA8_UNORM_SRGB,
+        ] {
+            let attachment = pixel::color_attachment(format)
+                .expect("a renderable eight-bit format")
+                .0;
+            let readback = TargetReadback {
+                pixels: stored.clone(),
+                bgra: snapshot(attachment).bgra(),
+            };
+            let rgba = readback.into_rgba8();
+            let mut landed = vec![0u8; stored.len()];
+            assert!(
+                pf::convert_rgba8_to_row(format, &rgba, PIXELS, &mut landed),
+                "{format:#x}"
+            );
+            assert_eq!(landed, stored, "{format:#x} via {attachment:?}");
+        }
     }
 }
 

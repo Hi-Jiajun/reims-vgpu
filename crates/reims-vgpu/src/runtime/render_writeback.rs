@@ -1279,9 +1279,12 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
         return Err(GvaWritebackDecline::Unlicensed);
     };
     // The blocking readback the direct arm exists to avoid. `into_rgba8` is the
-    // order every GVA guest writer takes; a GVA resident is already RGBA, so it
-    // is a no-op here and a whole-frame pass only for a target that fell back to
-    // a BGRA resident.
+    // order every GVA guest writer takes, and it exchanges or not according to
+    // the order the engine reports for the image it copied — which for a target
+    // the guest declared in BGRA order, as most of them are, is a whole-frame
+    // pass and not the no-op this comment used to claim. Both spellings of that
+    // declaration must reach the same answer; `ResidentReadSnapshot::bgra` is
+    // where they do, and where they did not.
     let rgba = crate::backend::vulkan::engine::read_target(identity)
         .map_err(|inner| GvaWritebackDecline::CopiedReadRefused { inner })?
         .into_rgba8();

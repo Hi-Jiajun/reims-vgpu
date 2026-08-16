@@ -688,6 +688,27 @@ mod tests {
     use crate::observe::Decline;
     use pixel_format as p;
 
+    /// [`vk_texel_layout`] names stored bytes and so never carries a transfer
+    /// function.
+    ///
+    /// The property matters where a format built by that function is asked a
+    /// channel-order question: `gva_resident_format`'s output reaches
+    /// `GvaTargetKey` on two sides of the GVA store witness, and both used to
+    /// spell the question as `== SCANOUT_FORMAT`. That spelling is only right
+    /// while this holds, and it is wrong the moment a caller passes a format
+    /// from anywhere else — which is exactly what happened one rail over, in
+    /// `engine::ResidentReadSnapshot::bgra`, where the format came from the
+    /// attachment and did carry one. Both sites ask [`has_bgra_order`] now; this
+    /// says the switch changed no answer.
+    #[test]
+    fn a_stored_texel_layout_never_names_a_transfer_function() {
+        for &layout in TexelLayout::ALL {
+            let f = vk_texel_layout(layout);
+            assert_eq!(storage_format(f), f, "{layout:?}");
+            assert_eq!(has_bgra_order(f), f == SCANOUT_FORMAT, "{layout:?}");
+        }
+    }
+
     /// The copy out of a render target into guest pages converts nothing, so the
     /// only thing the two sides must agree on is the stored texel.
     ///

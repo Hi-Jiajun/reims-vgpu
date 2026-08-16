@@ -596,8 +596,10 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 //
                 // A buffer→image copy converts nothing, so the GPU rail can
                 // only ever serve a destination whose bytes are already the
-                // resident's — which for a GVA/pooled target means RGBA8,
-                // since those residents stay in RGBA order. `format` is the
+                // resident's. That is not a channel order this rail may name for
+                // itself: `gva_resident_format` builds the resident from the
+                // order the guest declared, so a GVA target is RGBA or BGRA
+                // according to `c0.format` and nothing else. `format` is the
                 // gate, and it is recorded rather than assumed: whether this
                 // class is worth a GPU rail at all is exactly the question of
                 // how many of the 14 330 clear it, and `convert_rgba8_to_row`
@@ -4006,7 +4008,12 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
             generation,
             width: w,
             height: h,
-            bgra: resident_format == crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+            // From the identity built just above, not from `resident_format`
+            // again. `GvaTargetKey::of` builds this same key from the same
+            // identity on the other side of the witness, and the two must
+            // agree — a channel order written by hand at two sites is how they
+            // stop agreeing.
+            bgra: identity.is_bgra(),
         },
     );
     if !verdict.is_quiet() {
@@ -9799,10 +9806,18 @@ pub(crate) fn read_resident_chain(
         // arm-refusal fallback — has an RGBA contract, so the exchange happens
         // here, once, rather than at three call sites that would each have to
         // remember which namespace they were reading. `into_rgba8` uses the order
-        // the engine reports for the image it copied, so it is a no-op on the
-        // pooled and GVA residents — which is what the hot caller brings — and a
-        // single whole-frame pass on a BGRA surface, which only the two abandon
-        // callers reach.
+        // the engine reports for the image it copied, so it is a no-op on a
+        // pooled resident and a whole-frame pass on anything the guest declared
+        // in BGRA order — a surface, and a GVA target whose declared format
+        // `gva_resident_format` could honour, which is most of them.
+        //
+        // That last clause used to read "a no-op on the pooled and GVA
+        // residents", and it was wrong rather than imprecise: a GVA render
+        // target declared `BGRA8Unorm` or `BGRA8Unorm_sRGB` is resident in BGRA
+        // and owes the exchange. It was a true description of what the code did
+        // — `ResidentReadSnapshot::bgra` answered "not BGRA" for the sRGB
+        // spelling — so the comment documented the defect instead of catching
+        // it, and the Store below exchanged R and B on its way into guest pages.
         Ok(rb) => Some(rb.into_rgba8()),
         Err(e) => {
             crate::observe::fail(format!(
