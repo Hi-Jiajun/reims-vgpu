@@ -472,7 +472,22 @@ impl std::fmt::Display for DrawReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetReadDecline {
     /// The readback's identity is not in the resident registry.
-    UnknownIdentity,
+    ///
+    /// It carries both generations because the bare variant could not be
+    /// diagnosed. "Not in the registry" is two findings with opposite repairs
+    /// and one word: either **nothing names this surface**, so the guest never
+    /// rendered into it or its resident was reclaimed under the caller, or the
+    /// **target is there under a different generation**, so the key this caller
+    /// built and the key the draw registered disagree and the resident is
+    /// sitting untouched beside the lookup that missed it.
+    ///
+    /// `held` is `ResourcePools::registry_generation_near`: the generation of a
+    /// registry entry matching this identity in everything else, or `None` when
+    /// there is none. A `Some` that differs from `asked` is the second finding,
+    /// stated rather than inferred — which is what the bare variant made
+    /// impossible when `REIMS_VGPU_SHARED_TARGET=off` lost every Maps frame to
+    /// it.
+    UnknownIdentity { asked: u64, held: Option<u64> },
     /// The readback's resident has never had content written.
     NoReadyContent,
     /// Vulkan cannot copy a multisample image directly to a buffer. The image
@@ -498,7 +513,7 @@ pub enum TargetReadDecline {
 impl Decline for TargetReadDecline {
     fn slug(&self) -> &'static str {
         match self {
-            Self::UnknownIdentity => "read_target_unknown_identity",
+            Self::UnknownIdentity { .. } => "read_target_unknown_identity",
             Self::NoReadyContent => "read_target_no_ready_content",
             Self::MultisampleImage { .. } => "read_target_multisample_image",
             Self::TexelNotFourBytes { .. } => "read_target_texel_not_four_bytes",
@@ -507,7 +522,14 @@ impl Decline for TargetReadDecline {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::UnknownIdentity | Self::NoReadyContent => Vec::new(),
+            Self::UnknownIdentity { asked, held } => vec![
+                ("asked_gen", asked.to_string()),
+                (
+                    "held_gen",
+                    held.map_or_else(|| "none".to_string(), |g| g.to_string()),
+                ),
+            ],
+            Self::NoReadyContent => Vec::new(),
             Self::MultisampleImage { sample_count } => {
                 vec![("sample_count", sample_count.to_string())]
             }
@@ -738,7 +760,10 @@ mod tests {
     #[test]
     fn every_target_read_decline_has_its_own_slug() {
         const ALL: &[TargetReadDecline] = &[
-            TargetReadDecline::UnknownIdentity,
+            TargetReadDecline::UnknownIdentity {
+                asked: 7,
+                held: None,
+            },
             TargetReadDecline::NoReadyContent,
             TargetReadDecline::MultisampleImage { sample_count: 2 },
         ];
@@ -749,10 +774,45 @@ mod tests {
         assert_eq!(before, slugs.len(), "duplicate TargetReadDecline slug");
         for r in ALL {
             assert_eq!(r.to_string(), format!("reason={}", r.slug()));
-            if !matches!(r, TargetReadDecline::MultisampleImage { .. }) {
+            if matches!(r, TargetReadDecline::NoReadyContent) {
                 assert!(r.fields().is_empty(), "{r:?} carries no payload");
             }
         }
+    }
+
+    /// The two findings an absent registry entry can carry are distinguishable
+    /// on the line. They were one word until a driven boot lost every Maps
+    /// frame to this refusal and nothing in the log could say which of them it
+    /// was.
+    #[test]
+    fn an_absent_resident_says_whether_the_target_exists_under_another_key() {
+        let nothing = TargetReadDecline::UnknownIdentity {
+            asked: 4,
+            held: None,
+        };
+        let stale = TargetReadDecline::UnknownIdentity {
+            asked: 4,
+            held: Some(5),
+        };
+        // One slug, because it is one check. What separates them is the
+        // payload, which is what `Emit::decline` puts on the line — `Display`
+        // renders the slug alone and always has, so asserting on it here would
+        // pass whatever the fields said.
+        assert_eq!(nothing.slug(), stale.slug());
+        assert_eq!(
+            nothing.fields(),
+            vec![
+                ("asked_gen", "4".to_string()),
+                ("held_gen", "none".to_string())
+            ]
+        );
+        assert_eq!(
+            stale.fields(),
+            vec![
+                ("asked_gen", "4".to_string()),
+                ("held_gen", "5".to_string())
+            ]
+        );
     }
 
     /// A vertex-format decline reports the translation layer's own slug rather

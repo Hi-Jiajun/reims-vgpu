@@ -626,6 +626,25 @@ impl ResourcePools {
         self.registry.get(identity)
     }
 
+    /// The generation the registry holds for the *same target* as `identity`,
+    /// when the exact key is absent.
+    ///
+    /// This separates the two things an absent registry entry can mean, which
+    /// otherwise arrive as one word. `None` says nothing in the registry names
+    /// this surface at all — the guest never rendered into it, or its resident
+    /// was reclaimed. `Some(g)` says the target is there and the caller asked
+    /// under a different generation, which is a **key** fault rather than a
+    /// missing target and has an entirely different repair.
+    ///
+    /// A linear scan, on a refusal path only: the registry's own
+    /// `registry_pressure` census reads a peak of about thirty slots.
+    pub(crate) fn registry_generation_near(&self, identity: &TargetIdentity) -> Option<u64> {
+        self.registry.keys().find_map(|held| {
+            let generation = held.generation();
+            (identity.with_generation(generation) == *held).then_some(generation)
+        })
+    }
+
     /// Return the exact-format sampled view requested for a resident image.
     ///
     /// The image allocation is shared by every compatible texture view. Views

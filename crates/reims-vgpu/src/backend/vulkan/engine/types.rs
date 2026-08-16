@@ -1756,6 +1756,26 @@ impl TargetIdentity {
         }
     }
 
+    /// The same target named at a different generation.
+    ///
+    /// Exists so that "is this the same surface under a newer key?" can be asked
+    /// with `PartialEq` rather than by a hand-written field-by-field comparison:
+    /// `a.with_generation(b.generation()) == *b` is total over every field this
+    /// enum has now and every one it gains, where a comparison spelling out the
+    /// fields it cares about goes stale the moment one is added. `Anonymous`
+    /// carries no generation, so it is returned unchanged and compares as
+    /// itself.
+    pub fn with_generation(&self, generation: u64) -> Self {
+        let mut next = self.clone();
+        match &mut next {
+            Self::Surface { generation: g, .. }
+            | Self::Texture { generation: g, .. }
+            | Self::Gva { generation: g, .. } => *g = generation,
+            Self::Anonymous { .. } => {}
+        }
+        next
+    }
+
     /// Physical channel order of the resident image behind this identity.
     ///
     /// The rule is one sentence: **a resident holds the bytes its destination
@@ -2158,6 +2178,49 @@ mod tests {
             TargetIdentity::default(),
             TargetIdentity::Anonymous { slot: 0 }
         );
+    }
+
+    /// Re-generation changes the generation and nothing else, on every variant
+    /// that has one — which is what lets "is this the same target under a newer
+    /// key?" be asked with `PartialEq` instead of a field-by-field comparison
+    /// that a new field would silently fall out of.
+    #[test]
+    fn re_generation_moves_only_the_generation() {
+        let all = [
+            TargetIdentity::Surface {
+                id: 7,
+                width: 1920,
+                height: 1080,
+                generation: 4,
+                format: translate::pixel::SCANOUT_FORMAT,
+            },
+            TargetIdentity::Texture {
+                ref_: 12,
+                width: 64,
+                height: 64,
+                generation: 4,
+                stencil: true,
+            },
+            TargetIdentity::Gva {
+                gva: 0xdead_0000,
+                width: 8,
+                height: 8,
+                generation: 4,
+                format: translate::pixel::SCANOUT_FORMAT,
+            },
+        ];
+        for identity in &all {
+            let moved = identity.with_generation(9);
+            assert_eq!(moved.generation(), 9, "{identity:?}");
+            assert_ne!(&moved, identity, "{identity:?}");
+            // The round trip is the whole claim: everything but the generation
+            // survived, so equality after restoring it is field-complete.
+            assert_eq!(&moved.with_generation(identity.generation()), identity);
+        }
+        // `Anonymous` carries no generation, so it is returned as itself rather
+        // than being given one it has nowhere to keep.
+        let anonymous = TargetIdentity::Anonymous { slot: 99 };
+        assert_eq!(anonymous.with_generation(9), anonymous);
     }
 
     #[test]

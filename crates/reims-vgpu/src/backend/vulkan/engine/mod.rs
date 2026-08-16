@@ -4398,9 +4398,17 @@ fn resident_read_snapshot(
     pools: &pools::ResourcePools,
     identity: &TargetIdentity,
 ) -> Result<ResidentReadSnapshot, DrawError> {
-    let slot = pools.registry_get(identity).ok_or(DrawError::TargetRead(
-        reason::TargetReadDecline::UnknownIdentity,
-    ))?;
+    let Some(slot) = pools.registry_get(identity) else {
+        // The near-miss scan runs only here, on the refusal, and it is what
+        // makes the refusal diagnosable: a target that exists under a different
+        // generation and one that does not exist at all are opposite defects.
+        return Err(DrawError::TargetRead(
+            reason::TargetReadDecline::UnknownIdentity {
+                asked: identity.generation(),
+                held: pools.registry_generation_near(identity),
+            },
+        ));
+    };
     if !slot.content_ready {
         return Err(DrawError::TargetRead(
             reason::TargetReadDecline::NoReadyContent,
