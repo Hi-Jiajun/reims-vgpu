@@ -1548,10 +1548,12 @@ fn resolve_buffer_backing<M: HostMemory>(
 ///
 /// Four rails in this crate read a resource's raw guest bytes on the CPU, and
 /// each owes the same three terms before it may believe them: the
-/// [`crate::runtime::writeback_debt::note_unnamed_reach`] census, a payment of
-/// whatever the reference names, and the disjointness-narrowed settle. Three of
-/// them — the linear sampled read, its memoized twin, and the texture-view read
-/// — spell all three. This one spelled the settle alone.
+/// `note_unnamed_reach` census, a payment of whatever the reference names, and
+/// the disjointness-narrowed settle. Three of them — the linear sampled read,
+/// its memoized twin, and the texture-view read — spell all three. This one
+/// spelled the settle alone. All four go through
+/// [`crate::runtime::writeback_debt::settle_for_texture`] now, so there is one
+/// copy of the rule rather than four.
 ///
 /// The difference is not academic. A settle waits for writes this device has
 /// already **submitted**; a writeback debt is a frame it rendered and
@@ -1610,33 +1612,18 @@ fn read_buffer_bytes_resolved<M: HostMemory + HostOps>(
     }
     let want = host_alloc_len(avail).filter(|&n| n > 0)?;
     let (read_gva, read_span) = (gva + offset, want as u64);
-    // The same three terms every other reader of raw task-GVA bytes carries, in
-    // the same order: census what the naming cannot see, pay what it can, then
-    // wait for what has already been submitted. This site used to carry only the
-    // third, because it held `DeviceState` shared and so *could* not pay — the
-    // gap was counted instead, and a boot reading it above zero is a boot where a
-    // buffer read may have seen a superseded frame. It is the payment now, and
-    // the counter is gone with the gap it stood for.
-    {
-        let (tasks, page_shift) = (&state.tasks, state.page_shift);
-        let page_size = state.page_size();
-        crate::runtime::writeback_debt::note_unnamed_reach(state, || {
-            let pages = reims_vgpu_paging::span::pages_spanned(read_gva, read_span, page_size);
-            let gpas =
-                gva_mem::task_gva_page_gpas(host, tasks, task_id, read_gva, read_span, page_shift);
-            (gpas.len() as u64 == pages).then_some(gpas)
-        });
-    }
-    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, buffer_ref);
-    let (tasks, page_shift, page_size) = (&state.tasks, state.page_shift, state.page_size());
-    crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
+    // Census, pay, settle — the whole obligation of a CPU read of one named
+    // resource's guest bytes. This site used to carry the settle alone, because
+    // it held `DeviceState` shared and so *could* not pay; see
+    // `writeback_debt::settle_for_texture`, whose doc is about that gap.
+    crate::runtime::writeback_debt::settle_for_texture(
+        state,
+        host,
+        task_id,
+        buffer_ref,
+        read_gva,
+        read_span,
         crate::runtime::render_writeback::SettleSite::BufferGuestRead,
-        || {
-            let pages = reims_vgpu_paging::span::pages_spanned(read_gva, read_span, page_size);
-            let gpas =
-                gva_mem::task_gva_page_gpas(host, tasks, task_id, read_gva, read_span, page_shift);
-            (gpas.len() as u64 == pages).then_some(gpas)
-        },
     );
     let mut buf = vec![0u8; want];
     // Use device page_shift (x86=12); unshifted helper defaults to arm14 and fails.

@@ -828,29 +828,10 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // walk runs only when something is outstanding, and the pages read are the
     // ones `slice_read_span` names — not `bpr * h * planes`, so a padded source
     // does not claim the final trailing padding it never touches.
-    // The reads below walk a raw task GVA, but the reference names a resource,
-    // and a debt is keyed by mapping id — so only what this reference resolves
-    // to is paid. `note_unnamed_reach` stays as the standing alarm for the one
-    // thing the naming cannot see, raw page aliasing; it samples this read's own
-    // walk against every owed surface and must stay at zero overlap.
-    {
-        let (tasks, page_shift) = (&state.tasks, state.page_shift);
-        let page_size = state.page_size();
-        crate::runtime::writeback_debt::note_unnamed_reach(state, || {
-            let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
-            let gpas = gva_mem::task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift);
-            (gpas.len() as u64 == want).then_some(gpas)
-        });
-    }
-    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
-    let (tasks, page_shift, page_size) = (&state.tasks, state.page_shift, state.page_size());
-    crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
-        site,
-        || {
-            let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
-            let gpas = gva_mem::task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift);
-            (gpas.len() as u64 == want).then_some(gpas)
-        },
+    // Census, pay, settle — the whole obligation of a CPU read of one named
+    // resource's guest bytes. See `writeback_debt::settle_for_texture`.
+    crate::runtime::writeback_debt::settle_for_texture(
+        state, host, task_id, texture_ref, gva, span, site,
     );
     // Tight display textures are the common compositor source. Read the whole
     // image with one task-root/cache lifetime: the row loop below otherwise

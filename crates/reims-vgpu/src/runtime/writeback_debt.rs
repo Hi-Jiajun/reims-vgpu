@@ -600,7 +600,12 @@ static REACH_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// `pages` is the reader's own closure, the same one it hands the disjointness
 /// test, so both ends of the comparison stay one rule. It runs only on a sampled
 /// call and only while something is owed.
-pub fn note_unnamed_reach(state: &DeviceState, pages: impl FnOnce() -> Option<Vec<u64>>) {
+/// Private, and that is the half of the repair a reader is most likely to undo.
+/// The census is one of three terms a raw-GVA reader owes and it is worthless on
+/// its own — it reports what the naming missed, so a site that censuses without
+/// paying has measured its own omission and done nothing about it.
+/// [`settle_for_texture`] is the only way to it, and that one spells all three.
+fn note_unnamed_reach(state: &DeviceState, pages: impl FnOnce() -> Option<Vec<u64>>) {
     if state.pending_writebacks.is_empty() {
         return;
     }
@@ -992,6 +997,74 @@ pub fn settle_for_mapping<M: HostMemory + HostOps>(
         "wbdebt_reach_us",
         reach_started.elapsed().as_micros() as u64,
     );
+}
+
+/// [`settle_for_mapping`] for a reader that names a **resource** and walks a raw
+/// task GVA rather than a mapping — the whole obligation of a CPU read of one
+/// named resource's guest bytes, in one call.
+///
+/// # Why this exists, which is the same reason [`settle_for_mapping`] does
+///
+/// That function's doc says the payment and the wait "are one obligation and are
+/// spelled as one function so a new site cannot discharge half of it", and nine
+/// mapping-named sites go through it. The resource-named readers never got the
+/// equivalent, so each wrote the three terms out by hand: the
+/// [`note_unnamed_reach`] census, the payment, and the disjointness-narrowed
+/// settle, with the page walk spelled twice per site because the census and the
+/// settle each take their own closure.
+///
+/// Three hand-written copies is the shape this repository keeps paying for, and
+/// it failed here in the predicted direction. `draw::read_buffer_bytes_resolved`
+/// carried the settle **alone** — no census and no payment — because it held
+/// `DeviceState` shared and structurally could not pay, so a buffer-backed
+/// sampled texture read the guest's pages with the rendered frame still sitting
+/// in a host resident. A settle waits for writes already submitted; an owed frame
+/// has not been submitted at all, so the wait returns at once and finds nothing.
+///
+/// The three terms are ordered and the order matters. The census runs **first**,
+/// while the ledger still holds what the payment is about to clear — a census
+/// after the payment reports an empty ledger and reads as a healthy zero. The
+/// payment runs before the settle because it is what puts the owed frame on the
+/// queue; settling first would wait for a copy nobody had issued yet.
+///
+/// The walk is done here rather than taken as a closure for the reason
+/// [`settle_for_mapping`] gives: the payment needs `state` mutably and the
+/// disjointness test needs it shared, so one caller-supplied closure cannot span
+/// both. Both terms now get the same walk from the same expression, which is the
+/// point — a site cannot census one span and settle a different one.
+pub fn settle_for_texture<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    gva: u64,
+    span: u64,
+    site: crate::runtime::render_writeback::SettleSite,
+) {
+    // The reference names a resource and a surface debt is keyed by mapping id,
+    // so the payment reaches only what this reference resolves to. The census is
+    // the standing alarm for the one thing that naming cannot see — raw page
+    // aliasing, where a surface's pages back some other resource with no mapping
+    // entry — and `wbdebt_reach_overlap` must stay at zero.
+    {
+        let (tasks, page_shift) = (&state.tasks, state.page_shift);
+        let page_size = state.page_size();
+        note_unnamed_reach(state, || {
+            let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
+            let gpas = crate::runtime::gva_mem::task_gva_page_gpas(
+                host, tasks, task_id, gva, span, page_shift,
+            );
+            (gpas.len() as u64 == want).then_some(gpas)
+        });
+    }
+    pay_for_texture(state, host, task_id, texture_ref);
+    let (tasks, page_shift, page_size) = (&state.tasks, state.page_shift, state.page_size());
+    crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(site, || {
+        let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
+        let gpas =
+            crate::runtime::gva_mem::task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift);
+        (gpas.len() as u64 == want).then_some(gpas)
+    });
 }
 
 /// [`settle_for_mapping`] for a caller that is **about to land the owed frame

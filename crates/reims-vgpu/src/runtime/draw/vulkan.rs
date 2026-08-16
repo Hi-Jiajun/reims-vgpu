@@ -4991,32 +4991,16 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     // A short walk is `None` and settles. `pages_spanned` is the count the
     // resolver would have produced with nothing dropped, and a dropped page is
     // one this reader cannot rule out.
-    // The reads below walk a raw task GVA, but the reference names a resource,
-    // and a debt is keyed by mapping id — so only what this reference resolves
-    // to is paid. `note_unnamed_reach` stays as the standing alarm for the one
-    // thing the naming cannot see, raw page aliasing; it samples this read's own
-    // walk against every owed surface and must stay at zero overlap. The census runs first, while the
-    // ledger still holds what the payment is about to clear, and it is handed the
-    // same walk the disjointness test below uses so both are one rule.
-    {
-        let (tasks, page_shift) = (&state.tasks, state.page_shift);
-        let page_size = state.page_size();
-        crate::runtime::writeback_debt::note_unnamed_reach(state, || {
-            let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
-            let gpas = gva_mem::task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift);
-            (gpas.len() as u64 == want).then_some(gpas)
-        });
-    }
-    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
-    let (tasks, page_shift) = (&state.tasks, state.page_shift);
-    let page_size = state.page_size();
-    crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
+    // Census, pay, settle — the whole obligation of a CPU read of one named
+    // resource's guest bytes. See `writeback_debt::settle_for_texture`.
+    crate::runtime::writeback_debt::settle_for_texture(
+        state,
+        host,
+        task_id,
+        texture_ref,
+        gva,
+        span,
         crate::runtime::render_writeback::SettleSite::LinearMemoRead,
-        || {
-            let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
-            let gpas = gva_mem::task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift);
-            (gpas.len() as u64 == want).then_some(gpas)
-        },
     );
     let mut scratch = std::mem::take(&mut state.guest_linear_scratch);
     scratch.resize(native_len, 0);
