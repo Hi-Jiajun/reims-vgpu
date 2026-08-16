@@ -175,6 +175,54 @@ pub struct GvaResourceKey {
     pub texture_ref: u32,
 }
 
+/// One render plane of a GVA resource.
+///
+/// # Why the ledger's unit is not the resource
+///
+/// A render pass targets exactly one mip level, and a level is a sub-range of
+/// the resource's single allocation — `runtime::draw::render_target`'s
+/// `level != 0` arm resolves it to that level's own `(gva, row_stride, height)`.
+/// So one reference legitimately owns several live planes at once, and a ledger
+/// keyed by the reference holds one entry where the guest is using three.
+///
+/// That was measured rather than reasoned. A driven macos-26 boot cycles one
+/// reference through three declarations whose addresses are contiguous and
+/// whose spans fall in exact 4:1 ratios — 256×192, 128×96, 64×48 of one RGBA8
+/// allocation, the compositor's blur/backdrop pyramid. Keyed by the reference,
+/// arming level 1's Store drops level 0's unpaid frame and every level change
+/// mints a new generation, so no level's resident is ever reused.
+///
+/// [`GvaResourceKey`] stays the **resource**, because that is what
+/// `CmdSynchronizeResources` and `CmdDeleteResource` name and what
+/// `resource_validity` and `blit_exec` ask with — neither holds an address. The
+/// derived `Ord` puts `resource` first, so `BTreeMap::range` over
+/// [`GvaResourceKey::planes`] is every plane of one resource and the
+/// resource-wide operations stay one lookup shape rather than a second map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GvaPlaneKey {
+    pub resource: GvaResourceKey,
+    pub gva: u64,
+}
+
+impl GvaResourceKey {
+    /// This resource's plane at one guest address.
+    pub fn plane(self, gva: u64) -> GvaPlaneKey {
+        GvaPlaneKey {
+            resource: self,
+            gva,
+        }
+    }
+
+    /// Every plane of this resource, as a `BTreeMap` range.
+    ///
+    /// Total by construction: the bounds are this resource's own lowest and
+    /// highest representable plane, so no plane of it can sort outside them and
+    /// no plane of another resource can sort inside.
+    fn planes(self) -> std::ops::RangeInclusive<GvaPlaneKey> {
+        self.plane(0)..=self.plane(u64::MAX)
+    }
+}
+
 /// A frame held only by a GVA target's engine-resident image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GvaWritebackDebt {
@@ -188,17 +236,20 @@ pub struct GvaWritebackDebt {
     pub seq: u64,
 }
 
-/// The transfer backing retained by one live GVA texture resource.
+/// The transfer backing retained by one live plane of a GVA texture resource.
 ///
-/// The resource owns this physical-page identity after its virtual declaration
-/// has been resolved. Task unmap changes the task's CPU mapping bookkeeping; it
-/// does not retarget a live resource. An explicit resource discard drops only
-/// `pages`, allowing the next prepare/synchronize to establish a new transfer
-/// backing without changing the host texture's identity.
+/// The plane owns this physical-page identity after its virtual declaration has
+/// been resolved. Task unmap changes the task's CPU mapping bookkeeping; it does
+/// not retarget a live resource. An explicit resource discard drops only
+/// `pages` — on every plane — allowing the next prepare/synchronize to establish
+/// a new transfer backing without changing any host texture's identity.
+///
+/// The address is in the [`GvaPlaneKey`], so what remains here is what varies
+/// per plane at one address: its length, its host-texture identity, and its
+/// pages.
 #[derive(Clone, Debug)]
 struct GvaResourceState {
     generation: u64,
-    gva: u64,
     span: u64,
     pages: Option<std::sync::Arc<[u64]>>,
 }
@@ -211,14 +262,15 @@ pub enum WritebackKey {
 
 /// Every render resource whose current frame exists only in a host resident.
 ///
-/// Surface resources key by mapping id; GVA resources key by their task-local
-/// texture reference. In either representation, a second Store replaces the
-/// first rather than queueing another frame.
+/// Surface resources key by mapping id; GVA resources key by the plane of the
+/// task-local reference a pass rendered into — see [`GvaPlaneKey`] for why the
+/// plane and not the reference. In either representation, a second Store into
+/// the same thing replaces the first rather than queueing another frame.
 #[derive(Debug, Default)]
 pub struct PendingWritebacks {
     debts: std::collections::BTreeMap<u32, WritebackDebt>,
-    gva_debts: std::collections::BTreeMap<GvaResourceKey, GvaWritebackDebt>,
-    gva_resources: std::collections::BTreeMap<GvaResourceKey, GvaResourceState>,
+    gva_debts: std::collections::BTreeMap<GvaPlaneKey, GvaWritebackDebt>,
+    gva_resources: std::collections::BTreeMap<GvaPlaneKey, GvaResourceState>,
     next_seq: u64,
     next_gva_generation: u64,
 }
@@ -304,11 +356,16 @@ impl PendingWritebacks {
         evict
     }
 
-    /// Record a host-authoritative frame for one GVA resource.
+    /// Record a host-authoritative frame for one plane of a GVA resource.
     ///
-    /// A second Store through the same task-local texture reference replaces
-    /// the earlier debt. The returned previous debt names an older resident
-    /// identity that the caller must release when the declaration changed.
+    /// A second Store into the same plane replaces the earlier debt. The
+    /// returned previous debt names an older resident identity that the caller
+    /// must release when the declaration changed.
+    ///
+    /// The debt's own `gva` picks the plane, so a pass into a *different* level
+    /// of the same reference queues beside the first rather than dropping it.
+    /// Keyed by the reference, arming a blur pyramid's level 1 discarded level
+    /// 0's unpaid frame — see [`GvaPlaneKey`].
     #[must_use = "a replaced resource debt may own an older resident identity"]
     pub fn arm_gva(
         &mut self,
@@ -317,7 +374,7 @@ impl PendingWritebacks {
     ) -> Option<GvaWritebackDebt> {
         debt.seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        let previous = self.gva_debts.insert(key, debt);
+        let previous = self.gva_debts.insert(key.plane(debt.gva), debt);
         if previous.is_some() {
             crate::runtime::drain::note_store_route("gvadebt_superseded");
         }
@@ -325,22 +382,27 @@ impl PendingWritebacks {
         previous
     }
 
-    /// Establish or retrieve the lifetime identity of one live GVA resource.
+    /// Establish or retrieve the lifetime identity of one live plane of a GVA
+    /// resource.
     ///
     /// `pages` is accepted only on the first resolution after construction or
     /// explicit discard. Repeated draws and ordinary task unmaps keep the
     /// retained physical backing and the same host-texture generation.
     ///
-    /// # A second declaration under one reference is a second resource
+    /// A plane of this reference at an address it has not used before is simply
+    /// a new plane — the mip level case [`GvaPlaneKey`] describes — and gets its
+    /// own generation without disturbing the others.
     ///
-    /// A resource's guest storage is fixed for its life: the declaration lives
-    /// in the creation descriptor and nothing in the protocol retargets it.
-    /// So a draw that names this reference at a different `(gva, span)` is not
-    /// this resource at all — the guest retired the object and its object-list
-    /// slot now holds another one, without the `CmdDeleteResource` that would
-    /// have said so.
+    /// # A second span at one address is a second resource
     ///
-    /// That makes the new declaration a **lifetime boundary**, and the entry is
+    /// A plane's length is fixed for its life: it comes from the creation
+    /// descriptor and nothing in the protocol retargets it. So a draw naming
+    /// this reference's plane at *this* address with a different span is not
+    /// that plane at all — the guest retired the object and its object-list slot
+    /// now holds another one, without the `CmdDeleteResource` that would have
+    /// said so.
+    ///
+    /// That makes the new span a **lifetime boundary**, and the entry is
     /// replaced with a fresh generation rather than kept. Keeping it is what a
     /// caller cannot do anything correct with: the old generation names an image
     /// holding the old object's pixels, and the new declaration's image must not
@@ -357,8 +419,9 @@ impl PendingWritebacks {
         span: u64,
         pages: Option<Vec<u64>>,
     ) -> u64 {
-        if let Some(resource) = self.gva_resources.get_mut(&key) {
-            if resource.gva == gva && resource.span == span {
+        let plane = key.plane(gva);
+        if let Some(resource) = self.gva_resources.get_mut(&plane) {
+            if resource.span == span {
                 if resource.pages.is_none() {
                     resource.pages = pages.map(std::sync::Arc::from);
                 }
@@ -371,10 +434,9 @@ impl PendingWritebacks {
         }
         let generation = self.next_gva_generation;
         self.gva_resources.insert(
-            key,
+            plane,
             GvaResourceState {
                 generation,
-                gva,
                 span,
                 pages: pages.map(std::sync::Arc::from),
             },
@@ -382,23 +444,22 @@ impl PendingWritebacks {
         generation
     }
 
-    /// Give a live resource back the transfer backing an explicit discard took,
+    /// Give a live plane back the transfer backing an explicit discard took,
     /// without touching its declaration or its generation.
     ///
     /// This is what the payment path needs and all it may have. Payment names a
-    /// resource it did not declare — the declaration it holds is the debt's,
+    /// plane it did not declare — the declaration it holds is the debt's,
     /// recorded when the frame was armed — so letting it reach
     /// [`Self::ensure_gva_resource`] gives a stale debt the power to resurrect a
-    /// retired resource or to re-declare a live one out from under the draw that
+    /// retired plane or to re-declare a live one out from under the draw that
     /// owns it. Asking here instead makes that unrepresentable: absent the
-    /// resource, there is nothing to reback and nothing is created.
+    /// plane, there is nothing to reback and nothing is created.
     ///
-    /// `pages` is adopted only into a resource that has none, exactly as on the
-    /// establishing path. Returns the resource's own declaration and generation
-    /// so the caller can check the debt against it.
+    /// `pages` is adopted only into a plane that has none, exactly as on the
+    /// establishing path.
     #[cfg(feature = "backend-vulkan")]
-    fn reback_gva_resource(&mut self, key: GvaResourceKey, pages: Option<Vec<u64>>) -> bool {
-        let Some(resource) = self.gva_resources.get_mut(&key) else {
+    fn reback_gva_resource(&mut self, plane: GvaPlaneKey, pages: Option<Vec<u64>>) -> bool {
+        let Some(resource) = self.gva_resources.get_mut(&plane) else {
             return false;
         };
         if resource.pages.is_none() {
@@ -410,12 +471,11 @@ impl PendingWritebacks {
     #[cfg(any(feature = "backend-vulkan", test))]
     fn gva_resource_backing(
         &self,
-        key: GvaResourceKey,
-    ) -> Option<(u64, u64, u64, std::sync::Arc<[u64]>)> {
-        let resource = self.gva_resources.get(&key)?;
+        plane: GvaPlaneKey,
+    ) -> Option<(u64, u64, std::sync::Arc<[u64]>)> {
+        let resource = self.gva_resources.get(&plane)?;
         Some((
             resource.generation,
-            resource.gva,
             resource.span,
             std::sync::Arc::clone(resource.pages.as_ref()?),
         ))
@@ -426,19 +486,17 @@ impl PendingWritebacks {
     /// this one is [`gva_resource_generation`], which is Vulkan-only — so
     /// admitting `test` here leaves it dead on the Metal arm's test build.
     #[cfg(feature = "backend-vulkan")]
-    fn gva_resource_status(&self, key: GvaResourceKey) -> Option<(u64, u64, u64, bool)> {
-        self.gva_resources.get(&key).map(|resource| {
-            (
-                resource.generation,
-                resource.gva,
-                resource.span,
-                resource.pages.is_some(),
-            )
-        })
+    fn gva_resource_status(&self, plane: GvaPlaneKey) -> Option<(u64, u64, bool)> {
+        self.gva_resources
+            .get(&plane)
+            .map(|resource| (resource.generation, resource.span, resource.pages.is_some()))
     }
 
     /// Release the transfer buffer of each named resource while preserving its
     /// host texture and lifetime identity.
+    ///
+    /// Every plane of a named resource, because the guest's discard names the
+    /// resource and a resource holds all of its levels' backings.
     pub fn discard_gva_resources(&mut self, task_id: u32, object_ids: &[u32]) -> usize {
         let mut discarded = 0;
         for &texture_ref in object_ids {
@@ -446,44 +504,90 @@ impl PendingWritebacks {
                 task_id,
                 texture_ref,
             };
-            if let Some(resource) = self.gva_resources.get_mut(&key) {
-                discarded += usize::from(resource.pages.take().is_some());
+            for resource in self.gva_resources.range_mut(key.planes()) {
+                discarded += usize::from(resource.1.pages.take().is_some());
             }
         }
         discarded
     }
 
-    fn retire_gva_resource(&mut self, key: GvaResourceKey) -> (bool, Option<GvaWritebackDebt>) {
-        let existed = self.gva_resources.remove(&key).is_some();
-        (existed, self.gva_debts.remove(&key))
+    /// Every plane of one resource goes at once: `CmdDeleteResource` names the
+    /// resource, and a level that outlived its allocation names nothing.
+    fn retire_gva_resource(&mut self, key: GvaResourceKey) -> (bool, Vec<GvaWritebackDebt>) {
+        let planes: Vec<GvaPlaneKey> = self
+            .gva_resources
+            .range(key.planes())
+            .map(|(plane, _)| *plane)
+            .chain(self.gva_debts.range(key.planes()).map(|(plane, _)| *plane))
+            .collect();
+        let mut existed = false;
+        let mut debts = Vec::new();
+        for plane in planes {
+            existed |= self.gva_resources.remove(&plane).is_some();
+            debts.extend(self.gva_debts.remove(&plane));
+        }
+        (existed, debts)
     }
 
+    /// The one plane debt this resource owes, or `None` when it owes zero or
+    /// several.
+    ///
+    /// The caller — `blit_exec`'s whole-plane GPU copy — names a resource and
+    /// holds no address, so with several planes owed it cannot say which one its
+    /// source level is. Declining costs it the GPU shortcut and nothing else:
+    /// that path's own doc records that a fall-through spends a frame and cannot
+    /// lose one.
     pub fn get_gva(&self, key: GvaResourceKey) -> Option<GvaWritebackDebt> {
-        self.gva_debts.get(&key).copied()
+        let mut owed = self.gva_debts.range(key.planes());
+        let (_, only) = owed.next()?;
+        match owed.next() {
+            None => Some(*only),
+            Some(_) => {
+                crate::runtime::drain::note_store_route("gvadebt_resource_owes_many_planes");
+                None
+            }
+        }
     }
 
     pub fn has_gva(&self, key: GvaResourceKey) -> bool {
-        self.gva_debts.contains_key(&key)
+        self.gva_debts.range(key.planes()).next().is_some()
     }
 
-    pub fn take_gva(&mut self, key: GvaResourceKey) -> Option<GvaWritebackDebt> {
-        self.gva_debts.remove(&key)
+    /// Every plane debt this resource owes, taken out of the ledger.
+    ///
+    /// The resource is the unit the guest synchronizes and the unit a sampled
+    /// read names, so a payment for it owes every level's frame and not the one
+    /// that happened to sort first.
+    pub fn take_gva(&mut self, key: GvaResourceKey) -> Vec<(GvaPlaneKey, GvaWritebackDebt)> {
+        let planes: Vec<GvaPlaneKey> = self
+            .gva_debts
+            .range(key.planes())
+            .map(|(plane, _)| *plane)
+            .collect();
+        planes
+            .into_iter()
+            .filter_map(|plane| self.gva_debts.remove(&plane).map(|debt| (plane, debt)))
+            .collect()
+    }
+
+    fn take_gva_plane(&mut self, plane: GvaPlaneKey) -> Option<GvaWritebackDebt> {
+        self.gva_debts.remove(&plane)
     }
 
     /// Put back a debt whose guest backing was temporarily unavailable.
     /// Preserves its original age: inability to pay does not make an old frame
     /// the newest member of the ledger.
     #[cfg(feature = "backend-vulkan")]
-    fn restore_gva(&mut self, key: GvaResourceKey, debt: GvaWritebackDebt) {
-        let previous = self.gva_debts.insert(key, debt);
+    fn restore_gva(&mut self, plane: GvaPlaneKey, debt: GvaWritebackDebt) {
+        let previous = self.gva_debts.insert(plane, debt);
         debug_assert!(
             previous.is_none(),
             "a taken debt restores into its own hole"
         );
     }
 
-    fn gvas_by_age(&self) -> Vec<GvaResourceKey> {
-        let mut all: Vec<(u64, GvaResourceKey)> = self
+    fn gvas_by_age(&self) -> Vec<GvaPlaneKey> {
+        let mut all: Vec<(u64, GvaPlaneKey)> = self
             .gva_debts
             .iter()
             .map(|(key, debt)| (debt.seq, *key))
@@ -492,19 +596,25 @@ impl PendingWritebacks {
         all.into_iter().map(|(_, key)| key).collect()
     }
 
+    /// Distinct resources of one task, deduped across their planes: task
+    /// teardown retires resources, and [`Self::retire_gva_resource`] already
+    /// takes every plane of the one it is given.
     fn gvas_for_task(&self, task_id: u32) -> Vec<GvaResourceKey> {
-        self.gva_resources
+        let mut all: Vec<GvaResourceKey> = self
+            .gva_resources
             .keys()
+            .map(|plane| plane.resource)
             .filter(|key| key.task_id == task_id)
-            .copied()
-            .collect()
+            .collect();
+        all.dedup();
+        all
     }
 
     #[cfg(feature = "backend-vulkan")]
     fn gva_for_identity(
         &self,
         identity: &crate::backend::vulkan::engine::TargetIdentity,
-    ) -> Option<(GvaResourceKey, GvaWritebackDebt)> {
+    ) -> Option<(GvaPlaneKey, GvaWritebackDebt)> {
         let crate::backend::vulkan::engine::TargetIdentity::Gva {
             gva,
             width,
@@ -599,11 +709,11 @@ pub fn pay_all<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
         };
         pay(state, host, mapping_id, debt, "wbdebt_paid_all");
     }
-    for key in state.pending_writebacks.gvas_by_age() {
-        let Some(debt) = state.pending_writebacks.take_gva(key) else {
+    for plane in state.pending_writebacks.gvas_by_age() {
+        let Some(debt) = state.pending_writebacks.take_gva_plane(plane) else {
             continue;
         };
-        let _ = pay_gva(state, host, key, debt, GvaPaySite::All);
+        let _ = pay_gva(state, host, plane, debt, GvaPaySite::All);
     }
 }
 
@@ -725,9 +835,11 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
         texture_ref,
     };
     let mut named = false;
-    if let Some(debt) = state.pending_writebacks.take_gva(gva_key) {
+    // Every plane the reference owes, not the one that sorts first: a sampled
+    // read names the resource, and a mip pyramid's levels are separate debts.
+    for (plane, debt) in state.pending_writebacks.take_gva(gva_key) {
         named = true;
-        let _ = pay_gva(state, host, gva_key, debt, GvaPaySite::Named);
+        let _ = pay_gva(state, host, plane, debt, GvaPaySite::Named);
     }
     // Both surface spellings, from the one resolver `resource_validity::apply`
     // uses: a reference that is itself a mapping id, and the per-task
@@ -823,10 +935,10 @@ pub fn gva_resource_generation<M: HostMemory>(
     gva: u64,
     span: u64,
 ) -> u64 {
-    if let Some((generation, declared_gva, declared_span, has_pages)) =
-        state.pending_writebacks.gva_resource_status(key)
+    if let Some((generation, declared_span, has_pages)) =
+        state.pending_writebacks.gva_resource_status(key.plane(gva))
     {
-        if declared_gva == gva && declared_span == span {
+        if declared_span == span {
             if has_pages {
                 return generation;
             }
@@ -834,9 +946,8 @@ pub fn gva_resource_generation<M: HostMemory>(
             crate::observe::Emit::decline(
                 "gva_resource_redeclared",
                 &GvaResourceRedeclared {
-                    was_gva: declared_gva,
+                    gva,
                     was_span: declared_span,
-                    now_gva: gva,
                     now_span: span,
                 },
             )
@@ -862,17 +973,22 @@ pub fn gva_resource_generation<M: HostMemory>(
         .ensure_gva_resource(key, gva, span, pages)
 }
 
-/// One task-local reference observed naming two different guest regions.
+/// One plane of a reference observed at two different lengths.
 ///
-/// Carries both declarations because neither alone says anything: the question a
-/// reader has is whether the two are *stable* — a reference reused for a second
-/// object, which is ordinary guest lifetime — or whether they alternate, which
-/// would be this device describing one resource two ways.
+/// A *different address* under one reference is not this: that is another plane
+/// of the same resource — a mip level — and [`GvaPlaneKey`] gives it its own
+/// entry. What remains here is one address whose length moved, which the
+/// contract has no room for, so the reference has been reused for a second
+/// object.
+///
+/// Carries both lengths because neither alone says anything: the question a
+/// reader has is whether they are *stable* — a reference reused, ordinary guest
+/// lifetime — or whether they alternate, which would be this device describing
+/// one plane two ways.
 #[cfg(feature = "backend-vulkan")]
 struct GvaResourceRedeclared {
-    was_gva: u64,
+    gva: u64,
     was_span: u64,
-    now_gva: u64,
     now_span: u64,
 }
 
@@ -884,9 +1000,8 @@ impl crate::observe::Decline for GvaResourceRedeclared {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         vec![
-            ("was_gva", format!("{:#x}", self.was_gva)),
+            ("gva", format!("{:#x}", self.gva)),
             ("was_span", self.was_span.to_string()),
-            ("now_gva", format!("{:#x}", self.now_gva)),
             ("now_span", self.now_span.to_string()),
         ]
     }
@@ -895,23 +1010,23 @@ impl crate::observe::Decline for GvaResourceRedeclared {
 #[cfg(feature = "backend-vulkan")]
 crate::observe::decline_display!(GvaResourceRedeclared);
 
-/// Re-establish the transfer backing of the resource a debt names, without any
+/// Re-establish the transfer backing of the plane a debt names, without any
 /// power to declare one.
 ///
 /// The payment path's counterpart to [`gva_resource_generation`]. It asks only
-/// the question payment has standing to ask — "does this resource still exist,
-/// and does it still have its pages" — using the resource's *own* declaration,
-/// never the debt's. A debt that outlived its resource therefore finds nothing
-/// here and is released by the caller, where before it reached
+/// the question payment has standing to ask — "does this plane still exist, and
+/// does it still have its pages" — using the plane's *own* span, never the
+/// debt's. A debt that outlived its plane therefore finds nothing here and is
+/// released by the caller, where before it reached
 /// [`PendingWritebacks::ensure_gva_resource`] and could re-create the retired
 /// object at the dead declaration it was carrying.
 #[cfg(feature = "backend-vulkan")]
 fn reback_gva_resource<M: HostMemory>(
     state: &mut DeviceState,
     host: &M,
-    key: GvaResourceKey,
+    plane: GvaPlaneKey,
 ) -> bool {
-    let Some((_, gva, span, has_pages)) = state.pending_writebacks.gva_resource_status(key) else {
+    let Some((_, span, has_pages)) = state.pending_writebacks.gva_resource_status(plane) else {
         return false;
     };
     if has_pages {
@@ -921,14 +1036,14 @@ fn reback_gva_resource<M: HostMemory>(
     let ordered = crate::runtime::gva_mem::task_gva_page_gpas(
         host,
         &state.tasks,
-        key.task_id,
-        gva,
+        plane.resource.task_id,
+        plane.gva,
         span,
         state.page_shift,
     );
-    let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
+    let want = reims_vgpu_paging::span::pages_spanned(plane.gva, span, page_size);
     let pages = (ordered.len() as u64 == want).then_some(ordered);
-    state.pending_writebacks.reback_gva_resource(key, pages)
+    state.pending_writebacks.reback_gva_resource(plane, pages)
 }
 
 /// Record a GVA render result as host-authoritative without touching guest
@@ -985,12 +1100,12 @@ pub fn gva_resident_authoritative(
     state: &DeviceState,
     identity: &crate::backend::vulkan::engine::TargetIdentity,
 ) -> bool {
-    let Some((key, debt)) = state.pending_writebacks.gva_for_identity(identity) else {
+    let Some((plane, debt)) = state.pending_writebacks.gva_for_identity(identity) else {
         return false;
     };
     state
         .buffer_write_gen
-        .stamp(key.task_id, key.texture_ref)
+        .stamp(plane.resource.task_id, plane.resource.texture_ref)
         .quiet_since(debt.guest_write)
 }
 
@@ -1001,14 +1116,14 @@ pub fn retire_gva_for_task(state: &mut DeviceState, task_id: u32) -> usize {
     let keys = state.pending_writebacks.gvas_for_task(task_id);
     let mut retired = 0;
     for key in keys {
-        let (_, debt) = state.pending_writebacks.retire_gva_resource(key);
+        let (_, debts) = state.pending_writebacks.retire_gva_resource(key);
         retired += 1;
         #[cfg(feature = "backend-vulkan")]
-        if let Some(debt) = debt {
+        for debt in debts {
             release_gva(debt);
         }
         #[cfg(not(feature = "backend-vulkan"))]
-        let _ = debt;
+        let _ = debts;
     }
     if retired != 0 {
         crate::runtime::drain::note_store_route_n("gvadebt_retired_task", retired as u64);
@@ -1022,14 +1137,15 @@ pub fn retire_gva_resource(state: &mut DeviceState, task_id: u32, texture_ref: u
         task_id,
         texture_ref,
     };
-    let (existed, debt) = state.pending_writebacks.retire_gva_resource(key);
+    let (existed, debts) = state.pending_writebacks.retire_gva_resource(key);
+    let owed = !debts.is_empty();
     #[cfg(feature = "backend-vulkan")]
-    if let Some(debt) = debt {
+    for debt in debts {
         release_gva(debt);
     }
     #[cfg(not(feature = "backend-vulkan"))]
-    let _ = debt;
-    existed || debt.is_some()
+    let _ = debts;
+    existed || owed
 }
 
 /// Release named resources' retained transfer backings.
@@ -1383,10 +1499,11 @@ impl GvaPaySite {
 fn pay_gva<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
-    key: GvaResourceKey,
+    plane: GvaPlaneKey,
     debt: GvaWritebackDebt,
     site: GvaPaySite,
 ) -> bool {
+    let key = plane.resource;
     let identity = gva_identity(debt);
     let now = state.buffer_write_gen.stamp(key.task_id, key.texture_ref);
     if !now.quiet_since(debt.guest_write) {
@@ -1407,15 +1524,15 @@ fn pay_gva<M: HostMemory + HostOps>(
     // names storage that object no longer owns, so it is released here rather
     // than restored: restoring one would park it in the ledger forever, since
     // nothing retired can grow pages back.
-    if !reback_gva_resource(state, host, key) {
+    if !reback_gva_resource(state, host, plane) {
         crate::runtime::drain::note_store_route("gvadebt_resource_retired");
         release_gva(debt);
         return true;
     }
-    let Some((backing_generation, backing_gva, backing_span, ordered)) =
-        state.pending_writebacks.gva_resource_backing(key)
+    let Some((backing_generation, backing_span, ordered)) =
+        state.pending_writebacks.gva_resource_backing(plane)
     else {
-        state.pending_writebacks.restore_gva(key, debt);
+        state.pending_writebacks.restore_gva(plane, debt);
         crate::runtime::drain::note_store_route(match site {
             GvaPaySite::Named => "gvadebt_named_unmapped",
             GvaPaySite::All => "gvadebt_all_unmapped",
@@ -1428,10 +1545,9 @@ fn pay_gva<M: HostMemory + HostOps>(
         }
         return false;
     };
-    if backing_generation != debt.generation
-        || backing_gva != debt.gva
-        || backing_span != span
-    {
+    // The plane key already carries the address, so a mismatched one cannot
+    // reach here: it would have found no plane at all above.
+    if backing_generation != debt.generation || backing_span != span {
         crate::runtime::drain::note_store_route("gvadebt_generation_moved");
         release_gva(debt);
         return true;
@@ -1492,7 +1608,7 @@ fn pay<M: HostMemory + HostOps>(
 fn pay_gva<M: HostMemory + HostOps>(
     _state: &mut DeviceState,
     _host: &mut M,
-    _key: GvaResourceKey,
+    _plane: GvaPlaneKey,
     _debt: GvaWritebackDebt,
     _site: GvaPaySite,
 ) -> bool {
@@ -1695,16 +1811,22 @@ mod tests {
             pending.ensure_gva_resource(key, 0x4000, 4096, Some(vec![0xa000])),
             generation
         );
-        assert_eq!(&*pending.gva_resource_backing(key).unwrap().3, &[0x9000]);
+        assert_eq!(
+            &*pending.gva_resource_backing(key.plane(0x4000)).unwrap().2,
+            &[0x9000]
+        );
 
         assert_eq!(pending.discard_gva_resources(3, &[19]), 1);
-        assert!(pending.gva_resource_backing(key).is_none());
+        assert!(pending.gva_resource_backing(key.plane(0x4000)).is_none());
         assert_eq!(
             pending.ensure_gva_resource(key, 0x4000, 4096, Some(vec![0xa000])),
             generation,
             "discard replaces the transfer backing, not the host texture"
         );
-        assert_eq!(&*pending.gva_resource_backing(key).unwrap().3, &[0xa000]);
+        assert_eq!(
+            &*pending.gva_resource_backing(key.plane(0x4000)).unwrap().2,
+            &[0xa000]
+        );
     }
 
     /// Delete is the resource lifetime boundary. Reusing the same task-local
@@ -1722,37 +1844,86 @@ mod tests {
         assert_ne!(first, second);
     }
 
-    /// Delete is the *announced* lifetime boundary; a changed declaration is the
-    /// same boundary observed instead of announced. A resource's guest storage
-    /// is fixed for its life, so a reference naming a different `(gva, span)`
-    /// names a different object, and it must get a different host texture.
+    /// Delete is the *announced* lifetime boundary; a plane's length moving at
+    /// one address is the same boundary observed instead of announced. A
+    /// plane's length is fixed for its life, so this is a different object in a
+    /// reused slot and it must get a different host texture.
     ///
-    /// This is the case a macos-26 report spent 5 197 lines on. The entry used
-    /// to survive the mismatch, so the reference was pinned to the retired
-    /// object's declaration and every later draw into it compared against a dead
-    /// value — one reference refused 803 times in one boot, with no route back.
     /// Asserting the third call is what makes that visible: a fix that only
     /// stopped refusing, without replacing the entry, still fails here.
     #[test]
-    fn a_reference_redeclared_at_new_storage_is_a_new_resource() {
+    fn one_plane_redeclared_at_a_new_length_is_a_new_resource() {
         let mut pending = PendingWritebacks::default();
         let key = GvaResourceKey {
             task_id: 3,
             texture_ref: 19,
         };
         let first = pending.ensure_gva_resource(key, 0x4000, 4096, Some(vec![0x9000]));
-        let second = pending.ensure_gva_resource(key, 0x8000, 8192, Some(vec![0xa000, 0xb000]));
-        assert_ne!(first, second, "new storage is a new host texture");
+        let second = pending.ensure_gva_resource(key, 0x4000, 8192, Some(vec![0xa000, 0xb000]));
+        assert_ne!(first, second, "a new length is a new host texture");
         assert_eq!(
-            &*pending.gva_resource_backing(key).unwrap().3,
+            &*pending.gva_resource_backing(key.plane(0x4000)).unwrap().2,
             &[0xa000, 0xb000],
             "the new object's pages replace the retired one's"
         );
         assert_eq!(
-            pending.ensure_gva_resource(key, 0x8000, 8192, None),
+            pending.ensure_gva_resource(key, 0x4000, 8192, None),
             second,
             "the new declaration is the live one, so it is stable"
         );
+    }
+
+    /// A mip pyramid is one resource with several live planes, and the ledger
+    /// has to hold all of them at once.
+    ///
+    /// Measured on a driven macos-26 boot: one reference cycling three
+    /// contiguous declarations in exact 4:1 ratios — 256x192, 128x96, 64x48 of
+    /// one RGBA8 allocation, the compositor's blur/backdrop pyramid. Keyed by
+    /// the reference, each level change replaced the entry, so no level's
+    /// resident could ever be reused and arming one level's Store dropped the
+    /// previous level's unpaid frame. Both halves are asserted here: the
+    /// generations are distinct **and** stable, and three debts coexist.
+    #[test]
+    fn the_levels_of_one_pyramid_are_separate_planes_of_one_resource() {
+        let mut pending = PendingWritebacks::default();
+        let key = GvaResourceKey {
+            task_id: 1,
+            texture_ref: 135,
+        };
+        let levels = [
+            (0x11af000_u64, 196_608_u64),
+            (0x11df000, 49_152),
+            (0x11eb000, 12_288),
+        ];
+        let generations: Vec<u64> = levels
+            .iter()
+            .map(|&(gva, span)| pending.ensure_gva_resource(key, gva, span, Some(vec![gva])))
+            .collect();
+        let mut distinct = generations.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 3, "each level is its own host texture");
+
+        // The cycle the boot showed: re-declaring level 0 after levels 1 and 2
+        // must return level 0's own generation, not mint a fourth.
+        for (i, &(gva, span)) in levels.iter().enumerate() {
+            assert_eq!(
+                pending.ensure_gva_resource(key, gva, span, None),
+                generations[i],
+                "a live plane is stable across its siblings"
+            );
+        }
+
+        for (i, &(gva, _)) in levels.iter().enumerate() {
+            let mut debt = gva_debt(generations[i]);
+            debt.gva = gva;
+            assert_eq!(
+                pending.arm_gva(key, debt),
+                None,
+                "arming one level must not supersede another"
+            );
+        }
+        assert_eq!(pending.take_gva(key).len(), 3, "the resource owes all three");
     }
 
     /// A guest validity transition after the Store makes guest memory newer
