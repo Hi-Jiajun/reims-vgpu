@@ -381,16 +381,42 @@ pub fn capture_present_frame(
 }
 
 /// Blit tight BGRA8 `src` into `dst` (tight or strided).
+///
+/// # A destination row shorter than the frame's is a refusal, not a `min`
+///
+/// The copy length used to be `src_stride.min(dst_stride)`, which for a
+/// destination whose row is shorter than `width * 4` wrote the leading columns
+/// of every row and left the rest of each row untouched — a black band down the
+/// right of the frame, uniform on every row, with nothing on any channel saying
+/// so. It is the only silent column-truncating copy this crate had.
+///
+/// Every other stride consumer here already refuses a short row by name
+/// (`CaptureDecline::BprBelowTight`, and the two `dst_stride < width * 4`
+/// guards on the neighbouring entry points), so this was the one place where a
+/// destination that cannot hold the frame produced a partial frame instead of a
+/// decline. `false` is what the callers already handle: it is the same answer a
+/// short `src` gives two lines up.
+///
+/// This is not the cause of any reported black band — this path fills QEMU's own
+/// `DisplaySurface`, which under a host-owned window is not what the screen
+/// shows. It is the shape one would have to rule out first, and now the log
+/// rules it out instead of a reader having to.
 fn blit_bgra_buffer(src: &[u8], dst: &mut [u8], dst_stride: u32, width: u32, height: u32) -> bool {
     let src_stride = width.saturating_mul(RGBA8_BPP) as usize;
     if src.len() < src_stride.saturating_mul(height as usize) {
         return false;
     }
+    if (dst_stride as usize) < src_stride {
+        crate::observe::fail(format!(
+            "present_paint reason=dst_stride_below_tight \
+             dst_stride={dst_stride} tight={src_stride} geom={width}x{height}"
+        ));
+        return false;
+    }
     for y in 0..height as usize {
         let so = y * src_stride;
         let doff = y * (dst_stride as usize);
-        let n = src_stride.min(dst_stride as usize);
-        dst[doff..doff + n].copy_from_slice(&src[so..so + n]);
+        dst[doff..doff + src_stride].copy_from_slice(&src[so..so + src_stride]);
     }
     true
 }

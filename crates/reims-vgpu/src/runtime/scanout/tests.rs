@@ -1141,27 +1141,24 @@ fn blit_bgra_buffer_row_offsets_and_bounds_are_exact() {
         );
     }
 
-    // 4) Narrower dst than src (dst_stride < src_stride): copy min(strides)
-    //    per row — never overread src past the row nor overrun dst.
+    // 4) Narrower dst than src (dst_stride < src_stride): refuse whole.
+    //
+    // This case used to assert the opposite — that the blit copied
+    // `min(strides)` per row — which is a frame missing its rightmost columns on
+    // every row, written with nothing on any channel saying so. A destination
+    // that cannot hold the frame is the same kind of answer as a source too
+    // short to fill it, three cases up, and it gets the same one.
     {
-        let dst_stride = src_stride - bpp; // 8 bytes/row, drops last pixel
-        let mut dst = vec![0u8; dst_stride * height as usize];
-        assert!(blit_bgra_buffer(
-            &src,
-            &mut dst,
-            dst_stride as u32,
-            width,
-            height
-        ));
-        for y in 0..height as usize {
-            let doff = y * dst_stride;
-            let soff = y * src_stride;
-            assert_eq!(
-                &dst[doff..doff + dst_stride],
-                &src[soff..soff + dst_stride],
-                "row {y} must copy min(strides) bytes from the row start",
-            );
-        }
+        let dst_stride = src_stride - bpp; // 8 bytes/row, one pixel short
+        let mut dst = vec![0x22u8; dst_stride * height as usize];
+        assert!(
+            !blit_bgra_buffer(&src, &mut dst, dst_stride as u32, width, height),
+            "a dst row shorter than width*BPP must be refused, not truncated",
+        );
+        assert!(
+            dst.iter().all(|&b| b == 0x22),
+            "a refused blit must not have written any dst byte",
+        );
     }
 }
 
