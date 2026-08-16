@@ -5318,6 +5318,24 @@ pub(super) fn load_linear_from_host_caches<M: HostMemory + HostOps>(
             &rgba,
             byte_format,
         );
+        // The other half of a channel-order reading. A GVA span is *written* by
+        // the render Store at the attachment's declared format and *read* here
+        // at the sampled descriptor's, and on the copying rail those are two
+        // interpretations of one buffer rather than one typed image — so the
+        // pair has to be joinable. `gva_flush_gpu_declined` names the write's
+        // format against the same `gva=`; this names the read's. Latched per
+        // (gva, format) so a steady bind stays at one line and a *change* of
+        // interpretation still surfaces.
+        if crate::observe::first_sight(
+            "lin_serve_fmt",
+            gva ^ (u64::from(tex.pixel_format) << 48),
+        ) {
+            crate::observe::off(format!(
+                "lin_serve_fmt task={task_id} ref={texture_ref} gva={gva:#x} {w}x{h} \
+                 fmt={:#x} bytes={byte_format:?}",
+                tex.pixel_format
+            ));
+        }
         return Some((w, h, rgba, identity, byte_format));
     }
     // There is deliberately no second guest rung under the memo. One used to

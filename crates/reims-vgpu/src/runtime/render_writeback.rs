@@ -901,9 +901,16 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
     let leased = match crate::backend::vulkan::engine::read_target_leased(identity) {
         Ok(leased) => leased,
         Err(decline) => {
-            crate::observe::off(format!(
-                "render_flush_lease_declined mapping={mapping_id} {width}x{height} err={decline}"
-            ));
+            // The typed fields, not `Display`. `TargetReadDecline::UnknownIdentity`
+            // carries `diverges`/`asked_gen`/`held_gen` precisely because "not in
+            // the registry" is two findings with opposite repairs, and formatting
+            // the error dropped all three: a `REIMS_VGPU_GUEST_IMPORT=off` boot
+            // produced 80 of these and 80 `render_store_lost` beside them with
+            // nothing in the log saying which of the two it was.
+            crate::observe::Emit::decline("render_flush_lease_declined", &decline)
+                .field("mapping", mapping_id)
+                .field("geom", format!("{width}x{height}"))
+                .off();
             None
         }
     };
@@ -948,10 +955,14 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
                     (ok, len)
                 }
                 Err(e) => {
-                    crate::observe::fail(format!(
-                        "render_store_lost mapping={mapping_id} {width}x{height} \
-                         reason=resident_read err={e}"
-                    ));
+                    // Typed, for the reason the lease decline above is: this is
+                    // the one line that says *why* the frame was unreadable, and
+                    // `Display` on a `DrawError` prints the slug alone.
+                    crate::observe::Emit::decline("render_store_lost", &e)
+                        .field("mapping", mapping_id)
+                        .field("geom", format!("{width}x{height}"))
+                        .field("at", "resident_read")
+                        .fail();
                     return false;
                 }
             }
@@ -1134,6 +1145,16 @@ pub enum GvaWritebackDecline {
     Engine {
         inner: crate::backend::vulkan::engine::DrawError,
     },
+    /// The **copying** arm could not read the resident back, so neither arm
+    /// landed the frame. Unlike every variant above this one, it is a loss: the
+    /// direct arm has already declined by the time it can be produced, and there
+    /// is no third rail.
+    CopiedReadRefused {
+        inner: crate::backend::vulkan::engine::DrawError,
+    },
+    /// The **copying** arm read the frame and could not write it into the guest
+    /// pages its licence names. A loss, for the same reason as above.
+    CopiedWriteRefused { err: crate::runtime::host::MemError },
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -1148,6 +1169,8 @@ impl crate::observe::Decline for GvaWritebackDecline {
             Self::SpanIncomplete => "gvawb_span_incomplete",
             Self::GuestRefRefused { .. } => "gvawb_guest_ref_refused",
             Self::Engine { inner } => crate::observe::Decline::slug(inner),
+            Self::CopiedReadRefused { .. } => "gvawb_copied_read_refused",
+            Self::CopiedWriteRefused { .. } => "gvawb_copied_write_refused",
         }
     }
 
@@ -1167,6 +1190,12 @@ impl crate::observe::Decline for GvaWritebackDecline {
                 f
             }
             Self::Engine { inner } => crate::observe::Decline::fields(inner),
+            Self::CopiedReadRefused { inner } => {
+                let mut f = vec![("via", crate::observe::Decline::slug(inner).to_string())];
+                f.extend(crate::observe::Decline::fields(inner));
+                f
+            }
+            Self::CopiedWriteRefused { err } => vec![("err", format!("{err:?}"))],
         }
     }
 }
@@ -1174,25 +1203,170 @@ impl crate::observe::Decline for GvaWritebackDecline {
 #[cfg(feature = "backend-vulkan")]
 crate::observe::decline::decline_display!(GvaWritebackDecline);
 
+/// Land a GVA render Store's frame in the guest's pages, GPU-direct where the
+/// host allows it and by reading the resident back where it does not.
+///
+/// # The ladder, and why it is here rather than at one call site
+///
+/// The GPU-direct arm below needs a guest-RAM reference over the destination
+/// pages, which is `VK_EXT_external_memory_host` or nothing. On a host without
+/// that extension — and on every discrete GPU, where `linear_target_import`
+/// refuses `UnsupportedTopology` — it declines every Store of every GVA target
+/// with `gvawb_guest_ref_refused via=guest_ram_map_no_backend_import`.
+///
+/// That decline used to be a **lost frame** for one of the two callers. The
+/// eager site in `draw::vulkan` carries its own copying rail (`gva_store_sync`:
+/// read the resident back, then `write_gva_rgba8_within`), so it never sees
+/// one; the deferred site — [`crate::runtime::writeback_debt::pay_for_texture`],
+/// which pays a resource's debt at the moment the guest samples it — had
+/// nothing behind the decline and reported `gvadebt_pay_lost`. A driven
+/// macos-13 boot under `REIMS_VGPU_GUEST_IMPORT=off` read **27
+/// `gvadebt_paid_named` and 27 `gvadebt_pay_lost`**: every deferred payment on
+/// that host class lost its frame, and because the failure also released the
+/// debt, the sampled rail then read guest pages the frame had never reached.
+/// Thirteen of the twenty-seven were one texture of one task re-rendered over
+/// and over, which on screen is a window whose content stays blank while its
+/// chrome draws.
+///
+/// So the copying arm lives here, in the function that owns "land this GVA
+/// Store", and both callers get it. A decline of the direct arm is a *cost* —
+/// a blocking readback plus a host pass over the frame — and never a loss.
+///
+/// # What the licence is
+///
+/// A mapping carries its own page list and a page-table vouch licenses it; a
+/// GVA carries neither, so the licence is the exact page list supplied in
+/// `pages`, which **neither** arm may widen. The eager fallback captures it
+/// before draw submission; deferred payment gets it from the live resource's
+/// transfer backing. `pages == None` is therefore still `Unlicensed` on both
+/// arms: there is no authorisation to write anywhere, and a copy is not a
+/// second opinion about that.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    c0: &crate::runtime::draw::ColorRtRequest,
+    texture_ref: u32,
+    pages: Option<&crate::runtime::draw::StoreTargetPages>,
+) -> Result<u64, GvaWritebackDecline> {
+    let direct = store_gva_frame_direct(state, host, task_id, identity, c0, texture_ref, pages);
+    let decline = match direct {
+        Ok(extent) => {
+            crate::runtime::drain::note_store_route("gva_flush_gpu_direct");
+            return Ok(extent);
+        }
+        Err(decline) => decline,
+    };
+    // Latched per target GVA as well as per reason, for the reason
+    // `store_render_frame`'s twin latch gives: a host without the import
+    // declines every Store of every target, and a line each would drown the
+    // channel.
+    crate::observe::Emit::decline("gva_flush_gpu_declined", &decline)
+        .field("gva", format!("{:#x}", c0.target_gva))
+        .field("geom", format!("{}x{}", c0.width, c0.height))
+        // The destination's declared format and the resident's own. The copying
+        // arm below converts by `into_rgba8` and then
+        // `convert_rgba8_to_row(c0.format)`, and whether those two cancel is
+        // decided entirely by this pair — so without it a channel-order defect
+        // on this rail is a screenshot and no reading.
+        .field("fmt", format!("{:#x}", c0.format))
+        .field("resident", format!("{:?}", identity.resident_format()))
+        .fail_once(c0.target_gva);
+    crate::runtime::drain::note_store_route("gva_flush_gpu_declined");
+    let Some(pages) = pages else {
+        return Err(GvaWritebackDecline::Unlicensed);
+    };
+    // The blocking readback the direct arm exists to avoid. `into_rgba8` is the
+    // order every GVA guest writer takes; a GVA resident is already RGBA, so it
+    // is a no-op here and a whole-frame pass only for a target that fell back to
+    // a BGRA resident.
+    let rgba = crate::backend::vulkan::engine::read_target(identity)
+        .map_err(|inner| GvaWritebackDecline::CopiedReadRefused { inner })?
+        .into_rgba8();
+    let extent = land_gva_frame_bytes(state, host, task_id, c0, texture_ref, &rgba, pages)?;
+    crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
+    crate::runtime::drain::note_store_route("gva_flush_copied");
+    Ok(extent)
+}
+
+/// The copying arm's body: convert `rgba` into the destination's own texel
+/// order and write it into the guest pages `pages` licenses.
+///
+/// Split out from [`store_gva_frame`] at the readback boundary so it can be
+/// tested against real guest memory without a device — the readback is the only
+/// part of the arm that needs one.
+///
+/// It forgets both GVA pixel caches on the way out, exactly as the direct arm
+/// does and for the same reason: after this call the guest's own pages hold the
+/// frame, and a stale entry left behind would serve a later sample the previous
+/// Store's bytes. `write_gva_rgba8_within` records the host write itself, from
+/// inside `gva_view`, so the two arms leave the same witness behind and a
+/// decline is invisible to every reader of `gather_witness`.
+#[cfg(feature = "backend-vulkan")]
+fn land_gva_frame_bytes<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    c0: &crate::runtime::draw::ColorRtRequest,
+    texture_ref: u32,
+    rgba: &[u8],
+    pages: &crate::runtime::draw::StoreTargetPages,
+) -> Result<u64, GvaWritebackDecline> {
+    // The destination extent in the destination's own bytes, which is what the
+    // direct arm returns too — the two rails must agree about how much guest
+    // memory a Store of this geometry lands, or a caller could tell them apart.
+    let Some(tight) = crate::contract::pixel_format::tight_row_bytes(c0.width, c0.format) else {
+        return Err(GvaWritebackDecline::FormatNeedsConversion { format: c0.format });
+    };
+    let extent =
+        u64::from(c0.height.saturating_sub(1)) * u64::from(c0.row_stride) + u64::from(tight);
+    crate::runtime::draw::write_gva_rgba8_within(
+        state,
+        host,
+        task_id,
+        c0.target_gva,
+        c0.width,
+        c0.height,
+        c0.row_stride,
+        c0.format,
+        rgba,
+        Some(pages.membership()),
+    )
+    .map_err(|err| GvaWritebackDecline::CopiedWriteRefused { err })?;
+    forget_gva_host_copies(state, task_id, c0.target_gva, texture_ref);
+    Ok(extent)
+}
+
+/// Drop every host-side copy of a GVA target's pixels.
+///
+/// Both arms of [`store_gva_frame`] end here: once the guest's pages hold the
+/// frame they are the only place it exists, and a cache entry left behind would
+/// serve a later sample the previous Store's bytes. One function rather than two
+/// copies of the pair, because a copied rule is the next divergence.
+#[cfg(feature = "backend-vulkan")]
+fn forget_gva_host_copies(state: &mut DeviceState, task_id: u32, target_gva: u64, texture_ref: u32) {
+    crate::runtime::surface_cache::evict_gva(state, target_gva);
+    if texture_ref != 0 {
+        crate::runtime::surface_cache::evict_texture(state, task_id, texture_ref);
+    }
+}
+
 /// Copy `identity`'s pixels into the guest pages behind a type-2/3 render
 /// target's `target_gva`, with no host copy of the frame at any point.
 ///
 /// The GVA twin of [`store_render_frame`]'s first arm, and worth diffing
 /// against it: both end in `copy_target_to_guest_pages` and they differ only in
-/// how the destination pages are named. A mapping carries its own page list and
-/// a page-table vouch licenses it; a GVA carries neither, so the licence is the
-/// exact page list supplied in `pages`, which this rail may not widen. The eager
-/// fallback captures it before draw submission; deferred payment gets it from
-/// the live resource's transfer backing.
+/// how the destination pages are named.
 ///
 /// # Why this is the whole cost of a GVA synchronization
 ///
-/// The fallback behind this call reads the resident back to the host
-/// (`read_resident_chain`, a blocking fence) and then writes it out again a row
-/// at a time through `convert_rgba8_to_row`. On a driven desktop-compositing
-/// boot that is 59 % of render Stores and most of the time the device spends
-/// waiting on a fence. Everything this call declines on pays that instead, so a
-/// decline is a cost and never a lost frame.
+/// The arm behind this one reads the resident back to the host (a blocking
+/// fence) and then writes it out again a row at a time through
+/// `convert_rgba8_to_row`. On a driven desktop-compositing boot that is 59 % of
+/// render Stores and most of the time the device spends waiting on a fence.
+/// Everything this call declines on pays that instead.
 ///
 /// # What it does not do
 ///
@@ -1203,7 +1377,7 @@ crate::observe::decline::decline_display!(GvaWritebackDecline);
 /// previous Store's bytes. The sampled rail re-reads them from guest memory,
 /// which is what `store_gva_owned`'s `guest_holds_bytes` already promised.
 #[cfg(feature = "backend-vulkan")]
-pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
+fn store_gva_frame_direct<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
@@ -1293,10 +1467,7 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
         .map_err(|inner| GvaWritebackDecline::Engine { inner })?;
     // Nothing here leaves a host copy of the frame, so neither GVA-keyed cache
     // may go on naming one.
-    crate::runtime::surface_cache::evict_gva(state, c0.target_gva);
-    if texture_ref != 0 {
-        crate::runtime::surface_cache::evict_texture(state, task_id, texture_ref);
-    }
+    forget_gva_host_copies(state, task_id, c0.target_gva, texture_ref);
     // The copy means this image has stopped being the only place these pixels
     // exist, so the reclaim paths may take it — the same handover
     // `store_render_frame` performs in `finish`.
@@ -1312,16 +1483,134 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     // witness records is compared against that same ring — capturing it first
     // would have every target permanently invalidated by its own Store.
     //
-    // Only this rail stamps. The copying arm (`gva_store_sync`) leaves no
-    // witness, so its targets never read quiet and never take the shortcut this
-    // arms. That is safe and deliberate rather than an oversight: it is the arm
-    // a host without the guest-RAM import takes, and it already pays a blocking
-    // readback per Store, so the shortcut is worth less there and the rails stay
-    // easier to tell apart.
+    // Only this rail stamps. Both copying arms — the eager `gva_store_sync` and
+    // [`land_gva_frame_bytes`] behind this call — leave no witness, so their
+    // targets never read quiet and never take the shortcut this arms. That is
+    // safe and deliberate rather than an oversight: it is the arm a host without
+    // the guest-RAM import takes, and it already pays a blocking readback per
+    // Store, so the shortcut is worth less there and the rails stay easier to
+    // tell apart. The frame is in the guest's pages either way; what a missing
+    // stamp costs is a re-read, never a wrong image.
     if let Some(key) = crate::runtime::gva_store_witness::GvaTargetKey::of(identity) {
         crate::runtime::gva_store_witness::note_store(state, host, key, gpas);
     }
     Ok(extent)
+}
+
+#[cfg(all(test, feature = "backend-vulkan"))]
+mod gva_copying_arm_tests {
+    use super::*;
+    use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
+    use crate::runtime::draw::{ColorRtRequest, StoreTargetPages};
+    use crate::runtime::gva_mem::define_task_pages_arm64e;
+    use crate::runtime::host::FakeHost;
+
+    /// The first data page `define_task_pages_arm64e` installs, as a PFN. The
+    /// task's GVA page `i` is this plus `i`, which is what lets a test name a
+    /// destination page and the licence for it from one number.
+    const DATA_BASE_PFN: u64 = 4;
+    const PAGES: u32 = 8;
+    /// GVA page 1, so the destination is neither the null address
+    /// `write_gva_rows_within` rejects nor the first page of the walk.
+    const TARGET_GVA: u64 = 1 << PAGE_SHIFT_ARM64E;
+    const W: u32 = 4;
+    const H: u32 = 2;
+    const BPR: u32 = 16;
+
+    fn fixture() -> (FakeHost, DeviceState) {
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        define_task_pages_arm64e(&mut host, &mut state, DATA_BASE_PFN as u32, PAGES);
+        (host, state)
+    }
+
+    fn request() -> ColorRtRequest {
+        ColorRtRequest {
+            texture_ref: 0,
+            target_gva: TARGET_GVA,
+            row_stride: BPR,
+            width: W,
+            height: H,
+            // Byte-identical with the RGBA8 the readback hands over, so the
+            // assertion below is about where the bytes landed and not about the
+            // conversion, which has its own tests.
+            format: crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+            store_action: crate::contract::pass_action::MTL_STORE_ACTION_STORE,
+            ..Default::default()
+        }
+    }
+
+    fn frame() -> Vec<u8> {
+        (0..(W * H * 4) as u8).map(|b| b.wrapping_add(1)).collect()
+    }
+
+    /// The page the destination lives in, as a one-entry licence.
+    fn licence_for(page_index: u64) -> StoreTargetPages {
+        let span = u64::from(BPR) * u64::from(H);
+        StoreTargetPages::from_ordered(&[(DATA_BASE_PFN + page_index) << PAGE_SHIFT_ARM64E], span)
+    }
+
+    /// The whole point of the arm: a GVA render Store whose GPU-direct rail
+    /// cannot run still reaches the guest's pages.
+    ///
+    /// Before this arm existed the deferred payer had nothing behind the direct
+    /// decline and reported `gvadebt_pay_lost`, so these bytes never left the
+    /// resident on any host without `VK_EXT_external_memory_host`.
+    #[test]
+    fn the_copying_arm_lands_the_frame_in_the_guests_own_pages() {
+        let (mut host, mut state) = fixture();
+        let rgba = frame();
+        let pages = licence_for(1);
+        let extent = land_gva_frame_bytes(&mut state, &mut host, 1, &request(), 0, &rgba, &pages)
+            .expect("the licensed page is writable");
+        assert_eq!(
+            extent,
+            u64::from(H - 1) * u64::from(BPR) + u64::from(W) * 4,
+            "the extent must be the destination's own bytes, as the direct arm reports"
+        );
+        let gpa = (DATA_BASE_PFN + 1) << PAGE_SHIFT_ARM64E;
+        for y in 0..H as usize {
+            let mut got = [0u8; (W * 4) as usize];
+            crate::runtime::host::HostMemory::read_gpa(
+                &host,
+                gpa + (y as u64) * u64::from(BPR),
+                &mut got,
+            )
+            .expect("the destination page is guest RAM");
+            let at = y * (W * 4) as usize;
+            assert_eq!(
+                &got[..],
+                &rgba[at..at + (W * 4) as usize],
+                "row {y} of the frame did not reach the guest"
+            );
+        }
+    }
+
+    /// The copying arm may not widen the licence the direct arm was given.
+    ///
+    /// A GVA carries no page list of its own, so the supplied one is the entire
+    /// authorisation. A second rail that re-walked and wrote wherever the
+    /// address points now would be the stale-view class this device already
+    /// bounds — so the arm refuses by name and the guest's memory is untouched.
+    #[test]
+    fn the_copying_arm_refuses_a_page_its_licence_does_not_name() {
+        let (mut host, mut state) = fixture();
+        let rgba = frame();
+        // A licence naming some other page of the same task.
+        let pages = licence_for(5);
+        let refusal = land_gva_frame_bytes(&mut state, &mut host, 1, &request(), 0, &rgba, &pages)
+            .expect_err("the destination page is outside the licence");
+        assert_eq!(
+            crate::observe::Decline::slug(&refusal),
+            "gvawb_copied_write_refused",
+            "an unlicensed write is a named refusal, not a silent skip"
+        );
+        let gpa = (DATA_BASE_PFN + 1) << PAGE_SHIFT_ARM64E;
+        let mut got = [0u8; (W * 4) as usize];
+        crate::runtime::host::HostMemory::read_gpa(&host, gpa, &mut got)
+            .expect("the destination page is guest RAM");
+        assert_eq!(got, [0u8; (W * 4) as usize], "nothing may have been written");
+    }
 }
 
 #[cfg(test)]
