@@ -7,7 +7,9 @@
 use crate::contract::draw::DrawArgs;
 use crate::contract::endian::{ld32, ld64};
 use crate::contract::pass_action::{
-    MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD, MTL_STORE_ACTION_STORE,
+    store_action_publishes_single_sample, MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD,
+    MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, MTL_STORE_ACTION_STORE,
+    MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
 };
 use crate::contract::pixel_format::{
     f64_to_unorm8, solid_rgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
@@ -26,17 +28,17 @@ use crate::runtime::decode::fifo::{
     CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN, CHILD_EXEC_INDIRECT_TASK_ID,
 };
 use crate::runtime::decode::render::{
-    self, attachment_subresource_is_bindable, decode_color_attachment, decode_depth_attachment,
-    LevelSupport,
-    decode_stencil_attachment, ColorAttachment, DepthAttachment, Kind as RenderKind, ScissorRect,
-    Stage, StencilAttachment, PASS_MAX_COLOR_ATTACHMENTS,
+    self, attachment_subresource_is_bindable, color_attachment_subresource_is_bindable,
+    decode_color_attachment, decode_depth_attachment, decode_stencil_attachment, ColorAttachment,
+    DepthAttachment, Kind as RenderKind, LevelSupport, ScissorRect, Stage, StencilAttachment,
+    PASS_MAX_COLOR_ATTACHMENTS,
 };
 use crate::runtime::decode::stream::{
     self, decode_first_record, decode_next_record, SEGMENT_TYPE_BLIT, SEGMENT_TYPE_COMPUTE,
     SEGMENT_TYPE_EVENT, SEGMENT_TYPE_INFO, SEGMENT_TYPE_RENDER,
 };
 use crate::runtime::draw::{
-    self, BufferBind, EncodeStatus, IndexedDrawInfo, SamplerBind, TextureBind,
+    self, BindTable, BufferBind, EncodeStatus, IndexedDrawInfo, SamplerBind, TextureBind,
     MAX_BUFFER_BIND_SLOTS, MAX_SAMPLER_BIND_SLOTS, MAX_TEXTURE_BIND_SLOTS,
 };
 use crate::runtime::fence_exec;
@@ -52,21 +54,6 @@ use reims_vgpu_wire::ops::render as wire_render;
 use reims_vgpu_wire::ops::render_pass as wire_pass;
 use reims_vgpu_wire::ops::tile as wire_tile;
 use std::sync::Arc;
-
-/// One stage's bind table as a draw sees it.
-///
-/// `Arc` rather than a plain `Vec` because a render stream's draws share their
-/// bind state: the guest sets a table once and then issues many draws against
-/// it, so snapshotting per draw copied the same entries over and over. The
-/// accumulator mutates through [`Arc::make_mut`], which copies only when a
-/// snapshot is actually outstanding — so a stream that binds once and draws 400
-/// times allocates one table and 400 pointers.
-///
-/// That is what makes an unbounded draw list affordable, and an unbounded draw
-/// list is what the protocol requires: the guest emits as many records as its
-/// encoder recorded and every one of them contributes to the same attachment
-/// set. See [`StreamDrawDrop`].
-type BindTable<T> = Arc<Vec<T>>;
 
 /// Pending render-pass ICB execute (range form or indirect range buffer).
 #[derive(Clone, Debug, Default)]
@@ -188,9 +175,22 @@ struct StreamAccum {
     /// record genuinely replaces the first. What *accumulates* across draws is
     /// the count in the guest's buffer, not the arming.
     visibility: Option<draw::VisibilityArming>,
-    /// Draw records this stream decoded but did not keep. See
-    /// [`StreamDrawDrop`]; reported once per stream by [`note_stream_draw_drops`].
-    dropped_unbound: u32,
+    /// Draw records this stream decoded but did not keep because no pipeline was
+    /// latched. See [`StreamDrawDrop`]; reported once per stream by
+    /// [`note_stream_draw_drops`].
+    dropped_no_pipeline: u32,
+    /// Draw records this stream decoded but did not keep because they asked for
+    /// zero vertices.
+    ///
+    /// Split from [`Self::dropped_no_pipeline`] because the two are opposite
+    /// findings that were folded into one number for as long as the emitter has
+    /// existed: a zero count is a **legal empty draw** and nothing is lost, while
+    /// an unlatched pipeline is a **draw the guest asked for and this device
+    /// dropped**. [`StreamDrawDrop::Unbound`]'s own doc said to read the rate to
+    /// tell them apart, which cannot work when both increment the same field —
+    /// a workload emitting thousands of legal empty draws reads identically to
+    /// one losing thousands of real ones.
+    dropped_zero_count: u32,
     /// Something the guest asked this stream for that its state cannot carry.
     ///
     /// Every arm that sets this used to note its loss and carry on, and all of
@@ -231,7 +231,7 @@ impl StreamAccum {
     fn clears_reaching_guest_pages(&self) -> impl Iterator<Item = &ColorAttachment> {
         self.clears
             .iter()
-            .filter(|att| att.store_action == MTL_STORE_ACTION_STORE)
+            .filter(|att| store_action_publishes_single_sample(att.store_action))
     }
 
     /// The stream's bind state as a `PendingDraw`, or what makes it
@@ -298,12 +298,13 @@ impl StreamAccum {
 /// per-record cost at one pointer per stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StreamDrawDrop {
-    /// The record arrived with no pipeline bound or a zero primitive count.
+    /// The record arrived with no pipeline bound: a `SetPipeline` this decoder
+    /// failed to latch, and therefore a **lost draw**.
     ///
-    /// Either a genuinely empty draw — legal, and nothing is lost — or a
-    /// `SetPipeline` this decoder failed to latch, which is a lost draw. The
-    /// count is what separates the two: a rate that tracks the draw rate is the
-    /// second reading, an occasional one is the first.
+    /// This used to also carry the zero-primitive-count case, which is a legal
+    /// empty draw that loses nothing, and told the reader to separate the two by
+    /// the rate. That could not work — both incremented one field — so the two
+    /// now count apart at the check and only this one is a loss.
     Unbound { dropped: u32 },
     /// A depth or stencil attachment this device cannot honour as decoded.
     ///
@@ -1062,12 +1063,37 @@ fn compute_translation_inputs(stream: &[u8]) -> Vec<(u32, [u32; 3])> {
 /// refuses `command_end > bytes.len()`, so `bytes_offset + length` is inside
 /// `stream` by construction — the five copies of that same bounds check each
 /// had a silent `return` behind a branch none of them could take.
+///
+/// # The record count is the denominator for `exec_phase walk_us`
+///
+/// `walk_us` is the largest single span this device reports — 31.6 s of a 45.6 s
+/// driven macos-13 Maps window, against 6.4 s of actual drawing — and until this
+/// counter existed there was no way to tell which of two very different readings
+/// it was. 857 us per stream is either tens of microseconds spent on each of a
+/// few dozen records, which points at one expensive handler, or a fraction of a
+/// microsecond spent on each of tens of thousands, which points at the guest
+/// simply sending that many. Counted per segment family, because a blit record
+/// and a render record cost nothing like the same and the mix is what says which
+/// of the two the wall clock belongs to.
 fn walk_segment_records(stream: &[u8], seg: &stream::Segment, mut handle: impl FnMut(u32, &[u8])) {
     let mut cursor = 0usize;
+    let mut records = 0u64;
     let mut next = decode_first_record(stream, seg, &mut cursor);
+    let (route, route_us) = match seg.type_ {
+        SEGMENT_TYPE_RENDER => ("walk_records_render", "walk_render_us"),
+        SEGMENT_TYPE_BLIT => ("walk_records_blit", "walk_blit_us"),
+        SEGMENT_TYPE_COMPUTE => ("walk_records_compute", "walk_compute_us"),
+        _ => ("walk_records_other", "walk_other_us"),
+    };
+    // One clock pair per *segment*, not per record. A stream carries at most a
+    // handful of segments and tens of thousands of records, so this splits
+    // `exec_phase walk_us` by family for a cost that does not show up, where
+    // per-record timing would cost more than the handlers it measured.
+    let started = std::time::Instant::now();
     loop {
         match next {
             Ok(rec) => {
+                records += 1;
                 let start = rec.bytes_offset as usize;
                 handle(rec.opcode, &stream[start..start + rec.length as usize]);
                 next = decode_next_record(stream, seg, &mut cursor);
@@ -1075,6 +1101,11 @@ fn walk_segment_records(stream: &[u8], seg: &stream::Segment, mut handle: impl F
             // `Done` is end-of-segment and yields `None` here, so the normal exit
             // path stays silent; anything else names the check that refused.
             Err(status) => {
+                crate::runtime::drain::note_store_route_n(route, records);
+                crate::runtime::drain::note_store_route_us(
+                    route_us,
+                    started.elapsed().as_micros() as u64,
+                );
                 if let Some(e) = crate::observe::Emit::refusal("stream_record_fail", &status) {
                     // Latch per segment family: a guest re-submitting a malformed
                     // stream sends it on every frame and the second line carries
@@ -1417,6 +1448,17 @@ fn handle_blit_record<M: HostMemory + HostOps>(
     opcode: u32,
     cmd_bytes: &[u8],
 ) {
+    // `walk_blit_us` charges this rail 33.3 s of a 45 s driven Maps window and
+    // every clock inside `execute_blit` accounts for 0.14 s of it. The gap has
+    // to be in this function, and only two things here are outside that call:
+    // the decode above, and the `Fence` arm, which reaches
+    // `execute_blit_fence` directly rather than through `execute_blit`. A
+    // blocking fence wait costs exactly what is missing and does no work while
+    // it costs it, which is why no copy clock can see it.
+    //
+    // Timed at the closure `walk_segment_records` calls, so decode is inside the
+    // span and no arm can leave without being charged.
+    let record_started = std::time::Instant::now();
     let cmd = match blit::decode(cmd_bytes) {
         Ok(c) => c,
         // Was `Err(_) => return`: a decoded blit record dropped with no line at
@@ -1584,6 +1626,23 @@ fn handle_blit_record<M: HostMemory + HostOps>(
             ));
         }
     }
+    crate::runtime::drain::note_store_route_us(
+        match cmd.kind {
+            BlitKind::Fence => "blitrec_fence_us",
+            BlitKind::Copy => "blitrec_copy_us",
+            BlitKind::FillBuffer | BlitKind::FillBufferPattern4 => "blitrec_fill_us",
+            BlitKind::Resource | BlitKind::Image => "blitrec_noop_us",
+            _ => "blitrec_other_us",
+        },
+        record_started.elapsed().as_micros() as u64,
+    );
+    crate::runtime::drain::note_store_route(match cmd.kind {
+        BlitKind::Fence => "blitrec_fence_n",
+        BlitKind::Copy => "blitrec_copy_n",
+        BlitKind::FillBuffer | BlitKind::FillBufferPattern4 => "blitrec_fill_n",
+        BlitKind::Resource | BlitKind::Image => "blitrec_noop_n",
+        _ => "blitrec_other_n",
+    });
 }
 
 fn handle_render_record<M: HostMemory + HostOps>(
@@ -1620,7 +1679,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // and the next draw encoded against it — a wrong frame with nothing
             // on any channel. Dropping the record is not the neutral choice it
             // looks like: `acc.pipeline_ref == 0` is already a state the draw arm
-            // knows, where it declines as `dropped_unbound` and says so. Letting
+            // knows, where it declines as `dropped_no_pipeline` and says so. Letting
             // the zero through routes this into that named decline instead of
             // into a stale bind.
             //
@@ -1640,7 +1699,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 crate::observe::fail(
                     "stream_set_pipeline reason=render_set_pipeline_zero_ref \
                      (a render pipeline was set to ref 0; the pass is now unbound \
-                     and its draws decline as dropped_unbound)",
+                     and its draws decline as dropped_no_pipeline)",
                 );
             }
             acc.pipeline_ref = cmd.pipeline_ref;
@@ -1668,6 +1727,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     (b.buffer_ref != 0).then_some(BufferBind {
                         index,
                         buffer_ref: b.buffer_ref,
+                        resource: objects::resolve_resource(state, host, task_id, b.buffer_ref)
+                            .ok(),
                         offset: b.offset,
                         attribute_stride: b.attribute_stride,
                     })
@@ -1768,7 +1829,12 @@ fn handle_render_record<M: HostMemory + HostOps>(
                             out.type11_mappings.push(texture_ref);
                         }
                     }
-                    Some(TextureBind { index, texture_ref })
+                    Some(TextureBind {
+                        index,
+                        texture_ref,
+                        resource: objects::resolve_resource(state, host, task_id, texture_ref)
+                            .ok(),
+                    })
                 },
             );
             out.texture_unbinds = out.texture_unbinds.saturating_add(cleared);
@@ -1945,8 +2011,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         continue;
                     }
                     let slot = i as u32;
-                    // A slice, a depth plane or a multisample resolve target is
-                    // rendered past rather than into, and the pass is refused
+                    // A slice or depth plane is rendered past rather than into,
+                    // and the pass is refused
                     // for it. This used to be reported and then rendered anyway,
                     // on the argument that dropping the pass "would trade wrong
                     // pixels for none, which is worse". That argument does not
@@ -1966,14 +2032,10 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     // renders a blur pyramid level by level and every one of
                     // those passes was being dropped here.
                     //
-                    // Through the shared predicate rather than terms written out
-                    // here, which is what this arm used to carry and is how
-                    // `resolve_texture_ref` went untested: a colour attachment
-                    // with `resolveTexture` set is a multisample colour pass, and
-                    // this device rendered it single-sampled into the attachment
-                    // and never wrote the resolve target the guest goes on to
-                    // read.
-                    if !attachment_subresource_is_bindable(att.into(), LevelSupport::AnyLevel) {
+                    // A resolve destination is not a source coordinate. It stays
+                    // on the attachment so the backend can perform the
+                    // end-of-pass resolve or refuse that exact operation.
+                    if !color_attachment_subresource_is_bindable(att.into()) {
                         let drop = note_color_subresource_unsupported(task_id, slot, &att);
                         acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
                     }
@@ -1987,26 +2049,36 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     {
                         entry.1 = att;
                     }
-                    if !acc.color_targets.contains(&att.texture_ref) {
-                        acc.color_targets.push(att.texture_ref);
+                    let published_ref = if att.resolve_texture_ref != 0 {
+                        att.resolve_texture_ref
+                    } else {
+                        att.texture_ref
+                    };
+                    if !acc.color_targets.contains(&published_ref) {
+                        acc.color_targets.push(published_ref);
                     }
                     if !out.texture_refs.contains(&att.texture_ref) {
                         out.texture_refs.push(att.texture_ref);
                     }
-                    if let Some(m) =
-                        objects::resolve_type11_ref(state, host, task_id, att.texture_ref)
+                    if att.resolve_texture_ref != 0
+                        && !out.texture_refs.contains(&att.resolve_texture_ref)
                     {
-                        note_pass_extent_for_slot(state, slot, m, &cmd);
+                        out.texture_refs.push(att.resolve_texture_ref);
+                    }
+                    if let Some(m) =
+                        objects::resolve_type11_ref(state, host, task_id, published_ref)
+                    {
+                        note_pass_extent_for_slot(state, task_id, slot, m, &cmd);
                         if !out.type11_mappings.contains(&m) {
                             out.type11_mappings.push(m);
                         }
-                    } else if objects::resolve_type4_surface(state, host, att.texture_ref) {
+                    } else if objects::resolve_type4_surface(state, host, published_ref) {
                         // A type-4 attachment is its own mapping id — the arm
                         // below pushes `att.texture_ref` where the type-11 arm
                         // pushes the id it resolved to.
-                        note_pass_extent_for_slot(state, slot, att.texture_ref, &cmd);
-                        if !out.type11_mappings.contains(&att.texture_ref) {
-                            out.type11_mappings.push(att.texture_ref);
+                        note_pass_extent_for_slot(state, task_id, slot, published_ref, &cmd);
+                        if !out.type11_mappings.contains(&published_ref) {
+                            out.type11_mappings.push(published_ref);
                         }
                     }
                     // The load action decides this, and only the load action.
@@ -2034,7 +2106,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // Also keep color0 from command for convenience.
             if cmd.color0.texture_ref != 0
                 && cmd.color0.load_action == MTL_LOAD_ACTION_CLEAR
-                && cmd.color0.store_action == MTL_STORE_ACTION_STORE
+                && store_action_publishes_single_sample(cmd.color0.store_action)
                 && !acc
                     .clears
                     .iter()
@@ -2093,8 +2165,10 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 acc.indexed = None;
             }
             // Snapshot bind state for this draw (archive multi-draw job).
-            if acc.pipeline_ref == 0 || count == 0 {
-                acc.dropped_unbound = acc.dropped_unbound.saturating_add(1);
+            if acc.pipeline_ref == 0 {
+                acc.dropped_no_pipeline = acc.dropped_no_pipeline.saturating_add(1);
+            } else if count == 0 {
+                acc.dropped_zero_count = acc.dropped_zero_count.saturating_add(1);
             } else {
                 match acc.bind_snapshot() {
                     Ok(snapshot) => acc.draws.push(PendingDraw {
@@ -3044,6 +3118,10 @@ fn finish_stream<M: HostMemory + HostOps>(
     out: &mut ExecResult,
     acc: &StreamAccum,
 ) {
+    // Opens in `Prelude` and is charged to whichever part is open until it
+    // drops, so the six tile this function rather than sampling it. See
+    // [`finish_phase`] for what the split is for.
+    let mut fin = finish_phase::FinishTimer::open();
     note_stream_draw_drops(task_id, acc);
     // Archive ApplePVGPUDrawJob: clear/load seed is private initial_rgba for the
     // async job; guest pages are written once at completion. Apply clear-to-guest
@@ -3310,6 +3388,7 @@ fn finish_stream<M: HostMemory + HostOps>(
             dirty_color_targets(state, host, task_id, &acc.color_targets);
         }
         for (di, pd) in draw_list.iter().enumerate() {
+            fin.enter(crate::runtime::drain::FinishPhase::Retarget);
             let mut req = if di == 0 {
                 let Some(req) = first_req.take() else {
                     break;
@@ -3322,7 +3401,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                 retarget_render_pass_draw(template, pd)
             };
             {
+                fin.enter(crate::runtime::drain::FinishPhase::Binds);
                 fill_draw_binds_from_pending(&mut req, pd);
+                (req.continues_render_pass, req.render_pass_continues) =
+                    render_pass_chain_position(di, draw_list.len());
                 // A resident type-11 target carries attachment contents between
                 // records without a CPU chain buffer. Like a native Metal render
                 // pass, only the final record performs the guest-visible Store;
@@ -3373,8 +3455,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                     out.render_guest_stores = out.render_guest_stores.saturating_add(1);
                 }
                 let draw_started = std::time::Instant::now();
+                fin.enter(crate::runtime::drain::FinishPhase::Encode);
                 let encode =
                     draw::encode_draw_chain(state, host, &mut req, do_writeback, force_full_store);
+                fin.enter(crate::runtime::drain::FinishPhase::Result);
                 // Read before the status is matched: a draw whose Store failed
                 // still ran its query, and the count is the guest's answer
                 // either way.
@@ -3513,6 +3597,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                 }
             }
         }
+        fin.enter(crate::runtime::drain::FinishPhase::Tail);
         write_visibility_results(state, host, task_id, acc, &visibility_counts);
         // Encode never landed Stores (NoMetal stubs, missing MTLB/pipeline, or
         // mrt resolve fail). Honor CLEAR load+store into guest/host pages so
@@ -3676,6 +3761,14 @@ impl crate::observe::Decline for ChainAbandonDecline {
 /// Seedless fixed-attachment template for records after the first draw in one
 /// serialized Metal render pass. Construct fields explicitly so a multi-MiB
 /// CPU LOAD seed is not cloned merely to reuse attachment identity/geometry.
+/// Position one draw in the decoded Metal render encoder that owns it.
+/// A one-draw encoder has neither edge; longer encoders expose exactly one
+/// start, one end, and a continuation on both sides of every middle draw.
+fn render_pass_chain_position(index: usize, len: usize) -> (bool, bool) {
+    debug_assert!(index < len);
+    (index > 0, index + 1 < len)
+}
+
 fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::DrawEncodeRequest {
     let colors = first
         .colors
@@ -3689,10 +3782,12 @@ fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::Dra
             width: c.width,
             height: c.height,
             format: c.format,
+            sample_count: c.sample_count,
             load_action: MTL_LOAD_ACTION_LOAD,
             store_action: c.store_action,
             clear_color: c.clear_color,
             target_seed_rgba: None,
+            multisample_source_ref: c.multisample_source_ref,
         })
         .collect();
     draw::DrawEncodeRequest {
@@ -3814,12 +3909,15 @@ fn execute_indirect_draw<M: HostMemory + HostOps>(
     }
 
     // A zero count here is the guest's own, read from its own buffer, and it is
-    // a legal empty draw rather than a record this device failed to decode —
-    // so it takes `dropped_unbound` the way a zero-count direct draw does, and
-    // that counter's two readings ("an empty draw" / "a pipeline we failed to
-    // latch") are unchanged by this arm joining it.
-    if acc.pipeline_ref == 0 || args.vertex_count == 0 {
-        acc.dropped_unbound = acc.dropped_unbound.saturating_add(1);
+    // a legal empty draw rather than a record this device failed to decode — so
+    // it takes the zero-count counter the way a zero-count direct draw does, and
+    // the unlatched-pipeline reading beside it stays a loss on both arms.
+    if acc.pipeline_ref == 0 {
+        acc.dropped_no_pipeline = acc.dropped_no_pipeline.saturating_add(1);
+        return;
+    }
+    if args.vertex_count == 0 {
+        acc.dropped_zero_count = acc.dropped_zero_count.saturating_add(1);
         return;
     }
     match acc.bind_snapshot() {
@@ -3909,12 +4007,12 @@ fn multi_draw_chain_source(resident_chain: bool, cpu_chain_ready: bool) -> Multi
 }
 
 fn fill_draw_binds_from_pending(req: &mut draw::DrawEncodeRequest, pd: &PendingDraw) {
-    req.vertex_buffers = pd.vertex_buffers.as_ref().clone();
-    req.fragment_buffers = pd.fragment_buffers.as_ref().clone();
-    req.vertex_textures = pd.vertex_textures.as_ref().clone();
-    req.fragment_textures = pd.fragment_textures.as_ref().clone();
-    req.vertex_samplers = pd.vertex_samplers.as_ref().clone();
-    req.fragment_samplers = pd.fragment_samplers.as_ref().clone();
+    req.vertex_buffers.clone_from(&pd.vertex_buffers);
+    req.fragment_buffers.clone_from(&pd.fragment_buffers);
+    req.vertex_textures.clone_from(&pd.vertex_textures);
+    req.fragment_textures.clone_from(&pd.fragment_textures);
+    req.vertex_samplers.clone_from(&pd.vertex_samplers);
+    req.fragment_samplers.clone_from(&pd.fragment_samplers);
     req.viewports.clone_from(&pd.viewports);
     req.scissors.clone_from(&pd.scissors);
     req.indexed = pd.indexed.clone();
@@ -3985,9 +4083,18 @@ fn land_chain_before_abandon<M: HostMemory + HostOps>(
     chain_rgba: &mut Option<Vec<u8>>,
     end: ChainEnd,
 ) {
+    // The one caller that has no identity to be handed. The chain broke, so no
+    // span carries the key its last good record registered, and the abandoning
+    // read has to name the resident from the state it can still see. That is a
+    // second derivation and it is spelled out here rather than hidden inside
+    // `read_resident_chain`, because every *other* caller has the draw's own
+    // key and a shared re-derivation would silently give them this one's answer
+    // — see `draw::M2vDrawSpan::ResidentSurfaceStore` for what that cost.
     #[cfg(feature = "backend-vulkan")]
     if end.resident && chain_rgba.is_none() {
-        *chain_rgba = draw::read_resident_chain(state, req);
+        if let Some(identity) = draw::render_chain_identity(state, req) {
+            *chain_rgba = draw::read_resident_chain(req, &identity);
+        }
     }
     #[cfg(not(feature = "backend-vulkan"))]
     let _ = (req, end.resident);
@@ -4004,14 +4111,42 @@ fn apply_clear<M: HostMemory + HostOps>(
     task_id: u32,
     att: &ColorAttachment,
 ) -> bool {
-    if att.texture_ref == 0 || att.store_action != MTL_STORE_ACTION_STORE {
+    if att.texture_ref == 0 || !store_action_publishes_single_sample(att.store_action) {
         return false;
     }
+    if att.store_action == MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE {
+        crate::observe::fail(format!(
+            "render_clear reason=clear_store_and_multisample_resolve_unsupported \
+             source={} resolve={}",
+            att.texture_ref, att.resolve_texture_ref
+        ));
+        return false;
+    }
+    if att.store_action == MTL_STORE_ACTION_MULTISAMPLE_RESOLVE
+        && att.resolve_texture_ref == 0
+    {
+        crate::observe::fail(format!(
+            "render_clear reason=clear_multisample_resolve_target_missing source={}",
+            att.texture_ref
+        ));
+        return false;
+    }
+    let target = if att.resolve_texture_ref != 0 {
+        ColorAttachment {
+            texture_ref: att.resolve_texture_ref,
+            resolve_texture_ref: 0,
+            level: 0,
+            store_action: MTL_STORE_ACTION_STORE,
+            ..*att
+        }
+    } else {
+        *att
+    };
     // Prefer full draw-path resolve (type-11 or type-2/3 GVA wallpaper targets).
     let Some(req) =
         // A clear-only pass: no pipeline and no geometry, so every draw
         // argument including the base instance is zero by construction.
-        draw::color_target_request(state, host, task_id, *att, 0, 0, 1, 0, 0, 0)
+        draw::color_target_request(state, host, task_id, target, 0, 0, 1, 0, 0, 0)
     else {
         // A clear whose color target cannot resolve (mapping unresolved, geometry
         // missing) is dropped here with no other trace — the "background didn't
@@ -4063,6 +4198,8 @@ fn apply_clear<M: HostMemory + HostOps>(
     state.note_surface_clear(c0.mapping_id);
     ok
 }
+
+pub(crate) mod finish_phase;
 
 mod report;
 use report::{

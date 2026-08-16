@@ -48,10 +48,13 @@ pub mod device_features;
 pub mod device_select;
 pub mod host_pointer;
 pub mod linear_sampled;
+pub mod linear_target;
 pub mod memory_topology;
+pub mod push_descriptor;
 
 pub(crate) use host_pointer::{HostPointerCaps, HostPointerImport};
 pub(crate) use memory_topology::{MappedMemoryKind, MemoryClass, MemoryProfile};
+pub(crate) use push_descriptor::PushDescriptorCaps;
 
 use ash::vk;
 
@@ -87,12 +90,20 @@ impl DriverQuirk {
 #[derive(Clone, Debug)]
 pub struct HostGpuCaps {
     pub memory: MemoryProfile,
+    /// `maxMemoryAllocationSize` — see
+    /// [`memory_topology::max_allocation_size`]. Read by the one memory-type
+    /// entry point, which refuses an allocation past it rather than making a
+    /// call the specification declares invalid.
+    pub max_allocation_size: u64,
     pub quirks: DriverQuirk,
     /// Whether guest RAM may be imported as `VkDeviceMemory` through a host
     /// pointer over a whole RAMBlock, and at what granularity. Read by
     /// `runtime::guest_ram_map` through the granularity latch, by the import
     /// site, and by nothing else.
     pub host_pointer: HostPointerCaps,
+    /// Whether descriptor writes may be recorded directly into a command
+    /// buffer, and the maximum total descriptors in such a set layout.
+    pub push_descriptor: PushDescriptorCaps,
     /// `VK_KHR_portability_subset` was advertised. Kept for the selection log
     /// line and for constructing [`DriverQuirk`] — never gate behavior on it
     /// directly.
@@ -114,7 +125,7 @@ impl HostGpuCaps {
     /// something the device reported.
     pub fn selection_line(&self, device_name: &str) -> String {
         format!(
-            "vk_caps api={} baseline={} memory={} memory_signal={} device_local_mb={} host_visible_device_local_mb={} host_pointer_import={} host_pointer_align={} host_pointer_heap_mb={} portability_subset={} type={:?} name={device_name:?}",
+            "vk_caps api={} baseline={} memory={} memory_signal={} device_local_mb={} host_visible_device_local_mb={} host_pointer_import={} host_pointer_align={} host_pointer_heap_mb={} max_alloc_mb={} push_descriptors={} portability_subset={} type={:?} name={device_name:?}",
             api_floor::version_str(self.device_api_version),
             api_floor::version_str(api_floor::MIN_SUPPORTED_API),
             self.memory.topology.slug(),
@@ -124,6 +135,8 @@ impl HostGpuCaps {
             self.host_pointer.rung.slug(),
             self.host_pointer.min_alignment,
             self.host_pointer.heap_budget >> 20,
+            self.max_allocation_size >> 20,
+            self.push_descriptor.max_descriptors,
             self.portability_subset,
             self.device_type,
         )
@@ -138,12 +151,18 @@ mod tests {
     fn caps(api: u32, props: &vk::PhysicalDeviceMemoryProperties) -> HostGpuCaps {
         HostGpuCaps {
             memory: memory_topology::classify_memory(props),
+            // A real reported limit rather than a sentinel: it is on the
+            // selection line, and 4 GiB is the AMD APU value that made an
+            // unchecked import invalid usage.
+            max_allocation_size: 4 << 30,
             quirks: DriverQuirk::default(),
             host_pointer: HostPointerCaps {
                 rung: HostPointerImport::Supported,
                 min_alignment: 4096,
                 heap_budget: 8 << 30,
+                span_max: host_pointer::IMPORT_SPAN_CEILING,
             },
+            push_descriptor: PushDescriptorCaps::default(),
             portability_subset: false,
             device_api_version: api,
             device_type: vk::PhysicalDeviceType::DISCRETE_GPU,
@@ -179,6 +198,10 @@ mod tests {
         // `radv`/`amdgpu` failure: an operator whose guest is larger than this
         // number has a host that cannot import it, and no other field says so.
         assert!(line.contains("host_pointer_heap_mb=8192"), "{line}");
+        // `maxMemoryAllocationSize` is the other half of the same report: a
+        // host whose limit is below its heap refuses imports the heap could
+        // have held, and no other field on this line says so.
+        assert!(line.contains("max_alloc_mb=4096"), "{line}");
 
         let mut refused = caps(vk::API_VERSION_1_2, &fixtures::apple_m3_max());
         refused.host_pointer = HostPointerCaps::default();
@@ -201,6 +224,7 @@ mod tests {
             rung: HostPointerImport::NoHostPointerExtension,
             min_alignment: 0,
             heap_budget: 0,
+            span_max: 0,
         };
         let line = c.selection_line("Apple M3 Max");
         assert!(

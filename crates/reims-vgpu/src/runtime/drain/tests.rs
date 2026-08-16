@@ -1,4 +1,14 @@
 use super::*;
+
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_cpu_only_stamp_publishes_now_unless_its_fifo_has_an_older_completion() {
+    assert_eq!(StampOrder::from_debt(false, false), StampOrder::CpuReady);
+    assert_eq!(StampOrder::from_debt(true, false), StampOrder::Queued);
+    assert_eq!(StampOrder::from_debt(false, true), StampOrder::Queued);
+    assert!(!StampOrder::CpuReady.needs_blocking_fallback());
+    assert!(StampOrder::Declined.needs_blocking_fallback());
+}
 use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86, PAGE_SIZE_ARM64E};
 
 /// I2's carve-out, asserted rather than trusted: a partial packet is the
@@ -513,21 +523,13 @@ fn replace_physical_drops_the_cached_page_list() {
         let m = state.mappings.get_mut(&7).unwrap();
         m.mapped = true;
         m.page_entries = vec![0x11, 0x22, 0x33];
+        m.type4_walk = Some(crate::model::Type4Walk {
+            task_id: 0,
+            backing_pfn: 0x20,
+            map_generation: m.map_generation,
+        });
     }
     let generation_before = state.mappings.get(&7).unwrap().map_generation;
-
-    // A type-11 texture registered under object-list *ref* 7 of the same task,
-    // naming a different mapping. Surface ids and object-list refs are separate
-    // id spaces that collide, so resolving this packet through the ref-keyed map
-    // would land on mapping 99 — invalidating a surface the guest never named
-    // and leaving stale the one it did.
-    state.map_surface(99);
-    {
-        let m = state.mappings.get_mut(&99).unwrap();
-        m.mapped = true;
-        m.page_entries = vec![0xaa];
-    }
-    state.texture_to_mapping.insert((0, 7), 99);
 
     let mut payload = vec![0u8; 8];
     payload[4..8].copy_from_slice(&7u32.to_le_bytes()); // {task 0, object 7}
@@ -558,26 +560,13 @@ fn replace_physical_drops_the_cached_page_list() {
         "dropping the list must bump the incarnation, which is what retires the \
          type-4 walk latch and any state keyed on it"
     );
-    assert_eq!(
-        state.mappings.get(&99).unwrap().page_entries,
-        vec![0xaa],
-        "the object id is a mapping id, not an object-list ref: a mapping that \
-         merely shares the ref must be left alone"
-    );
 }
 
-/// A re-point naming an object this device holds no *mapping* for still names
-/// something: a type-11 texture, through the object-list ref its task registered
-/// it under. That fallback is the packet family the arm used to drop entirely —
+/// A re-point naming a type-11 resource reaches the mapping associated with its
+/// task-local ref. This is the packet family the arm used to drop entirely —
 /// 57 % of the re-points on a driven boot found no mapping under `object_id` —
 /// and dropping it leaves the texture's page list trusted while it names pages
 /// that back something else.
-///
-/// The fallback is safe here and only here, because the direct reading found
-/// nothing: there is no surface under this id to misroute the packet away from.
-/// [`replace_physical_drops_the_cached_page_list`] holds the other half — when
-/// the direct reading *does* answer, the ref-keyed map must not be consulted at
-/// all.
 #[test]
 fn replace_physical_routes_through_the_texture_ref_when_no_mapping_owns_the_id() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -618,15 +607,84 @@ fn replace_physical_routes_through_the_texture_ref_when_no_mapping_owns_the_id()
     );
 }
 
-/// The ref-keyed fallback must not fire when the direct reading found a mapping
-/// but that mapping happened to have no resolved pages. "Nothing to drop" is not
-/// "nobody owns this id", and treating it as one would walk into exactly the
-/// misroute [`replace_physical_drops_the_cached_page_list`] guards.
+/// ReplacePhysical is one resource's lifecycle transition, not a task reset.
+/// Retiring every GVA resident on the task loses unrelated host-authoritative
+/// frames when the compositor re-points several short-lived resources quickly.
 #[test]
-fn replace_physical_does_not_fall_back_when_the_named_mapping_is_merely_empty() {
+fn replace_physical_retires_only_the_named_resource() {
+    use crate::runtime::writeback_debt::{GvaResourceKey, GvaWritebackDebt};
+
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    state.map_surface(7); // exists, no page_entries
+    let key = |texture_ref| GvaResourceKey {
+        task_id: 3,
+        texture_ref,
+    };
+    let debt = |gva, generation| GvaWritebackDebt {
+        gva,
+        row_stride: 256,
+        width: 64,
+        height: 64,
+        format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        generation,
+        guest_write: Default::default(),
+        seq: 0,
+    };
+    assert_eq!(
+        state.pending_writebacks.arm_gva(key(12), debt(0x4000, 1)),
+        None
+    );
+    assert_eq!(
+        state.pending_writebacks.arm_gva(key(13), debt(0x8000, 2)),
+        None
+    );
+
+    let mut payload = vec![0u8; 8];
+    payload[0..4].copy_from_slice(&3u32.to_le_bytes());
+    payload[4..8].copy_from_slice(&12u32.to_le_bytes());
+    process_child_packet(
+        &mut state,
+        &mut host,
+        2,
+        &Packet {
+            opcode: CHILD_OP_REPLACE_PHYSICAL,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + 8,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        },
+    );
+
+    assert!(state.pending_writebacks.get_gva(key(12)).is_none());
+    assert_eq!(
+        state
+            .pending_writebacks
+            .get_gva(key(13))
+            .map(|debt| debt.generation),
+        Some(2),
+        "an unrelated resource on the task keeps its authoritative frame"
+    );
+}
+
+/// A same-number mapping owned by another task must not capture a task-local
+/// resource re-point. The association names mapping 99; mapping 7 merely shares
+/// its integer and has independent type-4 provenance.
+#[test]
+fn replace_physical_does_not_confuse_another_tasks_mapping_for_the_resource() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.map_surface(7);
+    {
+        let m = state.mappings.get_mut(&7).unwrap();
+        m.mapped = true;
+        m.page_entries = vec![0x77];
+        m.type4_walk = Some(crate::model::Type4Walk {
+            task_id: 1,
+            backing_pfn: 0x20,
+            map_generation: m.map_generation,
+        });
+    }
     state.map_surface(99);
     {
         let m = state.mappings.get_mut(&99).unwrap();
@@ -648,9 +706,13 @@ fn replace_physical_does_not_fall_back_when_the_named_mapping_is_merely_empty() 
     process_child_packet(&mut state, &mut host, 2, &pkt);
 
     assert_eq!(
-        state.mappings.get(&99).unwrap().page_entries,
-        vec![0xaa],
-        "an empty mapping still owns its id; the ref-keyed map must stay unread"
+        state.mappings.get(&7).unwrap().page_entries,
+        vec![0x77],
+        "task 1's surface 7 is unrelated to task 0's resource 7"
+    );
+    assert!(
+        state.mappings.get(&99).unwrap().page_entries.is_empty(),
+        "the task-local association names mapping 99"
     );
 }
 
@@ -782,7 +844,12 @@ fn composite_named_present_captures_the_named_member_however_far_it_lags() {
     state.present.height = h;
 
     let present_named = |state: &mut DeviceState, host: &mut FakeHost, mid: u32| {
-        process_child_packet(state, host, 5, &present_packet(CHILD_OP_DISPLAY_TRANSACTION2, mid));
+        process_child_packet(
+            state,
+            host,
+            5,
+            &present_packet(CHILD_OP_DISPLAY_TRANSACTION2, mid),
+        );
     };
 
     // Healthy alternation: both members publish, the named member is captured.
@@ -1361,15 +1428,22 @@ fn set_mapping_geom_size_change_resets_content_generation() {
         m.content_generation, 0,
         "new size must not keep prior gen (new surface identity)"
     );
-    // Same size again: preserve gen (no identity change).
+    // Same declaration again: preserve gen (no identity change).
+    //
+    // The format is held at `0x73` here on purpose. This line used to re-declare
+    // at `0x50` while asserting only that the *size* was unchanged, so it was
+    // reading a format change as "nothing changed" — and the reset it was
+    // pinning tested two thirds of the declaration. A format change withdraws
+    // the claim too, and that axis is covered by
+    // `model::state::mapping_declaration_tests`.
     {
         let m = state.mappings.get_mut(&4).unwrap();
         m.content_generation = 3;
     }
-    assert!(state.set_mapping_geom(4, 1440, 1080, 0x50));
+    assert!(state.set_mapping_geom(4, 1440, 1080, 0x73));
     assert_eq!(
         state.mappings[&4].content_generation, 3,
-        "same size preserves generation"
+        "an unchanged declaration preserves generation"
     );
 }
 
@@ -1856,6 +1930,58 @@ fn display_online_waits_for_enable_mask_then_signals() {
     assert!(host.actions.is_empty());
 }
 
+/// The first ONLINE pulse goes on the poll that first sees the enable bit, and
+/// does not wait out the re-assert cadence.
+///
+/// The guest is racing us for it. macOS's WindowServer asks
+/// `AppleParavirtFramebuffer` for a mappable VRAM aperture ~13 s into boot and
+/// aborts if it does not get one, taking the desktop with it for the life of the
+/// boot. This device used to gate the *enable-mask read* on the same divisor
+/// that paces the re-assert, so `apply_setup_shared_state` zeroing `poll_ctr`
+/// bought the handshake a full divisor of latency — measured at 2139-2365 ms
+/// across three boots, which is most of the margin WindowServer leaves.
+///
+/// So this is the ordering assertion and not a timing one: with the enable bit
+/// already set, one poll is enough. It fails on the previous code, which needed
+/// fifty.
+#[test]
+fn the_first_online_pulse_does_not_wait_out_the_reassert_cadence() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let gpa = 0x7b000000u64;
+    host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+    state.display.shared_gpa = gpa;
+    state.display.display_index = 0;
+    let mut m = [0u8; 4];
+    st32(&mut m, DISPLAY_ONLINE_EVENT_MASK);
+    host.write_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &m)
+        .unwrap();
+
+    // Exactly the state `apply_setup_shared_state` leaves behind, and then one
+    // single poll.
+    state.display.poll_ctr = 0;
+    state.display.online_tries = 0;
+    try_display_online(&mut state, &mut host);
+
+    assert_eq!(
+        state.display.online_tries, 1,
+        "the enable bit was set, so the first poll should have pulsed ONLINE \
+         rather than waiting for poll {DISPLAY_ONLINE_POLL_DIVISOR}"
+    );
+    assert_eq!(host.actions.len(), 1);
+    assert_eq!(host.actions[0].kind, HostActionKind::IrqGfxPulse);
+
+    // And the re-assert is still paced: the very next poll is not a multiple of
+    // the divisor, so it must not pulse again.
+    host.actions.clear();
+    try_display_online(&mut state, &mut host);
+    assert!(
+        host.actions.is_empty(),
+        "the divisor still paces every pulse after the first"
+    );
+    assert_eq!(state.display.online_tries, 1);
+}
+
 /// Display-lifecycle instrumentation: SETUP_SHARED_STATE, ONLINE ack, and the
 /// first ONLINE signal each leave an always-on line so a bad boot has a
 /// display-lifecycle timeline to correlate with post_converge_regress. A
@@ -2108,7 +2234,11 @@ fn the_vbl_census_reports_window_rate_and_separates_the_silent_arms() {
             lines.push(l);
         }
     }
-    assert_eq!(lines.len(), 16, "one report per 64 deliveries over the head");
+    assert_eq!(
+        lines.len(),
+        16,
+        "one report per 64 deliveries over the head"
+    );
     assert!(
         lines.iter().all(|l| l.contains("window_hz=125.0")),
         "every early window is 64 deliveries over 512 ms: {lines:?}"
@@ -2394,6 +2524,10 @@ fn a_fragmented_writeback_stages_nothing_when_the_staged_frame_is_the_source() {
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
+    // This test prices the fallback after a host declines a scattered alias.
+    // The default fixture can build a packed bounce view and would correctly
+    // take the contiguous arm instead.
+    host.strict_linux_map = true;
     // Large enough to span several guest pages: a frame that fits in one page is
     // contiguous by construction and would never reach the path under test.
     let (w, h) = (256u32, 64u32);
@@ -3022,7 +3156,10 @@ fn signal_display_vbl_declines_a_class_the_guest_did_not_enable() {
 
     // And the same tick delivers once the guest turns the class on, which is
     // what says the decline above is the mask and not some other refusal.
-    host.put_u32(gpa + DISPLAY_SHARED_ENABLE_MASK, 0x0e | DISPLAY_VBL_EVENT_MASK);
+    host.put_u32(
+        gpa + DISPLAY_SHARED_ENABLE_MASK,
+        0x0e | DISPLAY_VBL_EVENT_MASK,
+    );
     host.actions.clear();
     last_ms.store(0, std::sync::atomic::Ordering::Release);
     signal_display_vbl_at(&mut state, &mut host, &last_ms, 5_000_000);
@@ -3034,7 +3171,11 @@ fn signal_display_vbl_declines_a_class_the_guest_did_not_enable() {
         0,
         "the guest enabled VBL, so the pending bit is owed"
     );
-    assert_eq!(host.actions.len(), 1, "the guest enabled VBL, so an IRQ is owed");
+    assert_eq!(
+        host.actions.len(),
+        1,
+        "the guest enabled VBL, so an IRQ is owed"
+    );
 }
 
 /// The VBL limiter is phase-locked to a fixed interval grid so poll jitter
@@ -3145,7 +3286,8 @@ fn one_shot_display() -> (DeviceState, FakeHost, u64) {
 fn set_enable_mask(host: &mut FakeHost, gpa: u64, mask: u32) {
     let mut m = [0u8; 4];
     st32(&mut m, mask);
-    host.write_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &m).unwrap();
+    host.write_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &m)
+        .unwrap();
 }
 
 /// Did this tick hand the guest a VBL? Consumes the pending bit the way the
@@ -3179,19 +3321,30 @@ fn a_disarmed_tick_does_not_spend_the_grid_slot() {
     let last = AtomicU64::new(0);
 
     // The guest arms, and one interval in it is served.
-    set_enable_mask(&mut host, gpa, DISPLAY_VBL_EVENT_MASK | DISPLAY_ONLINE_EVENT_MASK);
+    set_enable_mask(
+        &mut host,
+        gpa,
+        DISPLAY_VBL_EVENT_MASK | DISPLAY_ONLINE_EVENT_MASK,
+    );
     signal_display_vbl_at(&mut state, &mut host, &last, interval);
     assert!(took_vbl(&mut host, gpa), "an armed guest is served");
 
     // It disarms inside its handler. The next grid point finds nothing armed.
     set_enable_mask(&mut host, gpa, DISPLAY_ONLINE_EVENT_MASK);
     signal_display_vbl_at(&mut state, &mut host, &last, 2 * interval);
-    assert!(!took_vbl(&mut host, gpa), "a disarmed guest is owed nothing");
+    assert!(
+        !took_vbl(&mut host, gpa),
+        "a disarmed guest is owed nothing"
+    );
 
     // It re-arms a millisecond later. A full interval has now passed since the
     // last *delivery*, so it must be served on the very next poll rather than
     // waiting out another interval it already waited.
-    set_enable_mask(&mut host, gpa, DISPLAY_VBL_EVENT_MASK | DISPLAY_ONLINE_EVENT_MASK);
+    set_enable_mask(
+        &mut host,
+        gpa,
+        DISPLAY_VBL_EVENT_MASK | DISPLAY_ONLINE_EVENT_MASK,
+    );
     signal_display_vbl_at(&mut state, &mut host, &last, 2 * interval + 1_000);
     assert!(
         took_vbl(&mut host, gpa),
@@ -3211,7 +3364,11 @@ fn a_continuously_armed_guest_is_still_capped_at_the_advertised_rate() {
     let interval = DISPLAY_VBL_MIN_INTERVAL_US;
     let (mut state, mut host, gpa) = one_shot_display();
     let last = AtomicU64::new(0);
-    set_enable_mask(&mut host, gpa, DISPLAY_VBL_EVENT_MASK | DISPLAY_ONLINE_EVENT_MASK);
+    set_enable_mask(
+        &mut host,
+        gpa,
+        DISPLAY_VBL_EVENT_MASK | DISPLAY_ONLINE_EVENT_MASK,
+    );
 
     // Poll far faster than the grid, the way the 4 ms PCI heartbeat oversamples
     // an 8333 us interval, and never disarm.
@@ -3264,7 +3421,10 @@ fn the_two_reporting_vbl_arms_do_not_share_one_window() {
         }
     }
     for (line, arm) in [
-        (served.expect("delivered reports at its own 1024"), "delivered"),
+        (
+            served.expect("delivered reports at its own 1024"),
+            "delivered",
+        ),
         (
             declined.expect("not_enabled reports at its own 1024"),
             "not_enabled",
@@ -4040,7 +4200,11 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
     // op6 does serialize a transaction, so the plane-list reading is its own
     // and must survive. Same alarm, different explanation.
     let cap = crate::observe::FailCapture::start();
-    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, vec![7u8; 64]));
+    note_display_txn_payload(
+        &mut state,
+        5,
+        &packet(CHILD_OP_DISPLAY_TRANSACTION2, vec![7u8; 64]),
+    );
     let lines = cap.lines();
     let line = lines
         .iter()
@@ -4105,8 +4269,14 @@ fn display_txn_trailer_slots_follow_the_emitting_command() {
     );
     // The present path reads the same field the census does, for every command.
     for (op, off) in [
-        (CHILD_OP_DISPLAY_TRANSACTION2, DISPLAY_TRANSACTION2_SURFACE_ID),
-        (CHILD_OP_DISPLAY_TRANSACTION3, DISPLAY_TRANSACTION3_SURFACE_ID),
+        (
+            CHILD_OP_DISPLAY_TRANSACTION2,
+            DISPLAY_TRANSACTION2_SURFACE_ID,
+        ),
+        (
+            CHILD_OP_DISPLAY_TRANSACTION3,
+            DISPLAY_TRANSACTION3_SURFACE_ID,
+        ),
         (CHILD_OP_DISPLAY_SWAP, DISPLAY_SWAP_MAPPING),
     ] {
         let mut p = vec![0u8; display_txn_trailer_len(op)];
@@ -4186,10 +4356,6 @@ fn a_resident_carried_present_is_unsampled_not_black() {
         PresentContentVerdict::Content
     );
 }
-
-
-
-
 
 /// Root and child `DefineTask2` decode one wire field one way.
 ///
@@ -4838,6 +5004,85 @@ fn a_stamp_wait_naming_a_slot_that_cannot_exist_runs_rather_than_parking() {
     );
 }
 
+/// The ledger separates a word this device is *holding* from one it has already
+/// handed to the publication rail.
+///
+/// That split is the whole reason the type exists: only the first is publishable
+/// early, and a repair that treats the second the same way releases packets
+/// ahead of the settle `write_stamp` carries — which is the unsoundness that got
+/// an earlier attempt reverted.
+#[test]
+fn the_stamp_ledger_separates_a_held_word_from_one_already_published() {
+    let page = 1u64 << PAGE_SHIFT_X86;
+    let mut ledger = StampLedger::default();
+    let wait = |slot: u32, value: u32| StampWait { index: slot, value };
+
+    assert_eq!(
+        ledger.classify(wait(2, 1)),
+        UnmetSource::Absent,
+        "a slot nothing has stamped is work we have not been given"
+    );
+
+    // Coalescing holds a word: publishable early, and safe to publish.
+    ledger.owe(2, 0x398f, page);
+    assert_eq!(
+        ledger.classify(wait(2, 0x398f)),
+        UnmetSource::Coalesced,
+        "a value in the latch is one this device could pay now"
+    );
+    assert_eq!(
+        ledger.classify(wait(2, 0x3990)),
+        UnmetSource::Absent,
+        "but only up to the value actually latched"
+    );
+
+    // Publication moves it: nothing left to pay, the GPU has to retire it.
+    ledger.wrote(2, 0x398f, page);
+    assert_eq!(
+        ledger.classify(wait(2, 0x398f)),
+        UnmetSource::Queued,
+        "once write_stamp has it, holding is correct and there is nothing to flush"
+    );
+
+    // A later latch on the same slot is owed again, above what was published.
+    ledger.owe(2, 0x3995, page);
+    assert_eq!(
+        ledger.classify(wait(2, 0x3995)),
+        UnmetSource::Coalesced,
+        "the next coalesced run is owed even though an older value was published"
+    );
+
+    // Publishing past an owed value clears it rather than leaving a stale debt.
+    ledger.wrote(2, 0x3999, page);
+    assert_eq!(
+        ledger.classify(wait(2, 0x3995)),
+        UnmetSource::Queued,
+        "a write past the latch drops the debt, or the ledger would offer to pay \
+         a word that has already gone"
+    );
+
+    // Wrapping order, matching `StampWait::satisfied_by`.
+    ledger.owe(6, 0xffff_fff0, page);
+    ledger.owe(6, 4, page);
+    assert_eq!(
+        ledger.classify(wait(6, 4)),
+        UnmetSource::Coalesced,
+        "across the wrap 4 is later than 0xffff_fff0, by signed difference"
+    );
+
+    // The bound: a slot the stamp page cannot hold is never recorded, so neither
+    // map can outgrow the page and there is nothing to scan for.
+    let bad = stamp_slot_count(page);
+    assert!(stamp_slot_offset(bad, page).is_none(), "test premise");
+    ledger.owe(bad, 1, page);
+    ledger.wrote(bad, 1, page);
+    assert_eq!(
+        ledger.classify(wait(bad, 1)),
+        UnmetSource::Absent,
+        "a slot outside the stamp page is refused by both recorders"
+    );
+}
+
 /// `retry_stamp_held_timelines` stops when a round publishes no stamp, so a wait
 /// nothing in the ring can satisfy costs one extra round and not a spin.
 ///
@@ -5048,7 +5293,7 @@ fn a_dispatched_command_this_device_declines_names_itself() {
         st32(&mut payload[0..], 0x11);
         st32(
             &mut payload[4..],
-            reims_vgpu_wire::ops::destroy::OPCODE_DELETE_SAMPLER_STATE,
+            reims_vgpu_wire::ops::destroy::OPCODE_DELETE_TEXTURE,
         );
         st32(
             &mut payload[8..],
@@ -5232,15 +5477,24 @@ fn a_delete_object_record_must_fit_the_payload_that_carries_it() {
 /// The test therefore rigs the collision deliberately: every ref the packets
 /// name is also a live object-table entry under the same task. An implementation
 /// that keys the table with the record's ref passes nothing here; it deletes all
-/// four and fails on the first assertion.
+/// every one and fails on the first assertion.
 ///
-/// The kinds are exercised across the family — a texture record and a
-/// sampler-state record — because the kind lives in the record's opcode and an
-/// arm that branched on kind could be safe for one and not the other.
+/// The kinds are exercised across the family. Sampler and render-pipeline
+/// records may retire their separate typed registries, but even then must leave
+/// the resource table alone. Conversely, resource deletion must not cross into
+/// the pipeline registry.
+///
+/// The retained render-pipeline registry is a Vulkan-arm structure
+/// ([`crate::model::state::DeviceState::task_render_pipeline_states`] and
+/// [`crate::runtime::pipeline_resolve`] are both gated on it), so the statements
+/// that populate and interrogate it are gated the same way. Everything else —
+/// including that the pipeline destroy opcode leaves the object table alone on
+/// an arm where it falls through to the unimplemented path — runs on both.
 #[test]
 fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     use reims_vgpu_wire::ops::destroy::{
-        DELETE_TOTAL_LEN, OPCODE_DELETE_SAMPLER_STATE, OPCODE_DELETE_TEXTURE,
+        DELETE_TOTAL_LEN, OPCODE_DELETE_DEPTH_STENCIL_STATE, OPCODE_DELETE_RENDER_PIPELINE_STATE,
+        OPCODE_DELETE_SAMPLER_STATE, OPCODE_DELETE_TEXTURE,
     };
     let mut host = FakeHost::new();
     let destroy_packet = |task: u32, record_opcode: u32, object_ref: u32| {
@@ -5262,8 +5516,33 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
     state.define_task(2, 0x2000, 9);
     assert!(state.set_object_list(2, 3, 64));
-    for ref_ in [10, 11, 12, 14] {
+    for ref_ in [10, 11, 12, 13, 14, 15] {
         assert!(state.insert_object(2, ref_));
+    }
+    state.task_sampler_states.register(
+        2,
+        11,
+        std::sync::Arc::new(crate::model::TaskSamplerState {
+            descriptor: Default::default(),
+        }),
+    );
+    #[cfg(feature = "backend-vulkan")]
+    {
+        state.task_depth_stencil_states.register(
+            2,
+            12,
+            std::sync::Arc::new(Default::default()),
+        );
+        state.task_render_pipeline_states.register(
+            2,
+            13,
+            crate::runtime::pipeline_resolve::retained_pipeline_for_test(),
+        );
+        state.task_render_pipeline_states.register(
+            2,
+            15,
+            crate::runtime::pipeline_resolve::retained_pipeline_for_test(),
+        );
     }
 
     // Same task, same number, well-formed record: the collision that an arm
@@ -5292,7 +5571,54 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
     );
     assert!(
         state.objects.contains(&(2, 11)),
-        "a second kind must be declined the same way"
+        "sampler deletion must not cross into the resource-list ref space"
+    );
+    assert!(
+        state.task_sampler_states.get(2, 11).is_none(),
+        "the sampler opcode retires the same integer only in its own ref space"
+    );
+
+    process_child_packet(
+        &mut state,
+        &mut host,
+        4,
+        &destroy_packet(2, OPCODE_DELETE_DEPTH_STENCIL_STATE, 12),
+    );
+    #[cfg(feature = "backend-vulkan")]
+    assert!(
+        state.task_depth_stencil_states.get(2, 12).is_none(),
+        "the depth-stencil destroy opcode retires its own retained state, which \
+         is the whole invalidation behind retaining it at all"
+    );
+    assert!(
+        state.objects.contains(&(2, 12)),
+        "depth-stencil deletion must not cross into the resource-list ref space"
+    );
+
+    process_child_packet(
+        &mut state,
+        &mut host,
+        4,
+        &destroy_packet(2, OPCODE_DELETE_RENDER_PIPELINE_STATE, 13),
+    );
+    #[cfg(feature = "backend-vulkan")]
+    assert!(
+        state.task_render_pipeline_states.get(2, 13).is_none(),
+        "the render-pipeline destroy opcode retires its own retained state"
+    );
+    assert!(
+        state.objects.contains(&(2, 13)),
+        "pipeline deletion must not cross into the resource-list ref space"
+    );
+
+    assert!(
+        state.delete_object(2, 15),
+        "the colliding resource-list object exists"
+    );
+    #[cfg(feature = "backend-vulkan")]
+    assert!(
+        state.task_render_pipeline_states.contains(2, 15),
+        "resource-list deletion must not cross into the pipeline ref space"
     );
 
     // The unclaimed number inside the destroy span is refused before the ref is
@@ -5303,10 +5629,6 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
         "0x3ec is unclaimed inside the destroy span and names no destroy at all"
     );
 
-    assert!(
-        state.objects.contains(&(2, 12)),
-        "a ref no packet named must be untouched"
-    );
 }
 
 /// The kind is decoded off the record and counted per kind.
@@ -5365,7 +5687,12 @@ fn a_delete_object_counts_the_kind_its_record_names() {
 
     // The one kind this device holds anything by ref for. Its counter reading
     // above zero on a boot is the signal that would justify a handler.
-    process_child_packet(&mut state, &mut host, 4, &destroy_packet(OPCODE_DELETE_FENCE));
+    process_child_packet(
+        &mut state,
+        &mut host,
+        4,
+        &destroy_packet(OPCODE_DELETE_FENCE),
+    );
     assert_eq!(
         store_route_count("child_delete_object_fence"),
         fence_before + 1,
@@ -5433,9 +5760,8 @@ fn a_retired_slot_is_reported_as_retired_and_not_as_undecodable() {
 /// payload that *fails* it: a count the packet has no room for. A swallowed
 /// command would report nothing.
 ///
-/// The synchronise half of `0x3e` is not asserted here because it is a no-op
-/// when no writeback is outstanding, which is every unit test; what is asserted
-/// is that the packet went through the arm that performs it.
+/// A valid packet is fully handled and a malformed one proves the payload
+/// reached the shared decoder.
 #[test]
 fn the_discarding_commands_share_the_synchronize_record_layout() {
     use crate::runtime::decode::fifo::ResourceListDecodeError;
@@ -5445,33 +5771,14 @@ fn the_discarding_commands_share_the_synchronize_record_layout() {
     st32(&mut good[0..], 7); // task
     st32(&mut good[4..], 1); // count
     st32(&mut good[8..], 0x2a); // object id
-    // The same header claiming four records in a packet that holds one.
+                                // The same header claiming four records in a packet that holds one.
     let mut liar = good.clone();
     st32(&mut liar[4..], 4);
 
-    // The two share a record layout and are declined for *different* reasons:
-    // `0x3f` drops the whole command, while `0x3e`'s synchronise half runs and
-    // only its discard hint is ignored. One slug for both could not say which
-    // fired, which is the defect the split reason exists to prevent.
-    for (opcode, expected) in [
-        (
-            CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES,
-            UnimplementedCommand::SynchronizeAndDiscardResources,
-        ),
-        (
-            CHILD_OP_DISCARD_RESOURCES,
-            UnimplementedCommand::DiscardResources,
-        ),
+    for opcode in [
+        CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES,
+        CHILD_OP_DISCARD_RESOURCES,
     ] {
-        assert_ne!(
-            expected.slug(),
-            if expected == UnimplementedCommand::DiscardResources {
-                UnimplementedCommand::SynchronizeAndDiscardResources.slug()
-            } else {
-                UnimplementedCommand::DiscardResources.slug()
-            },
-            "the two discard declines must not share a slug"
-        );
         let packet = |payload: &Vec<u8>| Packet {
             opcode,
             stamp_waits: Vec::new(),
@@ -5487,12 +5794,11 @@ fn the_discarding_commands_share_the_synchronize_record_layout() {
             ChildPacketDisposition::Complete
         );
         assert!(
-            state.fails.iter().any(|e| matches!(
-                e,
-                FailEvent::UnimplementedChildCommand { command, .. } if *command == expected
-            )),
-            "{opcode:#x}: the discard this device does not act on must be visible, \
-             under its own reason and not the other opcode's"
+            !state
+                .fails
+                .iter()
+                .any(|e| matches!(e, FailEvent::UnimplementedChildCommand { .. })),
+            "{opcode:#x}: a valid discard is fully handled"
         );
         assert!(
             !state
@@ -5563,23 +5869,13 @@ fn each_map_family_command_takes_its_own_branch() {
     // five neighbours: whether the named mapping's content generation moved, and
     // whether the command reported itself unimplemented.
     for (opcode, payload, bumps_generation, declined) in [
-        (
-            CHILD_OP_INVALIDATE_RESOURCES,
-            &invalidate,
-            true,
-            None,
-        ),
-        (
-            CHILD_OP_SYNCHRONIZE_RESOURCES,
-            &synchronize,
-            false,
-            None,
-        ),
+        (CHILD_OP_INVALIDATE_RESOURCES, &invalidate, true, None),
+        (CHILD_OP_SYNCHRONIZE_RESOURCES, &synchronize, false, None),
         (
             CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES,
             &synchronize,
             false,
-            Some(UnimplementedCommand::SynchronizeAndDiscardResources),
+            None,
         ),
         (
             CHILD_OP_DELETE_IOSURFACE_BACKING2,
@@ -6019,7 +6315,11 @@ fn the_map_interval_audit_counts_a_clean_pairing_and_not_only_a_finding() {
 #[test]
 fn a_coalesced_stamp_keeps_the_latest_value_across_the_u32_wrap() {
     let mut pending = PendingStamp::default();
-    assert_eq!(pending.owed(), None, "a drain that stamped nothing owes nothing");
+    assert_eq!(
+        pending.owed(),
+        None,
+        "a drain that stamped nothing owes nothing"
+    );
 
     pending.latch(7);
     pending.latch(9);
@@ -6056,21 +6356,42 @@ fn a_pending_stamp_discharges_a_wait_on_its_own_slot_and_no_other() {
     let mut pending = PendingStamp::default();
     pending.latch(20);
 
-    let met = StampWait { index: SLOT, value: 20 };
+    let met = StampWait {
+        index: SLOT,
+        value: 20,
+    };
     assert!(
         pending.discharges(SLOT, met),
         "a wait at exactly the latched value is discharged"
     );
     assert!(
-        pending.discharges(SLOT, StampWait { index: SLOT, value: 12 }),
+        pending.discharges(
+            SLOT,
+            StampWait {
+                index: SLOT,
+                value: 12
+            }
+        ),
         "and so is one behind it"
     );
     assert!(
-        !pending.discharges(SLOT, StampWait { index: SLOT, value: 21 }),
+        !pending.discharges(
+            SLOT,
+            StampWait {
+                index: SLOT,
+                value: 21
+            }
+        ),
         "a wait past the latched value is not discharged by it"
     );
     assert!(
-        !pending.discharges(SLOT, StampWait { index: SLOT + 1, value: 1 }),
+        !pending.discharges(
+            SLOT,
+            StampWait {
+                index: SLOT + 1,
+                value: 1
+            }
+        ),
         "a wait on another slot is not this drain's to answer"
     );
     assert!(

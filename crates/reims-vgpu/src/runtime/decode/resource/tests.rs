@@ -1119,10 +1119,14 @@ fn macos12_shaped_compute_pipeline(kernel_ref: u32, attrs: u32, layouts: u32) ->
     // the section's four-byte alignment.
     const TLV_TWO_FIELDS: usize = 1 + 2 * (1 + 1 + 4);
     let section = (TYPE7_FIRST_TLVS + TLV_TWO_FIELDS).next_multiple_of(4);
-    // The section's own two fields, then its two arrays, each a `u32` count.
+    // The section's own two fields, then its two offset arrays and compact-TLV
+    // entries. Both entry kinds carry four u32 properties.
+    const ENTRY_LEN: usize = 1 + 4 * (1 + 1 + 4);
     let attr_rel = (TLV_TWO_FIELDS).next_multiple_of(4);
-    let layout_rel = attr_rel + 4;
-    let total = section + layout_rel + 4;
+    let attr_array_len = 4 + attrs as usize * 4 + attrs as usize * ENTRY_LEN;
+    let layout_rel = attr_rel + attr_array_len;
+    let layout_array_len = 4 + layouts as usize * 4 + layouts as usize * ENTRY_LEN;
+    let total = section + layout_rel + layout_array_len;
 
     let mut b = vec![0u8; total];
     st32(&mut b[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
@@ -1158,6 +1162,42 @@ fn macos12_shaped_compute_pipeline(kernel_ref: u32, attrs: u32, layouts: u32) ->
     }
     st32(&mut b[section + attr_rel..], attrs);
     st32(&mut b[section + layout_rel..], layouts);
+    let write_entries = |b: &mut [u8], array: usize, count: u32, fields: &[(u8, u32)]| {
+        for i in 0..count as usize {
+            let entry = array + 4 + count as usize * 4 + i * ENTRY_LEN;
+            st32(&mut b[array + 4 + i * 4..], (entry - array) as u32);
+            b[entry] = fields.len() as u8;
+            let mut p = entry + 1;
+            for &(tag, value) in fields {
+                b[p] = tag;
+                b[p + 1] = 4;
+                st32(&mut b[p + 2..], value + i as u32);
+                p += 6;
+            }
+        }
+    };
+    write_entries(
+        &mut b,
+        section + attr_rel,
+        attrs,
+        &[
+            (VERTEX_ATTR_TAG_LOCATION, 3),
+            (VERTEX_ATTR_TAG_FORMAT, 31),
+            (VERTEX_ATTR_TAG_OFFSET, 16),
+            (VERTEX_ATTR_TAG_BUFFER_INDEX, 7),
+        ],
+    );
+    write_entries(
+        &mut b,
+        section + layout_rel,
+        layouts,
+        &[
+            (VERTEX_LAYOUT_TAG_BUFFER_INDEX, 7),
+            (VERTEX_LAYOUT_TAG_STEP_FUNCTION, 1),
+            (VERTEX_LAYOUT_TAG_STEP_RATE, 2),
+            (VERTEX_LAYOUT_TAG_STRIDE, 32),
+        ],
+    );
     b
 }
 
@@ -1192,22 +1232,24 @@ fn a_compute_pipeline_that_states_its_stage_input_offset_decodes() {
     );
 }
 
-/// The counterweight: a section that declares entries is refused, not emptied.
-///
-/// Nothing here knows how a compute stage-input attribute's format enumerates,
-/// and building the pipeline anyway would give it `stage_input: None` — which is
-/// indistinguishable downstream from a kernel that declared none, and is the
-/// silent-loss class the whole decline machinery exists to stop.
 #[test]
-fn a_populated_compute_stage_input_section_refuses_the_pipeline() {
-    for (attrs, layouts) in [(1, 0), (0, 1), (2, 3)] {
-        assert_eq!(
-            decode_compute_pipeline_descriptor(&macos12_shaped_compute_pipeline(9, attrs, layouts))
-                .unwrap_err(),
-            DecodeStatus::ErrUnsupported("res_compute_stage_input_populated"),
-            "attrs={attrs} layouts={layouts} must refuse rather than decode as empty"
-        );
-    }
+fn a_populated_compute_stage_input_section_preserves_every_field() {
+    let cp = decode_compute_pipeline_descriptor(&macos12_shaped_compute_pipeline(9, 2, 3))
+        .expect("the compact stage-input grammar is fully decoded");
+    let stage = cp.stage_input.expect("populated descriptor");
+    assert_eq!(stage.attributes.len(), 2);
+    assert_eq!(stage.layouts.len(), 3);
+    assert_eq!(stage.attributes[0].location, 3);
+    assert_eq!(stage.attributes[1].location, 4);
+    assert_eq!(stage.attributes[0].format, 31);
+    assert_eq!(stage.attributes[0].offset, 16);
+    assert_eq!(stage.attributes[0].buffer_index, 7);
+    assert_eq!(stage.layouts[0].buffer_index, 7);
+    assert_eq!(stage.layouts[1].step_function, 2);
+    assert_eq!(stage.layouts[0].step_rate, 2);
+    assert_eq!(stage.layouts[0].stride, 32);
+    assert_eq!(stage.dropped_attributes, 0);
+    assert_eq!(stage.dropped_layouts, 0);
 }
 
 /// An offset the record cannot contain is a refusal too. The guest named this
@@ -1653,12 +1695,50 @@ fn a_depth_stencil_pipeline_with_a_sample_count_decodes() {
     );
 }
 
+#[test]
+fn a_classic_tessellation_pipeline_preserves_its_three_properties() {
+    let fields = [
+        (PIPELINE_TAG_VERTEX_FUNC, 7),
+        (PIPELINE_TAG_FRAGMENT_FUNC, 8),
+        (PIPELINE_TAG_MAX_TESSELLATION_FACTOR, 64),
+        (PIPELINE_TAG_TESSELLATION_FACTOR_STEP_FUNCTION, 1),
+        (PIPELINE_TAG_TESSELLATION_OUTPUT_WINDING_ORDER, 1),
+    ];
+    let mut b = vec![0u8; TYPE7_FIRST_TLVS + 1 + fields.len() * 6];
+    let len = b.len() as u32;
+    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[4..], len);
+    st32(&mut b[8..], 22);
+    st32(&mut b[12..], len - TYPE7_FIRST_TLVS as u32);
+    b[TYPE7_FIRST_TLVS] = fields.len() as u8;
+    let mut p = TYPE7_FIRST_TLVS + 1;
+    for (tag, value) in fields {
+        b[p] = tag;
+        b[p + 1] = 4;
+        st32(&mut b[p + 2..], value);
+        p += 6;
+    }
+
+    let cap = crate::observe::FailCapture::start();
+    let d = decode_render_pipeline_descriptor(&b).expect("tessellation properties decode");
+    assert_eq!(d.max_tessellation_factor, 64);
+    assert_eq!(d.tessellation_factor_step_function, 1);
+    assert_eq!(d.tessellation_output_winding_order, 1);
+    assert!(
+        !cap.lines()
+            .iter()
+            .any(|line| line.contains("pipeline_descriptor_field_dropped")),
+        "every tessellation property has a reader: {:?}",
+        cap.lines()
+    );
+}
+
 /// A sample count this device has no attachments for is a named degradation and
 /// not a refusal: the draw still runs, at one sample.
 ///
 /// Absence and an explicit single sample are one answer, so neither reports.
 #[test]
-fn an_unrasterizable_sample_count_degrades_rather_than_refusing() {
+fn a_pipeline_sample_count_is_preserved_for_backend_rasterization() {
     let pipeline = |count: u32| {
         let mut b = vec![0u8; 16 + 1 + 6];
         let blen = b.len() as u32;
@@ -1680,37 +1760,23 @@ fn an_unrasterizable_sample_count_degrades_rather_than_refusing() {
         b
     };
 
-    // A count no attachment path here can meet: reported, and the descriptor
-    // still decodes so the geometry is kept.
+    // The decoder neither clamps nor diagnoses a valid sample count. Whether a
+    // particular attachment shape can carry it is the backend's typed decision.
     let cap = crate::observe::FailCapture::start();
     let d = decode_render_pipeline_descriptor(&pipeline(8)).expect("decodes");
     assert_eq!(d.raster_sample_count, 8);
-    let lines = cap.lines();
-    let degraded: Vec<&String> = lines
-        .iter()
-        .filter(|l| l.contains("reason=pipeline_raster_sample_count_degraded"))
-        .collect();
-    assert_eq!(degraded.len(), 1, "one line per distinct count: {lines:?}");
     assert!(
-        degraded[0].contains("count=8") && degraded[0].contains("built_at=1"),
-        "the line names what was asked for and what was built: {}",
-        degraded[0]
+        !cap.lines()
+            .iter()
+            .any(|line| line.contains("pipeline_raster_sample_count_degraded")),
+        "a decoded value that reaches the backend must not claim it was clamped"
     );
 
     // Neither an absent property nor an explicit single sample is a loss.
-    let cap2 = crate::observe::FailCapture::resume();
     for count in [0, 1] {
         let d = decode_render_pipeline_descriptor(&pipeline(count)).expect("decodes");
         assert!(d.raster_sample_count <= 1);
     }
-    assert!(
-        !cap2
-            .lines()
-            .iter()
-            .any(|l| l.contains("pipeline_raster_sample_count_degraded")),
-        "single-sampling is what this device does: {:?}",
-        cap2.lines()
-    );
 }
 
 /// A property the guest set on a pipeline descriptor that this decoder neither

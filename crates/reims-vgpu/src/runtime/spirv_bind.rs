@@ -44,13 +44,6 @@ const OP_VARIABLE: u16 = 59;
 const OP_FUNCTION_CALL: u16 = 57;
 const OP_IMAGE_TEXEL_POINTER: u16 = 60;
 const OP_LOAD: u16 = 61;
-const OP_STORE: u16 = 62;
-const OP_COPY_MEMORY: u16 = 63;
-const OP_COPY_MEMORY_SIZED: u16 = 64;
-const OP_ACCESS_CHAIN: u16 = 65;
-const OP_IN_BOUNDS_ACCESS_CHAIN: u16 = 66;
-const OP_PTR_ACCESS_CHAIN: u16 = 67;
-const OP_IN_BOUNDS_PTR_ACCESS_CHAIN: u16 = 70;
 const OP_COPY_OBJECT: u16 = 83;
 const OP_IMAGE_READ: u16 = 98;
 const OP_IMAGE_WRITE: u16 = 99;
@@ -61,30 +54,9 @@ const OP_IMAGE_QUERY_SIZE: u16 = 104;
 const OP_IMAGE_QUERY_LOD: u16 = 105;
 const OP_IMAGE_QUERY_LEVELS: u16 = 106;
 const OP_IMAGE_QUERY_SAMPLES: u16 = 107;
-const OP_CONVERT_PTR_TO_U: u16 = 117;
-const OP_PTR_CAST_TO_GENERIC: u16 = 121;
-const OP_GENERIC_CAST_TO_PTR: u16 = 122;
-const OP_GENERIC_CAST_TO_PTR_EXPLICIT: u16 = 123;
 const OP_SELECT: u16 = 169;
-const OP_ATOMIC_STORE: u16 = 228;
-const OP_ATOMIC_EXCHANGE: u16 = 229;
-const OP_ATOMIC_COMPARE_EXCHANGE: u16 = 230;
-const OP_ATOMIC_COMPARE_EXCHANGE_WEAK: u16 = 231;
-const OP_ATOMIC_I_INCREMENT: u16 = 232;
-const OP_ATOMIC_I_DECREMENT: u16 = 233;
-const OP_ATOMIC_I_ADD: u16 = 234;
-const OP_ATOMIC_I_SUB: u16 = 235;
-const OP_ATOMIC_S_MIN: u16 = 236;
-const OP_ATOMIC_U_MIN: u16 = 237;
-const OP_ATOMIC_S_MAX: u16 = 238;
-const OP_ATOMIC_U_MAX: u16 = 239;
-const OP_ATOMIC_AND: u16 = 240;
-const OP_ATOMIC_OR: u16 = 241;
-const OP_ATOMIC_XOR: u16 = 242;
 const OP_PHI: u16 = 245;
 const OP_RETURN_VALUE: u16 = 254;
-const OP_ATOMIC_FLAG_TEST_AND_SET: u16 = 318;
-const OP_ATOMIC_FLAG_CLEAR: u16 = 319;
 const OP_CAPABILITY: u16 = 17;
 // The three storage-image capability numbers, from SPIR-V's `Capability` enum.
 //
@@ -143,7 +115,6 @@ const HEADER_WORDS: usize = 5;
 /// and the next starts, which is a fact about our own translated layout.
 const SAMPLED_RESOURCE_BINDING_BASE: u32 = 32;
 const STORAGE_CLASS_UNIFORM_CONSTANT: u32 = 0;
-const STORAGE_CLASS_STORAGE_BUFFER: u32 = 12;
 
 // ---------------------------------------------------------------------------
 // Two numberings, and why they are not the same one
@@ -250,10 +221,9 @@ const _: () = assert!(
         < TEXTURE_BINDING_BASE + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
 );
 // The widest relocated binding still fits a `u32`.
-const _: () = assert!(
-    (SAMPLED_RESOURCE_BINDING_LIMIT - 1).checked_add(FRAG_SAMPLED_RESOURCE_BINDING_OFFSET)
-        .is_some()
-);
+const _: () = assert!((SAMPLED_RESOURCE_BINDING_LIMIT - 1)
+    .checked_add(FRAG_SAMPLED_RESOURCE_BINDING_OFFSET)
+    .is_some());
 
 /// Image dimensionality declared by a translated SPIR-V sampled-image binding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -261,6 +231,7 @@ pub enum SampledImageKind {
     D1,
     D1Array,
     D2,
+    D2Multisample,
     D2Array,
     D3,
     Cube,
@@ -387,7 +358,10 @@ pub enum ImageFormatSpecializeError {
     /// not survive: an NVIDIA SPIR-V compiler segmentation-faults inside
     /// `vkCreateComputePipelines` on exactly this defect, which ends the VM
     /// process. A guest authors its own kernels, so this must be a decline.
-    LoadTypeMismatch { pointer: u32, declared: u32 },
+    LoadTypeMismatch {
+        pointer: u32,
+        declared: u32,
+    },
 }
 
 impl crate::observe::Decline for ImageFormatSpecializeError {
@@ -416,18 +390,6 @@ impl crate::observe::Decline for ImageFormatSpecializeError {
             ],
         }
     }
-}
-
-/// Write access proven from the SPIR-V pointer-use graph for one storage buffer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BufferAccess {
-    ReadOnly,
-    Writable,
-    /// A pointer escapes through a function call/return, so local provenance
-    /// cannot prove whether the callee writes it.
-    PointerEscape,
-    /// More than one storage-buffer variable declares the same binding.
-    AmbiguousBinding,
 }
 
 /// One instruction's header, decoded once.
@@ -755,114 +717,6 @@ fn propagate_derived(
     derived
 }
 
-/// Reflect whether a storage-buffer descriptor can be written by the module.
-///
-/// Pointer provenance follows the SPIR-V operations that can preserve a buffer
-/// pointer (`AccessChain`, `CopyObject`, `Select`, and `Phi`). Stores, copy
-/// destinations, and atomics make the binding writable. Pointer calls/returns
-/// fail closed as unknown; this deliberately avoids inferring mutability from
-/// debug names, guest object ids, or corpus-specific function names.
-///
-/// The root pointer is seeded directly, which is safe here only because the
-/// escape scan below enumerates the opcodes it cares about. `storage_image_access`
-/// cannot seed its root for exactly that reason — see the note there.
-pub fn buffer_access(words: &[u32], wanted_binding: u32) -> Option<BufferAccess> {
-    let instrs = instructions(words)?;
-    let (root, bound) = match descriptor_root(
-        words,
-        &instrs,
-        wanted_binding,
-        STORAGE_CLASS_STORAGE_BUFFER,
-    )? {
-        Root::One { id, bound } => (id, bound),
-        Root::Ambiguous => return Some(BufferAccess::AmbiguousBinding),
-    };
-
-    let derived = propagate_derived(
-        words,
-        &instrs,
-        bound,
-        Some(root),
-        |opcode, word_count, i, derived| {
-            let marked = |id: u32| derived.get(id as usize).copied() == Some(true);
-            match opcode {
-                // Both families take the base pointer at operand 3 and yield another
-                // pointer to the same buffer.
-                OP_ACCESS_CHAIN
-                | OP_IN_BOUNDS_ACCESS_CHAIN
-                | OP_PTR_ACCESS_CHAIN
-                | OP_IN_BOUNDS_PTR_ACCESS_CHAIN
-                | OP_PTR_CAST_TO_GENERIC
-                | OP_GENERIC_CAST_TO_PTR
-                | OP_GENERIC_CAST_TO_PTR_EXPLICIT
-                    if word_count >= 4 =>
-                {
-                    marked(words[i + 3])
-                }
-                _ => false,
-            }
-        },
-    );
-
-    let is_derived = |id: u32| derived.get(id as usize).copied() == Some(true);
-    let mut unknown = false;
-    for &Instruction {
-        opcode,
-        word_count,
-        at: i,
-    } in &instrs
-    {
-        let writable = match opcode {
-            OP_STORE | OP_COPY_MEMORY | OP_COPY_MEMORY_SIZED | OP_ATOMIC_STORE
-                if word_count >= 2 =>
-            {
-                is_derived(words[i + 1])
-            }
-            OP_ATOMIC_EXCHANGE
-            | OP_ATOMIC_COMPARE_EXCHANGE
-            | OP_ATOMIC_COMPARE_EXCHANGE_WEAK
-            | OP_ATOMIC_I_INCREMENT
-            | OP_ATOMIC_I_DECREMENT
-            | OP_ATOMIC_I_ADD
-            | OP_ATOMIC_I_SUB
-            | OP_ATOMIC_S_MIN
-            | OP_ATOMIC_U_MIN
-            | OP_ATOMIC_S_MAX
-            | OP_ATOMIC_U_MAX
-            | OP_ATOMIC_AND
-            | OP_ATOMIC_OR
-            | OP_ATOMIC_XOR
-            | OP_ATOMIC_FLAG_TEST_AND_SET
-                if word_count >= 4 =>
-            {
-                is_derived(words[i + 3])
-            }
-            OP_ATOMIC_FLAG_CLEAR if word_count >= 2 => is_derived(words[i + 1]),
-            _ => false,
-        };
-        if writable {
-            return Some(BufferAccess::Writable);
-        }
-        if opcode == OP_FUNCTION_CALL
-            && word_count >= 5
-            && words[i + 4..i + word_count].iter().copied().any(is_derived)
-        {
-            unknown = true;
-        }
-        if opcode == OP_RETURN_VALUE && word_count >= 2 && is_derived(words[i + 1]) {
-            unknown = true;
-        }
-        if opcode == OP_CONVERT_PTR_TO_U && word_count >= 4 && is_derived(words[i + 3]) {
-            unknown = true;
-        }
-    }
-    Some(if unknown {
-        BufferAccess::PointerEscape
-    } else {
-        BufferAccess::ReadOnly
-    })
-}
-
 /// Reflect whether a storage image consumes its pre-dispatch contents.
 ///
 /// This follows `OpLoad` from the descriptor variable through the SSA image
@@ -997,13 +851,13 @@ pub fn validate(words: &[u32]) -> SpirvValidation {
     // different rail.
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "reims-vgpu-spirv-val-{}-{seq}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("reims-vgpu-spirv-val-{}-{seq}", std::process::id()));
     if let Err(e) = std::fs::create_dir_all(&dir) {
         if crate::observe::first_sight("spirv_val_no_tmp", 0) {
-            crate::observe::fail(format!("spirv_validate reason=validator_unavailable detail={e}"));
+            crate::observe::fail(format!(
+                "spirv_validate reason=validator_unavailable detail={e}"
+            ));
         }
         return SpirvValidation::Accepted;
     }
@@ -1029,7 +883,11 @@ pub fn validate(words: &[u32]) -> SpirvValidation {
             // own "spirv-val failed:" and the validator's diagnosis — the part
             // that names the instruction — is on the ones after it, so keeping
             // only the first is how a rejection reads as having no reason.
-            let flattened: Vec<&str> = why.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+            let flattened: Vec<&str> = why
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
             SpirvValidation::Rejected(flattened.join(" | "))
         }
     }
@@ -1626,6 +1484,9 @@ pub fn ensure_image_capabilities(
 /// This includes separate `OpTypeSampler` descriptors used by explicit and AIR
 /// static samplers, plus combined `OpTypeSampledImage` descriptors. The walk is
 /// structural and does not depend on debug names or guest object identifiers.
+/// Product code consumes [`reflected_sampler_descriptors`]; this remains a test
+/// oracle for proving that reflected variant transforms match executable words.
+#[cfg(test)]
 pub fn sampler_bindings(words: &[u32]) -> Vec<u32> {
     use std::collections::HashSet;
 
@@ -1754,9 +1615,9 @@ pub(crate) fn test_module_with_two_sampled_images(used: u32, declared_unused: u3
 /// opcode numbers are constants in this file, so a copy in another module's test
 /// would be those numbers spelled a second time.
 ///
-/// A *sampler*, not a sampled image — [`sampler_bindings`] partitions set 0 by
-/// the pointee type, so a fixture built out of images answers its question with
-/// an empty vector and would make any test over it vacuous.
+/// A *sampler*, not a sampled image: the test oracle partitions set 0 by the
+/// pointee type, so a fixture built out of images answers its question with an
+/// empty vector and would make any test over it vacuous.
 #[cfg(test)]
 pub(crate) fn test_module_with_samplers(bindings: &[u32]) -> Vec<u32> {
     const SAMPLER_TY: u32 = 10;
@@ -1809,6 +1670,89 @@ pub(crate) fn test_module_with_samplers(bindings: &[u32]) -> Vec<u32> {
 /// that build the layout. Pair it with [`descriptor_static_use`], which answers
 /// `NotDeclared` for anything that is not a `UniformConstant` descriptor and so
 /// narrows this to the population that walk can reason about exactly.
+/// [`declared_binding_numbers`] for a module the caller holds behind an `Arc`,
+/// answered from a memo after the first walk.
+///
+/// # Why the walk had to go
+///
+/// The render path asks this once per draw, to check that the pipeline layout
+/// describes every binding the fragment module carries. It is a linear walk of
+/// the whole module plus a sort, a dedup and an allocation, and it cost
+/// **0.34 µs of an 11.8 µs Maps chain** — a fifteenth of the whole render path,
+/// spent re-deriving a property of words that had not changed since the guest
+/// compiled them.
+///
+/// That is the same shape as `pl_shader_us`, which was 63 ms of every second
+/// spent deriving a key for a module already in hand, and the answer is the same
+/// one: memoize on the allocation.
+///
+/// # Why an address is a sound key
+///
+/// Only because the entry holds the `Arc`. While it does, the allocation cannot
+/// be freed, so nothing else can be given that address and the key cannot come
+/// to mean a different module. The words behind an `Arc<Vec<u32>>` are immutable,
+/// so the memoized answer is the one a fresh walk would produce. Drop the `Arc`
+/// from the entry and this becomes a use-after-free dressed as a cache hit —
+/// the same rule, in the same words, as the engine's `ShaderDigestIndex`.
+///
+/// `usize` rather than a raw pointer because the memo is `static` and shared;
+/// the address is compared and never dereferenced.
+///
+/// # The bound
+///
+/// Past [`DECLARED_BINDING_ENTRIES`] the whole memo is dropped rather than one
+/// entry evicted, because there is no recency to evict *by*: every entry is
+/// equally cheap to rebuild, and a boot that reaches the bound is reporting
+/// something rather than asking for a policy. Same disposal, and the same
+/// reason, as the engine's index — and the drop releases the `Arc`s, so a memo
+/// that outlives its modules costs a bounded number of live allocations and not
+/// a leak.
+pub fn declared_binding_numbers_memoized(
+    words: &std::sync::Arc<Vec<u32>>,
+) -> std::sync::Arc<[u32]> {
+    let key = std::sync::Arc::as_ptr(words) as usize;
+    let mut guard = match DECLARED_BINDINGS.lock() {
+        Ok(guard) => guard,
+        // A poisoned memo is a cache, not state: answer from the walk rather
+        // than refusing a draw over it.
+        Err(_) => return std::sync::Arc::from(declared_binding_numbers(words)),
+    };
+    let memo = guard.get_or_insert_with(std::collections::HashMap::new);
+    if let Some((_, declared)) = memo.get(&key) {
+        return std::sync::Arc::clone(declared);
+    }
+    if memo.len() >= DECLARED_BINDING_ENTRIES {
+        crate::observe::off(format!(
+            "declared_binding_reset entries={} words={}",
+            memo.len(),
+            words.len()
+        ));
+        memo.clear();
+    }
+    let declared: std::sync::Arc<[u32]> = std::sync::Arc::from(declared_binding_numbers(words));
+    memo.insert(
+        key,
+        (std::sync::Arc::clone(words), std::sync::Arc::clone(&declared)),
+    );
+    declared
+}
+
+/// Modules the memo holds before it starts over. Sized as the engine's
+/// `SHADER_DIGEST_ENTRIES` is: a driven macos-13 boot binds a few hundred
+/// distinct modules, so this is an order of magnitude of headroom and
+/// `declared_binding_reset` firing is the boot saying otherwise.
+const DECLARED_BINDING_ENTRIES: usize = 4096;
+
+/// Allocation address → the `Arc` that keeps that address meaningful, and the
+/// declared-binding list walked out of it.
+type DeclaredBindingMemo =
+    std::collections::HashMap<usize, (std::sync::Arc<Vec<u32>>, std::sync::Arc<[u32]>)>;
+
+/// `None` until the first walk: `HashMap::new` is not a `const fn`, and a
+/// `OnceLock` beside the mutex would be a second thing to keep in step with it.
+static DECLARED_BINDINGS: std::sync::Mutex<Option<DeclaredBindingMemo>> =
+    std::sync::Mutex::new(None);
+
 pub fn declared_binding_numbers(words: &[u32]) -> Vec<u32> {
     let mut bindings = Vec::new();
     let mut i = HEADER_WORDS;
@@ -1836,9 +1780,8 @@ const IMAGE_SAMPLED_WITH_SAMPLER: u32 = 1;
 
 /// Set-0 `Binding` decorations carried by a *sampled image* variable.
 ///
-/// The texture analogue of [`sampler_bindings`], and it exists for the same
-/// reason. The descriptor set layout this device builds is assembled from what
-/// the guest bound, so a binding the module carries and the guest left empty is
+/// The descriptor set layout this device builds is assembled from what the
+/// guest bound, so a binding the module carries and the guest left empty is
 /// absent from the layout entirely — not an unwritten slot in it.
 ///
 /// Vulkan requires the pipeline layout to contain a descriptor for every
@@ -2234,14 +2177,15 @@ use metal2vulkan::reflect::{
 /// `Buffer`, or a 3D array) — those are legitimate reflection shapes the sampled
 /// render path does not support and rejects fail-visibly at the call site.
 fn sampled_image_kind_from_shape(shape: &TextureShape) -> Option<SampledImageKind> {
-    match (shape.dimension, shape.arrayed) {
-        (TextureDimension::D1, false) => Some(SampledImageKind::D1),
-        (TextureDimension::D1, true) => Some(SampledImageKind::D1Array),
-        (TextureDimension::D2, false) => Some(SampledImageKind::D2),
-        (TextureDimension::D2, true) => Some(SampledImageKind::D2Array),
-        (TextureDimension::D3, false) => Some(SampledImageKind::D3),
-        (TextureDimension::Cube, false) => Some(SampledImageKind::Cube),
-        (TextureDimension::Cube, true) => Some(SampledImageKind::CubeArray),
+    match (shape.dimension, shape.arrayed, shape.multisampled) {
+        (TextureDimension::D1, false, false) => Some(SampledImageKind::D1),
+        (TextureDimension::D1, true, false) => Some(SampledImageKind::D1Array),
+        (TextureDimension::D2, false, false) => Some(SampledImageKind::D2),
+        (TextureDimension::D2, false, true) => Some(SampledImageKind::D2Multisample),
+        (TextureDimension::D2, true, false) => Some(SampledImageKind::D2Array),
+        (TextureDimension::D3, false, false) => Some(SampledImageKind::D3),
+        (TextureDimension::Cube, false, false) => Some(SampledImageKind::Cube),
+        (TextureDimension::Cube, true, false) => Some(SampledImageKind::CubeArray),
         _ => None,
     }
 }
@@ -2253,6 +2197,29 @@ fn texture_shape_for_binding(reflection: &ShaderReflection, binding: u32) -> Opt
         (is_texture_kind(b.kind) && b.descriptor.map(|d| d.binding) == Some(binding))
             .then_some(b.texture_shape.as_ref())
             .flatten()
+    })
+}
+
+/// Storage-image format emitted for one reflected descriptor. This maps the
+/// translator's decoded Metal texture contract into the executor vocabulary;
+/// it does not inspect the emitted module a second time.
+pub fn reflected_storage_image_format(
+    reflection: &ShaderReflection,
+    binding: u32,
+) -> Option<ImageFormat> {
+    use metal2vulkan::meta::TextureFormat;
+
+    let format = texture_shape_for_binding(reflection, binding)?.storage_format?;
+    Some(match format {
+        TextureFormat::R16f => ImageFormat::R16Float,
+        TextureFormat::Rg16f => ImageFormat::Rg16Float,
+        TextureFormat::R32f => ImageFormat::R32Float,
+        TextureFormat::R32ui => ImageFormat::R32ui,
+        TextureFormat::Rgba32f => ImageFormat::Rgba32Float,
+        TextureFormat::Rgba16f => ImageFormat::Rgba16Float,
+        TextureFormat::Rgba8ui => ImageFormat::Rgba8Uint,
+        TextureFormat::Rgba16ui => ImageFormat::Rgba16Uint,
+        TextureFormat::Rgba8i => ImageFormat::Rgba8Sint,
     })
 }
 
@@ -2273,6 +2240,220 @@ fn is_texture_kind(kind: ResourceKind) -> bool {
             | ResourceKind::StorageImage
             | ResourceKind::EmbeddedArgBufferTexture
     )
+}
+
+/// First reflected resource that needs a Vulkan runtime provisioning path this
+/// device does not implement. These must not collapse into an ordinary bind's
+/// `Absent` answer: each represents real shader work with no descriptor or
+/// synthesized input behind it.
+pub fn first_unsupported_vulkan_resource(
+    reflection: &ShaderReflection,
+) -> Option<&metal2vulkan::reflect::ResourceBinding> {
+    reflection
+        .bindings
+        .iter()
+        .find(|resource| unsupported_vulkan_resource_kind_name(resource.kind).is_some())
+}
+
+pub fn unsupported_vulkan_resource_kind_name(kind: ResourceKind) -> Option<&'static str> {
+    match kind {
+        ResourceKind::KernelStageInput => Some("kernel_stage_input"),
+        ResourceKind::AccelerationStructureShadow => Some("acceleration_structure_shadow"),
+        ResourceKind::PrimitiveAccelerationStructure => Some("primitive_acceleration_structure"),
+        ResourceKind::EmbeddedArgBufferTexture => Some("embedded_texture"),
+        ResourceKind::EmbeddedArgBufferBuffer => Some("embedded_buffer"),
+        ResourceKind::BufferAddressTable => Some("buffer_address_table"),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnsupportedVulkanInterface {
+    pub feature: &'static str,
+    pub count: usize,
+}
+
+/// First stage-level reflected interface the current Vulkan runtime cannot
+/// provision. Unlike a resource binding, these contracts live on the shader as
+/// a whole and otherwise have no bind loop in which to become visible.
+pub fn first_unsupported_vulkan_interface(
+    reflection: &ShaderReflection,
+    expected_stage: ShaderStage,
+) -> Option<UnsupportedVulkanInterface> {
+    if reflection.stage != expected_stage {
+        let feature = match reflection.stage {
+            ShaderStage::Vertex => "shader_stage_vertex",
+            ShaderStage::TessellationEvaluation => "shader_stage_tessellation_evaluation",
+            ShaderStage::Fragment => "shader_stage_fragment",
+            ShaderStage::Kernel => "shader_stage_kernel",
+        };
+        return Some(UnsupportedVulkanInterface { feature, count: 1 });
+    }
+    if reflection.tessellation.is_some() {
+        return Some(UnsupportedVulkanInterface {
+            feature: "tessellation",
+            count: 1,
+        });
+    }
+    if !reflection.imageblock_layouts.is_empty() {
+        return Some(UnsupportedVulkanInterface {
+            feature: "kernel_imageblock",
+            count: reflection.imageblock_layouts.len(),
+        });
+    }
+    if !reflection.implicit_imageblock_attachments.is_empty() {
+        return Some(UnsupportedVulkanInterface {
+            feature: "implicit_imageblock_attachments",
+            count: reflection.implicit_imageblock_attachments.len(),
+        });
+    }
+    reflection
+        .fragment_imageblock
+        .as_ref()
+        .map(|imageblock| UnsupportedVulkanInterface {
+            feature: "fragment_imageblock",
+            count: imageblock.members.len(),
+        })
+}
+
+/// One Metal texture-table slot's place in the Vulkan descriptor interface.
+/// Scalar textures have `array_element = 0, descriptor_count = 1`; a texture
+/// handle array maps consecutive Metal slots onto elements of one descriptor
+/// binding instead of pretending each handle is a separate binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReflectedTextureDescriptor {
+    pub binding: u32,
+    pub array_element: u32,
+    pub descriptor_count: u32,
+    pub access: ReflectedTextureAccess,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReflectedTextureAccess {
+    Sampled,
+    Storage,
+    Unknown,
+}
+
+/// Resolve one reflected sampler into the descriptor numbering used by the
+/// device's executable module. Reflection carries the translator ABI, whose
+/// sampler band starts at [`M2V_SAMPLER_BINDING_BASE`]; [`widen_sampled_bands`]
+/// moves that band into [`SAMPLER_BINDING_BASE`] before any shader is cached.
+/// A fragment variant may then move the complete sampled-resource interface a
+/// second time to keep two shader stages from aliasing one descriptor binding.
+///
+/// Keeping those two transforms beside the reflected resource makes the
+/// sampler state and the module's descriptor location one answer. In
+/// particular, constexpr sampler state must not be installed at the raw
+/// reflected binding after the module has already been widened.
+pub fn reflected_sampler_binding(
+    resource: &metal2vulkan::reflect::ResourceBinding,
+    fragment_relocated: bool,
+) -> Option<u32> {
+    if !matches!(
+        resource.kind,
+        ResourceKind::Sampler | ResourceKind::StaticSampler
+    ) {
+        return None;
+    }
+    let descriptor = resource.descriptor?;
+    let widened = descriptor.binding.checked_add(SAMPLED_TAIL_WIDEN_OFFSET)?;
+    widened.checked_add(if fragment_relocated {
+        FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+    } else {
+        0
+    })
+}
+
+/// One sampler in the executable descriptor interface. `static_state` is the
+/// exact AIR constexpr state; `None` means the guest supplies a sampler object
+/// or the runtime provisions the neutral default when that slot is unbound.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReflectedSamplerDescriptor {
+    pub binding: u32,
+    pub static_state: Option<metal2vulkan::reflect::StaticSamplerState>,
+}
+
+/// Every sampler descriptor declared by a reflected shader, transformed into
+/// the numbering of the selected executable variant. The result is canonical
+/// so it can be cached directly beside that variant's words.
+pub fn reflected_sampler_descriptors(
+    reflection: &ShaderReflection,
+    fragment_relocated: bool,
+) -> Vec<ReflectedSamplerDescriptor> {
+    let mut descriptors: Vec<ReflectedSamplerDescriptor> = reflection
+        .bindings
+        .iter()
+        .filter_map(|resource| {
+            reflected_sampler_binding(resource, fragment_relocated).map(|binding| {
+                ReflectedSamplerDescriptor {
+                    binding,
+                    static_state: (resource.kind == ResourceKind::StaticSampler)
+                        .then_some(resource.static_sampler)
+                        .flatten(),
+                }
+            })
+        })
+        .collect();
+    descriptors.sort_by_key(|descriptor| descriptor.binding);
+    descriptors
+}
+
+/// Resolve a Metal texture-table index through the final reflection interface.
+/// An exact scalar declaration wins over an enclosing array range.
+pub fn reflected_texture_descriptor(
+    reflection: &ShaderReflection,
+    metal_index: u32,
+) -> Option<ReflectedTextureDescriptor> {
+    let exact = reflection
+        .bindings
+        .iter()
+        .find(|binding| is_texture_kind(binding.kind) && binding.metal_index == metal_index);
+    let reflected = exact.or_else(|| {
+        reflection.bindings.iter().find(|binding| {
+            if binding.kind != ResourceKind::TextureArray {
+                return false;
+            }
+            let Some(descriptor) = binding.descriptor else {
+                return false;
+            };
+            metal_index
+                .checked_sub(binding.metal_index)
+                .is_some_and(|element| element < descriptor.count)
+        })
+    })?;
+    let descriptor = reflected.descriptor?;
+    let array_element = if reflected.kind == ResourceKind::TextureArray {
+        metal_index.checked_sub(reflected.metal_index)?
+    } else {
+        0
+    };
+    (descriptor.count > 0 && array_element < descriptor.count).then_some(
+        ReflectedTextureDescriptor {
+            binding: descriptor.binding,
+            array_element,
+            descriptor_count: descriptor.count,
+            access: match reflected.access {
+                Some(ResourceAccess::Sampled) => ReflectedTextureAccess::Sampled,
+                Some(ResourceAccess::Storage) => ReflectedTextureAccess::Storage,
+                _ => ReflectedTextureAccess::Unknown,
+            },
+        },
+    )
+}
+
+/// First texture descriptor that cannot be exposed through a sampled-image
+/// render binding. Compute has a storage-image request path; render does not.
+pub fn first_non_sampled_texture_descriptor(
+    reflection: &ShaderReflection,
+) -> Option<(u32, ReflectedTextureDescriptor)> {
+    reflection.bindings.iter().find_map(|binding| {
+        if !is_texture_kind(binding.kind) || binding.access == Some(ResourceAccess::Sampled) {
+            return None;
+        }
+        reflected_texture_descriptor(reflection, binding.metal_index)
+            .map(|descriptor| (binding.metal_index, descriptor))
+    })
 }
 
 /// Whether [`crate::env::BUFFER_EXTENT`] is switched off, read once per process.
@@ -2392,6 +2573,177 @@ pub fn reflected_buffer_extent(reflection: &ShaderReflection, metal_index: u32) 
     }
 }
 
+/// Invocation bounds needed to turn a reflected render-buffer footprint into
+/// one conservative byte extent.
+///
+/// These are maxima in the shader builtin's own value domain, not draw counts.
+/// Keeping that distinction in the type prevents a caller from forgetting
+/// `firstVertex` or `baseInstance`. `vertex_index` is absent for indexed draws:
+/// the index buffer, rather than `index_count`, bounds the values observed by
+/// the vertex shader, and this path deliberately does not read it merely to
+/// make the gather smaller.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RenderBufferIndexBounds {
+    vertex_index: Option<u64>,
+    instance_index: Option<u64>,
+}
+
+impl RenderBufferIndexBounds {
+    pub fn new(
+        first_vertex: u32,
+        vertex_count: u32,
+        base_instance: u32,
+        instance_count: u32,
+        indexed: bool,
+    ) -> Self {
+        let inclusive_max = |first: u32, count: u32| {
+            count
+                .checked_sub(1)
+                .and_then(|last| first.checked_add(last))
+                .map(u64::from)
+        };
+        Self {
+            vertex_index: if indexed {
+                None
+            } else {
+                inclusive_max(first_vertex, vertex_count)
+            },
+            instance_index: inclusive_max(base_instance, instance_count),
+        }
+    }
+
+    fn maximum(self, source: metal2vulkan::reflect::BufferIndexSource) -> Option<u64> {
+        use metal2vulkan::reflect::BufferIndexSource;
+        match source {
+            BufferIndexSource::VertexIndex => self.vertex_index,
+            BufferIndexSource::InstanceIndex => self.instance_index,
+            // A render stage cannot derive a useful bound for compute builtins.
+            // Treating an unexpected one as unknown keeps the whole guest
+            // window, which is the conservative answer.
+            BufferIndexSource::GlobalInvocationIdX
+            | BufferIndexSource::GlobalInvocationIdY
+            | BufferIndexSource::GlobalInvocationIdZ
+            | BufferIndexSource::LocalInvocationIdX
+            | BufferIndexSource::LocalInvocationIdY
+            | BufferIndexSource::LocalInvocationIdZ
+            | BufferIndexSource::WorkgroupIdX
+            | BufferIndexSource::WorkgroupIdY
+            | BufferIndexSource::WorkgroupIdZ
+            | BufferIndexSource::LocalInvocationIndex => None,
+        }
+    }
+}
+
+/// Bound a render-stage `[[buffer(n)]]` by the final shader's actual byte
+/// footprint for this draw.
+///
+/// The returned value is the largest exclusive byte offset any invocation may
+/// touch, so it can be passed directly as a Vulkan buffer range or staging
+/// length. Static ranges and affine vertex/instance accesses are both covered.
+/// A data-dependent access, an arithmetic overflow, or an index source this
+/// draw cannot bound returns the declared-object cap when one exists and
+/// otherwise keeps the complete guest allocation.
+///
+/// The footprint and declared-object answers are independent conservative
+/// upper bounds, so when both exist their minimum is still conservative. This
+/// is also why this function consumes reflection once and exports one answer:
+/// callers should not have to reconstruct which translator facts can safely be
+/// combined.
+pub fn reflected_render_buffer_extent(
+    reflection: &ShaderReflection,
+    metal_index: u32,
+    bounds: RenderBufferIndexBounds,
+) -> Option<u64> {
+    reflected_buffer_footprint_extent(reflection, metal_index, |source| bounds.maximum(source))
+}
+
+/// [`reflected_render_buffer_extent`] for a compute dispatch.
+///
+/// `workgroups` is the exact triple passed to `vkCmdDispatch`; `local_size` is
+/// the specialized shader's workgroup size. Their products bound the Vulkan
+/// invocations that can execute, including padding invocations introduced when
+/// a Metal `dispatchThreads` grid is rounded up to whole Vulkan workgroups.
+/// Bounding the actual host invocations, rather than the guest's requested
+/// thread count, keeps the staging valid even on that edge.
+pub fn reflected_compute_buffer_extent(
+    reflection: &ShaderReflection,
+    metal_index: u32,
+    workgroups: [u32; 3],
+    local_size: [u32; 3],
+) -> Option<u64> {
+    use metal2vulkan::reflect::BufferIndexSource;
+
+    let axis_max = |axis: usize| {
+        u64::from(workgroups[axis])
+            .checked_mul(u64::from(local_size[axis]))?
+            .checked_sub(1)
+    };
+    let local_max = |axis: usize| u64::from(local_size[axis]).checked_sub(1);
+    let workgroup_max = |axis: usize| u64::from(workgroups[axis]).checked_sub(1);
+    let local_linear_max = || {
+        local_size
+            .into_iter()
+            .try_fold(1u64, |product, axis| product.checked_mul(u64::from(axis)))?
+            .checked_sub(1)
+    };
+    reflected_buffer_footprint_extent(reflection, metal_index, |source| match source {
+        BufferIndexSource::GlobalInvocationIdX => axis_max(0),
+        BufferIndexSource::GlobalInvocationIdY => axis_max(1),
+        BufferIndexSource::GlobalInvocationIdZ => axis_max(2),
+        BufferIndexSource::LocalInvocationIdX => local_max(0),
+        BufferIndexSource::LocalInvocationIdY => local_max(1),
+        BufferIndexSource::LocalInvocationIdZ => local_max(2),
+        BufferIndexSource::WorkgroupIdX => workgroup_max(0),
+        BufferIndexSource::WorkgroupIdY => workgroup_max(1),
+        BufferIndexSource::WorkgroupIdZ => workgroup_max(2),
+        BufferIndexSource::LocalInvocationIndex => local_linear_max(),
+        BufferIndexSource::VertexIndex | BufferIndexSource::InstanceIndex => None,
+    })
+}
+
+fn reflected_buffer_footprint_extent(
+    reflection: &ShaderReflection,
+    metal_index: u32,
+    maximum: impl Fn(metal2vulkan::reflect::BufferIndexSource) -> Option<u64>,
+) -> Option<u64> {
+    if buffer_extent_disabled() {
+        return None;
+    }
+    let declared = reflected_buffer_extent(reflection, metal_index);
+    let footprint = reflection
+        .bindings
+        .iter()
+        .find(|binding| binding.kind == ResourceKind::Buffer && binding.metal_index == metal_index)
+        .and_then(|binding| binding.footprint.as_ref())
+        .and_then(|footprint| {
+            if footprint.has_unbounded_access {
+                return None;
+            }
+            let mut end = 0u64;
+            for range in &footprint.static_ranges {
+                end = end.max(range.offset.checked_add(range.size)?);
+            }
+            for access in &footprint.strided_accesses {
+                let mut access_end = access.base_offset.checked_add(access.access_size)?;
+                for term in &access.terms {
+                    access_end =
+                        access_end.checked_add(maximum(term.source)?.checked_mul(term.stride)?)?;
+                }
+                end = end.max(access_end);
+            }
+            // No reflected dereference is normally paired with
+            // `ResourceAccess::Unused` and served by the neutral bind. If the
+            // two facts ever disagree, an empty Vulkan range must not become
+            // the accidental policy; retain the guest window instead.
+            (end != 0).then_some(end)
+        });
+    match (declared, footprint) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(cap), None) | (None, Some(cap)) => Some(cap),
+        (None, None) => None,
+    }
+}
+
 /// Band a declared object size, because what decides whether narrowing is worth
 /// anything is the order of magnitude and not the byte.
 ///
@@ -2421,14 +2773,19 @@ pub enum ReflectedBufferAccess {
     /// The specialized entry point does not dereference this buffer. Its
     /// descriptor may still have to be bound, but no guest bytes are read
     /// through it, so nothing needs staging for this draw.
-    Unused = 0,
-    /// Reflection declares the bind and says the shader touches it —
-    /// `ReadOnly`, `WriteOnly`, `ReadWrite`, or an image class at this index.
-    Dereferenced = 1,
-    /// Reflection carries no `Buffer` at this index, or carries one with no
-    /// access recorded. Both mean *no answer*, which is not the same as
-    /// [`Self::Unused`] and must never be treated as one.
-    Undeclared = 2,
+    Unused,
+    /// The shader reads this buffer and never writes it.
+    ReadOnly,
+    /// The shader may write this buffer. `WriteOnly` and `ReadWrite` collapse
+    /// here because both require device-to-guest writeback after a dispatch.
+    Writable,
+    /// Reflection carries no `Buffer` at this Metal index. A compute encoder may
+    /// ignore that extra guest bind; a render encoder still has to consider the
+    /// separate stage-in use of the same index.
+    Absent,
+    /// Reflection declares the buffer but carries no usable access answer.
+    /// Consumers must retain the conservative read/write path.
+    Unknown,
 }
 
 /// Bytes in the neutral page a [`ReflectedBufferAccess::Unused`] bind is given
@@ -2513,9 +2870,38 @@ fn unused_binds_disabled() -> bool {
 /// visible while declining nothing. The caller checks the attribute list it
 /// already has.
 pub fn may_serve_neutral(access: ReflectedBufferAccess, feeds_stage_in: bool) -> bool {
-    matches!(access, ReflectedBufferAccess::Unused)
-        && !feeds_stage_in
-        && !unused_binds_disabled()
+    matches!(access, ReflectedBufferAccess::Unused) && !feeds_stage_in && !unused_binds_disabled()
+}
+
+/// [`reflected_buffer_extent`] for a **vertex** bind, carrying the same stage-in
+/// exclusion [`may_serve_neutral`] does and for the same reason.
+///
+/// Metal's vertex-descriptor layouts and its buffer argument table share one
+/// index space, so a vertex function may declare a bounded argument at an index
+/// the pipeline also uses as a vertex layout — which is why Apple's guidance is
+/// to place vertex buffers at high indices, and why the collision is legal
+/// rather than a decode error. Reflection then reports an `Object` whose size
+/// bounds the *argument*, and applying it truncates the *stream*: a few bytes
+/// staged where kilobytes were asked for, an attribute walk that picks the
+/// truncated content out for every attribute naming that index, and a draw that
+/// rasterises nothing or garbage. The `StageInBytesMissing` guard downstream
+/// fires only on an *empty* stream, so it does not catch a short one.
+///
+/// The two rails that narrow a vertex bind now spell one exclusion once. They
+/// were spelled apart, and the extent's call site rested on the argument
+/// [`may_serve_neutral`]'s own doc states and rejects — "the translator lists no
+/// `Buffer` at a pure stage-in index, so in principle such a bind classifies
+/// `Undeclared` and never reaches here".
+pub fn vertex_buffer_extent(
+    reflection: &ShaderReflection,
+    metal_index: u32,
+    feeds_stage_in: bool,
+    bounds: RenderBufferIndexBounds,
+) -> Option<u64> {
+    if feeds_stage_in {
+        return None;
+    }
+    reflected_render_buffer_extent(reflection, metal_index, bounds)
 }
 
 /// How reflection describes a `[[buffer(n)]]` bind's use by this stage.
@@ -2524,8 +2910,11 @@ pub fn may_serve_neutral(access: ReflectedBufferAccess, feeds_stage_in: bool) ->
 /// sharper reason. Reading `Unused` where the shader does dereference the buffer
 /// hands the GPU stale or absent bytes — silent wrong pixels, no error anywhere
 /// — so only an explicit [`ResourceAccess::Unused`] may answer
-/// [`ReflectedBufferAccess::Unused`]. A bind reflection never mentions, and one
-/// it mentions without an access, are both [`ReflectedBufferAccess::Undeclared`].
+/// [`ReflectedBufferAccess::Unused`]. A bind reflection never mentions is
+/// [`ReflectedBufferAccess::Absent`]; one it mentions without a usable access
+/// answer is [`ReflectedBufferAccess::Unknown`]. Keeping those distinct lets a
+/// compute dispatch skip an extra guest bind while failing closed on a declared
+/// buffer whose access could not be classified.
 ///
 /// Deliberately not gated on [`crate::env::BUFFER_EXTENT`]. That switch governs
 /// narrowing a bind's byte window, which is a different question from whether
@@ -2548,18 +2937,17 @@ pub fn reflected_buffer_access(
     let Some(access) = reflection.bindings.iter().find_map(|b| {
         (b.kind == ResourceKind::Buffer && b.metal_index == metal_index).then_some(b.access)
     }) else {
-        return ReflectedBufferAccess::Undeclared;
+        return ReflectedBufferAccess::Absent;
     };
     match access {
         Some(ResourceAccess::Unused) => ReflectedBufferAccess::Unused,
-        Some(
-            ResourceAccess::ReadOnly
-            | ResourceAccess::WriteOnly
-            | ResourceAccess::ReadWrite
-            | ResourceAccess::Sampled
-            | ResourceAccess::Storage,
-        ) => ReflectedBufferAccess::Dereferenced,
-        None => ReflectedBufferAccess::Undeclared,
+        Some(ResourceAccess::ReadOnly) => ReflectedBufferAccess::ReadOnly,
+        Some(ResourceAccess::WriteOnly | ResourceAccess::ReadWrite) => {
+            ReflectedBufferAccess::Writable
+        }
+        Some(ResourceAccess::Sampled | ResourceAccess::Storage) | None => {
+            ReflectedBufferAccess::Unknown
+        }
     }
 }
 
@@ -2661,7 +3049,10 @@ pub fn reflected_compute_texture(
 /// Logs `m2v_reflect_malformed reason=<slug>` fail-visibly; quiet on a healthy
 /// boot (returns the number of violations found, 0 when clean).
 pub fn census_reflection_wellformed(reflection: &ShaderReflection, pipeline_ref: u32) -> usize {
+    use std::collections::BTreeSet;
+
     let mut bad = 0;
+    let mut sampler_bindings = BTreeSet::new();
     if reflection.reflection_version != REFLECTION_VERSION {
         bad += 1;
         crate::observe::fail(format!(
@@ -2670,7 +3061,38 @@ pub fn census_reflection_wellformed(reflection: &ShaderReflection, pipeline_ref:
             reflection.reflection_version
         ));
     }
+    match (reflection.stage, reflection.local_size) {
+        (ShaderStage::Kernel, Some(size)) if size.into_iter().all(|axis| axis > 0) => {}
+        (ShaderStage::Kernel, local_size) => {
+            bad += 1;
+            crate::observe::fail(format!(
+                "m2v_reflect_malformed pipe={pipeline_ref} reason=kernel_local_size \
+                 local_size={local_size:?}"
+            ));
+        }
+        (_, Some(local_size)) => {
+            bad += 1;
+            crate::observe::fail(format!(
+                "m2v_reflect_malformed pipe={pipeline_ref} reason=nonkernel_local_size \
+                 stage={:?} local_size={local_size:?}",
+                reflection.stage
+            ));
+        }
+        (_, None) => {}
+    }
     for b in &reflection.bindings {
+        if matches!(b.kind, ResourceKind::Sampler | ResourceKind::StaticSampler) {
+            if let Some(descriptor) = b.descriptor {
+                if !sampler_bindings.insert(descriptor.binding) {
+                    bad += 1;
+                    crate::observe::fail(format!(
+                        "m2v_reflect_malformed pipe={pipeline_ref} \
+                         reason=sampler_descriptor_duplicate bind={} kind={:?}",
+                        descriptor.binding, b.kind
+                    ));
+                }
+            }
+        }
         if b.kind == ResourceKind::StaticSampler {
             match (b.descriptor, b.static_sampler) {
                 (None, _) => {
@@ -2691,21 +3113,71 @@ pub fn census_reflection_wellformed(reflection: &ShaderReflection, pipeline_ref:
                 }
                 (Some(descriptor), Some(_))
                     if descriptor.set != RESOURCE_DESCRIPTOR_SET
+                        || descriptor.count != 1
+                        || descriptor.binding
+                            != M2V_SAMPLER_BINDING_BASE.saturating_add(b.metal_index)
                         || !(M2V_SAMPLER_BINDING_BASE..M2V_COLOR_INPUT_BINDING_BASE)
                             .contains(&descriptor.binding) =>
                 {
                     bad += 1;
                     crate::observe::fail(format!(
                         "m2v_reflect_malformed pipe={pipeline_ref} \
-                         reason=static_sampler_descriptor_out_of_band set={} bind={} \
-                         expected_set={RESOURCE_DESCRIPTOR_SET} expected_band={}..{}",
+                         reason=static_sampler_descriptor_out_of_band set={} bind={} count={} \
+                         expected_set={RESOURCE_DESCRIPTOR_SET} expected_bind={} \
+                         expected_band={}..{}",
                         descriptor.set,
                         descriptor.binding,
+                        descriptor.count,
+                        M2V_SAMPLER_BINDING_BASE.saturating_add(b.metal_index),
                         M2V_SAMPLER_BINDING_BASE,
                         M2V_COLOR_INPUT_BINDING_BASE
                     ));
                 }
                 (Some(_), Some(_)) => {}
+            }
+            continue;
+        }
+        if b.kind == ResourceKind::Sampler {
+            match b.descriptor {
+                None => {
+                    bad += 1;
+                    crate::observe::fail(format!(
+                        "m2v_reflect_malformed pipe={pipeline_ref} \
+                         reason=sampler_no_descriptor metal_index={}",
+                        b.metal_index
+                    ));
+                }
+                Some(descriptor)
+                    if descriptor.set != RESOURCE_DESCRIPTOR_SET
+                        || descriptor.count != 1
+                        || descriptor.binding
+                            != M2V_SAMPLER_BINDING_BASE.saturating_add(b.metal_index)
+                        || !(M2V_SAMPLER_BINDING_BASE..M2V_COLOR_INPUT_BINDING_BASE)
+                            .contains(&descriptor.binding) =>
+                {
+                    bad += 1;
+                    crate::observe::fail(format!(
+                        "m2v_reflect_malformed pipe={pipeline_ref} \
+                         reason=sampler_descriptor_out_of_band set={} bind={} count={} \
+                         expected_set={RESOURCE_DESCRIPTOR_SET} expected_bind={} \
+                         expected_band={}..{}",
+                        descriptor.set,
+                        descriptor.binding,
+                        descriptor.count,
+                        M2V_SAMPLER_BINDING_BASE.saturating_add(b.metal_index),
+                        M2V_SAMPLER_BINDING_BASE,
+                        M2V_COLOR_INPUT_BINDING_BASE
+                    ));
+                }
+                Some(_) => {}
+            }
+            if b.static_sampler.is_some() {
+                bad += 1;
+                crate::observe::fail(format!(
+                    "m2v_reflect_malformed pipe={pipeline_ref} \
+                     reason=static_sampler_state_on_nonstatic kind={:?} metal_index={}",
+                    b.kind, b.metal_index
+                ));
             }
             continue;
         }
@@ -2717,6 +3189,39 @@ pub fn census_reflection_wellformed(reflection: &ShaderReflection, pipeline_ref:
                 b.kind, b.metal_index
             ));
         }
+        if let Some(descriptor) = b.descriptor {
+            if descriptor.set != RESOURCE_DESCRIPTOR_SET {
+                bad += 1;
+                crate::observe::fail(format!(
+                    "m2v_reflect_malformed pipe={pipeline_ref} reason=descriptor_set \
+                     kind={:?} metal_index={} set={} expected_set={RESOURCE_DESCRIPTOR_SET}",
+                    b.kind, b.metal_index, descriptor.set
+                ));
+            }
+        }
+        if b.kind == ResourceKind::Buffer
+            && matches!(
+                b.access,
+                Some(ResourceAccess::Sampled | ResourceAccess::Storage)
+            )
+        {
+            bad += 1;
+            crate::observe::fail(format!(
+                "m2v_reflect_malformed pipe={pipeline_ref} reason=buffer_access_wrong_class \
+                 metal_index={} access={:?}",
+                b.metal_index, b.access
+            ));
+        }
+        if b.kind == ResourceKind::Buffer
+            && matches!(b.extent, Some(BufferExtent::Object { bytes: 0 }))
+        {
+            bad += 1;
+            crate::observe::fail(format!(
+                "m2v_reflect_malformed pipe={pipeline_ref} reason=buffer_object_extent_zero \
+                 metal_index={}",
+                b.metal_index
+            ));
+        }
         let texture_family = matches!(
             b.kind,
             ResourceKind::Texture
@@ -2725,6 +3230,16 @@ pub fn census_reflection_wellformed(reflection: &ShaderReflection, pipeline_ref:
                 | ResourceKind::EmbeddedArgBufferTexture
         );
         if !texture_family {
+            if b.descriptor.is_some_and(|descriptor| descriptor.count != 1) {
+                bad += 1;
+                crate::observe::fail(format!(
+                    "m2v_reflect_malformed pipe={pipeline_ref} reason=descriptor_count \
+                     kind={:?} metal_index={} count={}",
+                    b.kind,
+                    b.metal_index,
+                    b.descriptor.expect("checked Some").count
+                ));
+            }
             continue;
         }
         let binding = b.descriptor.map(|d| d.binding);
@@ -2736,6 +3251,27 @@ pub fn census_reflection_wellformed(reflection: &ShaderReflection, pipeline_ref:
                 b.kind, b.metal_index
             ));
         }
+        if let Some(descriptor) = b.descriptor {
+            let invalid_count = match b.kind {
+                ResourceKind::TextureArray => descriptor.count <= 1,
+                ResourceKind::EmbeddedArgBufferTexture => {
+                    let reflected_length = b
+                        .texture_shape
+                        .as_ref()
+                        .and_then(|shape| shape.array_length);
+                    descriptor.count == 0 || reflected_length.unwrap_or(1) != descriptor.count
+                }
+                _ => descriptor.count != 1,
+            };
+            if invalid_count {
+                bad += 1;
+                crate::observe::fail(format!(
+                    "m2v_reflect_malformed pipe={pipeline_ref} reason=texture_descriptor_count \
+                     kind={:?} metal_index={} count={}",
+                    b.kind, b.metal_index, descriptor.count
+                ));
+            }
+        }
         // Only the two malformed-reflection lines below read this, and a missing
         // descriptor has already emitted its own. Rendering that case as `0`
         // names a real binding index the reflection never carried, so the two
@@ -2746,8 +3282,42 @@ pub fn census_reflection_wellformed(reflection: &ShaderReflection, pipeline_ref:
         };
         // Storage-vs-sampled must agree across the three encodings the consumer
         // and the translator both derive from the one `TextureShape`.
-        let kind_storage = matches!(b.kind, ResourceKind::StorageImage);
-        if let Some(writable) = b.texture_shape.as_ref().map(|s| s.writable) {
+        let access_storage = match b.access {
+            Some(ResourceAccess::Storage) => Some(true),
+            Some(ResourceAccess::Sampled) => Some(false),
+            _ => None,
+        };
+        if access_storage.is_none() {
+            bad += 1;
+            crate::observe::fail(format!(
+                "m2v_reflect_malformed pipe={pipeline_ref} reason=texture_access_missing_or_wrong \
+                 bind={bind} kind={:?} access={:?}",
+                b.kind, b.access
+            ));
+        }
+        let Some(shape) = b.texture_shape.as_ref() else {
+            bad += 1;
+            crate::observe::fail(format!(
+                "m2v_reflect_malformed pipe={pipeline_ref} reason=texture_shape_missing \
+                 bind={bind} kind={:?}",
+                b.kind
+            ));
+            continue;
+        };
+        if shape.writable != shape.storage_format.is_some() {
+            bad += 1;
+            crate::observe::fail(format!(
+                "m2v_reflect_malformed pipe={pipeline_ref} reason=texture_format_access_disagree \
+                 bind={bind} kind={:?} writable={} format={:?}",
+                b.kind, shape.writable, shape.storage_format
+            ));
+        }
+        let kind_storage = match b.kind {
+            ResourceKind::StorageImage => Some(true),
+            ResourceKind::TextureArray | ResourceKind::EmbeddedArgBufferTexture => access_storage,
+            _ => Some(false),
+        };
+        if let (Some(writable), Some(kind_storage)) = (Some(shape.writable), kind_storage) {
             if writable != kind_storage {
                 bad += 1;
                 crate::observe::fail(format!(
@@ -2757,12 +3327,7 @@ pub fn census_reflection_wellformed(reflection: &ShaderReflection, pipeline_ref:
                 ));
             }
         }
-        let access_storage = match b.access {
-            Some(ResourceAccess::Storage) => Some(true),
-            Some(ResourceAccess::Sampled) => Some(false),
-            _ => None,
-        };
-        if let Some(access_storage) = access_storage {
+        if let (Some(access_storage), Some(kind_storage)) = (access_storage, kind_storage) {
             if access_storage != kind_storage {
                 bad += 1;
                 crate::observe::fail(format!(
@@ -2805,6 +3370,7 @@ pub fn log_folded_function_constants(reflection: &ShaderReflection) -> usize {
     }
     let stage = match reflection.stage {
         ShaderStage::Vertex => "v",
+        ShaderStage::TessellationEvaluation => "te",
         ShaderStage::Fragment => "f",
         ShaderStage::Kernel => "k",
     };
@@ -2856,7 +3422,10 @@ mod tests {
         // (`ImageCubeArray`) through every run of this test. The number is
         // SPIR-V's, so the literal is the only side of the comparison that
         // carries information.
-        assert_eq!(words[8], 56, "SPIR-V Capability StorageImageWriteWithoutFormat");
+        assert_eq!(
+            words[8], 56,
+            "SPIR-V Capability StorageImageWriteWithoutFormat"
+        );
         assert_eq!(
             words[9] & 0xffff,
             14,
@@ -2866,6 +3435,39 @@ mod tests {
         assert!(!ensure_storage_write_without_format_capability(&mut words));
         assert_eq!(words.len(), before + 2);
     }
+}
+
+/// Module builders shared by this module's own tests and by the engine tests
+/// that ask the same questions of a draw's two modules.
+///
+/// Here rather than copied into each test module: the answer
+/// [`descriptor_static_use`] gives turns on the exact word layout below — an
+/// `OpEntryPoint` interface list that names the variable without referencing it
+/// is what separates `DeclaredUnused` from `Used` — so a second hand-built
+/// module that drifted from this one would test a different question under the
+/// same name.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Build a minimal module: header, `OpCapability Shader`, `OpMemoryModel`,
+    /// then whatever body words are given.
+    pub(crate) fn module_with(body: &[u32]) -> Vec<u32> {
+        let mut words = vec![
+            0x0723_0203,       // magic
+            0x0001_0600,       // version
+            0,                 // generator
+            64,                // bound
+            0,                 // schema
+            (2u32 << 16) | 17, // OpCapability
+            1,                 // Shader
+            (3u32 << 16) | 14, // OpMemoryModel
+            0,
+            1,
+        ];
+        words.extend_from_slice(body);
+        words
+    }
 
     /// A fragment module declaring one `UniformConstant` variable on `binding`,
     /// named by `OpEntryPoint`'s interface list the way SPIR-V 1.4 requires, and
@@ -2873,9 +3475,9 @@ mod tests {
     ///
     /// The entry point is not decoration: from 1.4 its interface list carries
     /// every global variable whether the body touches it or not, so a module
-    /// without it would not exercise the one exclusion that decides this
-    /// function's answer.
-    fn module_with_descriptor(binding: u32, loaded: bool) -> Vec<u32> {
+    /// without it would not exercise the one exclusion that decides
+    /// [`descriptor_static_use`]'s answer.
+    pub(crate) fn module_with_descriptor(binding: u32, loaded: bool) -> Vec<u32> {
         const VAR: u32 = 10;
         const FN: u32 = 11;
         let mut body = vec![
@@ -2905,6 +3507,16 @@ mod tests {
             body.extend_from_slice(&[(4u32 << 16) | OP_LOAD as u32, 2, 12, VAR]);
         }
         module_with(&body)
+    }
+}
+
+#[cfg(test)]
+mod more_tests {
+    use super::test_support::module_with;
+    use super::*;
+
+    fn module_with_descriptor(binding: u32, loaded: bool) -> Vec<u32> {
+        super::test_support::module_with_descriptor(binding, loaded)
     }
 
     /// Declaration and static use are different questions, and only the second
@@ -2985,24 +3597,8 @@ mod tests {
         assert_eq!(slugs.len(), all.len());
     }
 
-    /// Build a minimal module: header, `OpCapability Shader`, `OpMemoryModel`,
-    /// then whatever body words are given.
-    fn module_with(body: &[u32]) -> Vec<u32> {
-        let mut words = vec![
-            0x0723_0203,       // magic
-            0x0001_0600,       // version
-            0,                 // generator
-            64,                // bound
-            0,                 // schema
-            (2u32 << 16) | 17, // OpCapability
-            1,                 // Shader
-            (3u32 << 16) | 14, // OpMemoryModel
-            0,
-            1,
-        ];
-        words.extend_from_slice(body);
-        words
-    }
+    // `module_with` is `test_support`'s, imported above: one builder, so a
+    // module built here and one built by an engine test are the same module.
 
     /// `OpTypeImage %result %sampled_ty 2D 0 0 0 <sampled> <format>` (9 words).
     fn op_type_image(result: u32, sampled: u32, format: u32) -> [u32; 9] {
@@ -3062,6 +3658,36 @@ mod tests {
         assert!(!required_image_capabilities(&words).extended_formats);
     }
 
+    /// The memo answers what the walk answers, for every module and not only
+    /// for the one it was first asked about.
+    ///
+    /// The hazard a memo keyed on an address carries is that a *second* module
+    /// gets a hit meant for the first, and the failure mode is silent: the draw
+    /// is checked against another shader's binding set, so a real layout gap
+    /// reads as clean. So the assertion is over two modules with disjoint
+    /// bindings, each asked twice and interleaved, against the walking form
+    /// taken on the same words.
+    #[test]
+    fn the_memoized_binding_sweep_answers_per_module_and_not_per_first_call() {
+        let a = std::sync::Arc::new(test_module_with_two_sampled_images(33, 34));
+        let b = std::sync::Arc::new(test_module_with_two_sampled_images(40, 41));
+        let walk = |m: &std::sync::Arc<Vec<u32>>| declared_binding_numbers(m);
+
+        for _ in 0..2 {
+            assert_eq!(
+                declared_binding_numbers_memoized(&a).to_vec(),
+                walk(&a),
+                "the first module keeps its own answer"
+            );
+            assert_eq!(
+                declared_binding_numbers_memoized(&b).to_vec(),
+                walk(&b),
+                "and the second is not served the first one's"
+            );
+        }
+        assert_ne!(walk(&a), walk(&b), "the fixture modules must differ at all");
+    }
+
     /// The candidate list is class-blind and the use test is not, which is the
     /// division the layout backstop is built on.
     ///
@@ -3084,7 +3710,10 @@ mod tests {
         // statement about references, not about class.
         assert_eq!(sampled_image_bindings(&words), vec![33, 34]);
         // A binding no variable carries is not invented.
-        assert_eq!(descriptor_static_use(&words, 99), DescriptorUse::NotDeclared);
+        assert_eq!(
+            descriptor_static_use(&words, 99),
+            DescriptorUse::NotDeclared
+        );
     }
 
     /// A module in the shape of the compositor kernel that killed a host: a
@@ -3121,7 +3750,11 @@ mod tests {
             0,
         ));
         body.extend_from_slice(&[(2u32 << 16) | OP_TYPE_SAMPLER as u32, SAMPLER_TY]);
-        for (ptr, pointee) in [(20, STORAGE_IMAGE_TY), (21, SAMPLED_IMAGE_TY), (22, SAMPLER_TY)] {
+        for (ptr, pointee) in [
+            (20, STORAGE_IMAGE_TY),
+            (21, SAMPLED_IMAGE_TY),
+            (22, SAMPLER_TY),
+        ] {
             body.extend_from_slice(&[
                 (4u32 << 16) | OP_TYPE_POINTER as u32,
                 ptr,
@@ -3172,7 +3805,10 @@ mod tests {
         let words = module_with(&body);
 
         let need = required_image_capabilities(&words);
-        assert!(need.write_without_format, "write to an Unknown-format image");
+        assert!(
+            need.write_without_format,
+            "write to an Unknown-format image"
+        );
         assert!(!need.extended_formats, "Unknown is in the core set");
 
         // And the splice puts it in, once.
@@ -3185,7 +3821,10 @@ mod tests {
         // The splice lands in the capability section, before OpMemoryModel — a
         // capability declared after it is as invalid as a missing one.
         assert_eq!(patched[7] & 0xffff, OP_CAPABILITY as u32);
-        assert_eq!(patched[8], 56, "SPIR-V Capability StorageImageWriteWithoutFormat");
+        assert_eq!(
+            patched[8], 56,
+            "SPIR-V Capability StorageImageWriteWithoutFormat"
+        );
         assert_eq!(patched[9] & 0xffff, 14, "OpMemoryModel follows");
     }
 
@@ -3212,6 +3851,7 @@ mod tests {
 
     use metal2vulkan::meta::{FunctionConstant, TextureComponent, TextureShape};
     use metal2vulkan::reflect::{
+        BufferByteRange, BufferFootprint, BufferIndexSource, BufferStrideTerm, BufferStridedAccess,
         DescriptorLocation, ResourceBinding, ResourceKind, ShaderReflection, ShaderStage,
         REFLECTION_VERSION,
     };
@@ -3222,14 +3862,19 @@ mod tests {
             stage,
             entry_point: None,
             bindings: vec![],
+            argument_buffer_fields: vec![],
             vertex_attributes: vec![],
             varyings: vec![],
             render_targets: vec![],
             depth_members: vec![],
+            depth_qualifier: None,
             stencil_members: vec![],
-            local_size: None,
+            local_size: (stage == ShaderStage::Kernel).then_some([1, 1, 1]),
             vertex_builtins: None,
+            tessellation: None,
             imageblock_layouts: vec![],
+            implicit_imageblock_attachments: vec![],
+            fragment_imageblock: None,
             datalayout: None,
             function_constants: vec![],
         }
@@ -3242,11 +3887,14 @@ mod tests {
             descriptor: Some(DescriptorLocation {
                 set: RESOURCE_DESCRIPTOR_SET,
                 binding: metal_index,
+                count: 1,
             }),
             param_index: None,
+            stage_input_location: None,
             address_space: None,
             declared_size: None,
             extent,
+            footprint: None,
             type_layout: None,
             type_name: None,
             texture_shape: None,
@@ -3275,11 +3923,220 @@ mod tests {
             buffer_binding(3, None),
         ];
 
-        assert_eq!(reflected_buffer_extent(&r, 0), Some(288), "a bounded object");
+        assert_eq!(
+            reflected_buffer_extent(&r, 0),
+            Some(288),
+            "a bounded object"
+        );
         assert_eq!(reflected_buffer_extent(&r, 1), None, "an unbounded pointer");
         assert_eq!(reflected_buffer_extent(&r, 2), None, "an undecided extent");
         assert_eq!(reflected_buffer_extent(&r, 3), None, "no extent carried");
         assert_eq!(reflected_buffer_extent(&r, 9), None, "not declared at all");
+    }
+
+    /// A vertex index the pipeline also uses as a `[[stage_in]]` layout takes no
+    /// extent, however confidently reflection describes the argument at it.
+    ///
+    /// One index space, two uses: reflection's `Object` bounds the declared
+    /// argument, and the same index is the byte source for every attribute
+    /// naming it. Applying the argument's bound to the stream stages a few bytes
+    /// where kilobytes were asked for, and the only guard downstream fires on an
+    /// *empty* stream rather than a short one.
+    ///
+    /// The sibling rail — [`may_serve_neutral`] — has carried this exclusion
+    /// from the start, and its doc rejects in as many words the argument the
+    /// extent rail was resting on. This asserts they now agree.
+    #[test]
+    fn a_vertex_stream_index_is_not_bounded_by_the_argument_declared_at_it() {
+        let mut r = empty_reflection(ShaderStage::Vertex);
+        r.bindings = vec![buffer_binding(3, Some(BufferExtent::Object { bytes: 64 }))];
+
+        assert_eq!(
+            vertex_buffer_extent(&r, 3, false, RenderBufferIndexBounds::default()),
+            Some(64),
+            "a declared argument that feeds no attribute keeps its bound"
+        );
+        assert_eq!(
+            vertex_buffer_extent(&r, 3, true, RenderBufferIndexBounds::default()),
+            None,
+            "the same index feeding stage-in must keep the whole stream — 64 \
+             bytes of a vertex buffer rasterises garbage and declines nothing"
+        );
+        assert!(
+            !may_serve_neutral(ReflectedBufferAccess::Unused, true),
+            "the two vertex narrowing rails have to agree on the exclusion, \
+             which is the whole point of it living beside this one"
+        );
+    }
+
+    #[test]
+    fn render_footprint_bounds_static_vertex_and_instance_accesses() {
+        let mut r = empty_reflection(ShaderStage::Vertex);
+        let mut binding = buffer_binding(3, Some(BufferExtent::Unbounded));
+        binding.footprint = Some(BufferFootprint {
+            static_ranges: vec![BufferByteRange {
+                offset: 24,
+                size: 8,
+            }],
+            strided_accesses: vec![BufferStridedAccess {
+                base_offset: 16,
+                access_size: 12,
+                terms: vec![
+                    BufferStrideTerm {
+                        source: BufferIndexSource::VertexIndex,
+                        stride: 32,
+                    },
+                    BufferStrideTerm {
+                        source: BufferIndexSource::InstanceIndex,
+                        stride: 256,
+                    },
+                ],
+            }],
+            has_unbounded_access: false,
+        });
+        r.bindings.push(binding);
+
+        let bounds = RenderBufferIndexBounds::new(4, 3, 2, 2, false);
+        assert_eq!(
+            reflected_render_buffer_extent(&r, 3, bounds),
+            Some(16 + 12 + 6 * 32 + 3 * 256),
+            "the cap includes firstVertex and baseInstance, not just the two counts"
+        );
+    }
+
+    #[test]
+    fn render_footprint_fails_closed_for_indexed_and_unbounded_access() {
+        let mut r = empty_reflection(ShaderStage::Vertex);
+        let mut binding = buffer_binding(3, Some(BufferExtent::Unbounded));
+        binding.footprint = Some(BufferFootprint {
+            static_ranges: vec![],
+            strided_accesses: vec![BufferStridedAccess {
+                base_offset: 0,
+                access_size: 4,
+                terms: vec![BufferStrideTerm {
+                    source: BufferIndexSource::VertexIndex,
+                    stride: 4,
+                }],
+            }],
+            has_unbounded_access: false,
+        });
+        r.bindings.push(binding);
+
+        assert_eq!(
+            reflected_render_buffer_extent(&r, 3, RenderBufferIndexBounds::new(0, 200, 0, 1, true),),
+            None,
+            "index_count does not bound the values fetched from an index buffer"
+        );
+        r.bindings[0]
+            .footprint
+            .as_mut()
+            .unwrap()
+            .has_unbounded_access = true;
+        assert_eq!(
+            reflected_render_buffer_extent(
+                &r,
+                3,
+                RenderBufferIndexBounds::new(0, 200, 0, 1, false),
+            ),
+            None,
+            "one unmodelled pointer access keeps the complete guest window"
+        );
+    }
+
+    #[test]
+    fn declared_object_and_render_footprint_choose_the_tighter_proven_bound() {
+        let mut r = empty_reflection(ShaderStage::Fragment);
+        let mut binding = buffer_binding(5, Some(BufferExtent::Object { bytes: 512 }));
+        binding.footprint = Some(BufferFootprint {
+            static_ranges: vec![BufferByteRange {
+                offset: 40,
+                size: 8,
+            }],
+            strided_accesses: vec![],
+            has_unbounded_access: false,
+        });
+        r.bindings.push(binding);
+        assert_eq!(
+            reflected_render_buffer_extent(&r, 5, RenderBufferIndexBounds::default()),
+            Some(48)
+        );
+    }
+
+    #[test]
+    fn compute_footprint_bounds_every_dispatch_builtin_in_host_invocation_space() {
+        let mut r = empty_reflection(ShaderStage::Kernel);
+        let mut binding = buffer_binding(2, Some(BufferExtent::Unbounded));
+        let terms = [
+            BufferIndexSource::GlobalInvocationIdX,
+            BufferIndexSource::GlobalInvocationIdY,
+            BufferIndexSource::GlobalInvocationIdZ,
+            BufferIndexSource::LocalInvocationIdX,
+            BufferIndexSource::LocalInvocationIdY,
+            BufferIndexSource::LocalInvocationIdZ,
+            BufferIndexSource::WorkgroupIdX,
+            BufferIndexSource::WorkgroupIdY,
+            BufferIndexSource::WorkgroupIdZ,
+            BufferIndexSource::LocalInvocationIndex,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, source)| BufferStrideTerm {
+            source,
+            stride: 1u64 << i,
+        })
+        .collect();
+        binding.footprint = Some(BufferFootprint {
+            static_ranges: vec![],
+            strided_accesses: vec![BufferStridedAccess {
+                base_offset: 5,
+                access_size: 4,
+                terms,
+            }],
+            has_unbounded_access: false,
+        });
+        r.bindings.push(binding);
+
+        // 2x3x4 workgroups of 8x4x2 local invocations produce global maxima
+        // 15,11,7; local maxima 7,3,1; workgroup maxima 1,2,3; and local linear
+        // index maximum 63.
+        let expected =
+            5 + 4 + 15 + 11 * 2 + 7 * 4 + 7 * 8 + 3 * 16 + 32 + 64 + 2 * 128 + 3 * 256 + 63 * 512;
+        assert_eq!(
+            reflected_compute_buffer_extent(&r, 2, [2, 3, 4], [8, 4, 2]),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn compute_footprint_rejects_a_render_builtin_and_zero_dispatch_axis() {
+        let mut r = empty_reflection(ShaderStage::Kernel);
+        let mut binding = buffer_binding(2, Some(BufferExtent::Unbounded));
+        binding.footprint = Some(BufferFootprint {
+            static_ranges: vec![],
+            strided_accesses: vec![BufferStridedAccess {
+                base_offset: 0,
+                access_size: 4,
+                terms: vec![BufferStrideTerm {
+                    source: BufferIndexSource::VertexIndex,
+                    stride: 4,
+                }],
+            }],
+            has_unbounded_access: false,
+        });
+        r.bindings.push(binding);
+        assert_eq!(
+            reflected_compute_buffer_extent(&r, 2, [2, 3, 4], [8, 4, 2]),
+            None,
+            "an index domain this dispatch does not own keeps the full window"
+        );
+
+        r.bindings[0].footprint.as_mut().unwrap().strided_accesses[0].terms[0].source =
+            BufferIndexSource::GlobalInvocationIdX;
+        assert_eq!(
+            reflected_compute_buffer_extent(&r, 2, [0, 3, 4], [8, 4, 2]),
+            None,
+            "zero work has no inclusive invocation maximum"
+        );
     }
 
     /// A `metal_index` is unique only within a resource family, so the lookup
@@ -3299,16 +4156,14 @@ mod tests {
         assert_eq!(reflected_buffer_extent(&r, 1), None, "texture");
     }
 
-    /// Only an explicit `Unused` answers `Unused`, and every other way of not
-    /// knowing answers `Undeclared`.
+    /// Every foreign access answer maps to one total local class.
     ///
     /// Asserted case by case rather than as one "not Unused" arm, for the reason
     /// `only_a_bounded_object_extent_narrows_a_buffer_bind` gives about the
     /// extent: this is the direction with no alarm behind it. A bind wrongly
     /// read as unused would have its guest bytes withheld, and the shader would
     /// read whatever the descriptor happened to point at — wrong pixels, no
-    /// error anywhere. Reading a genuinely unused bind as `Dereferenced` only
-    /// costs the copy we already pay.
+    /// error anywhere.
     #[test]
     fn only_an_explicit_unused_access_answers_unused() {
         use metal2vulkan::reflect::ResourceAccess;
@@ -3332,22 +4187,27 @@ mod tests {
             ReflectedBufferAccess::Unused,
             "the one class that may withhold bytes"
         );
-        for index in 1..=3 {
-            assert_eq!(
-                reflected_buffer_access(&r, index),
-                ReflectedBufferAccess::Dereferenced,
-                "index {index} is touched by the shader"
-            );
-        }
+        assert_eq!(
+            reflected_buffer_access(&r, 1),
+            ReflectedBufferAccess::ReadOnly
+        );
+        assert_eq!(
+            reflected_buffer_access(&r, 2),
+            ReflectedBufferAccess::Writable
+        );
+        assert_eq!(
+            reflected_buffer_access(&r, 3),
+            ReflectedBufferAccess::Writable
+        );
         assert_eq!(
             reflected_buffer_access(&r, 4),
-            ReflectedBufferAccess::Undeclared,
+            ReflectedBufferAccess::Unknown,
             "declared, but carrying no access"
         );
         assert_eq!(
             reflected_buffer_access(&r, 9),
-            ReflectedBufferAccess::Undeclared,
-            "not declared at all — not a synonym for unused"
+            ReflectedBufferAccess::Absent,
+            "not declared at all"
         );
     }
 
@@ -3369,12 +4229,12 @@ mod tests {
 
         assert_eq!(
             reflected_buffer_access(&r, 0),
-            ReflectedBufferAccess::Undeclared,
+            ReflectedBufferAccess::Absent,
             "threadgroup buffer"
         );
         assert_eq!(
             reflected_buffer_access(&r, 1),
-            ReflectedBufferAccess::Undeclared,
+            ReflectedBufferAccess::Absent,
             "texture"
         );
     }
@@ -3396,8 +4256,10 @@ mod tests {
             "an index the attribute list names keeps its guest bytes"
         );
         for class in [
-            ReflectedBufferAccess::Dereferenced,
-            ReflectedBufferAccess::Undeclared,
+            ReflectedBufferAccess::ReadOnly,
+            ReflectedBufferAccess::Writable,
+            ReflectedBufferAccess::Absent,
+            ReflectedBufferAccess::Unknown,
         ] {
             for feeds_stage_in in [false, true] {
                 assert!(
@@ -3450,21 +4312,85 @@ mod tests {
     }
 
     fn texture_binding(binding: u32, shape: TextureShape) -> ResourceBinding {
+        let access = if shape.writable {
+            ResourceAccess::Storage
+        } else {
+            ResourceAccess::Sampled
+        };
         ResourceBinding {
             kind: ResourceKind::Texture,
             metal_index: binding - TEXTURE_BINDING_BASE,
-            descriptor: Some(DescriptorLocation { set: 0, binding }),
+            descriptor: Some(DescriptorLocation {
+                set: 0,
+                binding,
+                count: 1,
+            }),
             param_index: None,
+            stage_input_location: None,
             address_space: None,
             declared_size: None,
             extent: None,
+            footprint: None,
             type_layout: None,
             type_name: None,
             texture_shape: Some(shape),
             embedded_source: None,
-            access: None,
+            access: Some(access),
             static_sampler: None,
         }
+    }
+
+    #[test]
+    fn a_texture_handle_array_maps_consecutive_metal_slots_to_descriptor_elements() {
+        let mut reflection = empty_reflection(ShaderStage::Kernel);
+        let mut array = texture_binding(
+            TEXTURE_BINDING_BASE + 4,
+            TextureShape {
+                dimension: metal2vulkan::meta::TextureDimension::D2,
+                arrayed: false,
+                multisampled: false,
+                component: metal2vulkan::meta::TextureComponent::Float,
+                writable: false,
+                array_ref: true,
+                array_length: None,
+                storage_format: None,
+            },
+        );
+        array.kind = ResourceKind::TextureArray;
+        array.descriptor.as_mut().unwrap().count = 8;
+        reflection.bindings.push(array);
+
+        assert_eq!(
+            reflected_texture_descriptor(&reflection, 4),
+            Some(ReflectedTextureDescriptor {
+                binding: TEXTURE_BINDING_BASE + 4,
+                array_element: 0,
+                descriptor_count: 8,
+                access: ReflectedTextureAccess::Sampled,
+            })
+        );
+        assert_eq!(
+            reflected_texture_descriptor(&reflection, 11),
+            Some(ReflectedTextureDescriptor {
+                binding: TEXTURE_BINDING_BASE + 4,
+                array_element: 7,
+                descriptor_count: 8,
+                access: ReflectedTextureAccess::Sampled,
+            })
+        );
+        assert_eq!(reflected_texture_descriptor(&reflection, 12), None);
+
+        assert_eq!(first_non_sampled_texture_descriptor(&reflection), None);
+        reflection.bindings[0].access = Some(ResourceAccess::Storage);
+        assert!(matches!(
+            first_non_sampled_texture_descriptor(&reflection),
+            Some((4, ReflectedTextureDescriptor {
+                binding,
+                descriptor_count: 8,
+                access: ReflectedTextureAccess::Storage,
+                ..
+            })) if binding == TEXTURE_BINDING_BASE + 4
+        ));
     }
 
     /// A reflected static sampler. `binding` is the translator's number, because
@@ -3482,11 +4408,14 @@ mod tests {
             descriptor: Some(DescriptorLocation {
                 set: RESOURCE_DESCRIPTOR_SET,
                 binding,
+                count: 1,
             }),
             param_index: None,
+            stage_input_location: None,
             address_space: None,
             declared_size: None,
             extent: None,
+            footprint: None,
             type_layout: None,
             type_name: None,
             texture_shape: None,
@@ -3512,6 +4441,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reflected_sampler_binding_applies_device_widening_before_fragment_relocation() {
+        let sampler = static_sampler_binding(M2V_SAMPLER_BINDING_BASE + 5);
+        assert_eq!(
+            reflected_sampler_binding(&sampler, false),
+            Some(SAMPLER_BINDING_BASE + 5)
+        );
+        assert_eq!(
+            reflected_sampler_binding(&sampler, true),
+            Some(SAMPLER_BINDING_BASE + 5 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET)
+        );
+    }
+
     fn shape(dimension: TextureDimension, arrayed: bool, writable: bool) -> TextureShape {
         TextureShape {
             dimension,
@@ -3520,7 +4462,8 @@ mod tests {
             component: TextureComponent::Float,
             writable,
             array_ref: false,
-            storage_format: None,
+            array_length: None,
+            storage_format: writable.then_some(metal2vulkan::meta::TextureFormat::R32f),
         }
     }
 
@@ -3649,6 +4592,15 @@ mod tests {
         b.access = Some(ResourceAccess::Sampled);
         r.bindings.push(b);
         assert_eq!(census_reflection_wellformed(&r, 0), 0);
+        let mut nonkernel_local_size = r.clone();
+        nonkernel_local_size.local_size = Some([1, 1, 1]);
+        assert_eq!(census_reflection_wellformed(&nonkernel_local_size, 0), 1);
+        let mut missing_kernel_local_size = empty_reflection(ShaderStage::Kernel);
+        missing_kernel_local_size.local_size = None;
+        assert_eq!(
+            census_reflection_wellformed(&missing_kernel_local_size, 0),
+            1
+        );
 
         // Static samplers must carry decoded state in set 0 inside [64,96).
         let mut static_reflection = empty_reflection(ShaderStage::Fragment);
@@ -3663,6 +4615,26 @@ mod tests {
         out_of_band.bindings[0].descriptor.as_mut().unwrap().binding = COLOR_INPUT_BINDING_BASE;
         assert_eq!(census_reflection_wellformed(&out_of_band, 0), 1);
 
+        // Dynamic samplers obey the same translator-band contract. This is the
+        // premise that lets the runtime transform their reflection instead of
+        // rediscovering the interface by walking SPIR-V.
+        let mut dynamic_reflection = static_reflection.clone();
+        dynamic_reflection.bindings[0].kind = ResourceKind::Sampler;
+        dynamic_reflection.bindings[0].static_sampler = None;
+        assert_eq!(census_reflection_wellformed(&dynamic_reflection, 0), 0);
+        let mut duplicate_sampler = dynamic_reflection.clone();
+        duplicate_sampler
+            .bindings
+            .push(duplicate_sampler.bindings[0].clone());
+        assert_eq!(census_reflection_wellformed(&duplicate_sampler, 0), 1);
+        let mut shifted_dynamic = dynamic_reflection.clone();
+        shifted_dynamic.bindings[0]
+            .descriptor
+            .as_mut()
+            .unwrap()
+            .binding += 1;
+        assert_eq!(census_reflection_wellformed(&shifted_dynamic, 0), 1);
+
         // A consistent storage image: kind StorageImage, writable, access Storage.
         let mut rs = empty_reflection(ShaderStage::Kernel);
         let mut sb = texture_binding(
@@ -3673,13 +4645,99 @@ mod tests {
         sb.access = Some(ResourceAccess::Storage);
         rs.bindings.push(sb);
         assert_eq!(census_reflection_wellformed(&rs, 0), 0);
+        assert_eq!(
+            reflected_storage_image_format(&rs, TEXTURE_BINDING_BASE + 1),
+            Some(ImageFormat::R32Float)
+        );
+        let mut missing_storage_format = rs.clone();
+        missing_storage_format.bindings[0]
+            .texture_shape
+            .as_mut()
+            .unwrap()
+            .storage_format = None;
+        assert_eq!(census_reflection_wellformed(&missing_storage_format, 0), 1);
+
+        // Texture arrays use access, not kind, to choose sampled versus
+        // storage descriptors, and their reflected descriptor width is part
+        // of the ABI rather than an executor default.
+        let mut storage_array = texture_binding(
+            TEXTURE_BINDING_BASE + 3,
+            TextureShape {
+                array_ref: true,
+                ..shape(TextureDimension::D2, false, true)
+            },
+        );
+        storage_array.kind = ResourceKind::TextureArray;
+        storage_array.descriptor.as_mut().unwrap().count = 8;
+        let mut rsa = empty_reflection(ShaderStage::Kernel);
+        rsa.bindings.push(storage_array);
+        assert_eq!(census_reflection_wellformed(&rsa, 0), 0);
+        let mut zero_count = rsa.clone();
+        zero_count.bindings[0].descriptor.as_mut().unwrap().count = 0;
+        assert_eq!(census_reflection_wellformed(&zero_count, 0), 1);
+        let mut scalar_wide = r.clone();
+        scalar_wide.bindings[0].descriptor.as_mut().unwrap().count = 8;
+        assert_eq!(census_reflection_wellformed(&scalar_wide, 0), 1);
+        let mut wrong_set = r.clone();
+        wrong_set.bindings[0].descriptor.as_mut().unwrap().set = 1;
+        assert_eq!(census_reflection_wellformed(&wrong_set, 0), 1);
+
+        let mut embedded_storage_array = rsa.bindings[0].clone();
+        embedded_storage_array.kind = ResourceKind::EmbeddedArgBufferTexture;
+        embedded_storage_array
+            .texture_shape
+            .as_mut()
+            .unwrap()
+            .array_length = Some(8);
+        embedded_storage_array.embedded_source = Some(metal2vulkan::reflect::EmbeddedArgBuffer {
+            buffer_param_index: 0,
+            buffer_index: 0,
+            field_offset: 16,
+            field_ordinal: 1,
+            argument_index: 2,
+            resource_buffer_index: None,
+        });
+        let mut embedded = empty_reflection(ShaderStage::Kernel);
+        embedded.bindings.push(embedded_storage_array);
+        assert_eq!(census_reflection_wellformed(&embedded, 0), 0);
+        let embedded_resource = first_unsupported_vulkan_resource(&embedded).unwrap();
+        assert_eq!(
+            unsupported_vulkan_resource_kind_name(embedded_resource.kind),
+            Some("embedded_texture")
+        );
+        assert_eq!(
+            first_unsupported_vulkan_interface(&embedded, ShaderStage::Fragment),
+            Some(UnsupportedVulkanInterface {
+                feature: "shader_stage_kernel",
+                count: 1,
+            })
+        );
+
+        // A missing buffer access is the translator's documented conservative
+        // answer and stays valid; an image access class on a buffer is not.
+        let mut buffers = empty_reflection(ShaderStage::Kernel);
+        let mut read = buffer_binding(0, Some(BufferExtent::Unbounded));
+        read.access = Some(ResourceAccess::ReadOnly);
+        buffers.bindings.push(read);
+        assert_eq!(census_reflection_wellformed(&buffers, 0), 0);
+        let mut missing_buffer_access = buffers.clone();
+        missing_buffer_access.bindings[0].access = None;
+        assert_eq!(census_reflection_wellformed(&missing_buffer_access, 0), 0);
+        let mut wrong_buffer_access = buffers.clone();
+        wrong_buffer_access.bindings[0].access = Some(ResourceAccess::Storage);
+        assert_eq!(census_reflection_wellformed(&wrong_buffer_access, 0), 1);
+        let mut zero_object_extent = buffers.clone();
+        zero_object_extent.bindings[0].extent = Some(BufferExtent::Object { bytes: 0 });
+        assert_eq!(census_reflection_wellformed(&zero_object_extent, 0), 1);
+        let mut buffer_array = buffers.clone();
+        buffer_array.bindings[0].descriptor.as_mut().unwrap().count = 2;
+        assert_eq!(census_reflection_wellformed(&buffer_array, 0), 1);
 
         // Desync writable=true while kind stays Texture: one violation.
         let mut rbad = empty_reflection(ShaderStage::Fragment);
-        rbad.bindings.push(texture_binding(
-            bind,
-            shape(TextureDimension::D2, false, true),
-        ));
+        let mut writable_desync = texture_binding(bind, shape(TextureDimension::D2, false, true));
+        writable_desync.access = Some(ResourceAccess::Sampled);
+        rbad.bindings.push(writable_desync);
         assert_eq!(census_reflection_wellformed(&rbad, 0), 1);
 
         // Desync access=Storage while kind stays Texture: one violation.
@@ -3711,11 +4769,13 @@ mod tests {
                 index: 0,
                 name: "enable_tap".to_string(),
                 type_name: "i1".to_string(),
+                abi_type_encoding: "b".to_string(),
             },
             FunctionConstant {
                 index: 3,
                 name: "channel_count".to_string(),
                 type_name: "i32".to_string(),
+                abi_type_encoding: "i".to_string(),
             },
         ];
         assert_eq!(log_folded_function_constants(&r), 2);
@@ -3904,7 +4964,6 @@ mod tests {
         assert_eq!(binding_of(31), SAMPLER_BINDING_BASE + 8);
         assert_ne!(binding_of(30), binding_of(31));
     }
-
 
     /// A framebuffer-fetch input is an `OpTypeImage` too, and the exclusion that
     /// keeps it un-relocated must not be its binding number: `Dim SubpassData`
@@ -4421,105 +5480,6 @@ mod tests {
             Ok(1)
         );
         assert_eq!(image_format(&words, 33), Some(ImageFormat::Rgba32Float));
-    }
-
-    fn storage_buffer_module(binding: u32) -> Vec<u32> {
-        let mut words = vec![0x0723_0203, 0x0001_0000, 0, 12, 0];
-        words.extend([
-            (4u32 << 16) | OP_VARIABLE as u32,
-            1,
-            2,
-            STORAGE_CLASS_STORAGE_BUFFER,
-        ]);
-        words.extend([
-            (4u32 << 16) | OP_DECORATE as u32,
-            2,
-            DECORATION_BINDING,
-            binding,
-        ]);
-        // %4 = access-chain %2; pointer provenance must reach the leaf.
-        words.extend([(5u32 << 16) | OP_ACCESS_CHAIN as u32, 3, 4, 2, 5]);
-        words
-    }
-
-    #[test]
-    fn reflects_storage_buffer_read_only_without_names() {
-        let words = storage_buffer_module(1);
-        assert_eq!(buffer_access(&words, 1), Some(BufferAccess::ReadOnly));
-        assert_eq!(buffer_access(&words, 0), None);
-    }
-
-    #[test]
-    fn reflects_storage_buffer_write_through_access_chain() {
-        let mut words = storage_buffer_module(1);
-        words.extend([(3u32 << 16) | OP_STORE as u32, 4, 6]);
-        assert_eq!(buffer_access(&words, 1), Some(BufferAccess::Writable));
-    }
-
-    /// A module the walk cannot finish reflects nothing, and does not take the
-    /// process with it.
-    ///
-    /// Both shapes are what [`instructions`] exists to reject, and both are
-    /// reached through a module that is otherwise perfectly reflectable — the
-    /// binding, the variable and the storage class are all present and correct,
-    /// so nothing but the malformed tail can be what turns the answer into
-    /// `None`.
-    ///
-    /// This pins a contract rather than proving a repair: before the walk was
-    /// consolidated the same two inputs also answered `None`, because
-    /// `descriptor_root` rejected them on the way past. What changes is where
-    /// that can be undone from. The provenance scans indexed
-    /// `words[at + 1 .. at + word_count]` with no guard of their own, so
-    /// removing or reordering `descriptor_root`'s left the first case aborting
-    /// the device on an out-of-range slice and the second spinning forever on
-    /// `i += 0`. Neither failure has a test that can run *after* it happens.
-    #[test]
-    fn a_module_that_does_not_walk_reflects_nothing() {
-        for (what, tail) in [
-            // Claims six words with two left in the module.
-            ("runs past the end", vec![(6u32 << 16) | OP_STORE as u32, 4]),
-            // A zero word count advances the cursor by nothing.
-            ("zero word count", vec![0u32, 4]),
-        ] {
-            let mut words = storage_buffer_module(1);
-            assert_eq!(
-                buffer_access(&words, 1),
-                Some(BufferAccess::ReadOnly),
-                "{what}: the module is reflectable before the tail is appended"
-            );
-            words.extend(tail);
-            assert_eq!(buffer_access(&words, 1), None, "{what}: buffer_access");
-            assert_eq!(
-                storage_image_access(&words, 1),
-                None,
-                "{what}: storage_image_access"
-            );
-            assert!(instructions(&words).is_none(), "{what}: instructions");
-        }
-    }
-
-    #[test]
-    fn storage_buffer_pointer_call_fails_access_closed() {
-        let mut words = storage_buffer_module(1);
-        // OpFunctionCall result-type, result-id, function-id, pointer arg.
-        words.extend([(5u32 << 16) | OP_FUNCTION_CALL as u32, 7, 8, 9, 4]);
-        assert_eq!(buffer_access(&words, 1), Some(BufferAccess::PointerEscape));
-    }
-
-    #[test]
-    fn duplicate_storage_buffer_binding_fails_access_closed() {
-        let mut words = storage_buffer_module(1);
-        words.extend([
-            (4u32 << 16) | OP_VARIABLE as u32,
-            1,
-            6,
-            STORAGE_CLASS_STORAGE_BUFFER,
-        ]);
-        words.extend([(4u32 << 16) | OP_DECORATE as u32, 6, DECORATION_BINDING, 1]);
-        assert_eq!(
-            buffer_access(&words, 1),
-            Some(BufferAccess::AmbiguousBinding)
-        );
     }
 
     #[test]

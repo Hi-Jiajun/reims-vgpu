@@ -54,15 +54,15 @@
 //! Three things follow and they do not all point the same way.
 //!
 //! * **A cache of unbounded size would be *asked* for 91 % of the gathers.** It
-//!   would not serve them. `crate::runtime::buffer_gather_freshness`'s content
-//!   audit — 21 204 comparisons over two driven boots — found only **~27 % of
-//!   repeats unchanged**, so the ceiling on a content cache with a perfect
+//!   would not serve them. A retired content audit — 21 204 comparisons over
+//!   two driven boots — found only **~27 % of repeats unchanged**, so the
+//!   ceiling on a content cache with a perfect
 //!   oracle is `0.91 x 0.27 = 25 %` of the gathers, not 91 %. A repeat whose
 //!   bytes moved has to be re-copied by any cache.
 //!
 //!   Read `recur` as *the population a cache would be asked about* and never as
 //!   the population it would serve. This distinction is the whole reason that
-//!   audit exists: the number here was being quoted as the size of the prize.
+//!   audit established: the number here was being quoted as the size of the prize.
 //! * **It is 91 % and not the 99.2 % the buffer rail is usually argued from.**
 //!   The older figure came off a window-drag probe and a census that no longer
 //!   exists; this is the sustained-animation population. Quote the one whose

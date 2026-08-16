@@ -12,7 +12,7 @@
 //! [`reims_vgpu_wire::device_desc`], which states it once with `offset_of!`
 //! rather than as the eight literal offsets that used to sit in this module.
 
-use crate::contract::endian::{st16, st32, st64};
+use crate::contract::endian::{ld32, st16, st32, st64};
 use crate::contract::iosurface_pages::{
     entry_gpa_shift, page_size_of, DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BASE_OFFSET,
     DEVICE_DESC_BPE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS, DEVICE_DESC_LEN, DEVICE_DESC_PIXEL_FORMAT,
@@ -20,7 +20,7 @@ use crate::contract::iosurface_pages::{
     DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS, DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE,
     PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
 };
-use crate::model::{DeviceState, MappingEntry, TaskTable};
+use crate::model::{DeviceState, MappingEntry, TaskResource, TaskTable};
 use crate::runtime::decode::resource::{
     decode_list_object_entry, list_object_entry_offset, ListObjectEntry, OBJECT_LIST_ENTRY_LEN,
     OBJECT_TYPE_IOSURFACE,
@@ -28,6 +28,7 @@ use crate::runtime::decode::resource::{
 use crate::runtime::gva_mem;
 use crate::runtime::host::HostMemory;
 use crate::runtime::texture;
+use std::sync::Arc;
 
 pub mod slot_recheck;
 
@@ -1550,6 +1551,117 @@ pub enum LadderRung {
     DescRead { declared_len: u32 },
 }
 
+/// Why construction of a retained sampler object did not complete.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SamplerResolveError {
+    Rung(LadderRung),
+    Decode {
+        status: crate::runtime::decode::resource::DecodeStatus,
+        descriptor_len: usize,
+        tag: Option<u32>,
+        declared_len: Option<u32>,
+    },
+}
+
+/// Retrieve or construct the sampler named by `task_id` / `sampler_ref`.
+///
+/// A sampler is an immutable object in its own task-local reference space.
+/// Successful construction snapshots and decodes its descriptor once; failed
+/// construction remains retryable because nothing is registered until every
+/// rung, including decode, succeeds. Its explicit sampler-delete command and
+/// task teardown are the only events that retire this entry.
+pub fn resolve_sampler_state<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    sampler_ref: u32,
+) -> Result<Arc<crate::model::TaskSamplerState>, SamplerResolveError> {
+    use crate::runtime::decode::resource::{decode_sampler_descriptor, OBJECT_TYPE_TYPE7};
+
+    if let Some(sampler) = state.task_sampler_states.get(task_id, sampler_ref) {
+        return Ok(sampler);
+    }
+
+    let entry = lookup_list_entry(state, host, task_id, sampler_ref)
+        .ok_or(SamplerResolveError::Rung(LadderRung::NoListEntry))?;
+    if entry.object_type != OBJECT_TYPE_TYPE7 {
+        return Err(SamplerResolveError::Rung(LadderRung::WrongType {
+            got: entry.object_type,
+        }));
+    }
+    let bytes = read_descriptor(state, host, task_id, &entry).ok_or(SamplerResolveError::Rung(
+        LadderRung::DescRead {
+            declared_len: entry.descriptor_length,
+        },
+    ))?;
+    let descriptor_len = bytes.len();
+    let tag = bytes.get(..4).map(ld32);
+    let declared_len = bytes.get(4..8).map(ld32);
+    let descriptor =
+        decode_sampler_descriptor(&bytes).map_err(|status| SamplerResolveError::Decode {
+            status,
+            descriptor_len,
+            tag,
+            declared_len,
+        })?;
+    let sampler = state.task_sampler_states.register(
+        task_id,
+        sampler_ref,
+        Arc::new(crate::model::TaskSamplerState { descriptor }),
+    );
+    crate::runtime::drain::note_store_route("sampler_state_constructed");
+    Ok(sampler)
+}
+
+/// Object tags constructed through the task's resource registry.
+///
+/// Bit `n` names object type `n + 1`. The resource constructor accepts exactly
+/// types 1, 2, 3, 4, 5, 8, 9, 11, 12, 13, 14, and 15. Function (6), mutable
+/// serializer state (7), and type 10 have separate registries and lifetimes, so
+/// retaining their descriptors until `DeleteResource` would conflate distinct
+/// APIs. An immutable render pipeline constructed from a type-7 descriptor is
+/// retained separately in `DeviceState::task_render_pipeline_states`; the
+/// serializer bytes themselves remain outside this resource registry.
+const RESOURCE_CONSTRUCTOR_TYPE_MASK: u16 = 0x7d9f;
+
+fn object_type_is_resource(object_type: u8) -> bool {
+    object_type
+        .checked_sub(1)
+        .filter(|&bit| bit < u16::BITS as u8)
+        .is_some_and(|bit| RESOURCE_CONSTRUCTOR_TYPE_MASK & (1u16 << bit) != 0)
+}
+
+/// Retrieve or construct the resource named by `task_id` / `obj_ref`.
+///
+/// A successful construction snapshots the object-list entry and descriptor
+/// bytes for the lifetime of that reference. Subsequent binds retrieve the
+/// retained resource; guest memory is consulted again only after an explicit
+/// resource deletion or task teardown. Failed constructions are not retained,
+/// so a descriptor that is still being published can succeed on retry.
+pub fn resolve_resource<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    obj_ref: u32,
+) -> Result<Arc<TaskResource>, LadderRung> {
+    if let Some(resource) = state.task_resources.get(task_id, obj_ref) {
+        return Ok(resource);
+    }
+
+    let entry = lookup_list_entry(state, host, task_id, obj_ref).ok_or(LadderRung::NoListEntry)?;
+    if !object_type_is_resource(entry.object_type) {
+        return Err(LadderRung::WrongType {
+            got: entry.object_type,
+        });
+    }
+    let bytes = read_descriptor(state, host, task_id, &entry).ok_or(LadderRung::DescRead {
+        declared_len: entry.descriptor_length,
+    })?;
+    let descriptor: Arc<[u8]> = Arc::from(bytes);
+    let resource = Arc::new(TaskResource::new(entry, descriptor));
+    Ok(state.task_resources.register(task_id, obj_ref, resource))
+}
+
 /// Look `obj_ref` up in `task_id`'s list, require its type to be one of `want`,
 /// and read its descriptor bytes.
 ///
@@ -1572,7 +1684,19 @@ pub fn resolve_descriptor<M: HostMemory>(
     task_id: u32,
     obj_ref: u32,
     want: &[u8],
-) -> Result<(ListObjectEntry, Vec<u8>), LadderRung> {
+) -> Result<(ListObjectEntry, Arc<[u8]>), LadderRung> {
+    if let Some(resource) = state.task_resources.get(task_id, obj_ref) {
+        if !want.contains(&resource.entry.object_type) {
+            return Err(LadderRung::WrongType {
+                got: resource.entry.object_type,
+            });
+        }
+        return Ok((resource.entry, Arc::clone(&resource.descriptor)));
+    }
+
+    // Keep the ladder's type check ahead of the descriptor read. A caller
+    // asking for the wrong kind must not turn an unreadable descriptor into a
+    // different refusal merely because resource retention is enabled.
     let entry = lookup_list_entry(state, host, task_id, obj_ref).ok_or(LadderRung::NoListEntry)?;
     if !want.contains(&entry.object_type) {
         return Err(LadderRung::WrongType {
@@ -1582,7 +1706,21 @@ pub fn resolve_descriptor<M: HostMemory>(
     let bytes = read_descriptor(state, host, task_id, &entry).ok_or(LadderRung::DescRead {
         declared_len: entry.descriptor_length,
     })?;
-    Ok((entry, bytes))
+    if !object_type_is_resource(entry.object_type) {
+        return Ok((entry, Arc::from(bytes)));
+    }
+    let descriptor: Arc<[u8]> = Arc::from(bytes);
+    let resource = state.task_resources.register(
+        task_id,
+        obj_ref,
+        Arc::new(TaskResource::new(entry, descriptor)),
+    );
+    if !want.contains(&resource.entry.object_type) {
+        return Err(LadderRung::WrongType {
+            got: resource.entry.object_type,
+        });
+    }
+    Ok((resource.entry, Arc::clone(&resource.descriptor)))
 }
 
 /// Why a type-1 buffer ref did not yield a backing span.
@@ -1628,16 +1766,30 @@ pub fn resolve_buffer_span<M: HostMemory>(
     task_id: u32,
     buffer_ref: u32,
 ) -> Result<(u64, u64), BufferSpanRefusal> {
-    let (_entry, desc_bytes) = resolve_descriptor(
-        state,
-        host,
-        task_id,
-        buffer_ref,
-        &[crate::runtime::decode::resource::OBJECT_TYPE_BUFFER],
-    )
-    .map_err(BufferSpanRefusal::Rung)?;
-    let desc = crate::runtime::decode::resource::decode_buffer_descriptor(&desc_bytes)
-        .map_err(|_| BufferSpanRefusal::Decode)?;
+    let resource = resolve_resource(state, host, task_id, buffer_ref)
+        .map_err(BufferSpanRefusal::Rung)?;
+    resolve_buffer_span_from_resource(state, &resource)
+}
+
+/// Resolve the backing carried by an encoder-retained buffer object.
+pub fn resolve_buffer_span_from_resource(
+    state: &DeviceState,
+    resource: &crate::model::TaskResource,
+) -> Result<(u64, u64), BufferSpanRefusal> {
+    if resource.entry.object_type != crate::runtime::decode::resource::OBJECT_TYPE_BUFFER {
+        return Err(BufferSpanRefusal::Rung(LadderRung::WrongType {
+            got: resource.entry.object_type,
+        }));
+    }
+    let desc = match resource.decoded() {
+        Ok(crate::runtime::decode::resource::Descriptor::Buffer(desc)) => desc,
+        Ok(_) => {
+            return Err(BufferSpanRefusal::Rung(LadderRung::WrongType {
+                got: resource.entry.object_type,
+            }));
+        }
+        Err(_) => return Err(BufferSpanRefusal::Decode),
+    };
     desc.backing_gva_size(state.page_shift)
         .ok_or(BufferSpanRefusal::NoBacking)
 }
@@ -1651,58 +1803,137 @@ pub fn resolve_type11_ref<M: HostMemory>(
     task_id: u32,
     ref_: u32,
 ) -> Option<u32> {
-    let entry = lookup_list_entry(state, host, task_id, ref_)?;
-    // The list entry passed validation (descriptor_gva != 0, length != 0) but
-    // its descriptor blob is unreadable — genuine, only for a bound entry.
-    let Some(desc) = read_descriptor(state, host, task_id, &entry) else {
-        note_type11_fail(
-            task_id,
-            ref_,
-            crate::observe::ladder_slug!("type11", desc_read),
-            format!(
-                "type11_resolve_fail reason=type11_desc_read task={task_id} ref={ref_} obj_type={} desc_gva={:#x} desc_len={}",
-                entry.object_type, entry.descriptor_gva, entry.descriptor_length
-            ),
-        );
-        return None;
+    let resource = match resolve_resource(state, host, task_id, ref_) {
+        Ok(resource) => resource,
+        Err(LadderRung::DescRead { .. }) => {
+            // Keep this failure scoped to a confirmed type-11 object. The
+            // second lookup is only on the failed-construction path; successful
+            // binds retrieve the retained resource without a guest read.
+            if let Some(entry) = lookup_list_entry(state, host, task_id, ref_)
+                .filter(|entry| entry.object_type == OBJECT_TYPE_IOSURFACE)
+            {
+                note_type11_fail(
+                    task_id,
+                    ref_,
+                    crate::observe::ladder_slug!("type11", desc_read),
+                    format!(
+                        "type11_resolve_fail reason=type11_desc_read task={task_id} ref={ref_} obj_type={} desc_gva={:#x} desc_len={}",
+                        entry.object_type, entry.descriptor_gva, entry.descriptor_length
+                    ),
+                );
+            }
+            return None;
+        }
+        Err(_) => return None,
     };
-    // Record the ref as live; the type and descriptor come from the guest's own
-    // list at every use, never from here.
-    let _ = state.insert_object(task_id, ref_);
+    resolve_type11_resource(state, task_id, ref_, &resource)
+}
+
+/// Resolve an already-retained type-11 resource to its mapping.
+///
+/// Draw preparation resolves each bound reference once and threads the
+/// resulting object through all of its consumers. Keeping this half separate
+/// prevents the type-11 branch from looking the same reference up again and
+/// reparsing immutable construction bytes on every bind.
+pub fn resolve_type11_resource(
+    state: &mut DeviceState,
+    task_id: u32,
+    ref_: u32,
+    resource: &TaskResource,
+) -> Option<u32> {
+    let entry = resource.entry;
+    let desc = &resource.descriptor;
     if entry.object_type != OBJECT_TYPE_IOSURFACE {
         // Legitimate: this ref is a different object type, not a texture. Normal
         // control flow (resolve_type11_refs skips it) — never a failure.
         return None;
     }
-    if !texture::register_from_descriptor_bytes(state, OBJECT_TYPE_IOSURFACE, &desc) {
-        // A confirmed IOSurface texture whose descriptor could not register —
-        // the draw then samples a missing/black texture.
+    if let Some(mapping_id) = resource.registered_type11_mapping() {
+        return Some(mapping_id);
+    }
+    // Record the ref as live so the explicit delete path retires its associated
+    // host-side content as well as the retained resource object.
+    let _ = state.insert_object(task_id, ref_);
+    let mapping_id = match resource.decoded() {
+        Ok(crate::runtime::decode::resource::Descriptor::IOSurfaceTexture {
+            mapping_id,
+            pixel_format,
+            width,
+            height,
+            ..
+        }) => {
+            if !texture::register_type11_geom(state, *mapping_id, *width, *height, *pixel_format) {
+                note_type11_fail(
+                    task_id,
+                    ref_,
+                    "type11_register",
+                    format!(
+                        "type11_resolve_fail reason=type11_register task={task_id} ref={ref_} desc_len={}",
+                        desc.len()
+                    ),
+                );
+                return None;
+            }
+            *mapping_id
+        }
+        // Preserve the older headerless decoder as a compatibility rung for
+        // descriptors the total object decoder cannot name. This is a cold
+        // refusal path; successfully constructed resources take the typed arm.
+        Err(_) => {
+            if !texture::register_from_descriptor_bytes(state, OBJECT_TYPE_IOSURFACE, desc) {
+                note_type11_fail(
+                    task_id,
+                    ref_,
+                    "type11_register",
+                    format!(
+                        "type11_resolve_fail reason=type11_register task={task_id} ref={ref_} desc_len={}",
+                        desc.len()
+                    ),
+                );
+                return None;
+            }
+            u32::from_le_bytes(desc.get(..4)?.try_into().ok()?)
+        }
+        Ok(_) => return None,
+    };
+    if mapping_id == 0 {
+        // Defensive for a compatibility decoder that ever accepts the sentinel
+        // mapping id without registering it.
         note_type11_fail(
             task_id,
             ref_,
-            "type11_register",
+            "type11_mapping_zero",
             format!(
-                "type11_resolve_fail reason=type11_register task={task_id} ref={ref_} desc_len={}",
+                "type11_resolve_fail reason=type11_mapping_zero task={task_id} ref={ref_} desc_len={}",
                 desc.len()
             ),
         );
         return None;
     }
-    // mapping_id is first u32 of type-11 desc.
-    let mapping_id = u32::from_le_bytes(desc[0..4].try_into().ok()?);
-    if mapping_id == 0 {
-        note_type11_fail(
-            task_id,
-            ref_,
-            "type11_mapping_zero",
-            format!("type11_resolve_fail reason=type11_mapping_zero task={task_id} ref={ref_} desc_len={}", desc.len()),
-        );
-        return None;
-    }
     state.texture_to_mapping.insert((task_id, ref_), mapping_id);
+    let mapping_id = resource.register_type11_mapping(mapping_id);
     // Resolved: re-arm so a later genuine failure on this ref logs again.
     clear_type11_fail(task_id, ref_);
     Some(mapping_id)
+}
+
+/// Make the physical backing of a retained texture bindable.
+///
+/// A texture bind does not revalidate immutable surface construction input.
+/// The guest announces a physical re-point explicitly; that path clears the
+/// mapping's page entries and bumps its generation. Consequently a warm bind
+/// only checks the retained mapping, while the first bind and the first bind
+/// after a re-point rebuild the backing through the full resolver.
+pub fn ensure_surface_for_texture_bind<M: HostMemory + crate::runtime::host::HostOps>(
+    state: &mut DeviceState,
+    host: &M,
+    surface_id: u32,
+) -> bool {
+    let ready = state
+        .mappings
+        .get(&surface_id)
+        .is_some_and(|m| m.mapped && !m.page_entries.is_empty() && m.has_geom);
+    ready || ensure_surface_for_present(state, host, surface_id)
 }
 
 /// The detail line a refused page walk reports.
@@ -2026,10 +2257,19 @@ fn apply_type4_backing<M: HostMemory>(
             map_generation: m.map_generation,
         });
         // Contiguous view must be rebuilt.
+        let mut retired_import = None;
         if m.contig_ptr != 0 {
             state.retired_views.push((m.contig_ptr, m.contig_len));
             m.contig_ptr = 0;
             m.contig_len = 0;
+            m.contig_footprint = None;
+            retired_import = m.contig_import.take().map(|import| {
+                import.retire();
+                import.id()
+            });
+        }
+        if let Some(import) = retired_import {
+            state.retired_guest_imports.push(import);
         }
     }
 
@@ -2105,36 +2345,27 @@ fn record_type4_owner(state: &mut DeviceState, surface_id: u32, task_id: u32) {
 /// disqualified it. Clearing fails closed on the packet that says the pages
 /// moved; on this rail that is the direction every ambiguity resolves toward.
 ///
-/// # Two id spaces reach one packet
+/// # The packet names a task-local resource
 ///
-/// `object_id` is read as a mapping id first, and that reading is never
-/// replaced: a ref and a surface id are different id spaces that collide —
-/// `blit_exec`'s type-5 resolve states the rule ("never the task object-list ref
-/// — those id spaces collide") — so a ref-keyed lookup taken *ahead* of the
-/// direct one would misroute a packet naming surface `n` onto whatever mapping
-/// the same task registered under ref `n`, invalidating a surface the guest
-/// never named and leaving stale the one it did.
+/// The task and object fields are obtained from the same resource object. The
+/// object is therefore resolved in the task's namespace; its integer must never
+/// be tried as a global mapping id first. Surface ids and resource refs overlap
+/// numerically. Treating a ref in task B as mapping `n` can retire the pages of
+/// an unrelated type-4 surface `n` owned by task A, after which a compositor
+/// draw sees an unbound texture until that surface happens to be mapped again.
 ///
-/// The ref-keyed reading is taken only when the direct one names no mapping at
-/// all. There is nothing to misroute in that case — the device holds no surface
-/// under that id — and it is the only route this device has to a re-pointed
-/// type-11 texture.
-///
-/// **It has never answered.** Three driven x86/Vulkan boots read
-/// `replace_physical_routed_ref` at 0 while three quarters of the re-points
-/// named an id no mapping owned, and `exec`'s resource-table census reports
-/// the same of the sibling packet's ids ("`texture_to_mapping` answered for
-/// exactly none"). So the ref id space these packets use is not the one that map
-/// is keyed on, and finding the route that does reach it is open work. The arm
-/// stays because it costs one lookup on a lifecycle packet and it is the only
-/// candidate route in the tree; it is not evidence that the id space is covered.
+/// A latched type-4 walk is the exact provenance of a direct surface mapping.
+/// Type-11 resources carry the task/ref-to-mapping association established at
+/// construction. Both routes require the packet's task; a bare integer match is
+/// not ownership.
 ///
 /// What the *unreached* re-points turn out to be is measured rather than
 /// assumed, and it is mostly benign: 44 of 46 on a driven boot were
 /// `replace_physical_unmapped_no_state` — this device holds nothing at all for
 /// the object, so the first resolve of that ref reads the page table the guest
 /// has already rewritten. Two held a ref-keyed host copy.
-/// [`note_replace_physical_unmapped`] is what separates those, and it exists
+/// [`note_replace_physical_unmapped_after_invalidation`] is what separates
+/// those, and it exists
 /// because a bare "reached nothing" cannot: an announcement with nothing to
 /// apply it to and an announcement that missed a live host copy read the same.
 pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
@@ -2143,17 +2374,41 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
     task_id: u32,
     object_id: u32,
 ) {
-    let mut target = object_id;
-    if !state.mappings.contains_key(&target) {
-        if let Some(&mid) = state.texture_to_mapping.get(&(task_id, object_id)) {
-            target = mid;
-            crate::runtime::drain::note_store_route("replace_physical_routed_ref");
-        }
-    }
-    if !state.mappings.contains_key(&target) {
-        note_replace_physical_unmapped(state, host, task_id, object_id);
+    let target = state
+        .mappings
+        .get(&object_id)
+        .and_then(|mapping| {
+            mapping
+                .type4_walk
+                .filter(|walk| walk.task_id == task_id)
+                .map(|_| object_id)
+        })
+        .or_else(|| {
+            state
+                .texture_to_mapping
+                .get(&(task_id, object_id))
+                .copied()
+                .filter(|mid| state.mappings.contains_key(mid))
+                .inspect(|_| crate::runtime::drain::note_store_route("replace_physical_routed_ref"))
+        });
+
+    // A re-point changes every host representation of this resource, whether
+    // or not it also owns a mapping. Mapping and ref-keyed caches are different
+    // indexes over the same resource lifetime; reaching one does not excuse
+    // leaving the other stale.
+    let (texture_cache, linear_cache) = state.invalidate_object_host_copies(task_id, object_id);
+
+    let Some(target) = target else {
+        note_replace_physical_unmapped_after_invalidation(
+            state,
+            host,
+            task_id,
+            object_id,
+            texture_cache,
+            linear_cache,
+        );
         return;
-    }
+    };
     // A deferred window still owed on this mapping is riding the page plan the
     // guest has just replaced. The generation bump below would refuse it anyway,
     // so taking it here changes no outcome — it changes whether the loss has a
@@ -2178,15 +2433,15 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
     }
 }
 
-/// Say what a re-point named when no mapping owns the id, and whether this
+/// Say what a re-point named when no mapping belongs to the resource, and whether this
 /// device is holding anything else for it.
 ///
 /// A mapping is not the only place a resource's bytes can be cached. The type-2/3
 /// rails key their host copies by object-list ref (`host_texture_surfaces`,
 /// `host_linear_textures`) rather than by mapping id, and neither carries a page
-/// list to notice a move — so "no mapping under this id" does not settle whether
-/// the re-point had anything to invalidate. It only settles that the *mapping*
-/// rail had nothing.
+/// list to notice a move — so "no mapping for this task-local resource" does
+/// not settle whether the re-point had anything to invalidate. It only settles
+/// that the *mapping* rail had nothing.
 ///
 /// The counters split three ways. `_unmapped_no_state` is a re-point of a
 /// resource this device holds nothing for, which is genuinely a no-op — the
@@ -2247,16 +2502,15 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
 /// caches no copy of it. The type is on the line rather than in a counter
 /// because the interesting reading is which types show up at all, and that is a
 /// small set a boot enumerates in a handful of lines.
-fn note_replace_physical_unmapped<M: HostMemory>(
-    state: &mut DeviceState,
+fn note_replace_physical_unmapped_after_invalidation<M: HostMemory>(
+    state: &DeviceState,
     host: &M,
     task_id: u32,
     object_id: u32,
+    texture_cache: bool,
+    linear_cache: bool,
 ) {
     let object_type = lookup_list_entry(state, host, task_id, object_id).map(|e| e.object_type);
-    // Read by taking, not by asking: the re-point says these pages are no longer
-    // the object's, so a copy read from them cannot go on answering for it.
-    let (texture_cache, linear_cache) = state.invalidate_object_host_copies(task_id, object_id);
     crate::runtime::drain::note_store_route("replace_physical_unknown_object");
     if texture_cache {
         crate::runtime::drain::note_store_route("replace_physical_unmapped_texture_invalidated");
@@ -2279,7 +2533,7 @@ fn note_replace_physical_unmapped<M: HostMemory>(
         crate::observe::fail(format!(
             "replace_physical_unknown_object task={task_id} object={object_id} \
              obj_type={kind} tex_dropped={} lin_dropped={} \
-             (no mapping owns this id; ref-keyed host copies dropped)",
+             (no mapping belongs to this task-local resource; ref-keyed host copies dropped)",
             texture_cache as u8, linear_cache as u8
         ));
     }

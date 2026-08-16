@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """qmp.py — QMP client for the vmapple VM (raw commands + GUI helpers).
 
-vm/boot-arm64.sh exposes a per-boot QMP unix socket in vm/guest/run/ plus a stable
-`qmp.sock` symlink to the live one (the default here). Override with
-QMP_SOCK=/path/to.sock.
+Both boot scripts expose a per-boot QMP unix socket plus a stable `qmp.sock`
+symlink to the live one, in the run directory belonging to their pathway:
+vm/guest/run/ for boot-arm64.sh, vm/disks/run/ for boot-x86.sh. This resolves
+whichever of the two is currently live, so a driver script works on either
+pathway without being told which. Override with QMP_SOCK=/path/to.sock.
 
 Raw QMP:
   scripts/qmp/qmp.py cmd query-status
@@ -32,9 +34,27 @@ import tempfile
 import time
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SOCK = os.environ.get(
-    "QMP_SOCK", os.path.join(_REPO_ROOT, "vm", "guest", "run", "qmp.sock")
+
+# One per pathway. A boot removes its own symlink on the way out, so at most one
+# of these exists during a boot and "whichever is there" is unambiguous. Ordered
+# only to make the both-present case deterministic rather than to prefer a
+# pathway: that case means a stale symlink outlived its boot, and connecting to a
+# dead socket raises here instead of driving the wrong VM.
+_SOCK_CANDIDATES = (
+    os.path.join(_REPO_ROOT, "vm", "disks", "run", "qmp.sock"),
+    os.path.join(_REPO_ROOT, "vm", "guest", "run", "qmp.sock"),
 )
+
+
+def _default_sock() -> str:
+    for path in _SOCK_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    # Nothing live: return the first so the error names a real path to look at.
+    return _SOCK_CANDIDATES[0]
+
+
+SOCK = os.environ.get("QMP_SOCK") or _default_sock()
 TABLET_MAX = 32767
 
 # ASCII → qcode (unshifted), per qapi/ui.json QKeyCode.

@@ -348,13 +348,20 @@ fn compute_readonly_ssbo_has_zero_readback() {
         samplers: vec![],
         storage_images: vec![],
     };
+    let before = engine::counter_snapshot();
     let Some(out) = engine_or_skip("compute readonly ssbo", &req) else {
         return;
     };
     assert!(out.buffers.is_empty());
-    let snap = engine::counter_snapshot();
+    let snap = engine::counter_snapshot().delta_since(&before);
     assert_eq!(snap.readbacks, 0);
     assert_eq!(snap.readback_bytes, 0);
+    assert_eq!(
+        snap.descriptor_pushes + snap.descriptor_set_updates,
+        1,
+        "one descriptor-bearing dispatch takes exactly one capability rung: {snap:?}"
+    );
+    assert_eq!(snap.descriptor_set_binds, snap.descriptor_set_updates);
 }
 
 /// 2D grid tiling: proves grid.y is not dropped (GlobalInvocationId.y varies).
@@ -466,6 +473,8 @@ fn compute_storage_image_rgba8unorm_known_result() {
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
             binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
@@ -505,6 +514,8 @@ fn compute_storage_image_rgba8unorm_known_result() {
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
             binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
@@ -536,6 +547,8 @@ fn compute_storage_image_rgba8unorm_known_result() {
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
             binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
@@ -613,6 +626,8 @@ fn every_admitted_compute_storage_resident_survives_past_the_retired_slot_cap() 
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
             binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
@@ -701,6 +716,8 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
             binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
             format: StorageImageFormat::Bgra8Unorm,
             width: w,
             height: h,
@@ -763,6 +780,8 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
             samplers: vec![],
             storage_images: vec![ComputeStorageImageResource {
                 binding: 0,
+                array_element: 0,
+                descriptor_count: 1,
                 format: StorageImageFormat::Rgba8Unorm,
                 width: w,
                 height: h,
@@ -809,7 +828,6 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
     );
 }
 
-
 /// Copy-on-sample contract: a sampled input bound to a generation-matching
 /// resident storage image is seeded by a device-local copy (zero-placeholder
 /// `bytes` never uploaded, `compute_sampled_uploads == 0`) and fetches the
@@ -853,6 +871,8 @@ fn compute_sampled_resident_copy_and_lost_resident() {
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
             binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
@@ -881,6 +901,8 @@ fn compute_sampled_resident_copy_and_lost_resident() {
         }],
         sampled_images: vec![ComputeSampledImageResource {
             binding: 32,
+            array_element: 0,
+            descriptor_count: 1,
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
@@ -938,7 +960,6 @@ fn compute_sampled_resident_copy_and_lost_resident() {
     );
 }
 
-
 /// Sampled inputs must use SAMPLED_IMAGE descriptors and remain input-only.
 #[test]
 fn compute_sampled_image_fetch_preserves_float_bits() {
@@ -963,6 +984,8 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
         }],
         sampled_images: vec![ComputeSampledImageResource {
             binding: 32,
+            array_element: 0,
+            descriptor_count: 1,
             format: StorageImageFormat::Rgba32Float,
             width: 1,
             height: 1,
@@ -1171,6 +1194,8 @@ fn compute_storage_image_r16float_if_supported() {
         samplers: vec![],
         storage_images: vec![ComputeStorageImageResource {
             binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
             format: StorageImageFormat::R16Float,
             width: 2,
             height: 2,
@@ -1193,4 +1218,106 @@ fn compute_storage_image_r16float_if_supported() {
             }
         }
     }
+}
+
+/// Read one word well past the end of the bind and store it at word 0.
+///
+/// Index 30 is byte 120, which is inside a 128-byte pooled bucket and outside
+/// any bind shorter than 124 bytes. A runtime array's length comes from the
+/// descriptor's `range`, so this reads out of bounds exactly when the descriptor
+/// was written with the bind's own length and in bounds when it was written with
+/// `VK_WHOLE_SIZE` over the bucket.
+const READ_PAST_THE_BIND_KERNEL: &str = r#"
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %buf
+               OpExecutionMode %main LocalSize 1 1 1
+               OpDecorate %buf DescriptorSet 0
+               OpDecorate %buf Binding 0
+               OpDecorate %Buf Block
+               OpMemberDecorate %Buf 0 Offset 0
+               OpDecorate %Words ArrayStride 4
+       %void = OpTypeVoid
+       %uint = OpTypeInt 32 0
+     %uint_0 = OpConstant %uint 0
+    %uint_30 = OpConstant %uint 30
+      %Words = OpTypeRuntimeArray %uint
+        %Buf = OpTypeStruct %Words
+%_ptr_StorageBuffer_Buf = OpTypePointer StorageBuffer %Buf
+%_ptr_StorageBuffer_uint = OpTypePointer StorageBuffer %uint
+        %buf = OpVariable %_ptr_StorageBuffer_Buf StorageBuffer
+    %fn_type = OpTypeFunction %void
+       %main = OpFunction %void None %fn_type
+      %entry = OpLabel
+    %far_ptr = OpAccessChain %_ptr_StorageBuffer_uint %buf %uint_0 %uint_30
+       %seen = OpLoad %uint %far_ptr
+   %zero_ptr = OpAccessChain %_ptr_StorageBuffer_uint %buf %uint_0 %uint_0
+               OpStore %zero_ptr %seen
+               OpReturn
+               OpFunctionEnd
+"#;
+
+/// A bind may not see the bytes of the bind that used its pooled slot before it.
+///
+/// Staging slots are created at a **power-of-two bucket** at least as large as
+/// the bytes written, and `write_staging` does not zero the tail — so a 100-byte
+/// bind lands in a 128-byte buffer whose last 28 bytes are still the previous
+/// tenant's. Whether the shader can reach them is decided entirely by the
+/// descriptor's `range`: with `VK_WHOLE_SIZE` those bytes are in bounds of the
+/// binding and `robustBufferAccess` has nothing to clamp, which is why the claim
+/// that robust access made an over-read "visibly wrong rather than unsound" was
+/// not true. With the bind's own length the driver clamps and the read is zero.
+///
+/// The fixture dirties the bucket first with a 128-byte bind of `0xAA`, then
+/// binds 100 bytes of zeroes into the slot the free list hands back. A pass
+/// therefore means either that the range is exact or that the slot was never
+/// reused; the second is ruled out by the arm that reverts the range, which
+/// fails here with `0xAAAAAAAA`.
+#[test]
+fn a_short_bind_cannot_read_the_tail_of_the_slot_it_was_given() {
+    let _g = engine_test_session();
+    let Some(words) = assemble_spvasm(READ_PAST_THE_BIND_KERNEL, "read_past_the_bind") else {
+        return;
+    };
+
+    let dispatch = |bytes: Vec<u8>| ComputeRequest {
+        spirv: words.clone(),
+        entry: "main".into(),
+        grid: [1, 1, 1],
+        storage_buffers: vec![ComputeBufferResource {
+            binding: 0,
+            bytes,
+            writable: true,
+        }],
+        sampled_images: vec![],
+        samplers: vec![],
+        storage_images: vec![],
+    };
+
+    // Fill the 128-byte bucket, tail included.
+    let dirty = dispatch(vec![0xAAu8; 128]);
+    if engine_or_skip("read_past_the_bind_dirty", &dirty).is_none() {
+        return;
+    }
+
+    // 100 bytes is a 128-byte bucket with 28 bytes of somebody else's data after
+    // it, and word 30 sits in those 28 bytes.
+    let short = dispatch(vec![0u8; 100]);
+    let Some(out) = engine_or_skip("read_past_the_bind_short", &short) else {
+        return;
+    };
+    assert_eq!(out.buffers.len(), 1);
+    assert_eq!(out.buffers[0].bytes.len(), 100, "the bind's own length");
+    let seen = u32::from_le_bytes([
+        out.buffers[0].bytes[0],
+        out.buffers[0].bytes[1],
+        out.buffers[0].bytes[2],
+        out.buffers[0].bytes[3],
+    ]);
+    assert_eq!(
+        seen, 0,
+        "a read past this bind's 100 bytes returned {seen:#010x} — the descriptor \
+         range let the shader reach the pooled slot's tail, which still holds the \
+         previous bind's bytes"
+    );
 }

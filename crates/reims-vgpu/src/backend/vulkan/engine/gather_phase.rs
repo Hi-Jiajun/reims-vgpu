@@ -107,9 +107,8 @@
 //! Fewer dispatches has a floor of one per draw — the destination arena, ~35 %
 //! of `record`. It does **not** have a ceiling of none: the content cache that
 //! would have removed the dispatch, the run table, the descriptor set and the
-//! GPU copy together is closed, because
-//! [`crate::runtime::buffer_gather_freshness`]'s audit found only ~27 % of this
-//! rail's repeats unchanged. Three quarters of it is the guest genuinely
+//! GPU copy together is closed: a retired content audit found only ~27 % of
+//! this rail's repeats unchanged. Three quarters of it is the guest genuinely
 //! changing its vertex and constant data, and moving those bytes more cheaply is
 //! what this rail is for.
 //!

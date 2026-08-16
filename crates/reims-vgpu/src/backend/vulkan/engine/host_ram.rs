@@ -1,5 +1,5 @@
-//! Import a RAMBlock's host mapping as `VkDeviceMemory` and bind a `VkBuffer`
-//! over all of it.
+//! Import a bounded host mapping as `VkDeviceMemory` and bind a `VkBuffer` over
+//! all of it.
 //!
 //! This is the one place guest memory becomes something the engine can bind.
 //! Which *bytes* a draw reaches is decided before it gets here and is carried by
@@ -8,24 +8,17 @@
 //! and [`super::super::caps::host_pointer`] for the capability that gates the
 //! whole rail.
 //!
-//! # One import per RAMBlock, and no cache
+//! # One import per allocation identity
 //!
-//! The expensive step happens once per RAMBlock for the device's life, and the
-//! cheap step — naming a range inside it — is a bounds check. Nothing on the
-//! path a draw takes walks a page list, allocates, or takes a per-page kernel
-//! reference, so there is nothing left for a cache to amortise.
+//! RAMBlocks are imported once for the device's life. A scattered task buffer
+//! may also arrive as a stable packed host alias, created once per live guest
+//! buffer reference; its many draw offsets are still only bounds checks.
 //!
-//! So [`HostRamImports`] is a map with no eviction policy and no capacity. It
-//! holds at most one entry per span the shim reported, which on an ordinary
-//! machine is one or two. That is the whole prize of the model, and a future
-//! change that adds an eviction rule here has almost certainly misunderstood it:
-//! evicting an import does not free guest RAM, it only forces the next draw to
-//! pay `get_user_pages` again for a mapping that never moved.
-//!
-//! **Do not import the same RAMBlock twice.** `VK_EXT_external_memory_host`
-//! does not guarantee that importing one host allocation twice into one device
-//! works, which is why the map is keyed on
-//! [`crate::runtime::guest_ram::ImportId`] and the key is never reused.
+//! [`HostRamImports`] keys both forms by
+//! [`crate::runtime::guest_ram::ImportId`], so one allocation identity is never
+//! imported twice. The driver is allowed to refuse a packed alias; that answer
+//! is remembered and its caller gathers instead. The census separates RAMBlock
+//! entries from aliases so resource-shaped growth is visible.
 //!
 //! # What the import does not promise
 //!
@@ -40,15 +33,20 @@ use std::collections::HashMap;
 
 use ash::vk;
 
+use crate::backend::vulkan::caps::host_pointer::ImportTypeRefusal;
 use crate::observe::Decline;
 use crate::runtime::guest_ram::{GuestRamError, GuestRamImport, GuestRef};
 
-/// One RAMBlock living on the GPU as a bindable buffer, with no copy between it
-/// and the guest's own view of those bytes.
+/// One host allocation living on the GPU as a bindable buffer, with no copy
+/// between it and the guest's own view of those bytes.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ImportedHostRam {
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
+    /// Memory type selected when the parent allocation was imported. Child
+    /// images may alias this memory only when their own requirements name the
+    /// same type.
+    pub memory_type_index: u32,
     /// Bytes the import covers. The buffer spans all of it, so every
     /// [`crate::runtime::guest_ram::BoundRange`] inside the import is a valid
     /// offset into this one buffer.
@@ -87,9 +85,31 @@ pub enum HostRamDecline {
     Unsupported {
         rung: crate::backend::vulkan::caps::HostPointerImport,
     },
-    /// `vkGetMemoryHostPointerPropertiesEXT` declined the pointer, or no memory
-    /// type it named also satisfies what this device wants for guest memory.
-    NoImportableMemoryType { host_base: usize },
+    /// The guest ended this parent allocation's lifetime. Old child objects
+    /// may finish retiring, but no new view may resurrect its import identity.
+    Retired { import_id: u64 },
+    /// No memory type could be named for the pointer. Carries which of the two
+    /// checks refused — see [`ImportTypeRefusal`], whose doc says why they are
+    /// not one finding.
+    NoImportableMemoryType {
+        host_base: usize,
+        refusal: ImportTypeRefusal,
+    },
+    /// A memory type was named for the pointer and the *buffer* over the same
+    /// span excludes it.
+    ///
+    /// A separate variant rather than a second use of the one above, which is
+    /// what it was. The two are asked of different objects — the first of the
+    /// host allocation, this one of `vkGetBufferMemoryRequirements` — and they
+    /// have different repairs: the first is a request this device chose, and
+    /// this one is two driver answers that do not intersect, which no policy
+    /// here can widen. Sharing a slug meant a log line could not say which, and
+    /// `bugs/bug-06` is a hundred of exactly that line.
+    BufferExcludesMemoryType {
+        host_base: usize,
+        picked: u32,
+        buffer_types: u32,
+    },
     /// `vkCreateBuffer` over the whole span failed.
     CreateBuffer { result: vk::Result },
     /// The buffer the driver made needs more bytes than the span has. The import
@@ -111,7 +131,9 @@ impl Decline for HostRamDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self::Unsupported { .. } => "host_ram_import_unsupported",
+            Self::Retired { .. } => "host_ram_import_retired",
             Self::NoImportableMemoryType { .. } => "host_ram_import_no_importable_memory_type",
+            Self::BufferExcludesMemoryType { .. } => "host_ram_import_buffer_excludes_memory_type",
             Self::CreateBuffer { .. } => "host_ram_import_create_buffer",
             Self::TooSmall { .. } => "host_ram_import_too_small",
             Self::AllocateMemory { .. } => "host_ram_import_allocate_memory",
@@ -125,9 +147,37 @@ impl Decline for HostRamDecline {
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::Unsupported { rung } => vec![("rung", rung.slug().to_string())],
-            Self::NoImportableMemoryType { host_base } => {
-                vec![("host_base", format!("{host_base:#x}"))]
+            Self::Retired { import_id } => vec![("import_id", import_id.to_string())],
+            Self::NoImportableMemoryType { host_base, refusal } => {
+                let mut fields = vec![("host_base", format!("{host_base:#x}"))];
+                match refusal {
+                    ImportTypeRefusal::PointerDeclined { result } => {
+                        fields.push(("check", "pointer_declined".to_string()));
+                        fields.push(("result", format!("{result:?}")));
+                    }
+                    ImportTypeRefusal::NoTypeMeetsRequest {
+                        pointer_types,
+                        refusal,
+                    } => {
+                        // The selector's own check, not just "no type": a guest
+                        // this host has nowhere to put and a host that offers no
+                        // importable memory at all are different reports.
+                        fields.push(("check", refusal.slug().to_string()));
+                        fields.push(("detail", refusal.to_string()));
+                        fields.push(("pointer_types", format!("{pointer_types:#x}")));
+                    }
+                }
+                fields
             }
+            Self::BufferExcludesMemoryType {
+                host_base,
+                picked,
+                buffer_types,
+            } => vec![
+                ("host_base", format!("{host_base:#x}")),
+                ("picked", picked.to_string()),
+                ("buffer_types", format!("{buffer_types:#x}")),
+            ],
             Self::CreateBuffer { result }
             | Self::AllocateMemory { result }
             | Self::BindBuffer { result } => vec![("result", format!("{result:?}"))],
@@ -161,13 +211,37 @@ pub(crate) struct BoundGuestRam {
     pub head: vk::DeviceSize,
 }
 
-/// Every RAMBlock this device has imported, keyed by import identity.
+/// Every bounded host allocation this device has imported, keyed by identity.
+#[derive(Clone, Copy)]
+struct LiveImport {
+    allocation: ImportedHostRam,
+    child_images: usize,
+    retired: bool,
+    retirement_fences_cleared: bool,
+}
+
+pub(crate) enum ParentRetire {
+    NotImported,
+    WaitingForChildren,
+    Ready(ImportedHostRam),
+}
+
 #[derive(Default)]
 pub(crate) struct HostRamImports {
-    live: HashMap<u64, ImportedHostRam>,
+    live: HashMap<u64, LiveImport>,
+    /// `true` for RAMBlock-coordinate imports, `false` for packed task aliases.
+    kinds: HashMap<u64, bool>,
+    /// Driver refusals are properties of this pointer/device pair. Holding the
+    /// answer prevents every draw from repeating a failed allocation.
+    declined: HashMap<u64, HostRamDecline>,
 }
 
 impl HostRamImports {
+    fn remove_live(&mut self, key: u64) -> Option<ImportedHostRam> {
+        self.kinds.remove(&key);
+        self.live.remove(&key).map(|entry| entry.allocation)
+    }
+
     /// Resolve `guest_ref` to a bindable range, importing its RAMBlock if this
     /// is the first reference into it.
     ///
@@ -217,6 +291,78 @@ impl HostRamImports {
         unsafe { self.ensure(ctx, import) }.map(|(_, made)| made)
     }
 
+    /// Return the one device-memory import owned by `import`'s allocation.
+    ///
+    /// Child buffers and images are views into this parent allocation; they do
+    /// not import the host pointer again. The caller still has to validate the
+    /// child's memory requirements and bind offset before using the handle.
+    pub(crate) unsafe fn allocation(
+        &mut self,
+        ctx: &super::context::DeviceContext,
+        import: &GuestRamImport,
+    ) -> Result<ImportedHostRam, HostRamDecline> {
+        unsafe { self.ensure(ctx, import) }.map(|(live, _)| live)
+    }
+
+    /// Record one child image bound into this parent allocation.
+    pub(crate) fn retain_child(&mut self, import: &GuestRamImport) {
+        let entry = self
+            .live
+            .get_mut(&import.id().get())
+            .expect("a child can only retain the parent it just bound");
+        entry.child_images = entry
+            .child_images
+            .checked_add(1)
+            .expect("child image reference count overflow");
+    }
+
+    /// Release one retired child. Returns the parent allocation exactly when
+    /// its guest lifetime has ended and this was its last child.
+    pub(crate) fn release_child(&mut self, import: &GuestRamImport) -> Option<ImportedHostRam> {
+        let key = import.id().get();
+        let entry = self.live.get_mut(&key)?;
+        entry.child_images = entry
+            .child_images
+            .checked_sub(1)
+            .expect("every child release has a matching retain");
+        if entry.retired && entry.child_images == 0 && entry.retirement_fences_cleared {
+            return self.remove_live(key);
+        }
+        None
+    }
+
+    /// The submission slots that were open when the parent retired have all
+    /// completed. Returns the allocation when child retirement completed too.
+    pub(crate) fn retirement_fences_cleared(
+        &mut self,
+        import_id: crate::runtime::guest_ram::ImportId,
+    ) -> Option<ImportedHostRam> {
+        let key = import_id.get();
+        let entry = self.live.get_mut(&key)?;
+        entry.retirement_fences_cleared = true;
+        if entry.retired && entry.child_images == 0 {
+            return self.remove_live(key);
+        }
+        None
+    }
+
+    /// End a guest parent allocation's lifetime. Existing children keep its
+    /// Vulkan import alive until their in-flight-safe retirement completes.
+    pub(crate) fn retire(
+        &mut self,
+        import_id: crate::runtime::guest_ram::ImportId,
+    ) -> ParentRetire {
+        let key = import_id.get();
+        let Some(entry) = self.live.get_mut(&key) else {
+            return ParentRetire::NotImported;
+        };
+        entry.retired = true;
+        if entry.child_images == 0 {
+            return ParentRetire::Ready(self.remove_live(key).expect("the entry was found above"));
+        }
+        ParentRetire::WaitingForChildren
+    }
+
     /// The one place a RAMBlock becomes an import, so "have we imported this
     /// block" is asked once and cannot be answered two ways.
     ///
@@ -229,11 +375,32 @@ impl HostRamImports {
         import: &GuestRamImport,
     ) -> Result<(ImportedHostRam, bool), HostRamDecline> {
         let key = import.id().get();
-        if let Some(live) = self.live.get(&key) {
-            return Ok((*live, false));
+        if import.is_retired() {
+            return Err(HostRamDecline::Retired { import_id: key });
         }
-        let made = unsafe { import_ramblock(ctx, import) }?;
-        self.live.insert(key, made);
+        if let Some(live) = self.live.get(&key) {
+            return Ok((live.allocation, false));
+        }
+        if let Some(decline) = self.declined.get(&key) {
+            return Err(*decline);
+        }
+        let made = match unsafe { import_ramblock(ctx, import) } {
+            Ok(made) => made,
+            Err(decline) => {
+                self.declined.insert(key, decline);
+                return Err(decline);
+            }
+        };
+        self.live.insert(
+            key,
+            LiveImport {
+                allocation: made,
+                child_images: 0,
+                retired: false,
+                retirement_fences_cleared: false,
+            },
+        );
+        self.kinds.insert(key, import.gpa_base().is_some());
         Ok((made, true))
     }
 
@@ -244,20 +411,31 @@ impl HostRamImports {
     /// No submission may still reference any imported buffer.
     pub(crate) unsafe fn destroy_all(&mut self, device: &ash::Device) {
         for (_, live) in self.live.drain() {
-            unsafe { live.destroy(device) };
+            unsafe { live.allocation.destroy(device) };
         }
+        self.kinds.clear();
+        self.declined.clear();
     }
 
     /// Bytes of guest RAM this device currently has imported, for the census.
     pub(crate) fn imported_bytes(&self) -> u64 {
-        self.live.values().map(|l| l.size).sum()
+        self.live.values().map(|l| l.allocation.size).sum()
     }
 
     /// How many RAMBlocks are imported. One or two on an ordinary machine, and
     /// the number that must not grow with the workload — a rising count here is
     /// the per-resource import the model exists to avoid.
-    pub(crate) fn len(&self) -> usize {
-        self.live.len()
+    pub(crate) fn counts(&self) -> (usize, usize) {
+        self.live.keys().fold((0, 0), |(ramblocks, aliases), key| {
+            // Every live entry is created from the import passed to `ensure`;
+            // retain its kind beside the handle so the census does not call a
+            // packed task allocation a RAMBlock.
+            if self.kinds.get(key).copied().unwrap_or(false) {
+                (ramblocks + 1, aliases)
+            } else {
+                (ramblocks, aliases + 1)
+            }
+        })
     }
 }
 
@@ -325,15 +503,19 @@ unsafe fn import_ramblock(
             host_base as *const std::ffi::c_void,
             &req,
             size,
+            ctx.caps.max_allocation_size,
         )
     };
     let probe_us = probe_started.elapsed().as_micros() as u64;
-    let pick = picked.ok_or(HostRamDecline::NoImportableMemoryType { host_base })?;
-    ctx.report_oversized_allocation(
-        crate::backend::vulkan::caps::MemoryClass::Upload,
-        size,
-        pick,
-    );
+    // A refusal here is the whole of the heap and allocation-size admission for
+    // this rail. It reaches the caller as a decline, the copying rails take the
+    // guest's bytes instead, and no `vkAllocateMemory` the specification forbids
+    // is ever issued — which is the difference between the two drivers this was
+    // reported on, one of which returns success and then loses the device.
+    let pick = picked.map_err(|refusal| HostRamDecline::NoImportableMemoryType {
+        host_base,
+        refusal,
+    })?;
     let memory_type_index = pick.index;
     let alloc_started = Instant::now();
 
@@ -360,7 +542,11 @@ unsafe fn import_ramblock(
             });
         }
         if reqs.memory_type_bits & (1u32 << memory_type_index) == 0 {
-            return Err(HostRamDecline::NoImportableMemoryType { host_base });
+            return Err(HostRamDecline::BufferExcludesMemoryType {
+                host_base,
+                picked: memory_type_index,
+                buffer_types: reqs.memory_type_bits,
+            });
         }
 
         let mut host_import = vk::ImportMemoryHostPointerInfoEXT::default()
@@ -377,6 +563,7 @@ unsafe fn import_ramblock(
             Ok(()) => Ok(ImportedHostRam {
                 buffer,
                 memory,
+                memory_type_index,
                 size,
             }),
             Err(result) => {
@@ -393,24 +580,24 @@ unsafe fn import_ramblock(
     }
     // The heap is on this line and not just the type index, because "which type"
     // is not answerable from the index alone on an unfamiliar device and the
-    // heap is what a report of a slow host turns on. `fits=0` here is the whole
-    // diagnosis for a guest larger than the pool its import was charged to.
+    // heap is what a report of a slow host turns on. There is no `fits=` field
+    // any more and there cannot be one: a pick whose heap could not hold the
+    // import is a refusal now, so every line here is an import the device was
+    // allowed to make.
     crate::observe::off(format!(
         "host_ram_import id={} bytes={size} mtype={memory_type_index} heap={} heap_mb={} \
-         fits={} probe_us={probe_us} alloc_us={} ok={}",
+         probe_us={probe_us} alloc_us={} ok={}",
         import.id().get(),
         pick.heap_index,
         pick.heap_bytes >> 20,
-        pick.fits,
         alloc_started.elapsed().as_micros() as u64,
         bound.is_ok(),
     ));
     bound
 }
 
-
-/// A check that stopped a resident's frame from being copied straight into the
-/// guest's own pages, so the flush took the CPU route instead.
+/// A check that stopped GPU-ordered access to the guest's own pages, so the
+/// operation took its blocking CPU route instead.
 ///
 /// Every one of these is a *routing* answer rather than a loss — the copying
 /// rail still lands the frame — but each is a whole flush's worth of memcpy that
@@ -418,11 +605,18 @@ unsafe fn import_ramblock(
 /// counted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GuestWriteDecline {
+    /// The named resident is an ordinary device allocation rather than the
+    /// guest allocation synchronization requires.
+    NoSharedBacking,
     /// The device cannot import guest RAM at all. Carries the rung so the log
     /// says which check refused; expected on every host without the extension.
     Unsupported {
         rung: crate::backend::vulkan::caps::HostPointerImport,
     },
+    /// Guest-memory work is outstanding, but no successful FIFO submission
+    /// published a completion point for it. This is an ownership invariant
+    /// failure rather than a missing host capability.
+    NoCompletionPoint,
     /// The resident's physical channel order is not the order the destination
     /// stores, so landing it would need an R/B exchange — which an image→buffer
     /// copy cannot perform. The copying rail's per-row conversion is where that
@@ -466,7 +660,9 @@ pub enum GuestWriteDecline {
 impl Decline for GuestWriteDecline {
     fn slug(&self) -> &'static str {
         match self {
+            Self::NoSharedBacking => "gpu_writeback_no_shared_backing",
             Self::Unsupported { .. } => "gpu_writeback_unsupported",
+            Self::NoCompletionPoint => "gpu_completion_point_missing",
             Self::ResidentFormatMismatch { .. } => "gpu_writeback_resident_format_mismatch",
             Self::GeometryMoved { .. } => "gpu_writeback_geometry_moved",
             Self::WindowTooSmall { .. } => "gpu_writeback_window_too_small",
@@ -479,7 +675,9 @@ impl Decline for GuestWriteDecline {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
+            Self::NoSharedBacking => Vec::new(),
             Self::Unsupported { rung } => vec![("rung", rung.slug().to_string())],
+            Self::NoCompletionPoint => Vec::new(),
             Self::ResidentFormatMismatch { held, want } => vec![
                 ("resident", format!("{held:?}")),
                 ("want", format!("{want:?}")),
@@ -506,6 +704,7 @@ crate::observe::decline::decline_display!(GuestWriteDecline);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::vulkan::caps::memory_topology::MemoryTypeRefusal;
     use crate::backend::vulkan::caps::HostPointerImport;
 
     /// One slug per check. Two sharing one would mean watching a slug fire and
@@ -517,7 +716,19 @@ mod tests {
             HostRamDecline::Unsupported {
                 rung: HostPointerImport::Unqueried,
             },
-            HostRamDecline::NoImportableMemoryType { host_base: 0 },
+            HostRamDecline::Retired { import_id: 1 },
+            HostRamDecline::NoImportableMemoryType {
+                host_base: 0,
+                refusal: ImportTypeRefusal::NoTypeMeetsRequest {
+                    pointer_types: 0,
+                    refusal: MemoryTypeRefusal::NoTypeWithRequiredFlags { type_bits: 0 },
+                },
+            },
+            HostRamDecline::BufferExcludesMemoryType {
+                host_base: 0,
+                picked: 0,
+                buffer_types: 0,
+            },
             HostRamDecline::CreateBuffer {
                 result: vk::Result::ERROR_UNKNOWN,
             },
@@ -540,6 +751,158 @@ mod tests {
         for slug in slugs {
             assert!(slug.starts_with("host_ram_import_"), "{slug}");
         }
+    }
+
+    /// A refusal that cannot say which check refused is a log line nobody can
+    /// act on. `bugs/bug-06` is a hundred `no_importable_memory_type` lines at
+    /// one `host_base` and no way to tell the driver declining the mapping from
+    /// this device's own memory request excluding every type the driver named —
+    /// the first is the host's, the second is ours, and only one of them has a
+    /// repair here.
+    ///
+    /// Asserted on the emitted fields rather than on the variant, because the
+    /// fields are what a reader greps.
+    #[test]
+    fn the_memory_type_refusal_names_the_check_that_refused() {
+        let declined = HostRamDecline::NoImportableMemoryType {
+            host_base: 0x7ff5f7e00000,
+            refusal: ImportTypeRefusal::PointerDeclined {
+                result: vk::Result::ERROR_INVALID_EXTERNAL_HANDLE,
+            },
+        };
+        let unmet = HostRamDecline::NoImportableMemoryType {
+            host_base: 0x7ff5f7e00000,
+            refusal: ImportTypeRefusal::NoTypeMeetsRequest {
+                pointer_types: 0b1010,
+                refusal: MemoryTypeRefusal::EveryHeapTooSmall {
+                    bytes: 6 << 30,
+                    roomiest_heap: 2 << 30,
+                },
+            },
+        };
+        assert_eq!(declined.slug(), unmet.slug(), "one check, one slug");
+        let check = |d: &HostRamDecline| {
+            d.fields()
+                .into_iter()
+                .find(|(name, _)| *name == "check")
+                .map(|(_, value)| value)
+        };
+        assert_eq!(check(&declined).as_deref(), Some("pointer_declined"));
+        // The selector's own check, which is what separates "this host offers
+        // no importable memory" from "this host has nowhere to put six
+        // gigabytes" — one is a capability report and the other is a capacity
+        // one, and only the second says the guest is too big for the machine.
+        assert_eq!(
+            check(&unmet).as_deref(),
+            Some("vk_memory_every_heap_too_small")
+        );
+        // The mask rides along so an empty one — the driver accepting the
+        // pointer for no type at all — is separable from an incompatible one
+        // without a second boot.
+        assert!(unmet
+            .fields()
+            .iter()
+            .any(|(name, value)| *name == "pointer_types" && value == "0xa"));
+    }
+
+    #[test]
+    fn a_retired_parent_waits_for_its_last_child_and_cannot_resurrect() {
+        let import = GuestRamImport::new_host_allocation(0x1000, 0x4000, 0x1000)
+            .expect("aligned synthetic import");
+        let key = import.id().get();
+        let allocation = ImportedHostRam {
+            buffer: vk::Buffer::null(),
+            memory: vk::DeviceMemory::null(),
+            memory_type_index: 0,
+            size: 0x4000,
+        };
+        let mut imports = HostRamImports::default();
+        imports.live.insert(
+            key,
+            LiveImport {
+                allocation,
+                child_images: 0,
+                retired: false,
+                retirement_fences_cleared: false,
+            },
+        );
+        imports.retain_child(&import);
+        imports.retain_child(&import);
+        import.retire();
+
+        assert!(matches!(
+            imports.retire(import.id()),
+            ParentRetire::WaitingForChildren
+        ));
+        assert!(
+            imports.release_child(&import).is_none(),
+            "one child remains"
+        );
+        assert!(
+            imports.retirement_fences_cleared(import.id()).is_none(),
+            "the retirement barrier passed but one child remains"
+        );
+        assert_eq!(
+            imports.release_child(&import).map(|parent| parent.size),
+            Some(0x4000),
+            "the last child hands the parent back exactly once"
+        );
+        assert!(!imports.live.contains_key(&key));
+        assert!(import.is_retired());
+    }
+
+    #[test]
+    fn parent_release_waits_when_the_last_child_finishes_before_the_fence_barrier() {
+        let import = GuestRamImport::new_host_allocation(0x5000, 0x4000, 0x1000)
+            .expect("aligned synthetic import");
+        let key = import.id().get();
+        let mut imports = HostRamImports::default();
+        imports.live.insert(
+            key,
+            LiveImport {
+                allocation: ImportedHostRam {
+                    buffer: vk::Buffer::null(),
+                    memory: vk::DeviceMemory::null(),
+                    memory_type_index: 0,
+                    size: 0x4000,
+                },
+                child_images: 0,
+                retired: false,
+                retirement_fences_cleared: false,
+            },
+        );
+        imports.retain_child(&import);
+        import.retire();
+        assert!(matches!(
+            imports.retire(import.id()),
+            ParentRetire::WaitingForChildren
+        ));
+        assert!(
+            imports.release_child(&import).is_none(),
+            "the retirement fence has not completed"
+        );
+        assert_eq!(
+            imports
+                .retirement_fences_cleared(import.id())
+                .map(|parent| parent.size),
+            Some(0x4000)
+        );
+    }
+
+    #[test]
+    fn a_missing_shared_backing_has_its_own_sync_refusal() {
+        assert_eq!(
+            GuestWriteDecline::NoSharedBacking.slug(),
+            "gpu_writeback_no_shared_backing"
+        );
+    }
+
+    #[test]
+    fn a_missing_fifo_completion_point_has_its_own_refusal() {
+        assert_eq!(
+            GuestWriteDecline::NoCompletionPoint.slug(),
+            "gpu_completion_point_missing"
+        );
     }
 
     /// A bound refusal keeps the inner check's name rather than being renamed
@@ -644,7 +1007,7 @@ mod tests {
     #[test]
     fn an_empty_map_reports_no_imports() {
         let imports = HostRamImports::default();
-        assert_eq!(imports.len(), 0);
+        assert_eq!(imports.counts(), (0, 0));
         assert_eq!(imports.imported_bytes(), 0);
     }
 }

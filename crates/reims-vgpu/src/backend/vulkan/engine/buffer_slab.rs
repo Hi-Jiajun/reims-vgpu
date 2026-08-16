@@ -575,7 +575,7 @@ impl BufferSlabPool {
         // block that empties is *not* freed here: emptying is what a working set
         // crossing a block boundary does several times a minute, and freeing on
         // it costs a full block allocation to cross back. Returning shared
-        // blocks is the settled-idle drain's job ([`Self::trim_empty_blocks`]).
+        // blocks is settled maintenance's job ([`Self::trim_empty_blocks`]).
         if empty && dedicated {
             self.free_block(device, idx);
         }
@@ -622,7 +622,7 @@ impl BufferSlabPool {
     /// Free fully-empty shared blocks beyond `keep` spares per size class,
     /// returning the count freed.
     ///
-    /// Called only from the *settled* idle drain, never from a release, and
+    /// Called only from settled maintenance, never from a release, and
     /// that gate is the whole policy. Measured on the boot that first ran this
     /// allocator, freeing on the release that empties a block cost 13 block
     /// allocations against 10 frees in five minutes — the working set crossing
@@ -789,7 +789,7 @@ mod tests {
     }
 
     /// A block with no live carves and one spare already retained is surplus;
-    /// the first `keep` are not. Mirrors what the idle drain asks for.
+    /// the first `keep` are not. Mirrors what maintenance asks for.
     #[test]
     fn empty_block_victims_keeps_the_first_n() {
         let block = |free: bool| {

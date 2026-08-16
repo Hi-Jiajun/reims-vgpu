@@ -12,9 +12,11 @@ use crate::runtime::decode::resource::{
     list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, OBJECT_TYPE_IOSURFACE,
     RESOURCE_PAGE_SHIFT,
 };
-/// Compute-pipeline descriptor constants, used only by the Metal-arm
-/// execute tests below.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+/// Compute-pipeline descriptor constants used by the backend execute test.
+#[cfg(any(
+    feature = "backend-vulkan",
+    all(feature = "backend-metal", target_os = "macos")
+))]
 use crate::runtime::decode::resource::{
     OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, TYPE7_FIRST_TLVS, TYPE7_OBJECT_COMPUTE_PIPELINE,
 };
@@ -66,6 +68,42 @@ fn compute_spirv_declines_are_distinct_and_log_safe() {
             assert!(!value.contains(char::is_whitespace));
         }
     }
+}
+
+#[test]
+fn argument_buffer_reflection_decline_carries_the_owner_coordinate() {
+    use crate::observe::Decline as _;
+    let decline = ComputeReflectionDecline::ReflectedResourceUnsupported {
+        pipeline_ref: 7,
+        index: 9,
+        binding: Some(41),
+        kind: "embedded_texture",
+    };
+    assert_eq!(decline.slug(), "compute_reflection_resource_unsupported");
+    assert_eq!(
+        decline.fields(),
+        vec![
+            ("pipeline_ref", "7".into()),
+            ("index", "9".into()),
+            ("binding", "41".into()),
+            ("kind", "embedded_texture".into()),
+        ]
+    );
+
+    let interface = ComputeReflectionDecline::ReflectedInterfaceUnsupported {
+        pipeline_ref: 7,
+        feature: "kernel_imageblock",
+        count: 2,
+    };
+    assert_eq!(interface.slug(), "compute_reflection_interface_unsupported");
+    assert_eq!(
+        interface.fields(),
+        vec![
+            ("pipeline_ref", "7".into()),
+            ("feature", "kernel_imageblock".into()),
+            ("count", "2".into()),
+        ]
+    );
 }
 
 /// A type-5 view names its IOSurface plane on the wire (record `+0x20`, the
@@ -460,6 +498,39 @@ fn accum_stage_in_tg_imageblock_and_control_fail_closed() {
     }
 }
 
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn vulkan_ignores_stage_input_regions_without_a_stage_input_descriptor() {
+    let mut acc = ComputeAccum::default();
+    assert!(!super::linux_stage_input_or_imageblock_unsupported(
+        false, &acc
+    ));
+    assert!(super::linux_stage_input_or_imageblock_unsupported(
+        true, &acc
+    ));
+
+    acc.set_stage_in_region(StageInRegion {
+        origin_x: 0,
+        origin_y: 0,
+        origin_z: 0,
+        size_x: 1,
+        size_y: 1,
+        size_z: 1,
+    });
+    assert!(!super::linux_stage_input_or_imageblock_unsupported(
+        false, &acc
+    ));
+
+    acc.set_stage_in_region_indirect(3, 16);
+    assert!(acc.stage_in_region.is_none());
+    assert!(!super::linux_stage_input_or_imageblock_unsupported(
+        false, &acc
+    ));
+    assert!(super::linux_stage_input_or_imageblock_unsupported(
+        true, &acc
+    ));
+}
+
 #[test]
 fn resolve_indirect_threadgroups_from_buffer() {
     let mut host = FakeHost::new();
@@ -701,7 +772,7 @@ fn the_buffer_paths_refuse_under_their_own_names() {
         attribute_stride: 0,
         has_attribute_stride: false,
     };
-    let staged = stage_buffer(&state, &host, 1, &bind);
+    let staged = stage_buffer_with_extent(&state, &host, 1, &bind, None);
     assert_eq!(
         staged.err().and_then(|e| e.refusal()),
         Some(crate::observe::ladder_slug!(
@@ -709,6 +780,39 @@ fn the_buffer_paths_refuse_under_their_own_names() {
             no_list_entry
         ))
     );
+}
+
+#[test]
+fn a_compute_extent_stages_only_the_proven_prefix_from_the_bound_offset() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
+
+    let buffer_gva = 5u64 << RESOURCE_PAGE_SHIFT;
+    let contents: Vec<u8> = (0..64).collect();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], buffer_gva, &contents);
+    let descriptor_gva = 0x180u64;
+    let mut descriptor = [0u8; 16];
+    st64(&mut descriptor[0..], contents.len() as u64);
+    st32(&mut descriptor[8..], 5);
+    write_task_gva_arm64e(&mut host, &state.tasks[1], descriptor_gva, &descriptor);
+    let entry_offset = list_object_entry_offset(7, 32).unwrap();
+    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(&mut entry[0..], (OBJECT_TYPE_BUFFER as u32) | (16u32 << 8));
+    entry[4..12].copy_from_slice(&descriptor_gva.to_le_bytes());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], entry_offset, &entry);
+
+    let bind = ComputeBufferBind {
+        index: 0,
+        buffer_ref: 7,
+        offset: 8,
+        attribute_stride: 0,
+        has_attribute_stride: false,
+    };
+    let staged = stage_buffer_with_extent(&state, &host, 1, &bind, Some(12)).expect("stages");
+    assert_eq!(staged.gva, buffer_gva + 8);
+    assert_eq!(staged.bytes, contents[8..20]);
 }
 
 /// Callers must pass page_shift explicitly; 12 and 14 place handle differently.
@@ -895,7 +999,10 @@ fn a_format_with_no_storage_selector_refuses_the_same_way_from_every_rail() {
 }
 
 #[test]
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+#[cfg(any(
+    feature = "backend-vulkan",
+    all(feature = "backend-metal", target_os = "macos")
+))]
 fn dispatch_buffer_kernel_mul3add1() {
     use std::path::PathBuf;
     let mtlb_paths = [
@@ -966,15 +1073,25 @@ fn dispatch_buffer_kernel_mul3add1() {
 
     let mut acc = ComputeAccum::default();
     acc.set_pipeline(6);
-    acc.bind_buffers(
-        0,
-        &[BufferBinding {
+    let bindings = vec![
+        BufferBinding {
             ref_: 7,
             offset: 0,
             attribute_stride: 0,
             has_attribute_stride: false,
-        }],
-    );
+        },
+        #[cfg(feature = "backend-vulkan")]
+        BufferBinding {
+            // The kernel declares no buffer 1. Reflection must discard this
+            // extra encoder bind before object resolution; the nonexistent ref
+            // makes a pre-reflection staging pass fail as MissingBuffer.
+            ref_: 31,
+            offset: 0,
+            attribute_stride: 0,
+            has_attribute_stride: false,
+        },
+    ];
+    acc.bind_buffers(0, &bindings);
 
     let mut cmd = ComputeCommand::default();
     cmd.kind = Kind::DispatchThreadgroups;
@@ -984,7 +1101,10 @@ fn dispatch_buffer_kernel_mul3add1() {
     assert!(
         matches!(
             st,
-            ComputeStatus::Ok | ComputeStatus::MetalFailed(_) | ComputeStatus::BadGrid(_)
+            ComputeStatus::Ok
+                | ComputeStatus::MetalFailed(_)
+                | ComputeStatus::BadGrid(_)
+                | ComputeStatus::Unsupported(_)
         ),
         "unexpected {st:?}"
     );
@@ -1477,6 +1597,10 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
     let rgba = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
     let staged = StagedTexture {
         binding: 32,
+        #[cfg(feature = "backend-vulkan")]
+        array_element: 0,
+        #[cfg(feature = "backend-vulkan")]
+        descriptor_count: 1,
         #[cfg(all(feature = "backend-metal", target_os = "macos"))]
         texture_ref: 44,
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
@@ -1519,7 +1643,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
         Some(rgba.as_slice())
     );
     assert_eq!(
-        &surface_cache::get_texture(&state, texture_ref, 2, 2).unwrap()[..4],
+        &surface_cache::get_texture(&state, task_id, texture_ref, 2, 2).unwrap()[..4],
         &[3, 2, 1, 4],
         "RGBA compute output mirrors into the BGRA render-sample cache"
     );
@@ -2350,6 +2474,10 @@ fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
 
     let staged = |key: ComputeStorageResidencyKey| StagedTexture {
         binding: 33,
+        #[cfg(feature = "backend-vulkan")]
+        array_element: 0,
+        #[cfg(feature = "backend-vulkan")]
+        descriptor_count: 1,
         #[cfg(all(feature = "backend-metal", target_os = "macos"))]
         texture_ref: key.texture_ref,
         pixel_format: key.pixel_format,

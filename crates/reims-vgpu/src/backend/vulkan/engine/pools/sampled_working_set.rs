@@ -11,7 +11,7 @@
 //! > bound moves.
 //!
 //! The victim ledger is the closest thing to it and it is censored: it remembers
-//! `SAMPLED_CACHE_CAP * 8` = 512 evictions, and a driven macos-26 boot reports
+//! `SAMPLED_REACH_BAND * 8` = 512 evictions, and a driven macos-26 boot reports
 //! `sampled_reach_beyond_ledger` **6 704** times. A reading that falls off the
 //! end of its instrument is not a large reading, it is no reading, and "raise
 //! the cap" cannot be argued from it in either direction.
@@ -37,7 +37,7 @@
 
 use std::collections::HashMap;
 
-use super::{SampledKey, SAMPLED_CACHE_BYTE_CAP, SAMPLED_CACHE_CAP};
+use super::{SampledKey, SAMPLED_CACHE_BYTE_CAP, SAMPLED_REACH_BAND};
 use crate::backend::vulkan::engine::SampledContentIdentity;
 
 /// What one census window asked for.
@@ -95,7 +95,7 @@ impl Window {
         let bytes: usize = self.wanted.values().sum();
         let line = format!(
             "sampled_working_set distinct={distinct} mib={:.1} no_identity={} dropped={} \
-             count_cap={SAMPLED_CACHE_CAP} byte_cap_mib={} \
+             count_cap={SAMPLED_REACH_BAND} byte_cap_mib={} \
              (distinct (key, identity) windows this census second asked for, and what holding \
               all of them would cost; a per-window set, not a high-water — do not sum across \
               windows)",

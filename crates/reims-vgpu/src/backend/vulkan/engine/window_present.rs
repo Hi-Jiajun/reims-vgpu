@@ -297,6 +297,7 @@ enum BlitSource {
     Resident {
         image: vk::Image,
         access: super::pools::ResidentAccess,
+        next_access: super::pools::ResidentAccess,
         width: u32,
         height: u32,
     },
@@ -335,9 +336,20 @@ impl BlitSource {
         cmd: vk::CommandBuffer,
     ) -> vk::ImageLayout {
         match self {
-            Self::Resident { image, access, .. } => {
-                super::exec::barrier_resident_for_transfer_read(device, cmd, *image, *access);
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+            Self::Resident {
+                image,
+                access,
+                next_access,
+                ..
+            } => {
+                super::exec::barrier_resident_for_transfer_read(
+                    device,
+                    cmd,
+                    *image,
+                    *access,
+                    *next_access,
+                );
+                next_access.layout()
             }
             Self::Staged {
                 image, first_use, ..
@@ -379,6 +391,51 @@ pub enum WindowPresentOutcome {
         /// drawable on screen for that long.
         suboptimal: bool,
     },
+}
+
+/// Result of the lock-held half of a display transaction.
+pub(crate) enum WindowPresentDispatch {
+    Complete(WindowPresentOutcome),
+    Pending(PendingWindowPresent),
+}
+
+/// Queue-owner completion plus the immutable facts needed to classify it.
+///
+/// No engine or pool reference crosses this boundary.  The resident was pinned
+/// and its next access recorded before the transaction entered the ordered
+/// queue; only the host driver's result remains outstanding.
+pub(crate) struct PendingWindowPresent {
+    wait: super::queue_owner::PendingPresent,
+    acquire_suboptimal: bool,
+    direct: bool,
+    width: u32,
+    height: u32,
+    swapchain_images: usize,
+}
+
+pub(crate) struct FinishedWindowPresent {
+    result: Result<bool, vk::Result>,
+    acquire_suboptimal: bool,
+    direct: bool,
+    width: u32,
+    height: u32,
+    swapchain_images: usize,
+}
+
+impl PendingWindowPresent {
+    /// Wait only for the display transaction's own completion.  This method
+    /// carries no engine reference and is therefore safe to call after the
+    /// global engine guard has been dropped.
+    pub(crate) fn wait(self) -> FinishedWindowPresent {
+        FinishedWindowPresent {
+            result: self.wait.wait(),
+            acquire_suboptimal: self.acquire_suboptimal,
+            direct: self.direct,
+            width: self.width,
+            height: self.height,
+            swapchain_images: self.swapchain_images,
+        }
+    }
 }
 
 /// MAILBOX where the surface offers it, FIFO where it does not.
@@ -483,11 +540,33 @@ pub(crate) struct WindowPresenter {
     /// One entry per present that may be in flight at once, used round-robin.
     ///
     /// Every field in [`PresentFrame`] is per-present and none may be shared: a
-    /// second present recording into the first's command buffer, or signalling
-    /// its `render_finished` while the first's `queue_present` is still waiting
-    /// on it, is a use-after-submit the validation layers this device does not
-    /// run would be the only thing to catch.
+    /// second present recording into the first's command buffer, or waiting on
+    /// its `image_available` while the first's acquire is still outstanding, is
+    /// a use-after-submit.
     frames: Vec<PresentFrame>,
+    /// The semaphore `queue_submit` signals and `queue_present` waits on, **one
+    /// per swapchain image**, indexed by the acquired image index.
+    ///
+    /// # Why this is not per entry, which is where it used to live
+    ///
+    /// A binary semaphore signalled by a submit and waited on by a present is
+    /// free to be signalled again only once that present has completed — and a
+    /// present's completion is not observable. `vkAcquireNextImageKHR` returning
+    /// an image index says *that image* is reusable; it says nothing about the
+    /// presents of the other images. So the only index under which reuse is
+    /// safe is the image's.
+    ///
+    /// Keyed by the round-robin entry instead, the entry index and the image
+    /// index advance independently — the acquire hands back whatever image the
+    /// presentation engine has free — so entry N could be signalled while a
+    /// present that entry N started for a *different* image was still pending.
+    /// The Khronos validation layer reported exactly that on a driven macos-11
+    /// boot: `VUID-vkQueueSubmit-pSignalSemaphores-00067`, "is being signaled by
+    /// VkQueue, but it may still be in use by VkSwapchainKHR ... Swapchain image
+    /// 0 was presented but was not re-acquired".
+    ///
+    /// Rebuilt with the swapchain, because its length is the image count.
+    render_finished: Vec<vk::Semaphore>,
     /// Which entry the next present will use. Advances only on a successful
     /// submit, so a `Busy` return does not burn a slot.
     frame_ix: usize,
@@ -517,7 +596,6 @@ pub(crate) struct WindowPresenter {
 struct PresentFrame {
     cmd: vk::CommandBuffer,
     image_available: vk::Semaphore,
-    render_finished: vk::Semaphore,
     in_flight: vk::Fence,
     /// Whether this entry's blit has been submitted and not yet retired.
     submitted: bool,
@@ -527,6 +605,15 @@ struct PresentFrame {
     /// one's retire.
     pinned: Vec<TargetIdentity>,
 }
+
+/// The stage the acquire semaphore is waited at, and therefore the stage the
+/// first layout transition must name as its source.
+///
+/// One constant because the two must agree. A submit that waits at `TRANSFER`
+/// while the barrier ahead of it declares `TOP_OF_PIPE` puts the transition
+/// before the wait it exists to be ordered after, and the pair being written
+/// eleven lines apart is what let them disagree.
+const ACQUIRE_WAIT_STAGE: vk::PipelineStageFlags = vk::PipelineStageFlags::TRANSFER;
 
 /// How many presents may be in flight at once.
 ///
@@ -693,16 +780,6 @@ impl WindowPresenter {
                     .device
                     .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
                     .map_err(|e| (VkOp::WindowCreateAcquireSemaphore, e))?;
-                let render_finished = match ctx
-                    .device
-                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                {
-                    Ok(semaphore) => semaphore,
-                    Err(error) => {
-                        ctx.device.destroy_semaphore(image_available, None);
-                        return Err((VkOp::WindowCreateRenderSemaphore, error));
-                    }
-                };
                 // Created signaled: the first present through each entry finds
                 // it retired rather than waiting on a fence nothing submitted.
                 let in_flight = match ctx.device.create_fence(
@@ -711,7 +788,6 @@ impl WindowPresenter {
                 ) {
                     Ok(fence) => fence,
                     Err(error) => {
-                        ctx.device.destroy_semaphore(render_finished, None);
                         ctx.device.destroy_semaphore(image_available, None);
                         return Err((VkOp::WindowCreateFence, error));
                     }
@@ -719,7 +795,6 @@ impl WindowPresenter {
                 frames.push(PresentFrame {
                     cmd,
                     image_available,
-                    render_finished,
                     in_flight,
                     submitted: false,
                     pinned: Vec::new(),
@@ -730,7 +805,6 @@ impl WindowPresenter {
         if let Err((op, error)) = build() {
             for frame in frames.drain(..) {
                 ctx.device.destroy_fence(frame.in_flight, None);
-                ctx.device.destroy_semaphore(frame.render_finished, None);
                 ctx.device.destroy_semaphore(frame.image_available, None);
             }
             ctx.device.destroy_command_pool(cmd_pool, None);
@@ -758,6 +832,9 @@ impl WindowPresenter {
             staging: None,
             cmd_pool,
             frames,
+            // Sized by the swapchain's image count, which the recreate below is
+            // the first thing to know.
+            render_finished: Vec::new(),
             frame_ix: 0,
             cadence_started: Instant::now(),
             cadence_presents: 0,
@@ -849,8 +926,7 @@ impl WindowPresenter {
     }
 
     unsafe fn recreate_swapchain(&mut self, ctx: &DeviceContext) -> Result<(), DrawError> {
-        ctx.device
-            .queue_wait_idle(ctx.queue())
+        ctx.queue_wait_idle()
             .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowQueueWaitIdle, error)))?;
         let caps = self
             .surface_loader
@@ -991,45 +1067,47 @@ impl WindowPresenter {
         // whose acquire succeeded and whose submit then failed still holds an
         // unconsumed signal on its `image_available`, and that is invalid to
         // reuse against the new swapchain whichever entry it belongs to.
-        let mut fresh: Vec<(vk::Semaphore, vk::Semaphore)> =
-            Vec::with_capacity(self.frames.len());
+        // One acquire semaphore per entry and one render semaphore per swapchain
+        // **image** — the two counts are independent and the image count is only
+        // known here, which is the other reason the render semaphores live with
+        // the swapchain rather than with the entries.
+        let mut fresh_acquire: Vec<vk::Semaphore> = Vec::with_capacity(self.frames.len());
+        let mut fresh_render: Vec<vk::Semaphore> = Vec::with_capacity(images.len());
         let mut make = || -> Result<(), (VkOp, vk::Result)> {
             for _ in 0..self.frames.len() {
-                let image_available = ctx
-                    .device
-                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                    .map_err(|e| (VkOp::WindowCreateAcquireSemaphore, e))?;
-                let render_finished = match ctx
-                    .device
-                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                {
-                    Ok(semaphore) => semaphore,
-                    Err(error) => {
-                        ctx.device.destroy_semaphore(image_available, None);
-                        return Err((VkOp::WindowCreateRenderSemaphore, error));
-                    }
-                };
-                fresh.push((image_available, render_finished));
+                fresh_acquire.push(
+                    ctx.device
+                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                        .map_err(|e| (VkOp::WindowCreateAcquireSemaphore, e))?,
+                );
+            }
+            for _ in 0..images.len() {
+                fresh_render.push(
+                    ctx.device
+                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                        .map_err(|e| (VkOp::WindowCreateRenderSemaphore, e))?,
+                );
             }
             Ok(())
         };
         if let Err((op, error)) = make() {
-            for (image_available, render_finished) in fresh {
-                ctx.device.destroy_semaphore(render_finished, None);
-                ctx.device.destroy_semaphore(image_available, None);
+            for semaphore in fresh_acquire.into_iter().chain(fresh_render) {
+                ctx.device.destroy_semaphore(semaphore, None);
             }
             self.swapchain_loader.destroy_swapchain(swapchain, None);
             return Err(DrawError::VkCall(VkCall::new(op, error)));
         }
-        for (frame, (image_available, render_finished)) in self.frames.iter_mut().zip(fresh) {
+        for (frame, image_available) in self.frames.iter_mut().zip(fresh_acquire) {
             ctx.device.destroy_semaphore(frame.image_available, None);
-            ctx.device.destroy_semaphore(frame.render_finished, None);
             frame.image_available = image_available;
-            frame.render_finished = render_finished;
             // The queue idled, so nothing is outstanding regardless of what the
             // latch said before.
             frame.submitted = false;
         }
+        for semaphore in self.render_finished.drain(..) {
+            ctx.device.destroy_semaphore(semaphore, None);
+        }
+        self.render_finished = fresh_render;
         self.swapchain = swapchain;
         self.images = images;
         self.extent = extent;
@@ -1050,14 +1128,14 @@ impl WindowPresenter {
         Ok(())
     }
 
-    pub(crate) unsafe fn present(
+    pub(crate) unsafe fn begin_present(
         &mut self,
         ctx: &DeviceContext,
         pools: &mut ResourcePools,
         counters: &EngineCounters,
         source: Option<&WindowPresentSource>,
         cpu: Option<WindowCpuFrame<'_>>,
-    ) -> Result<WindowPresentOutcome, DrawError> {
+    ) -> Result<WindowPresentDispatch, DrawError> {
         if let Some(seq) = cpu.map(|frame| frame.seq) {
             if self.cadence_last_offered != Some(seq) {
                 self.cadence_last_offered = Some(seq);
@@ -1067,7 +1145,7 @@ impl WindowPresenter {
         if !self.retire(ctx, pools)? {
             self.cadence_busy_fence = self.cadence_busy_fence.saturating_add(1);
             self.note_cadence(false, false);
-            return Ok(WindowPresentOutcome::Busy);
+            return Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy));
         }
         if self.swapchain == vk::SwapchainKHR::null() || self.recreate_pending {
             self.recreate_swapchain(ctx)?;
@@ -1076,7 +1154,6 @@ impl WindowPresenter {
         let frame_ix = self.frame_ix;
         let frame_cmd = self.frames[frame_ix].cmd;
         let frame_image_available = self.frames[frame_ix].image_available;
-        let frame_render_finished = self.frames[frame_ix].render_finished;
         let frame_in_flight = self.frames[frame_ix].in_flight;
         let (image_index, acquire_suboptimal) = match self.swapchain_loader.acquire_next_image(
             self.swapchain,
@@ -1088,14 +1165,14 @@ impl WindowPresenter {
             Err(vk::Result::NOT_READY) | Err(vk::Result::TIMEOUT) => {
                 self.cadence_busy_acquire = self.cadence_busy_acquire.saturating_add(1);
                 self.note_cadence(false, false);
-                return Ok(WindowPresentOutcome::Busy);
+                return Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy));
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.recreate_pending = true;
                 self.recreate_reason = "acquire_out_of_date";
                 self.cadence_busy_acquire = self.cadence_busy_acquire.saturating_add(1);
                 self.note_cadence(false, false);
-                return Ok(WindowPresentOutcome::Busy);
+                return Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy));
             }
             Err(error) => {
                 return Err(DrawError::VkCall(VkCall::new(
@@ -1104,6 +1181,17 @@ impl WindowPresenter {
                 )));
             }
         };
+
+        // Keyed by the acquired image and not by the entry: the acquire is what
+        // says this image's previous present has completed, and nothing says
+        // that about the entry's previous present of some other image.
+        debug_assert_eq!(
+            self.render_finished.len(),
+            self.images.len(),
+            "one render semaphore per swapchain image; both are set from the \
+             same `images` in `recreate_swapchain` and nothing else writes either"
+        );
+        let frame_render_finished = self.render_finished[image_index as usize];
 
         pools.batch_flush(ctx, counters)?;
         let selected = source.and_then(|source| {
@@ -1115,6 +1203,7 @@ impl WindowPresenter {
                     slot.access,
                     slot.width,
                     slot.height,
+                    slot.memory.is_guest_imported(),
                 )
             })
         });
@@ -1144,7 +1233,7 @@ impl WindowPresenter {
             staged
         };
         let mut pinned = Vec::with_capacity(1);
-        if let Some((identity, _, _, _, _)) = selected.as_ref() {
+        if let Some((identity, _, _, _, _, _)) = selected.as_ref() {
             if !pools.pin_resident_target(identity, true) {
                 return Err(DrawError::Facade(
                     EngineFacadeDecline::WindowSourceDisappearedBeforePin {
@@ -1162,11 +1251,14 @@ impl WindowPresenter {
         let blit = selected
             .as_ref()
             .map(
-                |(_, image, access, base_width, base_height)| BlitSource::Resident {
-                    image: *image,
-                    access: *access,
-                    width: *base_width,
-                    height: *base_height,
+                |(_, image, access, base_width, base_height, host_accessible)| {
+                    BlitSource::Resident {
+                        image: *image,
+                        access: *access,
+                        next_access: super::pools::ResidentAccess::transfer_read(*host_accessible),
+                        width: *base_width,
+                        height: *base_height,
+                    }
                 },
             )
             .or(staged);
@@ -1195,6 +1287,17 @@ impl WindowPresenter {
                 .level_count(1)
                 .layer_count(1);
             let dst = self.images[image_index as usize];
+            // `srcStageMask` is `TRANSFER` and not `TOP_OF_PIPE`, and it has to
+            // match the `pWaitDstStageMask` of the submit below.
+            //
+            // A layout transition is a write, and the acquire semaphore's wait
+            // is what says the presentation engine has finished reading this
+            // image. `TOP_OF_PIPE` puts the transition ahead of that wait, so
+            // the transition is ordered against nothing — reported by the
+            // Khronos validation layer on a driven macos-11 boot as
+            // `SYNC-HAZARD-WRITE-AFTER-READ`, "vkCmdPipelineBarrier writes to
+            // VkImage, which was previously accessed by vkAcquireNextImageKHR
+            // ... layout transition does not synchronize with these stages".
             image_barrier(
                 &ctx.device,
                 frame_cmd,
@@ -1203,7 +1306,7 @@ impl WindowPresenter {
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::AccessFlags::empty(),
                 vk::AccessFlags::TRANSFER_WRITE,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                ACQUIRE_WAIT_STAGE,
                 vk::PipelineStageFlags::TRANSFER,
             );
             if let Some(blit) = blit {
@@ -1229,6 +1332,29 @@ impl WindowPresenter {
                         },
                         &[color_range],
                     );
+                    // The blit below overwrites the middle of what that clear
+                    // just wrote. Both are transfer writes and Vulkan orders
+                    // neither against the other — the clear stage and the blit
+                    // stage are distinct, so "same command buffer, recorded
+                    // earlier" says nothing. Without this the two race for the
+                    // letterboxed pixels, which is a frame of slate over guest
+                    // content: `SYNC-HAZARD-WRITE-AFTER-WRITE`, "vkCmdBlitImage
+                    // writes to VkImage, which was previously written by
+                    // vkCmdClearColorImage".
+                    //
+                    // Only on the letterbox arm, because that is the only arm
+                    // that writes the image twice.
+                    ctx.device.cmd_pipeline_barrier(
+                        frame_cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[vk::MemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)],
+                        &[],
+                        &[],
+                    );
                 }
                 let src_layout = blit.record_read_barrier(&ctx.device, frame_cmd);
                 blit_rect(
@@ -1240,10 +1366,10 @@ impl WindowPresenter {
                     (0, 0, base_width, base_height),
                     (vp.x, vp.y, vp.x + vp.width, vp.y + vp.height),
                 );
-                if let Some((identity, _, _, _, _)) = selected.as_ref() {
+                if let Some((identity, _, _, _, _, host_accessible)) = selected.as_ref() {
                     pools.registry_note_access(
                         identity,
-                        super::pools::ResidentAccess::TransferRead,
+                        super::pools::ResidentAccess::transfer_read(*host_accessible),
                     );
                 }
             } else {
@@ -1272,27 +1398,31 @@ impl WindowPresenter {
                 DrawError::VkCall(VkCall::new(VkOp::WindowEndCommandBuffer, error))
             })?;
             let waits = [frame_image_available];
-            let wait_stages = [vk::PipelineStageFlags::TRANSFER];
+            let wait_stages = [ACQUIRE_WAIT_STAGE];
             let signals = [frame_render_finished];
             let commands = [frame_cmd];
-            ctx.device
-                .queue_submit(
-                    ctx.queue(),
-                    &[vk::SubmitInfo::default()
-                        .wait_semaphores(&waits)
-                        .wait_dst_stage_mask(&wait_stages)
-                        .command_buffers(&commands)
-                        .signal_semaphores(&signals)],
-                    frame_in_flight,
-                )
-                .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowSubmitPresent, error)))
+            ctx.submit_present_transaction(super::context::PresentTransaction {
+                command_buffers: &commands,
+                wait_semaphores: &waits,
+                wait_stages: &wait_stages,
+                signal_semaphores: &signals,
+                fence: frame_in_flight,
+                loader: self.swapchain_loader.clone(),
+                present_wait: frame_render_finished,
+                swapchain: self.swapchain,
+                image_index,
+            })
+            .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowSubmitPresent, error)))
         })();
-        if let Err(error) = submit_result {
-            for identity in pinned.drain(..) {
-                let _ = pools.pin_resident_target(&identity, false);
+        let submission = match submit_result {
+            Ok(submission) => submission,
+            Err(error) => {
+                for identity in pinned.drain(..) {
+                    let _ = pools.pin_resident_target(&identity, false);
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
         self.frames[frame_ix].pinned = pinned;
         self.frames[frame_ix].submitted = true;
         // Only a successful submit advances the ring; a `Busy` return above
@@ -1308,16 +1438,36 @@ impl WindowPresenter {
             }
         }
 
-        let swapchains = [self.swapchain];
-        let indices = [image_index];
-        let waits = [frame_render_finished];
-        match self.swapchain_loader.queue_present(
-            ctx.queue(),
-            &vk::PresentInfoKHR::default()
-                .wait_semaphores(&waits)
-                .swapchains(&swapchains)
-                .image_indices(&indices),
-        ) {
+        let direct = selected.is_some();
+        match submission {
+            super::context::PresentSubmission::Complete(result) => self.finish_present(
+                FinishedWindowPresent {
+                    result,
+                    acquire_suboptimal,
+                    direct,
+                    width: self.extent.width,
+                    height: self.extent.height,
+                    swapchain_images: self.images.len(),
+                },
+            ),
+            super::context::PresentSubmission::Pending(wait) => {
+                Ok(WindowPresentDispatch::Pending(PendingWindowPresent {
+                    wait,
+                    acquire_suboptimal,
+                    direct,
+                    width: self.extent.width,
+                    height: self.extent.height,
+                    swapchain_images: self.images.len(),
+                }))
+            }
+        }
+    }
+
+    pub(crate) fn finish_present(
+        &mut self,
+        finished: FinishedWindowPresent,
+    ) -> Result<WindowPresentDispatch, DrawError> {
+        match finished.result {
             Ok(present_suboptimal) => {
                 // ash reports VK_SUBOPTIMAL_KHR as `Ok(true)` (a success code),
                 // never through the `Err` arm. MoltenVK returns it from both
@@ -1326,7 +1476,7 @@ impl WindowPresenter {
                 // including after a retired swapchain clobbered the layer's
                 // drawableSize — so ignoring the flag leaves an invisible
                 // window that still counts successful presents.
-                let suboptimal = acquire_suboptimal || present_suboptimal;
+                let suboptimal = finished.acquire_suboptimal || present_suboptimal;
                 if suboptimal {
                     self.recreate_pending = true;
                     self.recreate_reason = "suboptimal";
@@ -1342,21 +1492,20 @@ impl WindowPresenter {
                 } else {
                     self.suboptimal_streak = 0;
                 }
-                let direct = selected.is_some();
-                self.note_cadence(true, direct);
-                Ok(WindowPresentOutcome::Presented {
-                    direct,
-                    width: self.extent.width,
-                    height: self.extent.height,
-                    swapchain_images: self.images.len(),
+                self.note_cadence(true, finished.direct);
+                Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Presented {
+                    direct: finished.direct,
+                    width: finished.width,
+                    height: finished.height,
+                    swapchain_images: finished.swapchain_images,
                     suboptimal,
-                })
+                }))
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.recreate_pending = true;
                 self.recreate_reason = "present_out_of_date";
                 self.note_cadence(false, false);
-                Ok(WindowPresentOutcome::Busy)
+                Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy))
             }
             Err(error) => Err(DrawError::VkCall(VkCall::new(
                 VkOp::WindowQueuePresent,
@@ -1641,7 +1790,7 @@ impl WindowPresenter {
         ctx: &DeviceContext,
         pools: Option<&mut ResourcePools>,
     ) {
-        if let Err(error) = ctx.device.queue_wait_idle(ctx.queue()) {
+        if let Err(error) = ctx.queue_wait_idle() {
             let decline = VkCall::new(VkOp::WindowDestroyQueueWaitIdle, error);
             crate::observe::Emit::decline("host_window_destroy", &decline).fail_once(0);
         }
@@ -1664,8 +1813,13 @@ impl WindowPresenter {
         // — cannot double-free a handle.
         for frame in self.frames.drain(..) {
             ctx.device.destroy_fence(frame.in_flight, None);
-            ctx.device.destroy_semaphore(frame.render_finished, None);
             ctx.device.destroy_semaphore(frame.image_available, None);
+        }
+        // Drained for the same reason as the entries above: `destroy` may run
+        // twice and these handles are per swapchain image, so a second pass
+        // would double-free every one of them.
+        for semaphore in self.render_finished.drain(..) {
+            ctx.device.destroy_semaphore(semaphore, None);
         }
         ctx.device.destroy_command_pool(self.cmd_pool, None);
         if self.swapchain != vk::SwapchainKHR::null() {

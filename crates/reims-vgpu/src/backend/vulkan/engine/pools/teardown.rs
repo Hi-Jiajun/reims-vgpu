@@ -15,7 +15,11 @@ impl ResourcePools {
         // An open (never-submitted) batch dies with the pool: its CB belongs
         // to cmd_pool (destroyed below) and its dsets to desc_pool; the
         // accumulated transients are already in the live lists.
-        self.open_batch = None;
+        self.discard_open_batch();
+        // No command from this CB will be submitted now. Destroying its command
+        // pool discards the unfinished recording, including an open pass, so
+        // there is neither a legal nor a useful cmd_end_render_pass to emit.
+        self.open_pass = None;
         self.forget_pass_echo();
         // Best-effort quiesce: wait every in-flight fence so no CB references
         // what we are about to destroy. On device loss the waits fail — the
@@ -38,6 +42,8 @@ impl ResourcePools {
                 self.gather_live.extend(pending.gather);
                 self.readback_multi_live.extend(pending.readback);
                 self.sampled_live.extend(pending.sampled);
+                self.attachment_snapshot_live
+                    .extend(pending.attachment_snapshots);
                 self.storage_image_live.extend(pending.storage_images);
             }
         }
@@ -103,11 +109,21 @@ impl ResourcePools {
         for l in self.readback_leased.drain(..) {
             release_buffer_slot(device, &mut self.slabs, l.slot);
         }
+        // Ad-hoc framebuffers name views owned by the targets and residents
+        // destroyed below, and a framebuffer may not outlive its attachments —
+        // so they go first, before anything drains a view out from under one.
+        for (_, fb) in self.ad_hoc_framebuffers.drain() {
+            device.destroy_framebuffer(fb, None);
+        }
         // Sampled / target / registry images are slab-backed: destroy the image
         // + view handles here, but their memory belongs to shared blocks freed
         // once by `self.slab.destroy_all(device)` at the end — never a per-image
         // `vkFreeMemory` (that would double-free a block many images share).
         for s in self.sampled_free.drain() {
+            device.destroy_image_view(s.view, None);
+            device.destroy_image(s.image, None);
+        }
+        for s in self.attachment_snapshot_free.drain() {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);
         }
@@ -119,11 +135,19 @@ impl ResourcePools {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);
         }
+        for s in self.attachment_snapshot_live.drain(..) {
+            device.destroy_image_view(s.view, None);
+            device.destroy_image(s.image, None);
+        }
         for s in self.sampled_cache.drain(..) {
             device.destroy_image_view(s.slot.view, None);
             device.destroy_image(s.slot.image, None);
         }
         self.sampled_cache_bytes = 0;
+        for (_, sampled) in self.guest_sampled.drain() {
+            device.destroy_image_view(sampled.view, None);
+            device.destroy_image(sampled.image, None);
+        }
         for s in self.storage_image_free.drain() {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);
@@ -146,8 +170,16 @@ impl ResourcePools {
             device.destroy_image(t.image, None);
         }
         self.target_order.clear();
+        if let Some(t) = self.multisample_target.take() {
+            device.destroy_framebuffer(t.framebuffer, None);
+            device.destroy_image_view(t.view, None);
+            device.destroy_image(t.image, None);
+        }
         for (_, t) in self.registry.drain() {
             device.destroy_framebuffer(t.framebuffer, None);
+            for (_, view) in t.alternate_views {
+                device.destroy_image_view(view, None);
+            }
             device.destroy_image_view(t.view, None);
             device.destroy_image(t.image, None);
         }

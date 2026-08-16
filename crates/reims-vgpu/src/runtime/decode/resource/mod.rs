@@ -699,6 +699,13 @@ pub struct RenderPipelineDescriptor {
     /// are one answer, and so a defaulted `RenderPipelineDescriptor` does not
     /// read as a count no device can rasterize at.
     pub raster_sample_count: u32,
+    /// Maximum tessellation factor declared for a classic tessellation
+    /// pipeline. Zero means the property was omitted.
+    pub max_tessellation_factor: u32,
+    /// `MTLTessellationFactorStepFunction`; zero when omitted.
+    pub tessellation_factor_step_function: u32,
+    /// `MTLWinding`; zero when omitted.
+    pub tessellation_output_winding_order: u32,
     pub vertex_attributes: Vec<VertexAttribute>,
     /// First color attachment (compat / color0).
     pub color0: PipelineColorAttachment,
@@ -1241,6 +1248,12 @@ pub const PIPELINE_TAG_DEPTH_ATTACH_FORMAT: u8 = 0x09;
 /// `MTLPixelFormat`. The stencil half of [`PIPELINE_TAG_DEPTH_ATTACH_FORMAT`],
 /// and benign for the same reason.
 pub const PIPELINE_TAG_STENCIL_ATTACH_FORMAT: u8 = 0x0a;
+/// `MTLRenderPipelineDescriptor.maxTessellationFactor`.
+pub const PIPELINE_TAG_MAX_TESSELLATION_FACTOR: u8 = 0x0d;
+/// `MTLRenderPipelineDescriptor.tessellationFactorStepFunction`.
+pub const PIPELINE_TAG_TESSELLATION_FACTOR_STEP_FUNCTION: u8 = 0x11;
+/// `MTLRenderPipelineDescriptor.tessellationOutputWindingOrder`.
+pub const PIPELINE_TAG_TESSELLATION_OUTPUT_WINDING_ORDER: u8 = 0x12;
 /// The `rasterSampleCount` a descriptor that omits the property is asking for,
 /// and the only count this device rasterizes at.
 ///
@@ -2224,12 +2237,15 @@ pub fn decode_sampler_descriptor(bytes: &[u8]) -> Result<SamplerDescriptor, Deco
 /// boot's classic pipelines that carry `0x03` — an instrument built to find
 /// unread fields hiding one behind a tag its *other* branch reads. Which tags
 /// count as consumed is a property of the branch taken, so it is chosen there.
-const CLASSIC_PIPELINE_TAGS_CONSUMED: [u8; 5] = [
+const CLASSIC_PIPELINE_TAGS_CONSUMED: [u8; 8] = [
     PIPELINE_TAG_VERTEX_FUNC,
     PIPELINE_TAG_FRAGMENT_FUNC,
     PIPELINE_TAG_VERTEX_DESCRIPTOR_OFFSET,
     PIPELINE_TAG_COLOR_ATTACH_OFFSET,
     PIPELINE_TAG_RASTER_SAMPLE_COUNT,
+    PIPELINE_TAG_MAX_TESSELLATION_FACTOR,
+    PIPELINE_TAG_TESSELLATION_FACTOR_STEP_FUNCTION,
+    PIPELINE_TAG_TESSELLATION_OUTPUT_WINDING_ORDER,
 ];
 
 /// Tags [`decode_render_pipeline_descriptor`] reads on the **mesh** shape.
@@ -2319,10 +2335,9 @@ const COMPUTE_PIPELINE_TAG_LABEL: u8 = 0x02;
 /// it — so the two encodings are not alternatives to choose between here, and
 /// this tag's absence still takes the old path.
 ///
-/// Every macOS 12 pipeline observed declares **zero attributes and zero
-/// layouts**: `stageInputDescriptor` is set but empty, which is a kernel taking
-/// no per-thread input, which is [`None`]. A section that declares entries is
-/// refused rather than emptied — see `parse_compute_stage_input_section`.
+/// An empty descriptor is a kernel taking no per-thread input and decodes as
+/// [`None`]. A populated descriptor uses the compact attribute/layout grammar
+/// described above and survives as [`ComputeStageInputDescriptor`].
 pub const PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET: u8 = 0x03;
 
 /// Tags this decoder deliberately does not read, and which cost the guest
@@ -2362,8 +2377,7 @@ pub const PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET: u8 = 0x03;
 /// and neither has appeared in this block on a driven boot. If one arrives it
 /// must refuse rather than be waved through. The third,
 /// [`PIPELINE_TAG_RASTER_SAMPLE_COUNT`], is now read — it is consumed on both
-/// shapes and a count this device cannot rasterize at is a named degradation
-/// rather than a silent default. See `note_pipeline_raster_sample_count`.
+/// shapes and carried to the backend render-pass and pipeline keys.
 const RENDER_PIPELINE_TAGS_BENIGN: [u8; 3] = [
     RENDER_PIPELINE_TAG_LABEL,
     PIPELINE_TAG_DEPTH_ATTACH_FORMAT,
@@ -2533,52 +2547,6 @@ impl crate::observe::Decline for PipelineFieldDropped {
         }
         out
     }
-}
-
-/// A pipeline asking to be rasterized at a sample count this device does not
-/// have attachments for. The pipeline is built at
-/// [`DEFAULT_RASTER_SAMPLE_COUNT`] instead.
-///
-/// A **degradation, not a loss**: the draw runs and the guest keeps its
-/// geometry, with edges that alias where the guest asked for them not to. That
-/// is why this reports rather than refusing — a refusal here costs the whole
-/// draw to buy nothing, because every render target both backends allocate is
-/// single-sampled and so a pipeline built at any other count would not be
-/// compatible with the pass it is used in. Widening it is an attachment-path
-/// change, and this line is what would measure the demand for one.
-///
-/// On the fail channel because the reliance has to stay measurable, per this
-/// crate's rule that a repair which succeeded is still worth naming. Deduped on
-/// the requested count, which is the whole of what varies between two guests
-/// asking for this.
-struct PipelineRasterSampleCountDegraded {
-    count: u32,
-}
-
-impl crate::observe::Decline for PipelineRasterSampleCountDegraded {
-    fn slug(&self) -> &'static str {
-        "pipeline_raster_sample_count_degraded"
-    }
-
-    fn fields(&self) -> Vec<(&'static str, String)> {
-        vec![
-            ("count", self.count.to_string()),
-            ("built_at", DEFAULT_RASTER_SAMPLE_COUNT.to_string()),
-        ]
-    }
-}
-
-/// Name a `rasterSampleCount` this device cannot honour. See
-/// [`PipelineRasterSampleCountDegraded`].
-///
-/// Zero and one are the same answer — see
-/// [`RenderPipelineDescriptor::raster_sample_count`] — so only `> 1` reports.
-fn note_pipeline_raster_sample_count(count: u32) {
-    if count <= DEFAULT_RASTER_SAMPLE_COUNT {
-        return;
-    }
-    let drop = PipelineRasterSampleCountDegraded { count };
-    crate::observe::Emit::decline("type7_pipeline", &drop).fail_once(u64::from(count));
 }
 
 /// Report the shape of a type-7 pipeline's own compact-TLV block and every
@@ -2777,7 +2745,12 @@ pub fn decode_render_pipeline_descriptor(
     // case and means single-sampled; see the field's doc.
     out.raster_sample_count =
         compact_tlv_u32(&fields, PIPELINE_TAG_RASTER_SAMPLE_COUNT).unwrap_or(0);
-    note_pipeline_raster_sample_count(out.raster_sample_count);
+    out.max_tessellation_factor =
+        compact_tlv_u32(&fields, PIPELINE_TAG_MAX_TESSELLATION_FACTOR).unwrap_or(0);
+    out.tessellation_factor_step_function =
+        compact_tlv_u32(&fields, PIPELINE_TAG_TESSELLATION_FACTOR_STEP_FUNCTION).unwrap_or(0);
+    out.tessellation_output_winding_order =
+        compact_tlv_u32(&fields, PIPELINE_TAG_TESSELLATION_OUTPUT_WINDING_ORDER).unwrap_or(0);
     // Mesh SPI shape: tag 0x14 section offset (host serializeMeshRenderPipelineDescriptor).
     // Classic type-7 uses tag 0x08. Roles for 0x01/0x02/0x03 differ by shape.
     if let Some(off) = compact_tlv_u32(&fields, PIPELINE_TAG_MESH_SECTION_OFFSET) {
@@ -3894,23 +3867,14 @@ fn section_ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64) ->
 /// `section` is absolute in `bytes`, already resolved from the tag's
 /// header-relative offset by the caller.
 ///
-/// # Empty is [`None`]; populated is a refusal
+/// # Empty is [`None`]; populated preserves every declared entry
 ///
-/// Every macOS 12 compute pipeline observed sets `stageInputDescriptor` to an
-/// object with no attributes and no layouts, and a kernel that fetches nothing
-/// per thread is exactly what `stage_input: None` means to the rest of this
-/// device. So the empty case is not a degradation — it is the same pipeline the
-/// guest asked for.
-///
-/// A section that declares entries is refused, and the refusal is the point.
-/// This device has never seen one, so nothing here knows how a compute
-/// stage-input attribute's format enumerates or how its layout steps, and the
-/// alternative to refusing is building the pipeline with its stage-in fetch
-/// silently absent. `ComputePipelineDescriptor`'s own `classify_stage_input`
-/// makes that argument for the sibling encoding's over-cap case, and it applies
-/// unchanged here: a dropped stage-input is indistinguishable downstream from a
-/// kernel that declared none, and on the Vulkan arm it walks straight past a
-/// refusal that exists to catch it.
+/// The section uses the same descriptor, attribute, and layout tags as a
+/// render pipeline's vertex descriptor. Array offsets are relative to the
+/// descriptor entry; entry offsets are relative to their array. A populated
+/// descriptor must survive whole: losing one attribute changes the kernel's
+/// per-thread input contract, so malformed offsets and counts outside Metal's
+/// 31-entry arrays fail closed.
 ///
 /// Structural damage is refused rather than treated as absence, for the reason
 /// [`parse_compute_stage_input_block`] gives: the guest named this offset, so
@@ -3943,25 +3907,100 @@ fn parse_compute_stage_input_section(
     let attr_off = entry_tag_u32(bytes, section, VERTEX_DESC_TAG_ATTRIBUTES, u32::MAX);
     let layout_off = entry_tag_u32(bytes, section, VERTEX_DESC_TAG_LAYOUTS, u32::MAX);
     if attr_off == u32::MAX || layout_off == u32::MAX {
-        return Err(DecodeStatus::ErrShort("res_compute_stage_input_no_sections"));
-    }
-    // Each array starts with its own `u32` count, at an offset relative to the
-    // entry rather than to the record — which is what makes the two values
-    // identical across pipelines whose sections sit at three different places.
-    let count_at = |rel: u32| -> Option<u32> {
-        let at = section.checked_add(rel as usize)?;
-        let end = at.checked_add(4)?;
-        (end <= bytes.len()).then(|| ld32(&bytes[at..]))
-    };
-    let (Some(attr_count), Some(layout_count)) = (count_at(attr_off), count_at(layout_off)) else {
-        return Err(DecodeStatus::ErrShort("res_compute_stage_input_count_oob"));
-    };
-    if attr_count != 0 || layout_count != 0 {
-        return Err(DecodeStatus::ErrUnsupported(
-            "res_compute_stage_input_populated",
+        return Err(DecodeStatus::ErrShort(
+            "res_compute_stage_input_no_sections",
         ));
     }
-    Ok(None)
+    let array_at = |rel: u32| -> Result<(usize, usize), DecodeStatus> {
+        let at = section
+            .checked_add(rel as usize)
+            .ok_or(DecodeStatus::ErrShort("res_compute_stage_input_count_oob"))?;
+        let end = at
+            .checked_add(4)
+            .ok_or(DecodeStatus::ErrShort("res_compute_stage_input_count_oob"))?;
+        if end > bytes.len() {
+            return Err(DecodeStatus::ErrShort("res_compute_stage_input_count_oob"));
+        }
+        Ok((at, ld32(&bytes[at..]) as usize))
+    };
+    let (attr_section, attr_count) = array_at(attr_off)?;
+    let (layout_section, layout_count) = array_at(layout_off)?;
+    if attr_count == 0 && layout_count == 0 {
+        return Ok(None);
+    }
+    if attr_count > MAX_COMPUTE_STAGE_INPUT_ATTRS || layout_count > MAX_COMPUTE_STAGE_INPUT_LAYOUTS {
+        return Err(DecodeStatus::ErrUnsupported("stage_input_over_cap"));
+    }
+
+    let entry_at =
+        |array: usize, count: usize, index: usize, reason| -> Result<usize, DecodeStatus> {
+            let entries_start = array
+                .checked_add(4)
+                .and_then(|v| count.checked_mul(4).and_then(|n| v.checked_add(n)))
+                .ok_or(DecodeStatus::ErrShort(reason))?;
+            let offset_word = array
+                .checked_add(4)
+                .and_then(|v| index.checked_mul(4).and_then(|i| v.checked_add(i)))
+                .ok_or(DecodeStatus::ErrShort(reason))?;
+            let offset_end = offset_word
+                .checked_add(4)
+                .ok_or(DecodeStatus::ErrShort(reason))?;
+            if offset_end > bytes.len() {
+                return Err(DecodeStatus::ErrShort(reason));
+            }
+            let entry = array
+                .checked_add(ld32(&bytes[offset_word..]) as usize)
+                .ok_or(DecodeStatus::ErrShort(reason))?;
+            if entry < entries_start || entry >= bytes.len() {
+                return Err(DecodeStatus::ErrShort(reason));
+            }
+            Ok(entry)
+        };
+
+    let mut out = ComputeStageInputDescriptor::default();
+    for i in 0..layout_count {
+        let entry = entry_at(
+            layout_section,
+            layout_count,
+            i,
+            "res_compute_stage_input_layout_entry_oob",
+        )?;
+        note_entry_tlv_fields(
+            "compute_stage_input_layout",
+            bytes,
+            entry,
+            &VERTEX_LAYOUT_TAGS_CONSUMED,
+        );
+        out.layouts.push(ComputeStageInputLayout {
+            buffer_index: entry_tag_u32(bytes, entry, VERTEX_LAYOUT_TAG_BUFFER_INDEX, i as u32),
+            step_function: entry_tag_u32(bytes, entry, VERTEX_LAYOUT_TAG_STEP_FUNCTION, 0),
+            step_rate: entry_tag_u32(bytes, entry, VERTEX_LAYOUT_TAG_STEP_RATE, 1),
+            stride: u64::from(entry_tag_u32(bytes, entry, VERTEX_LAYOUT_TAG_STRIDE, 0)),
+            ..Default::default()
+        });
+    }
+    for i in 0..attr_count {
+        let entry = entry_at(
+            attr_section,
+            attr_count,
+            i,
+            "res_compute_stage_input_attr_entry_oob",
+        )?;
+        note_entry_tlv_fields(
+            "compute_stage_input_attr",
+            bytes,
+            entry,
+            &VERTEX_ATTR_TAGS_CONSUMED,
+        );
+        out.attributes.push(ComputeStageInputAttribute {
+            location: entry_tag_u32(bytes, entry, VERTEX_ATTR_TAG_LOCATION, i as u32),
+            format: entry_tag_u32(bytes, entry, VERTEX_ATTR_TAG_FORMAT, 0),
+            offset: entry_tag_u32(bytes, entry, VERTEX_ATTR_TAG_OFFSET, 0),
+            buffer_index: entry_tag_u32(bytes, entry, VERTEX_ATTR_TAG_BUFFER_INDEX, 0),
+            ..Default::default()
+        });
+    }
+    Ok(Some(out))
 }
 
 /// Parse optional MetalSerializer compute stage-input block after first TLVs.

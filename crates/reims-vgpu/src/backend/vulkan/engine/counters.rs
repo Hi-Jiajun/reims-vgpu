@@ -238,6 +238,12 @@ engine_counters! {
         pass_hits,
         pass_misses,
         pipeline_hits,
+        /// Positive render-pipeline lookups answered by the exact one-entry
+        /// front index without hashing the composite pipeline key.
+        pipeline_front_hits,
+        /// Positive render-pipeline lookups answered by the exact last variant
+        /// attached to this retained guest pipeline object's identity.
+        pipeline_object_hits,
         pipeline_misses,
         sampler_hits,
         sampler_misses,
@@ -303,6 +309,15 @@ engine_counters! {
         seed_gpu_copy_bytes,
         sampled_reuploads,
         sampled_reupload_bytes,
+        /// Actual sampled upload bytes, partitioned by decoded API resource.
+        /// These fields sum to `sampled_reupload_bytes`.
+        sampled_reupload_attachment_bytes,
+        sampled_reupload_buffer_texture_bytes,
+        sampled_reupload_surface_view_bytes,
+        sampled_reupload_surface_cache_bytes,
+        sampled_reupload_surface_guest_bytes,
+        sampled_reupload_linear_texture_bytes,
+        sampled_reupload_synthetic_bytes,
         /// Sampled binds served by gathering scattered guest pages into staging
         /// (`SampledSource::GuestRuns`), and the bytes those gathers moved.
         ///
@@ -398,7 +413,7 @@ engine_counters! {
         /// retained image could have answered and no size of sampled cache
         /// reaches them. Only the 2524 are a cache result. That is the reverse
         /// of what the structural zero was read as, and it is consistent with
-        /// the `SAMPLED_CACHE_CAP` A/B, where four times the entries and six
+        /// the `SAMPLED_REACH_BAND` A/B, where four times the entries and six
         /// times the bytes left the miss rate where it started.
         ///
         /// The 9876 count-cap evictions on the same boot are not evidence of a
@@ -452,12 +467,17 @@ engine_counters! {
         draw_cover_full,
         draw_cover_loaded_full_scissor,
         draw_cover_loaded_partial_scissor,
-        /// Vertex/storage buffer binds the draw pointed straight at the guest's
-        /// own pages through the imported RAMBlock, with no copy in either
-        /// direction. Ranked against `buffer_snapshot_binds` and the
+        /// Vertex/storage/index buffer binds the draw pointed straight at the
+        /// guest's own pages through the imported RAMBlock, with no copy in
+        /// either direction. Ranked against `buffer_snapshot_binds` and the
         /// `stage_phase` `runs_*` bars, which are what the CPU still gathers.
         buffer_guest_imports,
         buffer_guest_import_bytes,
+        /// Index-buffer subset of the direct-import totals above. Kept apart
+        /// because indexed draws previously copied this resource through a CPU
+        /// `Vec` and therefore appeared in neither zero-copy disposition.
+        buffer_guest_index_imports,
+        buffer_guest_index_import_bytes,
         /// Vertex/storage buffer binds the GPU assembled out of the guest's own
         /// pages, one `VkBufferCopy` per GPA-contiguous stretch, into a
         /// device-local destination the draw then binds.
@@ -477,6 +497,15 @@ engine_counters! {
         buffer_guest_gathers,
         buffer_guest_gather_bytes,
         buffer_guest_gather_regions,
+        /// Gathered windows consumed only by fixed-function vertex fetch.
+        buffer_guest_gather_vertex_bytes,
+        /// Gathered windows consumed only through a shader storage-buffer bind.
+        buffer_guest_gather_storage_bytes,
+        /// Gathered windows consumed by both fixed-function vertex fetch and a
+        /// shader storage-buffer bind. Counted once, like the physical gather.
+        buffer_guest_gather_shared_bytes,
+        /// Gather bytes consumed only by fixed-function index fetch.
+        buffer_guest_gather_index_bytes,
         /// Compute dispatches the buffer gather issued in place of those
         /// regions, and the plans that could not become one.
         ///
@@ -508,6 +537,8 @@ engine_counters! {
         /// buffer if it is taken against a boot's `batch_flush_draws /
         /// batch_flushes`, which says how many draws there were to reuse over.
         buffer_bind_reuses,
+        /// Reuses above whose consumer is the indexed-draw input.
+        buffer_index_bind_reuses,
         /// Graphics state a draw did **not** record because the command buffer
         /// it joined was already carrying exactly it — see
         /// `ResourcePools::CbGraphicsState`.
@@ -527,6 +558,26 @@ engine_counters! {
         dynstate_viewport_held,
         dynstate_scissor_held,
         dynstate_stencil_held,
+        /// Vertex-buffer binding slots requested by draws. This must equal
+        /// `vertex_buffer_bind_emitted`; compare either with
+        /// `vertex_buffer_bind_calls` to measure contiguous bulk encoding.
+        vertex_buffer_bind_slots,
+        /// Requested vertex-buffer slots actually handed to Vulkan. Kept
+        /// separately so a future optimization cannot silently turn bulk
+        /// encoding into dropped guest state.
+        vertex_buffer_bind_emitted,
+        /// `vkCmdBindVertexBuffers` calls used to emit those slots.
+        vertex_buffer_bind_calls,
+        /// Draw/dispatch descriptor state recorded directly into the command
+        /// buffer through `VK_KHR_push_descriptor`.
+        descriptor_pushes,
+        /// Graphics pushes omitted because the exact layout and descriptor
+        /// values were already present in the recording command buffer.
+        descriptor_push_held,
+        /// Descriptor sets updated through the Vulkan 1.2 fallback path.
+        descriptor_set_updates,
+        /// Updated descriptor sets subsequently bound for execution.
+        descriptor_set_binds,
         sampled_cache_hits,
         sampled_identity_hits,
         sampled_cache_hit_bytes,
@@ -564,6 +615,35 @@ engine_counters! {
         batch_joins,
         batch_flushes,
         batch_flush_draws,
+        /// End-of-drain-tranche batching cost, in microseconds. `lock` is time
+        /// spent acquiring the engine mutex and `call` is the complete
+        /// `ResourcePools::batch_flush` beneath it. Read their sum against
+        /// `drain_duty tail_us`; the remainder is the cheap latch/recovery
+        /// control flow around the call.
+        batch_tail_lock_us,
+        batch_tail_call_us,
+        /// Successful end-of-tranche flushes, and the elapsed-time band in
+        /// which the next draw batch opened. The five reopen bands partition
+        /// the tail-flush population that was followed by another batch.
+        batch_tail_flushes,
+        batch_tail_reopen_le100us,
+        batch_tail_reopen_le1ms,
+        batch_tail_reopen_le4ms,
+        batch_tail_reopen_le16ms,
+        batch_tail_reopen_gt16ms,
+        /// Phase attribution for every submitted draw batch, in microseconds.
+        /// Close includes ending the open render pass and sealing its GPU-span
+        /// query; end is `vkEndCommandBuffer`; submit is the ordered-owner
+        /// handoff; finish parks cleanup and publishes recorded sampled
+        /// resources. `queue_async_driver_us` separately retains the host queue
+        /// call cost moved off the drain worker.
+        batch_flush_close_us,
+        batch_flush_end_us,
+        batch_flush_submit_us,
+        batch_flush_finish_us,
+        /// Draws recorded inside the render pass instance their preceding draw
+        /// left open for the same decoded Metal render encoder.
+        render_pass_continuations,
         /// Readbacks that appended their copy to a batch that was still
         /// recording, and so were submitted with it instead of behind it.
         ///
@@ -585,6 +665,15 @@ engine_counters! {
         /// through `begin_entry` would put a diagnostic in the signature of the
         /// device's hottest slot claim.
         batch_readback_joins,
+        /// Completion stamps parked for the open draw batch's eventual
+        /// submission point.
+        gpu_stamp_batch_points,
+        /// Completion stamps that found their FIFO's bounded pending ring full
+        /// and therefore submitted the open batch to make room.
+        gpu_stamp_pressure_flushes,
+        /// Completion stamps that reused the newest successful FIFO submission
+        /// because no draw batch remained open.
+        gpu_stamp_reused_points,
         /// Guest-page writebacks that detiled through the device-local scratch
         /// and scattered with plain buffer copies — one region per guest
         /// stretch instead of up to three rectangles per stretch.
@@ -635,6 +724,20 @@ engine_counters! {
     }
 
     pool_sourced {
+        /// Ended draw-batch submissions executed by the queue owner, time they
+        /// spent queued before its host call, and time spent inside that call.
+        /// `batch_flush_submit_us` is the drain worker's handoff cost; these
+        /// fields retain the driver cost moved off that worker.
+        queue_async_submits,
+        queue_async_queue_us,
+        queue_async_driver_us,
+        /// Ordered window display transactions, time queued behind earlier GPU
+        /// work, and time in their submit-plus-present host driver calls.  The
+        /// queue and driver times are deliberately separate from
+        /// `engine_lock`: neither is paid while the resource registry is held.
+        queue_present_transactions,
+        queue_present_queue_us,
+        queue_present_driver_us,
         /// Sampled-cache pool recycle diagnostics (workstream D lag tail). These
         /// four come from `ResourcePools`, not the atomic counters — merged in by
         /// `engine::counter_snapshot`. `free_hits` = `acquire_sampled` reused a
@@ -683,8 +786,7 @@ engine_counters! {
         /// than something a boot can be asked for. That is the gap this closes.
         registry_non_pinned_peak,
         /// Worst gap, in milliseconds, between a resident being touched and
-        /// being read again — the margin against `IDLE_TARGET_AGE_MS`, the age
-        /// at which the idle drain destroys a resident terminally.
+        /// being read again. Diagnostic only; residency does not branch on it.
         ///
         /// Cumulative high-water, like `registry_non_pinned_peak` and for the
         /// same reason: the question is how close this boot ever came, and a gap
@@ -740,11 +842,95 @@ engine_counters! {
         compute_storage_sole_copy_peak_bytes,
     }
 }
+macro_rules! create_sites {
+    ($($variant:ident => $slug:literal),+ $(,)?) => {
+        /// The Vulkan object lifetime a successful create call belongs to.
+        ///
+        /// A single `creates` total cannot distinguish a pipeline compiled once
+        /// from a framebuffer rebuilt per draw. Every create charged to the
+        /// total carries this type, so adding an unclassified charge fails to
+        /// compile instead of silently widening the remainder of a census.
+        #[repr(usize)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(crate) enum CreateSite {
+            $($variant),+
+        }
+
+        const CREATE_SITES: &[(CreateSite, &str)] = &[
+            $((CreateSite::$variant, $slug)),+
+        ];
+
+        impl CreateSite {
+            fn index(self) -> usize {
+                self as usize
+            }
+        }
+    };
+}
+
+create_sites! {
+    ShaderModule => "shader_module",
+    DescriptorSetLayout => "descriptor_set_layout",
+    PipelineLayout => "pipeline_layout",
+    RenderPass => "render_pass",
+    Sampler => "sampler",
+    GraphicsPipeline => "graphics_pipeline",
+    ComputePipeline => "compute_pipeline",
+    StorageImage => "storage_image",
+    StorageImageView => "storage_image_view",
+    RegistryFramebuffer => "registry_framebuffer",
+    RegistryImportedImage => "registry_imported_image",
+    RegistryImage => "registry_image",
+    RegistryImageView => "registry_image_view",
+    MrtImage => "mrt_image",
+    MrtImageView => "mrt_image_view",
+    DepthImage => "depth_image",
+    DepthImageView => "depth_image_view",
+    MrtFramebuffer => "mrt_framebuffer",
+    CommandPool => "command_pool",
+    DescriptorPool => "descriptor_pool",
+    Fence => "fence",
+    StagingBuffer => "staging_buffer",
+    GatherBuffer => "gather_buffer",
+    ReadbackBuffer => "readback_buffer",
+    TargetImage => "target_image",
+    TargetImageView => "target_image_view",
+    TargetFramebuffer => "target_framebuffer",
+    GuestSampledImage => "guest_sampled_image",
+    GuestSampledImageView => "guest_sampled_image_view",
+    SampledImage => "sampled_image",
+    SampledImageView => "sampled_image_view",
+    QueryPool => "query_pool",
+}
+
+static CREATE_SITE_COUNTS: [AtomicU64; CREATE_SITES.len()] =
+    [const { AtomicU64::new(0) }; CREATE_SITES.len()];
+static CREATE_COUNT: AtomicU64 = AtomicU64::new(0);
+const CREATE_EMIT_EVERY: u64 = 512;
+
+fn emit_create_site_census() {
+    use std::fmt::Write as _;
+    let mut line = String::from("vk_create_sites");
+    for (site, name) in CREATE_SITES {
+        let _ = write!(
+            line,
+            " {name}={}",
+            CREATE_SITE_COUNTS[site.index()].load(Ordering::Relaxed)
+        );
+    }
+    crate::observe::off(line);
+}
+
 /// The `note_*` helpers: the increments that are not a bare `fetch_add(1)` at
 /// the call site, because they move a count and a byte total together.
 impl EngineCounters {
-    pub fn note_create(&self) {
+    pub(crate) fn note_create(&self, site: CreateSite) {
         self.creates.fetch_add(1, Ordering::Relaxed);
+        CREATE_SITE_COUNTS[site.index()].fetch_add(1, Ordering::Relaxed);
+        let count = CREATE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if count.is_multiple_of(CREATE_EMIT_EVERY) {
+            emit_create_site_census();
+        }
     }
 
     pub fn note_alloc(&self) {
@@ -766,10 +952,32 @@ impl EngineCounters {
         self.seed_upload_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub fn note_sampled_reupload(&self, bytes: u64) {
+    pub fn note_sampled_reupload(&self, bytes: u64, origin: super::types::SampledByteOrigin) {
         self.sampled_reuploads.fetch_add(1, Ordering::Relaxed);
         self.sampled_reupload_bytes
             .fetch_add(bytes, Ordering::Relaxed);
+        let split = match origin {
+            super::types::SampledByteOrigin::AttachmentAlias => {
+                &self.sampled_reupload_attachment_bytes
+            }
+            super::types::SampledByteOrigin::BufferBackedTexture => {
+                &self.sampled_reupload_buffer_texture_bytes
+            }
+            super::types::SampledByteOrigin::SerializedSurfaceView => {
+                &self.sampled_reupload_surface_view_bytes
+            }
+            super::types::SampledByteOrigin::SurfaceHostCache => {
+                &self.sampled_reupload_surface_cache_bytes
+            }
+            super::types::SampledByteOrigin::SurfaceGuestFallback => {
+                &self.sampled_reupload_surface_guest_bytes
+            }
+            super::types::SampledByteOrigin::LinearTexture => {
+                &self.sampled_reupload_linear_texture_bytes
+            }
+            super::types::SampledByteOrigin::Synthetic => &self.sampled_reupload_synthetic_bytes,
+        };
+        split.fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub fn note_sampled_gather(&self, bytes: u64) {
@@ -778,22 +986,51 @@ impl EngineCounters {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub fn note_buffer_bind_reused(&self) {
+    pub(super) fn note_buffer_bind_reused(&self, role: super::exec::BufferGatherRole) {
         self.buffer_bind_reuses.fetch_add(1, Ordering::Relaxed);
+        if role.includes_index() {
+            self.buffer_index_bind_reuses
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
-    pub fn note_buffer_guest_import(&self, bytes: u64) {
+    pub(super) fn note_buffer_guest_import(
+        &self,
+        bytes: u64,
+        role: super::exec::BufferGatherRole,
+    ) {
         self.buffer_guest_imports.fetch_add(1, Ordering::Relaxed);
         self.buffer_guest_import_bytes
             .fetch_add(bytes, Ordering::Relaxed);
+        if role.includes_index() {
+            self.buffer_guest_index_imports
+                .fetch_add(1, Ordering::Relaxed);
+            self.buffer_guest_index_import_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
     }
 
-    pub fn note_buffer_guest_gather(&self, bytes: u64, regions: u64) {
+    pub(super) fn note_buffer_guest_gather(
+        &self,
+        bytes: u64,
+        regions: u64,
+        role: super::exec::BufferGatherRole,
+    ) {
         self.buffer_guest_gathers.fetch_add(1, Ordering::Relaxed);
         self.buffer_guest_gather_bytes
             .fetch_add(bytes, Ordering::Relaxed);
         self.buffer_guest_gather_regions
             .fetch_add(regions, Ordering::Relaxed);
+        let counter = if role.is_shared() {
+            &self.buffer_guest_gather_shared_bytes
+        } else if role.includes_index() {
+            &self.buffer_guest_gather_index_bytes
+        } else if role.is_storage_only() {
+            &self.buffer_guest_gather_storage_bytes
+        } else {
+            &self.buffer_guest_gather_vertex_bytes
+        };
+        counter.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Record how much of its target one draw could have written.
@@ -896,7 +1133,7 @@ mod tests {
     #[test]
     fn note_helpers_update_event_and_byte_counters_together() {
         let counters = EngineCounters::default();
-        counters.note_create();
+        counters.note_create(CreateSite::ShaderModule);
         counters.note_alloc();
         counters.note_readback(4096);
         counters.note_seed_upload(1024);
@@ -961,6 +1198,48 @@ mod tests {
         // And neither is the skip, which counts the population these two divide
         // the complement of. Nothing above took the skip path.
         assert_eq!(s.sampled_gather_skips, 0);
+    }
+
+    /// Source attribution is a partition of uploads that actually happened,
+    /// not a second population counted earlier at resource resolution.
+    #[test]
+    fn sampled_reupload_source_bytes_partition_the_total() {
+        use super::super::types::SampledByteOrigin;
+
+        let counters = EngineCounters::default();
+        let origins = [
+            SampledByteOrigin::AttachmentAlias,
+            SampledByteOrigin::BufferBackedTexture,
+            SampledByteOrigin::SerializedSurfaceView,
+            SampledByteOrigin::SurfaceHostCache,
+            SampledByteOrigin::SurfaceGuestFallback,
+            SampledByteOrigin::LinearTexture,
+            SampledByteOrigin::Synthetic,
+        ];
+        for (index, origin) in origins.into_iter().enumerate() {
+            counters.note_sampled_reupload((index + 1) as u64, origin);
+        }
+
+        let s = counters.snapshot();
+        assert_eq!(s.sampled_reuploads, 7);
+        assert_eq!(s.sampled_reupload_bytes, 28);
+        assert_eq!(s.sampled_reupload_attachment_bytes, 1);
+        assert_eq!(s.sampled_reupload_buffer_texture_bytes, 2);
+        assert_eq!(s.sampled_reupload_surface_view_bytes, 3);
+        assert_eq!(s.sampled_reupload_surface_cache_bytes, 4);
+        assert_eq!(s.sampled_reupload_surface_guest_bytes, 5);
+        assert_eq!(s.sampled_reupload_linear_texture_bytes, 6);
+        assert_eq!(s.sampled_reupload_synthetic_bytes, 7);
+        assert_eq!(
+            s.sampled_reupload_attachment_bytes
+                + s.sampled_reupload_buffer_texture_bytes
+                + s.sampled_reupload_surface_view_bytes
+                + s.sampled_reupload_surface_cache_bytes
+                + s.sampled_reupload_surface_guest_bytes
+                + s.sampled_reupload_linear_texture_bytes
+                + s.sampled_reupload_synthetic_bytes,
+            s.sampled_reupload_bytes
+        );
     }
 
     #[test]

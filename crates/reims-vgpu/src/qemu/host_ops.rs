@@ -73,18 +73,21 @@ pub struct ReimsVgpuHostOps {
     /// indefinitely and `unmap_pages` has nothing to free.
     ///
     /// The two shims answer differently and the difference is real. x86 PCI
-    /// answers **1**: it never allocates, refusing any list that is not a
-    /// packed host-contiguous run and otherwise returning
-    /// `memory_region_get_ram_ptr() + xlat`. arm MMIO answers **0**: a
-    /// contiguous run gets the same direct HVA, but a fragmented one gets a
-    /// packed `mach_vm_remap` view, and a bare pointer cannot say which it is.
+    /// answers **1**: a contiguous run is the RAMBlock pointer, while a
+    /// fragmented list becomes a retained packed alias over the shared RAM
+    /// backing; both live until device teardown. arm MMIO answers **0**: a
+    /// contiguous run gets the direct HVA, but a fragmented one gets a packed
+    /// `mach_vm_remap` view with caller-owned lifetime, and a bare pointer
+    /// cannot say which it is.
     ///
     /// It used to also license retaining the pointer inside a cached host-pointer
     /// import, which is where the stronger promise came from — MMIO could claim
     /// 1 only because it never released a view at all, so every fragmented map
     /// leaked a VA reservation until teardown. The GPU rail does not read this
-    /// flag and must not: it imports the spans `guest_ram_regions` names, which
-    /// are RAMBlock mappings neither shim built and neither releases.
+    /// flag for the base RAMBlock import: those spans come from
+    /// `guest_ram_regions` and neither shim built them. Resource-shaped packed
+    /// imports do read it, because retaining such an import requires the
+    /// `map_pages` alias itself to outlive submitted GPU work.
     pub map_pages_stable: c_int,
     /// Register `count` page-aligned GPAs as one guest-write-tracked set and
     /// return a non-zero opaque token, or 0 when the host has no dirty bitmap.
@@ -388,6 +391,15 @@ impl HostOps for QemuHost<'_> {
                 // number decides a boot's frame rate.
                 let coalesced = q.iter().any(|a| a.kind == action.kind);
                 if !coalesced {
+                    // Arm the delivery clock while the queue lock is held, so
+                    // the stamp cannot be taken after the BH has already popped
+                    // this action on another thread. See `irq_wait_us`: the
+                    // guest cannot doorbell the drain worker until this pulse
+                    // reaches it, so this hop is the one candidate for
+                    // `gap_idle_us` that is ours.
+                    if q.is_empty() {
+                        crate::runtime::drain::note_irq_armed();
+                    }
                     q.push_back(action);
                 }
                 drop(q);
@@ -400,6 +412,9 @@ impl HostOps for QemuHost<'_> {
             HostActionKind::CursorUpdate => {
                 let mut q = prompt.lock();
                 q.retain(|a| a.kind != HostActionKind::CursorUpdate);
+                if q.is_empty() {
+                    crate::runtime::drain::note_irq_armed();
+                }
                 q.push_back(action);
                 drop(q);
                 self.notify_actions();

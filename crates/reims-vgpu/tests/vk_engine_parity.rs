@@ -10,8 +10,8 @@
 
 use metal2vulkan::passes::Stage;
 use reims_vgpu::backend::vulkan::engine::{
-    self, BlendFactor, BlendOp, BlendStateResource, CullMode, DepthState, DrawRequest, IndexType,
-    IndexedDrawResource, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
+    self, BlendFactor, BlendOp, BlendStateResource, BufferContent, CullMode, DepthState, DrawRequest,
+    IndexType, IndexedDrawResource, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
     SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
     StencilFaceOps, StencilOp, StencilState, StorageBufferResource, TargetIdentity,
     VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
@@ -83,6 +83,23 @@ fn translate_words(name: &str, stage: Stage) -> Vec<u32> {
     // engine binds the input attachment at 192, and the shader reads zero.
     reims_vgpu::runtime::spirv_bind::widen_sampled_bands(&mut words);
     words
+}
+
+/// The device binding number for sampler `index`.
+///
+/// `translate_words` widens the translator's bands, which moves a sampler out of
+/// metal2vulkan's `[64,96)` into this device's `[160,192)`. A request that keeps
+/// naming the pre-widen number provides a sampler at a binding the widened
+/// module does not use, and leaves the binding it *does* use absent from the
+/// descriptor set layout — so the fragment shader sampled through a descriptor
+/// nothing wrote. That was silent until `exec::used_binding_absent_from_layout`
+/// landed and started refusing the draw by name.
+///
+/// Derived from the constant rather than spelled, so the two cannot drift again.
+/// The texture band needs no such helper: `TEXTURE_BINDING_BASE` *is*
+/// metal2vulkan's texture base, so widening leaves a texture where it was.
+fn sampler_binding(index: u32) -> u32 {
+    reims_vgpu::runtime::spirv_bind::SAMPLER_BINDING_BASE + index
 }
 
 fn triangle_spirv() -> (Vec<u32>, Vec<u32>) {
@@ -180,6 +197,51 @@ fn plain_triangle_known_color() {
     let req = engine_req(&v, &f, 16, 16);
     if let Some(px) = draw_or_skip("plain_triangle", &req) {
         assert_fullscreen_fragment_color("plain_triangle", &px, 16, 16);
+    }
+}
+
+/// Four-sample rasterization with a matching resident depth attachment resolves
+/// coverage into the single-sample target.
+///
+/// The fixture covers its viewport. Moving the viewport's left edge into pixel
+/// zero leaves three standard 4x sample locations inside and one outside, so
+/// the resolved red channel must lie strictly between clear black and the
+/// fragment's red value. A one-sample redirect can only produce an endpoint.
+#[test]
+fn multisample_resolve_preserves_subpixel_coverage() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let mut req = engine_req(&v, &f, 32, 16);
+    req.raster_sample_count = 4;
+    req.color_sample_count = 4;
+    req.multisample_resolve = true;
+    req.depth = Some(DepthState {
+        identity: None,
+        test_enable: true,
+        write_enable: true,
+        compare: SamplerCompareFunction::Always,
+        clear_value: 1.0,
+        load: false,
+        stencil: None,
+    });
+    req.viewports = vec![ViewportResource {
+        x: 0.3,
+        y: 0.0,
+        width: 31.7,
+        height: 16.0,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    }];
+    if let Some(px) = draw_or_skip("multisample_resolve", &req) {
+        let red = px[(8 * 32) * 4];
+        assert!(
+            red > 0 && red < 64,
+            "resolved edge must carry partial coverage, got red={red}"
+        );
+        assert!(near(px[(8 * 32 + 1) * 4], 64));
+        let second = draw_or_skip("multisample_resolve_second", &req)
+            .expect("the second transient-depth framebuffer must not reuse the first one's view");
+        assert_eq!(second, px);
     }
 }
 
@@ -295,7 +357,9 @@ fn a_boolean_occlusion_query_needs_no_precise_feature() {
     let mut req = engine_req(&v, &f, 32, 32);
     req.occlusion_query = Some(VisibilityResultMode::Boolean);
     if let Some(out) = draw_out_or_skip("occlusion_boolean", &req) {
-        let n = out.occlusion_samples.expect("boolean query reports a result");
+        let n = out
+            .occlusion_samples
+            .expect("boolean query reports a result");
         assert!(n > 0, "a fullscreen triangle passes something; got {n}");
     }
 }
@@ -539,6 +603,8 @@ fn depth_test_honored_compare_and_clear_wired() {
         });
         req.sampled_images.push(SampledImageResource {
             binding: 32,
+            array_element: 0,
+            descriptor_count: 1,
             width: 2,
             height: 2,
             layers: 1,
@@ -546,12 +612,15 @@ fn depth_test_honored_compare_and_clear_wired() {
             volume: false,
             cube: false,
             one_dim: false,
+            multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
+            byte_origin: Default::default(),
             format: ash::vk::Format::R8G8B8A8_UNORM,
             identity: None,
             swizzle: Default::default(),
         });
-        req.samplers.push(SamplerResource::normalized_default(64));
+        req.samplers
+            .push(SamplerResource::normalized_default(sampler_binding(0)));
         req.depth = Some(DepthState {
             // Parity fixtures bind no guest depth texture, so they exercise the
             // transient rail rather than the registry-resident one.
@@ -667,6 +736,8 @@ fn depth_test_honored_on_resident_target_path() {
         });
         req.sampled_images.push(SampledImageResource {
             binding: 32,
+            array_element: 0,
+            descriptor_count: 1,
             width: 2,
             height: 2,
             layers: 1,
@@ -674,12 +745,15 @@ fn depth_test_honored_on_resident_target_path() {
             volume: false,
             cube: false,
             one_dim: false,
+            multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
+            byte_origin: Default::default(),
             format: ash::vk::Format::R8G8B8A8_UNORM,
             identity: None,
             swizzle: Default::default(),
         });
-        req.samplers.push(SamplerResource::normalized_default(64));
+        req.samplers
+            .push(SamplerResource::normalized_default(sampler_binding(0)));
         req.depth = Some(DepthState {
             // Parity fixtures bind no guest depth texture, so they exercise the
             // transient rail rather than the registry-resident one.
@@ -802,6 +876,8 @@ fn stencil_test_honored_compare_ref_and_clear_wired() {
         });
         req.sampled_images.push(SampledImageResource {
             binding: 32,
+            array_element: 0,
+            descriptor_count: 1,
             width: 2,
             height: 2,
             layers: 1,
@@ -809,12 +885,15 @@ fn stencil_test_honored_compare_ref_and_clear_wired() {
             volume: false,
             cube: false,
             one_dim: false,
+            multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
+            byte_origin: Default::default(),
             format: ash::vk::Format::R8G8B8A8_UNORM,
             identity: None,
             swizzle: Default::default(),
         });
-        req.samplers.push(SamplerResource::normalized_default(64));
+        req.samplers
+            .push(SamplerResource::normalized_default(sampler_binding(0)));
         req.depth = Some(DepthState {
             // Parity fixtures bind no guest depth texture, so they exercise the
             // transient rail rather than the registry-resident one.
@@ -906,13 +985,13 @@ fn indexed_u16_known_color() {
         index_type: IndexType::U16,
         index_count: 3,
         vertex_offset: 0,
-        indices: {
+        content: BufferContent::Bytes(std::sync::Arc::new({
             let mut b = Vec::new();
             for i in [0u16, 1, 2] {
                 b.extend_from_slice(&i.to_le_bytes());
             }
             b
-        },
+        })),
     });
     if let Some(px) = draw_or_skip("indexed_u16", &req) {
         assert_fullscreen_fragment_color("indexed_u16", &px, 16, 16);
@@ -950,6 +1029,8 @@ fn sampled_and_sampler_still_renders() {
     let mut req = engine_req(&v, &f, 8, 8);
     req.sampled_images.push(SampledImageResource {
         binding: 1,
+        array_element: 0,
+        descriptor_count: 1,
         width: 2,
         height: 2,
         layers: 1,
@@ -957,9 +1038,11 @@ fn sampled_and_sampler_still_renders() {
         volume: false,
         cube: false,
         one_dim: false,
+        multisampled: false,
         source: SampledSource::Bytes(std::sync::Arc::new(vec![
             255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
         ])),
+        byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
         swizzle: Default::default(),
@@ -1050,6 +1133,8 @@ fn sampled_upload_happens_once_across_more_draws_than_the_ring_is_deep() {
     let mut req = engine_req(&v, &f, 8, 8);
     req.sampled_images.push(SampledImageResource {
         binding: 1,
+        array_element: 0,
+        descriptor_count: 1,
         width: 2,
         height: 2,
         layers: 1,
@@ -1057,9 +1142,11 @@ fn sampled_upload_happens_once_across_more_draws_than_the_ring_is_deep() {
         volume: false,
         cube: false,
         one_dim: false,
+        multisampled: false,
         source: SampledSource::Bytes(std::sync::Arc::new(vec![
             255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
         ])),
+        byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
         swizzle: Default::default(),
@@ -1126,6 +1213,8 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
     let mut consume = engine_req(&v, &f, 16, 16);
     consume.sampled_images.push(SampledImageResource {
         binding: 1,
+        array_element: 0,
+        descriptor_count: 1,
         width: 16,
         height: 16,
         layers: 1,
@@ -1133,7 +1222,9 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
         volume: false,
         cube: false,
         one_dim: false,
+        multisampled: false,
         source: SampledSource::Target(source.clone()),
+        byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
         swizzle: Default::default(),
@@ -1162,10 +1253,101 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
     assert_fullscreen_fragment_color("resident_sample_reloaded", &semantic_rgba(&loaded), 16, 16);
 }
 
-/// Attachment feedback is represented as a GPU snapshot, matching Metal's
-/// prior-content sampling without binding one image for read and write at once.
+/// A resident allocation may be written through a linear attachment view and
+/// sampled through its sRGB sibling. The sample must use the binding's view
+/// format: binding the attachment's cached linear view instead leaves the
+/// original (64,128,191) values instead of decoding them.
 #[test]
-fn resident_sample_alias_uses_gpu_snapshot_without_roundtrip() {
+fn resident_sample_uses_the_bindings_compatible_format_view() {
+    let _g = engine_test_session();
+    let (source_v, source_f) = triangle_spirv();
+    let source = TargetIdentity::Surface {
+        id: 0x53,
+        width: 16,
+        height: 16,
+        generation: 1,
+        format: ash::vk::Format::B8G8R8A8_UNORM,
+    };
+    let mut produce = engine_req(&source_v, &source_f, 16, 16);
+    produce.target_identity = Some(source.clone());
+    produce.skip_readback = true;
+    match engine::execute_draw_request(&produce) {
+        Ok(_) => {}
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {
+            eprintln!("SKIP resident compatible-format view: {e}");
+            return;
+        }
+        Err(e) => panic!("resident compatible-format source: {e}"),
+    }
+
+    let vert = translate_words("textured_quad.air", Stage::Vertex);
+    let frag = translate_words("textured_quad.air", Stage::Fragment);
+    let mut consume = engine_req(&vert, &frag, 16, 16);
+    consume.vertex_count = 6;
+    let positions: [[f32; 4]; 6] = [
+        [-1.0, -1.0, 0.0, 1.0],
+        [1.0, -1.0, 0.0, 1.0],
+        [-1.0, 1.0, 0.0, 1.0],
+        [-1.0, 1.0, 0.0, 1.0],
+        [1.0, -1.0, 0.0, 1.0],
+        [1.0, 1.0, 0.0, 1.0],
+    ];
+    let uvs: [[f32; 2]; 6] = [
+        [0.0, 1.0],
+        [1.0, 1.0],
+        [0.0, 0.0],
+        [0.0, 0.0],
+        [1.0, 1.0],
+        [1.0, 0.0],
+    ];
+    let encode_f32 = |values: &[f32]| {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>()
+    };
+    consume.storage_buffers.push(StorageBufferResource {
+        binding: 0,
+        content: encode_f32(&positions.into_iter().flatten().collect::<Vec<_>>()).into(),
+    });
+    consume.storage_buffers.push(StorageBufferResource {
+        binding: 1,
+        content: encode_f32(&uvs.into_iter().flatten().collect::<Vec<_>>()).into(),
+    });
+    consume.sampled_images.push(SampledImageResource {
+        binding: 32,
+        array_element: 0,
+        descriptor_count: 1,
+        width: 16,
+        height: 16,
+        layers: 1,
+        arrayed: false,
+        volume: false,
+        cube: false,
+        one_dim: false,
+        multisampled: false,
+        source: SampledSource::Target(source),
+        byte_origin: Default::default(),
+        format: ash::vk::Format::B8G8R8A8_SRGB,
+        identity: None,
+        swizzle: Default::default(),
+    });
+    consume
+        .samplers
+        .push(SamplerResource::normalized_default(sampler_binding(0)));
+    let out = engine::execute_draw_request(&consume).expect("sample compatible sRGB view");
+    let center = ((16 / 2) * 16 + 16 / 2) as usize * 4;
+    let px = &out.pixels[center..center + 4];
+    assert!(
+        near(px[0], 13) && near(px[1], 55) && near(px[2], 133) && near(px[3], 255),
+        "sRGB view must decode stored UNORM bytes, got {px:?}"
+    );
+}
+
+/// Attachment feedback binds the resident in place when the host exposes the
+/// Vulkan feedback-loop contract, and otherwise uses one shared GPU snapshot.
+#[test]
+fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
     let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let identity = TargetIdentity::Surface {
@@ -1189,8 +1371,12 @@ fn resident_sample_alias_uses_gpu_snapshot_without_roundtrip() {
     let mut alias = engine_req(&v, &f, 16, 16);
     alias.target_identity = Some(identity.clone());
     alias.load_from_target = true;
+    alias.skip_readback = true;
+    alias.render_pass_continues = true;
     alias.sampled_images.push(SampledImageResource {
         binding: 1,
+        array_element: 0,
+        descriptor_count: 1,
         width: 16,
         height: 16,
         layers: 1,
@@ -1198,38 +1384,89 @@ fn resident_sample_alias_uses_gpu_snapshot_without_roundtrip() {
         volume: false,
         cube: false,
         one_dim: false,
-        source: SampledSource::Target(identity),
+        multisampled: false,
+        source: SampledSource::Target(identity.clone()),
+        byte_origin: Default::default(),
+        format: ash::vk::Format::R8G8B8A8_UNORM,
+        identity: None,
+        swizzle: Default::default(),
+    });
+    alias.sampled_images.push(SampledImageResource {
+        binding: 2,
+        array_element: 0,
+        descriptor_count: 1,
+        width: 16,
+        height: 16,
+        layers: 1,
+        arrayed: false,
+        volume: false,
+        cube: false,
+        one_dim: false,
+        multisampled: false,
+        source: SampledSource::Target(identity.clone()),
+        byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
         swizzle: Default::default(),
     });
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
-    let out = engine::execute_draw_request(&alias).expect("resident alias GPU snapshot");
-    assert_fullscreen_fragment_color("resident_sample_alias", &semantic_rgba(&out), 16, 16);
+    engine::execute_draw_request(&alias).expect("resident alias feedback");
+    let out = engine::read_target(&identity)
+        .expect("read native feedback result after deferred draw")
+        .into_rgba8();
+    assert_fullscreen_fragment_color("resident_sample_alias", &out, 16, 16);
     let delta = engine::counter_snapshot().delta_since(&before);
-    assert_eq!(delta.sampled_gpu_binds, 1, "GPU snapshot proxy: {delta:?}");
+    assert_eq!(
+        delta.sampled_gpu_binds, 2,
+        "GPU resident-bind proxy: {delta:?}"
+    );
+    let expected_snapshot_allocs = u64::from(!engine::attachment_feedback_loop_active());
+    assert_eq!(
+        delta.sampled_free_allocs, expected_snapshot_allocs,
+        "two bindings share one snapshot only on a host without feedback-loop support: {delta:?}"
+    );
     assert_eq!(delta.sampled_reuploads, 0, "no host reupload: {delta:?}");
-    assert_eq!(delta.readbacks, 1, "only target readback: {delta:?}");
+    assert_eq!(
+        delta.readbacks, 0,
+        "the draw stays deferred; its explicit target read joins the batch: {delta:?}"
+    );
+    assert_eq!(delta.target_reads, 1, "one explicit target read: {delta:?}");
+    assert_eq!(
+        delta.batch_readback_joins, 1,
+        "the read must exercise the open-pass close before its image barrier: {delta:?}"
+    );
 }
 
 #[test]
-fn vertex_float2_attr_still_renders() {
+fn vertex_buffers_bind_in_one_bulk_call_without_losing_slots() {
     let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
-    req.vertex_attributes.push(VertexAttributeResource {
-        location: 0,
-        binding: 0,
-        format: VertexAttributeFormat::Float2,
-        offset: 0,
-        stride: 8,
-        step_function: VertexStepFunction::PerVertex,
-        step_rate: 1,
-        content: vec![0u8; 24].into(),
-    });
+    // Location order deliberately disagrees with binding order: the executor
+    // must normalize by binding before the contiguous Vulkan call without
+    // moving a buffer away from its declared slot.
+    for (location, binding) in [(0, 2), (1, 0), (2, 1)] {
+        req.vertex_attributes.push(VertexAttributeResource {
+            location,
+            binding,
+            format: VertexAttributeFormat::Float2,
+            offset: 0,
+            stride: 8,
+            step_function: VertexStepFunction::PerVertex,
+            step_rate: 1,
+            content: vec![0u8; 24].into(),
+        });
+    }
+    let before = engine::counter_snapshot();
     match engine::execute_draw_request(&req) {
-        Ok(o) => assert_fullscreen_fragment_color("attr", &semantic_rgba(&o), 8, 8),
+        Ok(o) => {
+            assert_fullscreen_fragment_color("attr", &semantic_rgba(&o), 8, 8);
+            let d = engine::counter_snapshot().delta_since(&before);
+            assert_eq!(d.vertex_buffer_bind_slots, 3, "requested slots: {d:?}");
+            assert_eq!(d.vertex_buffer_bind_emitted, 3, "emitted slots: {d:?}");
+            assert_eq!(d.vertex_buffer_bind_calls, 1, "bulk calls: {d:?}");
+        }
         Err(e) if skip_if_no_gpu(&e.to_string()) => eprintln!("SKIP attr: {e}"),
         Err(e) => {
             let s = e.to_string();
@@ -1252,6 +1489,8 @@ fn sampled_identity_fast_path_skips_content_compare() {
     let mut req = engine_req(&v, &f, 8, 8);
     req.sampled_images.push(SampledImageResource {
         binding: 1,
+        array_element: 0,
+        descriptor_count: 1,
         width: 2,
         height: 2,
         layers: 1,
@@ -1259,9 +1498,11 @@ fn sampled_identity_fast_path_skips_content_compare() {
         volume: false,
         cube: false,
         one_dim: false,
+        multisampled: false,
         source: SampledSource::Bytes(std::sync::Arc::new(vec![
             255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
         ])),
+        byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: Some(SampledContentIdentity {
             key: 0x1234_5000,
@@ -1797,6 +2038,8 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
     let rgba = [17u8, 91, 203, 255];
     req.sampled_images.push(SampledImageResource {
         binding: 32,
+        array_element: 0,
+        descriptor_count: 1,
         width: 2,
         height: 2,
         layers: 1,
@@ -1804,12 +2047,15 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
         volume: false,
         cube: false,
         one_dim: false,
+        multisampled: false,
         source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
+        byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
         swizzle: Default::default(),
     });
-    req.samplers.push(SamplerResource::normalized_default(64));
+    req.samplers
+        .push(SamplerResource::normalized_default(sampler_binding(0)));
 
     match engine::execute_draw_request(&req) {
         Ok(_) => {}
@@ -1901,6 +2147,11 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect::<Vec<_>>();
     assert_eq!(
+        reims_vgpu::runtime::spirv_bind::widen_sampled_bands(&mut frag),
+        1,
+        "fixture has one sampler in the translator's narrow tail band"
+    );
+    assert_eq!(
         reims_vgpu::runtime::spirv_bind::offset_fragment_sampled_resource_bindings(&mut frag),
         2,
         "fixture has one sampled image and one constexpr sampler"
@@ -1910,7 +2161,7 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         .iter()
         .find(|binding| binding.kind == ResourceKind::StaticSampler)
         .expect("reflected constexpr sampler");
-    let descriptor = reflected.descriptor.expect("static sampler descriptor");
+    reflected.descriptor.expect("static sampler descriptor");
     let state = reflected.static_sampler.expect("static sampler state");
 
     let (w, h) = (16u32, 16u32);
@@ -1949,6 +2200,8 @@ fn reflected_static_sampler_descriptor_samples_texture() {
     let rgba = [17u8, 91, 203, 255];
     req.sampled_images.push(SampledImageResource {
         binding: 32 + reims_vgpu::runtime::spirv_bind::FRAG_SAMPLED_RESOURCE_BINDING_OFFSET,
+        array_element: 0,
+        descriptor_count: 1,
         width: 2,
         height: 2,
         layers: 1,
@@ -1956,7 +2209,9 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         volume: false,
         cube: false,
         one_dim: false,
+        multisampled: false,
         source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
+        byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
         swizzle: Default::default(),
@@ -1964,16 +2219,46 @@ fn reflected_static_sampler_descriptor_samples_texture() {
     req.samplers.push(
         reims_vgpu::runtime::draw::reflected_static_sampler_resource(
             "fragment",
-            descriptor.binding
-                + reims_vgpu::runtime::spirv_bind::FRAG_SAMPLED_RESOURCE_BINDING_OFFSET,
+            reims_vgpu::runtime::spirv_bind::reflected_sampler_binding(reflected, true)
+                .expect("reflected sampler maps into the executable variant"),
             state,
         )
         .expect("map reflected static sampler"),
     );
+    let target = TargetIdentity::Surface {
+        id: 880_024,
+        width: w,
+        height: h,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    req.target_identity = Some(target.clone());
+    req.skip_readback = true;
 
-    let Some(pixels) = draw_or_skip("reflected static sampler", &req) else {
+    let before = engine::counter_snapshot();
+    let Some(first) = draw_out_or_skip("reflected static sampler first", &req) else {
         return;
     };
+    assert!(first.pixels.is_empty());
+    req.load_from_target = true;
+    let second = engine::execute_draw_request(&req).expect("second static sampler draw");
+    assert!(second.pixels.is_empty());
+    let pixels = engine::read_target(&target)
+        .expect("read repeated static sampler target")
+        .into_rgba8();
+    let descriptors = engine::counter_snapshot().delta_since(&before);
+    if descriptors.descriptor_set_updates == 0 {
+        assert_eq!(descriptors.descriptor_pushes, 1, "first draw pushes: {descriptors:?}");
+        assert_eq!(
+            descriptors.descriptor_push_held, 1,
+            "the exact repeated state is retained by the command buffer: {descriptors:?}"
+        );
+    } else {
+        assert_eq!(descriptors.descriptor_set_updates, 2, "fallback updates: {descriptors:?}");
+        assert_eq!(descriptors.descriptor_set_binds, 2, "fallback binds: {descriptors:?}");
+        assert_eq!(descriptors.descriptor_pushes, 0);
+        assert_eq!(descriptors.descriptor_push_held, 0);
+    }
     for (index, pixel) in pixels.chunks_exact(4).enumerate() {
         assert_eq!(pixel, rgba, "static sampler pixel {index}");
     }
@@ -2046,6 +2331,8 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
         });
         req.sampled_images.push(SampledImageResource {
             binding: 32,
+            array_element: 0,
+            descriptor_count: 1,
             width: 2,
             height: 2,
             layers: 1,
@@ -2053,12 +2340,15 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
             volume: false,
             cube: false,
             one_dim: false,
+            multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(bytes)),
+            byte_origin: Default::default(),
             format,
             identity: None,
             swizzle: Default::default(),
         });
-        req.samplers.push(SamplerResource::normalized_default(64));
+        req.samplers
+            .push(SamplerResource::normalized_default(sampler_binding(0)));
         match engine::execute_draw_request(&req) {
             Ok(_) => Some(
                 engine::read_target(&identity)
@@ -2167,6 +2457,8 @@ fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
         });
         req.sampled_images.push(SampledImageResource {
             binding: 32,
+            array_element: 0,
+            descriptor_count: 1,
             width: 2,
             height: 2,
             layers: 1,
@@ -2174,12 +2466,15 @@ fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
             volume: false,
             cube: false,
             one_dim: false,
+            multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(source.repeat(4))),
+            byte_origin: Default::default(),
             format: ash::vk::Format::R8G8B8A8_UNORM,
             identity: None,
             swizzle: plan,
         });
-        req.samplers.push(SamplerResource::normalized_default(64));
+        req.samplers
+            .push(SamplerResource::normalized_default(sampler_binding(0)));
         match engine::execute_draw_request(&req) {
             Ok(_) => Some(engine::read_target(&identity).expect("read target").pixels),
             Err(e) if skip_if_no_gpu(&e.to_string()) => {
@@ -2263,6 +2558,75 @@ fn partial_draw_preserves_rgba_seed_on_bgra_target() {
         &raw[outside..outside + 4],
         &[seed_rgba[2], seed_rgba[1], seed_rgba[0], seed_rgba[3]],
         "untouched semantic RGBA seed must remain correct in native BGRA storage"
+    );
+}
+
+/// A guest-page LOAD seed preserves untouched pixels without first becoming a
+/// host RGBA framebuffer. `pages: None` deliberately exercises the universal
+/// host-run fallback; the imported and gathered arms feed the same copy after
+/// choosing a different buffer source.
+#[test]
+fn partial_draw_preserves_a_native_guest_target_seed() {
+    let _g = engine_test_session();
+    let (vert, frag) = triangle_spirv();
+    let (w, h) = (16u32, 16u32);
+    let identity = TargetIdentity::Surface {
+        id: 84,
+        width: w,
+        height: h,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let semantic_rgba = [17u8, 91, 203, 255];
+    let native_bgra = [
+        semantic_rgba[2],
+        semantic_rgba[1],
+        semantic_rgba[0],
+        semantic_rgba[3],
+    ];
+    // The run is a borrowed stable alias by contract. Keep its backing alive
+    // through execute just as a RAMBlock remains alive for the VM lifetime.
+    let backing = native_bgra.repeat((w * h) as usize);
+    let mut req = engine_req(&vert, &frag, w, h);
+    req.target_identity = Some(identity.clone());
+    req.skip_readback = true;
+    req.target_guest_seed = Some(engine::GuestTargetSeed {
+        source: engine::GuestRunSource {
+            runs: std::sync::Arc::new(vec![engine::GuestRun {
+                host_ptr: backing.as_ptr() as usize,
+                len: backing.len() as u64,
+            }]),
+            source_offset: 0,
+            total_len: backing.len() as u64,
+            row_length_texels: 0,
+            pages: None,
+            direct_image: None,
+        },
+        format: SURFACE_TEST_FORMAT,
+    });
+    req.scissors = vec![ScissorResource {
+        x: 0,
+        y: 0,
+        width: 1,
+        height: 1,
+    }];
+
+    match engine::execute_draw_request(&req) {
+        Ok(_) => {}
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {
+            eprintln!("SKIP guest target seed: {e}");
+            return;
+        }
+        Err(e) => panic!("guest target seed: {e}"),
+    }
+    let rgba = engine::read_target(&identity)
+        .expect("read guest-seeded target")
+        .into_rgba8();
+    let outside = ((h / 2) * w + w / 2) as usize * 4;
+    assert_eq!(
+        &rgba[outside..outside + 4],
+        &semantic_rgba,
+        "the untouched pixel must come from the native guest seed"
     );
 }
 
@@ -3132,6 +3496,8 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
     consume.target_identity = Some(consumer_target);
     consume.sampled_images.push(SampledImageResource {
         binding: 1,
+        array_element: 0,
+        descriptor_count: 1,
         width: 16,
         height: 16,
         layers: 1,
@@ -3139,7 +3505,9 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
         volume: false,
         cube: false,
         one_dim: false,
+        multisampled: false,
         source: SampledSource::Target(secondary.clone()),
+        byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
         swizzle: Default::default(),

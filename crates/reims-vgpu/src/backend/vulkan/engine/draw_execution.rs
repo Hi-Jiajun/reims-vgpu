@@ -32,6 +32,25 @@ pub enum DrawExecutionDecline {
     LoadTargetContentNotReady {
         identity: TargetIdentity,
     },
+    /// An MRT **secondary** colour attachment asked to `LOAD` content this
+    /// device has not produced.
+    ///
+    /// The twin of [`Self::LoadTargetContentNotReady`], and it exists because
+    /// the secondary had no such guard for as long as MRT has. A resident is
+    /// born `content_ready = false` over an image recycled from the target pool,
+    /// whose stale texels are some previous identity's; a `LOAD` pass then hands
+    /// the draw those texels and `registry_mark_ready_at` publishes the result
+    /// as ready for a later draw to sample. What is undefined at the Vulkan
+    /// level is only the recycled slot's contents, but what the guest observes
+    /// is another surface's pixels in this one — and once sampled, content this
+    /// device never defined reaching a shader.
+    ///
+    /// Refused rather than downgraded to `CLEAR`, so that it matches the primary
+    /// exactly. Two attachments of one pass answering the same question two ways
+    /// is how a divergence starts.
+    LoadSecondaryContentNotReady {
+        identity: TargetIdentity,
+    },
     SeedResidentMissing {
         identity: TargetIdentity,
     },
@@ -84,6 +103,12 @@ pub enum DrawExecutionDecline {
         resident_height: u32,
         resource_width: u32,
         resource_height: u32,
+    },
+    SampledResidentSampleCountMismatch {
+        binding: u32,
+        identity: TargetIdentity,
+        resident_samples: u32,
+        shader_multisampled: bool,
     },
     /// A staging write asked for more bytes than the slot it is writing into
     /// holds.
@@ -145,6 +170,9 @@ impl Decline for DrawExecutionDecline {
                 "vk_draw_exec_constant_vertex_allocation_overflow"
             }
             Self::LoadTargetContentNotReady { .. } => "vk_draw_exec_load_target_content_not_ready",
+            Self::LoadSecondaryContentNotReady { .. } => {
+                "vk_draw_exec_load_secondary_content_not_ready"
+            }
             Self::SeedResidentMissing { .. } => "vk_draw_exec_seed_resident_missing",
             Self::SeedResidentNotReady { .. } => "vk_draw_exec_seed_resident_not_ready",
             Self::SeedGeometryMismatch { .. } => "vk_draw_exec_seed_geometry_mismatch",
@@ -154,6 +182,9 @@ impl Decline for DrawExecutionDecline {
             Self::SampledResidentNotReady { .. } => "vk_draw_exec_sampled_resident_not_ready",
             Self::SampledResidentGeometryMismatch { .. } => {
                 "vk_draw_exec_sampled_resident_geometry_mismatch"
+            }
+            Self::SampledResidentSampleCountMismatch { .. } => {
+                "vk_draw_exec_sampled_resident_sample_count_mismatch"
             }
             Self::StagingWriteBeyondSlot { .. } => "vk_draw_exec_staging_write_beyond_slot",
             Self::ReadBackBeyondSlot { .. } => "vk_draw_exec_read_back_beyond_slot",
@@ -178,6 +209,7 @@ impl Decline for DrawExecutionDecline {
                 ("bytes_len", bytes_len.to_string()),
             ],
             Self::LoadTargetContentNotReady { identity }
+            | Self::LoadSecondaryContentNotReady { identity }
             | Self::SeedResidentMissing { identity }
             | Self::SeedResidentNotReady { identity } => identity_fields(identity),
             Self::SeedGeometryMismatch {
@@ -244,6 +276,20 @@ impl Decline for DrawExecutionDecline {
                     ("resident_height", resident_height.to_string()),
                     ("resource_width", resource_width.to_string()),
                     ("resource_height", resource_height.to_string()),
+                ]);
+                fields
+            }
+            Self::SampledResidentSampleCountMismatch {
+                binding,
+                identity,
+                resident_samples,
+                shader_multisampled,
+            } => {
+                let mut fields = vec![("binding", binding.to_string())];
+                fields.extend(identity_fields(identity));
+                fields.extend([
+                    ("resident_samples", resident_samples.to_string()),
+                    ("shader_multisampled", shader_multisampled.to_string()),
                 ]);
                 fields
             }
@@ -353,6 +399,9 @@ mod tests {
             DrawExecutionDecline::LoadTargetContentNotReady {
                 identity: identity(),
             },
+            DrawExecutionDecline::LoadSecondaryContentNotReady {
+                identity: identity(),
+            },
             DrawExecutionDecline::SeedResidentMissing {
                 identity: identity(),
             },
@@ -374,7 +423,7 @@ mod tests {
             DrawExecutionDecline::SampledResidentMissing {
                 binding: 32,
                 identity: identity(),
-                prior: Some(ResidentReclaim::IdleDrained),
+                prior: Some(ResidentReclaim::AllocationReclaimed),
             },
             DrawExecutionDecline::SampledResidentNotReady {
                 binding: 32,
@@ -416,7 +465,11 @@ mod tests {
         // The registry now holds a `ResidentAccess`, which has no state outside
         // the four the device puts a resident in, so the refusal has nothing
         // left to fire on and no arm can reach it.
-        assert_eq!(before, 11, "the draw executor's reason census moved");
+        //
+        // Back up to 12: `*_load_secondary_content_not_ready` is the primary's
+        // readiness guard given to the MRT secondary slot, which had gone
+        // without one for as long as MRT has existed.
+        assert_eq!(before, 12, "the draw executor's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-execution slug");
     }
 

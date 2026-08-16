@@ -168,23 +168,41 @@ pub struct HostPointerCaps {
     /// assumed to be 4096: MoltenVK reports Apple's page size, and a Linux
     /// driver may report more than either.
     pub min_alignment: u64,
-    /// The largest `VkMemoryHeap::size` this device reports, which is the
-    /// ceiling on any single import it could hold.
+    /// The largest heap an import could be charged to, which is the ceiling on
+    /// the guest RAM this device could hold at once.
     ///
     /// An import is a `VkDeviceMemory` and every `VkDeviceMemory` is charged to
-    /// one heap, so an import longer than the roomiest heap on the device cannot
-    /// be resident in any of them — whatever memory type the pointer turns out
+    /// one heap, so guest RAM totalling more than the roomiest heap an import
+    /// can reach cannot be resident — whatever memory type the pointer turns out
     /// to accept. That is a statement about the device alone, which is why it is
     /// answerable here with no pointer in hand.
     ///
-    /// The roomiest heap and not the one an import would land on: the memory
-    /// type is a property of the *pointer* and is resolved per RAMBlock at
-    /// import time. Taking the maximum makes this the widest true bound, so it
-    /// refuses only what no heap could have held.
+    /// **Over the heaps an import can reach, not over every heap on the
+    /// device.** The memory type is a property of the *pointer* and is resolved
+    /// per RAMBlock at import time, but whichever type that turns out to be, it
+    /// went through
+    /// [`super::memory_topology::select_memory_type`] carrying
+    /// [`super::MemoryClass::Upload`]'s required flags — so a heap no such type
+    /// draws from is a heap no import will ever land in. The maximum over every
+    /// heap is a *wider* number and it is the wrong one: a part whose
+    /// device-local heap is twice its host-visible heap passes this check with
+    /// room to spare and then refuses each import at the pick. Both numbers are
+    /// true statements about the device; only this one is a statement about the
+    /// import.
     ///
     /// Zero on every rung but [`HostPointerImport::Supported`], where no import
     /// may be made at all.
     pub heap_budget: u64,
+    /// The largest **single** `vkAllocateMemory` this device is trusted to
+    /// import correctly, which is not the same question as how much it can hold.
+    ///
+    /// [`Self::heap_budget`] bounds the total; this bounds one allocation, and a
+    /// RAMBlock longer than it is imported in several. See
+    /// [`IMPORT_SPAN_CEILING`] for why the bound exists at all and why it is not
+    /// simply a device limit.
+    ///
+    /// Zero on every rung but [`HostPointerImport::Supported`].
+    pub span_max: u64,
 }
 
 impl HostPointerCaps {
@@ -194,6 +212,7 @@ impl HostPointerCaps {
             rung,
             min_alignment: 0,
             heap_budget: 0,
+            span_max: 0,
         }
     }
 
@@ -238,6 +257,11 @@ fn env_override() -> Option<HostPointerImport> {
 ///
 /// `has_extension` is passed in rather than enumerated here because the caller
 /// already enumerates device extensions for the other capability queries.
+/// `max_allocation` is passed in for a stronger reason: it is
+/// `maxMemoryAllocationSize`, it bounds every allocation on the device rather
+/// than only an import, and the caller publishes it for the memory-type selector
+/// — so asking the device for it a second time here would be a second spelling
+/// of one limit.
 ///
 /// # Safety
 ///
@@ -246,6 +270,7 @@ pub unsafe fn query(
     instance: &ash::Instance,
     pd: vk::PhysicalDevice,
     has_extension: &dyn Fn(&std::ffi::CStr) -> bool,
+    max_allocation: u64,
 ) -> HostPointerCaps {
     if let Some(disabled) = env_override() {
         return HostPointerCaps::refused(disabled);
@@ -285,22 +310,128 @@ pub unsafe fn query(
     // size is what no allocation charged to it can exceed on any host, and a
     // budget is a second, optional answer that would leave hosts without the
     // extension unbounded.
+    //
+    // Restricted to the heaps an import can be charged to, which is the set the
+    // selector will choose from — see [`HostPointerCaps::heap_budget`]. The
+    // class is `Upload` because that is the class the import site names, and the
+    // topology comes from the same properties, so nothing here is a second
+    // policy.
     let props = unsafe { instance.get_physical_device_memory_properties(pd) };
-    let heap_budget = props.memory_heaps[..props.memory_heap_count as usize]
-        .iter()
-        .map(|h| h.size)
-        .max()
-        .unwrap_or(0);
+    let heap_budget = super::memory_topology::roomiest_heap_for(
+        &props,
+        &super::memory_topology::classify_memory(&props)
+            .topology
+            .request(super::MemoryClass::Upload),
+    );
+
+    // `maxBufferSize` is Vulkan 1.3 (`maintenance4`) and is asked for only when
+    // the device is that new — a device that does not report one is not thereby
+    // unbounded, it is bounded by the two limits that remain.
+    let mut v13 = vk::PhysicalDeviceVulkan13Properties::default();
+    let device_api = {
+        let mut base = vk::PhysicalDeviceProperties2::default();
+        unsafe { instance.get_physical_device_properties2(pd, &mut base) };
+        base.properties.api_version
+    };
+    if vk::api_version_major(device_api) > 1 || vk::api_version_minor(device_api) >= 3 {
+        let mut limits = vk::PhysicalDeviceProperties2::default().push_next(&mut v13);
+        unsafe { instance.get_physical_device_properties2(pd, &mut limits) };
+    }
+
+    let span_max = [
+        IMPORT_SPAN_CEILING,
+        max_allocation,
+        // Zero means the device never filled it in, i.e. it is not a 1.3 device.
+        if v13.max_buffer_size == 0 {
+            u64::MAX
+        } else {
+            v13.max_buffer_size
+        },
+    ]
+    .into_iter()
+    .min()
+    .unwrap_or(IMPORT_SPAN_CEILING)
+        & !(min_alignment - 1);
 
     HostPointerCaps {
         rung: HostPointerImport::Supported,
         min_alignment,
         heap_budget,
+        span_max,
     }
 }
 
-/// Which memory type an import of `bytes` at `host_ptr` must use, or `None` when
-/// the device accepts none that also meet `req`.
+/// The largest single host-pointer import this device will ask any driver for,
+/// before the device's own limits narrow it further.
+///
+/// # Why there is a ceiling that no Vulkan limit accounts for
+///
+/// `VkMemoryAllocateInfo::allocationSize` is a `VkDeviceSize`, so a 14 GiB
+/// import is a legal request and the API has nowhere to say otherwise. Mesa's
+/// Intel driver truncates it to 32 bits on the host-pointer import path: the
+/// readable window of the import is exactly `allocationSize mod 2^32`, and every
+/// byte past it reads back unrelated data. It is silent — `vkAllocateMemory`
+/// returns `VK_SUCCESS`, `vkCreateBuffer` accepts a buffer far larger than the
+/// window, `vkBindBufferMemory` accepts the pair, and only the reads are wrong.
+///
+/// Measured on Intel Arrow Lake / Mesa ANV 26.1.5 by bisecting the accepted
+/// import size at 4096-byte granularity: sizes whose value mod 2^32 is non-zero
+/// are accepted and readable only up to that remainder; a size that is an exact
+/// multiple of 2^32 is rejected outright with `ERROR_INVALID_EXTERNAL_HANDLE`.
+/// A 14 GiB RAMBlock therefore gave a 2 GiB window, which is why a guest on this
+/// host displayed nothing: roughly three quarters of its RAM gathered as
+/// garbage. Chunked imports of the same pages read correctly at every offset.
+///
+/// # Why 2 GiB and not "under 2^32"
+///
+/// The measured wall is `2^32`, and 4 GiB − 4096 imports correctly. Half of that
+/// is taken instead for three reasons: it is a power of two, so splitting a
+/// RAMBlock is a shift rather than a division; it leaves the arithmetic unable
+/// to land on the one size that fails loudly (an exact multiple of `2^32`); and
+/// it costs nothing to be wrong about, because chunking is invisible to a driver
+/// that handles the full size — such a driver just receives more, smaller
+/// imports, and every one of them is a legal allocation it would have accepted
+/// as part of a larger one.
+///
+/// This is deliberately **not** a driver-name branch, which `AGENTS.md` forbids
+/// and which would leave every other truncating driver broken. It is a bound on
+/// what this device asks for, applied everywhere.
+pub const IMPORT_SPAN_CEILING: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The ceiling has to be a multiple of any plausible import granularity, or the
+/// mask that applies the device's alignment to it would round it to zero on a
+/// host with a large page. A power of two at gigabyte scale satisfies every
+/// `minImportedHostPointerAlignment` a driver can report.
+const _: () = assert!(IMPORT_SPAN_CEILING.is_power_of_two());
+
+/// Why an import could not be given a memory type.
+///
+/// The two arms are different findings about different halves of the call and a
+/// reader has to be able to tell them apart: [`Self::PointerDeclined`] is the
+/// driver refusing the *mapping* — not a kind of memory it can take a reference
+/// on — while [`Self::NoTypeMeetsRequest`] is the driver naming types this
+/// device's own [`super::memory_topology::MemoryRequest`] then rejected. The
+/// first is a property of the host allocation and the second is a property of
+/// this device's policy, and only the second is ours to change. The mask the
+/// driver named rides along so the two sub-cases of the second — an empty mask
+/// and an incompatible one — are also separable without another boot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportTypeRefusal {
+    /// `vkGetMemoryHostPointerPropertiesEXT` returned a non-success result.
+    PointerDeclined { result: vk::Result },
+    /// The query succeeded and named `pointer_types`; no type in it can carry
+    /// this import. An empty mask means the driver accepts the pointer for no
+    /// type at all; the refusal says which of the selector's three checks
+    /// answered, because "this device has no such memory" and "this device has
+    /// nowhere to put six gigabytes" are different reports from the same line.
+    NoTypeMeetsRequest {
+        pointer_types: u32,
+        refusal: super::memory_topology::MemoryTypeRefusal,
+    },
+}
+
+/// Which memory type an import of `bytes` at `host_ptr` must use, or which check
+/// refused to name one.
 ///
 /// `vkGetMemoryHostPointerPropertiesEXT` answers with a `memoryTypeBits` mask
 /// that is a property of the *pointer*, not of the device, so it cannot be
@@ -326,7 +457,8 @@ pub unsafe fn import_memory_type(
     host_ptr: *const std::ffi::c_void,
     req: &super::memory_topology::MemoryRequest,
     bytes: u64,
-) -> Option<super::memory_topology::MemoryTypePick> {
+    max_allocation: u64,
+) -> Result<super::memory_topology::MemoryTypePick, ImportTypeRefusal> {
     let mut ptr_props = vk::MemoryHostPointerPropertiesEXT::default();
     // `ash` 0.38 wraps this extension as raw function pointers only, so the
     // call goes through `fp()` rather than a checked method.
@@ -343,9 +475,20 @@ pub unsafe fn import_memory_type(
         )
     };
     if rc != vk::Result::SUCCESS {
-        return None;
+        return Err(ImportTypeRefusal::PointerDeclined { result: rc });
     }
-    super::memory_topology::select_memory_type(memory_props, ptr_props.memory_type_bits, req, bytes)
+    let pointer_types = ptr_props.memory_type_bits;
+    super::memory_topology::select_memory_type(
+        memory_props,
+        pointer_types,
+        req,
+        bytes,
+        max_allocation,
+    )
+    .map_err(|refusal| ImportTypeRefusal::NoTypeMeetsRequest {
+        pointer_types,
+        refusal,
+    })
 }
 
 #[cfg(test)]

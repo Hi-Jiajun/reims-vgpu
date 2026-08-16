@@ -1,4 +1,4 @@
-//! Announcing a completion stamp the GPU wrote, off the drain worker.
+//! Publishing and announcing FIFO completion stamps off the drain worker.
 //!
 //! # What the guest is actually waiting on
 //!
@@ -8,20 +8,19 @@
 //! reached it builds a **one-second** deadline, sleeps on the stamp word's own
 //! address as the wait channel, and re-reads the word on every wake.
 //!
-//! Two things follow, and the second is the one that cost a rebuild:
+//! Two things follow:
 //!
-//! * The word is the authority. Writing it from the GPU, ordered behind the
-//!   writeback copies by a barrier, is a sound way to move a fence — the guest
-//!   never asks this device whether the value is real.
+//! * The word is the authority. This module stores it only after the timeline
+//!   point of the FIFO work it represents has completed.
 //! * **The interrupt is the wakeup, not a hint.** Nothing re-checks the word
 //!   until something wakes the thread, so a late interrupt is not a late
 //!   notification, it is up to a full second of guest stall. An earlier attempt
 //!   deferred the announcement to the drain worker's next tranche and measured
 //!   exactly that: draws/s 3237 -> 2, presents/s 45 -> 1.
 //!
-//! So the stamp word may be handed to the GPU, and the interrupt may not be
-//! handed to anything that runs on a schedule. It has to be raised the moment
-//! the submission completes, which is what this module is.
+//! The completion thread therefore waits the queue's monotonic timeline,
+//! release-stores the shared word, and immediately raises the interrupt. The
+//! drain worker only enqueues the checked word and returns.
 //!
 //! # Why a thread, and why it needs nothing from the device lock
 //!
@@ -37,37 +36,12 @@
 //! This module owns none of that. It takes an [`AnnounceStamp`] hook the device
 //! layer installs, so the engine keeps knowing nothing about `BoundDevice`.
 //!
-//! # What it measured
-//!
-//! Back-to-back on one machine against the parent commit, testufo animating,
-//! 30 census windows each:
-//!
-//! ```text
-//!                      before     after
-//! presents/s             44.0      64.0     +45%
-//! draws/s              3206.0    3346.5
-//! busy_us/s          909958.5  830495.0      -9%
-//! max_tranche_us      37250.5   25458.0     -32%
-//! ```
-//!
-//! The presents ranges do not overlap — 41-47 against 54-69 — which is what
-//! makes this readable at all, because the same config measured across an hour
-//! of other work read 51, 53 and 63. Take a reading from this rail only against
-//! a run of its own parent on the same quiet machine.
-//!
-//! **The drain worker's block did not go away, and the gain is not from its
-//! removal.** `fence/s` still tracks `flushes/s` (399 -> 421), because root slot
-//! 0 stays on the blocking rail. What changed is what that block costs: by the
-//! time a root stamp quiesces, the child stamps ahead of it have already ordered
-//! the same copies on the queue, so the wait finds them done. The worker does 9%
-//! less work and delivers 45% more frames.
-//!
 //! # Why a timeline semaphore rather than a fence
 //!
 //! A second waiter cannot use the ring's fences. `ResourcePools` owns every one
 //! of them and resets each at retire, so a thread waiting on a ring fence races
 //! the reset and a submission that signalled once can read as unsignalled
-//! forever. Giving the stamp submission its own fence instead breaks the ring
+//! forever. Giving completion tracking its own fence instead breaks the ring
 //! the other way: `vkQueueSubmit` takes exactly one fence, so the slot's fence
 //! would never signal and its cleanup would never retire.
 //!
@@ -78,8 +52,50 @@
 //! the blocking rail every host used before this existed.
 
 use ash::vk;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+
+/// Pending completions owned by one FIFO before its producer must wait.
+///
+/// This is the FIFO contract's queue depth, not a tuning knob. Keeping the
+/// bound per FIFO matters: pressure on one channel must not consume another
+/// channel's completion capacity.
+const FIFO_PENDING_STAMP_CAPACITY: usize = 32;
+
+/// FIFOs with at least one completion whose word has not yet been published.
+///
+/// The drain worker needs this before taking the engine lock: a CPU-only stamp
+/// still has to join the completion queue when an older stamp for the same FIFO
+/// is pending, or it can publish ahead and the older completion later moves the
+/// guest's fence backwards. There is one process-global engine and one
+/// completion worker, so this is the lock-free projection of that worker's
+/// per-FIFO counts.
+static PENDING_FIFO_MASK: AtomicU32 = AtomicU32::new(0);
+
+const _: () = assert!(crate::model::MAX_CHANNELS <= u32::BITS as usize);
+
+pub(crate) fn fifo_has_pending_stamp(index: u32) -> bool {
+    index < u32::BITS && PENDING_FIFO_MASK.load(Ordering::Acquire) & (1u32 << index) != 0
+}
+
+/// The subset of [`PENDING_FIFO_MASK`] whose completion point is a submission
+/// **this device has not made yet** — a stamp registered against the open
+/// batch's future point by [`Completion::queue_for_next_submission`].
+///
+/// The distinction is the whole difference between a guest waiting on the GPU
+/// and a guest waiting on *us*. A `Submitted` stamp is in flight and nothing can
+/// make it land sooner. A `NextSubmission` stamp is a word we have promised and
+/// then parked in a command buffer that is still recording, and the batch has no
+/// time bound — it stays open until a draw claims a slot, a readback arrives, a
+/// present runs, or the pending ring fills. So a timeline blocked on one is
+/// blocked until unrelated work happens to arrive, which on a quiet channel can
+/// be tens of milliseconds.
+static UNSUBMITTED_FIFO_MASK: AtomicU32 = AtomicU32::new(0);
+
+/// Whether FIFO `index` is owed a stamp that is parked on an unsubmitted batch.
+pub(crate) fn fifo_has_unsubmitted_stamp(index: u32) -> bool {
+    index < u32::BITS && UNSUBMITTED_FIFO_MASK.load(Ordering::Acquire) & (1u32 << index) != 0
+}
 
 /// Raise the guest-visible interrupt for a completed stamp slot.
 ///
@@ -131,18 +147,103 @@ fn announce(index: u32) {
     }
 }
 
-/// One stamp waiting on the GPU, in submission order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One stamp waiting for its queue point, in FIFO order.
+#[derive(Clone, Debug)]
 struct Waiting {
-    /// Timeline value the submission carrying this stamp's word will signal.
-    value: u64,
+    /// The exact submission this completion belongs to, before or after that
+    /// submission has reached `vkQueueSubmit`.
+    point: CompletionPoint,
     /// Stamp slot index, for the interrupt-status bit.
     index: u32,
+    /// The checked shared-memory word written before the interrupt is raised.
+    word: crate::runtime::guest_ram::GuestRef,
+    /// The FIFO completion value published into `word`.
+    stamp: u32,
+    /// When this stamp was registered, for the publish-latency census.
+    ///
+    /// This is the clock the guest actually experiences: it is blocked from the
+    /// moment the packet is held on the wait until the word appears, and every
+    /// hop in between — the batch reaching `vkQueueSubmit`, the GPU retiring it,
+    /// the completion thread waking, the store, the interrupt — is inside this
+    /// span. Nothing else in this device measures it end to end, and the drain's
+    /// own censuses cannot: they are written by the drain thread, which is not
+    /// the thread that finishes the work.
+    queued_at: std::time::Instant,
+}
+
+/// Association between one guest stamp and one FIFO-owned submission.
+///
+/// A stamp recorded in an open batch already knows which monotonic point the
+/// next reservation will receive. Carrying that point here prevents an older,
+/// delayed `vkQueueSubmit` from claiming stamps recorded for a newer batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletionPoint {
+    NextSubmission(u64),
+    Submitted(u64),
+}
+
+#[derive(Default)]
+struct PendingQueue {
+    waiting: std::collections::VecDeque<Waiting>,
+    per_fifo: [usize; crate::model::MAX_CHANNELS],
+}
+
+impl PendingQueue {
+    fn is_full(&self, index: usize) -> bool {
+        self.per_fifo[index] == FIFO_PENDING_STAMP_CAPACITY
+    }
+
+    fn push(&mut self, waiting: Waiting) {
+        self.per_fifo[waiting.index as usize] += 1;
+        self.waiting.push_back(waiting);
+    }
+
+    fn pop_front(&mut self) -> Option<Waiting> {
+        let waiting = self.waiting.pop_front()?;
+        self.per_fifo[waiting.index as usize] -= 1;
+        Some(waiting)
+    }
+
+    fn has_pending(&self, index: usize) -> bool {
+        self.per_fifo[index] != 0
+    }
+
+    fn bind_submission(&mut self, timeline: u64) -> usize {
+        let mut bound = 0;
+        for waiting in &mut self.waiting {
+            if waiting.point == CompletionPoint::NextSubmission(timeline) {
+                waiting.point = CompletionPoint::Submitted(timeline);
+                bound += 1;
+            }
+        }
+        self.republish_unsubmitted();
+        bound
+    }
+
+    /// Recompute the lock-free projection of which FIFOs still have a stamp
+    /// parked on an unsubmitted batch.
+    ///
+    /// Recomputed from the queue rather than decremented, because one
+    /// `bind_submission` can promote several of a FIFO's stamps at once while
+    /// leaving others — belonging to a *later* still-open batch — behind, and a
+    /// counter stepped per promotion would clear the bit while one of those is
+    /// still parked.
+    fn republish_unsubmitted(&self) {
+        let mut mask = 0u32;
+        for waiting in &self.waiting {
+            if matches!(waiting.point, CompletionPoint::NextSubmission(_))
+                && waiting.index < u32::BITS
+            {
+                mask |= 1u32 << waiting.index;
+            }
+        }
+        UNSUBMITTED_FIFO_MASK.store(mask, Ordering::Release);
+    }
 }
 
 /// The queue the drain worker pushes to and the completion thread drains.
 struct Shared {
-    queue: Mutex<std::collections::VecDeque<Waiting>>,
+    queue: Mutex<PendingQueue>,
     /// Woken by a push and by shutdown. The thread waits here only when the
     /// queue is empty; otherwise it is blocked in `vkWaitSemaphores`, which is
     /// where it should be.
@@ -151,6 +252,89 @@ struct Shared {
     /// Highest value handed out. The drain worker reserves with `fetch_add`
     /// under the engine lock, so reservation order is submission order.
     next_value: AtomicU64,
+    /// Highest timeline point successfully handed to the ordered queue owner.
+    ///
+    /// A completion stamp may be recorded after the handoff but before the
+    /// owner enters `vkQueueSubmit`. It must wait this point, not the preceding
+    /// submitted one, or the guest can reuse shared inputs while their reader
+    /// is still in the host FIFO.
+    latest_queued: AtomicU64,
+}
+
+impl Shared {
+    /// Point an open batch will receive when it is handed to the queue.
+    fn next_submission(&self) -> u64 {
+        self.next_value.load(Ordering::Acquire) + 1
+    }
+
+    /// Reserve the point previously advertised by [`Self::next_submission`].
+    fn reserve_submission(&self) -> u64 {
+        self.next_value.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn latest_queued(&self) -> Option<u64> {
+        let value = self.latest_queued.load(Ordering::Acquire);
+        (value != 0).then_some(value)
+    }
+}
+
+/// Cloneable publication half handed to the queue owner with one submission.
+/// It cannot stop the completion thread or destroy its semaphore; it can only
+/// bind pending guest stamps after `vkQueueSubmit` has actually succeeded.
+#[derive(Clone)]
+pub(crate) struct SubmissionNote {
+    shared: Arc<Shared>,
+}
+
+#[cfg(test)]
+pub(super) struct SubmissionProbe {
+    shared: Arc<Shared>,
+}
+
+#[cfg(test)]
+impl SubmissionProbe {
+    pub(super) fn new() -> Self {
+        Self {
+            shared: Arc::new(Shared {
+                queue: Mutex::new(PendingQueue::default()),
+                wake: Condvar::new(),
+                stop: AtomicBool::new(false),
+                next_value: AtomicU64::new(0),
+                latest_queued: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    pub(super) fn note(&self) -> SubmissionNote {
+        SubmissionNote {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
+    pub(super) fn latest_queued(&self) -> Option<u64> {
+        self.shared.latest_queued()
+    }
+}
+
+impl SubmissionNote {
+    pub(crate) fn queued(&self, value: u64) {
+        self.shared
+            .latest_queued
+            .fetch_max(value, Ordering::Release);
+    }
+
+    pub(crate) fn submitted(&self, value: u64) {
+        self.queued(value);
+        let bound = self
+            .shared
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bind_submission(value);
+        if bound != 0 {
+            self.shared.wake.notify_all();
+        }
+    }
 }
 
 /// A running completion thread, owned by the device context.
@@ -181,10 +365,11 @@ impl StampCompletion {
         let ci = vk::SemaphoreCreateInfo::default().push_next(&mut type_info);
         let semaphore = unsafe { device.create_semaphore(&ci, None) }?;
         let shared = Arc::new(Shared {
-            queue: Mutex::new(std::collections::VecDeque::new()),
+            queue: Mutex::new(PendingQueue::default()),
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
             next_value: AtomicU64::new(0),
+            latest_queued: AtomicU64::new(0),
         });
         let thread_shared = Arc::clone(&shared);
         let thread_device = device.clone();
@@ -199,46 +384,134 @@ impl StampCompletion {
         })
     }
 
-    /// The semaphore a stamp submission signals, and the value to signal.
+    /// Reserve the timeline point for one FIFO-owned queue submission.
     ///
     /// Reserved under the engine lock, so the values are handed out in
     /// submission order — which is what makes a single-threaded drain of the
     /// queue announce stamps in that same order without any further ordering
     /// machinery.
-    pub(crate) fn reserve(&self, index: u32) -> (vk::Semaphore, u64) {
-        let value = self.shared.next_value.fetch_add(1, Ordering::AcqRel) + 1;
-        self.shared
-            .queue
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push_back(Waiting { value, index });
-        self.shared.wake.notify_one();
-        (self.semaphore, value)
+    pub(crate) fn reserve_submission(&self) -> (vk::Semaphore, u64, SubmissionNote) {
+        let value = self.shared.reserve_submission();
+        (
+            self.semaphore,
+            value,
+            SubmissionNote {
+                shared: Arc::clone(&self.shared),
+            },
+        )
     }
 
-    /// Drop a reservation whose submission never happened.
-    ///
-    /// A submit that fails after [`Self::reserve`] leaves a value nothing will
-    /// ever signal, and the thread would then block on it until the deadline and
-    /// hold every later stamp behind it. Signalling the value from the host is
-    /// the repair: it is exactly what the queue would have done, so the thread's
-    /// wait completes and the announcement still reaches the guest — which is
-    /// the safe direction, because the alternative is a guest asleep on a fence
-    /// with a one-second deadline and nothing coming.
-    ///
-    /// # Safety
-    ///
-    /// `device` must be the device this was started with.
-    pub(crate) unsafe fn abandon(&self, device: &ash::Device, value: u64) {
-        let signal = vk::SemaphoreSignalInfo::default()
-            .semaphore(self.semaphore)
-            .value(value);
-        if let Err(e) = unsafe { device.signal_semaphore(&signal) } {
+    /// The newest queue point this device has accepted, including work waiting
+    /// in the ordered owner's host FIFO.
+    pub(crate) fn latest_queued(&self) -> Option<(vk::Semaphore, u64)> {
+        self.shared
+            .latest_queued()
+            .map(|value| (self.semaphore, value))
+    }
+
+    /// Retire one FIFO completion after `timeline` completes.
+    pub(crate) fn wait_for_stamp(
+        &self,
+        timeline: u64,
+        index: u32,
+        word: crate::runtime::guest_ram::GuestRef,
+        stamp: u32,
+    ) {
+        let Some(slot) = ((index as usize) < crate::model::MAX_CHANNELS).then_some(index as usize)
+        else {
             crate::observe::fail(format!(
-                "stamp_signal_abandon_failed reason=stamp_signal_abandon_failed value={value} \
-                 err={e:?} (a stamp submission failed and the host could not stand in for it; \
-                 the guest waiting on this stamp will sleep to its deadline)"
+                "stamp_fifo_out_of_range reason=stamp_fifo_out_of_range index={index} \
+                 max_channels={}",
+                crate::model::MAX_CHANNELS
             ));
+            return;
+        };
+        let mut queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        while queue.is_full(slot) && !self.shared.stop.load(Ordering::Acquire) {
+            queue = self
+                .shared
+                .wake
+                .wait(queue)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        if self.shared.stop.load(Ordering::Acquire) {
+            return;
+        }
+        queue.push(Waiting {
+            point: CompletionPoint::Submitted(timeline),
+            index,
+            word,
+            stamp,
+
+            queued_at: std::time::Instant::now(),
+        });
+        PENDING_FIFO_MASK.fetch_or(1u32 << index, Ordering::Release);
+        drop(queue);
+        self.shared.wake.notify_one();
+    }
+
+    /// Register a stamp behind the command buffer that is still recording.
+    ///
+    /// Returns `false` instead of blocking when this FIFO's contract-sized
+    /// pending ring is full. The caller owns the open command buffer, so
+    /// sleeping there would prevent the very submission that can make room;
+    /// it must submit the batch and retry against that concrete point.
+    pub(crate) fn queue_for_next_submission(
+        &self,
+        index: u32,
+        word: crate::runtime::guest_ram::GuestRef,
+        stamp: u32,
+    ) -> bool {
+        let Some(slot) = ((index as usize) < crate::model::MAX_CHANNELS).then_some(index as usize)
+        else {
+            crate::observe::fail(format!(
+                "stamp_fifo_out_of_range reason=stamp_fifo_out_of_range index={index} \
+                 max_channels={}",
+                crate::model::MAX_CHANNELS
+            ));
+            return false;
+        };
+        let mut queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.is_full(slot) || self.shared.stop.load(Ordering::Acquire) {
+            return false;
+        }
+        // The engine lock serializes this read with reservation. No other
+        // FIFO-owned submission can reserve between recording this stamp and
+        // flushing its open batch, so this is the batch's exact future point.
+        let target = self.shared.next_submission();
+        queue.push(Waiting {
+            point: CompletionPoint::NextSubmission(target),
+            index,
+            word,
+            stamp,
+
+            queued_at: std::time::Instant::now(),
+        });
+        PENDING_FIFO_MASK.fetch_or(1u32 << index, Ordering::Release);
+        UNSUBMITTED_FIFO_MASK.fetch_or(1u32 << index, Ordering::Release);
+        drop(queue);
+        self.shared.wake.notify_one();
+        true
+    }
+
+    /// Wait until this FIFO has no queued completion word left to publish.
+    ///
+    /// Used only before the CPU fallback writes a newer value. GPU work may
+    /// already be settled while its completion worker has not yet stored the
+    /// older word; waiting on the GPU alone would still permit that older store
+    /// to land after the fallback and move the guest's fence backwards.
+    pub(crate) fn wait_for_fifo_idle(&self, index: u32) {
+        let Some(slot) = ((index as usize) < crate::model::MAX_CHANNELS).then_some(index as usize)
+        else {
+            return;
+        };
+        let mut queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        while queue.has_pending(slot) && !self.shared.stop.load(Ordering::Acquire) {
+            queue = self
+                .shared
+                .wake
+                .wait(queue)
+                .unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -255,9 +528,8 @@ impl StampCompletion {
         self.shared.stop.store(true, Ordering::Release);
         // Signal past every reserved value so a thread blocked in
         // `vkWaitSemaphores` returns rather than sitting out its deadline. The
-        // stamps it then announces are ones whose bytes may not have landed —
-        // deliberately, and for the reason `abandon` gives: this device is going
-        // away, so a withheld announcement is a guest that never wakes.
+        // thread observes `stop` after the wait and never publishes a word for
+        // work this host signal merely skipped over.
         let past_everything = self.shared.next_value.load(Ordering::Acquire) + 1;
         let signal = vk::SemaphoreSignalInfo::default()
             .semaphore(self.semaphore)
@@ -267,6 +539,8 @@ impl StampCompletion {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
+        PENDING_FIFO_MASK.store(0, Ordering::Release);
+        UNSUBMITTED_FIFO_MASK.store(0, Ordering::Release);
         unsafe { device.destroy_semaphore(self.semaphore, None) };
     }
 }
@@ -284,8 +558,10 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
                 if shared.stop.load(Ordering::Acquire) {
                     return;
                 }
-                if let Some(front) = queue.front().copied() {
-                    break Some(front);
+                if let Some(front) = queue.waiting.front().cloned() {
+                    if matches!(front.point, CompletionPoint::Submitted(_)) {
+                        break Some(front);
+                    }
                 }
                 let (guard, _) = shared
                     .wake
@@ -298,7 +574,10 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
             return;
         };
         let semaphores = [semaphore];
-        let values = [waiting.value];
+        let CompletionPoint::Submitted(timeline) = waiting.point else {
+            unreachable!("front was checked as submitted")
+        };
+        let values = [timeline];
         let info = vk::SemaphoreWaitInfo::default()
             .semaphores(&semaphores)
             .values(&values);
@@ -307,66 +586,260 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
         // fault rather than a slow frame — announce anyway and say so, because
         // the guest's own deadline is one second and a withheld stamp costs it
         // that whether the GPU is wedged or not.
-        match unsafe { device.wait_semaphores(&info, super::context::FENCE_TIMEOUT_NS) } {
-            Ok(()) => {}
-            Err(vk::Result::TIMEOUT) => crate::observe::fail(format!(
-                "stamp_wait_timeout reason=stamp_wait_timeout index={} value={} \
-                 (the submission carrying this stamp's word has not executed within the \
-                 fence deadline; announcing it anyway so the guest is not left asleep)",
-                waiting.index, waiting.value
-            )),
-            Err(e) => crate::observe::fail(format!(
-                "stamp_wait_failed reason=stamp_wait_failed index={} value={} err={e:?} \
-                 (announcing regardless, for the reason a timeout does)",
-                waiting.index, waiting.value
-            )),
+        let completed =
+            match unsafe { device.wait_semaphores(&info, super::context::FENCE_TIMEOUT_NS) } {
+                Ok(()) => true,
+                Err(vk::Result::TIMEOUT) => {
+                    crate::observe::fail(format!(
+                        "stamp_wait_timeout reason=stamp_wait_timeout index={} value={} \
+                     (the submission carrying this stamp's word has not executed within the \
+                     fence deadline; announcing it anyway so the guest is not left asleep)",
+                        waiting.index, timeline
+                    ));
+                    false
+                }
+                Err(e) => {
+                    crate::observe::fail(format!(
+                        "stamp_wait_failed reason=stamp_wait_failed index={} value={} err={e:?} \
+                     (announcing regardless, for the reason a timeout does)",
+                        waiting.index, timeline
+                    ));
+                    // Announcing is not recovering. This thread may not take the
+                    // engine lock — it exists to announce guest fences while the
+                    // drain worker holds it — so it latches the loss and the drain's
+                    // end-of-tranche flush runs the recovery. Without this, a boot
+                    // whose device dies *here* never rebuilds it: the guest stops
+                    // drawing because its work stopped completing, and "the next
+                    // draw will surface it" then waits forever.
+                    if e == vk::Result::ERROR_DEVICE_LOST {
+                        super::device_lost::note_device_lost_seen();
+                    }
+                    false
+                }
+            };
+        let stopping = shared.stop.load(Ordering::Acquire);
+        if should_publish(completed, stopping) && !publish_stamp_word(&waiting) {
+            crate::observe::fail(format!(
+                "stamp_cpu_store_failed reason=stamp_cpu_store_failed index={} value={:#x} \
+                 (the completed queue point could not publish its checked shared word)",
+                waiting.index, waiting.stamp
+            ));
         }
-        shared
-            .queue
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop_front();
+        {
+            let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            queue.pop_front();
+            let slot = waiting.index as usize;
+            if !queue.has_pending(slot) {
+                PENDING_FIFO_MASK.fetch_and(!(1u32 << waiting.index), Ordering::Release);
+            }
+        }
+        shared.wake.notify_all();
         announce(waiting.index);
+        if stopping {
+            return;
+        }
     }
+}
+
+fn should_publish(completed: bool, stopping: bool) -> bool {
+    completed && !stopping
+}
+
+fn publish_stamp_word(waiting: &Waiting) -> bool {
+    note_publish_latency(waiting.queued_at.elapsed());
+    waiting.word.store_u32_release(waiting.stamp)
+}
+
+/// Band how long a guest stamp took to become visible, from registration to the
+/// word landing.
+///
+/// Banded rather than averaged because the question is a *distribution*: a mean
+/// hides whether the guest is losing a little on every stamp or a lot on a few,
+/// and those have different repairs. The bands straddle the frame period this
+/// rail is judged against (a macos-13 boot runs ~29 Hz, so ~34 ms), so a stamp
+/// landing in `lt64ms` has cost the guest most of a frame on its own.
+///
+/// The top two bands exist for one specific failure. The guest does not poll a
+/// stamp slot: it sleeps on the slot's address and is woken by this device's
+/// interrupt, with a **one-second deadline** as its only backstop. So a stamp
+/// whose interrupt is dropped, or whose word becomes visible *after* the
+/// interrupt rather than before it, is not slow by a little — the guest sleeps
+/// out the full second and wakes to re-read the page. Any weight at `ge500ms` is
+/// that signature and nothing else, and it would not be visible in a mean or in
+/// any band that stopped at "slower than a frame".
+fn note_publish_latency(elapsed: std::time::Duration) {
+    let us = elapsed.as_micros() as u64;
+    crate::runtime::drain::census::note_store_route(match us {
+        0..=99 => "stamp_publish_lt100us",
+        100..=999 => "stamp_publish_lt1ms",
+        1_000..=3_999 => "stamp_publish_lt4ms",
+        4_000..=15_999 => "stamp_publish_lt16ms",
+        16_000..=63_999 => "stamp_publish_lt64ms",
+        64_000..=499_999 => "stamp_publish_lt500ms",
+        _ => "stamp_publish_ge500ms",
+    });
+    crate::runtime::drain::census::note_store_route_us("stamp_publish_us", us);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Reservation order is submission order, and the queue keeps it. A single
-    /// thread draining a FIFO is the whole of this rail's ordering guarantee —
-    /// a stamp announced out of order moves a guest fence past a completion it
-    /// has not been told about.
-    ///
-    /// Device-free: drives the ledger, not the wait.
+    fn waiting(index: u32, stamp: u32) -> Waiting {
+        let mut word = Box::new(0u32);
+        let import = Arc::new(
+            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                (&mut *word) as *mut u32 as usize,
+                std::mem::size_of::<u32>() as u64,
+                std::mem::align_of::<u32>() as u64,
+            )
+            .expect("test import"),
+        );
+        // The import deliberately owns no allocation. Leak this one-word test
+        // backing so every queued GuestRef remains valid for the test's life.
+        Box::leak(word);
+        let slice = import.slice(0, 4).expect("stamp word");
+        Waiting {
+            point: CompletionPoint::Submitted(u64::from(stamp) + 1),
+            index,
+            word: crate::runtime::guest_ram::GuestRef::new(import, slice).expect("guest word"),
+            stamp,
+            queued_at: std::time::Instant::now(),
+        }
+    }
+
+    fn deferred(index: u32, stamp: u32, submission: u64) -> Waiting {
+        let mut waiting = waiting(index, stamp);
+        waiting.point = CompletionPoint::NextSubmission(submission);
+        waiting
+    }
+
+    fn test_shared(next_value: u64) -> Arc<Shared> {
+        Arc::new(Shared {
+            queue: Mutex::new(PendingQueue::default()),
+            wake: Condvar::new(),
+            stop: AtomicBool::new(false),
+            next_value: AtomicU64::new(next_value),
+            latest_queued: AtomicU64::new(0),
+        })
+    }
+
+    fn points(shared: &Shared) -> Vec<CompletionPoint> {
+        shared
+            .queue
+            .lock()
+            .expect("pending queue")
+            .waiting
+            .iter()
+            .map(|waiting| waiting.point)
+            .collect()
+    }
+
     #[test]
-    fn reservations_are_monotonic_and_queue_in_submission_order() {
+    fn pending_capacity_is_per_fifo_and_fifo_order_is_preserved() {
+        let mut queue = PendingQueue::default();
+        for stamp in 0..FIFO_PENDING_STAMP_CAPACITY as u32 {
+            queue.push(waiting(0, stamp));
+        }
+        assert!(queue.is_full(0));
+        assert!(!queue.is_full(1));
+        queue.push(waiting(1, 0xfeed));
+
+        for stamp in 0..FIFO_PENDING_STAMP_CAPACITY as u32 {
+            let entry = queue.pop_front().expect("root completion");
+            assert_eq!((entry.index, entry.stamp), (0, stamp));
+        }
+        assert!(!queue.has_pending(0));
+        assert!(queue.has_pending(1));
+        let child = queue.pop_front().expect("child completion");
+        assert_eq!((child.index, child.stamp), (1, 0xfeed));
+        assert!(!queue.has_pending(1));
+    }
+
+    /// The unsubmitted projection clears only when a FIFO has no stamp left on
+    /// an unmade submission — not merely when one of them is bound.
+    ///
+    /// A FIFO can hold stamps against two different open batches, and
+    /// `bind_submission` promotes only the one whose point matches. Stepping a
+    /// counter per promotion would clear the bit while the later batch's stamp
+    /// is still parked, and a timeline blocked on *that* one would then never
+    /// get its batch submitted. Hence the recompute.
+    #[test]
+    fn the_unsubmitted_projection_survives_a_partial_bind() {
+        let mut queue = PendingQueue::default();
+        UNSUBMITTED_FIFO_MASK.store(0, Ordering::Release);
+
+        // Two batches' worth of stamps on one FIFO, plus a sibling's.
+        let mut early = waiting(1, 0x10);
+        early.point = CompletionPoint::NextSubmission(7);
+        let mut late = waiting(1, 0x11);
+        late.point = CompletionPoint::NextSubmission(9);
+        let mut other = waiting(2, 0x20);
+        other.point = CompletionPoint::NextSubmission(9);
+        queue.push(early);
+        queue.push(late);
+        queue.push(other);
+        queue.republish_unsubmitted();
+        assert!(fifo_has_unsubmitted_stamp(1));
+        assert!(fifo_has_unsubmitted_stamp(2));
+
+        // Submitting batch 7 binds only the early one.
+        assert_eq!(queue.bind_submission(7), 1);
+        assert!(
+            fifo_has_unsubmitted_stamp(1),
+            "FIFO 1 still has a stamp on batch 9, so its batch must still be \
+             submittable on demand"
+        );
+        assert!(fifo_has_unsubmitted_stamp(2));
+
+        // Submitting batch 9 binds the rest, and both bits clear.
+        assert_eq!(queue.bind_submission(9), 2);
+        assert!(
+            !fifo_has_unsubmitted_stamp(1),
+            "with everything in flight there is nothing left to submit early"
+        );
+        assert!(!fifo_has_unsubmitted_stamp(2));
+        UNSUBMITTED_FIFO_MASK.store(0, Ordering::Release);
+    }
+
+    /// Reservation order is submission order; reserving alone does not publish
+    /// a point that a completion stamp could observe.
+    #[test]
+    fn reservations_are_monotonic_and_handoff_is_published_separately() {
         let shared = Shared {
-            queue: Mutex::new(std::collections::VecDeque::new()),
+            queue: Mutex::new(PendingQueue::default()),
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
             next_value: AtomicU64::new(0),
+            latest_queued: AtomicU64::new(0),
         };
-        for (n, index) in [(1u64, 3u32), (2, 0), (3, 3)] {
-            let value = shared.next_value.fetch_add(1, Ordering::AcqRel) + 1;
-            assert_eq!(value, n, "timeline values start at 1 and never repeat");
-            shared
-                .queue
-                .lock()
-                .unwrap()
-                .push_back(Waiting { value, index });
+        for n in 1u64..=100 {
+            assert_eq!(shared.next_submission(), n);
+            assert_eq!(
+                shared.reserve_submission(),
+                n,
+                "the point recorded into an open-batch stamp is exactly the point subsequently reserved"
+            );
         }
-        let queue = shared.queue.lock().unwrap();
-        assert_eq!(
-            queue.iter().copied().collect::<Vec<_>>(),
-            vec![
-                Waiting { value: 1, index: 3 },
-                Waiting { value: 2, index: 0 },
-                Waiting { value: 3, index: 3 },
-            ],
-            "the same slot may be stamped twice and both must be announced, in order"
-        );
+        assert_eq!(shared.latest_queued.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn queued_point_orders_a_stamp_before_driver_submission() {
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(PendingQueue::default()),
+            wake: Condvar::new(),
+            stop: AtomicBool::new(false),
+            next_value: AtomicU64::new(1),
+            latest_queued: AtomicU64::new(0),
+        });
+        let note = SubmissionNote {
+            shared: Arc::clone(&shared),
+        };
+
+        note.queued(1);
+
+        assert_eq!(shared.latest_queued.load(Ordering::Acquire), 1);
     }
 
     /// The initial value is 0 and the first reservation is 1, so no submission
@@ -377,5 +850,256 @@ mod tests {
     fn no_reservation_can_collide_with_the_semaphores_initial_value() {
         let next = AtomicU64::new(0);
         assert_eq!(next.fetch_add(1, Ordering::AcqRel) + 1, 1);
+    }
+
+    #[test]
+    fn completed_waiting_entry_publishes_its_word() {
+        let mut words = [0u32; 2];
+        let import = Arc::new(
+            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                words.as_mut_ptr() as usize,
+                std::mem::size_of_val(&words) as u64,
+                std::mem::align_of_val(&words) as u64,
+            )
+            .expect("test import"),
+        );
+        let slice = import.slice(4, 4).expect("second word");
+        let word = crate::runtime::guest_ram::GuestRef::new(import, slice).expect("guest word");
+        let waiting = Waiting {
+            point: CompletionPoint::Submitted(7),
+            index: 2,
+            word,
+            stamp: 0x89ab_cdef,
+            queued_at: std::time::Instant::now(),
+        };
+
+        assert!(publish_stamp_word(&waiting));
+        assert_eq!(words, [0, 0x89ab_cdefu32.to_le()]);
+    }
+
+    #[test]
+    fn teardown_wakeup_never_publishes_unfinished_work() {
+        assert!(should_publish(true, false));
+        assert!(!should_publish(false, false));
+        assert!(!should_publish(true, true));
+    }
+
+    #[test]
+    fn an_open_batch_stamp_binds_only_when_submission_succeeds() {
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(PendingQueue::default()),
+            wake: Condvar::new(),
+            stop: AtomicBool::new(false),
+            next_value: AtomicU64::new(0),
+            latest_queued: AtomicU64::new(0),
+        });
+        let mut submitted = waiting(0, 1);
+        submitted.point = CompletionPoint::Submitted(7);
+        let mut deferred_a = waiting(0, 2);
+        deferred_a.point = CompletionPoint::NextSubmission(11);
+        let mut deferred_b = waiting(1, 3);
+        deferred_b.point = CompletionPoint::NextSubmission(11);
+        {
+            let mut queue = shared.queue.lock().expect("pending queue");
+            queue.push(submitted);
+            queue.push(deferred_a);
+            queue.push(deferred_b);
+        }
+        let note = SubmissionNote {
+            shared: Arc::clone(&shared),
+        };
+
+        note.queued(11);
+        let before_submit: Vec<CompletionPoint> = shared
+            .queue
+            .lock()
+            .expect("pending queue")
+            .waiting
+            .iter()
+            .map(|w| w.point)
+            .collect();
+        assert_eq!(
+            before_submit,
+            vec![
+                CompletionPoint::Submitted(7),
+                CompletionPoint::NextSubmission(11),
+                CompletionPoint::NextSubmission(11),
+            ]
+        );
+
+        note.submitted(11);
+
+        let points: Vec<CompletionPoint> = shared
+            .queue
+            .lock()
+            .expect("pending queue")
+            .waiting
+            .iter()
+            .map(|w| w.point)
+            .collect();
+        assert_eq!(
+            points,
+            vec![
+                CompletionPoint::Submitted(7),
+                CompletionPoint::Submitted(11),
+                CompletionPoint::Submitted(11),
+            ]
+        );
+    }
+
+    /// A delayed older submit must not claim stamps that the drain worker
+    /// recorded for a newer batch while the queue owner was inside the driver.
+    #[test]
+    fn delayed_submission_binds_only_its_own_open_batch_stamps() {
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(PendingQueue::default()),
+            wake: Condvar::new(),
+            stop: AtomicBool::new(false),
+            next_value: AtomicU64::new(0),
+            latest_queued: AtomicU64::new(0),
+        });
+        let mut older = waiting(0, 1);
+        older.point = CompletionPoint::NextSubmission(1);
+        let mut newer = waiting(0, 2);
+        newer.point = CompletionPoint::NextSubmission(2);
+        {
+            let mut queue = shared.queue.lock().expect("pending queue");
+            queue.push(older);
+            queue.push(newer);
+        }
+        let note = SubmissionNote {
+            shared: Arc::clone(&shared),
+        };
+
+        note.submitted(1);
+
+        let points: Vec<CompletionPoint> = shared
+            .queue
+            .lock()
+            .expect("pending queue")
+            .waiting
+            .iter()
+            .map(|w| w.point)
+            .collect();
+        assert_eq!(
+            points,
+            vec![
+                CompletionPoint::Submitted(1),
+                CompletionPoint::NextSubmission(2),
+            ]
+        );
+    }
+
+    /// Exercise the ownership relation as a matrix rather than one observed
+    /// pair: every batch has stamps on several FIFOs, and each successful
+    /// submission may transition exactly its own cells.
+    #[test]
+    fn every_submission_binds_exactly_its_stamps_across_batches_and_fifos() {
+        const BATCHES: u64 = 8;
+        const FIFOS: u32 = 4;
+        let mut queue = PendingQueue::default();
+        let mut owners = Vec::new();
+
+        // A concrete pressure-path point is mixed into the same queue. No
+        // open-batch submission notification may rewrite it.
+        queue.push(waiting(FIFOS, 0xf000));
+        owners.push(None);
+        for batch in 1..=BATCHES {
+            for fifo in 0..FIFOS {
+                queue.push(deferred(fifo, (batch as u32) * 16 + fifo, batch));
+                owners.push(Some(batch));
+            }
+        }
+        let fifo_levels = queue.per_fifo;
+
+        for submitted in 1..=BATCHES {
+            assert_eq!(
+                queue.bind_submission(submitted),
+                FIFOS as usize,
+                "one notification binds every FIFO stamp in its batch and no other"
+            );
+            for (waiting, owner) in queue.waiting.iter().zip(&owners) {
+                let expected = match owner {
+                    None => CompletionPoint::Submitted(0xf001),
+                    Some(batch) if *batch <= submitted => CompletionPoint::Submitted(*batch),
+                    Some(batch) => CompletionPoint::NextSubmission(*batch),
+                };
+                assert_eq!(waiting.point, expected, "owner={owner:?} after={submitted}");
+            }
+            assert_eq!(
+                queue.bind_submission(submitted),
+                0,
+                "a duplicate driver-success notification is idempotent"
+            );
+            assert_eq!(
+                queue.per_fifo, fifo_levels,
+                "binding changes state, never FIFO occupancy"
+            );
+        }
+    }
+
+    /// Exact identity, rather than arrival order, owns a stamp. The real queue
+    /// owner is ordered, but keeping this true under an adversarial call order
+    /// prevents a future refactor from quietly restoring bind-all semantics.
+    #[test]
+    fn out_of_order_notifications_still_cannot_cross_batch_ownership() {
+        let mut queue = PendingQueue::default();
+        queue.push(deferred(0, 1, 1));
+        queue.push(deferred(0, 2, 2));
+        queue.push(deferred(0, 3, 3));
+
+        assert_eq!(queue.bind_submission(2), 1);
+        assert_eq!(
+            queue.waiting.iter().map(|w| w.point).collect::<Vec<_>>(),
+            vec![
+                CompletionPoint::NextSubmission(1),
+                CompletionPoint::Submitted(2),
+                CompletionPoint::NextSubmission(3),
+            ]
+        );
+        assert_eq!(queue.bind_submission(1), 1);
+        assert_eq!(queue.bind_submission(3), 1);
+        assert!(queue
+            .waiting
+            .iter()
+            .all(|waiting| matches!(waiting.point, CompletionPoint::Submitted(_))));
+    }
+
+    /// Reproduce the actual two-thread shape deterministically: the queue
+    /// worker is held inside the older submit while the drain side records a
+    /// newer stamp, then the older driver call returns.
+    #[test]
+    fn queue_worker_return_cannot_claim_a_stamp_recorded_during_its_driver_call() {
+        let shared = test_shared(0);
+        shared
+            .queue
+            .lock()
+            .expect("pending queue")
+            .push(deferred(0, 1, 1));
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let worker_gate = Arc::clone(&gate);
+        let note = SubmissionNote {
+            shared: Arc::clone(&shared),
+        };
+        let worker = std::thread::spawn(move || {
+            worker_gate.wait();
+            note.submitted(1);
+        });
+
+        shared
+            .queue
+            .lock()
+            .expect("pending queue")
+            .push(deferred(1, 2, 2));
+        gate.wait();
+        worker.join().expect("queue worker");
+
+        assert_eq!(
+            points(&shared),
+            vec![
+                CompletionPoint::Submitted(1),
+                CompletionPoint::NextSubmission(2),
+            ]
+        );
     }
 }

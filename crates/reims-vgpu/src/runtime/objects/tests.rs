@@ -5,6 +5,7 @@ use crate::contract::endian::{ld32, st16, st32, st64};
 use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 use crate::contract::iosurface_pages::DEVICE_DESC_PLANE_COUNT;
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+use crate::runtime::decode::resource::TYPE7_OBJECT_SAMPLER;
 use crate::runtime::host::FakeHost;
 
 #[test]
@@ -82,6 +83,260 @@ fn resolve_type11_from_list() {
     let m = state.mappings.get(&9).unwrap();
     assert!(m.has_geom);
     assert_eq!((m.width, m.height, m.format), (64, 32, 0x50));
+}
+
+/// Registering a type-11 texture is construction, not bind-time repair.
+///
+/// Once the task owns the texture object, later binds retrieve that object and
+/// must not replay its serialized descriptor over mutable mapping state. A new
+/// descriptor can take effect only after the resource lifetime ends.
+#[test]
+fn a_retained_type11_texture_runs_construction_side_effects_once() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let resource = resolve_resource(&state, &host, 1, 1).expect("construction");
+
+    assert_eq!(
+        resolve_type11_resource(&mut state, 1, 1, &resource),
+        Some(9)
+    );
+    {
+        let mapping = state.mappings.get_mut(&9).expect("registered mapping");
+        mapping.width = 17;
+        mapping.height = 19;
+        mapping.format = 0x71;
+    }
+
+    assert_eq!(
+        resolve_type11_resource(&mut state, 1, 1, &resource),
+        Some(9)
+    );
+    let mapping = &state.mappings[&9];
+    assert_eq!(
+        (mapping.width, mapping.height, mapping.format),
+        (17, 19, 0x71),
+        "a warm bind must not replay immutable construction input"
+    );
+}
+
+/// Physical replacement is the event that re-arms backing resolution for a
+/// retained texture. A warm bind accepts the already-latched page plan; once
+/// invalidation clears that plan, the same bind must enter the resolver again
+/// rather than treating object retention as proof that old pages remain live.
+#[test]
+fn a_texture_bind_reuses_backing_until_physical_invalidation() {
+    let host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    assert!(state.map_surface(9));
+    {
+        let mapping = state.mappings.get_mut(&9).expect("surface mapping");
+        mapping.mapped = true;
+        mapping.has_geom = true;
+        mapping.width = 64;
+        mapping.height = 32;
+        mapping.page_entries = vec![0x1234_5001];
+    }
+
+    assert!(ensure_surface_for_texture_bind(&mut state, &host, 9));
+    assert!(state.invalidate_mapping_pages(9));
+    assert!(
+        !ensure_surface_for_texture_bind(&mut state, &host, 9),
+        "the invalidated page plan must be rebuilt before the texture binds"
+    );
+}
+
+/// A list entry and descriptor are construction input for a resource, not
+/// mutable bind-time state.
+///
+/// Moving the task's object list changes where future resources are
+/// constructed from; it does not retarget an object that is already live. An
+/// explicit delete ends that lifetime, and reusing the reference constructs a
+/// new object from the then-current descriptor.
+#[test]
+fn resources_keep_construction_input_until_explicit_delete() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+
+    let first = resolve_resource(&state, &host, 1, 1).expect("first construction");
+    assert_eq!(ld32(&first.descriptor), 9);
+
+    // Rewrite the descriptor and move the list somewhere unreadable. Neither
+    // operation changes the already-registered object.
+    let _ = host.write_gpa(data_gpa + 0x40, &10u32.to_le_bytes());
+    assert!(state.set_object_list(1, 0xdead, 8));
+    let retained = resolve_resource(&state, &host, 1, 1).expect("registered object");
+    assert!(Arc::ptr_eq(&first, &retained));
+    assert_eq!(ld32(&retained.descriptor), 9);
+    assert!(matches!(
+        retained.decoded(),
+        Ok(
+            crate::runtime::decode::resource::Descriptor::IOSurfaceTexture {
+                mapping_id: 9,
+                width: 64,
+                height: 32,
+                ..
+            }
+        )
+    ));
+    assert_eq!(
+        resolve_type11_resource(&mut state, 1, 1, &retained),
+        Some(9),
+        "the retained typed object resolves after its construction bytes become unreadable"
+    );
+
+    // Delete and reuse is the lifecycle edge that permits the same reference
+    // to name a newly-constructed resource.
+    assert!(state.delete_object(1, 1));
+    assert!(state.set_object_list(1, 0, 8));
+    let replacement = resolve_resource(&state, &host, 1, 1).expect("replacement construction");
+    assert!(!Arc::ptr_eq(&first, &replacement));
+    assert_eq!(ld32(&replacement.descriptor), 10);
+    assert_eq!(
+        resolve_type11_resource(&mut state, 1, 1, &replacement),
+        Some(10),
+        "the replacement lifetime runs its own construction side effects"
+    );
+}
+
+#[test]
+fn task_lifetime_retires_all_of_its_resource_objects() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let resource = resolve_resource(&state, &host, 1, 1).expect("construction");
+    assert!(state.task_resources.get(1, 1).is_some());
+
+    assert!(state.delete_task(1));
+    assert!(state.task_resources.get(1, 1).is_none());
+    assert_eq!(ld32(&resource.descriptor), 9, "an outstanding host owner remains valid");
+}
+
+#[test]
+fn the_resource_registry_accepts_exactly_the_resource_constructor_types() {
+    let accepted: Vec<u8> = (0..=u8::MAX)
+        .filter(|&object_type| object_type_is_resource(object_type))
+        .collect();
+    assert_eq!(accepted, [1, 2, 3, 4, 5, 8, 9, 11, 12, 13, 14, 15]);
+}
+
+/// Serializer state has its own lifetime. A `DeleteResource`-scoped registry
+/// must not retain its descriptor and hide a later update.
+#[test]
+fn non_resource_descriptors_are_read_again() {
+    use crate::runtime::decode::resource::OBJECT_TYPE_TYPE7;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let mut entry = [0u8; 12];
+    st32(&mut entry, u32::from(OBJECT_TYPE_TYPE7) | (4u32 << 8));
+    entry[4..].copy_from_slice(&0x80u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 24, &entry);
+    let _ = host.write_gpa(data_gpa + 0x80, &1u32.to_le_bytes());
+
+    let (_, first) = resolve_descriptor(&state, &host, 1, 2, &[OBJECT_TYPE_TYPE7])
+        .expect("first serializer descriptor");
+    assert_eq!(ld32(&first), 1);
+    assert!(state.task_resources.get(1, 2).is_none());
+
+    let _ = host.write_gpa(data_gpa + 0x80, &2u32.to_le_bytes());
+    let (_, second) = resolve_descriptor(&state, &host, 1, 2, &[OBJECT_TYPE_TYPE7])
+        .expect("updated serializer descriptor");
+    assert_eq!(ld32(&second), 2);
+    assert!(state.task_resources.get(1, 2).is_none());
+}
+
+fn put_sampler_object(host: &mut FakeHost, ref_: u32, descriptor_gva: u64, lod_min: f32) {
+    use crate::runtime::decode::resource::OBJECT_TYPE_TYPE7;
+    use reims_vgpu_wire::ops::sampler::NEW_SAMPLER_TOTAL_LEN;
+
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut entry,
+        u32::from(OBJECT_TYPE_TYPE7) | (NEW_SAMPLER_TOTAL_LEN << 8),
+    );
+    st64(&mut entry[4..], descriptor_gva);
+    let _ = host.write_gpa(
+        data_gpa + u64::from(ref_) * OBJECT_LIST_ENTRY_LEN as u64,
+        &entry,
+    );
+
+    let mut descriptor = vec![0u8; NEW_SAMPLER_TOTAL_LEN as usize];
+    st32(&mut descriptor, TYPE7_OBJECT_SAMPLER);
+    st32(&mut descriptor[4..], NEW_SAMPLER_TOTAL_LEN);
+    st32(&mut descriptor[8..], ref_);
+    st32(&mut descriptor[12..], 0x8400_0000);
+    st32(&mut descriptor[20..], lod_min.to_bits());
+    let _ = host.write_gpa(data_gpa + descriptor_gva, &descriptor);
+}
+
+#[test]
+fn sampler_construction_is_retained_until_its_own_explicit_delete() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    put_sampler_object(&mut host, 2, 0x80, 1.25);
+
+    let first = resolve_sampler_state(&state, &host, 1, 2).expect("first sampler");
+    assert_eq!(first.descriptor.lod_min_clamp, 1.25);
+
+    // Neither mutable descriptor bytes nor a moved object-list pointer mutate
+    // an already-constructed sampler object.
+    put_sampler_object(&mut host, 2, 0x80, 7.5);
+    assert!(state.set_object_list(1, 0xdead, 8));
+    let retained = resolve_sampler_state(&state, &host, 1, 2).expect("retained sampler");
+    assert!(Arc::ptr_eq(&first, &retained));
+    assert_eq!(retained.descriptor.lod_min_clamp, 1.25);
+
+    // The sampler API's delete edge, not resource deletion, permits ref reuse.
+    assert!(state.task_sampler_states.delete(1, 2));
+    assert!(state.set_object_list(1, 0, 8));
+    let replacement = resolve_sampler_state(&state, &host, 1, 2).expect("replacement sampler");
+    assert!(!Arc::ptr_eq(&first, &replacement));
+    assert_eq!(replacement.descriptor.lod_min_clamp, 7.5);
+}
+
+#[test]
+fn failed_sampler_construction_is_not_retained_and_can_retry() {
+    use crate::runtime::decode::resource::OBJECT_TYPE_TYPE7;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let mut short_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(&mut short_entry, u32::from(OBJECT_TYPE_TYPE7) | (4 << 8));
+    st64(&mut short_entry[4..], 0x80);
+    let _ = host.write_gpa(data_gpa + 24, &short_entry);
+    let _ = host.write_gpa(data_gpa + 0x80, &TYPE7_OBJECT_SAMPLER.to_le_bytes());
+
+    assert!(matches!(
+        resolve_sampler_state(&state, &host, 1, 2),
+        Err(SamplerResolveError::Decode { .. })
+    ));
+    assert!(state.task_sampler_states.get(1, 2).is_none());
+
+    put_sampler_object(&mut host, 2, 0x80, 3.0);
+    let sampler = resolve_sampler_state(&state, &host, 1, 2).expect("published retry");
+    assert_eq!(sampler.descriptor.lod_min_clamp, 3.0);
+}
+
+#[test]
+fn task_teardown_retires_sampler_objects_without_touching_outstanding_owners() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    put_sampler_object(&mut host, 2, 0x80, 2.0);
+    let sampler = resolve_sampler_state(&state, &host, 1, 2).expect("sampler");
+
+    assert!(state.delete_task(1));
+    assert!(state.task_sampler_states.get(1, 2).is_none());
+    assert_eq!(sampler.descriptor.lod_min_clamp, 2.0);
 }
 
 /// The type-4 decoder refuses a descriptor it cannot decode as declared, and
@@ -1802,7 +2057,7 @@ fn the_shared_ladder_names_the_rung_that_refused() {
 /// `invalidate_mapping_pages`, but `host_texture_surfaces` and
 /// `host_linear_textures` are keyed by object-list ref and carry no page list,
 /// so nothing in them can notice — and this device holds a copy under exactly
-/// those keys for ids no mapping owns. Measured on a driven x86/PCI boot under
+/// those keys for resources that own no mapping. Measured on a driven x86/PCI boot under
 /// `web-content-probe`: 7 texture and 1 linear against 32 that held nothing, so
 /// the guest was being served stale content on an ordinary browsing workload.
 ///
@@ -1814,12 +2069,26 @@ fn a_repoint_drops_the_ref_keyed_host_copies_of_the_object() {
     let (task, object) = (7u32, 4242u32);
 
     state.host_texture_surfaces.insert(
-        object,
+        (task, object),
         crate::model::HostSurface {
             width: 4,
             height: 4,
             bgra: std::sync::Arc::new(vec![0xAB; 4 * 4 * 4]),
             host_gen: 1,
+            producer_object_type: 0,
+            last_touch: 0,
+            backing: None,
+            guest_holds_bytes: false,
+            source_gva: 0,
+        },
+    );
+    state.host_texture_surfaces.insert(
+        (task + 1, object),
+        crate::model::HostSurface {
+            width: 4,
+            height: 4,
+            bgra: std::sync::Arc::new(vec![0xEF; 4 * 4 * 4]),
+            host_gen: 2,
             producer_object_type: 0,
             last_touch: 0,
             backing: None,
@@ -1847,12 +2116,98 @@ fn a_repoint_drops_the_ref_keyed_host_copies_of_the_object() {
     super::replace_physical(&mut state, &mut host, task, object);
 
     assert!(
-        !state.host_texture_surfaces.contains_key(&object),
+        !state.host_texture_surfaces.contains_key(&(task, object)),
         "the ref-keyed texture copy was read from pages the guest has re-pointed"
+    );
+    assert!(
+        state
+            .host_texture_surfaces
+            .contains_key(&(task + 1, object)),
+        "a re-point must not evict another task's same-numbered texture copy"
     );
     assert!(
         !state.host_linear_textures.contains_key(&(task, object)),
         "the ref-keyed linear copy was read from pages the guest has re-pointed"
+    );
+}
+
+/// ReplacePhysical's object id is local to the task carried beside it. A
+/// mapping id is a different namespace even when the integers happen to be
+/// equal.
+///
+/// This is the compositor failure class: task 0 owns type-4 surface 1 while
+/// task 1 owns type-11 resource 1, which resolves to mapping 9. Re-pointing the
+/// latter must retire mapping 9 and leave task 0's surface intact. The old
+/// global-id-first route did the opposite.
+#[test]
+fn a_repoint_resolves_the_resource_in_its_task_before_touching_a_mapping() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    setup_task_with_list(&mut host, &mut state);
+
+    assert_eq!(resolve_type11_ref(&mut state, &host, 1, 1), Some(9));
+
+    assert!(state.map_surface(1));
+    {
+        let surface = state.mappings.get_mut(&1).expect("surface mapping");
+        surface.mapped = true;
+        surface.page_entries = vec![0x1234_5001];
+        surface.type4_walk = Some(crate::model::Type4Walk {
+            task_id: 0,
+            backing_pfn: 0x20,
+            map_generation: surface.map_generation,
+        });
+    }
+    {
+        let resource = state.mappings.get_mut(&9).expect("type-11 mapping");
+        resource.mapped = true;
+        resource.page_entries = vec![0x6789_a001];
+    }
+
+    super::replace_physical(&mut state, &mut host, 1, 1);
+
+    assert_eq!(
+        state.mappings[&1].page_entries,
+        vec![0x1234_5001],
+        "a same-number resource in another task does not own this surface"
+    );
+    assert!(
+        state.mappings[&9].page_entries.is_empty(),
+        "the task-local type-11 association names the mapping to invalidate"
+    );
+}
+
+/// A direct type-4 resource is routed by the task provenance latched with its
+/// page walk, so tightening the namespace must not suppress genuine surface
+/// re-points.
+#[test]
+fn a_repoint_retires_a_type4_mapping_owned_by_the_packet_task() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    assert!(state.map_surface(7));
+    let prior_generation = {
+        let surface = state.mappings.get_mut(&7).expect("surface mapping");
+        surface.mapped = true;
+        surface.page_entries = vec![0x1234_5001];
+        surface.type4_walk = Some(crate::model::Type4Walk {
+            task_id: 3,
+            backing_pfn: 0x20,
+            map_generation: surface.map_generation,
+        });
+        surface.map_generation
+    };
+
+    super::replace_physical(&mut state, &mut host, 3, 7);
+
+    assert!(state.mappings[&7].page_entries.is_empty());
+    assert_ne!(state.mappings[&7].map_generation, prior_generation);
+    assert_ne!(
+        state.mappings[&7]
+            .type4_walk
+            .expect("the old walk remains only as provenance")
+            .map_generation,
+        state.mappings[&7].map_generation,
+        "the generation bump makes the retired walk unusable as currency"
     );
 }
 

@@ -351,17 +351,6 @@ pub fn device_reset(id: u64) -> bool {
         slot.present_action_pending.store(false, Ordering::Release);
         slot.present_boundary_seen.store(false, Ordering::Release);
         crate::runtime::census::present_proxy::reset_for_device();
-        // The pipeline memo is keyed by `(task_id, pipeline_ref)`, which are the
-        // *guest's* names and mean nothing across a reset: the next guest to
-        // boot names its own task 1 and its own pipeline 9, and an entry left
-        // over from the last one would be checked against object-list entries
-        // read out of the new guest's memory. Those could match by coincidence
-        // — the entry is 12 bytes and a fresh guest lays its object list out the
-        // same way — and a coincidence there serves the previous boot's shader.
-        // Unlike the translate cache underneath it, this map is not
-        // content-keyed and so cannot survive the identity of its keys changing.
-        #[cfg(feature = "backend-vulkan")]
-        crate::runtime::pipeline_resolve::forget_all();
         true
     } else {
         false
@@ -532,16 +521,28 @@ pub fn device_drain(id: u64) -> bool {
     let Some(slot) = device_slot(id) else {
         return false;
     };
+    // Opens this worker's wall-clock accounting: everything since the previous
+    // exit was the condvar wait the C shim parks in, and everything from here to
+    // the lock is contention with the vCPU thread. `duty` says how much of a
+    // second the worker was busy; these say what the rest of it was.
+    let entry_us = crate::runtime::drain::note_drain_entry();
     // The action BH needs the same device state to copy +0x188. A doorbell may
     // wake this worker before that BH runs; do not reacquire the lock and hide
     // the queued scanout behind another synchronous render/compute tranche.
     if slot.present_action_pending.load(Ordering::Acquire) {
         crate::runtime::drain::note_drain_skipped();
+        crate::runtime::drain::note_drain_exit(entry_us, true);
         return true;
     }
     let mut d = lock_for_drain(&slot);
+    crate::runtime::drain::note_drain_lock_wait(
+        crate::observe::elapsed_us().saturating_sub(entry_us),
+    );
     let Some(ops) = slot.ops else {
-        // No host services — nothing to resolve from guest RAM.
+        // No host services — nothing to resolve from guest RAM. The lock wait is
+        // already banked, so this closes with no post-tranche span rather than
+        // leaving the entry open for the next one to absorb.
+        crate::runtime::drain::note_drain_exit(crate::observe::elapsed_us(), false);
         return true;
     };
     let DeviceInner { device, actions } = &mut *d;
@@ -596,24 +597,37 @@ pub fn device_drain(id: u64) -> bool {
         drain_us,
         publish_started.elapsed().as_micros() as u64,
     );
+    // Everything from here to the return is `gap_post_us`: the per-tranche
+    // sweeps below run on the worker's own wall clock and are outside both
+    // `drain_us` and `publish_us`, so `duty` cannot see them.
+    let busy_end_us = crate::observe::elapsed_us();
+    use crate::runtime::drain::{PostSweep, post_sweep};
     // Same one-second cadence, so the cache trend lines up row-for-row with
     // `store_routes` and `drain_duty`. Measure-only; see `note_cache_levels`.
-    crate::runtime::surface_cache::note_cache_levels(&device.state, &host);
+    post_sweep(PostSweep::CacheLevels, || {
+        crate::runtime::surface_cache::note_cache_levels(&device.state, &host)
+    });
     // Per tranche rather than per census window, unlike the levels above: this
     // measures how long a slot the guest named takes to appear, so the sampling
     // interval is the resolution of the answer. Returns immediately when nothing
     // is watched, which is every tranche on every rail but macos-26.
-    crate::runtime::objects::slot_recheck::sweep(&device.state, &host);
+    post_sweep(PostSweep::SlotRecheck, || {
+        crate::runtime::objects::slot_recheck::sweep(&device.state, &host)
+    });
     // Beside it and on the same cadence: a page the guest released is judged
     // against the write census, which only moves when this device writes. Also
     // returns immediately when nothing is watched.
-    crate::runtime::released_pages::sweep(&mut device.state);
-    crate::runtime::released_pages::note_levels(&device.state);
+    post_sweep(PostSweep::ReleasedPages, || {
+        crate::runtime::released_pages::sweep(&mut device.state);
+        crate::runtime::released_pages::note_levels(&device.state);
+    });
     // The bind registry's own levels, on that same cadence and read against the
     // `bb_retire_*` routes: what the retirements dropped, and what the survivors
     // look like.
     #[cfg(feature = "backend-vulkan")]
-    crate::runtime::bound_buffers::note_registry_levels(&device.state);
+    post_sweep(PostSweep::BindLevels, || {
+        crate::runtime::bound_buffers::note_registry_levels(&device.state)
+    });
     // The present-completion ack, re-homed off the QEMU paint — ONLY while the
     // host window is the display. With the window live no per-present
     // `ScanoutUpdate` is enqueued, so `display_surface::device_scanout_copy` —
@@ -642,6 +656,7 @@ pub fn device_drain(id: u64) -> bool {
     if device.state.pending.host_action_yield {
         slot.present_action_pending.store(true, Ordering::Release);
     }
+    crate::runtime::drain::note_drain_exit(busy_end_us, false);
     true
 }
 
@@ -698,28 +713,13 @@ pub fn device_poll(id: u64) -> bool {
     slot.vbl_page_size
         .store(device.state.page_size(), Ordering::Release);
     // Census both source polls and the independently time-gated VBL rate.
-    // Drive the resident idle-drain off the poll heartbeat, which ticks even when
-    // the guest stops compositing (a static page means no publishes at all).
-    // A publish-clocked drain froze there, pinning a burst's ~260
-    // stale residents (~516 MiB) for the guest lifetime; the wall clock keeps
-    // advancing and returns VRAM to baseline. The presented target is kept alive
-    // by identity so it is never reclaimed from under the display. The engine
-    // throttles the actual reclaim to IDLE_DRAIN_INTERVAL_MS internally.
+    // Drive bounded maintenance from the poll heartbeat, which ticks even when
+    // the guest stops publishing. The wall clock returns already-dead resources
+    // and free-pool memory; it has no authority over live residency, which is
+    // governed by resource lifetime and allocation pressure.
     #[cfg(feature = "backend-vulkan")]
     {
-        let present = &device.state.present;
-        let display_id = present.frame_valid.then(|| {
-            crate::runtime::present_identity::surface_identity(
-                &device.state,
-                present.frame_mapping,
-                present.frame_width,
-                present.frame_height,
-            )
-        });
-        crate::backend::vulkan::engine::maintain_idle_residents(
-            display_id.as_ref(),
-            crate::observe::elapsed_ms() as u64,
-        );
+        crate::backend::vulkan::engine::maintain_resources(crate::observe::elapsed_ms() as u64);
     }
     // Pre-boundary early-console → host window (headless-safe: the heartbeat
     // drives poll even under -display none). No-op post-boundary or with no
@@ -790,8 +790,18 @@ fn vbl_contended_pulse(slot: &BoundDevice) {
 /// their after-drain semantics behind `try_lock`.
 pub fn device_pop_action(id: u64) -> Option<HostAction> {
     let slot = device_slot(id)?;
-    if let Some(a) = slot.prompt_actions.lock().pop_front() {
-        return Some(a);
+    {
+        let mut q = slot.prompt_actions.lock();
+        if let Some(a) = q.pop_front() {
+            // The hop this closes is enqueue-to-BH, so it is banked when the
+            // queue empties rather than per action: an IRQ pulse behind a cursor
+            // move waited for the same BH and would double-count. See
+            // `irq_wait_us`.
+            if q.is_empty() {
+                crate::runtime::drain::note_irq_delivered();
+            }
+            return Some(a);
+        }
     }
     let mut d = slot.inner.try_lock()?;
     d.actions.pop_front()

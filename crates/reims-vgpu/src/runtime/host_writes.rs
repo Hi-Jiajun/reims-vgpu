@@ -51,8 +51,10 @@
 //!
 //! # Shape
 //!
-//! A per-page last-write epoch. `wrote_any_since` is one lookup per page the
-//! reader names, and it has **no horizon**: however long ago the reader last
+//! A per-page last-write epoch in lazily allocated chunks. One chunk occupies
+//! one minimum supported host page; a contiguous surface therefore hashes its
+//! chunk once and indexes page cells directly instead of hashing every GPA.
+//! `wrote_any_since` has **no horizon**: however long ago the reader last
 //! looked, the answer is exact.
 //!
 //! It was a ring of the last 64 writes, walked back to the reader's mark, until
@@ -72,20 +74,16 @@
 //! agrees ~950 times across three boots. That audit, not a second copy of this
 //! predicate, is the standing alarm here.
 //!
-//! Everything still fails closed. A write that cannot name its pages, and a
-//! reader older than the one event that can clear this record, both answer
-//! "assume written".
+//! Everything still fails closed. A write that cannot name its pages answers
+//! "assume written". Named page epochs have no horizon and are never cleared.
 
 /// Why [`HostWrites::wrote_any_since`] could not call a window quiet.
 ///
-/// Causes used to share one `true`, and only the first of them means the bytes
-/// under the reader's pages actually moved. The others are this type's
-/// fail-closed rule firing — a correct answer to "can you rule this out", and a
-/// very different thing to report. A boot that reads mostly `Unnamed` says its
-/// writers are not naming their pages; one that reads any `Forgotten` at all
-/// says [`PageEpochs::PAGES`] is too small for the write rate; one that reads
-/// mostly `Overlap` says the device really is writing the windows it samples,
-/// and only then is there nothing to reclaim here.
+/// Causes used to share one `true`, and only `Overlap` means the bytes under the
+/// reader's pages actually moved. `Unnamed` is the fail-closed answer when a
+/// writer loses its allocation identity. Keeping the two distinct says whether
+/// a workload really overlaps a cached window or whether a writer failed to
+/// name its pages.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostWriteVerdict {
     /// Nothing this device recorded touched these pages.
@@ -95,14 +93,6 @@ pub enum HostWriteVerdict {
     /// A writer that could not say which pages it landed in, so every reader
     /// older than it must assume its own.
     Unnamed,
-    /// The record was cleared for reaching its bound and no longer holds the
-    /// writes this reader is asking about.
-    ///
-    /// The last remnant of the ring's horizon, and the only one left: it can now
-    /// fire only on a whole-record reset rather than on every ask that reaches
-    /// past 64 writes. Six rails read it **zero**. A non-zero reading is an
-    /// alarm on the bound, not a normal cost.
-    Forgotten,
 }
 
 impl HostWriteVerdict {
@@ -119,7 +109,6 @@ impl HostWriteVerdict {
             Self::Quiet => "gw_hw_quiet",
             Self::Overlap => "gw_hw_overlap",
             Self::Unnamed => "gw_hw_unnamed",
-            Self::Forgotten => "gw_hw_forgotten",
         }
     }
 }
@@ -135,14 +124,12 @@ impl HostWriteVerdict {
 /// guest memory re-read per boot, and cutting them took the rail from 17.9 to
 /// 23.6 frames a second.
 ///
-/// # Fail-closed, in the two ways that are left
+/// # Fail-closed
 ///
 /// A write that cannot name its pages sets [`Self::unnamed_at`], and every
-/// reader older than it is refused. Reaching [`Self::PAGES`] clears the whole
-/// map and sets [`Self::reset_at`], and every reader older than *that* is
-/// refused. Shedding entries one page at a time would answer `Quiet` for a page
-/// that was written, which is the direction that loses a frame, so it is not
-/// done.
+/// reader older than it is refused. Named pages are never shed: forgetting one
+/// would answer `Quiet` for a page that was written, which is the direction that
+/// loses a frame.
 ///
 /// # What watches it
 ///
@@ -153,40 +140,81 @@ impl HostWriteVerdict {
 /// run** before this record — it needs 64 consecutive vouched binds and the
 /// ring's refusal rate meant the run never happened — and it now completes ~950
 /// times across three boots with `gw_audit_unsound` at zero.
-#[derive(Default, Debug)]
+#[derive(Debug, Default)]
 struct PageEpochs {
-    /// Last epoch at which this device wrote each page it has ever written.
-    last_write: std::collections::HashMap<u64, u64>,
+    /// Last epoch at which this device wrote each guest page. The page number
+    /// itself selects a chunk and a cell; only populated chunks are allocated.
+    chunks: std::collections::HashMap<u64, Box<EpochChunk>>,
     /// Newest write that could not name its pages. Fail-closed for any reader
     /// older than it, exactly as the ring's `Unknown` entry is.
     unnamed_at: u64,
-    /// Newest epoch at which the map was cleared for reaching [`Self::PAGES`].
-    ///
-    /// Clearing is the only sound way to shed entries: forgetting *one* page
-    /// would answer `Quiet` for a page that was written, which is the direction
-    /// that loses frames. So the whole map goes and every reader older than the
-    /// reset is refused, which is the ring's own failure mode confined to a rare
-    /// event instead of a per-ask one.
-    reset_at: u64,
+}
+
+/// One minimum supported guest page per allocation. This is derived from the
+/// project's page geometry rather than from a workload size.
+const EPOCH_CHUNK_BYTES: usize = 1usize << crate::model::PAGE_SHIFT_X86;
+const EPOCHS_PER_CHUNK: usize = EPOCH_CHUNK_BYTES / std::mem::size_of::<u64>();
+const _: () = assert!(EPOCHS_PER_CHUNK.is_power_of_two());
+
+#[derive(Debug)]
+struct EpochChunk {
+    /// Epoch that covers every cell. A later partial write lives in `cells`;
+    /// readers take whichever is newer.
+    all_at: u64,
+    cells: [u64; EPOCHS_PER_CHUNK],
+}
+
+impl Default for EpochChunk {
+    fn default() -> Self {
+        Self {
+            all_at: 0,
+            cells: [0; EPOCHS_PER_CHUNK],
+        }
+    }
 }
 
 impl PageEpochs {
-    /// The most pages the map will hold before it resets.
-    ///
-    /// A 1080p scanout is ~2 000 pages, so this is a few hundred distinct
-    /// full-screen surfaces' worth. Sized to make `hw_shadow_reset` a rare event
-    /// rather than to fit a measurement — if it is not rare, that counter says
-    /// so and the shadow's own verdict degrades to the ring's.
-    const PAGES: usize = 1 << 20;
-
-    fn note_pages(&mut self, pages: &[u64], epoch: u64) {
-        if self.last_write.len().saturating_add(pages.len()) > Self::PAGES {
-            self.last_write.clear();
-            self.reset_at = epoch;
-            crate::runtime::drain::note_store_route("hw_shadow_reset");
+    fn note_page_range(&mut self, mut page: u64, mut count: usize, epoch: u64) {
+        while count != 0 {
+            let chunk_key = page / EPOCHS_PER_CHUNK as u64;
+            let slot = (page % EPOCHS_PER_CHUNK as u64) as usize;
+            let take = count.min(EPOCHS_PER_CHUNK - slot);
+            let chunk = self
+                .chunks
+                .entry(chunk_key)
+                .or_insert_with(|| Box::new(EpochChunk::default()));
+            if slot == 0 && take == EPOCHS_PER_CHUNK {
+                chunk.all_at = epoch;
+            } else {
+                chunk.cells[slot..slot + take].fill(epoch);
+            }
+            page += take as u64;
+            count -= take;
         }
-        for &p in pages {
-            self.last_write.insert(p, epoch);
+    }
+
+    fn note_pages<I>(&mut self, pages: I, epoch: u64, page_shift: u32)
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        let mut pages = pages.into_iter().peekable();
+        while let Some(gpa) = pages.next() {
+            let page = gpa >> page_shift;
+            let chunk_key = page / EPOCHS_PER_CHUNK as u64;
+            let chunk = self
+                .chunks
+                .entry(chunk_key)
+                .or_insert_with(|| Box::new(EpochChunk::default()));
+            let slot = (page % EPOCHS_PER_CHUNK as u64) as usize;
+            chunk.cells[slot] = epoch;
+            while pages
+                .peek()
+                .is_some_and(|&next| (next >> page_shift) / EPOCHS_PER_CHUNK as u64 == chunk_key)
+            {
+                let gpa = pages.next().expect("peeked page");
+                let slot = ((gpa >> page_shift) % EPOCHS_PER_CHUNK as u64) as usize;
+                chunk.cells[slot] = epoch;
+            }
         }
     }
 
@@ -195,36 +223,81 @@ impl PageEpochs {
     }
 
     /// The verdict this map would give, in the ring's own vocabulary.
-    fn verdict(&self, since: u64, pages: &[u64]) -> HostWriteVerdict {
+    fn verdict(&self, since: u64, pages: &[u64], page_shift: u32) -> HostWriteVerdict {
         if since < self.unnamed_at {
             return HostWriteVerdict::Unnamed;
         }
-        if since < self.reset_at {
-            return HostWriteVerdict::Forgotten;
-        }
-        if pages
-            .iter()
-            .any(|p| self.last_write.get(p).is_some_and(|&e| e > since))
-        {
-            return HostWriteVerdict::Overlap;
+        let mut first = 0usize;
+        while first < pages.len() {
+            let page = pages[first] >> page_shift;
+            let chunk_key = page / EPOCHS_PER_CHUNK as u64;
+            let mut end = first + 1;
+            while end < pages.len()
+                && (pages[end] >> page_shift) / EPOCHS_PER_CHUNK as u64 == chunk_key
+            {
+                end += 1;
+            }
+            if let Some(chunk) = self.chunks.get(&chunk_key) {
+                if chunk.all_at > since {
+                    return HostWriteVerdict::Overlap;
+                }
+                for &gpa in &pages[first..end] {
+                    let slot = ((gpa >> page_shift) % EPOCHS_PER_CHUNK as u64) as usize;
+                    if chunk.cells[slot] > since {
+                        return HostWriteVerdict::Overlap;
+                    }
+                }
+            }
+            first = end;
         }
         HostWriteVerdict::Quiet
+    }
+
+    #[cfg(test)]
+    fn recorded_pages(&self) -> usize {
+        self.chunks
+            .values()
+            .map(|chunk| {
+                if chunk.all_at != 0 {
+                    EPOCHS_PER_CHUNK
+                } else {
+                    chunk.cells.iter().filter(|&&epoch| epoch != 0).count()
+                }
+            })
+            .sum()
     }
 }
 
 /// Which guest pages this device has written, and when.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct HostWrites {
     /// Monotonic stamp; a reader records the value current at its own read and
     /// asks later whether anything newer touched its pages. Never 0 once any
     /// write has happened, so 0 is usable as "never looked".
     epoch: u64,
+    /// Page addresses are normalized at the geometry of this guest, so arm64's
+    /// 16 KiB pages occupy one cell rather than four sparse 4 KiB cells.
+    page_shift: u32,
     /// The record itself. See [`PageEpochs`] for why it is page-keyed and what
     /// watches it.
     pages: PageEpochs,
 }
 
+impl Default for HostWrites {
+    fn default() -> Self {
+        Self::new(crate::model::PAGE_SHIFT_X86)
+    }
+}
+
 impl HostWrites {
+    pub fn new(page_shift: u32) -> Self {
+        Self {
+            epoch: 0,
+            page_shift,
+            pages: PageEpochs::default(),
+        }
+    }
+
     /// The stamp a reader records beside a copy it has just taken.
     pub fn epoch(&self) -> u64 {
         self.epoch
@@ -243,7 +316,9 @@ impl HostWrites {
     pub fn note_mapping(&mut self, pages: Option<&[u64]>) {
         self.epoch = self.epoch.wrapping_add(1);
         match pages {
-            Some(p) => self.pages.note_pages(p, self.epoch),
+            Some(p) => self
+                .pages
+                .note_pages(p.iter().copied(), self.epoch, self.page_shift),
             None => self.pages.note_unknown(self.epoch),
         }
     }
@@ -251,7 +326,37 @@ impl HostWrites {
     /// Record a write covering exactly `pages` (page-aligned guest addresses).
     pub fn note_pages(&mut self, pages: Vec<u64>) {
         self.epoch = self.epoch.wrapping_add(1);
-        self.pages.note_pages(&pages, self.epoch);
+        self.pages.note_pages(pages, self.epoch, self.page_shift);
+    }
+
+    /// Record an already-resolved page iterator without materializing a second
+    /// allocation. The caller retains ownership of the allocation identity;
+    /// this type owns only its page-exact epochs.
+    pub fn note_page_iter<I>(&mut self, pages: I)
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.pages.note_pages(pages, self.epoch, self.page_shift);
+    }
+
+    /// Record the exact page runs retained with an admitted guest allocation.
+    /// The run partition was derived once with the resource, so a repeated
+    /// Store updates slices rather than rebuilding adjacency page by page.
+    pub fn note_footprint(
+        &mut self,
+        footprint: &crate::runtime::guest_ram::GuestPageFootprint,
+    ) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if footprint.page_size() != (1u64 << self.page_shift) {
+            self.pages.note_unknown(self.epoch);
+            return;
+        }
+        for run in footprint.runs() {
+            let first_page = footprint.pages()[run.start] >> self.page_shift;
+            self.pages
+                .note_page_range(first_page, run.end - run.start, self.epoch);
+        }
     }
 
     /// Record a write whose pages are not known. Invalidates every reader older
@@ -261,25 +366,22 @@ impl HostWrites {
         self.pages.note_unknown(self.epoch);
     }
 
-
     /// Has this device written any of `pages` since `since`, and if so on what
     /// grounds?
     ///
     /// `since` is a value previously returned by [`Self::epoch`]. Everything it
-    /// cannot decide answers as written, and names which of the two
-    /// undecidables it was: a write that named no pages, or a record cleared for
-    /// reaching its bound. Only [`HostWriteVerdict::Overlap`] says a recorded
-    /// write actually covers one of `pages`.
+    /// cannot decide answers as written. Only [`HostWriteVerdict::Overlap`]
+    /// says a recorded write actually covers one of `pages`;
+    /// [`HostWriteVerdict::Unnamed`] says a writer could not name its pages.
     ///
-    /// One lookup per page, and no walk — there is nothing to walk back to. The
-    /// ring this replaced took `&DeviceState` to resolve a mapping-named write
-    /// at read time; the pages are captured when the write happens now, so no
-    /// state is needed and a mapping re-pointed afterwards cannot make the
-    /// answer wrong.
+    /// One chunk lookup per contiguous run and one direct cell read per page;
+    /// there is nothing to walk back to. The ring this replaced took
+    /// `&DeviceState` to resolve a mapping-named write at read time; the pages
+    /// are captured when the write happens now, so no state is needed and a
+    /// mapping re-pointed afterwards cannot make the answer wrong.
     pub fn wrote_any_since(&self, since: u64, pages: &[u64]) -> HostWriteVerdict {
-        self.pages.verdict(since, pages)
+        self.pages.verdict(since, pages, self.page_shift)
     }
-
 }
 
 #[cfg(test)]
@@ -295,7 +397,10 @@ mod tests {
         let mut w = HostWrites::default();
         let mark = w.epoch();
         w.note_pages(vec![9 * P, 10 * P]);
-        assert_eq!(w.wrote_any_since(mark, &[3 * P, 4 * P]), HostWriteVerdict::Quiet);
+        assert_eq!(
+            w.wrote_any_since(mark, &[3 * P, 4 * P]),
+            HostWriteVerdict::Quiet
+        );
         assert_eq!(
             w.wrote_any_since(mark, &[4 * P, 10 * P]),
             HostWriteVerdict::Overlap
@@ -311,7 +416,10 @@ mod tests {
         let after = w.epoch();
         assert_eq!(w.wrote_any_since(after, &[4 * P]), HostWriteVerdict::Quiet);
         w.note_pages(vec![4 * P]);
-        assert_eq!(w.wrote_any_since(after, &[4 * P]), HostWriteVerdict::Overlap);
+        assert_eq!(
+            w.wrote_any_since(after, &[4 * P]),
+            HostWriteVerdict::Overlap
+        );
     }
 
     /// A writer that could not name its pages must invalidate everything older.
@@ -327,7 +435,10 @@ mod tests {
             "a writer that named no pages must be reported as unnamed and not as \
              a write that landed in this window"
         );
-        assert_eq!(w.wrote_any_since(w.epoch(), &[999 * P]), HostWriteVerdict::Quiet);
+        assert_eq!(
+            w.wrote_any_since(w.epoch(), &[999 * P]),
+            HostWriteVerdict::Quiet
+        );
     }
 
     /// **There is no horizon.** A reader whose mark is arbitrarily old still
@@ -362,22 +473,92 @@ mod tests {
         for _ in 0..10_000 {
             w.note_pages(vec![4 * P, 5 * P]);
         }
-        assert_eq!(w.pages.last_write.len(), 2);
-        assert_eq!(w.wrote_any_since(w.epoch(), &[4 * P]), HostWriteVerdict::Quiet);
+        assert_eq!(w.pages.recorded_pages(), 2);
+        assert_eq!(
+            w.wrote_any_since(w.epoch(), &[4 * P]),
+            HostWriteVerdict::Quiet
+        );
     }
 
-    /// Shedding entries one page at a time would answer `Quiet` for a page that
-    /// was written, which is the direction that loses a frame. The map clears
-    /// whole and refuses everything older instead.
+    /// Chunks stay exact across their boundary and never impose a record
+    /// horizon. A write on the far side cannot displace an older page.
     #[test]
-    fn a_full_record_clears_whole_and_refuses_every_older_reader() {
-        let mut s = PageEpochs::default();
-        let pages: Vec<u64> = (0..PageEpochs::PAGES as u64).map(|i| i * P).collect();
-        s.note_pages(&pages, 1);
-        assert_eq!(s.verdict(0, &[3 * P]), HostWriteVerdict::Overlap);
-        s.note_pages(&[u64::from(u32::MAX) * P], 2);
-        assert_eq!(s.verdict(0, &[3 * P]), HostWriteVerdict::Forgotten);
-        assert_eq!(s.verdict(2, &[3 * P]), HostWriteVerdict::Quiet);
+    fn chunk_boundaries_preserve_every_older_page() {
+        let mut w = HostWrites::default();
+        let mark = w.epoch();
+        let far = (EPOCHS_PER_CHUNK as u64 * 4096) + 3 * P;
+        w.note_pages(vec![3 * P, far]);
+        assert_eq!(w.wrote_any_since(mark, &[3 * P]), HostWriteVerdict::Overlap);
+        assert_eq!(w.wrote_any_since(mark, &[far]), HostWriteVerdict::Overlap);
+        assert_eq!(w.pages.recorded_pages(), 2);
+    }
+
+    #[test]
+    fn a_retained_full_chunk_is_one_epoch_then_partial_writes_stay_page_exact() {
+        let pages: std::sync::Arc<[u64]> = (0..EPOCHS_PER_CHUNK as u64)
+            .map(|page| page * P)
+            .collect::<Vec<_>>()
+            .into();
+        let footprint = crate::runtime::guest_ram::GuestPageFootprint::new(pages, P)
+            .expect("one contiguous allocation chunk");
+        let mut w = HostWrites::default();
+        let before = w.epoch();
+        w.note_footprint(&footprint);
+        let after_full = w.epoch();
+        assert_eq!(w.pages.recorded_pages(), EPOCHS_PER_CHUNK);
+        assert_eq!(
+            w.wrote_any_since(before, &[(EPOCHS_PER_CHUNK as u64 - 1) * P]),
+            HostWriteVerdict::Overlap
+        );
+        assert_eq!(
+            w.wrote_any_since(after_full, &[7 * P]),
+            HostWriteVerdict::Quiet
+        );
+
+        w.note_pages(vec![7 * P]);
+        assert_eq!(
+            w.wrote_any_since(after_full, &[7 * P]),
+            HostWriteVerdict::Overlap
+        );
+        assert_eq!(
+            w.wrote_any_since(after_full, &[8 * P]),
+            HostWriteVerdict::Quiet,
+            "a later partial write must not refresh the chunk-wide epoch"
+        );
+    }
+
+    #[test]
+    fn a_retained_footprint_with_other_page_geometry_fails_closed() {
+        let pages: std::sync::Arc<[u64]> = [0x4000].into();
+        let footprint = crate::runtime::guest_ram::GuestPageFootprint::new(pages, 1 << 14)
+            .expect("arm64 footprint");
+        let mut w = HostWrites::default();
+        let mark = w.epoch();
+        w.note_footprint(&footprint);
+        assert_eq!(
+            w.wrote_any_since(mark, &[0x9000]),
+            HostWriteVerdict::Unnamed
+        );
+    }
+
+    /// The page index follows the guest geometry carried by `DeviceState`.
+    /// Arm64's four-times-wider pages remain two records here, not eight sparse
+    /// x86-sized cells that merely happen to give the same verdict.
+    #[test]
+    fn arm64_pages_use_arm64_geometry() {
+        const ARM_PAGE: u64 = 1 << crate::model::PAGE_SHIFT_ARM64E;
+        let mut w = HostWrites::new(crate::model::PAGE_SHIFT_ARM64E);
+        let mark = w.epoch();
+        w.note_pages(vec![3 * ARM_PAGE, 4 * ARM_PAGE]);
+        assert_eq!(w.pages.recorded_pages(), 2);
+        assert_eq!(
+            w.wrote_any_since(mark, &[4 * ARM_PAGE]),
+            HostWriteVerdict::Overlap
+        );
+        assert_eq!(
+            w.wrote_any_since(mark, &[5 * ARM_PAGE]),
+            HostWriteVerdict::Quiet
+        );
     }
 
     /// A mapping re-pointed after the write is answered exactly, because the
@@ -414,11 +595,7 @@ mod tests {
     /// Only `Quiet` is a permission. A new variant must not be readable as one.
     #[test]
     fn every_verdict_but_quiet_counts_as_written() {
-        for v in [
-            HostWriteVerdict::Overlap,
-            HostWriteVerdict::Unnamed,
-            HostWriteVerdict::Forgotten,
-        ] {
+        for v in [HostWriteVerdict::Overlap, HostWriteVerdict::Unnamed] {
             assert!(v.wrote(), "{v:?}");
         }
         assert!(!HostWriteVerdict::Quiet.wrote());

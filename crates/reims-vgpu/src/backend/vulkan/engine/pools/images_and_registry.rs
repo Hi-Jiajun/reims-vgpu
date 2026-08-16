@@ -1,126 +1,17 @@
-//! The resident-image registry and the storage images beside it — the
-//! [`ResourcePools`] methods whose unit is a *guest identity* rather than a
-//! slot.
+//! Guest-identity keyed render and storage residents.
 //!
-//! A registry entry outlives any one submission. The guest names the same
-//! surface across frames, so an entry is keyed by `TargetIdentity`, held alive
-//! by a pin count, and reclaimed by an idle drain or an allocation failure
-//! rather than by a fence — which is why none of this sits with the ring in
-//! [`super::submission_and_buffers`].
-//!
-//! The two meet in one place: the idle-drain planner over there picks its
-//! victims out of the registry order maintained here.
-//!
-//! `use super::*` is the seam. This is an `impl` chapter of the module that
-//! declares `ResourcePools` and owns its fields, not a layer beneath it.
+//! A live entry outlives submissions and remains resident until its serialized
+//! resource ends, its identity is explicitly replaced, or allocation pressure
+//! requires recovery. Fences govern in-flight safety; elapsed time does not end
+//! resource lifetime.
 
 use super::*;
+use crate::backend::vulkan::engine::types::TargetKeyDivergence;
 
-/// Band how long a resident had gone untouched before something read it,
-/// against the cutoff that would have destroyed it.
-///
-/// The idle drain terminally destroys any non-pinned resident untouched for
-/// `IDLE_TARGET_AGE_MS`, and nothing recreates a resident's content — so a draw
-/// that samples one afterwards refuses permanently. What stops that today is
-/// that a resident being read is touched by the read
-/// ([`ResourcePools::registry_note_sampled_use`]), which only helps while the
-/// gaps between reads stay under the cutoff. A guest that renders a layer, has
-/// it occluded for longer than that, and then reveals it is the shape that loses
-/// it.
-///
-/// `sampled_resident_missing` reading zero cannot say whether that is far away
-/// or one slow frame away — it is a drop counter, and this project's own rule is
-/// that a drop counter reading zero is not a measurement: a gap that peaks at
-/// 50 ms and one that peaks at 1900 ms both report zero, and only one of them
-/// says the cutoff has headroom. This is the reach that separates them, in time
-/// rather than in slots, and it is the same instrument the bind tables already
-/// have as their `reach_route` bands.
-///
-/// Read `resident_resample_past_cutoff` as the alarm: a resident that was read
-/// after sitting longer than its own drain cutoff survived only because the
-/// drain is throttled to `IDLE_TARGET_DRAIN_MAX_PER_CALL` per pass and had not
-/// reached it yet. A non-zero reading there is the argument for changing the
-/// drain — it does not mean content was lost, it means the margin is gone.
-///
-/// Bands are fractions of `IDLE_TARGET_AGE_MS` rather than absolute
-/// milliseconds, so retuning the cutoff moves them with it and no reading is
-/// ever quoted against a bound it did not come from. Division rather than
-/// multiplication so a large gap cannot overflow the comparison.
-///
-/// # First reading, and it is not the comfortable one
-///
-/// Driven x86/PCI boot, `web-content-probe --churn 1`, whole run, against
-/// `IDLE_TARGET_AGE_MS` = 2000 ms:
-///
-/// ```text
-///   lt_eighth_cutoff   (<250 ms)      24643
-///   lt_quarter_cutoff  (250-499 ms)     413
-///   lt_half_cutoff     (500-999 ms)       5
-///   under_cutoff       (1000-1999 ms)     1
-///   past_cutoff        (>=2000 ms)        0
-/// ```
-///
-/// The distribution is overwhelmingly under an eighth of the cutoff, which is
-/// the answer that would have been assumed. The reading that matters is the
-/// **1**: one resample arrived after its resident had sat between 1000 and
-/// 1999 ms, so somewhere between half the budget and none of it was left. The
-/// drain destroys at `last_touch_ms <= now - cutoff` and is throttled to
-/// `IDLE_TARGET_DRAIN_MAX_PER_CALL` per pass, so that resident was not yet a
-/// victim — but it is not the case that this workload stays an order of
-/// magnitude clear of the cutoff, which is what `sampled_resident_missing=0`
-/// on its own invites you to conclude.
-///
-/// Finer bands past the half mark are what would say whether that one sample sat
-/// at 1.0 s or at 1.9 s, and those are very different margins. This does not
-/// resolve it; it establishes that the question is live.
-///
-/// # `past_cutoff` has since fired, and it does not mean what it was written to
-///
-/// Two later driven x86/PCI boots, window-drag probe, quiesced, the second on a
-/// guest running a page animation:
-///
-/// ```text
-///                        boot A     boot B
-///   resamples, all bands   48738     392534
-///   past_cutoff                1          4
-///   resample_peak_ms        2007       2005
-/// ```
-///
-/// So both signals the top of this doc and [`IDLE_TARGET_AGE_MS`] name as the
-/// argument for changing the drain are now non-zero, routinely, on ordinary
-/// desktop work. Read that as the margin being gone, which it is — and not as
-/// work being at risk, which it no longer is. Two things changed underneath the
-/// alarm since it was written:
-///
-/// - **The class it guarded is closed.** Every draw that stores into a target
-///   marks it sole-copy ([`ResourcePools::registry_mark_ready`]), and only a
-///   writeback clears it, so a resident the drain is *allowed* to take has
-///   demonstrably been copied out to the guest's own pages. What a reclaim costs
-///   is the re-fetch, not the pixels — and `sampled_resident_missing` was 0 on
-///   both boots above, as it must be.
-/// - **The re-fetch is the reading worth having**, and it is much larger than
-///   these four: `t11sample_reclaimed_from_pages` was 2085 and 1937 on the same
-///   two boots, with 88.5 % of boot A's coming back more than 8 s after the
-///   destroy. The drain is churning residents the workload returns to, while
-///   `peak_mib=81` and `slab_mib=39/136` say VRAM was under no pressure at all.
-///
-/// Neither of those is fixed by moving this cutoff, and
-/// [`IDLE_TARGET_AGE_MS`]'s own history says why a population gate is not the
-/// answer either. What they change is what a `past_cutoff` reading is evidence
-/// *of*: a cost, measurable in re-fetches, rather than an imminent loss.
-///
-/// # Reading the count against `resident_samples`
-///
-/// The band total is about **twice** `sampled_gpu_binds` (25062 against 12531 on
-/// the run above, exactly 2x). That is not a discrepancy:
-/// [`ResourcePools::registry_note_sampled_use`] is called from two sites per
-/// draw — the pre-pass loop that marks every sampled target before the render
-/// target is ensured, and the resolve loop that binds them — while
-/// `sampled_gpu_binds` increments once per bind. So these bands count *touches*
-/// and `resident_samples` counts *binds*. Do not divide one by the other and
-/// call the result a rate.
+/// Band observed intervals between sampled uses. This is a reuse-distance
+/// diagnostic only; no residency decision reads it.
 fn resident_resample_band(idle_ms: u64) -> &'static str {
-    let cutoff = IDLE_TARGET_AGE_MS;
+    let cutoff = IDLE_MAINTENANCE_START_MS;
     if idle_ms < cutoff / 8 {
         "resident_resample_lt_eighth_cutoff"
     } else if idle_ms < cutoff / 4 {
@@ -143,21 +34,29 @@ fn resident_resample_band(idle_ms: u64) -> &'static str {
 /// patch afterwards.
 struct NewResident {
     image: vk::Image,
-    memory: vk::DeviceMemory,
+    memory: ResidentMemory,
     view: vk::ImageView,
     /// `vk::Framebuffer::null()` for a resident that is never bound as a
     /// standalone single-RT target — see
     /// [`ResidentTargetSlot::owed_framebuffer`], which is what every destroy
     /// path asks instead of testing this field itself.
     framebuffer: vk::Framebuffer,
-    /// Null exactly when `framebuffer` is: the pass a per-slot framebuffer was
-    /// built against, and the thing `registry_ensure` compares to decide
-    /// whether a reused image needs its framebuffer rebuilt.
+    /// Null exactly when `framebuffer` is: the pass handle used to create the
+    /// per-slot framebuffer. Compatibility, not handle identity, decides reuse.
     render_pass: vk::RenderPass,
+    /// `None` exactly when `framebuffer` is null. Unlike the creation handle,
+    /// this is the Vulkan compatibility identity: actions, layouts, and
+    /// dependencies can change without replacing it between encoder records.
+    framebuffer_compatibility: Option<FramebufferCompatibilityKey>,
     width: u32,
     height: u32,
+    sample_count: u32,
     generation: u64,
-    color_format: vk::Format,
+    format: translate::pixel::ResidentFormat,
+    /// The view in `format.declared()`, when the declaration needs one of its
+    /// own. `None` says the declaration and the allocation are one format and
+    /// `view` serves both, which is every format but the two sRGB spellings.
+    attachment_view: Option<vk::ImageView>,
 }
 
 impl ResourcePools {
@@ -203,7 +102,7 @@ impl ResourcePools {
                 None,
             )
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateStorageImage, e)))?;
-        counters.note_create();
+        counters.note_create(CreateSite::StorageImage);
         let req = ctx.device.get_image_memory_requirements(image);
         let mt = ctx
             .memory_type_for(req.memory_type_bits, req.size, MemoryClass::DeviceLocal)
@@ -270,7 +169,7 @@ impl ResourcePools {
                 ctx.device.destroy_image(image, None);
                 DrawError::VkCall(VkCall::new(VkOp::PoolsCreateStorageImageView, e))
             })?;
-        counters.note_create();
+        counters.note_create(CreateSite::StorageImageView);
         let slot = StorageImageSlot {
             image,
             memory,
@@ -297,7 +196,7 @@ impl ResourcePools {
     ) -> Result<ResidentStorageImageUse, DrawError> {
         // A shape change re-keys the identity, and one identity holds one slot,
         // so the old image is destroyed. Every other removal in this registry
-        // skips a pinned resident — the cap sweep and the age drain both do —
+        // skips a pinned resident, as allocation-pressure recovery does,
         // because a pin means the content owes a deferred writeback and exists
         // nowhere but that image. This path did not, so a re-shape between a
         // Store and its flush discarded accepted guest output with nothing said,
@@ -391,8 +290,7 @@ impl ResourcePools {
     /// the re-key is safe to perform.
     ///
     /// Split out from [`ResourcePools::acquire_resident_storage_image`] so the
-    /// pin check is unit-testable without a device, the same reason
-    /// `take_aged_storage_residents` is split from its disposal half.
+    /// pin check is unit-testable without a device.
     pub(crate) fn compute_rekey_refusal(
         &self,
         identity: &ComputeStorageResidencyKey,
@@ -434,8 +332,8 @@ impl ResourcePools {
     /// prerequisite that was missing — and the reason the two registries did not
     /// change together — is that `reclaim_for_allocation_retry` gave back target
     /// residents and recycle pools and nothing from here, so removing the count
-    /// alone would have left this population with the age drain trimming it and
-    /// nothing to hand back when an allocation failed.
+    /// alone would have left this population with nothing to hand back when an
+    /// allocation failed.
     /// [`Self::reclaim_compute_storage_for_allocation_retry`] is that half.
     ///
     /// Ordering is `compute_storage_order`, so the result is deterministic and
@@ -565,23 +463,14 @@ impl ResourcePools {
         );
     }
 
-    /// Record that something read this resident, refreshing its reclaim stamp.
+    /// Record that something read this resident for reuse-distance diagnostics.
     ///
     /// Reading a resident is using it. The three read-only accessors below all
     /// mean "a guest chain is about to consume this image" — the stage-time
     /// guest-read skip, the copy-on-sample gate, and the flush/sample snapshot —
     /// so a produce-once/sample-many resident that is never dispatched into
-    /// again is in continuous use while looking stone-cold to both reclaim
-    /// rules, which read `last_touch_ms`: the cap sweep takes the minimum and
-    /// the age drain compares it against its cutoff.
-    ///
-    /// The sibling target registry had exactly this defect and names it at its
-    /// own call site: "aging it out between two attempts is how a recoverable
-    /// not-ready became a permanent missing." Here the loss is a refused
-    /// dispatch — `ResidentSampleAbsent` or `ResidentSeedGenerationLost` — so
-    /// the stamp is written by the accessors themselves rather than by their
-    /// callers, because a caller that forgets is indistinguishable from this
-    /// bug.
+    /// again remains observable even when it is never dispatched into. No
+    /// reclaim decision reads this timestamp.
     fn note_compute_resident_use(&mut self, identity: &ComputeStorageResidencyKey) {
         let touch = self.idle_clock_ms;
         if let Some(resident) = self.compute_storage_registry.get_mut(identity) {
@@ -604,7 +493,7 @@ impl ResourcePools {
     ) {
         if let Some(resident) = self.compute_storage_registry.get_mut(identity) {
             resident.generation = generation;
-            resident.access = ResidentAccess::TransferRead;
+            resident.access = ResidentAccess::transfer_read(false);
         }
         // The dispatch just wrote this image, so nothing outside it holds the
         // result yet.
@@ -742,6 +631,126 @@ impl ResourcePools {
         self.registry.get(identity)
     }
 
+    /// The generation the registry holds for the *same target* as `identity`,
+    /// when the exact key is absent.
+    ///
+    /// This separates the two things an absent registry entry can mean, which
+    /// otherwise arrive as one word. `None` says nothing in the registry names
+    /// this surface at all — the guest never rendered into it, or its resident
+    /// was reclaimed. `Some(g)` says the target is there and the caller asked
+    /// under a different generation, which is a **key** fault rather than a
+    /// missing target and has an entirely different repair.
+    ///
+    /// A linear scan, on a refusal path only: the registry's own
+    /// `registry_pressure` census reads a peak of about thirty slots.
+    ///
+    /// It also names *how* the closest key differs, because "the generation
+    /// moved" is only one of four ways it can and a boot reading `held=none`
+    /// cannot tell "nothing names this object" from "this object is registered
+    /// under a different extent or namespace". See
+    /// [`crate::backend::vulkan::engine::TargetKeyDivergence`].
+    pub(crate) fn registry_key_divergence(
+        &self,
+        identity: &TargetIdentity,
+    ) -> (TargetKeyDivergence, Option<u64>) {
+        // The finest difference is the closest key, so the ladder is ranked and
+        // minimised over rather than short-circuited: a registry holding both a
+        // resized entry and a re-generated one should report the re-generated
+        // one, whichever the hash map yields first.
+        let rank = |d: TargetKeyDivergence| match d {
+            TargetKeyDivergence::Generation => 0,
+            TargetKeyDivergence::Other => 1,
+            TargetKeyDivergence::Geometry => 2,
+            TargetKeyDivergence::Namespace => 3,
+            TargetKeyDivergence::Absent => 4,
+        };
+        self.registry
+            .keys()
+            .map(|held| (identity.diverges_from(held), Some(held.generation())))
+            // A key in another namespace is not about this object at all, so it
+            // is not a near miss — reporting one would claim the target exists.
+            .filter(|(d, _)| *d != TargetKeyDivergence::Namespace)
+            .min_by_key(|(d, _)| rank(*d))
+            .unwrap_or((TargetKeyDivergence::Absent, None))
+    }
+
+    /// Return the sampled view for a resident image, at the format the guest's
+    /// declaration reaches rather than at the one the bind could spell.
+    ///
+    /// The image allocation is shared by every compatible texture view. Views
+    /// are retained with that allocation because their lifetime is the resource
+    /// lifetime, not one draw, and the finite translated format vocabulary is
+    /// the natural bound on this collection.
+    ///
+    /// **The transfer function comes from the resident and the channel order
+    /// from the bind**, which is [`translate::pixel::sample_view_format`]'s whole
+    /// job — read its doc before changing what is passed in. A sampled bind
+    /// names its format through a `TexelLayout`, which describes stored bytes and
+    /// cannot carry a transfer function, so asking it alone drops the sRGB
+    /// qualifier off every resident that has one. This is the single place that
+    /// decides which view a bind gets, so it is the single place the fold
+    /// belongs; a caller doing it for itself would be the second spelling.
+    pub(crate) unsafe fn registry_sample_view(
+        &mut self,
+        ctx: &DeviceContext,
+        identity: &TargetIdentity,
+        format: vk::Format,
+        counters: &EngineCounters,
+    ) -> Result<Option<vk::ImageView>, DrawError> {
+        let Some(slot) = self.registry.get(identity) else {
+            return Ok(None);
+        };
+        let format = translate::pixel::sample_view_format(format, slot.format.declared());
+        unsafe { self.registry_view(ctx, identity, format, counters) }
+    }
+
+    /// The view over this resident's allocation in exactly `format`, created and
+    /// retained on first ask.
+    ///
+    /// One home for every interpretation of one image, which is what lets
+    /// `slot.view` be the *allocation*-format view and nothing else. That
+    /// choice is load-bearing rather than arbitrary: the recycle pool is keyed
+    /// on the allocation format, so the view that travels with a retired image
+    /// must be the one in that format, and a slot whose stored view was the
+    /// guest's declaration instead would put an sRGB view into a bucket only
+    /// UNORM requests ever take from. Every other interpretation — the render
+    /// pass's attachment view included — is reached through here.
+    ///
+    /// A caller asking for the format the slot was allocated in gets
+    /// `slot.view` and no allocation happens, which is every format this device
+    /// renders to except the two sRGB spellings.
+    unsafe fn registry_view(
+        &mut self,
+        ctx: &DeviceContext,
+        identity: &TargetIdentity,
+        format: vk::Format,
+        counters: &EngineCounters,
+    ) -> Result<Option<vk::ImageView>, DrawError> {
+        let Some(slot) = self.registry.get_mut(identity) else {
+            return Ok(None);
+        };
+        if slot.format.allocation() == format {
+            return Ok(Some(slot.view));
+        }
+        if let Some((_, view)) = slot.alternate_views.iter().find(|(held, _)| *held == format) {
+            return Ok(Some(*view));
+        }
+        let view = unsafe {
+            ctx.device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(slot.image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(super::super::registry_subresource_range(format)),
+                None,
+            )
+        }
+        .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateRegistryView, error)))?;
+        counters.note_create(CreateSite::RegistryImageView);
+        slot.alternate_views.push((format, view));
+        Ok(Some(view))
+    }
+
     /// Forget the resident registered under `identity`, recording `why`, and
     /// hand back the slot that was removed.
     ///
@@ -751,10 +760,8 @@ impl ResourcePools {
     /// `DeviceContext` to dispose what it removes, and the bookkeeping — which
     /// is the part that was diverging — is worth testing without a GPU.
     ///
-    /// Every path that removes a live entry comes through here, including the
-    /// idle drain in [`super::submission_and_buffers`], which disposes on its
-    /// own terms and so is not a [`Self::retire_resident`] caller. It is the
-    /// death counterpart of [`Self::register_resident`], and the pair is why
+    /// Every path that removes a live entry comes through here. It is the death
+    /// counterpart of [`Self::register_resident`], and the pair is why
     /// `registry` and `registry_order` cannot fall out of step.
     ///
     /// `registry_order` is pruned whether or not the map held the entry, which
@@ -814,35 +821,52 @@ impl ResourcePools {
     ///   ago, so it carries no content stamp and no epoch; nothing has
     ///   transitioned it, so its layout is `UNDEFINED`; and no window holds it,
     ///   so it is unpinned. These are not defaults a creation site may pick —
-    ///   `registry_mark_ready`, the type-11 LOAD gate and the idle drain each
-    ///   read one of them, and an arm that guessed differently would be
+    ///   `registry_mark_ready_at` and the type-11 LOAD gate read them, and an arm
+    ///   that guessed differently would be
     ///   answering a question the others think they already asked.
-    /// - **The idle-drain clock belongs to the registry.** `last_touch_ms` comes
-    ///   from `idle_clock_ms`, which the poll heartbeat advances. A creation site
-    ///   that stamped its own value would age against a different clock than the
-    ///   drain reads.
+    /// - **The diagnostic clock belongs to the registry.** `last_touch_ms` comes
+    ///   from `idle_clock_ms`, which the poll heartbeat advances.
     /// - **`registry` and `registry_order` are written together.** They are one
     ///   structure split for lookup and for order. An entry in the map but not
     ///   the order is a resident no sweep can ever choose; one in the order but
     ///   not the map is a victim that frees nothing.
     fn register_resident(&mut self, identity: &TargetIdentity, new: NewResident) {
         let last_touch_ms = self.idle_clock_ms;
+        let guest_backed = new.memory.is_guest_imported();
         self.registry.insert(
             identity.clone(),
             ResidentTargetSlot {
                 image: new.image,
                 memory: new.memory,
                 view: new.view,
+                // Seeded rather than left empty: the declaration's view is one
+                // more interpretation of this allocation, and `alternate_views`
+                // is where every interpretation but the allocation's own lives,
+                // so putting it anywhere else would give `registry_view` a
+                // second place to look and `retire_resident` a view it does not
+                // dispose.
+                alternate_views: new
+                    .attachment_view
+                    .map(|v| vec![(new.format.declared(), v)])
+                    .unwrap_or_default(),
                 framebuffer: new.framebuffer,
                 render_pass: new.render_pass,
+                framebuffer_compatibility: new.framebuffer_compatibility,
                 width: new.width,
                 height: new.height,
+                sample_count: new.sample_count,
                 generation: new.generation,
-                content_ready: false,
+                content_ready: guest_backed,
                 content_epoch: None,
-                access: ResidentAccess::Untouched,
-                color_format: new.color_format,
+                access: if guest_backed {
+                    ResidentAccess::GuestBacking
+                } else {
+                    ResidentAccess::Untouched
+                },
+                format: new.format,
                 pin_count: 0,
+                resource_released: false,
+                resource_owner_count: 0,
                 // Nothing has drawn into it, so it holds no guest work to lose.
                 // A recycled image arrives here too, and its stale contents are
                 // not this identity's content.
@@ -875,13 +899,9 @@ impl ResourcePools {
     /// [`Self::note_resident_reclaimed`]. The primary path was the one that
     /// disposed `old.framebuffer` without asking whether the slot had one.
     ///
-    /// It is not the *only* exit, and reading it as one is how the fourth stayed
-    /// out of step. The idle drain destroys rather than recycles and does not
-    /// count a `target_evict`, both deliberately, so it cannot come through
-    /// here — what it shares is [`Self::unregister_resident`] and
-    /// [`ResidentTargetSlot::owed_framebuffer`], which is why the bookkeeping
-    /// and the null question are each their own function rather than lines in
-    /// this body.
+    /// Resource release also comes through here but is not counted as an
+    /// eviction: the guest ended that lifetime. Bookkeeping and the framebuffer
+    /// null question remain centralized so removal paths cannot diverge.
     unsafe fn retire_resident(
         &mut self,
         ctx: &DeviceContext,
@@ -891,26 +911,38 @@ impl ResourcePools {
     ) -> Option<ResidentTargetSlot> {
         let old = self.unregister_resident(identity, why)?;
         self.dispose_owed_framebuffer(&ctx.device, old.owed_framebuffer());
-        self.dispose(
-            &ctx.device,
-            DeferredHandle::RecycleTarget(FreeTargetImage {
+        for (_, view) in &old.alternate_views {
+            self.dispose(&ctx.device, DeferredHandle::ImageView(*view));
+        }
+        let retired = match &old.memory {
+            ResidentMemory::Recyclable(memory) => DeferredHandle::RecycleTarget(FreeTargetImage {
                 image: old.image,
-                memory: old.memory,
+                memory: *memory,
                 view: old.view,
                 width: old.width,
                 height: old.height,
-                format: old.color_format,
+                sample_count: old.sample_count,
+                format: old.format.allocation(),
             }),
-        );
-        counters
-            .target_evicts
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ResidentMemory::GuestImported { guest } => DeferredHandle::GuestImage {
+                image: old.image,
+                view: old.view,
+                _import: std::sync::Arc::clone(&guest.import),
+            },
+        };
+        self.dispose(&ctx.device, retired);
+        if why != ResidentReclaim::ResourceReleased {
+            counters
+                .target_evicts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         Some(old)
     }
 
     /// Ensure a resident target exists for `identity` with the given geometry + pass.
-    /// Image/memory persist across Load vs Clear render-pass changes; only the
-    /// framebuffer is rebuilt when the pass handle differs.
+    /// Image, memory, and framebuffer persist across compatible render-pass
+    /// changes. In particular, LOAD versus CLEAR does not rebuild a framebuffer;
+    /// formats and subpass attachment shape still partition it.
     ///
     /// This used to take a `protect` identity — a same-draw GPU seed source to
     /// shield from the capacity sweep the admission ran. Nothing is swept on
@@ -926,32 +958,55 @@ impl ResourcePools {
         identity: TargetIdentity,
         width: u32,
         height: u32,
+        sample_count: u32,
         render_pass: vk::RenderPass,
+        framebuffer_compatibility: FramebufferCompatibilityKey,
         generation: u64,
         format: vk::Format,
+        guest_memory: Option<crate::backend::vulkan::engine::GuestTargetMemory>,
         counters: &EngineCounters,
-    ) -> Result<&ResidentTargetSlot, DrawError> {
+    ) -> Result<(&ResidentTargetSlot, vk::ImageView), DrawError> {
         // The format arrives resolved rather than as a channel-order flag, and
         // from the same variable that built `render_pass`'s key — an image and
         // the pass it is attached to must name one format, and deriving it
         // twice from a shared input is how they drift apart.
         //
-        // Compatible geometry + gen + format: reuse image; rebuild FB if pass
-        // changed. A format change must recreate the image, not just the
-        // framebuffer — an RGBA image under a BGRA pass is invalid.
+        // It is the guest's *declaration*, so it carries the transfer function
+        // and the allocation behind it does not. The view handed back beside the
+        // slot is the attachment view, in that declaration; `slot.view` and the
+        // recycle bucket stay in the allocation format. See
+        // [`translate::pixel::ResidentFormat`].
+        let format = translate::pixel::ResidentFormat::of(format);
+        // Compatible geometry + gen + allocation: reuse image; rebuild the FB
+        // only if Vulkan render-pass compatibility changed. A change of
+        // allocation must recreate the image, not just the framebuffer — an RGBA
+        // image under a BGRA pass is invalid.
         if let Some(slot) = self.registry.get(&identity) {
-            if slot.reusable_for(width, height, generation, format) {
-                if slot.render_pass == render_pass {
+            if slot.reusable_for(width, height, sample_count, generation, format) {
+                // Resolved before the fast path rather than inside the rebuild,
+                // because a declaration that changed while the allocation did
+                // not is exactly the case the fast path must *not* take: the
+                // framebuffer it would hand back was built over the previous
+                // interpretation's view.
+                let attachment = unsafe {
+                    self.registry_view(ctx, &identity, format.declared(), counters)?
+                }
+                .expect("the slot reused on the line above is still registered");
+                let slot = self.registry.get(&identity).unwrap();
+                if slot.framebuffer_compatibility == Some(framebuffer_compatibility)
+                    && slot.format == format
+                {
                     counters
                         .gpu_load_hits
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let touch = self.idle_clock_ms;
                     let slot = self.registry.get_mut(&identity).unwrap();
                     slot.last_touch_ms = touch;
-                    return Ok(slot);
+                    return Ok((slot, attachment));
                 }
-                // Same image, new pass → recreate framebuffer only.
-                let view = slot.view;
+                // Same image, new pass or new interpretation → recreate
+                // framebuffer only.
+                let view = attachment;
                 let old_fb = slot.owed_framebuffer();
                 let attachments = [view];
                 let framebuffer = ctx
@@ -968,17 +1023,23 @@ impl ResourcePools {
                     .map_err(|e| {
                         DrawError::VkCall(VkCall::new(VkOp::PoolsCreateRegistryFramebuffer, e))
                     })?;
-                counters.note_create();
+                counters.note_create(CreateSite::RegistryFramebuffer);
                 self.dispose_owed_framebuffer(&ctx.device, old_fb);
                 let slot = self.registry.get_mut(&identity).unwrap();
                 slot.framebuffer = framebuffer;
                 slot.render_pass = render_pass;
+                slot.framebuffer_compatibility = Some(framebuffer_compatibility);
+                // The interpretation this framebuffer was just built over. The
+                // allocation is unchanged — `reusable_for` matched on it — so
+                // this is the one field a second texture view of one surface
+                // moves.
+                slot.format = format;
                 counters
                     .gpu_load_hits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Ok(self.registry.get(&identity).unwrap());
+                return Ok((self.registry.get(&identity).unwrap(), attachment));
             }
-            // Geometry/gen mismatch → destroy and recreate.
+            // Geometry/gen/allocation mismatch → destroy and recreate.
             if let Some(old) =
                 self.retire_resident(ctx, &identity, ResidentReclaim::Recreated, counters)
             {
@@ -993,11 +1054,14 @@ impl ResourcePools {
         // reclaims and retries on out-of-memory rather than trimming ahead of
         // one. See `recoverable_residents`.
         self.note_registry_reach();
-        let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
+        let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
             | vk::ImageUsageFlags::INPUT_ATTACHMENT
             | vk::ImageUsageFlags::TRANSFER_SRC
             | vk::ImageUsageFlags::TRANSFER_DST
             | vk::ImageUsageFlags::SAMPLED;
+        if ctx.features.attachment_feedback_loop_layout {
+            usage |= vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT;
+        }
         // Reuse a recycled image+memory+view of identical (geometry, format)
         // before allocating a fresh one — the usage set is identical across all
         // registry targets, so a recycled image of the same geometry/format is
@@ -1007,16 +1071,84 @@ impl ResourcePools {
         // The recycled contents are stale — the slot is inserted with
         // layout=UNDEFINED / content_ready=false, and a fresh framebuffer is
         // always built below (it binds this specific render_pass).
-        let (image, memory, view) = if let Some(free) = self.take_free_target(width, height, format)
+        let imported = match (guest_memory.as_ref(), sample_count) {
+            (Some(memory), 1) => match super::super::linear_target_import::create(
+                ctx,
+                &mut self.host_ram_imports,
+                &memory.import,
+                memory.backing,
+                width,
+                height,
+                format.allocation(),
+                usage,
+            ) {
+                Ok(imported) => Some(imported),
+                Err(reason) => {
+                    crate::runtime::drain::note_store_route("target_shared_declined");
+                    let key = crate::backend::hash::hash_u64(
+                        crate::backend::hash::hash_bytes(reason.slug().as_bytes()),
+                        format.allocation().as_raw() as u32 as u64,
+                    );
+                    crate::observe::Emit::decline("vk_guest_target", &reason)
+                        .field("format", format!("{:?}", format.allocation()))
+                        .field("width", width)
+                        .field("height", height)
+                        .fail_once(key);
+                    None
+                }
+            },
+            _ => None,
+        };
+        let (image, memory, view) = if let Some(imported) = imported {
+            counters.note_create(CreateSite::RegistryImportedImage);
+            let view = match ctx.device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(imported.image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format.allocation())
+                    .subresource_range(color_subresource_range()),
+                None,
+            ) {
+                Ok(view) => view,
+                Err(error) => {
+                    ctx.device.destroy_image(imported.image, None);
+                    let import = &guest_memory
+                        .as_ref()
+                        .expect("an imported target has guest memory")
+                        .import;
+                    if let Some(parent) = self.host_ram_imports.release_child(import) {
+                        parent.destroy(&ctx.device);
+                    }
+                    return Err(DrawError::VkCall(VkCall::new(
+                        VkOp::PoolsCreateRegistryView,
+                        error,
+                    )));
+                }
+            };
+            counters.note_create(CreateSite::RegistryImageView);
+            (
+                imported.image,
+                ResidentMemory::GuestImported {
+                    guest: guest_memory.expect("an imported target has guest memory"),
+                },
+                view,
+            )
+        } else if let Some(free) =
+            self.take_free_target(width, height, sample_count, format.allocation())
         {
-            (free.image, free.memory, free.view)
+            (
+                free.image,
+                ResidentMemory::Recyclable(free.memory),
+                free.view,
+            )
         } else {
             let image = ctx
                 .device
                 .create_image(
                     &vk::ImageCreateInfo::default()
+                        .flags(vk::ImageCreateFlags::MUTABLE_FORMAT)
                         .image_type(vk::ImageType::TYPE_2D)
-                        .format(format)
+                        .format(format.allocation())
                         .extent(vk::Extent3D {
                             width,
                             height,
@@ -1024,14 +1156,14 @@ impl ResourcePools {
                         })
                         .mip_levels(1)
                         .array_layers(1)
-                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .samples(super::super::caches::vk_sample_count(sample_count))
                         .tiling(vk::ImageTiling::OPTIMAL)
                         .usage(usage)
                         .initial_layout(vk::ImageLayout::UNDEFINED),
                     None,
                 )
                 .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateRegistryTarget, e)))?;
-            counters.note_create();
+            counters.note_create(CreateSite::RegistryImage);
             let ireq = ctx.device.get_image_memory_requirements(image);
             let memory = match self.bind_image_slab(
                 ctx,
@@ -1084,7 +1216,7 @@ impl ResourcePools {
                 &vk::ImageViewCreateInfo::default()
                     .image(image)
                     .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(format)
+                    .format(format.allocation())
                     .subresource_range(color_subresource_range()),
                 None,
             ) {
@@ -1098,10 +1230,52 @@ impl ResourcePools {
                     )));
                 }
             };
-            counters.note_create();
-            (image, memory, view)
+            counters.note_create(CreateSite::RegistryImageView);
+            (image, ResidentMemory::Recyclable(memory), view)
         };
-        let attachments = [view];
+        // `view` is the allocation's; the render pass was built against the
+        // declaration, and Vulkan requires the framebuffer attachment to name
+        // that same format. They are one handle on every format that carries no
+        // transfer function, which is every format but the two sRGB spellings.
+        let attachment_view = if format.needs_own_view() {
+            match ctx.device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format.declared())
+                    .subresource_range(color_subresource_range()),
+                None,
+            ) {
+                Ok(v) => {
+                    counters.note_create(CreateSite::RegistryImageView);
+                    Some(v)
+                }
+                Err(e) => {
+                    ctx.device.destroy_image_view(view, None);
+                    match &memory {
+                        ResidentMemory::Recyclable(_) => {
+                            self.free_image_slab(&ctx.device, image);
+                            ctx.device.destroy_image(image, None);
+                        }
+                        ResidentMemory::GuestImported { guest } => {
+                            ctx.device.destroy_image(image, None);
+                            if let Some(parent) =
+                                self.host_ram_imports.release_child(&guest.import)
+                            {
+                                parent.destroy(&ctx.device);
+                            }
+                        }
+                    }
+                    return Err(DrawError::VkCall(VkCall::new(
+                        VkOp::PoolsCreateRegistryView,
+                        e,
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+        let attachments = [attachment_view.unwrap_or(view)];
         let framebuffer = match ctx.device.create_framebuffer(
             &vk::FramebufferCreateInfo::default()
                 .render_pass(render_pass)
@@ -1114,15 +1288,28 @@ impl ResourcePools {
             Ok(fb) => fb,
             Err(e) => {
                 ctx.device.destroy_image_view(view, None);
-                self.free_image_slab(&ctx.device, image);
+                if let Some(extra) = attachment_view {
+                    ctx.device.destroy_image_view(extra, None);
+                }
                 ctx.device.destroy_image(image, None);
+                match &memory {
+                    ResidentMemory::Recyclable(_) => {
+                        self.free_image_slab(&ctx.device, image);
+                    }
+                    ResidentMemory::GuestImported { .. } => {}
+                }
+                if let ResidentMemory::GuestImported { guest } = &memory {
+                    if let Some(parent) = self.host_ram_imports.release_child(&guest.import) {
+                        parent.destroy(&ctx.device);
+                    }
+                }
                 return Err(DrawError::VkCall(VkCall::new(
                     VkOp::PoolsCreateRegistryFramebuffer,
                     e,
                 )));
             }
         };
-        counters.note_create();
+        counters.note_create(CreateSite::RegistryFramebuffer);
         self.register_resident(
             &identity,
             NewResident {
@@ -1131,13 +1318,19 @@ impl ResourcePools {
                 view,
                 framebuffer,
                 render_pass,
+                framebuffer_compatibility: Some(framebuffer_compatibility),
                 width,
                 height,
+                sample_count,
                 generation,
-                color_format: format,
+                format,
+                attachment_view,
             },
         );
-        Ok(self.registry.get(&identity).unwrap())
+        Ok((
+            self.registry.get(&identity).unwrap(),
+            attachment_view.unwrap_or(view),
+        ))
     }
 
     /// Ensure a resident attachment of an arbitrary Vulkan format — an MRT
@@ -1147,7 +1340,19 @@ impl ResourcePools {
     /// owns a framebuffer; this one builds none, because its residents are only
     /// ever attachment N of an ad-hoc framebuffer or sampled through the view,
     /// never a standalone single-RT target. Reuse requires an exact (geometry,
-    /// generation, format) match. Returns (image, view).
+    /// generation, storage format) match. Returns (image, view).
+    ///
+    /// **The allocation is keyed on [`translate::pixel::storage_format`], not on
+    /// the requested view format.** A guest texture view over a surface is a
+    /// second interpretation of one allocation, so a surface bound once as
+    /// `BGRA8Unorm` and once as `BGRA8Unorm_sRGB` must resolve to one image with
+    /// two views. Keying the image on the view format instead makes the second
+    /// spelling miss `reusable_for`, retire the resident and recreate it empty,
+    /// so the two interpretations alternate frame to frame and each shows half
+    /// the content. The requested format is served by
+    /// [`Self::registry_view`], which keeps `slot.view` the view in
+    /// `format.allocation()` and caches every other interpretation alongside the
+    /// allocation.
     ///
     /// **Colour and depth share this body rather than having one each.** The two
     /// differ only in image usage and view aspect, and both of those are
@@ -1163,23 +1368,33 @@ impl ResourcePools {
         identity: TargetIdentity,
         width: u32,
         height: u32,
+        sample_count: u32,
         generation: u64,
         format: vk::Format,
         counters: &EngineCounters,
     ) -> Result<(vk::Image, vk::ImageView), DrawError> {
+        // The guest's declaration; `format.allocation()` is the family it
+        // belongs to and is what the image, the reuse test and the recycle
+        // bucket are keyed on.
+        let format = translate::pixel::ResidentFormat::of(format);
         if let Some(slot) = self.registry.get(&identity) {
-            if slot.reusable_for(width, height, generation, format) {
+            if slot.reusable_for(width, height, sample_count, generation, format) {
                 counters
                     .gpu_load_hits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Ok((slot.image, slot.view));
+                let image = slot.image;
+                let view = unsafe {
+                    self.registry_view(ctx, &identity, format.declared(), counters)?
+                }
+                .expect("the slot reused on the line above is still registered");
+                return Ok((image, view));
             }
-            // Geometry / gen / format mismatch → destroy and recreate.
+            // Geometry / gen / allocation mismatch → destroy and recreate.
             self.retire_resident(ctx, &identity, ResidentReclaim::Recreated, counters);
         }
         // Census only, as in the primary `registry_ensure`.
         self.note_registry_reach();
-        let usage = super::super::registry_target_usage(format);
+        let usage = super::super::registry_target_usage(format.allocation());
         // Reuse a recycled image+memory+view of identical (geometry, format)
         // before allocating — same recycle discipline as the primary
         // `registry_ensure`. Usage is a function of the format
@@ -1188,7 +1403,8 @@ impl ResourcePools {
         // create/alloc/bind/view + their note_create/note_alloc; recycled
         // contents are stale, so the slot below is inserted layout=UNDEFINED /
         // content_ready=false.
-        let (image, memory, view) = if let Some(free) = self.take_free_target(width, height, format)
+        let (image, memory, view) = if let Some(free) =
+            self.take_free_target(width, height, sample_count, format.allocation())
         {
             (free.image, free.memory, free.view)
         } else {
@@ -1196,8 +1412,9 @@ impl ResourcePools {
                 .device
                 .create_image(
                     &vk::ImageCreateInfo::default()
+                        .flags(vk::ImageCreateFlags::MUTABLE_FORMAT)
                         .image_type(vk::ImageType::TYPE_2D)
-                        .format(format)
+                        .format(format.allocation())
                         .extent(vk::Extent3D {
                             width,
                             height,
@@ -1205,7 +1422,7 @@ impl ResourcePools {
                         })
                         .mip_levels(1)
                         .array_layers(1)
-                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .samples(super::super::caches::vk_sample_count(sample_count))
                         .tiling(vk::ImageTiling::OPTIMAL)
                         .usage(usage)
                         .initial_layout(vk::ImageLayout::UNDEFINED),
@@ -1214,7 +1431,7 @@ impl ResourcePools {
                 .map_err(|e| {
                     DrawError::VkCall(VkCall::new(VkOp::PoolsCreateMrtSecondaryTarget, e))
                 })?;
-            counters.note_create();
+            counters.note_create(CreateSite::MrtImage);
             let ireq = ctx.device.get_image_memory_requirements(image);
             let imt = ctx
                 .memory_type_for(ireq.memory_type_bits, ireq.size, MemoryClass::DeviceLocal)
@@ -1229,7 +1446,7 @@ impl ResourcePools {
                 &vk::MemoryAllocateInfo::default()
                     .allocation_size(ireq.size)
                     .memory_type_index(imt),
-                if super::super::format_is_depth(format) {
+                if super::super::format_is_depth(format.allocation()) {
                     AllocSite::DepthResident
                 } else {
                     AllocSite::MrtSecondary
@@ -1253,8 +1470,10 @@ impl ResourcePools {
                     &vk::ImageViewCreateInfo::default()
                         .image(image)
                         .view_type(vk::ImageViewType::TYPE_2D)
-                        .format(format)
-                        .subresource_range(super::super::registry_subresource_range(format)),
+                        .format(format.allocation())
+                        .subresource_range(super::super::registry_subresource_range(
+                            format.allocation(),
+                        )),
                     None,
                 )
                 .map_err(|e| {
@@ -1262,26 +1481,34 @@ impl ResourcePools {
                     ctx.device.destroy_image(image, None);
                     DrawError::VkCall(VkCall::new(VkOp::PoolsCreateMrtSecondaryView, e))
                 })?;
-            counters.note_create();
+            counters.note_create(CreateSite::MrtImageView);
             (image, memory, view)
         };
         self.register_resident(
             &identity,
             NewResident {
                 image,
-                memory,
+                memory: ResidentMemory::Recyclable(memory),
                 view,
                 // No per-slot framebuffer and so no pass it was built against:
                 // this arm's residents are bound as attachment N of an ad-hoc
                 // MRT framebuffer, or sampled through the view.
                 framebuffer: vk::Framebuffer::null(),
                 render_pass: vk::RenderPass::null(),
+                framebuffer_compatibility: None,
                 width,
                 height,
+                sample_count,
                 generation,
-                color_format: format,
+                format,
+                // Nothing here needs the declaration's view yet — this arm owns
+                // no framebuffer — so it is created on the first ask below,
+                // which is the same path a later sampled bind takes.
+                attachment_view: None,
             },
         );
+        let view = unsafe { self.registry_view(ctx, &identity, format.declared(), counters)? }
+            .expect("the resident registered on the line above is still there");
         Ok((image, view))
     }
 
@@ -1344,17 +1571,30 @@ impl ResourcePools {
     /// allocation, not the pixels. See
     /// [`crate::runtime::draw::vulkan::depth_chain_identity`] for why that
     /// distinction is what lets the identity carry generation zero.
+    // The arguments are the depth attachment's decoded geometry; a struct here
+    // would only rename the same fields at every call site.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn registry_ensure_depth(
         &mut self,
         ctx: &DeviceContext,
         identity: TargetIdentity,
         width: u32,
         height: u32,
+        sample_count: u32,
         with_stencil: bool,
         counters: &EngineCounters,
     ) -> Result<(vk::Image, vk::ImageView), DrawError> {
         let format = Self::depth_format(ctx, with_stencil);
-        self.registry_ensure_attachment(ctx, identity, width, height, 0, format, counters)
+        self.registry_ensure_attachment(
+            ctx,
+            identity,
+            width,
+            height,
+            sample_count,
+            0,
+            format,
+            counters,
+        )
     }
 
     /// The attachment format a depth buffer of this device is created with.
@@ -1382,6 +1622,7 @@ impl ResourcePools {
         ctx: &DeviceContext,
         width: u32,
         height: u32,
+        sample_count: u32,
         with_stencil: bool,
         counters: &EngineCounters,
     ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView), DrawError> {
@@ -1415,14 +1656,14 @@ impl ResourcePools {
                     })
                     .mip_levels(1)
                     .array_layers(1)
-                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .samples(super::super::caches::vk_sample_count(sample_count))
                     .tiling(vk::ImageTiling::OPTIMAL)
                     .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
                     .initial_layout(vk::ImageLayout::UNDEFINED),
                 None,
             )
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateDepthImage, e)))?;
-        counters.note_create();
+        counters.note_create(CreateSite::DepthImage);
         let ireq = ctx.device.get_image_memory_requirements(image);
         let imt = ctx
             .memory_type_for(ireq.memory_type_bits, ireq.size, MemoryClass::DeviceLocal)
@@ -1472,13 +1713,83 @@ impl ResourcePools {
                 ctx.device.destroy_image(image, None);
                 DrawError::VkCall(VkCall::new(VkOp::PoolsCreateDepthView, e))
             })?;
-        counters.note_create();
+        counters.note_create(CreateSite::DepthImageView);
         Ok((image, memory, view))
     }
 
+    /// The framebuffer for an attachment shape the target slot does not cache,
+    /// created once and handed back to every later draw naming the same render
+    /// pass, views and extent.
+    ///
+    /// This is the whole repair for `passdiff_fb`. The previous spelling built one
+    /// per draw, and because a framebuffer handle is part of [`super::PassEcho`],
+    /// two consecutive draws of one serialized render encoder — same target, same
+    /// depth resident, same extent — were read as wanting different render pass
+    /// instances. Reuse is not an optimisation Vulkan merely tolerates: the two
+    /// framebuffers agreed on every input `vkCreateFramebuffer` reads, so the
+    /// second was a distinct handle for an identical object.
+    ///
+    /// Not bounded by a count, because the population is bounded by what it is
+    /// keyed on — the views belong to registry residents and an entry dies with
+    /// the first of its views. A count bound could only evict entries whose views
+    /// are still live, which is the one case reuse exists for.
+    pub(crate) unsafe fn ensure_ad_hoc_framebuffer(
+        &mut self,
+        ctx: &DeviceContext,
+        render_pass: vk::RenderPass,
+        views: &[vk::ImageView],
+        width: u32,
+        height: u32,
+        counters: &EngineCounters,
+    ) -> Result<vk::Framebuffer, DrawError> {
+        use ash::vk::Handle;
+        let key = super::AdHocFramebufferKey {
+            render_pass: render_pass.as_raw(),
+            views: views.iter().map(|v| v.as_raw()).collect(),
+            width,
+            height,
+        };
+        if let Some(fb) = self.ad_hoc_framebuffers.get(&key) {
+            crate::runtime::drain::note_store_route("adhoc_fb_hit");
+            return Ok(*fb);
+        }
+        let fb =
+            unsafe { self.create_mrt_framebuffer(ctx, render_pass, views, width, height, counters) }?;
+        crate::runtime::drain::note_store_route("adhoc_fb_miss");
+        self.ad_hoc_framebuffers.insert(key, fb);
+        Ok(fb)
+    }
+
+    /// Destroy every cached ad-hoc framebuffer naming `view`, because the view is
+    /// about to be destroyed and a framebuffer may not outlive its attachments.
+    ///
+    /// Called from the terminal destroy rather than from `dispose`, so a
+    /// framebuffer goes at the same moment its view does and under the same
+    /// already-established guarantee that no command buffer still names either.
+    pub(crate) unsafe fn purge_ad_hoc_framebuffers_for_view(
+        &mut self,
+        device: &ash::Device,
+        view: vk::ImageView,
+    ) {
+        use ash::vk::Handle;
+        let raw = view.as_raw();
+        let doomed: Vec<super::AdHocFramebufferKey> = self
+            .ad_hoc_framebuffers
+            .keys()
+            .filter(|k| k.views.contains(&raw))
+            .cloned()
+            .collect();
+        for key in doomed {
+            if let Some(fb) = self.ad_hoc_framebuffers.remove(&key) {
+                unsafe { device.destroy_framebuffer(fb, None) };
+                crate::runtime::drain::note_store_route("adhoc_fb_purged");
+            }
+        }
+    }
+
     /// Build an ad-hoc MRT framebuffer over `views` (primary slot 0 + secondary
-    /// slots 1..) under `render_pass`. Not cached — the caller disposes it via
-    /// `dispose(Framebuffer)` after the draw is sealed onto the ring slot.
+    /// slots 1..) under `render_pass`. The caching entry point is
+    /// [`Self::ensure_ad_hoc_framebuffer`]; this is its miss arm.
     pub(crate) unsafe fn create_mrt_framebuffer(
         &mut self,
         ctx: &DeviceContext,
@@ -1500,27 +1811,52 @@ impl ResourcePools {
                 None,
             )
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateMrtFramebuffer, e)))?;
-        counters.note_create();
+        counters.note_create(CreateSite::MrtFramebuffer);
         Ok(fb)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn registry_mark_ready(&mut self, identity: &TargetIdentity) {
+        self.registry_mark_ready_at(
+            identity,
+            crate::backend::vulkan::engine::caches::color0_pass_exit_layout(),
+        );
     }
 
     /// Mark a resident ready after a render pass wrote it as a colour
     /// attachment and left it at an explicit `final_layout` — the MRT secondary
     /// arm, which settles at `COLOR_ATTACHMENT_OPTIMAL` where
-    /// [`Self::registry_mark_ready`]'s primary settles at
-    /// `TRANSFER_SRC_OPTIMAL`. Both record the same *access*; only the layout
-    /// differs, which is the distinction [`ResidentAccess::ColorWrite`] carries.
+    /// The layout is the pass's exact `finalLayout`, including `GENERAL` for a
+    /// host-accessible primary. Recording it beside the access is what keeps a
+    /// later barrier from naming an optimized layout the imported image is not
+    /// in.
     pub(crate) fn registry_mark_ready_at(
         &mut self,
         identity: &TargetIdentity,
         layout: vk::ImageLayout,
     ) {
+        self.registry_mark_ready_with_access(identity, ResidentAccess::ColorWrite(layout));
+    }
+
+    /// Publish newly rendered colour contents together with the exact access
+    /// contract the pass left behind. Feedback-loop passes are both shader
+    /// reads and colour writes, so reducing them to a plain colour write would
+    /// lose half of the next barrier's source scope.
+    pub(crate) fn registry_mark_ready_with_access(
+        &mut self,
+        identity: &TargetIdentity,
+        access: ResidentAccess,
+    ) {
+        let guest_backed = self
+            .registry
+            .get(identity)
+            .is_some_and(|slot| slot.memory.is_guest_imported());
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.content_ready = true;
             slot.content_epoch = None;
-            slot.access = ResidentAccess::ColorWrite(layout);
+            slot.access = access;
         }
-        self.set_sole_copy(identity, true);
+        self.set_sole_copy(identity, !guest_backed);
     }
 
     /// Mark a depth resident as holding rendered contents, after a pass that
@@ -1550,9 +1886,8 @@ impl ResourcePools {
             // OPTIMAL unconditionally, so this is where the image is left and it
             // is the `initial_layout` the next LOAD pass names. The two agreeing
             // is what makes a LOAD valid without a barrier between the passes.
-            slot.access = ResidentAccess::ColorWrite(
-                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            );
+            slot.access =
+                ResidentAccess::ColorWrite(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         }
     }
 
@@ -1584,7 +1919,7 @@ impl ResourcePools {
         let Some(slot) = self.registry.get_mut(identity) else {
             return false;
         };
-        if pinned && !slot.content_ready {
+        if pinned && (!slot.content_ready || slot.resource_released) {
             return false;
         }
         if !pinned && slot.pin_count == 0 {
@@ -1612,26 +1947,108 @@ impl ResourcePools {
         true
     }
 
-    /// Mark a resident ready after a draw stored into it.
+    /// Retain a live resource's resident and report whether that resident is
+    /// the guest allocation itself.
     ///
-    /// Clears `content_epoch`: this image's pixels just changed, and until
-    /// something publishes them as the mapping's content and stamps the slot,
-    /// nothing may claim they match a mapping epoch. Every path that ends in a
-    /// resident holding new pixels comes through here or
-    /// [`Self::registry_mark_ready_at`], which is what keeps the reset total
-    /// rather than a list of the writers somebody remembered.
-    pub(crate) fn registry_mark_ready(&mut self, identity: &TargetIdentity) {
-        if let Some(slot) = self.registry.get_mut(identity) {
-            slot.content_ready = true;
-            slot.content_epoch = None;
-            // Draw pass final_layout is TRANSFER_SRC_OPTIMAL, and the access
-            // that left it there is the pass's colour attachment write — not a
-            // transfer, despite the layout's name.
-            slot.access = ResidentAccess::ColorWrite(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+    /// The pin and the allocation-kind read are one registry operation. A
+    /// caller that performed them separately could observe a different slot
+    /// between the two and would also pay two engine transactions for one
+    /// resource acquisition.
+    pub(crate) fn retain_resident_target(&mut self, identity: &TargetIdentity) -> Option<bool> {
+        let guest_imported = self
+            .registry
+            .get(identity)
+            .filter(|slot| slot.content_ready)
+            .map(|slot| slot.memory.is_guest_imported())?;
+        // A new serialized owner may legitimately arrive while a transient GPU
+        // holder is finishing the previous owner's use of the same allocation.
+        // Revive the ownership before pinning; maintenance cannot retire the
+        // slot while this engine transaction holds the registry lock.
+        self.registry.get_mut(identity)?.resource_released = false;
+        if !self.pin_resident_target(identity, true) {
+            return None;
         }
-        self.set_sole_copy(identity, true);
+        let slot = self.registry.get_mut(identity)?;
+        let Some(next) = slot.resource_owner_count.checked_add(1) else {
+            crate::observe::fail(format!(
+                "resident_resource_owner_overflow identity={identity:?}"
+            ));
+            // Undo the pin acquired above; the caller receives no lease.
+            self.pin_resident_target(identity, false);
+            return None;
+        };
+        slot.resource_owner_count = next;
+        Some(guest_imported)
     }
 
+    /// End one serialized resource's ownership of its resident. The ownership
+    /// pin is released exactly once. If an in-flight holder still has the target
+    /// pinned, retirement waits for maintenance after that holder finishes; no
+    /// new holder may retain the released resource.
+    pub(crate) unsafe fn release_resident_resource(
+        &mut self,
+        ctx: &DeviceContext,
+        identity: &TargetIdentity,
+        counters: &EngineCounters,
+    ) -> bool {
+        let Some(unpinned) = self.release_resident_ownership(identity) else {
+            return false;
+        };
+        if unpinned {
+            self.retire_resident(ctx, identity, ResidentReclaim::ResourceReleased, counters);
+        }
+        true
+    }
+
+    /// Device-free ownership transition behind resource release. Returns
+    /// whether the ownership pin was the last pin and the resident may retire
+    /// immediately, or `None` when the identity was already absent.
+    fn release_resident_ownership(&mut self, identity: &TargetIdentity) -> Option<bool> {
+        let slot = self.registry.get_mut(identity)?;
+        if slot.resource_owner_count == 0 {
+            crate::observe::fail(format!(
+                "resident_resource_release_unbalanced identity={identity:?}"
+            ));
+            return Some(false);
+        }
+        slot.resource_owner_count -= 1;
+        slot.resource_released = slot.resource_owner_count == 0;
+        self.pin_resident_target(identity, false);
+        Some(
+            self.registry
+                .get(identity)
+                .is_some_and(ResidentTargetSlot::released_and_collectable),
+        )
+    }
+
+    fn released_resident_keys(&self, max: usize) -> Vec<TargetIdentity> {
+        self.registry_order
+            .iter()
+            .filter(|identity| {
+                self.registry
+                    .get(*identity)
+                    .is_some_and(ResidentTargetSlot::released_and_collectable)
+            })
+            .take(max)
+            .cloned()
+            .collect()
+    }
+
+    pub(super) unsafe fn retire_released_residents(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+        max: usize,
+    ) -> usize {
+        let victims = self.released_resident_keys(max);
+        for identity in &victims {
+            self.retire_resident(ctx, identity, ResidentReclaim::ResourceReleased, counters);
+        }
+        victims.len()
+    }
+
+    /// Mark a resident ready after a draw stored into it.
+    ///
     /// Record that this resident's current pixels have been copied somewhere
     /// that outlives the image — the guest's own pages — so reclaiming it now
     /// costs redundant work rather than the frame.
@@ -1669,13 +2086,17 @@ impl ResourcePools {
 
     /// Record a non-writing touch of a resident: a draw sampled it, or a
     /// transfer read it out (present blit, guest-page readback, GPU seed
-    /// source). The writing touches go through [`Self::registry_mark_ready`]
-    /// and [`Self::registry_mark_ready_at`], which also vouch for the pixels.
+    /// source). The writing touches go through [`Self::registry_mark_ready_at`]
+    /// or [`Self::registry_mark_ready_with_access`], which also vouch for the pixels.
     ///
     /// Every rail that touches a resident has to land in one of the three,
     /// because the next barrier over that image derives its source scope from
     /// what it finds here — see [`ResidentAccess`].
-    pub(crate) fn registry_note_access(&mut self, identity: &TargetIdentity, access: ResidentAccess) {
+    pub(crate) fn registry_note_access(
+        &mut self,
+        identity: &TargetIdentity,
+        access: ResidentAccess,
+    ) {
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.access = access;
         }
@@ -1725,8 +2146,13 @@ impl ResourcePools {
     /// lower bound on VRAM, which is the safe direction for a figure that exists
     /// to decide whether a bound is too loose.
     fn slot_attachment_bytes(slot: &ResidentTargetSlot) -> u64 {
-        crate::backend::vulkan::translate::pixel::bytes_per_texel(slot.color_format)
-            .map(|texel| u64::from(slot.width) * u64::from(slot.height) * u64::from(texel))
+        crate::backend::vulkan::translate::pixel::bytes_per_texel(slot.format.declared())
+            .map(|texel| {
+                u64::from(slot.width)
+                    * u64::from(slot.height)
+                    * u64::from(slot.sample_count)
+                    * u64::from(texel)
+            })
             .unwrap_or(0)
     }
 
@@ -1850,14 +2276,9 @@ impl ResourcePools {
     /// ([`crate::backend::vulkan::caps::memory_topology::MemoryProfile::device_local_bytes`])
     /// measured in gigabytes. One constant could not be both.
     ///
-    /// **And it could only ever have fired on residents in active use.** The idle
-    /// drain ([`ResourcePools::advance_registry_touch_and_drain`]) already
-    /// reclaims anything untouched for `IDLE_TARGET_AGE_MS`, at up to
-    /// `IDLE_TARGET_DRAIN_MAX_PER_CALL` per pass every `IDLE_DRAIN_INTERVAL_MS` —
-    /// about forty a second. So the standing population *is* the live
-    /// two-second working set, and a count crossing it means the guest is using
-    /// more targets than the count allowed, which is the worst moment to take one
-    /// away. Measured, it never came close: peak 194 of 320 under
+    /// A count crossing under load means the guest is using more targets than
+    /// the count allowed, which is the worst moment to take one away. Measured,
+    /// it never came close: peak 194 of 320 under
     /// `web-content-probe --churn 1`, `evicts=0` on every boot ever taken.
     ///
     /// # What bounds it now
@@ -1867,9 +2288,8 @@ impl ResourcePools {
     /// out-of-memory result it calls [`Self::reclaim_for_allocation_retry`],
     /// which gives back every recycle pool plus everything this function returns,
     /// and retries once. If that still fails the draw refuses with the driver's
-    /// own error. That is a GPU refusing because its memory is full — current,
-    /// attributable, and self-healing, since the idle drain frees the space for
-    /// the next attempt — rather than a count destroying an earlier accepted
+    /// own error. That is a GPU refusing because its memory is full — current
+    /// and attributable — rather than a count destroying an earlier accepted
     /// result in order to break a future draw.
     ///
     /// The sole-copy population was already exempt from the count and already
@@ -1987,17 +2407,10 @@ impl ResourcePools {
     ///
     /// Out of device memory is the one refusal this device can still do
     /// something about, and since the slot count was retired it is the only thing
-    /// bounding this population. The idle drain returns VRAM on a 2 s timer, so
-    /// at the moment an allocation fails the registry is usually holding
-    /// residents it was entitled to drop and had simply not got to yet. Refusing the guest's draw
-    /// while still holding them is not "the GPU is out of memory"; it is this
-    /// device declining to tidy up first, which is not what the hardware being
-    /// emulated does.
-    ///
-    /// Age is deliberately ignored. The drain cutoff is a throughput compromise,
-    /// and by this point throughput is already lost — what is left is whether the
-    /// draw survives at all. `pin_count` and `gpu_only_content` are still
-    /// honoured, so this can only ever cost re-reads, never a frame.
+    /// bounding this population. At allocation failure the registry may hold
+    /// reproducible residents it can safely give back. `pin_count` and
+    /// `gpu_only_content` are honoured, so this can only cost re-reads, never a
+    /// frame.
     ///
     /// The recycle pools go first and go completely, including the HOST_VISIBLE
     /// buffer pools that `trim_recycle_pools` otherwise holds back behind
@@ -2124,10 +2537,9 @@ impl ResourcePools {
             Self::high_water(self.registry_sole_copy_peak, self.registry_sole_copy);
     }
 
-    /// Refresh a resident's idle-drain timestamp to at least `now_ms`. Used by
-    /// host-window direct present before the export attempt so offscreen
-    /// compositor peers needed for route-B tile compositing do not age out while
-    /// the displayed member remains active.
+    /// Test seam for advancing one resident's idle age without running the
+    /// device-touching reclaim operation.
+    #[cfg(test)]
     pub(crate) fn registry_touch_at(&mut self, identity: &TargetIdentity, now_ms: u64) {
         if now_ms > self.idle_clock_ms {
             self.idle_clock_ms = now_ms;
@@ -2160,13 +2572,10 @@ impl ResourcePools {
     /// happened, for a caller that needs to know how long ago rather than only
     /// what.
     ///
-    /// This is what uncensors `resident_resample_peak_ms`. That peak can only
-    /// observe gaps for residents that *survived* to be read, so a reclaim
-    /// policy tuned from it is tuned from data it destroyed the tail of — every
-    /// gap longer than the cutoff shows up as an absence, not as a longer gap.
-    /// Pairing this with `IDLE_TARGET_AGE_MS` recovers the missing side: a
-    /// resident read `since` ms after being reclaimed had gone at least
-    /// `IDLE_TARGET_AGE_MS + since` ms between uses.
+    /// This distinguishes a missing identity that was explicitly released or
+    /// pressure-reclaimed from one that this device never held. The timestamp
+    /// reports how quickly it was requested again; it does not infer an idle
+    /// lifetime or authorize another reclaim.
     pub(crate) fn prior_reclaim_at(
         &self,
         identity: &TargetIdentity,
@@ -2196,32 +2605,11 @@ impl ResourcePools {
     /// See [`resident_resample_band`] for why this also bands how long the
     /// resident had been sitting untouched before the read.
     ///
-    /// Reading a resident was not a use. `last_touch_ms` was refreshed by
-    /// `registry_ensure` (a draw rendering *into* the target), by the present
-    /// touch, and by nothing else — while the sampled-source resolve in
-    /// `execute_draw_inner` goes through `registry_get`, which takes `&self` and
-    /// therefore cannot mark anything. A resident that every frame samples but
-    /// no frame draws into consequently aged as if it were abandoned.
-    ///
-    /// That is the shape of a compositor backdrop: the desktop behind a
-    /// translucent panel is rendered once and then read by every vibrancy draw
-    /// over it. After `IDLE_TARGET_AGE_MS` the idle drain took it, and the drain
-    /// is a terminal destroy rather than a recycle, so the pixels were gone. The
-    /// next draw to sample it refuses with
-    /// `vk_draw_exec_sampled_resident_missing`, and because the exec loop
-    /// abandons the remaining records of a packet once a record cannot encode,
-    /// one missing backdrop drops a whole packet of draws.
-    ///
-    /// Nothing recreates a resident except a draw rendering into that identity,
-    /// so a backdrop the guest considers still valid is never rebuilt: the
-    /// refusal repeats for the life of the boot. That is why this class survives
-    /// closing the application that caused the pressure and why only a reboot
-    /// clears it.
-    ///
-    /// The stamp this writes is the one the idle drain reads — it compares
-    /// `last_touch_ms` against `IDLE_TARGET_AGE_MS` — so recording a read here is
-    /// what keeps a resident nothing draws into from aging out under one that
-    /// every frame samples.
+    /// Sampling is a real use even when no draw renders back into the target.
+    /// Refresh the timestamp so reuse-distance diagnostics describe all GPU
+    /// access, including compositor backdrops. No residency decision reads this
+    /// timestamp: live targets end through resource lifetime or, when safe,
+    /// allocation-pressure recovery.
     pub(crate) fn registry_note_sampled_use(&mut self, identity: &TargetIdentity) {
         let touch = self.idle_clock_ms;
         if let Some(slot) = self.registry.get_mut(identity) {
@@ -2229,10 +2617,8 @@ impl ResourcePools {
             slot.last_touch_ms = touch;
             crate::runtime::drain::note_store_route(resident_resample_band(idle_ms));
             // The bands give the distribution; this gives the margin. They
-            // answer different questions, and the bands alone could not say
-            // whether their one sample above the half mark sat at 1.0 s or at
-            // 1.9 s against a 2 s cutoff — which is the difference between
-            // comfortable and one slow frame from a permanent loss.
+            // answer different questions: the peak preserves the longest exact
+            // reuse interval while the bands keep a cheap distribution.
             self.resident_resample_peak_ms = self.resident_resample_peak_ms.max(idle_ms);
         }
     }
@@ -2251,18 +2637,28 @@ pub(super) mod pin_count_tests {
     fn dummy_slot(content_ready: bool) -> ResidentTargetSlot {
         ResidentTargetSlot {
             image: vk::Image::null(),
-            memory: vk::DeviceMemory::null(),
+            memory: ResidentMemory::Recyclable(vk::DeviceMemory::null()),
             view: vk::ImageView::null(),
+            alternate_views: Vec::new(),
             framebuffer: vk::Framebuffer::null(),
             render_pass: vk::RenderPass::null(),
+            framebuffer_compatibility: None,
             width: 16,
             height: 16,
+            sample_count: 1,
             generation: 1,
             content_ready,
             content_epoch: None,
-            access: ResidentAccess::ColorWrite(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
-            color_format: translate::pixel::SCANOUT_FORMAT,
+            // What `registry_mark_ready` actually records, read from the same
+            // constant it reads, so this fixture cannot drift into describing a
+            // resident no pass produces.
+            access: ResidentAccess::ColorWrite(
+                crate::backend::vulkan::engine::caches::color0_pass_exit_layout(),
+            ),
+            format: translate::pixel::ResidentFormat::of(translate::pixel::SCANOUT_FORMAT),
             pin_count: 0,
+            resource_released: false,
+            resource_owner_count: 0,
             gpu_only_content: false,
             last_touch_ms: 0,
         }
@@ -2297,7 +2693,7 @@ pub(super) mod pin_count_tests {
         );
 
         let mut rgba = dummy_slot(true);
-        rgba.color_format = translate::pixel::RESIDENT_RGBA_FORMAT;
+        rgba.format = translate::pixel::ResidentFormat::of(translate::pixel::RESIDENT_RGBA_FORMAT);
         assert!(
             !slot_presentable(&rgba, 16, 16),
             "the blit does no channel swap; RGBA would present with red and blue exchanged"
@@ -2420,6 +2816,141 @@ pub(super) mod pin_count_tests {
         assert_eq!(pools.registry.get(&id).unwrap().pin_count, 0);
     }
 
+    #[test]
+    fn retaining_a_resource_returns_the_pinned_allocations_kind() {
+        let mut pools = ResourcePools::new();
+        let recyclable_id = pinned_identity();
+        pools
+            .registry
+            .insert(recyclable_id.clone(), dummy_slot(true));
+        assert_eq!(pools.retain_resident_target(&recyclable_id), Some(false));
+        assert_eq!(pools.registry[&recyclable_id].pin_count, 1);
+
+        let imported_id = surf(2);
+        let mut imported = dummy_slot(true);
+        imported.memory = ResidentMemory::GuestImported {
+            guest: crate::backend::vulkan::engine::GuestTargetMemory {
+                backing: crate::backend::vulkan::engine::GuestTargetBacking {
+                    allocation_host_ptr: 0x1000,
+                    allocation_len: 0x4000,
+                    plane_offset: 0,
+                    row_pitch: 64,
+                },
+                import: std::sync::Arc::new(
+                    crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                        0x1000, 0x4000, 0x1000,
+                    )
+                    .unwrap(),
+                ),
+                footprint: crate::runtime::guest_ram::GuestPageFootprint::new(
+                    std::sync::Arc::from([0x1000_u64]),
+                    0x1000,
+                )
+                .expect("page footprint"),
+            },
+        };
+        pools.registry.insert(imported_id.clone(), imported);
+        assert_eq!(pools.retain_resident_target(&imported_id), Some(true));
+        assert_eq!(pools.registry[&imported_id].pin_count, 1);
+    }
+
+    #[test]
+    fn ending_the_last_resource_ownership_makes_the_slot_retirable() {
+        let mut pools = ResourcePools::new();
+        let id = pinned_identity();
+        pools.registry.insert(id.clone(), dummy_slot(true));
+        pools.registry_order.push_back(id.clone());
+
+        assert_eq!(pools.retain_resident_target(&id), Some(false));
+        assert_eq!(pools.release_resident_ownership(&id), Some(true));
+        assert_eq!(pools.released_resident_keys(1), vec![id]);
+    }
+
+    #[test]
+    fn one_alias_release_does_not_end_another_resources_ownership() {
+        let mut pools = ResourcePools::new();
+        let id = pinned_identity();
+        pools.registry.insert(id.clone(), dummy_slot(true));
+        pools.registry_order.push_back(id.clone());
+
+        assert_eq!(pools.retain_resident_target(&id), Some(false));
+        assert_eq!(pools.retain_resident_target(&id), Some(false));
+        assert_eq!(pools.registry[&id].resource_owner_count, 2);
+        assert_eq!(pools.release_resident_ownership(&id), Some(false));
+        assert_eq!(pools.registry[&id].resource_owner_count, 1);
+        assert!(!pools.registry[&id].resource_released);
+        assert!(pools.released_resident_keys(1).is_empty());
+
+        assert_eq!(
+            pools.retain_resident_target(&id),
+            Some(false),
+            "the surviving alias keeps the shared allocation retainable"
+        );
+    }
+
+    #[test]
+    fn released_resource_waits_for_existing_holders_but_not_for_time() {
+        let mut pools = ResourcePools::new();
+        let id = pinned_identity();
+        pools.registry.insert(id.clone(), dummy_slot(true));
+        pools.registry_order.push_back(id.clone());
+
+        assert_eq!(pools.retain_resident_target(&id), Some(false));
+        assert!(pools.pin_resident_target(&id, true), "in-flight holder");
+        assert_eq!(pools.release_resident_ownership(&id), Some(false));
+        assert!(pools.released_resident_keys(1).is_empty());
+
+        assert!(pools.pin_resident_target(&id, false));
+        assert_eq!(pools.released_resident_keys(1), vec![id]);
+    }
+
+    /// A released resource whose resident still holds the only copy of a frame
+    /// survives the release, and is collected once that frame has been copied
+    /// out.
+    ///
+    /// This is [`ResidentTargetSlot::released_and_collectable`]'s third term.
+    /// Without it, a render Store that deferred its writeback into
+    /// `writeback_debt` and a guest that released the serialized resource
+    /// before the debt was paid destroy the frame between them — which is what
+    /// **135 of 135** `read_target_unknown_identity diverges=absent
+    /// prior=resource_released` refusals were, on one driven macos-13 boot of
+    /// the copying rail.
+    ///
+    /// The wait is on the copy-out and not on time: the second half asserts the
+    /// slot does not become uncollectable, only late.
+    #[test]
+    fn a_released_resource_holding_the_only_copy_of_a_frame_waits_for_the_copy_out() {
+        let mut pools = ResourcePools::new();
+        let id = pinned_identity();
+        pools.registry.insert(id.clone(), dummy_slot(true));
+        pools.registry_order.push_back(id.clone());
+
+        assert_eq!(pools.retain_resident_target(&id), Some(false));
+        pools.registry_mark_ready(&id);
+        assert!(
+            pools.registry[&id].gpu_only_content,
+            "a Store with no copy-out leaves the resident sole-copy"
+        );
+
+        assert_eq!(
+            pools.release_resident_ownership(&id),
+            Some(false),
+            "the guest ended the lifetime, but the frame is still only here"
+        );
+        assert!(pools.released_resident_keys(1).is_empty());
+        assert!(
+            pools.registry.contains_key(&id),
+            "the resident the owed writeback names is still findable"
+        );
+
+        assert!(pools.registry_note_content_copied_out(&id));
+        assert_eq!(
+            pools.released_resident_keys(1),
+            vec![id],
+            "once the frame is in the guest's pages the slot is collectable"
+        );
+    }
+
     fn surf(id: u32) -> TargetIdentity {
         TargetIdentity::Surface {
             id,
@@ -2436,16 +2967,26 @@ pub(super) mod pin_count_tests {
     /// parameters: `registry_ensure` passes a real framebuffer and the pass it
     /// was built against, `registry_ensure_attachment` passes neither.
     fn new_resident(framebuffer: vk::Framebuffer, render_pass: vk::RenderPass) -> NewResident {
+        let framebuffer_compatibility = (framebuffer != vk::Framebuffer::null()).then(|| {
+            crate::backend::vulkan::engine::caches::PassKey::single(
+                false,
+                translate::pixel::SCANOUT_FORMAT,
+            )
+            .framebuffer_compatibility()
+        });
         NewResident {
             image: vk::Image::null(),
-            memory: vk::DeviceMemory::null(),
+            memory: ResidentMemory::Recyclable(vk::DeviceMemory::null()),
             view: vk::ImageView::null(),
             framebuffer,
             render_pass,
+            framebuffer_compatibility,
             width: 16,
             height: 16,
+            sample_count: 1,
             generation: 1,
-            color_format: translate::pixel::SCANOUT_FORMAT,
+            format: translate::pixel::ResidentFormat::of(translate::pixel::SCANOUT_FORMAT),
+            attachment_view: None,
         }
     }
 
@@ -2563,6 +3104,52 @@ pub(super) mod pin_count_tests {
         assert_eq!(slot.pin_count, 0, "no deferred window holds it yet");
     }
 
+    #[test]
+    fn a_guest_import_is_born_with_shared_contents_and_never_becomes_sole_copy() {
+        let mut pools = ResourcePools::new();
+        let mut resident = new_resident(some_framebuffer(), vk::RenderPass::null());
+        resident.memory = ResidentMemory::GuestImported {
+            guest: crate::backend::vulkan::engine::GuestTargetMemory {
+                backing: crate::backend::vulkan::engine::GuestTargetBacking {
+                    allocation_host_ptr: 0x1000,
+                    allocation_len: 0x4000,
+                    plane_offset: 0,
+                    row_pitch: 64,
+                },
+                import: std::sync::Arc::new(
+                    crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                        0x1000, 0x4000, 0x1000,
+                    )
+                    .unwrap(),
+                ),
+                footprint: crate::runtime::guest_ram::GuestPageFootprint::new(
+                    std::sync::Arc::from([0x2000, 0x3000]),
+                    0x1000,
+                )
+                .expect("page footprint"),
+            },
+        };
+        let identity = surf(1);
+        pools.register_resident(&identity, resident);
+
+        let slot = pools.registry.get(&identity).expect("registered");
+        assert!(
+            slot.content_ready,
+            "the allocation carries its prior texels"
+        );
+        assert_eq!(slot.access, ResidentAccess::GuestBacking);
+        assert!(
+            !slot.gpu_only_content,
+            "the guest allocation is the other copy"
+        );
+
+        pools.registry_mark_ready(&identity);
+        assert!(
+            !pools.registry.get(&identity).unwrap().gpu_only_content,
+            "rendering writes the shared allocation itself"
+        );
+    }
+
     /// Registration writes the map and the order together.
     ///
     /// `registry` and `registry_order` are one structure split for lookup and
@@ -2606,7 +3193,7 @@ pub(super) mod pin_count_tests {
     /// `pin_count == 0` is true of a resident that was written back *and* of one
     /// that never was.
     #[test]
-    fn a_resident_that_is_the_only_copy_of_its_pixels_is_never_aged_out() {
+    fn elapsed_time_never_reclaims_a_live_resident() {
         let mut pools = ResourcePools::new();
         admit(&mut pools, surf(1), 10, 0);
         // The MRT-secondary path: rendered into, marked ready at the pass's
@@ -2614,21 +3201,15 @@ pub(super) mod pin_count_tests {
         pools.registry_mark_ready_at(&surf(1), vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         pools.registry_touch_at(&surf(1), 10);
 
-        let now = 10 + IDLE_TARGET_AGE_MS + 1;
-        assert_eq!(
-            pools.plan_idle_drain(now, None),
-            Some(Vec::new()),
-            "aged past the cutoff and unpinned, but destroying it destroys the frame"
-        );
+        let now = 10 + IDLE_MAINTENANCE_START_MS + 1;
+        assert!(pools.plan_idle_maintenance(now));
+        assert!(pools.registry.contains_key(&surf(1)));
 
         // Ten more cutoffs' worth of idleness changes nothing: this is not a
         // longer timer, it is a different question.
-        let much_later = now + IDLE_TARGET_AGE_MS * 10;
-        assert_eq!(
-            pools.plan_idle_drain(much_later, None),
-            Some(Vec::new()),
-            "no age makes destroying the only copy anything but a loss"
-        );
+        let much_later = now + IDLE_MAINTENANCE_START_MS * 10;
+        assert!(pools.plan_idle_maintenance(much_later));
+        assert!(pools.registry.contains_key(&surf(1)));
 
         // Something copies the pixels out — a landed flush, a writeback Store —
         // and the same resident is now exactly as reclaimable as any other.
@@ -2636,11 +3217,11 @@ pub(super) mod pin_count_tests {
             pools.registry_note_content_copied_out(&surf(1)),
             "the slot is there to be cleared"
         );
-        let later_still = much_later + IDLE_DRAIN_INTERVAL_MS + 1;
-        assert_eq!(
-            pools.plan_idle_drain(later_still, None),
-            Some(vec![surf(1)]),
-            "with the pixels held elsewhere, reclaiming costs redundant work only"
+        let later_still = much_later + MAINTENANCE_INTERVAL_MS + 1;
+        assert!(pools.plan_idle_maintenance(later_still));
+        assert!(
+            pools.registry.contains_key(&surf(1)),
+            "a current guest copy makes pressure reclaim safe, not time authoritative"
         );
     }
 
@@ -2699,9 +3280,9 @@ pub(super) mod pin_count_tests {
     #[test]
     fn no_reclaim_cause_may_take_the_only_copy_of_a_frame() {
         for cause in [
-            ResidentReclaim::IdleDrained,
             ResidentReclaim::AllocationReclaimed,
             ResidentReclaim::Recreated,
+            ResidentReclaim::ResourceReleased,
         ] {
             let mut pools = ResourcePools::new();
             admit(&mut pools, surf(1), 10, 0);
@@ -2709,14 +3290,7 @@ pub(super) mod pin_count_tests {
             // never stamped, never written back.
             pools.registry_mark_ready(&surf(1));
             pools.registry_touch_at(&surf(1), 10);
-            let aged = 10 + IDLE_TARGET_AGE_MS + 1;
-
             match cause {
-                ResidentReclaim::IdleDrained => assert_eq!(
-                    pools.plan_idle_drain(aged, None),
-                    Some(Vec::new()),
-                    "the idle drain must not offer a sole copy at any age"
-                ),
                 ResidentReclaim::AllocationReclaimed => assert!(
                     pools.recoverable_residents().is_empty(),
                     "a device out of memory refuses the next allocation rather \
@@ -2725,7 +3299,7 @@ pub(super) mod pin_count_tests {
                 // Exempt, and the assertion says why rather than skipping: the
                 // slot is still the sole copy, and that is not what stops this
                 // cause — the guest asking for a different target is.
-                ResidentReclaim::Recreated => assert!(
+                ResidentReclaim::Recreated | ResidentReclaim::ResourceReleased => assert!(
                     pools
                         .registry
                         .get(&surf(1))
@@ -2904,53 +3478,41 @@ pub(super) mod pin_count_tests {
         );
     }
 
-    /// A non-pinned resident untouched for `IDLE_TARGET_AGE_MS` is selected; a
+    /// A non-pinned resident untouched for `IDLE_MAINTENANCE_START_MS` is selected; a
     /// freshly-touched peer and a pinned peer are not. The wall clock advances to
     /// the passed `now_ms` (not a per-call increment), so a static guest that
     /// keeps ticking the poll heartbeat still reclaims stale VRAM.
     #[test]
-    fn plan_idle_drain_selects_only_aged_non_pinned() {
+    fn maintenance_never_selects_live_residents_by_age() {
         let mut pools = ResourcePools::new();
         admit(&mut pools, surf(1), 10, 0); // aged, non-pinned  -> victim
         admit(&mut pools, surf(2), 10, 1); // aged but PINNED   -> kept
                                            // now = 10 + AGE + 1 so slot 1's cutoff is crossed; a fresh slot is not.
-        let now = 10 + IDLE_TARGET_AGE_MS + 1;
+        let now = 10 + IDLE_MAINTENANCE_START_MS + 1;
         admit(&mut pools, surf(3), now, 0); // fresh            -> kept
-        let victims = pools.plan_idle_drain(now, None).expect("pass due");
-        assert_eq!(victims, vec![surf(1)], "only the aged non-pinned resident");
+        assert!(pools.plan_idle_maintenance(now), "maintenance pass is due");
+        assert_eq!(pools.registry.len(), 3, "time changes no live residency");
         assert_eq!(pools.idle_clock_ms, now, "clock advanced to wall time");
     }
 
     /// A reclaim records *when*, so the gap the drain censored can be recovered.
     ///
-    /// `resident_resample_peak_ms` measures the interval between two reads of a
-    /// resident that survived both, so it structurally cannot observe a gap
-    /// longer than `IDLE_TARGET_AGE_MS`: past that the resident is gone and the
-    /// closing read falls through to the guest's pages, recording an absence
-    /// rather than a longer interval. Tuning the cutoff from that peak means
-    /// tuning it from a distribution the policy itself truncates.
-    ///
-    /// The reclaim stamp is what closes the interval from the other side — a
-    /// resident read `since` ms after being destroyed had gone at least
-    /// `IDLE_TARGET_AGE_MS + since` between uses.
-    ///
-    /// Fails without the stamp: `reclaimed_recent` carries no time at all.
+    /// A reclaim records when it happened so diagnostics can report how soon an
+    /// explicitly released or pressure-reclaimed identity was requested again.
     #[test]
     fn a_reclaim_records_when_so_the_censored_gap_can_be_recovered() {
         let mut pools = ResourcePools::new();
         admit(&mut pools, surf(1), 0, 0);
         pools.idle_clock_ms = 5_000;
-        pools.unregister_resident(&surf(1), ResidentReclaim::IdleDrained);
+        pools.unregister_resident(&surf(1), ResidentReclaim::AllocationReclaimed);
 
         let (why, at) = pools
             .prior_reclaim_at(&surf(1))
             .expect("a reclaim is recorded with its time");
-        assert_eq!(why, ResidentReclaim::IdleDrained);
-        assert_eq!(at, 5_000, "stamped with the drain's own clock");
+        assert_eq!(why, ResidentReclaim::AllocationReclaimed);
+        assert_eq!(at, 5_000, "stamped with the maintenance clock");
 
-        // The guest comes back 3 s after the destroy, so it had gone at least
-        // IDLE_TARGET_AGE_MS + 3000 between uses — a gap the surviving-resident
-        // peak could never have reported.
+        // The guest comes back 3 s after the destroy.
         pools.idle_clock_ms = 8_000;
         assert_eq!(
             pools.idle_clock_ms().saturating_sub(at),
@@ -2965,20 +3527,12 @@ pub(super) mod pin_count_tests {
         );
     }
 
-    /// The resample bands are fractions of the drain cutoff, so retuning the
-    /// cutoff moves them with it and no reading is ever quoted against a bound
-    /// it did not come from.
-    ///
-    /// The boundary that matters is the last one. `past_cutoff` is exactly the
-    /// case where a resident was read after sitting longer than the age at which
-    /// the drain would have destroyed it, so it survived only because the drain
-    /// is throttled to `IDLE_TARGET_DRAIN_MAX_PER_CALL` per pass and had not
-    /// reached it. `IDLE_TARGET_AGE_MS` itself must therefore land in that band
-    /// and not under it: the drain's own comparison is `last_touch_ms <= cutoff`,
-    /// so a resident exactly at the cutoff is already a victim.
+    /// The resample bands use the maintenance start interval as a stable scale.
+    /// They are diagnostics only: crossing any boundary has no effect on a live
+    /// resident's lifetime.
     #[test]
     fn the_resident_resample_bands_are_fractions_of_the_drain_cutoff() {
-        let c = IDLE_TARGET_AGE_MS;
+        let c = IDLE_MAINTENANCE_START_MS;
         for (idle, expected) in [
             (0, "resident_resample_lt_eighth_cutoff"),
             (c / 8 - 1, "resident_resample_lt_eighth_cutoff"),
@@ -3024,11 +3578,11 @@ pub(super) mod pin_count_tests {
         assert!(pools.registry.contains_key(&surf(1)));
 
         // Destroyed: absent, and the cause survives.
-        pools.unregister_resident(&surf(1), ResidentReclaim::IdleDrained);
+        pools.unregister_resident(&surf(1), ResidentReclaim::AllocationReclaimed);
         assert!(!pools.registry.contains_key(&surf(1)));
         assert_eq!(
             pools.prior_reclaim(&surf(1)),
-            Some(ResidentReclaim::IdleDrained)
+            Some(ResidentReclaim::AllocationReclaimed)
         );
 
         // Re-created: the record is still in history, so only the presence
@@ -3040,7 +3594,7 @@ pub(super) mod pin_count_tests {
         );
         assert_eq!(
             pools.prior_reclaim(&surf(1)),
-            Some(ResidentReclaim::IdleDrained),
+            Some(ResidentReclaim::AllocationReclaimed),
             "history is deliberately not cleared on re-admit, which is why the \
              presence check cannot be dropped"
         );
@@ -3051,7 +3605,7 @@ pub(super) mod pin_count_tests {
     /// A high-water, so a large gap early is not erased by a run of small ones
     /// after it — which is the whole reason it is not a windowed reading. The
     /// margin question is "how close did this boot ever come to
-    /// `IDLE_TARGET_AGE_MS`", and a gap that peaks between two census samples is
+    /// `IDLE_MAINTENANCE_START_MS`", and a gap that peaks between two census samples is
     /// exactly what an instantaneous value misses.
     ///
     /// Fails without the fix: nothing records the gap at all.
@@ -3074,33 +3628,20 @@ pub(super) mod pin_count_tests {
         );
 
         // And a larger one does raise it.
-        pools.idle_clock_ms = 1_000 + IDLE_TARGET_AGE_MS;
+        pools.idle_clock_ms = 1_000 + IDLE_MAINTENANCE_START_MS;
         pools.registry_note_sampled_use(&surf(1));
-        assert_eq!(pools.resident_resample_peak_ms(), IDLE_TARGET_AGE_MS);
+        assert_eq!(pools.resident_resample_peak_ms(), IDLE_MAINTENANCE_START_MS);
 
         // A read of an identity the registry does not hold records nothing —
         // there is no gap to measure, and counting it as one would report a
         // margin that no resident ever spent.
         pools.idle_clock_ms = u64::MAX;
         pools.registry_note_sampled_use(&surf(99));
-        assert_eq!(pools.resident_resample_peak_ms(), IDLE_TARGET_AGE_MS);
+        assert_eq!(pools.resident_resample_peak_ms(), IDLE_MAINTENANCE_START_MS);
     }
 
-    /// A resident that a draw only ever *samples* survives the idle drain.
-    ///
-    /// This is the compositor-backdrop case: the desktop behind a translucent
-    /// panel is rendered once and then read by every vibrancy draw over it.
-    /// Before [`ResourcePools::registry_note_sampled_use`] existed, reading a
-    /// resident refreshed nothing — `registry_ensure` (render *into*) and the
-    /// present touch were the only writers of `last_touch_ms` — so the backdrop
-    /// aged exactly as if it had been abandoned and the drain terminally
-    /// destroyed it. Every later draw sampling it then refused with
-    /// `vk_draw_exec_sampled_resident_missing`, and nothing recreates a resident
-    /// except a draw rendering into that identity, so the refusal held for the
-    /// rest of the boot.
-    ///
-    /// Fails without the fix: with the body of `registry_note_sampled_use`
-    /// removed, `surf(1)` is selected and the assertion reports it as a victim.
+    /// A resident that a draw only ever samples remains live, and its diagnostic
+    /// timestamp reflects that use.
     #[test]
     fn a_sampled_only_resident_is_not_aged_out() {
         let mut pools = ResourcePools::new();
@@ -3108,22 +3649,16 @@ pub(super) mod pin_count_tests {
         // into again — only read.
         admit(&mut pools, surf(1), 10, 0);
         admit(&mut pools, surf(2), 10, 0);
-        let now = 10 + IDLE_TARGET_AGE_MS + 1;
+        let now = 10 + IDLE_MAINTENANCE_START_MS + 1;
         // The drain's clock has to be current before a use can be recorded
         // against it; the real caller advances it from the poll heartbeat.
-        pools.plan_idle_drain(now, None);
+        pools.plan_idle_maintenance(now);
         pools.registry_note_sampled_use(&surf(1));
         // A second pass, far enough after the first to clear the throttle.
-        let later = now + IDLE_DRAIN_INTERVAL_MS + 1;
-        let victims = pools.plan_idle_drain(later, None).expect("pass due");
-        assert!(
-            !victims.contains(&surf(1)),
-            "a resident being sampled is in use and must not be destroyed"
-        );
-        assert!(
-            victims.contains(&surf(2)),
-            "its untouched peer is still reclaimed — the fix must not disable the drain"
-        );
+        let later = now + MAINTENANCE_INTERVAL_MS + 1;
+        assert!(pools.plan_idle_maintenance(later), "second pass is due");
+        assert!(pools.registry.contains_key(&surf(1)));
+        assert!(pools.registry.contains_key(&surf(2)));
     }
 
     /// A pinned resident is never offered to the allocation-failure reclaim, and
@@ -3199,11 +3734,11 @@ pub(super) mod pin_count_tests {
     #[test]
     fn the_reclaim_history_names_the_path_and_is_bounded() {
         let mut pools = ResourcePools::new();
-        pools.note_resident_reclaimed(&surf(1), ResidentReclaim::IdleDrained);
+        pools.note_resident_reclaimed(&surf(1), ResidentReclaim::AllocationReclaimed);
         pools.note_resident_reclaimed(&surf(2), ResidentReclaim::AllocationReclaimed);
         assert_eq!(
             pools.prior_reclaim(&surf(1)),
-            Some(ResidentReclaim::IdleDrained)
+            Some(ResidentReclaim::AllocationReclaimed)
         );
         assert_eq!(
             pools.prior_reclaim(&surf(2)),
@@ -3234,52 +3769,37 @@ pub(super) mod pin_count_tests {
         );
     }
 
-    /// The reclaim pass is throttled to `IDLE_DRAIN_INTERVAL_MS`: a second call
+    /// The reclaim pass is throttled to `MAINTENANCE_INTERVAL_MS`: a second call
     /// inside the interval selects nothing even though a resident is aged, so the
     /// ~244 Hz poll cadence cannot empty the registry at once. The clock still
     /// advances (admits stay fresh).
     #[test]
-    fn plan_idle_drain_throttles_between_passes() {
+    fn maintenance_is_throttled_between_passes() {
         let mut pools = ResourcePools::new();
         admit(&mut pools, surf(1), 0, 0);
-        let t0 = IDLE_TARGET_AGE_MS + 1;
-        assert_eq!(pools.plan_idle_drain(t0, None), Some(vec![surf(1)]));
-        // Simulate the dispose the real caller (advance_registry_touch_and_drain)
-        // performs for each selected victim.
-        pools.registry.remove(&surf(1));
-        pools.registry_order.retain(|k| k != &surf(1));
+        let t0 = IDLE_MAINTENANCE_START_MS + 1;
+        assert!(pools.plan_idle_maintenance(t0));
         admit(&mut pools, surf(2), 0, 0);
-        // A call one ms later is inside the interval → no pass (None), despite
-        // surf(2) being aged.
-        assert_eq!(
-            pools.plan_idle_drain(t0 + 1, None),
-            None,
-            "throttled: no pass"
-        );
+        assert!(!pools.plan_idle_maintenance(t0 + 1), "throttled: no pass");
         assert_eq!(
             pools.idle_clock_ms,
             t0 + 1,
             "clock still advances when throttled"
         );
-        // Past the interval → the next aged resident is selected.
-        assert_eq!(
-            pools.plan_idle_drain(t0 + IDLE_DRAIN_INTERVAL_MS, None),
-            Some(vec![surf(2)])
-        );
+        assert!(pools.plan_idle_maintenance(t0 + MAINTENANCE_INTERVAL_MS));
+        assert_eq!(pools.registry.len(), 2, "maintenance owns no live residents");
     }
 
-    /// Each pass selects at most `IDLE_TARGET_DRAIN_MAX_PER_CALL` so a huge stale
-    /// set drains gradually (no dispose storm that would be a P3 hitch itself).
+    /// A maintenance pass cannot shrink a live registry, regardless of its size.
     #[test]
-    fn plan_idle_drain_bounds_batch_per_pass() {
+    fn maintenance_does_not_shrink_a_large_live_registry() {
         let mut pools = ResourcePools::new();
-        for i in 0..(IDLE_TARGET_DRAIN_MAX_PER_CALL as u32 + 5) {
+        const LIVE_RESIDENTS: usize = 9;
+        for i in 0..LIVE_RESIDENTS as u32 {
             admit(&mut pools, surf(100 + i), 0, 0);
         }
-        let victims = pools
-            .plan_idle_drain(IDLE_TARGET_AGE_MS + 1, None)
-            .expect("pass due");
-        assert_eq!(victims.len(), IDLE_TARGET_DRAIN_MAX_PER_CALL);
+        assert!(pools.plan_idle_maintenance(IDLE_MAINTENANCE_START_MS + 1));
+        assert_eq!(pools.registry.len(), LIVE_RESIDENTS);
     }
 
     /// A pass with no registry victim but live staging traffic is NOT settled.
@@ -3296,102 +3816,84 @@ pub(super) mod pin_count_tests {
         // Quiet the gate first, so the assertion below is about uploads and not
         // about the counter still warming up.
         for _ in 0..SETTLED_PASSES_FOR_BUFFER_TRIM {
-            pools.note_drain_settled(0);
+            pools.note_maintenance_settled();
         }
         assert!(
-            pools.note_drain_settled(0),
+            pools.note_maintenance_settled(),
             "no victims, no uploads → settled"
         );
 
         // One staging acquire between passes — no victim, still not settled.
         pools.staging_hits += 1;
         assert!(
-            !pools.note_drain_settled(0),
+            !pools.note_maintenance_settled(),
             "uploads ran between passes; the buffer pools must not be trimmed"
         );
         // …and the gate stays shut while uploads keep flowing, however many
         // zero-victim passes go by.
         for _ in 0..(SETTLED_PASSES_FOR_BUFFER_TRIM * 3) {
             pools.staging_misses += 1;
-            assert!(!pools.note_drain_settled(0), "still uploading");
+            assert!(!pools.note_maintenance_settled(), "still uploading");
         }
         // Uploads stop: the gate reopens after the usual consecutive passes.
         for _ in 0..(SETTLED_PASSES_FOR_BUFFER_TRIM - 1) {
-            assert!(!pools.note_drain_settled(0), "counter restarted from zero");
+            assert!(!pools.note_maintenance_settled(), "counter restarted from zero");
         }
-        assert!(pools.note_drain_settled(0), "settled once uploads stopped");
+        assert!(pools.note_maintenance_settled(), "settled once uploads stopped");
     }
 
     /// The HOST_VISIBLE buffer trim gate: only permitted after
-    /// `SETTLED_PASSES_FOR_BUFFER_TRIM` consecutive zero-victim passes, and any
-    /// pass that drains ≥1 victim (active churn) resets the counter — so a
-    /// staging buffer cannot be freed and re-alloc'd mid-video.
+    /// `SETTLED_PASSES_FOR_BUFFER_TRIM` consecutive passes without upload
+    /// activity, so a staging buffer cannot be freed and re-allocated mid-video.
     #[test]
-    fn note_drain_settled_gates_buffer_trim_on_consecutive_idle() {
+    fn note_maintenance_settled_gates_buffer_trim_on_consecutive_idle() {
         let mut pools = ResourcePools::new();
         // Fewer than the threshold of quiet passes: no buffer trim yet.
         for _ in 0..(SETTLED_PASSES_FOR_BUFFER_TRIM - 1) {
-            assert!(!pools.note_drain_settled(0), "not settled enough yet");
+            assert!(!pools.note_maintenance_settled(), "not settled enough yet");
         }
         // The Nth consecutive zero-victim pass crosses the threshold.
         assert!(
-            pools.note_drain_settled(0),
+            pools.note_maintenance_settled(),
             "N consecutive settled passes → trim allowed"
         );
         // A subsequent quiet pass stays allowed.
-        assert!(pools.note_drain_settled(0), "stays settled");
-        // A pass that drains a victim (active churn) resets the counter…
-        assert!(
-            !pools.note_drain_settled(1),
-            "any drained victim resets settled state"
-        );
+        assert!(pools.note_maintenance_settled(), "stays settled");
+        // Upload activity resets the counter.
+        pools.staging_hits += 1;
+        assert!(!pools.note_maintenance_settled(), "uploads reset settled state");
         // …and the gate stays closed until the run rebuilds.
         for _ in 0..(SETTLED_PASSES_FOR_BUFFER_TRIM - 1) {
-            assert!(!pools.note_drain_settled(0), "counter restarted from zero");
+            assert!(!pools.note_maintenance_settled(), "counter restarted from zero");
         }
-        assert!(pools.note_drain_settled(0), "settled again after rebuild");
+        assert!(pools.note_maintenance_settled(), "settled again after rebuild");
     }
 
     /// The presented target passed as `display` is stamped to the current clock
-    /// every call, so even though it is only resolved via `registry_get` (never
-    /// re-drawn on a static page) it never ages out from under the display.
+    /// every call, so reuse-distance diagnostics include presentation reads.
     #[test]
-    fn plan_idle_drain_keeps_display_target_alive() {
+    fn maintenance_keeps_the_display_target_alive_without_a_special_case() {
         let mut pools = ResourcePools::new();
         admit(&mut pools, surf(1), 0, 0); // would be aged...
-        let now = IDLE_TARGET_AGE_MS + 500;
+        let now = IDLE_MAINTENANCE_START_MS + 500;
         // ...but it is the presented target this frame.
-        let victims = pools
-            .plan_idle_drain(now, Some(&surf(1)))
-            .expect("pass due");
-        assert!(victims.is_empty(), "display target must not be reclaimed");
-        assert_eq!(
-            pools.registry.get(&surf(1)).unwrap().last_touch_ms,
-            now,
-            "display target stamped fresh"
-        );
+        assert!(pools.plan_idle_maintenance(now));
+        assert!(pools.registry.contains_key(&surf(1)));
     }
 
-    /// `registry_touch_at` refreshes a target against the idle-drain cutoff
-    /// without going through the draw path, so a target that is registered but
-    /// not being drawn survives a static desktop interval when a caller still
-    /// needs it.
+    /// Touching changes diagnostics, not lifetime: both touched and untouched
+    /// live targets survive a static desktop interval.
     #[test]
-    fn registry_touch_at_defers_the_idle_drain_for_an_untouched_target() {
+    fn maintenance_does_not_require_touching_a_live_target() {
         let mut pools = ResourcePools::new();
         admit(&mut pools, surf(1), 0, 0); // displayed target
         admit(&mut pools, surf(4), 0, 0); // registered but undrawn, otherwise aged
-        let now = IDLE_TARGET_AGE_MS + 500;
+        let now = IDLE_MAINTENANCE_START_MS + 500;
 
         pools.registry_touch_at(&surf(4), now);
-        let victims = pools
-            .plan_idle_drain(now, Some(&surf(1)))
-            .expect("pass due");
-        assert_eq!(
-            victims,
-            Vec::<TargetIdentity>::new(),
-            "the display target and the touched target both survive"
-        );
+        assert!(pools.plan_idle_maintenance(now));
+        assert!(pools.registry.contains_key(&surf(1)));
+        assert!(pools.registry.contains_key(&surf(4)));
         assert_eq!(
             pools.registry.get(&surf(4)).unwrap().last_touch_ms,
             now,

@@ -51,7 +51,8 @@
 //! | `gw_unarmed` | no token, or a generation not yet readable — no answer |
 //! | `gw_rearm` | the window's page set changed, so nothing to compare against |
 //! | `gw_audit_seed` | first fold of this window — expected, and not the alarm |
-//! | `gw_audit_restart` | the stride came due and the baseline had been dropped: **the audit declining to compare** |
+//! | `gw_audit_restart` | an armed window was refused `AUDIT_REBASELINE_LIMIT` times running, so no vouch was ever claimed to check |
+//! | `gw_audit_rebaseline` | armed and refused: the baseline is retaken from the bytes the gather reads anyway |
 //! | `gw_audit_ok` | folded under a live baseline and the bytes agreed |
 //! | `gw_audit_unsound` | folded under a live baseline and the bytes had moved |
 //!
@@ -76,7 +77,7 @@
 //! That reading used to end "`gw_audit_unsound` at 0 says the witness stayed
 //! sound throughout." **It says no such thing**, and the next section is why.
 //!
-//! # The audit has never once compared, and its zero is not a measurement
+//! # The audit could never once compare, and that zero was not a measurement
 //!
 //! [`ContentAudit`] is the alarm for a writer that escapes both halves. To
 //! reach a comparison it needs a fold taken under a vouch and still valid at
@@ -91,15 +92,71 @@
 //! `gw_audit_ok` **0** against `gw_audit_seed` 163-175: every audit bind was a
 //! first fold and the fold was never once checked against a previous one.
 //!
-//! `gw_audit_unsound` is therefore 0 because the comparison never ran, not
+//! `gw_audit_unsound` was therefore 0 because the comparison never ran, not
 //! because it ran and agreed. A real escaping writer went unnoticed behind that
 //! zero on this branch — the GPU-direct GVA Store wrote guest pages without
 //! recording them, and the audit was structurally incapable of noticing.
 //!
-//! **Read `gw_audit_restart` beside it.** While that dominates `gw_audit_ok`,
-//! the alarm is not running. The repair is to re-seed the fold on the *refused*
-//! binds, where the gather reads those bytes anyway, so a baseline survives to
-//! meet the next vouch; it is not done here.
+//! # On the Intel iGPU it *was* comparing, and its zero is a real reading
+//!
+//! The paragraphs above are a measurement of a host with a ~40 % refusal rate.
+//! This one is not. A four-rail sweep on the Arrow Lake iGPU sums to:
+//!
+//! ```text
+//!            gw_audit_ok  gw_audit_seed  gw_audit_restart  gw_audit_unsound   refusals/vouches
+//! macos-13           115             27                24                 0        838 / 13 331
+//! macos-11             7              1                 1                 0         22 /    756
+//! ```
+//!
+//! Six per cent refusals, not forty, so runs of `AUDIT_STRIDE` consecutive
+//! vouched binds are ordinary here and the comparison was reachable all along.
+//! **122 comparisons and zero disagreements is a real soundness reading for the
+//! zero-copy sampled cache on this host** — the first one this alarm has
+//! produced.
+//!
+//! So the two-phase arm is not resurrecting a dead alarm here; it makes the
+//! alarm's reachability independent of the refusal rate, which is what the
+//! 40 %-refusal host needed and what any future workload could need. Read a
+//! `gw_audit_unsound` zero as evidence only when `gw_audit_ok` beside it is
+//! large — that pairing is the whole point and it is why both are counted.
+//!
+//! It is not free: the arm folds twice per stride (once to take the baseline,
+//! once to check it) where the old design folded once, so `gw_audit_kb` roughly
+//! doubles — on the macos-13 sweep from 177 MB against a 14.6 GB rail, about
+//! 1.2 %, to about 2.4 %.
+//!
+//! **The repair is done.** The audit used to take its baseline and compare on
+//! the same stride bind, which is what made a comparison need `AUDIT_STRIDE`
+//! consecutive vouches. It is two phases now: the stride bind *arms* the window
+//! with a baseline, and the check happens on the **next vouched bind** — because
+//! that is the atomic form of the claim under test, "a vouched bind means these
+//! bytes did not move". A refusal while armed re-folds from the bytes the gather
+//! is about to read (`gw_audit_rebaseline`) and keeps the arm, bounded by
+//! [`AUDIT_REBASELINE_LIMIT`] so a never-vouched window cannot pull the whole
+//! rail back through the audit.
+//!
+//! # A sweep can judge every bind instead of one in sixty-four
+//!
+//! The 122 comparisons above stand against some fourteen thousand vouches, so a
+//! zero there is evidence about 1.6 % of the population. That is the right ratio
+//! to ship — the fold is a read of the window, which is the rail this cache
+//! exists to remove — but it is the wrong ratio to answer "is this cache sound
+//! on this host" with.
+//!
+//! [`crate::env::GATHER_AUDIT_ALL`] sets [`AuditDensity::EveryBind`], under which
+//! every vouched bind is compared against the bind before it: the stride drops to
+//! 1 and a completed comparison leaves the window armed, its own fold being the
+//! next bind's baseline. It can only turn elisions into re-gathers, never the
+//! other way, so it is a narrowing switch in this crate's sense — one that
+//! narrows by doing more work. Run a rail sweep under it and `gw_audit_unsound`
+//! becomes a verdict on the whole boot rather than a sample of it. Never quote a
+//! timing from such a boot.
+//!
+//! So `gw_audit_restart` no longer means "structurally unable to compare"; it
+//! means one armed window was refused eight times running. The reading to take
+//! now is `gw_audit_ok` against `gw_audit_seed`: every arm resolves, so
+//! `seed ≈ ok + unsound + restart`, and an `ok` that stays 0 while seeds climb
+//! would mean the alarm is dead again.
 //!
 //! # It was the ring, not the writes: `gw_hw_aged` 4275 against `gw_hw_overlap` 5
 //!
@@ -323,6 +380,18 @@ struct Entry {
     /// window happened to land on the multiple and could starve a busy one
     /// indefinitely, where the alarm's whole job is bounded latency per window.
     binds_since_fold: u32,
+    /// A baseline is held and the audit is waiting for a vouched bind to check
+    /// it against.
+    ///
+    /// The arm is what makes the comparison reachable. Without it the audit both
+    /// took its baseline and tried to compare on the same stride bind, so a
+    /// comparison needed [`AUDIT_STRIDE`] consecutive vouched binds — a run this
+    /// workload does not produce, which is why `gw_audit_ok` read 0 on three
+    /// consecutive boots and `gw_audit_unsound`'s zero meant nothing.
+    audit_armed: bool,
+    /// Refused binds this arm has re-baselined through, against
+    /// [`AUDIT_REBASELINE_LIMIT`].
+    rebaselines: u8,
     /// `HostWrites::epoch` at the previous bind, against which the page-exact
     /// question "did this device write any of *these pages* since" is asked.
     pages_epoch: u64,
@@ -339,11 +408,73 @@ struct Entry {
 }
 
 /// Per-device witness state: one entry per sampled window seen.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct GatherWitness {
     entries: BTreeMap<GatherKey, Entry>,
     /// Monotonic bind ordinal, stamped into [`Entry::last_seen`].
     binds: u64,
+    /// How often this device's content audit is allowed to compare.
+    ///
+    /// On the witness rather than in a process-wide `OnceLock` so a test can
+    /// state the arm it is testing. [`Default`] reads the environment, which is
+    /// what makes every construction site — the one in `DeviceState` and the
+    /// ones in this module's tests — pick the switch up without naming it.
+    audit: AuditDensity,
+}
+
+impl Default for GatherWitness {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            binds: 0,
+            audit: AuditDensity::from_env(),
+        }
+    }
+}
+
+/// How often the content audit compares a window against its own past.
+///
+/// The audit is a standing alarm on the one rule this whole module exists to
+/// uphold, and its density is the difference between believing that rule and
+/// having measured it — so the density is a stated policy rather than a
+/// constant read at the decision site.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AuditDensity {
+    /// One comparison per [`AUDIT_STRIDE`] binds of a window. The shipping arm:
+    /// the fold is a read of the window, which is the rail this cache removes.
+    #[default]
+    Strided,
+    /// Every bind this device vouches for is compared against the one before
+    /// it. A soundness sweep, never a timing — see [`crate::env::GATHER_AUDIT_ALL`].
+    EveryBind,
+}
+
+impl AuditDensity {
+    fn from_env() -> Self {
+        match crate::env::switch(crate::env::GATHER_AUDIT_ALL) {
+            crate::env::Switch::On => Self::EveryBind,
+            _ => Self::default(),
+        }
+    }
+
+    /// Binds of one window between baselines.
+    fn stride(self) -> u32 {
+        match self {
+            Self::Strided => AUDIT_STRIDE,
+            Self::EveryBind => 1,
+        }
+    }
+
+    /// Whether a completed comparison leaves the window armed.
+    ///
+    /// The fold a comparison just took describes the window as of that bind, so
+    /// it is already the baseline the next bind would be judged against. Staying
+    /// armed is what makes [`Self::EveryBind`] mean every bind rather than every
+    /// third — arm, compare, disarm is three binds per comparison, and a stride
+    /// of 1 alone would still judge only a third of the population.
+    fn stays_armed(self) -> bool {
+        matches!(self, Self::EveryBind)
+    }
 }
 
 /// Upper bound on tracked windows.
@@ -376,6 +507,20 @@ const MAX_TRACKED_WINDOWS: usize = 256;
 /// remove. Both the latency and the cost degrade smoothly, so neither edge is
 /// fitted to an observation.
 pub const AUDIT_STRIDE: u32 = 64;
+
+/// How many consecutive refused binds an armed window re-baselines through
+/// before the audit gives up and waits for the stride again.
+///
+/// An armed window folds on every bind until it meets the vouched bind it is
+/// waiting for, so without a bound a window the witness always refuses would
+/// fold on all of them — which is the whole 842 MB/s rail this cache exists to
+/// remove, arriving through the audit. Eight bounds that at eight folds per
+/// stride window in the worst case, against the one the common case costs.
+///
+/// Eight rather than a larger number because a window that has been refused
+/// eight times running is not one a vouch is being claimed about, and the
+/// comparison is only interesting where a vouch actually happens.
+pub const AUDIT_REBASELINE_LIMIT: u8 = 8;
 
 impl GatherWitness {
     /// Detach every tracking token this witness armed, for release through
@@ -416,6 +561,8 @@ impl GatherWitness {
                 fold_valid: false,
                 fold_seeded: false,
                 binds_since_fold: 0,
+                audit_armed: false,
+                rebaselines: 0,
                 pages_epoch: 0,
                 last_seen: 0,
                 generation: 0,
@@ -452,12 +599,6 @@ impl GatherWitness {
 /// result is position-sensitive: a fold that only summed words would call any
 /// permutation of a window unchanged, and a scrolled tile atlas is exactly a
 /// permutation of itself.
-///
-/// Shared with [`super::buffer_gather_freshness`], which audits the buffer rail
-/// against the guest's declarations rather than against this witness. One fold
-/// and not two: a second implementation would be a second place for "the bytes
-/// did not move" to mean something slightly different, in the one direction
-/// where being wrong serves a stale frame.
 ///
 /// # Safety
 /// Every run's `host_ptr` must be a live mapping of at least `len` bytes — the
@@ -517,6 +658,90 @@ struct HostWriteCounts {
     /// non-quiet values are this device declining to rule the write out rather
     /// than a write that landed here, and the three want different repairs.
     pages_wrote: Option<crate::runtime::host_writes::HostWriteVerdict>,
+    /// Whether a guest-page write this device has **submitted but the GPU has
+    /// not yet executed** could land in this window.
+    ///
+    /// This does **not** feed the vouch, and the reason is the whole of why it
+    /// exists. The gather this cache elides is a GPU copy on the same queue as
+    /// the writeback, so it is ordered behind it and a retained image cannot
+    /// contain pre-copy bytes. [`fold_runs`] is not: it is a **CPU** read of the
+    /// same guest pages, and `render_writeback`'s rule for those is that a
+    /// host-side reader must settle first or it reads the pre-Store bytes. The
+    /// audit was added to this call path after `draw::vulkan`'s zero-copy rail
+    /// had already recorded "no settle here — this rail does not read anything",
+    /// which stopped being true when the fold arrived.
+    ///
+    /// So a fold taken while a copy is in flight over the window reads pre-copy
+    /// bytes, the next one reads post-copy bytes, both binds are legitimately
+    /// vouched, and the audit reports `gw_audit_unsound` for an image that was
+    /// never stale. This field is what lets the audit decline to compare across
+    /// that, so its remaining alarms are about the cache rather than about
+    /// itself.
+    pending: PendingWrites,
+}
+
+/// Whether a guest-page write this device has submitted but the GPU has not yet
+/// executed could land in the window being judged.
+///
+/// The three arms are the engine's `GuestWriteReach`, restated here so this
+/// module's signature does not name a backend type — the Metal arm has no such
+/// queue and answers [`Self::Disjoint`] by construction. Only `Disjoint` may
+/// vouch, but the other two are kept apart because they want different repairs:
+/// an `Overlap` is this device really writing the window it samples, and an
+/// `Unnamed` is a footprint nobody could name.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PendingWrites {
+    /// Nothing outstanding, or the outstanding footprint provably misses these
+    /// pages.
+    #[default]
+    Disjoint,
+    /// An outstanding write names one of these pages.
+    Overlap,
+    /// Something is outstanding and its pages could not be ruled out.
+    Unnamed,
+}
+
+impl PendingWrites {
+    /// What this device has submitted over `gpas` and the GPU has not run yet.
+    ///
+    /// One relaxed atomic load in the common case — the same gate
+    /// `settle_guest_writes_unless_disjoint` opens with — so a bind with nothing
+    /// outstanding pays what it paid before.
+    fn over(gpas: &[u64]) -> Self {
+        #[cfg(feature = "backend-vulkan")]
+        {
+            use crate::backend::vulkan::engine::GuestWriteReach as Reach;
+            if !crate::backend::vulkan::engine::guest_writes_outstanding() {
+                return Self::Disjoint;
+            }
+            match crate::backend::vulkan::engine::guest_writes_reaching(gpas) {
+                Reach::Disjoint => Self::Disjoint,
+                Reach::Overlap => Self::Overlap,
+                Reach::Unnamed => Self::Unnamed,
+            }
+        }
+        #[cfg(not(feature = "backend-vulkan"))]
+        {
+            let _ = gpas;
+            Self::Disjoint
+        }
+    }
+
+    /// Census route, so the new refusals are bandable rather than a silent drop
+    /// in the vouch rate.
+    fn route(self) -> &'static str {
+        match self {
+            Self::Disjoint => "gw_pending_disjoint",
+            Self::Overlap => "gw_pending_overlap",
+            Self::Unnamed => "gw_pending_unnamed",
+        }
+    }
+
+    /// Whether a vouch is still available. Only a proof of disjointness buys
+    /// one; both other answers are this device declining to rule the write out.
+    fn settled(self) -> bool {
+        matches!(self, Self::Disjoint)
+    }
 }
 
 /// The resolved window one gather will read.
@@ -587,20 +812,42 @@ pub enum ContentAudit {
     /// nothing at all — which is exactly how it read while a writer that
     /// escaped both halves went unnoticed.
     ///
-    /// It is common by construction rather than by accident: the baseline is
-    /// dropped by any single refusal, so reaching a comparison needs
-    /// [`AUDIT_STRIDE`] consecutive vouched binds of one window. At the
-    /// refusal rates a driven boot measures — 4 669 refusals against 7 347
-    /// vouches — that is a run this workload never produces, and the fix is to
-    /// re-seed the fold on the refused binds, where the gather reads the bytes
-    /// anyway.
+    /// It used to be common by construction rather than by accident: the
+    /// baseline was dropped by any single refusal and a comparison was only
+    /// attempted once [`AUDIT_STRIDE`] binds had passed, so reaching one needed
+    /// sixty-four *consecutive* vouched binds of a window. At the refusal rates a
+    /// driven boot measures — 4 669 refusals against 7 347 vouches — that is a
+    /// run this workload never produces, and `gw_audit_ok` read 0 on three
+    /// consecutive boots while a real escaping writer went unnoticed.
+    ///
+    /// It now means the armed window was refused [`AUDIT_REBASELINE_LIMIT`]
+    /// times running without ever reaching a vouched bind, so there was nothing
+    /// to check. That is a real "declined to compare" rather than a structural
+    /// one, and it should be rare.
     Restarted,
+    /// Armed, and this bind was refused — so the bytes were free to move and the
+    /// baseline is taken again from the bytes the gather is about to read.
+    ///
+    /// The window stays armed. This is the arm *waiting* for the vouched bind it
+    /// exists to check, and it costs one fold of a window whose bytes are being
+    /// read regardless.
+    Rebaselined,
     /// Folded under a vouch, and the bytes are where the vouch said they were.
     Agreed,
     /// Folded under a vouch, and the bytes had moved. Some writer reaches these
     /// guest pages without either half of the witness seeing it, so every gather
     /// skipped since the last audit bound a stale image.
     Disagreed,
+    /// Not folded: a guest-page copy this device submitted is still in flight
+    /// over this window, so a CPU read of it now is neither the bytes before nor
+    /// reliably the bytes after.
+    ///
+    /// The audit's own limitation and not a finding about the cache. The gather
+    /// this cache elides is a GPU copy ordered behind that writeback on the same
+    /// queue; the fold is not ordered against it by anything, which is the rule
+    /// `render_writeback` states for every host-side reader of guest bytes.
+    /// Comparing across it reported the device's own queue as a stale image.
+    Indebted,
 }
 
 /// One bind's answers: what the witness decided, what the audit found, and the
@@ -713,7 +960,13 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
             .gather_witness
             .previous_pages_epoch(&key)
             .map(|since| state.host_writes.wrote_any_since(since, window.gpas)),
+        pending: PendingWrites::over(window.gpas),
     };
+    // Every bind, vouched or not, so the route is a denominator rather than a
+    // tally of refusals — the reading wanted is what fraction of binds this
+    // device has a copy in flight over, and a count with no denominator cannot
+    // say whether a repair moved it.
+    note_store_route(counts.pending.route());
     // Report the host-write half's grounds, not just its answer. Three of its
     // four non-quiet values are this device declining to rule a write out rather
     // than one that landed here, and they want different repairs — name the
@@ -761,7 +1014,15 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
         // while this dominates `gw_audit_ok`, the alarm is not running and a
         // zero from it is not a measurement.
         ContentAudit::Restarted => note_store_route("gw_audit_restart"),
+        // The arm holding itself open across a refusal. Costs one fold of a
+        // window the gather reads anyway, and the count is what the alarm pays
+        // to stay reachable at all.
+        ContentAudit::Rebaselined => note_store_route("gw_audit_rebaseline"),
         ContentAudit::Agreed => note_store_route("gw_audit_ok"),
+        // Read beside `gw_audit_ok` the same way `gw_audit_restart` is: it is
+        // the audit's blind spot, and a boot where it dominates has an alarm
+        // that is looking away rather than one that is seeing nothing.
+        ContentAudit::Indebted => note_store_route("gw_audit_indebted"),
         ContentAudit::Disagreed => {
             note_store_route("gw_audit_unsound");
             // Once per window: a writer escaping both halves escapes them on
@@ -860,6 +1121,7 @@ fn observe<M: crate::runtime::host::HostOps>(
     let HostWriteCounts {
         pages_epoch,
         pages_wrote,
+        pending,
     } = counts;
 
     witness.binds = witness.binds.wrapping_add(1);
@@ -898,6 +1160,8 @@ fn observe<M: crate::runtime::host::HostOps>(
                 fold_valid: false,
                 fold_seeded: false,
                 binds_since_fold: 0,
+                audit_armed: false,
+                rebaselines: 0,
                 pages_epoch,
                 last_seen: witness.binds,
                 generation: fresh_generation,
@@ -914,6 +1178,9 @@ fn observe<M: crate::runtime::host::HostOps>(
         };
     }
 
+    // Copied out before the entry is borrowed mutably: the policy belongs to the
+    // witness and the decisions that read it belong to one of its entries.
+    let density = witness.audit;
     let entry = witness
         .entries
         .get_mut(&key)
@@ -944,31 +1211,78 @@ fn observe<M: crate::runtime::host::HostOps>(
     };
     let vouched = matches!(verdict, GatherVerdict::Vouched);
 
-    let audit = if entry.binds_since_fold >= AUDIT_STRIDE {
-        // SAFETY: `runs` describe the window this draw is about to gather from,
-        // so their pointers are live here for the same reason they are live
-        // there. On a vouched bind the gather will be skipped, but the runs were
-        // resolved by the same producer in the same call and name the same
-        // pages, which the entry's page set is checked against above.
-        let fold = unsafe { fold_runs(runs, span) };
-        // `fold_valid` is the question "does the stored fold still describe
-        // this window", and it is false for two reasons that read identically
-        // here and do not mean the same thing: this window has never been
-        // folded, or a refusal since the last fold dropped the baseline. The
-        // second is the audit declining to compare, and counting it as a seed
-        // is what let `gw_audit_unsound=0` read as a clean sweep of a
-        // population the fold never looked at.
-        let audit = match (vouched && entry.fold_valid, fold == entry.fold) {
-            (false, _) if entry.fold_seeded => ContentAudit::Restarted,
-            (false, _) => ContentAudit::Seeded,
-            (true, true) => ContentAudit::Agreed,
-            (true, false) => ContentAudit::Disagreed,
-        };
-        entry.fold_seeded = true;
-        entry.fold = fold;
-        entry.fold_valid = true;
+    // SAFETY (every `fold_runs` below): `runs` describe the window this draw is
+    // about to gather from, so their pointers are live here for the same reason
+    // they are live there. On a vouched bind the gather will be skipped, but the
+    // runs were resolved by the same producer in the same call and name the same
+    // pages, which the entry's page set is checked against above.
+    let audit = if !pending.settled() {
+        // A copy this device submitted is in flight over these pages and the
+        // fold is a CPU read of them, so whatever it reads now is neither the
+        // before nor reliably the after. Comparing across that reports the
+        // device's own queue as a stale image.
+        //
+        // Declines rather than settles. The audit is a diagnostic and must not
+        // introduce a stall the shipping path does not have — and it must not
+        // take the engine lock from inside the witness, which the drain thread
+        // reaches with its own locks held. Dropping the baseline is the honest
+        // answer: this window is not comparable right now, and the stride will
+        // bring it back when the queue is quiet.
+        entry.audit_armed = false;
+        entry.fold_valid = false;
+        entry.rebaselines = 0;
         entry.binds_since_fold = 0;
-        audit
+        ContentAudit::Indebted
+    } else if entry.audit_armed {
+        // The claim under test is "a vouched bind means these bytes did not
+        // move", so the bind that tests it is the *next vouched one* after a
+        // baseline — not one sixty-four binds later. Waiting for the stride
+        // again is what made the comparison unreachable: any refusal in between
+        // drops the baseline, and a run of sixty-four vouched binds is not
+        // something this workload produces.
+        if vouched {
+            let fold = unsafe { fold_runs(runs, span) };
+            let audit = match fold == entry.fold {
+                true => ContentAudit::Agreed,
+                false => ContentAudit::Disagreed,
+            };
+            entry.fold = fold;
+            entry.fold_valid = true;
+            entry.audit_armed = density.stays_armed();
+            entry.rebaselines = 0;
+            entry.binds_since_fold = 0;
+            audit
+        } else if entry.rebaselines < AUDIT_REBASELINE_LIMIT {
+            // Refused, so the bytes were free to move and the old baseline says
+            // nothing. The gather is about to read this window anyway, so a
+            // fresh baseline costs the fold and keeps the arm alive for the
+            // vouched bind it is waiting for.
+            entry.fold = unsafe { fold_runs(runs, span) };
+            entry.fold_seeded = true;
+            entry.fold_valid = true;
+            entry.rebaselines += 1;
+            ContentAudit::Rebaselined
+        } else {
+            // A window refused this many times running is not one a vouch is
+            // being claimed about, and holding the arm open folds it on every
+            // bind. Disarm and let the stride bring it back.
+            entry.audit_armed = false;
+            entry.rebaselines = 0;
+            entry.fold_valid = false;
+            entry.binds_since_fold = 0;
+            ContentAudit::Restarted
+        }
+    } else if entry.binds_since_fold >= density.stride() {
+        // Arm: take the baseline whatever this bind's verdict is. The fold reads
+        // the guest pages directly, so it describes the window on a vouched bind
+        // (where the gather is skipped) exactly as it does on a refused one.
+        entry.fold = unsafe { fold_runs(runs, span) };
+        entry.fold_seeded = true;
+        entry.fold_valid = true;
+        entry.audit_armed = true;
+        entry.rebaselines = 0;
+        entry.binds_since_fold = 0;
+        ContentAudit::Seeded
     } else {
         entry.binds_since_fold += 1;
         // A bind the witness refused may have moved the bytes with nothing
@@ -1034,6 +1348,7 @@ mod tests {
     const QUIET: HostWriteCounts = HostWriteCounts {
         pages_epoch: 1,
         pages_wrote: Some(crate::runtime::host_writes::HostWriteVerdict::Quiet),
+        pending: PendingWrites::Disjoint,
     };
 
     /// One bind, discarding the audit — for the tests that are about the verdict.
@@ -1192,6 +1507,146 @@ mod tests {
         );
     }
 
+    /// A witness at a stated audit density, for the two tests that are about the
+    /// density rather than about the witness.
+    fn witness_auditing(density: AuditDensity) -> GatherWitness {
+        GatherWitness {
+            audit: density,
+            ..GatherWitness::default()
+        }
+    }
+
+    /// [`AuditDensity::EveryBind`] judges every bind it can, and the shipping
+    /// stride judges none of the same population.
+    ///
+    /// Both arms are asserted because only the pair says the switch does
+    /// anything: the dense arm alone would pass against a witness that always
+    /// audited, and the strided arm alone against one that never did.
+    ///
+    /// Six binds rather than a computed count, and the dense arm is allowed its
+    /// first three — a comparison needs a baseline bind and a bind to spend it
+    /// on, and the first sight of a window is a rearm that has neither.
+    #[test]
+    fn every_bind_compares_where_the_shipping_stride_has_not_yet_looked() {
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+        let compares = |density| {
+            let mut host = crate::runtime::host::FakeHost::new();
+            let mut w = witness_auditing(density);
+            (0..6)
+                .map(|_| observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()))
+                .filter(|seen| seen.audit == ContentAudit::Agreed)
+                .count()
+        };
+        assert_eq!(
+            compares(AuditDensity::Strided),
+            0,
+            "the shipping stride is {AUDIT_STRIDE} binds, so six cannot reach a comparison"
+        );
+        assert_eq!(
+            compares(AuditDensity::EveryBind),
+            3,
+            "every bind after the first three must compare against the bind before it"
+        );
+    }
+
+    /// The reading the switch exists to produce: a writer that escapes **both**
+    /// halves of the witness is caught on the very next bind.
+    ///
+    /// This is the failure the sampled cache's identity-only lookup cannot report
+    /// any other way — an elision correctly taken and one wrongly taken are the
+    /// same absence — so the audit catching it is the only instrument there is.
+    /// The bytes here move with no guest store and no recorded host write, which
+    /// is exactly the shape of an unrecorded writer.
+    ///
+    /// The vouch is asserted too, and it is the half that matters at a bind: a
+    /// `Disagreed` audit that still handed back a live generation would leave the
+    /// next bind serving the same stale image the audit had just convicted.
+    #[test]
+    fn an_unrecorded_write_is_convicted_on_the_next_bind_and_spends_the_generation() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut w = witness_auditing(AuditDensity::EveryBind);
+        let mut buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+        let settled = bind_quietly(&mut w, &mut host, &GPAS, &runs, 4);
+        assert_eq!(
+            (settled.audit, settled.vouch),
+            (ContentAudit::Agreed, GatherVouch::Vouched),
+            "the window has to be under a live vouch before the escape means anything"
+        );
+
+        // Neither half is told. This is the writer the module's whole soundness
+        // argument assumes does not exist.
+        buf[2048] ^= 0xff;
+
+        let caught = observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, 77);
+        assert_eq!(
+            (caught.verdict, caught.audit),
+            (GatherVerdict::Vouched, ContentAudit::Disagreed),
+            "both halves vouched and the bytes had moved, which is the alarm's whole purpose"
+        );
+        assert_eq!(
+            (caught.generation, caught.vouch),
+            (77, GatherVouch::Fresh),
+            "a convicted vouch must not be handed on, or the next bind serves the stale image"
+        );
+    }
+
+    /// The audit declines to compare across a copy this device has submitted and
+    /// the GPU has not run — and the *vouch* is untouched by it.
+    ///
+    /// Both halves matter and they pull opposite ways. The fold is a CPU read of
+    /// guest pages and is ordered against that copy by nothing, so comparing
+    /// across it reports the device's own queue as a stale image. The gather the
+    /// cache elides is a GPU copy on the same queue as the writeback, so it *is*
+    /// ordered and the vouch is still sound — making this refuse the vouch too
+    /// would cost re-gathers to fix a defect in the instrument.
+    ///
+    /// `Unnamed` is asserted beside `Overlap` because a footprint nobody could
+    /// name is not a proof of disjointness, and reading it as one is how the
+    /// blind spot would come back as "we could not tell, so we compared".
+    #[test]
+    fn an_unlanded_copy_stops_the_audit_comparing_and_leaves_the_vouch_alone() {
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+        let bind = |w: &mut GatherWitness, host: &mut crate::runtime::host::FakeHost, pending| {
+            observe(
+                w,
+                host,
+                KEY,
+                one_page(&GPAS, &runs),
+                HostWriteCounts { pending, ..QUIET },
+                next_gen(),
+            )
+        };
+
+        // Quiet queue: the audit reaches a comparison, which is the control —
+        // without it the assertions below would pass against an audit that never
+        // ran at all.
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut w = witness_auditing(AuditDensity::EveryBind);
+        let settled = bind_quietly(&mut w, &mut host, &GPAS, &runs, 4);
+        assert_eq!(
+            (settled.verdict, settled.audit),
+            (GatherVerdict::Vouched, ContentAudit::Agreed)
+        );
+
+        for pending in [PendingWrites::Overlap, PendingWrites::Unnamed] {
+            let seen = bind(&mut w, &mut host, pending);
+            assert_eq!(
+                seen.audit,
+                ContentAudit::Indebted,
+                "{pending:?} folded across a copy that has not landed"
+            );
+            assert_eq!(
+                seen.verdict,
+                GatherVerdict::Vouched,
+                "{pending:?} moved the vouch, which is ordered behind that copy and did not need to"
+            );
+            assert_eq!(seen.vouch, GatherVouch::Vouched);
+        }
+    }
+
     /// A window whose bytes and pages both stand still, bound twice: the whole
     /// point of the exercise, and the verdict whose count says what the cache
     /// saves.
@@ -1266,50 +1721,48 @@ mod tests {
         assert_eq!(checked.audit, ContentAudit::Agreed);
     }
 
-    /// A refusal inside a stride leaves the next audit unable to compare, and it
-    /// must say so rather than reading as a first fold.
+    /// A refusal inside a stride no longer disarms the alarm: the next arm takes
+    /// a fresh baseline and the comparison still happens.
     ///
-    /// This is the difference between an alarm that is armed and one that is
-    /// not, and until `Restarted` existed the two were one counter. Every
-    /// driven boot of this device reports `gw_audit_ok` 0 against
-    /// `gw_audit_seed` in the hundreds — because refusals are roughly two in
-    /// five binds, and a comparison needs `AUDIT_STRIDE` consecutive vouches of
-    /// one window. So `gw_audit_unsound` reading 0 was a check that never ran,
-    /// and it read exactly like one that ran and agreed. A real writer escaping
-    /// both halves hid behind that zero.
+    /// This is the repair, and the reason it was needed. Refusals are roughly
+    /// two binds in five, and the audit used to take its baseline and compare on
+    /// the *same* stride bind — so reaching a comparison needed `AUDIT_STRIDE`
+    /// consecutive vouched binds of one window, which this workload does not
+    /// produce. Three consecutive driven boots read `gw_audit_ok` **0** against
+    /// `gw_audit_seed` in the hundreds, so `gw_audit_unsound`'s zero was a check
+    /// that never ran while reading exactly like one that ran and agreed. A real
+    /// writer escaping both halves hid behind it.
     ///
     /// The test drives one refusal into an otherwise quiet run, which is the
-    /// smallest thing that puts the audit in the state the whole workload is
-    /// permanently in.
+    /// smallest thing that put the old audit into the state the whole workload
+    /// was permanently in.
     #[test]
-    fn a_refusal_inside_a_stride_makes_the_next_audit_say_it_could_not_compare() {
+    fn a_refusal_inside_a_stride_still_leaves_the_alarm_able_to_compare() {
         let mut host = crate::runtime::host::FakeHost::new();
         let mut w = GatherWitness::default();
         let buf = vec![0x5au8; PAGE];
         let runs = [run_over(&buf)];
-        // Rearm, then take a first fold so the window has a baseline at all.
         bind_quietly(&mut w, &mut host, &GPAS, &runs, 1);
         assert_eq!(
             bind_to_next_audit(&mut w, &mut host, &GPAS, &runs).audit,
             ContentAudit::Seeded,
-            "the first fold of a window is a seed"
+            "arming takes the baseline"
         );
-        // With nothing disturbing it, the next audit does compare — this is the
-        // case the existing tests live in and the workload never reaches.
         assert_eq!(
             bind_to_next_audit(&mut w, &mut host, &GPAS, &runs).audit,
-            ContentAudit::Agreed
+            ContentAudit::Agreed,
+            "and the very next vouched bind is the one that checks it"
         );
 
         // One refused bind: this device wrote a page of the window. Nothing
-        // about the bytes changed, so an audit that still compared would agree
-        // — the point is that it is no longer *entitled* to.
+        // about the bytes changed.
         let refused = observe(
             &mut w,
             &mut host,
             KEY,
             one_page(&GPAS, &runs),
             HostWriteCounts {
+                pending: PendingWrites::Disjoint,
                 pages_epoch: 2,
                 pages_wrote: Some(crate::runtime::host_writes::HostWriteVerdict::Overlap),
             },
@@ -1326,12 +1779,115 @@ mod tests {
             "the fixture must actually refuse, or the rest proves nothing"
         );
 
+        // The old design answered `Restarted` here and never compared again
+        // until sixty-four consecutive vouches, which never came.
         assert_eq!(
             bind_to_next_audit(&mut w, &mut host, &GPAS, &runs).audit,
-            ContentAudit::Restarted,
-            "a dropped baseline must not report as a window being met for the \
-             first time — that is the reading that made a dead alarm look clean"
+            ContentAudit::Seeded,
+            "the arm after a refusal takes a fresh baseline rather than giving up"
         );
+        assert_eq!(
+            bind_to_next_audit(&mut w, &mut host, &GPAS, &runs).audit,
+            ContentAudit::Agreed,
+            "and the alarm is running again one bind later"
+        );
+    }
+
+    /// A refused bind between the baseline and the check must not produce a
+    /// `Disagreed` for a witness that was right.
+    ///
+    /// An alarm that cries wolf is worse than no alarm, since the whole value of
+    /// this one is that a nonzero count means something. The refusal is the
+    /// witness working — it saw the store — so the baseline is retaken from the
+    /// bytes the gather is about to read, and the check that follows compares
+    /// across a vouched bind only.
+    #[test]
+    fn a_refused_bind_between_audits_does_not_leave_a_false_alarm_behind() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut w = GatherWitness::default();
+        let mut buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+        bind_quietly(&mut w, &mut host, &GPAS, &runs, 1);
+        assert_eq!(
+            bind_to_next_audit(&mut w, &mut host, &GPAS, &runs).audit,
+            ContentAudit::Seeded
+        );
+
+        // A guest store the hypervisor *does* see, repainting the window while
+        // the audit is armed. The gather happens, so nothing is stale — but the
+        // baseline is now from before the repaint.
+        buf[11] ^= 0xff;
+        host.guest_wrote_page(GPAS[0]);
+        let refused = observe(
+            &mut w,
+            &mut host,
+            KEY,
+            one_page(&GPAS, &runs),
+            QUIET,
+            next_gen(),
+        );
+        assert!(matches!(refused.verdict, GatherVerdict::Refused { .. }));
+        assert_eq!(
+            refused.audit,
+            ContentAudit::Rebaselined,
+            "the armed window retakes its baseline from the repainted bytes"
+        );
+
+        assert_eq!(
+            bind_to_next_audit(&mut w, &mut host, &GPAS, &runs).audit,
+            ContentAudit::Agreed,
+            "comparing across the repaint would have been a false alarm"
+        );
+    }
+
+    /// An armed window that is only ever refused gives up rather than folding on
+    /// every bind.
+    ///
+    /// The arm costs one fold per refused bind, and the rail it audits moves
+    /// 842 MB/s — so a window the witness never vouches for would pull the whole
+    /// of it back through the audit. `AUDIT_REBASELINE_LIMIT` bounds that, and
+    /// the stride is what brings the window back.
+    #[test]
+    fn an_armed_window_that_is_never_vouched_gives_up_instead_of_folding_forever() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut w = GatherWitness::default();
+        let buf = vec![0x11u8; PAGE];
+        let runs = [run_over(&buf)];
+        bind_quietly(&mut w, &mut host, &GPAS, &runs, 1);
+        assert_eq!(
+            bind_to_next_audit(&mut w, &mut host, &GPAS, &runs).audit,
+            ContentAudit::Seeded
+        );
+
+        let refuse = |w: &mut GatherWitness, host: &mut crate::runtime::host::FakeHost| {
+            observe(
+                w,
+                host,
+                KEY,
+                one_page(&GPAS, &runs),
+                HostWriteCounts {
+                    pending: PendingWrites::Disjoint,
+                    pages_epoch: 2,
+                    pages_wrote: Some(crate::runtime::host_writes::HostWriteVerdict::Overlap),
+                },
+                next_gen(),
+            )
+            .audit
+        };
+        for i in 0..AUDIT_REBASELINE_LIMIT {
+            assert_eq!(
+                refuse(&mut w, &mut host),
+                ContentAudit::Rebaselined,
+                "refusal {i} is still inside the arm's budget"
+            );
+        }
+        assert_eq!(
+            refuse(&mut w, &mut host),
+            ContentAudit::Restarted,
+            "past the budget the arm gives up rather than folding on every bind"
+        );
+        // And having given up it stops folding, so the cost really is bounded.
+        assert_eq!(refuse(&mut w, &mut host), ContentAudit::Skipped);
     }
 
     /// The unsound case, produced deliberately: bytes changed under pages neither
@@ -1433,52 +1989,6 @@ mod tests {
                 next_gen()
             ),
             GatherVerdict::Vouched
-        );
-    }
-
-    /// A refused bind between two audits invalidates the stored fold, because it
-    /// may have moved the bytes with nothing reading them.
-    ///
-    /// Without this the next audit would compare against a fold from before a
-    /// legitimate repaint and report `gw_audit_unsound` for a witness that was
-    /// right — an alarm that cries wolf is worse than no alarm, since the whole
-    /// value of this one is that a nonzero count means something.
-    #[test]
-    fn a_refused_bind_between_audits_does_not_leave_a_false_alarm_behind() {
-        let mut host = crate::runtime::host::FakeHost::new();
-        let mut w = GatherWitness::default();
-        let mut buf = vec![0xa5u8; PAGE];
-        let runs = [run_over(&buf)];
-        // Rearm, seed a fold, and reach a vouched steady state.
-        bind_quietly(&mut w, &mut host, &GPAS, &runs, 1);
-        assert_eq!(
-            bind_to_next_audit(&mut w, &mut host, &GPAS, &runs).audit,
-            ContentAudit::Seeded
-        );
-
-        // A guest store the hypervisor *does* see, repainting the window. The
-        // gather happens, so nothing is stale — but the stored fold is now from
-        // before the repaint.
-        buf[11] ^= 0xff;
-        host.guest_wrote_page(GPAS[0]);
-        assert!(matches!(
-            observe(
-                &mut w,
-                &mut host,
-                KEY,
-                one_page(&GPAS, &runs),
-                QUIET,
-                next_gen()
-            )
-            .verdict,
-            GatherVerdict::Refused { .. }
-        ));
-
-        let next = bind_to_next_audit(&mut w, &mut host, &GPAS, &runs);
-        assert_eq!(
-            next.audit,
-            ContentAudit::Restarted,
-            "the audit compared against a fold from before a repaint it knew about"
         );
     }
 

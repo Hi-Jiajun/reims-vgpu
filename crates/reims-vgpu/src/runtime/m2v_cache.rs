@@ -53,6 +53,10 @@ pub enum M2vCacheDecline {
     ReflectionDatalayoutMissing {
         stage: &'static str,
     },
+    ReflectionMalformed {
+        stage: &'static str,
+        violations: usize,
+    },
     LayoutRepair {
         stage: &'static str,
         reason: crate::runtime::spirv_layout::SpirvLayoutDecline,
@@ -62,6 +66,10 @@ pub enum M2vCacheDecline {
     },
     KernelLocalSizeZero {
         local_size: [u32; 3],
+    },
+    KernelLocalSizeMismatch {
+        requested: [u32; 3],
+        reflected: Option<[u32; 3]>,
     },
 }
 
@@ -101,9 +109,11 @@ impl M2vCacheDecline {
             | Self::FragmentTranslate { .. }
             | Self::KernelTranslate { .. }
             | Self::ReflectionDatalayoutMissing { .. }
+            | Self::ReflectionMalformed { .. }
             | Self::LayoutRepair { .. }
             | Self::TranslationPending { .. }
-            | Self::KernelLocalSizeZero { .. } => false,
+            | Self::KernelLocalSizeZero { .. }
+            | Self::KernelLocalSizeMismatch { .. } => false,
         }
     }
 }
@@ -171,9 +181,11 @@ impl Decline for M2vCacheDecline {
             Self::FragmentTranslate { .. } => "m2v_fragment_translate",
             Self::KernelTranslate { .. } => "m2v_kernel_translate",
             Self::ReflectionDatalayoutMissing { .. } => "m2v_reflection_datalayout_missing",
+            Self::ReflectionMalformed { .. } => "m2v_reflection_malformed",
             Self::LayoutRepair { reason, .. } => reason.slug(),
             Self::TranslationPending { .. } => "m2v_translation_pending_at_sync_boundary",
             Self::KernelLocalSizeZero { .. } => "m2v_kernel_local_size_zero",
+            Self::KernelLocalSizeMismatch { .. } => "m2v_kernel_local_size_mismatch",
         }
     }
 
@@ -214,10 +226,30 @@ impl Decline for M2vCacheDecline {
             Self::ReflectionDatalayoutMissing { stage } | Self::TranslationPending { stage } => {
                 vec![("stage", (*stage).to_string())]
             }
+            Self::ReflectionMalformed { stage, violations } => vec![
+                ("stage", (*stage).to_string()),
+                ("violations", violations.to_string()),
+            ],
             Self::KernelLocalSizeZero { local_size } => vec![
                 ("tg_x", local_size[0].to_string()),
                 ("tg_y", local_size[1].to_string()),
                 ("tg_z", local_size[2].to_string()),
+            ],
+            Self::KernelLocalSizeMismatch {
+                requested,
+                reflected,
+            } => vec![
+                (
+                    "requested",
+                    format!("{},{},{}", requested[0], requested[1], requested[2]),
+                ),
+                (
+                    "reflected",
+                    reflected.map_or_else(
+                        || "none".to_string(),
+                        |size| format!("{},{},{}", size[0], size[1], size[2]),
+                    ),
+                ),
             ],
         }
     }
@@ -250,28 +282,23 @@ pub struct CachedShader {
     frag_reloc: Mutex<FragmentRelocationCache>,
 }
 
-/// One binding numbering of a translated module, beside the answers derived
-/// from *that* numbering.
+/// One binding numbering of a translated module, beside the reflected
+/// interface transformed into *that* numbering.
 ///
 /// The pair is one struct because the second is only true of the first.
-/// Relocation renumbers a module's descriptor bindings, so
-/// `spirv_bind::sampler_bindings` taken over the unrelocated words is a wrong
-/// answer for a draw that relocated them — and the way to make that
-/// unrepresentable is for the words and the walk of them to be reachable only
-/// together, from one key. A caller cannot pass one set of flags to the words
-/// and another to the walk, because there is only one call.
+/// Relocation renumbers a module's descriptor bindings. The reflected sampler
+/// interface is transformed by the same variant key and stored here, so a
+/// caller cannot pair words from one numbering with resources from another.
 pub struct ShaderVariant {
     /// The module, in this variant's numbering.
     pub words: Arc<Vec<u32>>,
-    /// The descriptor bindings this module declares an `OpTypeSampler` at,
-    /// sorted and deduplicated — [`crate::runtime::spirv_bind::sampler_bindings`]
-    /// over [`Self::words`].
+    /// The typed sampler descriptors reflection declares, transformed into
+    /// this variant's numbering. Constexpr state stays attached to its binding.
     ///
-    /// Derived here rather than at the draw because it is a full walk of every
-    /// instruction in the module for an answer that depends on nothing else,
-    /// and the draw path ran it twice a draw. It is the larger half of what
-    /// `sampled_phase`'s `Part::Reflect` brackets, measured at 10 486 us/s over
-    /// 29 944 draws — 0.35 us a draw — on a driven macos-13 boot.
+    /// Derived here rather than at the draw because the answer depends only on
+    /// the shader and its relocation key. Reflection is the authority; the
+    /// former implementation rediscovered the same interface by walking every
+    /// SPIR-V instruction, twice per draw before this value was cached.
     ///
     /// # What it removed
     ///
@@ -304,16 +331,15 @@ pub struct ShaderVariant {
     /// and `present_hz` down — the GPU clocking down between the two groups,
     /// with nothing in the log to say so. Interleaving is not optional for a pin
     /// comparison on this host.
-    pub sampler_bindings: Arc<[u32]>,
+    pub samplers: Arc<[crate::runtime::spirv_bind::ReflectedSamplerDescriptor]>,
 }
 
 impl ShaderVariant {
-    fn of(words: Arc<Vec<u32>>) -> Arc<Self> {
-        let sampler_bindings = crate::runtime::spirv_bind::sampler_bindings(&words).into();
-        Arc::new(Self {
-            words,
-            sampler_bindings,
-        })
+    fn of(
+        words: Arc<Vec<u32>>,
+        samplers: Arc<[crate::runtime::spirv_bind::ReflectedSamplerDescriptor]>,
+    ) -> Arc<Self> {
+        Arc::new(Self { words, samplers })
     }
 }
 
@@ -367,7 +393,16 @@ impl CachedShader {
         if !separate_sampled && !buf_collide {
             return self
                 .base
-                .get_or_init(|| ShaderVariant::of(self.words.clone()))
+                .get_or_init(|| {
+                    ShaderVariant::of(
+                        self.words.clone(),
+                        crate::runtime::spirv_bind::reflected_sampler_descriptors(
+                            &self.reflection,
+                            false,
+                        )
+                        .into(),
+                    )
+                })
                 .clone();
         }
         let mut cache = self.frag_reloc.lock().unwrap_or_else(|e| e.into_inner());
@@ -385,7 +420,14 @@ impl CachedShader {
                     let n = crate::runtime::spirv_bind::offset_fragment_buffer_bindings(&mut w);
                     crate::observe::line(format!("linux_m2v frag_buf_reloc n={n}"));
                 }
-                ShaderVariant::of(Arc::new(w))
+                ShaderVariant::of(
+                    Arc::new(w),
+                    crate::runtime::spirv_bind::reflected_sampler_descriptors(
+                        &self.reflection,
+                        separate_sampled,
+                    )
+                    .into(),
+                )
             })
             .clone()
     }
@@ -710,6 +752,12 @@ fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedSha
     .map_err(|e| M2vCacheDecline::KernelTranslate {
         detail: e.to_string(),
     })?;
+    if reflection.local_size != Some(local_size) {
+        return Err(M2vCacheDecline::KernelLocalSizeMismatch {
+            requested: local_size,
+            reflected: reflection.local_size,
+        });
+    }
     finish_translated(spirv, reflection, Stage::Kernel)
 }
 
@@ -719,8 +767,8 @@ fn finish_translated(
     reflection: ShaderReflection,
     stage: Stage,
 ) -> M2vResult<CachedShader> {
+    validate_reflection(&reflection, stage)?;
     let spirv = repair_layout(&reflection, spirv, stage)?;
-    census_reflection(&reflection, stage);
     // Once-per-translate: surface any runtime function constants this shader
     // declares. metal2vulkan folds them to their disabled default and the paravirt
     // stream carries no MTLFunctionConstantValues, so the FC-disabled variant is
@@ -735,10 +783,17 @@ fn finish_translated(
 /// path: it validates the reflection's ABI version and its internal
 /// sampled-vs-storage consistency without a second walk of the SPIR-V. Must read
 /// zero on a healthy boot.
-fn census_reflection(reflection: &ShaderReflection, stage: Stage) {
+fn validate_reflection(reflection: &ShaderReflection, stage: Stage) -> M2vResult<()> {
     // pipeline_ref is telemetry only here; the stage tag localizes the shader.
     let pipe = stage_tag(stage) as u32;
-    let _ = crate::runtime::spirv_bind::census_reflection_wellformed(reflection, pipe);
+    let violations = crate::runtime::spirv_bind::census_reflection_wellformed(reflection, pipe);
+    if violations != 0 {
+        return Err(M2vCacheDecline::ReflectionMalformed {
+            stage: stage_name(stage),
+            violations,
+        });
+    }
+    Ok(())
 }
 
 fn repair_layout(
@@ -1124,8 +1179,8 @@ mod tests {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A variant's `sampler_bindings` must be the walk of *that variant's*
-    /// words, on every variant.
+    /// A variant's reflected sampler interface must agree with the executable
+    /// module in *that variant's* numbering.
     ///
     /// This is the invariant [`ShaderVariant`] exists to make unrepresentable,
     /// and it is worth a test because the failure it replaces was silent: the
@@ -1135,10 +1190,15 @@ mod tests {
     /// A relocated module renumbers its descriptor bindings, so an answer taken
     /// for the wrong variant is a real sampler bound at the wrong number.
     #[test]
-    fn every_variants_sampler_bindings_are_a_walk_of_that_variants_words() {
-        let words = crate::runtime::spirv_bind::test_module_with_samplers(&[3, 7, 11]);
+    fn every_variants_reflected_sampler_bindings_match_the_executable_module() {
+        let translator_base = metal2vulkan::reflect::SAMPLER_BINDING_BASE;
+        let words = crate::runtime::spirv_bind::test_module_with_samplers(&[
+            translator_base + 3,
+            translator_base + 7,
+            translator_base + 11,
+        ]);
         let spirv: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let shader = synth_shader(Stage::Fragment, spirv);
+        let shader = synth_shader_with_samplers(Stage::Fragment, spirv, &[3, 7, 11]);
 
         // The fixture is only useful if the walk finds something in it. Not
         // asserted against the numbers the fixture was built with:
@@ -1146,7 +1206,7 @@ mod tests {
         // the base variant is already in the device's numbering rather than the
         // translator's, and that is the numbering every consumer sees.
         assert_eq!(
-            shader.variant(false, false).sampler_bindings.len(),
+            shader.variant(false, false).samplers.len(),
             3,
             "the fixture's three samplers survive band widening"
         );
@@ -1156,8 +1216,11 @@ mod tests {
         {
             let v = shader.variant(separate_sampled, buf_collide);
             assert_eq!(
-                &*v.sampler_bindings,
-                &crate::runtime::spirv_bind::sampler_bindings(&v.words)[..],
+                v.samplers
+                    .iter()
+                    .map(|sampler| sampler.binding)
+                    .collect::<Vec<_>>(),
+                crate::runtime::spirv_bind::sampler_bindings(&v.words),
                 "variant({separate_sampled}, {buf_collide})"
             );
         }
@@ -1196,18 +1259,102 @@ mod tests {
                 stage,
                 entry_point: None,
                 bindings: vec![],
+                argument_buffer_fields: vec![],
                 vertex_attributes: vec![],
                 varyings: vec![],
                 render_targets: vec![],
                 depth_members: vec![],
+                depth_qualifier: None,
                 stencil_members: vec![],
-                local_size: None,
+                local_size: (stage == ShaderStage::Kernel).then_some([1, 1, 1]),
                 vertex_builtins: None,
+                tessellation: None,
                 imageblock_layouts: vec![],
+                implicit_imageblock_attachments: vec![],
+                fragment_imageblock: None,
                 datalayout: None,
                 function_constants: vec![],
             }),
         ))
+    }
+
+    fn synth_shader_with_samplers(
+        stage: Stage,
+        spirv: Vec<u8>,
+        metal_indices: &[u32],
+    ) -> Arc<CachedShader> {
+        use metal2vulkan::reflect::{
+            DescriptorLocation, ResourceBinding, ResourceKind, ShaderReflection, ShaderStage,
+            REFLECTION_VERSION, RESOURCE_DESCRIPTOR_SET, SAMPLER_BINDING_BASE,
+        };
+        let reflected_stage = match stage {
+            Stage::Vertex => ShaderStage::Vertex,
+            Stage::Fragment => ShaderStage::Fragment,
+            Stage::Kernel => ShaderStage::Kernel,
+        };
+        let bindings = metal_indices
+            .iter()
+            .copied()
+            .map(|metal_index| ResourceBinding {
+                kind: ResourceKind::Sampler,
+                metal_index,
+                descriptor: Some(DescriptorLocation {
+                    set: RESOURCE_DESCRIPTOR_SET,
+                    binding: SAMPLER_BINDING_BASE + metal_index,
+                    count: 1,
+                }),
+                param_index: None,
+                stage_input_location: None,
+                address_space: None,
+                declared_size: None,
+                extent: None,
+                footprint: None,
+                type_layout: None,
+                type_name: None,
+                texture_shape: None,
+                embedded_source: None,
+                access: None,
+                static_sampler: None,
+            })
+            .collect();
+        Arc::new(CachedShader::new(
+            spirv,
+            Arc::new(ShaderReflection {
+                reflection_version: REFLECTION_VERSION,
+                stage: reflected_stage,
+                entry_point: None,
+                bindings,
+                argument_buffer_fields: vec![],
+                vertex_attributes: vec![],
+                varyings: vec![],
+                render_targets: vec![],
+                depth_members: vec![],
+                depth_qualifier: None,
+                stencil_members: vec![],
+                local_size: (reflected_stage == ShaderStage::Kernel).then_some([1, 1, 1]),
+                vertex_builtins: None,
+                tessellation: None,
+                imageblock_layouts: vec![],
+                implicit_imageblock_attachments: vec![],
+                fragment_imageblock: None,
+                datalayout: None,
+                function_constants: vec![],
+            }),
+        ))
+    }
+
+    #[test]
+    fn malformed_reflection_is_refused_before_it_reaches_a_binding_path() {
+        let shader = synth_shader(Stage::Fragment, Vec::new());
+        let mut reflection = (*shader.reflection).clone();
+        reflection.reflection_version = reflection.reflection_version.wrapping_add(1);
+        assert!(matches!(
+            validate_reflection(&reflection, Stage::Fragment),
+            Err(M2vCacheDecline::ReflectionMalformed {
+                stage: "fragment",
+                violations: 1,
+            })
+        ));
     }
 
     /// `CachedShader::new` widens the translator's bands, and `variant`
@@ -1338,6 +1485,10 @@ mod tests {
             M2vCacheDecline::FragmentTranslate { detail: detail() },
             M2vCacheDecline::KernelTranslate { detail: detail() },
             M2vCacheDecline::ReflectionDatalayoutMissing { stage: "vertex" },
+            M2vCacheDecline::ReflectionMalformed {
+                stage: "vertex",
+                violations: 1,
+            },
             M2vCacheDecline::TranslationPending { stage: "vertex" },
             M2vCacheDecline::KernelLocalSizeZero {
                 local_size: [0, 1, 1],
@@ -1674,6 +1825,10 @@ mod tests {
                 detail: "tool failed".into(),
             },
             M2vCacheDecline::ReflectionDatalayoutMissing { stage: "fragment" },
+            M2vCacheDecline::ReflectionMalformed {
+                stage: "fragment",
+                violations: 1,
+            },
             M2vCacheDecline::LayoutRepair {
                 stage: "kernel",
                 reason:
@@ -1682,6 +1837,10 @@ mod tests {
             M2vCacheDecline::TranslationPending { stage: "vertex" },
             M2vCacheDecline::KernelLocalSizeZero {
                 local_size: [0, 16, 1],
+            },
+            M2vCacheDecline::KernelLocalSizeMismatch {
+                requested: [16, 16, 1],
+                reflected: Some([8, 8, 1]),
             },
         ];
         let mut slugs = Vec::new();
@@ -1699,7 +1858,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 10, "the m2v cache decline census moved");
+        assert_eq!(before, 12, "the m2v cache decline census moved");
         assert_eq!(before, slugs.len(), "duplicate m2v cache decline");
     }
 }

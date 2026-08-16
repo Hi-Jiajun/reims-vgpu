@@ -10,9 +10,10 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use super::buffer_slab::{BufferSlabToken, BUFFER_SLAB_IDLE_KEEP_EMPTY};
+use super::caches::{FramebufferCompatibilityKey, PassCompatibilityKey};
 use super::compute_execution::ComputeExecutionDecline;
-use super::context::{DeviceContext, DrawSpanProbe, FENCE_TIMEOUT_NS};
-use super::counters::EngineCounters;
+use super::context::{DeviceContext, DrawSpanProbe, TimestampProbe, FENCE_TIMEOUT_NS};
+use super::counters::{CreateSite, EngineCounters};
 use super::desc_arena::{DescriptorArena, DESC_BLOCK_MAX_SETS};
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::types::{DrawError, ResidentReclaim, StorageImageFormat, TargetIdentity};
@@ -120,6 +121,28 @@ pub(crate) struct TargetSlot {
     pub framebuffer: vk::Framebuffer,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MultisampleTargetKey {
+    pub width: u32,
+    pub height: u32,
+    pub format: vk::Format,
+    pub samples: u32,
+    pub compatibility: FramebufferCompatibilityKey,
+    pub resolve_view: vk::ImageView,
+    pub depth_view: Option<vk::ImageView>,
+    /// The depth view dies with this draw and therefore cannot make the cached
+    /// framebuffer reusable, even if the driver later recycles its raw handle.
+    pub transient_depth: bool,
+}
+
+pub(crate) struct MultisampleTargetSlot {
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub view: vk::ImageView,
+    pub framebuffer: vk::Framebuffer,
+    pub key: MultisampleTargetKey,
+}
+
 /// A readback slot checked out of the pool, and the token its holder returns.
 pub(crate) struct LeasedReadback {
     pub token: u64,
@@ -189,10 +212,31 @@ pub(crate) struct ResourcePools {
     /// Buffer binds the command buffer now recording has already staged or
     /// gathered, keyed by the content that produced them.
     ///
-    /// The key is `(Arc` address`, length)` of the bind's content — the runtime
-    /// holds one `Arc` per resolved `(task, reference, offset)`, so two binds of
-    /// the same guest window are the same pointer and two different windows
-    /// cannot collide however their bytes compare.
+    /// The key is `(Arc` address`, length)` of the bind's content, and the entry
+    /// **holds that `Arc`** — see [`CbBind`]. Two binds of the same content are
+    /// then the same pointer, and two different contents cannot collide however
+    /// their bytes compare, because neither allocation can be freed while an
+    /// entry names it.
+    ///
+    /// The holding is the whole safety argument and it was once absent. The map
+    /// stored a bare [`super::exec::BoundBuffer`], which is `Copy` and owns
+    /// nothing, on the justification that "the runtime holds one `Arc` per
+    /// resolved `(task, reference, offset)`". That is true of the `GuestRuns`
+    /// arm, whose `Arc` lives in the bound-buffer registry, and false of the
+    /// `Bytes` arm, which is `Arc::new`-ed per bind from a freshly read `Vec`
+    /// and dropped with the `DrawRequest` that asked for it — while this map
+    /// survives to the end of the command buffer, up to `BATCH_MAX_DRAWS`
+    /// draws later. `ArcInner<Vec<u8>>` is a fixed 40-byte allocation whatever
+    /// the payload, so the allocator hands the address straight back, and the
+    /// next draw's unrelated read of the same length was served the previous
+    /// draw's bytes and counted as a reuse win.
+    ///
+    /// This crate states the rule correctly in two other places —
+    /// `caches.rs`'s `ShaderDigestIndex` ("drop the `Arc` from the entry and
+    /// this becomes a use-after-free dressed as a cache hit") and
+    /// [`buffer_gather_working_set`], which is keyed the same way and says it
+    /// does not owe the `Arc` because it is measure-only. This map is looked up
+    /// for a *bind* and does owe it.
     ///
     /// # Why the command buffer and not the draw
     ///
@@ -230,7 +274,26 @@ pub(crate) struct ResourcePools {
     /// pages** ([`ResourcePools::note_guest_write_recorded`]). That last one is
     /// the correctness edge: a bind after a Store into the same pages must see
     /// what the Store wrote, and reusing a copy taken before it would not.
-    cb_bound_buffers: HashMap<(usize, u64), super::exec::BoundBuffer>,
+    cb_bound_buffers: HashMap<(usize, u64, u64), (super::exec::BoundBuffer, CbBindOwner)>,
+    /// Keys in `cb_bound_buffers` whose slot is **not yet filled**: a GPU gather
+    /// was planned for them and the copy or dispatch that lands it has not been
+    /// recorded into the command buffer.
+    ///
+    /// Every other arm of `stage_buffer_content` publishes a bind whose bytes
+    /// are already where the descriptor points — a `Bytes` bind is a CPU write
+    /// into mapped memory and a direct import binds the guest's own pages. The
+    /// gather arm is the exception: it hands back a **recycled** device-local
+    /// slot and owes a copy that `execute_draw_inner` records hundreds of lines
+    /// later, past every recoverable refusal the sampled rungs can raise. A draw
+    /// that abandons in between drops the owed copy — it lives in a local `Vec`
+    /// — and leaves the memo behind, so the next draw of the same command buffer
+    /// hits the memo, records no copy, and binds the slot's **previous tenant**
+    /// as its constant buffer or vertex stream.
+    ///
+    /// Tracked rather than solved by clearing the whole memo, because the entries
+    /// published by draws that did complete are still correct and this rail is
+    /// ~4.8 binds a draw.
+    cb_gather_owed: Vec<(usize, u64, u64)>,
     /// Graphics state the command buffer now recording already carries — see
     /// [`CbGraphicsState`].
     cb_graphics: CbGraphicsState,
@@ -240,12 +303,34 @@ pub(crate) struct ResourcePools {
     staging_misses: u64,
     staging_miss_bins: [usize; STAGING_BUCKET_BINS],
     staging_miss_us_bins: [u64; STAGING_BUCKET_BINS],
-    /// `staging_hits + staging_misses` at the previous fired idle pass; see
-    /// `note_drain_settled`.
+    /// `staging_hits + staging_misses` at the previous maintenance pass; see
+    /// `note_maintenance_settled`.
     settled_staging_mark: u64,
     /// Target images + framebuffers keyed by geometry + render_pass identity.
     targets: HashMap<(TargetKey, u64), TargetSlot>, // u64 = render_pass as u64
     target_order: Vec<(TargetKey, u64)>,
+    /// One discard-only multisample attachment. Its framebuffer includes the
+    /// current single-sample resolve view; a shape change safely retires it
+    /// behind the command-buffer ring rather than retaining guest content.
+    multisample_target: Option<MultisampleTargetSlot>,
+    /// Framebuffers for passes whose attachment shape is not the target slot's
+    /// colour-only one — MRT, depth, and colour-input draws.
+    ///
+    /// The registry already owns a framebuffer for a colour-only pass, on the
+    /// resident slot. It owns none for a pass that combines that colour view
+    /// with a depth view or a secondary attachment, so those were built fresh
+    /// per draw. That is not merely an allocation: a framebuffer handle is what
+    /// [`PassEcho`] compares, so a new one each time makes every such draw open a
+    /// new render pass instance even when its predecessor left an identical one
+    /// standing. On a driven Maps leg that was **430 513 of 455 530** merge
+    /// refusals — 94.5 %, against a workload whose exec packets average nine
+    /// draws and should therefore continue on eight of every nine.
+    ///
+    /// Keyed by [`AdHocFramebufferKey`], which is the whole of what
+    /// `vkCreateFramebuffer` reads. Entries are owned here and destroyed when any
+    /// view they name is destroyed — see `destroy_deferred_handle`, which is the
+    /// single terminal destroy for every view this device frees at runtime.
+    ad_hoc_framebuffers: HashMap<AdHocFramebufferKey, vk::Framebuffer>,
     /// Readback buffers by size.
     readback_free: HashMap<u64, Vec<BufferSlot>>,
     readback_live: Option<BufferSlot>,
@@ -263,11 +348,22 @@ pub(crate) struct ResourcePools {
     /// Transient sampled-image pool, keyed by exact image and view geometry.
     sampled_free: FreePool<SampledKey, SampledSlot>,
     sampled_live: Vec<SampledSlot>,
+    /// Attachment-feedback snapshots have a command-buffer working set rather
+    /// than a content-cache working set. Keeping them separate prevents the
+    /// general sampled cap from destroying the snapshots a full batch returns,
+    /// while preventing those large, contentless images from displacing upload
+    /// slots that are reusable for a different reason.
+    attachment_snapshot_free: FreePool<SampledKey, SampledSlot>,
+    attachment_snapshot_live: Vec<SampledSlot>,
     /// Exact-content sampled images retained across draw calls. Hash narrows
     /// candidates only; a hit always requires full byte equality.
     sampled_cache: Vec<ResidentSampledSlot>,
     sampled_cache_bytes: usize,
-    /// What [`SAMPLED_CACHE_CAP`] and [`SAMPLED_CACHE_BYTE_CAP`] have thrown
+    /// Linear sampled images bound directly over resource-owned packed guest
+    /// allocations. Unlike upload slots these images never enter a recycle
+    /// pool: their memory aliases one specific guest allocation.
+    guest_sampled: HashMap<GuestSampledKey, GuestSampledSlot>,
+    /// What [`SAMPLED_REACH_BAND`] and [`SAMPLED_CACHE_BYTE_CAP`] have thrown
     /// away, most recently evicted at the front, carrying no images — see
     /// [`SampledVictim`].
     sampled_victims: std::collections::VecDeque<SampledVictim>,
@@ -285,24 +381,20 @@ pub(crate) struct ResourcePools {
     /// reading it. That sweep is gone — the allocation bounds this population
     /// now, see `ResourcePools::recoverable_compute_storage_residents` — and
     /// what remains reads this order only to be deterministic, oldest-created
-    /// first. Recency still lives on the slot
-    /// ([`ResidentStorageImageSlot::last_touch_ms`]) for the age drain, which is
-    /// the one rule that still consults a stamp.
+    /// first. Recency is diagnostic rather than a removal policy.
     compute_storage_order: VecDeque<ComputeStorageResidencyKey>,
     /// Identity-keyed resident target registry (workstream D).
     registry: HashMap<TargetIdentity, ResidentTargetSlot>,
     /// Insertion order for [`Self::registry`], oldest *created* at the front. A
     /// `VecDeque` because the retired cap-eviction sweep popped and rotated at
-    /// the front; what reads it now — `recoverable_residents` and the idle
-    /// drain — only walks it, so the container is no longer load-bearing and the
-    /// order is.
+    /// the front; pressure recovery and released-resource maintenance only walk
+    /// it, so the container is no longer load-bearing and the order is.
     ///
     /// **Not use order.** Nothing promotes an entry when a draw reuses it, so
     /// this alone would make a session-long resident the permanent front and the
-    /// first candidate of every burst. Recency lives on the slot
-    /// ([`ResidentTargetSlot::last_touch_ms`]), which the idle drain reads
-    /// directly rather than reordering this list — so a promotion stays off the
-    /// per-bind path while this order still makes ties deterministic.
+    /// first candidate of every burst. Touch timestamps remain diagnostic, so
+    /// promotion stays off the per-bind path while this order keeps pressure
+    /// recovery deterministic.
     registry_order: VecDeque<TargetIdentity>,
     /// Recently reclaimed identities and which path took each, so a draw that
     /// samples a missing resident can say whether this device ever held one.
@@ -325,12 +417,8 @@ pub(crate) struct ResourcePools {
     /// Longest a resident had gone untouched before something read it, in
     /// milliseconds of the idle clock, for the life of the pools.
     ///
-    /// The margin against `IDLE_TARGET_AGE_MS`, which is the age at which the
-    /// drain destroys a resident terminally. `resident_resample_band`'s bands
-    /// give the distribution and this gives the worst case; the bands could not
-    /// distinguish their one over-half-cutoff sample sitting at 1.0 s from
-    /// sitting at 1.9 s, and those are opposite answers to whether this cutoff
-    /// has room.
+    /// `resident_resample_band` gives the distribution and this gives the worst
+    /// case. The reading is observational; residency does not branch on it.
     ///
     /// A high-water rather than a windowed value for the same reason
     /// `registry_non_pinned_peak` is: the question is "how close did this boot
@@ -370,25 +458,18 @@ pub(crate) struct ResourcePools {
     /// an allocation failure would have found something in.
     compute_storage_sole_copy: NonPinnedTotals,
     compute_storage_sole_copy_peak: NonPinnedTotals,
-    /// Monotonic wall-clock milliseconds for the resident-target idle drain, fed
-    /// from the poll heartbeat and each publish ([`Self::advance_registry_touch_and_drain`]).
-    /// Each admit/hit/present stamps its slot's `last_touch_ms` with this value;
-    /// the drain reclaims non-pinned residents whose stamp is `IDLE_TARGET_AGE_MS`
-    /// behind. Wall-clock (not a publish counter) so it keeps advancing when the
-    /// guest stops publishing, returning idle VRAM to baseline on a static page.
+    /// Monotonic wall clock for diagnostics and bounded maintenance cadence,
+    /// fed from the poll heartbeat and each publish.
     idle_clock_ms: u64,
-    /// Wall-clock ms of the last reclaim pass — enforces `IDLE_DRAIN_INTERVAL_MS`
-    /// spacing so the ~244 Hz poll cadence cannot empty the registry at once.
-    last_drain_ms: u64,
-    /// Consecutive fired idle-drain passes that reclaimed **zero** registry
-    /// residents. A pass that drains ≥1 victim means the working set is still
-    /// churning (active video keeps aging out old frame RTs), so we reset to 0.
+    /// Wall-clock ms of the last maintenance pass.
+    last_maintenance_ms: u64,
+    /// Consecutive maintenance passes without upload activity.
     /// The HOST_VISIBLE buffer pool trim (a full `vkAllocateMemory` re-alloc on
     /// the upload hot path when it refills) only fires once this crosses
     /// `SETTLED_PASSES_FOR_BUFFER_TRIM`, so a single quiet pass mid-video cannot
     /// steal a 64 MiB staging buffer and spike the next upload's latency. The
     /// image/slab trims stay ungated — they refill via cheap slab suballocation.
-    settled_drain_passes: u32,
+    settled_maintenance_passes: u32,
     /// Persistent command pool; each ring slot owns one primary CB.
     cmd_pool: vk::CommandPool,
     /// Growable descriptor-pool arena (FREE_DESCRIPTOR_SET blocks). Grows a new
@@ -472,12 +553,23 @@ pub(crate) struct ResourcePools {
     /// treat it as in flight; every path that claims a slot or quiesces the
     /// ring flushes it first ([`Self::batch_flush`]).
     open_batch: Option<OpenBatch>,
+    /// How many draws one command buffer may carry: the topology policy from
+    /// [`batch_default_draws`] unless [`crate::env::BATCH_DRAWS`] narrowed it.
+    ///
+    /// A field rather than a read inside [`Self::batch_fit`], because that
+    /// function's doc promises it is pure and testable without a device and a
+    /// process-global environment read is neither.
+    batch_max_draws: u64,
     /// The render pass the last recorded draw opened — see [`PassEcho`].
     ///
     /// Observation only: nothing branches on it. It exists because "could this
     /// draw have continued the previous one's pass" is not answerable from any
     /// counter this device had, and the answer is the size of the merge.
     last_pass: Option<PassEcho>,
+    /// Render pass currently open in the deferred batch command buffer.
+    /// Unlike `last_pass`, this is executable state: every outside-pass command
+    /// and every command-buffer end must close it first.
+    open_pass: Option<PassEcho>,
     /// Offset suballocator for DEVICE_LOCAL optimal images (targets, sampled,
     /// storage, resident registry). Sub-allocates many image binds from a few
     /// large `VkDeviceMemory` blocks to collapse the per-image
@@ -527,22 +619,20 @@ pub(crate) struct ResourcePools {
     /// waits into one and lets the copies pipeline against each other on the
     /// GPU instead of stopping the queue between them.
     guest_writes_in_flight: bool,
-    /// Residents held pinned because a submitted-but-unsettled writeback copy
-    /// reads them.
+    /// Residents pinned by guest-page copies in the command buffer currently
+    /// being recorded. [`ResourcePools::seal_entry`] transfers them to that
+    /// submission's [`PendingGpuCleanup`].
     ///
     /// A window's flush used to unpin its resident as soon as the copy returned,
     /// which was safe only because the copy had already executed by then. With
     /// the wait deferred, unpinning at that point would let the
-    /// allocation-failure reclaim or the idle drain take an image the GPU has
-    /// not read yet. The pin is transferred here instead and released by
-    /// [`ResourcePools::quiesce_guest_writes`], which waits the whole ring — so
-    /// the interval it covers is exactly the interval the copy can still be
-    /// running in.
+    /// allocation-pressure reclaim take an image the GPU has not read yet. The
+    /// pin is transferred here instead and then to the ring slot, which
+    /// releases it when that slot's fence retires.
     ///
-    /// Cannot strand a pin: nothing is pushed here without also setting
-    /// `guest_writes_in_flight`, and every setting of that flag is answered by a
-    /// quiesce at the next completion stamp.
-    unpin_on_settle: Vec<TargetIdentity>,
+    /// Cannot strand a pin: every entry that can submit passes through
+    /// `seal_entry`, and every sealed cleanup belongs to one retiring slot.
+    guest_write_pins_live: Vec<TargetIdentity>,
     initialized: bool,
 }
 
@@ -598,24 +688,115 @@ pub(crate) enum BatchFit {
 /// The render pass instance the previously recorded draw opened, and the
 /// command buffer it opened it in.
 ///
-/// Instrument for the merge this device has not taken: every batched draw
-/// begins and ends its own render pass, so a joiner whose pass is identical to
-/// its predecessor's *and* which records nothing between the two could have
-/// stayed inside the open one. `pass` and `fb` are what make two passes the same
-/// instance — a `CLEAR` joiner gets a different `pass` from a `LOAD` one, which
-/// is why the handle is compared rather than the target identity that decides
-/// batching. `area` is the render area, which must agree for the same reason.
+/// A draw in the same decoded Metal render encoder can stay inside this pass
+/// when its predecessor left it open and no Vulkan command that must be outside
+/// a pass intervened. `compatibility` and `fb` are what make two requests name
+/// the same instance. Load/store actions are excluded: they apply only when an
+/// instance begins or ends, and Vulkan explicitly permits a pipeline and
+/// framebuffer created against any compatible render pass. `area` is the
+/// render area, which must agree for the same reason.
 ///
 /// `cb` is carried because a command buffer handle is recycled: an echo left
 /// behind by the previous user of this handle names a pass that was ended and
 /// submitted. Every path that resets or submits a CB clears the echo, and the
 /// handle comparison is the second lock on the same door.
+/// `target_image` decides nothing — `fb` already covers it, because a
+/// framebuffer is a function of the views it was built over. It is carried so
+/// the census can tell the two reasons a framebuffer changes apart: the guest
+/// rendering somewhere else, and this device building a second framebuffer for
+/// the same attachments because it described the pass differently. Only the
+/// second is a defect, and without this field they were one number. See
+/// [`ResourcePools::pass_echo_delta`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PassEcho {
     pub(crate) cb: vk::CommandBuffer,
-    pub(crate) pass: vk::RenderPass,
+    pub(crate) compatibility: PassCompatibilityKey,
     pub(crate) fb: vk::Framebuffer,
+    pub(crate) target_image: vk::Image,
     pub(crate) area: (u32, u32),
+}
+
+/// Exactly what a `VkFramebuffer` is a function of, and therefore what two
+/// draws must share to be handed the same one.
+///
+/// `vkCreateFramebuffer` takes a render pass, an attachment view list and an
+/// extent, and nothing else. So a framebuffer is a pure function of those, and
+/// building a second one for the same triple produces an object indistinguishable
+/// from the first — except that it is a *different handle*, which is precisely
+/// what [`PassEcho`] compares.
+///
+/// Handles are keyed by their raw `u64` rather than by the ash newtype, matching
+/// how `targets` already keys a render pass.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct AdHocFramebufferKey {
+    pub(crate) render_pass: u64,
+    pub(crate) views: Vec<u64>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+/// Which field of a [`PassEcho`] stopped a draw continuing its predecessor's
+/// render pass.
+///
+/// `passmerge_pass_differs` is the largest bucket on a driven Maps leg by an
+/// order of magnitude, and on its own it names no repair: the echo is compared
+/// whole, so "differs" covers four independent reasons with four different
+/// fixes. This splits it.
+///
+/// The order is the order the fields are checked, and each answer is the
+/// *first* difference rather than the only one, for the reason the obstacle
+/// ladders beside it give: a draw recording into a different command buffer has
+/// no pass to continue whatever else is true of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PassEchoField {
+    /// No pass is echoed at all — the first draw of a command buffer.
+    Nothing,
+    /// A different command buffer, so the echoed pass is not reachable from here.
+    Cb,
+    /// Vulkan would not call the two passes compatible. Load and store actions
+    /// are excluded from this key by construction, so a firing here names a
+    /// genuine attachment-shape change.
+    ///
+    /// The field that changed travels with the variant rather than being asked
+    /// for separately, so nothing can charge `passdiff_compat` without also
+    /// saying which of the nine things moved.
+    Compatibility(super::caches::PassCompatField),
+    /// A different primary render target: the guest is drawing somewhere else.
+    ///
+    /// Asked before [`Self::Compatibility`] would be wrong — a target switch and
+    /// a shape change are both real and the shape is the actionable one — so it
+    /// is asked *after*, and [`Self::Framebuffer`] below is then the residue.
+    Target,
+    /// Same pass shape and same primary target, and still a different
+    /// framebuffer object: a secondary or depth attachment moved, or this device
+    /// built a second framebuffer over one set of views.
+    Framebuffer,
+    /// Same framebuffer, different render area.
+    Area,
+}
+
+impl PassEchoField {
+    pub(crate) fn route(self) -> &'static str {
+        match self {
+            Self::Nothing => "passdiff_nothing",
+            Self::Cb => "passdiff_cb",
+            Self::Compatibility(_) => "passdiff_compat",
+            Self::Target => "passdiff_target",
+            Self::Framebuffer => "passdiff_fb",
+            Self::Area => "passdiff_area",
+        }
+    }
+
+    /// The second, finer route this answer also carries, where it has one.
+    ///
+    /// Only the compatibility bucket does: the other four name a whole reason
+    /// on their own.
+    pub(crate) fn detail_route(self) -> Option<&'static str> {
+        match self {
+            Self::Compatibility(field) => Some(field.route()),
+            Self::Nothing | Self::Cb | Self::Target | Self::Framebuffer | Self::Area => None,
+        }
+    }
 }
 
 /// Graphics state a recording command buffer already carries, so a draw that
@@ -651,16 +832,84 @@ pub(crate) struct CbGraphicsState {
     cb: Option<vk::CommandBuffer>,
     /// The graphics pipeline last bound into `cb`.
     pipeline: Option<vk::Pipeline>,
+    /// The layout of `pipeline`, tracked separately because an incompatible
+    /// bind disturbs push descriptors even if a later draw returns to the
+    /// earlier pipeline.
+    pipeline_layout: Option<vk::PipelineLayout>,
     /// The viewport array last handed to `vkCmdSetViewport`, and the scissor
     /// array last handed to `vkCmdSetScissor`.
     viewports: Vec<vk::Viewport>,
     scissors: Vec<vk::Rect2D>,
     /// The front/back references last handed to `vkCmdSetStencilReference`.
     stencil: Option<(u32, u32)>,
+    /// The push-descriptor layout and exact descriptor values last recorded.
+    push_layout: Option<vk::PipelineLayout>,
+    push_bindings: Vec<PushDescriptorBinding>,
     /// Scratch the next draw builds into, so the comparison costs no allocation.
     /// Swapped with the bound array when they differ rather than cloned.
     vp_scratch: Vec<vk::Viewport>,
     sc_scratch: Vec<vk::Rect2D>,
+    push_scratch: Vec<PushDescriptorBinding>,
+    vertex_scratch: Vec<VertexBufferBinding>,
+    vertex_buffers: Vec<vk::Buffer>,
+    vertex_offsets: Vec<vk::DeviceSize>,
+}
+
+/// One normalized fixed-function vertex-buffer binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VertexBufferBinding {
+    binding: u32,
+    buffer: vk::Buffer,
+    offset: vk::DeviceSize,
+}
+
+/// Order a bulk bind by binding number. Vertex attributes arrive ordered by
+/// shader location, while Vulkan requires consecutive *binding* numbers.
+/// Duplicate bindings have already been rejected by draw validation.
+fn normalize_vertex_bindings(wanted: &mut [VertexBufferBinding]) {
+    wanted.sort_unstable_by_key(|entry| entry.binding);
+    debug_assert!(wanted.windows(2).all(|pair| pair[0].binding != pair[1].binding));
+}
+
+/// End index of the maximal consecutive binding run beginning at `start`.
+fn vertex_binding_run_end(bindings: &[VertexBufferBinding], start: usize) -> usize {
+    let mut end = start + 1;
+    while end < bindings.len()
+        && bindings[end - 1].binding.checked_add(1) == Some(bindings[end].binding)
+    {
+        end += 1;
+    }
+    end
+}
+
+/// One descriptor value in the normalized order used by a push layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PushDescriptorBinding {
+    Buffer {
+        binding: u32,
+        array_element: u32,
+        ty: vk::DescriptorType,
+        buffer: vk::Buffer,
+        offset: vk::DeviceSize,
+        range: vk::DeviceSize,
+    },
+    Image {
+        binding: u32,
+        array_element: u32,
+        ty: vk::DescriptorType,
+        sampler: vk::Sampler,
+        view: vk::ImageView,
+        layout: vk::ImageLayout,
+    },
+}
+
+fn push_descriptors_match(
+    bound_layout: Option<vk::PipelineLayout>,
+    bound: &[PushDescriptorBinding],
+    wanted_layout: vk::PipelineLayout,
+    wanted: &[PushDescriptorBinding],
+) -> bool {
+    bound_layout == Some(wanted_layout) && bound == wanted
 }
 
 /// Whether two viewport arrays are the value the driver already has.
@@ -719,6 +968,14 @@ struct CmdSlot {
     /// Read and cleared when the slot retires, which is the first moment the
     /// fence makes the queries readable. See [`super::gpu_span`].
     span: gpu_span::SlotSpan,
+    /// Whether this slot's copy command buffer armed the three-query readback
+    /// region belonging to it.
+    ///
+    /// Same lifetime rule as [`Self::span`] and for the same reason — the fence
+    /// is what makes the region readable — but a separate flag because the two
+    /// probes are armed by different callers and a slot can carry either, both
+    /// or neither. Set by `readback_span_arm`, cleared by the read at retire.
+    readback_span_armed: bool,
 }
 
 /// In-flight ring depth: the next draw/dispatch records + submits while
@@ -751,6 +1008,17 @@ const _: () = assert!(
     "SlotMask must have one bit per ring slot"
 );
 
+/// The hang trail keeps one outstanding-submission record per ring slot, and it
+/// cannot name [`RING_DEPTH`] itself: that module compiles on the Metal-direct
+/// arm too, where `backend::vulkan` does not exist. This is the only place both
+/// constants are in scope, so the relation is asserted here. A trail too short
+/// would drop exactly the slot a wedge is on and report `outstanding` as if the
+/// ring were shallower than it is.
+const _: () = assert!(
+    RING_DEPTH <= crate::runtime::gpu_hang_trail::SUBMIT_SLOTS,
+    "the hang trail must hold one submission record per ring slot"
+);
+
 /// A GPU object displaced while a CB may still reference it. Destroyed only
 /// once every in-flight fence has retired.
 pub(crate) enum DeferredHandle {
@@ -759,6 +1027,18 @@ pub(crate) enum DeferredHandle {
         view: vk::ImageView,
         memory: vk::DeviceMemory,
     },
+    GuestImage {
+        image: vk::Image,
+        view: vk::ImageView,
+        _import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
+    },
+    /// The parent allocation and its whole-span buffer. It retires only after
+    /// the guest ended the parent lifetime and every child image was destroyed.
+    GuestAllocation(host_ram::ImportedHostRam),
+    /// Fence barrier captured when a parent allocation's guest lifetime ended.
+    /// Child retirement and this barrier may complete in either order; the
+    /// second one releases the parent.
+    GuestAllocationBarrier(crate::runtime::guest_ram::ImportId),
     /// A sampled-cache slot evicted by the LRU/byte cap. Instead of destroying
     /// it, the drain returns it to `sampled_free` for reuse (bounded per key) so
     /// a content-changing sampled input (live tile / video frame) re-uploads
@@ -776,6 +1056,7 @@ pub(crate) enum DeferredHandle {
     /// still reference the displaced image, so it only rejoins the free list
     /// once `in_flight == 0`.
     RecycleTarget(FreeTargetImage),
+    ImageView(vk::ImageView),
     Framebuffer(vk::Framebuffer),
     Pipeline(vk::Pipeline),
     PipelineLayout(vk::PipelineLayout),
@@ -785,6 +1066,33 @@ pub(crate) enum DeferredHandle {
     Sampler(vk::Sampler),
 }
 
+impl DeferredHandle {
+    /// The image view this handle destroys, if it destroys one.
+    ///
+    /// Exhaustive on purpose rather than a `_ => None` catch-all: a new variant
+    /// that frees a view has to answer here, and a wildcard would let it compile
+    /// while leaving a cached framebuffer naming a destroyed attachment. The
+    /// arms mirror `destroy_deferred_handle`'s `destroy_image_view` calls one for
+    /// one, which is the only thing that makes this total.
+    fn destroyed_view(&self) -> Option<vk::ImageView> {
+        match self {
+            Self::Image { view, .. } | Self::GuestImage { view, .. } => Some(*view),
+            Self::RecycleSampled(slot) => Some(slot.view),
+            Self::RecycleTarget(img) => Some(img.view),
+            Self::ImageView(view) => Some(*view),
+            Self::GuestAllocation(_)
+            | Self::GuestAllocationBarrier(_)
+            | Self::Framebuffer(_)
+            | Self::Pipeline(_)
+            | Self::PipelineLayout(_)
+            | Self::DescriptorSetLayout(_)
+            | Self::RenderPass(_)
+            | Self::ShaderModule(_)
+            | Self::Sampler(_) => None,
+        }
+    }
+}
+
 impl ResourcePools {
     /// Terminal destroy of a deferred handle. Image variants free their backing
     /// memory through the slab suballocator (`free_image` releases the
@@ -792,6 +1100,13 @@ impl ResourcePools {
     /// slab/1:1 images both free correctly). Non-memory objects are destroyed
     /// directly.
     unsafe fn destroy_deferred_handle(&mut self, device: &ash::Device, handle: DeferredHandle) {
+        // A cached ad-hoc framebuffer names views, and Vulkan does not let one
+        // outlive its attachments. Every runtime path that destroys a view
+        // arrives here, so this is the one place that has to know — and it runs
+        // before the view is destroyed, not after.
+        if let Some(view) = handle.destroyed_view() {
+            unsafe { self.purge_ad_hoc_framebuffers_for_view(device, view) };
+        }
         match handle {
             DeferredHandle::Image {
                 image,
@@ -805,6 +1120,25 @@ impl ResourcePools {
                 device.destroy_image(image, None);
                 if !self.slab.free_image(device, image) {
                     device.free_memory(memory, None);
+                }
+            }
+            DeferredHandle::GuestImage {
+                image,
+                view,
+                _import,
+            } => {
+                device.destroy_image_view(view, None);
+                device.destroy_image(image, None);
+                if let Some(parent) = self.host_ram_imports.release_child(&_import) {
+                    crate::runtime::drain::note_store_route("guest_import_parent_released");
+                    parent.destroy(device);
+                }
+            }
+            DeferredHandle::GuestAllocation(parent) => parent.destroy(device),
+            DeferredHandle::GuestAllocationBarrier(import_id) => {
+                if let Some(parent) = self.host_ram_imports.retirement_fences_cleared(import_id) {
+                    crate::runtime::drain::note_store_route("guest_import_parent_released");
+                    parent.destroy(device);
                 }
             }
             DeferredHandle::RecycleSampled(slot) => {
@@ -821,6 +1155,7 @@ impl ResourcePools {
                     device.free_memory(img.memory, None);
                 }
             }
+            DeferredHandle::ImageView(view) => device.destroy_image_view(view, None),
             DeferredHandle::Framebuffer(fb) => device.destroy_framebuffer(fb, None),
             DeferredHandle::Pipeline(p) => device.destroy_pipeline(p, None),
             DeferredHandle::PipelineLayout(pl) => device.destroy_pipeline_layout(pl, None),
@@ -838,11 +1173,12 @@ impl ResourcePools {
 /// descriptor set and every transient pool slot the CB references, moved out of
 /// the live lists at seal time so a concurrent entry cannot recycle them.
 ///
-/// **The sampled images this entry filled are not here.** They leave the seal in
+/// **The upload images this entry filled are not here.** They leave the seal in
 /// [`SealedEntry::admissions`] and enter the content cache at submit, not at
-/// retire — see [`ResourcePools::finish_entry_async`] for why, and note that the
-/// absence of a field is the enforcement: nothing that reaches this struct can
-/// still be owed to the cache.
+/// retire — see [`ResourcePools::finish_entry_async`] for why. Attachment
+/// snapshots are different: their contents expire with this command buffer, so
+/// they remain here until its fence retires and then return to their scratch
+/// pool.
 pub(crate) struct PendingGpuCleanup {
     dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
     /// The guest-scatter sets, kept apart from `dsets` because they recycle
@@ -852,7 +1188,11 @@ pub(crate) struct PendingGpuCleanup {
     gather: Vec<BufferSlot>,
     readback: Vec<BufferSlot>,
     sampled: Vec<SampledSlot>,
+    attachment_snapshots: Vec<SampledSlot>,
     storage_images: Vec<StorageImageSlot>,
+    /// Resident pins held by guest-page copies in this submission. The slot's
+    /// fence is their lifetime boundary.
+    unpin_residents: Vec<TargetIdentity>,
 }
 
 /// What one sealed entry hands back: the cleanup its ring slot owes once the
@@ -892,6 +1232,41 @@ pub(crate) struct SampledSlot {
     /// channels. Identity is the overwhelmingly common case and keeps its own
     /// free list, so a rare swizzled bind cannot fragment the hot one.
     pub swizzle: crate::contract::pixel_format::SwizzlePlan,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct GuestSampledKey {
+    pub(crate) image: SampledKey,
+    pub(crate) backing: crate::backend::vulkan::engine::GuestTargetBacking,
+    pub(crate) owner_id: u64,
+}
+
+struct GuestSampledSlot {
+    image: vk::Image,
+    view: vk::ImageView,
+    /// Keeps the checked packed-allocation bound alive for exactly as long as
+    /// Vulkan can address it.
+    _import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
+    /// Weak resource lifetime: the cache must not keep the guest object alive.
+    owner: crate::model::TaskResourceLifetimeRef,
+    initialized: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct GuestSampledUse {
+    pub(crate) key: GuestSampledKey,
+    pub(crate) image: vk::Image,
+    pub(crate) view: vk::ImageView,
+    pub(crate) initialized: bool,
+}
+
+/// Which lifetime owns a newly acquired sampled image. Upload images may enter
+/// the exact-content cache; attachment snapshots are contentless command-buffer
+/// scratch and return only to their batch-sized pool after the fence retires.
+#[derive(Clone, Copy)]
+enum SampledTransientUse {
+    Upload,
+    AttachmentSnapshot,
 }
 
 /// Everything that has to match for one sampled image to stand in for another:
@@ -936,6 +1311,20 @@ impl SampledKey {
             swizzle: r.swizzle,
         }
     }
+
+    /// Whether this key has the one ordinary attachment-view shape for which
+    /// distinct sources bound a draw's scratch population. Other view shapes
+    /// can multiply one attachment into several incompatible image/view keys
+    /// (most plainly through component swizzles), so they keep the general
+    /// sampled pool rather than entering the attachment-count-sized pool.
+    pub(crate) fn is_plain_2d_identity_view(self) -> bool {
+        self.layers == 1
+            && !self.volume
+            && !self.cube
+            && !self.arrayed
+            && !self.one_dim
+            && self.swizzle.is_identity()
+    }
 }
 
 impl SampledSlot {
@@ -958,7 +1347,7 @@ impl SampledSlot {
     /// the slot and is responsible for recycling or destroying it, and a derive
     /// would make an ownership duplicate look like a copy of a value. Every
     /// caller is handing a binding something to sample.
-    fn handles(&self) -> Self {
+    pub(crate) fn handles(&self) -> Self {
         Self {
             image: self.image,
             memory: self.memory,
@@ -1074,15 +1463,9 @@ struct ResidentSampledSlot {
     /// Producer identity of the retained content; lets a same-identity,
     /// same-generation rebind skip the content hash + compare entirely.
     identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
-    /// Value of [`ResourcePools::idle_clock_ms`] at this entry's last use (admit
-    /// or `find_cached_sampled` hit). The idle drain
-    /// ([`ResourcePools::advance_registry_touch_and_drain`]) reclaims an entry
-    /// once its touch falls `IDLE_TARGET_AGE_MS` behind the clock — so a settled
-    /// video session's frame textures (the ≤128 MiB sampled cache) are returned
-    /// to the driver at idle instead of pinned for the guest lifetime, while an
-    /// actively-sampled entry (hit every frame) never ages out. Mirrors the
-    /// resident-target registry drain; the sampled cache is the analogous
-    /// upload-side pool the buffer/target idle trims already cover.
+    /// Value of [`ResourcePools::idle_clock_ms`] at this entry's last use, kept
+    /// for cache diagnostics. Removal is governed by the cache's count/byte
+    /// capacity, not by this timestamp.
     last_touch_ms: u64,
 }
 
@@ -1158,15 +1541,8 @@ struct ResidentStorageImageSlot {
     /// when one is available. A ratio near 1 means an allocation failure would
     /// find nothing here to give back.
     gpu_only_content: bool,
-    /// Value of `ResourcePools::idle_clock_ms` (wall-clock ms) at this resident's
-    /// last use (admit or `acquire_resident_storage_image` hit). The idle drain
-    /// ([`ResourcePools::advance_registry_touch_and_drain`]) reclaims a non-pinned
-    /// resident once its touch falls `IDLE_TARGET_AGE_MS` behind the clock — so a
-    /// compute-heavy burst's stale residents (a settled page's blur/decode storage
-    /// images) are returned to the driver instead of pinning standalone
-    /// VkDeviceMemory allocations for the
-    /// guest lifetime, while an actively-dispatched resident (touched every pass)
-    /// never ages out. Mirrors [`ResidentTargetSlot::last_touch_ms`].
+    /// Value of `ResourcePools::idle_clock_ms` at this resident's last use,
+    /// retained for diagnostics. It is not a lifetime or eviction deadline.
     last_touch_ms: u64,
 }
 
@@ -1267,25 +1643,112 @@ pub(crate) struct NonPinnedTotals {
 pub(crate) enum ResidentAccess {
     /// Created or recycled; nothing has touched the image.
     Untouched,
+    /// A newly imported linear image whose existing texels were most recently
+    /// written through the shared host allocation. Its initial Vulkan layout
+    /// is `PREINITIALIZED`, the only image birth state that preserves those
+    /// bytes across the first transition.
+    GuestBacking,
     /// A render pass wrote it as a colour attachment and left it in that pass's
     /// `final_layout` — `TRANSFER_SRC_OPTIMAL` for a primary target,
     /// `COLOR_ATTACHMENT_OPTIMAL` for an MRT secondary.
     ColorWrite(vk::ImageLayout),
+    /// A colour attachment was read by shaders and written by colour output in
+    /// an attachment-feedback-loop pass.
+    ColorFeedback(vk::ImageLayout),
     /// A draw sampled it.
-    ShaderRead,
+    ShaderRead(vk::ImageLayout),
     /// A transfer read it: a present blit, a guest-page readback, a GPU seed
     /// copy, or this draw's own copy-on-sample snapshot.
-    TransferRead,
+    TransferRead(vk::ImageLayout),
 }
 
 impl ResidentAccess {
+    /// Layout for a sampled read.
+    ///
+    /// It is the layout the colour target already rests in, so a resident this
+    /// device rendered into and now samples needs **no transition** — see
+    /// [`crate::backend::vulkan::engine::caches::color0_pass_exit_layout`] for why one layout
+    /// serves both uses and what it measured. Imported linear images stay
+    /// host-accessible between device operations, which is the same `GENERAL`,
+    /// so the parameter only matters under the ablation arm.
+    ///
+    /// The dedicated read-only layout is what the ablation restores, and it is
+    /// what makes the transition — and therefore the pass break — come back.
+    pub(crate) fn shader_read(host_accessible: bool) -> Self {
+        Self::ShaderRead(
+            if host_accessible || crate::backend::vulkan::engine::caches::unified_color_layout() {
+                vk::ImageLayout::GENERAL
+            } else {
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+            },
+        )
+    }
+
+    /// Whether a render pass's own incoming `VK_SUBPASS_EXTERNAL` dependency
+    /// already makes this prior access visible to a sampled read inside the
+    /// pass, so a draw sampling the image needs no barrier of its own.
+    ///
+    /// This is the sampled-image twin of
+    /// [`crate::backend::vulkan::engine::exec::pass_exit_needs_no_barrier`], and it is only ever
+    /// consulted once the layouts already match — it answers **visibility**, not
+    /// placement. Both halves are required and the caller checks the other.
+    ///
+    /// `VK_SUBPASS_EXTERNAL` as `srcSubpass` scopes every command submitted
+    /// before the render pass instance in submission order, and a subpass
+    /// dependency is a memory dependency over its whole scope rather than over
+    /// the attachment alone — which is what lets it cover an image that is not an
+    /// attachment of this pass at all.
+    /// [`crate::backend::vulkan::engine::caches::external_dependencies`] names
+    /// `COLOR_ATTACHMENT_OUTPUT | TRANSFER` with the attachment writes and
+    /// `TRANSFER_WRITE` in its source scope, and `VERTEX_SHADER |
+    /// FRAGMENT_SHADER` with `SHADER_READ` in its destination scope.
+    ///
+    /// So, variant by variant:
+    ///
+    /// - `ColorWrite` and `ColorFeedback` are a colour attachment write, which is
+    ///   the source scope exactly. Feedback also names a shader read, and a read
+    ///   before a read is not a hazard.
+    /// - `ShaderRead` and `TransferRead` are reads. Read-after-read needs no
+    ///   availability operation.
+    /// - `Untouched` is `UNDEFINED`: there is a real transition and the layouts
+    ///   cannot match, so this never decides it — it answers `false` anyway,
+    ///   because "nothing has touched it" must never read as "covered".
+    /// - `GuestBacking` is a host write to `PREINITIALIZED`. The submission's
+    ///   implicit host-memory dependency does make it visible, but the layout is
+    ///   not the resting one and the transition out of `PREINITIALIZED` is the
+    ///   one thing that preserves those bytes. Never skippable.
+    ///
+    /// A wrong `true` is a sampled read racing the write that produced its
+    /// pixels: a stale frame, with nothing reported anywhere.
+    pub(crate) fn covered_by_pass_entry(self) -> bool {
+        match self {
+            Self::Untouched | Self::GuestBacking => false,
+            Self::ColorWrite(_)
+            | Self::ColorFeedback(_)
+            | Self::ShaderRead(_)
+            | Self::TransferRead(_) => true,
+        }
+    }
+
+    /// Layout for a transfer read, preserving host access for imported linear
+    /// images while ordinary images use the dedicated transfer layout.
+    pub(crate) const fn transfer_read(host_accessible: bool) -> Self {
+        Self::TransferRead(if host_accessible {
+            vk::ImageLayout::GENERAL
+        } else {
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+        })
+    }
+
     /// Where the image is — the `old_layout` a barrier over it must name.
     pub(crate) fn layout(self) -> vk::ImageLayout {
         match self {
             Self::Untouched => vk::ImageLayout::UNDEFINED,
+            Self::GuestBacking => vk::ImageLayout::PREINITIALIZED,
             Self::ColorWrite(layout) => layout,
-            Self::ShaderRead => vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            Self::TransferRead => vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            Self::ColorFeedback(layout) | Self::ShaderRead(layout) | Self::TransferRead(layout) => {
+                layout
+            }
         }
     }
 
@@ -1312,15 +1775,24 @@ impl ResidentAccess {
                 vk::PipelineStageFlags::TOP_OF_PIPE,
                 vk::AccessFlags::empty(),
             ),
+            Self::GuestBacking => (vk::PipelineStageFlags::HOST, vk::AccessFlags::HOST_WRITE),
             Self::ColorWrite(_) => (
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
             ),
-            Self::ShaderRead => (
+            Self::ColorFeedback(_) => (
+                vk::PipelineStageFlags::VERTEX_SHADER
+                    | vk::PipelineStageFlags::FRAGMENT_SHADER
+                    | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::COLOR_ATTACHMENT_READ
+                    | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            ),
+            Self::ShaderRead(_) => (
                 vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::AccessFlags::SHADER_READ,
             ),
-            Self::TransferRead => (
+            Self::TransferRead(_) => (
                 vk::PipelineStageFlags::TRANSFER,
                 vk::AccessFlags::TRANSFER_READ,
             ),
@@ -1328,14 +1800,60 @@ impl ResidentAccess {
     }
 }
 
+/// Ownership route for a resident image's memory.
+///
+/// A recyclable allocation belongs to the image slab and may re-enter the
+/// geometry-keyed target pool. A guest import aliases one particular surface
+/// allocation, so recycling it under another identity would bind that surface's
+/// pages to unrelated guest work. The enum forces every retirement path to
+/// choose between those two operations.
+#[derive(Clone, Debug)]
+pub(crate) enum ResidentMemory {
+    Recyclable(vk::DeviceMemory),
+    GuestImported {
+        guest: crate::backend::vulkan::engine::GuestTargetMemory,
+    },
+}
+
+impl ResidentMemory {
+    pub(crate) fn is_guest_imported(&self) -> bool {
+        matches!(self, Self::GuestImported { .. })
+    }
+
+    pub(crate) fn guest_backing(
+        &self,
+    ) -> Option<crate::backend::vulkan::engine::GuestTargetBacking> {
+        match self {
+            Self::GuestImported { guest, .. } => Some(guest.backing),
+            Self::Recyclable(_) => None,
+        }
+    }
+
+    pub(crate) fn guest_footprint(
+        &self,
+    ) -> Option<crate::runtime::guest_ram::GuestPageFootprint> {
+        match self {
+            Self::GuestImported { guest, .. } => Some(guest.footprint.clone()),
+            Self::Recyclable(_) => None,
+        }
+    }
+}
+
 pub(crate) struct ResidentTargetSlot {
     pub image: vk::Image,
-    pub memory: vk::DeviceMemory,
+    pub memory: ResidentMemory,
     pub view: vk::ImageView,
+    /// Additional compatible-format views over `image`, retained for the
+    /// resident's lifetime. A texture view changes interpretation, not storage;
+    /// keeping these beside the allocation avoids copying pixels or rebuilding
+    /// a view on every draw.
+    pub alternate_views: Vec<(vk::Format, vk::ImageView)>,
     pub framebuffer: vk::Framebuffer,
     pub render_pass: vk::RenderPass,
+    pub framebuffer_compatibility: Option<FramebufferCompatibilityKey>,
     pub width: u32,
     pub height: u32,
+    pub sample_count: u32,
     pub generation: u64,
     pub content_ready: bool,
     /// The mapping-level `surface_content_epoch` this image's pixels were last
@@ -1352,11 +1870,17 @@ pub(crate) struct ResidentTargetSlot {
     /// What last touched this image, and where that left it. See
     /// [`ResidentAccess`] for why these are one field and not two.
     pub access: ResidentAccess,
-    /// Concrete Vulkan attachment format the image was created with. Every
-    /// question about this resident's channel order is asked of this field,
-    /// through [`ResidentTargetSlot::scanout_order`] — a format change forces an
-    /// image recreate, not just a framebuffer rebuild.
-    pub color_format: vk::Format,
+    /// The format the guest declared for this resident, and — through
+    /// [`translate::pixel::ResidentFormat`] — the allocation family that
+    /// declaration belongs to.
+    ///
+    /// One field for both because they are one fact asked two ways: the image
+    /// is created in `format.allocation()`, the render pass attaches
+    /// `format.declared()`, and a change of *allocation* forces a recreate while
+    /// a change of *declaration alone* is another view over the image already
+    /// there. Every question about this resident's channel order is asked of
+    /// this field, through [`ResidentTargetSlot::scanout_order`].
+    pub format: translate::pixel::ResidentFormat,
     /// Deferred render-Store pin count: this target's content exists only on
     /// the GPU (guest pages stale). The registry LRU sweep skips slots with a
     /// nonzero count. A count (not a bool) because a surface with several
@@ -1364,6 +1888,15 @@ pub(crate) struct ResidentTargetSlot {
     /// the first member's flush must not expose the image to eviction while
     /// a peer's window is still armed.
     pub pin_count: u32,
+    /// The last serialized resource owning this resident has ended its lifetime.
+    /// Existing GPU/window holders may finish, and the resident retires when the
+    /// last pin leaves unless a new serialized owner revives it first.
+    pub resource_released: bool,
+    /// Serialized resources currently owning this identity. Kept separate from
+    /// `pin_count`, which also includes transient GPU and writeback holders.
+    /// One parent resource may have several child identities, and several
+    /// parents may alias one shared allocation.
+    pub resource_owner_count: u32,
     /// This image holds pixels that exist **nowhere else** — not in the guest's
     /// pages, not in any host-side copy. Destroying it destroys guest work.
     ///
@@ -1477,13 +2010,8 @@ pub(crate) struct ResidentTargetSlot {
     /// Sampled and staging images are written on other paths, but they are not
     /// registry residents and hold no identity a later draw could resolve.
     pub gpu_only_content: bool,
-    /// Value of `ResourcePools::idle_clock_ms` (wall-clock ms) at this target's
-    /// last use (admit, `registry_ensure` hit, or present touch). The idle drain
-    /// ([`ResourcePools::advance_registry_touch_and_drain`]) reclaims a non-pinned
-    /// resident once its touch falls `IDLE_TARGET_AGE_MS` behind the current
-    /// clock — so a burst's stale targets (a settled YouTube page's thumbnail RTs)
-    /// are reclaimed instead of pinning VRAM for the guest lifetime, while an
-    /// actively-drawn target (touched every frame) never ages out.
+    /// Value of `ResourcePools::idle_clock_ms` at this target's last use,
+    /// retained for reuse-distance diagnostics. It is not a lifetime deadline.
     pub last_touch_ms: u64,
 }
 
@@ -1498,7 +2026,7 @@ impl ResidentTargetSlot {
     /// one slot. `resident_color` maps the two `bgra` values onto two distinct
     /// formats, so this test answers both arms identically.
     pub(crate) fn scanout_order(&self) -> bool {
-        self.color_format == translate::pixel::SCANOUT_FORMAT
+        translate::pixel::has_bgra_order(self.format.declared())
     }
 
     /// The framebuffer this slot owes the deferred-destroy path, or `None` when
@@ -1537,6 +2065,39 @@ impl ResidentTargetSlot {
         (self.framebuffer != vk::Framebuffer::null()).then_some(self.framebuffer)
     }
 
+    /// Whether a released resource's resident may be destroyed now.
+    ///
+    /// Three terms, and the third is the one that was missing.
+    /// [`Self::gpu_only_content`]'s own doc states the rule this device works
+    /// to — *nothing may destroy an image holding pixels no other copy has* —
+    /// and says both reclaim predicates honour it. Resource release is not a
+    /// reclaim, it is the guest ending a lifetime, and it went straight to
+    /// `retire_resident` past that rule. So a render Store that deferred its
+    /// writeback into the ledger, followed by the guest releasing the
+    /// serialized resource before the debt was paid, destroyed the only copy of
+    /// the frame.
+    ///
+    /// That is not a rare ordering. On a driven undriven-desktop macos-13 boot
+    /// under `REIMS_VGPU_GUEST_IMPORT=off` — the copying rail, which is the
+    /// only render-target rail a discrete host or a host without
+    /// `VK_EXT_external_memory_host` has — **135 of 135**
+    /// `read_target_unknown_identity` refusals read `diverges=absent
+    /// prior=resource_released`, each one a `wbdebt_pay_lost` behind it.
+    ///
+    /// Deferring costs retained VRAM until the ledger pays, which is exactly
+    /// what `gpu_only_content`'s doc says the default should cost. Payment
+    /// clears the flag through `registry_note_content_copied_out`, and
+    /// `retire_released_residents` runs off idle maintenance, so the slot is
+    /// collected on a later pass rather than never.
+    ///
+    /// Apple's device has no such ordering to get wrong: its render target *is*
+    /// the guest's IOSurface pages, so releasing a texture object cannot lose a
+    /// frame. The window exists only because this device defers, and it closes
+    /// where the deferral is recorded.
+    pub(crate) fn released_and_collectable(&self) -> bool {
+        self.resource_released && self.pin_count == 0 && !self.gpu_only_content
+    }
+
     /// Whether this slot's image may be re-used for a request of this geometry,
     /// generation and attachment format.
     ///
@@ -1553,7 +2114,17 @@ impl ResidentTargetSlot {
     /// framebuffer with an RGBA8 render pass over an `RG16Float` view, which
     /// Vulkan does not allow the attachment formats to disagree on.
     ///
-    /// `color_format` decides it for both, and it subsumes the `bgra` test:
+    /// **It is the *allocation* the two arms must agree on, not the
+    /// declaration.** A guest surface bound once as `BGRA8Unorm` and once as
+    /// `BGRA8Unorm_sRGB` is one `MTLTexture` seen through two texture views, so
+    /// the second spelling must find the first's image and add a view — not miss
+    /// here, retire a live resident and recreate it empty. Comparing the
+    /// declaration is what made the two interpretations alternate frame to
+    /// frame with each holding half the content; the declaration itself rides on
+    /// the view `registry_ensure` hands back, and cannot be lost by matching on
+    /// the family.
+    ///
+    /// `format` decides it for both, and it subsumes the `bgra` test:
     /// `translate::pixel::resident_color` maps the two `bgra` values onto two
     /// distinct formats, so equal formats implies equal `bgra` for anything the
     /// primary arm created.
@@ -1568,13 +2139,15 @@ impl ResidentTargetSlot {
         &self,
         width: u32,
         height: u32,
+        sample_count: u32,
         generation: u64,
-        format: vk::Format,
+        format: translate::pixel::ResidentFormat,
     ) -> bool {
         self.width == width
             && self.height == height
+            && self.sample_count == sample_count
             && self.generation == generation
-            && self.color_format == format
+            && self.format.allocation() == format.allocation()
     }
 }
 
@@ -1590,6 +2163,7 @@ impl ResidentTargetSlot {
 struct TargetRecycleKey {
     width: u32,
     height: u32,
+    sample_count: u32,
     format: vk::Format,
 }
 
@@ -1605,6 +2179,7 @@ pub(crate) struct FreeTargetImage {
     view: vk::ImageView,
     width: u32,
     height: u32,
+    sample_count: u32,
     format: vk::Format,
 }
 
@@ -1613,231 +2188,20 @@ impl FreeTargetImage {
         TargetRecycleKey {
             width: self.width,
             height: self.height,
+            sample_count: self.sample_count,
             format: self.format,
         }
     }
 }
 
-/// Wall-clock milliseconds a non-pinned resident may go untouched before the
-/// idle drain reclaims it. An actively-drawn target is touched every frame (and
-/// the presented target is touched every poll) so it never ages out, while a
-/// burst's stale targets (a settled page's thumbnail RTs) are reclaimed ~2 s
-/// after last use — so a burst is absorbed whole and its VRAM still comes back,
-/// which is what lets the population have no count bounding it at all.
-///
-/// **Wall-clock, not publish-count:** the drain clock is fed from the poll
-/// heartbeat (`device_poll`, ~244 Hz), which ticks even when the guest stops
-/// compositing and issuing present publishes. A publish-count clock froze on a
-/// static page — measured at zero publishes per second — so a burst's ~260 stale
-/// residents (~516 MiB) never aged out and VRAM never returned to the ~1005 MiB
-/// idle baseline. Real time keeps advancing regardless of guest activity.
-///
-/// # This value has 20 % margin on a routine workload, and that is measured
-///
-/// Reclaim here is terminal — `retire_resident` writes nothing back and nothing
-/// recreates a resident's content — so a resident aged out and then sampled
-/// refuses permanently. What keeps that from happening is that reading a
-/// resident touches it, which only works while the gap *between* reads stays
-/// under this value. Nothing reported that gap until
-/// `resident_resample_peak_ms` did.
-///
-/// Driven x86/PCI, `web-content-probe --churn 1`:
-///
-/// ```text
-///   registry_pressure ... resample_peak_ms=1609/2000
-/// ```
-///
-/// **1609 ms of a 2000 ms budget.** Not a contrived workload — a web page
-/// loading and churning. The distribution is not the reassuring part either:
-/// ~25 000 resamples land under 250 ms and then a handful jump straight to the
-/// top band, so the tail is not a gentle slope this value sits far above. It is
-/// a rare long gap that came within 391 ms of destroying a resident something
-/// was about to read.
-///
-/// Two things follow, and neither is "make the number bigger":
-///
-/// - A zero `sampled_resident_missing` on this workload is a near miss, not
-///   headroom. The margin is ~20 %, and a slower host, a heavier page or a
-///   contended machine eats that — every `us=` number this device reports is
-///   wall clock on a shared machine, and this cutoff is measured in the same
-///   wall clock.
-/// - The reclaim runs on a timer with no reference to memory pressure at all.
-///   On an idle desktop (~56 residents) it destroys terminally while freeing
-///   VRAM nobody wants back, which is pure downside; the burst it was written
-///   for is the only time the risk buys anything.
-///
-/// # A memory-pressure gate on the drain was tried, measured, and reverted
-///
-/// The obvious answer to that last bullet — skip the drain while the population
-/// is below some fraction of the slot count that then bounded it — was
-/// implemented and measured on a driven x86/PCI boot with
-/// `web-content-probe --churn 1`, floor at half that count:
-///
-/// ```text
-///                                   gate off   gate on
-///   slab_mib peak held (MiB)             456       584
-///   slab_mib SETTLED (MiB)                64       464
-///   t11sample_reclaimed_from_pages        36        26
-///   distinct mappings affected             5         3
-/// ```
-///
-/// The settled row is the verdict: **at rest the gate held 464 MiB where the
-/// ungated drain holds 64 — 7.25x** — because the floor is where the drain stops,
-/// so in steady state it returned no VRAM at all, which was its whole purpose.
-/// What it bought was a 28 % cut in destroy-then-sample events, none of which was
-/// shown to lose guest work. Do not re-add it in slot or in byte form; a byte
-/// floor stops the drain at the same steady state for the same reason.
-///
-/// The class it was reaching for is real but narrower than a population gate can
-/// address: a resident whose content exists **only** in VRAM must never be aged
-/// out at all, at any population, while one the guest can re-serve from its own
-/// pages costs only redundant work when it is. That distinction is a property of
-/// the resident, not of how many of them there are.
-///
-/// Reopen signal: `past_cutoff` non-zero in the `resident_resample_*` bands, or
-/// `resample_peak_ms` reaching this value, both of which mean a resident
-/// survived only because the drain is throttled and had not reached it yet.
-///
-/// **Both have since fired and neither reopened this.** Two driven x86/PCI
-/// boots, window-drag probe, quiesced: `past_cutoff` 1 of 48 738 resamples and
-/// 4 of 392 534, `resample_peak_ms` 2007 and 2005. `resident_resample_band`'s
-/// own doc carries why that is a cost rather than a risk — every resident the
-/// drain may take has been copied out to the guest's pages, so the reading to
-/// act on is `t11sample_reclaimed_from_pages` (2085 and 1937 on those boots) and
-/// not these four. Do not read a `past_cutoff` line as an imminent loss.
-///
-/// # Uncensored, this value is 3-5x too short — and the peak above could not
-/// have said so
-///
-/// `resident_resample_peak_ms` measures the interval between two reads of a
-/// resident that survived both, so it structurally cannot report a gap longer
-/// than this constant: past it the resident is gone, and the read that would
-/// have closed the interval falls through to the guest's pages instead. Every
-/// reading taken from that peak is therefore truncated by the very policy it is
-/// being used to judge, and will always make this value look *just barely*
-/// adequate.
-///
-/// `draw::vulkan::reclaimed_resample_band` closes the interval from the other
-/// side, using the time the reclaim itself is now stamped with: a resident read
-/// `since` ms after being destroyed had gone at least
-/// `IDLE_TARGET_AGE_MS + since` between uses. Driven x86/PCI,
-/// `web-content-probe --churn 1`, 26 fall-throughs:
-///
-/// ```text
-///   t11sample_reclaimed_within_1x_cutoff    0     (<2 s after the destroy)
-///   t11sample_reclaimed_within_2x_cutoff    2     (2-4 s after)
-///   t11sample_reclaimed_within_4x_cutoff   24     (4-8 s after)
-///   t11sample_reclaimed_past_4x_cutoff      0
-/// ```
-///
-/// Not one came back within a further cutoff's worth of time, and 24 of 26 came
-/// back **4-8 s after being destroyed** — so their true interval between uses is
-/// `2 s + 4-8 s` = **6-10 seconds**. Individual lines put it exactly:
-/// `since_reclaim_ms=4117` and `4521` on menu-bar strips, ~6.1-6.5 s. On the
-/// same boot a *surviving* resident recorded `resample_peak_ms=6445`, which
-/// confirms the interval directly on a resident the policy did not truncate.
-///
-/// ## Two later boots put more of the mass past the last band, not less
-///
-/// The reading above has a floor built into it — the top band was empty, so it
-/// could only say "at least 4-8 s". Two driven x86/PCI boots taken after the
-/// resident-registry slot counts were retired, same probe at `-n 10 --churn 1`,
-/// summing the per-window route counters rather than quoting one window:
-///
-/// ```text
-///                                   26-event boot   boot A   boot B
-///   t11sample_reclaimed_from_pages              26       54       66
-///     ...within_1x_cutoff                        0        1        0
-///     ...within_2x_cutoff                        2        0        0
-///     ...within_4x_cutoff                       24        9        5
-///     ...past_4x_cutoff                          0       44       61
-/// ```
-///
-/// **The mass moved to the top band**, which is open-ended: 44 of 54 and 61 of
-/// 66 came back more than 8 s after being destroyed, so their true interval
-/// between uses is over 10 s and the bands no longer bound it from above. The
-/// conclusion below is unchanged in direction and stronger in degree.
-///
-/// **Not attributable to retiring the slot counts.** Those walks reported
-/// `evicts=0` on every boot ever measured, so they were removing nothing and the
-/// idle drain — the only thing that reclaims here — is untouched. The non-pinned
-/// peak moved 194 -> 223 across the same change with `evicts=0` on both sides,
-/// which is workload variance rather than a count that had been holding the
-/// population down. What is *not* established is how much of 26 -> 54/66 is
-/// variance either; three boots is not a distribution, and the earlier one was
-/// taken in a different session.
-///
-/// None of it is lost work: `sampled_resident_missing` is 0 on both boots and
-/// the fall-through re-serves from the guest's own pages. It is redundant
-/// upload, and the count of it roughly doubled.
-///
-/// So this is not a value with a thin margin. It is between three and five times
-/// shorter than the re-use interval of the surfaces it destroys, and a strip
-/// redrawn every several seconds is not an exotic guest behaviour.
-///
-/// # The VRAM before/after, and why the value stays at 2000 anyway
-///
-/// The paragraph above used to end "raising it needs its own before/after on
-/// VRAM, which `peak_mib` — the registry's attachment bytes, not the device's
-/// footprint — cannot supply". That measurement has now been taken, against the
-/// host driver's own accounting (`nvidia-smi --query-gpu=memory.used`, sampled
-/// every 2 s, minus a flat 1025 MiB idle-desktop baseline). Three driven
-/// x86/PCI boots, `web-content-probe -n 10 --churn 1`, QEMU relinked between
-/// arms, nothing else running:
-///
-/// ```text
-///   age_ms   peak Δ   mean Δ   at-rest Δ   reclaims   registry peak_mib
-///     2000   546 MiB  249 MiB    279 MiB          6              190
-///     7000   834 MiB  413 MiB    778 MiB          5              396
-///    12000   886 MiB  426 MiB    883 MiB          0              441
-/// ```
-///
-/// **Raising it buys almost nothing until it buys everything, and the price is
-/// paid at rest.** 2000 → 7000 more than doubles the at-rest footprint (+499
-/// MiB) and removes one reclaim out of six. Only at 12000 does the class close,
-/// for +604 MiB held for the life of the guest. The reuse-interval distribution
-/// has a long tail — at 7000 the survivors came back with `since_reclaim_ms` of
-/// 86 and 1010, i.e. true intervals of ~7.1 and ~8.0 s — so each increment
-/// chases the tail rather than clearing it.
-///
-/// That trade is the one `af70d69f` already rejected once, for the same reason
-/// and at a similar magnitude: a gate holding 400 MiB at rest was reverted. Six
-/// avoided re-uploads across a ~90 s driven run does not pay for half a
-/// gigabyte of resident VRAM, and the fall-through is not a loss — the guest's
-/// own pages still hold the pixels, which `ResidentTargetSlot::gpu_only_content`
-/// is what guarantees. So this stays at 2000, now as a measured decision rather
-/// than an unexamined one.
-///
-/// One reading worth keeping separately: the registry's `peak_mib` moved
-/// 190 → 441 (+251 MiB) across the same span the device footprint moved
-/// 279 → 883 (+604 MiB). It understates the real cost by ~2.4x, which is the
-/// concrete form of the warning that it is attachment bytes and not the
-/// device's footprint. Do not size this constant from it.
-///
-/// What would change the answer is a workload with a working set large enough
-/// that the drain is reclaiming under real pressure rather than on a timer; the
-/// counts here (6, 5, 0) are small enough that only the 12000 arm's zero is
-/// clearly outside run-to-run noise.
-///
-/// # This is the crate's only eviction bound that is an age
-///
-/// Every other bound governing a removal here is a capacity — a count of
-/// entries or bytes. This one is a deadline, and the difference matters when
-/// reasoning about what a reading means: a capacity bound firing says the
-/// working set outgrew the table, while this one firing says only that time
-/// passed. A second age-based eviction is the thing to watch for; give it a
-/// name carrying `LIMIT`, because the bound *is* a limit on idle age.
-pub(crate) const IDLE_TARGET_AGE_MS: u64 = 2000;
-/// Minimum wall-clock spacing between reclaim passes. The poll path calls the
-/// drain ~244×/s; without this it would empty the whole registry in well under a
-/// second. At `IDLE_TARGET_DRAIN_MAX_PER_CALL` per pass this bounds reclaim to
-/// ~40 residents/s — a ~260-target burst drains to baseline over ~6.5 s, gently
-/// (no dispose storm that would itself be a P3 hitch).
-const IDLE_DRAIN_INTERVAL_MS: u64 = 100;
-/// Max non-pinned residents the idle drain reclaims per pass — bounds each drain
-/// pass so a large stale set (a ~600-target burst) drains gradually instead of
-/// stalling one call with hundreds of image destroys.
-const IDLE_TARGET_DRAIN_MAX_PER_CALL: usize = 4;
+/// Delay before periodic maintenance begins. Maintenance releases dead resource
+/// objects and already-free pool storage; it never uses age to remove a live
+/// resident.
+pub(crate) const IDLE_MAINTENANCE_START_MS: u64 = 2000;
+/// Minimum wall-clock spacing between bounded maintenance passes. The poll path
+/// runs far more often; throttling avoids repeated free-pool work under the
+/// engine lock.
+const MAINTENANCE_INTERVAL_MS: u64 = 100;
 /// Reclaimed identities remembered for [`ResourcePools::reclaimed_recent`].
 ///
 /// Sized to comfortably span one burst's reclamations so the answer is still
@@ -1937,7 +2301,7 @@ const RECLAIM_HISTORY: usize = 256;
 /// `gw_refused_guest_store` 14 on that boot. See
 /// [`EngineCounters::sampled_gather_unvouched`] for the reading and its
 /// qualifiers, and prefer removing the write to enlarging the cache.
-const SAMPLED_CACHE_CAP: usize = 64;
+const SAMPLED_REACH_BAND: usize = 64;
 const SAMPLED_CACHE_BYTE_CAP: usize = 128 * 1024 * 1024;
 /// How far back the victim ledger remembers what the caps threw away.
 ///
@@ -1946,9 +2310,9 @@ const SAMPLED_CACHE_BYTE_CAP: usize = 128 * 1024 * 1024;
 /// "eight times" whatever the cap becomes. Eight times is the whole ledger, so
 /// there is no band past it — a miss the ledger cannot see reports
 /// `sampled_reach_beyond_ledger` and says so.
-const SAMPLED_VICTIM_LEDGER: usize = SAMPLED_CACHE_CAP * 8;
+const SAMPLED_VICTIM_LEDGER: usize = SAMPLED_REACH_BAND * 8;
 
-/// One entry [`SAMPLED_CACHE_CAP`] or [`SAMPLED_CACHE_BYTE_CAP`] evicted,
+/// One entry [`SAMPLED_REACH_BAND`] or [`SAMPLED_CACHE_BYTE_CAP`] evicted,
 /// remembered without its image.
 ///
 /// The eviction *route* has been banded for a while and it answers a different
@@ -1977,21 +2341,11 @@ struct SampledVictim {
     route: SampledVictimRoute,
 }
 
-/// Which of the two things that empty the sampled cache took this entry.
-///
-/// They want opposite fixes and a reach series that folded them together would
-/// point at the wrong one: a window lost to the caps says the cache is too
-/// small for the workload's reuse distance, and a window lost to the idle drain
-/// says `IDLE_TARGET_AGE_MS` is shorter than the interval the guest re-binds at.
-/// The first was the only path the ledger recorded when it was written, so an
-/// aged-out window reported `sampled_reach_beyond_ledger` — the same answer as a
-/// window the cache had genuinely never held.
+/// Why a sampled cache entry stopped being reusable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SampledVictimRoute {
-    /// [`SAMPLED_CACHE_CAP`] or [`SAMPLED_CACHE_BYTE_CAP`] was over budget.
+    /// [`SAMPLED_REACH_BAND`] or [`SAMPLED_CACHE_BYTE_CAP`] was over budget.
     Cap,
-    /// The entry went untouched past `IDLE_TARGET_AGE_MS`.
-    Aged,
     /// The whole cache was discarded because a submission that had already
     /// published entries into it never reached the queue, so nothing in it could
     /// be trusted to hold what its name claimed. Not a capacity signal and not
@@ -2004,7 +2358,6 @@ impl SampledVictimRoute {
     fn route(self) -> &'static str {
         match self {
             Self::Cap => "sampled_reach_lost_to_cap",
-            Self::Aged => "sampled_reach_lost_to_age",
             Self::Discarded => "sampled_reach_lost_to_discard",
         }
     }
@@ -2025,6 +2378,23 @@ const SAMPLED_FREE_CAP_PER_KEY: usize = 4;
 /// global cap keeps the recycle pool from exceeding the working set; evictions
 /// past it are destroyed (freeing their slab range) instead of cached.
 const SAMPLED_FREE_CAP_TOTAL: usize = 64;
+/// A draw can feed back through at most the plain 2D identity views of the
+/// attachments its render pass carries: the decoded color table plus its one
+/// depth attachment. The producer shares duplicate binds of one attachment and
+/// routes every other view shape through the general sampled pool, making the
+/// largest dedicated snapshot population `draws × attachments` rather than
+/// `draws × texture-table width`.
+const fn attachment_snapshot_batch_cap(draws: u64) -> usize {
+    draws as usize * (crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS + 1)
+}
+
+const ATTACHMENT_SNAPSHOT_BATCH_CAP: usize = attachment_snapshot_batch_cap(BATCH_MAX_DRAWS);
+/// Every attachment may have the same geometry and view key, so the per-key
+/// bound is the whole batch population rather than only its draw count.
+const ATTACHMENT_SNAPSHOT_FREE_CAP_PER_KEY: usize = ATTACHMENT_SNAPSHOT_BATCH_CAP;
+/// A retired command buffer cannot return more snapshots than the batch bound,
+/// regardless of how many keys divide them.
+const ATTACHMENT_SNAPSHOT_FREE_CAP_TOTAL: usize = ATTACHMENT_SNAPSHOT_BATCH_CAP;
 /// Max recycled resident-target images retained per (geometry, format) key in
 /// `target_free`. A per-frame content-changing target only needs a few live at
 /// once (the CB ring is 3-deep plus the frame being acquired); beyond that a
@@ -2107,20 +2477,21 @@ const STORAGE_IMAGE_FREE_CAP_TOTAL: usize = 16;
 /// A bounded per-key free list of reusable GPU objects, with the census that
 /// says whether its own caps are what is limiting reuse.
 ///
-/// # One discipline, three pools
+/// # One discipline, several pools
 ///
-/// Resident targets, sampled images and transient compute storage all want the
-/// same thing: hand a retired object back keyed by the geometry that makes it
-/// reusable, take one back on the next create of that geometry, and bound the
-/// hoard two ways. That policy used to be written out three times, once per
-/// pool, each with its own four counters — a shape whose own doc comments said
-/// "mirrors `try_recycle_sampled`". It is written once here, and the pools
-/// differ only in their key type and their two caps.
+/// Resident targets, sampled images, attachment snapshots and transient
+/// compute storage all want the same thing: hand a retired object back keyed by
+/// the geometry that makes it reusable, take one back on the next create of
+/// that geometry, and bound the hoard two ways. That policy used to be written
+/// out repeatedly, once per pool, each with its own four counters — a shape
+/// whose own doc comments said "mirrors `try_recycle_sampled`". It is written
+/// once here, and the pools differ only in their key type and their two caps.
 ///
-/// It is also where a fourth pool joins. `create_transient_depth` is the one
-/// render target in this engine that never recycles, and it allocates the most
-/// by two orders of magnitude; its doc asks for exactly this — one discipline
-/// the depth path also uses, not a fourth pool beside the others.
+/// Transient depth joins the same discipline too. `create_transient_depth` is
+/// the one render target in this engine that never recycles, and it allocates
+/// the most by two orders of magnitude; its doc asks for exactly this — one
+/// discipline the depth path also uses, not another bespoke pool beside the
+/// others.
 ///
 /// # The two caps
 ///
@@ -2191,7 +2562,7 @@ impl<K: std::hash::Hash + Eq, V> FreePool<K, V> {
     /// signatures carry no `ash::Device`, so they cannot destroy an entry a cap
     /// would reject. The caps therefore bound only the deferred
     /// `DeferredHandle::Recycle*` route; what bounds this one is
-    /// `trim_recycle_pools` on the idle drain. That asymmetry is real and was
+    /// `trim_recycle_pools` during maintenance. That asymmetry is real and was
     /// measured: one 4x4K video session held `sfree=203` against a `total` of 64.
     fn push_uncapped(&mut self, key: K, entry: V) {
         self.free.entry(key).or_default().push(entry);
@@ -2209,7 +2580,7 @@ impl<K: std::hash::Hash + Eq, V> FreePool<K, V> {
         got
     }
 
-    /// Take any retained entry, for the idle trim that drains the pool toward
+    /// Take any retained entry, for maintenance that drains the pool toward
     /// empty. Not a reuse, so it does not move the hit/alloc split.
     fn pop_any(&mut self) -> Option<V>
     where
@@ -2238,22 +2609,18 @@ impl<K: std::hash::Hash + Eq, V> FreePool<K, V> {
     }
 }
 
-/// Images destroyed from the recycle pools per idle-drain pass. The recycle pools
-/// exist for *active* per-frame reuse; at idle (the drain only fires after
-/// `IDLE_TARGET_AGE_MS` of no touch) they are pure retained VRAM, so each pass
-/// also trims them toward empty. Bounded like the registry drain so a large pool
-/// drains gradually (no dispose storm) and refills a few-per-frame when activity
-/// resumes (no re-alloc hitch).
+/// Images destroyed from recycle pools per maintenance pass. These objects are
+/// already outside every live resource; the initial delay and bounded batch avoid
+/// a disposal storm and let the pools refill gradually when activity resumes.
 const IDLE_RECYCLE_TRIM_PER_PASS: usize = 8;
 
-/// Consecutive zero-victim idle-drain passes required before the HOST_VISIBLE
+/// Consecutive maintenance passes without upload activity required before the HOST_VISIBLE
 /// buffer pools (`staging_free`/`readback_free`) are trimmed. Unlike the image
 /// pools (cheap slab suballocation refill), a trimmed staging buffer costs a
 /// full `vkAllocateMemory` when the next upload refills it — on the upload hot
 /// path that spikes inter-VBL latency. Gating on N consecutive settled passes
-/// (drain interval `IDLE_DRAIN_INTERVAL_MS`) ensures a single quiet pass during
-/// active video — where old frame RTs mostly but not always age out each pass —
-/// cannot trigger a mid-playback buffer re-alloc. At true idle the counter
+/// (interval `MAINTENANCE_INTERVAL_MS`) ensures a single quiet pass during
+/// active video cannot trigger a mid-playback buffer re-allocation. At true idle the counter
 /// climbs and the buffers drain to zero within a few hundred ms of settling.
 const SETTLED_PASSES_FOR_BUFFER_TRIM: u32 = 3;
 
@@ -2265,7 +2632,7 @@ const SETTLED_PASSES_FOR_BUFFER_TRIM: u32 = 3;
 /// VRAM is the explicit goal.
 ///
 /// **The settled gate is what makes zero safe, and it was missing.** The drain
-/// fires every `IDLE_DRAIN_INTERVAL_MS` (100 ms) whenever the poll heartbeat
+/// fires every `MAINTENANCE_INTERVAL_MS` (100 ms) whenever the poll heartbeat
 /// ticks, which is *most of the time* on any workload that does not saturate the
 /// drain worker — and it used to trim to zero on every one of those passes,
 /// overriding the hot path's budget between two frames of a live animation. A
@@ -2368,9 +2735,10 @@ pub(crate) const STAGING_BUCKET_BINS: usize = 32;
 /// One `staging_pool` line per this many misses.
 const STAGING_MISS_EMIT_EVERY: u64 = 512;
 
-/// Max draws per deferred-submit batch before `batch_slot` refuses joiners
-/// and the run flushes + reopens. Bounds GPU-idle latency and staging-slot
-/// hoarding (see `batch_slot`) while amortizing per-draw submit overhead.
+/// Largest supported draw count for one deferred-submit command buffer.
+///
+/// The live default is topology-dependent; see [`batch_default_draws`]. This
+/// constant is the allocation and test ceiling shared by both policies.
 ///
 /// # This ceiling is not what binds, and the census says what does
 ///
@@ -2476,13 +2844,187 @@ const STAGING_MISS_EMIT_EVERY: u64 = 512;
 /// in what any draw observes, because a command buffer executes as one unit and
 /// two draws in it have always read guest RAM at the same instant.
 ///
-/// **64 is past the cliff** the paragraph above describes, and it fails exactly
-/// as predicted: it keeps saving bytes and loses 14 % of the frames. 32 is
-/// chosen over 24 for the byte saving and over 64 for that. `desc_pool_grow`
-/// stayed 0 and creates-per-frame stayed flat (39.40 -> 39.16) at 32, so
-/// neither the descriptor arena nor the staging free lists is the next thing to
-/// give.
-pub(crate) const BATCH_MAX_DRAWS: u64 = 32;
+/// **64 is past the cliff on that discrete host**: it keeps saving bytes and
+/// loses 14 % of the frames. 32 is therefore the discrete policy, not a
+/// protocol bound.
+///
+/// # Unified memory has a different optimum
+///
+/// The serialized API contract grows a command buffer by byte capacity and
+/// uses continuation segments; it does not end one at a fixed draw ordinal.
+/// A backend still needs a scheduling bound because one Vulkan submission is a
+/// non-preemptible-enough unit on some kernels, but applying the discrete
+/// transfer optimum to unified memory needlessly fragments that API unit.
+///
+/// A macos-13 x86/Vulkan vibrancy drive on the Intel unified-memory pathway,
+/// with identical 35-second TestUFO/window-motion phases, swept the cap:
+///
+/// ```text
+/// cap   draws      submissions   draws/CB   slot us/draw   record us/draw
+///  32   242 035       10 746       22.52          4.96             4.10
+///  64   243 223        6 876       35.37          2.88             3.76
+/// 128   305 909        6 805       44.95          1.85             3.16
+/// 256    94 536        1 894       49.91          1.07             3.61
+/// ```
+///
+/// Boot-selected display cadence makes absolute draw totals across rows an
+/// invalid frame-rate comparison. The normalized phases and within-run
+/// cadence settle the choice: 128 had no stalls, four ring waits, and only
+/// 0.21 % of draws reached the ceiling. At 256 GPU time per draw rose by about
+/// 35 % and presentation repeatedly fell into 5--24 Hz windows. The wider arm
+/// crossed the scheduling cliff for negligible extra batching
+/// (44.95 -> 49.91 draws/CB).
+///
+/// Thus 128 is the unified policy and the largest capacity any topology may
+/// request. The decision uses the existing structural memory-topology
+/// classification, never a vendor or driver name; misclassification can change
+/// performance only.
+pub(crate) const BATCH_MAX_DRAWS: u64 = 128;
+const DISCRETE_BATCH_MAX_DRAWS: u64 = 32;
+
+const fn batch_default_draws(
+    topology: crate::backend::vulkan::caps::memory_topology::MemoryTopology,
+) -> u64 {
+    use crate::backend::vulkan::caps::memory_topology::MemoryTopology;
+    match topology {
+        MemoryTopology::Unified => BATCH_MAX_DRAWS,
+        MemoryTopology::Discrete => DISCRETE_BATCH_MAX_DRAWS,
+    }
+}
+
+/// The draws-per-command-buffer cap this device runs with.
+///
+/// The topology default is not a bound on GPU *time*, and the host kernel
+/// imposes one of those whether or not this device has an opinion: i915 resets
+/// a context that holds its engine past `preempt_timeout_ms`. So the cap is
+/// narrowable from the environment — see [`crate::env::BATCH_DRAWS`] for why
+/// that is the lever and what a cap of one buys as an instrument.
+///
+/// Called only while an uninitialized pool is being attached to its device.
+/// The chosen cap is then a field on that pool, so neither the environment nor
+/// topology is re-read on the draw path.
+fn batch_max_draws(
+    topology: crate::backend::vulkan::caps::memory_topology::MemoryTopology,
+) -> u64 {
+    let default = batch_default_draws(topology);
+    let cap = match crate::env::count(crate::env::BATCH_DRAWS, default) {
+        crate::env::Count::Narrowed(n) => n,
+        crate::env::Count::Unset => default,
+        // Fail-visible: a bound the operator asked for and did not get is a
+        // silent difference between what a bisect thinks it measured and
+        // what ran, which is the one thing an arm must never be.
+        crate::env::Count::Refused(raw) => {
+            crate::observe::fail(format!(
+                "batch_draws_refused value={raw} ceiling={default} \
+                     (a count from 1 to the ceiling narrows the cap; anything \
+                      else would widen it or stop every batch)"
+            ));
+            default
+        }
+    };
+    crate::observe::off(format!(
+        "batch_draws cap={cap} topology={} default={default} ceiling={BATCH_MAX_DRAWS}",
+        topology.slug()
+    ));
+    cap
+}
+
+/// The allocation a `cb_bound_buffers` key names, held so the key cannot be
+/// answered by a different allocation that inherited the address.
+///
+/// Only the `Arc` the key is derived from, not the whole
+/// [`super::types::BufferContent`]: the `GuestRuns` arm carries a second `Vec`
+/// of guest references that the key says nothing about, and cloning it per bind
+/// would be real work rather than an atomic increment.
+///
+/// **Neither payload is ever read, and that is the design.** What this type
+/// contributes is a strong reference with the same lifetime as the map entry,
+/// so the address in the entry's key cannot be reissued to a different
+/// allocation while the entry can still answer for it. Its value matters only
+/// through `Drop`. Reading it would be a second way to get at bytes the entry
+/// already describes, which is not wanted.
+#[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "held for its Drop, never read — the strong reference is the whole contribution"
+)]
+pub(crate) enum CbBindOwner {
+    Bytes(std::sync::Arc<Vec<u8>>),
+    Runs(std::sync::Arc<Vec<super::types::GuestRun>>),
+}
+
+/// One bind's identity, inseparable from the allocation that identity names.
+///
+/// The point of the type is that [`ResourcePools::note_cb_bound_buffer`] takes
+/// it **by value**: there is no way to record an entry without handing over the
+/// `Arc` that keeps the key's address unique, so the defect described on
+/// `ResourcePools::cb_bound_buffers` cannot be reintroduced by a new call site.
+/// A raw `(usize, u64, u64)` never reaches the map's API.
+///
+/// Constructing one costs a single `Arc` clone, paid on hits as well as misses.
+/// That is two atomics against a bind that already hashes and probes a map, and
+/// it buys an invariant a reviewer would otherwise have to re-derive.
+#[derive(Clone, Debug)]
+pub(crate) struct CbBind {
+    key: (usize, u64, u64),
+    owner: CbBindOwner,
+}
+
+impl CbBind {
+    /// Derive the identity and take a reference to what it names, in one place,
+    /// so the address and the thing at that address cannot disagree.
+    pub(crate) fn of(content: &super::types::BufferContent) -> Self {
+        match content {
+            super::types::BufferContent::Bytes(b) => Self {
+                key: Self::key_of(content),
+                owner: CbBindOwner::Bytes(std::sync::Arc::clone(b)),
+            },
+            super::types::BufferContent::GuestRuns(src) => Self {
+                key: Self::key_of(content),
+                owner: CbBindOwner::Runs(std::sync::Arc::clone(&src.runs)),
+            },
+        }
+    }
+
+    /// The identity on its own, without taking a reference to what it names.
+    ///
+    /// [`Self::of`] exists so that no entry can be recorded in
+    /// `cb_bound_buffers` without the `Arc` that keeps the key's address
+    /// unique, and it pays two atomics for that guarantee. A caller that only
+    /// *compares* two binds within one draw — the gather-role partition, which
+    /// lives and dies inside a single `execute_draw_request` — holds the
+    /// `DrawRequest` and therefore the allocations for the whole comparison, so
+    /// it needs no reference of its own and should not pay for one.
+    ///
+    /// This reaches no map. The invariant on [`ResourcePools::cb_bound_buffers`]
+    /// is that a raw key never reaches *that* map's API, and it is enforced by
+    /// [`ResourcePools::note_cb_bound_buffer`] taking a [`CbBind`] by value —
+    /// which this cannot produce.
+    pub(crate) fn key_of(content: &super::types::BufferContent) -> (usize, u64, u64) {
+        match content {
+            super::types::BufferContent::Bytes(b) => {
+                (std::sync::Arc::as_ptr(b) as usize, 0, b.len() as u64)
+            }
+            super::types::BufferContent::GuestRuns(src) => (
+                std::sync::Arc::as_ptr(&src.runs) as *const () as usize,
+                src.source_offset,
+                src.total_len,
+            ),
+        }
+    }
+
+    /// The `(allocation address, source offset, length)` identity. The working
+    /// set census consumes the allocation and length fields for gathered
+    /// exact-window sources; command-buffer reuse consumes all three.
+    pub(crate) fn key(&self) -> (usize, u64, u64) {
+        self.key
+    }
+
+    /// Split into what the map stores under it.
+    fn into_parts(self) -> ((usize, u64, u64), CbBindOwner) {
+        (self.key, self.owner)
+    }
+}
 
 /// 128-bit content fingerprint for the sampled cache.
 ///
@@ -2741,6 +3283,8 @@ mod sampled_key_tests {
     fn resource(arrayed: bool, volume: bool, cube: bool, one_dim: bool) -> SampledImageResource {
         SampledImageResource {
             binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
             width: 7,
             height: 5,
             layers: 3,
@@ -2748,7 +3292,9 @@ mod sampled_key_tests {
             volume,
             cube,
             one_dim,
+            multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(Vec::new())),
+            byte_origin: Default::default(),
             format: ash::vk::Format::R8G8B8A8_UNORM,
             identity: None,
             swizzle: SwizzlePlan::default(),
@@ -2807,6 +3353,43 @@ mod sampled_key_tests {
         assert_eq!((k.width, k.height, k.layers), (7, 5, 3));
         assert_eq!(k.format, ash::vk::Format::R8G8B8A8_UNORM);
         assert_eq!(k.swizzle, SwizzlePlan::default());
+    }
+
+    /// Only one key can describe the plain view of one attachment. Every shape
+    /// dimension that could make a second incompatible view keeps that bind out
+    /// of the attachment-count-sized scratch pool.
+    #[test]
+    fn attachment_snapshot_pool_accepts_only_plain_2d_identity_views() {
+        let mut plain = SampledKey::of(&resource(false, false, false, false));
+        plain.layers = 1;
+        assert!(plain.is_plain_2d_identity_view());
+
+        let variants = vec![
+            SampledKey { layers: 2, ..plain },
+            SampledKey {
+                volume: true,
+                ..plain
+            },
+            SampledKey {
+                cube: true,
+                ..plain
+            },
+            SampledKey {
+                arrayed: true,
+                ..plain
+            },
+            SampledKey {
+                one_dim: true,
+                ..plain
+            },
+            SampledKey {
+                swizzle: crate::contract::pixel_format::swizzle_plan(&[4, 3, 2, 1]).unwrap(),
+                ..plain
+            },
+        ];
+        assert!(variants
+            .into_iter()
+            .all(|key| !key.is_plain_2d_identity_view()));
     }
 }
 
@@ -3460,7 +4043,7 @@ mod staging_mapping_tests {
 
 #[cfg(test)]
 mod resident_reuse_tests {
-    use super::{ResidentAccess, ResidentTargetSlot};
+    use super::{ResidentAccess, ResidentMemory, ResidentTargetSlot};
     use crate::backend::vulkan::translate;
     use ash::vk;
 
@@ -3468,18 +4051,23 @@ mod resident_reuse_tests {
     fn slot(width: u32, height: u32, generation: u64, format: vk::Format) -> ResidentTargetSlot {
         ResidentTargetSlot {
             image: vk::Image::null(),
-            memory: vk::DeviceMemory::null(),
+            memory: ResidentMemory::Recyclable(vk::DeviceMemory::null()),
             view: vk::ImageView::null(),
+            alternate_views: Vec::new(),
             framebuffer: vk::Framebuffer::null(),
             render_pass: vk::RenderPass::null(),
+            framebuffer_compatibility: None,
             width,
             height,
+            sample_count: 1,
             generation,
             content_ready: false,
             content_epoch: None,
             access: ResidentAccess::Untouched,
-            color_format: format,
+            format: translate::pixel::ResidentFormat::of(format),
             pin_count: 0,
+            resource_released: false,
+            resource_owner_count: 0,
             gpu_only_content: false,
             last_touch_ms: 0,
         }
@@ -3511,14 +4099,61 @@ mod resident_reuse_tests {
              is what made the one-bit test match"
         );
         assert!(
-            !secondary.reusable_for(64, 32, 7, rgba),
+            !secondary.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(rgba)),
             "an RG16Float image must not be handed to an RGBA8 attachment"
         );
-        assert!(!secondary.reusable_for(64, 32, 7, bgra));
+        assert!(!secondary.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(bgra)));
         assert!(
-            secondary.reusable_for(64, 32, 7, vk::Format::R16G16_SFLOAT),
+            secondary.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(vk::Format::R16G16_SFLOAT)),
             "the secondary path must still get its own slot back"
         );
+    }
+
+    /// One surface bound through both spellings of one format is one slot.
+    ///
+    /// This is the rule `registry_ensure_attachment`'s doc has always stated and
+    /// that `reusable_for` used to contradict: `BGRA8Unorm` and
+    /// `BGRA8Unorm_sRGB` name the same stored bytes, so a guest that renders
+    /// into a surface through one and then through the other is asking for a
+    /// second texture view of one allocation. Comparing the declaration here
+    /// made the second ask a miss, which retires the live resident and recreates
+    /// it empty — the two interpretations then alternate frame to frame and each
+    /// holds half the content.
+    ///
+    /// The declaration is not lost by matching on the family: it rides on the
+    /// view `registry_ensure` hands back beside the slot, and the framebuffer is
+    /// rebuilt over that view whenever it moves.
+    #[test]
+    fn the_two_spellings_of_one_surface_share_one_allocation() {
+        use translate::pixel::ResidentFormat;
+        for (unorm, srgb) in [
+            (vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB),
+            (vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_SRGB),
+        ] {
+            for held in [unorm, srgb] {
+                let s = slot(64, 32, 7, held);
+                for asked in [unorm, srgb] {
+                    assert!(
+                        s.reusable_for(64, 32, 1, 7, ResidentFormat::of(asked)),
+                        "{held:?} must serve a request for {asked:?}"
+                    );
+                }
+                // Everything a byte-level difference separates still separates.
+                for other in [
+                    vk::Format::R8G8B8A8_UNORM,
+                    vk::Format::B8G8R8A8_UNORM,
+                    vk::Format::R16G16B16A16_SFLOAT,
+                ]
+                .into_iter()
+                .filter(|f| *f != translate::pixel::storage_format(held))
+                {
+                    assert!(
+                        !s.reusable_for(64, 32, 1, 7, ResidentFormat::of(other)),
+                        "{held:?} must not serve {other:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// The format test is a strengthening, not a replacement: everything the
@@ -3528,12 +4163,13 @@ mod resident_reuse_tests {
     fn geometry_generation_and_format_all_still_decide_reuse() {
         let rgba = translate::pixel::resident_color(false);
         let s = slot(64, 32, 7, rgba);
-        assert!(s.reusable_for(64, 32, 7, rgba));
-        assert!(!s.reusable_for(65, 32, 7, rgba), "width");
-        assert!(!s.reusable_for(64, 33, 7, rgba), "height");
-        assert!(!s.reusable_for(64, 32, 8, rgba), "generation");
+        assert!(s.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(rgba)));
+        assert!(!s.reusable_for(65, 32, 1, 7, translate::pixel::ResidentFormat::of(rgba)), "width");
+        assert!(!s.reusable_for(64, 33, 1, 7, translate::pixel::ResidentFormat::of(rgba)), "height");
+        assert!(!s.reusable_for(64, 32, 1, 8, translate::pixel::ResidentFormat::of(rgba)), "generation");
+        assert!(!s.reusable_for(64, 32, 2, 7, translate::pixel::ResidentFormat::of(rgba)), "sample count");
         assert!(
-            !s.reusable_for(64, 32, 7, translate::pixel::resident_color(true)),
+            !s.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(translate::pixel::resident_color(true))),
             "format still separates the two bgra orders"
         );
     }
@@ -3546,7 +4182,7 @@ mod idle_slab_trim_tests {
     /// An idle pass that is not settled must leave the image slab alone.
     ///
     /// This is the whole of the policy, and the case it protects is not idle at
-    /// all: the drain fires every `IDLE_DRAIN_INTERVAL_MS` whenever the poll
+    /// all: the drain fires every `MAINTENANCE_INTERVAL_MS` whenever the poll
     /// heartbeat ticks, so a workload with 100 ms gaps between frames reaches it
     /// between every pair of them. Trimming there returns the block the next
     /// frame re-allocates — measured at 257 allocations against 162 trims of a
@@ -3576,9 +4212,67 @@ mod idle_slab_trim_tests {
 }
 
 #[cfg(test)]
-mod dynamic_state_match_tests {
-    use super::{scissors_match, viewports_match};
+mod vertex_binding_bulk_tests {
+    use super::{normalize_vertex_bindings, vertex_binding_run_end, VertexBufferBinding};
     use ash::vk;
+    use ash::vk::Handle;
+
+    fn binding(binding: u32, buffer: u64, offset: u64) -> VertexBufferBinding {
+        VertexBufferBinding {
+            binding,
+            buffer: vk::Buffer::from_raw(buffer),
+            offset,
+        }
+    }
+
+    #[test]
+    fn attributes_are_sorted_by_binding_without_losing_values() {
+        let mut wanted = vec![
+            binding(3, 30, 3),
+            binding(1, 10, 1),
+            binding(2, 20, 200),
+        ];
+
+        normalize_vertex_bindings(&mut wanted);
+
+        assert_eq!(
+            wanted,
+            vec![
+                binding(1, 10, 1),
+                binding(2, 20, 200),
+                binding(3, 30, 3),
+            ]
+        );
+        assert_eq!(vertex_binding_run_end(&wanted, 0), 3);
+    }
+
+    #[test]
+    fn gaps_split_the_request_into_maximal_consecutive_runs() {
+        let bindings = vec![
+            binding(1, 10, 0),
+            binding(2, 20, 0),
+            binding(4, 40, 0),
+            binding(5, 50, 0),
+            binding(u32::MAX, 60, 0),
+        ];
+        let mut starts_and_ends = Vec::new();
+        let mut start = 0;
+        while start < bindings.len() {
+            let end = vertex_binding_run_end(&bindings, start);
+            starts_and_ends.push((start, end));
+            start = end;
+        }
+        assert_eq!(starts_and_ends, vec![(0, 2), (2, 4), (4, 5)]);
+    }
+}
+
+#[cfg(test)]
+mod dynamic_state_match_tests {
+    use super::{
+        push_descriptors_match, scissors_match, viewports_match, PushDescriptorBinding,
+    };
+    use ash::vk;
+    use ash::vk::Handle;
 
     fn vp(x: f32, y: f32, w: f32, h: f32, near: f32, far: f32) -> vk::Viewport {
         vk::Viewport {
@@ -3671,5 +4365,39 @@ mod dynamic_state_match_tests {
     fn an_empty_cache_matches_only_an_empty_request() {
         assert!(viewports_match(&[], &[]));
         assert!(!viewports_match(&[vp(0.0, 0.0, 1.0, -1.0, 0.0, 1.0)], &[]));
+    }
+
+    #[test]
+    fn push_descriptor_match_requires_the_exact_layout_and_values() {
+        let layout = vk::PipelineLayout::from_raw(7);
+        let binding = PushDescriptorBinding::Buffer {
+            binding: 3,
+            array_element: 0,
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            buffer: vk::Buffer::from_raw(11),
+            offset: 64,
+            range: 128,
+        };
+        assert!(push_descriptors_match(Some(layout), &[binding], layout, &[binding]));
+        assert!(!push_descriptors_match(
+            Some(vk::PipelineLayout::from_raw(8)),
+            &[binding],
+            layout,
+            &[binding]
+        ));
+        let changed = PushDescriptorBinding::Buffer {
+            binding: 3,
+            array_element: 0,
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            buffer: vk::Buffer::from_raw(11),
+            offset: 80,
+            range: 128,
+        };
+        assert!(!push_descriptors_match(
+            Some(layout),
+            &[binding],
+            layout,
+            &[changed]
+        ));
     }
 }

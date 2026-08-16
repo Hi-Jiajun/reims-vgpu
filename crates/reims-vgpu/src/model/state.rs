@@ -1,9 +1,14 @@
 //! Device-owned state: registers, rings, tasks, mapper, present, fail log.
 
 use crate::model::{LruBytesMemo, GFX_MMIO_SIZE, MAX_CHANNELS};
+use crate::runtime::decode::resource::{
+    DecodeStatus as ResourceDecodeStatus, Descriptor, ListObjectEntry, SamplerDescriptor,
+};
+#[cfg(feature = "backend-vulkan")]
+use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Opaque device instance id (QEMU handle).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -100,8 +105,7 @@ impl ExecFault {
 /// writing the handler rather than by more reverse engineering.
 ///
 /// The variants that carry no risk of losing guest work say so in their own
-/// docs. A reader ranking the fail log needs that distinction: the discard hints
-/// cost memory and the display-state commands cost a wrong panel state.
+/// docs. A reader ranking the fail log needs that distinction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnimplementedCommand {
     /// `CmdDebug` (`0x00`). A host-side trace marker; nothing is owed.
@@ -136,20 +140,6 @@ pub enum UnimplementedCommand {
     /// continues immediately, which reorders nothing but can race a guest that
     /// used the delay for settling.
     Delay,
-    /// `CmdDiscardResources` (`0x3f`). A hint that the named resources' contents
-    /// are no longer needed; ignoring it costs memory and never correctness.
-    /// Nothing of this command is executed.
-    DiscardResources,
-    /// The discard half of `CmdSynchronizeAndDiscardResources` (`0x3e`).
-    ///
-    /// Its own variant rather than a second use of [`Self::DiscardResources`],
-    /// because the two declines do not mean the same thing and a shared slug
-    /// cannot say which fired: on `0x3f` the whole command was dropped, while
-    /// here the synchronise half **did** run and only the discard hint was
-    /// ignored. A reader ranking the log needs that difference — the first is a
-    /// resource the guest expected to be released, the second is only memory
-    /// held longer than asked.
-    SynchronizeAndDiscardResources,
     /// One of the reference host's retired opcodes. Its handler accepts the
     /// packet and does nothing with the payload, so matching it is fidelity
     /// rather than a gap — the record exists to say an old guest is still
@@ -165,10 +155,6 @@ impl UnimplementedCommand {
             Self::DisplaySleepState => "cmd_display_sleep_state_unimplemented",
             Self::DisplaySetProperties => "cmd_display_set_properties_unimplemented",
             Self::Delay => "cmd_delay_unimplemented",
-            Self::DiscardResources => "cmd_discard_resources_unimplemented",
-            Self::SynchronizeAndDiscardResources => {
-                "cmd_synchronize_and_discard_resources_discard_unimplemented"
-            }
             Self::Deprecated => "cmd_deprecated",
         }
     }
@@ -182,8 +168,6 @@ impl UnimplementedCommand {
             Self::DisplaySleepState => "CmdDisplaySleepState",
             Self::DisplaySetProperties => "CmdDisplaySetProperties",
             Self::Delay => "CmdDelay",
-            Self::DiscardResources => "CmdDiscardResources",
-            Self::SynchronizeAndDiscardResources => "CmdSynchronizeAndDiscardResources",
             Self::Deprecated => "CmdDeprecated",
         }
     }
@@ -574,6 +558,511 @@ impl TaskTable {
     /// How many tasks are live. Not the size of the id space — there is none.
     pub fn live_count(&self) -> usize {
         self.live_ids().count()
+    }
+}
+
+/// A resource constructed from one task/object-list reference.
+///
+/// The object-list entry and its descriptor are construction input. Once the
+/// resource exists, binds retrieve this retained object rather than consulting
+/// guest memory again. The guest ends that lifetime explicitly by deleting the
+/// resource or the task that owns it.
+#[derive(Debug)]
+pub struct TaskResource {
+    pub entry: ListObjectEntry,
+    pub descriptor: Arc<[u8]>,
+    /// Typed form of the construction descriptor, decoded exactly once for
+    /// this resource lifetime.
+    ///
+    /// The serialized object map resolves a reference to an object, not to a
+    /// byte string that every bind is expected to parse again. Keep the bytes
+    /// because a few partial/legacy consumers deliberately accept shapes the
+    /// total decoder refuses, and keep that refusal too so those consumers do
+    /// not silently widen the total contract.
+    decoded: OnceLock<Result<Descriptor, ResourceDecodeStatus>>,
+    /// Type-11 construction side effects, completed once for this resource
+    /// lifetime. The mapping id is immutable construction state; physical
+    /// backing replacement invalidates the mapping's pages without rebuilding
+    /// the texture object.
+    type11_mapping: OnceLock<u32>,
+    /// Identity whose strong lifetime is exactly this serialized resource.
+    /// Direct backend objects keep only a weak reference, so deletion—not an
+    /// arbitrary idle timeout—makes them reclaimable.
+    lifetime: Arc<TaskResourceLifetime>,
+    /// Engine objects retained for this serialized resource lifetime.
+    ///
+    /// The lease owns its resident pin and allocation classification. Its
+    /// Each identity includes the mapping generation. A resource may own
+    /// several child identities concurrently; page recycling replaces only the
+    /// matching identity instead of overwriting an unrelated child lease.
+    #[cfg(feature = "backend-vulkan")]
+    resident_targets: Mutex<
+        HashMap<
+            crate::backend::vulkan::engine::TargetIdentity,
+            crate::backend::vulkan::engine::ResidentResourceLease,
+        >,
+    >,
+}
+
+impl TaskResource {
+    pub fn new(entry: ListObjectEntry, descriptor: Arc<[u8]>) -> Self {
+        Self {
+            entry,
+            descriptor,
+            decoded: OnceLock::new(),
+            type11_mapping: OnceLock::new(),
+            lifetime: Arc::new(TaskResourceLifetime::new()),
+            #[cfg(feature = "backend-vulkan")]
+            resident_targets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Resolve this resource's immutable construction descriptor once.
+    pub fn decoded(&self) -> &Result<Descriptor, ResourceDecodeStatus> {
+        self.decoded.get_or_init(|| {
+            crate::runtime::decode::resource::decode_descriptor(
+                self.entry.object_type,
+                &self.descriptor,
+            )
+        })
+    }
+
+    pub fn lifetime_ref(&self) -> TaskResourceLifetimeRef {
+        TaskResourceLifetimeRef {
+            id: self.lifetime.id,
+            live: Arc::downgrade(&self.lifetime),
+        }
+    }
+
+    pub(crate) fn registered_type11_mapping(&self) -> Option<u32> {
+        self.type11_mapping.get().copied()
+    }
+
+    pub(crate) fn register_type11_mapping(&self, mapping_id: u32) -> u32 {
+        *self.type11_mapping.get_or_init(|| mapping_id)
+    }
+
+    /// Retain and classify the engine target named by this resource.
+    ///
+    /// Warm binds read the resource-owned lease without entering the engine.
+    /// A changed identity or engine epoch releases the old lease and resolves
+    /// a new one; execution remains the authority for mutable content state.
+    #[cfg(feature = "backend-vulkan")]
+    pub fn resident_target_backing(
+        &self,
+        identity: &crate::backend::vulkan::engine::TargetIdentity,
+    ) -> crate::backend::vulkan::engine::ResidentContentBacking {
+        self.resident_target_backing_with(identity, |identity| {
+            crate::backend::vulkan::engine::retain_resident_resource(identity)
+        })
+    }
+
+    #[cfg(feature = "backend-vulkan")]
+    fn resident_target_backing_with(
+        &self,
+        identity: &crate::backend::vulkan::engine::TargetIdentity,
+        retain: impl FnOnce(
+            &crate::backend::vulkan::engine::TargetIdentity,
+        ) -> Option<crate::backend::vulkan::engine::ResidentResourceLease>,
+    ) -> crate::backend::vulkan::engine::ResidentContentBacking {
+        use crate::backend::vulkan::engine::ResidentContentBacking;
+
+        let mut held = self
+            .resident_targets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(lease) = held.get(identity).filter(|lease| lease.matches(identity)) {
+            return lease.backing();
+        }
+        // An engine reset invalidates the lease under this exact identity, but
+        // another identity is another child resource, not a replacement. A
+        // texture can own several views/surfaces concurrently.
+        held.remove(identity);
+        let acquired = retain(identity);
+        let backing = acquired
+            .as_ref()
+            .map(|lease| lease.backing())
+            .unwrap_or(ResidentContentBacking::NotReady);
+        if let Some(lease) = acquired {
+            held.insert(identity.clone(), lease);
+        }
+        crate::runtime::drain::note_store_route(if backing != ResidentContentBacking::NotReady {
+            "resident_resource_acquired"
+        } else {
+            "resident_resource_unavailable"
+        });
+        backing
+    }
+}
+
+static NEXT_TASK_RESOURCE_LIFETIME: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+#[derive(Debug)]
+struct TaskResourceLifetime {
+    id: u64,
+}
+
+impl TaskResourceLifetime {
+    fn new() -> Self {
+        let id = NEXT_TASK_RESOURCE_LIFETIME
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |id| id.checked_add(1),
+            )
+            .expect("task resource lifetime identity exhausted");
+        Self { id }
+    }
+}
+
+/// Weak backend-facing proof that one serialized resource still exists.
+#[derive(Clone, Debug)]
+pub struct TaskResourceLifetimeRef {
+    id: u64,
+    live: std::sync::Weak<TaskResourceLifetime>,
+}
+
+impl TaskResourceLifetimeRef {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.live.strong_count() != 0
+    }
+}
+
+#[cfg(all(test, feature = "backend-vulkan"))]
+mod task_resource_resident_tests {
+    use super::*;
+    use crate::backend::vulkan::engine::{
+        ResidentContentBacking, ResidentResourceLease, TargetIdentity,
+    };
+    use std::cell::Cell;
+
+    fn identity(generation: u64) -> TargetIdentity {
+        TargetIdentity::Surface {
+            id: 9,
+            width: 64,
+            height: 32,
+            generation,
+            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+        }
+    }
+
+    #[test]
+    fn a_resource_retains_each_child_identity_until_the_resource_ends() {
+        let resource = TaskResource::new(ListObjectEntry::default(), Arc::from([]));
+        let first = identity(1);
+        let acquisitions = Cell::new(0_u32);
+        let acquired_before =
+            crate::runtime::drain::census::store_route_count("resident_resource_acquired");
+
+        let backing = resource.resident_target_backing_with(&first, |identity| {
+            acquisitions.set(acquisitions.get() + 1);
+            Some(ResidentResourceLease::test_new(
+                identity.clone(),
+                ResidentContentBacking::GuestAllocation,
+            ))
+        });
+        assert_eq!(backing, ResidentContentBacking::GuestAllocation);
+        assert_eq!(acquisitions.get(), 1);
+        assert_eq!(
+            crate::runtime::drain::census::store_route_count("resident_resource_acquired"),
+            acquired_before + 1
+        );
+
+        let backing = resource.resident_target_backing_with(&first, |_| {
+            panic!("a warm bind must not reacquire its live resource")
+        });
+        assert_eq!(backing, ResidentContentBacking::GuestAllocation);
+        assert_eq!(
+            crate::runtime::drain::census::store_route_count("resident_resource_acquired"),
+            acquired_before + 1,
+            "a warm bind must not be counted as another acquisition"
+        );
+
+        crate::backend::vulkan::engine::test_advance_resident_resource_epoch();
+        let backing = resource.resident_target_backing_with(&first, |identity| {
+            acquisitions.set(acquisitions.get() + 1);
+            Some(ResidentResourceLease::test_new(
+                identity.clone(),
+                ResidentContentBacking::DeviceAllocation,
+            ))
+        });
+        assert_eq!(backing, ResidentContentBacking::DeviceAllocation);
+        assert_eq!(acquisitions.get(), 2, "an engine reset reacquires once");
+
+        let replacement = identity(2);
+        let backing = resource.resident_target_backing_with(&replacement, |identity| {
+            acquisitions.set(acquisitions.get() + 1);
+            Some(ResidentResourceLease::test_new(
+                identity.clone(),
+                ResidentContentBacking::GuestAllocation,
+            ))
+        });
+        assert_eq!(backing, ResidentContentBacking::GuestAllocation);
+        assert_eq!(
+            acquisitions.get(),
+            3,
+            "a new mapping generation reacquires once"
+        );
+
+        assert_eq!(
+            resource.resident_target_backing_with(&first, |_| {
+                panic!("adding a child identity must not evict the first child")
+            }),
+            ResidentContentBacking::DeviceAllocation
+        );
+        assert_eq!(
+            acquisitions.get(),
+            3,
+            "both child identities remain retained"
+        );
+        assert_eq!(
+            crate::runtime::drain::census::store_route_count("resident_resource_acquired"),
+            acquired_before + 3
+        );
+
+        // The synthetic leases have no registry pins behind them. Make the
+        // final drop stale so it exercises the reset-safe no-op release.
+        crate::backend::vulkan::engine::test_advance_resident_resource_epoch();
+    }
+
+    #[test]
+    fn an_unavailable_target_is_counted_and_retried() {
+        let resource = TaskResource::new(ListObjectEntry::default(), Arc::from([]));
+        let unavailable_before =
+            crate::runtime::drain::census::store_route_count("resident_resource_unavailable");
+        let attempts = Cell::new(0_u32);
+
+        for _ in 0..2 {
+            assert_eq!(
+                resource.resident_target_backing_with(&identity(1), |_| {
+                    attempts.set(attempts.get() + 1);
+                    None
+                }),
+                ResidentContentBacking::NotReady
+            );
+        }
+        assert_eq!(attempts.get(), 2, "an absent target must remain retryable");
+        assert_eq!(
+            crate::runtime::drain::census::store_route_count("resident_resource_unavailable"),
+            unavailable_before + 2
+        );
+    }
+}
+
+/// Per-task resource objects, keyed by the guest's `(task, reference)` pair.
+///
+/// Interior synchronization keeps resource lookup available to encode helpers
+/// that only borrow [`DeviceState`] immutably. Those helpers run while the
+/// device already owns its state, but making the registry itself synchronized
+/// also makes the lifetime rule explicit instead of relying on that outer
+/// serialization.
+#[derive(Debug, Default)]
+pub struct TaskResources(Mutex<BTreeMap<(u32, u32), Arc<TaskResource>>>);
+
+impl TaskResources {
+    pub fn get(&self, task_id: u32, ref_: u32) -> Option<Arc<TaskResource>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(task_id, ref_))
+            .cloned()
+    }
+
+    /// Publish a newly constructed object unless another lookup won the race.
+    pub fn register(
+        &self,
+        task_id: u32,
+        ref_: u32,
+        resource: Arc<TaskResource>,
+    ) -> Arc<TaskResource> {
+        Arc::clone(
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry((task_id, ref_))
+                .or_insert(resource),
+        )
+    }
+
+    pub fn delete(&self, task_id: u32, ref_: u32) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&(task_id, ref_))
+            .is_some()
+    }
+
+    pub fn delete_task(&self, task_id: u32) -> usize {
+        let mut resources = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before = resources.len();
+        resources.retain(|&(task, _), _| task != task_id);
+        before - resources.len()
+    }
+}
+
+/// One immutable sampler object constructed in a task's sampler-reference space.
+///
+/// Sampler references are not resource-list ownership records. They have their
+/// own explicit delete command, so keeping them in [`TaskResources`] would let
+/// two distinct reference spaces destroy one another when their integers
+/// happen to collide. Construction snapshots the descriptor once; binds retain
+/// and retrieve this decoded state until that sampler or its task is deleted.
+#[derive(Debug)]
+pub struct TaskSamplerState {
+    pub descriptor: SamplerDescriptor,
+}
+
+/// Immutable objects in an API-specific task/reference namespace.
+///
+/// The map has no capacity or eviction policy. Its entries are object
+/// lifetimes: an explicit delete removes one reference and task teardown removes
+/// the namespace. A capacity would invent a third lifetime event that the guest
+/// never sent.
+pub struct TaskReferenceStates<T>(Mutex<BTreeMap<(u32, u32), Arc<T>>>);
+
+impl<T> Default for TaskReferenceStates<T> {
+    fn default() -> Self {
+        Self(Mutex::new(BTreeMap::new()))
+    }
+}
+
+impl<T> std::fmt::Debug for TaskReferenceStates<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let states = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        f.debug_struct("TaskReferenceStates")
+            .field("entries", &states.len())
+            .finish()
+    }
+}
+
+impl<T> TaskReferenceStates<T> {
+    pub fn contains(&self, task_id: u32, ref_: u32) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&(task_id, ref_))
+    }
+
+    pub fn get(&self, task_id: u32, ref_: u32) -> Option<Arc<T>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(task_id, ref_))
+            .cloned()
+    }
+
+    /// Publish a fully constructed object unless another resolver won the race.
+    pub fn register(&self, task_id: u32, ref_: u32, state: Arc<T>) -> Arc<T> {
+        Arc::clone(
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry((task_id, ref_))
+                .or_insert(state),
+        )
+    }
+
+    pub fn delete(&self, task_id: u32, ref_: u32) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&(task_id, ref_))
+            .is_some()
+    }
+
+    pub fn delete_task(&self, task_id: u32) -> usize {
+        let mut states = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before = states.len();
+        states.retain(|&(task, _), _| task != task_id);
+        before - states.len()
+    }
+}
+
+/// Per-task sampler objects, keyed by the sampler API's reference space.
+pub type TaskSamplerStates = TaskReferenceStates<TaskSamplerState>;
+
+/// Per-task render pipeline states, keyed by the pipeline API's reference
+/// space. A state owns its decoded descriptor, translated functions and derived
+/// bind plan exactly as one native pipeline state owns its construction.
+#[cfg(feature = "backend-vulkan")]
+pub type TaskRenderPipelineStates =
+    TaskReferenceStates<crate::runtime::pipeline_resolve::ResolvedRenderPipeline>;
+
+/// Per-task depth-stencil states, keyed by that API's reference space.
+///
+/// A depth-stencil state is an immutable object with its own explicit delete
+/// command (`OPCODE_DELETE_DEPTH_STENCIL_STATE`), exactly like a sampler state
+/// and a render pipeline state, so it belongs in this namespace and not in
+/// [`TaskResources`] — whose type mask deliberately excludes object type 7,
+/// because that tag is also worn by mutable serializer descriptors and two
+/// reference spaces sharing one map would destroy each other's entries when
+/// their integers collide.
+///
+/// It used to be resolved out of guest memory on **every draw that bound any
+/// depth state**: an object-list lookup, a descriptor read, an `Arc<[u8]>`
+/// allocation and a decode, measured at 0.43-0.47 µs of a 9.8 µs Maps chain.
+/// The census that licensed retaining it counted the bytes rather than assuming
+/// them — 1 878 843 reads of 32 distinct references over a driven boot, **every
+/// one of them byte-identical to the previous read of the same reference and not
+/// one changed**. The guest publishes the state once and binds it; the delete
+/// command is the invalidation, which is why this needs no capacity and no
+/// generation.
+#[cfg(feature = "backend-vulkan")]
+pub type TaskDepthStencilStates =
+    TaskReferenceStates<crate::runtime::decode::resource::DepthStencilDescriptor>;
+
+#[cfg(test)]
+mod task_reference_state_tests {
+    use super::TaskReferenceStates;
+    use std::sync::Arc;
+
+    #[test]
+    fn explicit_reference_and_task_deletion_are_the_only_retirement_events() {
+        let states = TaskReferenceStates::default();
+        let first = states.register(1, 7, Arc::new(10u32));
+        let raced = states.register(1, 7, Arc::new(11u32));
+        states.register(1, 8, Arc::new(12u32));
+        states.register(2, 7, Arc::new(13u32));
+
+        assert!(Arc::ptr_eq(&first, &raced), "the first construction wins");
+        assert_eq!(*states.get(1, 7).unwrap(), 10);
+        assert!(states.delete(1, 7));
+        assert!(!states.contains(1, 7));
+        assert!(states.contains(1, 8));
+        assert!(states.contains(2, 7));
+
+        assert_eq!(states.delete_task(1), 1);
+        assert!(!states.contains(1, 8));
+        assert!(states.contains(2, 7));
+        assert_eq!(
+            *first, 10,
+            "an encoder owner remains valid after registry deletion"
+        );
+    }
+
+    #[test]
+    fn a_live_reference_population_has_no_capacity_eviction() {
+        let states = TaskReferenceStates::default();
+        for ref_ in 0..2048 {
+            states.register(3, ref_, Arc::new(ref_));
+        }
+        for ref_ in 0..2048 {
+            assert_eq!(*states.get(3, ref_).unwrap(), ref_);
+        }
     }
 }
 
@@ -974,24 +1463,33 @@ pub struct MappingEntry {
     pub device_desc: Vec<u8>,
     /// Contiguous host-VA view over `page_entries` (`HostOps::map_pages`,
     /// mach_vm_remap of guest RAM). 0 = not built. This is the surface storage
-    /// for the guest mapping, and it is read and written by the **CPU only**:
-    /// Metal render targets used to be created directly on this view, which
-    /// gave the host GPU a handle on guest RAM, and that alias is deleted.
-    /// Guest CPU writes and host page reads still see one copy; a GPU Store
-    /// reaches it through the writeback. Retired (never freed in place)
+    /// for the guest mapping. Guest CPU writes and host page reads see this
+    /// allocation directly; on a capable unified-memory backend an imported
+    /// render attachment retains the same view. Retired (never freed in place)
     /// whenever `page_entries` change; see `DeviceState::retired_views`.
     pub contig_ptr: usize,
     pub contig_len: usize,
-    /// `map_generation` whose page list was measured non-packed, so no
-    /// contiguous view can exist over it. `None` = not measured for the
-    /// current list.
+    /// Guest-physical pages represented by `contig_ptr`, in allocation order.
     ///
-    /// "Packed or not" is a pure function of `page_entries`, and
-    /// `map_generation` names that list — the same key that makes `contig_ptr`
-    /// above safe to cache. Without it every caller on a fragmented mapping
-    /// re-collected the whole page-GPA vector and re-scanned it only to reach
-    /// the answer it reached last time.
-    pub contig_fragmented_gen: Option<u32>,
+    /// Kept with the view because a resource synchronization names the
+    /// resource, not a freshly reconstructed destination. The backend retains
+    /// this footprint with an imported attachment and uses it to order host
+    /// readers against the GPU write without walking the mapping again at
+    /// Store time.
+    pub contig_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint>,
+    /// Checked backend-import bound over `contig_ptr`, created once for this
+    /// mapping incarnation. Keeping it on the mapping makes every plane view a
+    /// slice of one resource-owned allocation instead of minting a new import
+    /// identity for each bind.
+    pub contig_import: Option<std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>>,
+    /// `map_generation` whose page list the host refused to expose as one
+    /// packed view. `None` = not asked for the current list.
+    ///
+    /// The host answer is stable for one page list, and `map_generation` names
+    /// that list — the same key that makes `contig_ptr` above safe to cache.
+    /// Without it every caller repeats a host mapping attempt that cannot
+    /// become possible until the guest changes the list.
+    pub contig_refused_gen: Option<u32>,
     /// Live [`crate::runtime::host::HostOps::track_guest_writes`] token for the
     /// page list in [`Self::page_entries`], or 0 when the host cannot observe
     /// guest writes (or none has been asked for yet).
@@ -1752,13 +2250,59 @@ pub struct GuestLinearMemo {
     /// content change. Padding is included so a write anywhere in the span is
     /// observed by the byte-compare.
     pub native: Vec<u8>,
-    /// Tight upload bytes of `native`: swizzled RGBA8, or — when `bgra8` — the
-    /// guest's native BGRA8 order (uploaded into a BGRA8 image, no CPU swap).
+    /// Tight upload bytes of `native`, in whatever layout [`Self::layout`]
+    /// names: converted RGBA8, or the guest's own texels kept exactly.
     pub rgba: std::sync::Arc<Vec<u8>>,
-    /// `rgba` holds native BGRA8 texels (upload as `Bgra8`) rather than RGBA8.
-    pub bgra8: bool,
+    /// What [`Self::rgba`] holds, so the memo hit re-states the layout the
+    /// miss-fill chose.
+    ///
+    /// This was a `bgra8: bool`, and it could only spell two of the layouts the
+    /// loader can now produce — so a half-float image stored on the miss would
+    /// have come back out of a hit described as `Rgba8`: eight-byte texels bound
+    /// into a four-byte image, which is a length the engine refuses and, if it
+    /// had not, garbage. A `bool` standing in for an enum is the one shape
+    /// `rustc` cannot tell you has gone short.
+    pub layout: crate::contract::pixel_format::TexelLayout,
     /// Content generation: bumps only when the native bytes change.
     pub generation: u64,
+}
+
+/// The mapping ids one object reference names, as
+/// [`DeviceState::mappings_named_by`] resolves them.
+///
+/// Two at most and that is a property of the contract rather than a capacity
+/// this device chose: a reference is its own mapping id or it is not, and the
+/// per-task registration holds exactly one entry per `(task, ref)`. Carrying
+/// the pair inline rather than in a `Vec` is what makes that statement, and it
+/// is why `push` past the second is unreachable rather than a bound to tune.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NamedMappings {
+    ids: [u32; 2],
+    len: u8,
+}
+
+impl NamedMappings {
+    /// Add `id` unless it is already named. Silently complete at two, which the
+    /// type's doc explains is unreachable rather than a truncation.
+    fn push(&mut self, id: u32) {
+        if self.iter().any(|held| held == id) {
+            return;
+        }
+        if let Some(slot) = self.ids.get_mut(self.len as usize) {
+            *slot = id;
+            self.len += 1;
+        }
+    }
+
+    /// The named ids, reference first.
+    pub fn iter(self) -> impl Iterator<Item = u32> {
+        (0..usize::from(self.len)).map(move |i| self.ids[i])
+    }
+
+    /// Whether this reference named no mapping at all.
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
 }
 
 /// Full device model state (backend-independent).
@@ -1855,15 +2399,23 @@ pub struct DeviceState {
     pub released_pages: crate::runtime::released_pages::ReleasedPages,
     /// Live object refs per task, as `(task_id, ref)`.
     ///
-    /// Membership only — deliberately carries no descriptor payload. Every
-    /// consumer that needs an object's type or descriptor reads the guest's own
-    /// list through `objects::lookup_list_entry`, which walks guest memory at
-    /// use time; a cached copy here would be a second source of truth for
-    /// something the guest can rewrite under us. What the set *is* load-bearing
-    /// for is [`Self::delete_object`], which gates the host-side resource
-    /// teardown (`host_texture_surfaces`, `host_linear_textures`,
-    /// `texture_to_mapping`) on whether the ref was live.
+    /// This is membership for host-copy teardown. [`Self::task_resources`]
+    /// owns the corresponding resource objects and their immutable descriptor
+    /// construction input.
     pub objects: std::collections::BTreeSet<(u32, u32)>,
+    /// Retained resource objects, with the task/reference lifetime defined by
+    /// [`TaskResources`].
+    pub task_resources: TaskResources,
+    /// Immutable sampler objects in the sampler API's separate ref space.
+    pub task_sampler_states: TaskSamplerStates,
+    /// Immutable depth-stencil objects in that API's separate ref space.
+    #[cfg(feature = "backend-vulkan")]
+    pub task_depth_stencil_states: TaskDepthStencilStates,
+    /// Immutable render pipeline states in the pipeline API's separate ref
+    /// space. The guest binds these by reference after construction and ends
+    /// them with resource deletion or task teardown.
+    #[cfg(feature = "backend-vulkan")]
+    pub task_render_pipeline_states: TaskRenderPipelineStates,
     /// Type-11 texture object ref → mapping_id: (task_id, ref) -> mapping_id.
     pub texture_to_mapping: BTreeMap<(u32, u32), u32>,
     pub mappings: BTreeMap<u32, MappingEntry>,
@@ -1871,10 +2423,14 @@ pub struct DeviceState {
     /// See [`crate::runtime::surface_cache`] and kb tahoe-x86-host-reims_vgpu §8.5.
     /// **Surface_id namespace only** — never texture_ref (object list ids collide).
     pub host_surfaces: BTreeMap<u32, HostSurface>,
-    /// Discrete encode cache for type-2/3 GVA color targets, keyed by texture
-    /// object ref. Separate from [`Self::host_surfaces`] so list ids cannot
-    /// clobber type-4 present mids (live: sky `tex_ref=24` vs mid 24).
-    pub host_texture_surfaces: BTreeMap<u32, HostSurface>,
+    /// Discrete encode cache for type-2/3 GVA color targets, keyed by
+    /// `(task_id, texture_ref)`.
+    ///
+    /// Object-list refs are local to a task. Separate from
+    /// [`Self::host_surfaces`] so list ids cannot clobber type-4 present mids,
+    /// and task-qualified so one address space cannot replace or evict another
+    /// task's same-numbered texture.
+    pub host_texture_surfaces: BTreeMap<(u32, u32), HostSurface>,
     /// Same type-2/3 encode content keyed by target GVA — survives texture_ref
     /// rebinding / small-atlas overwrite of the ref slot.
     ///
@@ -1924,10 +2480,11 @@ pub struct DeviceState {
     /// byte-exact against the memoized copy — a guest write is always seen;
     /// only the swizzle+alloc (and the engine's content hash+memcmp, via the
     /// generation identity) are skipped on unchanged content. Keyed by
-    /// (task_id, level-0 gva, width, height, sample format). Byte-bounded LRU
+    /// (task_id, level-0 gva, width, height, depth planes, sample format).
+    /// Byte-bounded LRU
     /// ([`GUEST_LINEAR_MEMO_BYTE_CAP`]): a cap crossing evicts the least-recently
     /// -used entries down to a low-water mark, never bulk-clearing the hot set.
-    pub guest_linear_memo: LruBytesMemo<(u32, u64, u32, u32, u16), GuestLinearMemo>,
+    pub guest_linear_memo: LruBytesMemo<(u32, u64, u32, u32, u32, u16), GuestLinearMemo>,
     /// Whether the hypervisor's guest-write generation would be a sound "these
     /// texels did not change" key for the zero-copy sampled gathers, measured
     /// against the bytes themselves. See
@@ -2093,9 +2650,12 @@ pub struct DeviceState {
     pub draining_mask: u32,
     /// Contiguous mapping views (`MappingEntry::contig_ptr`) whose page tables
     /// changed. `DeviceState` cannot unmap (no HostOps); the runtime flushes
-    /// these via `HostOps::unmap_pages` after dropping the Metal objects that
-    /// alias them (`mapper::flush_retired_views`).
+    /// these via `HostOps::unmap_pages` after retiring the backend objects and
+    /// parent allocations that alias them (`mapper::flush_retired_views`).
     pub retired_views: Vec<(usize, usize)>,
+    /// Backend parent allocations detached with `retired_views`. The runtime
+    /// retires the GPU import before releasing the host view it aliases.
+    pub retired_guest_imports: Vec<crate::runtime::guest_ram::ImportId>,
     /// Guest-write tokens whose page list is gone, awaiting release through
     /// `HostOps::untrack_guest_writes`. Drained by
     /// `mapper::flush_retired_views` alongside `retired_views`, for the same
@@ -2110,9 +2670,10 @@ pub struct DeviceState {
     /// ([`crate::runtime::render_writeback::retire_linear_residents`]) so the
     /// pinned images become LRU-evictable instead of leaking.
     pub retired_linear_residents: Vec<ComputeStorageResidencyKey>,
-    /// Type-11 surfaces whose latest frame is still only in the engine resident,
-    /// because nothing has read their guest pages since the Store that produced
-    /// it. See [`crate::runtime::writeback_debt`], which owns every transition.
+    /// Surface and GVA resources whose latest frame is still only in the engine
+    /// resident, because nothing has synchronized or read their guest pages
+    /// since the Store that produced it. See
+    /// [`crate::runtime::writeback_debt`], which owns every transition.
     ///
     /// Empty unless [`crate::env::LAZY_WRITEBACK`] is on, and empty on the
     /// `backend-metal` arm, which arms nothing.
@@ -2145,6 +2706,13 @@ pub struct DeviceState {
     /// answer to the one question its page-set guard cannot ask: was the guest
     /// told this render was done before we wrote its bytes?
     pub completion_stamp_seq: u64,
+    /// Census only: what this device has stamped, split by whether the value is
+    /// still owed by the coalescing rail or already handed to publication.
+    ///
+    /// Sizes the one repair available for the held-packet cost, and says which
+    /// unmet waits are honest. Feeds no verdict — see
+    /// [`crate::runtime::drain::StampLedger`].
+    pub stamp_ledger: crate::runtime::drain::StampLedger,
     /// Total stale views the reuse verify caught (fail-logged as
     /// `gva_view_stale`; the view self-heals via retire + rebuild).
     pub view_stale_reads: u64,
@@ -2200,6 +2768,12 @@ impl DeviceState {
             node_guard: std::collections::BTreeMap::new(),
             released_pages: crate::runtime::released_pages::ReleasedPages::default(),
             objects: std::collections::BTreeSet::new(),
+            task_resources: TaskResources::default(),
+            task_sampler_states: TaskSamplerStates::default(),
+            #[cfg(feature = "backend-vulkan")]
+            task_depth_stencil_states: TaskDepthStencilStates::default(),
+            #[cfg(feature = "backend-vulkan")]
+            task_render_pipeline_states: TaskRenderPipelineStates::default(),
             texture_to_mapping: BTreeMap::new(),
             mappings: BTreeMap::new(),
             host_surfaces: BTreeMap::new(),
@@ -2228,10 +2802,12 @@ impl DeviceState {
             draining_channel: 0,
             draining_mask: 0,
             retired_views: Vec::new(),
+            retired_guest_imports: Vec::new(),
             retired_guest_write_tokens: Vec::new(),
             retired_linear_residents: Vec::new(),
             pending_writebacks: crate::runtime::writeback_debt::PendingWritebacks::default(),
             completion_stamp_seq: 0,
+            stamp_ledger: Default::default(),
             gva_resident_backing: std::collections::BTreeMap::new(),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             #[cfg(feature = "backend-vulkan")]
@@ -2240,7 +2816,7 @@ impl DeviceState {
             bound_buffers: crate::runtime::bound_buffers::BoundBuffers::default(),
             buffer_write_gen: crate::runtime::buffer_write_gen::BufferWriteGens::default(),
             sampled_content_gen: 0,
-            host_writes: crate::runtime::host_writes::HostWrites::default(),
+            host_writes: crate::runtime::host_writes::HostWrites::new(page_shift),
             guest_linear_scratch: Vec::new(),
             type5_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             type11_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
@@ -2250,19 +2826,23 @@ impl DeviceState {
         }
     }
 
-
-
-
     /// Detach `e`'s contiguous view for later unmap (page table changed).
     /// Returns the retired (ptr, len) to push into `retired_views`.
-    fn take_mapping_view(e: &mut MappingEntry) -> Option<(usize, usize)> {
-        if e.contig_ptr == 0 {
-            return None;
-        }
-        let v = (e.contig_ptr, e.contig_len);
+    fn take_mapping_view(
+        e: &mut MappingEntry,
+    ) -> (
+        Option<(usize, usize)>,
+        Option<crate::runtime::guest_ram::ImportId>,
+    ) {
+        let import = e.contig_import.take().map(|import| {
+            import.retire();
+            import.id()
+        });
+        let view = (e.contig_ptr != 0).then_some((e.contig_ptr, e.contig_len));
         e.contig_ptr = 0;
         e.contig_len = 0;
-        Some(v)
+        e.contig_footprint = None;
+        (view, import)
     }
 
     /// Detach the guest-write token, returning it for release through
@@ -2288,8 +2868,12 @@ impl DeviceState {
         let mut views = std::mem::take(&mut self.retired_views);
         let mut tokens = std::mem::take(&mut self.retired_guest_write_tokens);
         for mapping in self.mappings.values_mut() {
-            if let Some(view) = Self::take_mapping_view(mapping) {
+            let (view, import) = Self::take_mapping_view(mapping);
+            if let Some(view) = view {
                 views.push(view);
+            }
+            if let Some(import) = import {
+                self.retired_guest_imports.push(import);
             }
             let token = Self::take_guest_write_token(mapping);
             if token != 0 {
@@ -2632,6 +3216,18 @@ impl DeviceState {
         }
         // Drop objects for this task on redefine.
         self.objects.retain(|&(t, _)| t != task_id);
+        self.task_resources.delete_task(task_id);
+        self.task_sampler_states.delete_task(task_id);
+        #[cfg(feature = "backend-vulkan")]
+        crate::runtime::drain::note_store_route_n(
+            "ds_state_task_deleted",
+            self.task_depth_stencil_states.delete_task(task_id) as u64,
+        );
+        #[cfg(feature = "backend-vulkan")]
+        crate::runtime::drain::note_store_route_n(
+            "pipeline_state_task_deleted",
+            self.task_render_pipeline_states.delete_task(task_id) as u64,
+        );
         // A deleted task's whole address space goes with it, so its live
         // mappings are not leaks and a reused id must not inherit them.
         self.map_audit.remove(&task_id);
@@ -2678,21 +3274,25 @@ impl DeviceState {
             return false;
         }
         self.objects.retain(|&(t, _)| t != task_id);
+        self.task_resources.delete_task(task_id);
+        self.task_sampler_states.delete_task(task_id);
+        #[cfg(feature = "backend-vulkan")]
+        crate::runtime::drain::note_store_route_n(
+            "ds_state_task_deleted",
+            self.task_depth_stencil_states.delete_task(task_id) as u64,
+        );
+        #[cfg(feature = "backend-vulkan")]
+        crate::runtime::drain::note_store_route_n(
+            "pipeline_state_task_deleted",
+            self.task_render_pipeline_states.delete_task(task_id) as u64,
+        );
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
+        self.host_texture_surfaces
+            .retain(|&(t, _), _| t != task_id);
         // Clear texture→mapping latches for this task.
-        let doomed_refs: Vec<u32> = self
-            .texture_to_mapping
-            .keys()
-            .filter_map(|&(t, r)| if t == task_id { Some(r) } else { None })
-            .collect();
         self.texture_to_mapping.retain(|&(t, _), _| t != task_id);
-        // Drop texture-ref encode slots that were latched for this task. Other
-        // refs are left (cache is ref-keyed without task); delete_object also
-        // evicts. GVA encode cache retained until Unmap of that range.
-        for r in doomed_refs {
-            self.host_texture_surfaces.remove(&r);
-        }
+        // GVA encode cache retained until Unmap of that range.
         // Task teardown ≡ all GPU VA maps for this task go away — retire any
         // HostOps views we held (does not touch host_gva_surfaces encode).
         // Runtime flushes retired_views via HostOps::unmap_pages.
@@ -2721,6 +3321,57 @@ impl DeviceState {
         true
     }
 
+    /// Every mapping id one task-local object reference can name.
+    ///
+    /// This device carries two ways from a reference to a surface, because the
+    /// guest has two: on some paths the reference *is* the mapping id, and on
+    /// the rest [`Self::texture_to_mapping`] holds the per-task registration a
+    /// type-11 create recorded. A statement about the reference — a validity
+    /// quad, an owed render frame — is a statement about every mapping it
+    /// names, so the candidate set is one rule and lives here.
+    ///
+    /// It is one rule because it used to be two, spelled differently, and only
+    /// one of them was right about what "named nothing" means:
+    /// `resource_validity::apply` built both candidates and then asked
+    /// [`Self::mappings`] which of them exists, while
+    /// `writeback_debt::pay_for_texture` asked only whether the ledger held a
+    /// debt and then reported "this reference named no surface" whenever the
+    /// per-task registration was empty. The reference-is-the-mapping-id
+    /// spelling never populates that registration, so that report was `100 %`
+    /// of its own census on both arms of a driven macos-13 boot — a census
+    /// whose whole purpose was to separate "nothing was owed" from "we could
+    /// not look".
+    ///
+    /// Deduplicated, so a reference that is its own mapping id is one target
+    /// and not two. Ordered as the guest's own namespaces are asked: the
+    /// reference first, the registration second.
+    pub fn mappings_named_by(&self, task_id: u32, object_id: u32) -> NamedMappings {
+        let mut named = NamedMappings::default();
+        if object_id == 0 {
+            // `writeInvalidates` skips null resources and id 0; `pageBacking`
+            // never emits one. A zero id names nothing.
+            return named;
+        }
+        named.push(object_id);
+        if let Some(&mid) = self.texture_to_mapping.get(&(task_id, object_id)) {
+            named.push(mid);
+        }
+        named
+    }
+
+    /// Whether any mapping this reference names is one this device still holds.
+    ///
+    /// The question a reader asks before concluding that nothing was owed: a
+    /// reference naming no live mapping did not *look*, and a reference naming
+    /// one and finding no debt genuinely found nothing. Derived from
+    /// [`Self::mappings_named_by`] so the two cannot answer about different
+    /// candidate sets.
+    pub fn names_live_mapping(&self, task_id: u32, object_id: u32) -> bool {
+        self.mappings_named_by(task_id, object_id)
+            .iter()
+            .any(|id| self.mappings.contains_key(&id))
+    }
+
     pub fn insert_object(&mut self, task_id: u32, ref_: u32) -> bool {
         let discriminant = (u64::from(task_id) << 32) | u64::from(ref_);
         self.max_task_id_seen = self.max_task_id_seen.max(task_id);
@@ -2738,11 +3389,12 @@ impl DeviceState {
 
     pub fn delete_object(&mut self, task_id: u32, ref_: u32) -> bool {
         let removed = self.objects.remove(&(task_id, ref_));
-        if removed {
+        let resource_removed = self.task_resources.delete(task_id, ref_);
+        if removed || resource_removed {
             self.invalidate_object_host_copies(task_id, ref_);
             self.texture_to_mapping.remove(&(task_id, ref_));
         }
-        removed
+        removed || resource_removed
     }
 
     /// Drop this device's ref-keyed host copies of an object's *contents*, for a
@@ -2764,7 +3416,10 @@ impl DeviceState {
     /// it is unpinned and its deferred window dropped rather than left to write
     /// pixels read from the old pages into the new ones.
     pub fn invalidate_object_host_copies(&mut self, task_id: u32, ref_: u32) -> (bool, bool) {
-        let had_texture = self.host_texture_surfaces.remove(&ref_).is_some();
+        let had_texture = self
+            .host_texture_surfaces
+            .remove(&(task_id, ref_))
+            .is_some();
         let had_linear = match self.host_linear_textures.remove(&(task_id, ref_)) {
             Some(e) => {
                 self.retire_linear_resident(task_id, ref_, &e);
@@ -2836,10 +3491,13 @@ impl DeviceState {
         e.page_table_kva = 0;
         e.condemned_entries = None;
         Self::bump_map_generation(e);
-        let retired = Self::take_mapping_view(e);
+        let (retired, retired_import) = Self::take_mapping_view(e);
         let retired_token = Self::take_guest_write_token(e);
         if let Some(v) = retired {
             self.retired_views.push(v);
+        }
+        if let Some(import) = retired_import {
+            self.retired_guest_imports.push(import);
         }
         if retired_token != 0 {
             self.retired_guest_write_tokens.push(retired_token);
@@ -2867,10 +3525,13 @@ impl DeviceState {
         }
         e.condemned_entries = Some(std::mem::take(&mut e.page_entries));
         e.page_table_kva = 0;
-        let retired = Self::take_mapping_view(e);
+        let (retired, retired_import) = Self::take_mapping_view(e);
         let retired_token = Self::take_guest_write_token(e);
         if let Some(v) = retired {
             self.retired_views.push(v);
+        }
+        if let Some(import) = retired_import {
+            self.retired_guest_imports.push(import);
         }
         if retired_token != 0 {
             self.retired_guest_write_tokens.push(retired_token);
@@ -2918,10 +3579,13 @@ impl DeviceState {
         e.width = 0;
         e.height = 0;
         e.format = 0;
-        let retired = Self::take_mapping_view(e);
+        let (retired, retired_import) = Self::take_mapping_view(e);
         let retired_token = Self::take_guest_write_token(e);
         if let Some(v) = retired {
             self.retired_views.push(v);
+        }
+        if let Some(import) = retired_import {
+            self.retired_guest_imports.push(import);
         }
         if retired_token != 0 {
             self.retired_guest_write_tokens.push(retired_token);
@@ -2957,10 +3621,13 @@ impl DeviceState {
             e.width = 0;
             e.height = 0;
             e.format = 0;
-            let retired = Self::take_mapping_view(e);
+            let (retired, retired_import) = Self::take_mapping_view(e);
             let retired_token = Self::take_guest_write_token(e);
             if let Some(v) = retired {
                 self.retired_views.push(v);
+            }
+            if let Some(import) = retired_import {
+                self.retired_guest_imports.push(import);
             }
             if retired_token != 0 {
                 self.retired_guest_write_tokens.push(retired_token);
@@ -3007,10 +3674,13 @@ impl DeviceState {
         e.width = 0;
         e.height = 0;
         e.format = 0;
-        let retired = Self::take_mapping_view(e);
+        let (retired, retired_import) = Self::take_mapping_view(e);
         let retired_token = Self::take_guest_write_token(e);
         if let Some(v) = retired {
             self.retired_views.push(v);
+        }
+        if let Some(import) = retired_import {
+            self.retired_guest_imports.push(import);
         }
         if retired_token != 0 {
             self.retired_guest_write_tokens.push(retired_token);
@@ -3072,9 +3742,24 @@ impl DeviceState {
             return false;
         }
         let e = self.mappings.entry(mapping_id).or_default();
-        // Geom change (mode switch / rematerialize) is a new surface identity:
-        // reset content_generation (the guest pages stay authoritative).
-        if e.width != width || e.height != height {
+        // A changed declaration (mode switch / rematerialize) is a new surface
+        // identity: reset `content_generation` and `surface_content_epoch`. The
+        // guest pages stay authoritative, so the cost of resetting when nothing
+        // really changed is one seed copy.
+        //
+        // **All three fields, not just the extent.** The epoch's claim is that a
+        // resident's pixels *are* this mapping's content, and it is what
+        // licenses the attachment LOAD elision — so it has to be withdrawn
+        // whenever the guest re-declares what those bytes mean. Extent alone
+        // read as sufficient because a format change usually moves the
+        // `TargetIdentity` too and picks up a different resident by itself. It
+        // does not always: `present_identity::surface_format` maps several guest
+        // declarations onto one `vk::Format` and falls back to the scanout order
+        // for any it cannot express, so a mapping going from a format with a
+        // linear texel to a compressed or planar one keeps its identity, keeps
+        // its resident, and keeps an epoch that was stamped against the old
+        // interpretation of the same bytes.
+        if e.width != width || e.height != height || e.format != format {
             e.content_generation = 0;
             e.surface_content_epoch = 0;
         }
@@ -3146,13 +3831,31 @@ impl DeviceState {
 
     /// The same, for a writer that knows which mapping's pages it is landing in.
     pub fn note_host_wrote_mapping(&mut self, mapping_id: u32) {
-        // A mapping whose pages cannot be named exactly cannot have its write
-        // ruled out later, so it is recorded as an unnamed one rather than as an
-        // empty (or short) page set.
-        match self.mapping_reach_pages(mapping_id) {
-            Some(pages) => self.host_writes.note_mapping(Some(&pages)),
-            None => self.host_writes.note_unknown(),
+        let Some(entries) = self
+            .mappings
+            .get(&mapping_id)
+            .map(|mapping| mapping.page_entries.as_slice())
+            .filter(|entries| !entries.is_empty())
+        else {
+            self.host_writes.note_unknown();
+            return;
+        };
+        let shift = self.page_shift;
+        if entries
+            .iter()
+            .any(|&entry| crate::contract::iosurface_pages::entry_gpa_shift(entry, shift).is_none())
+        {
+            // A mapping whose pages cannot be named exactly cannot have its
+            // write ruled out later. Record one unnamed write rather than the
+            // resolvable prefix.
+            self.host_writes.note_unknown();
+            return;
         }
+        self.host_writes
+            .note_page_iter(entries.iter().map(|&entry| {
+                crate::contract::iosurface_pages::entry_gpa_shift(entry, shift)
+                    .expect("page entries were validated above")
+            }));
     }
 
     /// Issue a sampled-content generation that has never been issued before.
@@ -3705,6 +4408,70 @@ mod fail_vocabulary_tests {
             assert_ne!(now, epoch, "a host write into guest RAM went unannounced");
             epoch = now;
         }
+    }
+}
+
+#[cfg(test)]
+mod mapping_declaration_tests {
+    use super::*;
+    use crate::model::{DeviceId, PAGE_SHIFT_X86};
+
+    fn state() -> DeviceState {
+        DeviceState::new(DeviceId(1), PAGE_SHIFT_X86)
+    }
+
+    fn declared(state: &DeviceState, id: u32) -> (u32, u32) {
+        let m = state.mappings.get(&id).expect("the mapping exists");
+        (m.content_generation, m.surface_content_epoch)
+    }
+
+    /// Re-declaring a mapping at the same extent but a different pixel format
+    /// withdraws the content claim, because the claim is about what the bytes
+    /// *mean* and the guest has just changed that.
+    ///
+    /// The reset used to test the extent alone, on the reasoning that a format
+    /// change moves the `TargetIdentity` and so picks up a different resident by
+    /// itself. `present_identity::surface_format` collapses several guest
+    /// declarations onto one `vk::Format` and falls back to the scanout order
+    /// for any it cannot express, so that reasoning does not hold for every
+    /// pair — and the failure is a resident served against an epoch stamped
+    /// under the previous interpretation.
+    #[test]
+    fn re_declaring_a_mapping_at_a_new_format_withdraws_its_content_claim() {
+        let mut state = state();
+        assert!(state.set_mapping_geom(7, 640, 480, 0x50));
+        let m = state.mappings.get_mut(&7).expect("the mapping exists");
+        m.content_generation = 9;
+        m.surface_content_epoch = 4;
+
+        // Same declaration in every field: nothing to withdraw.
+        assert!(state.set_mapping_geom(7, 640, 480, 0x50));
+        assert_eq!(
+            declared(&state, 7),
+            (9, 4),
+            "an unchanged declaration is not a new surface"
+        );
+
+        // Format alone, at one extent.
+        assert!(state.set_mapping_geom(7, 640, 480, 0x19));
+        assert_eq!(
+            declared(&state, 7),
+            (0, 0),
+            "the bytes mean something else now, so nothing may claim they are the content"
+        );
+    }
+
+    /// The extent half of the same rule, kept beside it so neither can be
+    /// dropped without the other being visible.
+    #[test]
+    fn re_declaring_a_mapping_at_a_new_extent_withdraws_its_content_claim() {
+        let mut state = state();
+        assert!(state.set_mapping_geom(7, 640, 480, 0x50));
+        let m = state.mappings.get_mut(&7).expect("the mapping exists");
+        m.content_generation = 9;
+        m.surface_content_epoch = 4;
+        assert!(state.set_mapping_geom(7, 800, 480, 0x50));
+        assert_eq!(declared(&state, 7), (0, 0));
     }
 }
 

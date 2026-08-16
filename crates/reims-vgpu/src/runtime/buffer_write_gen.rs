@@ -1,45 +1,17 @@
-//! When the guest last said it wrote a **buffer** object's bytes.
+//! Guest-declared write generations for task-local GVA resources.
 //!
-//! # The signal this recovers
+//! # Why this state is separate
 //!
 //! [`crate::runtime::resource_validity::apply`] takes the guest's validity quad
 //! for one object id and applies it to `DeviceState::mappings`. Buffers have no
-//! mapping, so every quad naming one falls out of the loop and is counted as
-//! `validity_no_surface` — ~4 700 a second on a driven macos-13
-//! sustained-animation boot. The statement is decoded, correct, and discarded.
+//! mapping, while GVA render resources are owned by a task-local texture
+//! reference. Their guest-write declarations therefore need a generation keyed
+//! by `(task, object)` rather than the mapping table's validity state.
 //!
-//! That is the one signal the draw-time buffer gather has no substitute for.
-//! `buffer_gather_working_set` measures ~20 800 gathers a second over ~1 900
-//! distinct windows, so **91 % of them re-assemble a window this device already
-//! assembled** — and whether that is 91 % of a copy that could be skipped or
-//! 91 % of a copy that had to be redone depends entirely on whether the bytes
-//! moved in between. Recurrence is about keys; this is about bytes.
-//!
-//! # Why not the hypervisor dirty bitmap, which is already built
-//!
-//! [`crate::runtime::gather_witness`] answers exactly this question for the
-//! sampled rails, soundly, from two halves — the hypervisor dirty bitmap for
-//! guest CPU stores and [`crate::runtime::host_writes`] for this device's own.
-//! Its `MAX_TRACKED_WINDOWS` is 256, and that bound is **not** about memory: it
-//! is a harvest bound, because `reims_vgpu_dirty_harvest` walks every page of
-//! every armed set on the BQL thread at each register write that hands the
-//! device work. The buffer rail's working set is ~1 900 windows of ~38 pages,
-//! so arming it there would put ~72 000 pages into a walk the whole VM waits
-//! on. That is not a resize; it is a different cost.
-//!
-//! The guest's own declaration costs nothing at all — it is already decoded,
-//! and this is a `u64` bump on a map keyed by the object it already names.
-//!
-//! # It is an instrument, and its soundness is not yet established
-//!
-//! Nothing here decides a skip. A cache built on this would be trusting that
-//! `writeInvalidates` and the exec table's validity quad are a **complete**
-//! account of guest CPU writes to a buffer's bytes, and that claim has not been
-//! tested — a surface's equivalent claim is not complete, which is exactly why
-//! the sampled rail carries a hypervisor half as well. What this measures is the
-//! *ceiling*: no cache invalidated by the guest's declarations can do better
-//! than the clean rate reported here, so a low reading closes the design and a
-//! high one is a licence to go and test the soundness, not to assume it.
+//! A Store stamps the generation beside a host-authoritative GVA image. If the
+//! guest later declares that object written, the changed stamp abandons that
+//! image instead of copying its older pixels over the guest's newer bytes.
+//! [`crate::runtime::writeback_debt`] owns both the stamp and the decision.
 //!
 //! # The bound
 //!
@@ -58,8 +30,9 @@ use std::collections::HashMap;
 #[derive(Default, Debug)]
 pub struct BufferWriteGens {
     gens: HashMap<(u32, u32), u64>,
-    /// Bumped on every clear, so a comparison spanning one is not mistaken for
-    /// a comparison that found the same generation twice. A reader stores this
+    /// Bumped on every drop of an entry — the whole-map clear and the per-task
+    /// retire alike — so a comparison spanning one is not mistaken for a
+    /// comparison that found the same generation twice. A debt stores this
     /// beside the generation and treats a change in it as "unknown".
     epoch: u64,
 }
@@ -89,14 +62,9 @@ impl BufferWriteGens {
         }
         let slot = self.gens.entry((task_id, object_id)).or_insert(0);
         *slot = slot.wrapping_add(1);
-        // The cross-check that makes the freshness split readable, and it is not
-        // optional. A reader compares this generation against a `(task,
-        // reference)` pair taken at a draw-time bind, and if those two ids turn
-        // out to be different namespaces then **no** comparison ever moves and
-        // the split reports ~100 % quiet — a false positive in the direction
-        // that licenses a cache serving stale bytes. A boot reading
-        // `buffer_gather_freshness quiet_rate=1.000` beside a zero here has
-        // measured a wiring fault and not a workload.
+        // Keep the decoded write rate visible beside GVA debt abandonment. A
+        // zero here with live GVA Stores means the task/object namespace is not
+        // reaching the authority check at all.
         crate::runtime::drain::note_store_route("buffer_write_gen_bump");
     }
 
@@ -119,8 +87,21 @@ impl BufferWriteGens {
     /// [`crate::runtime::bound_buffers`] states about its own registry: mapping
     /// an object id back to what resolved through it is machinery bought with
     /// nothing, and task teardown is rare.
+    ///
+    /// This bumps the epoch for the same reason the clear does, and the case is
+    /// not hypothetical: a guest reuses task ids. Drop `(5, 7)` at generation 3,
+    /// let a *different* task 5 create a *different* object 7 and declare three
+    /// writes to it, and a stamp taken before the retire compares equal to one
+    /// taken after — same epoch, same generation, unrelated bytes. That is the
+    /// one direction this whole type exists to refuse. Bumped only when an entry
+    /// actually went, so retiring a task that declared no writes costs no
+    /// reader's stamp.
     pub fn retire_task(&mut self, task_id: u32) {
+        let before = self.gens.len();
         self.gens.retain(|&(task, _), _| task != task_id);
+        if self.gens.len() != before {
+            self.epoch = self.epoch.wrapping_add(1);
+        }
     }
 
     /// Entries held.
@@ -158,8 +139,8 @@ impl BufferWriteStamp {
 mod tests {
     use super::*;
 
-    /// The generation moves only when the guest says it wrote, which is the
-    /// whole of what a cache would key on.
+    /// The generation moves only when the guest says it wrote, so a debt stays
+    /// authoritative across unrelated activity.
     #[test]
     fn a_declared_write_moves_the_generation_and_nothing_else_does() {
         let mut g = BufferWriteGens::default();
@@ -171,9 +152,8 @@ mod tests {
         assert!(g.stamp(1, 7).quiet_since(after), "still no further write");
     }
 
-    /// A write to one object must not invalidate another's stamp, or the
-    /// measurement collapses to "anything was written" and reports a floor of
-    /// zero for every window.
+    /// A write to one object must not invalidate another's stamp, or an
+    /// unrelated resource would abandon host-authoritative pixels.
     #[test]
     fn a_write_to_another_object_leaves_this_one_quiet() {
         let mut g = BufferWriteGens::default();
@@ -184,8 +164,7 @@ mod tests {
     }
 
     /// A stamp taken before a clear must not compare equal to one taken after
-    /// it. Forgetting an object silently is the direction that reports a hit
-    /// for a window whose bytes moved.
+    /// it. Forgetting an object silently must abandon, not preserve, authority.
     #[test]
     fn a_stamp_that_straddles_a_reset_is_not_quiet() {
         let mut g = BufferWriteGens::default();
@@ -214,6 +193,40 @@ mod tests {
             !g.stamp(1, 7).quiet_since(before),
             "the entry is gone, so its generation reads as 0 and cannot match"
         );
+    }
+
+    /// The retire is a forgetting, so it has to move the epoch exactly as the
+    /// clear does. A guest reuses task ids, and a generation that climbs back to
+    /// the value a reader recorded is the one shape where the entry going is not
+    /// enough on its own.
+    #[test]
+    fn a_stamp_that_straddles_a_retire_is_not_quiet() {
+        let mut g = BufferWriteGens::default();
+        for _ in 0..3 {
+            g.note_write(5, 7);
+        }
+        let before = g.stamp(5, 7);
+        g.retire_task(5);
+        // A different task 5, a different object 7, back to generation 3.
+        for _ in 0..3 {
+            g.note_write(5, 7);
+        }
+        assert!(
+            !g.stamp(5, 7).quiet_since(before),
+            "the tracked object was retired under this reader, so nothing it \
+             stamped is comparable across the gap however the count reads"
+        );
+    }
+
+    /// Retiring a task nothing was tracked for must not move anyone's stamp, or
+    /// task teardown alone would report every window as dirty.
+    #[test]
+    fn retiring_an_untracked_task_leaves_every_stamp_alone() {
+        let mut g = BufferWriteGens::default();
+        g.note_write(1, 7);
+        let before = g.stamp(1, 7);
+        g.retire_task(2);
+        assert!(g.stamp(1, 7).quiet_since(before));
     }
 
     /// The map stops at its bound rather than tracking a guest that creates

@@ -804,8 +804,103 @@ pub const DISPLAY_DESC_PRODUCT_NAME: u64 = 0x04;
 pub const DISPLAY_DESC_INDEX: u64 = 0x12;
 pub const DISPLAY_DESC_WIDTH_MM: u64 = 0x14;
 pub const DISPLAY_DESC_HEIGHT_MM: u64 = 0x16;
+/// The same physical size again, as IEEE binary32.
+///
+/// Apple's host writes **both** encodings on every publish, unconditionally and
+/// with no version test — `movss` here and `movw` to the u16 pair — because the
+/// `displayDimensionFloats` capability is an advertisement to the *guest* about
+/// which fields it may trust, not a switch on what the host writes. The host
+/// never reads the flag at all.
+///
+/// **No guest on this device reads this pair today**, and that is worth stating
+/// so nobody reads a fix into it: the capability arrives at protocol rung 0x2a
+/// and [`version_reply`] clamps down and never up, so a stock guest asking for 4
+/// gets 4 and stays below it. What writing them buys is that the field is not a
+/// zero waiting for the first guest that does negotiate higher — a 0 x 0 mm panel
+/// — and that this device publishes what the reference implementation publishes
+/// rather than half of it.
+pub const DISPLAY_DESC_WIDTH_MM_F32: u64 = 0x24;
+pub const DISPLAY_DESC_HEIGHT_MM_F32: u64 = 0x28;
+/// The pipe's **gamma channel table entry count**, and — because the guest tests
+/// it against zero — the switch that decides whether the guest ever sends its
+/// gamma table.
+///
+/// It is a count, not a bitmask. This doc used to say the opposite: that the bit
+/// meanings were an unrecovered userland contract and that setting one would be a
+/// guess. The caution was right and the model was wrong — there are no bits.
+///
+/// The guest reads it once, while setting up the pipe's shared state, on the
+/// straight-line path with no version test, so unlike the float pair above it is
+/// live at the rung this device grants. It then has exactly two consumers:
+///
+/// - the pipe compares it to zero. Non-zero selects the present-transaction form
+///   that prepares and ships the gamma table; zero selects the older form, which
+///   carries no gamma at all.
+/// - the framebuffer stashes the raw word and returns it verbatim to userland
+///   through a device-attribute query. That query is an AGDC extended-capability
+///   read, and the gamma capability's entry takes `type = (word != 0)` and
+///   **`count` = the word**. Its userland reader is CoreDisplay, whose accessor
+///   for the pair is named `GammaChannelTableEntryCountAndType` — which is the
+///   contract written down.
+///
+/// A trap this field invites: the AGDC *capability selector* is a one-hot bit
+/// (CSC, Gamma, Linearization, scalers, cursor …). Those are bits of the query,
+/// not of this word, and mistaking one for the other is what made this look like
+/// a flags field.
+///
+/// **The reference host writes 1024** — an unconditional straight-line store at
+/// display-nub creation, in the same instruction run that writes the pipe index,
+/// with no branch and no capability test behind it. Nothing in the guest is
+/// *sized* from it: the gamma table's own entry count comes from the transaction
+/// object, so a wrong value here misinforms CoreDisplay rather than overflowing
+/// anything.
+///
+/// **This device writes zero, so every guest on it presents through the older
+/// form and never sends gamma.** That is now a routing decision rather than an
+/// unrecovered contract: writing 1024 is writing what the reference writes, and
+/// what stands in the way is whether this crate executes the gamma-carrying
+/// present form, not whether the value is known.
+///
+/// # Two neighbouring fields this device also leaves unwritten
+///
+/// Named in prose rather than as constants, because a constant nothing writes is
+/// dead code and the useful part is the contract, not the offset.
+///
+/// **`+0x200`, a `u32` — a configuration generation counter the host
+/// *increments*.** The reference host does exactly that at the end of every
+/// descriptor refill, after writing the timing count at `+0x208` and the timing
+/// array from `+0x210`. The guest's online handler reads it and echoes it back as
+/// the second word of the online acknowledgement, beside the pipe index, which is
+/// how the host learns which generation the guest acked. This device never writes
+/// it, so the guest acknowledges zero and every publish looks like the same
+/// generation. Writing a *constant* here would be wrong for the same reason;
+/// what the contract asks for is an increment per publish.
+///
+/// **`+0x2c … +0x48`, eight `f32`.** The panel's CIE xy chromaticities — red, green,
+/// blue, white — which newer guests pass straight into the EDID they synthesise, and
+/// which their colour management then treats as the display's primaries. Older guests
+/// do not read the block. The guest seeds it *itself* with the sRGB primaries and a
+/// D65 white before asking the host to fill the page, so leaving it alone and writing
+/// zeroes over it are opposite outcomes: an sRGB display, or one whose primaries are
+/// black. This device writes neither value, so the seed should survive — but that is a
+/// deduction about a page this device does not clear rather than a measurement, and
+/// the instrument that settles it is the guest's own EDID, decoded on a boot of a
+/// guest new enough to read the block.
 pub const DISPLAY_DESC_FEATURES: u64 = 0x1c;
 /// Timing-element **count** (not a pixel width — large values hang the guest).
+///
+/// Each element is width `u16`, height `u16`, refresh as 16.16 fixed `u32`, and then
+/// eight bytes no guest driver read at either version examined — so `tail0`/`tail1`
+/// are dead rather than unimplemented, and there is **no per-mode flags word** here
+/// to leave unset.
+///
+/// The count is also not a limit on what the guest may run. The guest's framebuffer
+/// publishes a programmable timing range with one-pixel granularity and accepts a
+/// detailed timing the OS installs, replacing this list wholesale — so these entries
+/// seed the mode list rather than bound it. The guest driver reads none of the
+/// scaling terms out of an installed timing, reporting a mode by its active pixels
+/// only, which is the thing to hold on to when reading a report about a *scaled*
+/// resolution.
 pub const DISPLAY_DESC_TIMING_COUNT: u64 = 0x208;
 
 /// Modes advertised to AppleParavirtDisplay (archive apple_pv_gpu_display_setup).
@@ -823,8 +918,75 @@ pub const DISPLAY_MODE2_H: u16 = 1024;
 pub const DISPLAY_MODE3_W: u16 = 3840;
 pub const DISPLAY_MODE3_H: u16 = 2160;
 pub const DISPLAY_SERIAL_NUMBER: u32 = 1;
-pub const DISPLAY_WIDTH_MM: u16 = 400;
-pub const DISPLAY_HEIGHT_MM: u16 = 300;
+
+/// The panel's physical size, which the guest turns into an EDID and a DPI.
+///
+/// # These are millimetres, and that was measured rather than assumed
+///
+/// The two u16s at `DISPLAY_DESC_WIDTH_MM`/`_HEIGHT_MM` sit where a static read
+/// of the guest driver puts "display width/height", and reading that as *pixels*
+/// is the obvious mistake — it would make this device announce a 400x300 screen.
+/// A driven macos-13 boot settles it: the guest's synthesised EDID carries
+/// `max horizontal image size = 40 cm` and `max vertical = 30 cm`, which is these
+/// two constants divided by ten. Apple's host reaches the same field from
+/// `_PGDisplay`'s `{CGSize=dd}` accessor over its own `_sizeInMillimeters`.
+///
+/// So the units were right. The *values* were a 4:3 panel announced beside a 16:9
+/// native mode, which tells the guest its pixels are non-square by a third — and
+/// nothing derived them. macOS builds its scaled-resolution list from this DPI, so
+/// a display whose physical aspect contradicts its native mode is a contradiction
+/// the guest resolves somewhere, on every resolution that is not one of the four
+/// this device advertises.
+///
+/// # Where 48 x 27 cm comes from
+///
+/// The guest's EDID stores whole **centimetres**, so the pair has to be a whole-
+/// centimetre multiple of the native mode's aspect or the ratio it announces is
+/// not the ratio meant. 16:9 in whole centimetres is `16k x 9k`, and `k` is
+/// picked by density rather than taste:
+///
+/// | k | size | DPI at 1920x1080 |
+/// |---|---|---|
+/// | 2 | 32 x 18 cm | 152.4 — inside the band where macOS starts offering HiDPI |
+/// | **3** | **48 x 27 cm** | **101.6 — an ordinary desktop monitor** |
+/// | 4 | 64 x 36 cm | 76.2 |
+///
+/// `k = 3` is the only one that is both square-pixelled and unremarkable, so it
+/// is the value, and the assertion below is what keeps it honest: the ratio is
+/// tied to [`DISPLAY_MODE_EFI_W`]/[`DISPLAY_MODE_EFI_H`], so changing the native
+/// mode without changing the panel fails the build rather than shipping a second
+/// self-contradiction.
+pub const DISPLAY_WIDTH_MM: u16 = 480;
+pub const DISPLAY_HEIGHT_MM: u16 = 270;
+
+/// The panel's aspect is the native mode's aspect, exactly. Cross-multiplied so
+/// it is integer arithmetic and holds without a rounding argument.
+const _: () = assert!(
+    DISPLAY_WIDTH_MM as u64 * DISPLAY_MODE_EFI_H as u64
+        == DISPLAY_HEIGHT_MM as u64 * DISPLAY_MODE_EFI_W as u64,
+    "the announced panel must have the native mode's aspect, or the guest is told \
+     its pixels are not square"
+);
+
+/// The EDID the guest synthesises stores the size in whole centimetres, so a
+/// millimetre value that is not a multiple of ten loses its low digit on the way
+/// out and the aspect asserted above is not the aspect the guest sees.
+const _: () = assert!(
+    (DISPLAY_WIDTH_MM as u64).is_multiple_of(10) && (DISPLAY_HEIGHT_MM as u64).is_multiple_of(10)
+);
+
+/// One physical dimension in the two encodings the shared page carries, from one
+/// value, in the host's own order: narrow to `f32` first, then round the
+/// *narrowed* value half-up to the integer. Doing it the other way rounds a
+/// precision the guest never sees.
+///
+/// Returned as a pair rather than written by two call sites, because the whole
+/// point is that the two spellings cannot disagree — a caller that could write
+/// one without the other is the drift this exists to prevent.
+pub fn display_dimension_mm(millimetres: u16) -> (f32, u16) {
+    let narrowed = millimetres as f32;
+    (narrowed, (narrowed as f64 + 0.5) as u16)
+}
 /// Advertised refresh of every timing element. macOS paces CoreAnimation /
 /// rAF to the display's advertised rate, so 60 here caps the guest at 60 fps
 /// regardless of how fast VBL is signalled. 120 requests ProMotion-class
@@ -1620,6 +1782,50 @@ mod tests {
     /// own value for key 12; using it keeps this test about the host reduction
     /// and nothing else.
     const VERSION_WITH_DUAL_PLANE: u32 = 31;
+
+    /// The two encodings of one physical dimension have to agree, and the order
+    /// they are derived in is the host's: narrow to `f32`, then round the
+    /// narrowed value. The `const` assertions beside the constants already tie
+    /// the aspect to the native mode and pin the centimetre granularity, so what
+    /// is left to check here is the arithmetic and the round direction.
+    #[test]
+    fn one_physical_dimension_produces_two_encodings_that_agree() {
+        for mm in [DISPLAY_WIDTH_MM, DISPLAY_HEIGHT_MM] {
+            let (as_f32, as_u16) = display_dimension_mm(mm);
+            assert_eq!(as_u16, mm, "the integer must survive the round trip");
+            assert_eq!(as_f32, mm as f32);
+        }
+        // Half-up, not truncation: the host adds 0.5 before narrowing to int, so
+        // a value that is a hair under an integer still reports that integer.
+        // This is the arithmetic behind the standing 1920x1080 -> 1921x1079
+        // window oddity, so the direction is worth pinning even though every
+        // value this device publishes today is exact.
+        let (_, rounded) = display_dimension_mm(271);
+        assert_eq!(rounded, 271);
+        assert_eq!((269.6f32 as f64 + 0.5) as u16, 270);
+        assert_eq!((269.4f32 as f64 + 0.5) as u16, 269);
+    }
+
+    /// The announced panel is 16:9 because the native mode is, and the DPI it
+    /// implies is an ordinary desktop one.
+    ///
+    /// The aspect itself is a `const` assertion at the declaration and cannot
+    /// reach here. What this adds is the density, which is the reason `k = 3`
+    /// was chosen over `k = 2`: 2 lands at 152 DPI, inside the band where macOS
+    /// starts offering HiDPI modes, and this device has no HiDPI rail.
+    #[test]
+    fn the_announced_panel_is_an_ordinary_desktop_density() {
+        // Tenths of a DPI, to stay in integer arithmetic.
+        let dpi_x10 = |px: u16, mm: u16| (px as u64 * 254 * 10) / (mm as u64 * 10);
+        let horizontal = dpi_x10(DISPLAY_MODE_EFI_W, DISPLAY_WIDTH_MM);
+        let vertical = dpi_x10(DISPLAY_MODE_EFI_H, DISPLAY_HEIGHT_MM);
+        assert_eq!(horizontal, vertical, "square pixels, or the guest is misled");
+        assert!(
+            (900..1440).contains(&horizontal),
+            "{horizontal} tenths of a DPI is outside the ordinary desktop band; \
+             1440 is where macOS begins treating a display as HiDPI"
+        );
+    }
 
     #[test]
     fn a_more_capable_host_never_raises_a_device_info_answer() {

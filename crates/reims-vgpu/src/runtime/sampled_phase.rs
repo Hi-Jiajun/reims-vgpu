@@ -52,9 +52,18 @@
 //! | part | us/s | % | what it brackets | what would fix it |
 //! |---|---|---|---|---|
 //! | `Resolve` | 15498 | 72.1 | the attachment-alias branch and `resolve_sampled_source`, per texture bind | the sampled content cache and the gather witness |
-//! | [`Part::Reflect`] | 2556 | 11.9 | the AIR constexpr static-sampler walk and the residual SPIR-V `sampler_bindings` scan | computing both at translate time and holding them in `m2v_cache` |
+//! | [`Part::Reflect`] | 2556 | 11.9 | the AIR constexpr static-sampler walk and, in this measurement, the residual SPIR-V sampler-interface scan | carrying the reflected interface with each `m2v_cache` variant |
 //! | [`Part::Lookup`] | 1526 | 7.1 | `lookup_list_entry` + `resolve_texture_view`, per texture bind | caching the guest object-list walk and the type-8 view descriptor read |
-//! | [`Part::Samplers`] | 1263 | 5.9 | `load_vulkan_sampler` over the record's own sampler binds | a sampler object cache keyed on the guest sampler ref |
+//! | [`Part::Samplers`] | 1263 | 5.9 | `load_vulkan_sampler` over the record's own sampler binds | the task-scoped retained sampler registry |
+//!
+//! The sampler registry is now the contract rather than a prospective cache:
+//! construction snapshots one immutable sampler under `(task, ref)`, binds
+//! retrieve it, and the sampler-delete record or task teardown retires it. In a
+//! 34-window macOS 13 Safari drag it constructed 3,144 samplers for 62,609
+//! sampler binds, paired 3,143 explicit deletes with zero absent deletes, and
+//! reduced this bar from the earlier 5.4 ms/s to 0.89 ms/s. The native backend
+//! cache still deduplicates equivalent sampler state; this registry removes the
+//! object-list walk and descriptor decode above it.
 //!
 //! # That table is a light second, and the phase does not stay fourth
 //!
@@ -136,9 +145,9 @@ pub enum Part {
     /// `load_vulkan_sampler` over the record's vertex and fragment sampler
     /// binds.
     Samplers = 3,
-    /// The two per-shader walks that provision what the guest did not name:
-    /// AIR constexpr static samplers out of reflection, then the residual
-    /// SPIR-V `sampler_bindings` scan.
+    /// Provisioning for sampler state the guest did not name: AIR constexpr
+    /// samplers from reflection plus defaults for the reflected interface each
+    /// shader variant already carries.
     Reflect = 4,
 }
 

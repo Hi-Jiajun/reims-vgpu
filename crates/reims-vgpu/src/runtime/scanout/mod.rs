@@ -77,7 +77,18 @@ pub fn read_mapping_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
         return false;
     }
     let _ = crate::runtime::mapper::ensure_resolved_for_scanout(state, host, mapping_id);
-    paint_mapping(state, host, mapping_id, dst, dst_stride, width, height)
+    paint_mapping(
+        state,
+        host,
+        mapping_id,
+        PaintDst {
+            bytes: dst,
+            stride: dst_stride,
+            width,
+            height,
+        },
+        crate::runtime::render_writeback::SettleSite::SampledMappingRead,
+    )
 }
 
 /// Always-on census of the capture readback-elision ratio (never silent):
@@ -370,16 +381,42 @@ pub fn capture_present_frame(
 }
 
 /// Blit tight BGRA8 `src` into `dst` (tight or strided).
+///
+/// # A destination row shorter than the frame's is a refusal, not a `min`
+///
+/// The copy length used to be `src_stride.min(dst_stride)`, which for a
+/// destination whose row is shorter than `width * 4` wrote the leading columns
+/// of every row and left the rest of each row untouched — a black band down the
+/// right of the frame, uniform on every row, with nothing on any channel saying
+/// so. It is the only silent column-truncating copy this crate had.
+///
+/// Every other stride consumer here already refuses a short row by name
+/// (`CaptureDecline::BprBelowTight`, and the two `dst_stride < width * 4`
+/// guards on the neighbouring entry points), so this was the one place where a
+/// destination that cannot hold the frame produced a partial frame instead of a
+/// decline. `false` is what the callers already handle: it is the same answer a
+/// short `src` gives two lines up.
+///
+/// This is not the cause of any reported black band — this path fills QEMU's own
+/// `DisplaySurface`, which under a host-owned window is not what the screen
+/// shows. It is the shape one would have to rule out first, and now the log
+/// rules it out instead of a reader having to.
 fn blit_bgra_buffer(src: &[u8], dst: &mut [u8], dst_stride: u32, width: u32, height: u32) -> bool {
     let src_stride = width.saturating_mul(RGBA8_BPP) as usize;
     if src.len() < src_stride.saturating_mul(height as usize) {
         return false;
     }
+    if (dst_stride as usize) < src_stride {
+        crate::observe::fail(format!(
+            "present_paint reason=dst_stride_below_tight \
+             dst_stride={dst_stride} tight={src_stride} geom={width}x{height}"
+        ));
+        return false;
+    }
     for y in 0..height as usize {
         let so = y * src_stride;
         let doff = y * (dst_stride as usize);
-        let n = src_stride.min(dst_stride as usize);
-        dst[doff..doff + n].copy_from_slice(&src[so..so + n]);
+        dst[doff..doff + src_stride].copy_from_slice(&src[so..so + src_stride]);
     }
     true
 }
@@ -539,7 +576,18 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
     // Only latch painted_generation on a real pixel source. A clear-to-black
     // fallback must not stamp generation — that freezes the console on black
     // forever when the first paint races the mapper (Unchanged on next gen).
-    if paint_mapping(state, host, mapping_id, dst, dst_stride, width, height) {
+    if paint_mapping(
+        state,
+        host,
+        mapping_id,
+        PaintDst {
+            bytes: dst,
+            stride: dst_stride,
+            width,
+            height,
+        },
+        crate::runtime::render_writeback::SettleSite::ScanoutPaint,
+    ) {
         let need = (height as usize)
             .saturating_mul(width as usize)
             .saturating_mul(4);
@@ -874,15 +922,35 @@ impl crate::observe::Decline for CaptureDecline {
     }
 }
 
+/// Where a mapping paint lands: the buffer, its row stride, and the extent to
+/// fill. One parameter because the four travel together through every caller and
+/// a stride that belongs to a different buffer is the mistake worth making
+/// unspellable.
+struct PaintDst<'a> {
+    bytes: &'a mut [u8],
+    stride: u32,
+    width: u32,
+    height: u32,
+}
+
+/// `site` is the caller's own, not this leaf's. Both callers read the same guest
+/// pages the same way, and they are a once-a-boot console paint and a draw-rate
+/// sampled bind — so charging one slug made the console's settle rate unreadable
+/// and the sampled arm's invisible. Taken as an argument rather than named here
+/// so a third caller has to state which it is.
 fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
-    dst: &mut [u8],
-    dst_stride: u32,
-    width: u32,
-    height: u32,
+    dst: PaintDst<'_>,
+    site: crate::runtime::render_writeback::SettleSite,
 ) -> bool {
+    let PaintDst {
+        bytes: dst,
+        stride: dst_stride,
+        width,
+        height,
+    } = dst;
     use crate::runtime::mapping_write::type11_sample_window;
 
     // Every `false` return here shows as a black/stale console; log the specific
@@ -900,18 +968,13 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
     // raw contig view below, which bypasses the hooked readers — land any
     // resident-authoritative window (compute or render Store) first.
     //
-    // Narrowed on this mapping's own pages, which unlike every other narrowed
-    // site here costs no walk at all: `page_entries` already *is* the page list,
-    // and the writeback rail that lands in them built its own destination from
-    // the same field — literally, via `DeviceState::mapping_reach_pages`, which
-    // is also what names the write. A mapping with no page list, or one holding
-    // an entry that names no backing, cannot be ruled out and settles.
-    crate::runtime::writeback_debt::settle_for_mapping_unless_disjoint(
-        state,
-        host,
-        mapping_id,
-        crate::runtime::render_writeback::SettleSite::ScanoutPaint,
-    );
+    // The wait narrows to this mapping's own pages, which `settle_for_mapping`
+    // does for every caller now. Here it costs no walk at all: `page_entries`
+    // already *is* the page list, and the writeback rail that lands in them
+    // built its own destination from the same field. A mapping with no page
+    // list, or one holding an entry that names no backing, cannot be ruled out
+    // and settles.
+    crate::runtime::writeback_debt::settle_for_mapping(state, host, mapping_id, site);
 
     let Some(m) = state.mappings.get(&mapping_id) else {
         return fail(CaptureDecline::NoMapping);

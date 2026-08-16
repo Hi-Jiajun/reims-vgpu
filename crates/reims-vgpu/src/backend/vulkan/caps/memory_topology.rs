@@ -45,11 +45,12 @@
 //! driver accounts them to and manages residency against.
 //!
 //! So [`select_memory_type`] takes the allocation's size and tries every
-//! preference against heaps that could hold it before it tries any of them
-//! against a heap that could not. It never refuses on capacity —
-//! [`MemoryTypePick::fits`] reports the condition instead, and the engine emits
-//! it fail-visibly, because "this allocation has nowhere to live" is a fact a
-//! log from an unfamiliar machine has to carry.
+//! preference against heaps that could hold it, and where no heap can hold it at
+//! all it refuses by name rather than nominating the roomiest one. That is not a
+//! capacity policy this module invented: an `allocationSize` past its heap's
+//! `size`, or past `maxMemoryAllocationSize`, is invalid usage, and one of the
+//! two Mesa drivers this was reported on accepts the call and loses the device a
+//! second later. [`MemoryTypeRefusal`] carries which bound was crossed.
 
 use ash::vk;
 
@@ -256,6 +257,35 @@ pub fn classify_memory(props: &vk::PhysicalDeviceMemoryProperties) -> MemoryProf
     }
 }
 
+/// `maxMemoryAllocationSize` — the device-wide ceiling on one
+/// `vkAllocateMemory`, which no memory type and no heap can widen
+/// (VUID-vkAllocateMemory-pAllocateInfo-01713 bounds an allocation by its heap,
+/// -01714 by this).
+///
+/// Vulkan 1.1 core and the baseline is 1.2, so every supported device answers
+/// it. A device reporting zero has not filled the field in at all — the spec has
+/// no zero-sized allocation limit — and reading that as the limit would refuse
+/// every allocation on the device, so it is reported and treated as unbounded,
+/// which leaves the per-heap bound as the only one and is the state this device
+/// was in before it asked.
+///
+/// # Safety
+///
+/// `pd` must be a physical device belonging to `instance`.
+pub unsafe fn max_allocation_size(instance: &ash::Instance, pd: vk::PhysicalDevice) -> u64 {
+    let mut v11 = vk::PhysicalDeviceVulkan11Properties::default();
+    let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut v11);
+    unsafe { instance.get_physical_device_properties2(pd, &mut props) };
+    if v11.max_memory_allocation_size == 0 {
+        crate::observe::fail(
+            "vk_max_allocation_unreported reason=vk_max_allocation_unreported (the device \
+             reported maxMemoryAllocationSize=0; allocations are bounded by their heap alone)",
+        );
+        return u64::MAX;
+    }
+    v11.max_memory_allocation_size
+}
+
 /// A selected memory type, together with the heap behind it.
 ///
 /// The heap travels with the index because the index alone cannot say whether
@@ -268,28 +298,99 @@ pub struct MemoryTypePick {
     pub index: u32,
     /// The heap that type draws from.
     pub heap_index: u32,
-    /// `VkMemoryHeap::size` for that heap.
+    /// `VkMemoryHeap::size` for that heap, which is at least the bytes the pick
+    /// was made for — see [`select_memory_type`], which cannot return a pick
+    /// whose heap could not hold the allocation.
     pub heap_bytes: u64,
-    /// The heap is at least as large as the allocation asked for.
-    ///
-    /// **This is a capacity statement, not a residency one.** `VkMemoryHeap::size`
-    /// is the heap's total, not what is free, so `true` does not promise the
-    /// allocation will succeed or stay resident. `false` is the useful direction
-    /// and it is unambiguous: the driver is being asked to place an allocation in
-    /// a pool that could not hold it even if it were the only tenant.
-    pub fits: bool,
+}
+
+/// Which check refused to name a memory type for an allocation.
+///
+/// Two of the three are the two valid-usage statements Vulkan places on
+/// `VkMemoryAllocateInfo::allocationSize`, and they are refusals rather than
+/// warnings for the reason in [`select_memory_type`]'s doc: a driver is not
+/// required to reject an allocation that violates them, and one that accepts it
+/// has been asked for undefined behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryTypeRefusal {
+    /// No type in `type_bits` carries the request's required flags. A pure
+    /// flags answer: this device offers nothing of the kind asked for.
+    NoTypeWithRequiredFlags { type_bits: u32 },
+    /// `bytes` is past `maxMemoryAllocationSize`
+    /// (VUID-vkAllocateMemory-pAllocateInfo-01714). A device-wide limit, so no
+    /// memory type could have carried it.
+    AboveDeviceMaximum { bytes: u64, max: u64 },
+    /// Types with the required flags exist and every heap behind them is
+    /// smaller than `bytes`
+    /// (VUID-vkAllocateMemory-pAllocateInfo-01713). Carries the roomiest such
+    /// heap, which is what says how far past this device the request was.
+    EveryHeapTooSmall { bytes: u64, roomiest_heap: u64 },
+}
+
+impl MemoryTypeRefusal {
+    /// Stable slug for the fail channel.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::NoTypeWithRequiredFlags { .. } => "vk_memory_no_type_with_required_flags",
+            Self::AboveDeviceMaximum { .. } => "vk_memory_above_device_maximum",
+            Self::EveryHeapTooSmall { .. } => "vk_memory_every_heap_too_small",
+        }
+    }
+}
+
+impl std::fmt::Display for MemoryTypeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::NoTypeWithRequiredFlags { type_bits } => {
+                write!(f, "{} type_bits={type_bits:#x}", self.slug())
+            }
+            Self::AboveDeviceMaximum { bytes, max } => write!(
+                f,
+                "{} bytes_mb={} max_mb={}",
+                self.slug(),
+                bytes >> 20,
+                max >> 20
+            ),
+            Self::EveryHeapTooSmall {
+                bytes,
+                roomiest_heap,
+            } => write!(
+                f,
+                "{} bytes_mb={} roomiest_heap_mb={}",
+                self.slug(),
+                bytes >> 20,
+                roomiest_heap >> 20
+            ),
+        }
+    }
 }
 
 /// Pick a memory type satisfying `req` within `type_bits`, for an allocation of
-/// `bytes`.
+/// `bytes` on a device whose `maxMemoryAllocationSize` is `max_allocation`.
 ///
 /// Tries each `preferred` set best-first and then the required flags alone,
-/// **restricted at every step to heaps that can hold `bytes`**; only if no such
-/// type exists at all does it fall back to the largest heap satisfying the
-/// required flags. So a topology misclassification, or a device whose only
-/// capable heap is too small, is still a performance bug rather than an
-/// allocation failure — this function returns `None` only when nothing in
-/// `type_bits` carries the required flags.
+/// **restricted at every step to heaps that can hold `bytes`**. A topology
+/// misclassification is still a performance bug rather than an allocation
+/// failure: the fallback to the required flags alone is what guarantees that,
+/// and it is untouched. What this will not do is name a type whose heap could
+/// not hold the allocation — see below.
+///
+/// # Capacity is a validity rule, not a preference
+///
+/// Vulkan states both bounds on `allocationSize` as valid usage:
+/// it must be at most `maxMemoryAllocationSize`, and at most the `size` of
+/// `memoryHeaps[memoryTypes[memoryTypeIndex].heapIndex]`. An allocation past
+/// either is an invalid call, and a driver is under no obligation to return an
+/// error for it — the two behaviors seen on real hosts are Mesa ANV refusing
+/// with `VK_ERROR_OUT_OF_DEVICE_MEMORY` and Mesa RADV returning `VK_SUCCESS` and
+/// then losing the device a second later, taking the guest with it. So this
+/// function refuses by name where it used to hand back the roomiest heap and
+/// leave the call to the driver: relying on a refusal only one of two drivers
+/// makes is not a bound.
+///
+/// The condition is not a slow path either. `VkMemoryHeap::size` is the heap's
+/// total, so a heap that could not hold the allocation *empty* has nowhere to
+/// put it however patient the caller is.
 ///
 /// # Why the size is a parameter and not an afterthought
 ///
@@ -311,7 +412,8 @@ pub fn select_memory_type(
     type_bits: u32,
     req: &MemoryRequest,
     bytes: u64,
-) -> Option<MemoryTypePick> {
+    max_allocation: u64,
+) -> Result<MemoryTypePick, MemoryTypeRefusal> {
     let heap_index = |index: u32| props.memory_types[index as usize].heap_index;
     let heap_bytes = |index: u32| {
         props
@@ -329,26 +431,60 @@ pub fn select_memory_type(
         (0..props.memory_type_count)
             .find(|&index| carries(index, flags) && heap_bytes(index) >= bytes)
     };
-    // Nothing this device offers can hold the allocation. The flags preferences
-    // have nothing left to rank, so rank by the only quantity that still
-    // differs: take the roomiest heap that satisfies the requirement.
-    let largest_required = || {
-        (0..props.memory_type_count)
-            .filter(|&index| carries(index, req.required))
-            .max_by_key(|&index| heap_bytes(index))
+    // The roomiest heap any candidate type draws from. Zero candidates and a
+    // candidate on a zero-sized heap are told apart by the `Option`, because the
+    // two are different refusals.
+    let roomiest_required = (0..props.memory_type_count)
+        .filter(|&index| carries(index, req.required))
+        .map(heap_bytes)
+        .max();
+    let Some(roomiest_heap) = roomiest_required else {
+        return Err(MemoryTypeRefusal::NoTypeWithRequiredFlags { type_bits });
     };
+    if bytes > max_allocation {
+        return Err(MemoryTypeRefusal::AboveDeviceMaximum {
+            bytes,
+            max: max_allocation,
+        });
+    }
     let index = req
         .preferred
         .iter()
         .find_map(|bonus| find_fitting(req.required | *bonus))
         .or_else(|| find_fitting(req.required))
-        .or_else(largest_required)?;
-    Some(MemoryTypePick {
+        .ok_or(MemoryTypeRefusal::EveryHeapTooSmall {
+            bytes,
+            roomiest_heap,
+        })?;
+    Ok(MemoryTypePick {
         index,
         heap_index: heap_index(index),
         heap_bytes: heap_bytes(index),
-        fits: heap_bytes(index) >= bytes,
     })
+}
+
+/// The largest heap this device can charge an allocation carrying `req`'s
+/// required flags to.
+///
+/// The bound a caller sizing a whole family of allocations against this device
+/// needs, and the one [`select_memory_type`] enforces per allocation. Derived
+/// from the same `required` flags the selector filters on, so the two cannot
+/// name different populations of memory types.
+pub fn roomiest_heap_for(props: &vk::PhysicalDeviceMemoryProperties, req: &MemoryRequest) -> u64 {
+    (0..props.memory_type_count)
+        .filter(|&index| {
+            props.memory_types[index as usize]
+                .property_flags
+                .contains(req.required)
+        })
+        .map(|index| {
+            props
+                .memory_heaps
+                .get(props.memory_types[index as usize].heap_index as usize)
+                .map_or(0, |h| h.size)
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// The host-side cost properties of a selected memory type, for a caller that
@@ -541,7 +677,9 @@ mod tests {
         type_bits: u32,
         req: &MemoryRequest,
     ) -> Option<u32> {
-        select_memory_type(props, type_bits, req, 0).map(|p| p.index)
+        select_memory_type(props, type_bits, req, 0, u64::MAX)
+            .ok()
+            .map(|p| p.index)
     }
 
     /// Every unified-memory device in the matrix classifies unified, and the
@@ -845,8 +983,8 @@ mod tests {
     ///
     /// Asserted at three sizes because the interesting behaviour is the
     /// crossover: under the carve-out the preference is still honoured, over it
-    /// the larger pool wins, and past *every* pool the pick is the roomiest heap
-    /// rather than a refusal.
+    /// the larger pool wins, and past *every* pool it is a refusal naming the
+    /// roomiest heap rather than a call the specification forbids.
     #[test]
     fn an_allocation_larger_than_a_heap_does_not_get_charged_to_it() {
         const GIB: u64 = 1 << 30;
@@ -854,34 +992,63 @@ mod tests {
         let req = classify_memory(&props).topology.request(MemoryClass::Upload);
 
         // Under the 2 GiB carve-out: the device-local preference still wins.
-        let small = select_memory_type(&props, !0, &req, GIB).expect("a type");
+        let small = select_memory_type(&props, !0, &req, GIB, u64::MAX).expect("a type");
         assert_eq!(small.index, 2, "the DEVICE_LOCAL type is still preferred");
         assert_eq!(small.heap_index, 0);
-        assert!(small.fits);
 
         // Over it, and under the 14 GiB host heap: the preference loses to the
         // pool that can actually hold the allocation.
-        let mid = select_memory_type(&props, !0, &req, 4 * GIB).expect("a type");
+        let mid = select_memory_type(&props, !0, &req, 4 * GIB, u64::MAX).expect("a type");
         assert_eq!(mid.index, 1, "the 14 GiB host heap, not the 2 GiB carve-out");
         assert_eq!(mid.heap_index, 1);
-        assert!(mid.fits);
 
-        // Larger than every heap — a 16 GiB guest on this part. Still a valid
-        // type, still the roomiest one, and `fits` says the machine is over
-        // its own head so a log can name it.
-        let over = select_memory_type(&props, !0, &req, 16 * GIB).expect("a type");
-        assert_eq!(over.index, 1, "the roomiest heap satisfying the requirement");
-        assert!(!over.fits, "nothing on this device could hold 16 GiB");
-        assert_eq!(over.heap_bytes, 14 * GIB);
+        // Larger than every heap — a 16 GiB guest on this part. There is no
+        // legal allocation to make, so the answer is the refusal and the
+        // roomiest heap it came up against.
+        assert_eq!(
+            select_memory_type(&props, !0, &req, 16 * GIB, u64::MAX),
+            Err(MemoryTypeRefusal::EveryHeapTooSmall {
+                bytes: 16 * GIB,
+                roomiest_heap: 14 * GIB,
+            }),
+        );
     }
 
-    /// Capacity never turns a resolvable request into a refusal, on any device
-    /// family, for any class, at any size. This is the same load-bearing
-    /// invariant as `misclassification_degrades_to_a_valid_type_never_a_failure`
-    /// applied to the axis that was added after it: a heap check that can return
-    /// `None` would turn a slow host into a host with no allocation at all.
+    /// `maxMemoryAllocationSize` refuses before any heap is consulted, because
+    /// it is a device-wide bound no memory type can widen. The reported shape is
+    /// an APU whose limit is 4 GiB and whose roomiest heap is far larger, where
+    /// the heap check alone would have admitted the call.
     #[test]
-    fn a_size_no_heap_can_hold_still_resolves_a_type() {
+    fn a_size_past_the_device_maximum_is_refused_whatever_the_heaps_hold() {
+        const GIB: u64 = 1 << 30;
+        let props = amd_apu_host_heap();
+        let req = classify_memory(&props).topology.request(MemoryClass::Upload);
+
+        assert!(
+            select_memory_type(&props, !0, &req, 6 * GIB, u64::MAX).is_ok(),
+            "the 14 GiB heap holds 6 GiB, so only the device limit can refuse it",
+        );
+        assert_eq!(
+            select_memory_type(&props, !0, &req, 6 * GIB, 4 * GIB),
+            Err(MemoryTypeRefusal::AboveDeviceMaximum {
+                bytes: 6 * GIB,
+                max: 4 * GIB,
+            }),
+        );
+    }
+
+    /// A size no heap can hold is refused on every device family and for every
+    /// class, and the refusal is the capacity one rather than the flags one.
+    ///
+    /// This is the inverse of what this test asserted when
+    /// [`select_memory_type`] nominated the roomiest heap instead: an
+    /// `allocationSize` past its heap's `size` is invalid usage, one Mesa driver
+    /// returns `VK_SUCCESS` for it and loses the device a second later, and a
+    /// bound only the other driver enforces is not a bound. What must still
+    /// never happen is a *flags* refusal — a misclassification stays a
+    /// performance bug, which is what the variant assertion below pins.
+    #[test]
+    fn a_size_no_heap_can_hold_is_refused_by_capacity_and_never_by_flags() {
         for (name, props) in [
             ("apple_m3_max", apple_m3_max()),
             ("intel_igpu", intel_igpu()),
@@ -898,27 +1065,23 @@ mod tests {
                 MemoryClass::DeviceLocalPreferred,
             ] {
                 let req = profile.topology.request(class);
-                let pick = select_memory_type(&props, !0, &req, u64::MAX)
-                    .unwrap_or_else(|| panic!("{name}/{class:?} must still resolve"));
-                assert!(
-                    props.memory_types[pick.index as usize]
-                        .property_flags
-                        .contains(req.required),
-                    "{name}/{class:?} must still satisfy the required flags"
+                // The roomiest heap any type with the required flags draws
+                // from, which is the number the refusal must carry.
+                let roomiest = roomiest_heap_for(&props, &req);
+                assert_eq!(
+                    select_memory_type(&props, !0, &req, u64::MAX, u64::MAX),
+                    Err(MemoryTypeRefusal::EveryHeapTooSmall {
+                        bytes: u64::MAX,
+                        roomiest_heap: roomiest,
+                    }),
+                    "{name}/{class:?}",
                 );
-                assert!(!pick.fits, "{name}/{class:?}: no heap holds u64::MAX");
-                // And it is the roomiest candidate, which is the only ranking
-                // left once no heap can hold the allocation.
-                let roomiest = (0..props.memory_type_count)
-                    .filter(|&i| {
-                        props.memory_types[i as usize]
-                            .property_flags
-                            .contains(req.required)
-                    })
-                    .map(|i| props.memory_heaps[props.memory_types[i as usize].heap_index as usize].size)
-                    .max()
-                    .unwrap_or(0);
-                assert_eq!(pick.heap_bytes, roomiest, "{name}/{class:?}");
+                // And every class still resolves at a size this device can
+                // hold, so the capacity rule never stands in for a flags one.
+                assert!(
+                    select_memory_type(&props, !0, &req, 0, u64::MAX).is_ok(),
+                    "{name}/{class:?} must still resolve a type",
+                );
             }
         }
     }
@@ -932,13 +1095,13 @@ mod tests {
     fn the_pick_carries_the_heap_it_came_from() {
         let props = nvidia_discrete();
         let req = MemoryTopology::Discrete.request(MemoryClass::DeviceLocal);
-        let pick = select_memory_type(&props, !0, &req, 1 << 20).expect("a device-local type");
+        let pick =
+            select_memory_type(&props, !0, &req, 1 << 20, u64::MAX).expect("a device-local type");
         let t = props.memory_types[pick.index as usize];
         assert_eq!(pick.heap_index, t.heap_index);
         assert_eq!(
             pick.heap_bytes,
             props.memory_heaps[t.heap_index as usize].size
         );
-        assert!(pick.fits);
     }
 }

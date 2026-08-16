@@ -57,6 +57,100 @@ fn the_backing_probe_separates_a_reassigned_address_from_an_unmapped_one() {
     assert_eq!(checked, 3);
 }
 
+/// A guest virtual address means nothing outside the address space it was
+/// recorded in, and this cache is keyed by the address alone.
+///
+/// Serving across tasks hands a render pass another process's picture as the
+/// attachment's prior content, and because the matching Store writes the
+/// composite back it persists rather than flickering. The freshness probe cannot
+/// catch it — `gva_backing_state` walks the page table of the task that *stored*
+/// the entry, so it answers `Same` however foreign the asker is, which is why
+/// the ownership test has to come first and separately.
+#[test]
+fn the_seed_door_refuses_an_address_recorded_by_another_task() {
+    use crate::model::GvaBacking;
+    let mut host = FakeHost::new();
+    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_depth1_task(&mut host, &mut st);
+
+    let gva = 1u64 << PAGE_SHIFT_ARM64E;
+    store_gva_owned(&mut st, gva, 2, 2, vec![0u8; 2 * 2 * 4], 0, None, true);
+    st.host_gva_surfaces.get_mut(&gva).unwrap().backing = Some(GvaBacking {
+        task_id: 1,
+        first_gpa: 5u64 << PAGE_SHIFT_ARM64E,
+    });
+
+    assert_eq!(
+        gva_seed_verdict(&st, &host, 1, gva),
+        GvaSeedVerdict::Admit,
+        "the task that stored it, over pages that have not moved"
+    );
+    assert_eq!(
+        gva_seed_verdict(&st, &host, 2, gva),
+        GvaSeedVerdict::OtherTask,
+        "another task's identical address is not this entry"
+    );
+    // The blind spot this exists to cover: the freshness probe is perfectly
+    // happy, because it never asked who was asking.
+    assert_eq!(
+        gva_backing_state(&st, &host, gva),
+        GvaBackingState::Same,
+        "which is exactly why a zero from that probe was never evidence"
+    );
+}
+
+/// `Moved` is the one state carrying positive evidence the pixels belong to
+/// someone else now, and the door computed it for a counter without acting on
+/// it. Refusing costs a guest re-read; serving costs a persistent wrong layer.
+#[test]
+fn the_seed_door_refuses_a_backing_the_guest_has_re_pointed() {
+    use crate::model::GvaBacking;
+    let mut host = FakeHost::new();
+    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let root_gpa = setup_depth1_task(&mut host, &mut st);
+
+    let gva = 2u64 << PAGE_SHIFT_ARM64E;
+    store_gva_owned(&mut st, gva, 2, 2, vec![0u8; 2 * 2 * 4], 0, None, true);
+    st.host_gva_surfaces.get_mut(&gva).unwrap().backing = Some(GvaBacking {
+        task_id: 1,
+        first_gpa: 6u64 << PAGE_SHIFT_ARM64E,
+    });
+    assert_eq!(gva_seed_verdict(&st, &host, 1, gva), GvaSeedVerdict::Admit);
+
+    repoint_pte(&mut host, root_gpa, 2, 12);
+    assert_eq!(
+        gva_seed_verdict(&st, &host, 1, gva),
+        GvaSeedVerdict::Moved,
+        "the address now names another allocation's pages"
+    );
+
+    repoint_pte(&mut host, root_gpa, 2, 0);
+    assert_eq!(
+        gva_seed_verdict(&st, &host, 1, gva),
+        GvaSeedVerdict::Unmapped,
+        "and an address that does not translate cannot establish ownership \
+         either — unmapped must not fold into moved"
+    );
+}
+
+/// Every verdict has to carry a distinct route name, or the counters that price
+/// this gate cannot say which arm refused.
+#[test]
+fn the_seed_verdicts_have_distinct_route_names() {
+    let all = [
+        GvaSeedVerdict::Admit,
+        GvaSeedVerdict::OtherTask,
+        GvaSeedVerdict::Moved,
+        GvaSeedVerdict::Unmapped,
+        GvaSeedVerdict::Unrecorded,
+    ];
+    let mut names: Vec<&str> = all.iter().map(|v| v.route()).collect();
+    let distinct = names.len();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), distinct, "one route name per verdict");
+}
+
 /// The gauge has to separate the two shapes a growing cache can take, or it
 /// cannot tell "many small surfaces" from "a few 4K ones" — which is the
 /// distinction the no-size-cap question turns on, since a 4K entry is ~4x a
@@ -139,13 +233,13 @@ fn every_host_cache_producer_draws_from_one_generation_source() {
 
     store(&mut st, 7, 4, 4, px.clone());
     seen.insert(
-        get_from_with_gen(&st.host_surfaces, 7, 4, 4)
+        get_from_with_gen(&st.host_surfaces, &7, 4, 4)
             .expect("mid store")
             .1,
     );
-    store_texture(&mut st, 9, 4, 4, px.clone(), 0);
+    store_texture(&mut st, 3, 9, 4, 4, px.clone(), 0);
     seen.insert(
-        get_from_with_gen(&st.host_texture_surfaces, 9, 4, 4)
+        get_from_with_gen(&st.host_texture_surfaces, &(3, 9), 4, 4)
             .expect("ref store")
             .1,
     );
@@ -425,9 +519,31 @@ fn texture_and_surface_namespaces_are_separate() {
     let mut tex = vec![0u8; 16];
     tex[0] = 2;
     store(&mut st, 5, w, h, surface);
-    store_texture(&mut st, 5, w, h, tex, 0);
+    store_texture(&mut st, 3, 5, w, h, tex, 0);
     assert_eq!(get(&st, 5, w, h).unwrap()[0], 1);
-    assert_eq!(get_texture(&st, 5, w, h).unwrap()[0], 2);
+    assert_eq!(get_texture(&st, 3, 5, w, h).unwrap()[0], 2);
+}
+
+/// Texture object refs are local to their task. Two processes routinely use
+/// the same small integer, and replacing or evicting one must not discard the
+/// other process's render seed.
+#[test]
+fn texture_cache_keeps_same_numbered_refs_in_separate_tasks() {
+    let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let (texture_ref, w, h) = (5, 2, 2);
+    store_texture(&mut st, 0, texture_ref, w, h, vec![0x11; 16], 0x1000);
+    store_texture(&mut st, 1, texture_ref, w, h, vec![0x22; 16], 0x2000);
+
+    assert_eq!(get_texture(&st, 0, texture_ref, w, h).unwrap()[0], 0x11);
+    assert_eq!(get_texture(&st, 1, texture_ref, w, h).unwrap()[0], 0x22);
+
+    evict_texture(&mut st, 1, texture_ref);
+    assert!(get_texture(&st, 1, texture_ref, w, h).is_none());
+    assert_eq!(
+        get_texture(&st, 0, texture_ref, w, h).unwrap()[0],
+        0x11,
+        "evicting a client texture must preserve WindowServer's same-numbered seed"
+    );
 }
 
 /// The ref cache remembers which address produced its pixels, and a store at
@@ -443,22 +559,22 @@ fn the_ref_cache_remembers_which_address_produced_its_pixels() {
     let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let (w, h) = (2u32, 2u32);
     assert_eq!(
-        texture_source_gva(&st, 5, w, h),
+        texture_source_gva(&st, 3, 5, w, h),
         None,
         "no entry, no answer — an absent entry must not read as address 0"
     );
-    store_texture(&mut st, 5, w, h, vec![1u8; 16], 0x4000);
-    assert_eq!(texture_source_gva(&st, 5, w, h), Some(0x4000));
+    store_texture(&mut st, 3, 5, w, h, vec![1u8; 16], 0x4000);
+    assert_eq!(texture_source_gva(&st, 3, 5, w, h), Some(0x4000));
     // The guest re-points the texture and stores again: the recorded address
     // must move with the pixels, or a later serve compares against a stale one.
-    store_texture(&mut st, 5, w, h, vec![2u8; 16], 0x9000);
-    assert_eq!(texture_source_gva(&st, 5, w, h), Some(0x9000));
+    store_texture(&mut st, 3, 5, w, h, vec![2u8; 16], 0x9000);
+    assert_eq!(texture_source_gva(&st, 3, 5, w, h), Some(0x9000));
     // A producer with no address records none, which is its own case at the
     // serve site: unknowable, neither "same" nor "different".
-    store_texture(&mut st, 5, w, h, vec![3u8; 16], 0);
-    assert_eq!(texture_source_gva(&st, 5, w, h), Some(0));
+    store_texture(&mut st, 3, 5, w, h, vec![3u8; 16], 0);
+    assert_eq!(texture_source_gva(&st, 3, 5, w, h), Some(0));
     assert_eq!(
-        texture_source_gva(&st, 5, w + 1, h),
+        texture_source_gva(&st, 3, 5, w + 1, h),
         None,
         "a geometry the entry does not answer at answers nothing here either"
     );
@@ -543,7 +659,7 @@ fn host_surface_cache_hit_validates_geom_and_truncates_to_need() {
     let mut map: std::collections::BTreeMap<u32, HostSurface> = Default::default();
 
     // Absent id.
-    assert_eq!(get_from_with_gen(&map, id, w, h), None);
+    assert_eq!(get_from_with_gen(&map, &id, w, h), None);
 
     // Store an over-allocated (need + slop) buffer with a distinct host_gen.
     let mut bgra = vec![0xABu8; need + 16];
@@ -560,22 +676,22 @@ fn host_surface_cache_hit_validates_geom_and_truncates_to_need() {
     );
 
     // Geometry mismatch on either axis must miss (no resize-serve).
-    assert_eq!(get_from_with_gen(&map, id, w + 1, h), None);
-    assert_eq!(get_from_with_gen(&map, id, w, h + 1), None);
+    assert_eq!(get_from_with_gen(&map, &id, w + 1, h), None);
+    assert_eq!(get_from_with_gen(&map, &id, w, h + 1), None);
 
     // Exact hit: exactly `need` bytes (slop truncated) + the entry host_gen.
-    let (bytes, gen) = get_from_with_gen(&map, id, w, h).expect("exact geom must hit");
+    let (bytes, gen) = get_from_with_gen(&map, &id, w, h).expect("exact geom must hit");
     assert_eq!(bytes.len(), need, "must truncate to width*height*BPP");
     assert_eq!(gen, 9, "must report the entry host_gen");
     assert!(bytes.iter().all(|&b| b == 0xAB), "no slop byte leaks in");
 
     // get_from is the same content, generation dropped.
-    assert_eq!(get_from(&map, id, w, h), Some(bytes));
+    assert_eq!(get_from(&map, &id, w, h), Some(bytes));
 
     // Empty bytes -> None even with matching geometry.
     map.get_mut(&id).unwrap().bgra = std::sync::Arc::new(Vec::new());
     assert_eq!(
-        get_from_with_gen(&map, id, w, h),
+        get_from_with_gen(&map, &id, w, h),
         None,
         "empty entry misses"
     );
@@ -583,7 +699,7 @@ fn host_surface_cache_hit_validates_geom_and_truncates_to_need() {
     // Non-empty but short of `need` -> None (truncated store, no partial serve).
     map.get_mut(&id).unwrap().bgra = std::sync::Arc::new(vec![0xABu8; need - 1]);
     assert_eq!(
-        get_from_with_gen(&map, id, w, h),
+        get_from_with_gen(&map, &id, w, h),
         None,
         "under-`need` bytes must not be served",
     );

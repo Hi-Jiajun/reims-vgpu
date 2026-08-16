@@ -12,8 +12,9 @@
 
 use metal2vulkan::passes::Stage;
 use reims_vgpu::backend::vulkan::engine::{
-    self, BufferContent, DrawRequest, GuestRun, GuestRunSource, PrimitiveTopology,
-    SampledImageResource, SampledSource, SamplerResource, ScissorResource, StorageBufferResource,
+    self, BufferContent, DepthState, DrawRequest, GuestRun, GuestRunSource, IndexType,
+    IndexedDrawResource, PrimitiveTopology, SampledImageResource, SampledSource,
+    SamplerCompareFunction, SamplerResource, ScissorResource, StorageBufferResource,
     TargetIdentity,
 };
 /// The resident format every `TargetIdentity::Surface` in this file is built at.
@@ -171,6 +172,10 @@ fn batched_draws_compose_and_flush_on_read() {
         after.batch_flush_draws, 2,
         "the one submit carried both draws"
     );
+    assert_eq!(
+        after.queue_async_submits, 1,
+        "the ended batch must execute through the asynchronous queue owner"
+    );
 
     assert_eq!(px.len(), (W * H * 4) as usize);
     for y in [0u32, H / 2, H - 1] {
@@ -183,6 +188,189 @@ fn batched_draws_compose_and_flush_on_read() {
             );
         }
     }
+}
+
+/// The first and second draws from one decoded Metal render encoder retain one
+/// Vulkan pass instance even though the serialized continuation forces the
+/// second record's load action to LOAD. Load/store actions describe how a pass
+/// instance begins and ends; they do not make otherwise-identical render passes
+/// incompatible, and the second record never begins a pass when the first one
+/// remains open. The continuation counter makes this fail if the load-action
+/// rewrite regresses to two begin/end pairs, while the pixel check keeps the
+/// optimized recording honest.
+#[test]
+fn one_metal_encoder_continues_one_vulkan_render_pass() {
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_102,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+
+    let before = engine::counter_snapshot();
+    let mut first = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    first.render_pass_continues = true;
+    match engine::execute_draw_request(&first) {
+        Ok(_) => {}
+        Err(e) => {
+            let msg = e.to_string();
+            if skip_if_no_gpu(&msg) {
+                eprintln!("skipping: {msg}");
+                return;
+            }
+            panic!("encoder first draw: {msg}");
+        }
+    }
+
+    let mut second = batch_req(&vert, &frag, &identity, true, half_scissor(false));
+    second.continues_render_pass = true;
+    engine::execute_draw_request(&second).expect("encoder second draw");
+
+    let px = engine::read_target(&identity)
+        .expect("flush continued pass")
+        .into_rgba8();
+    let delta = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        delta.render_pass_continuations, 1,
+        "the second encoder draw must reuse the pass instance: {delta:?}"
+    );
+    for y in [0u32, H / 2, H - 1] {
+        for x in [W / 4, 3 * W / 4] {
+            let i = ((y * W + x) * 4) as usize;
+            assert!(
+                is_frag_color(&px[i..i + 4]),
+                "continued render pass at ({x},{y}) = {:?}",
+                &px[i..i + 4]
+            );
+        }
+    }
+}
+
+/// A resolve-only attachment keeps its multisample source alive for the whole
+/// guest encoder. The first draw cannot resolve and discard that source before
+/// the second draw: both halves must be present when the encoder-ending read
+/// finally closes the Vulkan pass and resolves it.
+#[test]
+fn one_multisample_encoder_resolves_after_its_last_draw() {
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_103,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+
+    let before = engine::counter_snapshot();
+    let mut first = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    first.raster_sample_count = 4;
+    first.color_sample_count = 4;
+    first.multisample_resolve = true;
+    first.render_pass_continues = true;
+    match engine::execute_draw_request(&first) {
+        Ok(_) => {}
+        Err(e) => {
+            let msg = e.to_string();
+            if skip_if_no_gpu(&msg) {
+                eprintln!("skipping: {msg}");
+                return;
+            }
+            panic!("multisample encoder first draw: {msg}");
+        }
+    }
+
+    let mut second = batch_req(&vert, &frag, &identity, true, half_scissor(false));
+    second.raster_sample_count = 4;
+    second.color_sample_count = 4;
+    second.multisample_resolve = true;
+    second.continues_render_pass = true;
+    engine::execute_draw_request(&second).expect("multisample encoder second draw");
+
+    let px = engine::read_target(&identity)
+        .expect("close and resolve the multisample encoder")
+        .into_rgba8();
+    let delta = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        delta.render_pass_continuations, 1,
+        "the resolve must occur after both draws in one pass: {delta:?}"
+    );
+    for y in [0u32, H / 2, H - 1] {
+        for x in [W / 4, 3 * W / 4] {
+            let i = ((y * W + x) * 4) as usize;
+            assert!(
+                is_frag_color(&px[i..i + 4]),
+                "resolved encoder at ({x},{y}) = {:?}",
+                &px[i..i + 4]
+            );
+        }
+    }
+}
+
+/// A stored multisample texture is itself the resource. It remains resident
+/// between encoders; the second encoder loads that image instead of requiring
+/// an implicit resolve or a linear image-to-buffer copy.
+#[test]
+fn stored_multisample_target_survives_for_a_later_encoder() {
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_104,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let depth_identity = TargetIdentity::Texture {
+        ref_: 990_105,
+        width: W,
+        height: H,
+        generation: 0,
+        stencil: false,
+    };
+
+    let mut first = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    first.raster_sample_count = 2;
+    first.color_sample_count = 2;
+    first.depth = Some(DepthState {
+        identity: Some(depth_identity.clone()),
+        test_enable: true,
+        write_enable: true,
+        compare: SamplerCompareFunction::Always,
+        clear_value: 1.0,
+        load: false,
+        stencil: None,
+    });
+    match engine::execute_draw_request(&first) {
+        Ok(out) => assert!(out.pixels.is_empty(), "stored multisample target stays GPU-resident"),
+        Err(e) => {
+            let msg = e.to_string();
+            if skip_if_no_gpu(&msg) {
+                eprintln!("skipping: {msg}");
+                return;
+            }
+            panic!("stored multisample opener: {msg}");
+        }
+    }
+    assert!(engine::resident_content_ready(&identity));
+
+    let mut second = batch_req(&vert, &frag, &identity, true, half_scissor(false));
+    second.raster_sample_count = 2;
+    second.color_sample_count = 2;
+    second.depth = Some(DepthState {
+        identity: Some(depth_identity),
+        test_enable: true,
+        write_enable: true,
+        compare: SamplerCompareFunction::Always,
+        clear_value: 1.0,
+        load: true,
+        stencil: None,
+    });
+    engine::execute_draw_request(&second).expect("later encoder loads multisample resident");
+    assert!(engine::resident_content_ready(&identity));
 }
 
 /// A draw to a DIFFERENT target joins the open batch, and both targets still
@@ -306,10 +494,9 @@ fn prefetch_arm_flushes_open_batch() {
 /// the GPU fed and the staging pool recycling instead of hoarding a whole run
 /// in one pending ring entry.
 ///
-/// The cap is read from the engine rather than written here. It is chosen by a
-/// live sweep and has moved once already (8 -> 32); a test carrying its own
-/// copy asserts the sweep's old answer against its new one and fails as though
-/// the device had broken.
+/// The cap is read from the live engine rather than written here. It is chosen
+/// from the physical device's memory topology and may be narrowed by the test
+/// environment; a copied constant would test the wrong boundary on one arm.
 #[test]
 fn batch_length_cap_flushes_and_reopens() {
     let _guard = engine_test_lock().lock().unwrap();
@@ -389,9 +576,11 @@ fn batched_guest_runs_buffer_snapshots_at_record() {
                 host_ptr: backing.as_ptr() as usize,
                 len: backing.len() as u64,
             }]),
+            source_offset: 0,
             total_len: backing.len() as u64,
             row_length_texels: 0,
             pages: None,
+            direct_image: None,
         }),
     });
     match engine::execute_draw_request(&opener) {
@@ -525,6 +714,8 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
     });
     req.sampled_images.push(SampledImageResource {
         binding: 32,
+        array_element: 0,
+        descriptor_count: 1,
         width: 2,
         height: 2,
         layers: 1,
@@ -532,25 +723,30 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
         volume: false,
         cube: false,
         one_dim: false,
-        source: SampledSource::GuestRuns(GuestRunSource {
-            runs: std::sync::Arc::new(vec![
-                GuestRun {
-                    host_ptr: ptr as usize,
-                    len: 8,
-                },
-                GuestRun {
-                    host_ptr: ptr as usize + 8,
-                    len: 8,
-                },
-            ]),
-            total_len: 16,
-            row_length_texels: 0,
-            pages: None,
-        },
-        // A fixture over a host `Vec` went through no witness, so the gather is
-        // the only disposition available to it.
-        reims_vgpu::runtime::gather_witness::GatherVouch::Fresh,
+        multisampled: false,
+        source: SampledSource::GuestRuns(
+            GuestRunSource {
+                runs: std::sync::Arc::new(vec![
+                    GuestRun {
+                        host_ptr: ptr as usize,
+                        len: 8,
+                    },
+                    GuestRun {
+                        host_ptr: ptr as usize + 8,
+                        len: 8,
+                    },
+                ]),
+                source_offset: 0,
+                total_len: 16,
+                row_length_texels: 0,
+                pages: None,
+                direct_image: None,
+            },
+            // A fixture over a host `Vec` went through no witness, so the gather is
+            // the only disposition available to it.
+            reims_vgpu::runtime::gather_witness::GatherVouch::Fresh,
         ),
+        byte_origin: Default::default(),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
         swizzle: Default::default(),
@@ -700,9 +896,11 @@ fn a_scattered_guest_buffer_window_is_gathered_by_the_gpu_in_one_region_per_stre
         binding: 0,
         content: BufferContent::GuestRuns(GuestRunSource {
             runs: std::sync::Arc::new(runs),
+            source_offset: 0,
             total_len: STRETCH * 3,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
+            direct_image: None,
         }),
     });
     engine::execute_draw_request(&req).expect("the gathered draw");
@@ -714,6 +912,16 @@ fn a_scattered_guest_buffer_window_is_gathered_by_the_gpu_in_one_region_per_stre
     assert_eq!(
         d.buffer_guest_gathers, 1,
         "the scattered window must be assembled by the GPU: {d:?}"
+    );
+    assert_eq!(
+        d.buffer_guest_gather_storage_bytes,
+        STRETCH * 3,
+        "this physical gather is consumed only as a storage buffer: {d:?}"
+    );
+    assert_eq!(
+        d.buffer_guest_gather_vertex_bytes + d.buffer_guest_gather_shared_bytes,
+        0,
+        "the role-byte columns must not double-charge this gather: {d:?}"
     );
     assert_eq!(
         d.buffer_guest_gather_regions, 3,
@@ -918,9 +1126,11 @@ void main() {{
         binding: 0,
         content: BufferContent::GuestRuns(GuestRunSource {
             runs: std::sync::Arc::new(runs),
+            source_offset: 0,
             total_len: STRETCH * 3,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
+            direct_image: None,
         }),
     });
     engine::execute_draw_request(&req).expect("the gathered draw");
@@ -1096,9 +1306,11 @@ void main() {{
         binding: 0,
         content: BufferContent::GuestRuns(GuestRunSource {
             runs: std::sync::Arc::new(runs),
+            source_offset: 0,
             total_len: STRETCH * RUNS,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
+            direct_image: None,
         }),
     });
     engine::execute_draw_request(&req).expect("the fallback draw");
@@ -1257,9 +1469,11 @@ void main() {{
         binding: 0,
         content: BufferContent::GuestRuns(GuestRunSource {
             runs: std::sync::Arc::new(runs),
+            source_offset: 0,
             total_len: WINDOW,
             row_length_texels: 0,
             pages: Some(std::sync::Arc::new(pages)),
+            direct_image: None,
         }),
     });
     engine::execute_draw_request(&req).expect("the in-place draw");
@@ -1291,5 +1505,107 @@ void main() {{
         FILL[1],
         FILL[0],
     );
+    engine::test_quiesce_ring();
+}
+
+/// An indexed draw retains the guest buffer window through execution. This is
+/// the fixed-function counterpart of the storage-buffer test above: the index
+/// bytes never become a host `Vec` or a staging upload, and a nonzero resource
+/// offset reaches `vkCmdBindIndexBuffer` unchanged.
+#[test]
+fn an_index_window_is_bound_in_place_without_a_cpu_copy() {
+    use reims_vgpu::runtime::guest_ram::{granularity, GuestRamImport, GuestRamRegion, GuestRef};
+    use reims_vgpu::runtime::guest_ram_map::GuestWindowRun;
+
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_411,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+
+    let warm = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    if let Err(e) = engine::execute_draw_request(&warm) {
+        let msg = e.to_string();
+        if skip_if_no_gpu(&msg) {
+            eprintln!("skipping: {msg}");
+            return;
+        }
+        panic!("warm-up draw: {msg}");
+    }
+    let Some(align) = granularity() else {
+        eprintln!("skipping: this host cannot import guest RAM");
+        engine::test_quiesce_ring();
+        return;
+    };
+
+    const SOURCE_OFFSET: u64 = 14;
+    const INDEX_BYTES: u64 = 6;
+    let block_len = align * 2;
+    let mut backing = vec![0u8; (block_len + align) as usize];
+    let pad = (backing.as_ptr() as u64).next_multiple_of(align) - backing.as_ptr() as u64;
+    let base = backing.as_ptr() as u64 + pad;
+    let start = (pad + SOURCE_OFFSET) as usize;
+    for (slot, index) in [0u16, 1, 2].into_iter().enumerate() {
+        backing[start + slot * 2..start + slot * 2 + 2]
+            .copy_from_slice(&index.to_le_bytes());
+    }
+
+    let import = std::sync::Arc::new(
+        GuestRamImport::new(
+            GuestRamRegion {
+                gpa_base: 0x1_1000_0000,
+                host_va: base,
+                len: block_len,
+            },
+            align,
+        )
+        .expect("an aligned, non-empty region"),
+    );
+    let pages = vec![GuestWindowRun {
+        window_offset: 0,
+        guest: GuestRef::new(
+            std::sync::Arc::clone(&import),
+            import.slice(0, block_len).expect("inside the import"),
+        )
+        .expect("the slice came from this import"),
+    }];
+    let source = GuestRunSource {
+        runs: std::sync::Arc::new(vec![GuestRun {
+            host_ptr: base as usize,
+            len: block_len,
+        }]),
+        source_offset: SOURCE_OFFSET,
+        total_len: INDEX_BYTES,
+        row_length_texels: 0,
+        pages: Some(std::sync::Arc::new(pages)),
+        direct_image: None,
+    };
+
+    let before = engine::counter_snapshot();
+    let mut req = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    req.indexed = Some(IndexedDrawResource {
+        index_type: IndexType::U16,
+        index_count: 3,
+        vertex_offset: 0,
+        content: BufferContent::GuestRuns(source),
+    });
+    engine::execute_draw_request(&req).expect("indexed draw");
+    engine::execute_draw_request(&req).expect("repeated indexed draw");
+    let px = engine::read_target(&identity)
+        .expect("read_target flushes the indexed draw")
+        .into_rgba8();
+
+    let d = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(d.buffer_guest_index_imports, 1, "index source: {d:?}");
+    assert_eq!(d.buffer_guest_index_import_bytes, INDEX_BYTES, "index source: {d:?}");
+    assert_eq!(d.buffer_index_bind_reuses, 1, "index source: {d:?}");
+    assert_eq!(d.buffer_guest_gathers, 0, "index source: {d:?}");
+    assert_eq!(d.buffer_snapshot_binds, 0, "index source: {d:?}");
+    let i = (((H / 2) * W + W / 4) * 4) as usize;
+    assert!(is_frag_color(&px[i..i + 4]), "indexed pixel = {:?}", &px[i..i + 4]);
     engine::test_quiesce_ring();
 }

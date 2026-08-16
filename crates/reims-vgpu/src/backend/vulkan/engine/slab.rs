@@ -671,7 +671,7 @@ impl SlabPool {
     /// absorb steady-state churn without re-paying a `vkAllocateMemory` on the
     /// reverse of a fullscreen toggle — but it only runs on an image *release*,
     /// so at settled idle (no releases) those empty blocks sit resident forever
-    /// (each a whole `SLAB_SIZE` of held VRAM). The idle drain calls this to
+    /// (each a whole `SLAB_SIZE` of held VRAM). Maintenance calls this to
     /// release them. Keeping one empty per class means a workload that cycles a
     /// single block empty↔full (one fullscreen toggle) never re-allocates; only
     /// genuinely surplus empties are returned to the driver. The engine passes
@@ -1304,7 +1304,7 @@ mod tests {
     /// The idle empty-block trim keeps exactly `keep` empty shared blocks and
     /// names the rest as victims — while never selecting a dedicated block (frees
     /// itself), a poisoned block (deliberately leaked), or a block still holding a
-    /// live sub-allocation (not empty). This is the selection the idle drain runs
+    /// live sub-allocation (not empty). This is the selection maintenance runs
     /// to return surplus empty `SLAB_SIZE` blocks to the driver.
     #[test]
     fn empty_block_victims_keeps_spare_and_skips_non_empty() {

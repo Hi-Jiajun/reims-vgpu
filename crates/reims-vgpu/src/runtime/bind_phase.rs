@@ -51,13 +51,10 @@ const PARTS: usize = 3;
 static ACC: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
 static BINDS: AtomicU64 = AtomicU64::new(0);
 
-/// One slot per [`ReflectedBufferAccess`], indexed by its ordinal.
-const ACCESS_CLASSES: usize = ReflectedBufferAccess::Undeclared as usize + 1;
-
-/// The table is wide enough for every class the parse can return. Derived from
-/// the highest ordinal rather than hand-counted, so a new class fails the build
-/// here instead of wrapping into another class's tally at runtime.
-const _: () = assert!(ACCESS_CLASSES == 3);
+/// The render census deliberately folds the detailed access answer into the
+/// three decisions render makes. Compute consumes read-only versus writable;
+/// render only decides neutral, guest-backed, or no reflection answer.
+const ACCESS_CLASSES: usize = 3;
 
 static ACCESS: [AtomicU64; ACCESS_CLASSES] = [const { AtomicU64::new(0) }; ACCESS_CLASSES];
 
@@ -75,7 +72,7 @@ pub struct BindPhaseWindow {
     /// Buffer binds reflection says the shader does touch.
     pub access_dereferenced: u64,
     /// Buffer binds reflection gives no answer for. Not a synonym for
-    /// [`Self::access_unused`] — see [`ReflectedBufferAccess::Undeclared`].
+    /// [`Self::access_unused`] — see [`ReflectedBufferAccess::Unknown`].
     pub access_undeclared: u64,
     /// Of [`Self::access_unused`], those whose guest bytes were staged anyway.
     ///
@@ -109,11 +106,9 @@ pub fn take_window() -> Option<BindPhaseWindow> {
         fragment_us: to_us(ACC[Part::FragmentLoad as usize].swap(0, Ordering::Relaxed)),
         attrs_us: to_us(ACC[Part::Attrs as usize].swap(0, Ordering::Relaxed)),
         binds,
-        access_unused: ACCESS[ReflectedBufferAccess::Unused as usize].swap(0, Ordering::Relaxed),
-        access_dereferenced: ACCESS[ReflectedBufferAccess::Dereferenced as usize]
-            .swap(0, Ordering::Relaxed),
-        access_undeclared: ACCESS[ReflectedBufferAccess::Undeclared as usize]
-            .swap(0, Ordering::Relaxed),
+        access_unused: ACCESS[0].swap(0, Ordering::Relaxed),
+        access_dereferenced: ACCESS[1].swap(0, Ordering::Relaxed),
+        access_undeclared: ACCESS[2].swap(0, Ordering::Relaxed),
         access_unused_staged: UNUSED_STAGED.swap(0, Ordering::Relaxed),
         neutral_served: NEUTRAL_SERVED.swap(0, Ordering::Relaxed),
     };
@@ -123,10 +118,15 @@ pub fn take_window() -> Option<BindPhaseWindow> {
 /// Count one buffer bind against what its stage's reflection said about it.
 ///
 /// Called once per resolved `[[buffer(n)]]` bind on the render path, in both the
-/// vertex and the fragment loop, so the three classes partition that population
+/// vertex and the fragment loop, so the three decision buckets partition that population
 /// — see [`BindPhaseWindow::access_total`].
 pub fn note_access(class: ReflectedBufferAccess) {
-    ACCESS[class as usize].fetch_add(1, Ordering::Relaxed);
+    let slot = match class {
+        ReflectedBufferAccess::Unused => 0,
+        ReflectedBufferAccess::ReadOnly | ReflectedBufferAccess::Writable => 1,
+        ReflectedBufferAccess::Absent | ReflectedBufferAccess::Unknown => 2,
+    };
+    ACCESS[slot].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Count one bind that reflection called unused and that was staged from guest
@@ -272,10 +272,10 @@ mod tests {
             note_access(ReflectedBufferAccess::Unused);
         }
         for _ in 0..11 {
-            note_access(ReflectedBufferAccess::Dereferenced);
+            note_access(ReflectedBufferAccess::ReadOnly);
         }
         for _ in 0..2 {
-            note_access(ReflectedBufferAccess::Undeclared);
+            note_access(ReflectedBufferAccess::Absent);
         }
 
         let w = take_window().expect("a bind was noted");
@@ -285,16 +285,15 @@ mod tests {
         assert_eq!(w.access_total(), 18, "{w:?}");
     }
 
-    /// Each class lands in its own slot. Indexing the table by the enum's
-    /// ordinal is only safe while the ordinals are distinct and in range, and a
-    /// class quietly tallying into another's slot would read as a real
-    /// population rather than as a bug.
+    /// Each detailed class lands in the render decision bucket it belongs to.
     #[test]
-    fn each_access_class_lands_in_its_own_slot() {
+    fn each_access_class_lands_in_its_render_decision_bucket() {
         for class in [
             ReflectedBufferAccess::Unused,
-            ReflectedBufferAccess::Dereferenced,
-            ReflectedBufferAccess::Undeclared,
+            ReflectedBufferAccess::ReadOnly,
+            ReflectedBufferAccess::Writable,
+            ReflectedBufferAccess::Absent,
+            ReflectedBufferAccess::Unknown,
         ] {
             let _ = take_window();
             note_bind();
@@ -303,10 +302,14 @@ mod tests {
             assert_eq!(w.access_total(), 1, "{class:?} counted once: {w:?}");
             let landed = match class {
                 ReflectedBufferAccess::Unused => w.access_unused,
-                ReflectedBufferAccess::Dereferenced => w.access_dereferenced,
-                ReflectedBufferAccess::Undeclared => w.access_undeclared,
+                ReflectedBufferAccess::ReadOnly | ReflectedBufferAccess::Writable => {
+                    w.access_dereferenced
+                }
+                ReflectedBufferAccess::Absent | ReflectedBufferAccess::Unknown => {
+                    w.access_undeclared
+                }
             };
-            assert_eq!(landed, 1, "{class:?} landed in its own slot: {w:?}");
+            assert_eq!(landed, 1, "{class:?} landed in its decision bucket: {w:?}");
         }
     }
 
@@ -315,7 +318,7 @@ mod tests {
     /// the classification restated.
     ///
     /// The staging arm is charged for every class and filters internally, which
-    /// is what this asserts: a `Dereferenced` bind that was staged must not
+    /// is what this asserts: a `ReadOnly` bind that was staged must not
     /// appear in `access_unused_staged`, or the identity would read as reliance
     /// on guest bytes by binds the rail never had a claim on.
     #[test]
@@ -330,8 +333,8 @@ mod tests {
         note_access(ReflectedBufferAccess::Unused);
         note_unused_staged(ReflectedBufferAccess::Unused);
         // A bind the rail has no claim on, staged as always.
-        note_access(ReflectedBufferAccess::Dereferenced);
-        note_unused_staged(ReflectedBufferAccess::Dereferenced);
+        note_access(ReflectedBufferAccess::ReadOnly);
+        note_unused_staged(ReflectedBufferAccess::ReadOnly);
 
         let w = take_window().expect("a bind was noted");
         assert_eq!(w.access_unused, 3, "{w:?}");

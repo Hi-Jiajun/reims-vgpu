@@ -304,11 +304,11 @@ typedef struct ReimsVgpuHostOps {
      * is never recycled for other memory. 0 if the view is a transient mapping
      * that unmap_pages tears down.
      *
-     * This is a claim about a CPU-side *view* and nothing else. It says nothing
-     * about the GPU rail: guest RAM reaches the GPU by importing the spans
-     * guest_ram_regions names, which are QEMU's own RAMBlock mappings and never
-     * a view this call built. Default (absent field / older shim) must be
-     * treated as 0.
+     * Base guest RAM reaches the GPU through the spans guest_ram_regions names,
+     * independently of this flag. A resource-shaped packed import may retain a
+     * map_pages view, however, and may do so only when this flag promises that
+     * submitted GPU work cannot outlive the alias. Default (absent field /
+     * older shim) must be treated as 0.
      */
     int map_pages_stable;
     /*

@@ -328,9 +328,56 @@ pub struct StencilState {
     pub clear_value: u32,
 }
 
+/// Identity of one retained guest render-pipeline state.
+///
+/// The token carries no Vulkan object and exposes no guest reference. It lets
+/// the engine remember the last exact Vulkan variant used by this immutable
+/// pipeline object without globally hashing the object's complete content key
+/// on every draw. A weak copy in the engine index follows this token's
+/// lifetime, so deleting the guest object does not leave an immortal identity
+/// entry behind.
+#[derive(Clone, Debug)]
+pub struct PipelineObjectIdentity {
+    id: std::num::NonZeroU64,
+    life: std::sync::Arc<PipelineObjectLife>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PipelineObjectLife;
+
+impl PipelineObjectIdentity {
+    pub(crate) fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let raw = NEXT
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .expect("retained pipeline identity space exhausted");
+        Self {
+            id: std::num::NonZeroU64::new(raw)
+                .expect("pipeline identity allocator never publishes zero"),
+            life: std::sync::Arc::new(PipelineObjectLife),
+        }
+    }
+
+    pub(crate) fn id(&self) -> std::num::NonZeroU64 {
+        self.id
+    }
+
+    pub(crate) fn downgrade(&self) -> std::sync::Weak<PipelineObjectLife> {
+        std::sync::Arc::downgrade(&self.life)
+    }
+}
+
 /// Inputs for one offscreen draw. Engine receives resolved bytes + post-reloc SPIR-V only.
 #[derive(Debug, Default)]
 pub struct DrawRequest {
+    /// The retained guest pipeline object this draw resolved, when the retained
+    /// lifecycle is enabled. Vulkan still compares the complete variant key;
+    /// this identity only chooses the object's exact front entry.
+    pub pipeline_object: Option<PipelineObjectIdentity>,
     /// Shared from the runtime translation cache — the engine never mutates
     /// module words; `Arc` avoids a full-module copy per draw.
     pub vert_spirv: std::sync::Arc<Vec<u32>>,
@@ -343,6 +390,15 @@ pub struct DrawRequest {
     /// Metal baseInstance / Vulkan firstInstance. Constant step-function shift uses this.
     pub base_instance: u32,
     pub primitive_topology: PrimitiveTopology,
+    /// Pipeline rasterization sample count.
+    pub raster_sample_count: u32,
+    /// Sample count of the colour attachment the fragment pipeline writes.
+    /// An explicit resolve still names its multisample source here; the
+    /// single-sample destination is represented by [`Self::multisample_resolve`].
+    pub color_sample_count: u32,
+    /// Rasterize into an N-sample attachment and resolve into the ordinary
+    /// primary target at render-pass end.
+    pub multisample_resolve: bool,
     /// Every viewport the guest bound, in its order. Empty takes the
     /// full-target default, and so does any slot past the end of this list when
     /// [`Self::scissors`] is longer — the two counts are independent in Metal
@@ -379,6 +435,13 @@ pub struct DrawRequest {
     /// `surface_cache` does — can seed a draw with a refcount instead of a
     /// whole-framebuffer copy.
     pub target_rgba8: Option<std::sync::Arc<Vec<u8>>>,
+    /// Guest-page form of the same LOAD seed. Mutually exclusive with
+    /// [`Self::target_rgba8`], [`Self::load_from_target`] and
+    /// [`Self::seed_from_target`]. The engine imports/gathers these bytes in
+    /// the draw command buffer and falls back to their host aliases if import
+    /// is unavailable, so the runtime never needs to allocate a framebuffer to
+    /// express the surface's own contents.
+    pub target_guest_seed: Option<GuestTargetSeed>,
     /// Byte order of the CPU seed above, relative to the attachment it seeds.
     ///
     /// The attachment's order is [`TargetIdentity::is_bgra`] and nothing else.
@@ -397,12 +460,38 @@ pub struct DrawRequest {
     pub color_write_mask: ColorWriteMask,
     /// Protocol-derived target identity for GPU residency (workstream D).
     pub target_identity: Option<TargetIdentity>,
+    /// Format of colour attachment zero's texture view.
+    ///
+    /// This can differ from [`TargetIdentity::resident_format`] without naming
+    /// another allocation. Metal texture views over one surface commonly use
+    /// the linear and sRGB members of one format-compatibility class; Vulkan
+    /// represents that distinction on the image view and render pass.
+    pub color_attachment_format: Option<vk::Format>,
+    /// Stable shared allocation that may back the primary resident image
+    /// directly.
+    ///
+    /// This is the retained backing named by the guest surface, not a staging
+    /// source. The runtime only constructs it after revalidating the mapping's
+    /// page ownership and obtaining a host alias whose lifetime covers the
+    /// device. The Vulkan engine still verifies the complete image-binding
+    /// equation (layout offset, row pitch, allocation extent and memory type)
+    /// before using it; any mismatch keeps the ordinary resident image.
+    pub guest_target_memory: Option<GuestTargetMemory>,
+    /// Load the primary attachment's prior contents from
+    /// [`Self::guest_target_memory`] when that backing is admitted.
+    ///
+    /// Separate from carrying the backing because CLEAR and DontCare Stores
+    /// should still render directly into guest memory while discarding its old
+    /// texels. This is true only when the guest's load source is that same
+    /// surface allocation, never for an explicit texture-derived seed.
+    pub load_guest_target_backing: bool,
     /// Load the live GPU image for [`DrawRequest::target_identity`] instead of
     /// seeding the attachment from the CPU. Requires that resident to exist.
     ///
-    /// This, `target_rgba8` and [`DrawRequest::target_clear`] are the whole
-    /// load action, and they are ordered: `load_from_target` wins, else a seed
-    /// is uploaded, else the attachment clears to `target_clear`.
+    /// This, [`Self::target_rgba8`], [`Self::target_guest_seed`] and
+    /// [`DrawRequest::target_clear`] are the whole load action, and they are
+    /// ordered: `load_from_target` wins, else exactly one seed is copied, else
+    /// the attachment clears to `target_clear`.
     pub load_from_target: bool,
     /// Clear value for the primary colour attachment, in semantic float
     /// channels — the same shape [`SecondaryColorTarget::clear`] has carried all
@@ -425,6 +514,13 @@ pub struct DrawRequest {
     /// When true, skip full-frame readback (non-Store / ticket path). Content
     /// remains on the GPU under `target_identity` when provided.
     pub skip_readback: bool,
+    /// Publish a Store into an admitted guest-backed primary attachment to the
+    /// guest-write completion ledger in this draw's engine transaction.
+    ///
+    /// This is meaningful only when the resolved target is actually backed by
+    /// [`Self::guest_target_memory`]. An ordinary resident ignores it and keeps
+    /// the copied-resource writeback path.
+    pub record_guest_store: bool,
     /// Present-boundary GPU seed: copy this READY resident target's content
     /// into the draw target before the pass (which then runs with LOAD),
     /// eliding the CPU front-frame read + full-frame seed upload. Requires
@@ -470,6 +566,99 @@ pub struct DrawRequest {
     /// an INPUT_ATTACHMENT descriptor pointing at the color target's view.
     /// `false` (default) keeps the pass byte-identical to the pre-fetch engine.
     pub color_input: bool,
+    /// The preceding engine request belongs to this draw's Metal render
+    /// encoder. Used only when its Vulkan pass is still open and identical.
+    pub continues_render_pass: bool,
+    /// The decoded Metal render encoder contains another draw after this one.
+    /// Allows the Vulkan pass to remain open across the engine-call boundary.
+    pub render_pass_continues: bool,
+}
+
+impl DrawRequest {
+    /// Whether this draw binds `identity` as one of its own attachments.
+    ///
+    /// Sampling an attachment the same draw renders into is an attachment
+    /// feedback loop. Vulkan requires that relationship to be declared through
+    /// an optional extension; `exec` binds the resident under that contract
+    /// where available and snapshots it on every other host or view shape.
+    ///
+    /// **Every attachment, not just the primary.** The test used to be
+    /// `req.target_identity == Some(identity)` written at the one call site,
+    /// which is slot 0 alone: a draw sampling one of its own MRT secondaries or
+    /// its own depth target compared unequal and took the bind-it-directly arm.
+    /// `SecondaryColorTarget::identity` exists precisely so a later draw can
+    /// sample that attachment, so the same-draw case is reachable by
+    /// construction rather than hypothetically.
+    ///
+    /// Widening this can only select an attachment-safe disposition: the native
+    /// extension rail when its narrower view contract also holds, or the
+    /// snapshot fallback otherwise.
+    pub fn writes_attachment(&self, identity: &TargetIdentity) -> bool {
+        self.attachment_slot(identity).is_some()
+    }
+
+    /// The colour-attachment index occupied by `identity`, with primary at
+    /// zero and MRT secondaries following in framebuffer order.
+    ///
+    /// Vulkan's feedback-loop layout is selected per attachment, so the exact
+    /// index is part of the answer. Keeping that ordering here beside the
+    /// request fields prevents the render-pass builder and sampled resolver
+    /// from each reconstructing it differently.
+    pub fn color_attachment_index(&self, identity: &TargetIdentity) -> Option<usize> {
+        if self.target_identity.as_ref() == Some(identity) {
+            Some(0)
+        } else {
+            self.secondary_targets
+                .iter()
+                .position(|target| &target.identity == identity)
+                .map(|index| index + 1)
+        }
+    }
+
+    /// Which of this draw's attachments `identity` is, when it is one.
+    ///
+    /// The slot is carried rather than a bare `bool` so the census can say which
+    /// of the three matched, and two of the three answers are alarms: `Primary`
+    /// is the long-handled case, while a `Secondary` or `Depth` firing is a draw
+    /// the primary-only test used to hand the driver as a live feedback loop.
+    /// Zero on those two is the healthy reading.
+    pub fn attachment_slot(&self, identity: &TargetIdentity) -> Option<AttachmentSlot> {
+        if let Some(index) = self.color_attachment_index(identity) {
+            Some(if index == 0 {
+                AttachmentSlot::Primary
+            } else {
+                AttachmentSlot::Secondary
+            })
+        } else if self.depth.as_ref().and_then(|d| d.identity.as_ref()) == Some(identity) {
+            Some(AttachmentSlot::Depth)
+        } else {
+            None
+        }
+    }
+}
+
+/// Which attachment of a draw a sampled identity turned out to be.
+///
+/// A type rather than the slot number it could have been: these three are this
+/// crate's own vocabulary rather than a guest value, and the consumers are a
+/// census name and a snapshot decision, so an integer would cost the
+/// exhaustiveness check at both and buy nothing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachmentSlot {
+    Primary,
+    Secondary,
+    Depth,
+}
+
+impl AttachmentSlot {
+    /// The census route for a draw that samples this attachment of its own.
+    pub fn sampled_self_route(self) -> &'static str {
+        match self {
+            Self::Primary => "sampled_self_primary",
+            Self::Secondary => "sampled_self_secondary",
+            Self::Depth => "sampled_self_depth",
+        }
+    }
 }
 
 /// How many viewport/scissor slots one draw rasterizes into.
@@ -543,6 +732,22 @@ pub struct SecondaryColorTarget {
 #[derive(Debug, Default)]
 pub struct DrawOutput {
     pub pixels: Vec<u8>,
+    /// Whether color attachment zero was rendered through the retained guest
+    /// allocation supplied on this request.
+    ///
+    /// Reported by the engine rather than inferred by the runtime: capability,
+    /// layout, memory-type and creation checks can all send one request to the
+    /// ordinary resident fallback, and only the engine knows which image the
+    /// draw actually encoded against.
+    pub target_guest_backed: bool,
+    /// Whether this draw recorded its guest-backed Store in the completion
+    /// ledger before releasing the engine transaction.
+    pub guest_store_recorded: bool,
+    /// Exact physical pages retained by the guest-backed target whose Store was
+    /// recorded. The runtime publishes this same admitted footprint to its
+    /// coherence ledgers instead of reconstructing it from mutable mapping
+    /// state after the engine transaction.
+    pub guest_store_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint>,
     /// Physical channel order of `pixels`: BGRA8 when true, semantic RGBA8
     /// otherwise. Empty when `skip_readback`, in which case this states the
     /// order the attachment *would* have read back in.
@@ -628,30 +833,8 @@ pub struct IndexedDrawResource {
     pub index_type: IndexType,
     pub index_count: u32,
     pub vertex_offset: i32,
-    pub indices: Vec<u8>,
-}
-
-impl IndexedDrawResource {
-    pub(crate) fn index_range(&self) -> (u32, u32) {
-        let mut min = u32::MAX;
-        let mut max = 0u32;
-        for i in 0..self.index_count as usize {
-            let v = match self.index_type {
-                IndexType::U16 => {
-                    u16::from_le_bytes([self.indices[i * 2], self.indices[i * 2 + 1]]) as u32
-                }
-                IndexType::U32 => u32::from_le_bytes([
-                    self.indices[i * 4],
-                    self.indices[i * 4 + 1],
-                    self.indices[i * 4 + 2],
-                    self.indices[i * 4 + 3],
-                ]),
-            };
-            min = min.min(v);
-            max = max.max(v);
-        }
-        (min, max)
-    }
+    /// Exact resource window consumed by the fixed-function index fetch.
+    pub content: BufferContent,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -774,7 +957,7 @@ pub struct StorageBufferResource {
     pub content: BufferContent,
 }
 
-/// Where a draw-time buffer's bytes come from (vertex attribute streams and
+/// Where a draw-time buffer's bytes come from (vertex streams, index input and
 /// storage/SSBO binds).
 ///
 /// `Bytes` is the CPU staging origin: the runtime read the guest span at
@@ -838,18 +1021,28 @@ impl BufferContent {
             Self::Bytes(b) => std::borrow::Cow::Borrowed(b.as_slice()),
             Self::GuestRuns(src) => {
                 let mut out = Vec::with_capacity(src.total_len as usize);
+                let mut skip = src.source_offset;
                 for run in src.runs.iter() {
                     let take = (src.total_len as usize).saturating_sub(out.len());
                     if take == 0 {
                         break;
                     }
-                    let n = (run.len as usize).min(take);
+                    if skip >= run.len {
+                        skip -= run.len;
+                        continue;
+                    }
+                    let within = skip as usize;
+                    skip = 0;
+                    let n = (run.len as usize).saturating_sub(within).min(take);
                     // SAFETY: `host_ptr` is a stable RAMBlock alias from
                     // `HostOps::map_pages`, valid for the VM lifetime; the
                     // read races guest CPU writes exactly like the staging
                     // path's `read_task_gva_by_id` copy does.
                     unsafe {
-                        let slice = std::slice::from_raw_parts(run.host_ptr as *const u8, n);
+                        let slice = std::slice::from_raw_parts(
+                            (run.host_ptr as *const u8).add(within),
+                            n,
+                        );
                         out.extend_from_slice(slice);
                     }
                 }
@@ -869,6 +1062,10 @@ impl From<Vec<u8>> for BufferContent {
 #[derive(Debug)]
 pub struct SampledImageResource {
     pub binding: u32,
+    /// Element within the Vulkan descriptor array at [`Self::binding`].
+    pub array_element: u32,
+    /// Declared descriptor-array cardinality. Scalar Metal textures carry one.
+    pub descriptor_count: u32,
     pub width: u32,
     pub height: u32,
     pub layers: u32,
@@ -880,7 +1077,19 @@ pub struct SampledImageResource {
     /// shader's declared 1D image. `height` is 1; `arrayed` selects
     /// `TYPE_1D_ARRAY`. Mutually exclusive with `volume` and `cube`.
     pub one_dim: bool,
+    /// The shader declares a multisampled 2D image at this binding. Such an
+    /// image can only come from a retained multisample target; linear bytes
+    /// cannot be uploaded into one with a buffer-to-image copy.
+    pub multisampled: bool,
     pub source: SampledSource,
+    /// API resource family that produced [`SampledSource::Bytes`].
+    ///
+    /// This is accounting metadata, not an execution selector: it cannot change
+    /// how a texture is validated, cached, uploaded, or sampled. Keeping the
+    /// family on the resource lets the upload site attribute only bytes that
+    /// actually missed the sampled-image cache; counting at the runtime
+    /// resolver would charge cache hits as copies that never happened.
+    pub byte_origin: SampledByteOrigin,
     /// Format the image and its view are created with, and the layout
     /// [`SampledSource::Bytes`] / [`SampledSource::GuestRuns`] content is read
     /// as (ignored for [`SampledSource::Target`], which carries its own
@@ -902,6 +1111,24 @@ pub struct SampledImageResource {
     /// content rail it was already on, including the zero-copy one — a CPU
     /// remap would force every swizzled bind onto the upload path.
     pub swizzle: crate::contract::pixel_format::SwizzlePlan,
+}
+
+/// Contract-level source of a CPU-materialized sampled image.
+///
+/// The variants follow the decoded resource families rather than call sites so
+/// the census can identify an API rail that should expose stronger backing
+/// guarantees. [`Self::Synthetic`] covers tests and the fail-visible neutral
+/// texture used after an unbound guest resource.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SampledByteOrigin {
+    #[default]
+    Synthetic,
+    AttachmentAlias,
+    BufferBackedTexture,
+    SerializedSurfaceView,
+    SurfaceHostCache,
+    SurfaceGuestFallback,
+    LinearTexture,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
@@ -1217,6 +1444,8 @@ pub struct ComputeBufferOutput {
 #[derive(Debug)]
 pub struct ComputeStorageImageResource {
     pub binding: u32,
+    pub array_element: u32,
+    pub descriptor_count: u32,
     pub format: StorageImageFormat,
     pub width: u32,
     pub height: u32,
@@ -1264,6 +1493,8 @@ pub struct ComputeStorageResidency {
 #[derive(Debug)]
 pub struct ComputeSampledImageResource {
     pub binding: u32,
+    pub array_element: u32,
+    pub descriptor_count: u32,
     pub format: StorageImageFormat,
     pub width: u32,
     pub height: u32,
@@ -1332,6 +1563,30 @@ pub enum StorageImageFormat {
     /// `R16G16B16A16_UNORM` and `STORAGE_IMAGE` is not, which is the whole of why
     /// it sits here rather than in the storage selector.
     Rgba16Unorm,
+    /// Ten bits per colour channel and two of alpha in one packed word, red in
+    /// the low bits (`MTLPixelFormatRGB10A2Unorm`); **sampled-image only**.
+    ///
+    /// Here for [`Self::R16Unorm`]'s reason: Vulkan mandates
+    /// `A2B10G10R10_UNORM_PACK32` for `SAMPLED_IMAGE` and
+    /// `SAMPLED_IMAGE_FILTER_LINEAR` and mandates nothing for `STORAGE_IMAGE`,
+    /// so it is reachable through `translate::pixel::sampled_image` and not
+    /// through `translate::pixel::storage_image`.
+    Rgb10a2Unorm,
+    /// [`Self::Rgb10a2Unorm`] with the colour channels the other way round in
+    /// the word (`MTLPixelFormatBGR10A2Unorm`); **sampled-image only**.
+    ///
+    /// One caveat its two neighbours do not carry:
+    /// `A2R10G10B10_UNORM_PACK32` is **not** in Vulkan's mandatory format
+    /// table at all, where `A2B10G10R10_UNORM_PACK32` and
+    /// `B10G11R11_UFLOAT_PACK32` are. A host without it fails image creation
+    /// and declines by name, which is the same work the guest lost when the
+    /// format was refused at decode — but a capability gate would say so before
+    /// the allocation rather than after it, and that gate is not written.
+    Bgr10a2Unorm,
+    /// Eleven bits of red and green, ten of blue, no alpha, in one packed word
+    /// (`MTLPixelFormatRG11B10Float`); **sampled-image only**, for
+    /// [`Self::Rgb10a2Unorm`]'s reason.
+    Rg11b10Float,
 }
 
 impl StorageImageFormat {
@@ -1355,7 +1610,10 @@ impl StorageImageFormat {
             | Self::R32Uint
             | Self::R32Sint
             | Self::R32Float
-            | Self::Rgb9e5Ufloat => 4,
+            | Self::Rgb9e5Ufloat
+            | Self::Rgb10a2Unorm
+            | Self::Bgr10a2Unorm
+            | Self::Rg11b10Float => 4,
         }
     }
 }
@@ -1365,6 +1623,14 @@ impl StorageImageFormat {
 // ---------------------------------------------------------------------------
 
 /// Protocol-derived render-target identity (resource state, not content hash).
+///
+/// Every field of every variant is a scalar the protocol handed over, so an
+/// identity is a *value* and never a handle. That is what lets
+/// [`crate::runtime::writeback_debt::WritebackDebt`] hold one without breaking
+/// the rule its module doc states — the rail this replaces held resolved host
+/// pointers and corrupted the guest's page tables with them. It is `Clone` and
+/// not `Copy` only because several hundred call sites spell the clone, and
+/// rewriting them would bury whatever change asked for it.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum TargetIdentity {
     /// Type-4 mapping / surface id namespace.
@@ -1450,8 +1716,6 @@ pub enum TargetIdentity {
 /// value of recording this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResidentReclaim {
-    /// The idle drain aged it out. A terminal destroy, not a recycle.
-    IdleDrained,
     /// An allocation was refused and the reclaim retry gave it back, because it
     /// was neither pinned nor the only copy of its pixels. A terminal destroy of
     /// the image, but not of the pixels — the guest's own pages still hold them,
@@ -1460,14 +1724,18 @@ pub enum ResidentReclaim {
     /// `registry_ensure` replaced it for the same identity at a new geometry,
     /// generation or format.
     Recreated,
+    /// The serialized resource that owned this resident was explicitly deleted
+    /// or replaced. The guest ended the resource lifetime, so the host object no
+    /// longer participates in allocation-pressure recovery.
+    ResourceReleased,
 }
 
 impl ResidentReclaim {
     pub fn slug(self) -> &'static str {
         match self {
-            Self::IdleDrained => "idle_drained",
             Self::AllocationReclaimed => "allocation_reclaimed",
             Self::Recreated => "recreated",
+            Self::ResourceReleased => "resource_released",
         }
     }
 }
@@ -1492,6 +1760,52 @@ pub struct WindowPresentSource {
 impl Default for TargetIdentity {
     fn default() -> Self {
         Self::Anonymous { slot: 0 }
+    }
+}
+
+/// Why a registry lookup missed, given the closest key the registry does hold.
+///
+/// A miss is not one finding. The registry is keyed by whole
+/// [`TargetIdentity`], so every field of it can be the reason, and each has a
+/// different repair: a namespace difference is two producers disagreeing about
+/// which object this is, a geometry difference is a surface that resized under
+/// a caller holding the old extent, a generation difference is a key that moved
+/// between the draw and the reader, and `Other` is a format. Reporting the miss
+/// without saying which sent one session hunting a stale generation that was
+/// the minority case.
+///
+/// Ordered from coarsest to finest, and answered as the *first* difference
+/// rather than the only one — the same rule
+/// [`super::pools::PassEchoField`] states for its own ladder, and for the same
+/// reason: two identities in different namespaces are not about one object, so
+/// nothing finer about them is worth reporting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetKeyDivergence {
+    /// Nothing in the registry names this object at all.
+    Absent,
+    /// The registry holds this id in a different namespace — a mapping id
+    /// against a texture ref, a GVA against a surface.
+    Namespace,
+    /// Same object, different extent.
+    Geometry,
+    /// Same object and extent, and the key moved.
+    Generation,
+    /// Same object and extent, and re-generating still does not match. The only
+    /// field left is the format, and a new field would land here too rather
+    /// than be misreported as one of the above.
+    Other,
+}
+
+impl TargetKeyDivergence {
+    /// The name this goes on the fail line as.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Namespace => "namespace",
+            Self::Geometry => "geometry",
+            Self::Generation => "generation",
+            Self::Other => "other",
+        }
     }
 }
 
@@ -1521,6 +1835,63 @@ impl TargetIdentity {
             | Self::Gva { generation, .. } => *generation,
             Self::Anonymous { .. } => 0,
         }
+    }
+
+    /// Which namespace this identity is in, and what names it there.
+    ///
+    /// Two identities with the same answer are about the same guest object; two
+    /// with different answers cannot be, whatever else they agree on. That is
+    /// what splits "the registry holds nothing for this key" into "it holds
+    /// nothing for this object" and "it holds this object under a key differing
+    /// in geometry, format or generation" — see [`TargetKeyDivergence`].
+    ///
+    /// The discriminant is folded in rather than returned beside the value: a
+    /// mapping id 7 and a texture ref 7 are different objects, and a bare `u64`
+    /// would call them one.
+    pub fn namespaced_id(&self) -> (u8, u64) {
+        match self {
+            Self::Surface { id, .. } => (0, u64::from(*id)),
+            Self::Texture { ref_, .. } => (1, u64::from(*ref_)),
+            Self::Gva { gva, .. } => (2, *gva),
+            Self::Anonymous { slot } => (3, *slot),
+        }
+    }
+
+    /// How `held` differs from this identity, for a registry lookup that missed.
+    pub fn diverges_from(&self, held: &Self) -> TargetKeyDivergence {
+        if self.namespaced_id() != held.namespaced_id() {
+            return TargetKeyDivergence::Namespace;
+        }
+        if (self.width(), self.height()) != (held.width(), held.height()) {
+            return TargetKeyDivergence::Geometry;
+        }
+        // Whatever is left is spared by re-generation or it is not. Asked with
+        // `PartialEq` so a field this enum gains lands in `Other` rather than
+        // being reported as a generation difference it is not.
+        if self.with_generation(held.generation()) == *held {
+            return TargetKeyDivergence::Generation;
+        }
+        TargetKeyDivergence::Other
+    }
+
+    /// The same target named at a different generation.
+    ///
+    /// Exists so that "is this the same surface under a newer key?" can be asked
+    /// with `PartialEq` rather than by a hand-written field-by-field comparison:
+    /// `a.with_generation(b.generation()) == *b` is total over every field this
+    /// enum has now and every one it gains, where a comparison spelling out the
+    /// fields it cares about goes stale the moment one is added. `Anonymous`
+    /// carries no generation, so it is returned unchanged and compares as
+    /// itself.
+    pub fn with_generation(&self, generation: u64) -> Self {
+        let mut next = self.clone();
+        match &mut next {
+            Self::Surface { generation: g, .. }
+            | Self::Texture { generation: g, .. }
+            | Self::Gva { generation: g, .. } => *g = generation,
+            Self::Anonymous { .. } => {}
+        }
+        next
     }
 
     /// Physical channel order of the resident image behind this identity.
@@ -1559,7 +1930,7 @@ impl TargetIdentity {
     /// disagree, and every readback reports the order it copied. The identity
     /// is the only place the answer was pinned to a namespace.
     pub fn is_bgra(&self) -> bool {
-        self.resident_format() == translate::pixel::SCANOUT_FORMAT
+        translate::pixel::has_bgra_order(self.resident_format())
     }
 
     /// Whether these two identities name the same destination, whatever format
@@ -1603,9 +1974,7 @@ impl TargetIdentity {
         match self {
             Self::Surface { format, .. } => *format,
             Self::Gva { format, .. } => *format,
-            Self::Texture { .. } | Self::Anonymous { .. } => {
-                translate::pixel::RESIDENT_RGBA_FORMAT
-            }
+            Self::Texture { .. } | Self::Anonymous { .. } => translate::pixel::RESIDENT_RGBA_FORMAT,
         }
     }
 }
@@ -1635,19 +2004,16 @@ pub enum SampledSource {
     Bytes(std::sync::Arc<Vec<u8>>),
     /// Bind a prior GPU-resident target directly (no CPU round-trip).
     Target(TargetIdentity),
-    /// Zero-copy guest origin: the GPU gathers the texel bytes from imported
-    /// guest RAM inside the draw's own command buffer (two-hop: imported
-    /// buffer → pooled scratch → image). No CPU read and no hash — guest CPU
-    /// writes are observed at execute time (at least as fresh as the CPU path's
-    /// encode-time read).
+    /// Guest-memory origin. A resource-owned packed allocation binds as a
+    /// linear sampled image directly; hosts or layouts that decline it retain
+    /// the copy-backed route from imported buffers into an optimal image. No
+    /// CPU read or hash is required on either GPU route.
     ///
-    /// The gather is elided where a retained image already answers to the bind's
+    /// A copy is elided where a retained image already answers to the bind's
     /// identity, which is what [`crate::runtime::gather_witness::GatherVouch`]
-    /// says is possible. `Fresh` means the identity was minted this bind and no
-    /// retained image can match it, so the copy runs and the result is retained
-    /// for the next bind to hit; carrying it lets the engine report *why* a
-    /// gather happened instead of inferring it from the identity being present,
-    /// which it always is.
+    /// says is possible. Resource-owned direct images carry no copied-content
+    /// identity. If the backend declines one, the copy fallback therefore runs
+    /// conservatively instead of reusing content that was never witnessed.
     GuestRuns(GuestRunSource, crate::runtime::gather_witness::GatherVouch),
 }
 
@@ -1661,8 +2027,9 @@ pub struct GuestRun {
     pub len: u64,
 }
 
-/// Zero-copy sampled source: `runs` cover the linear texel window in order
-/// (`sum(len) == total_len`). With `row_length_texels == 0` the window is
+/// Guest-RAM texel source: the requested window is
+/// `source_offset..source_offset + total_len` inside `runs`. With
+/// `row_length_texels == 0` the window is
 /// tight (`total_len == tight_row_bytes * height`); a nonzero value gives
 /// the guest row stride in texels for padded layouts, and the window then
 /// spans `(height-1) * stride_bytes + tight_row_bytes` (the final row needs
@@ -1673,6 +2040,12 @@ pub struct GuestRun {
 #[derive(Clone, Debug)]
 pub struct GuestRunSource {
     pub runs: std::sync::Arc<Vec<GuestRun>>,
+    /// First byte of the requested window inside `runs` and `pages`.
+    ///
+    /// Normally zero. Task buffers reconstructed as one stable allocation keep
+    /// one source per resource and vary this offset at bind time, just as the
+    /// guest command carries one buffer reference plus an offset.
+    pub source_offset: u64,
     pub total_len: u64,
     /// Guest row stride in texels for the buffer→image copy
     /// (`bufferRowLength`); 0 = tight rows.
@@ -1705,6 +2078,141 @@ pub struct GuestRunSource {
     /// `Arc` because a source is cloned per bind and these are shared, immutable
     /// and never rebuilt.
     pub pages: Option<std::sync::Arc<Vec<crate::runtime::guest_ram_map::GuestWindowRun>>>,
+    /// One resource-owned packed allocation that can back a linear sampled
+    /// image directly. When the host declines that image layout, `runs` and
+    /// `pages` remain the complete copy-backed fallback for the same texels.
+    pub direct_image: Option<GuestSampledBacking>,
+}
+
+/// One stretch of a [`GuestRunSource`]'s window, already clipped to it.
+///
+/// `skip` is the distance from the stretch's own first requested byte to the
+/// first byte of the window that lands in it, and `window_offset` is where those
+/// bytes belong in the assembled window. Neither is the number nearest to hand:
+/// a [`crate::runtime::guest_ram_map::GuestWindowRun`] is positioned against the
+/// whole allocation its `pages` list describes, while the window is
+/// `source_offset..source_offset + total_len` inside that.
+#[derive(Debug)]
+pub struct WindowStretch<'a> {
+    pub guest: &'a crate::runtime::guest_ram::GuestRef,
+    pub skip: u64,
+    pub window_offset: u64,
+    pub len: u64,
+}
+
+impl GuestRunSource {
+    /// This source's window as the single guest stretch holding it, when it is
+    /// one — the arm that binds the import in place with nothing copied.
+    ///
+    /// A single run starting at allocation byte zero *is* the whole allocation:
+    /// [`crate::runtime::guest_ram_map::references_for_runs`] guarantees the runs
+    /// ascend and tile it exactly, so one of them covering byte zero leaves
+    /// nothing else to name. Anything longer has to be gathered, because a
+    /// vertex, index, storage or copy source names one contiguous range.
+    ///
+    /// The window still need not start at that stretch's first byte: a mapped
+    /// sampled plane names the whole allocation as its one stretch and puts the
+    /// plane's own offset in `source_offset`, which is what [`WindowStretch::skip`]
+    /// carries. `None` when the window is scattered, or when it does not fit
+    /// inside the one stretch named, which is a malformed source rather than a
+    /// slow one.
+    pub fn single_stretch(&self) -> Option<WindowStretch<'_>> {
+        let [only] = self.pages.as_ref()?.as_slice() else {
+            return None;
+        };
+        if only.window_offset != 0 {
+            return None;
+        }
+        let end = self.source_offset.checked_add(self.total_len)?;
+        if end > only.guest.requested() {
+            return None;
+        }
+        Some(WindowStretch {
+            guest: &only.guest,
+            skip: self.source_offset,
+            window_offset: 0,
+            len: self.total_len,
+        })
+    }
+
+    /// Every stretch this source's window touches, in window order, each
+    /// clipped to the window. Stretches the window does not reach are absent
+    /// rather than empty, so the lengths sum to [`Self::total_len`] exactly.
+    pub fn window_stretches(&self) -> Option<impl Iterator<Item = WindowStretch<'_>> + '_> {
+        let pages = self.pages.as_ref()?;
+        let wanted_end = self.source_offset.checked_add(self.total_len)?;
+        Some(pages.iter().filter_map(move |run| {
+            let run_end = run.window_offset.checked_add(run.guest.requested())?;
+            let start = run.window_offset.max(self.source_offset);
+            let end = run_end.min(wanted_end);
+            if start >= end {
+                return None;
+            }
+            Some(WindowStretch {
+                guest: &run.guest,
+                skip: start - run.window_offset,
+                window_offset: start - self.source_offset,
+                len: end - start,
+            })
+        }))
+    }
+}
+
+/// A render attachment's prior contents, read from the surface's own guest
+/// pages rather than materialized as a host framebuffer.
+///
+/// `source` carries both representations of the same window: bounded RAMBlock
+/// references for the native import rail and stable host aliases for its exact
+/// CPU fallback. `format` is the guest plane's physical texel layout; a raw
+/// buffer→image copy performs no conversion, so validation requires it to equal
+/// the attachment format before either representation may be used.
+#[derive(Clone, Debug)]
+pub struct GuestTargetSeed {
+    pub source: GuestRunSource,
+    pub format: ash::vk::Format,
+}
+
+/// One guest surface plane within a stable shared host allocation.
+///
+/// `allocation_host_ptr..allocation_len` is the object imported into Vulkan.
+/// `plane_offset` identifies the attachment's first texel within it, while
+/// `row_pitch` is the plane's declared physical stride. Keeping the whole
+/// allocation and the plane coordinates together is what lets the engine
+/// derive `vkBindImageMemory`'s offset without manufacturing a pointer before
+/// the plane or extending the import past its real bound.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GuestTargetBacking {
+    pub allocation_host_ptr: usize,
+    pub allocation_len: u64,
+    pub plane_offset: u64,
+    pub row_pitch: u64,
+}
+
+/// A sampled plane within the packed allocation retained for its guest
+/// resource. The import owns the checked allocation bound; `backing` carries
+/// only the image-layout coordinates derived inside that bound.
+#[derive(Clone, Debug)]
+pub struct GuestSampledBacking {
+    pub backing: GuestTargetBacking,
+    pub import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
+    /// The serialized resource that owns this image. The engine keeps this
+    /// weak so its cache cannot extend the guest-visible resource lifetime.
+    pub owner: crate::model::TaskResourceLifetimeRef,
+    /// Resource family for accounting only; never an execution selector.
+    pub origin: SampledByteOrigin,
+}
+
+/// An importable guest allocation and the physical pages it owns.
+///
+/// Keeping these together makes the retained resource its own synchronization
+/// authority: once admitted, the engine can publish the exact footprint that
+/// was validated with the allocation instead of reconstructing it at Store.
+#[derive(Clone, Debug)]
+pub struct GuestTargetMemory {
+    pub backing: GuestTargetBacking,
+    /// The parent allocation whose one backend import all child views share.
+    pub import: std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
+    pub footprint: crate::runtime::guest_ram::GuestPageFootprint,
 }
 
 /// Producer-assigned identity + generation for CPU-sourced sampled content.
@@ -1726,29 +2234,100 @@ pub struct SampledContentIdentity {
 mod tests {
     use super::*;
 
+    /// A draw that samples one of its own attachments must reach the snapshot
+    /// arm, and "its own" is every attachment it binds rather than slot 0.
+    ///
+    /// The secondary and depth cases below are the ones that fail against the
+    /// primary-only test this replaced, which is what makes them worth writing:
+    /// each was a live attachment feedback loop handed to the driver.
     #[test]
-    fn indexed_draw_range_decodes_both_wire_index_widths() {
-        let u16_draw = IndexedDrawResource {
-            index_type: IndexType::U16,
-            index_count: 4,
-            vertex_offset: 0,
-            indices: [9u16, 2, 17, 4]
-                .into_iter()
-                .flat_map(u16::to_le_bytes)
-                .collect(),
+    fn a_draw_samples_its_own_attachment_on_every_slot_that_can_carry_one() {
+        let surface = |id: u32| TargetIdentity::Surface {
+            id,
+            width: 64,
+            height: 64,
+            generation: 0,
+            format: vk::Format::B8G8R8A8_UNORM,
         };
-        assert_eq!(u16_draw.index_range(), (2, 17));
 
-        let u32_draw = IndexedDrawResource {
-            index_type: IndexType::U32,
-            index_count: 3,
-            vertex_offset: 0,
-            indices: [u32::MAX, 7, 99]
-                .into_iter()
-                .flat_map(u32::to_le_bytes)
-                .collect(),
+        let mut req = DrawRequest {
+            target_identity: Some(surface(1)),
+            ..DrawRequest::default()
         };
-        assert_eq!(u32_draw.index_range(), (7, u32::MAX));
+        assert!(req.writes_attachment(&surface(1)), "primary colour");
+        assert!(
+            !req.writes_attachment(&surface(9)),
+            "a target this draw does not bind is not a feedback loop, and \
+             routing it through the snapshot would cost a copy per draw"
+        );
+
+        req.secondary_targets.push(SecondaryColorTarget {
+            identity: surface(2),
+            width: 64,
+            height: 64,
+            format: vk::Format::B8G8R8A8_UNORM,
+            clear: [0.0; 4],
+            load: false,
+            blend: None,
+            color_write_mask: ColorWriteMask::default(),
+        });
+        assert!(req.writes_attachment(&surface(2)), "MRT secondary");
+        assert_eq!(
+            req.attachment_slot(&surface(2)),
+            Some(AttachmentSlot::Secondary),
+            "the census has to be able to say which slot matched"
+        );
+        assert_eq!(req.color_attachment_index(&surface(1)), Some(0));
+        assert_eq!(req.color_attachment_index(&surface(2)), Some(1));
+        assert_eq!(
+            req.attachment_slot(&surface(1)),
+            Some(AttachmentSlot::Primary)
+        );
+
+        req.depth = Some(DepthState {
+            identity: Some(surface(3)),
+            test_enable: true,
+            write_enable: true,
+            compare: SamplerCompareFunction::Less,
+            clear_value: 1.0,
+            load: false,
+            stencil: None,
+        });
+        assert!(req.writes_attachment(&surface(3)), "depth");
+        assert_eq!(
+            req.attachment_slot(&surface(3)),
+            Some(AttachmentSlot::Depth)
+        );
+        assert_eq!(req.attachment_slot(&surface(9)), None);
+        // Three distinct routes, so a census reading one of them cannot be a
+        // different slot's population.
+        let routes = [
+            AttachmentSlot::Primary,
+            AttachmentSlot::Secondary,
+            AttachmentSlot::Depth,
+        ]
+        .map(AttachmentSlot::sampled_self_route);
+        assert_eq!(
+            routes
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3
+        );
+
+        // The generation is part of the identity, so a resident the guest has
+        // since rewritten is a different target and not this draw's attachment.
+        assert!(!req.writes_attachment(&TargetIdentity::Surface {
+            id: 1,
+            width: 64,
+            height: 64,
+            generation: 1,
+            format: vk::Format::B8G8R8A8_UNORM,
+        }));
+    }
+
+    #[test]
+    fn indexed_draw_widths_are_the_fixed_function_element_widths() {
         assert_eq!(IndexType::U16.byte_size(), 2);
         assert_eq!(IndexType::U32.byte_size(), 4);
     }
@@ -1790,6 +2369,114 @@ mod tests {
         assert_eq!(
             TargetIdentity::default(),
             TargetIdentity::Anonymous { slot: 0 }
+        );
+    }
+
+    /// Re-generation changes the generation and nothing else, on every variant
+    /// that has one — which is what lets "is this the same target under a newer
+    /// key?" be asked with `PartialEq` instead of a field-by-field comparison
+    /// that a new field would silently fall out of.
+    #[test]
+    fn re_generation_moves_only_the_generation() {
+        let all = [
+            TargetIdentity::Surface {
+                id: 7,
+                width: 1920,
+                height: 1080,
+                generation: 4,
+                format: translate::pixel::SCANOUT_FORMAT,
+            },
+            TargetIdentity::Texture {
+                ref_: 12,
+                width: 64,
+                height: 64,
+                generation: 4,
+                stencil: true,
+            },
+            TargetIdentity::Gva {
+                gva: 0xdead_0000,
+                width: 8,
+                height: 8,
+                generation: 4,
+                format: translate::pixel::SCANOUT_FORMAT,
+            },
+        ];
+        for identity in &all {
+            let moved = identity.with_generation(9);
+            assert_eq!(moved.generation(), 9, "{identity:?}");
+            assert_ne!(&moved, identity, "{identity:?}");
+            // The round trip is the whole claim: everything but the generation
+            // survived, so equality after restoring it is field-complete.
+            assert_eq!(&moved.with_generation(identity.generation()), identity);
+        }
+        // `Anonymous` carries no generation, so it is returned as itself rather
+        // than being given one it has nowhere to keep.
+        let anonymous = TargetIdentity::Anonymous { slot: 99 };
+        assert_eq!(anonymous.with_generation(9), anonymous);
+    }
+
+    /// The four ways a registry key can miss are told apart, and the ladder is
+    /// answered coarsest-first: two identities in different namespaces are not
+    /// about one object, so nothing finer about them is reported. A miss that
+    /// named none of these sent one session hunting the generation case, which
+    /// turned out to be the minority.
+    #[test]
+    fn a_registry_miss_names_which_field_moved() {
+        let asked = TargetIdentity::Surface {
+            id: 7,
+            width: 1920,
+            height: 1080,
+            generation: 2,
+            format: translate::pixel::SCANOUT_FORMAT,
+        };
+        assert_eq!(
+            asked.diverges_from(&asked.with_generation(1)),
+            TargetKeyDivergence::Generation
+        );
+        assert_eq!(
+            asked.diverges_from(&TargetIdentity::Surface {
+                id: 7,
+                width: 1920,
+                height: 900,
+                generation: 2,
+                format: translate::pixel::SCANOUT_FORMAT,
+            }),
+            TargetKeyDivergence::Geometry
+        );
+        assert_eq!(
+            asked.diverges_from(&TargetIdentity::Texture {
+                ref_: 7,
+                width: 1920,
+                height: 1080,
+                generation: 2,
+                stencil: false,
+            }),
+            TargetKeyDivergence::Namespace
+        );
+        // A format change is what is left once the object, the extent and the
+        // generation all agree — and so is any field this enum gains, which is
+        // the point of asking the last question with `PartialEq`.
+        assert_eq!(
+            asked.diverges_from(&TargetIdentity::Surface {
+                id: 7,
+                width: 1920,
+                height: 1080,
+                generation: 2,
+                format: vk::Format::R16G16B16A16_SFLOAT,
+            }),
+            TargetKeyDivergence::Other
+        );
+        // Namespace outranks everything: a texture ref that happens to equal a
+        // mapping id must not be reported as a resize of it.
+        assert_eq!(
+            asked.diverges_from(&TargetIdentity::Texture {
+                ref_: 7,
+                width: 8,
+                height: 8,
+                generation: 99,
+                stencil: false,
+            }),
+            TargetKeyDivergence::Namespace
         );
     }
 
@@ -1874,6 +2561,8 @@ mod tests {
         for (format, bgra) in [
             (translate::pixel::RESIDENT_RGBA_FORMAT, false),
             (translate::pixel::SCANOUT_FORMAT, true),
+            (ash::vk::Format::R8G8B8A8_SRGB, false),
+            (ash::vk::Format::B8G8R8A8_SRGB, true),
         ] {
             let gva = TargetIdentity::Gva {
                 gva: 0x1000,

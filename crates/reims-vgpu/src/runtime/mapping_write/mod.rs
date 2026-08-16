@@ -841,6 +841,33 @@ fn plan_guest_window(
     })
 }
 
+/// The plane of `m` that [`write_bgra8_from_resident_gpu`] would write a frame
+/// of this extent into, as `(surface_offset, row_stride, pixel_format)`.
+///
+/// # Why a caller has to ask
+///
+/// That rail takes a mapping id and an extent and nothing else: it resolves the
+/// plane itself, from the mapping's own declaration, through the same two steps
+/// this function performs. A caller that already holds its own idea of the
+/// destination plane — the blit rail resolves one out of the guest's texture
+/// descriptor, and a type-5 view carries a **wire plane index** this rail has no
+/// parameter for — must compare the two before routing a copy here, because a
+/// disagreement is not an error anywhere: the frame lands, in the wrong plane of
+/// the right surface, and the only symptom is the next plane's pixels.
+///
+/// `None` means the rail would decline, so a caller that gets it owes the frame
+/// to whatever path it was going to take anyway. The rail names *which* check
+/// declined, through [`GpuWritebackDecline`]; this collapses them, because a
+/// pre-question only needs to know that the answer is not "yes".
+pub fn resident_gpu_plane(m: &MappingEntry, width: u32, height: u32) -> Option<(u64, u32, u16)> {
+    let (mw, mh, format) = mapping_write_geometry(m, width, height);
+    if mw != width || mh != height {
+        return None;
+    }
+    let (base_off, bpr, _span_end) = type11_sample_window(m, mw, mh, format)?;
+    Some((base_off, bpr, format))
+}
+
 /// Copy a resident target straight into the guest's pages, with the frame never
 /// existing on the host.
 ///
@@ -924,6 +951,42 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
             format,
         });
     };
+    let shared_backing = if host.map_pages_stable() {
+        mapper::ensure_contig_view(state, host, mapping_id).map(|(ptr, len)| {
+            crate::backend::vulkan::engine::GuestTargetBacking {
+                allocation_host_ptr: ptr,
+                allocation_len: len as u64,
+                plane_offset: base_off,
+                row_pitch: u64::from(bpr),
+            }
+        })
+    } else {
+        None
+    };
+    // One live window per physical format is enough to answer the remaining
+    // device-level question: whether the driver's actual linear layout and
+    // memory requirements agree with a guest plane on this host. The packed
+    // view is the allocation a direct image retains. The report remains useful
+    // because creation declines are per target and this gives the full binding
+    // equation once per physical format.
+    let probe_key = dst_format.as_raw() as u32 as u64;
+    if crate::observe::first_sight("vk_linear_target_window_probe", probe_key) {
+        if let Some(backing) = shared_backing {
+            crate::backend::vulkan::engine::probe_guest_backed_target(
+                backing.allocation_host_ptr,
+                backing.allocation_len,
+                backing.plane_offset,
+                backing.row_pitch,
+                mw,
+                mh,
+                dst_format,
+            );
+        } else {
+            crate::observe::off(format!(
+                "vk_linear_target_window verdict=no_packed_alias format={dst_format:?} {mw}x{mh} plane_offset={base_off} guest_row_pitch={bpr}"
+            ));
+        }
+    }
     // No settle here, and the twin rail is why. `render_writeback::store_gva_frame`
     // does exactly this for a GVA-addressed destination — vouch, resolve runs,
     // submit a buffer copy — and takes no settle at all, because nothing between
@@ -1030,6 +1093,7 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
         // from its width, and the engine refuses the copy outright if the
         // resident does not hold exactly this.
         format: dst_format,
+        shared_backing,
     };
     // Both witnesses before the copy rather than after it, matching
     // `contig_for_write`: a refused write costs a spurious bump, which makes a
@@ -1057,6 +1121,76 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     Ok(span_end - base_off)
 }
 
+/// Publish a Store from an attachment already backed by this mapping.
+///
+/// Import admission retained the mapping's bounded allocation and physical-page
+/// footprint in the resident. Synchronization therefore names that resident;
+/// it does not reconstruct a `GuestPageTarget`, re-walk the page table, or
+/// reacquire one guest reference per page.  Those operations describe a copy
+/// destination, and this path has no copy destination—the attachment is the
+/// guest allocation.
+#[cfg(feature = "backend-vulkan")]
+pub fn synchronize_guest_backed_resident(
+    state: &mut DeviceState,
+    mapping_id: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    width: u32,
+    height: u32,
+    guest_store_recorded: bool,
+    guest_store_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint>,
+) -> Result<u64, GpuWritebackDecline> {
+    if !scanout_extent_ok(width, height) {
+        return Err(GpuWritebackDecline::NotWritable);
+    }
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return Err(GpuWritebackDecline::NotWritable);
+    };
+    if !m.mapped || m.page_entries.is_empty() {
+        return Err(GpuWritebackDecline::NotWritable);
+    }
+    let (mw, mh, format) = mapping_write_geometry(m, width, height);
+    if mw != width || mh != height {
+        return Err(GpuWritebackDecline::GeometryMoved {
+            latched_width: mw,
+            latched_height: mh,
+            frame_width: width,
+            frame_height: height,
+        });
+    }
+    let Some((base_off, _bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
+        return Err(GpuWritebackDecline::WindowUnresolved {
+            width: mw,
+            height: mh,
+            format,
+        });
+    };
+    let footprint = if guest_store_needs_separate_sync(guest_store_recorded) {
+        crate::backend::vulkan::engine::synchronize_guest_backed_target(identity)
+            .map_err(|inner| GpuWritebackDecline::Engine { inner })?
+    } else {
+        guest_store_footprint.ok_or(GpuWritebackDecline::Engine {
+            inner: crate::backend::vulkan::engine::DrawError::GuestPageWrite(
+                crate::backend::vulkan::engine::GuestWriteDecline::NoSharedBacking,
+            ),
+        })?
+    };
+
+    mapper::note_physical_page_write_footprint(
+        &footprint,
+        base_off,
+        span_end - base_off,
+    );
+    state.host_writes.note_footprint(&footprint);
+    state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
+    let _ = state.mark_mapping_written(mapping_id);
+    crate::runtime::surface_cache::forget(state, mapping_id);
+    Ok(span_end - base_off)
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn guest_store_needs_separate_sync(recorded_in_draw: bool) -> bool {
+    !recorded_in_draw
+}
 
 /// The geometry and pixel format a writeback to this mapping must land in.
 ///
@@ -1160,12 +1294,30 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     };
     // Deferred-writeback flush-on-access: land pending resident content in
     // these pages before touching them.
-    crate::runtime::writeback_debt::settle_for_mapping(
-        state,
-        host,
-        mapping_id,
-        crate::runtime::render_writeback::SettleSite::MappingBgra8Write,
-    );
+    //
+    // Except when this write has ranges it must not touch. The payment writes the
+    // owed resident over the *whole* window with no exclusions, and the one
+    // caller that passes a skip list — `merge_guest_writes_into_pages` — passes
+    // exactly the pages the guest painted under a live resident. Paying first
+    // overwrites them, and the write below then restores everything *except*
+    // them, so the guest's repaint is destroyed by the mechanism built to keep
+    // it. What this write is about to land is the same surface at the same
+    // geometry (`GeometryMoved` above refuses anything else), so the owed frame
+    // is superseded rather than lost.
+    if skip.is_empty() {
+        crate::runtime::writeback_debt::settle_for_mapping(
+            state,
+            host,
+            mapping_id,
+            crate::runtime::render_writeback::SettleSite::MappingBgra8Write,
+        );
+    } else {
+        crate::runtime::writeback_debt::supersede_for_mapping(
+            state,
+            mapping_id,
+            crate::runtime::render_writeback::SettleSite::MappingBgra8Write,
+        );
+    }
     // Taken after the flush, because the flush can invalidate this mapping, and
     // once for the whole frame, because the loop below writes a row at a time.
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "bgra8") else {
@@ -2060,11 +2212,16 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     // `flush_intersecting` returns immediately when nothing is armed, so this
     // costs a map-empty check per read. It must also precede `contig_for_span`:
     // the flush writes through the mapping and can retire the cached view.
+    let settle_started = std::time::Instant::now();
     crate::runtime::writeback_debt::settle_for_mapping(
         state,
         host,
         mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingRectRead,
+    );
+    crate::runtime::drain::note_store_route_us(
+        "rectrd_settle_us",
+        settle_started.elapsed().as_micros() as u64,
     );
     let Some(m) = state.mappings.get(&mapping_id) else {
         return false;
@@ -2108,7 +2265,20 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
         ));
         return false;
     }
-    if let Some((ptr, _)) = contig_for_span(state, host, mapping_id, span_end) {
+    // The rail's remaining cost is per *call*, so every phase of a call is
+    // charged and the arms are disjoint: `rectrd_contig_us` covers the view
+    // revalidation both arms need, then exactly one of `rectrd_copy_us` (the
+    // packed arm's memcpy) and `rectrd_window_us` (the fragmented arm, which
+    // materialises the whole sample window however small the rect) runs. With
+    // `rectrd_settle_us` above them, the four sum to the call.
+    let contig_started = std::time::Instant::now();
+    let contig = contig_for_span(state, host, mapping_id, span_end);
+    crate::runtime::drain::note_store_route_us(
+        "rectrd_contig_us",
+        contig_started.elapsed().as_micros() as u64,
+    );
+    if let Some((ptr, _)) = contig {
+        let copy_started = std::time::Instant::now();
         // SAFETY: contig covers span_end, and read_end ≤ span_end (checked).
         let base = unsafe { (ptr as *const u8).add(base_off as usize) };
         if x_off == 0 && rb == bpr && dst_stride as usize == rb {
@@ -2130,7 +2300,14 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
                 }
             }
         }
+        crate::runtime::drain::note_store_route_us(
+            "rectrd_copy_us",
+            copy_started.elapsed().as_micros() as u64,
+        );
+        crate::runtime::drain::note_store_route("rectrd_contig_n");
     } else {
+        crate::runtime::drain::note_store_route("rectrd_frag_n");
+        let window_started = std::time::Instant::now();
         // Exact full-plane row layout: the tight texture bytes are already the
         // mapping byte window. Import fragmented GPA runs directly into the
         // caller's Vulkan staging vector instead of allocating another
@@ -2150,13 +2327,18 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
             crate::observe::off(format!(
                 "mapping_read full_tight_direct mid={mapping_id} bytes={direct_len} bpr={surface_bpr} rows={height}"
             ));
-            return mapper::read_mapping_bytes(
+            let ok = mapper::read_mapping_bytes(
                 state,
                 host,
                 mapping_id,
                 base_off,
                 &mut dst[..direct_len],
             );
+            crate::runtime::drain::note_store_route_us(
+                "rectrd_window_us",
+                window_started.elapsed().as_micros() as u64,
+            );
+            return ok;
         }
         // Materialize the fragmented sample window once. Calling
         // read_mapping_bytes for every row revalidates every page and rebuilds
@@ -2181,6 +2363,10 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
             };
             dst[dst_off..dst_off + rb].copy_from_slice(row);
         }
+        crate::runtime::drain::note_store_route_us(
+            "rectrd_window_us",
+            window_started.elapsed().as_micros() as u64,
+        );
     }
     true
 }
@@ -2373,16 +2559,37 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     // surfaces only. Safe to call from inside a flush — the storage rail reaches
     // this function through `write_full_rect_raw_at`, and `flush_intersecting`
     // removes intersecting windows up front so the nested call finds nothing.
+    // Charged in the same partition as the read side above: settle, vouch, and
+    // view revalidation are per *call*, and this rail's remaining cost is per
+    // call rather than per byte. See `rectrd_contig_us`.
+    let settle_started = std::time::Instant::now();
     crate::runtime::writeback_debt::settle_for_mapping(
         state,
         host,
         mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingRectWrite,
     );
-    let Some(vouched) = vouch_for_write(state, host, mapping_id, "rect_raw") else {
+    crate::runtime::drain::note_store_route_us(
+        "rectwr_settle_us",
+        settle_started.elapsed().as_micros() as u64,
+    );
+    let vouch_started = std::time::Instant::now();
+    let vouched = vouch_for_write(state, host, mapping_id, "rect_raw");
+    crate::runtime::drain::note_store_route_us(
+        "rectwr_vouch_us",
+        vouch_started.elapsed().as_micros() as u64,
+    );
+    let Some(vouched) = vouched else {
         return false;
     };
-    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched) {
+    let contig_started = std::time::Instant::now();
+    let contig = contig_for_write(state, host, mapping_id, span_end, &vouched);
+    crate::runtime::drain::note_store_route_us(
+        "rectwr_contig_us",
+        contig_started.elapsed().as_micros() as u64,
+    );
+    if let Some((ptr, _)) = contig {
+        crate::runtime::drain::note_store_route("rectwr_contig_n");
         // SAFETY: contig covers span_end, and write_end ≤ span_end (checked).
         let base = unsafe { (ptr as *mut u8).add(base_off as usize) };
         if x_off == 0 && rb == bpr && src_stride as usize == rb {
@@ -2405,6 +2612,7 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
             }
         }
     } else if full_plane {
+        crate::runtime::drain::note_store_route("rectwr_frag_full_n");
         // Fragmented full-plane write: stage the native row layout and import
         // each maximal packed GPA run once. Calling write_mapping_bytes once
         // per row turns a 1928-row storage-texture writeback into thousands of

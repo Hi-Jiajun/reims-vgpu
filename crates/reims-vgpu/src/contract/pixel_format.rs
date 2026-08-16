@@ -81,8 +81,50 @@ pub const MTL_FORMAT_RGBA8_UINT: u16 = 0x49;
 pub const MTL_FORMAT_RGBA8_SINT: u16 = 0x4a;
 pub const MTL_FORMAT_BGRA8_UNORM: u16 = 0x50;
 pub const MTL_FORMAT_BGRA8_UNORM_SRGB: u16 = 0x51;
+/// `MTLPixelFormatRGB10A2Unorm`. Ten bits per colour channel and two of alpha,
+/// packed into one 32-bit word with red in the low bits.
+///
+/// # Why the packed family is declared together, and why it is native
+///
+/// Metal numbers `RGB10A2Unorm`, `RGB10A2Uint`, `RG11B10Float`, `RGB9E5Float`
+/// and `BGR10A2Unorm` consecutively from 90; this table carried the fourth of
+/// the five and none of the others, so a guest naming any of the rest was
+/// refused at the *width* gate — `bytes_per_pixel` answered `None`, and
+/// [`crate::runtime::draw::effective_view_sample_format`] asks that before
+/// anything else looks at the bind. The refusal reads as "the guest asked for an
+/// illegal reinterpretation" when what happened is that this crate had never
+/// heard of the format. That is the same gap [`MTL_FORMAT_R8_UINT`] records, one
+/// storage shape over.
+///
+/// Unlike that one, three of these have an *exact* Vulkan spelling, so they do
+/// not stop at being declared: `A2B10G10R10_UNORM_PACK32`,
+/// `A2R10G10B10_UNORM_PACK32` and `B10G11R11_UFLOAT_PACK32` are the same bits in
+/// the same order, so the guest's own word is sampled unchanged. Converting one
+/// to unorm8 instead would throw away the two bits of colour resolution the
+/// guest chose the format for, which is [`TexelLayout::R16Unorm`]'s argument at
+/// a different bit depth — and [`texel_to_rgba8`] has no arm that could do it
+/// anyway.
+///
+/// This device advertises `isRGB10A2GammaSupported` to the guest
+/// (`model::regs::DEVICE_INFO_KEY_RGB10A2_GAMMA`), so a guest taking it at its
+/// word and binding one of these was being refused by the device that invited it.
+pub const MTL_FORMAT_RGB10A2_UNORM: u16 = 0x5a;
+/// `MTLPixelFormatRGB10A2Uint`. The integer twin of
+/// [`MTL_FORMAT_RGB10A2_UNORM`], declared for its width and nothing more:
+/// integer texels must not run through the unorm converters, so it has no
+/// [`TexelLayout`] and no storage selector, and both decline it by name. Same
+/// rule as [`MTL_FORMAT_R8_UINT`].
+pub const MTL_FORMAT_RGB10A2_UINT: u16 = 0x5b;
+/// `MTLPixelFormatRG11B10Float`. Eleven bits of red and green, ten of blue, no
+/// alpha, in one 32-bit word — `VK_FORMAT_B10G11R11_UFLOAT_PACK32` exactly. An
+/// HDR-intermediate colour format; see [`MTL_FORMAT_RGB10A2_UNORM`].
+pub const MTL_FORMAT_RG11B10_FLOAT: u16 = 0x5c;
 /// Packed RGB9E5 shared-exponent float. 32-bit texels.
 pub const MTL_FORMAT_RGB9E5_FLOAT: u16 = 0x5d;
+/// `MTLPixelFormatBGR10A2Unorm`. [`MTL_FORMAT_RGB10A2_UNORM`] with the colour
+/// channels the other way round in the word — `VK_FORMAT_A2R10G10B10_UNORM_PACK32`
+/// exactly, as `BGRA8Unorm` is to `RGBA8Unorm` one storage shape up.
+pub const MTL_FORMAT_BGR10A2_UNORM: u16 = 0x5e;
 /// `MTLPixelFormatRGBA16Unorm`. Its ordinal sits between two this table
 /// already carries — `RGBA16Uint` at `0x71` and `RGBA16Float` at `0x73` — and
 /// its absence was a decode gap rather than a rail gap: `bytes_per_pixel`
@@ -149,6 +191,7 @@ pub enum SampledClass {
     Rgba8Unorm,
     Bgra8Unorm,
     Rgba16Float,
+    Rg16Float,
 }
 
 /// The byte layout of one guest texel on the sampled rails, independent of any
@@ -241,6 +284,27 @@ pub enum TexelLayout {
     /// wide, so like [`Self::Rgba16Float`] it stays out of the four-byte colour
     /// rails despite being a colour order.
     Rgba16Unorm,
+    /// 4 bytes/texel — ten bits per colour channel and two of alpha in one
+    /// packed word, red in the low bits, sampled natively as
+    /// `A2B10G10R10_UNORM_PACK32`.
+    ///
+    /// `MTLPixelFormatRGB10A2Unorm` and that Vulkan format are the same bits in
+    /// the same order, so the guest's word is sampled unchanged. Native for
+    /// [`Self::R16Unorm`]'s reason two bits down: an unorm8 conversion would
+    /// discard the resolution the guest picked the format for, and
+    /// [`texel_to_rgba8`] has no arm that could cut a non-byte channel boundary
+    /// anyway. Four bytes wide and **not** a byte-order colour layout, so it
+    /// stays out of the RGBA8-shaped loaders and `is_four_byte_color`.
+    Rgb10a2Unorm,
+    /// 4 bytes/texel — [`Self::Rgb10a2Unorm`] with the colour channels the
+    /// other way round in the word, sampled natively as
+    /// `A2R10G10B10_UNORM_PACK32`. The same relation `Bgra8` has to `Rgba8`,
+    /// one storage shape up.
+    Bgr10a2Unorm,
+    /// 4 bytes/texel — eleven bits of red and green, ten of blue, no alpha,
+    /// sampled natively as `B10G11R11_UFLOAT_PACK32`. An HDR-intermediate
+    /// colour format, native for the same reason as its two neighbours.
+    Rg11b10Float,
 }
 
 impl TexelLayout {
@@ -264,6 +328,9 @@ impl TexelLayout {
         Self::Rgba16Float,
         Self::Rg16Float,
         Self::Rgba16Unorm,
+        Self::Rgb10a2Unorm,
+        Self::Bgr10a2Unorm,
+        Self::Rg11b10Float,
     ];
 
     /// This layout's position in [`Self::ALL`], so a host-side table can be an
@@ -287,6 +354,9 @@ impl TexelLayout {
             Self::Rgba16Float => 8,
             Self::Rg16Float => 9,
             Self::Rgba16Unorm => 10,
+            Self::Rgb10a2Unorm => 11,
+            Self::Bgr10a2Unorm => 12,
+            Self::Rg11b10Float => 13,
         }
     }
 
@@ -303,6 +373,7 @@ impl TexelLayout {
             Self::Rgba16Float => RGBA16F_BPP,
             Self::Rg16Float => RG16F_BPP,
             Self::Rgba16Unorm => RGBA16_BPP,
+            Self::Rgb10a2Unorm | Self::Bgr10a2Unorm | Self::Rg11b10Float => RGBA8_BPP,
         }
     }
 
@@ -340,23 +411,176 @@ impl TexelLayout {
             // The two half-float colour layouts answer `true` because the arm
             // genuinely exists — `texel_to_rgba8` converts both through
             // `f16_to_unorm8_lut`. This is a statement about the loader, not an
-            // endorsement: that arm quantizes to 256 levels and clamps above
-            // 1.0, which for an extended-range compositor is lost highlight
-            // range. Answering `false` to force the native rail would be a lie
-            // about the loader and would leave a below-floor window with nothing
-            // to fall to; the native rail earns those binds by being reachable,
-            // not by the floor being unable to turn them away.
+            // endorsement, and [`Self::cpu_loader_arm_is_lossy`] is where the
+            // endorsement is withheld.
             Self::Rgba16Float | Self::Rg16Float => true,
             // The two sixteen-bit normalized layouts join the floats here for
             // the same reason and a different quantity: `texel_to_rgba8` has no
             // arm for them because an arm would have to narrow ten bits of video
             // luma to eight.
+            //
+            // The three packed 32-bit colour layouts answer `false` for a third
+            // reason: their channels do not sit on byte boundaries at all, so
+            // there is nothing for a byte-shaped loader to pick up.
             Self::R16Float
             | Self::R32Float
             | Self::R16Unorm
             | Self::Rg16Unorm
-            | Self::Rgba16Unorm => false,
+            | Self::Rgba16Unorm
+            | Self::Rgb10a2Unorm
+            | Self::Bgr10a2Unorm
+            | Self::Rg11b10Float => false,
         }
+    }
+
+    /// Whether [`texel_to_rgba8`]'s arm for this layout loses information the
+    /// guest can see.
+    ///
+    /// An arm existing and an arm being *equivalent* are two different facts,
+    /// and conflating them is how a cost threshold becomes a data-loss gate.
+    /// The half-float colour arms go through `f16_to_unorm8_lut`: every channel
+    /// is clamped to `[0, 1]` and quantized to 256 levels, so a compositor
+    /// working in extended range has its highlights removed and a colour ramp
+    /// banded. That is not a slower way to the same pixels; it is different
+    /// pixels.
+    ///
+    /// Every other arm is exact — `Rgba8` is an identity copy, `Bgra8` a
+    /// channel swap, `R8`/`Rg8` a zero-extend that the matching one- and
+    /// two-channel Vulkan formats sample to identically.
+    pub fn cpu_loader_arm_is_lossy(self) -> bool {
+        match self {
+            Self::Rgba16Float | Self::Rg16Float => true,
+            Self::Rgba8
+            | Self::Bgra8
+            | Self::R8
+            | Self::Rg8
+            | Self::R16Float
+            | Self::R32Float
+            | Self::R16Unorm
+            | Self::Rg16Unorm
+            | Self::Rgba16Unorm
+            | Self::Rgb10a2Unorm
+            | Self::Bgr10a2Unorm
+            | Self::Rg11b10Float => false,
+        }
+    }
+
+    /// Whether a **cost** threshold may turn this layout away from a GPU rail
+    /// onto the CPU byte loader.
+    ///
+    /// This is the question the zero-copy floors are really asking, and it is
+    /// derived from the two above rather than re-listed, so a layout added with
+    /// a lossy arm cannot be waved past by a floor that only checked whether an
+    /// arm existed. A floor is a performance decision exactly when the path it
+    /// declines to produces the same pixels; where the only CPU arm is lossy —
+    /// or absent — the same floor is a correctness gate wearing a threshold's
+    /// clothes.
+    ///
+    /// The half-float colour layouts are why this exists. They answered
+    /// `has_cpu_loader_arm()` truthfully and were therefore turned away by the
+    /// 64 KiB sampled floor, which is above a 64x64 `RGBA16Float` texture's
+    /// 32 KiB — so a colour-management LUT the guest stored in extended range
+    /// reached the shader clamped and quantized, every boot, reported by
+    /// `sampled_texture_narrowed` and by nothing else.
+    pub fn a_cost_floor_may_decline(self) -> bool {
+        self.has_cpu_loader_arm() && !self.cpu_loader_arm_is_lossy()
+    }
+
+    /// Whether an sRGB-encoded image can be *stored* in this layout, so a host
+    /// sampled view of it can carry the transfer function.
+    ///
+    /// sRGB is defined on eight-bit unsigned normalized colour channels and
+    /// nowhere else, which is also why [`is_srgb`] names exactly two Metal
+    /// formats. A layout that answers `false` here cannot hold an sRGB image at
+    /// all, so a [`SampledByteFormat`] pairing one with an sRGB source is a
+    /// loader that converted the values *out* of the encoding's domain — the
+    /// one case the fold has to report rather than honour.
+    ///
+    /// Deliberately equal to [`Self::is_four_byte_color`] rather than written as
+    /// it: the two agree today because the eight-bit colour orders are both the
+    /// four-byte ones, and they answer different questions. A three-byte
+    /// `RGB8_SRGB` layout would separate them.
+    pub fn has_srgb_encoding(self) -> bool {
+        matches!(self, Self::Rgba8 | Self::Bgra8)
+    }
+}
+
+/// What a CPU loader produced for a sampled bind: the channel layout the bytes
+/// are in, and the guest format whose transfer function they still carry.
+///
+/// # Why this is two facts and not one
+///
+/// [`TexelLayout`] is linear by construction — it names a channel order and a
+/// width, and nothing in it can say that the stored values are sRGB-encoded.
+/// For as long as the sampled byte rails carried a bare layout, every CPU
+/// upload of an `MTLPixelFormatBGRA8Unorm_sRGB` texture was bound through a
+/// `_UNORM` view: the hardware never decoded, and the next sRGB attachment
+/// write encoded values that had never been decoded. Meanwhile the *zero-copy*
+/// rails, which carry a resolved host format, bound the `_SRGB` spelling and
+/// decoded correctly — so one guest texture got two different colours depending
+/// on which rail won, and which rail wins is a cost decision.
+///
+/// The two axes are genuinely independent: a loader may reorder channels
+/// (BGRA to RGBA) without touching the transfer function, so the layout it
+/// wrote and the encoding it preserved are separate answers and pairing them is
+/// not a flag threaded past a resolver. The source format is kept rather than
+/// boiled down to a `bool` so the fail log can name what was traded away when
+/// the fold cannot be honoured.
+///
+/// # Construct it where the source format is known
+///
+/// [`Self::from_source`] is the only way to say "these bytes came from a guest
+/// texture", and it takes that texture's `MTLPixelFormat`. A loader that has to
+/// reach for [`Self::synthesised`] is saying there is no guest format behind
+/// the values at all — a solid clear colour, for instance, which the guest
+/// specified in the attachment's decoded space. Choosing `synthesised` for
+/// bytes that *do* have a source format is the same silent loss this type
+/// exists to end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SampledByteFormat {
+    layout: TexelLayout,
+    /// The guest format the values were loaded from, when there is one. Held
+    /// privately because the layout above is what the bytes are *in*: deriving
+    /// one of these from the other is exactly the confusion this type ends.
+    source: Option<u16>,
+}
+
+impl SampledByteFormat {
+    /// Bytes a loader read out of a guest texture declared as `source`.
+    ///
+    /// `layout` is what the loader wrote, which may differ from `source`'s own
+    /// order; the transfer function is `source`'s and survives any reordering.
+    pub fn from_source(layout: TexelLayout, source: u16) -> Self {
+        Self {
+            layout,
+            source: Some(source),
+        }
+    }
+
+    /// Bytes this device built itself, with no guest texture behind them.
+    ///
+    /// Linear by construction and by contract, not by omission: the values are
+    /// whatever this device computed, in the space the guest named them in.
+    pub const fn synthesised(layout: TexelLayout) -> Self {
+        Self {
+            layout,
+            source: None,
+        }
+    }
+
+    /// The channel order and width the bytes are in.
+    pub const fn layout(self) -> TexelLayout {
+        self.layout
+    }
+
+    /// The guest format these values are sRGB-encoded by, or `None` when they
+    /// are linear.
+    ///
+    /// The format, not a `bool`, because the only caller that acts on a `Some`
+    /// either honours it — where the answer is the layout's sRGB spelling — or
+    /// reports it, where naming the guest format is the whole value of the line.
+    pub fn srgb_source(self) -> Option<u16> {
+        self.source.filter(|&source| is_srgb(source))
     }
 }
 
@@ -383,6 +607,18 @@ impl Default for SwizzlePlan {
 }
 
 impl SwizzlePlan {
+    /// Whether this plan moves nothing — every output channel takes its own
+    /// input.
+    ///
+    /// Derived from [`swizzle_identity`] rather than spelling the four sources a
+    /// second time, so there is nothing for a second spelling to disagree with.
+    /// The question is asked wherever a rail can carry channels one way but not
+    /// the other: a hardware component mapping expresses any plan, and a view
+    /// this device did not create expresses only this one.
+    pub fn is_identity(&self) -> bool {
+        *self == swizzle_identity()
+    }
+
     /// This plan applied **after** `inner`, as one plan.
     ///
     /// Two remaps stack whenever a texture's own channel layout does not sit
@@ -480,7 +716,15 @@ pub fn bytes_per_pixel(format: u16) -> Option<u32> {
         | MTL_FORMAT_R32_UINT
         | MTL_FORMAT_R32_SINT
         | MTL_FORMAT_R32_FLOAT
+        // The packed families are four bytes for the same reason the byte
+        // orders are: one 32-bit word per texel. What differs is where the
+        // channel boundaries fall inside it, which is the format code's answer
+        // and not the width's.
         | MTL_FORMAT_RGB9E5_FLOAT
+        | MTL_FORMAT_RGB10A2_UNORM
+        | MTL_FORMAT_RGB10A2_UINT
+        | MTL_FORMAT_RG11B10_FLOAT
+        | MTL_FORMAT_BGR10A2_UNORM
         | MTL_FORMAT_DEPTH32_FLOAT
         | MTL_FORMAT_DEPTH24_UNORM_STENCIL8
         | MTL_FORMAT_X24_STENCIL8 => RGBA8_BPP,
@@ -875,6 +1119,7 @@ pub fn sampled_class(format: u16) -> Option<SampledClass> {
         MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => SampledClass::Rgba8Unorm,
         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => SampledClass::Bgra8Unorm,
         MTL_FORMAT_RGBA16_FLOAT => SampledClass::Rgba16Float,
+        MTL_FORMAT_RG16_FLOAT => SampledClass::Rg16Float,
         _ => return None,
     })
 }
@@ -1387,11 +1632,21 @@ pub fn expand_rgba8_to_texel(
         // has been observed declaring a two-channel eight-bit render target, and
         // the arm is trivial to add when one is. Admitting a layout costs three
         // conversions and a census line, so they are added on measurement.
+        //
+        // The three packed 32-bit colour layouts are here because
+        // `render_target_bpp` does not admit their formats: no guest has been
+        // observed declaring a render target in one, so there is no seed to
+        // convert and an arm would be a conversion written against nothing. Add
+        // both halves together if one is ever measured — the obligation
+        // `render_target_bpp` states runs in that direction.
         TexelLayout::Rg8
         | TexelLayout::R32Float
         | TexelLayout::R16Unorm
         | TexelLayout::Rg16Unorm
-        | TexelLayout::Rgba16Unorm => return false,
+        | TexelLayout::Rgba16Unorm
+        | TexelLayout::Rgb10a2Unorm
+        | TexelLayout::Bgr10a2Unorm
+        | TexelLayout::Rg11b10Float => return false,
     }
     true
 }
@@ -1483,7 +1738,10 @@ pub fn narrow_texel_to_rgba8(
         | TexelLayout::R32Float
         | TexelLayout::R16Unorm
         | TexelLayout::Rg16Unorm
-        | TexelLayout::Rgba16Unorm => return false,
+        | TexelLayout::Rgba16Unorm
+        | TexelLayout::Rgb10a2Unorm
+        | TexelLayout::Bgr10a2Unorm
+        | TexelLayout::Rg11b10Float => return false,
     }
     true
 }
@@ -1610,6 +1868,28 @@ fn row_walk_backward(
         return false;
     }
     dst_stride > src_stride
+}
+
+/// Whether [`texel_to_rgba8`] answers for this format by **narrowing** it
+/// rather than by rearranging bytes it can carry exactly.
+///
+/// The float arms go through `f16_to_unorm8_lut`, which does two things the
+/// unorm8 arms never do: it **clamps to `[0,1]`** and it **quantises to 256
+/// levels**. For a colour that is a small visible error. For a texture whose
+/// texels are *not* colours — a lookup table, a coordinate pair, a chain of
+/// offsets — it is data loss with no upper bound on the consequence, and it is
+/// silent, because the conversion succeeds.
+///
+/// [`TexelLayout::R16Float`] exists precisely so a single-channel float sampled
+/// bind escapes this. Its two- and four-channel siblings have no such layout, so
+/// they do not escape it, and the callers that convert a sampled texture are
+/// expected to say so — see `runtime::draw::note_sampled_narrowing`.
+///
+/// Asked of the **guest's** `MTLPixelFormat`, which is the only place the
+/// original width is still known: past the conversion every texel is four bytes
+/// and nothing downstream can tell a narrowed one from a native one.
+pub fn narrows_to_unorm8(format: u16) -> bool {
+    matches!(format, MTL_FORMAT_RGBA16_FLOAT | MTL_FORMAT_RG16_FLOAT)
 }
 
 pub fn convert_row_to_rgba8(format: u16, src: &[u8], pixels: u32, dst_rgba: &mut [u8]) -> bool {
@@ -2418,6 +2698,9 @@ mod tests {
                 TexelLayout::Rgba16Float => MTL_FORMAT_RGBA16_FLOAT,
                 TexelLayout::Rg16Float => MTL_FORMAT_RG16_FLOAT,
                 TexelLayout::Rgba16Unorm => MTL_FORMAT_RGBA16_UNORM,
+                TexelLayout::Rgb10a2Unorm => MTL_FORMAT_RGB10A2_UNORM,
+                TexelLayout::Bgr10a2Unorm => MTL_FORMAT_BGR10A2_UNORM,
+                TexelLayout::Rg11b10Float => MTL_FORMAT_RG11B10_FLOAT,
             };
             assert_eq!(
                 Some(layout.bytes_per_texel()),
@@ -2573,6 +2856,49 @@ mod tests {
             TexelLayout::ALL.len(),
             "two layouts share an index, or ALL holds one twice"
         );
+    }
+
+    /// **A cost floor may never be the reason a texture loses precision.**
+    ///
+    /// [`TexelLayout::a_cost_floor_may_decline`] is the zero-copy floors' whole
+    /// admission rule, and it must stay the conjunction it is derived from: a
+    /// layout may be turned away onto the CPU byte loader only where that
+    /// loader has an arm *and* the arm is exact. The half-float colour pair is
+    /// the case that made this necessary — both answer
+    /// `has_cpu_loader_arm() == true` truthfully, so a floor asking only that
+    /// question turned a 32 KiB `RGBA16Float` away from the exact rail and onto
+    /// one that clamps to `[0, 1]` and quantizes to 256 levels.
+    #[test]
+    fn a_cost_floor_may_only_decline_a_layout_whose_cpu_arm_is_exact() {
+        for &layout in TexelLayout::ALL {
+            assert_eq!(
+                layout.a_cost_floor_may_decline(),
+                layout.has_cpu_loader_arm() && !layout.cpu_loader_arm_is_lossy(),
+                "{layout:?} — the floor rule must stay derived, not re-listed"
+            );
+            if layout.cpu_loader_arm_is_lossy() {
+                assert!(
+                    layout.has_cpu_loader_arm(),
+                    "{layout:?} — an arm that does not exist cannot be lossy"
+                );
+                assert!(
+                    !layout.a_cost_floor_may_decline(),
+                    "{layout:?} has only a lossy CPU arm, so a byte threshold \
+                     declining it is data loss and not a cost decision"
+                );
+            }
+        }
+        // Named rather than derived, because the point is that these two are
+        // *not* in the set a floor may turn away, and a test that only checked
+        // the identity above would pass with the set empty.
+        for layout in [TexelLayout::Rgba16Float, TexelLayout::Rg16Float] {
+            assert!(layout.cpu_loader_arm_is_lossy(), "{layout:?}");
+            assert!(!layout.a_cost_floor_may_decline(), "{layout:?}");
+        }
+        for layout in [TexelLayout::Rgba8, TexelLayout::Bgra8, TexelLayout::R8] {
+            assert!(!layout.cpu_loader_arm_is_lossy(), "{layout:?}");
+            assert!(layout.a_cost_floor_may_decline(), "{layout:?}");
+        }
     }
 
     /// Four bytes wide is not the same as a four-byte colour order.

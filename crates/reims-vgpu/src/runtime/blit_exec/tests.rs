@@ -1708,6 +1708,64 @@ fn install_linear_rgba(
     write_task_gva_arm64e(host, &state.tasks[1], off, &list_entry);
 }
 
+/// A blit endpoint is a guest-byte reader, so resolving one must land whatever
+/// this device still owes that resource's pages.
+///
+/// A render pass into an ordinary private `MTLTexture` resolves on
+/// `render_target`'s linear rung, and `writeback_debt::arm_gva` leaves the result
+/// in the engine's resident with a debt armed against `(task_id, texture_ref)`
+/// rather than copying it into guest memory. `draw::texture_view` and
+/// `compute_exec` named that resource before touching its bytes; the blit rail
+/// did not, and every `copyFromTexture:` out of such a target copied the bytes
+/// the pages held before the pass — zeros for a freshly allocated one.
+///
+/// The ledger is what this can assert on both backend arms: `pay_gva` itself is
+/// `backend-vulkan`-only, but `take_gva` is not, so a resolve that named the debt
+/// leaves the ledger empty and a resolve that did not leaves it holding one.
+#[test]
+fn a_blit_endpoint_lands_the_writeback_its_texture_still_owes() {
+    use crate::runtime::writeback_debt::{GvaResourceKey, GvaWritebackDebt};
+
+    const STRIDE: u32 = 64;
+    let (mut host, mut state) = blit_device();
+    install_linear_rgba(&mut host, &mut state, 2, 2, 16, 8, STRIDE);
+
+    let key = GvaResourceKey {
+        task_id: 1,
+        texture_ref: 2,
+    };
+    let guest_write = state.buffer_write_gen.stamp(key.task_id, key.texture_ref);
+    assert_eq!(
+        state.pending_writebacks.arm_gva(
+            key,
+            GvaWritebackDebt {
+                gva: 0x4000,
+                row_stride: STRIDE,
+                width: 16,
+                height: 8,
+                format: MTL_FORMAT_RGBA8_UNORM,
+                generation: 3,
+                guest_write,
+                seq: 0,
+            },
+        ),
+        None,
+        "the resource owes exactly one frame going in"
+    );
+    assert!(state.pending_writebacks.has_gva(key));
+
+    let backing = resolve_texture_backing(&mut state, &mut host, 1, 2, 0, 0)
+        .expect("a linear RGBA8 texture resolves as a blit endpoint");
+    assert!(
+        matches!(backing, TextureBacking::Linear(_)),
+        "this is the private-texture rung, not a surface"
+    );
+    assert!(
+        !state.pending_writebacks.has_gva(key),
+        "resolving a blit endpoint must land what the texture owed, not read around it"
+    );
+}
+
 /// Overwrite an installed texture descriptor's `allocation_size` in place.
 /// The `install_linear_*` helpers floor it at 0x1000, and a bounds test
 /// needs an allocation sized to the image and nothing more.
@@ -1806,6 +1864,73 @@ fn whole_surface_0x13e_single_level_copy() {
     // Only tight 4×4=16 B per row are defined; padding in stride may be zero.
     assert_eq!(&back[0..16], &pat[0..16]);
     assert_eq!(&back[16..32], &pat[16..32]);
+}
+
+/// A type-11 whole-surface `0x13e` moves every row, in order.
+///
+/// This arm stages the slice whole rather than a row at a time, because a
+/// per-row call into the mapping rail re-pays that rail's per-*rect* costs —
+/// settle, vouch, window revalidation, and a fresh import per guest page run —
+/// once for every row. A driven Maps leg charged the old row loop 30.15 s of a
+/// 30.28 s blit rail to move 14.6 MB.
+///
+/// The failure the whole-slice form can have that the row loop could not is a
+/// stride one: the staging buffer is packed `row_bytes` apart while the surface
+/// is `row_stride` apart, and the mapping rail is told both. Get that pair
+/// backwards and rows land shifted or on top of each other. So the source rows
+/// here are made distinguishable and the assertion is per row, not on the
+/// buffer entire — a whole-buffer compare of a uniform fill would pass on a
+/// copy that wrote row 0 twice.
+#[test]
+fn a_type11_whole_surface_copy_lands_every_row_in_order() {
+    let (mut host, mut state) = blit_device();
+    install_type11(&mut host, &mut state, 2, 20, 0x40);
+    install_type11(&mut host, &mut state, 3, 21, 0x50);
+
+    // 2×2 BGRA: two rows of 8 bytes, each row its own byte value.
+    let src_pixels: [u8; 16] = [
+        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // row 0
+        0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, // row 1
+    ];
+    assert!(mapping_write::write_rect_raw(
+        &mut state,
+        &mut host,
+        20,
+        mapping_write::Rect {
+            origin_x: 0,
+            origin_y: 0,
+            width: 2,
+            height: 2
+        },
+        &src_pixels,
+        8
+    ));
+
+    let mut cmd = copy_cmd(CopyKind::TextureToTextureSliceLevel, 2, 3);
+    cmd.slice_count = 1;
+    cmd.level_count = 1;
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &cmd),
+        BlitStatus::Ok,
+        "a type-11 to type-11 whole-surface copy must execute"
+    );
+
+    let mut back = [0u8; 16];
+    assert!(mapping_write::read_rect_raw(
+        &mut state,
+        &mut host,
+        21,
+        mapping_write::Rect {
+            origin_x: 0,
+            origin_y: 0,
+            width: 2,
+            height: 2
+        },
+        &mut back,
+        8
+    ));
+    assert_eq!(&back[0..8], &src_pixels[0..8], "row 0 did not land");
+    assert_eq!(&back[8..16], &src_pixels[8..16], "row 1 did not land");
 }
 
 /// Regression guard for the identity self-copy no-op: the guest issues
@@ -2523,5 +2648,251 @@ fn a_copy_refuses_a_view_chain_the_sample_arm_also_refuses() {
         execute_blit(&mut state, &mut host, 1, &cmd),
         BlitStatus::Unsupported,
         "the copy arm followed a chain the sample arm refused"
+    );
+}
+
+/// The GPU whole-plane arm's cheap half, which decides whether resolving the
+/// destination — and paying its debt — is worth doing at all.
+///
+/// The interesting refusal is `SelfCopy`. Resolving the destination is what pays
+/// its writeback debt, so a command whose two endpoints are one reference would
+/// pay away the very resident this arm was about to copy *from* and then find
+/// nothing there. It is not a Metal restriction; it is a consequence of the order
+/// this arm has to do things in.
+#[test]
+fn the_gpu_whole_plane_arm_refuses_before_it_resolves_anything() {
+    use GpuPlaneRefusal::*;
+
+    assert_eq!(gpu_whole_plane_admissible(1, 1, 4, 5, true), Ok(()));
+    assert_eq!(
+        gpu_whole_plane_admissible(2, 1, 4, 5, true),
+        Err(MultiLevel),
+        "the arm copies one plane, not a mip chain"
+    );
+    assert_eq!(
+        gpu_whole_plane_admissible(1, 3, 4, 5, true),
+        Err(MultiLevel),
+        "nor an array slice run"
+    );
+    assert_eq!(
+        gpu_whole_plane_admissible(1, 1, 4, 4, true),
+        Err(SelfCopy),
+        "resolving the destination would pay away the source's own resident"
+    );
+    assert_eq!(
+        gpu_whole_plane_admissible(1, 1, 4, 5, false),
+        Err(SrcNotResident),
+        "with nothing owed the source's guest pages already hold its content"
+    );
+    assert_eq!(
+        gpu_whole_plane_admissible(1, 1, 4, 4, false),
+        Err(SelfCopy),
+        "the cheapest refusal that applies is the one reported, so the counters \
+         partition rather than overlap"
+    );
+}
+
+/// The GPU whole-plane arm's destination half, and specifically the plane check.
+///
+/// `write_bgra8_from_resident_gpu` resolves the plane itself, from the mapping's
+/// declaration, and takes no plane index. A type-5 view carries one on the wire
+/// and can therefore name a plane at a `surface_offset` that scan does not reach.
+/// Landing a frame there is silent at every layer — the pixels appear in the next
+/// plane of the same IOSurface — so the disagreement has to refuse before the
+/// copy, not be detected after it.
+#[test]
+fn the_gpu_whole_plane_arm_refuses_a_plane_the_rail_would_not_write() {
+    use GpuPlaneRefusal::*;
+
+    let dst = GpuPlane {
+        width: 64,
+        height: 32,
+        surface_offset: 0,
+        row_stride: 256,
+        pixel_format: MTL_FORMAT_BGRA8_UNORM,
+    };
+    let window = GpuMappingWindow {
+        surface_offset: 0,
+        row_stride: 256,
+        pixel_format: MTL_FORMAT_BGRA8_UNORM,
+    };
+    let src = GpuResidentSource {
+        width: 64,
+        height: 32,
+        pixel_format: MTL_FORMAT_BGRA8_UNORM,
+    };
+
+    assert_eq!(
+        gpu_whole_plane_destination(Some(dst), Some(window), src),
+        Ok(())
+    );
+    assert_eq!(
+        gpu_whole_plane_destination(None, Some(window), src),
+        Err(DstNotType11),
+        "a linear allocation has no mapping for the rail to name"
+    );
+    assert_eq!(
+        gpu_whole_plane_destination(Some(dst), None, src),
+        Err(DstWindowUnresolved),
+        "a mapping that declines the extent has no window to write"
+    );
+
+    // The type-5 plane hazard: the guest's descriptor names the second plane of a
+    // biplanar surface, the mapping's own geometry scan resolves the first.
+    let second_plane = GpuPlane {
+        surface_offset: 0x8000,
+        ..dst
+    };
+    assert_eq!(
+        gpu_whole_plane_destination(Some(second_plane), Some(window), src),
+        Err(PlaneOffset),
+        "a plane the rail would not write must never be written"
+    );
+    assert_eq!(
+        gpu_whole_plane_destination(
+            Some(dst),
+            Some(GpuMappingWindow {
+                row_stride: 512,
+                ..window
+            }),
+            src
+        ),
+        Err(PlaneOffset),
+        "and neither must a plane it would write at a different pitch"
+    );
+
+    assert_eq!(
+        gpu_whole_plane_destination(
+            Some(dst),
+            Some(window),
+            GpuResidentSource { height: 16, ..src }
+        ),
+        Err(GeometryDiffers),
+        "a full-plane copy is not a resize"
+    );
+    assert_eq!(
+        gpu_whole_plane_destination(
+            Some(dst),
+            Some(window),
+            GpuResidentSource {
+                pixel_format: MTL_FORMAT_RGBA8_UNORM,
+                ..src
+            }
+        ),
+        Err(FormatDiffers),
+        "a copy converts nothing, so the resident must already be the destination's texel"
+    );
+    assert_eq!(
+        gpu_whole_plane_destination(
+            Some(dst),
+            Some(GpuMappingWindow {
+                pixel_format: MTL_FORMAT_RGBA8_UNORM,
+                ..window
+            }),
+            src
+        ),
+        Err(FormatDiffers),
+        "including the format the guest will read the landed bytes back as"
+    );
+}
+
+/// The transfer function is not part of a stored texel, so it cannot decide a
+/// copy that converts nothing.
+///
+/// This is the shape a driven macos-13 Maps leg actually presents, and it was
+/// **1 609 of 1 609** records — the whole arm. The triple reads
+/// `src=81 dst=81 mapping=80`: the guest declares its render target
+/// `BGRA8Unorm_sRGB`, both endpoints of the copy agree with each other, and the
+/// IOSurface mapping declares plain `BGRA8Unorm` for the very same four stored
+/// bytes. Format equality calls that a disagreement forever, so the arm refused
+/// every record it was written for while every real precondition passed.
+///
+/// `store_texel_order` is the fold, and its own doc states the rule: the sRGB
+/// qualifier says how a sampler interprets bytes, not how they are stored.
+/// What must still separate — channel order and texel width — survives it, which
+/// is what the assertions below pin.
+#[test]
+fn the_gpu_whole_plane_arm_compares_stored_texels_and_not_transfer_functions() {
+    use crate::contract::pixel_format::{
+        MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_R32_FLOAT, MTL_FORMAT_RGBA8_UNORM_SRGB,
+    };
+    use GpuPlaneRefusal::*;
+
+    let dst = GpuPlane {
+        width: 1024,
+        height: 768,
+        surface_offset: 0,
+        row_stride: 4096,
+        pixel_format: MTL_FORMAT_BGRA8_UNORM_SRGB,
+    };
+    let window = GpuMappingWindow {
+        surface_offset: 0,
+        row_stride: 4096,
+        pixel_format: MTL_FORMAT_BGRA8_UNORM,
+    };
+    let src = GpuResidentSource {
+        width: 1024,
+        height: 768,
+        pixel_format: MTL_FORMAT_BGRA8_UNORM_SRGB,
+    };
+
+    assert_eq!(
+        gpu_whole_plane_destination(Some(dst), Some(window), src),
+        Ok(()),
+        "81/81/80 is one stored texel three times, which is what a copy moves"
+    );
+
+    // The fold is onto the sibling, not onto "any four-byte colour": channel
+    // order still decides, from either side.
+    assert_eq!(
+        gpu_whole_plane_destination(
+            Some(dst),
+            Some(GpuMappingWindow {
+                pixel_format: MTL_FORMAT_RGBA8_UNORM_SRGB,
+                ..window
+            }),
+            src
+        ),
+        Err(FormatDiffers),
+        "BGRA and RGBA are the same width and the same transfer function, and \
+         still not the same bytes"
+    );
+    assert_eq!(
+        gpu_whole_plane_destination(
+            Some(GpuPlane {
+                pixel_format: MTL_FORMAT_RGBA8_UNORM,
+                ..dst
+            }),
+            Some(GpuMappingWindow {
+                pixel_format: MTL_FORMAT_RGBA8_UNORM,
+                ..window
+            }),
+            src
+        ),
+        Err(FormatDiffers),
+        "and the resident's own order is compared against the folded destination"
+    );
+
+    // A format with no byte-copy layout is one the copy would have to convert,
+    // which this arm does not do. It must refuse rather than fold to `None ==
+    // None` and read as agreement.
+    let unlayed = GpuPlane {
+        pixel_format: MTL_FORMAT_R32_FLOAT,
+        ..dst
+    };
+    assert_eq!(
+        gpu_whole_plane_destination(
+            Some(unlayed),
+            Some(GpuMappingWindow {
+                pixel_format: MTL_FORMAT_R32_FLOAT,
+                ..window
+            }),
+            GpuResidentSource {
+                pixel_format: MTL_FORMAT_R32_FLOAT,
+                ..src
+            }
+        ),
+        Err(FormatDiffers),
+        "three agreeing formats with no stored-texel layout are still not a byte copy"
     );
 }

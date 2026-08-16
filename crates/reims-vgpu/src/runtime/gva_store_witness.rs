@@ -121,13 +121,19 @@ impl GvaTargetKey {
                 width,
                 height,
                 generation,
-                format,
+                format: _,
             } if generation != 0 && gva != 0 => Some(Self {
                 gva,
                 generation,
                 width,
                 height,
-                bgra: format == crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+                // Asked of the identity rather than spelled here. A channel
+                // order is one question with one owner, and a second
+                // hand-written copy of it is the divergence that put an
+                // R/B-exchanged frame in guest memory once already — see
+                // `engine::ResidentReadSnapshot::bgra`. The pattern still names
+                // the field so a new one cannot be added without meeting it.
+                bgra: identity.is_bgra(),
             }),
             _ => None,
         }
@@ -351,7 +357,6 @@ impl GvaWriteReach {
             Self::Host(HostWriteVerdict::Quiet) => "gvaw_host_quiet",
             Self::Host(HostWriteVerdict::Overlap) => "gvaw_host_overlap",
             Self::Host(HostWriteVerdict::Unnamed) => "gvaw_host_unnamed",
-            Self::Host(HostWriteVerdict::Forgotten) => "gvaw_host_forgotten",
         }
     }
 
@@ -365,7 +370,8 @@ impl GvaWriteReach {
 /// Ask both witnesses about `key`.
 ///
 /// The guest half is asked first because it is a word; the host-write half
-/// walks a ring and is only reached when the guest half is clean.
+/// indexes the target's page epochs and is only reached when the guest half is
+/// clean.
 pub fn reach<H: HostOps>(state: &DeviceState, host: &H, key: GvaTargetKey) -> GvaWriteReach {
     let Some(e) = state.gva_store_witness.entries.get(&key) else {
         return GvaWriteReach::Guest(GuestWriteVerdict::NoMapping);

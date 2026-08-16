@@ -10,9 +10,17 @@
 //! Under the host-pointer model there is nothing left to cache.
 //! [`crate::runtime::guest_ram::GuestRamImport::slice`] is a range check.
 //! What *is* worth holding is the small thing the cache was built around: the
-//! imports themselves, one per RAMBlock, made once at first use and held for
-//! the VM's lifetime. This module is that, and it is a `Vec` of at most a
-//! handful of entries rather than a cache with an eviction policy.
+//! imports themselves, made once at first use and held for the VM's lifetime.
+//! This module is that, and it is a sorted `Vec` of a dozen or so entries rather
+//! than a cache with an eviction policy.
+//!
+//! A RAMBlock is imported in **chunks** rather than whole, because a driver has
+//! been measured truncating a multi-gigabyte `allocationSize` to 32 bits on this
+//! path and reading back garbage past the truncation — see
+//! [`crate::backend::vulkan::caps::host_pointer::IMPORT_SPAN_CEILING`]. Chunking
+//! needed nothing else to change: a window has always resolved against whichever
+//! import backs its GPA, and one straddling two of them has always grouped into
+//! two `VkBuffer` sources, because a RAMBlock boundary could already split one.
 //!
 //! # Why the imports are built here and not at device create
 //!
@@ -40,7 +48,8 @@
 //! off channel rather than as a failure per reference.
 
 use crate::runtime::guest_ram::{
-    granularity, import_budget, GuestRamError, GuestRamImport, GuestRef,
+    granularity, import_budget, import_span_max, GuestRamError, GuestRamImport, GuestRamRegion,
+    GuestRef,
 };
 use crate::runtime::host::{GuestRamRegionsError, HostOps};
 use std::sync::Arc;
@@ -86,29 +95,41 @@ pub enum MapRefusal {
     /// The comparison is against the sum, because every import is live at once
     /// for the VM's lifetime and a submission may name any of them.
     ///
+    /// # Its relationship to the per-import check, which is the exact one
+    ///
+    /// The backend publishes this budget as the roomiest heap an import can be
+    /// *charged to* — the same population of memory types
+    /// `caps::memory_topology::select_memory_type` will choose from, since every
+    /// import goes through it carrying one class's required flags. So a sum that
+    /// passes here has a heap that each individual chunk fits, and the exact
+    /// per-allocation check at the pick — which refuses rather than making a
+    /// call Vulkan declares invalid — agrees with this one by construction
+    /// rather than by coincidence. Publishing the maximum over *every* heap
+    /// instead, which this once did, breaks that: a part whose device-local heap
+    /// is twice its host-visible heap passes here with room to spare and then
+    /// refuses at every pick, which is the partial import this refusal exists to
+    /// prevent.
+    ///
     /// This is a heap-*capacity* test and not a residency one, so it is a lower
     /// bound: a host that passes it can still be too full to import. It catches
     /// the direction that has been seen to kill a guest.
     ///
     /// # What would give such a host the fast rail back
     ///
-    /// Not this refusal, which only makes the host work. The import is one
-    /// `VkDeviceMemory` per RAMBlock because that is the coarsest thing a bound
-    /// can be sized to, and nothing about the rail requires it: a window already
-    /// resolves against whichever import backs its GPA, and one straddling two of
-    /// them already groups into two `VkBuffer` sources. So a RAMBlock could be
-    /// imported in granularity-aligned chunks instead, imported on the first
-    /// reference into each, and then only the chunks a submission names have to
-    /// be resident — which is the guest's working set rather than its RAM.
+    /// Not this refusal, which only makes the host work. A RAMBlock is now
+    /// imported in chunks — for an unrelated reason, a driver truncating
+    /// `allocationSize` — and two of the three things that stood in the way of
+    /// using those chunks for *residency* have gone with it: the split exists,
+    /// and the lookup is a binary search rather than a linear `find`, so a
+    /// hundred imports cost what two did.
     ///
-    /// Two things make that more than a `flat_map` in [`resolve`], and both have
-    /// to be answered before it is worth building. The lookup is a linear
-    /// `find` over the imports, which is right for two and is not right for a
-    /// hundred. And a chunk imported and never released is only a *slower* way
-    /// to reach this same refusal, so a small-heap host needs the chunks to be
-    /// evictable — against this module's own standing advice, which is sound
-    /// only while every import fits. Neither can be measured on a host whose
-    /// roomiest heap is four times its guest.
+    /// What is left is the part that was always the hard one. Chunks are still
+    /// imported eagerly and all at once, and the sum is still what this compares,
+    /// so the refusal fires exactly where it did. Making a small-heap host work
+    /// means importing a chunk on first reference into it and *releasing* chunks
+    /// again — against this module's standing advice, which is sound only while
+    /// every import fits. That cannot be measured on a host whose roomiest heap
+    /// is four times its guest.
     ImportExceedsHeap { needed: u64, budget: u64 },
     /// The address is not inside any imported span. Guest RAM the GPU can reach
     /// exists, and this address is not in it — a device MMIO address, a hole,
@@ -237,10 +258,24 @@ impl Resolved {
     /// before walking, and asking again per run would emit the same standing
     /// refusal N times for one window.
     fn reference(&self, gpa: u64, len: u64) -> Result<GuestRef, MapRefusal> {
+        // Binary search, not a linear scan. The imports are sorted by
+        // `gpa_base`, so the last one whose base is at or below `gpa` is the
+        // only one that can contain it — `partition_point` names that index and
+        // `contains_gpa` still decides, so an address in a hole between two
+        // imports is refused exactly as before.
+        //
+        // A scan was right while a machine had one or two imports. Chunking a
+        // RAMBlock at the span ceiling makes it eight to a dozen on an ordinary
+        // guest, and this runs once per run of a scattered window — 9 to 32 runs
+        // per bind, thousands of binds a second — so the growth would land in
+        // the hot path. This makes the count stop mattering instead of trading
+        // one host's correctness for another's throughput.
         let import = self
             .imports
-            .iter()
-            .find(|i| i.contains_gpa(gpa))
+            .partition_point(|i| i.gpa_base().is_some_and(|base| base <= gpa))
+            .checked_sub(1)
+            .map(|last| &self.imports[last])
+            .filter(|i| i.contains_gpa(gpa))
             .ok_or(MapRefusal::GpaNotInAnyImport { gpa })
             .map_err(report_once)?;
         // `slice_for_gpa` emits its own named refusal on the fail channel, so
@@ -249,6 +284,23 @@ impl Resolved {
             .slice_for_gpa(gpa, len)
             .map_err(MapRefusal::OutsideImport)?;
         GuestRef::new(Arc::clone(import), slice).map_err(MapRefusal::OutsideImport)
+    }
+
+    /// The exclusive end GPA of the import backing `gpa`, or `None` if nothing
+    /// backs it.
+    ///
+    /// Exists so a caller can split a contiguous guest stretch at the seam
+    /// between two imports instead of being refused at it — see
+    /// [`references_for_runs`]. Deliberately not a public entry point: an import
+    /// boundary is this module's own bookkeeping, and the only thing outside it
+    /// may do with one is stop at it.
+    fn import_end(&self, gpa: u64) -> Option<u64> {
+        self.imports
+            .partition_point(|i| i.gpa_base().is_some_and(|base| base <= gpa))
+            .checked_sub(1)
+            .map(|last| &self.imports[last])
+            .filter(|i| i.contains_gpa(gpa))
+            .and_then(|i| i.gpa_base().map(|base| base + i.len()))
     }
 }
 
@@ -338,8 +390,7 @@ pub fn warm<H: HostOps + ?Sized>(host: &mut H) {
     {
         let imports = imports();
         if !imports.is_empty() {
-            let (warmed, bytes) =
-                crate::backend::vulkan::engine::warm_guest_ram_imports(&imports);
+            let (warmed, bytes) = crate::backend::vulkan::engine::warm_guest_ram_imports(&imports);
             if warmed > 0 {
                 crate::observe::off(format!(
                     "guest_ram_warm blocks={warmed} bytes={bytes} spans={}",
@@ -378,6 +429,58 @@ fn with_map<H: HostOps + ?Sized, R>(host: &mut H, body: impl FnOnce(&Resolved) -
 /// of the four refusals and silence for the other three.
 pub fn standing_refusal<H: HostOps + ?Sized>(host: &mut H) -> Option<MapRefusal> {
     with_map(host, |resolved| resolved.refusal)
+}
+
+/// The whole admission rule for a packed-alias import, in one place.
+///
+/// The alias rails do something the RAMBlock map does not: they build a *new*
+/// host-pointer import over a host allocation they arrange themselves, so that a
+/// guest resource whose pages are scattered can still be presented to Vulkan as
+/// one contiguous range. They are the only importers outside [`resolve`].
+///
+/// # Why they may not assemble this themselves
+///
+/// They did, and it was the same three latches written by hand twice —
+/// `granularity`, `import_span_max`, `import_budget` — with the term that
+/// matters missing from both copies: [`standing_refusal`]. That is precisely
+/// what that function's doc forbids, in the sentence saying a caller must ask it
+/// "rather than re-reading `guest_ram::granularity`, which is the same answer
+/// for one of the four refusals and silence for the other three".
+///
+/// The silence is the bug. The latches are published once at device create from
+/// what the *host* supports, and they stay `Some` for the whole boot. The map's
+/// refusal is a different judgement made later, about what this *guest* fits
+/// into that host — `ImportExceedsHeap` above all, where the guest's RAMBlocks
+/// sum past the roomiest heap an import can be charged to. On such a host the
+/// map is discarded and every RAMBlock reference declines, and these two rails
+/// went on importing anyway, because every latch they asked still answered
+/// `Some`.
+///
+/// That is the reported failure and not a theoretical one: an 8 GiB-or-larger
+/// guest on a host whose importable heap is smaller boots to a black screen or
+/// dies, while the same guest with `REIMS_VGPU_GUEST_IMPORT=off` works — and
+/// `off` is the one arm that also takes these rails' latches away, which is why
+/// it was the arm that worked.
+///
+/// So the rule is one function and the answer is the alignment to import at.
+/// `None` is a refusal already named on the fail channel by whoever owns it.
+pub fn packed_alias_import_align<H: HostOps + ?Sized>(host: &mut H, len: u64) -> Option<u64> {
+    if let Some(refusal) = standing_refusal(host) {
+        // Latched by the refusal, not per call: on a host standing on one,
+        // every alias attempt of every resource refuses for the same reason and
+        // a line each would drown the channel.
+        crate::observe::Emit::decline("packed_alias_refused", &refusal)
+            .fail_once(crate::observe::Decline::slug(&refusal).as_ptr() as u64);
+        crate::runtime::drain::note_store_route("zc_packed_alias_standing_refusal");
+        return None;
+    }
+    let align = crate::runtime::guest_ram::granularity()?;
+    if len > crate::runtime::guest_ram::import_span_max()?
+        || len > crate::runtime::guest_ram::import_budget()?
+    {
+        return None;
+    }
+    Some(align)
 }
 
 /// Turn a guest physical address and a length into a bindable reference.
@@ -485,13 +588,37 @@ pub fn references_for_runs<H: HostOps + ?Sized>(
             if start >= end {
                 continue;
             }
+            // GPA-contiguous is not import-contiguous. A RAMBlock is imported in
+            // chunks, so a stretch the guest laid out as one run can cross a
+            // seam between two of them — and a `GuestRef` is an offset into one
+            // import, so it cannot describe both sides.
+            //
+            // Split at the seam rather than refuse at it. The consumers already
+            // take a list and a RAMBlock boundary has always been able to
+            // produce one, so two runs here are indistinguishable from two the
+            // guest's own page plan produced. Refusing instead would drop the
+            // *whole window* to the copying rail — a named, safe decline, but
+            // one that fires on roughly one writeback in 250 for no reason the
+            // guest could see, which is a chunk size leaking into throughput.
+            //
             // Within a run the GPAs are contiguous by construction, so one add
             // reaches any byte of it.
-            let gpa = gpas[run.start] + (start - run_start);
-            out.push(GuestWindowRun {
-                window_offset: start - window_start,
-                guest: resolved.reference(gpa, end - start)?,
-            });
+            let mut piece = start;
+            while piece < end {
+                let gpa = gpas[run.start] + (piece - run_start);
+                // `None` means nothing backs this address at all: hand the whole
+                // remainder to `reference` so it names that refusal rather than
+                // this loop inventing a second one.
+                let piece_end = match resolved.import_end(gpa) {
+                    Some(import_end) if import_end > gpa => end.min(piece + (import_end - gpa)),
+                    _ => end,
+                };
+                out.push(GuestWindowRun {
+                    window_offset: piece - window_start,
+                    guest: resolved.reference(gpa, piece_end - piece)?,
+                });
+                piece = piece_end;
+            }
         }
         if out.is_empty() {
             return Err(report_once(MapRefusal::Scattered {
@@ -589,6 +716,39 @@ pub fn reference_for_pages<H: HostOps + ?Sized>(
 ///
 /// Timings above are wall clock on a shared host and are upper bounds; the
 /// counts and byte totals are not.
+/// Split one RAMBlock into consecutive regions of at most `span_max` bytes.
+///
+/// The regions tile the block exactly and in ascending order: no byte is
+/// dropped, none is covered twice, and the last one is whatever remains. A block
+/// already inside the ceiling comes back as itself, so a host that needs no
+/// chunking pays one comparison and allocates the same one-element shape it
+/// always had.
+///
+/// Alignment is deliberately *not* applied here. `GuestRamImport::new` trims
+/// each region to the device's granularity and names its own refusal when a
+/// region cannot survive that — doing it twice would be two spellings of one
+/// rule, and this one has no granularity in hand. The consequence is that
+/// `span_max` must itself be a multiple of the granularity, which is why the
+/// backend masks it before publishing and why a ceiling below the granularity is
+/// refused outright rather than clamped.
+fn chunk_span(span: GuestRamRegion, span_max: u64) -> Vec<GuestRamRegion> {
+    if span_max == 0 || span.len <= span_max {
+        return vec![span];
+    }
+    let mut out = Vec::with_capacity((span.len / span_max) as usize + 1);
+    let mut done = 0u64;
+    while done < span.len {
+        let len = span_max.min(span.len - done);
+        out.push(GuestRamRegion {
+            host_va: span.host_va + done,
+            gpa_base: span.gpa_base + done,
+            len,
+        });
+        done += len;
+    }
+    out
+}
+
 fn resolve<H: HostOps + ?Sized>(host: &mut H) -> Resolved {
     let Some(align) = granularity() else {
         return Resolved {
@@ -610,10 +770,27 @@ fn resolve<H: HostOps + ?Sized>(host: &mut H) -> Resolved {
     // with one ordinary RAMBlock and one odd sliver should import the RAMBlock.
     // `GuestRamImport::new` names the check that rejected each skipped one on
     // the fail channel, so a partial import is never silent.
-    let imports: Vec<Arc<GuestRamImport>> = spans
+    //
+    // One import per RAMBlock was the shape until a driver was found truncating
+    // `allocationSize` to 32 bits on this path — see
+    // [`crate::backend::vulkan::caps::host_pointer::IMPORT_SPAN_CEILING`]. Each
+    // block is now imported in chunks no larger than the span the backend
+    // published. Nothing else had to change: a window already resolves against
+    // whichever import backs its GPA, and one straddling two of them already
+    // groups into two `VkBuffer` sources, because a RAMBlock boundary has always
+    // been able to split one.
+    let span_max = import_span_max().unwrap_or(u64::MAX);
+    let mut imports: Vec<Arc<GuestRamImport>> = spans
         .into_iter()
+        .flat_map(|span| chunk_span(span, span_max))
         .filter_map(|span| GuestRamImport::new(span, align).ok().map(Arc::new))
         .collect();
+    // `reference` binary-searches this, so the order is load-bearing rather than
+    // cosmetic. The shim reports blocks in ascending GPA and `chunk_span` keeps
+    // that, so this is a no-op on every machine seen so far — it is here because
+    // the search would silently answer `GpaNotInAnyImport` for a live address if
+    // a future shim ever reported them out of order.
+    imports.sort_by_key(|i| i.gpa_base());
     // Every import is live for the VM's lifetime and any submission may name any
     // of them, so what has to fit is the sum and not the largest block. A guest
     // that does not fit takes the copying rails whole rather than in part — see
@@ -644,7 +821,7 @@ fn resolve<H: HostOps + ?Sized>(host: &mut H) -> Resolved {
     for (n, import) in imports.iter().enumerate() {
         crate::observe::off(format!(
             "guest_ram_span n={n}/{count} gpa={:#x} len={} mib={}",
-            import.gpa_base(),
+            import.gpa_base().expect("RAMBlock imports have a GPA base"),
             import.len(),
             import.len() / (1024 * 1024),
         ));
@@ -681,9 +858,10 @@ mod tests {
     /// also a test about the heap. The budget tests name their own.
     const UNBOUNDED: u64 = u64::MAX;
 
-    /// Latch a granularity with a budget that admits everything.
+    /// Latch a granularity with a budget and a span ceiling that admit
+    /// everything, so a test about the granularity is only about that.
     fn latch_granularity(align: u64) {
-        latch_import_limits(align, UNBOUNDED);
+        latch_import_limits(align, UNBOUNDED, UNBOUNDED);
     }
 
     fn forget_granularity() {
@@ -751,11 +929,203 @@ mod tests {
         out
     }
 
+    /// Run `body` with a granularity and an explicit span ceiling latched, so a
+    /// test about chunking is not also a test about the heap.
+    fn with_span_max<R>(align: u64, span_max: u64, body: impl FnOnce() -> R) -> R {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        reset();
+        latch_import_limits(align, UNBOUNDED, span_max);
+        let out = body();
+        reset();
+        forget_import_limits();
+        out
+    }
+
+    /// The chunks must tile the block: every byte covered once, in order, none
+    /// invented and none dropped.
+    ///
+    /// Written as a walk rather than as an expected list because the failure
+    /// this guards is an off-by-one at a boundary, and a hand-written list of
+    /// expected chunks is exactly as likely to carry the same off-by-one as the
+    /// code it checks. The three sizes are the three shapes: an exact multiple, a
+    /// remainder, and a block already inside the ceiling.
+    #[test]
+    fn chunking_tiles_the_block_exactly() {
+        for (len, span_max) in [
+            (0x8000u64, 0x2000u64), // exact multiple
+            (0x9001, 0x2000),       // ragged remainder
+            (0x1000, 0x2000),       // already inside the ceiling
+            (0x2000, 0x2000),       // exactly the ceiling
+        ] {
+            let span = GuestRamRegion {
+                gpa_base: 0x1_0000_0000,
+                host_va: 0x7f00_0000_0000,
+                len,
+            };
+            let chunks = chunk_span(span, span_max);
+            assert!(!chunks.is_empty(), "len={len:#x} produced no chunk");
+            let mut walked = 0u64;
+            for c in &chunks {
+                assert!(c.len > 0, "len={len:#x} produced an empty chunk");
+                assert!(
+                    c.len <= span_max,
+                    "len={len:#x} chunk of {:#x} is past the ceiling {span_max:#x}",
+                    c.len
+                );
+                assert_eq!(
+                    c.gpa_base,
+                    span.gpa_base + walked,
+                    "len={len:#x} chunk does not continue where the last ended"
+                );
+                assert_eq!(
+                    c.host_va,
+                    span.host_va + walked,
+                    "len={len:#x} host pointer drifted from the GPA"
+                );
+                walked += c.len;
+            }
+            assert_eq!(walked, len, "len={len:#x} chunks do not cover the block");
+        }
+    }
+
+    /// The reason chunking exists: no single import may be longer than the span
+    /// the backend published.
+    ///
+    /// A driver has been measured truncating `allocationSize` to 32 bits on the
+    /// host-pointer path and reading back unrelated data past the truncation, so
+    /// an import longer than the published ceiling is not a slow import, it is a
+    /// silently wrong one. This asserts the property that makes that
+    /// unreachable, and asserts it about every import rather than about the
+    /// count, because the count is a consequence and the length is the rule.
+    #[test]
+    fn no_import_is_longer_than_the_span_the_backend_published() {
+        const CEILING: u64 = 0x2000_0000;
+        with_span_max(0x1000, CEILING, || {
+            let mut host = two_spans();
+            assert_eq!(standing_refusal(&mut host), None);
+            let imports = imports();
+            assert_eq!(
+                imports.len(),
+                8,
+                "two 2 GiB blocks at a 512 MiB ceiling are four chunks each"
+            );
+            for i in &imports {
+                assert!(
+                    i.len() <= CEILING,
+                    "import at {:#x} is {} bytes, past the {CEILING} ceiling",
+                    i.gpa_base().expect("RAMBlock imports have a GPA base"),
+                    i.len()
+                );
+            }
+            assert_eq!(
+                imports.iter().map(|i| i.len()).sum::<u64>(),
+                two_spans_bytes(),
+                "chunking must not lose or duplicate guest RAM"
+            );
+        });
+    }
+
+    /// Every address the unchunked map resolved must still resolve, including
+    /// the ones that now fall in a later chunk — and a hole must still be
+    /// refused, which is what says the search did not simply widen.
+    ///
+    /// The boundary addresses are the point. `partition_point` picks the last
+    /// import whose base is `<= gpa`, so a GPA exactly on a chunk base is the
+    /// case an off-by-one puts in the previous chunk, where it is one byte past
+    /// the end.
+    #[test]
+    fn a_chunked_block_resolves_at_every_boundary_and_still_refuses_the_hole() {
+        const CEILING: u64 = 0x2000_0000;
+        with_span_max(0x1000, CEILING, || {
+            let mut host = two_spans();
+            for gpa in [
+                0u64,
+                CEILING - 0x1000,
+                CEILING,
+                CEILING + 0x1000,
+                0x8000_0000 - 0x1000,
+                0x1_0000_0000,
+                0x1_0000_0000 + CEILING,
+                0x1_8000_0000 - 0x1000,
+            ] {
+                let got = reference(&mut host, gpa, 0x1000);
+                assert!(
+                    got.is_ok(),
+                    "gpa {gpa:#x} is guest RAM and did not resolve: {:?}",
+                    got.err()
+                );
+            }
+            assert_eq!(
+                reference(&mut host, 0x8000_0000, 0x1000).err(),
+                Some(MapRefusal::GpaNotInAnyImport { gpa: 0x8000_0000 }),
+                "the PCI hole is not guest RAM and chunking must not have covered it"
+            );
+        });
+    }
+
+    /// A guest run that crosses a seam between two chunks of one RAMBlock is
+    /// **split**, not refused, and the pieces tile the request exactly.
+    ///
+    /// A `GuestRef` is an offset into one import, so it cannot describe both
+    /// sides of a seam. Refusing would be safe — a named decline, whole window
+    /// to the copying rail — and would put a chunk size the guest cannot see
+    /// into this device's throughput on roughly one writeback in 250. The
+    /// consumers already take a list, and a RAMBlock boundary has always been
+    /// able to produce one, so a split here is indistinguishable from a split
+    /// the guest's own page plan produced.
+    ///
+    /// Asserted on the tiling rather than on the count, because "two runs" would
+    /// still pass if the second one started in the wrong place.
+    #[test]
+    fn a_run_crossing_a_chunk_seam_is_split_and_the_pieces_tile_the_window() {
+        const CEILING: u64 = 0x2000_0000;
+        const PAGE: u64 = 0x1000;
+        with_span_max(PAGE, CEILING, || {
+            let mut host = two_spans();
+            // Two GPA-contiguous pages either side of the first chunk seam.
+            let gpas = [CEILING - PAGE, CEILING];
+            let runs = references_for_runs(&mut host, &gpas, PAGE, 0, 2 * PAGE)
+                .expect("both pages are guest RAM; a seam is not a refusal");
+
+            assert_eq!(runs.len(), 2, "one piece per import the run touches");
+            let mut want = 0u64;
+            for r in &runs {
+                assert_eq!(
+                    r.window_offset, want,
+                    "a piece does not begin where the last one ended"
+                );
+                want += r.guest.requested();
+            }
+            assert_eq!(want, 2 * PAGE, "the pieces do not cover the window");
+            assert!(
+                runs[0].guest.import().id() != runs[1].guest.import().id(),
+                "a split that stays inside one import is not a seam split"
+            );
+        });
+    }
+
+    /// The same run, with the seam moved out of its way, must stay one piece.
+    /// Without this the test above would pass on an implementation that split
+    /// every run in half.
+    #[test]
+    fn a_run_inside_one_chunk_is_not_split() {
+        const CEILING: u64 = 0x2000_0000;
+        const PAGE: u64 = 0x1000;
+        with_span_max(PAGE, CEILING, || {
+            let mut host = two_spans();
+            let gpas = [CEILING + PAGE, CEILING + 2 * PAGE];
+            let runs = references_for_runs(&mut host, &gpas, PAGE, 0, 2 * PAGE)
+                .expect("both pages are guest RAM");
+            assert_eq!(runs.len(), 1, "a run wholly inside one import is one piece");
+            assert_eq!(runs[0].guest.requested(), 2 * PAGE);
+        });
+    }
+
     /// Run `body` with a granularity and an explicit heap budget latched.
     fn with_budget<R>(align: u64, budget: u64, body: impl FnOnce() -> R) -> R {
         let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         reset();
-        latch_import_limits(align, budget);
+        latch_import_limits(align, budget, UNBOUNDED);
         let out = body();
         reset();
         forget_import_limits();

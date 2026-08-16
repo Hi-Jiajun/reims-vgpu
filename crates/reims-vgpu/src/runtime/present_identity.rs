@@ -1,20 +1,14 @@
 //! The resident identity a type-11 guest surface renders into.
 //!
-//! This is all that survives of `import_present`, which owned three ways of
-//! landing a Vulkan composite Store in guest IOSurface pages without a CPU
-//! copy: a packed-contig strided DMA, a fragmented multi-run scatter DMA, and
-//! an ack-fast deferred rung that pinned the resident and replayed the Store on
-//! first access.
+//! A compatible surface resident is a Vulkan image imported over the guest
+//! allocation itself. Rendering, attachment LOAD, Store synchronization, and
+//! sampled binding then name one resource; there is no device-local mirror to
+//! reconcile on a unified host. If exact-pitch import is unavailable, the same
+//! identity keys the ordinary resident and the existing copied fallbacks.
 //!
-//! All three needed `VK_EXT_external_memory_host` — a host pointer over the
-//! guest's own pages, which is a pointer the GPU can write. Neither the
-//! extension nor the two engine entry points exist any more, so type-11 Stores
-//! take the CPU writeback
-//! (`mapping_write::write_rgba8_image_changed`), which every one of those rails
-//! already fell back to whenever an import was refused.
-//!
-//! What is left is the identity itself, which was never about importing: the
-//! registry is keyed by it whichever way the pixels reach the guest.
+//! The identity is independent of that storage choice. It names the guest
+//! resource and its current incarnation, so changing host capability changes
+//! performance and ownership but never which surface the guest observes.
 
 #![cfg(feature = "backend-vulkan")]
 

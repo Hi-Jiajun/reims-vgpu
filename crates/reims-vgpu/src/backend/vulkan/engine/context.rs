@@ -3,8 +3,10 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use ash::vk;
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use super::counters::EngineCounters;
 use super::device_lost::DeviceLostDecline;
@@ -292,40 +294,67 @@ pub(crate) struct VertexDivisorCapabilities {
 /// small fraction of `fence_us`, the rest is the batch and the asking, and
 /// making the copy cheaper cannot pay.
 ///
-/// Two queries are enough because the readback is serialized: the caller waits
-/// on this copy's fence before it can start another, so the pool is never read
-/// while a second submission is writing it.
+/// # This region is per ring slot, and it has to be
+///
+/// The doc that stood here said "two queries are enough because the readback is
+/// serialized: the caller waits on this copy's fence before it can start
+/// another, so the pool is never read while a second submission is writing it."
+/// That premise stopped being true when the guest-page writeback stopped waiting
+/// on its fence. Two writers then shared **one** three-query region: the
+/// readback, which still waits, and `copy_image_level0_to_buffer`, which submits
+/// and returns.
+///
+/// Vulkan orders nothing between two submissions on one queue without explicit
+/// synchronization — submission order is start order, not completion order — so
+/// the second writeback's `vkCmdResetQueryPool` could execute while the first's
+/// timestamps were still pending, and its `vkCmdWriteTimestamp` could execute
+/// before its own reset. Resetting a query in use and writing one whose reset
+/// has not run are both undefined, and the Khronos validation layer reported it
+/// on a driven macos-11 boot as `VUID-vkGetQueryPoolResults-None-09401`
+/// ("query not reset ... queries must also be reset between uses").
+///
+/// The fix is [`DrawSpanProbe`]'s, directly below, and for its reason: the ring
+/// slot is the natural owner because the slot's fence is exactly the event that
+/// makes its queries readable, and the ring already retires a slot before
+/// reusing it. Both writers record into a slot command buffer, so both get a
+/// region of their own for free.
 pub(crate) struct TimestampProbe {
-    /// Slot 0 is written at `TOP_OF_PIPE` before the barrier, slot 1 at
-    /// `TRANSFER` immediately after it, slot 2 at `BOTTOM_OF_PIPE` after the
-    /// copy. [`Self::SLOTS`] is the count the pool is created with and the count
-    /// the command buffer resets; a mismatch reads as a silent zero rather than
-    /// as an error, which is how the two-slot first version shipped and measured
-    /// nothing.
+    /// Query `base(slot) + 0` is written at `TOP_OF_PIPE` before the barrier,
+    /// `+ 1` at `TRANSFER` immediately after it, `+ 2` at `BOTTOM_OF_PIPE` after
+    /// the copy. [`Self::PER_SLOT`] is the count each region holds, the count
+    /// the command buffer resets, and the count the read asks for; a mismatch
+    /// reads as a silent zero rather than as an error, which is how the
+    /// two-slot first version shipped and measured nothing.
     pub pool: vk::QueryPool,
-    /// `VkPhysicalDeviceLimits::timestampPeriod` — nanoseconds per tick.
-    pub ns_per_tick: f32,
+    /// How a raw tick difference becomes nanoseconds. Shared with
+    /// [`DrawSpanProbe`] so this probe cannot ship without the valid-bits mask
+    /// that one's doc explains — it did, and every reading it produced was a
+    /// raw subtraction of two numbers whose high halves the driver leaves
+    /// undefined.
+    pub scale: TickScale,
 }
 
 impl TimestampProbe {
-    /// How many queries the pool holds, the command buffer resets, and the read
-    /// asks for. One constant because the three must agree: created with two
-    /// while the command buffer wrote three, the reads failed and the census
-    /// printed zeros that read exactly like "the GPU did no work".
-    pub const SLOTS: u32 = 3;
+    /// Queries per ring slot: the start stamp, the post-barrier stamp, and the
+    /// post-copy stamp.
+    pub const PER_SLOT: u32 = 3;
+
+    /// First query index belonging to ring slot `slot`.
+    pub const fn base(slot: usize) -> u32 {
+        slot as u32 * Self::PER_SLOT
+    }
 }
 
-/// A timestamp pair per submission ring slot: the top of a draw command buffer
-/// and its bottom.
+/// How a queue family's raw timestamp ticks become nanoseconds.
 ///
-/// Why a pair per *slot* and not one pair shared: up to
-/// [`super::pools::RING_DEPTH`] command buffers are in flight at once, and a
-/// shared pair would be overwritten by the next submission long before the first
-/// one's fence made it readable. The slot is the natural key because the slot's
-/// fence is exactly the event that makes its pair readable, and the ring already
-/// retires a slot before reusing it — see [`super::gpu_span::SlotSpan`].
-pub(crate) struct DrawSpanProbe {
-    pub pool: vk::QueryPool,
+/// One type rather than a field pair on each probe, because the two halves are
+/// only correct together and a probe that carries the period without the mask
+/// silently produces garbage on any host that writes fewer than 64 meaningful
+/// bits. Making the pair the thing a probe holds is what stops the second one
+/// being written without it — which is exactly what happened to
+/// [`TimestampProbe`].
+#[derive(Clone, Copy)]
+pub(crate) struct TickScale {
     /// `VkPhysicalDeviceLimits::timestampPeriod` — nanoseconds per tick.
     pub ns_per_tick: f32,
     /// The low `timestampValidBits` of a query result, as a mask.
@@ -340,6 +369,52 @@ pub(crate) struct DrawSpanProbe {
     pub valid_mask: u64,
 }
 
+impl TickScale {
+    /// The pair a queue family reports, or `None` where it reports no usable
+    /// timestamps at all. The one constructor, so a mask can only come from the
+    /// `valid_bits` beside the period it belongs to.
+    pub fn resolve(valid_bits: u32, timestamp_period: f32) -> Option<Self> {
+        (valid_bits > 0 && timestamp_period > 0.0).then(|| Self {
+            ns_per_tick: timestamp_period,
+            // A `valid_bits` of 64 has to become an all-ones mask rather than a
+            // shift that overflows.
+            valid_mask: if valid_bits >= u64::BITS {
+                u64::MAX
+            } else {
+                (1u64 << valid_bits) - 1
+            },
+        })
+    }
+
+    /// Elapsed nanoseconds between two raw query results, masked to the bits the
+    /// queue family actually writes and treating a wrap within that width as a
+    /// wrap rather than as an enormous negative.
+    pub fn elapsed_ns(&self, from: u64, to: u64) -> u64 {
+        let span = (to & self.valid_mask).wrapping_sub(from & self.valid_mask) & self.valid_mask;
+        // In f64, not integer ticks-times-period: `timestampPeriod` is a float
+        // and drivers do report values below 1 ns (a counter faster than 1 GHz),
+        // which an integer multiply would truncate to zero and report as "the
+        // GPU did nothing".
+        (span as f64 * self.ns_per_tick.max(0.0) as f64) as u64
+    }
+}
+
+/// A timestamp pair per submission ring slot: the top of a draw command buffer
+/// and its bottom.
+///
+/// Why a pair per *slot* and not one pair shared: up to
+/// [`super::pools::RING_DEPTH`] command buffers are in flight at once, and a
+/// shared pair would be overwritten by the next submission long before the first
+/// one's fence made it readable. The slot is the natural key because the slot's
+/// fence is exactly the event that makes its pair readable, and the ring already
+/// retires a slot before reusing it — see [`super::gpu_span::SlotSpan`].
+pub(crate) struct DrawSpanProbe {
+    pub pool: vk::QueryPool,
+    /// How a raw tick difference becomes nanoseconds. See [`TickScale`], which
+    /// [`TimestampProbe`] shares so the mask cannot be omitted from one of them.
+    pub scale: TickScale,
+}
+
 impl DrawSpanProbe {
     /// Queries per ring slot: the top stamp and the bottom stamp.
     pub const PER_SLOT: u32 = 2;
@@ -348,14 +423,17 @@ impl DrawSpanProbe {
     pub const fn base(slot: usize) -> u32 {
         slot as u32 * Self::PER_SLOT
     }
+}
 
-    /// Elapsed nanoseconds between two raw query results, masked to the bits the
-    /// queue family actually writes and treating a wrap within that width as a
-    /// wrap rather than as an enormous negative.
-    pub fn elapsed_ns(&self, top: u64, bottom: u64) -> u64 {
-        let span = (bottom & self.valid_mask).wrapping_sub(top & self.valid_mask) & self.valid_mask;
-        (span as f64 * self.ns_per_tick as f64) as u64
-    }
+/// The Vulkan limit governing every shader-visible buffer offset this engine
+/// emits.
+///
+/// Guest shader buffers and the internal scatter tables are all
+/// `STORAGE_BUFFER` descriptors. Uniform-buffer alignment is a different
+/// contract and vertex offsets are checked on their own path, so neither may
+/// widen this answer.
+fn storage_buffer_offset_alignment(limits: &vk::PhysicalDeviceLimits) -> u64 {
+    limits.min_storage_buffer_offset_alignment
 }
 
 pub(crate) struct DeviceContext {
@@ -379,6 +457,9 @@ pub(crate) struct DeviceContext {
     /// `None` is the answer on every host without the extension, and the import
     /// site declines by name when it sees one.
     pub external_memory_host: Option<ash::ext::external_memory_host::Device>,
+    /// `VK_KHR_push_descriptor` entry points, present only when the extension
+    /// was advertised, queried, and enabled for this device.
+    pub push_descriptor: Option<ash::khr::push_descriptor::Device>,
     /// Queue family used for all engine submits (graphics draws + compute).
     pub gq: u32,
     /// True when `gq` supports both GRAPHICS and COMPUTE (required for engine compute).
@@ -411,19 +492,14 @@ pub(crate) struct DeviceContext {
     pub sampled_linear_filter: [bool; TexelLayout::ALL.len()],
     pub pipeline_cache: vk::PipelineCache,
     pub vertex_divisor: VertexDivisorCapabilities,
-    /// Offset alignment a guest-window import must satisfy before a draw may
-    /// bind it directly as a vertex or storage buffer, taken from
-    /// `VkPhysicalDeviceLimits`.
+    /// Offset alignment for every storage-buffer descriptor this engine writes,
+    /// taken directly from `minStorageBufferOffsetAlignment`.
     ///
-    /// One number for both because the dedup in `stage_buffer_content` shares a
-    /// bound buffer between a stream that feeds vertex fetch and one that feeds
-    /// a storage binding, so a value legal for only one of them would be a
-    /// valid-usage violation the moment the same guest span is used twice.
-    /// `min*BufferOffsetAlignment` are the device's own answers; the 16 floor
-    /// covers vertex fetch, which the spec gives no queryable limit for and
-    /// which implementations may require to be component-aligned — 16 bytes is
-    /// the largest component-size any vertex format has.
-    pub guest_bind_offset_align: u64,
+    /// Vertex-buffer offsets have no corresponding device limit and the engine
+    /// checks them separately. Uniform-buffer alignment does not participate:
+    /// guest shader buffers and the scatter kernel's run tables are storage
+    /// descriptors, so imposing the uniform limit would reject legal offsets.
+    pub storage_buffer_offset_align: u64,
     /// The widest span this device will bind as one storage buffer, from
     /// `VkPhysicalDeviceLimits::maxStorageBufferRange`.
     ///
@@ -445,6 +521,10 @@ pub(crate) struct DeviceContext {
     /// this rather than re-querying: a feature asked about in two places is a
     /// feature that will eventually be enabled in one of them.
     pub features: crate::backend::vulkan::caps::device_features::DeviceFeatures,
+    /// Per-format/usage answers for explicit linear external-image layout.
+    /// Physical-device support is immutable, while target identities churn, so
+    /// the query belongs to the device lifetime rather than each image lifetime.
+    pub explicit_linear_support: Mutex<HashMap<(i32, u32), bool>>,
     /// Combined depth-stencil format supported for DEPTH_STENCIL_ATTACHMENT on
     /// this device (D32_SFLOAT_S8_UINT preferred, D24_UNORM_S8_UINT fallback).
     /// Used only by the stencil-test path; depth-only uses D32_SFLOAT.
@@ -471,8 +551,8 @@ pub(crate) struct DeviceContext {
     /// while a draw's pair belongs to the ring slot whose fence will make it
     /// readable. See [`super::gpu_span`].
     pub draw_spans: Option<DrawSpanProbe>,
-    /// The thread that announces a GPU-written completion stamp, and the
-    /// timeline semaphore its submissions signal.
+    /// The thread that publishes and announces FIFO completion stamps, and the
+    /// timeline semaphore FIFO-owned submissions signal.
     ///
     /// `None` when the device does not advertise `timelineSemaphore` or the
     /// thread would not start — the stamp rail then falls back to blocking the
@@ -480,6 +560,10 @@ pub(crate) struct DeviceContext {
     /// [`super::stamp_completion`] for why the interrupt cannot be deferred to
     /// anything that runs on a schedule.
     pub stamp_completion: Option<super::stamp_completion::StampCompletion>,
+    /// Sole host-side owner of the graphics queue.  All submissions, presents,
+    /// and queue-idle waits pass through its FIFO so an asynchronous batch tail
+    /// cannot race a later synchronous consumer.
+    pub queue_owner: Option<super::queue_owner::QueueOwner>,
     /// On-disk VkPipelineCache blob for this device (keyed by
     /// pipelineCacheUUID), or None when persistence is unavailable.
     pub pipeline_cache_path: Option<std::path::PathBuf>,
@@ -489,6 +573,62 @@ pub(crate) struct DeviceContext {
     /// `VK_KHR_swapchain` was enabled for the engine-owned host window.
     #[cfg(feature = "host-window")]
     pub swapchain: bool,
+}
+
+/// Whether a display transaction completed inline on the raw-queue fallback or
+/// was handed to the ordered queue owner.
+#[cfg(feature = "host-window")]
+pub(crate) enum PresentSubmission {
+    Complete(Result<bool, vk::Result>),
+    Pending(super::queue_owner::PendingPresent),
+}
+
+/// The two host queue operations that make one display transaction.
+///
+/// Keeping the submission and presentation operands in one value prevents a
+/// caller from handing them to the ordered queue as separately interleavable
+/// requests.
+#[cfg(feature = "host-window")]
+pub(crate) struct PresentTransaction<'a> {
+    pub command_buffers: &'a [vk::CommandBuffer],
+    pub wait_semaphores: &'a [vk::Semaphore],
+    pub wait_stages: &'a [vk::PipelineStageFlags],
+    pub signal_semaphores: &'a [vk::Semaphore],
+    pub fence: vk::Fence,
+    pub loader: ash::khr::swapchain::Device,
+    pub present_wait: vk::Semaphore,
+    pub swapchain: vk::SwapchainKHR,
+    pub image_index: u32,
+}
+
+#[cfg(test)]
+mod storage_buffer_alignment_tests {
+    use super::*;
+
+    /// A host may require a wider offset for uniform descriptors than for
+    /// storage descriptors. Guest shader buffers use the latter, so the
+    /// unrelated limit must not turn a legal direct bind into a gather.
+    #[test]
+    fn uniform_buffer_alignment_does_not_constrain_storage_bindings() {
+        let limits = vk::PhysicalDeviceLimits {
+            min_storage_buffer_offset_alignment: 4,
+            min_uniform_buffer_offset_alignment: 64,
+            ..Default::default()
+        };
+        assert_eq!(storage_buffer_offset_alignment(&limits), 4);
+    }
+
+    /// The selected value is still the device's exact storage requirement; it
+    /// is not a fixed floor derived from one host.
+    #[test]
+    fn a_wider_storage_requirement_is_preserved() {
+        let limits = vk::PhysicalDeviceLimits {
+            min_storage_buffer_offset_alignment: 256,
+            min_uniform_buffer_offset_alignment: 16,
+            ..Default::default()
+        };
+        assert_eq!(storage_buffer_offset_alignment(&limits), 256);
+    }
 }
 
 // SAFETY: ash handles; only accessed under engine mutex.
@@ -729,9 +869,6 @@ impl DeviceContext {
             features.storage_image_write_without_format_bgra();
         let sampled_linear_filter = features.sampled_linear_filter;
         let has16 = features.storage16;
-        let has8 = features.storage8;
-        let has_float16 = features.float16;
-        let has_int8 = features.int8;
         // Defined bounds-clamped behavior for out-of-range shader buffer access
         // is among these — the ONE feature the Vulkan spec requires every
         // implementation to support, so enabling it is portability-clean and
@@ -746,8 +883,23 @@ impl DeviceContext {
         // whole RAMBlocks, and at what granularity. Same shape as the query
         // above and for the same reason: the answer is the only producer of the
         // extension string it requires.
-        let host_pointer =
-            crate::backend::vulkan::caps::host_pointer::query(&instance, pd, &has_device_extension);
+        //
+        // `maxMemoryAllocationSize` is read before it, because it bounds every
+        // allocation on the device and not only an import: the import's own
+        // span ceiling is the minimum of it and two other limits.
+        let max_allocation_size =
+            crate::backend::vulkan::caps::memory_topology::max_allocation_size(&instance, pd);
+        let host_pointer = crate::backend::vulkan::caps::host_pointer::query(
+            &instance,
+            pd,
+            &has_device_extension,
+            max_allocation_size,
+        );
+        let push_descriptor = crate::backend::vulkan::caps::push_descriptor::query(
+            &instance,
+            pd,
+            &has_device_extension,
+        );
         // Published for `runtime::guest_ram_map`, which builds the imports and
         // has no device context to read the granularity or the heap sizes from.
         // A negative rung withdraws them rather than publishing zeroes, so the
@@ -758,6 +910,7 @@ impl DeviceContext {
                 crate::runtime::guest_ram::latch_import_limits(
                     host_pointer.min_alignment,
                     host_pointer.heap_budget,
+                    host_pointer.span_max,
                 );
             }
             _ => crate::runtime::guest_ram::forget_import_limits(),
@@ -836,11 +989,22 @@ impl DeviceContext {
         // Only the `Supported` rung names `VK_EXT_external_memory_host`, so a
         // host without it gets a device rather than a failed `vkCreateDevice`.
         enabled_device_extensions.extend(host_pointer.rung.required_extensions());
-        // These three are built in `caps` too. They are bound to locals here
-        // only because `push_next` borrows them for the lifetime of `dci`.
+        enabled_device_extensions.extend(push_descriptor.required_extensions());
+        // Built in `caps` too. Bound to a local here only because `push_next`
+        // borrows it for the lifetime of `dci`.
+        //
+        // 8-bit storage and shaderFloat16/shaderInt8 used to be chained here as
+        // their own structs alongside `enabled_vulkan12`, which the spec forbids
+        // — they were promoted into it at 1.2 and the two spellings could
+        // disagree. They are set inside `enabled_vulkan12` now. 16-bit storage
+        // was promoted into the 1.1 struct instead, which this chain does not
+        // carry, so it keeps its own.
         let mut en16 = features.enabled_16bit_storage();
-        let mut en8 = features.enabled_8bit_storage();
-        let mut enfi = features.enabled_float16_int8();
+        // Metal defines an out-of-bounds texture read; Vulkan does not unless
+        // this is enabled. Chained only when the host advertised it, because
+        // asking for a feature a device declined fails `vkCreateDevice`.
+        let mut en_image_robustness = features.enabled_image_robustness();
+        let mut en_attachment_feedback = features.enabled_attachment_feedback_loop_layout();
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
             .enabled_features(&enabled)
@@ -852,32 +1016,36 @@ impl DeviceContext {
         if has16 {
             dci = dci.push_next(&mut en16);
         }
-        if has8 {
-            dci = dci.push_next(&mut en8);
+        if features.image_robustness.is_available() {
+            dci = dci.push_next(&mut en_image_robustness);
         }
-        if has_float16 || has_int8 {
-            dci = dci.push_next(&mut enfi);
+        if features.attachment_feedback_loop_layout {
+            dci = dci.push_next(&mut en_attachment_feedback);
         }
         let device = instance
             .create_device(pd, &dci, None)
             .map_err(|result| DrawError::Init(InitDecline::CreateDevice { result }))?;
         let props = instance.get_physical_device_properties(pd);
-        // Both halves are capability answers, not assumptions: Vulkan permits a
-        // queue family to support no timestamps at all, and permits
-        // `timestampPeriod` to be any positive float. A device that says either
-        // gets no probe and the census reports zero rather than a wrong number.
-        let timestamps = (qfs[gq as usize].timestamp_valid_bits > 0
-            && props.limits.timestamp_period > 0.0)
-            .then(|| {
+        // Capability answers, not assumptions: Vulkan permits a queue family to
+        // support no timestamps at all, and permits `timestampPeriod` to be any
+        // positive float. A device that says either gets no probe at all and the
+        // census reports zero rather than a wrong number. One resolve for both
+        // probes, so neither can be built against a mask the other derived.
+        let scale = TickScale::resolve(
+            qfs[gq as usize].timestamp_valid_bits,
+            props.limits.timestamp_period,
+        );
+        // One region per ring slot, for the reason `TimestampProbe`'s doc gives:
+        // the guest-page writeback submits without waiting, so two of its copies
+        // can be in flight at once and a shared region is reset under the first.
+        let timestamps = scale
+            .and_then(|scale| {
                 let ci = vk::QueryPoolCreateInfo::default()
                     .query_type(vk::QueryType::TIMESTAMP)
-                    .query_count(TimestampProbe::SLOTS);
+                    .query_count(TimestampProbe::PER_SLOT * super::pools::RING_DEPTH as u32);
                 device
                     .create_query_pool(&ci, None)
-                    .map(|pool| TimestampProbe {
-                        pool,
-                        ns_per_tick: props.limits.timestamp_period,
-                    })
+                    .map(|pool| TimestampProbe { pool, scale })
                     .map_err(|e| {
                         crate::observe::Emit::decline(
                             "vk_timestamp_pool",
@@ -886,31 +1054,16 @@ impl DeviceContext {
                         .fail_once(0);
                     })
                     .ok()
-            })
-            .flatten();
-        // The same two capability answers as above, plus the switch. Both halves
-        // matter: a queue family that writes no timestamps must get no probe, and
-        // a `valid_bits` of 64 has to become an all-ones mask rather than a shift
-        // that overflows.
-        let valid_bits = qfs[gq as usize].timestamp_valid_bits;
-        let draw_spans = (valid_bits > 0
-            && props.limits.timestamp_period > 0.0
-            && crate::env::read(crate::env::GPU_SPANS).0 != crate::env::Switch::Off)
-            .then(|| {
+            });
+        let draw_spans = scale
+            .filter(|_| crate::env::read(crate::env::GPU_SPANS).0 != crate::env::Switch::Off)
+            .and_then(|scale| {
                 let ci = vk::QueryPoolCreateInfo::default()
                     .query_type(vk::QueryType::TIMESTAMP)
                     .query_count(DrawSpanProbe::PER_SLOT * super::pools::RING_DEPTH as u32);
                 device
                     .create_query_pool(&ci, None)
-                    .map(|pool| DrawSpanProbe {
-                        pool,
-                        ns_per_tick: props.limits.timestamp_period,
-                        valid_mask: if valid_bits >= u64::BITS {
-                            u64::MAX
-                        } else {
-                            (1u64 << valid_bits) - 1
-                        },
-                    })
+                    .map(|pool| DrawSpanProbe { pool, scale })
                     .map_err(|e| {
                         crate::observe::Emit::decline(
                             "vk_draw_span_pool",
@@ -919,8 +1072,7 @@ impl DeviceContext {
                         .fail_once(0);
                     })
                     .ok()
-            })
-            .flatten();
+            });
         // Gated on the feature actually being enabled, not on the API version.
         // `timelineSemaphore` is core in 1.2 and this backend's baseline is 1.2,
         // so a device that declines it is out of spec — which is exactly why the
@@ -939,11 +1091,24 @@ impl DeviceContext {
             })
             .ok()
             .flatten();
+        let queue = device.get_device_queue(gq, 0);
+        let queue_owner = match super::queue_owner::QueueOwner::start(&device, queue) {
+            Ok(owner) => Some(owner),
+            Err(error) => {
+                crate::observe::fail(format!(
+                    "vk_queue_owner_start_failed reason=vk_queue_owner_start_failed error={error} \
+                     (queue submission remains synchronous)"
+                ));
+                None
+            }
+        };
         let memory_properties = instance.get_physical_device_memory_properties(pd);
         let caps = HostGpuCaps {
             memory: classify_memory(&memory_properties),
+            max_allocation_size,
             quirks: DriverQuirk::for_portability_subset(portability_subset),
             host_pointer,
+            push_descriptor,
             portability_subset,
             device_api_version: props.api_version,
             device_type: props.device_type,
@@ -954,6 +1119,10 @@ impl DeviceContext {
             .host_pointer
             .is_available()
             .then(|| ash::ext::external_memory_host::Device::new(&instance, &device));
+        let push_descriptor = caps
+            .push_descriptor
+            .is_available()
+            .then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
         let device_name = CStr::from_ptr(props.device_name.as_ptr())
             .to_string_lossy()
             .into_owned();
@@ -979,6 +1148,11 @@ impl DeviceContext {
         // Reported and never branched on — see the module doc for why a positive
         // answer here is necessary and not sufficient.
         crate::backend::vulkan::caps::linear_sampled::report(&instance, pd);
+        // Whether a resident colour image can use imported guest storage as
+        // its backing. Like the sampled report, this is necessary but not
+        // sufficient: alias stability, memory requirements and row pitch are
+        // per-target questions.
+        crate::backend::vulkan::caps::linear_target::report(&instance, pd);
         // Fine-grained capabilities that do change what a draw can express.
         crate::observe::off(format!(
             "vk_device_select name={device_name:?} type={:?} depth_stencil_format={:?} bgra_storage_composite={} compute_capable={} quirks_no_deferred_batching={} quirks_guest_pages_authoritative={}",
@@ -1050,6 +1224,7 @@ impl DeviceContext {
             caps,
             memory_properties,
             external_memory_host,
+            push_descriptor,
             gq,
             compute_capable,
             storage_image_write_without_format: storage_image_write_without_format_bgra,
@@ -1059,20 +1234,18 @@ impl DeviceContext {
             sampled_linear_filter,
             pipeline_cache,
             vertex_divisor,
-            guest_bind_offset_align: props
-                .limits
-                .min_storage_buffer_offset_alignment
-                .max(props.limits.min_uniform_buffer_offset_alignment)
-                .max(16),
+            storage_buffer_offset_align: storage_buffer_offset_alignment(&props.limits),
             max_storage_buffer_range: u64::from(props.limits.max_storage_buffer_range),
             vertex_formats,
             max_sampler_anisotropy: features.max_sampler_anisotropy,
             sampler_anisotropy: features.sampler_anisotropy,
             features,
+            explicit_linear_support: Mutex::new(HashMap::new()),
             depth_stencil_format,
             timestamps,
             draw_spans,
             stamp_completion,
+            queue_owner,
             pipeline_cache_path: Some(pipeline_cache_path),
             pipeline_cache_saved_len: AtomicUsize::new(initial_len),
             #[cfg(feature = "host-window")]
@@ -1163,9 +1336,15 @@ impl DeviceContext {
     }
 
     pub(crate) unsafe fn destroy(&mut self) {
-        // First, and before anything else this function touches: the completion
-        // thread holds a clone of `self.device` and is blocked inside it. Every
-        // line below is a use-after-free if it is still running.
+        // The queue owner may still hold ended command buffers and a clone of
+        // the device. Drain it before stopping completion publication or
+        // destroying anything a queued submission names.
+        if let Some(mut owner) = self.queue_owner.take() {
+            owner.stop();
+        }
+        // The completion thread also holds a clone of `self.device` and may be
+        // blocked inside it. Every line below is a use-after-free if it is still
+        // running.
         if let Some(mut completion) = self.stamp_completion.take() {
             unsafe { completion.stop(&self.device) };
         }
@@ -1189,13 +1368,16 @@ impl DeviceContext {
     /// skip a staging hop and a discrete host can avoid burning its BAR window
     /// without either decision being duplicated at an allocation site.
     ///
-    /// Returns `None` only when no type in `type_bits` carries the class's
-    /// *required* flags — the caller must then decline with a named reason.
+    /// Returns `None` when no memory type on this device may legally carry the
+    /// allocation — the caller must then decline with a named reason. Which of
+    /// the three checks refused is on the fail channel, once per (class,
+    /// reason), because a caller's own decline cannot say whether this device
+    /// has no such memory or merely nowhere to put this much of it.
     ///
     /// `bytes` is the allocation this pick is for, and every caller has it in the
     /// `VkMemoryRequirements` it just queried. It is what keeps a large
     /// allocation out of a heap that could not hold it — see
-    /// [`select_memory_type`].
+    /// [`select_memory_type`], which refuses rather than nominating one.
     pub(crate) fn memory_type_for(
         &self,
         type_bits: u32,
@@ -1212,22 +1394,50 @@ impl DeviceContext {
         // size is a difference in which heap the pick landed in. Naming the
         // index and its flags is what turns that from an inference into a
         // reading.
-        if let Some(pick) = picked {
-            // Keyed on the class and the index together, so a device whose
-            // table makes the pick differ between call sites says so instead of
-            // latching the first answer for the boot.
-            let key = ((class as u64) << 32) | pick.index as u64;
-            if crate::observe::first_sight("vk_memory_type_pick", key) {
-                let t = self.memory_properties.memory_types[pick.index as usize];
-                crate::observe::off(format!(
-                    "vk_memory_type_pick class={class:?} index={} heap={} flags={:?} \
-                     heap_bytes={} bytes={bytes} fits={}",
-                    pick.index, pick.heap_index, t.property_flags, pick.heap_bytes, pick.fits,
-                ));
+        match picked {
+            Ok(pick) => {
+                // Keyed on the class and the index together, so a device whose
+                // table makes the pick differ between call sites says so instead
+                // of latching the first answer for the boot.
+                let key = ((class as u64) << 32) | pick.index as u64;
+                if crate::observe::first_sight("vk_memory_type_pick", key) {
+                    let t = self.memory_properties.memory_types[pick.index as usize];
+                    crate::observe::off(format!(
+                        "vk_memory_type_pick class={class:?} index={} heap={} flags={:?} \
+                         heap_bytes={} bytes={bytes}",
+                        pick.index, pick.heap_index, t.property_flags, pick.heap_bytes,
+                    ));
+                }
+                Some(pick.index)
             }
-            self.report_oversized_allocation(class, bytes, pick);
+            Err(refusal) => {
+                self.report_memory_type_refusal(class, refusal);
+                None
+            }
         }
-        picked.map(|p| p.index)
+    }
+
+    /// Report, once per (class, check), an allocation this device may not make.
+    ///
+    /// Fail-visible and a real loss: the caller declines and whatever it was
+    /// allocating for does not happen. The line is here rather than at each
+    /// caller because the caller knows what it wanted the memory for and this
+    /// knows why the device cannot supply it, and a report from a machine nobody
+    /// here owns needs both halves.
+    fn report_memory_type_refusal(
+        &self,
+        class: MemoryClass,
+        refusal: crate::backend::vulkan::caps::memory_topology::MemoryTypeRefusal,
+    ) {
+        // The tag is the refusing check and the key is the class, so the two
+        // together are the (class, check) pair without a hand-packed word.
+        if !crate::observe::first_sight(refusal.slug(), class as u64) {
+            return;
+        }
+        crate::observe::fail(format!(
+            "vk_memory_type_refused reason={} class={class:?}",
+            refusal
+        ));
     }
 
     /// Escape hatch for a caller that has already built a [`MemoryRequest`]
@@ -1238,46 +1448,17 @@ impl DeviceContext {
         type_bits: u32,
         bytes: u64,
         req: &MemoryRequest,
-    ) -> Option<crate::backend::vulkan::caps::memory_topology::MemoryTypePick> {
-        select_memory_type(&self.memory_properties, type_bits, req, bytes)
-    }
-
-    /// Report, once per (class, heap), an allocation charged to a heap that could
-    /// not hold it even empty.
-    ///
-    /// Fail-visible rather than off-channel, and it is not a loss of guest work:
-    /// the allocation is still attempted and usually succeeds. What it says is
-    /// that this device has asked its driver to keep something resident in a pool
-    /// with no room for it, which is the condition under which a driver's
-    /// residency manager evicts the rest of the working set on every submission.
-    /// That reads from the outside as "the whole machine got slow", and until
-    /// this line existed there was nothing in a boot's log that named it.
-    ///
-    /// [`MemoryTypePick::fits`] is a heap-capacity test and not a residency one,
-    /// so this is a lower bound: a heap large enough to hold the allocation can
-    /// still be too full to. The direction it does catch is unambiguous.
-    pub(crate) fn report_oversized_allocation(
-        &self,
-        class: MemoryClass,
-        bytes: u64,
-        pick: crate::backend::vulkan::caps::memory_topology::MemoryTypePick,
-    ) {
-        if pick.fits {
-            return;
-        }
-        let key = ((class as u64) << 32) | pick.heap_index as u64;
-        if !crate::observe::first_sight("vk_memory_heap_too_small", key) {
-            return;
-        }
-        crate::observe::fail(format!(
-            "vk_memory_heap_too_small reason=vk_memory_heap_too_small class={class:?} \
-             index={} heap={} heap_mb={} bytes_mb={} (the allocation is charged to a heap that \
-             could not hold it empty; expect driver-side eviction of the working set)",
-            pick.index,
-            pick.heap_index,
-            pick.heap_bytes >> 20,
-            bytes >> 20,
-        ));
+    ) -> Result<
+        crate::backend::vulkan::caps::memory_topology::MemoryTypePick,
+        crate::backend::vulkan::caps::memory_topology::MemoryTypeRefusal,
+    > {
+        select_memory_type(
+            &self.memory_properties,
+            type_bits,
+            req,
+            bytes,
+            self.caps.max_allocation_size,
+        )
     }
 
     /// Whether a selected memory type is host-cached and whether it is coherent.
@@ -1291,6 +1472,147 @@ impl DeviceContext {
 
     pub(crate) fn queue(&self) -> vk::Queue {
         unsafe { self.device.get_device_queue(self.gq, 0) }
+    }
+
+    /// Submit FIFO-owned GPU work and publish its monotonic completion point.
+    ///
+    /// The caller supplies no signal semaphores; this method owns that part of
+    /// the submission so every guest-memory access participates in the same
+    /// completion timeline. A failed submit publishes nothing, and a later
+    /// successful value may legally skip the unused reservation.
+    pub(crate) unsafe fn submit_guest_work(
+        &self,
+        command_buffers: &[vk::CommandBuffer],
+        fence: vk::Fence,
+    ) -> Result<(), vk::Result> {
+        let timeline = self
+            .stamp_completion
+            .as_ref()
+            .map(|completion| completion.reserve_submission());
+        if let Some(owner) = self.queue_owner.as_ref() {
+            return owner.submit_sync(command_buffers, fence, timeline);
+        }
+        unsafe { self.submit_guest_work_reserved(command_buffers, fence, timeline) }
+    }
+
+    /// Hand an ended draw batch to the ordered queue owner without waiting for
+    /// the host driver's `vkQueueSubmit` call.  A host that could not start the
+    /// owner retains the synchronous contract.
+    pub(crate) unsafe fn submit_guest_work_async(
+        &self,
+        command_buffers: &[vk::CommandBuffer],
+        fence: vk::Fence,
+    ) -> Result<(), vk::Result> {
+        let timeline = self
+            .stamp_completion
+            .as_ref()
+            .map(|completion| completion.reserve_submission());
+        let Some(owner) = self.queue_owner.as_ref() else {
+            return unsafe { self.submit_guest_work_reserved(command_buffers, fence, timeline) };
+        };
+        owner.submit_async(command_buffers, fence, timeline)
+    }
+
+    unsafe fn submit_guest_work_reserved(
+        &self,
+        command_buffers: &[vk::CommandBuffer],
+        fence: vk::Fence,
+        timeline: Option<(vk::Semaphore, u64, super::stamp_completion::SubmissionNote)>,
+    ) -> Result<(), vk::Result> {
+        let plain = vk::SubmitInfo::default().command_buffers(command_buffers);
+        let Some((semaphore, value, note)) = timeline else {
+            return unsafe { self.device.queue_submit(self.queue(), &[plain], fence) };
+        };
+        let semaphores = [semaphore];
+        let values = [value];
+        let mut timeline_info =
+            vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&values);
+        let info = vk::SubmitInfo::default()
+            .command_buffers(command_buffers)
+            .signal_semaphores(&semaphores)
+            .push_next(&mut timeline_info);
+        unsafe { self.device.queue_submit(self.queue(), &[info], fence) }?;
+        note.submitted(value);
+        Ok(())
+    }
+
+    pub(crate) fn queue_failure(&self) -> Option<vk::Result> {
+        self.queue_owner.as_ref().and_then(|owner| owner.failure())
+    }
+
+    pub(crate) fn queue_wait_idle(&self) -> Result<(), vk::Result> {
+        match self.queue_owner.as_ref() {
+            Some(owner) => owner.wait_idle(),
+            None => unsafe { self.device.queue_wait_idle(self.queue()) },
+        }
+    }
+
+    pub(crate) fn queue_barrier(&self) {
+        if let Some(owner) = self.queue_owner.as_ref() {
+            owner.barrier();
+        }
+    }
+
+    pub(crate) unsafe fn submit_queue_work(
+        &self,
+        command_buffers: &[vk::CommandBuffer],
+        wait_semaphores: &[vk::Semaphore],
+        wait_stages: &[vk::PipelineStageFlags],
+        signal_semaphores: &[vk::Semaphore],
+        fence: vk::Fence,
+    ) -> Result<(), vk::Result> {
+        if let Some(owner) = self.queue_owner.as_ref() {
+            return owner.submit_sync_ordered(
+                command_buffers,
+                wait_semaphores,
+                wait_stages,
+                signal_semaphores,
+                fence,
+            );
+        }
+        let info = vk::SubmitInfo::default()
+            .wait_semaphores(wait_semaphores)
+            .wait_dst_stage_mask(wait_stages)
+            .command_buffers(command_buffers)
+            .signal_semaphores(signal_semaphores);
+        unsafe { self.device.queue_submit(self.queue(), &[info], fence) }
+    }
+
+    /// Submit one window blit and present the image it signals as a single
+    /// ordered display transaction.
+    ///
+    /// The queue-owner arm returns after enqueue.  Its completion may be waited
+    /// without holding the engine lock; the fallback remains synchronous because
+    /// that lock is the only external synchronization around the raw queue.
+    #[cfg(feature = "host-window")]
+    pub(crate) unsafe fn submit_present_transaction(
+        &self,
+        transaction: PresentTransaction<'_>,
+    ) -> Result<PresentSubmission, vk::Result> {
+        if let Some(owner) = self.queue_owner.as_ref() {
+            return owner
+                .enqueue_present(transaction)
+                .map(PresentSubmission::Pending);
+        }
+        let info = vk::SubmitInfo::default()
+            .wait_semaphores(transaction.wait_semaphores)
+            .wait_dst_stage_mask(transaction.wait_stages)
+            .command_buffers(transaction.command_buffers)
+            .signal_semaphores(transaction.signal_semaphores);
+        unsafe { self.device.queue_submit(self.queue(), &[info], transaction.fence) }?;
+        let waits = [transaction.present_wait];
+        let swapchains = [transaction.swapchain];
+        let indices = [transaction.image_index];
+        let result = unsafe {
+            transaction.loader.queue_present(
+                self.queue(),
+                &vk::PresentInfoKHR::default()
+                    .wait_semaphores(&waits)
+                    .swapchains(&swapchains)
+                    .image_indices(&indices),
+            )
+        };
+        Ok(PresentSubmission::Complete(result))
     }
 }
 
@@ -1473,7 +1795,10 @@ impl ContextOwner {
         }
         if self.ctx.is_none() {
             match unsafe { DeviceContext::create() } {
-                Ok(c) => self.ctx = Some(c),
+                Ok(c) => {
+                    super::publish_device_capabilities(&c);
+                    self.ctx = Some(c);
+                }
                 Err(e) => {
                     self.note_init_failure(&e);
                     return Err(e);
@@ -1525,6 +1850,7 @@ impl ContextOwner {
         counters.recreates.fetch_add(1, Ordering::Relaxed);
         match unsafe { DeviceContext::create() } {
             Ok(c) => {
+                super::publish_device_capabilities(&c);
                 self.ctx = Some(c);
                 self.poisoned = false;
                 Ok(())
@@ -2161,16 +2487,8 @@ mod recreate_budget_tests {
 mod draw_span_probe_tests {
     use super::*;
 
-    fn probe(valid_bits: u32, ns_per_tick: f32) -> DrawSpanProbe {
-        DrawSpanProbe {
-            pool: vk::QueryPool::null(),
-            ns_per_tick,
-            valid_mask: if valid_bits >= u64::BITS {
-                u64::MAX
-            } else {
-                (1u64 << valid_bits) - 1
-            },
-        }
+    fn probe(valid_bits: u32, ns_per_tick: f32) -> TickScale {
+        TickScale::resolve(valid_bits, ns_per_tick).expect("the fixture is a usable queue family")
     }
 
     /// The ordinary case: a full-width counter, a tick that is not one
@@ -2223,6 +2541,55 @@ mod draw_span_probe_tests {
             last + DrawSpanProbe::PER_SLOT,
             DrawSpanProbe::PER_SLOT * super::super::pools::RING_DEPTH as u32,
             "the pool is exactly as large as the ring needs"
+        );
+    }
+
+    /// The readback probe tiles its pool the same way, because it had the same
+    /// problem and did not know it.
+    ///
+    /// It held **one** three-query region for the device's life, on the written
+    /// argument that "the readback is serialized: the caller waits on this
+    /// copy's fence before it can start another". That stopped being true when
+    /// the guest-page writeback stopped waiting, leaving two writers sharing one
+    /// region with no synchronization between their submissions — a reset
+    /// executing while another submission's timestamps were pending, which the
+    /// Khronos validation layer reported as
+    /// `VUID-vkGetQueryPoolResults-None-09401` on a driven macos-11 boot.
+    ///
+    /// Asserting the tiling here is what stops the region going back to being
+    /// shared: a base that ignores its slot fails this immediately.
+    #[test]
+    fn the_readback_probe_gives_every_ring_slot_its_own_region() {
+        let bases: Vec<u32> = (0..super::super::pools::RING_DEPTH)
+            .map(TimestampProbe::base)
+            .collect();
+        for w in bases.windows(2) {
+            assert_eq!(
+                w[1] - w[0],
+                TimestampProbe::PER_SLOT,
+                "slot bases must tile the pool: {bases:?}"
+            );
+        }
+        assert_eq!(
+            bases.last().expect("the ring is not empty") + TimestampProbe::PER_SLOT,
+            TimestampProbe::PER_SLOT * super::super::pools::RING_DEPTH as u32,
+            "the pool is exactly as large as the ring needs"
+        );
+    }
+
+    /// A queue family that writes no timestamps yields no scale, so neither
+    /// probe is built and the census reports zero rather than a wrong number.
+    /// One constructor is what stops a mask being derived beside a period it
+    /// does not belong to — which is how the readback probe came to have a
+    /// period and no mask at all.
+    #[test]
+    fn a_queue_family_without_timestamps_yields_no_scale() {
+        assert!(TickScale::resolve(0, 1.0).is_none());
+        assert!(TickScale::resolve(64, 0.0).is_none());
+        assert_eq!(
+            TickScale::resolve(64, 1.0).expect("usable").valid_mask,
+            u64::MAX,
+            "64 valid bits must not shift out of range"
         );
     }
 }

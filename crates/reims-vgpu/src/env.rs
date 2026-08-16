@@ -113,6 +113,16 @@
 /// comparable across compositing regimes and only one pair matched.
 pub const GUEST_IMPORT: &str = "REIMS_VGPU_GUEST_IMPORT";
 
+/// `off` keeps descriptor state on the allocated Vulkan 1.2 set path even when
+/// the device advertises `VK_KHR_push_descriptor` and the layout fits its
+/// reported limit.
+///
+/// This is a narrowing-only A/B control: it cannot enable an extension the
+/// device lacks, and it cannot make an over-limit layout use push descriptors.
+/// The two arms encode the same descriptor writes; only their Vulkan lifetime
+/// differs (command-buffer state versus an allocated set).
+pub const PUSH_DESCRIPTORS: &str = "REIMS_VGPU_PUSH_DESCRIPTORS";
+
 /// Verbose per-draw logging on top of the always-on fail sink.
 pub const DRAW_LOG: &str = "REIMS_VGPU_DRAW_LOG";
 
@@ -214,6 +224,23 @@ pub const BUFFER_EXTENT: &str = "REIMS_VGPU_BUFFER_EXTENT";
 /// and gathered bytes to the batching rule rather than to a rebuild. Off is a
 /// refusal (`nojoin_target_switch`) and never a permission.
 pub const BATCH_MIXED_TARGETS: &str = "REIMS_VGPU_BATCH_MIXED_TARGETS";
+
+/// `off` bars a draw carrying a depth attachment from deferring its submit, the
+/// way every such draw was barred before its ad-hoc framebuffer was given to the
+/// graveyard on the deferred path as well as the submitting one.
+///
+/// The bar was never a statement about depth. It was a statement about the
+/// per-draw framebuffer a depth pass builds — a deferred draw returns before the
+/// disposal block, so batching one used to leak that framebuffer. Both paths now
+/// dispose through one function, and the ordering rule the graveyard needs is met
+/// on each: the slot is in `open_slot_mask` because `finish_entry_async` marked
+/// it pending, or because `batch_append` installed the open batch.
+///
+/// It exists as a switch for the same reason [`BATCH_MIXED_TARGETS`] does: the
+/// arms differ by one term in one process, so one driven boot of each attributes
+/// a change in submissions and frames to the join rule rather than to a rebuild.
+/// Off is a refusal (`nojoin_depth`) and never a permission.
+pub const BATCH_DEPTH: &str = "REIMS_VGPU_BATCH_DEPTH";
 
 /// `off` stages the guest bytes of a `[[buffer(n)]]` bind even when the stage's
 /// own reflection says the shader never dereferences it.
@@ -383,6 +410,51 @@ pub const LAZY_WRITEBACK: &str = "REIMS_VGPU_LAZY_WRITEBACK";
 /// pays a block allocation in every one of them. Ranking that needs both arms in
 /// one binary on one guest.
 pub const SLAB_RETAIN: &str = "REIMS_VGPU_SLAB_RETAIN";
+
+/// `off` narrows the sampled cache's **identity-only** lookup out of existence:
+/// a retained image is served only when its retained bytes compare equal to the
+/// bytes this bind is asking for, never on the producer's identity alone.
+///
+/// It narrows in the sense this module requires. The identity lookup is a
+/// shortcut in front of the content compare and reaches no image the compare
+/// could not also serve — with one asymmetry that is the whole point of having
+/// the switch: a `Gathered` entry has no retained bytes to compare, so with this
+/// off the guest-gather rail re-gathers and re-uploads every bind. That is
+/// strictly more copying and strictly fewer elisions, never a different image.
+///
+/// It exists because the identity lookup is the only place in the sampled path
+/// where an image is bound with **nothing read and nothing compared** — the bind
+/// rests entirely on the guest-write witness in
+/// [`crate::runtime::gather_witness`] having seen every write to the window. A
+/// witness that missed one binds a stale texture, and the failure mode is
+/// content: no counter can report it, because an elision correctly taken and one
+/// wrongly taken are the same absence. The eighteen-switch narrowing sweep that
+/// preceded this could not reach it — there was no switch — so it is the largest
+/// piece of this device's behaviour that has never been run both ways.
+pub const SAMPLED_IDENTITY: &str = "REIMS_VGPU_SAMPLED_IDENTITY";
+
+/// `on` audits **every** vouched gather bind instead of one in
+/// [`crate::runtime::gather_witness::AUDIT_STRIDE`].
+///
+/// It narrows in the sense this module requires, and it is the only switch here
+/// that narrows by doing *more* work: the fold is a read of the window, and a
+/// fold that disagrees spends the generation, so this arm can only turn
+/// elisions into re-gathers. It reaches no image the default arm does not also
+/// reach.
+///
+/// It exists because of what [`SAMPLED_IDENTITY`]'s doc says one paragraph up —
+/// a stale bind's failure mode is content, and no counter reports it. The
+/// content audit *is* that counter, and at a stride of sixty-four it samples
+/// about 1.6 % of the binds it could judge: a four-rail sweep of this host read
+/// 122 comparisons against some fourteen thousand vouches. A zero over 1.6 % of
+/// a population is evidence about 1.6 % of it. With this on the sweep judges
+/// every bind, which is the difference between believing the zero-copy sampled
+/// cache is sound and having measured it.
+///
+/// Not a shipping arm: at a stride of one the audit re-reads every window the
+/// cache exists to avoid reading, which is the whole 842 MB/s rail arriving
+/// through the alarm. Use it for a soundness sweep, never for a timing.
+pub const GATHER_AUDIT_ALL: &str = "REIMS_VGPU_GATHER_AUDIT_ALL";
 
 /// `off` narrows the CLEAR-seed Store at the head of a draw chain out of
 /// existence: the solid colour is not written into the guest's pages before the
@@ -647,25 +719,35 @@ pub const GPU_SPANS: &str = "REIMS_VGPU_GPU_SPANS";
 /// layout transitions costs less than the ~5 % spread between two boots of one
 /// binary.
 ///
-/// The reading is that this host does not compress what it is asked to transfer:
-/// the colour attachment is created with `TRANSFER_SRC` usage, so the driver has
-/// no compression to resolve when the layout moves. **So do not remove the
-/// existing pair on this evidence.** Every loading draw barriers its target into
-/// `COLOR_ATTACHMENT_OPTIMAL` and the pass's `final_layout` puts it back, for a
-/// transfer reader that arrives a few times a second against tens of thousands of
-/// draws — it looks wasteful and it measures free, and the barrier family it sits
-/// in has had five live dependency bugs, so the refactor is all risk and no
-/// measured gain *here*.
+/// The reading was that *that* host did not compress what it was asked to
+/// transfer: the colour attachment is created with `TRANSFER_SRC` usage, so the
+/// driver had no compression to resolve when the layout moved.
 ///
-/// # Why it stays
+/// # The pair is gone, and this switch is now the control arm that prices it
 ///
-/// "Here" is the whole caveat, and it is why this is a kept probe rather than a
-/// deleted one. AMD and Intel parts keep colour compression metadata that a
-/// transfer layout can force a whole-attachment resolve of, and this project has
-/// no such host to boot. Anyone who has one can answer the question in two boots
-/// without writing any code: if `us/draw` rises on the `on` arm there, the pair
-/// is worth removing and this doc is wrong about their machine, not about this
-/// one.
+/// **Those six boots were taken on a discrete NVIDIA host**, and this doc used
+/// to end by saying so and inviting the experiment: "AMD and Intel parts keep
+/// colour compression metadata that a transfer layout can force a
+/// whole-attachment resolve of, and this project has no such host to boot.
+/// Anyone who has one can answer the question in two boots."
+///
+/// There is such a host now — Intel Arrow Lake / Mesa ANV — and the pair was
+/// removed there without waiting for those two boots. `caches::color0_pass_exit_layout`
+/// carries the reasoning; the short version is that the transition is only half
+/// of it. The other half is the `vkCmdPipelineBarrier` each loading draw
+/// recorded to undo the exit, which `exec::pass_exit_needs_no_barrier` drops
+/// outright because the pass's own `VK_SUBPASS_EXTERNAL` dependency already
+/// carries the ordering. That saving is driver CPU work at ~24 000 draws a
+/// second on a device measured to be CPU-bound in `record`, and it does not
+/// depend on compression existing at all.
+///
+/// So the honest state is: the *barrier* half is justified without a
+/// measurement, the *transition* half is not, and this switch is what measures
+/// it — turning it on re-enacts exactly the removed round trip and nothing else.
+/// `scripts/perf-ab/perf-ab.sh --rail macos-13 --arms "shipping LAYOUT_CHURN=on"`
+/// is the run, and it is owed. If `us/draw` does not rise on the `on` arm here
+/// either, the transition was free on this host too and the win is the barrier
+/// alone.
 pub const LAYOUT_CHURN: &str = "REIMS_VGPU_LAYOUT_CHURN";
 
 /// **Default off.** `on` records one extra empty render pass instance per
@@ -749,115 +831,243 @@ pub const LAYOUT_CHURN: &str = "REIMS_VGPU_LAYOUT_CHURN";
 /// us/draw — excluded as slow, and a single such boot says nothing either.
 pub const PASS_CHURN: &str = "REIMS_VGPU_PASS_CHURN";
 
-/// **Default off.** `on` lets a declared object size narrow the guest bytes the
-/// gather rail *moves*, instead of only narrowing binds that stay above the
-/// zero-copy floor after narrowing — which is none of them.
+/// **Default on.** `off` stops the primary colour attachment being a linear
+/// `VkImage` bound to the guest surface's own pages, so the render target is an
+/// ordinary optimally-tiled device-local resident and its Store copies out.
 ///
-/// # Why the rail is inert without it, and why the floor is the reason
+/// A narrowing in the strict sense this file requires: the copying arm is not a
+/// fallback anyone had to write for this switch. It is the only arm on a
+/// discrete host — `linear_target_import::create` refuses
+/// `UnsupportedTopology` there — and the only arm on a host without
+/// `VK_EXT_external_memory_host`. `off` makes a unified host take it.
 ///
-/// `spirv_bind::reflected_buffer_extent` answers `Object` for **57 % of buffer
-/// binds** at the current translator pin, and essentially every answer is 512
-/// bytes or less. `ZERO_COPY_BUFFER_MIN_BYTES` is 16 KiB, so
-/// `load_buffer_content` drops every one of those caps before the rail sees it,
-/// and `try_buffer_zero_copy_resolved` then resolves the whole rest of the
-/// allocation. Both narrowing counters read **zero** across a driven boot of 2.57
-/// million binds.
+/// # What it is asking
 ///
-/// The bytes behind that, two driven macos-13 boots, summed over the boot:
+/// It prices the largest structural choice in this device, which had no
+/// instrument. Rendering into the guest's pages is the deepest zero-copy
+/// available: the Store is free because the pixels are already where the guest
+/// will read them. What it costs is the *tiling*. A `VkImage` over guest pages
+/// must be `VK_IMAGE_TILING_LINEAR`, because the guest declares a row pitch and
+/// a plane offset in bytes and only linear storage can honour them — and a
+/// linear colour attachment on this class of hardware gives up the render
+/// target's tiled layout, its lossless colour compression and its fast clear.
+/// Every fragment of every draw pays that; the copy it saves is paid once per
+/// Store.
 ///
-/// ```text
-///                            boot 1      boot 2
-/// bext_capped_span_bytes     274.1 GB    272.9 GB
-/// bext_would_save_bytes      274.0 GB    272.9 GB   (99.97 % of the capped)
-/// bext_uncapped_span_bytes   287.3 GB    283.7 GB
-/// ```
+/// So the two arms trade **per-draw rasterisation against per-Store bandwidth**,
+/// and which wins is a property of the workload's draw-to-Store ratio and of
+/// the host's memory system. On a driven Maps boot that ratio is about 65 draws
+/// per Store, which is exactly the regime where the answer is not obvious from
+/// either side.
 ///
-/// That reads as "49 % of every byte this rail moves sits behind a cap that
-/// would remove 99.97 % of it", and the gather is ~55 % of all the GPU time this
-/// device spends (see [`GUEST_IMPORT`]). **Both halves of that sentence are
-/// true and the conclusion drawn from it was still wrong**; the six boots below
-/// say why.
+/// # The frame loss this switch was built to find, and its repair
 ///
-/// # What it is actually worth: bytes yes, time no
+/// The arm is not hypothetical: `linear_target_import::create` refuses
+/// `UnsupportedTopology` on every discrete GPU and `HostImportUnavailable` on
+/// any host without `VK_EXT_external_memory_host`, so this is the shipping
+/// render-target rail for those hosts. It used to lose the guest's frame, and
+/// that was invisible because this host always takes the shared rail.
 ///
-/// Six interleaved driven macos-13 boots, one binary, quiesced host,
-/// `sustained-animation-probe`. The byte columns are the mechanism's own
-/// control and they are **fully disjoint**:
-///
-/// ```text
-/// arm   gather KB/draw    gathers/draw   zc_buffer_held   narrowed
-/// on         95.5             0.578         2 671 242       7 054
-/// on         98.4             0.585         1 521 450       6 868
-/// on         98.4             0.584         1 496 094       6 679
-/// off       112.6             0.652         1 538 409           0
-/// off       111.2             0.645         1 121 638           0
-/// off       109.4             0.643         2 711 284           0
-/// ```
-///
-/// So the rail moves **12.3 % fewer bytes** in **10 % fewer gathers**, the gate
-/// holds at zero on the `off` arm, and `zc_buffer_held` does *not* fall — the
-/// registry churn that sank the earlier attempt is genuinely avoided, and both
-/// arms' screenshots show a correct desktop.
-///
-/// `us/draw` does not move. Banded within regime, because the guest picks its
-/// own draw rate per boot and the two populations are not comparable:
+/// **What it read when it was broken.** A driven macos-13 Maps boot lost the
+/// entire map — the screenshot was Apple Maps with its sidebar, toolbar, scale
+/// bar and compass drawn and the map view flat ocean, against a map on `on` from
+/// the same probe minute. Once
+/// `backend::vulkan::engine::reason::TargetReadDecline::UnknownIdentity` was
+/// given fields:
 ///
 /// ```text
-/// regime ~245-255 draws/frame (GPU 23 % busy)   on 15.45, 15.55 | off 15.24, 15.54
-/// regime ~272-274 draws/frame (GPU 41-43 % busy) on 13.77       | off 14.53
+/// read_target_unknown_identity asked_gen=2 held_gen=none  mapping=7  1920x1080
+/// read_target_unknown_identity asked_gen=2 held_gen=1     mapping=3  1920x1080
+/// read_target_unknown_identity asked_gen=1 held_gen=none  mapping=33 1136x880
 /// ```
 ///
-/// At the idle regime the arms interleave, at n=2 against n=2. The one loaded
-/// pair reads −5.2 % for `on`, which is close to the ~6.8 % a 12.3 % byte cut
-/// off a 55 %-of-GPU-time rail predicts — but it is one pair against one pair,
-/// and the same table shows `us/draw` varying by more than that between two
-/// boots of the *same* arm. It is a lead, not a result.
+/// with `target_evicts=0`. So the dominant case was neither eviction nor the
+/// stale-key case the second line shows: the identity the writeback named was
+/// never in the registry at all. Everything else followed from it — the guest's
+/// pages stayed stale, so the sampled rail re-uploaded them
+/// (`passmerge_outside_sampled_upload` 609 378 against 590 on the default arm),
+/// and a sampled upload cannot happen inside a render pass, so the boot ended at
+/// 0.94 pass begins per draw and 42 us of GPU a draw against 10.8.
 ///
-/// **The 49 % headroom figure is an over-count, and this is the trap to avoid
-/// repeating.** `note_extent_headroom` charges every bind that reaches the
-/// gather rail — about 2.6 M of them — while the GPU only gathers ~640 k times
-/// a boot, because `buffer_bind_reuses` collapses repeats inside one command
-/// buffer before any copy happens. `bext_would_save_bytes` is therefore an upper
-/// bound over *binds*, not over *gathers*, and the honest reduction is the 12.3 %
-/// measured above. Do not flip a default on it.
+/// **Both halves of that were closed, by two changes aimed at other reports.**
+/// The `held_gen=N-1` half is the debt rebuilding its identity from the
+/// mapping's generation *now* instead of carrying the one the draw registered —
+/// see [`crate::runtime::writeback_debt::WritebackDebt::identity`]. The
+/// `held_gen=none` half is a released resource whose resident held the only copy
+/// of a frame being collected before the debt was paid — see
+/// `ResidentTargetSlot::released_and_collectable`'s third term.
 ///
-/// # What `on` changes, and what it deliberately does not
+/// One driven macos-13 Maps boot an arm, from one snapshot, reads:
 ///
-/// Only which length is compared against the floor. The floor decides whether a
-/// bind is worth the zero-copy rail *at all*, and that is a question about the
-/// window the guest bound — so it is asked of the full span on both arms. The
-/// narrowed length then decides how much of that window is walked and copied.
+/// ```text
+/// arm    disabled_by_env  read_target_unknown_identity  render_store_lost  wbdebt_pay_lost
+/// off                  7                             0                  0                0
+/// on                   0                             0                  0                0
+/// ```
 ///
-/// That distinction is the whole point. `load_buffer_content`'s doc records an
-/// earlier attempt that applied the cap to the rail *decision*: it saved 2.2 GB a
-/// run, halved `zc_buffer_held` by pushing binds off the registry onto CPU reads,
-/// and bought no time. This arm cannot do that — every bind stays on the rail it
-/// was on, with the same registry entry, and only the extent moves.
+/// so the gate took and the whole refusal chain is gone. The re-upload storm
+/// went with it: `passmerge_outside_sampled_upload` reads 1102 on `off` against
+/// 3 on `on`, where it was 609 378 against 590. The residual is not loss — on
+/// this arm the copy-out into the guest's pages is the rail, so some re-upload
+/// is the work rather than a symptom.
 ///
-/// It was also ranked on `draw_us/draw`, a CPU wall clock, before this device
-/// could time the GPU. The gather is a PCIe copy; no CPU counter was going to see
-/// it.
+/// **The pixel half of that claim is still open, and not because it failed.**
+/// Apple Maps fetched no tiles on *either* arm of that pair, so both screenshots
+/// are the same flat canvas and the comparison env.rs was built on could not be
+/// reproduced in either direction. What is established is that the named
+/// refusals are at zero; what is not is a same-pixels verdict. Take that with
+/// the undriven pairing `AGENTS.md` prescribes for the guest-import arms — one
+/// snapshot, both arms to the Dock, drive nothing, screenshot — before quoting
+/// either arm's timing, because a whole window rendering on one arm and black on
+/// the other is a shape no counter here reports.
+pub const SHARED_TARGET: &str = "REIMS_VGPU_SHARED_TARGET";
+
+/// **Probe, default off.** On, every render pass's outgoing `VK_SUBPASS_EXTERNAL`
+/// dependency names only the attachment stages, instead of also naming
+/// `TRANSFER | FRAGMENT_SHADER` with `TRANSFER_READ | SHADER_READ`.
 ///
-/// # Why it is off by default
+/// # What it is asking
 ///
-/// Reading fewer bytes than a shader touches is wrong pixels with no error
-/// anywhere, and the entire safety argument is the translator's `Object` verdict
-/// meaning what it says. `robustBufferAccess` bounds-clamps an over-read rather
-/// than leaving it undefined, so the failure mode is visibly wrong rather than
-/// unsound — but visibly wrong is still wrong, and this stays off until an A/B
-/// has both the `gpu_span` reading and a screenshot.
+/// A render pass boundary is the largest single cost this device has on the
+/// x86/Vulkan iGPU pathway, and it is measured causally: [`PASS_CHURN`] on —
+/// one extra end/begin pair per merged loading draw, same draws, same pixels —
+/// moved GPU per draw from **9.25 to 67.64 µs** and drain CPU from 8.41 to 26.69
+/// on interleaved driven macos-13 Maps boots. At 165 731 pass begins a boot that
+/// is roughly two thirds of the device's whole GPU second.
 ///
-/// It now has both, and the screenshot passed while the number did not: the six
-/// boots above bought no time on the host that can be measured here. Reading
-/// fewer guest bytes than the guest declared is a correctness risk taken on the
-/// translator's word, and a risk with no measured return is not a default.
+/// It is **flat in attachment area**: banding pass begins by pixels and
+/// regressing a census window's `gpu_span busy_us` on the bands puts a
+/// `< 256x256` pass at 124-143 µs on three boots, at least as much as a
+/// full-screen one. So it is not a load, a clear or a resolve — it is a pipeline
+/// drain and a cache flush, and the interesting question becomes *who asked for
+/// the flush*.
 ///
-/// What would overturn this is a host where the gather is the constraint rather
-/// than 55 % of a device that is idle three-quarters of the second — which is
-/// exactly the iGPU column of the support matrix, and see [`GUEST_IMPORT`] for
-/// why that host wants a different answer on this whole family. Two boots there
-/// settle it, and the arm and its `bext_*` census stay so that they can.
-pub const EXTENT_NARROW: &str = "REIMS_VGPU_EXTENT_NARROW";
+/// A destination scope naming `FRAGMENT_SHADER`/`SHADER_READ` and
+/// `TRANSFER`/`TRANSFER_READ` is a request to make colour writes visible to the
+/// texture and transfer caches, which on this driver is a full stall plus a
+/// render-target flush plus a texture-cache invalidate — at every
+/// `vkCmdEndRenderPass`, whatever comes next. This probe removes that request and
+/// prices it.
+///
+/// # Why it is a probe and not the default
+///
+/// The scope is not decorative. `super::backend::vulkan::engine::caches`'
+/// `external_dependencies` records that this pass once declared its external
+/// dependencies only for depth, and the colour attachment silently lost the
+/// implicit ones — three `SYNC-HAZARD` findings from the Khronos synchronization
+/// validation layer followed. Narrowing the destination scope is the same *class*
+/// of change, and its failure mode is the same: a read that is not ordered
+/// against the pass's colour store, which is wrong pixels and no error anywhere.
+///
+/// The argument that it is safe is that every one of those consumers issues its
+/// own barrier — `barrier_resident_for_transfer_read` before a transfer read, and
+/// the `PassObstacle::ResidentLayout` transition before a sample — and the one
+/// consumer that deliberately does not, the next draw into the same target under
+/// `pass_exit_needs_no_barrier`, is a colour attachment write and stays in the
+/// scope. **That argument is not a measurement.** Before this becomes the
+/// default it needs a driven boot under the synchronization validation layer
+/// showing no new hazard, and the screenshots compared.
+///
+/// On is therefore a permission in the narrow sense this file otherwise forbids,
+/// and it is spelled as a probe for that reason: it is not reachable by accident,
+/// it is not on any shipping path, and it exists to put a number on a boundary
+/// nothing else can price.
+///
+/// # What it read: not the flush. Leave it off.
+///
+/// Four interleaved driven macos-13 Maps boots, one binary, quiesced
+/// (/tmp/wb-outA0..A3), scored by `scripts/boot-score`:
+///
+/// ```text
+///            gpu us/draw     sum us/draw
+/// off        11.34, 10.53    20.64, 19.26
+/// on         10.39, 10.24    19.38, 19.27
+/// ```
+///
+/// About **−6 % of the GPU half with the ranges overlapping** — 10.39 on sits
+/// inside 10.53..11.34 off — at two boots an arm against a ±12 % boot-to-boot
+/// spread on this column. A range built from two samples is not a noise estimate,
+/// so this establishes nothing except an upper bound, and the upper bound is the
+/// finding: **if the whole ~100 µs pass boundary were this visibility request,
+/// removing it would have taken most of it.** It took at most a fifteenth.
+///
+/// So the drain is somewhere else — the pass instance itself on this driver,
+/// not a scope this device chose — and the lever stays *fewer* pass boundaries
+/// rather than cheaper ones. Do not spend the synchronization-validation-layer
+/// run this would need to ship: a ≤6 % unestablished gain does not buy a change
+/// whose failure mode is wrong pixels with nothing reported.
+pub const PASS_EXIT_NARROW: &str = "REIMS_VGPU_PASS_EXIT_NARROW";
+
+/// **Default on.** `off` splits a colour target's layout back in two:
+/// `COLOR_ATTACHMENT_OPTIMAL` while it is an attachment and
+/// `SHADER_READ_ONLY_OPTIMAL` when a draw samples it. A narrowing, because it
+/// restores a transition this device otherwise does not record.
+///
+/// # What the split cost, and why Apple never pays it
+///
+/// A `MTLTexture` a render encoder writes is the same object a later fragment
+/// shader samples, and nothing in Metal marks the crossing. In Vulkan the
+/// crossing is an image layout, and every layout optimal for one of the two uses
+/// is illegal for the other — so a device that picks the optimal one has to
+/// transition on every sample, and a transition is exactly what a render pass
+/// instance may not contain. The pass closes.
+///
+/// That is `passmerge_outside_resident_layout`: **25 344 of 176 914 pass begins**
+/// on a driven macos-13 Maps boot, each ending a pass instance measured at
+/// ~100 µs of GPU and ~18 µs of CPU on this iGPU.
+///
+/// `GENERAL` is legal for both uses, so the crossing is not a transition, and
+/// with the pass's own incoming `VK_SUBPASS_EXTERNAL` dependency naming shader
+/// reads, it is not a barrier either — see
+/// `pools::ResidentAccess::covered_by_pass_entry`.
+///
+/// # The layout was priced on its own before anything was built on it
+///
+/// What `GENERAL` gives up is framebuffer compression, which on this host is real
+/// hardware. Six interleaved driven macos-13 Maps boots of one binary
+/// (`/tmp/wb-outC0..C5`) moved the layout and **nothing else** — every transition
+/// still recorded, the pass census unmoved — so the arms differ by the layout
+/// alone:
+///
+/// ```text
+///                    sum us/draw              gpu us/draw
+/// split (off)        22.95, 22.73, 25.50      13.00, 11.70, 13.82
+/// one layout (on)    21.43, 22.33, 21.93      11.94, 11.67, 11.24
+/// ```
+///
+/// **Disjoint on the sum** — the worst `on` boot beats the best `off` one — at
+/// −7.7 %, with the three position-matched pairs agreeing one by one. So the
+/// compression is worth less than the full-attachment transitions it buys, and
+/// that was true before a single pass boundary had been saved.
+///
+/// # What `off` is for
+///
+/// A host whose compression is worth more than this one's would read the other
+/// way, and there is no capability to ask. `off` is how that host is measured,
+/// and how a suspected content bug is bisected against the layout — both sides
+/// move together through
+/// `caches::color0_pass_exit_layout`, so the
+/// arm is one switch and not a family of them.
+pub const COLOR_GENERAL: &str = "REIMS_VGPU_COLOR_GENERAL";
+
+/// **A count, not a switch.** How many draws one command buffer may carry,
+/// narrowing the active memory-topology batch policy. Read through [`count`],
+/// so a value above that device's default is refused rather than obeyed.
+///
+/// It exists because the host kernel, not this device, owns the deadline a
+/// submission has to meet. i915 resets any context that holds `rcs0` past its
+/// `preempt_timeout_ms`, which is 7500 on the Arrow Lake iGPU this is measured
+/// on, and nothing in this crate bounds how much GPU time one command buffer's
+/// accumulated draws and gather dispatches add up to. Fewer draws per submission
+/// is the one lever that does, and it is strictly a narrowing: the same draws
+/// run, in more and smaller batches.
+///
+/// It is also the instrument that says *which* submission hung. At a cap of one
+/// the ring holds one draw per slot, so a fence that never signals names a
+/// single draw rather than up to thirty-two, and
+/// [`crate::runtime::gpu_hang_trail`]'s ring covers every submission still in
+/// flight instead of the last half millisecond of a batch.
+pub const BATCH_DRAWS: &str = "REIMS_VGPU_BATCH_DRAWS";
 
 /// What one variable says, including the two ways it says nothing usable.
 ///
@@ -878,6 +1088,51 @@ pub enum Switch {
     /// the value is handed back by [`read`] for the caller to name in its own
     /// refusal, because only the caller knows which variable this was.
     Unrecognized,
+}
+
+/// A count narrowing a compiled bound, or why the value was not usable.
+///
+/// Separate from [`Switch`] because the two answer different questions and
+/// folding them into one enum would put a `Count(u64)` arm in front of every
+/// existing `match` on a boolean switch. This is additive; nothing that reads a
+/// switch changes.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Count {
+    /// Nothing set. The caller keeps the bound it compiled with.
+    Unset,
+    /// A value the caller may adopt: at least one and no more than its ceiling.
+    Narrowed(u64),
+    /// Set to something unusable, carrying the raw text so the refusal can
+    /// quote what it rejected.
+    Refused(String),
+}
+
+/// Read `name` as a count that may only *narrow* `ceiling`.
+///
+/// The rule from `AGENTS.md` — an override may narrow what the device does and
+/// may never widen it — is enforced here rather than at each call site, because
+/// a bound is exactly the shape where widening is the tempting mistake: a
+/// caller reading a raw number and using it would let `=64` push a submission
+/// past a limit that was measured, and the failure of that is a stutter rather
+/// than an error.
+///
+/// Zero is refused rather than clamped. A cap of zero says "no draw may ever
+/// join a batch", which is not a smaller version of the compiled behavior; it is
+/// a different one, and a typo that silently selected it would read as a device
+/// that had stopped drawing.
+pub fn count(name: &str, ceiling: u64) -> Count {
+    let Some(raw) = std::env::var_os(name) else {
+        return Count::Unset;
+    };
+    let value = raw.to_string_lossy().into_owned();
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Count::Unset;
+    }
+    match trimmed.parse::<u64>() {
+        Ok(n) if n >= 1 && n <= ceiling => Count::Narrowed(n),
+        _ => Count::Refused(value),
+    }
 }
 
 /// The spellings accepted for each state, ASCII-case-insensitively.
@@ -932,17 +1187,28 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 20] = [
+pub const ALL: [&str; 26] = [
+    COLOR_GENERAL,
     LAZY_WRITEBACK,
     SLAB_RETAIN,
+    // Both absent until 2026-08-12, for the same reason `COMPUTE_GATHER` was:
+    // added next to their constants and not here. `SAMPLED_IDENTITY`'s two arms
+    // differ in what the guest *sees* rather than in how fast it sees it, so a
+    // boot that cannot say which arm it ran is a boot whose content evidence is
+    // unattributable.
+    SAMPLED_IDENTITY,
+    GATHER_AUDIT_ALL,
+    PIPELINE_MEMO,
     CLEAR_SEED,
     GUEST_IMPORT,
+    PUSH_DESCRIPTORS,
     DRAW_LOG,
     GPU_STAMP,
     PAGE_GUARDS,
     RANGE_COVERAGE,
     BUFFER_EXTENT,
     BATCH_MIXED_TARGETS,
+    BATCH_DEPTH,
     UNUSED_BINDS,
     PRESENT_DEPTH,
     STAMP_COALESCE,
@@ -957,8 +1223,16 @@ pub const ALL: [&str; 20] = [
     GPU_SPANS,
     LAYOUT_CHURN,
     PASS_CHURN,
-    EXTENT_NARROW,
+    SHARED_TARGET,
 ];
+
+/// Every variable read as a [`count`] rather than as a [`Switch`].
+///
+/// A second list because [`report_line`] has to print these differently: a count
+/// has no on/off state to name, and running one through the switch parse would
+/// report `REIMS_VGPU_BATCH_DRAWS=4` as `unrecognized(4)` — a line saying the
+/// device rejected the very value it adopted.
+pub const ALL_COUNTS: [&str; 1] = [BATCH_DRAWS];
 
 /// The state of every variable in [`ALL`], for the one-shot boot line.
 ///
@@ -979,6 +1253,17 @@ pub fn report_line() -> String {
             Switch::Unrecognized => format!("unrecognized({})", value.unwrap_or_default()),
         };
         out.push_str(&format!(" {}={state}", short.to_ascii_lowercase()));
+    }
+    // The raw text, not the parse: the ceiling a count narrows belongs to the
+    // module that owns the bound, and this line is written before any device
+    // exists to ask. A refusal is reported where the bound is adopted.
+    for name in ALL_COUNTS {
+        let short = name.strip_prefix("REIMS_VGPU_").unwrap_or(name);
+        let raw = std::env::var_os(name)
+            .map(|v| v.to_string_lossy().into_owned())
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "unset".to_owned());
+        out.push_str(&format!(" {}={raw}", short.to_ascii_lowercase()));
     }
     out
 }
@@ -1012,6 +1297,76 @@ mod tests {
 
     fn probe(value: Option<&str>) -> Switch {
         with_probe(value, || switch("REIMS_VGPU_TEST_PROBE"))
+    }
+
+    fn probe_count(value: Option<&str>, ceiling: u64) -> Count {
+        with_probe(value, || count("REIMS_VGPU_TEST_PROBE", ceiling))
+    }
+
+    /// A count narrows its ceiling and never widens it.
+    ///
+    /// The widening arm is the one that matters. `AGENTS.md`'s rule — an
+    /// override may turn a rail off and may never turn one on — has a quiet
+    /// second form for a *bound*, where obeying a raw number lets an operator
+    /// push past a limit that was measured. A caller reading `str::parse`
+    /// directly would take `=64` against a ceiling of 32; this must not.
+    #[test]
+    fn a_count_narrows_its_ceiling_and_never_widens_it() {
+        assert_eq!(probe_count(Some("1"), 32), Count::Narrowed(1));
+        assert_eq!(probe_count(Some("8"), 32), Count::Narrowed(8));
+        // The ceiling itself is a legal narrowing to exactly the compiled bound.
+        assert_eq!(probe_count(Some("32"), 32), Count::Narrowed(32));
+        // One past it is a widening, and the value is quoted back so the
+        // refusal can say what it rejected.
+        assert_eq!(probe_count(Some("33"), 32), Count::Refused("33".to_owned()));
+        assert_eq!(
+            probe_count(Some("1000"), 32),
+            Count::Refused("1000".to_owned())
+        );
+    }
+
+    /// Zero is refused, not clamped to one.
+    ///
+    /// A cap of zero is not a smaller version of the compiled behavior — it says
+    /// no draw may ever join a batch — so a typo that selected it would read as
+    /// a device that had stopped drawing rather than as a rejected value.
+    #[test]
+    fn a_count_of_zero_is_refused_rather_than_clamped() {
+        assert_eq!(probe_count(Some("0"), 32), Count::Refused("0".to_owned()));
+    }
+
+    /// Anything that is not a count is refused with its own text, and an unset
+    /// or blank variable leaves the caller on its compiled bound.
+    #[test]
+    fn a_count_that_does_not_parse_is_refused_with_its_text() {
+        assert_eq!(probe_count(None, 32), Count::Unset);
+        assert_eq!(probe_count(Some("   "), 32), Count::Unset);
+        assert_eq!(probe_count(Some("on"), 32), Count::Refused("on".to_owned()));
+        assert_eq!(probe_count(Some("-1"), 32), Count::Refused("-1".to_owned()));
+        assert_eq!(
+            probe_count(Some("4.5"), 32),
+            Count::Refused("4.5".to_owned())
+        );
+    }
+
+    /// A count is reported as the value it was given, not run through the switch
+    /// parse.
+    ///
+    /// [`report_line`] is the only record of which arm a boot ran, and a count
+    /// pushed through [`read`] reports `4` as `unrecognized(4)` — a line saying
+    /// the device rejected the value it had in fact adopted, which is exactly
+    /// the "compare arms, not pins" trap the [`ALL`] doc records.
+    #[test]
+    fn a_count_is_reported_as_its_value_and_not_as_an_unrecognized_switch() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the lock serializes every mutation of this variable here, and
+        // the value is removed before the guard drops.
+        unsafe { std::env::set_var(BATCH_DRAWS, "4") };
+        let line = report_line();
+        unsafe { std::env::remove_var(BATCH_DRAWS) };
+        assert!(line.contains(" batch_draws=4"), "{line}");
+        assert!(!line.contains("unrecognized"), "{line}");
+        assert!(report_line().contains(" batch_draws=unset"));
     }
 
     /// Both directions, in every spelling the module claims to accept. A
@@ -1075,10 +1430,13 @@ mod tests {
     /// by grepping their own environment.
     #[test]
     fn every_name_carries_the_crate_prefix() {
-        // `ALL` rather than a second list: a list written twice is the thing
-        // this module exists to stop, and the boot line reads the same one.
-        let names = ALL;
-        for name in names {
+        // The declared lists rather than a third one written here: a list
+        // written twice is the thing this module exists to stop, and the boot
+        // line reads the same two. The uniqueness check below spans both, so a
+        // name appearing in each — read once as a switch and once as a count —
+        // fails here rather than reaching the line twice with two answers.
+        let names: Vec<&str> = ALL.iter().chain(ALL_COUNTS.iter()).copied().collect();
+        for name in &names {
             assert!(name.starts_with("REIMS_VGPU_"), "{name}");
             assert!(
                 name.bytes()
@@ -1103,7 +1461,7 @@ mod tests {
     fn the_boot_line_names_every_variable_set_or_not() {
         let line = report_line();
         assert!(line.starts_with("vgpu_env "), "{line}");
-        for name in ALL {
+        for name in ALL.iter().chain(ALL_COUNTS.iter()) {
             let short = name
                 .strip_prefix("REIMS_VGPU_")
                 .expect("the prefix is asserted above")

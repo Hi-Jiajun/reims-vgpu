@@ -1,173 +1,49 @@
-//! Resolving a draw's pipeline and both its shaders, once per pipeline object
-//! rather than once per draw.
+//! Render pipeline states constructed once and retained in their task's
+//! pipeline-reference namespace.
 //!
-//! # What this replaces, and what it cost
+//! # Contract
 //!
-//! Every draw chain used to walk the whole path from `pipeline_ref` to two
-//! translated SPIR-V modules: an object-list read and a descriptor read for the
-//! pipeline, a full TLV decode of that descriptor, then for each of the two
-//! functions another object-list read, another descriptor read, a decode, and a
-//! read of the whole MTLB container out of guest memory — followed by a linear
-//! scan of each container for the wrapper magic and a content hash of each AIR
-//! blob to key the translate cache.
+//! Pipeline construction resolves the serialized descriptor and both function
+//! objects, translates the functions, derives the bind plan, and registers that
+//! immutable state under `(task, pipeline_ref)`. An encoder bind retrieves the
+//! registered state by reference. The render-pipeline destroy record removes
+//! one reference; task deletion or redefinition removes the task's entire
+//! namespace. Resource-list deletion belongs to a separate reference space and
+//! cannot retire a pipeline merely because its integer collides.
 //!
-//! That is **eight guest page-table walks and five allocations per draw**, and
-//! the answer is the same one every time: on a driven macos-13
-//! sustained-animation boot, `pipeline_misses` and `shader_misses` are both
-//! **zero** across 27 000 chains a second. `chain_phase`'s split of the span
-//! (see [`crate::runtime::chain_phase::Phase::PipelineMtlb`]) priced the four
-//! parts, per chain of 26.5 us:
+//! The broad type-7 serializer object is not itself a retained resource: other
+//! type-7 subtypes are mutable serializer state. A render pipeline *constructed
+//! from* that serializer is a distinct, immutable object with the explicit
+//! lifetime above. Keeping pipelines in their own typed registry preserves that
+//! distinction instead of either retaining every type-7 descriptor or re-reading
+//! pipeline construction input on every draw.
 //!
-//! ```text
-//! pl_desc_us    2.03 us   load_render_pipeline: 2 walks, 1 alloc, TLV decode
-//! pl_mtlb_us    1.26 us   both load_mtlb: 6 walks, 4 allocs, 2 decodes
-//! pl_xlate_us   1.19 us   both content hashes and the translate cache mutex
-//! pl_air_us     0.20 us   both wrapper-magic scans
-//! ```
+//! This used to be an insertion-bounded process-global memo. Every hit re-read
+//! the pipeline and both function object-list entries to infer whether the
+//! object was still alive. That saved the full eight-walk construction path but
+//! still cost about 0.9 us per draw on the macOS 13 x86 Vulkan window-drag rail.
+//! It also invented capacity eviction, and its key omitted the device.
 //!
-//! 4.68 us, **17.7 % of a draw chain**, spent arriving somewhere this device had
-//! already been. A hit that costs what a compile costs is the thing this module
-//! deletes.
+//! There is no content freshness check here because a pipeline state is
+//! immutable after construction. Replacement is deletion followed by a new
+//! construction, and deletion retires the old state before that reference can
+//! resolve again. The held descriptor and shaders are host-owned copies, so no
+//! guest page remains borrowed for the pipeline lifetime.
 //!
-//! # What it removed, and why that is only worth 1.7 % of the frames
-//!
-//! Ten driven macos-13 sustained-animation boots, interleaved arms of
-//! `REIMS_VGPU_PIPELINE_MEMO`. The span it targets collapses, and the four bars
-//! are disjoint across every pair of boots:
-//!
-//! ```text
-//!                 on (n=4)     off (n=4)
-//! pl_desc_us        20 000        52 400     the three-entry identity check
-//! pl_mtlb_us             0        34 900     gone
-//! pl_air_us              0         5 300     gone
-//! pl_xlate_us            0        33 100     gone
-//! span per chain   0.89 us       4.86 us     -3.97 us, 15 % of a 26.5 us chain
-//! ```
-//!
-//! **And the frames barely moved: +1.70 %, disjoint but at sep 0.9x.** What the
-//! same boots say about why is not ambiguous, because it is also disjoint —
-//! every on boot blocked longer than every off boot:
-//!
-//! ```text
-//! slot_us     on  129 484  132 023  121 964  121 124     (min 121 124)
-//!            off   90 427   78 494   68 489   83 515     (max  90 427)
-//! ```
-//!
-//! `slot_us` is the drain worker blocked waiting for a ring slot, which is
-//! waiting for the GPU. It rose 1.74 us a chain of the 3.97 us this saved, and
-//! `drain_duty`'s `busy_us` is unchanged at ~840 ms a second across both arms.
-//! So the worker did not go idle and did not draw more; it spent what it saved
-//! waiting.
-//!
-//! **This rail is GPU-bound on this host, and that is the finding, not this
-//! memo.** A CPU saving here converts at roughly the residual rate until the GPU
-//! work comes down — the largest piece of which is the guest buffer gather, at
-//! 5.8 GB/s over 427 000 transfer regions a second.
-//!
-//! The memo stays anyway, and not out of sunk cost. It is a strict reduction in
-//! work with no measured regression on any metric; the balance it is measured
-//! against is one host's (a discrete NVIDIA GPU with a fast CPU beside it) and
-//! the unified-memory cells of the support matrix have the opposite one, where
-//! guest page-table walks contend with the GPU for the same memory; and a probe
-//! heavy enough to make the drain worker the bottleneck again would convert it.
-//! What may **not** be said is that it bought 15 % of anything.
-//!
-//! # The identity a memo entry is checked against
-//!
-//! A guest object's identity is its **object-list entry**, and this module's
-//! whole correctness argument is that sentence. A 12-byte entry is the guest's
-//! own authoritative statement of what a ref means — its type tag, its
-//! descriptor's address and its descriptor's length — and the guest writes it
-//! into shared memory with no doorbell, which is exactly why every rail here
-//! re-reads it instead of caching what it once said.
-//!
-//! So this memo re-reads it too. [`resolve`] reads the three entries a draw
-//! depends on — the pipeline object and both function objects — and serves the
-//! cached resolution only when all three are byte-identical to the ones the
-//! entry was built from. Three 12-byte reads is three page-table walks, ~0.6 us,
-//! against the 4.68 us of work they authorise skipping.
-//!
-//! ## What that check does not cover, stated exactly
-//!
-//! An entry that has not changed permits two things this memo will not notice:
-//!
-//! - the guest **rewriting a descriptor in place**, at the same address and the
-//!   same length, to mean a different object;
-//! - the guest **rewriting the MTLB bytes in place**, at the `blob_gva` and
-//!   `blob_size` the unchanged descriptor names, to hold a different shader.
-//!
-//! Neither is a shape Metal produces. A `MTLRenderPipelineState` and a
-//! `MTLFunction` are immutable once created; a recompile is a new object, and a
-//! new object gets a new descriptor allocation and therefore a new entry. But
-//! "Metal does not do this" is a claim about a guest and not about the contract,
-//! which is why it is written here rather than assumed, and why the memo is
-//! switchable: `REIMS_VGPU_PIPELINE_MEMO=off` takes every chain back down the
-//! full path, so a guest that ever contradicts the paragraph above can be
-//! confirmed against a binary that cannot be wrong about it.
-//!
-//! The hazard this is **not** is page recycling. A memo entry holds an
-//! `Arc<CachedShader>` and an `Arc<RenderPipelineDescriptor>` — host-side owned
-//! copies — so it never reads through a stale guest pointer and holds no
-//! reference over a guest page. The failure mode of a wrong entry is a stale
-//! *shader*, which is a visual defect, not a memory-safety one.
-//!
-//! # Counters
-//!
-//! On `store_routes`, so a boot says which path it took rather than leaving it
-//! inferred from a frame rate:
-//!
-//! | route | meaning |
-//! |---|---|
-//! | `pipe_memo_hit` | all three entries matched; the resolution was reused |
-//! | `pipe_memo_miss` | no entry for this `(task, pipeline_ref)` |
-//! | `pipe_memo_stale` | an entry existed and one of the three had changed |
-//! | `pipe_memo_evict` | [`MEMO_CAPACITY`] pushed a resolution out |
-//! | `pipe_memo_forget_all` | a device reset invalidated every key at once |
-//! | `pipe_memo_off` | the memo is switched off; one per chain |
-//! | `preflight_memo_ready` | [`translations_ready`] served the exec preflight |
-//! | `preflight_memo_absent` | no entry; the preflight loaded the AIR itself |
-//! | `preflight_memo_stale` | an entry existed and the identity had changed |
-//!
-//! The three `preflight_*` routes are the same memo asked a **different
-//! question** by a different caller — "are these shaders already translated?"
-//! rather than "give me the resolution" — so they are counted apart from the
-//! `pipe_memo_*` set. Summing the two would double-count a pipeline that both
-//! the preflight and the draw asked about, which is every pipeline on a healthy
-//! packet.
-//!
-//! `pipe_memo_stale` is the one to read. It is the population the paragraph
-//! above says should be near zero on a steady desktop and non-zero only when a
-//! guest genuinely replaces a pipeline; a boot where it tracks the hit count is
-//! a boot where this memo is buying nothing and the check should be reconsidered
-//! rather than the cap raised.
+//! `REIMS_VGPU_PIPELINE_MEMO=off` remains an ablation that narrows the device
+//! back to reconstructing every draw. The `pipe_memo_*` and
+//! `preflight_memo_*` route names remain for longitudinal log compatibility;
+//! a hit now means a retained pipeline-state lookup, not a byte comparison.
 
-use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::hash::Hash;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use crate::backend::vulkan::engine::DrawPreparationDecline;
 use crate::model::DeviceState;
-use crate::runtime::decode::resource::{ListObjectEntry, RenderPipelineDescriptor};
+use crate::runtime::decode::resource::RenderPipelineDescriptor;
 use crate::runtime::drain::note_store_route;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::m2v_cache::CachedShader;
 use crate::runtime::mtlb::{load_mtlb, AirLoadRail};
-use crate::runtime::objects;
-
-/// How many `(task_id, pipeline_ref)` resolutions are held at once.
-///
-/// Sized against what a guest asks for rather than picked: a macOS desktop
-/// compositing session drives a few dozen distinct pipeline objects per task
-/// across a handful of live tasks, so this is roughly an order of magnitude of
-/// headroom. `pipe_memo_evict` is the reading that says whether that is true on
-/// a rail — a non-zero count means the working set exceeded this and the cap is
-/// costing hits, which is the only thing that would justify raising it.
-///
-/// An entry is three `Arc` clones and a `[ListObjectEntry; 3]`; the shaders it
-/// names are the same allocations the translate cache already holds, so the cap
-/// bounds pointers rather than shader bytes.
-pub const MEMO_CAPACITY: usize = 1024;
 
 /// The two buffer-index sets every draw of one pipeline used to rebuild from
 /// that pipeline's attribute list.
@@ -186,7 +62,7 @@ pub const MEMO_CAPACITY: usize = 1024;
 /// # The measurement did not confirm it, and this is what it said
 ///
 /// The twelve interleaved boots quoted on
-/// [`crate::runtime::m2v_cache::ShaderVariant::sampler_bindings`] carried this
+/// [`crate::runtime::m2v_cache::ShaderVariant::samplers`] carried this
 /// change too, and `binds_us` — the column this targets — moved the **wrong
 /// way**: 2.477 [2.418..2.525] before against 2.636 [2.510..2.695] after, per
 /// draw. The ranges touch rather than separate, and the sub-column where the two
@@ -225,11 +101,26 @@ impl VertexBindPlan {
         let mut constant_step: Vec<u32> = desc
             .vertex_attributes
             .iter()
+            // No stride term, for the reason `attribute` below states in full:
+            // the draw walk does not use `a.stride`, it uses
+            // `draw::bind_attribute_stride`, which prefers the per-draw
+            // `attributeStride` the guest sent with the bind and falls back to
+            // the pipeline's only when there is none. A pipeline declaring
+            // stride 0 for a dynamic layout is therefore still walked, still
+            // emits a `Constant` step, and still needs the CPU base-instance
+            // prefix — while this set, filtered on the pipeline's stride, would
+            // say the bind may take the zero-copy rail. `execute_draw_inner`
+            // then refuses it with `ConstantVertexRequiresCpuBytes` and the draw
+            // is lost.
+            //
+            // Listing an index the walk turns out to skip costs one CPU staging
+            // read and never correctness, which is the direction a set derived
+            // from the pipeline alone is allowed to be wrong in.
             .filter(|a| {
                 a.format != 0
-                    && a.stride != 0
-                    && crate::backend::vulkan::translate::vertex::step_function(a.declared_step_function)
-                        == Ok(crate::backend::vulkan::engine::VertexStepFunction::Constant)
+                    && crate::backend::vulkan::translate::vertex::step_function(
+                        a.declared_step_function,
+                    ) == Ok(crate::backend::vulkan::engine::VertexStepFunction::Constant)
             })
             .map(|a| a.buffer_index)
             .collect();
@@ -262,12 +153,16 @@ impl VertexBindPlan {
 
 /// Everything a draw chain needs from its pipeline ref, resolved once.
 ///
-/// Every field is an `Arc` because the whole point is that a hit copies nothing:
-/// `RenderPipelineDescriptor` owns two `Vec`s (its vertex attributes and its
-/// colour attachments) and cloning it per draw would put back a fraction of the
-/// allocation traffic this module exists to remove.
+/// The registry owns this structure behind one `Arc`, so a hit acquires only
+/// that object. The fields are also shared with downstream engine/cache owners;
+/// in particular, `RenderPipelineDescriptor` owns two `Vec`s that must never be
+/// cloned per draw.
 #[derive(Clone)]
 pub struct ResolvedRenderPipeline {
+    /// Present only for a state registered under the guest pipeline object's
+    /// lifetime. The memo-off ablation reconstructs per draw and therefore has
+    /// no retained identity to publish to a backend cache.
+    pub pipeline_object: Option<crate::backend::vulkan::engine::PipelineObjectIdentity>,
     pub desc: Arc<RenderPipelineDescriptor>,
     pub vertex: Arc<CachedShader>,
     pub fragment: Arc<CachedShader>,
@@ -275,86 +170,54 @@ pub struct ResolvedRenderPipeline {
     pub bind_plan: Arc<VertexBindPlan>,
 }
 
-/// The three object-list entries a resolution depends on, in the order they are
-/// read: the pipeline object, then the vertex and fragment function objects.
-///
-/// A fixed-size array rather than three named fields because the only operation
-/// on it is equality against a freshly-read one, and a named-field struct
-/// invites a comparison that forgets a member. See the module doc for why the
-/// entry is the identity.
-type EntryTriple = [ListObjectEntry; 3];
+#[cfg(test)]
+pub(crate) fn retained_pipeline_with_desc_for_test(
+    desc: RenderPipelineDescriptor,
+) -> Arc<ResolvedRenderPipeline> {
+    use metal2vulkan::reflect::{ShaderReflection, ShaderStage, REFLECTION_VERSION};
 
-struct Entry {
-    identity: EntryTriple,
-    resolved: ResolvedRenderPipeline,
+    let reflection = |stage| {
+        Arc::new(ShaderReflection {
+            reflection_version: REFLECTION_VERSION,
+            stage,
+            entry_point: None,
+            bindings: vec![],
+            argument_buffer_fields: vec![],
+            vertex_attributes: vec![],
+            varyings: vec![],
+            render_targets: vec![],
+            depth_members: vec![],
+            depth_qualifier: None,
+            stencil_members: vec![],
+            local_size: None,
+            vertex_builtins: None,
+            tessellation: None,
+            imageblock_layouts: vec![],
+            implicit_imageblock_attachments: vec![],
+            fragment_imageblock: None,
+            datalayout: None,
+            function_constants: vec![],
+        })
+    };
+    let desc = Arc::new(desc);
+    Arc::new(ResolvedRenderPipeline {
+        pipeline_object: Some(crate::backend::vulkan::engine::PipelineObjectIdentity::new()),
+        bind_plan: Arc::new(VertexBindPlan::build(&desc)),
+        desc,
+        vertex: Arc::new(CachedShader::new(Vec::new(), reflection(ShaderStage::Vertex))),
+        fragment: Arc::new(CachedShader::new(
+            Vec::new(),
+            reflection(ShaderStage::Fragment),
+        )),
+    })
 }
 
-/// A map that holds at most `CAP` entries, dropping the oldest *insertion* to
-/// stay there.
-///
-/// The capacity is a const parameter rather than a field so it cannot be passed
-/// wrong at a second construction site, and the map is private with `insert` as
-/// its only mutator so a caller cannot reach `entries` and grow it past the
-/// bound — `AGENTS.md`'s "make the invariant unrepresentable" rather than a scan
-/// looking for places that forgot to check.
-///
-/// Oldest-insertion and not least-recently-used: a resolution's value does not
-/// decay with time, and the population this bounds is pipeline objects a guest
-/// creates at app launch and then keeps. LRU would buy a different eviction
-/// order for a working set that does not exceed the cap at all —
-/// `pipe_memo_evict` is what says whether that assumption holds on a rail.
-struct BoundedByInsertion<K: Copy + Eq + Hash, V, const CAP: usize> {
-    entries: HashMap<K, V>,
-    order: VecDeque<K>,
+#[cfg(test)]
+pub(crate) fn retained_pipeline_for_test() -> Arc<ResolvedRenderPipeline> {
+    retained_pipeline_with_desc_for_test(RenderPipelineDescriptor::default())
 }
 
-impl<K: Copy + Eq + Hash, V, const CAP: usize> BoundedByInsertion<K, V, CAP> {
-    fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-            order: VecDeque::new(),
-        }
-    }
-
-    fn get(&self, key: &K) -> Option<&V> {
-        self.entries.get(key)
-    }
-
-    /// File `value` under `key`, returning whatever the cap pushed out.
-    ///
-    /// Re-filing a live key replaces its value and does **not** queue a second
-    /// slot in the order — otherwise the deque outgrows the map and starts
-    /// evicting keys that are the newest thing in it.
-    fn insert(&mut self, key: K, value: V) -> Option<K> {
-        if self.entries.insert(key, value).is_some() {
-            return None;
-        }
-        self.order.push_back(key);
-        if self.order.len() <= CAP {
-            return None;
-        }
-        let old = self.order.pop_front()?;
-        self.entries.remove(&old);
-        Some(old)
-    }
-}
-
-type Memo = BoundedByInsertion<(u32, u32), Entry, MEMO_CAPACITY>;
-
-fn memo() -> &'static Mutex<Memo> {
-    static MEMO: OnceLock<Mutex<Memo>> = OnceLock::new();
-    MEMO.get_or_init(|| Mutex::new(Memo::new()))
-}
-
-/// Drop every resolution. Called from `device_reset`, which is where the keys
-/// stop meaning anything — see the comment at that call site.
-pub fn forget_all() {
-    let mut m = memo().lock().unwrap_or_else(|e| e.into_inner());
-    *m = Memo::new();
-    note_store_route("pipe_memo_forget_all");
-}
-
-/// Whether the memo is on. See [`crate::env::PIPELINE_MEMO`].
+/// Whether retained pipeline states are on. See [`crate::env::PIPELINE_MEMO`].
 fn memo_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -365,36 +228,9 @@ fn memo_enabled() -> bool {
     })
 }
 
-/// Read the object-list entries for a pipeline and the two functions it names.
-///
-/// `None` from any of the three is "the guest has not told us", which the full
-/// path reports with its own rung — so a miss here does not refuse, it declines
-/// to *serve from the memo* and lets [`resolve_uncached`] produce the named
-/// failure. There is exactly one place a draw's pipeline failure is described
-/// and it is not this function.
-///
-/// Neither func ref can be zero here. `ref == 0` is "no function bound" and
-/// would read object-list slot 0 rather than refusing, but every triple this is
-/// called with comes from a descriptor [`resolve_uncached`] already accepted,
-/// and `load_render_pipeline` refuses a zero in either stage before returning
-/// one.
-fn read_identity<M: HostMemory + HostOps>(
-    state: &DeviceState,
-    host: &M,
-    task_id: u32,
-    pipeline_ref: u32,
-    vertex_ref: u32,
-    fragment_ref: u32,
-) -> Option<EntryTriple> {
-    Some([
-        objects::lookup_list_entry(state, host, task_id, pipeline_ref)?,
-        objects::lookup_list_entry(state, host, task_id, vertex_ref)?,
-        objects::lookup_list_entry(state, host, task_id, fragment_ref)?,
-    ])
-}
-
 /// Whether `pipeline_ref`'s two shaders are **already translated**, answered
-/// from this memo alone and without resolving, translating or reading any AIR.
+/// from the retained pipeline registry alone and without resolving, translating
+/// or reading any AIR.
 ///
 /// # Why the exec preflight can ask this instead of loading the AIR
 ///
@@ -404,7 +240,8 @@ fn read_identity<M: HostMemory + HostOps>(
 /// it to `m2v_cache::ensure_cached_async` — three guest resolves at **4.3 us a
 /// pipeline ref, 12 700 refs a second, ~54 ms of every second**.
 ///
-/// A memo hit answers the same question for ~0.6 us, and it is not a weaker
+/// A retained-state hit answers the same question without reading guest memory,
+/// and it is not a weaker
 /// answer:
 ///
 /// - an entry is only ever filed after a successful [`resolve_uncached`], and it
@@ -413,180 +250,92 @@ fn read_identity<M: HostMemory + HostOps>(
 /// - the m2v translate cache is **unbounded and nothing evicts it** (its only
 ///   removal is `forget_if_transient`, dropping a transient failure so it can be
 ///   retried), so a shader translated once is translated for the life of the
-///   process;
-/// - therefore even if this memo's own [`MEMO_CAPACITY`] evicts the entry before
-///   the draw reaches it, the draw's `translate_cached_reflected` finds the
-///   shader ready and does not translate synchronously. The eviction costs the
-///   resolve, never the translation.
-///
-/// The identity check is the same three object-list entry reads [`resolve`]
-/// makes, with the same coverage and the same two documented gaps — a
-/// descriptor or an MTLB rewritten in place. Those gaps are not widened by
-/// asking here: the draw that follows performs the identical check, so a guest
-/// that could fool this one already fools that one.
+///   process.
 ///
 /// Returns `false` whenever the memo is switched off, so
 /// `REIMS_VGPU_PIPELINE_MEMO=off` takes the preflight back down its full path
 /// along with everything else this module short-circuits.
 ///
-/// # What it measured, two driven macos-13 boots
-///
-/// ```text
-/// preflight_memo_ready    716 427 / 708 872
-/// preflight_memo_absent     1 207 /   1 428      99.83 % hit
-/// preflight_memo_stale          0 /       0
-///
-///                    before        after
-/// preflight ms/s     ~76           15.19 / 14.99      -80 %
-/// air ms/s           53.90/54.23    0.00 /  0.00
-/// cache ms/s         16.30/16.60    0.00 /  0.00
-/// refs ms/s           6.24/6.23     6.21 /  6.10      control, held
-/// refs_us/call        0.41/0.42     0.39 /  0.40      control, held
-/// op0x37 us/packet  101.2          94.34 / 94.43
-/// ```
-///
-/// **~60 ms/s off the drain worker.** `cache` falling is not a second win and
-/// not a regression — it only ever ran on a miss, so it tracks the hit rate by
-/// construction. `refs` still runs for every packet and is the control that says
-/// the two boots are comparable.
-///
-/// `preflight_memo_stale` being **0** across 1.4 million asks is the reading
-/// that matters for the identity check: on a steady desktop the three entries
-/// never move, which is what the module doc's argument predicts.
-///
-/// # And on the other five drivers, where it is *not* zero
-///
-/// One undriven boot of each x86 rail, which catches the cold memo and the
-/// pipeline churn of app launch rather than a settled desktop:
-///
-/// ```text
-/// macos-11  ready=2353  absent= 617  stale= 0     79 % hit
-/// macos-12  ready=1613  absent= 951  stale= 0     63 %
-/// macos-13  ready= 930  absent= 919  stale= 0     50 %
-/// macos-14  ready= 906  absent=1137  stale=19     44 %
-/// macos-15  ready= 838  absent=1610  stale= 0     34 %
-/// macos-26  ready=5415  absent=2146  stale=23     72 %
-/// ```
-///
-/// Two things worth keeping. First, **the 99.83 % above is a steady-state
-/// number, not a universal one** — a cold memo during boot hits 34-79 %, which
-/// is the population this optimisation does not serve and does not need to.
-///
-/// Second, and more useful: **`stale` is not always zero.** macos-14 and
-/// macos-26 replace pipelines during boot and the identity check catches it,
-/// falling back to the full preflight exactly as designed. That is the reading
-/// that says the check is **not vacuous** — a comparison that returned zero on
-/// every rail under every condition would be indistinguishable from one that
-/// could never fire, and this one demonstrably fires on real guest behaviour and
-/// then declines the entry.
-///
-/// One artifact to know: `sum vs preflight_us` drops to ~0.41, because the three
-/// timed sub-spans now cover almost nothing while this check — which is inside
-/// `preflight_us` and outside all three — covers the rest. That is the
-/// instrument no longer tiling its subject, not time going missing.
 pub fn translations_ready<M: HostMemory + HostOps>(
     state: &DeviceState,
-    host: &M,
+    _host: &M,
     task_id: u32,
     pipeline_ref: u32,
 ) -> bool {
     if !memo_enabled() {
         return false;
     }
-    let cached = {
-        let m = memo().lock().unwrap_or_else(|e| e.into_inner());
-        m.get(&(task_id, pipeline_ref)).map(|e| {
-            (
-                e.identity,
-                e.resolved.desc.vertex_func_ref,
-                e.resolved.desc.fragment_func_ref,
-            )
-        })
-    };
-    let Some((identity, vertex_ref, fragment_ref)) = cached else {
+    if !state
+        .task_render_pipeline_states
+        .contains(task_id, pipeline_ref)
+    {
         note_store_route("preflight_memo_absent");
         return false;
-    };
-    if read_identity(state, host, task_id, pipeline_ref, vertex_ref, fragment_ref)
-        == Some(identity)
-    {
-        note_store_route("preflight_memo_ready");
-        return true;
     }
-    note_store_route("preflight_memo_stale");
-    false
+    note_store_route("preflight_memo_ready");
+    true
 }
 
 /// Resolve `pipeline_ref` to its descriptor and both translated shaders.
 ///
-/// Serves a memoized resolution when the three object-list entries it was built
-/// from still read identically; see the module doc for what that check is and
-/// what it does not cover.
+/// Serves the task's retained pipeline state when it has already been
+/// constructed. The returned `Arc` is the encoder's ownership of that immutable
+/// state while it assembles and executes the draw.
 pub fn resolve<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
     pipeline_ref: u32,
-) -> Result<ResolvedRenderPipeline, DrawPreparationDecline> {
+) -> Result<Arc<ResolvedRenderPipeline>, DrawPreparationDecline> {
     if !memo_enabled() {
         note_store_route("pipe_memo_off");
-        return resolve_uncached(state, host, task_id, pipeline_ref);
+        return resolve_uncached(state, host, task_id, pipeline_ref).map(Arc::new);
     }
 
-    // The func refs come from the cached entry rather than from a fresh
-    // descriptor read: reading the descriptor to learn which functions to check
-    // would pay most of what the memo is here to skip. The pipeline object's own
-    // entry is the first of the three compared, so a pipeline that has been
-    // replaced fails the check before its stale func refs are believed for
-    // anything but the two reads that then also fail it.
-    let cached = {
-        let m = memo().lock().unwrap_or_else(|e| e.into_inner());
-        m.get(&(task_id, pipeline_ref))
-            .map(|e| (e.identity, e.resolved.clone()))
-    };
-    if let Some((identity, resolved)) = cached {
-        let fresh = read_identity(
-            state,
-            host,
-            task_id,
-            pipeline_ref,
-            resolved.desc.vertex_func_ref,
-            resolved.desc.fragment_func_ref,
-        );
-        if fresh == Some(identity) {
-            note_store_route("pipe_memo_hit");
-            return Ok(resolved);
-        }
-        note_store_route("pipe_memo_stale");
-    } else {
-        note_store_route("pipe_memo_miss");
+    if let Some(resolved) = state
+        .task_render_pipeline_states
+        .get(task_id, pipeline_ref)
+    {
+        note_store_route("pipe_memo_hit");
+        return Ok(resolved);
     }
+    note_store_route("pipe_memo_miss");
 
-    let resolved = resolve_uncached(state, host, task_id, pipeline_ref)?;
-    // Built after the resolution and from the same refs it used, so an entry can
-    // only be filed under an identity that was readable at the moment the
-    // resolution was taken. An unreadable one files nothing rather than filing a
-    // resolution no later read can invalidate.
-    if let Some(identity) = read_identity(
-        state,
-        host,
+    let mut resolved = resolve_uncached(state, host, task_id, pipeline_ref)?;
+    resolved.pipeline_object = Some(crate::backend::vulkan::engine::PipelineObjectIdentity::new());
+    let resolved = Arc::new(resolved);
+    Ok(state.task_render_pipeline_states.register(
         task_id,
         pipeline_ref,
-        resolved.desc.vertex_func_ref,
-        resolved.desc.fragment_func_ref,
-    ) {
-        let evicted = memo().lock().unwrap_or_else(|e| e.into_inner()).insert(
-            (task_id, pipeline_ref),
-            Entry {
-                identity,
-                resolved: resolved.clone(),
-            },
-        );
-        if evicted.is_some() {
-            note_store_route("pipe_memo_evict");
+        resolved,
+    ))
+}
+
+/// The sample count an attachment bound with this pipeline must carry.
+///
+/// The serialized allocation dimensions available while resolving a linear
+/// texture do not repeat the immutable texture-creation sample count. The
+/// render contract still supplies a total answer: every attached render target
+/// must match the bound pipeline's `rasterSampleCount`, while a distinct resolve
+/// destination is single-sampled. Ask retained pipeline state first; on its
+/// first draw, decode only the pipeline descriptor and let [`resolve`] retain
+/// the complete translated state when encoding begins.
+pub fn attachment_sample_count<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    pipeline_ref: u32,
+) -> Option<u32> {
+    if memo_enabled() {
+        if let Some(resolved) = state
+            .task_render_pipeline_states
+            .get(task_id, pipeline_ref)
+        {
+            return Some(resolved.desc.raster_sample_count.max(1));
         }
     }
-    Ok(resolved)
+    crate::runtime::draw::load_render_pipeline(state, host, task_id, pipeline_ref)
+        .map(|desc| desc.raster_sample_count.max(1))
 }
 
 /// The full path: object list → descriptor → decode → MTLB → AIR → SPIR-V, for
@@ -609,8 +358,8 @@ fn resolve_uncached<M: HostMemory + HostOps>(
     // The same three sub-phases the call site used to open around this work,
     // moved in with it. They are inert outside a live `ChainTimer`, so the two
     // non-draw callers of the loaders below are unaffected — and on the draw
-    // rail `pl_desc_us` now brackets the memo's own identity check, which is
-    // what makes the hit path's cost readable against the miss path's.
+    // rail `pl_desc_us` brackets the task registry lookup on a hit and this
+    // construction on a miss, so the lifecycle correction remains measurable.
     use crate::runtime::chain_phase::{enter, Phase};
     enter(Phase::PipelineMtlb);
     let v_mtlb = load_mtlb(
@@ -669,6 +418,7 @@ fn resolve_uncached<M: HostMemory + HostOps>(
     })?;
     let bind_plan = Arc::new(VertexBindPlan::build(&desc));
     Ok(ResolvedRenderPipeline {
+        pipeline_object: None,
         desc: Arc::new(desc),
         vertex,
         fragment,
@@ -681,16 +431,8 @@ mod tests {
     use super::*;
     use crate::runtime::decode::resource::VertexAttribute;
 
-    fn entry(gva: u64, len: u32, ot: u8) -> ListObjectEntry {
-        ListObjectEntry {
-            object_type: ot,
-            descriptor_length: len,
-            descriptor_gva: gva,
-        }
-    }
-
-    /// An empty memo must answer **not ready**, and that direction is the whole
-    /// safety of asking it.
+    /// An empty retained registry must answer **not ready**, and that direction
+    /// is the whole safety of asking it.
     ///
     /// `translations_ready` gates whether the exec preflight skips loading a
     /// pipeline's AIR. A wrong `false` costs the resolve it was trying to save;
@@ -699,83 +441,93 @@ mod tests {
     /// with the packet already committed. So the absent case is pinned
     /// explicitly rather than left to follow from the `Option` being `None`.
     #[test]
-    fn an_absent_memo_entry_is_never_reported_ready() {
+    fn an_absent_retained_pipeline_is_never_reported_ready() {
         use crate::model::DeviceId;
         use crate::runtime::host::FakeHost;
 
-        forget_all();
         let state = DeviceState::new(DeviceId(1), 12);
         let host = FakeHost::new();
         assert!(
             !translations_ready(&state, &host, 7, 9),
-            "a pipeline this memo has never resolved must send the preflight \
+            "a pipeline this registry has never resolved must send the preflight \
              down its own path, not be waved through as translated"
         );
     }
 
-    /// The cap has to evict, or a guest that cycles pipeline refs grows this map
-    /// without bound for the life of the VM.
+    /// A pipeline state has the pipeline API's lifetime, not the lifetime of the
+    /// serializer bytes that constructed it. Re-pointing the object list changes
+    /// future construction input; explicit resource deletion and task teardown
+    /// end states that already exist.
     #[test]
-    fn the_capacity_evicts_the_oldest_insertion() {
-        let mut m: BoundedByInsertion<u32, u32, 4> = BoundedByInsertion::new();
-        assert_eq!(m.insert(1, 10), None, "under the cap evicts nothing");
-        for k in 2..=4 {
-            assert_eq!(m.insert(k, k * 10), None);
-        }
-        assert_eq!(m.insert(5, 50), Some(1), "the oldest insertion is named");
-        assert_eq!(m.entries.len(), 4, "the cap holds");
-        assert_eq!(m.get(&1), None, "and it is gone");
-        assert_eq!(m.get(&5), Some(&50));
-    }
+    fn pipeline_states_survive_list_changes_and_retire_on_explicit_lifetime_events() {
+        use crate::model::DeviceId;
 
-    /// Re-inserting a live key must not queue a second eviction slot for it, or
-    /// the order deque outgrows the map and evicts entries that are still the
-    /// newest thing in it.
-    #[test]
-    fn re_inserting_a_key_does_not_grow_the_order() {
-        let mut m: BoundedByInsertion<u32, u32, 4> = BoundedByInsertion::new();
-        for v in 0..64 {
-            assert_eq!(m.insert(5, v), None, "a replacement evicts nothing");
-        }
-        assert_eq!(m.entries.len(), 1);
-        assert_eq!(m.order.len(), 1, "one key, one slot in the order");
-        assert_eq!(m.get(&5), Some(&63), "and the newest value won");
-    }
+        let mut state = DeviceState::new(DeviceId(1), 12);
+        state.define_task(3, 1 << 20, 7);
+        let first = state
+            .task_render_pipeline_states
+            .register(3, 9, retained_pipeline_for_test());
+        let first_id = first
+            .pipeline_object
+            .as_ref()
+            .expect("a retained state has an object identity")
+            .id();
 
-    /// The identity is compared as a whole. A change to any of the three
-    /// entries, in any of their three fields, has to read as different — this is
-    /// the check the module's whole correctness argument rests on.
-    #[test]
-    fn every_field_of_every_entry_is_part_of_the_identity() {
-        let base: EntryTriple = [
-            entry(0x1000, 64, 7),
-            entry(0x2000, 32, 6),
-            entry(0x3000, 32, 6),
-        ];
-        for slot in 0..3 {
-            let mut gva = base;
-            gva[slot].descriptor_gva += 1;
-            assert_ne!(base, gva, "slot {slot} descriptor_gva");
-            let mut len = base;
-            len[slot].descriptor_length += 1;
-            assert_ne!(base, len, "slot {slot} descriptor_length");
-            let mut ot = base;
-            ot[slot].object_type += 1;
-            assert_ne!(base, ot, "slot {slot} object_type");
-        }
+        assert!(state.set_object_list(3, 11, 64));
+        assert!(Arc::ptr_eq(
+            &first,
+            &state.task_render_pipeline_states.get(3, 9).unwrap()
+        ));
+        assert!(state.task_render_pipeline_states.delete(3, 9));
+        assert!(!state.task_render_pipeline_states.contains(3, 9));
+        assert_eq!(Arc::strong_count(&first), 1, "the encoder owner remains valid");
+
+        let replacement = state
+            .task_render_pipeline_states
+            .register(3, 9, retained_pipeline_for_test());
+        assert_ne!(
+            replacement
+                .pipeline_object
+                .as_ref()
+                .expect("the replacement is retained")
+                .id(),
+            first_id,
+            "reusing a guest reference constructs a new pipeline object"
+        );
+        state.define_task(3, 1 << 20, 8);
+        assert!(
+            !state.task_render_pipeline_states.contains(3, 9),
+            "task redefinition ends the old task namespace"
+        );
+
+        state
+            .task_render_pipeline_states
+            .register(3, 9, retained_pipeline_for_test());
+        assert!(state.delete_task(3));
+        assert!(!state.task_render_pipeline_states.contains(3, 9));
     }
 
     /// The two sets [`VertexBindPlan`] carries used to be rebuilt inside the
     /// draw path from the same attribute list, and this pins the classification
     /// they replaced rather than the shape of the code that does it.
     ///
-    /// The interesting rows are the ones the old inline filter got right by
-    /// construction and a rewrite can get wrong: a Constant-step attribute whose
-    /// `format` is zero, and one whose `stride` is zero, are **not** constant
-    /// step for this purpose — the draw's attribute walk skips them, so a bind
-    /// of their buffer must stay eligible for the zero-copy rail — while both
-    /// still count as named by the attribute list, because that set is
-    /// deliberately unfiltered.
+    /// The interesting rows are the ones a rewrite can get wrong. A Constant-step
+    /// attribute whose `format` is zero is **not** constant step for this
+    /// purpose: the draw's attribute walk skips it, so a bind of its buffer stays
+    /// eligible for the zero-copy rail.
+    ///
+    /// A **zero `stride` is different, and it used to be filtered here too.** The
+    /// walk does not read `a.stride`; it reads `draw::bind_attribute_stride`,
+    /// which prefers the per-draw `attributeStride` the guest sent with the bind.
+    /// So a pipeline declaring stride 0 for a dynamic layout is still walked,
+    /// still emits a `Constant` step, and still needs the CPU base-instance
+    /// prefix — and this set saying otherwise put the bind on the zero-copy rail
+    /// and lost the whole draw to `ConstantVertexRequiresCpuBytes`. The rule the
+    /// `attribute` field's doc states applies to both sets: a set derived from
+    /// the pipeline alone may not depend on a field the draw re-derives.
+    ///
+    /// Both zero rows still count as *named* by the attribute list, because that
+    /// set is deliberately unfiltered.
     #[test]
     fn the_bind_plan_separates_constant_step_from_merely_named() {
         const CONSTANT: Option<u32> = Some(0);
@@ -791,19 +543,28 @@ mod tests {
         };
         let desc = RenderPipelineDescriptor {
             vertex_attributes: vec![
-                attr(1, 0x21, 16, CONSTANT),      // constant, and it counts
-                attr(2, 0x21, 16, PER_INSTANCE),  // named, not constant
-                attr(3, 0, 16, CONSTANT),         // format 0: the walk skips it
-                attr(4, 0x21, 0, CONSTANT),       // stride 0: the walk skips it
-                attr(1, 0x21, 32, PER_INSTANCE),  // a second attribute on buffer 1
-                attr(5, 0x21, 16, None),          // undeclared step is per-vertex
+                attr(1, 0x21, 16, CONSTANT),     // constant, and it counts
+                attr(2, 0x21, 16, PER_INSTANCE), // named, not constant
+                attr(3, 0, 16, CONSTANT),        // format 0: the walk skips it
+                attr(4, 0x21, 0, CONSTANT),      // stride 0: the draw supplies one
+                attr(1, 0x21, 32, PER_INSTANCE), // a second attribute on buffer 1
+                attr(5, 0x21, 16, None),         // undeclared step is per-vertex
             ],
             ..Default::default()
         };
         let plan = VertexBindPlan::build(&desc);
 
-        assert!(plan.is_constant_step(1), "declared Constant with real bytes");
-        for index in [2, 3, 4, 5] {
+        assert!(
+            plan.is_constant_step(1),
+            "declared Constant with real bytes"
+        );
+        assert!(
+            plan.is_constant_step(4),
+            "a dynamic layout declares stride 0 and the draw supplies the real \
+             one, so this attribute is walked and needs the base-instance \
+             prefix; calling it zero-copy-eligible loses the draw"
+        );
+        for index in [2, 3, 5] {
             assert!(
                 !plan.is_constant_step(index),
                 "buffer {index} must keep the zero-copy rail"

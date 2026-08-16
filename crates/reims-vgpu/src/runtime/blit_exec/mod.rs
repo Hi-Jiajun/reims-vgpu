@@ -526,6 +526,37 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     if view_depth as usize > crate::runtime::draw::MAX_TEXTURE_VIEW_CHAIN {
         return Err(br(BlitStatus::Unsupported, "tex_view_depth_cap"));
     }
+    // **This function is the whole blit rail's definition of "the guest bytes of
+    // a texture", and guest bytes are only a resource's content once everything
+    // this device rendered into it has landed.** Every endpoint of every blit —
+    // source and destination, texture-to-texture, texture-to-buffer and back —
+    // arrives here, so this is the one place the rail has to state that.
+    //
+    // A render pass whose colour attachment is an ordinary private `MTLTexture`
+    // resolves on `render_target`'s fourth rung to a linear guest VA, and
+    // `writeback_debt::arm_gva` then keeps the result in the engine's resident
+    // and arms a debt against `(task_id, texture_ref)` instead of copying it
+    // out. Nothing lands until a **guest-byte reader** names the resource. The
+    // two readers that did name it are `draw::texture_view` and `compute_exec`;
+    // a blit is exactly as much a guest-byte reader as either, and it was
+    // silent. Its copy read whatever the pages held before the pass — which for
+    // a freshly allocated private target is zeros, at scale, with no error, the
+    // "Never Fail Silently" class in its worst form.
+    //
+    // `pay_for_texture` is the call that covers both spellings a debt can have
+    // (the task-local GVA resource and the surface mapping), and it early-returns
+    // on an empty ledger, so the cost on a rail with nothing owed is one
+    // `is_empty`. Paying here rather than at the copy also covers the view chain:
+    // the recursion below re-enters with the base ref, and the debt may be armed
+    // against either spelling of the pair.
+    //
+    // Paying a *destination*'s debt before overwriting it is deliberate, not
+    // waste. The blit writes a rect, not the plane, so the pixels outside that
+    // rect are the resource's content and must be real; and leaving the debt
+    // armed would let it land the pre-blit resident over the blit's own bytes
+    // later.
+    note_blit_endpoint_debt(state, task_id, texture_ref);
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
     let Some(entry) = objects::lookup_list_entry(state, host, task_id, texture_ref) else {
         return Err(br(
             BlitStatus::MissingResource,
@@ -732,6 +763,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         else {
             return Err(br(BlitStatus::Bounds, "t11_sample_window"));
         };
+        note_blit_t11_resident(state, mapping_id);
         return Ok(TextureBacking::Type11(Type11Texture {
             mapping_id,
             width: tex_w,
@@ -819,6 +851,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         // repair of anything this workload does, and a screen that looks the
         // same after changing it says nothing either way.
         crate::runtime::drain::note_store_route("blit_t5_plane_device");
+        note_blit_t11_resident(state, sid);
         return Ok(TextureBacking::Type11(Type11Texture {
             mapping_id: sid,
             width: view.width,
@@ -1140,6 +1173,363 @@ fn write_texture_row<M: HostMemory + HostOps>(
     }
 }
 
+/// Read a whole `row_bytes`-wide, `row_count`-tall rectangle at `origin` into
+/// `buf`, rows packed `row_bytes` apart.
+///
+/// # A rect is the unit the mapping rail is built for, and a row is not
+///
+/// [`mapping_write::read_rect_raw_at`] takes a height because every per-call
+/// cost it carries is per *rect*, not per row: a writeback settle, a mapping
+/// lookup, a window revalidation, and — on a fragmented mapping, which is the
+/// arm a driven x86 boot takes — a fresh QEMU memory-region import per guest
+/// page run. Handing it `height: 1` in a loop pays all of that `row_count`
+/// times to move one row of texels.
+///
+/// That is not a small constant. A driven macos-13 Maps leg measured the
+/// slice/level copy's row loop at **30.15 s of a 30.28 s blit rail** while
+/// moving 14.6 MB — 0.48 MB/s, against 0.22 s for every strided guest-RAM copy
+/// in the device put together. The bytes were never the cost; the per-row
+/// re-entry into the mapping rail was.
+///
+/// The linear arm keeps its row loop, because there the per-row call is a bare
+/// guest-RAM read with none of that preamble, and rows of a strided level are
+/// genuinely discontiguous.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the rect helper names the same geometry its row counterpart does"
+)]
+fn read_texture_rect<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    tex: &TextureBacking,
+    origin: Point,
+    row_bytes: u64,
+    row_count: u64,
+    buf: &mut [u8],
+) -> Result<(), BlitStatus> {
+    let need = row_bytes
+        .checked_mul(row_count)
+        .ok_or_else(|| br(BlitStatus::Capacity, "rd_rect_span_overflow"))?;
+    if need as usize > buf.len() {
+        return Err(br(BlitStatus::Capacity, "rd_rect_buf_cap"));
+    }
+    match tex {
+        TextureBacking::Linear(_) => {
+            for y in 0..row_count {
+                let at = (y * row_bytes) as usize;
+                read_texture_row(
+                    state,
+                    host,
+                    task_id,
+                    tex,
+                    origin,
+                    y,
+                    row_bytes,
+                    &mut buf[at..at + row_bytes as usize],
+                )?;
+            }
+            Ok(())
+        }
+        TextureBacking::Type11(t) => {
+            let (pixels, height, origin_x, origin_y) =
+                t11_rect_extent(t, origin, row_bytes, row_count)?;
+            if !mapping_write::read_rect_raw_at(
+                state,
+                host,
+                t.mapping_id,
+                t11_window(t),
+                mapping_write::Rect {
+                    origin_x,
+                    origin_y,
+                    width: pixels,
+                    height,
+                },
+                &mut buf[..need as usize],
+                row_bytes as u32,
+            ) {
+                return Err(br(BlitStatus::GuestIo, "rd_rect_t11_io"));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Write a whole `row_bytes`-wide, `row_count`-tall rectangle at `origin` from
+/// `buf`, rows packed `row_bytes` apart. The rect counterpart of
+/// [`write_texture_row`]; see [`read_texture_rect`] for why the rect is the
+/// unit.
+///
+/// A rect that covers a type-11 plane entirely goes through
+/// [`mapping_write::write_full_rect_raw_at`], whose fragmented arm imports each
+/// maximal packed GPA run once instead of once per row. The two calls address
+/// identical guest bytes; only the fragmented staging differs.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the rect helper names the same geometry its row counterpart does"
+)]
+fn write_texture_rect<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    tex: &TextureBacking,
+    origin: Point,
+    row_bytes: u64,
+    row_count: u64,
+    buf: &[u8],
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
+) -> Result<(), BlitStatus> {
+    let need = row_bytes
+        .checked_mul(row_count)
+        .ok_or_else(|| br(BlitStatus::Capacity, "wr_rect_span_overflow"))?;
+    if need as usize > buf.len() {
+        return Err(br(BlitStatus::Capacity, "wr_rect_buf_cap"));
+    }
+    match tex {
+        TextureBacking::Linear(_) => {
+            for y in 0..row_count {
+                let at = (y * row_bytes) as usize;
+                write_texture_row(
+                    state,
+                    host,
+                    task_id,
+                    tex,
+                    origin,
+                    y,
+                    row_bytes,
+                    &buf[at..at + row_bytes as usize],
+                    allowed,
+                )?;
+            }
+            Ok(())
+        }
+        TextureBacking::Type11(t) => {
+            let (pixels, height, origin_x, origin_y) =
+                t11_rect_extent(t, origin, row_bytes, row_count)?;
+            let src = &buf[..need as usize];
+            let ok = if origin_x == 0 && origin_y == 0 && pixels == t.width && height == t.height {
+                mapping_write::write_full_rect_raw_at(
+                    state,
+                    host,
+                    t.mapping_id,
+                    t.surface_offset,
+                    t.row_stride,
+                    t.span_end,
+                    pixels,
+                    height,
+                    t.bpp,
+                    src,
+                    row_bytes as u32,
+                )
+            } else {
+                mapping_write::write_rect_raw_at(
+                    state,
+                    host,
+                    t.mapping_id,
+                    t11_window(t),
+                    mapping_write::Rect {
+                        origin_x,
+                        origin_y,
+                        width: pixels,
+                        height,
+                    },
+                    src,
+                    row_bytes as u32,
+                )
+            };
+            if !ok {
+                return Err(br(BlitStatus::GuestIo, "wr_rect_t11_io"));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The mapping-rail sample window a type-11 texture backing names.
+///
+/// Spelled once so the four rect/row call sites cannot drift on which of the
+/// four fields a copy presents.
+fn t11_window(t: &Type11Texture) -> mapping_write::SurfaceWindow {
+    mapping_write::SurfaceWindow {
+        base_off: t.surface_offset,
+        bpr: t.row_stride,
+        span_end: t.span_end,
+        bpp: t.bpp,
+    }
+}
+
+/// Narrow a rect's texel geometry to the `u32` the mapping rail's [`mapping_write::Rect`]
+/// is expressed in, refusing by name rather than truncating.
+fn t11_rect_extent(
+    t: &Type11Texture,
+    origin: Point,
+    row_bytes: u64,
+    row_count: u64,
+) -> Result<(u32, u32, u32, u32), BlitStatus> {
+    if origin.z != 0 {
+        return Err(br(BlitStatus::Unsupported, "rect_t11_z"));
+    }
+    if t.bpp == 0 {
+        return Err(br(BlitStatus::Bounds, "rect_t11_bpp_zero"));
+    }
+    let origin_x =
+        u32::try_from(origin.x).map_err(|_| br(BlitStatus::Bounds, "rect_t11_x_range"))?;
+    let origin_y =
+        u32::try_from(origin.y).map_err(|_| br(BlitStatus::Bounds, "rect_t11_y_range"))?;
+    let height =
+        u32::try_from(row_count).map_err(|_| br(BlitStatus::Bounds, "rect_t11_height_range"))?;
+    let pixels = u32::try_from(row_bytes / t.bpp as u64)
+        .map_err(|_| br(BlitStatus::Bounds, "rect_t11_width_range"))?;
+    Ok((pixels, height, origin_x, origin_y))
+}
+
+/// Census: does the surface this blit is about to copy through its **guest
+/// pages** have live GPU-resident content instead?
+///
+/// The sampled rail and the blit rail consume the same wire form — a type-11
+/// IOSurface, named directly or through a type-5 view — and they resolve it
+/// completely differently. `draw::vulkan`'s sampled resolver runs a four-rung
+/// ladder whose top rung is `t11rung_resident`, the engine image, and a driven
+/// session puts 64-93 % of its binds there. This resolver has no ladder at all:
+/// it returns a [`Type11Texture`] over the mapping's guest pages every time, and
+/// the copy then reads and writes those pages on the CPU.
+///
+/// That is only sound while the guest pages hold the surface's newest content.
+/// The writeback debt is what is supposed to make that true, and
+/// `mapping_write`'s settle pays it before every read — but a resident carrying
+/// `gpu_only_content` with no debt armed owes nothing, so nothing lands, and the
+/// copy reads whatever the pages held before. A blit is not a decode failure and
+/// not a refusal: it succeeds, and the pixels are simply not the guest's.
+///
+/// So this counts rather than branches. `blit_t11_resident_ready` above zero
+/// says this device is copying a surface whose authoritative content is on the
+/// GPU, which is the reading that decides whether the blit rail needs the
+/// sampled rail's ladder. `_not_ready` beside it is the denominator, so a zero
+/// can be told from an arm that never ran.
+/// What a texture-to-texture copy is actually made of: which pair of backings it
+/// joins, and how many bytes it moves through the host.
+///
+/// `walk_blit_us` says this rail costs 33.6 s of a 45 s driven Maps window
+/// against 0.45 s for 1.49 M render records, and a per-record average cannot say
+/// whether that is a few enormous copies or many small ones, nor which pair of
+/// endpoint kinds is paying it. A GPU-side rail can only serve pairs whose
+/// **both** ends this device can hold as images, so the pair split is what
+/// decides whether such a rail would serve the workload or a corner of it.
+///
+/// `blit_t2t_bytes` is the denominator for every later claim about this rail: a
+/// copy that is genuinely moving a gigabyte a second through `memcpy` is a
+/// bandwidth problem, and one that is not is a per-row overhead problem, and the
+/// two have opposite repairs. The two reverted attempts in `09a45414` and
+/// `81f99f4f` were both aimed at granularity without this number in hand.
+fn note_t2t_shape(
+    src: &TextureBacking,
+    dst: &TextureBacking,
+    copy_w: u64,
+    copy_h: u64,
+    copy_d: u64,
+    copy_bpp: u32,
+) {
+    use crate::runtime::drain::{note_store_route, note_store_route_n};
+    note_store_route(match (src.is_type11(), dst.is_type11()) {
+        (false, false) => "blit_t2t_linear_linear",
+        (false, true) => "blit_t2t_linear_t11",
+        (true, false) => "blit_t2t_t11_linear",
+        (true, true) => "blit_t2t_t11_t11",
+    });
+    let bytes = copy_w
+        .saturating_mul(copy_h)
+        .saturating_mul(copy_d)
+        .saturating_mul(u64::from(copy_bpp));
+    note_store_route_n("blit_t2t_bytes", bytes);
+    // Banded rather than averaged, because the mean of a full-window copy and a
+    // 16x16 icon says nothing about either and this rail issues both.
+    note_store_route(match bytes {
+        0..=4_095 => "blit_t2t_band_tiny",
+        4_096..=262_143 => "blit_t2t_band_small",
+        262_144..=4_194_303 => "blit_t2t_band_medium",
+        _ => "blit_t2t_band_large",
+    });
+}
+
+/// Whether a blit endpoint arrived owing this device a writeback, split by which
+/// spelling of the debt named it.
+///
+/// The payment itself is unconditional and silent — `pay_for_texture` early-exits
+/// on an empty ledger — so without this the repair is unattributable: a rail that
+/// never had a debt to pay and a rail that pays thousands look identical from
+/// outside, and the screen cannot tell them apart either.
+///
+/// `gva` is the interesting one. It counts blit endpoints whose real content was
+/// sitting in an engine resident behind an armed [`crate::runtime::writeback_debt::GvaWritebackDebt`],
+/// i.e. copies that read guest pages the render never reached. `surface` is the
+/// type-11/type-4 spelling, which `mapping_write`'s own settle already covered
+/// from the other side, so a large `surface` next to a zero `gva` says this
+/// change bought nothing new.
+fn note_blit_endpoint_debt(state: &DeviceState, task_id: u32, texture_ref: u32) {
+    if state.pending_writebacks.is_empty() {
+        return;
+    }
+    if state
+        .pending_writebacks
+        .has_gva(crate::runtime::writeback_debt::GvaResourceKey {
+            task_id,
+            texture_ref,
+        })
+    {
+        crate::runtime::drain::note_store_route("blit_endpoint_owed_gva");
+    }
+    let mapped = state
+        .texture_to_mapping
+        .get(&(task_id, texture_ref))
+        .copied();
+    if state.pending_writebacks.get(texture_ref).is_some()
+        || mapped.is_some_and(|id| state.pending_writebacks.get(id).is_some())
+    {
+        crate::runtime::drain::note_store_route("blit_endpoint_owed_surface");
+    }
+}
+
+fn note_blit_t11_resident(state: &DeviceState, mapping_id: u32) {
+    #[cfg(feature = "backend-vulkan")]
+    {
+        // This census asks the engine a question, and asking takes the engine
+        // lock — the same lock the draw rail holds while it encodes and submits.
+        // A probe that blocks is not a probe, so time it: if this reads anywhere
+        // near `walk_blit_us`, the blit rail's cost is this instrument waiting
+        // for the renderer rather than anything the blit itself does.
+        let probe_started = std::time::Instant::now();
+        let _probe = ProbeClock(probe_started);
+        struct ProbeClock(std::time::Instant);
+        impl Drop for ProbeClock {
+            fn drop(&mut self) {
+                crate::runtime::drain::note_store_route_us(
+                    "blit_resident_probe_us",
+                    self.0.elapsed().as_micros() as u64,
+                );
+            }
+        }
+        let Some(m) = state.mappings.get(&mapping_id) else {
+            return;
+        };
+        if !m.has_geom || m.width == 0 || m.height == 0 {
+            crate::runtime::drain::note_store_route("blit_t11_resident_no_geom");
+            return;
+        }
+        let (w, h) = (m.width, m.height);
+        let id = crate::runtime::present_identity::surface_identity(state, mapping_id, w, h);
+        crate::runtime::drain::note_store_route(
+            match crate::backend::vulkan::engine::resident_content_backing(&id) {
+                crate::backend::vulkan::engine::ResidentContentBacking::NotReady => {
+                    "blit_t11_resident_not_ready"
+                }
+                _ => "blit_t11_resident_ready",
+            },
+        );
+    }
+    #[cfg(not(feature = "backend-vulkan"))]
+    let _ = (state, mapping_id);
+}
+
 fn range_fits(offset: u64, length: u64, size: u64) -> bool {
     offset <= size && length <= size - offset
 }
@@ -1431,7 +1821,22 @@ fn copy_row_region<M: HostMemory + HostOps>(
         image_count,
     )
     .ok_or_else(|| br(BlitStatus::Capacity, "copy_region_dst_span_overflow"))?;
+    // The window is built once and the rows run against it, so a single total
+    // over the pair cannot say which is the cost. `dest_window` walks the whole
+    // destination span's guest page table into a `HashSet`, which is per-record
+    // work that does not shrink with the copy; the row loop is per-row work that
+    // does. Timed apart because the repair differs.
+    let window_started = std::time::Instant::now();
     let allowed = dest_window(state, host, task_id, dst_base, dst_span);
+    crate::runtime::drain::note_store_route_us(
+        "blit_window_us",
+        window_started.elapsed().as_micros() as u64,
+    );
+    let rows_started = std::time::Instant::now();
+    crate::runtime::drain::note_store_route_n(
+        "blit_rows_n",
+        row_count.saturating_mul(image_count),
+    );
     let mut row_buf = vec![0u8; row_len];
     for z in 0..image_count {
         let src_plane = src_base
@@ -1487,6 +1892,10 @@ fn copy_row_region<M: HostMemory + HostOps>(
             }
         }
     }
+    crate::runtime::drain::note_store_route_us(
+        "blit_rows_us",
+        rows_started.elapsed().as_micros() as u64,
+    );
     Ok(())
 }
 
@@ -1833,6 +2242,31 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
     let storage_row = (copy_w as u64)
         .checked_mul(storage_bpp as u64)
         .ok_or(BlitStatus::Capacity)? as usize;
+    // The other half of the rail. `note_t2t_shape` covers texture-to-texture
+    // only, and that left 4 243 of a driven Maps leg's 26 234 blit records
+    // uncounted — a population big enough to hold the whole per-record cost if
+    // its copies are large, and invisible in a census that stops at one copy
+    // kind. Same three readings, so the two halves are comparable line for line.
+    {
+        use crate::runtime::drain::{note_store_route, note_store_route_n};
+        note_store_route(match (to_texture, tex.is_type11()) {
+            (true, false) => "blit_b2t_linear",
+            (true, true) => "blit_b2t_t11",
+            (false, false) => "blit_t2b_linear",
+            (false, true) => "blit_t2b_t11",
+        });
+        let bytes = (plane_row as u64)
+            .saturating_mul(copy_h)
+            .saturating_mul(copy_d);
+        note_store_route_n("blit_bt_bytes", bytes);
+        note_store_route_n("blit_bt_rows_n", copy_h.saturating_mul(copy_d));
+        note_store_route(match bytes {
+            0..=4_095 => "blit_bt_band_tiny",
+            4_096..=262_143 => "blit_bt_band_small",
+            262_144..=4_194_303 => "blit_bt_band_medium",
+            _ => "blit_bt_band_large",
+        });
+    }
     let mut plane = vec![0u8; plane_row];
     let mut packed = vec![0u8; storage_row.max(plane_row)];
     // Destination pages, taken before the loop below rather than per row. The
@@ -1866,6 +2300,12 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
         .ok_or(BlitStatus::Capacity)?;
         dest_window(state, host, task_id, buf_base_gva, span)
     };
+    // The half `blit_rows_us` cannot see. That counter sits in `copy_row_region`,
+    // which only the linear-to-linear fast path reaches; every type-11 and
+    // type-5 endpoint stages through this loop instead, and each of its rows
+    // re-vouches the mapping's guest page table. `mapw_pages_vouched` reads over
+    // a million on a driven Maps leg and nothing timed the loop that spends them.
+    let bt_rows_started = std::time::Instant::now();
     for z in 0..copy_d {
         for y in 0..copy_h {
             let buf_gva = buf_base_gva
@@ -2015,6 +2455,10 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
             }
         }
     }
+    crate::runtime::drain::note_store_route_us(
+        "blit_bt_rows_us",
+        bt_rows_started.elapsed().as_micros() as u64,
+    );
     Ok(())
 }
 
@@ -2449,6 +2893,11 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
         dst_base,
         dst_span.saturating_sub(cmd.destination_offset),
     );
+    // `blit_rows_us` lives in `copy_row_region`, which only the linear-to-linear
+    // fast path reaches. A texture-to-buffer copy stages every row through
+    // `read_texture_row` instead, and for a type-11 or type-5 source that
+    // re-vouches the mapping's guest page table per row.
+    let stage_rows_started = std::time::Instant::now();
     let mut row = vec![0u8; row_bytes as usize];
     for z in 0..copy_d {
         for y in 0..copy_h {
@@ -2489,6 +2938,14 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
             }
         }
     }
+    crate::runtime::drain::note_store_route_us(
+        "blit_t2b_stage_us",
+        stage_rows_started.elapsed().as_micros() as u64,
+    );
+    crate::runtime::drain::note_store_route_n(
+        "blit_t2b_stage_rows",
+        copy_h.saturating_mul(copy_d),
+    );
     BlitStatus::Ok
 }
 
@@ -2498,6 +2955,12 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     task_id: u32,
     cmd: &Command,
 ) -> BlitStatus {
+    // `walk_blit_us` says this call costs ~1.1 ms and `blit_t2t_bytes` says it
+    // moves ~800 of them, so the cost is not in the copy and a single total
+    // cannot say where it is instead. The three phases below are the whole body:
+    // resolving both endpoints, arming the destination's page window, and the
+    // row loop. Whichever of them holds the millisecond is the one to repair.
+    let phase_started = std::time::Instant::now();
     let src = match resolve_texture_backing(
         state,
         host,
@@ -2594,6 +3057,11 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     if copy_w == 0 || copy_h == 0 || copy_d == 0 {
         return BlitStatus::ZeroExtent;
     }
+    note_t2t_shape(&src, &dst, copy_w, copy_h, copy_d, copy_bpp);
+    crate::runtime::drain::note_store_route_us(
+        "blit_t2t_resolve_us",
+        phase_started.elapsed().as_micros() as u64,
+    );
     let row_bytes = match copy_w.checked_mul(copy_bpp as u64) {
         Some(v) => v,
         None => return br(BlitStatus::Capacity, "t2t_row_bytes_overflow"),
@@ -2876,44 +3344,59 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         Ok(v) => v,
         Err(st) => return st,
     };
-    let mut row = vec![0u8; row_bytes as usize];
+    // The last untimed loop on the rail: a texture-to-texture copy with a
+    // type-11 or type-5 end on either side stages through here rather than
+    // through `copy_row_region`, so `blit_rows_us` reports nothing for it.
+    //
+    // A plane at a time, not a row at a time: this is the same staging shape the
+    // slice/level form carried, and there a driven Maps leg charged the row loop
+    // 30.15 s of a 30.28 s rail. See [`read_texture_rect`] for what a per-row
+    // call into the mapping rail re-pays.
+    let t2t_stage_started = std::time::Instant::now();
+    let mut staged = vec![0u8; row_bytes.saturating_mul(copy_h) as usize];
     for z in 0..copy_d {
-        for y in 0..copy_h {
-            if let Err(st) = read_texture_row(
-                state,
-                host,
-                task_id,
-                &src,
-                Point {
-                    x: sox,
-                    y: soy,
-                    z: soz + z,
-                },
-                y,
-                row_bytes,
-                &mut row,
-            ) {
-                return st;
-            }
-            if let Err(st) = write_texture_row(
-                state,
-                host,
-                task_id,
-                &dst,
-                Point {
-                    x: dox,
-                    y: doy,
-                    z: doz + z,
-                },
-                y,
-                row_bytes,
-                &row,
-                allowed.as_ref(),
-            ) {
-                return st;
-            }
+        if let Err(st) = read_texture_rect(
+            state,
+            host,
+            task_id,
+            &src,
+            Point {
+                x: sox,
+                y: soy,
+                z: soz + z,
+            },
+            row_bytes,
+            copy_h,
+            &mut staged,
+        ) {
+            return st;
+        }
+        if let Err(st) = write_texture_rect(
+            state,
+            host,
+            task_id,
+            &dst,
+            Point {
+                x: dox,
+                y: doy,
+                z: doz + z,
+            },
+            row_bytes,
+            copy_h,
+            &staged,
+            allowed.as_ref(),
+        ) {
+            return st;
         }
     }
+    crate::runtime::drain::note_store_route_us(
+        "blit_t2t_stage_us",
+        t2t_stage_started.elapsed().as_micros() as u64,
+    );
+    crate::runtime::drain::note_store_route_n(
+        "blit_t2t_stage_rows",
+        copy_h.saturating_mul(copy_d),
+    );
     BlitStatus::Ok
 }
 
@@ -2926,6 +3409,359 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
 ///   destination slices 0; copies full `width×height×depth` of that mip with
 ///   depth planes strided by `bytes_per_image`. Linear type-2/3 only.
 ///
+/// One resolved blit endpoint, reduced to what the GPU whole-plane arm reads.
+///
+/// A [`TextureBacking`] says where a texture's *guest bytes* are, which is the
+/// question every other consumer in this module asks. This is the other one:
+/// which plane of which surface a GPU-side copy would land in.
+#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GpuPlane {
+    width: u32,
+    height: u32,
+    /// Byte offset of this texture's plane within its mapping's allocation.
+    surface_offset: u64,
+    row_stride: u32,
+    pixel_format: u16,
+}
+
+/// The plane `mapping_write::write_bgra8_from_resident_gpu` will address, from
+/// the destination mapping's own declaration rather than from the texture
+/// descriptor the blit named.
+///
+/// The two are independent derivations of one plane and the whole safety of the
+/// GPU arm is that they agree. See [`mapping_write::resident_gpu_plane`].
+#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GpuMappingWindow {
+    surface_offset: u64,
+    row_stride: u32,
+    pixel_format: u16,
+}
+
+/// The source's real content, as the engine holds it behind an armed
+/// [`crate::runtime::writeback_debt::GvaWritebackDebt`].
+#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GpuResidentSource {
+    width: u32,
+    height: u32,
+    pixel_format: u16,
+}
+
+/// Why one whole-surface texture-to-texture copy is not the GPU arm's.
+///
+/// Every variant is a **fall-through and not a loss**: the host path below runs
+/// unchanged and lands the same pixels. They are counters rather than fail-log
+/// records for that reason, and they partition the whole-surface population with
+/// `sl_gpu_landed`, so a census that does not add up is the bug.
+///
+/// There is deliberately no partial-rect variant. `0x13e` is the *whole-surface*
+/// form: its origins are (0,0,0) and its extent is the endpoints' full
+/// width/height by construction of the opcode, so a rect check here would be an
+/// arm no guest command can take.
+#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GpuPlaneRefusal {
+    /// More than one level or slice: the GPU arm copies one plane.
+    MultiLevel,
+    /// Source and destination are the same reference, so resolving the
+    /// destination would pay away the very debt holding the source's content.
+    SelfCopy,
+    /// The source's bytes are its guest pages' bytes already — nothing to copy
+    /// from a resident, and the host path is the cheap one.
+    SrcNotResident,
+    /// The destination is a linear guest allocation, which has no mapping for a
+    /// GPU-side copy to name.
+    DstNotType11,
+    /// The destination mapping declines a resident-to-guest-pages copy at this
+    /// extent, so there is no window to write.
+    DstWindowUnresolved,
+    /// The two derivations of the destination plane disagree. A type-5 view's
+    /// wire plane index lands here: it can name a plane the mapping's own
+    /// geometry scan does not resolve to, and the GPU rail takes no index.
+    PlaneOffset,
+    /// The resident is not the destination's size, so a full-plane copy would
+    /// be a resize.
+    GeometryDiffers,
+    /// A copy converts nothing, so all three of source, destination and mapping
+    /// must already agree on the texel.
+    FormatDiffers,
+}
+
+impl GpuPlaneRefusal {
+    #[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+    fn route(self) -> &'static str {
+        match self {
+            Self::MultiLevel => "sl_gpu_multi_level",
+            Self::SelfCopy => "sl_gpu_self_copy",
+            Self::SrcNotResident => "sl_gpu_src_not_resident",
+            Self::DstNotType11 => "sl_gpu_dst_not_t11",
+            Self::DstWindowUnresolved => "sl_gpu_dst_window",
+            Self::PlaneOffset => "sl_gpu_plane_offset",
+            Self::GeometryDiffers => "sl_gpu_geometry_differs",
+            Self::FormatDiffers => "sl_gpu_format_differs",
+        }
+    }
+}
+
+/// Everything the GPU arm can decide before resolving anything.
+///
+/// Split from [`gpu_whole_plane_destination`] because resolving the destination
+/// is the expensive half and it is also the half with the side effect: it pays
+/// the destination's own debt. This decides whether that is worth doing.
+#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+fn gpu_whole_plane_admissible(
+    level_count: u16,
+    slice_count: u16,
+    source_ref: u32,
+    destination_ref: u32,
+    source_is_resident: bool,
+) -> Result<(), GpuPlaneRefusal> {
+    if level_count != 1 || slice_count != 1 {
+        return Err(GpuPlaneRefusal::MultiLevel);
+    }
+    if source_ref == destination_ref {
+        return Err(GpuPlaneRefusal::SelfCopy);
+    }
+    if !source_is_resident {
+        return Err(GpuPlaneRefusal::SrcNotResident);
+    }
+    Ok(())
+}
+
+/// Whether the resolved destination is the plane the GPU rail will actually
+/// write, and whether the resident is a whole-plane copy into it.
+///
+/// `dst` is `None` for a linear endpoint and `window` is `None` when the mapping
+/// declines the extent, so the two `Option`s are the caller's two resolution
+/// steps and not defensive wrapping.
+#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+fn gpu_whole_plane_destination(
+    dst: Option<GpuPlane>,
+    window: Option<GpuMappingWindow>,
+    src: GpuResidentSource,
+) -> Result<(), GpuPlaneRefusal> {
+    let Some(dst) = dst else {
+        return Err(GpuPlaneRefusal::DstNotType11);
+    };
+    let Some(window) = window else {
+        return Err(GpuPlaneRefusal::DstWindowUnresolved);
+    };
+    // The plane the guest's descriptor named against the plane the rail will
+    // write. `mapping_write/mod.rs`'s own record of a bound error landing in the
+    // next plane's pixels of a multi-plane IOSurface is what this is here for:
+    // that failure is silent at every layer, so it has to be refused before the
+    // copy rather than detected after it.
+    if window.surface_offset != dst.surface_offset || window.row_stride != dst.row_stride {
+        return Err(GpuPlaneRefusal::PlaneOffset);
+    }
+    if src.width != dst.width || src.height != dst.height {
+        return Err(GpuPlaneRefusal::GeometryDiffers);
+    }
+    // All three, not two. The engine refuses a resident whose texel is not the
+    // destination's (`copy_target_to_guest_pages`), and the mapping's declared
+    // format is what the guest will read these bytes back as — a chain that
+    // agrees pairwise but not as a whole would land a converted-looking frame
+    // with nothing having converted anything.
+    //
+    // **Stored texels, not declared formats.** A copy converts nothing, so what
+    // has to agree is what the bytes *are*, and the transfer function is not part
+    // of that: it says how a sampler reads a texel, not how one is stored.
+    // `store_texel_order` is this crate's single answer to that question and its
+    // own doc states the fold ("only the storage matters to a copy"), which is
+    // also what `translate::pixel::stored_bytes_agree` encodes one layer down for
+    // the Vulkan spelling of the same comparison.
+    //
+    // Equality here is not a stricter version of that rule, it is a different and
+    // wrong one, and it cost this arm every record it was written for: a guest
+    // render target declared `BGRA8Unorm_sRGB` meets an IOSurface mapping that
+    // declares plain `BGRA8Unorm` for the same four stored bytes, so the triple
+    // reads 81/81/80 and equality calls that a disagreement forever. A `None`
+    // still refuses — a format with no byte-copy layout is one where the copy
+    // would have to convert, which this arm does not do.
+    let texel = crate::contract::pixel_format::store_texel_order(dst.pixel_format);
+    if texel.is_none()
+        || crate::contract::pixel_format::store_texel_order(src.pixel_format) != texel
+        || crate::contract::pixel_format::store_texel_order(window.pixel_format) != texel
+    {
+        return Err(GpuPlaneRefusal::FormatDiffers);
+    }
+    Ok(())
+}
+
+/// Land the source's engine resident straight into the destination's guest pages
+/// with the GPU, for the one shape where that is exactly the copy the guest asked
+/// for.
+///
+/// # Why a blit is not a guest-byte reader here
+///
+/// `resolve_texture_backing` pays every endpoint's writeback debt, because its
+/// answer is "where are this texture's guest bytes" and guest bytes are only a
+/// resource's content once everything rendered into it has landed. That is right
+/// for every endpoint the host row loops read or write. It is wrong for *this*
+/// shape, and expensively so: a whole-plane copy out of a resident makes the
+/// device read the resident back into the source's guest pages, then memcpy those
+/// pages into the destination's — two crossings of a frame to move content the
+/// GPU already holds.
+///
+/// So this arm never resolves the source, and **never pays the source's debt**.
+/// The source's own guest pages stay stale and stay owed; the debt stays armed,
+/// and the next genuine guest-byte reader — a sample, a compute bind, a
+/// `CmdSynchronizeResources` — is what lands them. That is what the Metal
+/// contract says: `copyFromTexture:toTexture:` is a blit-encoder command with no
+/// host visibility, and `synchronizeResource:` is the separate call that means
+/// "make this CPU-visible".
+///
+/// The *destination*'s debt is still paid, by the resolve below, and must be:
+/// leaving it armed would let a pre-blit resident land over this copy's bytes
+/// later.
+///
+/// Returns `None` for every fall-through, having named it on a counter. The
+/// caller then runs the host path unchanged, so nothing here can lose a frame —
+/// only spend one.
+#[cfg(feature = "backend-vulkan")]
+fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    cmd: &Command,
+) -> Option<BlitStatus> {
+    use crate::runtime::drain::note_store_route;
+    let key = crate::runtime::writeback_debt::GvaResourceKey {
+        task_id,
+        texture_ref: cmd.source,
+    };
+    let debt = state.pending_writebacks.get_gva(key);
+    if let Err(refusal) = gpu_whole_plane_admissible(
+        cmd.level_count,
+        cmd.slice_count,
+        cmd.source,
+        cmd.destination,
+        debt.is_some(),
+    ) {
+        note_store_route(refusal.route());
+        return None;
+    }
+    let debt = debt?;
+    // Resolving the destination — and only the destination — is what pays its
+    // debt, and it is the reason this call sits here rather than after the loop
+    // below has resolved both endpoints.
+    let dst = match resolve_texture_backing(
+        state,
+        host,
+        task_id,
+        cmd.destination,
+        cmd.destination_level,
+        cmd.destination_slice,
+    ) {
+        Ok(t) => t,
+        Err(_) => {
+            // The host path re-resolves and returns this same refusal with its
+            // own reason, so saying anything more here would double-count one
+            // failure under two names.
+            note_store_route("sl_gpu_dst_unresolved");
+            return None;
+        }
+    };
+    let TextureBacking::Type11(t) = &dst else {
+        note_store_route(GpuPlaneRefusal::DstNotType11.route());
+        return None;
+    };
+    let plane = GpuPlane {
+        width: t.width,
+        height: t.height,
+        surface_offset: t.surface_offset,
+        row_stride: t.row_stride,
+        pixel_format: t.pixel_format,
+    };
+    let mapping_id = t.mapping_id;
+    let window = state
+        .mappings
+        .get(&mapping_id)
+        .and_then(|m| mapping_write::resident_gpu_plane(m, plane.width, plane.height))
+        .map(
+            |(surface_offset, row_stride, pixel_format)| GpuMappingWindow {
+                surface_offset,
+                row_stride,
+                pixel_format,
+            },
+        );
+    let src = GpuResidentSource {
+        width: debt.width,
+        height: debt.height,
+        pixel_format: debt.format,
+    };
+    if let Err(refusal) = gpu_whole_plane_destination(Some(plane), window, src) {
+        note_store_route(refusal.route());
+        // "The formats differ" does not say which of the three does, and the
+        // three have different answers: a source that disagrees is a converting
+        // copy the contract does not describe, while a *mapping* that disagrees
+        // with a destination the source already matches is this device's own
+        // declaration being narrower than the texture it describes. Name all
+        // three once per distinct triple so the reading is the diagnosis.
+        if refusal == GpuPlaneRefusal::FormatDiffers {
+            let discriminant = (u64::from(src.pixel_format) << 32)
+                | (u64::from(plane.pixel_format) << 16)
+                | u64::from(window.map_or(u16::MAX, |w| w.pixel_format));
+            if crate::observe::first_sight("sl_gpu_format_differs", discriminant) {
+                crate::observe::fail(format!(
+                    "blit_gpu_plane reason=sl_gpu_format_differs src_format={} \
+                     dst_format={} mapping_format={} width={} height={}",
+                    src.pixel_format,
+                    plane.pixel_format,
+                    window.map_or(u16::MAX, |w| w.pixel_format),
+                    plane.width,
+                    plane.height
+                ));
+            }
+        }
+        return None;
+    }
+    let identity = crate::runtime::writeback_debt::gva_identity(debt);
+    match mapping_write::write_bgra8_from_resident_gpu(
+        state,
+        host,
+        mapping_id,
+        &identity,
+        plane.width,
+        plane.height,
+    ) {
+        Ok(_) => {
+            note_store_route("sl_gpu_landed");
+            Some(BlitStatus::Ok)
+        }
+        Err(decline) => {
+            // A decline is a routing answer, so the counter is the record and the
+            // off channel carries which check answered — the engine's format
+            // comparison in particular, which is the one that can refuse every
+            // payment on one texture and leave a canvas black.
+            note_store_route("sl_gpu_engine_declined");
+            crate::observe::off(format!(
+                "blit_gpu_plane mid={mapping_id} {}x{} decline={decline:?}",
+                plane.width, plane.height
+            ));
+            None
+        }
+    }
+}
+
+/// [`try_copy_whole_plane_on_gpu`] on an arm with no Vulkan engine.
+///
+/// A GVA debt is only ever armed by `draw::vulkan`, so this arm's ledger holds
+/// none and the fast path would refuse `SrcNotResident` on every record. It is
+/// spelled as a fall-through rather than as a `cfg` at the call site so the
+/// whole-surface form reads the same on both backends.
+#[cfg(not(feature = "backend-vulkan"))]
+fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
+    _state: &mut DeviceState,
+    _host: &mut M,
+    _task_id: u32,
+    _cmd: &Command,
+) -> Option<BlitStatus> {
+    None
+}
+
 /// Zero `slice_count` or `level_count` is a Metal no-op ([`BlitStatus::ZeroExtent`]).
 fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -2938,6 +3774,11 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
     }
     if cmd.source == 0 || cmd.destination == 0 {
         return br(BlitStatus::MissingResource, "sl_missing_ref");
+    }
+    // Before the loop, because the loop's first act is to resolve the source and
+    // resolving is what pays its debt. See [`try_copy_whole_plane_on_gpu`].
+    if let Some(status) = try_copy_whole_plane_on_gpu(state, host, task_id, cmd) {
+        return status;
     }
     for level_i in 0..cmd.level_count {
         let src_level = match cmd.source_level.checked_add(level_i) {
@@ -2961,6 +3802,14 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
             None => return br(BlitStatus::Bounds, "sl_dst_slice_overflow"),
         };
 
+        // `blit_kind_t2t_sl_us` charges this function 28.8 s of a 29.1 s rail
+        // while `blit_rows_us` — its linear arm's whole copy — reads 0.275 s.
+        // Between those two numbers sit the resolves below, and this form runs
+        // them once per level and again per slice, so their count is the
+        // multiplier nobody has measured. `sl_levels_n` is the denominator that
+        // says whether a level loop of two or of twelve is being paid for.
+        crate::runtime::drain::note_store_route("sl_levels_n");
+        let sl_resolve_started = std::time::Instant::now();
         // Resolve the starting slice at this level for geometry / format.
         // Volume (depth>1) forms use slice 0 only; non-zero source_slice on a
         // depth-1 packing fails at resolve (Bounds). For volumes we require
@@ -3002,6 +3851,10 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
         if src0.depth() != dst0.depth() {
             return br(BlitStatus::Bounds, "sl_depth_mismatch");
         }
+        crate::runtime::drain::note_store_route_us(
+            "sl_resolve_us",
+            sl_resolve_started.elapsed().as_micros() as u64,
+        );
         let w = src0.width();
         let h = src0.height();
         let d = src0.depth();
@@ -3124,6 +3977,14 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
         if is_volume {
             return br(BlitStatus::Unsupported, "sl_volume_mixed");
         }
+        // The slice/level form's type-11 arm. It used to stage one row at a
+        // time, and a driven Maps leg charged that loop 30.15 s of a 30.28 s
+        // blit rail to move 14.6 MB, against 0.12 s for the resolves beside it
+        // and 0.22 s for every strided guest-RAM copy in the device. The bytes
+        // were never the cost — re-entering the mapping rail per row was. It
+        // stages the slice whole now; see [`read_texture_rect`].
+        let sl_mixed_started = std::time::Instant::now();
+        let mut staged = vec![0u8; (row_bytes.saturating_mul(h as u64)) as usize];
         for si in 0..cmd.slice_count {
             let ss = match cmd.source_slice.checked_add(si) {
                 Some(v) => v,
@@ -3147,7 +4008,6 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
             if src.width() != w || src.height() != h || dst.width() != w || dst.height() != h {
                 return br(BlitStatus::Bounds, "sl_inner_dim_mismatch");
             }
-            let mut row = vec![0u8; row_bytes as usize];
             let allowed = match texture_region_window(
                 state,
                 host,
@@ -3162,34 +4022,36 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
                 Ok(v) => v,
                 Err(st) => return st,
             };
-            for y in 0..h as u64 {
-                if let Err(st) = read_texture_row(
-                    state,
-                    host,
-                    task_id,
-                    &src,
-                    Point { x: 0, y: 0, z: 0 },
-                    y,
-                    row_bytes,
-                    &mut row,
-                ) {
-                    return st;
-                }
-                if let Err(st) = write_texture_row(
-                    state,
-                    host,
-                    task_id,
-                    &dst,
-                    Point { x: 0, y: 0, z: 0 },
-                    y,
-                    row_bytes,
-                    &row,
-                    allowed.as_ref(),
-                ) {
-                    return st;
-                }
+            if let Err(st) = read_texture_rect(
+                state,
+                host,
+                task_id,
+                &src,
+                Point { x: 0, y: 0, z: 0 },
+                row_bytes,
+                h as u64,
+                &mut staged,
+            ) {
+                return st;
+            }
+            if let Err(st) = write_texture_rect(
+                state,
+                host,
+                task_id,
+                &dst,
+                Point { x: 0, y: 0, z: 0 },
+                row_bytes,
+                h as u64,
+                &staged,
+                allowed.as_ref(),
+            ) {
+                return st;
             }
         }
+        crate::runtime::drain::note_store_route_us(
+            "sl_mixed_us",
+            sl_mixed_started.elapsed().as_micros() as u64,
+        );
     }
     BlitStatus::Ok
 }
@@ -3253,7 +4115,32 @@ pub fn execute_blit<M: HostMemory + HostOps>(
     // Fresh reason channel per command: an uninstrumented failure reports empty
     // rather than a stale slug left by a prior blit (see `br` / `blit_fail_reason`).
     clear_blit_fail_reason();
-    match cmd.kind {
+    // One clock over the whole dispatch, attributed by the arm that ran.
+    //
+    // The per-loop clocks added alongside this are the ones that say *why* an
+    // arm is slow, but each of them had to be placed by hand and between them
+    // they accounted for 0.7 % of `walk_blit_us`. Being exhaustive by
+    // construction is what this one buys: every record entering `execute_blit`
+    // leaves through exactly one arm and is charged to it, so the sum of
+    // `blit_kind_*_us` cannot be less than the rail's cost the way a hand-placed
+    // set can. A family that turns out to hold the wall clock and has no inner
+    // clock yet is then a known gap rather than an invisible one.
+    let kind_started = std::time::Instant::now();
+    let kind_route = match cmd.kind {
+        Kind::FillBuffer => "blit_kind_fill_us",
+        Kind::FillBufferPattern4 => "blit_kind_fill4_us",
+        Kind::Copy => match cmd.copy_kind {
+            CopyKind::BufferToBuffer => "blit_kind_b2b_us",
+            CopyKind::BufferToTexture => "blit_kind_b2t_us",
+            CopyKind::TextureToBuffer => "blit_kind_t2b_us",
+            CopyKind::TextureToTexture => "blit_kind_t2t_us",
+            CopyKind::TextureToTextureSliceLevel => "blit_kind_t2t_sl_us",
+            CopyKind::None => "blit_kind_none_us",
+        },
+        Kind::Fence => "blit_kind_fence_us",
+        _ => "blit_kind_other_us",
+    };
+    let status = match cmd.kind {
         Kind::FillBuffer => exec_fill_buffer(state, host, task_id, cmd),
         Kind::FillBufferPattern4 => exec_fill_buffer_pattern4(state, host, task_id, cmd),
         Kind::Copy => match cmd.copy_kind {
@@ -3285,7 +4172,12 @@ pub fn execute_blit<M: HostMemory + HostOps>(
         Kind::FillTexture | Kind::InvalidateCompressedTexture => {
             br(BlitStatus::Unsupported, "blit_kind_spi_misrouted")
         }
-    }
+    };
+    crate::runtime::drain::note_store_route_us(
+        kind_route,
+        kind_started.elapsed().as_micros() as u64,
+    );
+    status
 }
 
 #[cfg(test)]

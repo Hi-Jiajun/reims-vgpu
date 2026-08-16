@@ -251,19 +251,26 @@ fn mapping_io_still_rejects_non_ram_page_at_map_boundary() {
 fn invalidate_mapping_pages_bumps_map_generation_and_clears() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     state.map_surface(5);
-    {
+    let import_id = {
         let m = state.mappings.get_mut(&5).unwrap();
         m.page_entries = vec![1];
         m.contig_ptr = 0xdead;
         m.contig_len = 4096;
-    }
+        m.contig_import = Some(std::sync::Arc::new(
+            crate::runtime::guest_ram::GuestRamImport::new_host_allocation(0xdead_0000, 4096, 4096)
+                .expect("synthetic aligned import"),
+        ));
+        m.contig_import.as_ref().unwrap().id()
+    };
     let gen0 = state.mappings.get(&5).unwrap().map_generation;
     assert!(state.invalidate_mapping_pages(5));
     let m = state.mappings.get(&5).unwrap();
     assert!(m.page_entries.is_empty());
     assert_eq!(m.contig_ptr, 0);
+    assert!(m.contig_import.is_none());
     assert!(m.map_generation != gen0);
     assert_eq!(state.retired_views, vec![(0xdead, 4096)]);
+    assert_eq!(state.retired_guest_imports, vec![import_id]);
 }
 
 /// Invalidating a mapping's pages drops the host-side copy of those pages.
@@ -304,8 +311,8 @@ fn invalidate_mapping_pages_drops_the_host_cache_of_those_pages() {
     );
 }
 
-/// The "cannot pack" verdict is derived once per page list, not once per
-/// call, and a new page list re-derives it.
+/// A host refusal is derived once per page list, not once per call, and a new
+/// page list re-asks the host.
 ///
 /// Before this cache every call on a fragmented mapping rebuilt the page-GPA
 /// vector, rescanned it for runs, and emitted a line — 471 757 of them in
@@ -313,7 +320,7 @@ fn invalidate_mapping_pages_drops_the_host_cache_of_those_pages() {
 /// line count is therefore the assertion: repeated calls must add none, and
 /// the magnitude the old line carried must still be readable as `served=`.
 #[test]
-fn fragmented_verdict_is_derived_once_per_page_list() {
+fn a_host_refusal_is_cached_but_fragmentation_is_still_offered_to_it() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     host.strict_linux_map = true;
@@ -333,13 +340,13 @@ fn fragmented_verdict_is_derived_once_per_page_list() {
     let lines = || -> Vec<String> {
         cap.lines()
             .into_iter()
-            .filter(|l| l.starts_with("OFF contig_view_fragmented"))
+            .filter(|l| l.starts_with("OFF contig_view_refused"))
             .collect()
     };
     for _ in 0..16 {
         assert!(
             ensure_contig_view(&mut state, &mut host, mid).is_none(),
-            "fragmented list must never pack"
+            "this fixture models a host that declines scattered aliases"
         );
     }
     let first = lines();
@@ -349,7 +356,7 @@ fn fragmented_verdict_is_derived_once_per_page_list() {
         "16 calls on one page list must derive (and say) the verdict once: {first:?}"
     );
     assert!(
-        first[0].contains(" pages=2 runs=2 "),
+        first[0].contains(" pages=2 physical_runs=2 "),
         "the derived line keeps its shape: {}",
         first[0]
     );
@@ -369,7 +376,7 @@ fn fragmented_verdict_is_derived_once_per_page_list() {
         "a new page list must re-derive and re-report: {after:?}"
     );
     assert!(
-        after[1].contains(" pages=3 runs=3 "),
+        after[1].contains(" pages=3 physical_runs=3 "),
         "the second line describes the second list: {}",
         after[1]
     );
@@ -388,10 +395,14 @@ fn fragmented_verdict_is_derived_once_per_page_list() {
         16,
         "served must count cached answers too: {after:?}"
     );
+    assert_eq!(
+        host.map_pages_calls, 2,
+        "each page-list generation must reach the host exactly once"
+    );
 }
 
-/// Product Linux: full page list is non-packed → ensure_contig_view fails;
-/// write_mapping_bytes still lands bytes via maximal packed runs.
+/// A host without a scattered-alias primitive declines the full view;
+/// `write_mapping_bytes` still lands bytes via maximal packed runs.
 #[test]
 fn multi_import_fragmented_mapping_write() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -559,9 +570,14 @@ fn a_contiguous_mapping_write_marks_only_the_pages_its_offset_reaches() {
             (((gpa1 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
         ];
     }
+    let (_, _, pages) = ensure_contig_view_with_pages(&mut state, &mut host, mid)
+        .expect("the fixture must take the fast path or it is testing the other one");
+    assert_eq!(&*pages, &[gpa0, gpa1]);
+    let (_, _, reused) = ensure_contig_view_with_pages(&mut state, &mut host, mid)
+        .expect("the retained view remains live");
     assert!(
-        ensure_contig_view(&mut state, &mut host, mid).is_some(),
-        "the fixture must take the fast path or it is testing the other one"
+        std::sync::Arc::ptr_eq(&pages, &reused),
+        "resource synchronization must retain the admitted footprint, not rebuild it"
     );
     let vouched = vouch_mapping_pages_verdict(&mut state, &host, mid)
         .1
@@ -583,4 +599,30 @@ fn a_contiguous_mapping_write_marks_only_the_pages_its_offset_reaches() {
          would claim page 0, which this write never touched"
     );
     assert_eq!(footprint::counts(), (1, 0));
+}
+
+/// A guest-backed resident publishes the page footprint retained at admission,
+/// not a second decode of the mapping that happened to carry the same identity
+/// earlier. The byte window must still select within that retained scatter.
+#[test]
+fn an_admitted_page_footprint_marks_its_window_without_filling_scatter_gaps() {
+    use crate::observe::footprint;
+
+    let _fp = footprint::exclusive_for_tests();
+    let page = 1u64 << PAGE_SHIFT_X86;
+    let pages: std::sync::Arc<[u64]> = [0x1200_0000u64, 0x3200_0000u64].into();
+    let retained = crate::runtime::guest_ram::GuestPageFootprint::new(
+        std::sync::Arc::clone(&pages),
+        page,
+    )
+    .expect("non-empty page footprint");
+    note_physical_page_write_footprint(&retained, page - 8, 16);
+
+    assert!(footprint::wrote_gpa(pages[0] + page - 8));
+    assert!(footprint::wrote_gpa(pages[1]));
+    assert!(
+        !footprint::wrote_gpa((pages[0] + pages[1]) / 2),
+        "the retained allocation is still a scatter, never its physical hull"
+    );
+    assert_eq!(footprint::counts(), (2, 0));
 }

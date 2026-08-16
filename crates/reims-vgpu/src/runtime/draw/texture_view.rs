@@ -606,15 +606,28 @@ impl crate::observe::Decline for LinearLoadRefusal {
     }
 }
 
-pub(super) fn load_linear_texture_rgba_host<M: HostMemory + HostOps>(
+/// Load a linear (buffer-backed) texture for sampling, keeping the layout its
+/// bytes are in.
+///
+/// A caller that passes anything but [`NativeUploads::NONE`] must carry the
+/// returned layout all the way to the bind: the bytes are then the guest's own
+/// and their length is `width * height * layout.bytes_per_texel()`, which for
+/// the half-float arms is not `width * height * 4`.
+// Eight, for [`load_linear_texture_impl`]'s reason: the last two are the
+// caller's own answers — which native layouts it carries, and which rung it is
+// — and neither is derivable here. Bundling the descriptor selectors into a
+// struct would hide which of them a call site varies.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_linear_texture_host<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
     level: u32,
     format_override: Option<u16>,
+    native: NativeUploads,
     site: crate::runtime::render_writeback::SettleSite,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, SampledByteFormat)> {
     load_linear_texture_impl(
         state,
         host,
@@ -622,45 +635,103 @@ pub(super) fn load_linear_texture_rgba_host<M: HostMemory + HostOps>(
         texture_ref,
         level,
         format_override,
-        false,
+        native,
         site,
     )
     .ok()
-    .map(|(bytes, _)| bytes)
+}
+
+/// Which non-RGBA8 sampled layouts a caller of the linear loaders will carry.
+///
+/// A loader that hands back the guest's own bytes hands back a layout whose
+/// bytes-per-texel need not be four, and not every caller can take one: the
+/// colour-LOAD seed rail discards the layout entirely and reads the bytes as
+/// RGBA8, so it must be able to say it takes none of them. That is what
+/// [`Self::NONE`] is for, and it is why this is a parameter rather than a fact
+/// this module could work out for itself.
+///
+/// Two independent questions decide each field, and both belong to the caller:
+/// whether it can carry the layout at all, and whether this host can sample and
+/// filter the matching format — which `engine::supports_sampled_layout_linear_filter`
+/// answers and a backend-independent module cannot ask.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NativeUploads {
+    /// Upload guest BGRA8 as `B8G8R8A8_UNORM` and let the sampler read the
+    /// channels in the order the guest stored them, instead of running a
+    /// full-image CPU channel swap.
+    pub bgra8: bool,
+    /// Upload guest half-float colour (`RGBA16Float`, `RG16Float`) at its own
+    /// eight- or four-byte footprint, as `R16G16B16A16_SFLOAT` /
+    /// `R16G16_SFLOAT`. Unlike the BGRA8 case this is not a saved pass — it is
+    /// the only exact path. The CPU arm for these goes through
+    /// `f16_to_unorm8_lut`, which clamps to `[0, 1]` and quantizes to 256
+    /// levels; see [`pixel_format::TexelLayout::cpu_loader_arm_is_lossy`].
+    pub float16: bool,
+}
+
+impl NativeUploads {
+    /// Everything converts to RGBA8. The answer for any caller that keeps the
+    /// bytes and drops the layout.
+    pub const NONE: Self = Self {
+        bgra8: false,
+        float16: false,
+    };
+
+    /// Native BGRA8 only — the answer this parameter carried when it was a
+    /// `bool`, kept so a caller that has not thought about the wider layouts
+    /// says so rather than inheriting them.
+    ///
+    /// Gated because the only rail that opts into a native upload is the
+    /// Vulkan one; the Metal arm's single caller drops the layout and takes
+    /// [`Self::NONE`]. Ungated it is dead code on `backend-metal`, which the
+    /// cross-compiled clippy run is what catches.
+    #[cfg(any(feature = "backend-vulkan", test))]
+    pub const BGRA8: Self = Self {
+        bgra8: true,
+        float16: false,
+    };
+
+    /// Every native layout the loaders can produce.
+    ///
+    /// Test-only on purpose. Production reaches this answer through
+    /// `native_uploads_for_host`, which asks the host whether it can filter the
+    /// half-float formats; a constant that says yes without asking is exactly
+    /// the shape that would let a capability go unchecked.
+    #[cfg(test)]
+    pub const ALL: Self = Self {
+        bgra8: true,
+        float16: true,
+    };
 }
 
 /// When a sampled format's guest bytes are ALREADY in the final upload order —
 /// so the loader can read padded source rows straight into the tight output
 /// with no intermediate buffer and no per-row convert — this returns the engine
 /// upload format. `RGBA8` always qualifies (its convert is an identity copy);
-/// `BGRA8` qualifies only when the caller opts into a native BGRA8 upload
-/// (`native_bgra8`), otherwise it must be swapped to RGBA8. Every other format
-/// needs a real convert pass and returns `None`.
-pub(super) fn linear_native_upload_format(
+/// the other classes qualify only where `native` says the caller carries them.
+/// Every other format needs a real convert pass and returns `None`.
+///
+/// The returned layout's [`TexelLayout::bytes_per_texel`] is what sizes the
+/// output — it is **not** four for the half-float arms, so a caller reading
+/// this must size its rows from the layout and never from `RGBA8_BPP`.
+pub(crate) fn linear_native_upload_format(
     sample_format: u16,
-    native_bgra8: bool,
+    native: NativeUploads,
 ) -> Option<TexelLayout> {
     use pixel_format::SampledClass;
-    // The decode contract's sampled class is the one rule for "which 8-bit
-    // channel order is this"; it folds each sRGB format onto its linear
-    // sibling's layout, which is right — they share a layout — but loses the
-    // qualifier, so the census records what the fold cost.
-    let upload = match pixel_format::sampled_class(sample_format)? {
+    // The decode contract's sampled class is the one rule for "which channel
+    // order and width is this"; it folds each sRGB format onto its linear
+    // sibling's layout, which is right — they share a layout. The qualifier is
+    // no longer lost by that fold: every caller pairs the layout it gets here
+    // with `sample_format` into a [`SampledByteFormat`], and the bind applies
+    // the transfer function from there.
+    Some(match pixel_format::sampled_class(sample_format)? {
         SampledClass::Rgba8Unorm => TexelLayout::Rgba8,
-        SampledClass::Bgra8Unorm if native_bgra8 => TexelLayout::Bgra8,
+        SampledClass::Bgra8Unorm if native.bgra8 => TexelLayout::Bgra8,
+        SampledClass::Rgba16Float if native.float16 => TexelLayout::Rgba16Float,
+        SampledClass::Rg16Float if native.float16 => TexelLayout::Rg16Float,
         _ => return None,
-    };
-    note_srgb_upload_downgrade(srgb_census::site::LINEAR_NATIVE_UPLOAD, sample_format);
-    Some(upload)
-}
-
-/// Record an sRGB downgrade on a byte-layout rail, if this format had a
-/// qualifier to lose. One helper so the two CPU upload paths cannot drift on
-/// when they report.
-fn note_srgb_upload_downgrade(site: &'static str, sample_format: u16) {
-    if pixel_format::is_srgb(sample_format) {
-        srgb_census::note_downgrade(site, sample_format);
-    }
+    })
 }
 
 // Eight, because the last one is the caller's identity and the whole point of
@@ -675,9 +746,9 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     texture_ref: u32,
     level: u32,
     format_override: Option<u16>,
-    native_bgra8: bool,
+    native: NativeUploads,
     site: crate::runtime::render_writeback::SettleSite,
-) -> Result<(Vec<u8>, TexelLayout), LinearLoadRefusal> {
+) -> Result<(Vec<u8>, SampledByteFormat), LinearLoadRefusal> {
     use LinearLoadRefusal as R;
     let (_entry, desc_bytes) = objects::resolve_descriptor(
         state,
@@ -707,6 +778,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
         .ok_or(R::NoLevelGva { level })?;
     let w = layout.width;
     let h = layout.height;
+    let planes = layout.planes();
     let bpr = layout.row_stride;
     if bpr > u32::MAX as u64 {
         return Err(R::SizeOverflow);
@@ -725,11 +797,13 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     }
     let need_rgba = (w as u64)
         .checked_mul(h as u64)
+        .and_then(|n| n.checked_mul(u64::from(planes)))
         .and_then(|n| n.checked_mul(RGBA8_BPP as u64))
         .and_then(host_alloc_len)
         .ok_or(R::SizeOverflow)?;
-    // The extent actually read, not `bpr * h` — see `TextureLevelLayout::read_span`.
-    let span = layout.read_span(tight).ok_or(R::SizeOverflow)?;
+    // Every depth plane belongs to the level; only the final plane's final-row
+    // padding lies outside the bytes this loader reads.
+    let span = layout.slice_read_span(tight).ok_or(R::SizeOverflow)?;
     let end = layout.offset.saturating_add(span);
     if tex.allocation_size != 0 && end > tex.allocation_size {
         return Err(R::SpanExceedsAllocation {
@@ -743,31 +817,12 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     //
     // Narrowed on this read's own pages, as `load_linear_guest_memoized` is: the
     // walk runs only when something is outstanding, and the pages read are the
-    // ones `read_span` names — not `bpr * h`, so a padded source does not claim
-    // the trailing padding it never touches.
-    // The reads below walk a raw task GVA, but the reference names a resource,
-    // and a debt is keyed by mapping id — so only what this reference resolves
-    // to is paid. `note_unnamed_reach` stays as the standing alarm for the one
-    // thing the naming cannot see, raw page aliasing; it samples this read's own
-    // walk against every owed surface and must stay at zero overlap.
-    {
-        let (tasks, page_shift) = (&state.tasks, state.page_shift);
-        let page_size = state.page_size();
-        crate::runtime::writeback_debt::note_unnamed_reach(state, || {
-            let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
-            let gpas = gva_mem::task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift);
-            (gpas.len() as u64 == want).then_some(gpas)
-        });
-    }
-    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
-    let (tasks, page_shift, page_size) = (&state.tasks, state.page_shift, state.page_size());
-    crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
-        site,
-        || {
-            let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
-            let gpas = gva_mem::task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift);
-            (gpas.len() as u64 == want).then_some(gpas)
-        },
+    // ones `slice_read_span` names — not `bpr * h * planes`, so a padded source
+    // does not claim the final trailing padding it never touches.
+    // Census, pay, settle — the whole obligation of a CPU read of one named
+    // resource's guest bytes. See `writeback_debt::settle_for_texture`.
+    crate::runtime::writeback_debt::settle_for_texture(
+        state, host, task_id, texture_ref, gva, span, site,
     );
     // Tight display textures are the common compositor source. Read the whole
     // image with one task-root/cache lifetime: the row loop below otherwise
@@ -775,32 +830,47 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // Safari source). Padded rows retain the conservative disjoint reads so we
     // never touch padding that the guest did not make readable.
     if bpr_u32 == tight {
-        let (rgba, fmt) = load_tight_linear_rgba_with(w, h, sample_fmt, native_bgra8, |native| {
-            gva_mem::read_task_gva_by_id(host, &state.tasks, task_id, gva, native, state.page_shift)
+        let (rgba, fmt) =
+            load_tight_linear_rgba_with(w, h, planes, sample_fmt, native, site.route(), |dst| {
+                gva_mem::read_task_gva_by_id(
+                    host,
+                    &state.tasks,
+                    task_id,
+                    gva,
+                    dst,
+                    state.page_shift,
+                )
                 .is_ok()
-        })?;
+            })?;
         return Ok((rgba, fmt));
     }
     // Padded rows. When the source bytes are already in the final upload order
-    // (RGBA8 always; BGRA8 under a native upload) AND the guest rows are 4-byte
-    // tight, read each padded source row STRAIGHT into the tight output — no
-    // intermediate row buffer, no per-row convert/swizzle pass. This is the
-    // Safari-scroll fallback hot path (`lin_guest_fb`), so the elided convert
-    // pass is a full second walk over the sampled bytes off the drain worker.
-    let tight_4bpp = tight as u64
-        == (w as u64)
-            .checked_mul(RGBA8_BPP as u64)
-            .ok_or(R::SizeOverflow)?;
-    if let Some(fmt) = linear_native_upload_format(sample_fmt, native_bgra8).filter(|_| tight_4bpp)
-    {
+    // (RGBA8 always; BGRA8 and half-float colour under a native upload), read
+    // each padded source row STRAIGHT into the tight output — no intermediate
+    // row buffer, no per-row convert/swizzle pass. This is the Safari-scroll
+    // fallback hot path (`lin_guest_fb`), so the elided convert pass is a full
+    // second walk over the sampled bytes off the drain worker.
+    //
+    // The output is sized from the layout's own texel width and not from
+    // `RGBA8_BPP`: the half-float arms are eight and four bytes a texel, and
+    // `need_rgba` is the RGBA8 figure. The tight-row check is the same
+    // agreement one step earlier — a source row that is not exactly one tight
+    // row of the upload layout cannot be copied straight through.
+    if let Some(fmt) = linear_native_upload_format(sample_fmt, native).filter(|fmt| {
+        (tight as u64) == (w as u64).saturating_mul(fmt.bytes_per_texel() as u64)
+    }) {
         let row_bytes = tight as usize;
-        let mut rgba = vec![0u8; need_rgba];
-        for y in 0..h {
-            let row_gva = (y as u64)
+        let rows = (h as usize)
+            .checked_mul(planes as usize)
+            .ok_or(R::SizeOverflow)?;
+        let out_len = row_bytes.checked_mul(rows).ok_or(R::SizeOverflow)?;
+        let mut rgba = vec![0u8; out_len];
+        for row_index in 0..rows {
+            let row_gva = (row_index as u64)
                 .checked_mul(bpr)
                 .and_then(|off| gva.checked_add(off))
                 .ok_or(R::SizeOverflow)?;
-            let dst_off = (y as usize).checked_mul(row_bytes).ok_or(R::SizeOverflow)?;
+            let dst_off = row_index.checked_mul(row_bytes).ok_or(R::SizeOverflow)?;
             let dst = rgba
                 .get_mut(dst_off..dst_off + row_bytes)
                 .ok_or(R::SizeOverflow)?;
@@ -812,14 +882,17 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
                 dst,
                 state.page_shift,
             )
-            .map_err(|_| R::PaddedRowUnreadable { row: y })?;
+            .map_err(|_| R::PaddedRowUnreadable {
+                row: u32::try_from(row_index).unwrap_or(u32::MAX),
+            })?;
         }
-        return Ok((rgba, fmt));
+        return Ok((rgba, SampledByteFormat::from_source(fmt, sample_fmt)));
     }
     let mut rgba = vec![0u8; need_rgba];
     let mut row = vec![0u8; tight as usize];
-    for y in 0..h {
-        let row_gva = (y as u64)
+    let rows = h.checked_mul(planes).ok_or(R::SizeOverflow)?;
+    for row_index in 0..rows {
+        let row_gva = (row_index as u64)
             .checked_mul(bpr)
             .and_then(|off| gva.checked_add(off))
             .ok_or(R::SizeOverflow)?;
@@ -831,22 +904,29 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
             &mut row,
             state.page_shift,
         )
-        .map_err(|_| R::PaddedRowUnreadable { row: y })?;
-        let dst_off = (y as usize) * (w as usize) * 4;
+        .map_err(|_| R::PaddedRowUnreadable { row: row_index })?;
+        crate::runtime::draw::note_sampled_narrowing(site.route(), 0, sample_fmt, w, h);
+        let dst_off = (row_index as usize) * (w as usize) * 4;
         if !pixel_format::convert_row_to_rgba8(sample_fmt, &row, w, &mut rgba[dst_off..]) {
             return Err(R::RowConvertUnsupported { format: sample_fmt });
         }
     }
-    Ok((rgba, TexelLayout::Rgba8))
+    Ok((rgba, SampledByteFormat::from_source(TexelLayout::Rgba8, sample_fmt)))
 }
 
-pub(super) fn load_tight_linear_rgba_with<F>(
+///
+/// `site` names the calling rung and is what a narrowing is reported under, so
+/// a `RGBA8`-by-design seed read and a sampled bind that lost precision are two
+/// census lines rather than one.
+pub(crate) fn load_tight_linear_rgba_with<F>(
     width: u32,
     height: u32,
+    planes: u32,
     sample_format: u16,
-    native_bgra8: bool,
+    native: NativeUploads,
+    site: &'static str,
     mut read: F,
-) -> Result<(Vec<u8>, TexelLayout), LinearLoadRefusal>
+) -> Result<(Vec<u8>, SampledByteFormat), LinearLoadRefusal>
 where
     F: FnMut(&mut [u8]) -> bool,
 {
@@ -854,54 +934,60 @@ where
     let tight = pixel_format::tight_row_bytes(width, sample_format).ok_or(R::FormatBppUnknown {
         format: sample_format,
     })?;
+    let rows = height.checked_mul(planes).ok_or(R::SizeOverflow)?;
     let native_len = (tight as u64)
-        .checked_mul(height as u64)
+        .checked_mul(rows as u64)
         .and_then(host_alloc_len)
         .ok_or(R::SizeOverflow)?;
     let rgba_stride = width.checked_mul(RGBA8_BPP).ok_or(R::SizeOverflow)?;
     let rgba_len = (rgba_stride as u64)
-        .checked_mul(height as u64)
+        .checked_mul(rows as u64)
         .and_then(host_alloc_len)
         .ok_or(R::SizeOverflow)?;
-    let mut native = vec![0u8; native_len];
-    if !read(&mut native) {
+    let mut bytes = vec![0u8; native_len];
+    if !read(&mut bytes) {
         return Err(R::TightImageUnreadable);
     }
-    // The compositor's common BGRA8/RGBA8 sources already have the output
-    // allocation size. Convert them in place so the bulk page walk does not
-    // add a second display-sized allocation and copy.
-    if native_len == rgba_len {
-        // Same single rule as `linear_native_upload_format`: the contract's
-        // sampled class names the channel order, and an sRGB source is reported
-        // to the census rather than folded away unnoticed.
-        match pixel_format::sampled_class(sample_format) {
-            Some(pixel_format::SampledClass::Rgba8Unorm) => {
-                note_srgb_upload_downgrade(srgb_census::site::TIGHT_LINEAR_LOAD, sample_format);
-                return Ok((native, TexelLayout::Rgba8));
-            }
-            Some(pixel_format::SampledClass::Bgra8Unorm) => {
-                note_srgb_upload_downgrade(srgb_census::site::TIGHT_LINEAR_LOAD, sample_format);
-                if native_bgra8 {
-                    // Upload the guest's native BGRA8 order; the engine binds a
-                    // BGRA8 image and the sampler swizzles in hardware. Elides
-                    // the full-image CPU channel-swap pass over the read bytes.
-                    return Ok((native, TexelLayout::Bgra8));
-                }
-                for pixel in native.chunks_exact_mut(RGBA8_BPP as usize) {
-                    pixel.swap(0, 2);
-                }
-                return Ok((native, TexelLayout::Rgba8));
-            }
-            _ => {}
-        }
+    // A format whose guest bytes are already the upload bytes is returned as
+    // read, and the layout says what they are. This is decided from the format
+    // alone and NOT from `native_len == rgba_len`, which is the shape this gate
+    // used to have: that comparison is true only for a four-byte texel, so a
+    // half-float source could never reach the arm that keeps it exact however
+    // the classes were extended, and fell through to the quantizing convert
+    // below every time.
+    //
+    // The BGRA8 arm additionally converts in place when the caller will not
+    // take a native BGRA8 image, which is free of a second display-sized
+    // allocation precisely because the two lengths agree there.
+    if let Some(layout) = linear_native_upload_format(sample_format, native) {
+        return Ok((bytes, SampledByteFormat::from_source(layout, sample_format)));
     }
+    if native_len == rgba_len
+        && pixel_format::sampled_class(sample_format) == Some(pixel_format::SampledClass::Bgra8Unorm)
+    {
+        // A channel exchange, which moves no value across the transfer
+        // function: the bytes stay encoded exactly as the guest stored them.
+        for pixel in bytes.chunks_exact_mut(RGBA8_BPP as usize) {
+            pixel.swap(0, 2);
+        }
+        return Ok((
+            bytes,
+            SampledByteFormat::from_source(TexelLayout::Rgba8, sample_format),
+        ));
+    }
+    // Keyed by the calling rung, not by "tight rows". Which rung narrowed is
+    // the question a boot's census leaves open otherwise: the colour LOAD seed
+    // reads RGBA8 by design and a narrowing there is expected, while one on the
+    // sampled rung is a texture the guest is about to read back through a
+    // shader. One shared slug reported both as the same event.
+    crate::runtime::draw::note_sampled_narrowing(site, 0, sample_format, width, height);
     let mut rgba = vec![0u8; rgba_len];
-    for y in 0..height as usize {
+    for y in 0..rows as usize {
         let src_off = y.checked_mul(tight as usize).ok_or(R::SizeOverflow)?;
         let dst_off = y.checked_mul(rgba_stride as usize).ok_or(R::SizeOverflow)?;
         if !pixel_format::convert_row_to_rgba8(
             sample_format,
-            &native[src_off..src_off + tight as usize],
+            &bytes[src_off..src_off + tight as usize],
             width,
             &mut rgba[dst_off..dst_off + rgba_stride as usize],
         ) {
@@ -910,7 +996,10 @@ where
             });
         }
     }
-    Ok((rgba, TexelLayout::Rgba8))
+    Ok((
+        rgba,
+        SampledByteFormat::from_source(TexelLayout::Rgba8, sample_format),
+    ))
 }
 
 #[cfg(test)]

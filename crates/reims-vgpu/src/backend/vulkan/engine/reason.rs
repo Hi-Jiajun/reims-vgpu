@@ -80,6 +80,20 @@ pub enum DrawReason {
     /// `PRECISE` would answer a counting guest with a number that is neither
     /// the count nor recognisably wrong.
     VisibilityCountingUnsupported { occlusion_query_precise: bool },
+    MultisampleAttachmentSampleCountMismatch { attachment: u32, raster: u32 },
+    MultisampleResidentTargetMissing { sample_count: u32 },
+    MultisampleLinearTransferUnsupported { sample_count: u32 },
+    MultisampleSampleCountUnsupported { requested: u32, limit: u32 },
+    MultisampleStoreActionUnsupported { store_action: u16 },
+    /// A multisample source asks to load prior contents. The current scratch
+    /// rail can preserve an already-open encoder, but cannot import a
+    /// multisample image from guest linear storage at encoder start.
+    MultisampleLoadActionUnsupported { load_action: u16 },
+    MultisampleResolveShapeUnsupported {
+        color_targets: u32,
+        depth: bool,
+        color_input: bool,
+    },
     /// Same for a zero-copy guest-run sampled bind.
     GuestRunSampledNot2d { binding: u32 },
     /// More MRT secondary attachments than the render pass can carry.
@@ -97,6 +111,21 @@ pub enum DrawReason {
     /// for. That is undefined behaviour a validation layer catches on someone
     /// else's GPU; declining by name is the honest answer.
     SamplerMirrorClampToEdgeUnsupported,
+    /// The guest sampler asks for pixel (unnormalized) coordinates **and** a
+    /// depth-compare function, and Vulkan forbids the pair outright
+    /// (`VUID-VkSamplerCreateInfo-unnormalizedCoordinates-01077`: `compareEnable`
+    /// must be `VK_FALSE`).
+    ///
+    /// Every other constraint an unnormalized sampler carries is conformed
+    /// silently by [`super::caches::ObjectCaches::get_or_create_sampler`],
+    /// because under Vulkan's own rules such a sampler may only be reached by an
+    /// explicit-LOD, non-minifying sample — so forcing `minFilter = magFilter`,
+    /// `mipmapMode = NEAREST`, `minLod = maxLod = 0` and anisotropy off changes
+    /// no result the guest can observe. A compare function is not in that class:
+    /// dropping it returns the sampled value instead of the comparison, which is
+    /// a different picture. So this one is a refusal by name rather than a
+    /// repair.
+    SamplerUnnormalizedCompare,
     /// The guest pipeline names one of `MTLBlendFactor`'s four dual-source
     /// factors (`Source1Color` .. `OneMinusSource1Alpha`, 15-18) and this device
     /// does not advertise `VkPhysicalDeviceFeatures::dualSrcBlend`.
@@ -125,6 +154,9 @@ pub enum DrawReason {
     /// near and far planes, which is missing geometry rather than shifted
     /// geometry — the sibling of the fill-mode refusal above.
     DepthClampUnsupported,
+    /// The primary colour attachment has no faithful Vulkan format on this
+    /// backend. Carries the translation reason so the refusal keeps one name.
+    ColorAttachmentFormat(TranslateReason),
     /// The device declines this vertex attribute format and no portable
     /// substitute fits. Carries the translation-layer reason so the two log
     /// lines agree on why.
@@ -146,6 +178,25 @@ pub enum DrawReason {
     /// No queue family supports graphics and compute together, which the
     /// engine's single-queue submit model requires.
     NoCombinedGraphicsComputeQueue,
+    /// A shader declares a descriptor array with unpopulated Metal handle
+    /// slots, but the host cannot make those slots legally partially bound.
+    DescriptorArrayUnsupported {
+        binding: u32,
+        count: u32,
+        required_descriptors: u32,
+        descriptor_limit: u32,
+        partially_bound: bool,
+        dynamic_indexing: bool,
+    },
+    /// Two resources claim one Vulkan binding with incompatible descriptor
+    /// type, stage visibility, or array width.
+    DescriptorBindingConflict {
+        binding: u32,
+        first_type: u32,
+        first_count: u32,
+        second_type: u32,
+        second_count: u32,
+    },
     // The memory-type lookups. Each is a `memory_type_for(bits, class)` that
     // found nothing: the device advertises no memory type satisfying the buffer
     // or image's requirement bits under the class this allocation needs. That is
@@ -180,6 +231,39 @@ pub enum DrawReason {
     SwapchainNoSurfaceFormat,
     /// The surface advertises no composite-alpha mode.
     SwapchainNoCompositeAlpha,
+    /// A binding one of this draw's two modules statically uses is absent from
+    /// the descriptor set layout this draw would build.
+    ///
+    /// The draw-path twin of
+    /// [`super::compute_execution::ComputeExecutionDecline::UsedBindingAbsentFromLayout`],
+    /// and it is the same host kill: Vulkan requires the pipeline layout to
+    /// describe every statically-used resource, and Mesa's Intel driver does not
+    /// merely assume that — it scores each used binding as
+    /// `(use_count << 7) / array_size` over an array it sized to
+    /// `max_binding + 1` and zero-filled, so an absent binding under a declared
+    /// one divides by zero and `vkCreateGraphicsPipelines` kills the process
+    /// with `SIGFPE` rather than returning an error. There is no status to
+    /// inspect afterwards and no guest packet to fail; the process is gone.
+    ///
+    /// The compute path has carried this backstop since `25051457` and the draw
+    /// path did not, which is the `## Before A Broad Sweep` rule about two arms
+    /// consuming one wire form: the neutralizing pass was ported and the refusal
+    /// that catches what it cannot neutralize was not.
+    ///
+    /// **Expected to stay at zero.** `runtime::draw`'s
+    /// `frag_unbound_textures_to_neutralize` fills the one repairable class
+    /// before the request is built, and
+    /// [`crate::runtime::spirv_bind::descriptor_static_use`] answers
+    /// `NotDeclared` for anything that is not a `UniformConstant`, so a storage
+    /// buffer — whose root that walk cannot resolve — is never refused on a
+    /// guess. A firing therefore names a class the neutralizing pass does not
+    /// cover, and costs one draw rather than the VM.
+    UsedBindingAbsentFromLayout {
+        binding: u32,
+        /// Which of the draw's two modules declared it, so a firing does not
+        /// need a second boot to say where to look.
+        fragment: bool,
+    },
 }
 
 impl crate::observe::Decline for DrawReason {
@@ -188,25 +272,52 @@ impl crate::observe::Decline for DrawReason {
     fn slug(&self) -> &'static str {
         match self {
             Self::SpirvInvalid => "spirv_module_invalid",
+            Self::UsedBindingAbsentFromLayout { .. } => "draw_used_binding_absent_from_layout",
             Self::DriverCallQuarantined => "driver_call_quarantined",
             Self::ResidentSampledNot2d { .. } => "resident_sampled_not_2d",
             Self::GuestRunSampledNot2d { .. } => "guest_run_sampled_not_2d",
             Self::SecondaryAttachmentCap { .. } => "secondary_attachment_cap",
             Self::ViewportSlotsUnsupported { .. } => "viewport_slots_unsupported",
             Self::VisibilityCountingUnsupported { .. } => "visibility_counting_unsupported",
+            Self::MultisampleAttachmentSampleCountMismatch { .. } => {
+                "multisample_attachment_sample_count_mismatch"
+            }
+            Self::MultisampleResidentTargetMissing { .. } => {
+                "multisample_resident_target_missing"
+            }
+            Self::MultisampleLinearTransferUnsupported { .. } => {
+                "multisample_linear_transfer_unsupported"
+            }
+            Self::MultisampleSampleCountUnsupported { .. } => {
+                "multisample_sample_count_unsupported"
+            }
+            Self::MultisampleStoreActionUnsupported { .. } => {
+                "multisample_store_action_unsupported"
+            }
+            Self::MultisampleLoadActionUnsupported { .. } => {
+                "multisample_load_action_unsupported"
+            }
+            Self::MultisampleResolveShapeUnsupported { .. } => {
+                "multisample_resolve_shape_unsupported"
+            }
             Self::SamplerAnisotropyUnsupported => "sampler_anisotropy_unsupported",
             Self::SamplerMirrorClampToEdgeUnsupported => "sampler_mirror_clamp_to_edge_unsupported",
+            Self::SamplerUnnormalizedCompare => "sampler_unnormalized_compare",
             Self::DualSourceBlendUnsupported => "dual_source_blend_unsupported",
             Self::FillModeNonSolidUnsupported => "fill_mode_non_solid_unsupported",
             Self::DepthClampUnsupported => "depth_clamp_unsupported",
             // Deliberately delegates: the translation layer already named the
             // exact format problem, and inventing a second slug here would make
             // the two log lines disagree about one event.
-            Self::VertexFormat(reason) | Self::VisibilityResultMode(reason) => reason.slug(),
+            Self::ColorAttachmentFormat(reason)
+            | Self::VertexFormat(reason)
+            | Self::VisibilityResultMode(reason) => reason.slug(),
             Self::ConstantVertexAttribute => "constant_vertex_attribute",
             Self::InstanceRateDivisorUnsupported { .. } => "instance_rate_divisor_unsupported",
             Self::InstanceRateDivisorOverLimit { .. } => "instance_rate_divisor_over_limit",
             Self::NoCombinedGraphicsComputeQueue => "no_combined_graphics_compute_queue",
+            Self::DescriptorArrayUnsupported { .. } => "descriptor_array_unsupported",
+            Self::DescriptorBindingConflict { .. } => "descriptor_binding_conflict",
             Self::NoHostVisibleMemoryForStaging { .. } => "no_host_visible_memory_for_staging",
             Self::NoHostVisibleMemoryForReadback { .. } => "no_host_visible_memory_for_readback",
             Self::NoHostVisibleMemoryForStats { .. } => "no_host_visible_memory_for_stats",
@@ -237,6 +348,10 @@ impl std::fmt::Display for DrawReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "reason={}", self.slug())?;
         match self {
+            Self::UsedBindingAbsentFromLayout { binding, fragment } => {
+                let stage = if *fragment { "fragment" } else { "vertex" };
+                write!(f, " binding={binding} stage={stage}")
+            }
             Self::ResidentSampledNot2d { binding } | Self::GuestRunSampledNot2d { binding } => {
                 write!(f, " binding={binding}")
             }
@@ -259,7 +374,35 @@ impl std::fmt::Display for DrawReason {
                 " occlusion_query_precise={}",
                 u8::from(*occlusion_query_precise)
             ),
-            Self::VertexFormat(reason) | Self::VisibilityResultMode(reason) => {
+            Self::MultisampleAttachmentSampleCountMismatch { attachment, raster } => {
+                write!(f, " attachment={attachment} raster={raster}")
+            }
+            Self::MultisampleResidentTargetMissing { sample_count }
+            | Self::MultisampleLinearTransferUnsupported { sample_count } => {
+                write!(f, " sample_count={sample_count}")
+            }
+            Self::MultisampleSampleCountUnsupported { requested, limit } => {
+                write!(f, " requested={requested} limit={limit}")
+            }
+            Self::MultisampleStoreActionUnsupported { store_action } => {
+                write!(f, " store_action={store_action}")
+            }
+            Self::MultisampleLoadActionUnsupported { load_action } => {
+                write!(f, " load_action={load_action}")
+            }
+            Self::MultisampleResolveShapeUnsupported {
+                color_targets,
+                depth,
+                color_input,
+            } => write!(
+                f,
+                " color_targets={color_targets} depth={} color_input={}",
+                u8::from(*depth),
+                u8::from(*color_input)
+            ),
+            Self::ColorAttachmentFormat(reason)
+            | Self::VertexFormat(reason)
+            | Self::VisibilityResultMode(reason) => {
                 write!(f, " value={}", reason.value())
             }
             Self::InstanceRateDivisorUnsupported { step_rate } => write!(f, " rate={step_rate}"),
@@ -277,6 +420,33 @@ impl std::fmt::Display for DrawReason {
                 write!(f, " memory_type_bits={memory_type_bits:#x}")
             }
             Self::QueueCannotPresent { queue_family } => write!(f, " queue_family={queue_family}"),
+            Self::DescriptorArrayUnsupported {
+                binding,
+                count,
+                required_descriptors,
+                descriptor_limit,
+                partially_bound,
+                dynamic_indexing,
+            } => {
+                write!(
+                    f,
+                    " binding={binding} count={count} required_descriptors={required_descriptors} \
+                     descriptor_limit={descriptor_limit} partially_bound={} dynamic_indexing={}",
+                    u8::from(*partially_bound),
+                    u8::from(*dynamic_indexing)
+                )
+            }
+            Self::DescriptorBindingConflict {
+                binding,
+                first_type,
+                first_count,
+                second_type,
+                second_count,
+            } => write!(
+                f,
+                " binding={binding} first_type={first_type} first_count={first_count} \
+                 second_type={second_type} second_count={second_count}"
+            ),
             _ => Ok(()),
         }
     }
@@ -302,9 +472,44 @@ impl std::fmt::Display for DrawReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetReadDecline {
     /// The readback's identity is not in the resident registry.
-    UnknownIdentity,
+    ///
+    /// It carries both generations because the bare variant could not be
+    /// diagnosed. "Not in the registry" is two findings with opposite repairs
+    /// and one word: either **nothing names this surface**, so the guest never
+    /// rendered into it or its resident was reclaimed under the caller, or the
+    /// **target is there under a different generation**, so the key this caller
+    /// built and the key the draw registered disagree and the resident is
+    /// sitting untouched beside the lookup that missed it.
+    ///
+    /// `held` is `ResourcePools::registry_generation_near`: the generation of a
+    /// registry entry matching this identity in everything else, or `None` when
+    /// there is none. A `Some` that differs from `asked` is the second finding,
+    /// stated rather than inferred — which is what the bare variant made
+    /// impossible when `REIMS_VGPU_SHARED_TARGET=off` lost every Maps frame to
+    /// it.
+    ///
+    /// `prior` closes the first finding the same way. `how == Absent` says the
+    /// registry names this surface under no key at all, which is still two
+    /// findings — the guest never rendered into it, or **this device took its
+    /// resident away** — and `ResourcePools::prior_reclaim` has held the answer
+    /// to the second the whole time. The sampled rail already quotes it as
+    /// `prior=`; the readback did not, so 132 latched refusals on one driven
+    /// import-off macos-13 boot said a resident was gone and none of them said
+    /// who removed it. `None` is the honest "no record", which covers both
+    /// "never held one" and "reclaimed longer ago than the history window
+    /// reaches" — that method deliberately does not guess between them.
+    UnknownIdentity {
+        asked: u64,
+        held: Option<u64>,
+        how: super::types::TargetKeyDivergence,
+        prior: Option<super::types::ResidentReclaim>,
+    },
     /// The readback's resident has never had content written.
     NoReadyContent,
+    /// Vulkan cannot copy a multisample image directly to a buffer. The image
+    /// remains usable by GPU consumers; a host serialization needs an explicit
+    /// shader resolve chosen by the caller's sample semantics.
+    MultisampleImage { sample_count: u32 },
     /// The readback's resident does not hold four-byte texels.
     ///
     /// Every consumer of a [`super::TargetReadback`] speaks RGBA8 —
@@ -324,15 +529,36 @@ pub enum TargetReadDecline {
 impl Decline for TargetReadDecline {
     fn slug(&self) -> &'static str {
         match self {
-            Self::UnknownIdentity => "read_target_unknown_identity",
+            Self::UnknownIdentity { .. } => "read_target_unknown_identity",
             Self::NoReadyContent => "read_target_no_ready_content",
+            Self::MultisampleImage { .. } => "read_target_multisample_image",
             Self::TexelNotFourBytes { .. } => "read_target_texel_not_four_bytes",
         }
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::UnknownIdentity | Self::NoReadyContent => Vec::new(),
+            Self::UnknownIdentity {
+                asked,
+                held,
+                how,
+                prior,
+            } => vec![
+                ("diverges", how.label().to_string()),
+                ("asked_gen", asked.to_string()),
+                (
+                    "held_gen",
+                    held.map_or_else(|| "none".to_string(), |g| g.to_string()),
+                ),
+                (
+                    "prior",
+                    prior.map_or("none", |why| why.slug()).to_string(),
+                ),
+            ],
+            Self::NoReadyContent => Vec::new(),
+            Self::MultisampleImage { sample_count } => {
+                vec![("sample_count", sample_count.to_string())]
+            }
             Self::TexelNotFourBytes { format } => vec![("format", format!("{format:?}"))],
         }
     }
@@ -363,9 +589,27 @@ mod tests {
         DrawReason::VisibilityCountingUnsupported {
             occlusion_query_precise: false,
         },
+        DrawReason::MultisampleAttachmentSampleCountMismatch {
+            attachment: 4,
+            raster: 2,
+        },
+        DrawReason::MultisampleResidentTargetMissing { sample_count: 4 },
+        DrawReason::MultisampleLinearTransferUnsupported { sample_count: 4 },
+        DrawReason::MultisampleSampleCountUnsupported {
+            requested: 4,
+            limit: 1,
+        },
+        DrawReason::MultisampleStoreActionUnsupported { store_action: 3 },
+        DrawReason::MultisampleLoadActionUnsupported { load_action: 1 },
+        DrawReason::MultisampleResolveShapeUnsupported {
+            color_targets: 2,
+            depth: false,
+            color_input: false,
+        },
         DrawReason::VisibilityResultMode(TranslateReason::UnknownVisibilityResultMode(0)),
         DrawReason::SamplerAnisotropyUnsupported,
         DrawReason::SamplerMirrorClampToEdgeUnsupported,
+        DrawReason::SamplerUnnormalizedCompare,
         DrawReason::ConstantVertexAttribute,
         DrawReason::InstanceRateDivisorUnsupported { step_rate: 0 },
         DrawReason::InstanceRateDivisorOverLimit {
@@ -373,6 +617,21 @@ mod tests {
             limit: 0,
         },
         DrawReason::NoCombinedGraphicsComputeQueue,
+        DrawReason::DescriptorArrayUnsupported {
+            binding: 0,
+            count: 2,
+            required_descriptors: 2,
+            descriptor_limit: 1,
+            partially_bound: false,
+            dynamic_indexing: false,
+        },
+        DrawReason::DescriptorBindingConflict {
+            binding: 0,
+            first_type: 0,
+            first_count: 1,
+            second_type: 1,
+            second_count: 2,
+        },
         DrawReason::NoHostVisibleMemoryForStaging {
             memory_type_bits: 0,
         },
@@ -527,8 +786,14 @@ mod tests {
     #[test]
     fn every_target_read_decline_has_its_own_slug() {
         const ALL: &[TargetReadDecline] = &[
-            TargetReadDecline::UnknownIdentity,
+            TargetReadDecline::UnknownIdentity {
+                asked: 7,
+                held: None,
+                how: crate::backend::vulkan::engine::TargetKeyDivergence::Absent,
+                prior: None,
+            },
             TargetReadDecline::NoReadyContent,
+            TargetReadDecline::MultisampleImage { sample_count: 2 },
         ];
         let mut slugs: Vec<&str> = ALL.iter().map(|r| r.slug()).collect();
         slugs.sort_unstable();
@@ -537,8 +802,59 @@ mod tests {
         assert_eq!(before, slugs.len(), "duplicate TargetReadDecline slug");
         for r in ALL {
             assert_eq!(r.to_string(), format!("reason={}", r.slug()));
-            assert!(r.fields().is_empty(), "{r:?} carries no payload");
+            if matches!(r, TargetReadDecline::NoReadyContent) {
+                assert!(r.fields().is_empty(), "{r:?} carries no payload");
+            }
         }
+    }
+
+    /// The two findings an absent registry entry can carry are distinguishable
+    /// on the line. They were one word until a driven boot lost every Maps
+    /// frame to this refusal and nothing in the log could say which of them it
+    /// was.
+    ///
+    /// `prior` is the third: `diverges=absent` is itself two findings, and this
+    /// is the one where **this device** took the resident away rather than the
+    /// guest never having created it. A `none` there is a real "no record" and
+    /// not a claim that nothing was reclaimed.
+    #[test]
+    fn an_absent_resident_says_whether_the_target_exists_under_another_key() {
+        use crate::backend::vulkan::engine::TargetKeyDivergence;
+        let nothing = TargetReadDecline::UnknownIdentity {
+            asked: 4,
+            held: None,
+            how: TargetKeyDivergence::Absent,
+            prior: Some(crate::backend::vulkan::engine::types::ResidentReclaim::ResourceReleased),
+        };
+        let stale = TargetReadDecline::UnknownIdentity {
+            asked: 4,
+            held: Some(5),
+            how: TargetKeyDivergence::Generation,
+            prior: None,
+        };
+        // One slug, because it is one check. What separates them is the
+        // payload, which is what `Emit::decline` puts on the line — `Display`
+        // renders the slug alone and always has, so asserting on it here would
+        // pass whatever the fields said.
+        assert_eq!(nothing.slug(), stale.slug());
+        assert_eq!(
+            nothing.fields(),
+            vec![
+                ("diverges", "absent".to_string()),
+                ("asked_gen", "4".to_string()),
+                ("held_gen", "none".to_string()),
+                ("prior", "resource_released".to_string())
+            ]
+        );
+        assert_eq!(
+            stale.fields(),
+            vec![
+                ("diverges", "generation".to_string()),
+                ("asked_gen", "4".to_string()),
+                ("held_gen", "5".to_string()),
+                ("prior", "none".to_string())
+            ]
+        );
     }
 
     /// A vertex-format decline reports the translation layer's own slug rather

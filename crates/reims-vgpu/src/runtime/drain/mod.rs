@@ -228,21 +228,21 @@ fn delete_object_kind_route(opcode: u32) -> &'static str {
     }
 }
 
-/// `CmdDeleteObject` (`0x28`): decode the record, name the kind, retire nothing.
+/// `CmdDeleteObject` (`0x28`): decode the serializer object and retire its kind.
 ///
 /// The payload is `{u32 task}` then one serializer destroy record. Every kind in
 /// that family writes the identical twelve-byte body — a single object ref — and
 /// carries the kind in the record's own opcode.
 ///
-/// # Why the ref is decoded and then not acted on
+/// # Separate reference spaces stay separate
 ///
-/// The ref is in the **serializer's per-kind ref space**, which this device does
-/// not track. Nothing here is a matter of taste: the object table is keyed by
-/// the *kernel object-list* ref, established by `0x33 CmdSetObjectList` and
-/// populated when a decoded command resolves an entry out of that list, and the
-/// caches holding the kinds this command actually names — samplers and pipeline
-/// states — are keyed by the object's own **state**, not by a ref, so they have
-/// no ref to retire by even in principle.
+/// The ref is in the **serializer's per-kind ref space**. The object table is
+/// keyed by the *kernel object-list* ref, established by `0x33 CmdSetObjectList` and
+/// populated when a decoded command resolves an entry out of that list, so this
+/// command must never call `DeviceState::delete_object`: equal integers across
+/// those spaces are unrelated. Samplers and render pipeline states have their
+/// own task-local retained registries, and each destroy opcode retires exactly
+/// its kind's registry entry.
 ///
 /// Keying the object table with a number from the other namespace was measured
 /// and is worse than declining. On a driven boot the guest sent 1 988 of these
@@ -254,20 +254,8 @@ fn delete_object_kind_route(opcode: u32) -> &'static str {
 /// call could ever have had is destroying an unrelated object that happened to
 /// share the integer.
 ///
-/// This costs the guest nothing. The kinds named are content-keyed and
-/// deduplicated, so there is no per-object allocation to leak; what is lost is
-/// the chance to drop a cache entry slightly earlier, which is why the decline
-/// is a decline and not a loss.
-///
-/// The per-kind counters are what would justify revisiting it: a kind this
-/// device *does* hold by ref appearing here is the finding, and nothing else is.
-/// There is exactly one such kind today. `DeviceState::fence_generations` is
-/// keyed `(task, domain, fence_ref)` and nothing ever removes an entry, so a
-/// `child_delete_object_fence` reading above zero would be both a real leak and
-/// the one place this command has something to retire. The driven boot measured
-/// it at zero — every sampled record was a sampler state — so wiring it now
-/// would be building a handler for traffic no boot has produced. Read that
-/// counter before deciding otherwise.
+/// Other kinds remain fail-visible until this device owns a corresponding
+/// per-kind object registry. Their counters say which contract gap is active.
 fn apply_delete_object(state: &mut DeviceState, channel_id: u32, payload: &[u8], packet: &Packet) {
     let task_id = ld32(&payload[0..]);
     let record = &payload[4..];
@@ -307,11 +295,42 @@ fn apply_delete_object(state: &mut DeviceState, channel_id: u32, payload: &[u8],
         .fail();
         return;
     };
-    // Read so the record is proved decodable and the kind is countable. It is
-    // deliberately not used as a key: see this function's doc for the boot that
-    // measured what keying the object table with it would have done.
-    let _object_ref = rec.object_ref.get();
+    let object_ref = rec.object_ref.get();
     note_store_route(delete_object_kind_route(op.opcode()));
+    if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_SAMPLER_STATE {
+        let retired = state.task_sampler_states.delete(task_id, object_ref);
+        note_store_route(if retired {
+            "sampler_state_deleted"
+        } else {
+            "sampler_state_delete_absent"
+        });
+        return;
+    }
+    #[cfg(feature = "backend-vulkan")]
+    if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_DEPTH_STENCIL_STATE {
+        // The invalidation for `task_depth_stencil_states`, and the whole reason
+        // that retention is sound: the guest names the end of the object's life
+        // rather than leaving this device to guess it from the bytes.
+        let retired = state.task_depth_stencil_states.delete(task_id, object_ref);
+        note_store_route(if retired {
+            "ds_state_deleted"
+        } else {
+            "ds_state_delete_absent"
+        });
+        return;
+    }
+    #[cfg(feature = "backend-vulkan")]
+    if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_RENDER_PIPELINE_STATE {
+        let retired = state
+            .task_render_pipeline_states
+            .delete(task_id, object_ref);
+        note_store_route(if retired {
+            "pipeline_state_deleted"
+        } else {
+            "pipeline_state_delete_absent"
+        });
+        return;
+    }
     note_unimplemented(
         state,
         channel_id,
@@ -416,7 +435,11 @@ fn apply_delete_task(state: &mut DeviceState, payload: &[u8], channel: Option<u3
     // names bytes that are no longer this task's. Here rather than at the two
     // call sites: the root and child FIFOs both reach this, and a rule written
     // twice is the one that diverges.
-    note_bb_retired("bb_retire_delete_task", state.retire_bound_buffers_for_task(task_id));
+    crate::runtime::writeback_debt::retire_gva_for_task(state, task_id);
+    note_bb_retired(
+        "bb_retire_delete_task",
+        state.retire_bound_buffers_for_task(task_id),
+    );
     let ok = state.delete_task(task_id);
     crate::observe::off(format!(
         "delete_task site={} task={task_id} ok={} plen={}",
@@ -466,8 +489,13 @@ fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Optio
     let task_id = ld32(&payload[SET_OBJECT_LIST_TASK_ID..]);
     let pfn = ld32(&payload[SET_OBJECT_LIST_PFN..]);
     let count = ld32(&payload[SET_OBJECT_LIST_COUNT..]);
-    // A new object list re-points every reference on this task, so no
-    // resolution keyed by reference survives it. Both FIFOs reach this.
+    // A new object list changes the construction input for references this
+    // device has not constructed yet. Exact-window buffer resolutions are not
+    // object states and therefore retire here. Typed objects already
+    // constructed in the task's resource, sampler, and pipeline namespaces keep
+    // their explicit delete/task lifetime; this packet does not destroy them.
+    // Both FIFOs reach this.
+    crate::runtime::writeback_debt::retire_gva_for_task(state, task_id);
     note_bb_retired(
         "bb_retire_set_object_list",
         state.retire_bound_buffers_for_task(task_id),
@@ -510,7 +538,11 @@ fn apply_define_task2<H: HostMemory + HostOps>(
     // through the old one may translate elsewhere now. Keyed on the shifted
     // `task_id`, not `raw_id` — the registry is keyed the way the draw path
     // keys it, and `raw_id` is the wrong number by a factor of two.
-    note_bb_retired("bb_retire_define_task2", state.retire_bound_buffers_for_task(task_id));
+    crate::runtime::writeback_debt::retire_gva_for_task(state, task_id);
+    note_bb_retired(
+        "bb_retire_define_task2",
+        state.retire_bound_buffers_for_task(task_id),
+    );
     state.define_task(task_id, length, dir);
     // Capture directory + root/depth so one boot shows the page-table identity.
     let Some(slot) = state.tasks.get(task_id) else {
@@ -833,9 +865,9 @@ impl StampWait {
 /// only through its greatest value unless the guest samples between the writes,
 /// and writing only that value discharges every wait the run would have.
 ///
-/// That matters because a stamp is not a word write. On the Vulkan arm
-/// `write_stamp` submits a command buffer, measured at **12.3 us a packet**
-/// against 59 ns for the tail read beside it.
+/// That matters because a stamp is a FIFO completion, not merely a word write.
+/// Coalescing avoids one completion record per packet while preserving the
+/// greatest value the guest can observe from the drain.
 ///
 /// # What it bought, six driven macos-13 boots, one binary, both arms
 ///
@@ -886,13 +918,11 @@ impl StampWait {
 /// These are undriven boots: they prove the desktop composites on each driver,
 /// not that the saving reproduces there. Only macos-13 has been driven.
 ///
-/// **One thing this was expected to do and does not.** `batch_flushes` is
-/// unchanged (0.987, 1.90 draws a flush against 1.85). The reasoning was that
-/// `engine::write_stamp_after_guest_writes` appends to the open batch and then
-/// flushes it, so removing the stamps should let the batch accumulate. It does
-/// not, so the batch is flushed by something else and the stamp rode along with
-/// a flush that was already going to happen. Do not repeat the claim that the
-/// stamp was what flushed the draw batch.
+/// Completion publication does not close an open draw batch. It registers the
+/// stamp in the bounded pending queue and the batch's eventual successful
+/// submission assigns its completion point. The pending-stamp capacity remains
+/// the pressure bound: filling it submits the batch rather than sleeping while
+/// holding the only command buffer that can make room.
 ///
 /// [`Self::latch`] takes the **maximum in wrapping-signed order** rather than
 /// the last value seen. For a well-formed guest those are the same, and taking
@@ -904,6 +934,122 @@ pub struct PendingStamp {
     /// `None` until a packet in this drain has completed. A drain that stamps
     /// nothing owes nothing and must submit nothing.
     value: Option<u32>,
+}
+
+/// Why a stamp wait was unmet, partitioned by what this device could have done
+/// about it. Census only — see [`StampLedger`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnmetSource {
+    /// This device has executed the packet that stamps the awaited value but has
+    /// **not called [`write_stamp`] yet** — the coalescing latch is holding it
+    /// until the drain ends. Publishing early would discharge this wait, and the
+    /// settle on the publication path makes that ordering-safe.
+    Coalesced,
+    /// [`write_stamp`] has been called with a satisfying value, so the settle has
+    /// run and the word is with the engine's completion thread, awaiting the GPU
+    /// submission that carries it. **Nothing this device can do makes it ready
+    /// sooner**; the work is genuinely still in flight, and holding is correct.
+    Queued,
+    /// No satisfying value exists anywhere in this device. The guest is waiting
+    /// on work it has not yet given us, or that we have not yet executed.
+    Absent,
+}
+
+/// What this device has stamped, split by whether the value is still *owed* or
+/// already handed to the publication rail.
+///
+/// # Why this exists
+///
+/// A driven Maps boot leaves 44 % of every stamp wait the guest sends unmet, and
+/// each unmet wait abandons a drain for a later re-entry — ~520 round trips a
+/// second on the frame's critical path. The question that decides whether any
+/// repair is available is *which* unmet waits this device was in a position to
+/// answer, and the two cases have opposite answers:
+///
+/// * [`UnmetSource::Coalesced`] is a value we have and have not published. The
+///   coalescing latch defers the write to the end of the drain, and
+///   `max_tranche_us` runs 42-91 ms, so the guest can wait tens of milliseconds
+///   for a word already sitting in a local. Paying it on demand is a real repair
+///   and an ordering-safe one, because the payment goes through [`write_stamp`]
+///   and takes its settle with it.
+/// * [`UnmetSource::Queued`] is a value already through [`write_stamp`], settled,
+///   and waiting on the GPU submission that carries it. There is nothing to
+///   publish early. Holding is the correct behavior and the wait is honest.
+///
+/// An earlier attempt (reverted) answered *both* out of a device-side record.
+/// That was unsound for the second: it released packets ahead of the settle,
+/// against a fence whose meaning is "guest RAM debts have landed, you may
+/// reclaim". This type exists to size the first case before repairing it, rather
+/// than to answer anything.
+///
+/// **This is census only.** Nothing here feeds a verdict; [`note_packet_stamp_waits`]
+/// decides exactly as it did before, from the stamp page.
+///
+/// The three counters partition the unmet total, so
+/// `stamp_unmet_coalesced + stamp_unmet_queued + stamp_unmet_absent ==
+/// packet_stamp_wait_unmet` is the identity that catches a miscount.
+#[derive(Clone, Default, Debug)]
+pub struct StampLedger {
+    /// Slot → greatest value latched by the coalescing rail and not yet passed
+    /// to [`write_stamp`].
+    owed: std::collections::BTreeMap<u32, u32>,
+    /// Slot → greatest value ever passed to [`write_stamp`], whether or not the
+    /// completion thread has put it in the page yet.
+    written: std::collections::BTreeMap<u32, u32>,
+}
+
+impl StampLedger {
+    /// Record that the coalescing rail is holding `value` for `slot`.
+    ///
+    /// Refuses a slot the stamp page of `page_bytes` cannot hold — the same
+    /// refusal [`write_stamp`] makes — which is what bounds both maps by
+    /// [`stamp_slot_count`] with nothing to scan for.
+    pub fn owe(&mut self, slot: u32, value: u32, page_bytes: u64) {
+        Self::fold(&mut self.owed, slot, value, page_bytes);
+    }
+
+    /// Record that [`write_stamp`] has been called for `slot` with `value`, and
+    /// drop anything the coalescing rail was owing at or below it.
+    pub fn wrote(&mut self, slot: u32, value: u32, page_bytes: u64) {
+        let slot = stamp_slot_index(slot);
+        if stamp_slot_offset(slot, page_bytes).is_none() {
+            return;
+        }
+        Self::fold(&mut self.written, slot, value, page_bytes);
+        if self
+            .owed
+            .get(&slot)
+            .is_some_and(|held| (held.wrapping_sub(value) as i32) <= 0)
+        {
+            self.owed.remove(&slot);
+        }
+    }
+
+    /// Which of the three cases an unmet `wait` falls in.
+    pub fn classify(&self, wait: StampWait) -> UnmetSource {
+        let slot = stamp_slot_index(wait.index);
+        if self.owed.get(&slot).is_some_and(|v| wait.satisfied_by(*v)) {
+            return UnmetSource::Coalesced;
+        }
+        if self.written.get(&slot).is_some_and(|v| wait.satisfied_by(*v)) {
+            return UnmetSource::Queued;
+        }
+        UnmetSource::Absent
+    }
+
+    fn fold(map: &mut std::collections::BTreeMap<u32, u32>, slot: u32, value: u32, page_bytes: u64) {
+        let slot = stamp_slot_index(slot);
+        if stamp_slot_offset(slot, page_bytes).is_none() {
+            return;
+        }
+        map.entry(slot)
+            .and_modify(|held| {
+                if (value.wrapping_sub(*held) as i32) > 0 {
+                    *held = value;
+                }
+            })
+            .or_insert(value);
+    }
 }
 
 impl PendingStamp {
@@ -1359,6 +1505,33 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
             continue;
         }
         note_store_route("packet_stamp_wait_unmet");
+        // Census only, and it does not change the verdict below. Says whether
+        // this device was holding the awaited word (publishable early, and
+        // ordering-safe because publication carries the settle), had already
+        // handed it to the GPU-ordered rail (nothing to do), or never had it.
+        let source = state.stamp_ledger.classify(*wait);
+        note_store_route(match source {
+            UnmetSource::Coalesced => "stamp_unmet_coalesced",
+            UnmetSource::Queued => "stamp_unmet_queued",
+            UnmetSource::Absent => "stamp_unmet_absent",
+        });
+        // A `Queued` wait is on a word already through `write_stamp`, so the
+        // settle has run and only the GPU is left — unless the submission it
+        // was registered against has not been made, because the batch carrying
+        // it is still recording. Then the guest is blocked on this device
+        // rather than on the GPU, and submitting ends it without changing any
+        // ordering. Counted both ways so the split stays visible: a flush that
+        // fires is a stall that was real.
+        #[cfg(feature = "backend-vulkan")]
+        if source == UnmetSource::Queued {
+            note_store_route(
+                if crate::backend::vulkan::engine::submit_batch_for_waiting_stamp(index) {
+                    "stamp_waiter_flushed_batch"
+                } else {
+                    "stamp_waiter_already_in_flight"
+                },
+            );
+        }
         verdict = verdict.and(StampVerdict::Hold);
         if crate::observe::first_sight(
             "packet_stamp_wait_unmet",
@@ -1545,53 +1718,119 @@ fn note_stamp_direction<H: HostMemory + HostOps>(host: &H, gpa: u64, index: u32,
     }
 }
 
-/// Record this stamp's word into the GPU queue behind the writebacks it
-/// follows, so the drain worker never blocks on them.
+/// Queue this stamp behind the FIFO completion point of the guest-memory work
+/// it follows, so the drain worker never blocks on that work.
 ///
-/// `false` means the caller still owes the stamp and must settle it the blocking
-/// way. Four things answer `false`, and only the last is a fault: the operator
-/// narrowed the rail with `REIMS_VGPU_GPU_STAMP=off`; nothing was owed, so there
-/// is nothing to order behind and the plain store is both correct and cheaper;
-/// the stamp page would not resolve to imported guest RAM; or the engine
-/// declined, which it reports itself.
+/// [`StampOrder::CpuReady`] means the caller may publish immediately;
+/// [`StampOrder::Declined`] means it must settle through the blocking fallback.
+/// Keeping those answers distinct is load-bearing: another thread may arm an
+/// unrelated guest write after this function observes no preceding work, and a
+/// fallback that re-reads the global debt would incorrectly wait for that later
+/// work before completing this FIFO.
 ///
 /// The word is four bytes inside one page, so the contiguity rule
 /// `reference_for_pages` enforces is satisfied by construction — but it is asked
 /// rather than assumed, because a stamp page outside an imported RAMBlock is
 /// exactly the case that must fall back rather than be written blind.
 #[cfg(feature = "backend-vulkan")]
-fn stamp_word_ordered_on_gpu<H: HostMemory + HostOps>(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StampOrder {
+    CpuReady,
+    Queued,
+    Declined,
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl StampOrder {
+    fn from_debt(guest_access: bool, fifo_pending: bool) -> Self {
+        if guest_access || fifo_pending {
+            Self::Queued
+        } else {
+            Self::CpuReady
+        }
+    }
+
+    fn needs_blocking_fallback(self) -> bool {
+        self == Self::Declined
+    }
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn note_stamp_guest_ref_refusal(refusal: &crate::runtime::guest_ram_map::MapRefusal) {
+    use crate::runtime::guest_ram_map::MapRefusal;
+    let route = match refusal {
+        MapRefusal::NoBackendImport => "stamp_guest_ref_no_backend_import",
+        MapRefusal::HostRefused(_) => "stamp_guest_ref_host_refused",
+        MapRefusal::NoUsableRegion { .. } => "stamp_guest_ref_no_usable_region",
+        MapRefusal::ImportExceedsHeap { .. } => "stamp_guest_ref_import_exceeds_heap",
+        MapRefusal::GpaNotInAnyImport { .. } => "stamp_guest_ref_gpa_not_imported",
+        MapRefusal::OutsideImport(_) => "stamp_guest_ref_outside_import",
+        MapRefusal::Scattered { .. } => "stamp_guest_ref_scattered",
+    };
+    note_store_route(route);
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn stamp_word_order_on_fifo<H: HostMemory + HostOps>(
     state: &DeviceState,
     host: &mut H,
     index: u32,
     value: u32,
-) -> bool {
+) -> StampOrder {
     if crate::env::switch(crate::env::GPU_STAMP) == crate::env::Switch::Off {
-        return false;
+        return StampOrder::Declined;
     }
-    // Nothing owed means nothing to order behind. Taking the GPU rail here would
-    // add a submission and a thread hop to buy an ordering that already holds,
-    // and most stamps in a boot are this case.
-    if !crate::backend::vulkan::engine::guest_writes_outstanding() {
-        return false;
+    // A CPU-only packet normally has nothing queued behind it. It must still
+    // join an older pending completion on this same FIFO: publishing it now
+    // would let the older completion overwrite the slot with a prior value.
+    // Reads count just as much as writes: once this stamp moves, the guest may
+    // repaint or free pages a preceding command buffer still sources.
+    let guest_access = crate::backend::vulkan::engine::guest_access_outstanding();
+    let fifo_pending =
+        crate::backend::vulkan::engine::stamp_completion::fifo_has_pending_stamp(index);
+    if StampOrder::from_debt(guest_access, fifo_pending) == StampOrder::CpuReady {
+        return StampOrder::CpuReady;
     }
     let page_size = state.page_size();
     let Some(off) = stamp_slot_offset(index, page_size) else {
-        return false;
+        return StampOrder::Declined;
     };
     let gpa = state.pfn_gpa(state.gfx.fifo_base_page) + off;
     let page = gpa & !(page_size - 1);
     let in_page = gpa - page;
-    let Ok(guest_ref) =
-        crate::runtime::guest_ram_map::reference_for_pages(host, &[page], page_size, in_page, 4)
-    else {
-        return false;
+    let guest_ref = match crate::runtime::guest_ram_map::reference_for_pages(
+        host,
+        &[page],
+        page_size,
+        in_page,
+        4,
+    ) {
+        Ok(guest_ref) => guest_ref,
+        Err(refusal) => {
+            note_stamp_guest_ref_refusal(&refusal);
+            return StampOrder::Declined;
+        }
     };
     // The direction check the CPU rail gets from `note_stamp_direction`. Taken
-    // before the submit, because after it the word is the GPU's and reading it
-    // back says nothing about what this device promised.
+    // before enqueueing because the completion thread owns the next write and
+    // reading the word afterward says nothing about what this device promised.
     note_stamp_direction(host, gpa, index, value);
-    crate::backend::vulkan::engine::write_stamp_after_guest_writes(&guest_ref, index, value).is_ok()
+    let queued =
+        match crate::backend::vulkan::engine::write_completion_stamp(&guest_ref, index, value) {
+            Ok(()) => true,
+            Err(_) => {
+                note_store_route("stamp_gpu_engine_declined");
+                false
+            }
+        };
+    if queued && !guest_access {
+        note_store_route("stamp_pending_fifo_chained");
+    }
+    if queued {
+        StampOrder::Queued
+    } else {
+        StampOrder::Declined
+    }
 }
 
 /// Write stamp value to FIFO base page slot and set status bit.
@@ -1605,6 +1844,11 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     if state.gfx.fifo_base_page == 0 {
         return;
     }
+    // Census: from here the value is no longer owed by the coalescing rail, it
+    // is with the publication rail below. Recorded before that rail runs so the
+    // ledger never reports as still-owed a word already being settled.
+    let page_bytes = state.page_size();
+    state.stamp_ledger.wrote(index, stamp_value, page_bytes);
     // Before the guest is told anything finished, everything this device still
     // owes guest RAM has to be in guest RAM. After this write the guest may free
     // the render targets and its allocator may hand those pages to anything, and
@@ -1612,7 +1856,7 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     // which is why the page-set guard passed on 810 of 810 landings and the heap
     // corruption continued.
     //
-    // **Nothing may settle those writes before the GPU rail below is offered
+    // **Nothing may settle those writes before the ordered rail below is offered
     // one.** That rail's first question is whether anything is still
     // outstanding, because ordering behind nothing is a submission and a thread
     // hop for an ordering that already holds. A settle here answers that
@@ -1621,40 +1865,42 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     // beside a `readback_split` `fence` that tracks the flush count exactly.
     // Both quiesces below are reached only when the rail declines, and there
     // they are the settle this comment used to describe.
-    // The stamp word ordered behind the copies by the GPU rather than by this
-    // thread blocking. Tried before either quiesce because when it takes,
-    // neither is owed: its leading barrier names every command submitted before
-    // it, which covers the writebacks and the guest reads alike.
+    // The completion thread waits the newest FIFO submission and then stores
+    // the stamp, rather than making this thread block. Tried before either
+    // quiesce because the timeline point covers the preceding guest reads and
+    // writes alike.
     //
     // Nothing about the *interrupt* is deferred by this — the completion thread
-    // raises it the moment the submission lands. See
+    // raises it immediately after publishing the word. See
     // `backend::vulkan::engine::stamp_completion` for the measurement that says
     // it cannot be deferred to anything slower.
     #[cfg(feature = "backend-vulkan")]
-    if stamp_word_ordered_on_gpu(state, host, index, stamp_value) {
-        // Advanced at submit, not at completion. From here the guest may see the
-        // word at any moment, so a window still armed has already outlived this
-        // fence — which is what `armed_stamp_seq` is compared against, and
-        // dating it from the completion would call that window punctual.
-        state.completion_stamp_seq = state.completion_stamp_seq.wrapping_add(1);
-        return;
+    {
+        let order = stamp_word_order_on_fifo(state, host, index, stamp_value);
+        if order == StampOrder::Queued {
+            // Advanced at submit, not at completion. From here the guest may see the
+            // word at any moment, so a window still armed has already outlived this
+            // fence — which is what `armed_stamp_seq` is compared against, and
+            // dating it from the completion would call that window punctual.
+            state.completion_stamp_seq = state.completion_stamp_seq.wrapping_add(1);
+            return;
+        }
+        if order.needs_blocking_fallback() {
+            crate::backend::vulkan::engine::quiesce_completion_stamps(index);
+            // The asynchronous route was required but could not carry the
+            // completion. Only this answer may re-read global debt: CpuReady
+            // already proved the packet had nothing preceding it, and work
+            // another thread arms afterward belongs after this stamp.
+            crate::runtime::render_writeback::settle_guest_writes(
+                crate::runtime::render_writeback::SettleSite::CompletionStamp,
+            );
+            crate::backend::vulkan::engine::quiesce_guest_reads();
+        }
     }
-    // The flush above submits its copies without waiting for them, so "owed" is
-    // not yet "landed" until this returns. One settle for every window the pass
-    // issued, taken after all of them are on the queue, rather than one blocking
-    // fence per window taken between them.
+    #[cfg(not(feature = "backend-vulkan"))]
     crate::runtime::render_writeback::settle_guest_writes(
         crate::runtime::render_writeback::SettleSite::CompletionStamp,
     );
-    // And the other half of that sentence: everything this device is still
-    // *reading* out of guest RAM has to be done reading. A draw that binds guest
-    // pages through the imported RAMBlock reads them when its command buffer
-    // executes, and this stamp is what tells the guest those pages are free to
-    // repaint. The owed-writes flush above cannot stand in for it — it settles
-    // residents into guest memory and knows nothing about what a submission
-    // still sources.
-    #[cfg(feature = "backend-vulkan")]
-    crate::backend::vulkan::engine::quiesce_guest_reads();
     let Some(off) = stamp_slot_offset(index, state.page_size()) else {
         return;
     };
@@ -2367,9 +2613,7 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
             Ok(packet) => {
                 // The main FIFO stamps per packet and latches nothing, so there is
                 // no pending value here for a wait to be answered from.
-                if note_packet_stamp_waits(state, host, None, &packet, None)
-                    == StampVerdict::Hold
-                {
+                if note_packet_stamp_waits(state, host, None, &packet, None) == StampVerdict::Hold {
                     // Same hold as the child drain, and this is the timeline
                     // where it matters most: the measured root wait is a
                     // `DELETE_TASK` ordered behind a child FIFO's stamp, so
@@ -2390,32 +2634,41 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                 // Root stamp = slot 0.
                 if state.gfx.fifo_base_page != 0 {
                     if let Some(off) = stamp_slot_offset(0, state.page_size()) {
-                        // The root stamp is a completion the guest waits on, so
-                        // every deferred rail owes guest RAM its bytes here, not
-                        // only at `write_stamp`'s child slots. The settle is the
-                        // `quiesce_guest_writes` below — one call, not two, since
-                        // the first would clear the debt the second then finds
-                        // clear.
-                        //
-                        // Root slot 0 stays on the blocking rail, and the
-                        // measurement is the reason rather than caution. Routing
-                        // it through the GPU rail as well was booted and scored
-                        // worse on the thing the guest sees: presents/s 63 -> 53
-                        // against an otherwise identical tree, with draws/s
-                        // 3320 -> 3141. The child slots keep the fast rail
-                        // because there it pays; this is a submission and a
-                        // thread hop for a stamp the guest is already waiting on.
-                        //
-                        // The first attempt at it was also outright broken, and
-                        // that shape is worth keeping: `completed` raises slot
-                        // 0's interrupt *after* this loop, so a GPU-ordered root
-                        // stamp that still set it announced the completion before
-                        // the word moved. The guest treats an interrupt as its
-                        // wakeup, re-read the old value, and slept out its
-                        // one-second deadline — a total stall, draws/s to 0 and
-                        // no presents. Any future attempt here must leave
-                        // `completed` false and let the completion thread
-                        // announce.
+                        // Census: the root FIFO publishes slot 0 inline rather
+                        // than through `write_stamp`, so it records here or the
+                        // ledger would never see slot 0 leave the owed state.
+                        let page_bytes = state.page_size();
+                        state
+                            .stamp_ledger
+                            .wrote(0, packet.completion_stamp, page_bytes);
+                        // Root and child FIFOs own the same bounded pending-stamp
+                        // queue contract. Slot 0 therefore takes the same
+                        // submission-attached completion rail: the completion
+                        // worker publishes the word and announces it in that
+                        // order, while `completed` stays false so this drain does
+                        // not announce an unfinished root stamp.
+                        #[cfg(feature = "backend-vulkan")]
+                        {
+                            let order =
+                                stamp_word_order_on_fifo(state, host, 0, packet.completion_stamp);
+                            if order == StampOrder::Queued {
+                                note_store_route("root_stamp_ordered_gpu");
+                                state.completion_stamp_seq =
+                                    state.completion_stamp_seq.wrapping_add(1);
+                                continue;
+                            }
+                            if order.needs_blocking_fallback() {
+                                // A declined asynchronous route still owes both
+                                // guest reads and writes before the CPU publishes
+                                // the word, and must let an older root word land.
+                                crate::backend::vulkan::engine::quiesce_completion_stamps(0);
+                                crate::runtime::render_writeback::settle_guest_writes(
+                                    crate::runtime::render_writeback::SettleSite::RootStamp,
+                                );
+                                crate::backend::vulkan::engine::quiesce_guest_reads();
+                            }
+                        }
+                        #[cfg(not(feature = "backend-vulkan"))]
                         crate::runtime::render_writeback::settle_guest_writes(
                             crate::runtime::render_writeback::SettleSite::RootStamp,
                         );
@@ -2643,8 +2896,19 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
         psz,
     );
     shared_w16(host, gpa, DISPLAY_DESC_INDEX, index as u16, psz);
-    shared_w16(host, gpa, DISPLAY_DESC_WIDTH_MM, DISPLAY_WIDTH_MM, psz);
-    shared_w16(host, gpa, DISPLAY_DESC_HEIGHT_MM, DISPLAY_HEIGHT_MM, psz);
+    // Both encodings of the physical size, from one value each, as the reference
+    // host does: it writes the pair and the float pair on every publish with no
+    // version test. The integer pair is what the guest's synthesised EDID takes
+    // its centimetre fields from and is the one a stock rung-4 guest reads; the
+    // float pair is what `displayDimensionFloats` licenses at rung 0x2a and
+    // above, and leaving it unwritten is a 0 x 0 mm panel to any guest that gets
+    // there.
+    let (width_f32, width_mm) = display_dimension_mm(DISPLAY_WIDTH_MM);
+    let (height_f32, height_mm) = display_dimension_mm(DISPLAY_HEIGHT_MM);
+    shared_w16(host, gpa, DISPLAY_DESC_WIDTH_MM, width_mm, psz);
+    shared_w16(host, gpa, DISPLAY_DESC_HEIGHT_MM, height_mm, psz);
+    shared_w32(host, gpa, DISPLAY_DESC_WIDTH_MM_F32, width_f32.to_bits(), psz);
+    shared_w32(host, gpa, DISPLAY_DESC_HEIGHT_MM_F32, height_f32.to_bits(), psz);
     shared_w32(host, gpa, DISPLAY_DESC_FEATURES, 0, psz);
 
     // HW cursor capability so the guest doorbells glyph/show/move.
@@ -3361,8 +3625,7 @@ fn observe_page_table_nodes<H: HostMemory + HostOps>(
     if !node_guard::enabled() {
         return;
     }
-    let Some(geometry) =
-        reims_vgpu_paging::resolve::geometry_for_page_shift(state.page_shift)
+    let Some(geometry) = reims_vgpu_paging::resolve::geometry_for_page_shift(state.page_shift)
     else {
         return;
     };
@@ -3574,7 +3837,10 @@ fn apply_map_family<H: HostMemory + HostOps>(
             // never-fired signal there is.
             note_store_route(verdict.slug());
             if verdict.is_finding()
-                && crate::observe::first_sight(verdict.slug(), u64::from(task_id) << 32 | u64::from(channel_id))
+                && crate::observe::first_sight(
+                    verdict.slug(),
+                    u64::from(task_id) << 32 | u64::from(channel_id),
+                )
             {
                 let live = intervals.live_count();
                 crate::observe::fail(format!(
@@ -3668,9 +3934,8 @@ fn apply_map_family<H: HostMemory + HostOps>(
                 "bb_retire_map_range",
                 state.retire_bound_buffers_in_range(task_id, gva, length),
             );
-            let n = crate::runtime::gva_view::retire_gva_views_overlapping(
-                state, task_id, gva, length,
-            );
+            let n =
+                crate::runtime::gva_view::retire_gva_views_overlapping(state, task_id, gva, length);
             let op = if family == MapFamily::UnmapMemory {
                 "unmap_memory"
             } else {
@@ -3810,12 +4075,9 @@ fn apply_map_family<H: HostMemory + HostOps>(
             // host-cached pixels for a resource the guest has just
             // CPU-written, so the line has to say which check refused
             // and not only that one did.
-            Err(e) => note_resource_list_decode_fail(
-                "InvalidateResources",
-                packet.opcode,
-                channel_id,
-                e,
-            ),
+            Err(e) => {
+                note_resource_list_decode_fail("InvalidateResources", packet.opcode, channel_id, e)
+            }
         }
     } else if matches!(
         family,
@@ -3824,9 +4086,9 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // Two opcodes, one arm, because the reference host validates
         // both with byte-for-byte the same check — `{u32 task, u32
         // count}` then `count` 4-byte object ids — and the synchronise
-        // obligation they name is the same one. `0x3e` adds a discard of
-        // the named resources' contents on top, which this device does
-        // not act on and reports below.
+        // obligation they name is the same one. `0x3e` then releases the
+        // named resources' transfer backings while preserving their host
+        // textures and resource identities.
         //
         // The command carries `{task, count}` and a list of object ids,
         // and nothing else — no region, no direction. It is the guest
@@ -3846,16 +4108,25 @@ fn apply_map_family<H: HostMemory + HostOps>(
         use crate::runtime::decode::fifo::decode_synchronize_resources;
         match decode_synchronize_resources(&packet.payload) {
             Ok(cmd) => {
-                // The guest asking for a resource synchronize is the one
-                // host-to-guest copy the contract actually names, so it is the
-                // land point every owed frame is owed to. A driven boot issues
-                // zero of these; a boot where this arm fires is a boot where the
-                // lazy rail is being asked for exactly what it defers.
-                crate::runtime::writeback_debt::settle_unnamed(
+                // Synchronization is resource-scoped. Apple batches the named
+                // resources into transfer encoders; synchronizing one object
+                // does not publish every other host-valid texture in the task.
+                crate::runtime::writeback_debt::submit_for_resources(
                     state,
                     host,
-                    crate::runtime::render_writeback::SettleSite::ChildStamp,
+                    cmd.task_id,
+                    &cmd.object_ids,
                 );
+                if family == MapFamily::SynchronizeAndDiscardResources {
+                    let discarded = crate::runtime::writeback_debt::discard_gva_resources(
+                        state,
+                        cmd.task_id,
+                        &cmd.object_ids,
+                    );
+                    if discarded != 0 {
+                        note_store_route_n("gva_transfer_backing_discarded", discarded as u64);
+                    }
+                }
                 let oid = cmd.object_ids.first().copied().unwrap_or(0);
                 if crate::observe::draw_log_enabled() {
                     crate::observe::line(format!(
@@ -3879,17 +4150,6 @@ fn apply_map_family<H: HostMemory + HostOps>(
             // black frame the guest has no way to notice.
             Err(e) => note_resource_list_decode_fail(name, packet.opcode, channel_id, e),
         }
-        // The half of `0x3e` that is not the synchronise. Reported after
-        // the synchronise has run, so the record cannot be read as the
-        // whole command having been dropped.
-        if family == MapFamily::SynchronizeAndDiscardResources {
-            note_unimplemented(
-                state,
-                channel_id,
-                UnimplementedCommand::SynchronizeAndDiscardResources,
-                packet,
-            );
-        }
     } else {
         let w0 = if plen >= 4 {
             crate::contract::endian::ld32(&packet.payload[0..])
@@ -3907,7 +4167,6 @@ fn apply_map_family<H: HostMemory + HostOps>(
         ));
     }
 }
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChildPacketDisposition {
@@ -3995,6 +4254,9 @@ fn process_child_packet<H: HostMemory + HostOps>(
                     "bb_retire_delete_resource",
                     state.retire_bound_buffers_for_ref(task_id, id),
                 );
+                if crate::runtime::writeback_debt::retire_gva_resource(state, task_id, id) {
+                    note_store_route("gva_resource_retired");
+                }
                 let _ = state.delete_object(task_id, id);
             }
         }
@@ -4047,7 +4309,9 @@ fn process_child_packet<H: HostMemory + HostOps>(
         // op6 `CmdDisplayTransaction2_DEPRECATED` and op7
         // `CmdDisplayTransaction3`. They differ only in where the surface word
         // sits, which `display_txn_trailer_slots` owns for all three.
-        opcode @ (CHILD_OP_DISPLAY_SWAP | CHILD_OP_DISPLAY_TRANSACTION2 | CHILD_OP_DISPLAY_TRANSACTION3) => {
+        opcode @ (CHILD_OP_DISPLAY_SWAP
+        | CHILD_OP_DISPLAY_TRANSACTION2
+        | CHILD_OP_DISPLAY_TRANSACTION3) => {
             note_display_txn_payload(state, channel_id, packet);
             let Some(mapping) = present_surface_id(opcode, &packet.payload) else {
                 crate::observe::fail(format!(
@@ -4239,6 +4503,62 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         result.render_attachment_resolves,
                         result.render_guest_stores
                     ));
+                    // What the engine was holding while this tranche waited.
+                    // This line is the only join anywhere between a stalled
+                    // submission and the pipeline objects in it, and a host GPU
+                    // hang is the case it exists for: the counts above say a
+                    // tranche took seconds, and nothing else says what it took
+                    // them on. Emitted beside the count rather than folded into
+                    // it because the two have different lengths and a reader
+                    // greps for one or the other.
+                    if let Some(trail) = crate::runtime::gpu_hang_trail::trail() {
+                        crate::observe::fail(format!(
+                            "TRANSPORT reason=sync_exec_lock_hold_trail ch={channel_id} {trail}"
+                        ));
+                    }
+                    // The trail above is what this device *recorded*; this is
+                    // what it is still *waiting on*. They are different
+                    // questions and the second is the one a stall asks: the
+                    // oldest outstanding submission is the one every later one
+                    // is queued behind, and a stall whose oldest carries
+                    // `draws=0` is a wedge that is not in a draw at all.
+                    //
+                    // `None` here is a reading rather than a gap — it says this
+                    // tranche is blocked on something the submission ring did
+                    // not submit.
+                    if let Some(outstanding) = crate::runtime::gpu_hang_trail::outstanding() {
+                        crate::observe::fail(format!(
+                            "TRANSPORT reason=sync_exec_lock_hold_outstanding ch={channel_id} \
+                             {outstanding}"
+                        ));
+                    }
+                    // The trail above is the last twelve draws, which at this
+                    // rail's rate is the last half millisecond — and a wedged
+                    // device goes on drawing about one draw per stall, so by the
+                    // second stall the trail is entirely post-wedge. The first
+                    // stall's is not, but even that one reaches only the
+                    // millisecond before the wait, while the wedge on the rail
+                    // this was built for begins in the ~300 ms after an
+                    // application's first window.
+                    //
+                    // Latched to the first stall of the boot, on purpose. It is a
+                    // per-process record, so every later stall would print the
+                    // same list one draw further on and the log would carry a
+                    // dozen near-identical copies of a line whose value is that
+                    // there is one of it.
+                    if crate::observe::first_sight("sync_exec_lock_hold_pipes", 0) {
+                        if let Some(firsts) =
+                            crate::runtime::gpu_hang_trail::recent_pipeline_firsts()
+                        {
+                            crate::observe::fail(format!(
+                                "TRANSPORT reason=sync_exec_lock_hold_pipes ch={channel_id} \
+                                 {firsts} (the pipelines this device drew for the first time \
+                                 most recently, oldest first, each with how many draws ago — \
+                                 a wedge in the second an application opens its first window \
+                                 has new pipelines in front of it and nothing else says which)"
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -4266,14 +4586,20 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 if let Some(cmd) =
                     crate::runtime::decode::fifo::decode_replace_physical(&packet.payload)
                 {
-                    // The GPA behind this object's GVAs changes here, so any
-                    // held bind resolution on the task names the old frames.
-                    // The packet names an object, not a range, and which
-                    // references resolved through it is not recorded — so the
-                    // task's resolutions go together.
+                    // The GPA behind this resource changes here. The command is
+                    // scoped to one task-local resource id, so unrelated
+                    // resources on the same task keep both their authoritative
+                    // frame and their held address resolution.
+                    if crate::runtime::writeback_debt::retire_gva_resource(
+                        state,
+                        cmd.task_id,
+                        cmd.object_id,
+                    ) {
+                        note_store_route("gva_resource_retired");
+                    }
                     note_bb_retired(
                         "bb_retire_replace_physical",
-                        state.retire_bound_buffers_for_task(cmd.task_id),
+                        state.retire_bound_buffers_for_ref(cmd.task_id, cmd.object_id),
                     );
                     crate::runtime::objects::replace_physical(
                         state,
@@ -4310,10 +4636,22 @@ fn process_child_packet<H: HostMemory + HostOps>(
             apply_map_family(state, host, channel_id, packet, MapFamily::MapMemory2);
         }
         CHILD_OP_INVALIDATE_RESOURCES => {
-            apply_map_family(state, host, channel_id, packet, MapFamily::InvalidateResources);
+            apply_map_family(
+                state,
+                host,
+                channel_id,
+                packet,
+                MapFamily::InvalidateResources,
+            );
         }
         CHILD_OP_SYNCHRONIZE_RESOURCES => {
-            apply_map_family(state, host, channel_id, packet, MapFamily::SynchronizeResources);
+            apply_map_family(
+                state,
+                host,
+                channel_id,
+                packet,
+                MapFamily::SynchronizeResources,
+            );
         }
         CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES => {
             apply_map_family(
@@ -4334,8 +4672,8 @@ fn process_child_packet<H: HostMemory + HostOps>(
             );
         }
         // `CmdDiscardResources`: the discard half of `0x3e` on its own, with the
-        // same payload contract, and nothing owed to the guest — a discard this
-        // device ignores costs memory and never correctness.
+        // same payload contract. It releases each resource's transfer backing;
+        // prepare or synchronize recreates that backing lazily if needed.
         //
         // The payload is still decoded, with `0x35`'s decoder because the host
         // validates all three with the same check. A malformed one is worth a
@@ -4345,12 +4683,16 @@ fn process_child_packet<H: HostMemory + HostOps>(
         CHILD_OP_DISCARD_RESOURCES => {
             use crate::runtime::decode::fifo::decode_synchronize_resources;
             match decode_synchronize_resources(&packet.payload) {
-                Ok(_) => note_unimplemented(
-                    state,
-                    channel_id,
-                    UnimplementedCommand::DiscardResources,
-                    packet,
-                ),
+                Ok(cmd) => {
+                    let discarded = crate::runtime::writeback_debt::discard_gva_resources(
+                        state,
+                        cmd.task_id,
+                        &cmd.object_ids,
+                    );
+                    if discarded != 0 {
+                        note_store_route_n("gva_transfer_backing_discarded", discarded as u64);
+                    }
+                }
                 Err(e) => {
                     note_resource_list_decode_fail("DiscardResources", packet.opcode, channel_id, e)
                 }
@@ -4694,6 +5036,15 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     // the submit, and folding a value into a latch is not one.
                     // The submit it defers to is timed where it happens, below.
                     pending.latch(packet.completion_stamp);
+                    // Census: the packet has executed and the word is held in
+                    // the latch above until this drain ends. That window is the
+                    // only one a repair could shorten.
+                    let page_bytes = state.page_size();
+                    state.stamp_ledger.owe(
+                        stamp_index_slot,
+                        packet.completion_stamp,
+                        page_bytes,
+                    );
                 } else {
                     let stamp_started = std::time::Instant::now();
                     write_stamp(state, host, stamp_index, packet.completion_stamp);
@@ -5347,10 +5698,7 @@ pub(crate) fn signal_display_refresh_classes<H: HostMemory + HostOps>(
     // and the two are directly comparable. A guest that arms only the
     // transaction class still reports `not_enabled` here, because this arm names
     // the VBL class and not "did the tick do anything".
-    note_vbl(
-        if vbl { VBL_DELIVERED } else { VBL_NOT_ENABLED },
-        now_ms,
-    );
+    note_vbl(if vbl { VBL_DELIVERED } else { VBL_NOT_ENABLED }, now_ms);
     if transaction {
         note_display_present_signal(DISPLAY_PRESENT_REFRESH);
     }
@@ -5467,13 +5815,37 @@ pub fn try_display_online<H: HostMemory + HostOps>(state: &mut DeviceState, host
         }
         return;
     }
-    // Cadence: skip most ticks (archive divisor); still run often enough via
-    // gfx_update / drain that enable() is observed within seconds.
+    // The divisor is a cadence for **re-asserting** ONLINE, not for looking at
+    // whether the guest has enabled the display. It used to gate both, and that
+    // cost the first pulse a whole divisor of latency: `poll_ctr` is zeroed by
+    // `apply_setup_shared_state`, so the guest could set the enable bit
+    // immediately after registering the shared page and this device would not
+    // read it until 50 polls later.
+    //
+    // Measured, on three macos-11/12 boots, as the interval between
+    // `display_shared_state_setup` and `display_online_signal` in each boot's own
+    // log: 2365 ms, 2324 ms and 2139 ms. Fifty polls at the ~45 ms this is
+    // actually called at during early boot — the poll is driven by `gfx_update`
+    // and the drain, and neither runs at the 4 ms heartbeat before the guest is
+    // drawing anything. So essentially the whole of that interval was this gate.
+    //
+    // It is a real cost and not a cosmetic one, because the guest is racing us.
+    // macOS's WindowServer asks `AppleParavirtFramebuffer` for a mappable VRAM
+    // aperture about 13 s into boot and **aborts the process** if it does not get
+    // one — `CGXMappedDisplayStart` asserts, and the desktop never appears for
+    // the life of the boot. Onlining at 14.2 s loses that race and onlining at
+    // 11.9 s wins it, which is the whole margin.
+    //
+    // So the counter still advances every poll, the enable mask is read every
+    // poll, and the divisor now gates only the *repeat* — first pulse on the
+    // first poll that observes the enable bit, retries at the archive's ~200 ms.
+    //
+    // Measured again the same way on five macos-11 boots afterwards, the same
+    // interval reads **1, 1, 1, 3 and 4 ms**. The wait is gone rather than
+    // shortened, which is what says the divisor was the whole of it and not one
+    // term in it.
     let ctr = state.display.poll_ctr.wrapping_add(1);
     state.display.poll_ctr = ctr;
-    if !ctr.is_multiple_of(DISPLAY_ONLINE_POLL_DIVISOR) {
-        return;
-    }
     let gpa = state.display.shared_gpa;
     let mut mask_le = [0u8; 4];
     if host
@@ -5537,6 +5909,11 @@ pub fn try_display_online<H: HostMemory + HostOps>(state: &mut DeviceState, host
                 state.display.poll_ctr,
             ));
         }
+        return;
+    }
+    // The guest has enabled. The first pulse goes now; every later one waits for
+    // the archive's cadence, which is what the divisor was always for.
+    if state.display.online_tries > 0 && !ctr.is_multiple_of(DISPLAY_ONLINE_POLL_DIVISOR) {
         return;
     }
     // pending word is atomic read-and-clear on the guest side.

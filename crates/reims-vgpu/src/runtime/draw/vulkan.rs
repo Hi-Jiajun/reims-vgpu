@@ -1,6 +1,6 @@
 //! Vulkan-backend half of the [`super`] draw encode path: sampled-source
 //! resolution, zero-copy load paths, metal2vulkan draw submission, and the
-//! deferred GVA/surface store windows.
+//! host-authoritative GVA/surface Store ownership.
 //!
 //! The whole module is gated on `backend-vulkan` at its declaration in
 //! [`super`], which also re-exports these items flat so callers keep addressing
@@ -22,6 +22,7 @@ struct SampledImageShape {
     volume: bool,
     cube: bool,
     one_dim: bool,
+    multisampled: bool,
     layers: u32,
 }
 
@@ -41,6 +42,7 @@ fn sampled_image_shape(
         volume: false,
         cube: false,
         one_dim: false,
+        multisampled: false,
         layers: 1,
     };
     Some(match kind {
@@ -54,6 +56,10 @@ fn sampled_image_shape(
             ..d2
         },
         SampledImageKind::D2 => d2,
+        SampledImageKind::D2Multisample => SampledImageShape {
+            multisampled: true,
+            ..d2
+        },
         SampledImageKind::D2Array => SampledImageShape {
             arrayed: true,
             ..d2
@@ -93,7 +99,23 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     };
 
     let mut any_store = false;
-    let mut color0_rgba: Option<Vec<u8>> = None;
+    // The seeded solid colour of attachment 0, as its recipe rather than as its
+    // pixels.
+    //
+    // This used to be the `Vec<u8>` itself, built by `solid_rgba8` inside the
+    // seed loop. Only one of this function's five exits returns it — the
+    // clear-only one at the bottom, where the record encoded no draw — and the
+    // three that matter under compositing (`chain_resident_established`, an armed
+    // Store, a real `draw_rgba`) each return something else and dropped it
+    // unread. On a macos-11 Safari-torture leg the seed loop landed 2.87 GB of
+    // solid colour through `write_gva_solid8`, which converts one row and repeats
+    // it; the full-surface image built beside it was the same 2.87 GB of
+    // allocate-and-fill, and 188 ms of the leg's 892 ms `prep_seed_us` sat
+    // outside both landing spans, which is where it was.
+    //
+    // Held as `(width, height, colour)` so the recipe costs a few words and the
+    // exit that wants pixels calls the same constructor with the same arguments.
+    let mut color0_solid: Option<(u32, u32, [f64; 4])> = None;
     // The engine draw's own refusal slug, kept so the skipped-draw tail can name
     // why its draws were skipped instead of guessing. `None` means the engine
     // draw was never attempted — this record carried no pipeline or no vertices.
@@ -107,7 +129,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             // it is the site that disagrees with this module's writeback loop
             // about what such a value means. See `super::store_action_in_contract`.
             let _ = super::store_action_in_contract(req.pipeline_ref, c.store_action);
-            if c.store_action != MTL_STORE_ACTION_STORE {
+            if !crate::contract::pass_action::store_action_publishes_single_sample(c.store_action) {
                 continue;
             }
             if c.load_action != MTL_LOAD_ACTION_CLEAR && c.load_action != MTL_LOAD_ACTION_DONT_CARE
@@ -118,11 +140,11 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             if c.width == 0 || c.height == 0 {
                 continue;
             }
-            // The only reader of a full-surface RGBA copy is this chain's
-            // `color0_rgba`. Neither writer below takes one — the GVA landing
-            // repeats a single row and the type-11 landing builds its own image
-            // in the mapping's order — so no other attachment materialises one.
-            let rgba = (i == 0).then(|| solid_rgba8(c.width, c.height, &c.clear_color));
+            // Neither writer below takes a full-surface RGBA copy — the GVA
+            // landing repeats a single row and the type-11 landing builds its own
+            // image in the mapping's order — so the only reader of one is the
+            // clear-only exit, and it is the one place that builds it.
+            let solid = (i == 0).then_some((c.width, c.height, c.clear_color));
             // Which branch this loop actually takes, how many bytes it lands and
             // what the landing costs. `prep_seed_us` is 8.6 µs of a 41 µs chain
             // on the `blur=40` dial and rebuilding the images without their two
@@ -184,7 +206,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             if ok {
                 any_store = true;
                 if i == 0 {
-                    color0_rgba = rgba;
+                    color0_solid = solid;
                 }
                 crate::observe::line(format!(
                     "linux_clear_store mid={} gva={:#x} {}x{} pipe={} load={}",
@@ -194,10 +216,10 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         }
     }
 
-    // Pages the synchronous GVA Store below is allowed to reach, resolved
+    // Pages the eager GVA fallback below is allowed to reach, resolved
     // **before** any GPU work.
     //
-    // That Store's write was documented as needing no bound because "the command
+    // The write was documented as needing no bound because "the command
     // being executed is what names its destination, and its authorisation is the
     // page table at the moment it runs". That is true of the CLEAR store above,
     // which is a solid colour written on this thread with nothing in between. It
@@ -208,9 +230,12 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // authorised — which is exactly the shape the deferred rail was corrupting
     // guest memory through before it was bounded.
     //
-    // Resolved here rather than at the write so the set predates the submit.
-    // `None` when there is no GVA target, no writeback, or the walk cannot name
-    // the span — an unresolvable span is not an authorisation to write anywhere.
+    // Resolved here rather than at the fallback write so the set predates the
+    // submit. The host-authoritative path keeps no pages from this walk; its
+    // eventual transfer performs one fresh walk and verifies the allocation
+    // generation before writing. `None` here means there is no GVA target, no
+    // writeback, or the walk cannot name the span — an unresolvable span is not
+    // an authorisation for the eager fallback to write anywhere.
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::PrepPages);
     let sync_store_pages =
         sync_store_allowed_pages(state, host, req.task_id, colors.first(), writeback_guest);
@@ -229,9 +254,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // pages by `store_surface_resident`, so this encode owes the caller nothing
     // further.
     let mut surface_store_armed = false;
-    // GVA render Store: the frame was written into the target's guest pages by
-    // `store_gva_frame`, so this encode owes the caller nothing further. The
-    // twin of `surface_store_armed`, and it returns through the same door.
+    // GVA render Store: the frame remains authoritative in the resident and a
+    // resource-scoped debt records the future transfer. The twin of
+    // `surface_store_armed`, and it returns through the same door.
     let mut gva_store_armed = false;
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
         req.chain_resident_established = false;
@@ -255,65 +280,19 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     req.colors.first().map(|c| c.target_gva).unwrap_or(0)
                 ));
             }
-            Ok(M2vDrawSpan::ResidentGvaStore) => {
-                // Landed from the resident the draw just produced, in this call.
-                // This Store used to arm a deferred window instead; the window
-                // rail is gone, and on a driven boot this route armed 88 windows
-                // in 51 seconds against the surface rail's 21 314, so what it
-                // deferred was never where the cost was.
+            Ok(M2vDrawSpan::ResidentGvaStore { identity }) => {
                 let _store_span = StoreCostSpan::new("gva_store_us");
                 note_type11_store_route("gva_flush");
-                // The GPU writes the guest's pages directly, exactly as the
-                // type-11 surface Store does. Tried first because when it works
-                // there is nothing left to do: no fence is waited on, no
-                // staging buffer is mapped and no host pass over the frame
-                // happens at all. Every decline below pays a blocking readback
-                // of the whole framebuffer plus a per-row conversion of it,
-                // which is this device's largest single cost.
-                let direct = req.colors.first().and_then(|c0| {
-                    let identity = gva_chain_identity(req)?;
-                    Some((
-                        crate::runtime::render_writeback::store_gva_frame(
-                            state,
-                            host,
-                            &identity,
-                            c0,
-                            c0.texture_ref,
-                            sync_store_pages.as_ref(),
-                        ),
-                        c0.target_gva,
-                    ))
+                // Metal Store preserves the attachment in host GPU memory. It
+                // does not synchronize that texture into guest backing; the
+                // resource-validity protocol asks for that separately. The
+                // live resource retains its transfer backing until explicit
+                // discard or delete; the debt records only content ownership.
+                let landed = req.colors.first().is_some_and(|c0| {
+                    crate::runtime::writeback_debt::arm_gva(state, host, req.task_id, c0, &identity)
                 });
-                let landed = match direct {
-                    Some((Ok(_), gva)) => {
-                        note_type11_store_route("gva_flush_gpu_direct");
-                        crate::observe::line(format!(
-                            "linux_m2v_draw ok resident_gva_store_direct pipe={} {}x{} gva={gva:#x}",
-                            req.pipeline_ref, pass_w, pass_h
-                        ));
-                        true
-                    }
-                    Some((Err(decline), gva)) => {
-                        // Latched per target as well as per reason: a host
-                        // without the import declines every Store of every
-                        // target, and a line each would drown the channel.
-                        crate::observe::Emit::decline("gva_flush_gpu_declined", &decline)
-                            .field("gva", format!("{gva:#x}"))
-                            .field("geom", format!("{pass_w}x{pass_h}"))
-                            .fail_once(gva);
-                        note_type11_store_route("gva_flush_gpu_declined");
-                        false
-                    }
-                    // No color0 or no identity: the same pair
-                    // `gva_store_defer_eligible` already required to reach this
-                    // arm, so a `None` here is a contradiction rather than a
-                    // routing answer.
-                    None => {
-                        note_type11_store_route("gva_flush_no_identity");
-                        false
-                    }
-                };
                 if landed {
+                    note_type11_store_route("gva_resident_authoritative");
                     gva_store_armed = true;
                 } else {
                     // The copying rail: read the resident the draw just
@@ -321,7 +300,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     // run exactly as it does for a Store that never skipped its
                     // readback. `read_resident_chain` fail-logs a lost resident.
                     note_type11_store_route("gva_store_sync");
-                    draw_rgba = read_resident_chain(state, req);
+                    draw_rgba = read_resident_chain(req, &identity);
                     crate::observe::line(format!(
                         "linux_m2v_draw ok resident_gva_store pipe={} {}x{} gva={:#x} rgba={}",
                         req.pipeline_ref,
@@ -332,7 +311,10 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     ));
                 }
             }
-            Ok(M2vDrawSpan::ResidentSurfaceStore) => {
+            Ok(M2vDrawSpan::ResidentSurfaceStore {
+                identity,
+                guest_store,
+            }) => {
                 // Into the same `t11_store_us` bucket the synchronous and `Owned`
                 // routes report, because the whole claim of this rail is that the
                 // bucket shrinks. Leaving it unbracketed would move the arm's cost
@@ -345,7 +327,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     .first()
                     .map(|c0| (c0.mapping_id, c0.width, c0.height, c0.format));
                 let stored = c0_store
-                    .map(|(mid, cw, ch, _)| store_surface_resident(state, host, req, mid, cw, ch))
+                    .map(|(mid, cw, ch, _)| {
+                        store_surface_resident(state, host, &identity, mid, cw, ch, guest_store)
+                    })
                     .unwrap_or(false);
                 match (stored, c0_store) {
                     (true, Some((mid, cw, ch, fmt))) => {
@@ -373,7 +357,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         // readback the rail exists to avoid, which is the point —
                         // the fallback is a cost, never a lost frame.
                         note_type11_store_route("surface_resident_sync");
-                        draw_rgba = read_resident_chain(state, req);
+                        draw_rgba = read_resident_chain(req, &identity);
                         crate::observe::line(format!(
                             "linux_m2v_draw ok resident_surface_store_sync_fallback pipe={} {}x{} mid={} rgba={}",
                             req.pipeline_ref,
@@ -413,6 +397,22 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         }
     }
 
+    // Everything below is Store routing, for both kinds of record, so charge it
+    // as Store for both.
+    //
+    // `Phase::Store` used to be entered only *inside* `try_metal2vulkan_draw`,
+    // which a record with no pipeline or no vertices never calls — so such a
+    // record kept `Prep` open through its whole guest writeback, and `prep_us`
+    // was the chain head for one class of record and the entire body for
+    // another. That is not a phase. It is also not a small error: `prep_us` read
+    // 0.89 µs a chain on one driven Maps boot and 4.69 on the next of the same
+    // binary, with `store_us` moving 0.53 → 0.96 beside it, which is the ratio
+    // of the two classes changing and nothing about the code.
+    //
+    // For a record that did draw, the open phase is already `Store` and this
+    // charges the same accumulator it reopens, so the drawing path is unchanged
+    // by construction rather than by a condition.
+    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
     // A resident render-pass chain intermediate: the exec loop reads
     // `chain_resident_established` and arms the next record's LoadFromTarget.
     if req.chain_resident_established {
@@ -596,8 +596,10 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 //
                 // A buffer→image copy converts nothing, so the GPU rail can
                 // only ever serve a destination whose bytes are already the
-                // resident's — which for a GVA/pooled target means RGBA8,
-                // since those residents stay in RGBA order. `format` is the
+                // resident's. That is not a channel order this rail may name for
+                // itself: `gva_resident_format` builds the resident from the
+                // order the guest declared, so a GVA target is RGBA or BGRA
+                // according to `c0.format` and nothing else. `format` is the
                 // gate, and it is recorded rather than assumed: whether this
                 // class is worth a GPU rail at all is exactly the question of
                 // how many of the 14 330 clear it, and `convert_rgba8_to_row`
@@ -765,7 +767,29 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 u64::from(req.vertex_count),
             );
         }
-        (EncodeStatus::Ok, color0_rgba)
+        // The one exit that hands the seed on: this record encoded no draw, so
+        // the solid colour it landed *is* this chain's colour-0 content, and the
+        // next record loads it as its seed. Built here rather than in the loop
+        // above because the four exits before this one return without it.
+        //
+        // The route is what says the deferral is worth having: read it against
+        // `clear_seed_gva` + `clear_seed_t11`, which count the seeds, and the
+        // difference is the full-surface images that used to be built and
+        // dropped. A boot where the two are equal has nothing to save here.
+        (
+            EncodeStatus::Ok,
+            color0_solid.map(|(w, h, clear)| {
+                crate::runtime::drain::note_store_route("clear_seed_color0_image");
+                crate::runtime::drain::note_store_route_n(
+                    "clear_seed_color0_image_kb",
+                    u64::from(w)
+                        .saturating_mul(u64::from(h))
+                        .saturating_mul(u64::from(RGBA8_BPP))
+                        / 1024,
+                );
+                solid_rgba8(w, h, &clear)
+            }),
+        )
     } else {
         (EncodeStatus::NoMetal("draw_vk_nothing_stored"), None)
     }
@@ -774,26 +798,43 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
 /// Sampled texture source + geometry for an engine draw.
 pub(super) enum SampledSourceRequest {
     /// Shared texel bytes + optional producer identity (see
-    /// [`LinearSampleIdentity`]) + the byte layout of those texels; the Arc lets
-    /// memoized repeat binds skip the per-draw copy and the engine skip
-    /// re-hashing.
+    /// [`LinearSampleIdentity`]) + what those texels are; the Arc lets memoized
+    /// repeat binds skip the per-draw copy and the engine skip re-hashing.
+    ///
+    /// The third field is a [`SampledByteFormat`] and not a bare `TexelLayout`
+    /// because a layout is linear by construction. While it was one, every CPU
+    /// upload of an sRGB guest texture reached the sampler through a `_UNORM`
+    /// view and was never decoded, while the zero-copy rails beside it — which
+    /// carry a resolved host format — bound the `_SRGB` spelling and were. One
+    /// guest texture, two colours, and which one it got decided by a cost
+    /// threshold. Each producer answers from the format it *loaded from*, so a
+    /// convert that reorders channels keeps the transfer function it never
+    /// touched.
     Bytes(
         std::sync::Arc<Vec<u8>>,
         Option<LinearSampleIdentity>,
-        TexelLayout,
+        SampledByteFormat,
+        crate::backend::vulkan::engine::SampledByteOrigin,
     ),
-    Target(crate::backend::vulkan::engine::TargetIdentity),
+    /// Engine-resident allocation plus the exact view format this sampled
+    /// texture declared. Allocation identity and view interpretation are
+    /// separate parts of the texture contract.
+    Target(
+        crate::backend::vulkan::engine::TargetIdentity,
+        ash::vk::Format,
+    ),
     /// Zero-copy guest gather: the engine copies the texel bytes from
     /// imported guest RAM inside the draw CB — no CPU read, no memo, no
     /// hash. Carries the native texel layout the image is created with.
     /// Guest-RAM runs the engine gathers from, the byte layout of those texels,
-    /// the identity that lets the engine bind a retained image instead of
-    /// gathering at all, and what the guest-write witness says that identity is
-    /// worth (see [`crate::runtime::gather_witness`]).
+    /// an optional copied-content identity, and what the guest-write witness
+    /// says that identity is worth (see [`crate::runtime::gather_witness`]).
     ///
-    /// The identity is not optional on this rail: every window that reaches here
-    /// went through the witness, and the witness names every window it is asked
-    /// about. The vouch beside it is the part that varies.
+    /// A resource-owned direct image has no copied content to witness and
+    /// carries no identity. A copy-backed source carries the identity that lets
+    /// the engine bind a retained gathered image without gathering again. If a
+    /// backend declines a supplied direct image, the absent identity makes the
+    /// copy fallback gather conservatively on that bind.
     /// The last field is the **format's own** channel plan, not the guest's
     /// view swizzle: this rail binds guest bytes untouched, so a format whose
     /// Metal channels do not sit identically on the Vulkan format carrying them
@@ -803,7 +844,13 @@ pub(super) enum SampledSourceRequest {
     GuestRuns(
         crate::backend::vulkan::engine::GuestRunSource,
         TexelLayout,
-        LinearSampleIdentity,
+        /// Exact Vulkan image/view format. This is distinct from the texel
+        /// layout because linear and sRGB formats carry the same bytes while
+        /// applying different fixed-function sampling conversions.
+        ash::vk::Format,
+        /// Consecutive depth planes carried by the source window.
+        u32,
+        Option<LinearSampleIdentity>,
         crate::runtime::gather_witness::GatherVouch,
         pixel_format::SwizzlePlan,
     ),
@@ -855,14 +902,14 @@ type LoadedType5View = (
     u32,
     std::sync::Arc<Vec<u8>>,
     LinearSampleIdentity,
-    TexelLayout,
+    SampledByteFormat,
 );
 type LoadedLinearSample = (
     u32,
     u32,
     std::sync::Arc<Vec<u8>>,
     Option<LinearSampleIdentity>,
-    TexelLayout,
+    SampledByteFormat,
 );
 
 /// Authoritative contents when a fragment texture aliases a GVA color target.
@@ -874,8 +921,21 @@ type LoadedLinearSample = (
 /// chained image.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum AttachmentAliasSample<'a> {
+    /// The attachment's `MTLClearColor`, which the guest states in the colour
+    /// space the attachment decodes *to*. Metal encodes it on the way into an
+    /// sRGB attachment and decodes it back on sample, so the value a shader
+    /// reads is the one written here — this device stores that value directly
+    /// and binds it linear. No attachment format is carried because none is
+    /// needed: the round trip cancels.
     Clear([f64; 4]),
-    Seed(&'a [u8]),
+    /// The attachment's prior contents, read back out of its guest pages, plus
+    /// the format they were **stored** in.
+    ///
+    /// The format is here and not on [`Self::Clear`] because a seed is stored
+    /// bytes rather than a decoded value: an sRGB attachment holds encoded ones,
+    /// and a bind that samples them linear hands the shader an undecoded value
+    /// the next attachment write then encodes a second time.
+    Seed(&'a [u8], u16),
     /// Records 2+ of a resident GVA chain: the prior record's content lives
     /// on the engine-resident target, not in a CPU seed. Bound as a resident
     /// sampled source (the engine snapshots on self-alias).
@@ -908,7 +968,11 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
                 .as_deref()
                 .filter(|seed| seed.len() == need)
             {
-                return Some((color.width, color.height, AttachmentAliasSample::Seed(seed)));
+                return Some((
+                    color.width,
+                    color.height,
+                    AttachmentAliasSample::Seed(seed, color.format),
+                ));
             }
             if req.chain_from_resident {
                 return Some((
@@ -952,8 +1016,12 @@ pub(super) fn sampled_texture_descriptor<M: HostMemory>(
     host: &M,
     task_id: u32,
     texture_ref: u32,
-) -> Option<(crate::runtime::decode::resource::ListObjectEntry, Vec<u8>)> {
-    let entry = objects::lookup_list_entry(state, host, task_id, texture_ref)?;
+) -> Option<(
+    crate::runtime::decode::resource::ListObjectEntry,
+    std::sync::Arc<[u8]>,
+)> {
+    let resource = objects::resolve_resource(state, host, task_id, texture_ref).ok()?;
+    let entry = resource.entry;
     use crate::runtime::decode::resource::{OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT};
     if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
     {
@@ -967,10 +1035,8 @@ pub(super) fn sampled_texture_descriptor<M: HostMemory>(
             ));
         }
     }
-    let bytes = objects::read_descriptor(state, host, task_id, &entry)?;
-    Some((entry, bytes))
+    Some((entry, std::sync::Arc::clone(&resource.descriptor)))
 }
-
 
 /// Resolve a sampled texture ref to `(width, height, mapping_id, source)`.
 ///
@@ -1028,12 +1094,20 @@ pub(super) fn sampled_texture_descriptor<M: HostMemory>(
 ///   both page-reading rungs, so nothing below would have corrected it. Two
 ///   uncorrected stale binds on a repainted surface is the "renders correctly
 ///   for a few frames, then stays corrupted" report.
+///
+/// On a unified host, an admitted guest-backed target changes the first fact:
+/// the resident is not a copy of the pages, it is the guest allocation itself.
+/// Sampling it binds the same resource the render pass attached, so guest CPU
+/// writes cannot make a second copy stale and the guest-write currency ladder
+/// has no question to answer. `t11sample_ready_guest_allocation` and
+/// `t11sample_ready_device_allocation` keep that population measurable. The
+/// copied resident retains every rung and witness below.
 pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
-    entry: Option<ListObjectEntry>,
+    resource: Option<std::sync::Arc<crate::model::TaskResource>>,
     may_bind_resident: bool,
 ) -> Option<(u32, u32, u32, SampledSourceRequest)> {
     if texture_ref == 0 {
@@ -1043,16 +1117,30 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     // Opcode-9 buffer-backed texture (type-8): the sampled bytes are an MTLBuffer's
     // guest storage, not a view over another texture. Resolve it directly before
     // the view/surface paths (which would mis-decode the opcode-9 descriptor).
-    // `entry` (when supplied by the caller) reuses the object-list read this call
-    // and its buffer-texture / view classification below would otherwise each
-    // repeat — the guest object list is immutable for the draw.
-    if let Some(bt) = buffer_texture_descriptor(state, host, task_id, texture_ref, entry) {
+    // `resource` (when supplied by the caller) serves every classification and
+    // descriptor consumer below from the one retained object.
+    if let Some(bt) = buffer_texture_descriptor(
+        state,
+        host,
+        task_id,
+        texture_ref,
+        resource.as_deref(),
+    ) {
+        // The opcode-9 descriptor's own pixel format. The loader converts to
+        // RGBA8 order and decodes nothing, so the transfer function the guest
+        // declared is still the one these bytes carry.
+        let source = bt.desc.pixel_format;
         let (w, h, rgba) = load_buffer_texture_rgba(state, host, task_id, texture_ref, &bt)?;
         return Some((
             w,
             h,
             0,
-            SampledSourceRequest::Bytes(std::sync::Arc::new(rgba), None, TexelLayout::Rgba8),
+            SampledSourceRequest::Bytes(
+                std::sync::Arc::new(rgba),
+                None,
+                SampledByteFormat::from_source(TexelLayout::Rgba8, source),
+                crate::backend::vulkan::engine::SampledByteOrigin::BufferBackedTexture,
+            ),
         ));
     }
 
@@ -1065,25 +1153,28 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     //   type-4 Surface         — the ref *is* the surface id
     //   type-11 IOSurface      — resolves to the mapping id it was created on
     //
-    // `resolve_type11_ref` re-reads this same entry and returns `None` for every
-    // type but 11, so it can only ever fill a slot the classification above left
-    // empty. Hence an `Option`, not a list of candidates to choose between.
+    // The retained resource already carries the total typed decode. Type 11 can
+    // therefore fill the slot directly from that object rather than looking up
+    // and decoding the same reference a second time. It returns `None` for every
+    // other type, so it can only fill a slot the classification above left empty.
+    // Hence an `Option`, not a list of candidates to choose between.
     let mut is_linear_tex = false;
     let mut is_type5 = false;
     let mut type5_view: Option<objects::Type5TextureView> = None;
     let mut surface: Option<u32> = None;
-    let resolved_entry =
-        entry.or_else(|| objects::lookup_list_entry(state, host, task_id, texture_ref));
-    if let Some(entry) = resolved_entry {
+    let resolved_resource = resource.or_else(|| {
+        objects::resolve_resource(state, host, task_id, texture_ref).ok()
+    });
+    if let Some(resource) = resolved_resource.as_ref() {
+        let entry = resource.entry;
         if entry.object_type == objects::OBJECT_TYPE_REF_TEXTURE {
             is_type5 = true;
-            if let Some(desc) = objects::read_descriptor(state, host, task_id, &entry) {
-                if let Ok(t5) = reims_vgpu_wire::device_desc::type5_header(&desc) {
-                    let sid = t5.surface_id.get();
-                    if sid != 0 {
-                        type5_view = objects::decode_type5_texture_view(&desc);
-                        surface = Some(sid);
-                    }
+            let desc = &resource.descriptor;
+            if let Ok(t5) = reims_vgpu_wire::device_desc::type5_header(desc) {
+                let sid = t5.surface_id.get();
+                if sid != 0 {
+                    type5_view = objects::decode_type5_texture_view(desc);
+                    surface = Some(sid);
                 }
             }
         }
@@ -1101,17 +1192,16 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         // type-11 hit it can return: the resolve records the ref as live in the
         // task's object set and reports a typed failure when the descriptor is
         // unreadable. Both are wanted for any ref a draw sampled.
-        surface = surface.or(objects::resolve_type11_ref(
-            state,
-            host,
-            task_id,
-            texture_ref,
-        ));
+        surface = surface.or_else(|| {
+            resolved_resource.as_ref().and_then(|resource| {
+                objects::resolve_type11_resource(state, task_id, texture_ref, resource)
+            })
+        });
     }
 
     if let Some(mid) = surface {
         // Ensure type-4 pages exist for this surface id.
-        let _ = objects::ensure_surface_for_present(state, host, mid);
+        let _ = objects::ensure_surface_for_texture_bind(state, host, mid);
         // A type-5 serialized record is the exact Metal texture view over the
         // IOSurface bytes. Materialize it only when it differs from (or cannot
         // be inferred from) the base mapping. Exact base views keep the fast
@@ -1135,7 +1225,9 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // it samples byte-identically (video NV12 R8/RG8, BGRA8/
                 // RGBA8). This bypasses the ~1.5 MB/plane/frame CPU read +
                 // upload the CPU loader below would pay every decoded frame.
-                if let Some(src) = try_type5_sample_zero_copy(state, host, mid, view) {
+                if let Some(src) = resolved_resource.as_ref().and_then(|resource| {
+                    try_type5_sample_zero_copy(state, host, mid, view, resource.lifetime_ref())
+                }) {
                     // Success path: a healthy video decodes ~2 planes/frame,
                     // so this fires per-bind (~99k lines/boot). The aggregate
                     // lives in `sampled_branch_census` (`t5_zc=count:bytes`),
@@ -1154,23 +1246,20 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     w,
                     h,
                     mid,
-                    SampledSourceRequest::Bytes(rgba, Some(identity), byte_format),
+                    SampledSourceRequest::Bytes(
+                        rgba,
+                        Some(identity),
+                        byte_format,
+                        crate::backend::vulkan::engine::SampledByteOrigin::SerializedSurfaceView,
+                    ),
                 ));
             }
         }
         if let Some(m) = state.mappings.get(&mid) {
             if m.has_geom && m.width > 0 && m.height > 0 {
                 let (w, h) = (m.width, m.height);
-                // Attribute the resident-readiness/bind sub-slice of the resolve so
-                // the census can separate engine-lock cost (this block) from the
-                // object-list decode prelude. This block acquires the global engine
-                // lock (`resident_content_ready`), the suspected dock-hover-freeze
-                // contention site.
-                // Resident-surface identity: computed once and reused for both the
-                // readiness check and the direct bind. `surface_identity` locks a
-                // global dedup mutex and does an output-group lookup; this bind
-                // resolves the same (mid, w, h), so recomputing it per resident
-                // sample (the census shows ~29k/session) is pure waste.
+                // Compute the resident-surface identity once and reuse it for
+                // both the readiness check and the direct bind.
                 let resident_id =
                     crate::runtime::present_identity::surface_identity(state, mid, w, h);
                 // `content_ready` only. The obvious strengthening — also require
@@ -1188,8 +1277,54 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // change. What guards this rung today is the guest-write witness
                 // below, which is the witness the LOAD elision's epoch pair
                 // cannot supply anyway.
-                let resident_ready =
-                    crate::backend::vulkan::engine::resident_content_ready(&resident_id);
+                let resident_backing = resolved_resource
+                    .as_ref()
+                    .filter(|resource| {
+                        resource_type_owns_surface_resident(resource.entry.object_type)
+                    })
+                    .map(|resource| resource.resident_target_backing(&resident_id))
+                    // An unclassified ref has no resource object to own a
+                    // lease. Keep its existing query path so compatibility
+                    // traffic still reaches the copying rails.
+                    .unwrap_or_else(|| {
+                        crate::backend::vulkan::engine::resident_content_backing(&resident_id)
+                    });
+                let resident_ready = resident_backing
+                    != crate::backend::vulkan::engine::ResidentContentBacking::NotReady;
+                if resident_ready {
+                    crate::runtime::drain::note_store_route(match resident_backing {
+                        crate::backend::vulkan::engine::ResidentContentBacking::GuestAllocation => {
+                            "t11sample_ready_guest_allocation"
+                        }
+                        crate::backend::vulkan::engine::ResidentContentBacking::DeviceAllocation => {
+                            "t11sample_ready_device_allocation"
+                        }
+                        crate::backend::vulkan::engine::ResidentContentBacking::NotReady => {
+                            unreachable!("resident_ready excludes this arm")
+                        }
+                    });
+                }
+                // A render attachment and a sampled binding name the same
+                // texture resource. When that resource's storage is the guest
+                // allocation itself, a guest CPU write changes the resource;
+                // it cannot make a second resident copy stale because there is
+                // no second copy. Bind it directly before entering the currency
+                // ladder, which exists for device-allocation mirrors.
+                //
+                // A non-identity view still falls through. The target bind
+                // cannot carry that view's channel remap yet, so treating it as
+                // direct would preserve the bytes and sample the wrong logical
+                // channels.
+                if guest_allocation_sample_is_direct(resident_backing, may_bind_resident) {
+                    crate::runtime::drain::note_store_route("t11rung_resident");
+                    let format = resident_id.resident_format();
+                    return Some((
+                        w,
+                        h,
+                        mid,
+                        SampledSourceRequest::Target(resident_id, format),
+                    ));
+                }
 
                 // What the hypervisor can say about the guest's own stores into
                 // this surface since the Store that produced our copies of it.
@@ -1257,7 +1392,13 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 } else if resident_ready {
                     if !guest_replaced {
                         note_type11_sample_rung("t11rung_resident", guest_write);
-                        return Some((w, h, mid, SampledSourceRequest::Target(resident_id)));
+                        let format = resident_id.resident_format();
+                        return Some((
+                            w,
+                            h,
+                            mid,
+                            SampledSourceRequest::Target(resident_id, format),
+                        ));
                     }
                     note_type11_sample_rung("t11rung_resident_refused", guest_write);
                     match guest_owned {
@@ -1344,17 +1485,15 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 //
                 // `ResidentTargetSlot::gpu_only_content` closed it at the
                 // reclaim end, which is the only end that can be closed: both
-                // selectors that choose a victim, `plan_idle_drain` and
-                // `recoverable_residents`, now skip such a slot at any age and
-                // any population, and the capacity walk exceeds its cap rather
-                // than take one. So **a resident that reaches this arm was, by
+                // allocation-pressure recovery skips such a slot at any
+                // population. So **a resident that reaches this arm was, by
                 // construction, not the sole copy of its pixels when it was
                 // reclaimed** — something had copied them out, which is what
                 // cleared the flag.
                 //
                 // The guarantee therefore does not live here and cannot be
                 // asserted here; it lives beside those two selectors, held by
-                // `a_resident_that_is_the_only_copy_of_its_pixels_is_never_aged_out`,
+                // `elapsed_time_never_reclaims_a_live_resident`,
                 // `the_capacity_walk_finds_no_victim_rather_than_destroy_the_only_copy`
                 // and `no_reclaim_cause_may_take_the_only_copy_of_a_frame` —
                 // the last of which is exhaustive over `ResidentReclaim`, so a
@@ -1364,7 +1503,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // What the line below still reports is a **cost**, not a
                 // soundness risk: this device paid for the reclaim by re-reading
                 // guest pages. It stays on the fail channel because the reclaim
-                // cutoff is a measured trade (see `IDLE_TARGET_AGE_MS`) and the
+                // cutoff is a measured trade (see `IDLE_MAINTENANCE_START_MS`) and the
                 // reliance on it should stay visible, not because a firing means
                 // something was lost.
                 if !resident_ready {
@@ -1379,7 +1518,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                         // censored out of it and a reclaim policy tuned from it
                         // is tuned from data it destroyed the tail of. A
                         // resident read here had gone at least
-                        // `IDLE_TARGET_AGE_MS + since_ms` between uses.
+                        // `IDLE_MAINTENANCE_START_MS + since_ms` between uses.
                         crate::runtime::drain::note_store_route(reclaimed_resample_band(since_ms));
                         if crate::observe::first_sight("sampled_resident_reclaimed", u64::from(mid))
                         {
@@ -1444,11 +1583,22 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                         generation: host_gen,
                     });
                     note_type11_sample_rung("t11rung_host_cache", guest_write);
+                    // BGRA8 by construction — it is a type-4 scanout cache — but
+                    // the *values* in it are the surface's, and this cache is
+                    // filled from a writeback that reorders channels and decodes
+                    // nothing. So the transfer function is the mapping's declared
+                    // one, exactly as it is on the guest-page rungs below.
+                    let source = crate::runtime::draw::mapping_declared_format(state, mid, None);
                     return Some((
                         w,
                         h,
                         mid,
-                        SampledSourceRequest::Bytes(bgra, identity, TexelLayout::Bgra8),
+                        SampledSourceRequest::Bytes(
+                            bgra,
+                            identity,
+                            SampledByteFormat::from_source(TexelLayout::Bgra8, source),
+                            crate::backend::vulkan::engine::SampledByteOrigin::SurfaceHostCache,
+                        ),
                     ));
                 }
 
@@ -1458,20 +1608,28 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // guest bytes are taken unconditionally. Declining the gather is
                 // expected control flow — the CPU byte loader below serves the
                 // same pixels — so it stays quiet, like the type-2/3 rail's.
-                if let Some(src) = try_type11_sample_zero_copy(state, host, mid, w, h) {
+                if let Some(src) = resolved_resource.as_ref().and_then(|resource| {
+                    try_type11_sample_zero_copy(state, host, mid, w, h, resource.lifetime_ref())
+                }) {
                     note_type11_sample_rung("t11rung_zero_copy", guest_write);
                     return Some((w, h, mid, src));
                 }
                 // The memo skips the convert/alloc on unchanged content and
                 // returns a content identity so the engine skips re-hash+upload;
                 // its census (T11Memo hit / T11Guest fill) is emitted internally.
+                let memo_source = crate::runtime::draw::mapping_declared_format(state, mid, None);
                 if let Some((rgba, identity)) = load_type11_rgba_memoized(state, host, mid) {
                     note_type11_sample_rung("t11rung_guest_memo", guest_write);
                     return Some((
                         w,
                         h,
                         mid,
-                        SampledSourceRequest::Bytes(rgba, Some(identity), TexelLayout::Rgba8),
+                        SampledSourceRequest::Bytes(
+                            rgba,
+                            Some(identity),
+                            SampledByteFormat::from_source(TexelLayout::Rgba8, memo_source),
+                            crate::backend::vulkan::engine::SampledByteOrigin::SurfaceGuestFallback,
+                        ),
                     ));
                 }
 
@@ -1502,70 +1660,175 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         // the CPU host-cache/memo byte paths below for eligible formats (the
         // lin_memo full-window re-read + memcmp per bind was the dominant
         // per-draw cost under compositor load).
-        // Resolve + decode the texture descriptor ONCE for both linear loaders
-        // below. The zero-copy attempt (which returns None on the ~35k/session
-        // cache-fallback majority) and the host-cache fallback each read the same
-        // descriptor blob and run the identical `decode_texture_descriptor`; the
-        // object list is immutable for the draw, so one read+decode serves both.
-        // Both readers take only the decoded descriptor.
-        if let Some(tex) = resolved_entry.and_then(|e| {
-            objects::read_descriptor(state, host, task_id, &e)
-                .and_then(|d| decode_texture_descriptor(&d).ok())
-        }) {
+        // The object map retains the typed construction descriptor for the
+        // resource lifetime. Both linear loaders consume that same object here;
+        // neither needs to revisit guest construction bytes.
+        if let Some(tex) =
+            resolved_resource
+                .as_ref()
+                .and_then(|resource| match resource.decoded() {
+                    Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) => Some(tex),
+                    _ => None,
+                })
+        {
             // Above the gather: a span whose pages a render Store published and
             // nothing has written since is already an engine image, so there is
             // nothing to gather and — the point of the rung — no writeback to
             // wait for. See [`try_gva_resident_sample`].
             if may_bind_resident {
-                if let Some((w, h, src)) = try_gva_resident_sample(state, host, task_id, &tex) {
+                if let Some((w, h, src)) =
+                    try_gva_resident_sample(state, host, task_id, texture_ref, tex)
+                {
                     return Some((w, h, 0, src));
                 }
             }
-            if let Some((w, h, src)) =
-                try_linear_sample_zero_copy(state, host, task_id, texture_ref, &tex)
-            {
+            if let Some((w, h, src)) = try_linear_sample_zero_copy(
+                state,
+                host,
+                task_id,
+                texture_ref,
+                tex,
+                resolved_resource.as_ref()?.lifetime_ref(),
+            ) {
                 return Some((w, h, 0, src));
             }
             if let Some((w, h, rgba, identity, byte_format)) =
-                load_linear_from_host_caches(state, host, task_id, texture_ref, &tex)
+                load_linear_from_host_caches(state, host, task_id, texture_ref, tex)
             {
                 return Some((
                     w,
                     h,
                     0,
-                    SampledSourceRequest::Bytes(rgba, identity, byte_format),
+                    SampledSourceRequest::Bytes(
+                        rgba,
+                        identity,
+                        byte_format,
+                        crate::backend::vulkan::engine::SampledByteOrigin::LinearTexture,
+                    ),
                 ));
             }
         }
     }
 
-    // Linear / view path returns only RGBA; the geometry comes from the decoded
-    // texture descriptor and from nowhere else. Neither a payload shorter than
-    // the descriptor's own `width * height * 4` nor a descriptor naming no
-    // extent at all is a geometry this call may invent one for: the caller turns
-    // `None` into a typed `DrawPreparationDecline::TextureResolveMissing`, which
-    // names the ref and the stage. `TextureDescriptor::extent` owns the second
-    // check and says what clamping the two fields up would have bound instead.
-    let mut rgba = load_sampled_rgba_static(
+    // The last-resort sampled rung. The geometry comes from the decoded texture
+    // descriptor and from nowhere else. Neither a payload shorter than the
+    // descriptor's own extent nor a descriptor naming no extent at all is a
+    // geometry this call may invent one for: the caller turns `None` into a
+    // typed `DrawPreparationDecline::TextureResolveMissing`, which names the ref
+    // and the stage. `TextureDescriptor::extent` owns the second check and says
+    // what clamping the two fields up would have bound instead.
+    //
+    // The layout is carried rather than assumed. This rung answered
+    // `TexelLayout::Rgba8` unconditionally and sized its own length check at
+    // four bytes a texel, so it was the one place a half-float texture could
+    // still be quantised after every rail above it learned not to — and it is
+    // the rung a `RGBA16Float` display-profile LUT actually lands on, because
+    // the three rungs above are reached only for a resource the draw already
+    // knows is a linear texture.
+    let (mut bytes, layout) = load_sampled_rgba_static(
         state,
         host,
         task_id,
         texture_ref,
+        native_uploads_asking_host(),
         crate::runtime::render_writeback::SettleSite::LinearTextureSampled,
     )?;
     let (_entry, desc) = sampled_texture_descriptor(state, host, task_id, texture_ref)?;
-    let (w, h) = decode_texture_descriptor(&desc).ok()?.extent()?;
-    let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
-    if rgba.len() < need {
+    let tex = decode_texture_descriptor(&desc).ok()?;
+    let (w, h) = tex.extent()?;
+    let planes = tex.levels.first()?.planes();
+    let need = (w as usize)
+        .saturating_mul(h as usize)
+        .saturating_mul(planes as usize)
+        .saturating_mul(layout.layout().bytes_per_texel() as usize);
+    if bytes.len() < need {
         return None;
     }
-    rgba.truncate(need);
+    bytes.truncate(need);
     Some((
         w,
         h,
         0,
-        SampledSourceRequest::Bytes(std::sync::Arc::new(rgba), None, TexelLayout::Rgba8),
+        SampledSourceRequest::Bytes(
+            std::sync::Arc::new(bytes),
+            None,
+            layout,
+            crate::backend::vulkan::engine::SampledByteOrigin::LinearTexture,
+        ),
     ))
+}
+
+/// Whether a decoded resource object owns the resident reached by the surface
+/// branch above.
+///
+/// Base surfaces, texture views, and IOSurface textures are three construction
+/// forms of a texture object. Each carries one stable resource reference for
+/// its lifetime; a view additionally names its parent, but that does not make
+/// its own reference transient. Other object kinds can reach this resolver as
+/// probes, but cannot produce the `surface` value whose resident is retained.
+fn resource_type_owns_surface_resident(object_type: u8) -> bool {
+    matches!(
+        object_type,
+        objects::OBJECT_TYPE_SURFACE
+            | objects::OBJECT_TYPE_REF_TEXTURE
+            | crate::runtime::decode::resource::OBJECT_TYPE_IOSURFACE
+    )
+}
+
+/// Whether a decoded resource object owns a linear GVA texture resident.
+///
+/// Normal textures and their serialized variants carry one stable resource
+/// reference from construction until deletion. Their level-zero GVA identity
+/// may therefore retain the engine allocation for that same lifetime. Surface
+/// texture forms use [`resource_type_owns_surface_resident`] instead, while an
+/// anonymous attachment keeps the registry-query fallback.
+fn resource_type_owns_gva_resident(object_type: u8) -> bool {
+    matches!(
+        object_type,
+        crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE
+            | crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VARIANT
+    )
+}
+
+#[cfg(test)]
+mod resource_resident_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn every_surface_texture_construction_form_owns_its_resident() {
+        for object_type in [
+            objects::OBJECT_TYPE_SURFACE,
+            objects::OBJECT_TYPE_REF_TEXTURE,
+            crate::runtime::decode::resource::OBJECT_TYPE_IOSURFACE,
+        ] {
+            assert!(resource_type_owns_surface_resident(object_type));
+        }
+        for object_type in [
+            crate::runtime::decode::resource::OBJECT_TYPE_BUFFER,
+            crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE,
+            crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VARIANT,
+        ] {
+            assert!(!resource_type_owns_surface_resident(object_type));
+        }
+    }
+
+    #[test]
+    fn linear_texture_construction_forms_own_their_gva_resident() {
+        for object_type in [
+            crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE,
+            crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VARIANT,
+        ] {
+            assert!(resource_type_owns_gva_resident(object_type));
+        }
+        for object_type in [
+            objects::OBJECT_TYPE_SURFACE,
+            objects::OBJECT_TYPE_REF_TEXTURE,
+            crate::runtime::decode::resource::OBJECT_TYPE_IOSURFACE,
+            crate::runtime::decode::resource::OBJECT_TYPE_BUFFER,
+        ] {
+            assert!(!resource_type_owns_gva_resident(object_type));
+        }
+    }
 }
 
 #[inline]
@@ -1807,6 +2070,20 @@ enum Type11SeedRung {
     GuestPages,
 }
 
+/// A type-11 attachment's prior contents, kept in the representation of the
+/// freshest rung that supplied them.
+enum Type11LoadSeed {
+    /// Host-owned bytes from the render cache, or the universal converted
+    /// fallback when the native guest-page view cannot be described.
+    Host(
+        std::sync::Arc<Vec<u8>>,
+        crate::backend::vulkan::engine::SeedOrder,
+    ),
+    /// The mapping's native texels as bounded guest-RAM runs. The engine imports
+    /// them when possible and uses the runs themselves for its CPU fallback.
+    Guest(crate::backend::vulkan::engine::GuestTargetSeed),
+}
+
 impl Type11SeedRung {
     fn name(self) -> &'static str {
         match self {
@@ -1909,13 +2186,13 @@ fn note_type11_load_seed(
 ///    hardcoded `[0,0,0,0]` primary clear and the matching Store published that
 ///    wipe, which is a whole compositing layer going solid black.
 ///
-/// `load_type11_mapping_rgba` reads at the mapping's own latched geometry and
-/// converts to RGBA8, so the length check is what confirms the pass wanted that
-/// extent — the engine rejects a seed of any other length, and the decline this
-/// falls through to carries both geometries so a mismatch is diagnosable rather
-/// than silent. `paint_mapping` underneath it lands every intersecting deferred
-/// window first, so the read observes our own not-yet-written-back Stores rather
-/// than pre-Store bytes.
+/// The guest-pages rung preserves the mapping's native texels as bounded runs.
+/// The engine imports or gathers those runs and copies them straight into the
+/// same-format attachment; when the host cannot expose stable aliases, the
+/// existing RGBA reader remains the universal fallback. Both arms use the
+/// mapping's latched geometry, and the engine validates the exact strided span
+/// before recording the copy. Any writeback debt is paid before the page view is
+/// built, so it observes this device's latest Store rather than pre-Store bytes.
 ///
 /// The sibling Metal path already had rung 2: type-11 `seed_color_load` falls
 /// through to the same reader via `load_sampled_rgba_static`. Only the Vulkan arm
@@ -1923,27 +2200,11 @@ fn note_type11_load_seed(
 ///
 /// `None` means the guest's LOAD could not be honoured at all, and
 /// [`note_type11_load_seed`] has already said which check refused.
-/// Band how long after this device destroyed a resident the guest came back to
-/// sample it, in multiples of the age at which the drain destroyed it.
-///
-/// The missing half of `resident_resample_peak_ms`. That peak measures the gap
-/// between two reads of a resident that *survived* both, so it cannot see a gap
-/// longer than `IDLE_TARGET_AGE_MS` — the resident it would have been measured
-/// on was destroyed partway through, and the sample that would have closed the
-/// interval falls through to the guest's pages instead. Tuning the cutoff from
-/// that peak means tuning it from a distribution the policy truncates, and it
-/// will always look like the cutoff is just barely enough.
-///
-/// A resident read `since_ms` after being reclaimed had gone at least
-/// `IDLE_TARGET_AGE_MS + since_ms` between uses, so these bands are the tail:
-/// `gt_4x` means the guest's real re-use interval on that surface is more than
-/// five times the cutoff.
-///
-/// Multiples of the cutoff rather than absolute milliseconds, for the reason
-/// `resident_resample_band`'s are fractions of it: a reading must not outlive
-/// the bound it was taken against.
+/// Band how long after pressure recovery the guest wanted the resident again.
+/// The fixed reference interval keeps existing census buckets comparable; it
+/// has no role in deciding whether the resident remains alive.
 fn reclaimed_resample_band(since_ms: u64) -> &'static str {
-    let cutoff = crate::backend::vulkan::engine::IDLE_TARGET_AGE_MS;
+    let cutoff = crate::backend::vulkan::engine::IDLE_MAINTENANCE_START_MS;
     if since_ms < cutoff {
         "t11sample_reclaimed_within_1x_cutoff"
     } else if since_ms < cutoff * 2 {
@@ -1955,34 +2216,142 @@ fn reclaimed_resample_band(since_ms: u64) -> &'static str {
     }
 }
 
+/// Whether one shader stage occupies any binding number in the **sampled band**,
+/// which holds textures and samplers together.
+///
+/// The band's relocation — `separate_sampled` — is what stops one stage's
+/// binding number landing on the other's, so the question it has to be triggered
+/// from is about the whole band and not about half of it. Asking only about
+/// textures leaves a stage that binds a sampler and no texture invisible to the
+/// trigger, and Metal argument tables are sticky across draws in an encoder, so
+/// a vertex sampler routinely survives a re-bind that zeroed the vertex
+/// textures. With the two stages unseparated their sampler at index 0 resolves
+/// to one binding, `push_smp` is first-writer-wins, and the loser's filter,
+/// address mode and LOD clamp are dropped while the layout's
+/// `VERTEX | FRAGMENT` stage flags let it go on sampling through the winner's.
+///
+/// A ref of zero is not a bind: it is the guest leaving a slot empty, which is
+/// the same reading `push_smp`'s own callers take.
+fn stage_uses_sampled_band(textures: &[TextureBind], samplers: &[SamplerBind]) -> bool {
+    textures.iter().any(|t| t.texture_ref != 0) || samplers.iter().any(|s| s.sampler_ref != 0)
+}
+
+fn try_type11_target_guest_seed<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    w: u32,
+    h: u32,
+    target_format: ash::vk::Format,
+) -> Option<crate::backend::vulkan::engine::GuestTargetSeed> {
+    use crate::backend::vulkan::engine::{GuestRunSource, GuestTargetSeed};
+    use crate::runtime::mapping_write::type11_sample_window;
+
+    if w == 0 || h == 0 || !mapper::ensure_resolved_for_scanout(state, host, mapping_id) {
+        return None;
+    }
+    let (base_off, bpr, layout) = {
+        let mapping = state.mappings.get(&mapping_id)?;
+        if !mapping.mapped
+            || mapping.page_entries.is_empty()
+            || !mapping.has_geom
+            || mapping.width != w
+            || mapping.height != h
+        {
+            return None;
+        }
+        let format = if mapping.format == 0 {
+            pixel_format::MTL_FORMAT_BGRA8_UNORM
+        } else {
+            mapping.format
+        };
+        let layout = pixel_format::store_texel_order(format)?;
+        let (base_off, bpr, _) = type11_sample_window(mapping, w, h, format)?;
+        (base_off, u64::from(bpr), layout)
+    };
+    let source_format = translate::pixel::vk_texel_layout(layout);
+    if source_format != target_format {
+        return None;
+    }
+    let (span, row_length_texels) =
+        strided_window_extent(w, h, u64::from(layout.bytes_per_texel()), bpr)?;
+
+    // A debt is not submitted work, so queue order cannot put it before the
+    // seed read until this call turns it into work. A submitted payment and the
+    // draw use the same queue; no CPU settle is needed between them.
+    crate::runtime::writeback_debt::pay_for_mapping(state, host, mapping_id);
+    let (gpas, runs) = mapping_window_guest_runs(state, host, mapping_id, base_off, span)?;
+    let page = state.page_size();
+    Some(GuestTargetSeed {
+        source: GuestRunSource {
+            runs: std::sync::Arc::new(runs),
+            source_offset: 0,
+            total_len: span,
+            row_length_texels,
+            pages: guest_page_window(host, gpas, page, base_off % page, span),
+            direct_image: None,
+        },
+        format: source_format,
+    })
+}
+
 fn resolve_type11_load_seed<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
     w: u32,
     h: u32,
-) -> Option<(
-    std::sync::Arc<Vec<u8>>,
-    crate::backend::vulkan::engine::SeedOrder,
-)> {
+    target_format: ash::vk::Format,
+) -> Option<Type11LoadSeed> {
     use crate::backend::vulkan::engine::SeedOrder;
-    let served =
-        if let Some(bgra) = crate::runtime::surface_cache::get_shared(state, mapping_id, w, h) {
-            Some((bgra, SeedOrder::Bgra8, Type11SeedRung::Cache))
-        } else {
-            load_type11_mapping_rgba(state, host, mapping_id, None)
-                .map(|(_, _, r)| r)
-                .filter(|rgba| rgba.len() == (w as usize) * (h as usize) * 4)
-                .map(|rgba| {
-                    (
-                        std::sync::Arc::new(rgba),
-                        SeedOrder::Rgba8,
-                        Type11SeedRung::GuestPages,
-                    )
-                })
-        };
-    note_type11_load_seed(state, mapping_id, w, h, served.as_ref().map(|s| s.2));
-    served.map(|(bytes, order, _)| (bytes, order))
+    // The cache is the other host-side copy of these pages, and it sits above
+    // the only rung that reads the pages themselves — so a stale hit here is
+    // never corrected by anything below it. It takes the same witness the
+    // sampled path's read of this same map takes (`resolve_sampled_source`'s
+    // `guest_replaced`), spelled the same way and for the same reason: the
+    // coarse token says whether the guest wrote the *allocation*, and only when
+    // it did is the page list walked to say whether it wrote the *pixels*.
+    //
+    // Without it this rung served exactly the frame the elision gate two frames
+    // up had just refused. The caller computes `type11_guest_wrote_since_store`
+    // to decide whether the resident may carry the chain, declines when it says
+    // written, and then arrived here to be handed the same stale bytes out of
+    // the host cache. The pass composites onto them and its Store publishes
+    // them back over the guest's pages, which is the fixpoint this file's own
+    // note above `type11_load_currency_query` calls "renders correctly for a few
+    // frames then stays corrupted".
+    let guest_write = mapping_guest_write_verdict(state, host, mapping_id);
+    let site = guest_wrote_allocation(guest_write)
+        .then(|| guest_write_site(state, host, mapping_id, w, h));
+    let guest_replaced = !matches!(site, None | Some(GuestWriteSite::Elsewhere));
+    if guest_replaced {
+        crate::runtime::drain::note_store_route("t11seed_cache_refused_guest_wrote");
+    }
+    let cached = (!guest_replaced)
+        .then(|| crate::runtime::surface_cache::get_shared(state, mapping_id, w, h))
+        .flatten();
+    let served = if let Some(bgra) = cached {
+        Some((
+            Type11LoadSeed::Host(bgra, SeedOrder::Bgra8),
+            Type11SeedRung::Cache,
+        ))
+    } else {
+        try_type11_target_guest_seed(state, host, mapping_id, w, h, target_format)
+            .map(|seed| (Type11LoadSeed::Guest(seed), Type11SeedRung::GuestPages))
+            .or_else(|| {
+                load_type11_mapping_rgba(state, host, mapping_id, None)
+                    .map(|(_, _, r)| r)
+                    .filter(|rgba| rgba.len() == (w as usize) * (h as usize) * 4)
+                    .map(|rgba| {
+                        (
+                            Type11LoadSeed::Host(std::sync::Arc::new(rgba), SeedOrder::Rgba8),
+                            Type11SeedRung::GuestPages,
+                        )
+                    })
+            })
+    };
+    note_type11_load_seed(state, mapping_id, w, h, served.as_ref().map(|s| s.1));
+    served.map(|(seed, _)| seed)
 }
 
 /// Materialize the exact serialized Metal view carried by a type-5 object.
@@ -2131,13 +2500,34 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     // native rail for the same reason and one more: `texel_to_rgba8` has no arm
     // for them, because an arm would have to narrow ten bits of graded luma to
     // eight. `TexelLayout::has_cpu_loader_arm` is where that is stated.
-    let byte_format = match view.pixel_format {
-        pixel_format::MTL_FORMAT_R8_UNORM => TexelLayout::R8,
-        pixel_format::MTL_FORMAT_RG8_UNORM => TexelLayout::Rg8,
-        pixel_format::MTL_FORMAT_R16_UNORM => TexelLayout::R16Unorm,
-        pixel_format::MTL_FORMAT_RG16_UNORM => TexelLayout::Rg16Unorm,
-        _ => TexelLayout::Rgba8,
-    };
+    //
+    // The half-float colour pair is deliberately **not** here yet. It belongs
+    // by the same argument the linear rails took — `texel_to_rgba8`'s arm for
+    // it clamps to `[0, 1]` and quantizes to 256 levels — but nothing has ever
+    // measured a type-5 view arriving in one, and this rail is the video-plane
+    // rail. `type5_view_narrowed` below is the measurement; add the arm when it
+    // fires, not before.
+    //
+    // The packed 32-bit colour formats take the native rail for the same
+    // reason and a sharper one: their channel boundaries are not byte
+    // boundaries, so `TexelLayout::Rgba8` would not merely quantize them, it
+    // would read the word as four unrelated bytes. Four bytes wide is exactly
+    // what the default arm below tests for and exactly what makes that wrong,
+    // which is why they are named here rather than left to it.
+    // The layout is the view's own; the transfer function travels with it,
+    // because the default arm below converts to RGBA8 order and decodes nothing.
+    let byte_format = SampledByteFormat::from_source(
+        match view.pixel_format {
+            pixel_format::MTL_FORMAT_RG8_UNORM => TexelLayout::Rg8,
+            pixel_format::MTL_FORMAT_R16_UNORM => TexelLayout::R16Unorm,
+            pixel_format::MTL_FORMAT_RG16_UNORM => TexelLayout::Rg16Unorm,
+            pixel_format::MTL_FORMAT_RGB10A2_UNORM => TexelLayout::Rgb10a2Unorm,
+            pixel_format::MTL_FORMAT_BGR10A2_UNORM => TexelLayout::Bgr10a2Unorm,
+            pixel_format::MTL_FORMAT_RG11B10_FLOAT => TexelLayout::Rg11b10Float,
+            _ => TexelLayout::Rgba8,
+        },
+        view.pixel_format,
+    );
     let ok_line = |generation_source: &str, rgba: &[u8]| {
         // Per-draw success echo — fires on EVERY type-5 plane bind (thousands/sec
         // under video → ~36k lines/boot, 61% of the fail log), burying real
@@ -2177,7 +2567,7 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     // RGBA8 formats expand per-pixel into a fresh RGBA8 buffer; native R8/RG8
     // upload the plane bytes verbatim (the memo stores those bytes as both the
     // memcmp key and the upload payload).
-    let rgba: std::sync::Arc<Vec<u8>> = if byte_format == TexelLayout::Rgba8 {
+    let rgba: std::sync::Arc<Vec<u8>> = if byte_format.layout() == TexelLayout::Rgba8 {
         let Some(rgba_stride) = view.width.checked_mul(RGBA8_BPP) else {
             return fail(Type5ViewDecline::RgbaStride);
         };
@@ -2190,6 +2580,17 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
             });
         };
         let mut rgba = vec![0u8; rgba_len];
+        // The third CPU convert in this crate, and the third that said nothing
+        // when it lost precision. `byte_format`'s table above names the video
+        // plane formats natively and folds everything else here, so a half-float
+        // type-5 view is quantized on the same terms the linear rails were.
+        crate::runtime::draw::note_sampled_narrowing(
+            "type5_view_narrowed",
+            texture_ref,
+            view.pixel_format,
+            view.width,
+            view.height,
+        );
         for y in 0..view.height as usize {
             let src_off = y.saturating_mul(tight as usize);
             let dst_off = y.saturating_mul(rgba_stride as usize);
@@ -2214,10 +2615,10 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
         crate::model::GuestLinearMemo {
             native,
             rgba: rgba.clone(),
-            // The type-5 view path carries its own native format (R8/Rg8/…);
-            // this reused struct's `bgra8` flag is only read by the guest-linear
-            // memo, so it is not load-bearing here.
-            bgra8: false,
+            // The type-5 view path re-derives this from the view's own pixel
+            // format on every call, hit or miss, so storing it is a statement of
+            // what the bytes are rather than the source anything reads.
+            layout: byte_format.layout(),
             generation,
         },
         entry_bytes,
@@ -2234,9 +2635,10 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     ))
 }
 
-/// Zero-copy floor: below this the CPU byte path (one small read + memo) is
-/// cheaper than a cached-window import plus a recorded GPU gather. Performance
-/// threshold only — never a correctness gate.
+/// Copied sampled-gather floor: below this the CPU byte path (one small read +
+/// memo) is cheaper than a recorded buffer-to-image transfer. Performance
+/// threshold only — never a correctness gate and never a gate on a direct
+/// buffer-backed image.
 ///
 /// Set to 64 KiB from a video-playback census: after the type-5 plane rail
 /// landed, the whole remaining CPU copy under video was `t11_guest`
@@ -2251,10 +2653,11 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
 /// surfaces, so the band it opens to zero-copy is exactly those per-frame video
 /// composites.
 ///
-/// The floor is also the *only* thing that has ever declined the type-11
-/// gather: over 1 051 sampled declines it was 100% of them, which is why the
-/// rail no longer carries a reason enum to distinguish the rest.
-pub(super) const ZERO_COPY_SAMPLED_MIN_BYTES: u64 = 64 * 1024;
+/// Resource construction is independent of byte length: when a retained guest
+/// allocation can back the sampled image directly, that is the resource and no
+/// crossover is consulted. This floor applies only after direct construction
+/// is unavailable and the remaining GPU path would copy into another image.
+pub(super) const SAMPLED_GATHER_MIN_BYTES: u64 = 64 * 1024;
 
 /// Zero-copy floor for draw-time vertex/storage buffer binds. Performance
 /// threshold only — never a correctness gate; below it the bind takes the CPU
@@ -2305,11 +2708,12 @@ pub(super) const ZERO_COPY_BUFFER_MIN_BYTES: u64 = 16 * 1024;
 /// disappearing is not something a reader should have to infer from an absence,
 /// so the first refusal of the process says so by name.
 ///
-/// This is where the arm64 pathway now diverges: its MMIO shim can return a
+/// This is where the arm64 pathway diverges: its MMIO shim can return a
 /// `mach_vm_remap` view for a fragmented page list, and since that view is
 /// released on `unmap_pages` rather than retained until teardown, the shim
-/// answers 0. The x86 PCI shim never allocates — it refuses anything that is
-/// not a packed host-contiguous run — so it still answers 1.
+/// answers 0. The x86 PCI shim can assemble scattered file-backed guest pages
+/// into one packed alias and retains every such address until teardown, so it
+/// answers 1.
 fn guest_run_alias_available<M: HostOps>(host: &M) -> bool {
     if host.map_pages_stable() {
         return true;
@@ -2351,8 +2755,8 @@ pub(super) fn task_gva_guest_run_window<M: HostMemory + HostOps>(
     if gpas.len() as u64 != wanted {
         return Err(WindowRefusal::SpanUnmapped);
     }
-    let runs =
-        coalesce_pages_to_runs(host, &gpas, page, gva % page, span).ok_or(WindowRefusal::Untileable)?;
+    let runs = coalesce_pages_to_runs(host, &gpas, page, gva % page, span)
+        .ok_or(WindowRefusal::Untileable)?;
     Ok((gpas, runs))
 }
 
@@ -2551,6 +2955,348 @@ fn coalesce_pages_to_runs<M: HostOps>(
     Some(runs)
 }
 
+/// Ensure one linear resource has the packed host allocation shared by all of
+/// its buffer offsets or texture planes, returning whether that allocation is
+/// available. The caller then borrows it from
+/// [`crate::runtime::bound_buffers::BoundBuffers`]. A negative result is held
+/// under the same retirement rules as a positive one: mappings do not become
+/// complete without a map/object notification, and those notifications remove
+/// the entry.
+#[derive(Clone, Copy)]
+pub(super) enum PackedResourceRail {
+    Buffer,
+    LinearSample,
+}
+
+/// Band a scattered packed window by how many maximal GPA runs it is made of.
+///
+/// A window that refuses [`crate::runtime::guest_ram_map::reference_for_pages`]
+/// costs a `vkAllocateMemory` and a host virtual alias, and the alternative —
+/// one RAMBlock reference per run, which `references_for_runs` already builds
+/// for the gather rail — is only cheaper while the run count is small. A two-run
+/// window is two binds against one allocation; a five-hundred-run window is not.
+/// Nothing measured the distribution, so the choice cannot be made from the run
+/// count without this, and a `Scattered` refusal's own `runs` field is deduped
+/// by `report_once` and so reports the first window of a boot rather than the
+/// population.
+pub(super) fn packed_scatter_band(gpas: &[u64], page: u64) -> &'static str {
+    match reims_vgpu_paging::runs::contig_run_count(gpas, page) {
+        0 | 1 => "zc_packed_scatter_runs_1",
+        2 => "zc_packed_scatter_runs_2",
+        3..=4 => "zc_packed_scatter_runs_3_4",
+        5..=8 => "zc_packed_scatter_runs_5_8",
+        9..=16 => "zc_packed_scatter_runs_9_16",
+        17..=64 => "zc_packed_scatter_runs_17_64",
+        _ => "zc_packed_scatter_runs_65_up",
+    }
+}
+
+pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    resource_ref: u32,
+    backing: &BufferBacking,
+    rail: PackedResourceRail,
+) -> bool {
+    use crate::runtime::bound_buffers::{PackedBuffer, PackedBufferResolution};
+
+    if let Some(held) = state.bound_buffers.packed(task_id, resource_ref) {
+        let matches = match held {
+            PackedBufferResolution::Available(buffer) => {
+                buffer.gva == backing.gva && buffer.size == backing.size
+            }
+            PackedBufferResolution::Unavailable { gva, size } => {
+                *gva == backing.gva && *size == backing.size
+            }
+        };
+        if matches {
+            return matches!(held, PackedBufferResolution::Available(_));
+        }
+    }
+
+    let unavailable = || PackedBufferResolution::Unavailable {
+        gva: backing.gva,
+        size: backing.size,
+    };
+    let made = (|| {
+        if !guest_run_alias_available(host) {
+            return None;
+        }
+        let page = state.page_size();
+        let page_base = backing.gva & !(page - 1);
+        let head = backing.gva - page_base;
+        let map_len =
+            crate::contract::checked::align_up_u64(head.checked_add(backing.size)?, page)?;
+        // The one admission rule, which asks the map's standing refusal before
+        // the latches. Assembling it here from the latches alone is what let
+        // this rail import on a host that had already refused the whole map.
+        let align = crate::runtime::guest_ram_map::packed_alias_import_align(host, map_len)?;
+        let gpas = gva_mem::task_gva_page_gpas(
+            host,
+            &state.tasks,
+            task_id,
+            page_base,
+            map_len,
+            state.page_shift,
+        );
+        if gpas.len() as u64 != map_len / page {
+            return None;
+        }
+        let host_base = host.map_pages(&gpas, page as usize)?;
+        // A packed view answers a **scatter**: Vulkan host-pointer memory takes
+        // one contiguous host range, and a linear guest resource may name guest
+        // pages that are not contiguous. When this window's pages *are* one run
+        // there is no scatter to answer, and the bytes are already inside the
+        // RAMBlock import this device holds for the VM's lifetime — so importing
+        // them again allocates a second device memory over memory already
+        // imported, and pays the driver's page pinning for it.
+        //
+        // That was not a small cost. One driven Maps boot made **13 681**
+        // host-pointer imports totalling 5.05 s of `vkAllocateMemory`, and
+        // **12 380 of them were 4096 bytes** — a single page, which is one run by
+        // construction, so every one of those was answering a scatter that could
+        // not exist. `host_ram_import`'s own census doc states the invariant this
+        // broke: "one or two for a whole boot. A count that tracks the workload
+        // is a per-resource import".
+        //
+        // `reference_for_pages` is the existing resolver for exactly this
+        // question — it checks the run itself and refuses `Scattered` with a run
+        // count — so the contiguous case is routed to it rather than re-deciding
+        // contiguity here. `map_pages` above stays: on a contiguous window it
+        // hands back a direct RAMBlock alias, which is a lookup, and `runs` needs
+        // that host pointer either way.
+        let ramblock = crate::runtime::guest_ram_map::reference_for_pages(
+            host,
+            &gpas,
+            page,
+            head,
+            backing.size,
+        )
+        .ok()
+        .and_then(|guest| {
+            // `head` is an offset *into the import*, because every consumer
+            // spends it as `import.slice(head + offset, span)`. Against the
+            // RAMBlock import that is where this window's first byte sits in the
+            // block, not where it sits in a freshly mapped alias.
+            let base = guest.import().gpa_base()?;
+            let head_in_import = gpas.first()?.checked_add(head)?.checked_sub(base)?;
+            Some((std::sync::Arc::clone(guest.import()), head_in_import, guest))
+        });
+        let (import, head, guest) = match ramblock {
+            Some(resolved) => {
+                crate::runtime::drain::note_store_route("zc_packed_ramblock");
+                resolved
+            }
+            None => {
+                crate::runtime::drain::note_store_route("zc_packed_alias_import");
+                crate::runtime::drain::note_store_route(packed_scatter_band(&gpas, page));
+                let import = std::sync::Arc::new(
+                    crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                        host_base, map_len, align,
+                    )
+                    .ok()?,
+                );
+                let whole = import.slice(head, backing.size).ok()?;
+                let guest = crate::runtime::guest_ram::GuestRef::new(
+                    std::sync::Arc::clone(&import),
+                    whole,
+                )
+                .ok()?;
+                (import, head, guest)
+            }
+        };
+        Some(PackedBufferResolution::Available(PackedBuffer {
+            gva: backing.gva,
+            size: backing.size,
+            head,
+            import,
+            gpas: std::sync::Arc::new(gpas),
+            runs: std::sync::Arc::new(vec![crate::backend::vulkan::engine::GuestRun {
+                host_ptr: host_base.checked_add(head as usize)?,
+                len: backing.size,
+            }]),
+            pages: std::sync::Arc::new(vec![
+                crate::runtime::guest_ram_map::GuestWindowRun {
+                    window_offset: 0,
+                    guest,
+                },
+            ]),
+        }))
+    })()
+    .unwrap_or_else(unavailable);
+
+    crate::runtime::drain::note_store_route(match (rail, &made) {
+        (PackedResourceRail::Buffer, PackedBufferResolution::Available(_)) => {
+            "zc_buffer_packed_alias"
+        }
+        (PackedResourceRail::Buffer, PackedBufferResolution::Unavailable { .. }) => {
+            "zc_buffer_packed_unavailable"
+        }
+        (PackedResourceRail::LinearSample, PackedBufferResolution::Available(_)) => {
+            "zc_lin_packed_alias"
+        }
+        (PackedResourceRail::LinearSample, PackedBufferResolution::Unavailable { .. }) => {
+            "zc_lin_packed_unavailable"
+        }
+    });
+    let available = matches!(made, PackedBufferResolution::Available(_));
+    state
+        .bound_buffers
+        .insert_packed(task_id, resource_ref, made);
+    available
+}
+
+pub(super) fn slice_packed_buffer(
+    packed: &crate::runtime::bound_buffers::PackedBuffer,
+    offset: u64,
+    span: u64,
+) -> Option<crate::runtime::bound_buffers::BoundBuffer> {
+    offset.checked_add(span).filter(|&end| end <= packed.size)?;
+    Some(crate::runtime::bound_buffers::BoundBuffer {
+        gva: packed.gva.checked_add(offset)?,
+        span,
+        source_offset: offset,
+        runs: std::sync::Arc::clone(&packed.runs),
+        pages: Some(std::sync::Arc::clone(&packed.pages)),
+    })
+}
+
+pub(super) fn sampled_backing_from_packed(
+    packed: &crate::runtime::bound_buffers::PackedBuffer,
+    level_offset: u64,
+    row_pitch: u64,
+    span: u64,
+    owner: crate::model::TaskResourceLifetimeRef,
+) -> Option<crate::backend::vulkan::engine::GuestSampledBacking> {
+    let plane_offset = packed.head.checked_add(level_offset)?;
+    plane_offset
+        .checked_add(span)
+        .filter(|end| *end <= packed.import.len())?;
+    Some(crate::backend::vulkan::engine::GuestSampledBacking {
+        backing: crate::backend::vulkan::engine::GuestTargetBacking {
+            allocation_host_ptr: packed.import.host_base(),
+            allocation_len: packed.import.len(),
+            plane_offset,
+            row_pitch,
+        },
+        import: std::sync::Arc::clone(&packed.import),
+        owner,
+        origin: crate::backend::vulkan::engine::SampledByteOrigin::LinearTexture,
+    })
+}
+
+/// Build the single-plane direct sampled request from a borrowed retained
+/// allocation. Only the execution payloads take new strong references; the
+/// allocation geometry and physical construction list stay with the resource.
+// Each argument is an independently decoded piece of the guest's sampled-source
+// contract; grouping them into a struct would only move the same fields.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn direct_linear_sample_from_packed(
+    packed: &crate::runtime::bound_buffers::PackedBuffer,
+    level_offset: u64,
+    row_pitch: u64,
+    span: u64,
+    row_length_texels: u32,
+    native: TexelLayout,
+    format: ash::vk::Format,
+    native_components: pixel_format::SwizzlePlan,
+    owner: crate::model::TaskResourceLifetimeRef,
+) -> Option<SampledSourceRequest> {
+    let direct_image = sampled_backing_from_packed(
+        packed,
+        level_offset,
+        row_pitch,
+        span,
+        owner,
+    )?;
+    Some(SampledSourceRequest::GuestRuns(
+        crate::backend::vulkan::engine::GuestRunSource {
+            runs: std::sync::Arc::clone(&packed.runs),
+            source_offset: level_offset,
+            total_len: span,
+            row_length_texels,
+            pages: Some(std::sync::Arc::clone(&packed.pages)),
+            direct_image: Some(direct_image),
+        },
+        native,
+        format,
+        1,
+        None,
+        crate::runtime::gather_witness::GatherVouch::Fresh,
+        native_components,
+    ))
+}
+
+/// Build one directly sampled plane from the mapping's retained allocation.
+/// The complete allocation is the resource whose plane offset and row pitch
+/// the descriptor names; no copied-image freshness witness participates in
+/// this resource-owned disposition.
+struct MappedSamplePlane {
+    mapping_id: u32,
+    base_off: u64,
+    row_pitch: u64,
+    span: u64,
+    row_length_texels: u32,
+    origin: crate::backend::vulkan::engine::SampledByteOrigin,
+    owner: crate::model::TaskResourceLifetimeRef,
+}
+
+fn mapped_sampled_source<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    plane: MappedSamplePlane,
+) -> Option<crate::backend::vulkan::engine::GuestRunSource> {
+    use crate::backend::vulkan::engine::{GuestRun, GuestRunSource};
+    use crate::runtime::guest_ram::GuestRef;
+
+    let MappedSamplePlane {
+        mapping_id,
+        base_off,
+        row_pitch,
+        span,
+        row_length_texels,
+        origin,
+        owner,
+    } = plane;
+
+    let (import, _footprint) =
+        crate::runtime::mapper::ensure_contig_import_with_footprint(state, host, mapping_id)?;
+    let end = base_off.checked_add(span)?;
+    if end > import.len() {
+        return None;
+    }
+    let whole = import.slice(0, import.len()).ok()?;
+    let guest = GuestRef::new(std::sync::Arc::clone(&import), whole).ok()?;
+    let direct_image = Some(crate::backend::vulkan::engine::GuestSampledBacking {
+        backing: crate::backend::vulkan::engine::GuestTargetBacking {
+            allocation_host_ptr: import.host_base(),
+            allocation_len: import.len(),
+            plane_offset: base_off,
+            row_pitch,
+        },
+        import: std::sync::Arc::clone(&import),
+        owner,
+        origin,
+    });
+    Some(GuestRunSource {
+        runs: std::sync::Arc::new(vec![GuestRun {
+            host_ptr: import.host_base(),
+            len: import.len(),
+        }]),
+        source_offset: base_off,
+        total_len: span,
+        row_length_texels,
+        pages: Some(std::sync::Arc::new(vec![
+            crate::runtime::guest_ram_map::GuestWindowRun {
+                window_offset: 0,
+                guest,
+            },
+        ])),
+        direct_image,
+    })
+}
+
 /// The byte extent of a `w × h` image at `bpr` bytes per row and `bpp` bytes per
 /// texel, and the `bufferRowLength` in texels the copy needs to stride the
 /// padding (0 when rows are tight).
@@ -2576,13 +3322,32 @@ pub(super) fn strided_window_extent(w: u32, h: u32, bpp: u64, bpr: u64) -> Optio
     Some((span, row_length_texels))
 }
 
+/// Byte window and Vulkan row pitch for one complete linear texture level.
+/// Depth planes are consecutive at `row_stride * height`; only the final
+/// plane's final-row padding is outside the sampled window.
+pub(super) fn strided_level_extent(
+    layout: &crate::runtime::decode::resource::TextureLevelLayout,
+    bpp: u64,
+) -> Option<(u64, u32)> {
+    let (last_plane, row_length_texels) = strided_window_extent(
+        layout.width,
+        layout.height,
+        bpp,
+        layout.row_stride,
+    )?;
+    let preceding_planes = u64::from(layout.planes() - 1)
+        .checked_mul(layout.row_stride)?
+        .checked_mul(u64::from(layout.height))?;
+    Some((preceding_planes.checked_add(last_plane)?, row_length_texels))
+}
+
 /// Gather `span` bytes from `base_off` into mapping `mid`'s guest pages as host
 /// runs, landing any deferred writeback that aliases them first. Returns the
 /// window's own page list beside the runs, for the same reason
 /// [`task_gva_guest_run_window`] does.
 ///
-/// Shared by the type-11 and type-5 sampled rails, which reach the same pages
-/// through different window math.
+/// Shared by the type-11 attachment seed and the type-11/type-5 sampled rails,
+/// which reach the same pages through different window math.
 ///
 /// # No settle, for the reason its linear twin already states
 ///
@@ -2634,45 +3399,16 @@ fn mapping_window_guest_runs<M: HostMemory + HostOps>(
 /// Deferred stores intersecting the span are landed first, exactly like the
 /// CPU path.
 ///
-/// # The span is the rest of the allocation, and narrowing it is closed
-///
-/// `span` is `size - offset`: the bind's offset to the end of the guest
-/// allocation, not the range the draw reads. That is deliberate only in the
-/// sense that it is the widest safe answer — it was never measured against what
-/// a draw can actually reach until a `zcreach_*` census did it, and the census
-/// is gone because it answered on every axis. Do not rebuild it to re-ask; the
-/// answers, from a driven Safari-drag boot moving 2.74 GB/s on this rail:
-///
-/// * **Bound it by the vertex descriptor's stride and the draw's counts.** Only
-///   1.2 % of gathered bytes are bindable that way — but every one of those was
-///   at most 5 % of its span, so where the contract does bound a bind this
-///   gather is twenty times too wide. A small population with a large ratio.
-/// * **Bound it by the shader's declared argument size.** 67.5 % of the bytes
-///   are buffers Metal binds to the vertex stage through
-///   `setVertexBuffer:offset:atIndex:` that the pipeline's vertex descriptor
-///   never names — constant buffers, which no stride bounds. Their reflection
-///   carries `declared_size` but **no `type_name`** for 211 180 binds a boot,
-///   and without the name a `constant T&` (whose declared size is the bound)
-///   cannot be told from a `device T*` (whose declared size is one element the
-///   shader may index far past). Narrowing on the size alone is correct for the
-///   first and silently hands the GPU a short buffer for the second. This is a
-///   translator metadata gap, not a guest-contract fact: carrying the AIR
-///   argument type name is what would reopen ~46.5 GB of a boot's traffic.
-/// * **Bound an indexed draw.** 31.2 % of the bytes. `vertex_count` counts
-///   indices and an index names any vertex in the stream, so it means reading
-///   the index buffer — CPU work on the rail whose point is that the CPU does
-///   not touch these bytes.
-///
-/// The rail's real cost is not its width. 99.2 % of gathers re-copy a span this
-/// device already copied. The census that measured that is gone; what counts the
-/// same population now is
-/// [`crate::backend::vulkan::engine::buffer_gather_working_set_census`], which
-/// reports the recurrence beside the *distinct* window count a cache would have
-/// to hold to serve it — the half the recurrence rate alone does not give.
+/// The guest bind itself has no length, so `size - offset` remains the admission
+/// window and the fallback whenever reflection cannot prove a tighter answer.
+/// A reflected bounded object or invocation-bounded footprint narrows only the
+/// bytes walked and moved. Unbounded pointers, unknown access, and indexed
+/// vertex access keep the full window.
 fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
+    buffer_ref: u32,
     backing: &BufferBacking,
     offset: u64,
     extent_cap: Option<u64>,
@@ -2685,7 +3421,10 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("zc_buffer_offset_past_end");
         return None;
     }
-    let Some(span) = host_alloc_len(size - offset).filter(|&n| n > 0).map(|n| n as u64) else {
+    let Some(span) = host_alloc_len(size - offset)
+        .filter(|&n| n > 0)
+        .map(|n| n as u64)
+    else {
         // A declared length this process cannot address. `offset < size` above
         // makes the `n > 0` arm unreachable, so this is the width check alone.
         crate::runtime::drain::note_store_route("zc_buffer_span_unusable");
@@ -2696,30 +3435,72 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     // and the shader disagreeing, and the allocation is the side that bounds
     // what this device may read.
     let full = span;
-    let span = match extent_cap {
-        Some(cap) => span.min(cap),
-        None => span,
-    };
-    if full < ZERO_COPY_BUFFER_MIN_BYTES {
-        // `full` and not the narrowed `span`, because the floor asks whether this
-        // *window* is worth the zero-copy rail and that is a property of what the
-        // guest bound, not of how much of it one shader reads. Comparing the
-        // narrowed span instead is what made a 64-byte declared object cost the
-        // bind its registry entry and fall to a CPU read.
-        //
-        // On the default arm the two are the same number: the caller only hands
-        // this function a cap that already clears the floor, so `span == full`
-        // whenever `full >= FLOOR`. The distinction only bites with
-        // `REIMS_VGPU_EXTENT_NARROW=on`.
-        crate::runtime::drain::note_store_route("zc_buffer_below_floor");
-        return None;
-    }
+    // The floor gates the **gather**, not the rail.
+    //
+    // `ZERO_COPY_BUFFER_MIN_BYTES` earns its keep against one outcome and its
+    // own doc says which: removing it moved `submit_us` by 13 % because "every
+    // gathered bind is a recorded GPU gather", while `stage_us` — the CPU read
+    // it was once believed to be saving — barely moved. But it used to refuse
+    // here, at the top of the rail, which also refused the two outcomes below
+    // that record no gather at all: `zc_buffer_imported`, an offset into the
+    // RAMBlock import this device already holds for the VM's lifetime, and the
+    // retained packed alias. Neither costs a submit, and neither was ever what
+    // the measurement was about.
+    //
+    // What that cost is the sentence the route family's own doc opens with: **a
+    // resolution is cached; a refusal is not.** An admitted bind lands in the
+    // held-resolution registry and answers `zc_buffer_held` on every later draw;
+    // a refused one re-resolves its backing and re-reads its bytes on the CPU
+    // every draw for as long as the guest keeps binding it. A driven macos-13
+    // Maps leg scored `zc_buffer_below_floor` 2 909 326 against
+    // `zc_buffer_held` 1 820 542 — the refusal was the *majority* route, and
+    // `binds_us` was 31 % of per-chain cost with two thirds of it in the vertex
+    // loads. The floor's own table was measured where it governed one bind in
+    // eight, on a different workload; `AGENTS.md`'s rule against generalising
+    // across workloads applies to it as much as to a pathway.
+    //
+    // So the span is computed unconditionally and the floor is asked again at
+    // the one place a gather is what would actually be recorded.
+    let span = extent_cap.map_or(full, |cap| full.min(cap));
+    let gather_eligible = gather_span_if_eligible(full, extent_cap).is_some();
     // Counted only once the rail has actually taken the bind. Counting at the
     // narrowing instead credited this rail with bytes the bind then went and
     // read on the CPU path anyway, which is a saving that did not happen.
     if span < full {
         crate::runtime::drain::note_store_route("zc_buffer_extent_narrowed");
         crate::runtime::drain::note_store_route_n("zc_buffer_extent_saved_bytes", full - span);
+    }
+    // Packed construction is not behind the floor, and the registry census is
+    // why. A packed alias is retained once per `(task, reference)` and every
+    // offset slices it, which is the representation this rail is built around —
+    // `load_buffer_content_resolved` explicitly declines to add a per-offset
+    // entry when one exists, "the per-offset registry the packed representation
+    // exists to remove".
+    //
+    // Admitting sub-floor binds while leaving this behind the floor sent them to
+    // the direct window instead, and that path *does* key per offset: one driven
+    // Maps leg took `bound_buffers` from `entries=0 peak=0` — the registry was
+    // not in use at all — to `entries=9770 peak=16723`, with 1926 pairs holding
+    // more than one offset and one holding 56. Against that, a retained alias
+    // per resource is ~2138 pairs total and each answers every offset in O(1).
+    if ensure_packed_resource(
+        state,
+        host,
+        task_id,
+        buffer_ref,
+        backing,
+        PackedResourceRail::Buffer,
+    ) {
+        let packed = state.bound_buffers.packed_available(
+            task_id,
+            buffer_ref,
+            backing.gva,
+            backing.size,
+        )?;
+        if let Some(bound) = slice_packed_buffer(packed, offset, span) {
+            crate::runtime::drain::note_store_route("zc_buffer_imported");
+            return Some(bound);
+        }
     }
     // No settle here, for the reason `try_linear_sample_zero_copy` states at
     // length: this rail hands the engine guest-RAM runs and the *GPU* reads them
@@ -2744,6 +3525,18 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     };
     let page = state.page_size();
     let pages = guest_page_window(host, gpas, page, (gva + offset) % page, span);
+    // Here, and only here, is it known whether this bind would record a gather,
+    // which is the one thing the floor governs. See [`window_binds_zero_copy`].
+    //
+    // The walk above is spent either way and is not cached on this exit, so the
+    // refusing arm is a real new cost for a *scattered* sub-floor buffer. It is
+    // counted apart from the binds that never reached the walk, so a boot can
+    // say how much of the family that is.
+    if !window_binds_zero_copy(pages.is_none(), gather_eligible) {
+        crate::runtime::drain::note_store_route("zc_buffer_below_floor");
+        crate::runtime::drain::note_store_route("zc_buffer_below_floor_walked");
+        return None;
+    }
     crate::runtime::drain::note_store_route(if pages.is_some() {
         "zc_buffer_imported"
     } else {
@@ -2752,47 +3545,10 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     Some(crate::runtime::bound_buffers::BoundBuffer {
         gva: gva + offset,
         span,
+        source_offset: 0,
         runs: std::sync::Arc::new(runs),
         pages,
     })
-}
-
-/// Charge one zero-copy buffer bind to the freshness split.
-///
-/// Called from **both** rails that take the bind — the held resolution and the
-/// fresh walk — because they are one population: a cache would serve a window
-/// whether or not this device had to re-walk its addresses, and counting only
-/// the fresh walks would report the rate over the 0.8 % of binds that miss the
-/// registry. See [`crate::runtime::buffer_gather_freshness`].
-///
-/// Charged where the *bind* is taken and not where the engine gathers, because
-/// the engine has neither the task nor the reference — it sees an `Arc` address.
-/// A window the engine binds in place rather than gathering is therefore counted
-/// here and would not have needed a cache, which makes this reading a slight
-/// under-statement of the achievable rate rather than an over-statement.
-fn note_gather_freshness(
-    state: &crate::model::DeviceState,
-    task_id: u32,
-    buffer_ref: u32,
-    offset: u64,
-    extent_cap: Option<u64>,
-    bound: &crate::runtime::bound_buffers::BoundBuffer,
-) {
-    // SAFETY: `bound.runs` is the resolution the CPU gather itself walks, whose
-    // `host_ptr`s are stable aliases of at least `len` bytes into this process's
-    // guest-RAM import. This reads them at the same point in the draw the gather
-    // does, under the same borrow of `state`.
-    unsafe {
-        crate::runtime::buffer_gather_freshness::note_bind(
-            task_id,
-            buffer_ref,
-            offset,
-            extent_cap,
-            state.buffer_write_gen.stamp(task_id, buffer_ref),
-            bound.span,
-            &bound.runs,
-        );
-    }
 }
 
 /// The engine's view of a held resolution.
@@ -2805,9 +3561,11 @@ fn bound_buffer_content(
     use crate::backend::vulkan::engine;
     engine::BufferContent::GuestRuns(engine::GuestRunSource {
         runs: std::sync::Arc::clone(&bound.runs),
+        source_offset: bound.source_offset,
         total_len: bound.span,
         row_length_texels: 0,
         pages: bound.pages.clone(),
+        direct_image: None,
     })
 }
 
@@ -2849,112 +3607,96 @@ fn bound_buffer_content(
 /// of the registry key rather than of the resolution, because it describes the
 /// shader and not the bind — see [`crate::runtime::bound_buffers`].
 ///
-/// # The cap reaches the two rails differently, and it is measured why
+/// The CPU staging and GPU gather rails apply the same cap. Rail admission is
+/// deliberately different: it uses the full guest window, not the narrowed
+/// extent, so a small reflected object keeps the registry and execution route
+/// the guest bind would otherwise have used. [`gather_span_if_eligible`] owns
+/// that relation.
+/// The bytes a gather-eligible guest buffer window actually has to move.
 ///
-/// The gather rail takes it **only when the capped span still clears
-/// [`ZERO_COPY_BUFFER_MIN_BYTES`]**; the CPU read takes it always.
+/// Admission is a property of the full window the guest bound; reflection only
+/// bounds the shader's reach within it. Keeping both decisions in this function
+/// makes it impossible to save bytes by accidentally moving a small reflected
+/// object off the gather rail and its held-resolution registry.
+pub(super) fn gather_span_if_eligible(full: u64, extent_cap: Option<u64>) -> Option<u64> {
+    (full >= ZERO_COPY_BUFFER_MIN_BYTES).then(|| extent_cap.map_or(full, |cap| full.min(cap)))
+}
+
+/// Whether a walked guest window may bind zero-copy, once it is known whether
+/// binding it would record a GPU gather.
 ///
-/// The asymmetry is not tidiness. A bind whose cap drops it under the floor
-/// leaves the gather rail, and leaving the gather rail means leaving the
-/// **registry** with it — a below-floor bind is never held, so it re-resolves its
-/// backing and re-reads guest memory on *every draw*, where the same bind above
-/// the floor was one hashmap hit. Applying the cap regardless traded a cached
-/// whole-window gather for an uncached narrow read, and three driven macos-13
-/// Maps boots per arm measured that trade as a loss on every boot:
-/// `binds_us/chain` 6.14 / 6.33 / 4.01 us with the rail off against
-/// 9.19 / 10.65 / 8.84 us with it on, with `zc_buffer_held` falling 30 835 ->
-/// 16 360. Total `draw_us/draw` was indistinguishable (370 / 364 / 310 against
-/// 378 / 372 / 307), so the 2.2 GB a run the cap saved bought no time at all:
-/// these binds are not bus-bound, they are per-bind-cost-bound.
+/// The whole of what [`ZERO_COPY_BUFFER_MIN_BYTES`] governs, in one place. That
+/// floor was measured against exactly one outcome — a recorded gather, which
+/// costs a submit — and it used to be asked before the window was walked, where
+/// "would this gather?" is not yet answerable. Asking it there refused two
+/// outcomes that record no gather: a window resolving to pages is an offset into
+/// an import this device already holds for the VM's lifetime, and costs nothing
+/// a submit would notice.
 ///
-/// So the rail narrows only where narrowing does not change which rail a bind is
-/// on. Today's shaders declare objects of at most 512 bytes
-/// (`bugs/buffer-binding-extent-and-access` measured 60 blobs: median 64, max
-/// 512), so that condition is rarely met and the rail is close to inert — which
-/// is the honest outcome, not a bug to tune around. On the CPU read the cap is
-/// free: that bind was reading the whole window uncached either way.
-/// Charge one bind that took the gather rail to the extent-headroom split: how
-/// many of the bytes this rail is about to move a declared object size would
-/// have removed.
-///
-/// # The question two prior measurements leave open
-///
-/// `try_buffer_zero_copy_resolved`'s doc puts 67.5 % of a boot's gathered bytes
-/// on vertex-stage constant buffers that no vertex descriptor bounds, and says
-/// the way to reopen them is for the translator to answer whether the bind is a
-/// bounded reference or an indexable pointer. **It now answers.** A driven
-/// macos-13 boot at the current pin reads `bext_unknown=0` against
-/// `bext_object=1 179 068` — and every one of those objects is small, 601 826 at
-/// 64 bytes or under and 577 143 between 65 and 512.
-///
-/// `load_buffer_content`'s own doc measured the other side: applying the cap
-/// everywhere saved **2.2 GB a run** and cost half the held resolutions, for no
-/// change in `draw_us/draw`. Both cannot be true of one workload. 2.2 GB a run
-/// is ~2 % of what this rail moves, and 67.5 % of the bytes sitting behind caps
-/// of 512 bytes or less would be nearly all of it.
-///
-/// So this counts the bytes rather than arguing about them, without changing
-/// what any bind does. `bext_would_save_bytes` against `gather_bytes` is the
-/// whole answer, and `bext_capped_span_bytes` beside `bext_uncapped_span_bytes`
-/// says how much of the traffic even has a cap to apply.
-///
-/// The other reason to re-ask: that 2.2 GB was ranked on `draw_us/draw`, a CPU
-/// wall clock, before this device could time the GPU. The gather is a PCIe copy
-/// and about 55 % of all GPU time here, and no CPU counter was ever going to
-/// see it.
-/// Whether a declared object size may narrow the bytes the gather rail moves.
-///
-/// **Default off** — see [`crate::env::EXTENT_NARROW`] for the bytes at stake,
-/// for what separates this from the earlier attempt that applied the cap to the
-/// rail *decision*, and for why an arm that reads fewer guest bytes has to earn
-/// its default with a screenshot as well as a number.
-/// Which cap the gather rail and the held-resolution registry key carry.
-///
-/// A function rather than two lines at the call site because it is the whole of
-/// the difference between the two arms, and because a test can then assert the
-/// rule instead of restating it — the test that used to cover this re-implemented
-/// the filter and so could only ever agree with itself.
-///
-/// `narrow` false is the default: a cap below [`ZERO_COPY_BUFFER_MIN_BYTES`] is
-/// dropped, because the floor is compared against the narrowed span and a
-/// 64-byte object would move the bind off the rail and out of the registry. Every
-/// object this workload declares is 512 bytes or under, so that drops all of
-/// them.
-///
-/// `narrow` true keeps every cap, and
-/// [`try_buffer_zero_copy_resolved`] then compares the floor against the *full*
-/// span instead, so the bind stays on the rail it was on and only the extent
-/// walked and copied moves.
-pub(super) fn gather_cap_for(extent_cap: Option<u64>, narrow: bool) -> Option<u64> {
-    if narrow {
-        extent_cap
-    } else {
-        extent_cap.filter(|&cap| cap >= ZERO_COPY_BUFFER_MIN_BYTES)
+/// The asymmetry is the point, so the truth table is the test: size may only
+/// ever veto a *gather*.
+pub(super) fn window_binds_zero_copy(needs_gather: bool, gather_eligible: bool) -> bool {
+    !needs_gather || gather_eligible
+}
+
+/// Answer a retained zero-copy resolution without touching the object table or
+/// walking the task page table.
+fn held_buffer_content(
+    state: &mut DeviceState,
+    task_id: u32,
+    buffer_ref: u32,
+    offset: u64,
+    extent_cap: Option<u64>,
+) -> Option<crate::backend::vulkan::engine::BufferContent> {
+    // The guest contract is buffer-plus-offset. Once the whole resource has a
+    // packed alias, derive the bind directly from that one retained object:
+    // neither the object descriptor nor the task page table changes between
+    // offsets, and both announce the events that retire this entry.
+    if let Some(crate::runtime::bound_buffers::PackedBufferResolution::Available(packed)) =
+        state.bound_buffers.packed(task_id, buffer_ref)
+    {
+        if offset < packed.size {
+            let full = packed.size - offset;
+            // No floor here. Slicing a retained packed alias records no gather —
+            // the alias is already imported and this hands back a sub-range of
+            // it — so `ZERO_COPY_BUFFER_MIN_BYTES`, which governs gathers alone,
+            // has nothing to say. It used to be asked, and that sent every
+            // sub-floor bind past the one branch that answers in O(1) and down
+            // the full resolve-and-reconstruct path on *every* draw: one driven
+            // Maps leg scored `zc_buffer_imported` 1 924 454 against
+            // `zc_buffer_held` 1 389 939, for binds whose alias was sitting
+            // right here the whole time.
+            let span = extent_cap.map_or(full, |cap| full.min(cap));
+            if let Some(bound) = slice_packed_buffer(packed, offset, span) {
+                crate::runtime::drain::note_store_route("zc_buffer_held");
+                return Some(bound_buffer_content(&bound));
+            }
+        }
     }
-}
-
-fn extent_narrow_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(
-            crate::env::read(crate::env::EXTENT_NARROW).0,
-            crate::env::Switch::On
-        )
-    })
-}
-
-fn note_extent_headroom(extent_cap: Option<u64>, span: u64) {
-    let Some(cap) = extent_cap else {
-        crate::runtime::drain::note_store_route_n("bext_uncapped_span_bytes", span);
-        return;
-    };
-    crate::runtime::drain::note_store_route_n("bext_capped_span_bytes", span);
-    if cap < span {
-        crate::runtime::drain::note_store_route_n("bext_would_save_bytes", span - cap);
+    // The registry is keyed on the same cap the walk uses, or a lookup could
+    // answer with a shorter span than this shader needs.
+    // A held resolution answers before anything is resolved at all: the walk
+    // below produces the same runs until the guest moves the addresses, and it
+    // announces every such move. This is the whole point of the registry — see
+    // `crate::runtime::bound_buffers`.
+    if let Some(bound) = state
+        .bound_buffers
+        .get(task_id, buffer_ref, offset, extent_cap)
+    {
+        let content = bound_buffer_content(bound);
+        crate::runtime::drain::note_store_route("zc_buffer_held");
+        return Some(content);
     }
+    None
 }
 
-fn load_buffer_content<M: HostMemory + HostOps>(
+/// Resolve a previously validated backing through the zero-copy ladder, with
+/// the CPU read as the capability fallback.
+// Hot buffer-load path: the arguments are the decoded bind plus the host and
+// device state it resolves against, and threading a struct through would only
+// rename them.
+#[allow(clippy::too_many_arguments)]
+fn load_buffer_content_resolved<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
@@ -2962,34 +3704,54 @@ fn load_buffer_content<M: HostMemory + HostOps>(
     offset: u64,
     allow_zero_copy: bool,
     extent_cap: Option<u64>,
+    backing: &BufferBacking,
 ) -> Option<crate::backend::vulkan::engine::BufferContent> {
-    // Which cap the rail and the registry key carry. Keyed on the same value the
-    // walk used, or a lookup would answer with a span it did not ask for.
-    //
-    // Default: below the floor the cap is dropped, because it would cost the bind
-    // its registry entry — the floor was compared against the *narrowed* span, so
-    // a 64-byte object turned a registry hit into a CPU read. Since every object
-    // this workload declares is 512 bytes or less, that drops all of them and the
-    // rail is inert.
-    //
-    // `REIMS_VGPU_EXTENT_NARROW=on` keeps the cap and moves the floor comparison
-    // onto the full span instead (`try_buffer_zero_copy_resolved`), so the bind
-    // stays on exactly the rail it was on and only the extent walked and copied
-    // narrows.
-    let gather_cap = gather_cap_for(extent_cap, extent_narrow_enabled());
-    // A held resolution answers before anything is resolved at all: the walk
-    // below produces the same runs until the guest moves the addresses, and it
-    // announces every such move. This is the whole point of the registry — see
-    // `crate::runtime::bound_buffers`.
+    // Resolve the backing (object-list entry + descriptor) ONCE and share it
+    // between the zero-copy attempt and the CPU fallback. Sub-floor binds used
+    // to walk the task PT twice — once in the failed ZC attempt, once in the
+    // CPU read.
     if allow_zero_copy {
-        if let Some(bound) = state
-            .bound_buffers
-            .get(task_id, buffer_ref, offset, gather_cap)
+        if let Some(bound) = try_buffer_zero_copy_resolved(
+            state, host, task_id, buffer_ref, backing, offset, extent_cap,
+        ) {
+            let content = bound_buffer_content(&bound);
+            // A packed resource is already retained by `(task, reference)` and
+            // the content above shares its whole-buffer source. Holding this
+            // offset as a second entry would recreate the per-offset registry
+            // the packed representation exists to remove.
+            let packed = matches!(
+                state.bound_buffers.packed(task_id, buffer_ref),
+                Some(crate::runtime::bound_buffers::PackedBufferResolution::Available(_))
+            );
+            if !packed {
+                state
+                    .bound_buffers
+                    .insert(task_id, buffer_ref, offset, extent_cap, bound);
+            }
+            return Some(content);
+        }
+    }
+    let bytes =
+        read_buffer_bytes_resolved(state, host, task_id, buffer_ref, backing, offset, extent_cap)?;
+    Some(crate::backend::vulkan::engine::BufferContent::from(bytes))
+}
+
+// Same shape as `load_buffer_content_resolved`, which this forwards to.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    buffer_ref: u32,
+    resource: Option<&crate::model::TaskResource>,
+    offset: u64,
+    allow_zero_copy: bool,
+    extent_cap: Option<u64>,
+) -> Option<crate::backend::vulkan::engine::BufferContent> {
+    if allow_zero_copy {
+        if let Some(content) =
+            held_buffer_content(state, task_id, buffer_ref, offset, extent_cap)
         {
-            let content = bound_buffer_content(bound);
-            crate::runtime::drain::note_store_route("zc_buffer_held");
-            note_extent_headroom(extent_cap, bound.span);
-            note_gather_freshness(state, task_id, buffer_ref, offset, gather_cap, bound);
             return Some(content);
         }
     }
@@ -2997,23 +3759,51 @@ fn load_buffer_content<M: HostMemory + HostOps>(
     // between the zero-copy attempt and the CPU fallback. Sub-floor binds used
     // to walk the task PT twice — once in the failed ZC attempt, once in the
     // CPU read.
-    let backing = resolve_buffer_backing(state, host, task_id, buffer_ref)?;
-    if allow_zero_copy {
-        if let Some(bound) =
-            try_buffer_zero_copy_resolved(state, host, task_id, &backing, offset, gather_cap)
-        {
-            let content = bound_buffer_content(&bound);
-            // Before the insert, which takes `state` mutably and moves `bound`.
-            note_extent_headroom(extent_cap, bound.span);
-            note_gather_freshness(state, task_id, buffer_ref, offset, gather_cap, &bound);
-            state
-                .bound_buffers
-                .insert(task_id, buffer_ref, offset, gather_cap, bound);
-            return Some(content);
-        }
+    let backing = resolve_buffer_backing(state, host, task_id, buffer_ref, resource)?;
+    load_buffer_content_resolved(
+        state,
+        host,
+        task_id,
+        buffer_ref,
+        offset,
+        allow_zero_copy,
+        extent_cap,
+        &backing,
+    )
+}
+
+/// Retain an indexed draw's exact guest-buffer window for the Vulkan vertex
+/// input stage. Unlike the Metal fallback, this does not materialize the index
+/// array on the CPU: Vulkan consumes the bounded resource directly when the
+/// command buffer executes.
+fn load_index_content_reason<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    info: &IndexedDrawInfo,
+) -> Result<crate::backend::vulkan::engine::BufferContent, IndexLoadReason> {
+    let (backing, need) = resolve_index_window_reason(state, host, task_id, info)?;
+    let extent = Some(need as u64);
+    if let Some(content) = held_buffer_content(
+        state,
+        task_id,
+        info.index_buffer_ref,
+        info.index_buffer_offset,
+        extent,
+    ) {
+        return Ok(content);
     }
-    let bytes = read_buffer_bytes_resolved(state, host, task_id, &backing, offset, extent_cap)?;
-    Some(crate::backend::vulkan::engine::BufferContent::from(bytes))
+    load_buffer_content_resolved(
+        state,
+        host,
+        task_id,
+        info.index_buffer_ref,
+        info.index_buffer_offset,
+        true,
+        extent,
+        &backing,
+    )
+    .ok_or(IndexLoadReason::ReadFail)
 }
 
 /// Zero-copy linear sampled bind: resolve the texture's tight level-0 GVA
@@ -3122,6 +3912,7 @@ fn load_buffer_content<M: HostMemory + HostOps>(
 /// the same five by hand is how they come to disagree about one of them.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct GvaSpan {
+    pub texture_ref: u32,
     pub gva: u64,
     pub row_stride: u32,
     pub width: u32,
@@ -3139,14 +3930,58 @@ pub(super) struct GvaSpan {
 /// names them on its own census routes — the rule is shared, the vocabulary is
 /// not, so a reading says which rung refused as well as why.
 pub(super) enum GvaResidentRefusal {
-    /// The page walk came up short, so the span has no key to look up. The same
-    /// refusal the Store itself takes; a target that never got a key was never a
-    /// candidate.
+    /// The resource has no complete initial transfer backing, so it has no
+    /// usable resident identity yet.
     NoGeneration,
     /// The witness will not call the pages quiet.
     Wrote(crate::runtime::gva_store_witness::GvaWriteReach),
     /// Quiet, but the engine is not holding an image under this identity.
     NoResident,
+}
+
+fn retained_resident_is_ready(
+    backing: Option<crate::backend::vulkan::engine::ResidentContentBacking>,
+    registry_query: impl FnOnce() -> bool,
+) -> bool {
+    use crate::backend::vulkan::engine::ResidentContentBacking;
+
+    match backing {
+        Some(
+            ResidentContentBacking::GuestAllocation | ResidentContentBacking::DeviceAllocation,
+        ) => true,
+        Some(ResidentContentBacking::NotReady) => false,
+        None => registry_query(),
+    }
+}
+
+/// Whether the resident named by a GVA texture is still usable.
+///
+/// A named texture owns a retained allocation lease, so warm binds answer from
+/// the texture object without re-entering the global engine. Anonymous and
+/// unclassified spans have no protocol lifetime to hold such a lease and keep
+/// the fail-closed registry query.
+fn gva_resident_ready(
+    state: &DeviceState,
+    task_id: u32,
+    texture_ref: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+) -> bool {
+    let backing = (texture_ref != 0)
+        .then(|| state.task_resources.get(task_id, texture_ref))
+        .flatten()
+        .filter(|resource| resource_type_owns_gva_resident(resource.entry.object_type))
+        .map(|resource| resource.resident_target_backing(identity));
+    let retained = backing.is_some();
+    let ready = retained_resident_is_ready(backing, || {
+        crate::backend::vulkan::engine::resident_content_ready(identity)
+    });
+    crate::runtime::drain::note_store_route(match (retained, ready) {
+        (true, true) => "gva_ready_resource",
+        (true, false) => "gva_not_ready_resource",
+        (false, true) => "gva_ready_registry",
+        (false, false) => "gva_not_ready_registry",
+    });
+    ready
 }
 
 /// The one currency test behind every GVA resident shortcut: does the engine
@@ -3157,13 +3992,9 @@ pub(super) enum GvaResidentRefusal {
 /// is written once because a copied version of this rule is the next
 /// divergence. The callers differ only in what they do with the answer.
 ///
-/// The generation is recomputed from the span's *current* page set rather than
-/// read out of whatever witness entry sits at this address. The map can hold an
-/// orphan, a target whose pages have since moved keyed under the hash they had,
-/// and an orphan's token still answers about pages that now belong to something
-/// else. Recomputing makes a moved page list miss, which is
-/// [`crate::runtime::gva_store_witness`]'s own rule: the wrong answer is
-/// unreachable rather than guarded.
+/// A named resource uses its stable host-texture generation and retained
+/// transfer backing. The page-set fallback remains only for an attachment with
+/// no resource reference and therefore no protocol lifetime to carry.
 pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -3173,6 +4004,7 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
     use crate::runtime::gva_store_witness::{reach, GvaTargetKey};
 
     let GvaSpan {
+        texture_ref,
         gva,
         row_stride,
         width: w,
@@ -3182,11 +4014,42 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
     if gva == 0 || w == 0 || h == 0 {
         return Err(GvaResidentRefusal::NoGeneration);
     }
-    let generation = gva_span_alloc_generation(state, host, task_id, gva, row_stride, h);
+    let span_bytes = u64::from(row_stride).saturating_mul(u64::from(h));
+    let generation = if texture_ref != 0 {
+        crate::runtime::writeback_debt::gva_resource_generation(
+            state,
+            host,
+            crate::runtime::writeback_debt::GvaResourceKey {
+                task_id,
+                texture_ref,
+            },
+            gva,
+            span_bytes,
+        )
+    } else {
+        gva_span_alloc_generation(state, host, task_id, gva, row_stride, h)
+    };
     if generation == 0 {
         return Err(GvaResidentRefusal::NoGeneration);
     }
     let resident_format = gva_resident_format(format);
+    let identity = crate::backend::vulkan::engine::TargetIdentity::Gva {
+        gva,
+        width: w,
+        height: h,
+        generation,
+        format: resident_format,
+    };
+    // An unpaid Store says the guest pages are deliberately stale and this
+    // image is authoritative. The older witness below answers the opposite
+    // state: a Store was copied out and both locations still agree. Keeping
+    // those states distinct prevents a skipped copy from masquerading as a
+    // statement about bytes that were never written.
+    if crate::runtime::writeback_debt::gva_resident_authoritative(state, &identity) {
+        return gva_resident_ready(state, task_id, texture_ref, &identity)
+            .then_some(identity)
+            .ok_or(GvaResidentRefusal::NoResident);
+    }
     let verdict = reach(
         state,
         host,
@@ -3195,23 +4058,53 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
             generation,
             width: w,
             height: h,
-            bgra: resident_format == crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+            // From the identity built just above, not from `resident_format`
+            // again. `GvaTargetKey::of` builds this same key from the same
+            // identity on the other side of the witness, and the two must
+            // agree — a channel order written by hand at two sites is how they
+            // stop agreeing.
+            bgra: identity.is_bgra(),
         },
     );
     if !verdict.is_quiet() {
         return Err(GvaResidentRefusal::Wrote(verdict));
     }
-    let identity = crate::backend::vulkan::engine::TargetIdentity::Gva {
-        gva,
-        width: w,
-        height: h,
-        generation,
-        format: resident_format,
-    };
-    if !crate::backend::vulkan::engine::resident_content_ready(&identity) {
-        return Err(GvaResidentRefusal::NoResident);
+    gva_resident_ready(state, task_id, texture_ref, &identity)
+        .then_some(identity)
+        .ok_or(GvaResidentRefusal::NoResident)
+}
+
+#[cfg(test)]
+mod gva_resident_ownership_tests {
+    use super::*;
+    use crate::backend::vulkan::engine::ResidentContentBacking;
+    use std::cell::Cell;
+
+    #[test]
+    fn a_retained_texture_answers_readiness_without_a_registry_query() {
+        for backing in [
+            ResidentContentBacking::GuestAllocation,
+            ResidentContentBacking::DeviceAllocation,
+        ] {
+            assert!(retained_resident_is_ready(Some(backing), || {
+                panic!("a retained allocation must not query the registry")
+            }));
+        }
+        assert!(!retained_resident_is_ready(
+            Some(ResidentContentBacking::NotReady),
+            || panic!("a named resource's failed retain is already authoritative")
+        ));
     }
-    Ok(identity)
+
+    #[test]
+    fn an_anonymous_gva_span_keeps_the_registry_fallback() {
+        let queries = Cell::new(0_u32);
+        assert!(retained_resident_is_ready(None, || {
+            queries.set(queries.get() + 1);
+            true
+        }));
+        assert_eq!(queries.get(), 1);
+    }
 }
 
 /// May the colour LOAD seed at this GVA attachment be skipped, because the
@@ -3302,6 +4195,7 @@ pub(super) fn try_gva_resident_sample<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
+    texture_ref: u32,
     tex: &TextureDescriptor,
 ) -> Option<(u32, u32, SampledSourceRequest)> {
     use crate::runtime::drain::note_store_route;
@@ -3314,6 +4208,7 @@ pub(super) fn try_gva_resident_sample<M: HostMemory + HostOps>(
         host,
         task_id,
         GvaSpan {
+            texture_ref,
             gva,
             row_stride,
             width: w,
@@ -3332,8 +4227,10 @@ pub(super) fn try_gva_resident_sample<M: HostMemory + HostOps>(
             return None;
         }
     };
+    let declared_format = tex.declared_pixel_format()?;
+    let format = translate::pixel::translate(declared_format).ok()?.vk;
     note_store_route("gvarung_resident");
-    Some((w, h, SampledSourceRequest::Target(identity)))
+    Some((w, h, SampledSourceRequest::Target(identity, format)))
 }
 
 /// Which repair would let the linear zero-copy rung carry this format, as a
@@ -3354,12 +4251,13 @@ fn zc_lin_no_layout_route(reason: translate::TranslateReason) -> &'static str {
     }
 }
 
-fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
+pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    _texture_ref: u32,
+    texture_ref: u32,
     tex: &TextureDescriptor,
+    owner: crate::model::TaskResourceLifetimeRef,
 ) -> Option<(u32, u32, SampledSourceRequest)> {
     use crate::backend::vulkan::engine;
     // The object-list entry + descriptor are resolved+decoded once by the caller
@@ -3408,7 +4306,8 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // for all but `A8Unorm`, whose byte rides in `R8_UNORM`. It is composed with
     // the guest's type-8 view swizzle where the image view is built, so this
     // rail no longer has to refuse a format for having one.
-    let (native, native_components) = match translate::pixel::sampled_pixels(declared_format) {
+    let (native, sampled_vk_format, native_components) =
+        match translate::pixel::sampled_pixels(declared_format) {
         // Deduped per declared format, which is a handful of values a boot
         // enumerates in a handful of lines. The number is the guest's own
         // `MTLPixelFormat` ordinal, so it names the format without this device
@@ -3433,7 +4332,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             }
             return None;
         }
-        Ok((layout, decline, components)) => {
+        Ok((layout, _decline, components)) => {
             // Every layout is asked about, not just the one that was known to
             // be optional. This rail hands the guest's bytes to a sampler that
             // interpolates them, so "can this host filter this format" is a
@@ -3443,13 +4342,8 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 crate::runtime::drain::note_store_route("zc_lin_layout_unfilterable");
                 return None;
             }
-            if decline.is_some() {
-                srgb_census::note_downgrade(
-                    srgb_census::site::LINEAR_SAMPLE_ZERO_COPY,
-                    declared_format,
-                );
-            }
-            (layout, components)
+            let format = translate::pixel::translate(declared_format).ok()?.vk;
+            (layout, format, components)
         }
     };
     let bpp = native.bytes_per_texel();
@@ -3462,47 +4356,16 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("zc_lin_no_extent");
         return None;
     }
-    let Some((span, row_length_texels)) =
-        strided_window_extent(w, h, bpp as u64, layout.row_stride)
+    let Some((span, row_length_texels)) = strided_level_extent(layout, bpp as u64)
     else {
         crate::runtime::drain::note_store_route("zc_lin_unstrideable");
         return None;
     };
-    // The min-byte floor keeps small textures on the cheaper CPU memo/cache
-    // path. It applies to every layout that has somewhere to be turned away
-    // *to*: the single-channel float LUTs have no CPU loader arm
-    // (`texel_to_rgba8` returns `None` for them), so this native gather is
-    // their only correct rail and a floor over them would not be a cost
-    // decision at all — a small display-profile LUT would fall through to a
-    // failed resolve.
-    //
-    // Asked as `has_cpu_loader_arm` and not `is_four_byte_color`. The two
-    // agreed for as long as only four-byte colour could reach here, and they
-    // stop agreeing the moment `R8`/`Rg8` are admitted above: those have arms
-    // and are not four bytes, so the four-byte spelling would have waved every
-    // one of them past the floor — including the 3.6 KiB scroll glyphs the
-    // floor's own doc names as legitimately preferring the CPU byte path.
-    if native.has_cpu_loader_arm() && span < ZERO_COPY_SAMPLED_MIN_BYTES {
-        // Banded, because the floor's own doc argues from where the workload's
-        // spans cluster relative to it, and a bare count cannot re-check that
-        // argument on a workload the doc was not tuned against. The bands are
-        // read against the floor: a population sitting just under it is the
-        // floor mis-set, and one sitting two decades under it is the floor
-        // doing what it was written to do.
-        crate::runtime::drain::note_store_route(if span < 4 * 1024 {
-            "zc_lin_below_floor_lt4k"
-        } else if span < 16 * 1024 {
-            "zc_lin_below_floor_lt16k"
-        } else {
-            "zc_lin_below_floor_lt64k"
-        });
-        return None;
-    }
+    let planes = layout.planes();
     if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
         crate::runtime::drain::note_store_route("zc_lin_past_allocation");
         return None;
     }
-    // Same coherence rule as the CPU loaders: land any resident-authoritative
     // No settle here, and that is the difference between this rail and the CPU
     // loaders it replaces.
     //
@@ -3520,7 +4383,153 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // `try_type11_sample_zero_copy` and `try_type5_sample_zero_copy` are the two
     // rails that were already written this way, and this one is now consistent
     // with them.
-    // Fixed per-texture window: the walk covers exactly the bound span.
+    //
+    // That argument is about a **submitted** writeback, and it does not extend
+    // to an owed one: a writeback debt is a frame this device rendered and
+    // deliberately did not write down, so there is no command on any queue for
+    // queue order to order and the pages hold the frame before it. The payment
+    // is what puts it on the queue; then the paragraph above applies again.
+    //
+    // Paid through the texture ref, the same call this rail's CPU twin makes,
+    // because a linear texture's bytes may alias a surface this device owes a
+    // frame and only `pay_for_texture` resolves one id namespace to the other.
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
+    // Retain the texture's complete allocation once. A sampled image needs the
+    // allocation base, level offset and row pitch together; reducing it to the
+    // level's page runs would throw away the resource shape and force a copy.
+    let allocation = tex
+        .allocation_base_gva(state.page_shift)
+        .filter(|_| tex.allocation_size != 0)
+        .map(|allocation_gva| BufferBacking {
+            gva: allocation_gva,
+            size: tex.allocation_size,
+        });
+
+    let available = allocation.as_ref().is_some_and(|backing| {
+        ensure_packed_resource(
+            state,
+            host,
+            task_id,
+            texture_ref,
+            backing,
+            PackedResourceRail::LinearSample,
+        )
+    });
+
+    // A warm resource bind borrows the retained allocation directly. The
+    // single-plane request retains only the import/run payloads execution
+    // needs; allocation geometry and the physical construction list remain on
+    // the task resource.
+    if available && planes == 1 {
+        let backing = allocation.as_ref()?;
+        if let Some(packed) = state.bound_buffers.packed_available(
+            task_id,
+            texture_ref,
+            backing.gva,
+            backing.size,
+        ) {
+            if let Some(request) = direct_linear_sample_from_packed(
+                packed,
+                layout.offset,
+                layout.row_stride,
+                span,
+                row_length_texels,
+                native,
+                sampled_vk_format,
+                native_components,
+                owner.clone(),
+            ) {
+                if span < SAMPLED_GATHER_MIN_BYTES {
+                    crate::runtime::drain::note_store_route("zc_lin_direct_below_gather_floor");
+                }
+                return Some((w, h, request));
+            }
+        }
+    }
+
+    // The witness recorder mutably borrows `state`, so the multi-plane arm
+    // owns its resource state across that call. Single-plane binds return above
+    // and never pay this construction-state clone.
+    let packed = if available && planes != 1 {
+        allocation.as_ref().and_then(|backing| {
+            state
+                .bound_buffers
+                .packed_available(task_id, texture_ref, backing.gva, backing.size)
+                .cloned()
+        })
+    } else {
+        None
+    };
+
+    if let Some(packed) = packed {
+        if !native.a_cost_floor_may_decline() || span >= SAMPLED_GATHER_MIN_BYTES {
+            let page = state.page_size();
+            let packed_offset = packed.head.checked_add(layout.offset)?;
+            let first_page = usize::try_from(packed_offset / page).ok()?;
+            let head_off = packed_offset % page;
+            let page_count = usize::try_from(head_off.checked_add(span)?.div_ceil(page)).ok()?;
+            let witness_gpas = packed
+                .gpas
+                .get(first_page..first_page.checked_add(page_count)?)?;
+            let witness_runs = [engine::GuestRun {
+                host_ptr: packed
+                    .import
+                    .host_base()
+                    .checked_add(usize::try_from(packed_offset).ok()?)?,
+                len: span,
+            }];
+            let seen = crate::runtime::gather_witness::note_gather(
+                state,
+                host,
+                crate::runtime::gather_witness::GatherRail::Linear,
+                crate::runtime::gather_witness::GatherKey::TaskGva { task_id, gva },
+                crate::runtime::gather_witness::GatherWindow {
+                    gpas: witness_gpas,
+                    runs: &witness_runs,
+                    span,
+                    page_size: page as usize,
+                },
+            );
+            return Some((
+                w,
+                h,
+                SampledSourceRequest::GuestRuns(
+                    engine::GuestRunSource {
+                        runs: std::sync::Arc::clone(&packed.runs),
+                        source_offset: layout.offset,
+                        total_len: span,
+                        row_length_texels,
+                        pages: Some(std::sync::Arc::clone(&packed.pages)),
+                        direct_image: None,
+                    },
+                    native,
+                    sampled_vk_format,
+                    planes,
+                    Some(LinearSampleIdentity::from(seen.identity)),
+                    seen.vouch,
+                    native_components,
+                ),
+            ));
+        }
+    }
+
+    // Only the copied fallback has a size crossover. A direct image above was
+    // constructed from the guest allocation exactly as the resource contract
+    // describes, so its size never selects a different ownership model.
+    // Single-channel float LUTs have no equivalent CPU loader arm and therefore
+    // cannot be declined on cost grounds even on this fallback.
+    if native.a_cost_floor_may_decline() && span < SAMPLED_GATHER_MIN_BYTES {
+        crate::runtime::drain::note_store_route(if span < 4 * 1024 {
+            "zc_lin_below_floor_lt4k"
+        } else if span < 16 * 1024 {
+            "zc_lin_below_floor_lt16k"
+        } else {
+            "zc_lin_below_floor_lt64k"
+        });
+        return None;
+    }
+
+    // The copy-backed fallback still covers exactly the bound level window.
     let (gpas, runs) = match task_gva_guest_run_window(state, host, task_id, gva, span) {
         Ok(window) => window,
         Err(refusal) => {
@@ -3551,12 +4560,16 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
         SampledSourceRequest::GuestRuns(
             engine::GuestRunSource {
                 runs: std::sync::Arc::new(runs),
+                source_offset: 0,
                 total_len: span,
                 row_length_texels,
                 pages: guest_page_window(host, gpas, page as u64, gva % page as u64, span),
+                direct_image: None,
             },
             native,
-            LinearSampleIdentity::from(seen.identity),
+            sampled_vk_format,
+            planes,
+            Some(LinearSampleIdentity::from(seen.identity)),
             seen.vouch,
             native_components,
         ),
@@ -3576,13 +4589,14 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     mid: u32,
     w: u32,
     h: u32,
+    owner: crate::model::TaskResourceLifetimeRef,
 ) -> Option<SampledSourceRequest> {
     use crate::backend::vulkan::engine;
     use crate::runtime::mapping_write::type11_sample_window;
     if w == 0 || h == 0 {
         return None;
     }
-    let (native, base_off, bpr) = {
+    let (native, sampled_vk_format, base_off, bpr) = {
         let m = state.mappings.get(&mid)?;
         if !m.mapped || m.page_entries.is_empty() {
             return None;
@@ -3598,27 +4612,67 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
         // format (`A8Unorm` is a single byte), but that is a coincidence of
         // widths and not the rule this line depends on.
         let native = match translate::pixel::sampled_pixels(format) {
-            Ok((layout, decline, components)) if layout.is_four_byte_color() => {
+            Ok((layout, _decline, components)) if layout.is_four_byte_color() => {
                 if !pixel_format::swizzle_is_identity(&components) {
                     crate::runtime::drain::note_store_route("zc_t11_needs_swizzle");
                     return None;
-                }
-                if decline.is_some() {
-                    srgb_census::note_downgrade(srgb_census::site::TYPE11_SAMPLE_ZERO_COPY, format);
                 }
                 layout
             }
             _ => return None,
         };
+        let sampled_vk_format = translate::pixel::translate(format).ok()?.vk;
         let (base_off, bpr_u32, _span_end) = type11_sample_window(m, w, h, format)?;
-        (native, base_off, bpr_u32 as u64)
+        (native, sampled_vk_format, base_off, bpr_u32 as u64)
     };
     // From the layout the translation chose, as the type-5 rail does, so the
     // texel size cannot disagree with the image the engine creates. The
     // `is_four_byte_color` gate above already fixes it at four.
     let (span, row_length_texels) =
         strided_window_extent(w, h, native.bytes_per_texel() as u64, bpr)?;
-    if span < ZERO_COPY_SAMPLED_MIN_BYTES {
+    // The owed frame, before anything looks at the pages that owe it.
+    //
+    // The comment on the linear rail explains why this rail needs no *settle* —
+    // a submitted writeback is already ahead of this gather in queue order, so a
+    // CPU fence wait buys nothing. A writeback **debt** is a different object: it
+    // has not been submitted, there is no command for queue order to order, and
+    // the surface's pages hold the frame before the one the resident is holding.
+    // Gathering them without paying binds the guest a stale frame.
+    //
+    // Paid before `note_gather` and not after, because the payment writes those
+    // pages: the witness has to see the write, or it vouches for bytes that
+    // changed underneath the vouch.
+    //
+    // Free when nothing is owed — `pay_for_mapping` is one emptiness check on
+    // the ledger, which is the answer on nearly every call.
+    crate::runtime::writeback_debt::pay_for_mapping(state, host, mid);
+    if let Some(source) = mapped_sampled_source(
+        state,
+        host,
+        MappedSamplePlane {
+            mapping_id: mid,
+            base_off,
+            row_pitch: bpr,
+            span,
+            row_length_texels,
+            origin: crate::backend::vulkan::engine::SampledByteOrigin::SurfaceGuestFallback,
+            owner,
+        },
+    ) {
+        if span < SAMPLED_GATHER_MIN_BYTES {
+            crate::runtime::drain::note_store_route("zc_t11_direct_below_gather_floor");
+        }
+        return Some(SampledSourceRequest::GuestRuns(
+            source,
+            native,
+            sampled_vk_format,
+            1,
+            None,
+            crate::runtime::gather_witness::GatherVouch::Fresh,
+            pixel_format::swizzle_identity(),
+        ));
+    }
+    if span < SAMPLED_GATHER_MIN_BYTES {
         return None;
     }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
@@ -3638,12 +4692,16 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     Some(SampledSourceRequest::GuestRuns(
         engine::GuestRunSource {
             runs: std::sync::Arc::new(runs),
+            source_offset: 0,
             total_len: span,
             row_length_texels,
             pages: guest_page_window(host, gpas, page as u64, base_off % page as u64, span),
+            direct_image: None,
         },
         native,
-        LinearSampleIdentity::from(seen.identity),
+        sampled_vk_format,
+        1,
+        Some(LinearSampleIdentity::from(seen.identity)),
         seen.vouch,
         // Identity: this rail admitted the format only after checking its plan
         // was identity, so there is nothing to fold in.
@@ -3660,11 +4718,12 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
 /// Mirrors `try_type11_sample_zero_copy`'s page coalescing over the plane
 /// window from `type5_sample_window` (which carries the wire plane index +
 /// biplanar offset); any gate miss falls back to the CPU byte path.
-fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
+pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mid: u32,
     view: objects::Type5TextureView,
+    owner: crate::model::TaskResourceLifetimeRef,
 ) -> Option<SampledSourceRequest> {
     use crate::backend::vulkan::engine;
     use crate::runtime::mapping_write::type5_sample_window;
@@ -3676,7 +4735,7 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     if !mapper::ensure_resolved_for_scanout(state, host, mid) {
         return None;
     }
-    let (native, bpp, base_off, bpr) = {
+    let (native, sampled_vk_format, bpp, base_off, bpr) = {
         let m = state.mappings.get(&mid)?;
         if !m.mapped || m.page_entries.is_empty() {
             return None;
@@ -3690,16 +4749,10 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
         // which sit identically on their Vulkan spellings. Required rather than
         // assumed, for the reason the type-11 rail states.
         let (native, bpp) = match translate::pixel::sampled_pixels(view.pixel_format) {
-            Ok((layout, decline, components)) => {
+            Ok((layout, _decline, components)) => {
                 if !pixel_format::swizzle_is_identity(&components) {
                     crate::runtime::drain::note_store_route("zc_t5_needs_swizzle");
                     return None;
-                }
-                if decline.is_some() {
-                    srgb_census::note_downgrade(
-                        srgb_census::site::TYPE5_PLANE_ZERO_COPY,
-                        view.pixel_format,
-                    );
                 }
                 (layout, layout.bytes_per_texel())
             }
@@ -3707,10 +4760,44 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
         };
         let (base_off, bpr_u32, _span_end) =
             type5_sample_window(m, view.plane_index, w, h, view.pixel_format)?;
-        (native, bpp, base_off, bpr_u32 as u64)
+        let sampled_vk_format = translate::pixel::translate(view.pixel_format).ok()?.vk;
+        (native, sampled_vk_format, bpp, base_off, bpr_u32 as u64)
     };
     let (span, row_length_texels) = strided_window_extent(w, h, bpp as u64, bpr)?;
-    if span < ZERO_COPY_SAMPLED_MIN_BYTES {
+    // Same rule as the linear rail's floor: a cost threshold may only turn a
+    // plane away onto a CPU arm that produces the same pixels. The type-11 rail
+    // needs no such qualifier because `is_four_byte_color` already fixes what
+    // reaches its floor; this one admits every layout the translation names.
+    // The owed frame, for the reason `try_type11_sample_zero_copy` states: a
+    // debt is not a submitted writeback and queue order cannot order it.
+    crate::runtime::writeback_debt::pay_for_mapping(state, host, mid);
+    if let Some(source) = mapped_sampled_source(
+        state,
+        host,
+        MappedSamplePlane {
+            mapping_id: mid,
+            base_off,
+            row_pitch: bpr,
+            span,
+            row_length_texels,
+            origin: crate::backend::vulkan::engine::SampledByteOrigin::SerializedSurfaceView,
+            owner,
+        },
+    ) {
+        if span < SAMPLED_GATHER_MIN_BYTES {
+            crate::runtime::drain::note_store_route("zc_t5_direct_below_gather_floor");
+        }
+        return Some(SampledSourceRequest::GuestRuns(
+            source,
+            native,
+            sampled_vk_format,
+            1,
+            None,
+            crate::runtime::gather_witness::GatherVouch::Fresh,
+            pixel_format::swizzle_identity(),
+        ));
+    }
+    if native.a_cost_floor_may_decline() && span < SAMPLED_GATHER_MIN_BYTES {
         return None;
     }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
@@ -3730,12 +4817,16 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     Some(SampledSourceRequest::GuestRuns(
         engine::GuestRunSource {
             runs: std::sync::Arc::new(runs),
+            source_offset: 0,
             total_len: span,
             row_length_texels,
             pages: guest_page_window(host, gpas, page as u64, base_off % page as u64, span),
+            direct_image: None,
         },
         native,
-        LinearSampleIdentity::from(seen.identity),
+        sampled_vk_format,
+        1,
+        Some(LinearSampleIdentity::from(seen.identity)),
         seen.vouch,
         // Identity: this rail admitted the format only after checking its plan
         // was identity, so there is nothing to fold in.
@@ -3757,49 +4848,115 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
 /// cannot decode, which fall through to the general loader.
 /// Convert the raw native rows read for a guest-linear texture (row stride
 /// `bpr`, `tight` = the packed row byte count) into the tight upload buffer.
-/// A 4-byte straight upload — RGBA8, or BGRA8 kept native — gathers each row
-/// with a plain copy (padding skipped, no swizzle) and reports its native
-/// format; every other format converts to RGBA8 per row. Shared by the
-/// guest-linear memo's miss-fill so its padded and tight branches agree
-/// byte-for-byte with the direct loader.
+/// A straight upload — RGBA8, BGRA8 kept native, or half-float colour kept at
+/// its own width — gathers each row with a plain copy (padding skipped, no
+/// swizzle) and reports its native format; every other format converts to
+/// RGBA8 per row. Shared by the guest-linear memo's miss-fill so its padded and
+/// tight branches agree byte-for-byte with the direct loader.
+///
+/// The straight-upload output is sized from the chosen layout's own texel
+/// width. It was sized from `RGBA8_BPP` while only four-byte layouts could be
+/// chosen, and the half-float arms are eight and four bytes a texel — so a
+/// hard-coded four here would under-allocate an `RGBA16Float` image by half and
+/// the row copy would refuse rather than write past it, which is a lost bind
+/// dressed as a decline.
 fn native_scratch_to_upload(
     scratch: &[u8],
     w: u32,
     h: u32,
+    planes: u32,
     bpr: u64,
     sample_fmt: u16,
     tight: u64,
 ) -> Option<(Vec<u8>, TexelLayout)> {
-    let out_row = (w as usize).checked_mul(RGBA8_BPP as usize)?;
-    let out_len = out_row.checked_mul(h as usize)?;
+    let native = native_uploads_for(sample_fmt);
     let bpr = bpr as usize;
-    if let Some(fmt) = linear_native_upload_format(sample_fmt, true)
-        .filter(|_| tight == (w as u64).saturating_mul(RGBA8_BPP as u64))
+    if let Some(fmt) = linear_native_upload_format(sample_fmt, native)
+        .filter(|fmt| tight == (w as u64).saturating_mul(fmt.bytes_per_texel() as u64))
     {
         let row_bytes = tight as usize;
-        let mut out = vec![0u8; out_len];
-        for y in 0..h as usize {
-            let src = y.checked_mul(bpr)?;
-            let dst = y * row_bytes;
+        let rows = (h as usize).checked_mul(planes as usize)?;
+        let mut out = vec![0u8; row_bytes.checked_mul(rows)?];
+        for row_index in 0..rows {
+            let src = row_index.checked_mul(bpr)?;
+            let dst = row_index * row_bytes;
             out.get_mut(dst..dst + row_bytes)?
                 .copy_from_slice(scratch.get(src..src + row_bytes)?);
         }
         return Some((out, fmt));
     }
+    let out_row = (w as usize).checked_mul(RGBA8_BPP as usize)?;
+    let rows = (h as usize).checked_mul(planes as usize)?;
+    let out_len = out_row.checked_mul(rows)?;
     let trow = tight as usize;
     let mut out = vec![0u8; out_len];
-    for y in 0..h as usize {
-        let src = y.checked_mul(bpr)?;
+    // This rung carries nearly all of the pathway's sampled traffic, so a
+    // narrowing taken here is the one most likely to be the narrowing that
+    // matters — and until this line existed the rung reported none at all while
+    // the general loader reported its own. Same key as the others, so a format
+    // narrowed on both rails is two lines and not one.
+    crate::runtime::draw::note_sampled_narrowing("linear_memo_narrowed", 0, sample_fmt, w, h);
+    for row_index in 0..rows {
+        let src = row_index.checked_mul(bpr)?;
         if !pixel_format::convert_row_to_rgba8(
             sample_fmt,
             scratch.get(src..src + trow)?,
             w,
-            &mut out[y * out_row..],
+            &mut out[row_index * out_row..],
         ) {
             return None;
         }
     }
     Some((out, TexelLayout::Rgba8))
+}
+
+/// Which native sampled layouts the CPU byte rails may hand the engine for this
+/// guest format on this host.
+///
+/// [`NativeUploads`] is a parameter of the loaders and not a constant because
+/// the answer has a capability half that `runtime/draw/texture_view.rs` cannot
+/// ask: an image is created at the layout's own `VkFormat`, and a host that
+/// cannot linearly filter that format would sample it through a sampler that
+/// asks for filtering anyway. This is the one place that asks, so the two
+/// halves of the answer are decided together.
+///
+/// `Bgra8` is unconditional: `B8G8R8A8_UNORM` carries
+/// `SAMPLED_IMAGE_FILTER_LINEAR` on every Vulkan implementation by mandate, and
+/// the rail that first took it argues the same.
+///
+/// **Keyed on the format so the common one never asks an irrelevant question.**
+/// The host capability is a lock-free device-lifetime snapshot, but this sits
+/// on the rung carrying essentially all of the pathway's sampled traffic and
+/// only two guest formats can make use of the answer.
+/// [`pixel_format::narrows_to_unorm8`] is exactly the set of formats whose CPU
+/// arm is lossy, which is exactly the set the half-float flag can change the
+/// answer for — so keying on it is the same rule stated once, not a fast path
+/// that could disagree with the slow one.
+fn native_uploads_for(sample_format: u16) -> NativeUploads {
+    if !pixel_format::narrows_to_unorm8(sample_format) {
+        return NativeUploads::BGRA8;
+    }
+    native_uploads_asking_host()
+}
+
+/// The same answer for a caller that does not yet know the guest format.
+///
+/// The last-resort sampled rung resolves the format inside the loader, so it
+/// cannot key the question the way the hot rung does — and it does not need to:
+/// `settle_linear_texture_sampled` read **0** across a four-rail sweep, because
+/// every rung above it serves. A lock on a path that does not run is not a cost.
+fn native_uploads_asking_host() -> NativeUploads {
+    use crate::backend::vulkan::engine;
+    NativeUploads {
+        // One flag for both half-float layouts, so the answer is the
+        // conjunction: a host that filters one and not the other keeps neither
+        // on the native rail. Nothing on record separates them — both carry
+        // `SAMPLED_IMAGE_FILTER_LINEAR` by mandate — and a per-layout flag
+        // would be two fields nobody could point at a host that needed them.
+        float16: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba16Float)
+            && engine::supports_sampled_layout_linear_filter(TexelLayout::Rg16Float),
+        ..NativeUploads::BGRA8
+    }
 }
 
 /// The sampled linear ladder's hot rung: read the guest's own rows for this
@@ -3814,7 +4971,8 @@ fn native_scratch_to_upload(
 ///   memory, `read_descriptor` re-reads the descriptor, and `level_gva` derives
 ///   the span from that. No step caches, so a recycled `texture_ref` cannot
 ///   hand this the previous resource's address.
-/// - The staleness check is exact, not sampled. The full `bpr * h` native span
+/// - The staleness check is exact, not sampled. The full
+///   `bpr * h * depth_planes` native span
 ///   is re-read every call and compared byte for byte against the memo
 ///   (`m.native == scratch`), padding included, so a guest write anywhere in
 ///   the span misses the memo.
@@ -3838,30 +4996,33 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 ) -> Option<(
     std::sync::Arc<Vec<u8>>,
     Option<LinearSampleIdentity>,
-    TexelLayout,
+    SampledByteFormat,
 )> {
     let declared_format = tex.declared_pixel_format()?;
     let sample_fmt = effective_view_sample_format(declared_format, None)?;
     let (_, layout) = tex.level_gva(0, state.page_shift)?;
     let bpr = layout.row_stride;
+    let planes = layout.planes();
     let tight = pixel_format::tight_row_bytes(w, declared_format)? as u64;
     // Padded strides ride the same memo now — the native read below covers the
-    // full `bpr*h` span (padding included, so a write anywhere is observed) and
+    // full `bpr*h*planes` span (padding included, so a write anywhere is
+    // observed) and
     // `native_scratch_to_upload` gathers the tight rows. A sub-tight stride
     // (impossible geometry) or a zero dimension declines to the fallback.
     if bpr < tight || w == 0 || h == 0 {
         return None;
     }
-    // `bpr*h` and not `TextureLevelLayout::read_span`, which every reader that
-    // walks only the tight rows uses instead. This one really does read the last
-    // row's padding — that is what makes the memo's byte-for-byte compare able to
-    // notice a guest write into it — so it is charged for what it touches.
+    // `bpr*h*planes` and not `TextureLevelLayout::slice_read_span`, which every
+    // reader that walks only the tight rows uses instead. This one really does
+    // read the last row's padding — that is what makes the memo's byte-for-byte
+    // compare able to notice a guest write into it — so it is charged for what
+    // it touches.
     //
     // The consequence is a third way to decline, and the one most worth knowing:
     // an image the guest sized to `offset + read_span` exactly is refused here
     // and served by the general loader below, which uses the tighter rule. That
     // is a slower path, not lost work.
-    let span = bpr.checked_mul(h as u64)?;
+    let span = bpr.checked_mul(h as u64)?.checked_mul(u64::from(planes))?;
     let native_len = host_alloc_len(span)?;
     if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
         return None;
@@ -3879,32 +5040,16 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     // A short walk is `None` and settles. `pages_spanned` is the count the
     // resolver would have produced with nothing dropped, and a dropped page is
     // one this reader cannot rule out.
-    // The reads below walk a raw task GVA, but the reference names a resource,
-    // and a debt is keyed by mapping id — so only what this reference resolves
-    // to is paid. `note_unnamed_reach` stays as the standing alarm for the one
-    // thing the naming cannot see, raw page aliasing; it samples this read's own
-    // walk against every owed surface and must stay at zero overlap. The census runs first, while the
-    // ledger still holds what the payment is about to clear, and it is handed the
-    // same walk the disjointness test below uses so both are one rule.
-    {
-        let (tasks, page_shift) = (&state.tasks, state.page_shift);
-        let page_size = state.page_size();
-        crate::runtime::writeback_debt::note_unnamed_reach(state, || {
-            let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
-            let gpas = gva_mem::task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift);
-            (gpas.len() as u64 == want).then_some(gpas)
-        });
-    }
-    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
-    let (tasks, page_shift) = (&state.tasks, state.page_shift);
-    let page_size = state.page_size();
-    crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
+    // Census, pay, settle — the whole obligation of a CPU read of one named
+    // resource's guest bytes. See `writeback_debt::settle_for_texture`.
+    crate::runtime::writeback_debt::settle_for_texture(
+        state,
+        host,
+        task_id,
+        texture_ref,
+        gva,
+        span,
         crate::runtime::render_writeback::SettleSite::LinearMemoRead,
-        || {
-            let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
-            let gpas = gva_mem::task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift);
-            (gpas.len() as u64 == want).then_some(gpas)
-        },
     );
     let mut scratch = std::mem::take(&mut state.guest_linear_scratch);
     scratch.resize(native_len, 0);
@@ -3920,7 +5065,7 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
         state.guest_linear_scratch = scratch;
         return None;
     }
-    let key = (task_id, gva, w, h, sample_fmt);
+    let key = (task_id, gva, w, h, planes, sample_fmt);
     // Three-way, because "the memo did not answer" has two causes that want
     // opposite fixes and a hit/miss pair cannot tell them apart.
     //
@@ -3959,19 +5104,14 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
         // Vec equality is length + byte memcmp with early exit on change.
         Some(m) if m.native == scratch => {
             crate::runtime::drain::note_store_route("lin_memo_hit");
-            Some((m.rgba.clone(), m.generation, m.bgra8))
+            Some((m.rgba.clone(), m.generation, m.layout))
         }
         Some(_) => {
             crate::runtime::drain::note_store_route("lin_memo_changed");
             None
         }
     };
-    if let Some((rgba, generation, bgra8)) = hit {
-        let fmt = if bgra8 {
-            TexelLayout::Bgra8
-        } else {
-            TexelLayout::Rgba8
-        };
+    if let Some((rgba, generation, fmt)) = hit {
         state.guest_linear_scratch = scratch;
         return Some((
             rgba,
@@ -3979,11 +5119,16 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
                 key: gva,
                 generation,
             }),
-            fmt,
+            // The memo stores the layout it converted to; the transfer function
+            // is `sample_fmt`'s and is re-derived on hit and miss alike, so a
+            // retained entry cannot carry a stale one.
+            SampledByteFormat::from_source(fmt, sample_fmt),
         ));
     }
     // First sight or native bytes changed: convert fresh, new generation.
-    let Some((rgba, fmt)) = native_scratch_to_upload(&scratch, w, h, bpr, sample_fmt, tight) else {
+    let Some((rgba, fmt)) =
+        native_scratch_to_upload(&scratch, w, h, planes, bpr, sample_fmt, tight)
+    else {
         state.guest_linear_scratch = scratch;
         return None;
     };
@@ -3995,7 +5140,7 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
         crate::model::GuestLinearMemo {
             native: scratch,
             rgba: rgba.clone(),
-            bgra8: fmt == TexelLayout::Bgra8,
+            layout: fmt,
             generation,
         },
         entry_bytes,
@@ -4006,7 +5151,7 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
             key: gva,
             generation,
         }),
-        fmt,
+        SampledByteFormat::from_source(fmt, sample_fmt),
     ))
 }
 
@@ -4095,7 +5240,7 @@ fn note_guest_rung_blank<H: HostMemory>(
     texture_ref: u32,
     span: (u64, u32, u32),
     rgba: &[u8],
-    byte_format: TexelLayout,
+    byte_format: SampledByteFormat,
 ) {
     let (gva, w, h) = span;
     crate::runtime::drain::note_store_route("lin_rung_guest_memo");
@@ -4217,6 +5362,24 @@ pub(super) fn load_linear_from_host_caches<M: HostMemory + HostOps>(
             &rgba,
             byte_format,
         );
+        // The other half of a channel-order reading. A GVA span is *written* by
+        // the render Store at the attachment's declared format and *read* here
+        // at the sampled descriptor's, and on the copying rail those are two
+        // interpretations of one buffer rather than one typed image — so the
+        // pair has to be joinable. `gva_flush_gpu_declined` names the write's
+        // format against the same `gva=`; this names the read's. Latched per
+        // (gva, format) so a steady bind stays at one line and a *change* of
+        // interpretation still surfaces.
+        if crate::observe::first_sight(
+            "lin_serve_fmt",
+            gva ^ (u64::from(tex.pixel_format) << 48),
+        ) {
+            crate::observe::off(format!(
+                "lin_serve_fmt task={task_id} ref={texture_ref} gva={gva:#x} {w}x{h} \
+                 fmt={:#x} bytes={byte_format:?}",
+                tex.pixel_format
+            ));
+        }
         return Some((w, h, rgba, identity, byte_format));
     }
     // There is deliberately no second guest rung under the memo. One used to
@@ -4236,7 +5399,7 @@ pub(super) fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     None
 }
 
-/// Guest pages the Vulkan draw's single synchronous GVA Store may write.
+/// Guest pages the Vulkan draw's eager GVA fallback may write.
 ///
 /// The Vulkan rail writes back only color attachment 0, so this narrows
 /// [`sync_store_target_pages`] to that record and to the case where this record
@@ -4279,7 +5442,7 @@ pub(super) fn sync_store_allowed_pages<M: HostMemory>(
 ///
 /// ```text
 /// type11_seed_elided      41389      t11elide_le_64x64          5
-/// type11_seed_uploaded      242      t11elide_le_256x256        4
+/// type11_seed_provided      242      t11elide_le_256x256        4
 ///                                    t11elide_le_512x512      903
 ///                                    t11elide_le_1024x1024  15641
 ///                                    t11elide_display       24836
@@ -4291,7 +5454,7 @@ pub(super) fn sync_store_allowed_pages<M: HostMemory>(
 /// **An unconditional revalidation is not affordable.** At RGBA8 the elided
 /// extent is ~237 GB of guest reads per session. The rail is not a micro-
 /// optimisation to be traded away for correctness; it is carrying essentially
-/// all of the composite seed traffic, and `type11_seed_uploaded` at 242 against
+/// all of the composite seed traffic, and `type11_seed_provided` at 242 against
 /// 41 389 says what the un-elided rate would be.
 ///
 /// **The latch is not on the icon target.** Nine elisions in the entire session
@@ -4309,7 +5472,7 @@ pub(super) fn sync_store_allowed_pages<M: HostMemory>(
 /// [`type11_guest_wrote_since_store`] is that witness, over
 /// `HostOps::guest_write_gen`: O(pages) at the harvest instead of O(bytes) at
 /// every LOAD, with the 237 GB left saved. One driven boot after it landed
-/// measured `type11_seed_elided` 283 against `type11_seed_uploaded` 23, so the
+/// measured `type11_seed_elided` 283 against `type11_seed_provided` 23, so the
 /// reuse survived the soundness.
 fn note_type11_elision_extent(w: u32, h: u32) {
     let texels = (w as u64).saturating_mul(h as u64);
@@ -4732,7 +5895,6 @@ fn note_load_seed_outcome(
     }
 }
 
-
 /// Store type-2/3 encode into texture_ref + GVA host caches (BGRA).
 ///
 /// `task_id` is the task whose page table gives the GVA meaning; the store
@@ -4768,6 +5930,7 @@ pub(crate) fn host_cache_store_gva_layer<M: HostMemory + HostOps>(
     if texture_ref != 0 {
         crate::runtime::surface_cache::store_texture(
             state,
+            task_id,
             texture_ref,
             width,
             height,
@@ -4812,7 +5975,12 @@ enum M2vDrawSpan {
     /// resident with `skip_readback`: the caller lands the frame from that
     /// resident, which is where the pixels are — this record produced none on
     /// the host.
-    ResidentGvaStore,
+    ///
+    /// `identity` is the key the draw registered, carried rather than re-derived
+    /// — see [`Self::ResidentSurfaceStore`] for what a second derivation costs.
+    ResidentGvaStore {
+        identity: crate::backend::vulkan::engine::TargetIdentity,
+    },
     /// Type-11 composite Store executed into its registry resident with
     /// `skip_readback`: the caller copies that image into the mapping's guest
     /// pages through [`crate::runtime::render_writeback`], which never brings
@@ -4823,7 +5991,32 @@ enum M2vDrawSpan {
     /// different routes. Distinct from [`Self::Pixels`] because there are no
     /// pixels — a caller that treated an empty frame as one would write a blank
     /// framebuffer into guest memory.
-    ResidentSurfaceStore,
+    ///
+    /// # Why the identity travels with the span
+    ///
+    /// `identity` is the exact key this record handed `registry_ensure`, so the
+    /// image the Store reads is the image the draw rendered into by
+    /// construction. The Store used to call `type11_store_identity` a second
+    /// time instead, on the grounds that it is the same function that produced
+    /// `DrawRequest::target_identity` — but it is not the same *value*. That
+    /// identity carries `MappingEntry::map_generation`, the draw mutates
+    /// `DeviceState` between the two calls, and any writer that revalidates the
+    /// mapping advances the generation. The Store then asked the registry for a
+    /// key one generation ahead of the one the draw registered, which is
+    /// `read_target_unknown_identity diverges=generation asked_gen=N
+    /// held_gen=N-1` — the whole Maps frame lost, on the only render-target
+    /// rail a host without `VK_EXT_external_memory_host` has.
+    ResidentSurfaceStore {
+        identity: crate::backend::vulkan::engine::TargetIdentity,
+        guest_store: GuestStoreStatus,
+    },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct GuestStoreStatus {
+    guest_backed: bool,
+    recorded: bool,
+    footprint: Option<crate::runtime::guest_ram::GuestPageFootprint>,
 }
 
 /// Name the guest-Store route this record actually took, once per distinct
@@ -4964,7 +6157,7 @@ fn note_type11_store_route(route: &'static str) {
     reason = "every argument is a distinct wire-derived input to the attachment set"
 )]
 pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     colors: &[ColorRtRequest],
@@ -5048,14 +6241,27 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
                 gva: c.target_gva,
                 width: c.width,
                 height: c.height,
-                generation: gva_span_alloc_generation(
-                    state,
-                    host,
-                    task_id,
-                    c.target_gva,
-                    c.row_stride,
-                    c.height,
-                ),
+                generation: if c.texture_ref != 0 {
+                    crate::runtime::writeback_debt::gva_resource_generation(
+                        state,
+                        host,
+                        crate::runtime::writeback_debt::GvaResourceKey {
+                            task_id,
+                            texture_ref: c.texture_ref,
+                        },
+                        c.target_gva,
+                        u64::from(c.row_stride).saturating_mul(u64::from(c.height)),
+                    )
+                } else {
+                    gva_span_alloc_generation(
+                        state,
+                        host,
+                        task_id,
+                        c.target_gva,
+                        c.row_stride,
+                        c.height,
+                    )
+                },
                 // The format this attachment's image is actually created with,
                 // not a re-derivation of it. `registry_ensure_attachment` takes
                 // `format` — resolved just above by `color_attachment` — so
@@ -5091,7 +6297,16 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
         // `aliases` and not `==`: the destination is the conflict, not the
         // registry slot. Two attachments over one guest span at two formats are
         // two images, so `==` says no and the span is still written twice.
-        if identity.aliases(primary) {
+        //
+        // The rule is pairwise over the whole attachment set rather than a test
+        // against slot 0. Two *secondaries* over one destination write it twice
+        // in one pass for exactly the reason the primary case does, and this
+        // named `primary` alone — so slots 1 and 2 over one span were admitted,
+        // built into a framebuffer and drawn.
+        let aliases_a_sibling = out
+            .iter()
+            .any(|s: &SecondaryColorTarget| identity.aliases(&s.identity));
+        if identity.aliases(primary) || aliases_a_sibling {
             crate::runtime::census::present_proxy::note_secondary_mrt_drop(
                 crate::runtime::census::present_proxy::MrtDrop::AliasesPrimary,
                 c.width,
@@ -5236,8 +6451,10 @@ pub(super) fn honour_gva_load_elision<M: HostMemory + HostOps>(
     if !req.gva_load_from_resident || *chain_load_from_target {
         return None;
     }
-    let ready = gva_chain_identity(req)
-        .filter(crate::backend::vulkan::engine::resident_content_ready);
+    let ready = gva_chain_identity(req).filter(|identity| {
+        let texture_ref = req.colors.first().map(|c0| c0.texture_ref).unwrap_or(0);
+        gva_resident_ready(state, req.task_id, texture_ref, identity)
+    });
     match ready {
         Some(identity) => {
             crate::runtime::drain::note_store_route("gvaseed_chained");
@@ -5252,8 +6469,15 @@ pub(super) fn honour_gva_load_elision<M: HostMemory + HostOps>(
             // decline into a panic on the drain worker.
             let c0 = req.colors.first()?;
             let (tex_ref, gva, cw, ch) = (c0.texture_ref, c0.target_gva, c0.width, c0.height);
-            let seed =
-                crate::runtime::draw::seed_color_load(state, host, req.task_id, tex_ref, gva, cw, ch);
+            let seed = crate::runtime::draw::seed_color_load(
+                state,
+                host,
+                req.task_id,
+                tex_ref,
+                gva,
+                cw,
+                ch,
+            );
             if seed.is_none() {
                 crate::observe::fail(format!(
                     "gvaseed_reseed_miss ref={tex_ref} {cw}x{ch} gva={gva:#x} \
@@ -5312,6 +6536,118 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     let v_shader = resolved.vertex.clone();
     let f_shader = resolved.fragment.clone();
 
+    // Request construction obtains the attachment count from this immutable
+    // pipeline before LOAD/CLEAR and Store policy can inspect it. Keep the
+    // equality explicit at the backend boundary: reaching here with a different
+    // count is an internal contract violation, not a shape Vulkan may repair.
+    let pipeline_sample_count = pd.raster_sample_count.max(1);
+    if pipeline_sample_count > 1 {
+        let color = req.colors.first();
+        let key = (u64::from(req.pipeline_ref) << 32)
+            | u64::from(color.map_or(0, |color| color.texture_ref));
+        if crate::observe::first_sight("render_multisample_contract", key) {
+            crate::observe::off(format!(
+                "render_multisample_contract task={} pipe={} raster_samples={} \
+                 colors={} color_ref={} source_ref={} mid={} gva={:#x} {}x{} \
+                 fmt={:#x} load={} store={} depth_ref={}",
+                req.task_id,
+                req.pipeline_ref,
+                pipeline_sample_count,
+                req.colors.len(),
+                color.map_or(0, |color| color.texture_ref),
+                color.map_or(0, |color| color.multisample_source_ref),
+                color.map_or(0, |color| color.mapping_id),
+                color.map_or(0, |color| color.target_gva),
+                color.map_or(0, |color| color.width),
+                color.map_or(0, |color| color.height),
+                color.map_or(0, |color| color.format),
+                color.map_or(0, |color| color.load_action),
+                color.map_or(0, |color| color.store_action),
+                req.depth_attach.as_ref().map_or(0, |depth| depth.texture_ref),
+            ));
+        }
+    }
+    if let Some(color) = req
+        .colors
+        .iter()
+        .find(|color| color.sample_count != pipeline_sample_count)
+    {
+        return Err(DrawError::Unsupported(
+            crate::backend::vulkan::engine::reason::DrawReason::MultisampleAttachmentSampleCountMismatch {
+                attachment: color.sample_count,
+                raster: pipeline_sample_count,
+            },
+        ));
+    }
+
+    for (stage, shader, textures) in [
+        ("vertex", &v_shader, &req.vertex_textures),
+        ("fragment", &f_shader, &req.fragment_textures),
+    ] {
+        if let Some((index, descriptor)) =
+            crate::runtime::spirv_bind::first_non_sampled_texture_descriptor(&shader.reflection)
+        {
+            let access = match descriptor.access {
+                crate::runtime::spirv_bind::ReflectedTextureAccess::Storage => "storage",
+                crate::runtime::spirv_bind::ReflectedTextureAccess::Unknown => "unknown",
+                crate::runtime::spirv_bind::ReflectedTextureAccess::Sampled => continue,
+            };
+            return Err(DrawError::DrawPreparation(
+                DrawPreparationDecline::TextureAccessUnsupported {
+                    stage,
+                    index,
+                    texture_ref: textures
+                        .iter()
+                        .find(|texture| texture.index == index)
+                        .map(|texture| texture.texture_ref)
+                        .unwrap_or(0),
+                    binding: descriptor.binding,
+                    access,
+                },
+            ));
+        }
+    }
+    for (stage, expected_stage, shader) in [
+        (
+            "vertex",
+            metal2vulkan::reflect::ShaderStage::Vertex,
+            &v_shader,
+        ),
+        (
+            "fragment",
+            metal2vulkan::reflect::ShaderStage::Fragment,
+            &f_shader,
+        ),
+    ] {
+        if let Some(unsupported) = crate::runtime::spirv_bind::first_unsupported_vulkan_interface(
+            &shader.reflection,
+            expected_stage,
+        ) {
+            return Err(DrawError::DrawPreparation(
+                DrawPreparationDecline::ReflectedInterfaceUnsupported {
+                    stage,
+                    feature: unsupported.feature,
+                    count: unsupported.count,
+                },
+            ));
+        }
+        if let Some(resource) =
+            crate::runtime::spirv_bind::first_unsupported_vulkan_resource(&shader.reflection)
+        {
+            let kind =
+                crate::runtime::spirv_bind::unsupported_vulkan_resource_kind_name(resource.kind)
+                    .expect("helper returned an unsupported Vulkan resource");
+            return Err(DrawError::DrawPreparation(
+                DrawPreparationDecline::ReflectedResourceUnsupported {
+                    stage,
+                    index: resource.metal_index,
+                    binding: resource.descriptor.map(|descriptor| descriptor.binding),
+                    kind,
+                },
+            ));
+        }
+    }
+
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Pipeline);
     let Some((w, h)) = req.colors.first().map(|c0| (c0.width, c0.height)) else {
         return Ok(M2vDrawSpan::None);
@@ -5362,6 +6698,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // the attribute walk, holds only the indices that actually carried
         // bytes, and decides storage binding.
         let bind_plan = &resolved.bind_plan;
+        let render_buffer_bounds = crate::runtime::spirv_bind::RenderBufferIndexBounds::new(
+            req.first_vertex,
+            req.vertex_count,
+            req.base_instance,
+            req.instance_count,
+            req.indexed.is_some(),
+        );
         let mut vtx_storage: Vec<(u32, crate::backend::vulkan::engine::BufferContent)> = Vec::new();
         // The three `bind_phase` spans below divide `chain_phase`'s `binds_us`,
         // which is this draw path's largest column and covered three costs with
@@ -5369,26 +6712,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // the span it left from rather than losing the time.
         let vertex_span =
             crate::runtime::bind_phase::Span::open(crate::runtime::bind_phase::Part::VertexLoad);
-        for b in &req.vertex_buffers {
+        for b in req.vertex_buffers.iter() {
             if b.buffer_ref == 0 {
                 continue;
             }
             let allow_zc = !bind_plan.is_constant_step(b.index);
-            // The vertex shader's own reflection bounds its own `[[buffer(n)]]`
-            // binds. A buffer feeding `[[stage_in]]` is a vertex *attribute*
-            // rather than a declared argument, so reflection lists no Buffer at
-            // its index and the lookup declines to narrow it — which is correct
-            // twice over, because the vertex descriptor's stride is what would
-            // bound one of those and it is a different number.
-            let cap = crate::runtime::spirv_bind::reflected_buffer_extent(
-                &v_shader.reflection,
-                b.index,
-            );
-            let access = crate::runtime::spirv_bind::reflected_buffer_access(
-                &v_shader.reflection,
-                b.index,
-            );
-            crate::runtime::bind_phase::note_access(access);
             // A vertex buffer is read twice on this path — as the declared
             // argument reflection describes, and as the byte source for every
             // stage-in attribute naming this index, which it does not. Only the
@@ -5396,6 +6724,18 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // attribute list names keeps its guest bytes whatever reflection
             // says about the argument.
             let feeds_stage_in = bind_plan.feeds_stage_in(b.index);
+            // The vertex shader's own reflection bounds its own `[[buffer(n)]]`
+            // binds, and a stage-in index is excluded — see that function's doc
+            // for why the exclusion is not implied by the translator's output.
+            let cap = crate::runtime::spirv_bind::vertex_buffer_extent(
+                &v_shader.reflection,
+                b.index,
+                feeds_stage_in,
+                render_buffer_bounds,
+            );
+            let access =
+                crate::runtime::spirv_bind::reflected_buffer_access(&v_shader.reflection, b.index);
+            crate::runtime::bind_phase::note_access(access);
             let content = if crate::runtime::spirv_bind::may_serve_neutral(access, feeds_stage_in) {
                 crate::runtime::bind_phase::note_neutral_served();
                 crate::backend::vulkan::engine::BufferContent::Bytes(
@@ -5408,6 +6748,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     host,
                     req.task_id,
                     b.buffer_ref,
+                    b.resource.as_deref(),
                     b.offset,
                     allow_zc,
                     cap,
@@ -5429,7 +6770,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             Vec::new();
         let fragment_span =
             crate::runtime::bind_phase::Span::open(crate::runtime::bind_phase::Part::FragmentLoad);
-        for b in &req.fragment_buffers {
+        for b in req.fragment_buffers.iter() {
             if b.buffer_ref == 0 {
                 continue;
             }
@@ -5437,14 +6778,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // stages are looked up separately because one Metal buffer index
             // names a different argument in each, and a cap taken from the
             // wrong stage would bound a bind the other stage never declared.
-            let cap = crate::runtime::spirv_bind::reflected_buffer_extent(
+            let cap = crate::runtime::spirv_bind::reflected_render_buffer_extent(
                 &f_shader.reflection,
                 b.index,
+                render_buffer_bounds,
             );
-            let access = crate::runtime::spirv_bind::reflected_buffer_access(
-                &f_shader.reflection,
-                b.index,
-            );
+            let access =
+                crate::runtime::spirv_bind::reflected_buffer_access(&f_shader.reflection, b.index);
             crate::runtime::bind_phase::note_access(access);
             // No stage-in exclusion here: `[[stage_in]]` is a vertex-stage
             // concept and `pd.vertex_attributes` names vertex buffer indices,
@@ -5461,6 +6801,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     host,
                     req.task_id,
                     b.buffer_ref,
+                    b.resource.as_deref(),
                     b.offset,
                     true,
                     cap,
@@ -5542,12 +6883,27 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let vtx_idx: std::collections::BTreeSet<u32> =
             vtx_storage.iter().map(|(i, _)| *i).collect();
         let buf_collide = frag_storage.iter().any(|(i, _)| vtx_idx.contains(i));
-        let has_vtx_tex = req.vertex_textures.iter().any(|t| t.texture_ref != 0);
-        let has_frag_tex = req.fragment_textures.iter().any(|t| t.texture_ref != 0);
+        // The sampled band holds textures **and** samplers, and the relocation is
+        // what stops one stage's binding number landing on the other's. So the
+        // trigger asks about the whole band: a stage with a sampler and no
+        // texture is still occupying binding numbers in it.
+        //
+        // Textures alone is what stood here, and Metal argument tables are sticky
+        // across draws in an encoder — a vertex sampler survives a re-bind that
+        // zeroed the vertex textures. With `has_vtx_tex` false the two stages'
+        // sampler at index 0 both resolve to `SAMPLER_BINDING_BASE + 0`, and
+        // `push_smp`'s `sampler_binds.insert` is first-writer-wins: the vertex
+        // sampler takes the binding and the fragment one is *dropped*. The layout
+        // gives every sampler `VERTEX | FRAGMENT` stage flags, so the fragment
+        // module then samples its textures through the vertex stage's filter,
+        // address mode and LOD clamp, with nothing refused and nothing counted.
+        let has_vtx_sampled = stage_uses_sampled_band(&req.vertex_textures, &req.vertex_samplers);
+        let has_frag_sampled =
+            stage_uses_sampled_band(&req.fragment_textures, &req.fragment_samplers);
         let reflected_sampled_collision =
             reflected_sampled_binding_collision(&v_shader.reflection, &f_shader.reflection);
         let separate_sampled =
-            (has_vtx_tex && has_frag_tex) || buf_collide || reflected_sampled_collision;
+            (has_vtx_sampled && has_frag_sampled) || buf_collide || reflected_sampled_collision;
         // Sampled relocation first (archive order), then buffer band. The
         // buffer band lands at [104,136), clear of the [96,104) ColorInput /
         // framebuffer-fetch band, which neither relocation touches. The
@@ -5570,11 +6926,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // every stage-in buffer left that binding unbound, so each glyph read a
         // zero position/size and collapsed to a degenerate (zero-area) quad —
         // the "blank Safari body text" class. Bind a stage-in buffer as storage
-        // too whenever the vertex SPIR-V structurally declares a StorageBuffer at
-        // that binding (decoration-driven, never name-keyed).
+        // too whenever the adopted vertex reflection structurally declares a
+        // buffer at that binding (never name-keyed).
         let mut storage: Vec<crate::backend::vulkan::engine::StorageBufferResource> = Vec::new();
         for (idx, content) in &vtx_storage {
-            if !vertex_buffer_needs_storage_binding(&v_words, *idx, stage_in_bufs.contains(idx)) {
+            if !vertex_buffer_needs_storage_binding(
+                &v_shader.reflection,
+                *idx,
+                stage_in_bufs.contains(idx),
+            ) {
                 continue;
             }
             storage.push(crate::backend::vulkan::engine::StorageBufferResource {
@@ -5605,8 +6965,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // unbound descriptor executes with no error. Fragment-only: a vertex
         // `[[buffer(n)]]` may legitimately be bound as a stage-in attribute (not
         // storage), so a vertex check would false-fire. Standard directly-bound
-        // kinds only; ColorInput / ThreadgroupBuffer / StorageImage reach the shader
-        // by other paths and carry their own census (`census_reflection_wellformed`).
+        // kinds only; ColorInput / ThreadgroupBuffer reach the shader by other
+        // paths, while storage textures were declined before bind preparation.
         // Verified non-flooding: 0 fires across a full x86 boot (desktop convergence
         // + Safari + CSS gradients + a 23-binding compositor shader), so any fire is
         // a genuine bind gap, not expected control flow.
@@ -5615,12 +6975,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // samples, which is the hot path.
         let frag_unbound_used_textures: Vec<u32> = {
             // Membership predicates over the (tiny) provided-resource slices — the
-            // scan allocates nothing on the all-bound hot path (both result Vecs
-            // stay empty). The `frag_embedded_*` reason names a DIFFERENT silent
-            // hole: a fragment shader declaring an `EmbeddedArgBufferTexture` (m2v
-            // flattened out of an `air.indirect_buffer` arg) that only the compute
-            // path can source, so the render path leaves it structurally unbound.
-            let (unbound, embedded) = frag_unbound_scan(
+            // scan allocates nothing on the all-bound hot path. Unsupported
+            // reflected resource families have already been refused above.
+            let unbound = frag_unbound_scan(
                 &f_shader.reflection.bindings,
                 |i| frag_storage.iter().any(|(x, _)| *x == i),
                 |i| {
@@ -5656,7 +7013,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // boot says which population these firings belong to.
             let uses: Vec<_> = unbound
                 .iter()
-                .map(|gap| (*gap, frag_unbound_static_use(gap, &f_words, separate_sampled)))
+                .map(|gap| {
+                    (
+                        *gap,
+                        frag_unbound_static_use(gap, &f_words, separate_sampled),
+                    )
+                })
                 .collect();
             for (_, use_) in &uses {
                 crate::runtime::drain::note_store_route(use_.slug());
@@ -5696,14 +7058,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     uses.len(),
                     w,
                     h
-                ));
-            }
-            if !embedded.is_empty() {
-                crate::observe::fail(format!(
-                    "shader_resource_declared_unbound reason=frag_embedded_argbuffer_unsupported \
-                     pipe={} embedded_tex={embedded:?} {}x{} \
-                     (render path cannot source air.indirect_buffer textures)",
-                    req.pipeline_ref, w, h
                 ));
             }
             // Textures only, and violations only. A buffer or sampler gap is
@@ -5753,34 +7107,84 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let mut images: Vec<crate::backend::vulkan::engine::SampledImageResource> = Vec::new();
         let mut samplers: Vec<crate::backend::vulkan::engine::SamplerResource> = Vec::new();
         let mut sampler_binds: std::collections::BTreeSet<u32> = Default::default();
+        // Where each provisioned sampler's state came from, keyed by binding, for
+        // the hang trail. A `SamplerResource` cannot be asked this after the
+        // fact: a translated guest sampler that happens to be `Linear`/`Linear`
+        // and one this device invented are the same value, and only one of them
+        // is something the guest asked for. See
+        // [`crate::runtime::gpu_hang_trail::SamplerNote`].
+        let mut sampler_origin: std::collections::BTreeMap<u32, u8> = Default::default();
         {
             let mut push_tex = |index: u32,
                                 texture_ref: u32,
+                                retained: Option<&std::sync::Arc<crate::model::TaskResource>>,
                                 frag_stage: bool|
              -> Result<(), DrawError> {
                 if texture_ref == 0 {
                     return Ok(());
                 }
+                let base_off = if frag_stage && separate_sampled {
+                    FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+                } else {
+                    0
+                };
+                let reflection = if frag_stage {
+                    &f_shader.reflection
+                } else {
+                    &v_shader.reflection
+                };
+                let reflected_descriptor =
+                    crate::runtime::spirv_bind::reflected_texture_descriptor(reflection, index);
+                let img_bind = reflected_descriptor
+                    .map(|descriptor| descriptor.binding)
+                    .unwrap_or(TEXTURE_BINDING_BASE + index)
+                    + base_off;
+                if let Some(descriptor) = reflected_descriptor {
+                    use crate::runtime::spirv_bind::ReflectedTextureAccess;
+                    let unsupported = match descriptor.access {
+                        ReflectedTextureAccess::Sampled => None,
+                        ReflectedTextureAccess::Storage => Some("storage"),
+                        ReflectedTextureAccess::Unknown => Some("unknown"),
+                    };
+                    if let Some(access) = unsupported {
+                        return Err(DrawError::DrawPreparation(
+                            DrawPreparationDecline::TextureAccessUnsupported {
+                                stage: if frag_stage { "fragment" } else { "vertex" },
+                                index,
+                                texture_ref,
+                                binding: img_bind,
+                                access,
+                            },
+                        ));
+                    }
+                }
                 // The two guest reads this bind needs before anything can decide
                 // where its texels come from. `sampled_phase::Part::Lookup` is
                 // this pair and nothing else, so the object-list walk is priced
                 // against the resolve below rather than summed into it.
-                let (texture_entry, view_swizzle) = {
+                let (texture_resource, view_swizzle) = {
                     let _s = crate::runtime::sampled_phase::Span::open(
                         crate::runtime::sampled_phase::Part::Lookup,
                     );
-                    let texture_entry =
-                        objects::lookup_list_entry(state, host, req.task_id, texture_ref);
+                    let texture_resource = retained.cloned().or_else(|| {
+                        objects::resolve_resource(state, host, req.task_id, texture_ref).ok()
+                    });
                     // A type-8 view's channel remap. Resolved here rather than in
                     // the loaders because it describes how the bind READS the
                     // texture, not what the texture contains: the engine hands it
                     // to the image view as a component mapping and the hardware
                     // applies it at sample time, so the texels stay untouched and
                     // the bind keeps whatever content rail it was already on.
-                    let view_swizzle = resolve_texture_view(state, host, req.task_id, texture_ref)
+                    let view_swizzle = texture_resource
+                        .as_ref()
+                        .filter(|resource| {
+                            resource.entry.object_type
+                                == crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VIEW
+                        })
+                        .and_then(|_| resolve_texture_view(state, host, req.task_id, texture_ref))
                         .and_then(|view| view.swizzle)
                         .filter(|plan| !pixel_format::swizzle_is_identity(plan));
-                    (texture_entry, view_swizzle)
+                    (texture_resource, view_swizzle)
                 };
                 // Where the texels come from, which is the part with the cache
                 // behind it. Scoped to a block so it closes at the resolve and
@@ -5809,16 +7213,18 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 SampledSourceRequest::Bytes(
                                     std::sync::Arc::new(solid_rgba8(aw, ah, &clear)),
                                     None,
-                                    TexelLayout::Rgba8,
+                                    SampledByteFormat::synthesised(TexelLayout::Rgba8),
+                                    crate::backend::vulkan::engine::SampledByteOrigin::AttachmentAlias,
                                 ),
                             ),
-                            AttachmentAliasSample::Seed(seed) => (
+                            AttachmentAliasSample::Seed(seed, stored) => (
                                 aw,
                                 ah,
                                 SampledSourceRequest::Bytes(
                                     std::sync::Arc::new(seed.to_vec()),
                                     None,
-                                    TexelLayout::Rgba8,
+                                    SampledByteFormat::from_source(TexelLayout::Rgba8, stored),
+                                    crate::backend::vulkan::engine::SampledByteOrigin::AttachmentAlias,
                                 ),
                             ),
                             AttachmentAliasSample::ResidentChain => {
@@ -5830,22 +7236,24 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                         },
                                     )
                                 })?;
-                                if !crate::backend::vulkan::engine::resident_content_ready(
-                                    &identity,
-                                ) {
-                                    return Err(DrawError::DrawPreparation(
-                                        DrawPreparationDecline::AttachmentAliasResidentNotReady {
-                                            index,
-                                            texture_ref,
-                                            width: identity.width(),
-                                            height: identity.height(),
-                                        },
-                                    ));
-                                }
                                 (
                                     identity.width(),
                                     identity.height(),
-                                    SampledSourceRequest::Target(identity),
+                                    SampledSourceRequest::Target(
+                                        identity.clone(),
+                                        req.colors
+                                            .iter()
+                                            .find(|color| {
+                                                color.slot == index
+                                                    && color.texture_ref == texture_ref
+                                            })
+                                            .and_then(|color| {
+                                                translate::pixel::color_attachment(color.format)
+                                                    .ok()
+                                                    .map(|resolved| resolved.0)
+                                            })
+                                            .unwrap_or_else(|| identity.resident_format()),
+                                    ),
                                 )
                             }
                         }
@@ -5859,7 +7267,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             host,
                             req.task_id,
                             texture_ref,
-                            texture_entry,
+                            texture_resource.clone(),
                             view_swizzle.is_none(),
                         ) else {
                             let detail = sample_miss_detail(state, host, req.task_id, texture_ref);
@@ -5877,53 +7285,71 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     }
                 };
                 let mut bytes_identity = None;
+                let mut byte_origin = crate::backend::vulkan::engine::SampledByteOrigin::Synthetic;
                 // Byte layout of a CPU-origin bind. Default RGBA8; a source that
                 // already holds its bytes in an uploadable order keeps them —
                 // BGRA8 from the type-4 scanout cache, a native single/dual-channel
                 // video plane — and the host spelling is applied once, where the
                 // engine resource is built (`vk_texel_layout` below).
-                let mut sampled_format = TexelLayout::Rgba8;
+                let sampled_vk_format;
                 // How the bound texels' channels sit on the host format, from
                 // the rail that produced them. Identity for every CPU-origin
                 // bind, because those loaders have already put the channels
                 // where Metal presents them; non-identity only where a rail
                 // handed the guest's own bytes over untouched.
                 let mut sampled_components = pixel_format::swizzle_identity();
+                let mut source_planes = 1;
+                let source_is_target = matches!(&loaded, SampledSourceRequest::Target(_, _));
                 let source = match loaded {
-                    SampledSourceRequest::Bytes(rgba, identity, byte_format) => {
+                    SampledSourceRequest::Bytes(rgba, identity, byte_format, origin) => {
                         bytes_identity = identity;
-                        sampled_format = byte_format;
+                        sampled_vk_format = translate::pixel::vk_sampled_bytes(byte_format);
+                        byte_origin = origin;
                         crate::backend::vulkan::engine::SampledSource::Bytes(rgba)
                     }
-                    SampledSourceRequest::Target(identity) => {
-                        // A resident bound directly reuses the registry's own
-                        // image view, which the engine creates once per target
-                        // and cannot re-decorate per bind. Refuse rather than
-                        // bind it unswizzled: reading the wrong channels is a
-                        // rendering bug that looks like content, whereas a
-                        // named decline is one grep away.
-                        if view_swizzle.is_some() {
-                            crate::runtime::census::view_swizzle_census::note_declined(
-                                crate::runtime::census::view_swizzle_census::SwizzleDecline::ResidentDirectBind,
-                                texture_ref,
-                            );
-                            return Ok(());
-                        }
+                    SampledSourceRequest::Target(identity, format) => {
+                        sampled_vk_format = format;
+                        // The source resolver carries the sampled texture's
+                        // exact view format beside the allocation identity. A
+                        // resident attachment view is not necessarily the view
+                        // this bind names; collapsing the two loses both sRGB
+                        // interpretation and physical channel order.
+                        //
+                        // The resource's `swizzle` below remains independent and
+                        // is composed once with the format's component plan.
+                        //
+                        // This arm used to `return Ok(())` — no resource pushed
+                        // at all. That was not a decline: the unbound scan had
+                        // already counted `texture_ref != 0` as provided, so no
+                        // neutral image was substituted either, and the binding
+                        // went missing from a layout the fragment module
+                        // statically uses. The engine's
+                        // `used_binding_absent_from_layout` then refused the
+                        // whole draw, which cost the guest every pixel of it.
                         crate::backend::vulkan::engine::SampledSource::Target(identity)
                     }
-                    SampledSourceRequest::GuestRuns(src, native, identity, vouch, components) => {
-                        sampled_format = native;
+                    SampledSourceRequest::GuestRuns(
+                        src,
+                        _native,
+                        format,
+                        planes,
+                        identity,
+                        vouch,
+                        components,
+                    ) => {
+                        sampled_vk_format = format;
                         sampled_components = components;
-                        bytes_identity = Some(identity);
+                        source_planes = planes;
+                        bytes_identity = identity;
                         crate::backend::vulkan::engine::SampledSource::GuestRuns(src, vouch)
                     }
                 };
-                let base_off = if frag_stage && separate_sampled {
-                    FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
-                } else {
-                    0
-                };
-                let img_bind = TEXTURE_BINDING_BASE + index + base_off;
+                let array_element = reflected_descriptor
+                    .map(|descriptor| descriptor.array_element)
+                    .unwrap_or(0);
+                let descriptor_count = reflected_descriptor
+                    .map(|descriptor| descriptor.descriptor_count)
+                    .unwrap_or(1);
                 // Texture dimensionality comes solely from the translator's reflection,
                 // keyed on the UN-relocated descriptor binding. The always-on
                 // `census_reflection_wellformed` guard (m2v_cache) proves the reflection
@@ -5933,14 +7359,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // sampled path can't express — log fail-visibly, then keep the 2D default
                 // so the draw still paints rather than dropping content.
                 use crate::runtime::spirv_bind::{ReflectedSampledKind, SampledImageKind};
-                let reflection = if frag_stage {
-                    &f_shader.reflection
-                } else {
-                    &v_shader.reflection
-                };
                 let image_kind = match crate::runtime::spirv_bind::reflected_sampled_kind(
                     reflection,
-                    TEXTURE_BINDING_BASE + index,
+                    reflected_descriptor
+                        .map(|descriptor| descriptor.binding)
+                        .unwrap_or(TEXTURE_BINDING_BASE + index),
                 ) {
                     ReflectedSampledKind::Kind(k) => k,
                     ReflectedSampledKind::Absent => SampledImageKind::D2,
@@ -5968,8 +7391,31 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     volume,
                     cube,
                     one_dim,
-                    layers,
+                    multisampled,
+                    mut layers,
                 } = shape;
+                if multisampled && !source_is_target {
+                    return Err(DrawError::DrawPreparation(
+                        DrawPreparationDecline::TextureDimensionUnsupported {
+                            stage: if frag_stage { "fragment" } else { "vertex" },
+                            index,
+                            texture_ref,
+                            binding: img_bind,
+                            kind: format!("{image_kind:?}"),
+                        },
+                    ));
+                }
+                if volume {
+                    layers = texture_resource
+                        .as_ref()
+                        .and_then(|resource| match resource.decoded() {
+                            Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) => {
+                                tex.levels.first().map(|level| level.planes())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(source_planes);
+                }
                 // A Vulkan 1D image is defined to have height 1; the descriptor
                 // may report the LUT's texel count in either axis, so collapse
                 // to a single row and fold the other axis into the width the
@@ -5981,6 +7427,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 };
                 images.push(crate::backend::vulkan::engine::SampledImageResource {
                     binding: img_bind,
+                    array_element,
+                    descriptor_count,
                     width: tw,
                     height: th,
                     layers,
@@ -5988,8 +7436,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     volume,
                     cube,
                     one_dim,
+                    multisampled,
                     source,
-                    format: translate::pixel::vk_texel_layout(sampled_format),
+                    byte_origin,
+                    format: sampled_vk_format,
                     identity: bytes_identity.map(|i| {
                         crate::backend::vulkan::engine::SampledContentIdentity {
                             key: i.key,
@@ -6002,17 +7452,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // "does this need it" branch: identity is the unit on both
                     // sides, so the fold is a no-op for every bind that does not
                     // need it, and there is no case left to forget.
-                    swizzle: view_swizzle
-                        .unwrap_or_default()
-                        .after(&sampled_components),
+                    swizzle: view_swizzle.unwrap_or_default().after(&sampled_components),
                 });
                 Ok(())
             };
-            for t in &req.vertex_textures {
-                push_tex(t.index, t.texture_ref, false)?;
+            for t in req.vertex_textures.iter() {
+                push_tex(t.index, t.texture_ref, t.resource.as_ref(), false)?;
             }
-            for t in &req.fragment_textures {
-                push_tex(t.index, t.texture_ref, true)?;
+            for t in req.fragment_textures.iter() {
+                push_tex(t.index, t.texture_ref, t.resource.as_ref(), true)?;
             }
         }
         // Repair the gaps the guard found. A fragment texture the module
@@ -6068,6 +7516,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 ));
                 continue;
             };
+            if shape.multisampled {
+                crate::observe::fail(format!(
+                    "shader_resource_declared_unbound \
+                     reason=frag_neutral_texture_multisample_unrepresentable \
+                     pipe={} idx={index} binding={img_bind} kind={kind:?}",
+                    req.pipeline_ref
+                ));
+                continue;
+            }
             // A repair that succeeded, not a success: the shader samples a
             // texture whose contents this device invented, so it stays on the
             // fail channel and the reliance stays measurable.
@@ -6079,6 +7536,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             ));
             images.push(crate::backend::vulkan::engine::SampledImageResource {
                 binding: img_bind,
+                array_element: 0,
+                descriptor_count: 1,
                 width: 1,
                 height: 1,
                 layers: shape.layers,
@@ -6086,13 +7545,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 volume: shape.volume,
                 cube: shape.cube,
                 one_dim: shape.one_dim,
-                source: crate::backend::vulkan::engine::SampledSource::Bytes(
-                    std::sync::Arc::new(crate::contract::pixel_format::solid_rgba8(
-                        1,
-                        1,
-                        &[0.0; 4],
-                    )),
-                ),
+                multisampled: false,
+                source: crate::backend::vulkan::engine::SampledSource::Bytes(std::sync::Arc::new(
+                    crate::contract::pixel_format::solid_rgba8(1, 1, &[0.0; 4]),
+                )),
+                byte_origin: crate::backend::vulkan::engine::SampledByteOrigin::Synthetic,
                 format: ash::vk::Format::R8G8B8A8_UNORM,
                 identity: None,
                 swizzle: Default::default(),
@@ -6112,9 +7569,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 let smp_bind = SAMPLER_BINDING_BASE + index + base_off;
                 if sampler_binds.insert(smp_bind) {
                     let mut sampler = if sampler_ref != 0 {
+                        sampler_origin.insert(smp_bind, b'g');
                         load_vulkan_sampler(state, host, req.task_id, sampler_ref, smp_bind)
                             .map_err(DrawError::DrawPreparation)?
                     } else {
+                        sampler_origin.insert(smp_bind, b'd');
                         crate::backend::vulkan::engine::SamplerResource::normalized_default(
                             smp_bind,
                         )
@@ -6130,6 +7589,31 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         sampler.lod_max = max_bits;
                     }
                     samplers.push(sampler);
+                } else {
+                    // A second sampler resolving to a binding this draw already
+                    // provisioned. First-writer-wins, so this one's filter,
+                    // address mode and LOD clamp are dropped — and because the
+                    // layout gives every sampler `VERTEX | FRAGMENT` stage flags,
+                    // the stage that lost goes on sampling through the stage that
+                    // won.
+                    //
+                    // A **healthy zero** now that `separate_sampled` covers the
+                    // whole sampled band: with both stages relocated apart, two
+                    // stages cannot collide, and one stage cannot bind its own
+                    // index twice. A firing is the bug, not the report — most
+                    // likely a band whose relocation offset stopped separating
+                    // the two.
+                    crate::runtime::drain::note_store_route("sampler_bind_collided");
+                    if crate::observe::first_sight("sampler_bind_collided", u64::from(smp_bind)) {
+                        crate::observe::fail(format!(
+                            "sampler_bind_collided binding={smp_bind} index={index} \
+                             stage={} separate_sampled={separate_sampled} \
+                             (a second sampler resolved to a binding this draw had \
+                             already provisioned; its state is dropped and the \
+                             other stage's is what samples)",
+                            if frag_stage { "fragment" } else { "vertex" }
+                        ));
+                    }
                 }
                 Ok(())
             };
@@ -6140,80 +7624,44 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             let _s = crate::runtime::sampled_phase::Span::open(
                 crate::runtime::sampled_phase::Part::Samplers,
             );
-            for s in &req.vertex_samplers {
+            for s in req.vertex_samplers.iter() {
                 if s.sampler_ref != 0 {
                     push_smp(s.index, s.sampler_ref, s.lod_clamp, false)?;
                 }
             }
-            for s in &req.fragment_samplers {
+            for s in req.fragment_samplers.iter() {
                 if s.sampler_ref != 0 {
                     push_smp(s.index, s.sampler_ref, s.lod_clamp, true)?;
                 }
             }
         }
-        // One span over both walks below, because they answer the same question
-        // — which sampler bindings nothing has provisioned yet — and have the
-        // same fix: answer it once per translated shader in `m2v_cache` rather
-        // than once per draw. Two bars here would not be separately actionable.
+        // Each shader variant carries the reflected sampler interface in the
+        // same numbering as its executable words. Constexpr state therefore
+        // cannot drift away from its relocated binding, and residual bindings
+        // need no SPIR-V walk.
         {
             let _s = crate::runtime::sampled_phase::Span::open(
                 crate::runtime::sampled_phase::Part::Reflect,
             );
-            // AIR constexpr samplers carry their immutable state in reflection. Bind
-            // those exact values before the residual SPIR-V scan provisions defaults
-            // for translator-generated sampler-less read helpers.
-            for (reflection, frag_stage) in
-                [(&v_shader.reflection, false), (&f_shader.reflection, true)]
-            {
-                for reflected in &reflection.bindings {
-                    if reflected.kind != metal2vulkan::reflect::ResourceKind::StaticSampler {
-                        continue;
-                    }
-                    let Some(descriptor) = reflected.descriptor else {
-                        return Err(DrawError::DrawPreparation(
-                            DrawPreparationDecline::StaticSamplerReflectionDescriptorMissing {
-                                stage: if frag_stage { "fragment" } else { "vertex" },
-                            },
-                        ));
-                    };
-                    let Some(state) = reflected.static_sampler else {
-                        return Err(DrawError::DrawPreparation(
-                            DrawPreparationDecline::StaticSamplerReflectionStateMissing {
-                                stage: if frag_stage { "fragment" } else { "vertex" },
-                                binding: descriptor.binding,
-                            },
-                        ));
-                    };
-                    let binding = descriptor.binding
-                        + if frag_stage && separate_sampled {
-                            FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+            for (variant, stage) in [(&v_variant, "vertex"), (&f_variant, "fragment")] {
+                for reflected in variant.samplers.iter() {
+                    if sampler_binds.insert(reflected.binding) {
+                        let binding = reflected.binding;
+                        if let Some(state) = reflected.static_state {
+                            sampler_origin.insert(binding, b'c');
+                            samplers.push(
+                                reflected_static_sampler_resource(stage, binding, state)
+                                    .map_err(DrawError::DrawPreparation)?,
+                            );
                         } else {
-                            0
-                        };
-                    if sampler_binds.insert(binding) {
-                        let sampler = reflected_static_sampler_resource(
-                            if frag_stage { "fragment" } else { "vertex" },
-                            binding,
-                            state,
-                        )
-                        .map_err(DrawError::DrawPreparation)?;
-                        samplers.push(sampler);
+                            sampler_origin.insert(binding, b'd');
+                            samplers.push(
+                                crate::backend::vulkan::engine::SamplerResource::normalized_default(
+                                    binding,
+                                ),
+                            );
+                        }
                     }
-                }
-            }
-            // Reflect the residual shader interface and provision defaults only
-            // where explicit guest or constexpr state did not already win.
-            for &binding in v_variant
-                .sampler_bindings
-                .iter()
-                .chain(f_variant.sampler_bindings.iter())
-            {
-                if sampler_binds.insert(binding) {
-                    samplers.push(
-                        crate::backend::vulkan::engine::SamplerResource::normalized_default(
-                            binding,
-                        ),
-                    );
                 }
             }
         }
@@ -6226,6 +7674,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // CLEAR is not a seed. It travels as `target_clear` and the render pass
         // does it, which is what `MTLLoadActionClear` asks for.
         let mut target_rgba8: Option<std::sync::Arc<Vec<u8>>> = None;
+        let mut target_guest_seed = None;
         let mut target_clear = [0.0f32; 4];
         let mut seed_order = crate::backend::vulkan::engine::SeedOrder::Rgba8;
         let gpu_only_content_allowed =
@@ -6236,40 +7685,32 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Resolved once and read by both the Load gate below and the
         // `target_identity` assignment further down, so the record that loads
         // from a resident is by construction the record that renders into it.
+        // Resolve and revalidate the shared allocation before minting the
+        // resident identity below. Revalidation may advance the mapping
+        // generation when the guest recycled a page, and the identity must
+        // name that new generation rather than the one paired with the retired
+        // alias.
+        let type11_guest_backing = type11_guest_target_backing(state, host, req);
         let type11_resident_target = type11_store_identity(state, req, writeback_guest);
-        if req.chain_from_resident {
-            if let Some(identity) = render_chain_identity(state, req) {
-                if crate::backend::vulkan::engine::resident_content_ready(&identity) {
-                    chain_load_from_target = true;
-                } else {
-                    // The armed chain lost its resident (engine reset /
-                    // registry eviction). Seeding from stale guest/cache
-                    // bytes here would silently wipe the chained records —
-                    // fail visibly and let the exec loop abandon the chain.
-                    return Err(DrawError::DrawPreparation(
-                        DrawPreparationDecline::ChainResidentNotReady {
-                            target_gva: req.colors.first().map(|c| c.target_gva).unwrap_or(0),
-                            width: w,
-                            height: h,
-                        },
-                    ));
-                }
-            }
+        if req.chain_from_resident && render_chain_identity(state, req).is_some() {
+            // The serialized chain names the resident it intends to load;
+            // existence and readiness are engine state and are validated
+            // atomically with target acquisition by `execute_draw_request`.
+            // A preparation-time query could only be a stale hint and cost
+            // a second engine transaction for the same command.
+            chain_load_from_target = true;
         }
         // Colour0's LOAD seed was skipped by `mrt_draw_request` because the
         // engine still held what the render Store published into its guest
         // pages. Honour that here, or put the seed back.
-        let mut gva_load_identity = honour_gva_load_elision(
-            state,
-            host,
-            req,
-            &mut chain_load_from_target,
-        );
-        // Type-11 composite Load: when the resident this record is about to
-        // render into was stamped with the mapping's current
-        // `surface_content_epoch`, its image already holds exactly the bytes
-        // `resolve_type11_load_seed` would upload. Load from it and skip the
-        // upload.
+        let mut gva_load_identity =
+            honour_gva_load_elision(state, host, req, &mut chain_load_from_target);
+        // Type-11 composite Load. A retained guest-allocation target is the
+        // guest's texture resource itself, so its LOAD is authoritative without
+        // comparing two copies. A device-allocation target is a mirror: only
+        // when it was stamped with the mapping's current
+        // `surface_content_epoch` does it hold exactly the bytes
+        // `resolve_type11_load_seed` would upload.
         //
         // The epoch is the witness. `mark_mapping_written` advances it and every
         // guest-page writer *in this crate* calls it, so a blit or a compute
@@ -6345,7 +7786,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Why not the sibling rail's shape — `load_linear_guest_memoized`
         // re-reads the guest's native rows on every call and byte-compares
         // before reusing its `Arc`. Priced on one boot: `type11_seed_elided`
-        // 41 389 against `type11_seed_uploaded` 242, at a mean 1.43 M texels per
+        // 41 389 against `type11_seed_provided` 242, at a mean 1.43 M texels per
         // elision, so revalidating by re-reading would move ~237 GB of guest
         // memory a session. The bitmap answers the same question in a word.
         if !chain_load_from_target {
@@ -6355,16 +7796,40 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // skipped" from "this record was never a candidate", and the
                 // ratio of the two is a within-boot number — the only kind that
                 // survives the 1.8x `us_per_draw` drift between boots on this rig.
-                let resident_epoch =
-                    crate::backend::vulkan::engine::resident_content_epoch(&identity);
-                let mapping_id = req.colors.first().map(|c| c.mapping_id).unwrap_or(0);
-                let guest_wrote = type11_guest_wrote_since_store(state, host, mapping_id);
-                if type11_resident_is_current(mapping_epoch, resident_epoch) && !guest_wrote {
+                let backing = req.colors.first().and_then(|c0| {
+                    state
+                        .task_resources
+                        .get(req.task_id, c0.texture_ref)
+                        .filter(|resource| {
+                            resource_type_owns_surface_resident(resource.entry.object_type)
+                        })
+                        .map(|resource| resource.resident_target_backing(&identity))
+                });
+                let (resident_current, guest_wrote) =
+                    type11_load_resident_is_current(backing, || {
+                        let resident_epoch =
+                            crate::backend::vulkan::engine::resident_content_epoch(&identity);
+                        let mapping_id = req.colors.first().map(|c| c.mapping_id).unwrap_or(0);
+                        let guest_wrote = type11_guest_wrote_since_store(state, host, mapping_id);
+                        (
+                            type11_resident_is_current(mapping_epoch, resident_epoch)
+                                && !guest_wrote,
+                            guest_wrote,
+                        )
+                    });
+                if resident_current {
                     chain_load_from_target = true;
                     crate::runtime::drain::note_store_route("type11_seed_elided");
+                    if backing
+                        == Some(
+                            crate::backend::vulkan::engine::ResidentContentBacking::GuestAllocation,
+                        )
+                    {
+                        crate::runtime::drain::note_store_route("type11_seed_guest_allocation");
+                    }
                     note_type11_elision_extent(w, h);
                 } else {
-                    crate::runtime::drain::note_store_route("type11_seed_uploaded");
+                    crate::runtime::drain::note_store_route("type11_seed_provided");
                     // Separated from the epoch's refusal so a boot can say which
                     // half refused. The two answer different questions and a
                     // single counter would hide a rail that never fires.
@@ -6384,6 +7849,32 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             } else {
                 MTL_LOAD_ACTION_DONT_CARE
             };
+            // The declared load action of slot 0, as a population **and** as
+            // pixels, before the three-into-two collapse below erases the
+            // difference.
+            //
+            // `passbegin_load` / `passbegin_clear` are counted in the engine and
+            // cannot separate a Clear from a DontCare: by then both have become
+            // "no seed", which `caches::get_or_create_pass` spells
+            // `AttachmentLoadOp::CLEAR`. The two cost very different amounts —
+            // a CLEAR writes every texel of the attachment, and on this
+            // pathway a quarter of all attachments are `VK_IMAGE_TILING_LINEAR`
+            // over guest RAM with no fast clear and no colour compression, so
+            // the write is the full plane at memory bandwidth. A DontCare
+            // spelled `AttachmentLoadOp::DONT_CARE` writes none of it.
+            //
+            // Pixels rather than records because the price is proportional to
+            // area and the population is dominated by small attachments: a
+            // census of records would rank a boot's thousands of 64x64 passes
+            // above its dozens of full-screen ones.
+            let declared_px = u64::from(w).saturating_mul(u64::from(h));
+            // `load_action` was already folded to DontCare above for anything
+            // out of contract, so this fold is exact and the two spellings
+            // cannot disagree.
+            let (declared_n, declared_area) =
+                crate::contract::pass_action::LoadAction::from_declared(load_action).census_routes();
+            crate::runtime::drain::note_store_route(declared_n);
+            crate::runtime::drain::note_store_route_n(declared_area, declared_px);
             match load_action {
                 MTL_LOAD_ACTION_LOAD if chain_load_from_target => {
                     // Resident target carries the chain; no CPU seed bytes.
@@ -6418,11 +7909,29 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         }
                     } else if c0.mapping_id != 0 {
                         seed_door = "mapping";
-                        if let Some((bytes, order)) =
-                            resolve_type11_load_seed(state, host, c0.mapping_id, w, h)
-                        {
-                            target_rgba8 = Some(bytes);
-                            seed_order = order;
+                        // The attachment format follows the render identity,
+                        // including an intermediate chain record that does not
+                        // own the packet's final guest writeback. The Store-only
+                        // identity below is deliberately narrower and would
+                        // misclassify that record as a pooled RGBA target here.
+                        let target_format = type11_render_identity(state, req)
+                            .as_ref()
+                            .map(|identity| identity.resident_format())
+                            .unwrap_or(translate::pixel::RESIDENT_RGBA_FORMAT);
+                        match resolve_type11_load_seed(
+                            state,
+                            host,
+                            c0.mapping_id,
+                            w,
+                            h,
+                            target_format,
+                        ) {
+                            Some(Type11LoadSeed::Host(bytes, order)) => {
+                                target_rgba8 = Some(bytes);
+                                seed_order = order;
+                            }
+                            Some(Type11LoadSeed::Guest(seed)) => target_guest_seed = Some(seed),
+                            None => {}
                         }
                     }
                     // Two doors, and there is no third. There is no separate
@@ -6436,7 +7945,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // independently driven x86/Vulkan boots: 1 558, 395 and 295
                     // colour LOAD seed resolutions, and 0 serves plus 0 misses
                     // at that door in every one.
-                    note_load_seed_outcome(seed_door, target_rgba8.is_some(), c0, w, h);
+                    note_load_seed_outcome(
+                        seed_door,
+                        target_rgba8.is_some() || target_guest_seed.is_some(),
+                        c0,
+                        w,
+                        h,
+                    );
                 }
                 // DontCare: the guest declared the prior contents undefined, so
                 // arriving with no seed is the contract rather than a loss. It
@@ -6453,6 +7968,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         }
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         let mut resources = crate::backend::vulkan::engine::DrawRequest {
+            pipeline_object: resolved.pipeline_object.clone(),
             // Honor the guest's face-culling state, its winding, and its
             // primitive type. All three come from `translate::raster`, and all
             // three fall back to a Metal default when the guest bound nothing —
@@ -6508,8 +8024,55 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 req.pipeline_ref,
                 "primitive_type_unmapped",
             ),
+            raster_sample_count: pd.raster_sample_count.max(1),
+            color_sample_count: req
+                .colors
+                .first()
+                .map(|color| color.sample_count.max(1))
+                .unwrap_or(1),
+            multisample_resolve: req
+                .colors
+                .first()
+                .is_some_and(|color| color.multisample_source_ref != 0),
             ..crate::backend::vulkan::engine::DrawRequest::default()
         };
+        let resolving_colors = req
+            .colors
+            .iter()
+            .filter(|color| color.multisample_source_ref != 0)
+            .count();
+        if resolving_colors != 0
+            && (resolving_colors != 1
+                || req
+                    .colors
+                    .first()
+                    .is_none_or(|color| color.multisample_source_ref == 0))
+        {
+            return Err(DrawError::Unsupported(
+                crate::backend::vulkan::engine::reason::DrawReason::MultisampleResolveShapeUnsupported {
+                    color_targets: req.colors.len() as u32,
+                    depth: req.depth_attach.is_some(),
+                    color_input: false,
+                },
+            ));
+        }
+        if let Some(color) = req.colors.first().filter(|color| color.multisample_source_ref != 0) {
+            use crate::contract::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
+            if color.store_action != MTL_STORE_ACTION_MULTISAMPLE_RESOLVE {
+                return Err(DrawError::Unsupported(
+                    crate::backend::vulkan::engine::reason::DrawReason::MultisampleStoreActionUnsupported {
+                        store_action: color.store_action,
+                    },
+                ));
+            }
+            if color.load_action == MTL_LOAD_ACTION_LOAD {
+                return Err(DrawError::Unsupported(
+                    crate::backend::vulkan::engine::reason::DrawReason::MultisampleLoadActionUnsupported {
+                        load_action: color.load_action,
+                    },
+                ));
+            }
+        }
         resources.viewports = req
             .viewports
             .iter()
@@ -6531,7 +8094,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 w,
                 h,
                 req.colors.first().map(|c| c.load_action),
-                target_rgba8.is_some(),
+                target_rgba8.is_some() || target_guest_seed.is_some(),
                 chain_load_from_target,
             );
         }
@@ -6566,8 +8129,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     reason: IndexLoadReason::TypeUnsupported,
                 })
             })?;
-            let indices =
-                load_index_bytes_reason(state, host, req.task_id, idx).map_err(|reason| {
+            let content =
+                load_index_content_reason(state, host, req.task_id, idx).map_err(|reason| {
                     DrawError::DrawPreparation(DrawPreparationDecline::IndexLoad { reason })
                 })?;
             resources.indexed = Some(crate::backend::vulkan::engine::IndexedDrawResource {
@@ -6584,7 +8147,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         reason: crate::runtime::draw::IndexLoadReason::BaseVertexOutOfRange,
                     })
                 })?,
-                indices,
+                content,
             });
         }
         // Vulkan's `firstInstance` is Metal's `baseInstance`. The field has
@@ -6596,6 +8159,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         resources.storage_buffers = storage;
         resources.sampled_images = images;
         resources.color_input = frag_color_input;
+        resources.continues_render_pass = req.continues_render_pass;
+        resources.render_pass_continues = req.render_pass_continues;
         resources.samplers = samplers;
         // Load seed always goes to the GPU (workstream D3). Premult One/OMSA is
         // hardware blend over the Load-seeded target — identical math to the
@@ -6605,9 +8170,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let store_is_store = req
             .colors
             .first()
-            .map(|c| c.store_action == MTL_STORE_ACTION_STORE)
+            .map(|c| crate::contract::pass_action::store_action_publishes_single_sample(c.store_action))
             .unwrap_or(true);
         resources.target_rgba8 = target_rgba8;
+        resources.target_guest_seed = target_guest_seed;
         resources.target_clear = target_clear;
         resources.target_seed_order = seed_order;
         // A Store reads back; anything else skips it.
@@ -6619,17 +8185,22 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // import is gone, so the only way a Store's pixels reach the guest is
         // the CPU writeback, and that needs them read back.
         resources.skip_readback = !store_is_store;
+        crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::AssembleTarget);
         // Ephemeral resident render-pass rail: intermediate Store records render
         // into a protocol-keyed RGBA target on every Vulkan backend. This does
         // not leave guest-visible content GPU-only: portability devices read the
         // final record back and perform the normal synchronous guest Store.
         // Cross-pass deferred ownership remains gated below.
         let mut resident_render_chain = false;
-        // Deferred GVA Store rail: the final/single record also stays on the
-        // registry resident (skip_readback) — the caller arms a flush-on-
-        // access window instead of the sync readback + guest write on the
-        // stamp path (`arm_gva_deferred_store`).
-        let mut gva_resident_store = false;
+        // Host-authoritative GVA Store rail: the final/single record also stays
+        // on the registry resident (skip_readback). The caller records the
+        // resource declaration and transfers only when synchronization or an
+        // actual guest-page reader makes that copy observable.
+        //
+        // The rail's own resident, not a bool: the span this returns has to name
+        // the key the draw registered, and a flag beside `resources` would let a
+        // caller derive a second one. See `M2vDrawSpan::ResidentSurfaceStore`.
+        let mut gva_resident_store: Option<crate::backend::vulkan::engine::TargetIdentity> = None;
         if req.chain_from_resident || (store_is_store && !writeback_guest) {
             if let Some(identity) = render_chain_identity(state, req) {
                 resources.target_identity = Some(identity);
@@ -6646,9 +8217,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // (The sibling rail above re-tests its pair for real, because
                 // its outer condition is an `||`.)
                 if gva_store_defer_eligible(req) {
-                    resources.target_identity = Some(identity);
+                    resources.target_identity = Some(identity.clone());
                     resources.skip_readback = true;
-                    gva_resident_store = true;
+                    gva_resident_store = Some(identity);
                 }
             }
         }
@@ -6668,7 +8239,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // asks again after the draw and falls back to a materializing read on any
         // refusal, which is what makes a stale answer here cost a readback rather
         // than a lost frame.
-        let mut surface_resident_store = false;
+        //
+        // The rail's own resident, not a bool, for the reason `gva_resident_store`
+        // states: the span carries this value out to the Store.
+        let mut surface_resident_store: Option<crate::backend::vulkan::engine::TargetIdentity> =
+            None;
         if resources.target_identity.is_none() {
             resources.target_identity = type11_resident_target.clone();
         }
@@ -6695,8 +8270,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // derived, because the derivation is a property of two other blocks.
         if renders_into_surface_identity && !resources.skip_readback {
             resources.skip_readback = true;
-            surface_resident_store = true;
+            // `resources.target_identity`, which the comparison just proved is
+            // this same value, and which is what `registry_ensure` will be
+            // handed. Taken from here rather than unwrapped from the `Option`
+            // above so the span cannot name a slot the draw did not register.
+            surface_resident_store = type11_resident_target.clone();
         }
+        resources.record_guest_store = surface_resident_store.is_some();
         // A first-failure classifier for a composite Store that still reads
         // back used to sit here. Its outer gate was never once true — none of
         // its four counters, nor its `else` arm, appears anywhere in the
@@ -6726,11 +8306,24 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             resources.load_from_target = true;
             resources.target_rgba8 = None;
         }
+        // The backing belongs only to the type-11 surface identity it was
+        // resolved from. A GVA or render-chain namespace may legitimately own
+        // this draw's primary attachment instead, in which case handing it the
+        // surface allocation would bind two unrelated resources together.
+        if resources.target_identity == type11_render_identity(state, req) {
+            resources.guest_target_memory = type11_guest_backing;
+            resources.load_guest_target_backing = resources.guest_target_memory.is_some()
+                && req.colors.first().is_some_and(|color| {
+                    color.load_action == MTL_LOAD_ACTION_LOAD && color.target_seed_rgba.is_none()
+                });
+        }
         // Type-11 Load used to have a GPU rail here — ~170 lines of front-frame
         // retention policy resolving which resident image held the frame the
         // guest computes its damage against. It was reachable only under
-        // `try_import`. A Store now always reads back and always seeds from
-        // guest pages, so there is no resident-only attachment to reseed.
+        // `try_import`. A shared resident now keeps the guest allocation as
+        // its own backing, while a copied resident is always landed before its
+        // guest pages become a later seed, so neither needs a separate
+        // front-frame retention policy.
         // Metal path always passes color0 blend into the encoder. Linux/engine
         // previously left `resources.blend = None` → opaque replace for every
         // draw, so Load seeds (gray/wallpaper/logo bases) were wiped by sparse
@@ -6740,6 +8333,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // unblended attachment with a mask still leaves its unwritten channels
         // alone, so gating the mask on blending would drop it exactly where the
         // guest is replacing rather than compositing.
+        crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         resources.color_write_mask = pd.color0.write_mask;
         if pd.color0.blending_enabled {
             let constants = req.blend_color.unwrap_or([0.0; 4]);
@@ -6802,6 +8396,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Still-unrepresented sub-cases (guest depth LOAD, stencil test,
         // out-of-contract compare) are dropped fail-visibly, deduped per
         // (pipe,slug) so 3D content cannot flood the log.
+        crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::AssembleDepth);
         if req.depth_stencil_ref != 0 {
             let ds = match load_depth_stencil_descriptor(
                 state,
@@ -6967,6 +8562,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
             }
         }
+        crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         // The `fixed_gap` anomaly — decoded fixed-function state the Vulkan
         // request cannot represent — is the one thing here the always-on log
         // wants. It is deduped per (pipe, w, h, gap) so recurring depth/stencil
@@ -7045,7 +8641,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 req.colors.len(),
                 color_target_diag(&req.colors),
                 fixed_state_gap,
-                resources.target_rgba8.is_some() as u8,
+                (resources.target_rgba8.is_some() || resources.target_guest_seed.is_some()) as u8,
                 resources.indexed.is_some() as u8,
                 resources.indexed.as_ref().map(|i| i.index_count).unwrap_or(0),
                 attr_meta,
@@ -7054,11 +8650,160 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             ));
         }
 
+        crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::AssembleTrail);
+        // Asked of the module rather than of m2v's reflection, which is the
+        // whole point: the render path's existing unbound guard walks
+        // `f_shader.reflection.bindings`, so a binding the translated SPIR-V
+        // carries and the reflection omits is checked by nothing.
+        // `descriptor_static_use` cannot close it either — it answers
+        // `NotDeclared` for anything that is not a `UniformConstant`, which by
+        // construction excludes every storage buffer.
+        // Memoized on the `Arc`, because this is a per-draw walk of the whole
+        // module and the words behind an `Arc` cannot change.
+        let frag_declared_bindings =
+            crate::runtime::spirv_bind::declared_binding_numbers_memoized(&f_words);
+        let frag_layout_bindings: Vec<u32> = resources
+            .storage_buffers
+            .iter()
+            .map(|s| s.binding)
+            .chain(resources.sampled_images.iter().map(|i| i.binding))
+            .chain(resources.samplers.iter().map(|s| s.binding))
+            .collect();
+        let frag_gap =
+            crate::runtime::gpu_hang_trail::gap(&frag_declared_bindings, &frag_layout_bindings);
+        // The hang trail, recorded here because this is the last point at which
+        // the guest's pipeline ref and both translated module sizes are in scope
+        // together: past it the engine keys on digests and the ref is gone. See
+        // [`crate::runtime::gpu_hang_trail`] for what reads it and why a counter
+        // could not answer the question.
+        // What the draw is about to sample, lowest binding first. The trail's
+        // whole subject is a fragment module that walks a pointer chain through
+        // a sampled image, and until this it recorded the module's *size* and
+        // nothing about its inputs — so a wedged boot could not say which rail
+        // supplied the walked texture, what format the shader would read it as,
+        // or whether the extent was the one the guest meant.
+        //
+        // Sorted here rather than relied upon: `sampled_images` is in the order
+        // the two texture loops pushed it, vertex stage first, so the fragment
+        // bindings are neither first nor contiguous.
+        let mut sampled_notes = [crate::runtime::gpu_hang_trail::SampledNote::default();
+            crate::runtime::gpu_hang_trail::SAMPLED_KEPT];
+        let mut by_binding: Vec<&crate::backend::vulkan::engine::SampledImageResource> =
+            resources.sampled_images.iter().collect();
+        by_binding.sort_unstable_by_key(|i| i.binding);
+        for (slot, image) in sampled_notes.iter_mut().zip(by_binding.iter()) {
+            *slot = crate::runtime::gpu_hang_trail::SampledNote {
+                binding: image.binding,
+                kind: match &image.source {
+                    crate::backend::vulkan::engine::SampledSource::Bytes(_) => 1,
+                    crate::backend::vulkan::engine::SampledSource::Target(_) => 2,
+                    crate::backend::vulkan::engine::SampledSource::GuestRuns(..) => 3,
+                },
+                format: image.format.as_raw() as u32,
+                width: image.width,
+                height: image.height,
+                // Only the CPU-bytes rail has bytes here to read. The gather
+                // rail's texels are in guest RAM and the target rail's are on
+                // the GPU; reading either one would be a device-memory access
+                // taken to write a log line, which is not a trade this makes.
+                texel0: match &image.source {
+                    crate::backend::vulkan::engine::SampledSource::Bytes(b) => b
+                        .get(..4)
+                        .map(|t| u32::from_le_bytes([t[0], t[1], t[2], t[3]]))
+                        .unwrap_or(0),
+                    _ => 0,
+                },
+            };
+        }
+        // And what it will sample them *through*. All four of the uber shader's
+        // unbounded loops share one sampler, and a `LINEAR` filter on a texture
+        // whose texels are the next UV walks a blend of two cells rather than
+        // either — so the third of the wedge's three hypotheses is a property of
+        // this list and of nothing the trail recorded before.
+        let mut sampler_notes = [crate::runtime::gpu_hang_trail::SamplerNote::default();
+            crate::runtime::gpu_hang_trail::SAMPLER_KEPT];
+        let mut smp_by_binding: Vec<&crate::backend::vulkan::engine::SamplerResource> =
+            resources.samplers.iter().collect();
+        smp_by_binding.sort_unstable_by_key(|s| s.binding);
+        for (slot, smp) in sampler_notes.iter_mut().zip(smp_by_binding.iter()) {
+            use crate::backend::vulkan::engine::{
+                SamplerAddressMode as A, SamplerFilter as F, SamplerMipFilter as M,
+            };
+            let filter = |f: F| match f {
+                F::Nearest => b'N',
+                F::Linear => b'L',
+            };
+            let address = |a: A| match a {
+                A::ClampToEdge => b'e',
+                A::MirrorClampToEdge => b'E',
+                A::Repeat => b'r',
+                A::MirrorRepeat => b'R',
+                A::ClampToZero => b'z',
+                A::ClampToBorderColor => b'b',
+            };
+            *slot = crate::runtime::gpu_hang_trail::SamplerNote {
+                binding: smp.binding,
+                min_filter: filter(smp.min_filter),
+                mag_filter: filter(smp.mag_filter),
+                mip_filter: match smp.mip_filter {
+                    M::NotMipmapped => b'n',
+                    M::Nearest => b'N',
+                    M::Linear => b'L',
+                },
+                address_u: address(smp.address_mode_u),
+                address_v: address(smp.address_mode_v),
+                // `?` is a sampler that reached the list by a route that did not
+                // record where its state came from, which is the reading that
+                // would send the next session looking for a fourth path rather
+                // than concluding anything about the three.
+                provenance: sampler_origin.get(&smp.binding).copied().unwrap_or(b'?'),
+                unnormalized: smp.unnormalized_coordinates,
+            };
+        }
+        crate::runtime::gpu_hang_trail::note_draw(crate::runtime::gpu_hang_trail::DrawNote {
+            sampled: sampled_notes,
+            sampled_count: resources.sampled_images.len() as u32,
+            samplers: sampler_notes,
+            sampler_count: resources.samplers.len() as u32,
+            pipeline_ref: req.pipeline_ref,
+            vert_words: v_words.len() as u32,
+            frag_words: f_words.len() as u32,
+            width: w,
+            height: h,
+            vertex_count,
+            instance_count: req.instance_count,
+            // Asked of the module rather than of m2v's reflection, which is the
+            // whole point: the render path's existing unbound guard walks
+            // `f_shader.reflection.bindings`, so a binding the translated
+            // SPIR-V carries and the reflection omits is checked by nothing.
+            // `descriptor_static_use` cannot close it either — it answers
+            // `NotDeclared` for anything that is not a `UniformConstant`, which
+            // by construction excludes every storage buffer.
+            frag_declared: frag_declared_bindings.len() as u32,
+            // What the engine will build the layout from: the storage binds this
+            // draw resolved, at the numbers they will carry, plus the textures
+            // and samplers it provided at theirs.
+            frag_provided: frag_layout_bindings.len() as u32,
+            frag_gap: frag_gap.0,
+            frag_gap_lo: frag_gap.1,
+        });
+        crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         resources.vert_spirv = v_words;
         resources.frag_spirv = f_words;
         resources.width = w;
         resources.height = h;
         resources.vertex_count = vertex_count;
+        if let Some(c0) = req.colors.first() {
+            resources.color_attachment_format = Some(
+                translate::pixel::color_attachment(c0.format)
+                    .map_err(|reason| {
+                        DrawError::Unsupported(
+                            crate::backend::vulkan::engine::reason::DrawReason::ColorAttachmentFormat(reason),
+                        )
+                    })?
+                    .0,
+            );
+        }
         // Attachment-count census, taken before the MRT gate rather than inside
         // it. `build_secondary_targets` returns empty for a single-attachment
         // draw without emitting, and every MRT counter below it therefore reads
@@ -7205,11 +8950,18 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         if resident_render_chain {
             return Ok(M2vDrawSpan::ResidentChain);
         }
-        if gva_resident_store {
-            return Ok(M2vDrawSpan::ResidentGvaStore);
+        if let Some(identity) = gva_resident_store {
+            return Ok(M2vDrawSpan::ResidentGvaStore { identity });
         }
-        if surface_resident_store {
-            return Ok(M2vDrawSpan::ResidentSurfaceStore);
+        if let Some(identity) = surface_resident_store {
+            return Ok(M2vDrawSpan::ResidentSurfaceStore {
+                identity,
+                guest_store: GuestStoreStatus {
+                    guest_backed: out.target_guest_backed,
+                    recorded: out.guest_store_recorded,
+                    footprint: out.guest_store_footprint,
+                },
+            });
         }
         Ok(M2vDrawSpan::Pixels {
             bytes: pixels,
@@ -7290,7 +9042,7 @@ pub(super) fn depth_chain_identity(
     })
 }
 
-pub(super) fn render_chain_identity(
+pub(crate) fn render_chain_identity(
     state: &DeviceState,
     req: &DrawEncodeRequest,
 ) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
@@ -7378,10 +9130,52 @@ fn type11_render_identity(
     req: &DrawEncodeRequest,
 ) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
     let c0 = req.colors.first()?;
-    if c0.mapping_id == 0 || c0.store_action != MTL_STORE_ACTION_STORE {
+    if c0.mapping_id == 0
+        || !crate::contract::pass_action::store_action_publishes_single_sample(c0.store_action)
+    {
         return None;
     }
     render_chain_identity(state, req)
+}
+
+/// Stable shared allocation behind the type-11 primary attachment, if this
+/// host can retain the mapping view for the device lifetime.
+///
+/// The mapping revalidation inside `ensure_contig_view` is part of the answer:
+/// it retires an alias when the guest has recycled any of its pages, and that
+/// advances the generation carried by `type11_render_identity`. The engine is
+/// therefore handed a pointer and an identity derived from the same current
+/// page ownership, never a cached pointer paired with a newly rewired surface.
+fn type11_guest_target_backing<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    req: &DrawEncodeRequest,
+) -> Option<crate::backend::vulkan::engine::GuestTargetMemory> {
+    if !host.map_pages_stable() {
+        return None;
+    }
+    let c0 = req.colors.first()?;
+    type11_render_identity(state, req)?;
+    let (plane_offset, row_pitch, span_end) = {
+        let mapping = state.mappings.get(&c0.mapping_id)?;
+        let format = crate::runtime::mapping_write::mapping_store_format(mapping);
+        crate::runtime::mapping_write::type11_sample_window(mapping, c0.width, c0.height, format)?
+    };
+    let (import, footprint) =
+        crate::runtime::mapper::ensure_contig_import_with_footprint(state, host, c0.mapping_id)?;
+    if span_end > import.len() {
+        return None;
+    }
+    Some(crate::backend::vulkan::engine::GuestTargetMemory {
+        backing: crate::backend::vulkan::engine::GuestTargetBacking {
+            allocation_host_ptr: import.host_base(),
+            allocation_len: import.len(),
+            plane_offset,
+            row_pitch: u64::from(row_pitch),
+        },
+        import,
+        footprint,
+    })
 }
 
 /// Whether this record's color0 LOAD is one the resident could serve at all —
@@ -7422,15 +9216,15 @@ pub(super) fn type11_load_currency_query(
     Some((identity, mapping_epoch))
 }
 
-/// Has the guest written this surface's pages since the Store that produced
-/// the resident stamped them?
+/// Has the guest written this surface's pages since the Store that produced a
+/// copied resident stamped them?
 ///
 /// The device-side half of the currency test — the `surface_content_epoch`
 /// comparison one function up — can only witness writers inside this crate.
 /// A type-11 surface's pages are plain guest RAM, and the guest CPU stores
 /// into them with no device operation, so the epoch does not move and the
 /// resident silently stops matching what the seed would upload. This is the
-/// only witness for that, and it is the hypervisor's.
+/// only witness for that copied-allocation question, and it is the hypervisor's.
 ///
 /// Answers `true` — "written, do not reuse" — for every case that is not a
 /// live token whose current generation equals the one the Store recorded:
@@ -7738,6 +9532,14 @@ fn note_type11_sample_rung(rung: &'static str, guest_write: GuestWriteVerdict) {
     }
 }
 
+fn guest_allocation_sample_is_direct(
+    backing: crate::backend::vulkan::engine::ResidentContentBacking,
+    may_bind_resident: bool,
+) -> bool {
+    backing == crate::backend::vulkan::engine::ResidentContentBacking::GuestAllocation
+        && may_bind_resident
+}
+
 /// The census column for a rung's guest-write verdict, or `None` for a rung the
 /// verdict says nothing about.
 fn sample_rung_gw_route(rung: &str, guest_write: GuestWriteVerdict) -> Option<&'static str> {
@@ -7769,6 +9571,24 @@ fn sample_rung_gw_route(rung: &str, guest_write: GuestWriteVerdict) -> Option<&'
 /// precisely the black-layer class. Absence on either side is a refusal.
 fn type11_resident_is_current(mapping_epoch: Option<u32>, resident_epoch: Option<u32>) -> bool {
     mapping_epoch.is_some() && mapping_epoch == resident_epoch
+}
+
+/// Decide whether a type-11 LOAD can use its retained target.
+///
+/// A guest allocation is the serialized texture's own storage, not a cached
+/// copy, so a host or guest write changes the allocation the next render pass
+/// loads. The copied-allocation currency query is supplied as a closure so the
+/// shared case cannot accidentally pay either engine lookup or guest-write
+/// lookup on a warm LOAD.
+fn type11_load_resident_is_current(
+    backing: Option<crate::backend::vulkan::engine::ResidentContentBacking>,
+    copied_currency: impl FnOnce() -> (bool, bool),
+) -> (bool, bool) {
+    if backing == Some(crate::backend::vulkan::engine::ResidentContentBacking::GuestAllocation) {
+        (true, false)
+    } else {
+        copied_currency()
+    }
 }
 
 /// Record that the resident this Store rendered into holds the mapping's
@@ -7823,7 +9643,7 @@ fn stamp_type11_resident<M: HostMemory + HostOps>(
 /// golden-ratio constant (2^64 / phi rounded to odd), used here only to spread
 /// page GPAs — which are dense multiples of the page size, so their low bits are
 /// all zero — across the whole word before the XOR fold.
-fn gva_page_set_hash(pages: &std::collections::HashSet<u64>) -> u64 {
+pub(crate) fn gva_page_set_hash(pages: &std::collections::HashSet<u64>) -> u64 {
     let mut hash: u64 = 0;
     for p in pages {
         hash ^= p.wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -7831,29 +9651,14 @@ fn gva_page_set_hash(pages: &std::collections::HashSet<u64>) -> u64 {
     hash
 }
 
-/// Allocation identity of this draw's color0 GVA render target: the hash of the
-/// guest physical pages its span resolves to right now.
+/// Host-texture identity of this draw's color0 GVA resource.
 ///
-/// The engine registry keys a `TargetIdentity::Gva` on all four of its fields,
-/// so this is the only field that can separate two guest allocations reusing one
-/// address at one geometry. Identical pages means literally the same guest
-/// memory and sharing the image is correct; different pages means a different
-/// allocation, and sharing would hand the second one the first one's pixels as
-/// its prior content — which is exactly what the cross-pass resident Load in
-/// [`encode_draw_chain`] reads.
-///
-/// Resolved once per draw, before any GPU work, and carried on
-/// [`DrawEncodeRequest::gva_alloc_gen`] so every identity the draw builds agrees.
-/// Returns 0 when color0 is not a GVA target and when the walk does not cover
-/// the whole span: an incomplete walk names no allocation, and a hash of the
-/// pages that happened to resolve would be an identity the guest never had.
-///
-/// A generation that disagrees with the one a resident was created under can
-/// only *miss* the registry lookup, which costs a CPU seed and never produces
-/// wrong pixels. Sharing a slot is the wrong-content direction, so every
-/// ambiguity here resolves toward the miss.
+/// A task-local texture reference keeps one generation from creation through
+/// ordinary task map changes and transfer-backing discard. Explicit resource
+/// delete ends that lifetime. A target with no resource reference falls back to
+/// the page-set identity because it has no protocol lifetime to name instead.
 fn gva_alloc_generation<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &mut DeviceState,
     host: &mut M,
     req: &DrawEncodeRequest,
 ) -> u64 {
@@ -7865,14 +9670,27 @@ fn gva_alloc_generation<M: HostMemory + HostOps>(
     }
     // Same span as the deferred arm walks (`arm_gva_deferred_store`) so the two
     // describe one region: the guest bytes a Store into this target writes.
-    gva_span_alloc_generation(
-        state,
-        host,
-        req.task_id,
-        c0.target_gva,
-        c0.row_stride,
-        c0.height,
-    )
+    if c0.texture_ref != 0 {
+        crate::runtime::writeback_debt::gva_resource_generation(
+            state,
+            host,
+            crate::runtime::writeback_debt::GvaResourceKey {
+                task_id: req.task_id,
+                texture_ref: c0.texture_ref,
+            },
+            c0.target_gva,
+            u64::from(c0.row_stride).saturating_mul(u64::from(c0.height)),
+        )
+    } else {
+        gva_span_alloc_generation(
+            state,
+            host,
+            req.task_id,
+            c0.target_gva,
+            c0.row_stride,
+            c0.height,
+        )
+    }
 }
 
 /// The page-set generation of one `row_stride * height` GVA span under one task.
@@ -7883,7 +9701,7 @@ fn gva_alloc_generation<M: HostMemory + HostOps>(
 ///
 /// A short walk yields 0. An incomplete walk names no allocation, and hashing the
 /// pages that happened to resolve would be an identity the guest never had.
-fn gva_span_alloc_generation<M: HostMemory + HostOps>(
+pub(crate) fn gva_span_alloc_generation<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &mut M,
     task_id: u32,
@@ -7967,15 +9785,35 @@ pub(crate) fn gva_chain_identity(
 /// for per host: a widening that reads the spec's table instead of the device
 /// is the shape AGENTS.md names, and this one would fail at `vkCreateImage`
 /// rather than decline.
-fn gva_resident_format(format: u16) -> ash::vk::Format {
+pub(crate) fn gva_resident_format(format: u16) -> ash::vk::Format {
     use crate::backend::vulkan::translate::pixel;
-    let Some(layout) = pixel_format::store_texel_order(format) else {
+    // The declaration the *attachment* will be built from, folded onto its
+    // allocation family, which is what `registry_ensure` creates the image in.
+    //
+    // Asked of `color_attachment` and not of `store_texel_order`, which is what
+    // this used to ask and which is a different question — that one says whether
+    // a resident's texels can be byte-copied into guest pages, and it answers
+    // for three formats where `render_target_bpp` admits six. A guest render
+    // target declared `R8Unorm`, `R16Float` or `RG16Float` therefore built its
+    // image at one to four bytes a texel through `color_attachment` while its
+    // identity claimed `RESIDENT_RGBA_FORMAT` and four, so everything keyed off
+    // the identity — `bytes_per_texel`, the readback size, `stored_bytes_agree`
+    // — read the wrong width for the image it was describing. `R16Float` and
+    // `RG16Float` are both in the guest's vocabulary on boots on record.
+    let Ok((attachment, _)) = pixel::color_attachment(format) else {
         return pixel::RESIDENT_RGBA_FORMAT;
     };
-    if !crate::backend::vulkan::engine::render_target_layout_supported(layout) {
-        return pixel::RESIDENT_RGBA_FORMAT;
+    let allocation = pixel::ResidentFormat::of(attachment).allocation();
+    match pixel::texel_layout_of(allocation) {
+        // Capability, never an API-version assumption: the host is asked whether
+        // it renders to and blends this layout.
+        Some(layout)
+            if crate::backend::vulkan::engine::render_target_layout_supported(layout) =>
+        {
+            allocation
+        }
+        _ => pixel::RESIDENT_RGBA_FORMAT,
     }
-    pixel::vk_texel_layout(layout)
 }
 
 /// Read a resident render-pass chain back to host memory so the exec loop can
@@ -7990,13 +9828,11 @@ fn gva_resident_format(format: u16) -> ash::vk::Format {
 /// shape, and reading it as the hot path sends the next reader at a premise that
 /// has already been fixed.
 ///
-/// Both Store rails write the guest's pages from the GPU now. `ResidentGvaStore`
-/// goes to `render_writeback::store_gva_frame` and `ResidentSurfaceStore` to
-/// `store_surface_resident`; this function is what each falls back to when its
-/// arm declines, plus `writeback_chain_rgba`. A driven Safari-drag boot puts
-/// `gva_store_sync` at **3 for the whole boot** against `gva_flush_gpu_direct`
-/// and `render_flush_gpu_direct` carrying the rail. `draw_phase`'s `wait_us` and
-/// `readback_us` are both flat zero across the drag.
+/// Both Store rails normally leave the frame host-authoritative. Their payments
+/// use the GPU-direct guest-page copies in `render_writeback`; this function is
+/// what either Store falls back to when it cannot arm or materialize that copy,
+/// plus `writeback_chain_rgba`. The ordinary path therefore has no framebuffer
+/// readback or CPU conversion at Store time.
 ///
 /// So this is genuinely the abandon path, and it is a cost rather than a lost
 /// frame — but it is the expensive one, and the reason to keep it narrow: it
@@ -8012,17 +9848,33 @@ fn gva_resident_format(format: u16) -> ash::vk::Format {
 /// render target — see `is_bgra` on
 /// [`crate::backend::vulkan::engine::TargetIdentity`] for why it is keyed on the
 /// identity and what a change there has to keep true.
-pub(crate) fn read_resident_chain(state: &DeviceState, req: &DrawEncodeRequest) -> Option<Vec<u8>> {
-    let identity = render_chain_identity(state, req)?;
-    match crate::backend::vulkan::engine::read_target(&identity) {
+///
+/// The identity is the caller's, never re-derived here: both callers hold the
+/// key their own draw registered, carried out of `M2vDrawSpan`, and
+/// `render_chain_identity` asked again after the draw can answer at a newer
+/// mapping generation than the one the registry holds. See
+/// [`M2vDrawSpan::ResidentSurfaceStore`].
+pub(crate) fn read_resident_chain(
+    req: &DrawEncodeRequest,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+) -> Option<Vec<u8>> {
+    match crate::backend::vulkan::engine::read_target(identity) {
         // Every caller of this function — `writeback_chain_rgba` and the GVA
         // arm-refusal fallback — has an RGBA contract, so the exchange happens
         // here, once, rather than at three call sites that would each have to
         // remember which namespace they were reading. `into_rgba8` uses the order
-        // the engine reports for the image it copied, so it is a no-op on the
-        // pooled and GVA residents — which is what the hot caller brings — and a
-        // single whole-frame pass on a BGRA surface, which only the two abandon
-        // callers reach.
+        // the engine reports for the image it copied, so it is a no-op on a
+        // pooled resident and a whole-frame pass on anything the guest declared
+        // in BGRA order — a surface, and a GVA target whose declared format
+        // `gva_resident_format` could honour, which is most of them.
+        //
+        // That last clause used to read "a no-op on the pooled and GVA
+        // residents", and it was wrong rather than imprecise: a GVA render
+        // target declared `BGRA8Unorm` or `BGRA8Unorm_sRGB` is resident in BGRA
+        // and owes the exchange. It was a true description of what the code did
+        // — `ResidentReadSnapshot::bgra` answered "not BGRA" for the sRGB
+        // spelling — so the comment documented the defect instead of catching
+        // it, and the Store below exchanged R and B on its way into guest pages.
         Ok(rb) => Some(rb.into_rgba8()),
         Err(e) => {
             crate::observe::fail(format!(
@@ -8050,39 +9902,86 @@ pub(crate) fn read_resident_chain(state: &DeviceState, req: &DrawEncodeRequest) 
 /// materialize it the slow way — read the resident back and run the synchronous
 /// Store block. That is a cost, never a lost frame.
 ///
-/// The identity is [`type11_store_identity`] — the same call that produced the
-/// draw's `target_identity` — so the image read here is the image the draw
-/// rendered into. Deriving it a second way is how a writeback ends up
-/// publishing a frame the draw is not in.
+/// The identity is the caller's, carried out of the draw on
+/// [`M2vDrawSpan::ResidentSurfaceStore`], so the image read here is the image
+/// the draw rendered into by construction.
+///
+/// It used to be [`type11_store_identity`] called again here, on the argument
+/// that this is the same function that produced the draw's `target_identity`.
+/// The same function is not the same value: that identity carries
+/// `MappingEntry::map_generation`, and the draw mutates `DeviceState` between
+/// the two calls. Read that variant's doc before reintroducing a derivation
+/// anywhere on this path — deriving it a second *time* is as wrong as deriving
+/// it a second *way*.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SurfaceStorePlan {
+    SynchronizeGuestBacking,
+    DeferCopy,
+    CopyNow,
+}
+
+fn surface_store_plan(lazy_enabled: bool, guest_backed: bool) -> SurfaceStorePlan {
+    if guest_backed {
+        SurfaceStorePlan::SynchronizeGuestBacking
+    } else if lazy_enabled {
+        SurfaceStorePlan::DeferCopy
+    } else {
+        SurfaceStorePlan::CopyNow
+    }
+}
+
 fn store_surface_resident<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
-    req: &DrawEncodeRequest,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
     mapping_id: u32,
     width: u32,
     height: u32,
+    guest_store: GuestStoreStatus,
 ) -> bool {
     // The union belongs to the draws that just ran whether or not the write
     // below succeeds, and leaving it un-reset on a refused write would fold this
     // pass into the next Store's reading.
     note_pass_scissor_union(width, height);
-    let Some(identity) = type11_store_identity(state, req, true) else {
-        return false;
-    };
-    // Owe the frame rather than write it, when the rail is on. The resident this
-    // draw just filled is the only place these pixels exist and the engine
-    // already refuses to reclaim such a slot, so nothing has to be pinned and
-    // nothing resolved is held — see `runtime::writeback_debt` for why that
-    // distinction is the whole difference from the rail that corrupted the
-    // guest's page tables.
-    if crate::runtime::writeback_debt::lazy_writeback_enabled()
-        && arm_surface_writeback_debt(state, host, mapping_id, &identity, width, height)
+    // A copied resident may defer the transfer until something reads the
+    // mapping. A guest-backed resident may not: its Store is already the draw
+    // into that allocation, so deferring creates an invented second operation
+    // and makes correctness depend on the texture identity outliving the
+    // command that synchronized it. Publish the existing alias eagerly and let
+    // the completion stamp carry its queue ordering.
+    let lazy = crate::runtime::writeback_debt::lazy_writeback_enabled();
+    let plan = surface_store_plan(lazy, guest_store.guest_backed);
+    if plan == SurfaceStorePlan::DeferCopy
+        && arm_surface_writeback_debt(state, host, mapping_id, identity, width, height)
     {
         crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
         return true;
     }
+    if plan == SurfaceStorePlan::SynchronizeGuestBacking {
+        if lazy {
+            crate::runtime::drain::note_store_route("target_store_shared_eager");
+        }
+        match crate::runtime::render_writeback::store_guest_backed_frame(
+            state,
+            mapping_id,
+            identity,
+            width,
+            height,
+            guest_store.recorded,
+            guest_store.footprint,
+        ) {
+            Ok(()) => return true,
+            Err(decline) => {
+                crate::observe::Emit::decline("target_store_shared_declined", &decline)
+                    .field("mapping", mapping_id)
+                    .field("geom", format!("{width}x{height}"))
+                    .fail_once(u64::from(mapping_id));
+                crate::runtime::drain::note_store_route("target_store_shared_declined");
+            }
+        }
+    }
     if !crate::runtime::render_writeback::store_render_frame(
-        state, host, mapping_id, &identity, width, height,
+        state, host, mapping_id, identity, width, height,
     ) {
         return false;
     }
@@ -8129,6 +10028,54 @@ fn arm_surface_writeback_debt<M: HostMemory + HostOps>(
     let Some(map_generation) = state.mappings.get(&mapping_id).map(|m| m.map_generation) else {
         return false;
     };
+    // The host surface cache is the *other* host-side copy of this mapping, and
+    // this Store has just superseded it without writing a byte anywhere. The
+    // eager arm ends with `surface_cache::forget` for exactly this reason; this
+    // arm cedes instead, because here the resident genuinely does hold the frame
+    // and a cession says so — see [`surface_cache::cede_surface_to_resident`],
+    // which was written for this call and had no caller.
+    //
+    // Without it the type-11 sampled ladder's host-cache rung serves the
+    // *previous* frame for as long as the debt is outstanding: that rung is
+    // gated on the guest-write witness alone, which by construction cannot see a
+    // publish this device made itself, and it sits above both rungs that read
+    // the guest's own pages, so nothing below corrects it. It repairs when the
+    // debt is paid, which is what makes it a flicker rather than a stuck layer.
+    //
+    // A geometry this cache would not have stored is refused rather than armed,
+    // per that function's contract: leaving a live entry beside a
+    // resident-authoritative window is the state this whole call exists to
+    // prevent, and the eager Store is always available.
+    if !crate::runtime::surface_cache::cede_surface_to_resident(state, mapping_id, width, height) {
+        crate::runtime::drain::note_store_route("wbdebt_uncedable_geometry");
+        return false;
+    }
+    // The *third* host-side claim on this window, and the one this arm was
+    // missing. `compute_storage_residency` records that a storage image and the
+    // guest's pages both hold a window a compute dispatch wrote back, so
+    // `compute_exec::stage_texture_raw` may serve the storage image and skip the
+    // guest read entirely. This Store has just superseded both halves of that
+    // claim without writing a byte, so the next dispatch staging the same window
+    // would be fed the earlier dispatch's image and never see the render frame.
+    //
+    // The eager arm has always done this — `write_bgra8_from_resident_gpu` calls
+    // `invalidate_storage_residency_window` over the same extent — so without it
+    // here the two arms of `env::LAZY_WRITEBACK` disagree about what the GPU
+    // observes, which is the one thing that switch's doc promises they never do.
+    // Nothing else drops an entry from that map and no guest-write witness feeds
+    // it, so a stale claim is held until the window is written some other way.
+    if let Some(m) = state.mappings.get(&mapping_id) {
+        let format = if m.format != 0 {
+            m.format
+        } else {
+            pixel_format::MTL_FORMAT_BGRA8_UNORM
+        };
+        if let Some((base_off, _bpr, span_end)) =
+            crate::runtime::mapping_write::type11_sample_window(m, width, height, format)
+        {
+            state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
+        }
+    }
     // The one call that says "these pixels changed and the guest's pages do not
     // hold them yet". It advances the surface's content epoch, which is what the
     // stamp below records, and `ResourceValidity::host_published_seq`, which is
@@ -8141,17 +10088,18 @@ fn arm_surface_writeback_debt<M: HostMemory + HostOps>(
     // one mapping and the payment below cannot be the one just armed.
     let evicted = state
         .pending_writebacks
-        .arm(mapping_id, width, height, map_generation);
+        .arm(mapping_id, identity.clone(), width, height, map_generation);
     if let Some(evicted) = evicted {
         crate::runtime::drain::note_store_route("wbdebt_evicted");
-        crate::runtime::writeback_debt::pay_for_mapping(state, host, evicted);
+        if !crate::runtime::writeback_debt::pay_key(state, host, evicted) {
+            let armed = state.pending_writebacks.take(mapping_id);
+            debug_assert!(armed.is_some());
+            crate::runtime::drain::note_store_route("wbdebt_capacity_fallback");
+            return false;
+        }
     }
     true
 }
-
-
-
-
 
 /// Readback-skip gate for the final/single record of a GVA render Store: the
 /// record may leave its pixels on the engine registry resident and let the
@@ -8163,7 +10111,12 @@ fn gva_store_defer_eligible(req: &DrawEncodeRequest) -> bool {
     let Some(c0) = req.colors.first() else {
         return false;
     };
-    if c0.mapping_id != 0 || c0.target_gva == 0 || c0.row_stride == 0 {
+    if c0.mapping_id != 0
+        || c0.target_gva == 0
+        || c0.row_stride == 0
+        || c0.texture_ref == 0
+        || req.gva_alloc_gen == 0
+    {
         return false;
     }
     let Some(identity) = gva_chain_identity(req) else {
@@ -8172,16 +10125,52 @@ fn gva_store_defer_eligible(req: &DrawEncodeRequest) -> bool {
     if identity.width() != c0.width || identity.height() != c0.height {
         return false;
     }
-    pixel_format::tight_row_bytes(c0.width, c0.format).is_some_and(|t| c0.row_stride >= t)
+    pixel_format::tight_row_bytes(c0.width, c0.format)
+        .and_then(|bytes| bytes.checked_mul(c0.sample_count.max(1)))
+        .is_some_and(|tight| c0.row_stride >= tight)
 }
-
-
 
 #[cfg(all(test, feature = "backend-vulkan"))]
 mod vulkan_split_tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
+
+    #[test]
+    fn a_sampled_guest_allocation_does_not_enter_copy_currency_checks() {
+        use crate::backend::vulkan::engine::ResidentContentBacking;
+
+        assert!(guest_allocation_sample_is_direct(
+            ResidentContentBacking::GuestAllocation,
+            true
+        ));
+        assert!(!guest_allocation_sample_is_direct(
+            ResidentContentBacking::DeviceAllocation,
+            true
+        ));
+        assert!(!guest_allocation_sample_is_direct(
+            ResidentContentBacking::NotReady,
+            true
+        ));
+        assert!(!guest_allocation_sample_is_direct(
+            ResidentContentBacking::GuestAllocation,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_guest_backed_store_is_never_turned_into_a_future_copy() {
+        assert_eq!(
+            surface_store_plan(true, true),
+            SurfaceStorePlan::SynchronizeGuestBacking
+        );
+        assert_eq!(
+            surface_store_plan(false, true),
+            SurfaceStorePlan::SynchronizeGuestBacking
+        );
+        assert_eq!(surface_store_plan(true, false), SurfaceStorePlan::DeferCopy);
+        assert_eq!(surface_store_plan(false, false), SurfaceStorePlan::CopyNow);
+    }
 
     /// The blank-with-host-entry loss must be reported as a subset of a
     /// population, not as a bare count.
@@ -8225,7 +10214,7 @@ mod vulkan_split_tests {
             9,
             (gva, w, h),
             &content,
-            TexelLayout::Rgba8,
+            SampledByteFormat::synthesised(TexelLayout::Rgba8),
         );
         assert_eq!(
             store_route_count("lin_rung_host_entry"),
@@ -8241,7 +10230,7 @@ mod vulkan_split_tests {
         // All zeroes over the same cached span: the loss, and still a member of
         // the population it is a subset of.
         let blank = vec![0u8; (w * h * 4) as usize];
-        note_guest_rung_blank(&state, &host, 1, 9, (gva, w, h), &blank, TexelLayout::Rgba8);
+        note_guest_rung_blank(&state, &host, 1, 9, (gva, w, h), &blank, SampledByteFormat::synthesised(TexelLayout::Rgba8));
         assert_eq!(store_route_count("lin_rung_host_entry"), entries + 2);
         assert_eq!(
             store_route_count("lin_rung_blank_with_host_entry"),
@@ -8257,7 +10246,7 @@ mod vulkan_split_tests {
             9,
             (gva + 0x10_0000, w, h),
             &blank,
-            TexelLayout::Rgba8,
+            SampledByteFormat::synthesised(TexelLayout::Rgba8),
         );
         assert_eq!(store_route_count("lin_rung_host_entry"), entries + 2);
         assert_eq!(
@@ -8515,7 +10504,7 @@ mod vulkan_split_tests {
             9,
             (content_gva, w, h),
             &blank,
-            TexelLayout::Rgba8,
+            SampledByteFormat::synthesised(TexelLayout::Rgba8),
         );
         assert_eq!(
             store_route_count("lin_rung_blank_host_content"),
@@ -8535,7 +10524,7 @@ mod vulkan_split_tests {
             9,
             (blank_gva, w, h),
             &blank,
-            TexelLayout::Rgba8,
+            SampledByteFormat::synthesised(TexelLayout::Rgba8),
         );
         assert_eq!(
             store_route_count("lin_rung_blank_host_agrees"),
@@ -8555,8 +10544,6 @@ mod vulkan_split_tests {
             "the split partitions the population rather than replacing it"
         );
     }
-
-
 
     /// One guest page-table entry pointing GVA page 1 at `pfn`, on a task the
     /// GVA walker will accept. Returns the state the walk reads its task from;
@@ -8598,62 +10585,48 @@ mod vulkan_split_tests {
         }
     }
 
-    /// A GVA render target is named by the guest memory behind it, not by its
-    /// address.
-    ///
-    /// The engine registry keys a resident on every field of
-    /// `TargetIdentity::Gva`. With `generation` constant the key was
-    /// `(gva, width, height)`, so a second guest allocation handed the same
-    /// address at the same geometry got **the same GPU image** — and the
-    /// cross-pass resident Load in `encode_draw_chain` then reads the first
-    /// allocation's pixels as the second one's prior content. The guest recycles
-    /// render-target addresses hard enough for that to be ~5.6 % of arms.
-    ///
-    /// Only the generation may separate them: the same address at the same
-    /// geometry backed by the same page must still be one identity, or every
-    /// re-render of a live buffer would mint a slot and lose its content.
+    /// A GVA render target is named by its live task-local resource, whose host
+    /// texture survives task virtual-memory map changes. Delete ends that
+    /// lifetime; reusing the integer afterwards must mint another identity.
     #[test]
-    fn a_gva_targets_identity_follows_its_guest_pages_not_its_address() {
+    fn a_gva_targets_identity_follows_resource_lifetime() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut host = FakeHost::new();
         map_one_gva_page(&mut host, 4);
         state.define_task(1, 0x1_0000, 2);
 
         let mut req = one_page_gva_request();
-        let gen_a = super::gva_alloc_generation(&state, &mut host, &req);
+        let gen_a = super::gva_alloc_generation(&mut state, &mut host, &req);
         assert_ne!(gen_a, 0, "a fully walked GVA span must name its allocation");
         req.gva_alloc_gen = gen_a;
         let id_a = super::gva_chain_identity(&req).expect("a GVA color0 has a chain identity");
 
         // The same buffer rendered again: same pages, so the same resident.
         assert_eq!(
-            super::gva_alloc_generation(&state, &mut host, &req),
+            super::gva_alloc_generation(&mut state, &mut host, &req),
             gen_a,
             "an unchanged mapping must not mint a second identity"
         );
 
-        // The guest frees the target and its allocator hands the address to a
-        // different page. Same task, same GVA, same geometry.
+        // Ordinary virtual-memory remapping does not retarget the live resource.
         map_one_gva_page(&mut host, 5);
-        let gen_b = super::gva_alloc_generation(&state, &mut host, &req);
-        assert_ne!(
-            gen_b, gen_a,
-            "different guest pages are a different allocation"
-        );
+        let gen_b = super::gva_alloc_generation(&mut state, &mut host, &req);
+        assert_eq!(gen_b, gen_a);
         req.gva_alloc_gen = gen_b;
         let id_b = super::gva_chain_identity(&req).expect("a GVA color0 has a chain identity");
+        assert_eq!(id_a, id_b);
 
-        assert_ne!(
-            id_a, id_b,
-            "two allocations at one address must not share one image"
-        );
+        assert!(crate::runtime::writeback_debt::retire_gva_resource(
+            &mut state, 1, 7
+        ));
+        let gen_c = super::gva_alloc_generation(&mut state, &mut host, &req);
+        assert_ne!(gen_c, gen_a, "delete ends the host texture's lifetime");
         assert_eq!(
             (id_a.width(), id_a.height()),
             (id_b.width(), id_b.height()),
             "and the generation must be the only thing that separates them"
         );
     }
-
 
     /// The set of pages is the identity; the order a walk reports them in is
     /// not, and one page of difference is a different allocation.
@@ -8695,6 +10668,32 @@ mod vulkan_split_tests {
         assert!(!type11_resident_is_current(None, None));
         assert!(!type11_resident_is_current(None, Some(0)));
         assert!(!type11_resident_is_current(Some(7), None));
+    }
+
+    #[test]
+    fn a_guest_allocation_load_never_queries_copy_currency() {
+        use crate::backend::vulkan::engine::ResidentContentBacking;
+
+        assert_eq!(
+            type11_load_resident_is_current(
+                Some(ResidentContentBacking::GuestAllocation),
+                || panic!("one allocation has no second copy whose currency can be queried"),
+            ),
+            (true, false)
+        );
+        for backing in [
+            Some(ResidentContentBacking::DeviceAllocation),
+            Some(ResidentContentBacking::NotReady),
+            None,
+        ] {
+            for copied_answer in [(false, true), (true, false)] {
+                assert_eq!(
+                    type11_load_resident_is_current(backing, || copied_answer),
+                    copied_answer,
+                    "{backing:?} must retain the copied-allocation currency test"
+                );
+            }
+        }
     }
 
     /// A sampled bind may only be served from a host-side copy of a type-4
@@ -8926,6 +10925,425 @@ mod vulkan_split_tests {
     /// Every one of those 121 lines had `want == mapgeom` and `hostgen=0`: the
     /// cache had never held the surface and its pages were readable. That pair is
     /// what makes reading them the fix rather than a guess.
+    /// The lazy type-11 Store publishes a frame nothing has written down yet, so
+    /// the host surface cache — the other host-side copy of the same mapping —
+    /// must stop naming the frame before it.
+    ///
+    /// The eager Store's GPU-direct arm ends in `surface_cache::forget` and says
+    /// why; the lazy arm published a strictly newer frame and left the entry
+    /// alone. The consumer that would read it is the type-11 sampled ladder's
+    /// host-cache rung, gated on the guest-write witness alone — which cannot
+    /// see a publish this device made itself — and sitting above both rungs that
+    /// read the guest's pages, so nothing below it corrects the answer.
+    ///
+    /// Asserted through `get_shared_with_gen`, which is the accessor that rung
+    /// actually calls: a cession leaves the entry present and empty, so a test
+    /// that only asked whether the map contained the key would pass either way.
+    #[test]
+    fn arming_a_writeback_debt_stops_the_host_cache_naming_the_previous_frame() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::runtime::mapping_write::write_bgra8;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let mid = 912u32;
+        let pfn = 0x31u32;
+        let gpa = (pfn as u64) << PAGE_SHIFT_X86;
+        host.map_range(gpa, 0x4000, 0);
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        let (w, h) = (4u32, 2u32);
+        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+
+        // Frame N, mirrored into the host cache by the write itself.
+        let frame_n = vec![0x11u8; (w * h * 4) as usize];
+        assert!(write_bgra8(
+            &mut state,
+            &mut host,
+            mid,
+            &frame_n,
+            w * 4,
+            w,
+            h
+        ));
+        assert!(
+            crate::runtime::surface_cache::get_shared_with_gen(&state, mid, w, h).is_some(),
+            "the cache has to be warm or this test proves nothing"
+        );
+
+        // Frame N+1, rendered and deliberately not written down.
+        let identity = crate::backend::vulkan::engine::TargetIdentity::Gva {
+            gva: gpa,
+            width: w,
+            height: h,
+            generation: 1,
+            format: gva_resident_format(MTL_FORMAT_BGRA8_UNORM),
+        };
+        // The third host-side claim on the same window: a compute dispatch's
+        // storage image, recorded as holding what the guest's pages hold. This
+        // Store supersedes both halves of that claim.
+        let (base_off, bpr, span_end) = crate::runtime::mapping_write::type11_sample_window(
+            state.mappings.get(&mid).expect("mapped above"),
+            w,
+            h,
+            MTL_FORMAT_BGRA8_UNORM,
+        )
+        .expect("a latched geometry resolves its window");
+        let residency = crate::model::ComputeStorageResidencyKey {
+            mapping_id: mid,
+            map_generation: state.mappings[&mid].map_generation,
+            surface_offset: base_off,
+            surface_bpr: bpr,
+            span_end,
+            width: w,
+            height: h,
+            pixel_format: MTL_FORMAT_BGRA8_UNORM,
+            texture_ref: 0,
+        };
+        state
+            .compute_storage_residency
+            .insert(residency, Default::default());
+
+        assert!(
+            arm_surface_writeback_debt(&mut state, &mut host, mid, &identity, w, h),
+            "a mapped surface at a cacheable geometry arms"
+        );
+        assert!(
+            crate::runtime::surface_cache::get_shared_with_gen(&state, mid, w, h).is_none(),
+            "frame N is still on offer while frame N+1 exists only on the GPU"
+        );
+        assert!(
+            !state.compute_storage_residency.contains_key(&residency),
+            "the eager arm invalidates this window and the lazy one published a \
+             strictly newer frame into it; leaving the claim standing feeds the \
+             next dispatch the earlier dispatch's storage image instead of the \
+             render frame, and the two arms of LAZY_WRITEBACK then disagree \
+             about what the GPU observes"
+        );
+    }
+
+    /// The Store lands the frame in the slot the *draw* registered, even when
+    /// the mapping's generation has moved since.
+    ///
+    /// `map_generation` is part of [`crate::backend::vulkan::engine::TargetIdentity::Surface`],
+    /// so a Store that re-derives its identity from `DeviceState` asks the
+    /// registry for a key one generation ahead of the one `registry_ensure`
+    /// was handed, and the registry answers `read_target_unknown_identity
+    /// diverges=generation asked_gen=N held_gen=N-1`. Every Maps frame went
+    /// that way on `REIMS_VGPU_SHARED_TARGET=off`, which is the only
+    /// render-target rail a host without `VK_EXT_external_memory_host` has.
+    ///
+    /// The repair is that the identity travels out of the draw on
+    /// [`M2vDrawSpan::ResidentSurfaceStore`] rather than being asked for twice,
+    /// so this test bumps the generation between the two points and asserts the
+    /// debt still names the draw's key. Before it, the ledger recorded the
+    /// generation this test bumps to.
+    #[test]
+    fn the_store_names_the_slot_the_draw_registered_after_the_mapping_generation_moves() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::runtime::mapping_write::write_bgra8;
+
+        if !crate::runtime::writeback_debt::lazy_writeback_enabled() {
+            // The eager arm stores through the engine instead of the ledger and
+            // has no debt to inspect. Reported rather than silently passing.
+            eprintln!("skipped: REIMS_VGPU_LAZY_WRITEBACK=off selects the eager Store");
+            return;
+        }
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let mid = 913u32;
+        let pfn = 0x37u32;
+        let gpa = (pfn as u64) << PAGE_SHIFT_X86;
+        host.map_range(gpa, 0x4000, 0);
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        let (w, h) = (4u32, 2u32);
+        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+        // Warms the host cache, so the cession inside the arm has something to
+        // cede and the arm is testing its own gate rather than an empty one.
+        assert!(write_bgra8(
+            &mut state,
+            &mut host,
+            mid,
+            &vec![0x22u8; (w * h * 4) as usize],
+            w * 4,
+            w,
+            h
+        ));
+
+        // The key the draw would have handed `registry_ensure`.
+        let drawn = crate::runtime::present_identity::surface_identity(&state, mid, w, h);
+        crate::model::DeviceState::bump_map_generation(state.mappings.get_mut(&mid).unwrap());
+        assert_ne!(
+            crate::runtime::present_identity::surface_identity(&state, mid, w, h),
+            drawn,
+            "the bump has to change what a second derivation answers or this \
+             test cannot see the defect"
+        );
+
+        assert!(
+            store_surface_resident(
+                &mut state,
+                &mut host,
+                &drawn,
+                mid,
+                w,
+                h,
+                GuestStoreStatus::default(),
+            ),
+            "a copied resident at a cacheable geometry defers"
+        );
+        assert_eq!(
+            state
+                .pending_writebacks
+                .get(mid)
+                .expect("the deferred plan arms a debt")
+                .identity,
+            drawn,
+            "the ledger has to name the image the draw rendered into"
+        );
+    }
+
+    /// The type-11 zero-copy sampled rail hands the engine the surface's guest
+    /// pages, so an owed frame has to be written into them first.
+    ///
+    /// The rail is exempt from the *settle* and its comment says why: a
+    /// submitted writeback is already ahead of this gather in queue order. That
+    /// argument does not reach a writeback **debt**, which is not submitted at
+    /// all — there is no command for queue order to order, and the pages hold
+    /// the frame before the one the resident is holding. The exemption was
+    /// written before the debt rail existed and silently took the payment with
+    /// it.
+    #[test]
+    fn the_type11_zero_copy_gather_pays_the_frame_those_pages_owe() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+
+        // Keep this large enough that either the direct resource or the copied
+        // fallback can take; the test is about debt payment, not ownership.
+        let (w, h) = (128u32, 128u32);
+        let span = (w * h * 4) as u64;
+        assert!(span >= SAMPLED_GATHER_MIN_BYTES);
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        // The rail refuses a host whose page views are transient before it ever
+        // builds one — see `type11_zero_copy_declines_transient_host_mappings`.
+        host.stable_map_pages = true;
+        let mid = 913u32;
+        let first_pfn = 0x40u32;
+        let pages = (span >> PAGE_SHIFT_X86) as u32;
+        host.map_range((first_pfn as u64) << PAGE_SHIFT_X86, span as usize, 0);
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = (0..pages)
+                .map(|i| ((first_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+                .collect();
+        }
+        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+        let resource =
+            crate::model::TaskResource::new(Default::default(), std::sync::Arc::from([]));
+
+        let map_generation = state.mappings.get(&mid).unwrap().map_generation;
+        assert!(
+            state
+                .pending_writebacks
+                .arm(
+                    mid,
+                    crate::runtime::writeback_debt::test_resident_identity(
+                        mid,
+                        w,
+                        h,
+                        u64::from(map_generation),
+                    ),
+                    w,
+                    h,
+                    map_generation,
+                )
+                .is_none(),
+            "an empty ledger evicts nobody"
+        );
+
+        assert!(
+            try_type11_sample_zero_copy(&mut state, &mut host, mid, w, h, resource.lifetime_ref())
+                .is_some(),
+            "the rail has to take, or this test proves nothing about what it does"
+        );
+        assert!(
+            state.pending_writebacks.get(mid).is_none(),
+            "the gather bound pages still owed a frame this device never wrote down"
+        );
+    }
+
+    /// A stage that binds a sampler and no texture is still in the sampled band,
+    /// so it still triggers the band's relocation.
+    ///
+    /// Asking only about textures is what stood here, and Metal argument tables
+    /// are sticky across draws in an encoder: a vertex sampler survives a re-bind
+    /// that zeroed the vertex textures. Unseparated, both stages' sampler at
+    /// index 0 resolves to `SAMPLER_BINDING_BASE`, `push_smp` takes the first
+    /// writer, and the fragment module goes on sampling through the vertex
+    /// stage's filter, address mode and LOD clamp with nothing refused.
+    #[test]
+    fn a_stage_that_binds_only_a_sampler_is_still_in_the_sampled_band() {
+        let tex = |texture_ref| TextureBind {
+            index: 0,
+            texture_ref,
+            ..Default::default()
+        };
+        let smp = |sampler_ref| SamplerBind {
+            index: 0,
+            sampler_ref,
+            ..Default::default()
+        };
+
+        assert!(
+            stage_uses_sampled_band(&[], &[smp(7)]),
+            "a sampler with no texture occupies a binding number all the same"
+        );
+        assert!(stage_uses_sampled_band(&[tex(3)], &[]));
+        assert!(stage_uses_sampled_band(&[tex(3)], &[smp(7)]));
+        assert!(
+            !stage_uses_sampled_band(&[], &[]),
+            "a stage that binds nothing is not in the band"
+        );
+        assert!(
+            !stage_uses_sampled_band(&[tex(0)], &[smp(0)]),
+            "a zero ref is the guest leaving a slot empty, not a bind — the same \
+             reading `push_smp`'s callers take"
+        );
+    }
+
+    /// The `LOAD` seed's host-cache rung must refuse a surface the hypervisor
+    /// watched the guest repaint, exactly as the sampled path's read of the same
+    /// map does.
+    ///
+    /// The two are one cache with two readers, and only one of them asked. The
+    /// damage is not a single wrong frame: this rung sits above the only rung
+    /// that reads the guest's pages, so nothing below corrects it, and the pass
+    /// that seeds from it composites onto the stale bytes and Stores them back
+    /// over the pages the guest just wrote. The guest's repaint is then gone
+    /// from both copies and the next frame loads what this one stored.
+    #[test]
+    fn the_type11_load_seed_cache_rung_refuses_a_surface_the_guest_rewrote() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::runtime::host::HostOps;
+        use crate::runtime::mapping_write::write_bgra8;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        host.stable_map_pages = true;
+        // Not shared with any other test's: `first_sight` latches per
+        // `(reason, discriminant)` for the life of the process.
+        let mid = 913u32;
+        let pfn = 0x27u32;
+        let gpa = (pfn as u64) << PAGE_SHIFT_X86;
+        host.map_range(gpa, 0x4000, 0);
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).expect("mapped above");
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        let (w, h) = (4u32, 2u32);
+        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+
+        // What the guest painted, on the wire in BGRA and distinct per channel so
+        // a swizzle cannot pass for a rung.
+        let mut pages = vec![0u8; (w * h * 4) as usize];
+        for px in pages.chunks_exact_mut(4) {
+            px.copy_from_slice(&[0x10, 0x20, 0x30, 0xFF]);
+        }
+        assert!(write_bgra8(&mut state, &mut host, mid, &pages, w * 4, w, h));
+
+        // What this device last published for the same surface — an older frame,
+        // and the one the rung under test would serve.
+        let mut cached = vec![0u8; (w * h * 4) as usize];
+        for px in cached.chunks_exact_mut(4) {
+            px.copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xFF]);
+        }
+        crate::runtime::surface_cache::store(&mut state, mid, w, h, cached);
+
+        // Armed and stamped: with nothing written since, the cache is the
+        // fresher copy and must still win. Asserting this first is what stops
+        // the fix from being "refuse always", which would pass the real
+        // assertion below while costing every seed a guest read.
+        let token = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, mid)
+            .expect("FakeHost observes guest writes");
+        state
+            .mappings
+            .get_mut(&mid)
+            .expect("mapped above")
+            .guest_write_gen_at_store = host.guest_write_gen(token).expect("a live token has one");
+        let Type11LoadSeed::Host(bytes, order) = resolve_type11_load_seed(
+            &mut state,
+            &mut host,
+            mid,
+            w,
+            h,
+            gva_resident_format(MTL_FORMAT_BGRA8_UNORM),
+        )
+        .expect("an unwritten surface may be seeded from the cache") else {
+            panic!("the fresh cache must stay above the guest-page rung");
+        };
+        assert_eq!(order, crate::backend::vulkan::engine::SeedOrder::Bgra8);
+        assert_eq!(&bytes[..4], &[0xAA, 0xBB, 0xCC, 0xFF]);
+
+        // The guest CPU repaints the surface. No device operation, so the
+        // content epoch does not move and this is the only witness that sees it.
+        host.guest_wrote_page(gpa);
+        assert_eq!(
+            guest_write_site(&state, &host, mid, w, h),
+            // Whole-page, because the hypervisor's witness has page granularity
+            // and the surface's one page is the whole of its mapping offsets.
+            GuestWriteSite::Pixels(vec![(0, 1u64 << PAGE_SHIFT_X86)]),
+            "the write has to land inside the sampled window, or the rung under \
+             test is being asked the wrong question"
+        );
+
+        let Type11LoadSeed::Guest(seed) = resolve_type11_load_seed(
+            &mut state,
+            &mut host,
+            mid,
+            w,
+            h,
+            gva_resident_format(MTL_FORMAT_BGRA8_UNORM),
+        )
+        .expect("the guest's own pages are still a seed") else {
+            panic!("a repainted surface must bypass the stale host cache");
+        };
+        assert_eq!(seed.format, ash::vk::Format::B8G8R8A8_UNORM);
+        let (_, bpr, _) = crate::runtime::mapping_write::type11_sample_window(
+            &state.mappings[&mid],
+            w,
+            h,
+            MTL_FORMAT_BGRA8_UNORM,
+        )
+        .expect("the seed used this mapping window");
+        let (span, row_length_texels) = strided_window_extent(w, h, 4, u64::from(bpr))
+            .expect("the native row pitch describes this image");
+        assert_eq!(seed.source.total_len, span);
+        assert_eq!(seed.source.row_length_texels, row_length_texels);
+    }
+
     #[test]
     fn a_type11_load_seed_falls_back_to_the_surfaces_own_guest_pages() {
         use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
@@ -8934,6 +11352,7 @@ mod vulkan_split_tests {
 
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut host = FakeHost::new();
+        host.stable_map_pages = true;
         let mid = 911u32;
         let pfn = 0x21u32;
         let gpa = (pfn as u64) << PAGE_SHIFT_X86;
@@ -8970,24 +11389,39 @@ mod vulkan_split_tests {
         // refused rather than showing a bare `None`: every rung on this ladder
         // declines by name, and the panic message is where that is worth reading.
         let cap = crate::observe::sink::FailCapture::start();
-        let served = resolve_type11_load_seed(&mut state, &mut host, mid, w, h);
-        let (bytes, order) = served.unwrap_or_else(|| {
+        let served = resolve_type11_load_seed(
+            &mut state,
+            &mut host,
+            mid,
+            w,
+            h,
+            gva_resident_format(MTL_FORMAT_BGRA8_UNORM),
+        );
+        let seed = served.unwrap_or_else(|| {
             panic!(
                 "a cold cache must not lose the guest's LOAD; sink said {:?}",
                 cap.lines()
             )
         });
         drop(cap);
+        let Type11LoadSeed::Guest(seed) = seed else {
+            panic!("a cold cache should preserve the native guest-page source");
+        };
+        assert_eq!(seed.format, ash::vk::Format::B8G8R8A8_UNORM);
+        let (_, bpr, _) = crate::runtime::mapping_write::type11_sample_window(
+            &state.mappings[&mid],
+            w,
+            h,
+            MTL_FORMAT_BGRA8_UNORM,
+        )
+        .expect("the seed used this mapping window");
+        let (span, row_length_texels) = strided_window_extent(w, h, 4, u64::from(bpr))
+            .expect("the native row pitch describes this image");
+        assert_eq!(seed.source.total_len, span);
+        assert_eq!(seed.source.row_length_texels, row_length_texels);
         assert_eq!(
-            order,
-            crate::backend::vulkan::engine::SeedOrder::Rgba8,
-            "the guest-pages reader converts to RGBA8; mislabelling it swaps R and B"
-        );
-        assert_eq!(bytes.len(), (w * h * 4) as usize);
-        assert_eq!(
-            &bytes[..4],
-            &[0x30, 0x20, 0x10, 0xFF],
-            "BGRA guest bytes must arrive as semantic RGBA"
+            seed.source.runs.iter().map(|run| run.len).sum::<u64>(),
+            seed.source.total_len
         );
 
         // A live cache entry still wins: it is the fresher copy (the last Store's
@@ -8997,8 +11431,17 @@ mod vulkan_split_tests {
             px.copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xFF]);
         }
         crate::runtime::surface_cache::store(&mut state, mid, w, h, cached);
-        let (bytes, order) = resolve_type11_load_seed(&mut state, &mut host, mid, w, h)
-            .expect("a warm cache must serve");
+        let Type11LoadSeed::Host(bytes, order) = resolve_type11_load_seed(
+            &mut state,
+            &mut host,
+            mid,
+            w,
+            h,
+            gva_resident_format(MTL_FORMAT_BGRA8_UNORM),
+        )
+        .expect("a warm cache must serve") else {
+            panic!("a live cache is the freshest rung");
+        };
         assert_eq!(order, crate::backend::vulkan::engine::SeedOrder::Bgra8);
         assert_eq!(&bytes[..4], &[0xAA, 0xBB, 0xCC, 0xFF]);
 
@@ -9006,7 +11449,15 @@ mod vulkan_split_tests {
         // and refusing is right: a seed of the wrong length is rejected by the
         // engine anyway, and the decline names both geometries.
         assert!(
-            resolve_type11_load_seed(&mut state, &mut host, mid, w, h + 1).is_none(),
+            resolve_type11_load_seed(
+                &mut state,
+                &mut host,
+                mid,
+                w,
+                h + 1,
+                gva_resident_format(MTL_FORMAT_BGRA8_UNORM),
+            )
+            .is_none(),
             "a mismatched extent must refuse by name, not seed something else"
         );
     }
@@ -9177,7 +11628,6 @@ mod vulkan_split_tests {
         );
     }
 
-
     #[test]
     fn m2v_draw_runtime_failure_returns_a_typed_decline() {
         use crate::observe::Decline as _;
@@ -9224,7 +11674,9 @@ mod vulkan_split_tests {
             fragment_textures: vec![TextureBind {
                 index: MAX_TEXTURE_BIND_SLOTS,
                 texture_ref: 9,
-            }],
+                ..Default::default()
+            }]
+            .into(),
             ..DrawEncodeRequest::default()
         };
 
@@ -9248,7 +11700,7 @@ mod vulkan_split_tests {
         // The same request with the slot cleared reaches the pipeline resolve,
         // which is what says the refusal is about live guest work and not about
         // the index alone.
-        req.fragment_textures[0].texture_ref = 0;
+        std::sync::Arc::make_mut(&mut req.fragment_textures)[0].texture_ref = 0;
         let err = match try_metal2vulkan_draw(&mut state, &mut host, &mut req, true) {
             Err(err) => err,
             Ok(_) => panic!("an empty state cannot resolve pipeline 41"),
@@ -9407,9 +11859,9 @@ mod vulkan_split_tests {
             format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
         };
 
-        let gen_of = |host: &mut FakeHost| {
+        let mut gen_of = |host: &mut FakeHost| {
             let secs = super::build_secondary_targets(
-                &state, host, 1, &colors, &pipeline, &primary, 8, 8, [0.0; 4],
+                &mut state, host, 1, &colors, &pipeline, &primary, 8, 8, [0.0; 4],
             )
             .expect("slot 1 is a resolvable secondary");
             assert_eq!(secs.len(), 1, "slot 1 is a resolvable secondary");
@@ -9430,14 +11882,10 @@ mod vulkan_split_tests {
             "an unchanged mapping must not mint a second identity"
         );
 
-        // The guest hands GVA 0x1000 to a different page. Same task, same
-        // address, same geometry — only the memory changed.
+        // The live secondary resource retains its host texture across a task
+        // page-table change.
         map_one_gva_page(&mut host, 5);
-        assert_ne!(
-            gen_of(&mut host),
-            gen_a,
-            "two allocations at one secondary address must not share one image"
-        );
+        assert_eq!(gen_of(&mut host), gen_a);
     }
 }
 

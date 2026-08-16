@@ -581,6 +581,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     // Read before the `get_mut` below takes `state` mutably.
     let page_shift = state.page_shift;
     let mut retired = None;
+    let mut retired_import = None;
     let mut incarnation_changed = false;
     let mut reprieved = false;
     let mut pages_changed = false;
@@ -600,6 +601,11 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
             retired = Some((m.contig_ptr, m.contig_len));
             m.contig_ptr = 0;
             m.contig_len = 0;
+            m.contig_footprint = None;
+            retired_import = m.contig_import.take().map(|import| {
+                import.retire();
+                import.id()
+            });
         }
         if pages_changed {
             DeviceState::bump_map_generation(m);
@@ -679,6 +685,9 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     }
     if let Some(v) = retired {
         state.retired_views.push(v);
+    }
+    if let Some(import) = retired_import {
+        state.retired_guest_imports.push(import);
     }
     if incarnation_changed {
         // The condemned backing really died and the id now carries a new
@@ -1464,10 +1473,23 @@ fn revalidate_timing_is_slow(elapsed_us: u64) -> bool {
     elapsed_us >= REVALIDATE_SLOW_US
 }
 
-/// Unmap contiguous views whose page tables changed. No GPU object can hold one
-/// of these views: nothing on either backend aliases guest pages any more, so
-/// the only readers are CPU copies that finish inside their own call.
+/// Release contiguous views whose page tables changed.
+///
+/// A GPU object can retain a view only when [`HostOps::map_pages_stable`]
+/// promises the address for the device lifetime; `unmap_pages` is a no-op on
+/// exactly that host. A transient view is never admitted to a backend import,
+/// so its only users are CPU copies that finish inside their own call.
 pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
+    // The backend allocation aliases the host view, so revoke the GPU parent
+    // first. Existing child images and recorded buffers hold it through their
+    // fence-safe retirement; the host view is stable on every backend that can
+    // import it, making `unmap_pages` a no-op there until device teardown.
+    #[cfg(feature = "backend-vulkan")]
+    for import in state.retired_guest_imports.drain(..) {
+        crate::backend::vulkan::engine::retire_guest_import(import);
+    }
+    #[cfg(not(feature = "backend-vulkan"))]
+    state.retired_guest_imports.clear();
     for (ptr, len) in state.retired_views.drain(..) {
         host.unmap_pages(ptr, len);
     }
@@ -1879,31 +1901,43 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
     None
 }
 
-/// Device-wide count of [`ensure_contig_view`] calls answered "fragmented",
-/// whether the verdict was derived or served from `contig_fragmented_gen`.
-/// Reported as `served=` on every `contig_view_fragmented` line so the
+/// Device-wide count of [`ensure_contig_view`] calls the host refused,
+/// whether the verdict was derived or served from `contig_refused_gen`.
+/// Reported as `served=` on every `contig_view_refused` line so the
 /// magnitude the old per-call line carried survives its deduplication.
-static CONTIG_FRAGMENTED_SERVED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static CONTIG_REFUSED_SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Contiguous host-VA view over the mapping's guest pages (unified memory).
 ///
-/// Builds the view on first use via [`HostOps::map_pages`] (mach_vm_remap of
-/// guest RAM). Returns `(ptr, len)`. The view is the single storage for
-/// surface content: Metal textures are created directly on it, so there is
-/// nothing to synchronize — resolve failure here must fail the caller visibly.
+/// Builds the view on first use via [`HostOps::map_pages`]. The host may return
+/// a direct run or reconstruct a scattered page list as one shared virtual
+/// alias; either answer is the same packed byte sequence to the caller.
+/// Returns `(ptr, len)`.
 ///
 /// **Safe zero-copy contract:** always [`revalidate_mapping_pages`] first so a
 /// cached contig never aliases PFNs after ReplacePhysical / guest recycle.
 ///
-/// On Linux, only a **packed** sequential host run succeeds. Fragmented
-/// IOSurface page lists must use [`write_mapping_bytes`] / [`read_mapping_bytes`]
-/// or multi-run import-present.
+/// A refusal is cached on the page-list generation. Whether scattered pages
+/// can be packed is a host capability: pre-rejecting them here would make a
+/// shared file-backed alias unreachable and force the scatter paths even when
+/// the host can express the exact view.
 pub fn ensure_contig_view<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     mapping_id: u32,
 ) -> Option<(usize, usize)> {
+    ensure_contig_view_with_pages(state, host, mapping_id).map(|(ptr, len, _)| (ptr, len))
+}
+
+/// [`ensure_contig_view`] plus the guest-physical footprint owned by the view.
+///
+/// The footprint is retained with an imported GPU resource so synchronizing
+/// that resource never has to reconstruct its backing from a mapping id.
+pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+) -> Option<(usize, usize, std::sync::Arc<[u64]>)> {
     // Always revalidate before returning a cached contig (ReplacePhysical /
     // recycle must not leave a live view over freelist PFNs).
     if !revalidate_mapping_pages(state, host, mapping_id) {
@@ -1913,47 +1947,94 @@ pub fn ensure_contig_view<H: HostMemory + HostOps>(
     {
         let m = state.mappings.get(&mapping_id)?;
         if m.contig_ptr != 0 {
-            return Some((m.contig_ptr, m.contig_len));
+            let Some(footprint) = &m.contig_footprint else {
+                return None;
+            };
+            return Some((
+                m.contig_ptr,
+                m.contig_len,
+                footprint.pages_arc(),
+            ));
         }
         // The negative verdict caches on exactly the key that makes the
         // positive one above safe. Re-deriving it per call collected the page
         // GPAs and rescanned them every time, and said so in the always-on sink
         // every time: 471 757 lines in one 2 900 s boot, the sole prefix ever to
         // trip `log_flood_detected`, at up to 1 826 lines in a one-second window.
-        if m.contig_fragmented_gen == Some(m.map_generation) {
-            CONTIG_FRAGMENTED_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if m.contig_refused_gen == Some(m.map_generation) {
+            CONTIG_REFUSED_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return None;
         }
     }
     let gpas = mapping_page_gpas(state, host, mapping_id)?;
     let page_sz = crate::contract::iosurface_pages::page_size_of(state.page_shift) as usize;
-    // A fragmented page list can never map as one packed view, and asking
-    // anyway turns documented control flow ("use write_mapping_bytes /
-    // read_mapping_bytes / multi-run import-present") into a logged
-    // `qemu_map_pages_callback_failed`.
-    let runs = reims_vgpu_paging::runs::contig_run_count(&gpas, page_sz as u64);
-    if runs != 1 {
-        let served = CONTIG_FRAGMENTED_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let physical_runs = reims_vgpu_paging::runs::contig_run_count(&gpas, page_sz as u64);
+    let Some(ptr) = host.map_pages(&gpas, page_sz) else {
+        let served = CONTIG_REFUSED_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let m = state.mappings.get_mut(&mapping_id)?;
-        m.contig_fragmented_gen = Some(m.map_generation);
+        m.contig_refused_gen = Some(m.map_generation);
         let generation = m.map_generation;
-        // One line per (mapping, page list) rather than per call. The count the
-        // per-call line used to carry moves to `served`, a device-wide
-        // cumulative total of fragmented answers, so a census still reads
-        // magnitude off the newest line while the line count now measures
-        // distinct fragmented page lists — which is what the slug claims.
+        // One line per (mapping, page list) rather than per call. Physical run
+        // count remains diagnosis: it distinguishes a host that declined even
+        // a direct run from one that cannot reconstruct a scattered list.
         crate::observe::off(format!(
-            "contig_view_fragmented mid={mapping_id} pages={} runs={runs} generation={generation} served={served}",
+            "contig_view_refused mid={mapping_id} pages={} physical_runs={physical_runs} generation={generation} served={served}",
             gpas.len(),
         ));
         return None;
-    }
-    let ptr = host.map_pages(&gpas, page_sz)?;
+    };
     let len = gpas.len() * page_sz;
+    let gpas: std::sync::Arc<[u64]> = gpas.into();
+    let footprint = crate::runtime::guest_ram::GuestPageFootprint::new(
+        std::sync::Arc::clone(&gpas),
+        page_sz as u64,
+    )?;
     let m = state.mappings.get_mut(&mapping_id)?;
     m.contig_ptr = ptr;
     m.contig_len = len;
-    Some((ptr, len))
+    m.contig_footprint = Some(footprint);
+    Some((ptr, len, gpas))
+}
+
+/// The mapping's one checked backend import and its physical-page footprint.
+///
+/// A mapping is the allocation; planes and texture views are offsets inside
+/// it. The import therefore follows the mapping lifetime and is reused by all
+/// of those views. Hosts whose page aliases are transient or backends that did
+/// not publish host-pointer import limits retain the copy-backed paths.
+#[cfg(feature = "backend-vulkan")]
+pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+) -> Option<(
+    std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
+    crate::runtime::guest_ram::GuestPageFootprint,
+)> {
+    if !host.map_pages_stable() {
+        return None;
+    }
+    let (ptr, len, _pages) = ensure_contig_view_with_pages(state, host, mapping_id)?;
+    let footprint = state.mappings.get(&mapping_id)?.contig_footprint.clone()?;
+    let len = u64::try_from(len).ok()?;
+    // The one admission rule, which asks the map's standing refusal before the
+    // latches. This site used to ask the three latches directly and so kept
+    // importing on a host whose whole RAMBlock map had been refused.
+    let align = crate::runtime::guest_ram_map::packed_alias_import_align(host, len)?;
+    if let Some(import) = state
+        .mappings
+        .get(&mapping_id)
+        .and_then(|mapping| mapping.contig_import.as_ref())
+    {
+        if import.host_base() == ptr && import.len() == len && import.align() == align {
+            return Some((std::sync::Arc::clone(import), footprint));
+        }
+    }
+    let import = std::sync::Arc::new(
+        crate::runtime::guest_ram::GuestRamImport::new_host_allocation(ptr, len, align).ok()?,
+    );
+    state.mappings.get_mut(&mapping_id)?.contig_import = Some(std::sync::Arc::clone(&import));
+    Some((import, footprint))
 }
 
 /// Record the guest frames a mapping-rail write of `[off, off+len)` lands in.
@@ -1981,24 +2062,68 @@ pub(crate) fn note_mapping_write_footprint(
     };
     let page_size = state.page_size();
     let page_shift = state.page_shift;
+    note_page_write_footprint(page_size, off, len, |i| {
+        m.page_entries.get(i).map(|&entry| {
+            crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift)
+        })
+    });
+}
+
+/// Record a write through a retained allocation footprint.
+///
+/// These are the pages admitted with a guest-backed GPU resource. Consuming
+/// them directly keeps Store publication tied to the allocation that actually
+/// rendered, even if mutable mapping state changes after admission.
+#[cfg(any(feature = "backend-vulkan", test))]
+pub(crate) fn note_physical_page_write_footprint(
+    footprint: &crate::runtime::guest_ram::GuestPageFootprint,
+    off: u64,
+    len: u64,
+) {
+    footprint.visit_window(off, len, crate::observe::footprint::note_written_range);
+}
+
+fn note_page_write_footprint(
+    page_size: u64,
+    off: u64,
+    len: u64,
+    mut page_at: impl FnMut(usize) -> Option<Option<u64>>,
+) {
+    if len == 0 {
+        return;
+    }
     let end = off.saturating_add(len);
     let first = off / page_size;
     let last = (end - 1) / page_size;
+    let mut physical_run: Option<(u64, u64)> = None;
     for i in first..=last {
-        let Some(&entry) = m.page_entries.get(i as usize) else {
+        let Some(gpa) = page_at(i as usize) else {
             // A short page list is a refusal the caller reports; there is no
             // frame to name for a page the list does not have.
             break;
         };
-        let Some(gpa) = crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift) else {
+        let Some(gpa) = gpa else {
             continue;
         };
         let page_lo = i.saturating_mul(page_size);
         let lo = off.max(page_lo);
         let hi = end.min(page_lo.saturating_add(page_size));
         if lo < hi {
-            crate::observe::footprint::note_written_range(gpa + (lo - page_lo), hi - lo);
+            let segment = (gpa + (lo - page_lo), gpa + (hi - page_lo));
+            match physical_run {
+                Some((start, run_end)) if run_end == segment.0 => {
+                    physical_run = Some((start, segment.1));
+                }
+                Some((start, run_end)) => {
+                    crate::observe::footprint::note_written_range(start, run_end - start);
+                    physical_run = Some(segment);
+                }
+                None => physical_run = Some(segment),
+            }
         }
+    }
+    if let Some((start, run_end)) = physical_run {
+        crate::observe::footprint::note_written_range(start, run_end - start);
     }
 }
 
@@ -2359,7 +2484,7 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
     // an unnameable set (`None`) settles exactly as before. The page set comes
     // from the same `mapping_reach_pages` the writeback's own destination is
     // named with, so both ends of the comparison are one rule.
-    crate::runtime::writeback_debt::settle_for_mapping_unless_disjoint(
+    crate::runtime::writeback_debt::settle_for_mapping(
         state,
         host,
         mapping_id,

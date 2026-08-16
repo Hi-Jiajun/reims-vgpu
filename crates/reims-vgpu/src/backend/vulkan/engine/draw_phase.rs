@@ -36,6 +36,10 @@
 //! | `descriptors` | there | the descriptor set is written |
 //! | `record` | there | the CB is ended |
 //! | `submit` | there | `queue_submit` returns |
+//! | `post_target` | there | target state is published |
+//! | `post_store` | inside it | exact guest Store bookkeeping is published |
+//! | `post_sampled` | there | sampled-resource state and retains are prepared |
+//! | `post_park` | there | cache admission and async cleanup are parked |
 //! | `wait` | there | this draw's fence signals |
 //! | `readback` | there | the mapped buffer is copied out |
 //!
@@ -121,7 +125,7 @@
 //!   `sampled_gpu_binds`.
 //! - No bind uploads or re-uploads bytes; the `Bytes` arm always hits cache.
 //! - The hit it takes is `find_cached_sampled`'s identity fast path, which
-//!   scans a `SAMPLED_CACHE_CAP`-bounded list of **64** entries and moves one to
+//!   scans a `SAMPLED_REACH_BAND`-bounded list of **64** entries and moves one to
 //!   the back. That cannot be the ~100 us per bind the arithmetic demands.
 //!
 //! **Do not read the third bullet as "the content path never fires".** A later
@@ -382,6 +386,38 @@ pub(crate) enum Phase {
     PipelineCompile = 17,
     /// The per-sampler `get_or_create_sampler` loop.
     PipelineSampler = 18,
+    /// Target resident-state publication after submission (or after choosing
+    /// deferred submit).
+    PostTarget = 19,
+    /// Exact guest Store-footprint publication.
+    PostStore = 20,
+    /// Sampled-resource state publication and retained-image preparation.
+    PostSampled = 21,
+    /// Cache admission and parking asynchronous cleanup on the submission slot.
+    PostPark = 22,
+    /// `buffer_gather_roles` — the pre-pass that classifies every bind before
+    /// any of them is resolved.
+    StageRoles = 23,
+    /// The vertex-attribute bind loop.
+    StageVertex = 24,
+    /// The index buffer bind.
+    StageIndex = 25,
+    /// The storage-buffer bind loop.
+    StageStorage = 26,
+    /// Resolving the colour Load seed into a staging slot.
+    StageSeed = 27,
+    /// What is left of [`Phase::Stage`] once the five above are taken out of it.
+    ///
+    /// Carved out rather than added beside, exactly as the pipeline split is, so
+    /// the six together are what `stage_us` used to be alone and the total still
+    /// divides against `chain_phase`'s `engine_us`.
+    ///
+    /// This split exists because `stage_us` is the largest bar in the slow half
+    /// of a Maps boot — 17.29 µs/draw against 1.57 in the fast half — while
+    /// `stage_phase`, which tiles the actual staging *work*, reports under
+    /// 100 µs of a whole census second for it, with `gather_us` and `runs_us` at
+    /// zero. So almost none of the bar is the byte movement anyone would assume,
+    /// and no field named what the rest is.
     Stage = 3,
     StagePass = 4,
     Acquire = 5,
@@ -389,20 +425,82 @@ pub(crate) enum Phase {
     SampledUpload = 7,
     AcquireReadback = 8,
     Descriptors = 9,
+    /// What is left of the recording span once the five below are taken out of
+    /// it. See [`Phase::RecordBarrier`] for why the split exists.
     Record = 10,
     Submit = 11,
     Wait = 12,
     Readback = 13,
+    /// Opening the command buffer: `begin_slot_recording`. Zero for a batch
+    /// joiner, whose command buffer is already recording.
+    RecordBegin = 28,
+    /// Everything between the command buffer opening and the render pass
+    /// beginning: the guest-gather copies, the resident transitions, the sampled
+    /// transitions and the seed copies. **Twenty of this device's
+    /// `cmd_pipeline_barrier` call sites are inside this span.**
+    ///
+    /// # Why the recording span is split at all
+    ///
+    /// `record_us` is the largest phase this device has — 1.310 µs/draw summed
+    /// over 7 396 783 draws across three driven Maps boots, against
+    /// `sg_storage_us`'s 1.137 and nothing else above 0.5 — and it was one
+    /// undivided bar spanning roughly twelve hundred lines. No field named which
+    /// part of the encode it was, so every statement about it was a guess.
+    ///
+    /// This is the division the pipeline group and the `sg_*` group already got,
+    /// for the same reason and in the same shape: carved out of [`Phase::Record`]
+    /// rather than added beside it, appended after the existing ordinals so that
+    /// none of them moved, and summing back to what `record_us` was alone.
+    ///
+    /// # And the answer was not the barriers
+    ///
+    /// First reading, driven Maps boot F0, summed over 2 622 704 draws
+    /// (`throttle_ms=0`, `sum` 18.07 µs/draw, 52.2 fps at 1128 draws a frame):
+    ///
+    /// ```text
+    /// rec_draw_us     0.528     vertex/index binds and the draw call
+    /// rec_state_us    0.318     pipeline bind, dynamic state, descriptors
+    /// rec_pass_us     0.202     continue-or-begin, and cmd_begin_render_pass
+    /// rec_begin_us    0.155     begin_slot_recording
+    /// rec_barrier_us  0.104     all twenty barrier sites
+    /// record_us       0.044     the remainder
+    /// ```
+    ///
+    /// **The barrier region is 8 % of the span it was assumed to dominate**, and
+    /// the twenty `cmd_pipeline_barrier` sites that made it look expensive are
+    /// nearly free — most of them skip. Do not go hunting for barriers to remove
+    /// here; that theory is measured and dead.
+    ///
+    /// What is left is mostly a floor. `rec_draw` is 39 % of the span and is one
+    /// vertex bind plus one draw call per guest draw, which Apple's driver also
+    /// issues; `rec_state` is the pipeline and descriptor binds Vulkan requires.
+    /// So `record` as a whole is close to irreducible, and a per-draw CPU win has
+    /// to come from somewhere else — `sg_storage_us` (1.137 µs/draw) is now the
+    /// largest genuinely reducible item this device has.
+    RecordBarrier = 29,
+    /// Deciding whether the predecessor's render pass can be continued, and
+    /// beginning one when it cannot. The pass-merge census is charged here, so
+    /// this is the bar to read against `passdiff_*`.
+    RecordPass = 30,
+    /// Pipeline bind, dynamic viewport/scissor/stencil, and the descriptor push
+    /// or bind — the state a draw needs that is not the draw.
+    RecordState = 31,
+    /// The vertex and index binds and the `cmd_draw`/`cmd_draw_indexed` itself.
+    ///
+    /// This is the floor. Whatever else this device stops doing, it still issues
+    /// one draw call per guest draw, exactly as Apple's driver does.
+    RecordDraw = 32,
 }
 
 impl Phase {
     /// Highest ordinal, so [`PHASES`] is derived from the enum rather than
     /// hand-counted beside it.
     ///
-    /// The pipeline sub-phases were appended after `Readback` rather than
-    /// inserted next to `Pipeline`, so that every existing ordinal kept its
-    /// value and this stayed the only place the count is written.
-    const LAST: Phase = Phase::PipelineSampler;
+    /// The pipeline, staging and recording sub-phases were each appended after
+    /// the ordinals that existed when they were added, rather than inserted next
+    /// to the phase they divide, so that every existing ordinal kept its value
+    /// and this stayed the only place the count is written.
+    const LAST: Phase = Phase::RecordDraw;
 }
 
 const PHASES: usize = Phase::LAST as usize + 1;
@@ -456,6 +554,13 @@ pub struct DrawPhaseWindow {
     pub pipeline_compile_us: u64,
     pub pipeline_sampler_us: u64,
     pub stage_us: u64,
+    /// The five below are carved out of `stage_us`; the six together are what it
+    /// used to be alone.
+    pub stage_roles_us: u64,
+    pub stage_vertex_us: u64,
+    pub stage_index_us: u64,
+    pub stage_storage_us: u64,
+    pub stage_seed_us: u64,
     pub stage_pass_us: u64,
     pub acquire_us: u64,
     pub acquire_sampled_us: u64,
@@ -463,7 +568,16 @@ pub struct DrawPhaseWindow {
     pub acquire_readback_us: u64,
     pub descriptors_us: u64,
     pub record_us: u64,
+    pub rec_begin_us: u64,
+    pub rec_barrier_us: u64,
+    pub rec_pass_us: u64,
+    pub rec_state_us: u64,
+    pub rec_draw_us: u64,
     pub submit_us: u64,
+    pub post_target_us: u64,
+    pub post_store_us: u64,
+    pub post_sampled_us: u64,
+    pub post_park_us: u64,
     pub wait_us: u64,
     pub readback_us: u64,
     pub draws: u64,
@@ -487,6 +601,11 @@ pub fn take_window() -> Option<DrawPhaseWindow> {
         pipeline_compile_us: to_us(ACC[Phase::PipelineCompile as usize].swap(0, Ordering::Relaxed)),
         pipeline_sampler_us: to_us(ACC[Phase::PipelineSampler as usize].swap(0, Ordering::Relaxed)),
         stage_us: to_us(ACC[Phase::Stage as usize].swap(0, Ordering::Relaxed)),
+        stage_roles_us: to_us(ACC[Phase::StageRoles as usize].swap(0, Ordering::Relaxed)),
+        stage_vertex_us: to_us(ACC[Phase::StageVertex as usize].swap(0, Ordering::Relaxed)),
+        stage_index_us: to_us(ACC[Phase::StageIndex as usize].swap(0, Ordering::Relaxed)),
+        stage_storage_us: to_us(ACC[Phase::StageStorage as usize].swap(0, Ordering::Relaxed)),
+        stage_seed_us: to_us(ACC[Phase::StageSeed as usize].swap(0, Ordering::Relaxed)),
         stage_pass_us: to_us(ACC[Phase::StagePass as usize].swap(0, Ordering::Relaxed)),
         acquire_us: to_us(ACC[Phase::Acquire as usize].swap(0, Ordering::Relaxed)),
         acquire_sampled_us: to_us(ACC[Phase::AcquireSampled as usize].swap(0, Ordering::Relaxed)),
@@ -494,7 +613,16 @@ pub fn take_window() -> Option<DrawPhaseWindow> {
         acquire_readback_us: to_us(ACC[Phase::AcquireReadback as usize].swap(0, Ordering::Relaxed)),
         descriptors_us: to_us(ACC[Phase::Descriptors as usize].swap(0, Ordering::Relaxed)),
         record_us: to_us(ACC[Phase::Record as usize].swap(0, Ordering::Relaxed)),
+        rec_begin_us: to_us(ACC[Phase::RecordBegin as usize].swap(0, Ordering::Relaxed)),
+        rec_barrier_us: to_us(ACC[Phase::RecordBarrier as usize].swap(0, Ordering::Relaxed)),
+        rec_pass_us: to_us(ACC[Phase::RecordPass as usize].swap(0, Ordering::Relaxed)),
+        rec_state_us: to_us(ACC[Phase::RecordState as usize].swap(0, Ordering::Relaxed)),
+        rec_draw_us: to_us(ACC[Phase::RecordDraw as usize].swap(0, Ordering::Relaxed)),
         submit_us: to_us(ACC[Phase::Submit as usize].swap(0, Ordering::Relaxed)),
+        post_target_us: to_us(ACC[Phase::PostTarget as usize].swap(0, Ordering::Relaxed)),
+        post_store_us: to_us(ACC[Phase::PostStore as usize].swap(0, Ordering::Relaxed)),
+        post_sampled_us: to_us(ACC[Phase::PostSampled as usize].swap(0, Ordering::Relaxed)),
+        post_park_us: to_us(ACC[Phase::PostPark as usize].swap(0, Ordering::Relaxed)),
         wait_us: to_us(ACC[Phase::Wait as usize].swap(0, Ordering::Relaxed)),
         readback_us: to_us(ACC[Phase::Readback as usize].swap(0, Ordering::Relaxed)),
         draws,
@@ -576,7 +704,8 @@ impl Drop for DrawTimer {
             "draw_stall us={} prep_us={} slot_us={} pipeline_us={} stage_us={} stage_pass_us={} \
              acquire_us={} acquire_sampled_us={} sampled_upload_us={} acquire_readback_us={} \
              descriptors_us={} \
-             record_us={} submit_us={} wait_us={} readback_us={} geom={w}x{h} \
+             record_us={} submit_us={} post_target_us={} post_store_us={} post_sampled_us={} \
+             post_park_us={} wait_us={} readback_us={} geom={w}x{h} \
              readback_bytes={} exit={:?}{latched}",
             to_us(total),
             to_us(self.ns[Phase::Prep as usize]),
@@ -591,6 +720,10 @@ impl Drop for DrawTimer {
             to_us(self.ns[Phase::Descriptors as usize]),
             to_us(self.ns[Phase::Record as usize]),
             to_us(self.ns[Phase::Submit as usize]),
+            to_us(self.ns[Phase::PostTarget as usize]),
+            to_us(self.ns[Phase::PostStore as usize]),
+            to_us(self.ns[Phase::PostSampled as usize]),
+            to_us(self.ns[Phase::PostPark as usize]),
             to_us(self.ns[Phase::Wait as usize]),
             to_us(self.ns[Phase::Readback as usize]),
             self.readback_bytes,
@@ -677,6 +810,24 @@ mod tests {
             Phase::PipelineLayoutPass,
             Phase::PipelineCompile,
             Phase::PipelineSampler,
+            Phase::PostTarget,
+            Phase::PostStore,
+            Phase::PostSampled,
+            Phase::PostPark,
+            // The staging split, appended for the same reason the pipeline one
+            // was: every ordinal above keeps its value.
+            Phase::StageRoles,
+            Phase::StageVertex,
+            Phase::StageIndex,
+            Phase::StageStorage,
+            Phase::StageSeed,
+            // The recording split, appended for the same reason the pipeline and
+            // staging ones were.
+            Phase::RecordBegin,
+            Phase::RecordBarrier,
+            Phase::RecordPass,
+            Phase::RecordState,
+            Phase::RecordDraw,
         ];
         assert_eq!(all.len(), PHASES);
         for (want, phase) in all.iter().enumerate() {
@@ -748,6 +899,30 @@ mod tests {
         assert_eq!(w.descriptors_us, 0);
         assert_eq!(w.record_us, 0);
         assert_eq!(w.readback_us, 0);
+    }
+
+    /// Store publication must not be charged to the driver submit bar. The
+    /// split exists because the two require different fixes, and a swapped
+    /// readout would send a real-traffic profile back toward queue batching.
+    #[test]
+    fn post_submit_store_work_has_its_own_bar() {
+        let _ = take_window();
+        {
+            let mut t = DrawTimer::start();
+            t.enter(Phase::Submit);
+            t.enter(Phase::PostTarget);
+            t.enter(Phase::PostStore);
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            t.enter(Phase::PostTarget);
+        }
+        let w = take_window().expect("a dropped timer counts a draw");
+        assert!(w.post_store_us >= 2_000, "Store bar lost its work: {w:?}");
+        assert!(
+            w.submit_us < 1_500,
+            "Store bookkeeping was charged to queue submission: {w:?}"
+        );
+        assert_eq!(w.post_sampled_us, 0);
+        assert_eq!(w.post_park_us, 0);
     }
 
     /// An idle second must produce no line at all: the census divides against

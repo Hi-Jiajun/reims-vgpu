@@ -197,7 +197,117 @@ Never special-case behavior for a screenshot, boot stage, pixel dimension, resou
 function name, pipeline ref, or observed content pattern. Implement the decoded API contract.
 
 Temporary probes are fine when they collect evidence. Remove probe-only behavior before claiming the
-fix. Do not turn observations into product heuristics.
+fix. Do not turn observations into product heuristics. The three rules below say what to do when the
+contract is not in reach, which is the situation that produces every heuristic anyone has written
+here.
+
+### The Contract Is The Only Input
+
+This device implements a decoded API contract. Every branch it takes must be justified by something
+the contract states: a decoded guest field, a header constant, a `sizeof`/`offsetof`, a documented
+serializer output, or a capability the host reported about itself. Nothing else is an input.
+
+**"It works" is not a justification.** A rule that reproduces the right answer on the boots you ran
+is a coincidence until you can name the contract term it implements. The distinction is not how
+confident you are, it is whether the sentence you would write in the code comment names a field or
+names an observation — "`page_shift` is 14 on this attach" is the contract; "the guest always sends
+these in ascending order" is a heuristic wearing the same clothes.
+
+**When the contract is not in reach, the answer is a typed refusal, not a guess.** Reading the
+interface back out of a binary is legitimate and is how most of this contract was learned; guessing
+is not the same activity, and a guess that lands is worse than one that does not, because it stops
+anyone looking. An unimplemented case that refuses by name costs the guest one command and tells the
+next session exactly what to go and learn. A case that guesses costs it silently and forever.
+
+### No Side Channels
+
+A side channel is a guess with an observation attached, and it is the specific failure this file has
+had to name most often. When the contract does not carry the answer, you may not reconstruct it from
+anything correlated with it. Not from timing, arrival order, or the gap between two commands. Not
+from an allocation's size, alignment, or address range. Not from a name string, an object id, a
+pipeline ref, or a function name. Not from pixel content, frame counts, or what the last frame did.
+Not from how many times something has already happened.
+
+The reason is not purity. A side channel is a rule the other side never agreed to, so it holds for
+exactly as long as the guest's incidental behavior does — and the day it stops holding, it stops
+silently, on one rail, on one guest version, with no counter that reports it and nothing in the log
+to read. That is the same failure the `stat -f%Su /dev/console` reading produced under `## A login
+window means WindowServer crashed`: a signal that correlates with the answer, quoted as the answer,
+wrong on four boots that all read green.
+
+Two things that look like side channels and are not. **Host capability is measured, not inferred**:
+asking the device what it supports is the contract, which is why `caps::memory_topology` reads two
+structural signals and why gating on a vendor or driver name — a correlate — is banned in the same
+breath. And **an instrument may observe whatever it likes**, because it changes nothing the guest
+sees; a probe, a census, or an audit is not bound by this rule. The line is whether the observation
+reaches a decision the guest's work depends on.
+
+### It Fits Or It Does Not Belong
+
+New behavior goes through the type, state machine, or resolver that already owns the concern. It
+does not sit beside one. A flag threaded past a resolver, a second lookup bolted after the first, a
+fixup pass that corrects what the layer above produced, a `if let Some(x) = special_case` ahead of
+the general path — each is a seam, and every one of them is a place where two rules disagree and the
+one that runs is decided by ordering.
+
+The test is whether the addition can be removed by deleting your lines and nothing else has to
+change. If it can, it was tacked on. The seam is not a style complaint: `## Before A Broad Sweep`
+already records what it costs — a four-term admission rule written by hand three times with two
+copies short a different term, a `reims_vgpu_qemu_scanout_may_paint` reassembled shim-side from two
+other queries. Both of those started as one small thing added next to the thing that owned it.
+
+So when the owning type cannot express what you need, the work is to change that type. That is more
+edit than a branch at the call site and it is the whole point: after it, the next site cannot get it
+wrong, and there is no second rule to keep in sync.
+
+### A Bounded Cache Is Fake Performance
+
+**No capacity limits, no eviction policies, no sampling strides, no LRU, no ring buffer standing in
+for a map.** A bounded cache does not make this device fast; it makes it fast on workloads that fit
+and slow on workloads that do not, and nothing tells you which one you measured. The bound is a
+number nobody derived from the contract — the host API has no such bound — so it is a magic number
+under `## No Magic Numbers` and a heuristic under the rule above, and it fails as both.
+
+Three specific costs, in the order they bite:
+
+- **It overflows on the workload that matters.** The bound is sized against the boots you ran, which
+  are the small ones. A guest that opens more windows, binds more textures, or compiles more
+  pipelines crosses it, and past that point the cache is a cost with no benefit — every lookup pays
+  the insert and the eviction and misses anyway.
+- **It makes performance unpredictable in the direction that reads as noise.** Two boots of one
+  binary, one under and one over the bound, differ by more than any change ever measured here, and
+  the census records nothing that says which happened. Every ranking rule in `## Verification`
+  assumes the two arms did the same work; a bound that one arm crossed silently breaks that
+  assumption and the number that comes out looks like a result.
+- **An eviction is lost state.** Under `## Before A Broad Sweep`, "an entry evicted" is the first of
+  the four ways a bound costs guest work, and a cache is the one place it is *policy* rather than an
+  oversight.
+
+What to do instead. A cache keyed by something the contract owns, whose entries live and die with
+that thing, is not bounded by a number — it is bounded by the guest's own lifetimes, which is the
+correct bound and the only one that is always right. Tie an entry to the resource, the pipeline, or
+the mapping it describes and drop it when the guest drops that. If the guest holds a million live
+objects then a million entries is what correctness costs, and the memory pressure is a real reading
+about a real workload rather than a number you chose.
+
+The rule's subject is anything whose loss the guest pays for. A bound over a purely derived thing
+that costs nothing but recomputation — `ObjectCache`'s `NEGATIVE_CAP`, which remembers creates
+already measured to fail, or `ShaderDigestIndex`'s entry limit, which drops the whole index and says
+so on the `OFF` channel — is a different object and is fine. Ask what an eviction costs the guest: a
+re-derivation, or a record.
+
+If a real bound cannot be avoided, it stops being a cache decision: the excess must be a typed
+refusal on the fail channel naming what was dropped, so the overflow is visible as loss rather than
+absorbed as a slow path. A silent eviction and a `reason=` line cost the same microseconds and only
+one of them can be found.
+
+**Both worked examples are already in the tree, and they are precedent rather than debt.**
+`backend::vulkan::engine::caches` held 1024 entries (64 for render passes) evicting in insertion
+order, which discards the compositor's pipeline — created first, bound every frame — and pays a
+driver-side shader compile per frame forever after. `model::content_cache` held 96/64/64/64/32/16
+and overwrote a rotating slot; a boot that settles at 92 distinct render pipelines against 64 slots
+is how that cap was shown to be binding. Both are unbounded now, keyed by content, and both module
+docs carry the argument. Read one before adding a bound anywhere.
 
 ### No Magic Numbers
 
@@ -328,7 +438,11 @@ number, so a rename fails the build.
 
 Their output is a map, not a kill list. And one trap they teach: **an `Ok` from `render::decode` is
 not a decode** — `Kind::OtherAccepted` is the catch-all for "no arm claimed this", and reading it as
-success hides a whole family of lost records behind a green run.
+success hides a whole family of lost records behind a green run. That is a trap for a *reader* of
+the decode result, not a silent loss: execution reports every one of them as
+`render_unimplemented reason=accepted_without_executor`, deduped to one line per distinct opcode
+with the raw wire captured on first sighting (`runtime/exec/report.rs`). A test that stops at
+`decode` sees the `Ok` and not the report, which is why the fixture test counts the two separately.
 
 ### Reading the fail log
 
@@ -444,11 +558,16 @@ a revocation handle for a primitive that exists on all three hosts. If a host is
 migrating a page under a live import, that is a real defect with a measurement — it belongs in
 `kb/`, not in a retrofitted guarantee here.
 
-Guest RAM is not **fd-backed**: the import is over an ordinary mapping, so `vm/boot-x86.sh` uses a
-plain `-m` allocation. `memory-backend-memfd,share=on` outlived the dma-buf rail it was for, on the
-grounds that a shared memfd is what makes uffd minor-fault mode applicable; it is gone, because uffd
-needs a privilege QEMU does not have on the dev host anyway. Restoring the backing is a
-prerequisite for ever wanting uffd here, but it buys nothing alone.
+**The x86 RAM backing remains a shared memfd.** The base host-pointer imports still consume the
+ordinary RAMBlock pointers and do not import an fd. The fd serves a different contract: a linear
+guest virtual resource may name scattered guest-physical pages, while Vulkan host-pointer memory
+accepts one contiguous host virtual range. The PCI shim reserves that range and maps each shared
+page into its resource offset, producing a stable zero-copy alias which can be imported as one
+buffer or linear image. This is the Linux VM-remapping counterpart of the packed virtual views the
+macOS shim constructs. Removing `memory-backend-memfd,share=on` leaves the base RAMBlock imports
+working but makes every scattered packed view fail and pushes those resources onto multi-run
+gathers or copying paths. Do not remove it unless the replacement can express the same stable
+resource-shaped alias; uffd and the retired dma-buf rail are unrelated to this requirement.
 
 So the deferred-flush rail — the device's largest cost — is retired, by writing into guest pages
 directly. **`runtime/storage_flush/` went with it and no longer exists**; do not go looking for it,
@@ -471,9 +590,21 @@ measured from the device, and binding an extension a host does not advertise fai
 while importing a handle type it declines is undefined behavior inside the driver. Add a switch as a
 new refusal reason, never as a new permission.
 
-`REIMS_VGPU_GUEST_IMPORT=off` is the one that matters for verification: it takes a capable host down
-to the `disabled_by_env` rung, which is how the copying rails get exercised without hunting for
-hardware that lacks the extension.
+Two matter for verification rather than for ablation:
+
+- `REIMS_VGPU_GUEST_IMPORT=off` takes a capable host down to the `disabled_by_env` rung, which is
+  how the copying rails get exercised without hunting for hardware that lacks the extension.
+- `REIMS_VGPU_GATHER_AUDIT_ALL=on` makes the zero-copy sampled cache's content audit judge **every**
+  vouched bind instead of one in sixty-four. The stride is the alarm's sampling rate and nothing the
+  guest observes depends on it — the bind itself is vouched by two witnesses covering disjoint
+  writers, the hypervisor dirty bitmap and this device's own page-exact write record, which is why
+  it is a contract rail and not a guess; read `runtime/gather_witness.rs` before touching either.
+  That cache is the only place in this device where an
+  image is bound with nothing read and nothing compared, and a stale bind's failure mode is content,
+  which no counter reports — the audit is the sole instrument, and at the shipping stride it samples
+  about 1.6 % of the binds it could judge. Run a rail sweep under it and read `gw_audit_unsound`
+  against `gw_audit_ok` beside it; a zero is only evidence when the `ok` is large. **Never quote a
+  timing from such a boot** — the fold re-reads the very windows the cache exists to avoid reading.
 
 ## Verification
 
@@ -564,6 +695,51 @@ is not a rail that passes, and one clean boot of it is not evidence — **band a
 at least six boots before believing a rate**, in both directions. A single green run says nothing,
 and so does a single red one.
 
+### A login window means WindowServer crashed. Pull the report. Do not log in.
+
+**If a boot shows the login screen, the guest's WindowServer aborted.** It is not "the desktop is
+taking a while" and it is not "nobody logged in yet" — the guest wrote a `.ips` crash report naming
+the failure, and that report is the most direct evidence this project ever gets about a graphics
+failure inside the guest. **Typing the password destroys it**: the login starts a fresh session over
+the top, and the next boot's snapshot revert throws the reports away with the overlay.
+
+This cost sessions before it was written down, because every harness here treated the login window as
+a state to get past. `scripts/app-sweep-probe/wait-for-desktop.sh` now does the opposite: it pulls
+`/Library/Logs/DiagnosticReports` and the user's copy into `--reports DIR` **before** anything is
+typed, and **exits 3 without logging in** when any report is there. `--login-after-crash` overrides
+it and an unattended sweep must not pass it — a screenshot is not worth a crash report.
+
+Two readings that follow, and the first corrects what this file said when the rule was first written:
+
+- **The report is the crash detector; the console owner is not.** `stat -f%Su /dev/console`
+  answering `_windowserver` reads like an abort and is not one on its own — four driven macos-11
+  boots answered `_windowserver` at the login window with
+  `/Library/Logs/DiagnosticReports/` **empty**, which the collector proved by listing the directory
+  rather than by finding nothing in it. That directory is `root:admin 0750` and the rails' account is
+  in `admin`, so it is readable without `sudo`; the per-user copy does not exist until something
+  writes one. Quote the report, never the console owner.
+- **A crash can be invisible at the console.** Autologin restarts the session, so a WindowServer that
+  aborted early can have a Dock by the time any harness looks. The report is the only thing that sees
+  that class, which is why the success path collects too.
+
+### A freeze verdict is a rate too, so an arm that fixes one is confirmed at n≥3
+
+The same rule as the panic rate, on the leg verdicts. A leg that freezes has a *rate*, and a
+candidate arm that produces one passing boot has moved that rate by an amount one boot cannot
+measure. One `ok` in three against zero in sixteen is `p ≈ 0.16` on a Fisher exact test — consistent
+with chance. Note which way that cuts: it does not establish that the arm does nothing either. An
+arm at n=3 with one `ok` is **unresolved**, and the only thing that settles it is more boots of the
+same arm.
+
+Score arms on the asymmetry, which is real and cheap:
+
+- a **FREEZE eliminates** the arm — a candidate that does not fix it at n=1 does not fix it at n=6,
+  so single-boot arms are the right way to work through a list of suspects;
+- an **`ok` confirms nothing** on its own. Repeat the passing arm at least three times, and check a
+  second rail before believing it.
+
+Never report a fix from the boot that first showed it. Queue the repeats first and report once.
+
 ### A boot on a capable host does not exercise the copying rails
 
 Where the import works, every guest window takes it, and the copying rails run zero times — so a
@@ -573,6 +749,15 @@ change touching guest-memory upload, writeback or bind needs the boot a second t
 `host_pointer_import=disabled_by_env`, and `OFF guest_ram_map reason=guest_ram_map_no_backend_import`
 appears once. Nothing may then report a bound import — a non-zero import count means a bind ran past
 a closed gate.
+
+**Compare the two boots on their pixels, not only on their counters.** The gate check above says the
+arm ran; it does not say the arm is correct, and the two are not the same question. Take both boots
+from the same snapshot, let each reach the Dock, drive nothing, and screenshot — the restored windows
+are identical by construction, so any difference is this device's. A whole window's content has been
+observed rendering on one arm and solid black on the other with every counter self-consistent and the
+gate correctly closed, which is a shape no counter in the tree reports. That comparison is also the
+only local reproduction of what a discrete host, a small-heap host and an `ImportExceedsHeap` host
+run all the time, so a change to guest-memory upload, writeback or bind is not verified without it.
 
 ### `present_hz` tracks `offered_hz` exactly, so read the pair and never one alone
 
@@ -644,6 +829,31 @@ and zero frames" — a bounded pipeline cache, −39 % submissions, −20x `stag
 None of them could have bought frames through a presenter already at its
 ceiling, and a per-draw saving measured before this fix is **owed a re-run**
 rather than believed to have been worthless.
+
+### Score a boot on CPU **plus** GPU per draw, and join the censuses by `t`
+
+Two rules, both learned by getting them wrong on the x86/Vulkan iGPU pathway.
+
+**Join by the timestamp, never by line ordinal.** `drain_duty`, `gpu_span`,
+`window_publish` and `store_routes` all carry `t=` and all skip different windows,
+so pairing them by position drifts and pulls idle-desktop samples into a driven
+band. A harness that did this read a driven Maps boot at ~31 fps where banding
+`window_publish` by its own `t` reads **47-52**. Every rate quoted from a bad join
+is wrong in the direction that looks like a device problem.
+
+**`gpu_span busy_us / draws` is half the score and on this pathway it is the
+larger half.** An iGPU boot that reads 9 µs of drain CPU a draw also reads 10-12
+µs of GPU, and `(cpu + gpu) x draws/s` comes to 95-100 % of every busy second —
+the device is saturated and the two halves barely overlap, so frames track their
+*sum* roughly linearly. Ranking a change on `us/draw` alone therefore scores half
+of it, and the standing 0.35-frames-per-unit elasticity note beside
+`VBL_REPORT_EARLY` was measured on a discrete host at 51 % GPU occupancy where
+nothing was bound: it does not describe a host where something is.
+
+`gpu us/draw` carries a ±12 % boot-to-boot spread against `cpu us/draw`'s ±4 %, so
+a GPU arm needs n≥3 where a CPU one may not. And do not rank on frames across
+boots at all unless draws-per-frame is quoted beside them: that is the workload,
+it drifts between boots of one binary, and `fps = 1e6 / (sum x draws_per_frame)`.
 
 ### An undriven boot measures an idle device
 
@@ -870,6 +1080,16 @@ them was clean on the arms it ran, and nobody on a Linux host ran the Metal one.
 Do not hide warnings, skip an affected arm, or commit a dropped test
 count without calling it out — and **do not read "clippy clean" in a commit body as covering every
 arm**; it means the arms that commit ran.
+
+### Never run `cargo fmt`
+
+This crate is not kept rustfmt-clean and must not be made so in passing. One invocation rewrote 77
+files and 984 lines, nearly all of it code the change had nothing to do with, and the diff had to be
+thrown away and the two intended edits re-applied by hand. A reformatting commit would also bury
+every `git blame` line the doc comments here depend on.
+
+Match the surrounding style by hand. If a line you wrote is too long, wrap it the way its neighbours
+wrap. Reformatting is its own commit, decided deliberately, and nobody has decided it.
 
 One standing exception, carried by `#[allow]`s at the module declaration that states the reason.
 `backend::metal::error::Status` is large by design — the payload is what makes each refusal name the

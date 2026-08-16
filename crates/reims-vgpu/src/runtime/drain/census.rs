@@ -948,6 +948,92 @@ impl PreflightPart {
     }
 }
 
+/// Which part of `finish_stream` a span was spent in.
+///
+/// [`ExecPhase::Finish`] is the largest phase in this device — 9.61 µs a draw of
+/// an 11.72 µs `proc_us` on a driven Maps boot — and it *contains* `draw_us`,
+/// which names itself at 8.36. So 1.25 µs a draw, 15 % of the whole draw path
+/// and larger than any single bar in `draw_phase`, sits between the two with no
+/// field naming it. This divides that residue, in the same shape and for the
+/// same reason as the `Record` and `Stage` splits inside the engine.
+///
+/// The parts tile `finish_us` by construction: every one of them is a lexical
+/// span in `finish_stream` and [`Prelude`](Self::Prelude) is what is left, so
+/// the sum is checkable on the line rather than assumed.
+///
+/// Read [`Encode`](Self::Encode) against `drain_duty`'s own `draw_us`: they
+/// measure the same call from two places, so a divergence between them is a
+/// census bug and not a finding.
+#[derive(Clone, Copy)]
+pub enum FinishPhase {
+    /// Everything outside the other parts: the clear-only prelude, the ICB
+    /// executes, the `draw_list` collect, `mrt_draw_request` for the first
+    /// record, and the attachment template it is turned into. Derived rather
+    /// than measured directly, so the parts sum to the whole by construction.
+    Prelude,
+    /// `retarget_render_pass_draw` — rebuilding record N's `DrawRequest` from
+    /// the pass template.
+    ///
+    /// Entered once per record so `fin_retarget_n` is the loop's own trip count
+    /// and every other part has a denominator; record 0 only moves the request
+    /// the prelude already built, and charges near nothing.
+    ///
+    /// A `MTLRenderCommandEncoder`'s attachment set is fixed for its life and
+    /// the guest never re-states it, so anything this costs is this device
+    /// re-materializing state the guest sent once.
+    Retarget,
+    /// `fill_draw_binds_from_pending` and the per-record request fixups around
+    /// it: the chain position, the records-2+ load-action rewrite, and choosing
+    /// the chain source.
+    Binds,
+    /// `encode_draw_chain`, which is also what `drain_duty`'s `draw_us` spans.
+    Encode,
+    /// Reading the encode's result: the visibility-count bookkeeping and the
+    /// status match, including the abandon paths.
+    Result,
+    /// After the per-draw loop: `write_visibility_results` and the
+    /// draw-failed clear fallback.
+    Tail,
+}
+
+impl FinishPhase {
+    /// How many parts there are. The census arrays are sized from this, so a new
+    /// variant that forgets to bump it fails to build [`Self::ALL`] rather than
+    /// overflowing an array at report time.
+    pub(crate) const COUNT: usize = 6;
+
+    pub(crate) const ALL: [FinishPhase; Self::COUNT] = [
+        FinishPhase::Prelude,
+        FinishPhase::Retarget,
+        FinishPhase::Binds,
+        FinishPhase::Encode,
+        FinishPhase::Result,
+        FinishPhase::Tail,
+    ];
+
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            FinishPhase::Prelude => 0,
+            FinishPhase::Retarget => 1,
+            FinishPhase::Binds => 2,
+            FinishPhase::Encode => 3,
+            FinishPhase::Result => 4,
+            FinishPhase::Tail => 5,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            FinishPhase::Prelude => "fin_prelude",
+            FinishPhase::Retarget => "fin_retarget",
+            FinishPhase::Binds => "fin_binds",
+            FinishPhase::Encode => "fin_encode",
+            FinishPhase::Result => "fin_result",
+            FinishPhase::Tail => "fin_tail",
+        }
+    }
+}
+
 /// The per-opcode split of `proc_ns`, indexed by the opcode itself.
 ///
 /// Sized from the contract rather than from a count of the arms
@@ -1028,6 +1114,63 @@ impl RegsOp {
             RegsOp::TailRead => "tailrd",
             RegsOp::HeadWrite => "headwr",
             RegsOp::Stamp => "stamp",
+        }
+    }
+}
+
+/// One of the per-tranche sweeps that run after `publish_us` is banked.
+///
+/// They are the whole of `gap_post_us`, which is **~21 ms of every driven second**
+/// on the x86/Vulkan iGPU — the only device-side item left in the drain worker's
+/// missing third once `gap_lock_us` (0.02 %) and the interrupt hop (6 % of the
+/// idle, ~10 µs a pulse) were measured and excluded.
+///
+/// Every one of them documents itself as returning immediately when there is
+/// nothing to do, and collectively they cost this, so which one it is cannot be
+/// reasoned out from those docs. Hence a split rather than a guess.
+#[derive(Clone, Copy)]
+pub enum PostSweep {
+    /// `surface_cache::note_cache_levels` — self-gated to a one-second cadence.
+    CacheLevels,
+    /// `objects::slot_recheck::sweep` — deliberately per tranche, because the
+    /// sampling interval is the resolution of the answer it gives. Watches
+    /// nothing on every rail but macos-26.
+    SlotRecheck,
+    /// `released_pages::sweep` + `note_levels`, timed as one because they are
+    /// the two halves of the same question and neither has a caller elsewhere.
+    ReleasedPages,
+    /// `bound_buffers::note_registry_levels`, Vulkan only.
+    BindLevels,
+}
+
+impl PostSweep {
+    /// How many sweeps there are. The census array is sized from this, so a new
+    /// variant that forgets to bump it fails to build [`Self::ALL`] rather than
+    /// overflowing an array at report time.
+    pub(crate) const COUNT: usize = 4;
+
+    const ALL: [PostSweep; Self::COUNT] = [
+        PostSweep::CacheLevels,
+        PostSweep::SlotRecheck,
+        PostSweep::ReleasedPages,
+        PostSweep::BindLevels,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            PostSweep::CacheLevels => 0,
+            PostSweep::SlotRecheck => 1,
+            PostSweep::ReleasedPages => 2,
+            PostSweep::BindLevels => 3,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            PostSweep::CacheLevels => "cachelv",
+            PostSweep::SlotRecheck => "slotre",
+            PostSweep::ReleasedPages => "relpg",
+            PostSweep::BindLevels => "bindlv",
         }
     }
 }
@@ -1424,6 +1567,61 @@ impl ResidentArmCensus {
 pub(crate) struct DrainDutyCensus {
     tranches: std::sync::atomic::AtomicU64,
     skipped: std::sync::atomic::AtomicU64,
+    /// The wall clock this worker spent **not** in a tranche, split four ways so
+    /// that `idle + lock + skip + post + busy` tiles the census window.
+    ///
+    /// `duty` says how much of the window the worker was busy. What the other
+    /// `1 - duty` was has never been named, and on a driven Maps boot it is
+    /// **31 %** of the one thread every guest packet serializes through — worth
+    /// more than another microsecond off any phase, because at `duty` 1.0 and
+    /// today's per-draw cost this device would run ~65 fps where it runs ~51.
+    ///
+    /// The four are the only things the worker can be doing. It waits on a
+    /// condvar for the doorbell (`idle`); it takes the device lock, which the
+    /// vCPU thread also holds (`lock`); it bails before the lock when the action
+    /// BH owes a present (`skip`); and it runs the per-tranche sweeps after
+    /// `publish_us` is taken (`post`). A reading concentrated in `idle` says the
+    /// guest is upstream of us and no device change moves it; one in `lock` says
+    /// the vCPU is the contender; one in `post` says a sweep on the worker's own
+    /// path is the cost.
+    ///
+    /// Kept as separate accumulators rather than derived from a residue: a
+    /// residue absorbs every mistake in the other three and always tiles.
+    gap_idle_us: std::sync::atomic::AtomicU64,
+    gap_lock_us: std::sync::atomic::AtomicU64,
+    gap_skip_us: std::sync::atomic::AtomicU64,
+    gap_post_us: std::sync::atomic::AtomicU64,
+    /// The per-sweep division of [`Self::gap_post_us`], indexed by
+    /// [`PostSweep::index`]. Emitted beside the total it divides, so
+    /// `sum(post_*_us) == gap_post_us` is checkable on the line — a sweep that
+    /// gains a call site and no timer shows up as a shortfall there.
+    post_sweep_ns: [std::sync::atomic::AtomicU64; PostSweep::COUNT],
+    /// `observe::elapsed_us()` when this worker last returned from a drain
+    /// entry point, skipped or not. Zero before the first, which is the one
+    /// entry whose `idle` cannot be measured and is dropped rather than
+    /// attributed to a zero origin.
+    gap_last_exit_us: std::sync::atomic::AtomicU64,
+    /// How long a prompt `HostAction` — an IRQ pulse or a cursor move — sits in
+    /// the slot queue between being enqueued here and the QEMU action BH popping
+    /// it.
+    ///
+    /// This is the one candidate for `gap_idle_us` that is **ours**. The drain
+    /// worker parks on a condvar until the guest doorbells, and the guest cannot
+    /// doorbell until it has been interrupted; the interrupt is enqueued on the
+    /// prompt queue and raised on the QEMU main loop, one `qemu_bh_schedule`
+    /// later. If that hop costs hundreds of microseconds under load, the
+    /// worker's idle is a main-loop round trip this device causes rather than
+    /// the guest thinking — and the two have opposite repairs.
+    ///
+    /// `max` beside the total because a mean over a thousand pulses hides the
+    /// tail, and the tail is what a frame waits on.
+    irq_wait_us: std::sync::atomic::AtomicU64,
+    irq_waits: std::sync::atomic::AtomicU64,
+    irq_wait_max_us: std::sync::atomic::AtomicU64,
+    /// `observe::elapsed_us()` at which the prompt queue stopped being empty, or
+    /// zero while it is empty. The *oldest* undelivered action is the one whose
+    /// wait matters, so arming over a non-empty queue leaves this alone.
+    irq_armed_us: std::sync::atomic::AtomicU64,
     drain_us: std::sync::atomic::AtomicU64,
     publish_us: std::sync::atomic::AtomicU64,
     draw_us: std::sync::atomic::AtomicU64,
@@ -1527,6 +1725,11 @@ pub(crate) struct DrainDutyCensus {
     pre_ns: [std::sync::atomic::AtomicU64; PreflightPart::COUNT],
     pre_count: [std::sync::atomic::AtomicU64; PreflightPart::COUNT],
     pre_pipes: std::sync::atomic::AtomicU64,
+    /// The inside of [`ExecPhase::Finish`], indexed by [`FinishPhase::index`].
+    /// Sums to `finish_us` on the `exec_phase` line, and its `fin_encode` is
+    /// `drain_duty`'s own `draw_us` measured a second time.
+    fin_ns: [std::sync::atomic::AtomicU64; FinishPhase::COUNT],
+    fin_count: [std::sync::atomic::AtomicU64; FinishPhase::COUNT],
     max_tranche_us: std::sync::atomic::AtomicU64,
     /// Longest single Flush in the window. `flush_us/flushes` is a mean, and a
     /// mean cannot tell "every flush costs 7.7 ms" from "most are free and one
@@ -1580,6 +1783,73 @@ impl DrainDutyCensus {
     pub(crate) fn note_skipped(&self) {
         self.skipped
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Open a drain entry at `entry_us`, banking the condvar wait that preceded
+    /// it, and hand back the same instant for the caller to time its lock from.
+    ///
+    /// The wait is measured from the *previous* exit rather than by bracketing
+    /// `qemu_cond_wait`, because that wait is in the C shim and this crate does
+    /// not get to hold a timer across it. The difference is the shim's own few
+    /// instructions, which is below this line's resolution.
+    pub(crate) fn note_gap_entry(&self, entry_us: u64) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let last = self.gap_last_exit_us.load(Relaxed);
+        if last != 0 {
+            self.gap_idle_us
+                .fetch_add(entry_us.saturating_sub(last), Relaxed);
+        }
+        entry_us
+    }
+
+    /// The prompt queue has gone from empty to holding something at `now_us`.
+    ///
+    /// Idempotent while the queue stays non-empty: the first arm is the oldest
+    /// undelivered action and is the one whose wait the BH hop costs.
+    pub(crate) fn note_irq_armed(&self, now_us: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _ = self
+            .irq_armed_us
+            .compare_exchange(0, now_us.max(1), Relaxed, Relaxed);
+    }
+
+    /// The BH has emptied the prompt queue at `now_us`; bank the hop.
+    pub(crate) fn note_irq_delivered(&self, now_us: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let armed = self.irq_armed_us.swap(0, Relaxed);
+        if armed == 0 {
+            return;
+        }
+        let waited = now_us.saturating_sub(armed);
+        self.irq_wait_us.fetch_add(waited, Relaxed);
+        self.irq_waits.fetch_add(1, Relaxed);
+        self.irq_wait_max_us.fetch_max(waited, Relaxed);
+    }
+
+    /// Attribute `ns` of this entry's `gap_post_us` to one sweep.
+    ///
+    /// Nanoseconds because a single sweep call is a few hundred of them; the
+    /// report divides back to microseconds like every other span on the line.
+    pub(crate) fn note_post_sweep(&self, sweep: PostSweep, ns: u64) {
+        self.post_sweep_ns[sweep.index()].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Bank the device-lock wait of an entry that went on to run a tranche.
+    pub(crate) fn note_gap_lock(&self, us: u64) {
+        self.gap_lock_us
+            .fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Close a drain entry at `exit_us`, banking everything since `busy_end_us`
+    /// as post-tranche work — or as a skip, when the entry never ran one.
+    pub(crate) fn note_gap_exit(&self, exit_us: u64, busy_end_us: u64, skipped: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let bucket = match skipped {
+            true => &self.gap_skip_us,
+            false => &self.gap_post_us,
+        };
+        bucket.fetch_add(exit_us.saturating_sub(busy_end_us), Relaxed);
+        self.gap_last_exit_us.store(exit_us, Relaxed);
     }
 
     /// Attribute `us` of the current tranche's `drain_us` to one phase.
@@ -1821,6 +2091,41 @@ impl DrainDutyCensus {
         any.then(|| format!("exec_phase win_ms={win_ms}{body}"))
     }
 
+    /// One stream's spans in one part of `finish_stream`: the nanoseconds it
+    /// spent there and how many times it entered.
+    ///
+    /// Both at once because the caller accumulates a whole stream locally — a
+    /// packet of ninety draws enters `Encode` ninety times and pays two atomics
+    /// for all of them.
+    pub(crate) fn note_finish(&self, phase: FinishPhase, ns: u64, entries: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let i = phase.index();
+        self.fin_ns[i].fetch_add(ns, Relaxed);
+        self.fin_count[i].fetch_add(entries, Relaxed);
+    }
+
+    /// The inside of [`ExecPhase::Finish`] over the window [`Self::note`] just
+    /// reported.
+    ///
+    /// Read against `exec_phase`: these six sum to its `finish_us`, and
+    /// `fin_encode_us` is `drain_duty`'s `draw_us` measured from the other side
+    /// of the same call.
+    pub(crate) fn take_finish_phases(&self) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let win_ms = self.last_win_ms.load(Relaxed);
+        let mut body = String::new();
+        let mut any = false;
+        for phase in FinishPhase::ALL {
+            let i = phase.index();
+            let us = self.fin_ns[i].swap(0, Relaxed) / 1000;
+            let n = self.fin_count[i].swap(0, Relaxed);
+            any |= n != 0;
+            let label = phase.label();
+            body.push_str(&format!(" {label}_us={us} {label}_n={n}"));
+        }
+        any.then(|| format!("finish_phase win_ms={win_ms}{body}"))
+    }
+
     /// One access around a packet, in nanoseconds, into both the total and the
     /// per-op split. Recording both is what makes the sum identity checkable.
     pub(crate) fn note_regs(&self, op: RegsOp, ns: u64) {
@@ -1904,11 +2209,36 @@ impl DrainDutyCensus {
             regs_split.push_str(&format!(" {label}_us={us} {label}_n={n}"));
         }
         let slow = self.slow_tranches.swap(0, Relaxed);
+        // The four buckets that tile `1 - duty`. Emitted beside the total they
+        // divide, so `idle + lock + skip + post + busy == win_ms * 1000` is
+        // checkable on the line itself — the same rule `regs_split` follows.
+        // They will not tile exactly: each is banked at a different instant of
+        // the window and the swap below races the worker, so a few hundred
+        // microseconds either way is sampling, not a lost bucket.
+        let gap_idle = self.gap_idle_us.swap(0, Relaxed);
+        let gap_lock = self.gap_lock_us.swap(0, Relaxed);
+        let gap_skip = self.gap_skip_us.swap(0, Relaxed);
+        let gap_post = self.gap_post_us.swap(0, Relaxed);
+        // Emitted beside the total it divides, so `sum(post_*_us) == gap_post_us`
+        // is checkable on the line itself.
+        let mut post_split = String::new();
+        for sweep in PostSweep::ALL {
+            let us = self.post_sweep_ns[sweep.index()].swap(0, Relaxed) / 1000;
+            post_split.push_str(&format!(" post_{}_us={us}", sweep.label()));
+        }
+        // Beside the gap they are a candidate cause of, not on a line of their
+        // own: the question is only ever "is `gap_idle_us` this?".
+        let irq_wait = self.irq_wait_us.swap(0, Relaxed);
+        let irq_waits = self.irq_waits.swap(0, Relaxed);
+        let irq_wait_max = self.irq_wait_max_us.swap(0, Relaxed);
         let busy = drain.saturating_add(publish);
         let duty = busy as f64 / (win_ms as f64 * 1000.0);
         Some(format!(
             "drain_duty win_ms={win_ms} tranches={tranches} skipped={skipped} busy_us={busy} \
              duty={duty:.3} drain_us={drain} publish_us={publish} max_tranche_us={max} \
+             gap_idle_us={gap_idle} gap_lock_us={gap_lock} gap_skip_us={gap_skip} \
+             gap_post_us={gap_post}{post_split} \
+             irq_wait_us={irq_wait} irq_waits={irq_waits} irq_wait_max_us={irq_wait_max} \
              draw_us={draw} draws={draws} compute_us={compute} computes={computes} \
              flush_us={flush} flushes={flushes} max_flush_us={max_flush} \
              tail_us={tail} boundary_us={boundary} \
@@ -2423,6 +2753,15 @@ pub fn note_exec_phase(phase: ExecPhase, ns: u64) {
     DRAIN_DUTY.note_exec(phase, ns);
 }
 
+/// Attribute one span inside `finish_stream`, in nanoseconds.
+///
+/// The caller is [`crate::runtime::exec::finish_phase::FinishTimer`], which
+/// accumulates a whole stream's spans locally and flushes them here once, so a
+/// packet of a hundred draws costs twelve atomics rather than twelve hundred.
+pub fn note_finish_phase(phase: FinishPhase, ns: u64, entries: u64) {
+    DRAIN_DUTY.note_finish(phase, ns, entries);
+}
+
 /// Attribute one span inside the translation preflight, in nanoseconds.
 pub fn note_preflight_part(part: PreflightPart, ns: u64) {
     DRAIN_DUTY.note_preflight(part, ns);
@@ -2466,6 +2805,11 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         // Under `exec_phase`, dividing its `preflight_us`.
         if let Some(pre) = DRAIN_DUTY.take_preflight_parts() {
             crate::observe::off(pre);
+        }
+        // Also under `exec_phase`, dividing its `finish_us` — the phase that
+        // holds `draw_us` and 1.25 µs a draw of unnamed work around it.
+        if let Some(fin) = DRAIN_DUTY.take_finish_phases() {
+            crate::observe::off(fin);
         }
         // Under `flush_rails`, dividing its `render_us`.
         if let Some(split) = DRAIN_DUTY.take_readback_split() {
@@ -2525,12 +2869,6 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         #[cfg(feature = "backend-vulkan")]
         if let Some(wanted) = crate::backend::vulkan::engine::buffer_gather_working_set_census() {
             crate::observe::off(wanted);
-        }
-        // Beside it, because the two answer one question between them: that one
-        // says the same window comes back and this says whether its bytes moved.
-        #[cfg(feature = "backend-vulkan")]
-        if let Some(fresh) = crate::runtime::buffer_gather_freshness::census() {
-            crate::observe::off(fresh);
         }
         emit_engine_delta();
         // After `emit_engine_delta`, which emits `draw_phase`: the two divide
@@ -2610,18 +2948,18 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
 /// currently reach, against what the machine reported.
 #[cfg(feature = "backend-vulkan")]
 fn emit_guest_import_levels() {
-    let (bytes, count) = crate::backend::vulkan::engine::guest_import_census();
+    let (bytes, count, aliases) = crate::backend::vulkan::engine::guest_import_census();
     let (spans, span_bytes) = crate::runtime::guest_ram_map::span_census();
     // An engine that never imported emits nothing, so a host on a negative
     // `host_pointer` rung — or a boot before the first guest window — costs no
     // line, and a zero here always means the copying rails rather than silence.
-    if count == 0 {
+    if count == 0 && aliases == 0 {
         return;
     }
     crate::observe::off(format!(
-        "guest_import_levels (levels, not per-interval) ramblocks={count}/{spans} \
-         mib={}/{} (imported/reported; a span is imported at first reference, \
-         so below is lazy and above is impossible)",
+        "guest_import_levels (levels, not per-interval) ramblocks={count}/{spans} aliases={aliases} \
+         imported_mib={} ramblock_reported_mib={} (RAMBlock spans import lazily; \
+         packed aliases add to imported_mib without changing the reported RAM size)",
         bytes / (1024 * 1024),
         span_bytes / (1024 * 1024),
     ));
@@ -2738,7 +3076,7 @@ fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot)
         now.registry_non_pinned_peak_bytes >> 20,
         now.sampled_gpu_binds,
         now.resident_resample_peak_ms,
-        crate::backend::vulkan::engine::IDLE_TARGET_AGE_MS,
+        crate::backend::vulkan::engine::IDLE_MAINTENANCE_START_MS,
         now.slab_carved_bytes >> 20,
         now.slab_held_bytes >> 20,
         now.registry_sole_copy_peak,
@@ -2799,7 +3137,7 @@ fn emit_chain_phase() {
         "chain_phase chains={} prep_us={} pipeline_us={} pl_gen_us={} pl_desc_us={} \
          pl_mtlb_us={} pl_air_us={} pl_xlate_us={} binds_us={} sampled_us={} \
          seed_us={} assemble_us={} engine_us={} store_us={} prep_seed_us={} \
-         prep_pages_us={} max_us={}",
+         prep_pages_us={} asm_target_us={} asm_depth_us={} asm_trail_us={} max_us={}",
         w.chains,
         w.prep_us,
         w.pipeline_us,
@@ -2816,6 +3154,9 @@ fn emit_chain_phase() {
         w.store_us,
         w.prep_seed_us,
         w.prep_pages_us,
+        w.assemble_target_us,
+        w.assemble_depth_us,
+        w.assemble_trail_us,
         w.max_us,
     ));
     // Under `chain_phase`, dividing its largest column the same way
@@ -2859,10 +3200,13 @@ fn emit_draw_phase() {
     crate::observe::off(format!(
         "draw_phase draws={} prep_us={} slot_us={} pipeline_us={} \
          pl_depth_us={} pl_shader_us={} pl_layoutpass_us={} pl_compile_us={} pl_sampler_us={} \
-         stage_us={} stage_pass_us={} \
+         stage_us={} sg_roles_us={} sg_vertex_us={} sg_index_us={} sg_storage_us={} \
+         sg_seed_us={} stage_pass_us={} \
          acquire_us={} acquire_sampled_us={} sampled_upload_us={} acquire_readback_us={} \
          descriptors_us={} \
-         record_us={} submit_us={} wait_us={} readback_us={} max_us={} stalls={}",
+         record_us={} rec_begin_us={} rec_barrier_us={} rec_pass_us={} rec_state_us={} \
+         rec_draw_us={} submit_us={} post_target_us={} post_store_us={} post_sampled_us={} \
+         post_park_us={} wait_us={} readback_us={} max_us={} stalls={}",
         w.draws,
         w.prep_us,
         w.slot_us,
@@ -2873,6 +3217,11 @@ fn emit_draw_phase() {
         w.pipeline_compile_us,
         w.pipeline_sampler_us,
         w.stage_us,
+        w.stage_roles_us,
+        w.stage_vertex_us,
+        w.stage_index_us,
+        w.stage_storage_us,
+        w.stage_seed_us,
         w.stage_pass_us,
         w.acquire_us,
         w.acquire_sampled_us,
@@ -2880,7 +3229,16 @@ fn emit_draw_phase() {
         w.acquire_readback_us,
         w.descriptors_us,
         w.record_us,
+        w.rec_begin_us,
+        w.rec_barrier_us,
+        w.rec_pass_us,
+        w.rec_state_us,
+        w.rec_draw_us,
         w.submit_us,
+        w.post_target_us,
+        w.post_store_us,
+        w.post_sampled_us,
+        w.post_park_us,
         w.wait_us,
         w.readback_us,
         w.max_us,
@@ -3052,6 +3410,54 @@ pub fn note_drain_skipped() {
     DRAIN_DUTY.note_skipped();
 }
 
+/// Open a drain entry, banking the condvar wait that preceded it. Returns the
+/// entry instant, which the caller times its device-lock wait from.
+pub fn note_drain_entry() -> u64 {
+    DRAIN_DUTY.note_gap_entry(crate::observe::elapsed_us())
+}
+
+/// Bank the device-lock wait of an entry that went on to run a tranche.
+pub fn note_drain_lock_wait(us: u64) {
+    DRAIN_DUTY.note_gap_lock(us);
+}
+
+/// Time one post-tranche sweep and attribute it, returning what it returned.
+///
+/// A wrapper rather than a `started`/`note` pair at each call site: these four
+/// sit in one straight run of statements, and a pair spelled four times is four
+/// chances to time the wrong one.
+pub fn post_sweep<T>(sweep: PostSweep, run: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let out = run();
+    DRAIN_DUTY.note_post_sweep(sweep, started.elapsed().as_nanos() as u64);
+    out
+}
+
+/// A prompt `HostAction` has just been pushed onto an empty prompt queue.
+///
+/// Process-global, like every counter here: this device is instantiated once per
+/// QEMU process, and a second slot would fold its pulses into the first's mean
+/// rather than corrupt it.
+pub fn note_irq_armed() {
+    DRAIN_DUTY.note_irq_armed(crate::observe::elapsed_us());
+}
+
+/// The QEMU action BH has just emptied the prompt queue.
+pub fn note_irq_delivered() {
+    DRAIN_DUTY.note_irq_delivered(crate::observe::elapsed_us());
+}
+
+/// Close a drain entry: everything since `busy_end_us` is post-tranche work, or
+/// the whole entry is a skip when it never took the lock.
+///
+/// Must be called on **every** return path out of the entry point, including the
+/// ones that bail after taking the lock — an unclosed entry leaves
+/// `gap_last_exit_us` stale and folds this entry's whole duration into the next
+/// one's `gap_idle_us`, which reads as an idle worker rather than as a bug here.
+pub fn note_drain_exit(busy_end_us: u64, skipped: bool) {
+    DRAIN_DUTY.note_gap_exit(crate::observe::elapsed_us(), busy_end_us, skipped);
+}
+
 /// Attribute elapsed time since `started` to one phase of the current tranche.
 pub fn note_drain_phase(phase: DrainPhase, started: std::time::Instant) {
     DRAIN_DUTY.note_phase(phase, started.elapsed().as_micros() as u64);
@@ -3085,8 +3491,18 @@ pub fn note_readback_gpu_us(barrier_us: u64, copy_us: u64) {
 /// deferred rail to take. Whether that is 2 Stores a second or 20 decides
 /// whether building one is worth it, and the route's own first-appearance line
 /// is deduplicated per process and cannot say.
-static STORE_ROUTES: std::sync::Mutex<Option<std::collections::BTreeMap<&'static str, u64>>> =
-    std::sync::Mutex::new(None);
+type StoreRouteCounter = std::sync::Arc<std::sync::atomic::AtomicU64>;
+
+static STORE_ROUTES: std::sync::Mutex<std::collections::BTreeMap<&'static str, StoreRouteCounter>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+thread_local! {
+    /// Routes repeat at render-command frequency. Keep their registry lookup
+    /// off the hot path; the registry remains sorted solely for census output.
+    static STORE_ROUTE_CACHE: std::cell::RefCell<
+        std::collections::HashMap<&'static str, StoreRouteCounter>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
 
 /// # This census cannot find the Finder icon defect, and that is now measured
 ///
@@ -3168,17 +3584,40 @@ pub fn note_store_route(route: &'static str) {
 /// Add `n` to a named count in the same per-second window as [`note_store_route`].
 ///
 /// For events that arrive in batches — one notify marking many cache entries —
-/// where the number that matters is the entries, not the notifies, and taking
-/// the lock once per entry would cost more than the census is worth.
+/// where the number that matters is the entries, not the notifies. The common
+/// path is a thread-local lookup and a relaxed atomic addition; the registry
+/// lock is taken only the first time one thread sees one route.
 pub fn note_store_route_n(route: &'static str, n: u64) {
     if n == 0 {
         return;
     }
-    if let Ok(mut g) = STORE_ROUTES.lock() {
-        *g.get_or_insert_with(Default::default)
-            .entry(route)
-            .or_default() += n;
-    }
+    STORE_ROUTE_CACHE.with(|cache| {
+        let hit = {
+            let cache = cache.borrow();
+            if let Some(counter) = cache.get(route) {
+                counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        };
+        if hit {
+            return;
+        }
+
+        let counter = {
+            let Ok(mut routes) = STORE_ROUTES.lock() else {
+                return;
+            };
+            std::sync::Arc::clone(
+                routes
+                    .entry(route)
+                    .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))),
+            )
+        };
+        counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        cache.borrow_mut().insert(route, counter);
+    });
 }
 
 /// Accumulate microseconds against a named cost, into the same per-second window
@@ -3194,11 +3633,7 @@ pub fn note_store_route_n(route: &'static str, n: u64) {
 /// `wait_us`). A phase table that sums to 72 % of the thing it decomposes
 /// cannot be used to choose what to fix.
 pub fn note_store_route_us(name: &'static str, us: u64) {
-    if let Ok(mut g) = STORE_ROUTES.lock() {
-        *g.get_or_insert_with(Default::default)
-            .entry(name)
-            .or_default() += us;
-    }
+    note_store_route_n(name, us);
 }
 
 /// Read one route's count out of the live window, for tests that assert a
@@ -3213,23 +3648,215 @@ pub(crate) fn store_route_count(route: &str) -> u64 {
     STORE_ROUTES
         .lock()
         .ok()
-        .and_then(|g| g.as_ref().and_then(|m| m.get(route).copied()))
+        .and_then(|routes| routes.get(route).cloned())
+        .map(|counter| counter.load(std::sync::atomic::Ordering::Relaxed))
         .unwrap_or(0)
 }
 
 /// Drain and format the window's route counts, or `None` if none were taken.
 fn take_store_routes() -> Option<String> {
-    let mut g = STORE_ROUTES.lock().ok()?;
-    let routes = g.as_mut()?;
-    if routes.is_empty() {
-        return None;
-    }
+    let routes = STORE_ROUTES.lock().ok()?;
     let mut out = String::from("store_routes");
-    for (route, n) in routes.iter() {
-        out.push_str(&format!(" {route}={n}"));
+    let mut any = false;
+    for (route, counter) in routes.iter() {
+        let n = counter.swap(0, std::sync::atomic::Ordering::Relaxed);
+        if n != 0 {
+            out.push_str(&format!(" {route}={n}"));
+            any = true;
+        }
     }
-    routes.clear();
-    Some(out)
+    any.then_some(out)
+}
+
+#[cfg(test)]
+mod drain_gap_tests {
+    use super::{DRAIN_DUTY_REPORT_MS, DrainDutyCensus, PostSweep};
+
+    /// The four gap buckets plus `busy_us` account for the whole window.
+    ///
+    /// `duty` has always said what fraction of a second the worker was busy and
+    /// nothing has ever said what the rest was — 31 % of the one thread every
+    /// guest packet serializes through, on a driven Maps boot. These four are
+    /// the only things it can be doing, so the check that they are the right
+    /// four is that they tile: a bucket that is really two, or a span banked
+    /// into no bucket at all, shows up here as a shortfall.
+    #[test]
+    fn the_gap_buckets_and_the_busy_time_tile_the_window() {
+        let c = DrainDutyCensus::default();
+        // Arms the window at t=1ms. The first `note` never reports — it would
+        // divide the whole process lifetime into one tranche — so the window
+        // under test has to be opened before anything is accumulated into it.
+        assert!(c.note(0, 0, 1).is_none(), "the first call arms the window");
+        // Six entries on a fixed stride, each: 40 idle, 10 lock, 30 drain, 5
+        // publish, 16 post — 16 so the four-way sweep split divides it whole and
+        // the shortfall check below reads truncation as nothing. Times are microseconds on the crate clock. The
+        // first entry's idle is the one span that cannot be measured — there is
+        // no previous exit to measure it from — so it lies before `t0` and is
+        // not part of what has to tile.
+        let (idle, lock, drain, publish, post) = (40u64, 10u64, 30u64, 5u64, 16u64);
+        let stride = idle + lock + drain + publish + post;
+        let entries = 6u64;
+        let t0 = 1_000u64;
+        for i in 0..entries {
+            let entry = t0 + i * stride;
+            c.note_gap_entry(entry);
+            c.note_gap_lock(lock);
+            let busy_end = entry + lock + drain + publish;
+            assert!(c.note(drain, publish, 1).is_none(), "the window is not due");
+            // The four sweeps that make up `post`, in nanoseconds. They tile it
+            // exactly here, which is what the shortfall check below is for: on a
+            // real tranche the wrapper's own `Instant` reads sit outside them.
+            for sweep in PostSweep::ALL {
+                c.note_post_sweep(sweep, post * 1_000 / PostSweep::COUNT as u64);
+            }
+            c.note_gap_exit(busy_end + post, busy_end, false);
+        }
+        // One skipped entry on the same stride: no lock, no tranche, the whole
+        // call is a skip.
+        let skip_entry = t0 + entries * stride;
+        let skip_us = 7u64;
+        c.note_gap_entry(skip_entry);
+        c.note_skipped();
+        c.note_gap_exit(skip_entry + skip_us, skip_entry, true);
+        let last_exit = skip_entry + skip_us;
+
+        let line = c
+            .note(0, 0, 1 + DRAIN_DUTY_REPORT_MS)
+            .expect("the window is due");
+        let field = |name: &str| -> u64 {
+            line.split_whitespace()
+                .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+                .unwrap_or_else(|| panic!("{name} is on the line: {line}"))
+                .parse()
+                .expect("a microsecond count")
+        };
+        // `entries` idle gaps, not `entries + 1`: the first entry contributes
+        // none and the skipped one contributes the last.
+        assert_eq!(field("gap_idle_us"), idle * entries);
+        assert_eq!(field("gap_lock_us"), lock * entries);
+        assert_eq!(field("gap_post_us"), post * entries);
+        // The split has to add up to the total it divides, so a sweep that gains
+        // a call site and no timer reads as a shortfall rather than as noise.
+        let post_split: u64 = ["cachelv", "slotre", "relpg", "bindlv"]
+            .into_iter()
+            .map(|s| field(&format!("post_{s}_us")))
+            .sum();
+        assert_eq!(post_split, post * entries);
+        assert_eq!(field("gap_skip_us"), skip_us);
+        assert_eq!(field("busy_us"), (drain + publish) * entries);
+        // The whole point: nothing the worker did between `t0` and its last
+        // exit is outside these five.
+        assert_eq!(
+            field("gap_idle_us")
+                + field("gap_lock_us")
+                + field("gap_post_us")
+                + field("gap_skip_us")
+                + field("busy_us"),
+            last_exit - t0,
+            "a span banked into no bucket reads as a shortfall here: {line}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod irq_wait_tests {
+    use super::DrainDutyCensus;
+
+    /// The delivery clock measures the **oldest** undelivered prompt action, and
+    /// banks one wait per emptying of the queue.
+    ///
+    /// Both halves matter. Re-arming over a non-empty queue would restart the
+    /// clock and report the newest pulse's wait, which is not the one a frame is
+    /// blocked behind; banking per action instead of per emptying would count
+    /// the same BH hop once for every action that rode it.
+    #[test]
+    fn the_delivery_clock_times_the_oldest_action_and_banks_once_per_hop() {
+        let c = DrainDutyCensus::default();
+        c.note_irq_armed(1_000);
+        // A second pulse joining a queue that is already waiting does not
+        // restart the clock.
+        c.note_irq_armed(1_040);
+        c.note_irq_delivered(1_300);
+        // A delivery with nothing armed banks nothing — the BH runs on its own
+        // cadence and finds the queue empty far more often than not.
+        c.note_irq_delivered(1_400);
+        c.note_irq_armed(2_000);
+        c.note_irq_delivered(2_050);
+
+        assert!(c.note(0, 0, 1).is_none(), "the first call arms the window");
+        let line = c
+            .note(0, 0, 1 + super::DRAIN_DUTY_REPORT_MS)
+            .expect("the window is due");
+        let field = |name: &str| -> u64 {
+            line.split_whitespace()
+                .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+                .unwrap_or_else(|| panic!("{name} is on the line: {line}"))
+                .parse()
+                .expect("a microsecond count")
+        };
+        assert_eq!(field("irq_waits"), 2, "one per emptying, not one per action");
+        assert_eq!(field("irq_wait_us"), 300 + 50);
+        assert_eq!(
+            field("irq_wait_max_us"),
+            300,
+            "the tail is what a frame waits on, so it is reported and not averaged away"
+        );
+    }
+}
+
+#[cfg(test)]
+mod store_route_tests {
+    use super::{
+        note_store_route, note_store_route_n, note_store_route_us, store_route_count,
+        take_store_routes,
+    };
+
+    fn clear_window() {
+        let _ = take_store_routes();
+    }
+
+    #[test]
+    fn counts_and_costs_share_the_window() {
+        clear_window();
+        note_store_route("test_route_count");
+        note_store_route_n("test_route_count", 4);
+        note_store_route_us("test_route_cost_us", 17);
+
+        assert_eq!(store_route_count("test_route_count"), 5);
+        assert_eq!(store_route_count("test_route_cost_us"), 17);
+    }
+
+    #[test]
+    fn counters_coalesce_across_threads() {
+        clear_window();
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..1_000 {
+                        note_store_route("test_route_threaded");
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(store_route_count("test_route_threaded"), 4_000);
+    }
+
+    #[test]
+    fn drain_is_sorted_and_does_not_repeat_values() {
+        clear_window();
+        note_store_route("test_route_zulu");
+        note_store_route("test_route_alpha");
+
+        let line = take_store_routes().unwrap();
+        let alpha = line.find(" test_route_alpha=1").unwrap();
+        let zulu = line.find(" test_route_zulu=1").unwrap();
+        assert!(alpha < zulu);
+        assert!(take_store_routes().is_none());
+    }
 }
 
 #[cfg(test)]

@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 // ash Handle trait not required here.
 
 use super::context::DeviceContext;
-use super::counters::EngineCounters;
+use super::counters::{CreateSite, EngineCounters};
 use super::digest::Digest128;
 use super::pools::{DeferredHandle, ResourcePools};
 use super::types::{
@@ -17,6 +17,18 @@ use super::types::{
     SamplerStateKey, VertexAttributeFormat, VertexStepFunction,
 };
 use super::vk_call::{VkCall, VkOp};
+
+pub(crate) fn vk_sample_count(count: u32) -> vk::SampleCountFlags {
+    match count {
+        2 => vk::SampleCountFlags::TYPE_2,
+        4 => vk::SampleCountFlags::TYPE_4,
+        8 => vk::SampleCountFlags::TYPE_8,
+        16 => vk::SampleCountFlags::TYPE_16,
+        32 => vk::SampleCountFlags::TYPE_32,
+        64 => vk::SampleCountFlags::TYPE_64,
+        _ => vk::SampleCountFlags::TYPE_1,
+    }
+}
 
 /// A device-specific widening of an optional three-component vertex format.
 ///
@@ -67,11 +79,45 @@ pub(crate) struct BindingSig {
     pub binding: u32,
     pub ty: u32, // vk::DescriptorType as u32
     pub stages: u32,
+    pub count: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct LayoutKey {
     pub bindings: Vec<BindingSig>,
+}
+
+impl LayoutKey {
+    /// Whether this layout is represented by command-buffer-local push
+    /// descriptors on this device. This same answer creates the layout and
+    /// chooses how every consumer writes it.
+    pub(crate) fn uses_push_descriptors(
+        &self,
+        caps: crate::backend::vulkan::caps::PushDescriptorCaps,
+    ) -> bool {
+        !self.bindings.is_empty() && caps.supports_counts(self.bindings.iter().map(|b| b.count))
+    }
+}
+
+pub(crate) fn canonicalize_layout_bindings(
+    mut bindings: Vec<BindingSig>,
+) -> Result<Vec<BindingSig>, super::DrawError> {
+    bindings.sort_by_key(|binding| binding.binding);
+    for pair in bindings.windows(2) {
+        if pair[0].binding == pair[1].binding && pair[0] != pair[1] {
+            return Err(super::DrawError::Unsupported(
+                super::reason::DrawReason::DescriptorBindingConflict {
+                    binding: pair[0].binding,
+                    first_type: pair[0].ty,
+                    first_count: pair[0].count,
+                    second_type: pair[1].ty,
+                    second_count: pair[1].count,
+                },
+            ));
+        }
+    }
+    bindings.dedup();
+    Ok(bindings)
 }
 
 /// Max secondary color attachments (MRT slot 1..): every colour slot Apple's
@@ -94,6 +140,7 @@ pub(crate) struct LayoutKey {
 pub(crate) const MAX_SECONDARY_ATTACH: usize = 7;
 const _: () =
     assert!(1 + MAX_SECONDARY_ATTACH == crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS);
+const _: () = assert!(MAX_SECONDARY_ATTACH < u8::BITS as usize);
 
 /// A secondary MRT attachment's contribution to the render-pass / pipeline key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
@@ -119,6 +166,14 @@ pub(crate) struct DepthAttachKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct PassKey {
     pub load_seed: bool, // LOAD vs CLEAR (slot 0)
+    /// Slot 0 aliases memory the host may modify between submissions.
+    ///
+    /// A linear image is host-accessible only in `PREINITIALIZED` or `GENERAL`.
+    /// The former is an image's one-way birth layout, so a retained imported
+    /// attachment must use `GENERAL` for both its pass layout and its exit
+    /// layout. This bit partitions render passes and pipelines from ordinary
+    /// device-local attachments, which retain their dedicated layouts.
+    pub host_accessible_color0: bool,
     /// Slot-0 attachment format, as a format rather than a channel-order flag.
     ///
     /// This used to be `bgra: bool`, meaning `B8G8R8A8_UNORM` or
@@ -147,6 +202,16 @@ pub(crate) struct PassKey {
     /// self-dependency — the Vulkan feedback-loop form MoltenVK lowers to Metal
     /// programmable blending. `false` keeps the pass byte-identical.
     pub color_input: bool,
+    /// Bit N says colour attachment N is also sampled through
+    /// `VK_EXT_attachment_feedback_loop_layout`. The decoded render pass has at
+    /// most eight colour attachments, so the wire-derived attachment table is
+    /// the bound and one byte carries the whole set.
+    pub feedback_colors: u8,
+    /// Sample count of the colour attachment pipelines rasterize into.
+    pub sample_count: u32,
+    /// Attachment zero resolves into a single-sample attachment appended
+    /// immediately after it.
+    pub multisample_resolve: bool,
 }
 
 impl PassKey {
@@ -154,11 +219,271 @@ impl PassKey {
     pub(crate) fn single(load_seed: bool, color0_format: ash::vk::Format) -> Self {
         Self {
             load_seed,
+            host_accessible_color0: false,
             color0_format,
             secondary: [SecondaryAttachKey::default(); MAX_SECONDARY_ATTACH],
             secondary_count: 0,
             depth: None,
             color_input: false,
+            feedback_colors: 0,
+            sample_count: 1,
+            multisample_resolve: false,
+        }
+    }
+
+    pub(crate) fn color_feedback(self, index: usize) -> bool {
+        index < u8::BITS as usize && self.feedback_colors & (1u8 << index) != 0
+    }
+
+    /// The part of a render pass that Vulkan requires to agree for pipeline,
+    /// framebuffer, and in-instance compatibility.
+    ///
+    /// Load actions describe how a newly begun pass obtains attachment
+    /// contents; they are deliberately excluded. A serialized render encoder
+    /// rewrites a continuation segment to LOAD, but an uninterrupted segment
+    /// remains inside the pass begun with the encoder's original action. Store
+    /// actions and initial/final layouts are functions of these same fields in
+    /// this backend, so there is no second compatibility spelling to normalize.
+    ///
+    /// `feedback_colors` is erased **exactly when it changes nothing about the
+    /// pass** — that is, when [`color_feedback_layout`] and
+    /// [`color0_pass_exit_layout`] are the same layout. The self-dependency is
+    /// declared on every pass, so once the layouts also coincide a feedback draw
+    /// and an ordinary one want a byte-identical `VkRenderPass` and there is
+    /// nothing left to keep them apart. Which is the point: whether a draw samples
+    /// the target it is writing is a property of the *draw*, exactly as it is in
+    /// Metal, and it stops closing the render pass.
+    ///
+    /// The condition is not decoration. Under [`crate::env::COLOR_GENERAL`]`=off`
+    /// the resting layout admits no feedback loop, the feedback slots really are
+    /// in a different layout, and erasing the field there would merge two draws
+    /// whose attachment is in two different layouts — a pass naming a layout its
+    /// image is not in.
+    pub(crate) fn compatibility(self) -> PassCompatibilityKey {
+        let mut key = self;
+        key.load_seed = false;
+        for secondary in &mut key.secondary {
+            secondary.load = false;
+        }
+        if let Some(depth) = &mut key.depth {
+            depth.load = false;
+        }
+        if color_feedback_layout() == color0_pass_exit_layout() {
+            key.feedback_colors = 0;
+        }
+        PassCompatibilityKey(key)
+    }
+
+    /// The render-pass state Vulkan uses to decide framebuffer compatibility.
+    ///
+    /// Attachment load actions, attachment-reference layouts, and subpass
+    /// dependencies do not participate. Host accessibility changes only the
+    /// primary attachment's layouts and external dependency; feedback changes
+    /// layouts and a dependency. Neither requires a framebuffer to be rebuilt.
+    /// Attachment formats and the subpass attachment-reference shape remain in
+    /// the key.
+    pub(crate) fn framebuffer_compatibility(self) -> FramebufferCompatibilityKey {
+        let mut key = self.compatibility().0;
+        key.host_accessible_color0 = false;
+        key.feedback_colors = 0;
+        FramebufferCompatibilityKey(key)
+    }
+
+    pub(crate) fn color_layout(self, index: usize) -> vk::ImageLayout {
+        if self.color_feedback(index) {
+            color_feedback_layout()
+        } else if index == 0 && (self.color_input || self.host_accessible_color0) {
+            vk::ImageLayout::GENERAL
+        } else {
+            // The same layout the pass exits at, so an ordinary pass performs no
+            // transition of its own at either end. Written as the exit rather
+            // than as `COLOR_ATTACHMENT_OPTIMAL` for the reason
+            // `color0_pass_exit_layout` gives: there is one spelling.
+            color0_pass_exit_layout()
+        }
+    }
+
+    pub(crate) fn color_final_layout(self, index: usize) -> vk::ImageLayout {
+        if index == 0 && self.host_accessible_color0 {
+            vk::ImageLayout::GENERAL
+        } else if self.color_feedback(index) {
+            color_feedback_layout()
+        } else {
+            color0_pass_exit_layout()
+        }
+    }
+}
+
+/// The layout a colour attachment a draw also samples is placed in.
+///
+/// The resting layout itself whenever that admits a feedback loop, which is the
+/// shipping arm — so a slot the guest samples and a slot it does not are in the
+/// **same** layout, the pass declares no transition for either, and there is no
+/// second layout for a colour target anywhere in this device. Only the ablation
+/// arm, where the resting layout is `COLOR_ATTACHMENT_OPTIMAL` and admits
+/// nothing, reaches the extension's dedicated layout.
+///
+/// One function because four places name this: the subpass attachment reference,
+/// the `finalLayout`, the sampled descriptor
+/// ([`super::exec::PreparedSampled::descriptor_layout`]) and the registry record
+/// the pass leaves behind. A descriptor naming a layout the attachment reference
+/// does not is undefined behaviour, and it is not an error anywhere.
+pub(crate) fn color_feedback_layout() -> vk::ImageLayout {
+    let resting = color0_pass_exit_layout();
+    if layout_admits_color_feedback(resting) {
+        resting
+    } else {
+        vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+    }
+}
+
+/// Whether a colour attachment resting in `layout` may also be sampled by a draw
+/// inside the same render pass instance — a Vulkan *feedback loop*.
+///
+/// Two layouts admit one. `ATTACHMENT_FEEDBACK_LOOP_OPTIMAL` is the dedicated
+/// spelling `VK_EXT_attachment_feedback_loop_layout` adds, and `GENERAL` is the
+/// core one: a sampled-image descriptor may name `GENERAL`, and the core rule for
+/// an attachment written earlier in the subpass permits it to be accessed "as an
+/// attachment, storage image, or sampled image" by a later command. So the
+/// extension layout is an *optimisation over* `GENERAL`, never a requirement.
+///
+/// This is the whole reason feedback is not a second layout. While
+/// [`color0_pass_exit_layout`] answers `GENERAL`, a slot the guest samples and a
+/// slot it does not are in the same layout, so the render pass declares no
+/// transition for either and the registry's record is true for both.
+///
+/// It matters that this is a question about the layout and not a switch read.
+/// Under [`crate::env::COLOR_GENERAL`]`=off` the resting layout is
+/// `COLOR_ATTACHMENT_OPTIMAL`, which admits no feedback loop at all, and the
+/// extension layout has to come back — naming the resting layout there would be a
+/// sampled read of an attachment in a layout that forbids it, which is undefined
+/// behaviour rather than an error. The ablation therefore restores two layouts
+/// because the contract says it must, not because a flag says so.
+const fn layout_admits_color_feedback(layout: vk::ImageLayout) -> bool {
+    matches!(
+        layout,
+        vk::ImageLayout::GENERAL | vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+    )
+}
+
+/// A normalized [`PassKey`] containing exactly Vulkan render-pass
+/// compatibility state. Construction is private to [`PassKey::compatibility`]
+/// so a load action cannot accidentally enter a pipeline or framebuffer key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct PassCompatibilityKey(PassKey);
+
+/// The subset of [`PassKey`] that Vulkan requires to agree when a framebuffer
+/// created against one render pass is used with another.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct FramebufferCompatibilityKey(PassKey);
+
+impl PassCompatibilityKey {
+    pub(crate) fn secondary_count(self) -> usize {
+        self.0.secondary_count as usize
+    }
+
+    pub(crate) fn has_depth(self) -> bool {
+        self.0.depth.is_some()
+    }
+
+    /// Which field makes two compatibility keys disagree, or `None` when they
+    /// are equal.
+    ///
+    /// A `passdiff_compat` firing says a draw could not continue its
+    /// predecessor's render pass because Vulkan would not call the two passes
+    /// compatible, and on a driven Maps leg that is the dominant merge blocker
+    /// once the framebuffer identity one is fixed. On its own it names no
+    /// repair: this key carries nine independent things and a change in any of
+    /// them lands in the same bucket. A colour format change is the guest
+    /// drawing into a different target and is not repairable at all; a
+    /// `sample_count` or `feedback_colors` change might be this device's own
+    /// bookkeeping.
+    ///
+    /// The order is arbitrary — unlike [`super::pools::PassEchoField`]'s, where
+    /// an earlier field makes a later one unreachable — so an answer here is
+    /// *a* difference and not the only one. That is what the census needs: the
+    /// question is which field to look at first, and any field that ever
+    /// differs is worth a reading.
+    ///
+    /// The destructure is exhaustive on purpose. A tenth field added to
+    /// [`PassKey`] fails this function to compile rather than joining a bucket
+    /// that silently stops being a partition.
+    pub(crate) fn first_difference(self, other: Self) -> Option<PassCompatField> {
+        let PassKey {
+            // Load actions are erased by `PassKey::compatibility`, so they are
+            // equal here by construction and cannot be a difference.
+            load_seed: _,
+            host_accessible_color0,
+            color0_format,
+            secondary,
+            secondary_count,
+            depth,
+            color_input,
+            feedback_colors,
+            sample_count,
+            multisample_resolve,
+        } = self.0;
+        let them = other.0;
+        if color0_format != them.color0_format {
+            return Some(PassCompatField::Color0Format);
+        }
+        if secondary_count != them.secondary_count {
+            return Some(PassCompatField::SecondaryCount);
+        }
+        if secondary != them.secondary {
+            return Some(PassCompatField::SecondaryFormat);
+        }
+        if depth != them.depth {
+            return Some(PassCompatField::Depth);
+        }
+        if host_accessible_color0 != them.host_accessible_color0 {
+            return Some(PassCompatField::HostAccessibleColor0);
+        }
+        if color_input != them.color_input {
+            return Some(PassCompatField::ColorInput);
+        }
+        if feedback_colors != them.feedback_colors {
+            return Some(PassCompatField::FeedbackColors);
+        }
+        if sample_count != them.sample_count {
+            return Some(PassCompatField::SampleCount);
+        }
+        if multisample_resolve != them.multisample_resolve {
+            return Some(PassCompatField::MultisampleResolve);
+        }
+        None
+    }
+}
+
+/// Which field of a [`PassCompatibilityKey`] two draws disagreed about.
+///
+/// See [`PassCompatibilityKey::first_difference`] for why the split exists and
+/// why the order carries no meaning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PassCompatField {
+    Color0Format,
+    SecondaryCount,
+    SecondaryFormat,
+    Depth,
+    HostAccessibleColor0,
+    ColorInput,
+    FeedbackColors,
+    SampleCount,
+    MultisampleResolve,
+}
+
+impl PassCompatField {
+    pub(crate) fn route(self) -> &'static str {
+        match self {
+            Self::Color0Format => "passcompat_color0_format",
+            Self::SecondaryCount => "passcompat_secondary_count",
+            Self::SecondaryFormat => "passcompat_secondary_format",
+            Self::Depth => "passcompat_depth",
+            Self::HostAccessibleColor0 => "passcompat_host_accessible",
+            Self::ColorInput => "passcompat_color_input",
+            Self::FeedbackColors => "passcompat_feedback",
+            Self::SampleCount => "passcompat_sample_count",
+            Self::MultisampleResolve => "passcompat_ms_resolve",
         }
     }
 }
@@ -187,7 +512,21 @@ pub(crate) struct PipelineKey {
     /// pipelines. Vulkan's write mask is pipeline state with no dynamic
     /// spelling below `VK_EXT_extended_dynamic_state3`.
     pub color_write_mask: [ColorWriteMask; 1 + MAX_SECONDARY_ATTACH],
-    pub pass: PassKey,
+    pub pass: PassCompatibilityKey,
+    /// Which colour attachments this draw samples while writing them.
+    ///
+    /// Pipeline state, not pass state. `VK_PIPELINE_CREATE_COLOR_ATTACHMENT_-
+    /// FEEDBACK_LOOP_BIT_EXT` is what "feedback loop is enabled" means for the
+    /// draw-time rules, and it is fixed at pipeline creation — so a feedback draw
+    /// and an ordinary one need two pipelines even when they share a render pass.
+    ///
+    /// It lives here rather than being read back out of [`Self::pass`] because
+    /// [`PassKey::compatibility`] erases it precisely when the render pass stops
+    /// depending on it, which is the shipping arm. Reading it from there would
+    /// silently drop the create flag off every feedback pipeline, and the result
+    /// is a draw sampling an attachment it is writing with no feedback loop
+    /// enabled — undefined behaviour, reported nowhere.
+    pub feedback_colors: u8,
     /// Face culling. `None` (the 2D UI default) keeps the raster state at
     /// `CULL_NONE`, byte-identical to the pre-cull engine; the key still
     /// participates in hashing so a later culled draw with the same shaders gets
@@ -309,6 +648,10 @@ const NEGATIVE_CAP: usize = 1024;
 /// outlive the instant.
 struct ObjectCache<K, V> {
     map: HashMap<K, V>,
+    /// Last positive lookup, retained as the exact key and value. Render
+    /// encoders commonly repeat one pipeline for long runs; equality against
+    /// that key avoids hashing the same composite state on every draw.
+    front: Option<(K, V)>,
     negative: HashMap<K, DrawError>,
     /// FIFO order for `negative`, bounded by [`NEGATIVE_CAP`]. Negative entries
     /// are only added on create failures that a second identical attempt would
@@ -332,26 +675,57 @@ impl<K: Clone + Eq + std::hash::Hash, V> ObjectCache<K, V> {
     fn with_negative_cap(negative_cap: usize) -> Self {
         Self {
             map: HashMap::new(),
+            front: None,
             negative: HashMap::new(),
             negative_order: VecDeque::new(),
             negative_cap,
         }
     }
 
-    fn get(&self, k: &K) -> Option<&V> {
-        self.map.get(k)
+    fn get(&mut self, k: &K) -> Option<V>
+    where
+        V: Copy,
+    {
+        self.get_routed(k).map(|(value, _)| value)
+    }
+
+    /// Positive lookup and whether the one-entry front index answered it.
+    fn get_routed(&mut self, k: &K) -> Option<(V, bool)>
+    where
+        V: Copy,
+    {
+        if let Some((front_key, value)) = &self.front {
+            if front_key == k {
+                return Some((*value, true));
+            }
+        }
+        let value = *self.map.get(k)?;
+        self.front = Some((k.clone(), value));
+        Some((value, false))
     }
 
     fn get_negative(&self, k: &K) -> Option<DrawError> {
+        // The healthy hot path has never cached a refusal. Avoid hashing the
+        // full object key merely to ask an empty table; render pipeline keys in
+        // particular carry attribute, attachment and descriptor arrays, and a
+        // positive hit immediately hashes the same key again below.
+        if self.negative.is_empty() {
+            return None;
+        }
         self.negative.get(k).cloned()
     }
 
     /// Insert. Returns the value a *replace* displaced, so the caller can
     /// destroy the Vulkan object it owned; a fresh key returns `None`. Nothing
     /// is ever displaced for capacity.
-    fn insert(&mut self, k: K, v: V) -> Option<V> {
+    fn insert(&mut self, k: K, v: V) -> Option<V>
+    where
+        V: Copy,
+    {
         self.negative.remove(&k);
-        self.map.insert(k, v)
+        let old = self.map.insert(k.clone(), v);
+        self.front = Some((k, v));
+        old
     }
 
     /// Remember a create failure so the next identical ask replays it without
@@ -410,12 +784,14 @@ impl<K: Clone + Eq + std::hash::Hash, V> ObjectCache<K, V> {
     }
 
     fn clear(&mut self) {
+        self.front = None;
         self.map.clear();
         self.negative.clear();
         self.negative_order.clear();
     }
 
     fn take_all(&mut self) -> Vec<V> {
+        self.front = None;
         self.negative.clear();
         self.negative_order.clear();
         self.map.drain().map(|(_, v)| v).collect()
@@ -506,6 +882,10 @@ pub(crate) struct ObjectCaches {
     layouts: ObjectCache<LayoutKey, (vk::DescriptorSetLayout, vk::PipelineLayout)>,
     passes: ObjectCache<PassKey, vk::RenderPass>,
     pipelines: ObjectCache<PipelineKey, vk::Pipeline>,
+    /// Exact last Vulkan variant for each retained guest pipeline object.
+    /// Values are weakly tied to the runtime object's lifetime; the content
+    /// cache remains the authority and owns every Vulkan handle.
+    pipeline_objects: ObjectVariantIndex<PipelineKey, vk::Pipeline>,
     samplers: ObjectCache<SamplerStateKey, vk::Sampler>,
     /// Lc: compute pipelines (content digest + entry + layout).
     compute_pipelines: ObjectCache<ComputePipelineKey, vk::Pipeline>,
@@ -515,6 +895,464 @@ pub(crate) struct ObjectCaches {
     shader_digests: ShaderDigestIndex,
 }
 
+struct ObjectVariantIndex<K, V> {
+    map: HashMap<
+        std::num::NonZeroU64,
+        (
+            std::sync::Weak<super::types::PipelineObjectLife>,
+            K,
+            V,
+        ),
+    >,
+}
+
+impl<K, V> Default for ObjectVariantIndex<K, V> {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+        }
+    }
+}
+
+impl<K: Clone + Eq, V: Copy> ObjectVariantIndex<K, V> {
+    /// The variant this object last resolved to, if the object is still alive
+    /// and still asks for the same one.
+    ///
+    /// One probe, and `strong_count` rather than `upgrade`: this answers 96 % of
+    /// every draw's pipeline lookups on a driven Maps boot, so the second
+    /// `HashMap::get` and the `Arc` that `upgrade` creates only to drop —
+    /// two more atomics on the hottest path in the engine — were both paid per
+    /// draw for nothing. A `Weak` reads `strong_count() == 0` exactly when its
+    /// value has been dropped, which is the same question `upgrade().is_none()`
+    /// asked.
+    fn get(
+        &mut self,
+        identity: &super::types::PipelineObjectIdentity,
+        key: &K,
+    ) -> Option<V> {
+        let id = identity.id();
+        let (life, held_key, pipeline) = self.map.get(&id)?;
+        if life.strong_count() == 0 {
+            self.map.remove(&id);
+            return None;
+        }
+        (held_key == key).then_some(*pipeline)
+    }
+
+    fn remember(
+        &mut self,
+        identity: &super::types::PipelineObjectIdentity,
+        key: &K,
+        value: V,
+    ) {
+        let id = identity.id();
+        if !self.map.contains_key(&id) {
+            // Object construction is rare. Reap identities whose runtime
+            // object has gone before admitting the new one, so the index
+            // follows object lifetime without a capacity or eviction policy.
+            self.map.retain(|_, (life, _, _)| life.strong_count() != 0);
+        }
+        self.map
+            .insert(id, (identity.downgrade(), key.clone(), value));
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+    }
+}
+
+/// The layout every colour attachment of every render pass this device builds is
+/// left in when the pass ends.
+///
+/// # This is the one spelling, and the registry derives from it
+///
+/// [`super::pools::ResourcePools::registry_mark_ready_at`] records the layout a
+/// finished pass left its target in, and it must name the same layout this
+/// `finalLayout` does or every subsequent barrier is issued with the wrong
+/// `oldLayout` — which is undefined behaviour, not a validation error, because
+/// nothing in Vulkan re-checks it. It reads this constant rather than repeating
+/// the name.
+///
+/// # Why it is not `TRANSFER_SRC_OPTIMAL`
+///
+/// It used to be, so that a present blit or a readback copy could read the
+/// target without transitioning it. The trade was badly priced, and the
+/// mispricing is structural rather than workload-specific: on a driven
+/// macos-13 sustained-animation boot the target was read ~1 200 times a second
+/// and drawn into ~24 000 times a second, and **every one of those draws paid a
+/// barrier back to `COLOR_ATTACHMENT_OPTIMAL` to undo an exit that only 5 % of
+/// them would ever have used.** It is charged as
+/// `passmerge_outside_target_layout` and took 82 % of draws on macos-13, 37 % on
+/// macos-11 and 29 % on macos-12.
+///
+/// On a discrete GPU that round trip is a barrier and probably little else. On a
+/// GPU with framebuffer compression — every Intel iGPU (CCS), every AMD part
+/// (DCC), every tiler — a transition out of `COLOR_ATTACHMENT_OPTIMAL` and back
+/// is a decompress and recompress of the whole attachment, per draw.
+///
+/// Nothing depended on the old exit. Every consumer that reads a colour target
+/// — the present blit, the readback copy, the writeback copy, the copy-on-sample
+/// snapshot, and both seed copies — already issues its own barrier into
+/// `TRANSFER_SRC_OPTIMAL` first, unconditionally, because the barrier is what
+/// carries the *dependency* and a matching layout would not have removed the
+/// need for it. So those ~1 200 reads a second gain a real transition each and
+/// the ~24 000 draws lose one, which is the whole change.
+///
+/// # And it is `GENERAL`, because a colour target here is also a texture
+///
+/// The layout above is where a pass *leaves* the attachment. This one is where
+/// the attachment **lives**, and it is `GENERAL` for the reason Metal has no
+/// layouts at all: a `MTLTexture` a render encoder writes is the same object a
+/// later fragment shader samples, and nothing in that API marks the crossing. In
+/// Vulkan the crossing is an image layout, and every layout that is optimal for
+/// one of the two uses is illegal for the other — so a device that picks
+/// `COLOR_ATTACHMENT_OPTIMAL` has to transition on every sample, and a
+/// transition is exactly what a render pass instance may not contain. That is
+/// `passmerge_outside_resident_layout`, 25 344 of 176 914 pass begins on a driven
+/// macos-13 Maps boot, each closing a pass worth ~100 µs of GPU.
+///
+/// `GENERAL` is legal for both, so the crossing disappears and the resident is
+/// where the next user wants it whichever user that is. What it gives up is
+/// framebuffer compression, which on this host is real hardware —
+/// Intel Arrow Lake CCS.
+///
+/// **Measured twice, and the second chain refuted the first.** Both are
+/// interleaved driven macos-13 Maps boots of one binary with the layout moved and
+/// nothing else, scored by `scripts/boot-score` on `sum us/draw`, every boot at
+/// `throttle_ms=0`:
+///
+/// ```text
+///                    chain C (/tmp/wb-outC0..C5)   chain D (/tmp/wb-outD0..D5)
+/// COLOR_ATTACHMENT   22.95, 22.73, 25.50          17.44, 19.07, 18.05
+/// GENERAL            21.43, 22.33, 21.93          20.86, 20.38
+/// ```
+///
+/// Chain C alone reads as a disjoint −7.7 %. Chain D reads the *other way* by a
+/// similar margin, and pooled the two arms overlap completely — 21.39 mean for
+/// `GENERAL` against 20.96 for `COLOR_ATTACHMENT`. (Chain D also produced one boot
+/// at `sum` 52.04 with `d/frame` 225, a different workload regime, excluded from
+/// both means.)
+///
+/// So **this layout is perf-neutral as far as this host can measure**, and the
+/// three-boot disjointness in chain C was chain position, not the arm. It is worth
+/// stating why the earlier reading was believed: three position-matched pairs
+/// agreeing one by one looks like a controlled result and is not one, because the
+/// pairs share their position in a chain whose spread is larger than the effect.
+///
+/// The change stays, on **correctness** rather than on speed: one resting layout
+/// is what lets every spelling below be one function instead of six, and it is
+/// what makes a feedback colour slot legal (see [`PassKey::color_layout`]).
+/// Do not re-quote the −7.7 %.
+///
+/// # It is a function, and [`crate::env::COLOR_GENERAL`] is the ablation
+///
+/// **Every** spelling of the layout has to move together — the pass's
+/// `finalLayout`, the `initialLayout` a `LOAD` pass names, the subpass
+/// reference, the registry's record of where the pass left the image, the layout
+/// a sampled descriptor declares, and the comparisons
+/// [`super::exec::pass_exit_needs_no_barrier`] and
+/// [`super::pools::ResidentAccess::covered_by_pass_entry`] make. A `const` plus a
+/// switch read beside it would be that second spelling, and two of them
+/// disagreeing is a barrier naming an `oldLayout` the image is not in, which is
+/// undefined behaviour and not an error. So there is one function and no
+/// constant, and `REIMS_VGPU_COLOR_GENERAL=off` moves all of them back at once —
+/// a narrowing, since it restores a transition rather than removing one.
+pub(crate) fn color0_pass_exit_layout() -> vk::ImageLayout {
+    if unified_color_layout() {
+        vk::ImageLayout::GENERAL
+    } else {
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+    }
+}
+
+/// Whether a colour target rests in one layout for its whole life. **Default
+/// on**; `REIMS_VGPU_COLOR_GENERAL=off` is the ablation arm.
+///
+/// Read once. This decides the content of cached `VkRenderPass` objects and of
+/// registry records that outlive them, so an answer that changed mid-boot would
+/// leave both built under two layouts in one cache.
+pub(crate) fn unified_color_layout() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            crate::env::read(crate::env::COLOR_GENERAL).0,
+            crate::env::Switch::Off
+        )
+    })
+}
+
+/// The two `VK_SUBPASS_EXTERNAL` dependencies every render pass this device
+/// builds must carry, covering **every** attachment class the pass has.
+///
+/// # Why this is unconditional, and what it cost to be conditional
+///
+/// Vulkan supplies an implicit external dependency for an attachment only *"if
+/// there is no subpass dependency from `VK_SUBPASS_EXTERNAL` to the first
+/// subpass that uses"* it — and the implicit one is per render pass, not per
+/// attachment. So the moment a pass declares one explicit external dependency
+/// for **any** reason, every attachment loses its implicit one.
+///
+/// This pass used to declare a pair only when it had a depth attachment, and
+/// that pair named the `EARLY`/`LATE_FRAGMENT_TESTS` stages and the
+/// depth-stencil accesses alone. The colour attachment silently lost the
+/// synchronization it had been getting for free, so on a depth pass:
+///
+/// - the incoming transition into `COLOR_ATTACHMENT_OPTIMAL` was not ordered
+///   against the `loadOp` clear that follows it, and
+/// - the outgoing transition into `TRANSFER_SRC_OPTIMAL` was not ordered
+///   against the subpass's own colour store, nor against the copy that reads
+///   the target afterwards.
+///
+/// All three were reported by the Khronos synchronization validation layer on a
+/// driven macos-11 boot, as `SYNC-HAZARD-WRITE-AFTER-WRITE` at
+/// `vkCmdBeginRenderPass` and `vkCmdEndRenderPass` and
+/// `SYNC-HAZARD-READ-AFTER-WRITE` at the `vkCmdCopyImage` /
+/// `vkCmdCopyImageToBuffer` that follows.
+///
+/// Building both dependencies here, always, from the pass's own composition is
+/// what makes the split unrepresentable: there is no longer an arm that adds a
+/// dependency for one attachment class without stating the others.
+///
+/// # The outgoing `dst` scope covers every way the attachment is read next
+///
+/// Every slot now exits at [`color0_pass_exit_layout`], so the nearest consumer
+/// is usually the next draw into the same target — which is why the attachment
+/// stages and accesses are in the destination scope, and why
+/// [`super::exec::pass_exit_needs_no_barrier`] may then drop that draw's own
+/// barrier entirely. `TRANSFER` and `FRAGMENT_SHADER` stay named because a
+/// readback, a present blit or a later sample can follow instead; each of those
+/// issues its own transition, and this is the scope that transition orders
+/// against.
+///
+/// # The incoming dependency is what makes the skip legal
+///
+/// `VK_SUBPASS_EXTERNAL` as `srcSubpass` scopes every command submitted before
+/// the render pass instance, in submission order. So the incoming dependency
+/// here — colour writes to attachment reads and writes — already orders the
+/// previous draw's store against this pass's `loadOp`, with no barrier from the
+/// draw. Weakening its source scope would silently make that skip unsound.
+fn external_dependencies(
+    has_depth: bool,
+    color_input: bool,
+    host_accessible_color0: bool,
+    // Taken as an argument rather than read here, so both arms are reachable
+    // from a test. The switch is read once, at the one call site that builds a
+    // pass; see [`pass_exit_scope_narrow`].
+    exit_scope_narrow: bool,
+) -> [vk::SubpassDependency; 2] {
+    // Colour is unconditional: every pass this device builds has slot 0.
+    let mut attach_stages = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT;
+    let mut attach_writes = vk::AccessFlags::COLOR_ATTACHMENT_WRITE;
+    let mut attach_reads = vk::AccessFlags::COLOR_ATTACHMENT_READ;
+    if has_depth {
+        attach_stages |= vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+            | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS;
+        attach_writes |= vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE;
+        attach_reads |= vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ;
+    }
+    // Framebuffer fetch reads attachment 0 through the fragment stage, so the
+    // incoming transition has to be visible to that read too. The intra-subpass
+    // ordering is the separate `BY_REGION` dependency; this is the entry.
+    //
+    // The shader stages are unconditional, and they are what
+    // [`super::pools::ResidentAccess::covered_by_pass_entry`] rests on. A draw
+    // inside this pass may sample a resident an *earlier* pass wrote, and with
+    // one resting layout there is no transition left for that draw to record —
+    // only a visibility request, which this entry then carries for every such
+    // draw at once instead of each of them closing the pass to state it.
+    // Weakening this to the attachment stages makes that skip a missing
+    // dependency, which is a stale frame and no error.
+    let (in_dst_stages, mut in_dst_access) = (
+        attach_stages | vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+        attach_writes | attach_reads | vk::AccessFlags::SHADER_READ,
+    );
+    if color_input {
+        in_dst_access |= vk::AccessFlags::INPUT_ATTACHMENT_READ;
+    }
+    let mut source_stages = attach_stages | vk::PipelineStageFlags::TRANSFER;
+    let mut source_access = attach_writes | vk::AccessFlags::TRANSFER_WRITE;
+    if host_accessible_color0 {
+        source_stages |= vk::PipelineStageFlags::HOST;
+        source_access |= vk::AccessFlags::HOST_WRITE;
+    }
+    [
+        vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            // Whatever last wrote these images: a previous pass's colour store,
+            // a depth store, or the transfer that seeded a LOAD attachment.
+            .src_stage_mask(source_stages)
+            .src_access_mask(source_access)
+            .dst_stage_mask(in_dst_stages)
+            .dst_access_mask(in_dst_access),
+        {
+            // Narrowing this to the attachment stages alone is the probe: see
+            // [`pass_exit_scope_narrow`] for what it is asking and what it must
+            // not break.
+            let (dst_stages, dst_access) = if exit_scope_narrow {
+                (attach_stages, attach_writes | attach_reads)
+            } else {
+                (
+                    vk::PipelineStageFlags::TRANSFER
+                        | vk::PipelineStageFlags::FRAGMENT_SHADER
+                        | attach_stages,
+                    vk::AccessFlags::TRANSFER_READ
+                        | vk::AccessFlags::SHADER_READ
+                        | attach_writes
+                        | attach_reads,
+                )
+            };
+            vk::SubpassDependency::default()
+                .src_subpass(0)
+                .dst_subpass(vk::SUBPASS_EXTERNAL)
+                .src_stage_mask(attach_stages)
+                .src_access_mask(attach_writes)
+                .dst_stage_mask(dst_stages)
+                .dst_access_mask(dst_access)
+        },
+    ]
+}
+
+/// The colour write a feedback draw's own sampled read must be ordered after.
+pub(crate) const COLOR_FEEDBACK_SRC: (vk::PipelineStageFlags, vk::AccessFlags) = (
+    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+    vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+);
+
+/// The sampled read a feedback draw performs of the attachment it is writing.
+///
+/// `FRAGMENT_SHADER` alone, and that is a rule rather than a choice. A subpass
+/// self-dependency whose `srcStageMask` contains a framebuffer-space stage may
+/// name only framebuffer-space stages in its `dstStageMask`
+/// (`VUID-VkSubpassDependency-srcSubpass-06809`), and `VERTEX_SHADER` is not one.
+/// It was never right on its own terms either: a feedback loop is a fragment
+/// reading the pixel it is about to write, and `BY_REGION` below is that
+/// same-pixel claim. A vertex stage reading the attachment is not a feedback loop
+/// and could not be ordered by this dependency whatever it named.
+pub(crate) const COLOR_FEEDBACK_DST: (vk::PipelineStageFlags, vk::AccessFlags) = (
+    vk::PipelineStageFlags::FRAGMENT_SHADER,
+    vk::AccessFlags::SHADER_READ,
+);
+
+/// The subpass self-dependency that orders a feedback draw's sampled read after
+/// the colour writes of the draws before it in the same pass instance.
+///
+/// **Declared on every pass this device builds, whether or not any draw in it
+/// feeds back.** A self-dependency costs nothing until a
+/// `vkCmdPipelineBarrier` inside the pass invokes it — but its *presence* changes
+/// `dependencyCount`, and Vulkan render-pass compatibility spares initial/final
+/// layouts, attachment-reference layouts and load/store ops while sparing nothing
+/// about dependencies. So a pass built with this dependency and one built without
+/// it are **incompatible**, and a `VkFramebuffer` created against either cannot be
+/// used with the other. Declaring it conditionally is what produced
+/// `VUID-VkRenderPassBeginInfo-renderPass-00904` (`dependencyCount is
+/// incompatible`) on a driven Maps boot, on both layout arms.
+///
+/// The general rule, which is the one to keep: **a render pass may only vary in
+/// ways [`PassKey::framebuffer_compatibility`] preserves.** Anything that key
+/// erases must not reach the `VkRenderPassCreateInfo`.
+///
+/// `dependency_flags` derives the extension bit from the attachment layout via
+/// [`super::feedback_transition_dependency`], so the arm that has no feedback
+/// layout cannot ask for the extension's flag.
+fn color_feedback_self_dependency(color0_layout: vk::ImageLayout) -> vk::SubpassDependency {
+    vk::SubpassDependency::default()
+        .src_subpass(0)
+        .dst_subpass(0)
+        .src_stage_mask(COLOR_FEEDBACK_SRC.0)
+        .src_access_mask(COLOR_FEEDBACK_SRC.1)
+        .dst_stage_mask(COLOR_FEEDBACK_DST.0)
+        .dst_access_mask(COLOR_FEEDBACK_DST.1)
+        .dependency_flags(
+            vk::DependencyFlags::BY_REGION | super::feedback_transition_dependency(color0_layout),
+        )
+}
+
+/// Whether the outgoing external dependency names only the attachment stages.
+///
+/// **Probe, default off.** See [`crate::env::PASS_EXIT_NARROW`] for the whole
+/// argument; in one line, the shipping scope names `TRANSFER | FRAGMENT_SHADER`
+/// with `TRANSFER_READ | SHADER_READ`, which asks this driver for a render-cache
+/// flush and a texture-cache invalidate at **every** `vkCmdEndRenderPass`, and a
+/// pass boundary is the single largest cost in this device on the iGPU pathway.
+///
+/// Read once. This decides the content of a cached `VkRenderPass`, so a value
+/// that changed mid-boot would leave passes built under both answers in one
+/// cache and make the arm unreadable.
+fn pass_exit_scope_narrow() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::env::read(crate::env::PASS_EXIT_NARROW).0,
+            crate::env::Switch::On
+        )
+    })
+}
+
+/// The guest's sampler request, made legal for `vkCreateSampler`.
+///
+/// # Why this exists
+///
+/// Metal lets `coord::pixel` sit beside any filter, any address mode, any
+/// anisotropy and any compare function. Vulkan makes six of those combinations
+/// **invalid usage** — undefined behaviour inside the driver, not an error code
+/// this device gets to see. Only the LOD pair was honoured here, so a guest
+/// sampler with pixel coordinates and, say, `address::repeat` or a linear mip
+/// filter built an invalid `VkSampler` on every host and every rail.
+///
+/// # Why conforming is correct for five of the six, and not a silent degradation
+///
+/// Vulkan also forbids an unnormalized sampler being reached by any
+/// implicit-LOD, `Proj` or `Dref` instruction
+/// (`VUID-vkCmdDispatch-None-08610`). What is left can only sample at an
+/// explicit level 0 with no derivatives, so each of these five changes nothing
+/// the guest can observe:
+///
+/// - `-01072` `minFilter == magFilter` — no minification path exists, so
+///   `magFilter` is the filter that ever applies;
+/// - `-01073` `mipmapMode == NEAREST` and `-01074` `minLod == maxLod == 0` —
+///   only level 0 is reachable (the LOD pair is forced by the caller);
+/// - `-01076` `anisotropyEnable == VK_FALSE` — anisotropy is computed from
+///   derivatives such a sample cannot carry;
+/// - `-01075` `addressModeU`/`V` must clamp — Metal restricts `coord::pixel` to
+///   `clamp_to_edge`/`clamp_to_zero` itself, so any other mode is a descriptor
+///   Metal would not have honoured either.
+///
+/// `addressModeW` is left alone on purpose: `-01075` names U and V only, because
+/// an unnormalized sampler may only read a 2D view.
+///
+/// The sixth is `compareEnable`, and it is **not** in that class — dropping the
+/// compare returns the sampled value instead of the comparison, which is a
+/// different picture. That one is returned as a typed refusal.
+///
+/// A normalized sampler is returned unchanged; every branch here is gated on
+/// `unnormalized_coordinates`.
+fn vulkan_conformed_sampler(
+    key: &SamplerStateKey,
+) -> Result<SamplerStateKey, super::reason::DrawReason> {
+    use super::types::{SamplerAddressMode as A, SamplerCompareFunction, SamplerMipFilter};
+    if !key.unnormalized_coordinates {
+        return Ok(*key);
+    }
+    if key.compare_function != SamplerCompareFunction::Never {
+        return Err(super::reason::DrawReason::SamplerUnnormalizedCompare);
+    }
+    let clamped = |mode: A| match mode {
+        A::ClampToEdge | A::ClampToZero | A::ClampToBorderColor => mode,
+        _ => A::ClampToEdge,
+    };
+    Ok(SamplerStateKey {
+        min_filter: key.mag_filter,
+        mip_filter: SamplerMipFilter::Nearest,
+        address_mode_u: clamped(key.address_mode_u),
+        address_mode_v: clamped(key.address_mode_v),
+        max_anisotropy: 1,
+        lod_min: 0.0f32.to_bits(),
+        lod_max: 0.0f32.to_bits(),
+        ..*key
+    })
+}
+
 impl ObjectCaches {
     pub(crate) fn new() -> Self {
         Self {
@@ -522,6 +1360,7 @@ impl ObjectCaches {
             layouts: ObjectCache::new(),
             passes: ObjectCache::new(),
             pipelines: ObjectCache::new(),
+            pipeline_objects: ObjectVariantIndex::default(),
             samplers: ObjectCache::new(),
             compute_pipelines: ObjectCache::new(),
             shader_digests: ShaderDigestIndex::default(),
@@ -529,6 +1368,9 @@ impl ObjectCaches {
     }
 
     pub(crate) unsafe fn destroy_all(&mut self, device: &ash::Device) {
+        // This index borrows handles owned by `pipelines`; forget those echoes
+        // before destroying the authoritative objects.
+        self.pipeline_objects.clear();
         for p in self.pipelines.take_all() {
             device.destroy_pipeline(p, None);
         }
@@ -579,6 +1421,7 @@ impl ObjectCaches {
         self.shaders.clear();
         self.layouts.clear();
         self.passes.clear();
+        self.pipeline_objects.clear();
         self.pipelines.clear();
         self.samplers.clear();
         self.compute_pipelines.clear();
@@ -637,7 +1480,7 @@ impl ObjectCaches {
                 counters.shader_misses.fetch_add(1, Ordering::Relaxed);
                 return Err(err);
             }
-            if let Some(&module) = self.shaders.get(&key) {
+            if let Some(module) = self.shaders.get(&key) {
                 counters.shader_hits.fetch_add(1, Ordering::Relaxed);
                 counters.shader_digest_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok((key, module));
@@ -724,7 +1567,7 @@ impl ObjectCaches {
             counters.shader_misses.fetch_add(1, Ordering::Relaxed);
             return Err(err);
         }
-        if let Some(&m) = self.shaders.get(&key) {
+        if let Some(m) = self.shaders.get(&key) {
             counters.shader_hits.fetch_add(1, Ordering::Relaxed);
             return Ok((key, m));
         }
@@ -781,7 +1624,7 @@ impl ObjectCaches {
             self.shaders.insert_negative(key, err.clone());
             err
         })?;
-        counters.note_create();
+        counters.note_create(CreateSite::ShaderModule);
         if let Some(old) = self.shaders.insert(key, module) {
             pools.dispose(&ctx.device, DeferredHandle::ShaderModule(old));
         }
@@ -799,7 +1642,7 @@ impl ObjectCaches {
             counters.layout_misses.fetch_add(1, Ordering::Relaxed);
             return Err(err);
         }
-        if let Some(&(dsl, pl)) = self.layouts.get(key) {
+        if let Some((dsl, pl)) = self.layouts.get(key) {
             counters.layout_hits.fetch_add(1, Ordering::Relaxed);
             return Ok((dsl, pl));
         }
@@ -811,26 +1654,43 @@ impl ObjectCaches {
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(b.binding)
                     .descriptor_type(vk::DescriptorType::from_raw(b.ty as i32))
-                    .descriptor_count(1)
+                    .descriptor_count(b.count)
                     .stage_flags(vk::ShaderStageFlags::from_raw(b.stages))
             })
             .collect();
         let dsl = if bindings.is_empty() {
             vk::DescriptorSetLayout::null()
         } else {
+            let binding_flags: Vec<_> = key
+                .bindings
+                .iter()
+                .map(|binding| {
+                    if binding.count > 1 {
+                        vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                    } else {
+                        vk::DescriptorBindingFlags::empty()
+                    }
+                })
+                .collect();
+            let mut flags = vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
+                .binding_flags(&binding_flags);
+            let mut create_info = vk::DescriptorSetLayoutCreateInfo::default()
+                .bindings(&bindings)
+                .push_next(&mut flags);
+            if key.uses_push_descriptors(ctx.caps.push_descriptor) {
+                create_info = create_info
+                    .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR);
+            }
             let d = ctx
                 .device
-                .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
-                    None,
-                )
+                .create_descriptor_set_layout(&create_info, None)
                 .map_err(|e| {
                     let err =
                         DrawError::VkCall(VkCall::new(VkOp::CachesCreateDescriptorSetLayout, e));
                     self.layouts.insert_negative(key.clone(), err.clone());
                     err
                 })?;
-            counters.note_create();
+            counters.note_create(CreateSite::DescriptorSetLayout);
             d
         };
         let layouts: Vec<vk::DescriptorSetLayout> = if dsl == vk::DescriptorSetLayout::null() {
@@ -852,7 +1712,7 @@ impl ObjectCaches {
                 self.layouts.insert_negative(key.clone(), err.clone());
                 err
             })?;
-        counters.note_create();
+        counters.note_create(CreateSite::PipelineLayout);
         if let Some((old_dsl, old_pl)) = self.layouts.insert(key.clone(), (dsl, pl)) {
             pools.dispose(&ctx.device, DeferredHandle::PipelineLayout(old_pl));
             if old_dsl != vk::DescriptorSetLayout::null() {
@@ -873,45 +1733,47 @@ impl ObjectCaches {
             counters.pass_misses.fetch_add(1, Ordering::Relaxed);
             return Err(err);
         }
-        if let Some(&rp) = self.passes.get(&key) {
+        if let Some(rp) = self.passes.get(&key) {
             counters.pass_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(rp);
         }
         counters.pass_misses.fetch_add(1, Ordering::Relaxed);
         let target_format = key.color0_format;
+        // A `LOAD` pass names the layout the *previous* pass left the attachment
+        // in, so it reads the exit constant rather than respelling the layout.
+        // These two agreeing is what lets `exec::pass_exit_needs_no_barrier`
+        // drop the transition between consecutive draws into one target; a
+        // second spelling here would make that skip a missing transition the
+        // first time somebody changed one of them.
+        let color0_final = key.color_final_layout(0);
         let (load_op, initial) = if key.load_seed {
-            (
-                vk::AttachmentLoadOp::LOAD,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            )
+            (vk::AttachmentLoadOp::LOAD, color0_final)
         } else {
             (vk::AttachmentLoadOp::CLEAR, vk::ImageLayout::UNDEFINED)
         };
-        // Slot 0 (primary): final layout TRANSFER_SRC_OPTIMAL for readback /
-        // present. Secondary attachments (slot 1..) are consumed by a *later*
-        // draw as sampled images, but they resolve to COLOR_ATTACHMENT_OPTIMAL —
-        // NOT SHADER_READ_ONLY. The consumer's resident-sample barrier is
-        // skipped when the tracked layout is already SHADER_READ_ONLY, which
-        // would drop the producer(color-write)→consumer(shader-read) dependency;
-        // leaving the mask at COLOR_ATTACHMENT_OPTIMAL forces that barrier to
-        // fire with a color-write source scope. The registry tracks this layout.
+        // Slot 0 (primary) and the secondary attachments (slot 1..) now exit the
+        // same way, at [`color0_pass_exit_layout`], and for the same reason: a
+        // consumer's barrier is what establishes the dependency, so leaving the
+        // mask at COLOR_ATTACHMENT_OPTIMAL forces that barrier to fire with a
+        // colour-write source scope rather than being skipped as a no-op. The
+        // registry tracks this layout.
         let mut attachments = vec![vk::AttachmentDescription::default()
             .format(target_format)
-            .samples(vk::SampleCountFlags::TYPE_1)
+            .samples(vk_sample_count(key.sample_count))
             .load_op(load_op)
+            // Vulkan render-pass splits are an implementation detail inside one
+            // guest encoder. Preserve the scratch source across such a split;
+            // the guest's resolve-only store action still exposes only the
+            // single-sample destination.
             .store_op(vk::AttachmentStoreOp::STORE)
             .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
             .initial_layout(initial)
-            .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)];
+            .final_layout(color0_final)];
         // Framebuffer fetch: when attachment 0 is also a subpass input, BOTH
         // references must use GENERAL (same-attachment color+input requires it);
         // the pass still transitions initial→GENERAL→final automatically.
-        let color0_layout = if key.color_input {
-            vk::ImageLayout::GENERAL
-        } else {
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
-        };
+        let color0_layout = key.color_layout(0);
         let mut color_ref = vec![vk::AttachmentReference::default()
             .attachment(0)
             .layout(color0_layout)];
@@ -919,11 +1781,10 @@ impl ObjectCaches {
             .iter()
             .enumerate()
         {
+            let attachment_index = i + 1;
+            let final_layout = key.color_final_layout(attachment_index);
             let (sload, sinitial) = if sec.load {
-                (
-                    vk::AttachmentLoadOp::LOAD,
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                )
+                (vk::AttachmentLoadOp::LOAD, final_layout)
             } else {
                 (vk::AttachmentLoadOp::CLEAR, vk::ImageLayout::UNDEFINED)
             };
@@ -936,13 +1797,38 @@ impl ObjectCaches {
                     .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
                     .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
                     .initial_layout(sinitial)
-                    .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+                    .final_layout(final_layout),
             );
             color_ref.push(
                 vk::AttachmentReference::default()
                     .attachment(1 + i as u32)
-                    .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+                    .layout(key.color_layout(attachment_index)),
             );
+        }
+        let mut resolve_ref = Vec::new();
+        if key.multisample_resolve {
+            let resolve_index = attachments.len() as u32;
+            attachments.push(
+                vk::AttachmentDescription::default()
+                    .format(target_format)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .initial_layout(color0_layout)
+                    .final_layout(color0_final),
+            );
+            resolve_ref.push(
+                vk::AttachmentReference::default()
+                    .attachment(resolve_index)
+                    .layout(color0_layout),
+            );
+            resolve_ref.extend((1..color_ref.len()).map(|_| {
+                vk::AttachmentReference::default()
+                    .attachment(vk::ATTACHMENT_UNUSED)
+                    .layout(vk::ImageLayout::UNDEFINED)
+            }));
         }
         // Depth attachment is appended LAST (after color + secondaries), so its
         // index is the current attachment count and color slot 0 is untouched.
@@ -975,7 +1861,7 @@ impl ObjectCaches {
             attachments.push(
                 vk::AttachmentDescription::default()
                     .format(dformat)
-                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .samples(vk_sample_count(key.sample_count))
                     .load_op(dload)
                     .store_op(vk::AttachmentStoreOp::STORE)
                     .stencil_load_op(sload)
@@ -989,10 +1875,13 @@ impl ObjectCaches {
         });
         let input_ref = [vk::AttachmentReference::default()
             .attachment(0)
-            .layout(vk::ImageLayout::GENERAL)];
+            .layout(key.color_layout(0))];
         let mut subpass_desc = vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(&color_ref);
+        if !resolve_ref.is_empty() {
+            subpass_desc = subpass_desc.resolve_attachments(&resolve_ref);
+        }
         if key.color_input {
             subpass_desc = subpass_desc.input_attachments(&input_ref);
         }
@@ -1000,40 +1889,6 @@ impl ObjectCaches {
             subpass_desc = subpass_desc.depth_stencil_attachment(depth_ref);
         }
         let subpass = [subpass_desc];
-        // Explicit subpass dependencies only for the depth pass — the color-only
-        // pass keeps relying on the implicit dependencies (byte-identical). The
-        // implicit external dependency synchronizes only COLOR_ATTACHMENT_OUTPUT,
-        // NOT the EARLY/LATE_FRAGMENT_TESTS stages a depth attachment's
-        // load-clear + test + store use, so the depth layout transition and the
-        // clear can race without these.
-        let depth_deps = [
-            vk::SubpassDependency::default()
-                .src_subpass(vk::SUBPASS_EXTERNAL)
-                .dst_subpass(0)
-                .src_stage_mask(
-                    vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
-                        | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
-                )
-                .dst_stage_mask(
-                    vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
-                        | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
-                )
-                .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                .dst_access_mask(
-                    vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
-                        | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                ),
-            vk::SubpassDependency::default()
-                .src_subpass(0)
-                .dst_subpass(vk::SUBPASS_EXTERNAL)
-                .src_stage_mask(vk::PipelineStageFlags::LATE_FRAGMENT_TESTS)
-                .dst_stage_mask(vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
-                .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                .dst_access_mask(
-                    vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
-                        | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                ),
-        ];
         // Framebuffer-fetch feedback loop: the same-pixel color-write →
         // input-read ordering within the one subpass. BY_REGION keeps it
         // framebuffer-local (the form MoltenVK lowers to tile-memory fetch).
@@ -1045,25 +1900,27 @@ impl ObjectCaches {
             .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
             .dst_access_mask(vk::AccessFlags::INPUT_ATTACHMENT_READ)
             .dependency_flags(vk::DependencyFlags::BY_REGION);
-        let mut deps: Vec<vk::SubpassDependency> = Vec::new();
-        if key.depth.is_some() {
-            deps.extend_from_slice(&depth_deps);
-        }
+        let mut deps: Vec<vk::SubpassDependency> = external_dependencies(
+            key.depth.is_some(),
+            key.color_input,
+            key.host_accessible_color0,
+            pass_exit_scope_narrow(),
+        )
+        .to_vec();
         if key.color_input {
             deps.push(fetch_dep);
         }
-        let mut rp_info = vk::RenderPassCreateInfo::default()
+        deps.push(color_feedback_self_dependency(key.color_layout(0)));
+        let rp_info = vk::RenderPassCreateInfo::default()
             .attachments(&attachments)
-            .subpasses(&subpass);
-        if !deps.is_empty() {
-            rp_info = rp_info.dependencies(&deps);
-        }
+            .subpasses(&subpass)
+            .dependencies(&deps);
         let rp = ctx.device.create_render_pass(&rp_info, None).map_err(|e| {
             let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateRenderPass, e));
             self.passes.insert_negative(key, err.clone());
             err
         })?;
-        counters.note_create();
+        counters.note_create(CreateSite::RenderPass);
         if let Some(old) = self.passes.insert(key, rp) {
             pools.dispose(&ctx.device, DeferredHandle::RenderPass(old));
         }
@@ -1081,20 +1938,109 @@ impl ObjectCaches {
             counters.sampler_misses.fetch_add(1, Ordering::Relaxed);
             return Err(err);
         }
-        if let Some(&s) = self.samplers.get(key) {
+        if let Some(s) = self.samplers.get(key) {
             counters.sampler_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(s);
         }
         counters.sampler_misses.fetch_add(1, Ordering::Relaxed);
-        let not_mipmapped = key.mip_filter == super::types::SamplerMipFilter::NotMipmapped;
-        let (min_lod, max_lod) = if key.unnormalized_coordinates || not_mipmapped {
+        // Everything below is built from the *conformed* key, never from `key`
+        // itself; `key` stays the guest's request so the cache and the negative
+        // cache still index what was asked for.
+        let conformed = match vulkan_conformed_sampler(key) {
+            Ok(k) => k,
+            Err(reason) => {
+                crate::observe::Emit::decline("vk_engine_sampler", &reason)
+                    .field("compare_function", format!("{:?}", key.compare_function))
+                    .fail();
+                let err = DrawError::Unsupported(reason);
+                self.samplers.insert_negative(*key, err.clone());
+                return Err(err);
+            }
+        };
+        // One line per distinct unnormalized sampler this boot creates — the
+        // cache is what bounds it, so a workload with three such samplers logs
+        // three lines however many million binds it does.
+        //
+        // # What this is measuring, and why it is not a decline
+        //
+        // `VUID-vkCmdDispatch-None-08610`/`-08611` forbid an unnormalized sampler
+        // being *used* by an implicit-LOD, `Proj`, `Dref`, `Bias` or `Offset`
+        // sample, and `-08611` is the one violation a driven macos-11 boot under
+        // the Khronos validation layer still reports after every other one here
+        // was fixed. That is a property of the SPIR-V instruction, so this device
+        // cannot repair it — but it can say which samplers are candidates.
+        //
+        // `metal2vulkan` already emulates pixel-coordinate sampling in-shader
+        // rather than emitting `OpImageSample`, on three arms — a per-tap
+        // fetch-and-lerp for linear, a bicubic one, and a plain fetch for
+        // integer/nearest/arrayed. **All three of its predicates require
+        // `min_filter == mag_filter`**, so a pixel-coordinate sampler with
+        // *mixed* filters matches none of them and falls through to a real
+        // `OpImageSample` against the unnormalized sampler. `min_mag_differed`
+        // is therefore the field to read: a boot that logs it has the shape that
+        // produces the VUID, and a boot that never does has ruled it out.
+        // Logged for *every* unnormalized sampler and not only the conformed
+        // ones, so a boot's line count is the population and the `conformed`
+        // field splits it. Reading only the conformed ones would miss exactly
+        // the samplers the translator handles correctly, which is the control.
+        //
+        // # The VUID is real and it is **not** what hangs this GPU
+        //
+        // Both halves are measured, and the second one is why this stayed a
+        // census rather than becoming a repair. A driven macos-11 boot logs
+        // `min_mag_differed=false` on every unnormalized sampler it creates, so
+        // the mixed-filter shape above is not how this workload reaches the
+        // VUID — a *dynamically* bound `MTLSamplerState` is, because
+        // `metal2vulkan` intercepts only samplers whose state it knows at
+        // translate time and a runtime-bound one is invisible to it.
+        //
+        // A probe then forced `unnormalized_coordinates` false here, which makes
+        // `-08611` unreachable by construction: Maps froze anyway, with the same
+        // two device recreates. So the violation is a passenger. Do not spend
+        // another boot treating it as the hang, and do not read a future
+        // `sampler_unnormalized` line as one — it says a sampler exists, not
+        // that a frame was lost.
+        //
+        // Repairing it properly still needs the offset folded into the
+        // coordinate, which is exact only for an unnormalized sampler and so
+        // needs the normalization known at translate time. That is a
+        // `metal2vulkan` input this device does not currently supply.
+        if key.unnormalized_coordinates {
+            crate::observe::off(format!(
+                "sampler_unnormalized min_mag_differed={} conformed={} \
+                 min={:?} mag={:?} mip={:?} address_u={:?} address_v={:?} aniso={}",
+                key.min_filter != key.mag_filter,
+                conformed != *key,
+                key.min_filter,
+                key.mag_filter,
+                key.mip_filter,
+                key.address_mode_u,
+                key.address_mode_v,
+                key.max_anisotropy,
+            ));
+        }
+        let not_mipmapped = conformed.mip_filter == super::types::SamplerMipFilter::NotMipmapped;
+        let (min_lod, max_lod) = if conformed.unnormalized_coordinates || not_mipmapped {
             (0.0, 0.0)
         } else {
-            (f32::from_bits(key.lod_min), f32::from_bits(key.lod_max))
+            (
+                f32::from_bits(conformed.lod_min),
+                f32::from_bits(conformed.lod_max),
+            )
         };
-        let address_uses_zero = [key.address_mode_u, key.address_mode_v, key.address_mode_w]
+        let unnorm = conformed.unnormalized_coordinates;
+        let mag_filter = conformed.mag_filter;
+        let min_filter = conformed.min_filter;
+        let mip_filter = conformed.mip_filter;
+        let address_mode_u = conformed.address_mode_u;
+        let address_mode_v = conformed.address_mode_v;
+        let max_anisotropy_req = conformed.max_anisotropy;
+        let compare_function = conformed.compare_function;
+        // `address_mode_w` is deliberately not clamped: `-01075` names U and V
+        // only, because an unnormalized sampler may only read a 2D view.
+        let address_uses_zero = [address_mode_u, address_mode_v, conformed.address_mode_w]
             .contains(&super::types::SamplerAddressMode::ClampToZero);
-        if key.max_anisotropy > 1 && !ctx.sampler_anisotropy {
+        if max_anisotropy_req > 1 && !ctx.sampler_anisotropy {
             let reason = super::reason::DrawReason::SamplerAnisotropyUnsupported;
             // Fail-visible here, at the check, and exactly once per sampler key:
             // the negative cache means a replay returns without reaching this
@@ -1103,7 +2049,7 @@ impl ObjectCaches {
             // precisely the class says must
             // never surface as a silently different sampler.
             crate::observe::Emit::decline("vk_engine_sampler", &reason)
-                .field("max_anisotropy", key.max_anisotropy)
+                .field("max_anisotropy", max_anisotropy_req)
                 .fail();
             // The negative cache stores the typed `DrawError`, so a replay
             // returns this exact decline — slug and all — not a re-rendered
@@ -1118,14 +2064,18 @@ impl ObjectCaches {
         // mode was bound with neither requested — the sampler was created with
         // something the device had not been asked for. Same shape as the
         // anisotropy check above: capability question, typed decline, cached.
-        let uses_mirror_clamp = [key.address_mode_u, key.address_mode_v, key.address_mode_w]
+        //
+        // Read against the conformed modes, not the requested ones: an
+        // unnormalized sampler's U and V are already clamped above, so declining
+        // there would refuse a mode this device is not going to bind.
+        let uses_mirror_clamp = [address_mode_u, address_mode_v, conformed.address_mode_w]
             .contains(&super::types::SamplerAddressMode::MirrorClampToEdge);
         if uses_mirror_clamp && !ctx.features.mirror_clamp_to_edge.is_available() {
             let reason = super::reason::DrawReason::SamplerMirrorClampToEdgeUnsupported;
             crate::observe::Emit::decline("vk_engine_sampler", &reason)
-                .field("address_u", format!("{:?}", key.address_mode_u))
-                .field("address_v", format!("{:?}", key.address_mode_v))
-                .field("address_w", format!("{:?}", key.address_mode_w))
+                .field("address_u", format!("{address_mode_u:?}"))
+                .field("address_v", format!("{address_mode_v:?}"))
+                .field("address_w", format!("{:?}", conformed.address_mode_w))
                 .fail();
             let err = DrawError::Unsupported(reason);
             self.samplers.insert_negative(*key, err.clone());
@@ -1134,31 +2084,29 @@ impl ObjectCaches {
         // Not floored here: every producer of this key either writes a literal
         // 1 (the reflected static sampler) or carries a decoded
         // `SamplerDescriptor`, which `decode_sampler_descriptor` already floors.
-        let max_anisotropy = (key.max_anisotropy as f32).min(ctx.max_sampler_anisotropy);
+        let max_anisotropy = (max_anisotropy_req as f32).min(ctx.max_sampler_anisotropy);
         let sampler = ctx
             .device
             .create_sampler(
                 &vk::SamplerCreateInfo::default()
-                    .mag_filter(key.mag_filter.vk())
-                    .min_filter(key.min_filter.vk())
-                    .mipmap_mode(key.mip_filter.vk())
-                    .address_mode_u(key.address_mode_u.vk())
-                    .address_mode_v(key.address_mode_v.vk())
-                    .address_mode_w(key.address_mode_w.vk())
+                    .mag_filter(mag_filter.vk())
+                    .min_filter(min_filter.vk())
+                    .mipmap_mode(mip_filter.vk())
+                    .address_mode_u(address_mode_u.vk())
+                    .address_mode_v(address_mode_v.vk())
+                    .address_mode_w(conformed.address_mode_w.vk())
                     .mip_lod_bias(0.0)
-                    .anisotropy_enable(key.max_anisotropy > 1)
+                    .anisotropy_enable(max_anisotropy_req > 1)
                     .max_anisotropy(max_anisotropy)
-                    .compare_enable(
-                        key.compare_function != super::types::SamplerCompareFunction::Never,
-                    )
-                    .compare_op(key.compare_function.vk())
+                    .compare_enable(compare_function != super::types::SamplerCompareFunction::Never)
+                    .compare_op(compare_function.vk())
                     .min_lod(min_lod)
                     .max_lod(max_lod)
                     .border_color(translate::sampler::vk_border_color_with_clamp_to_zero(
-                        key.border_color,
+                        conformed.border_color,
                         address_uses_zero,
                     ))
-                    .unnormalized_coordinates(key.unnormalized_coordinates),
+                    .unnormalized_coordinates(unnorm),
                 None,
             )
             .map_err(|e| {
@@ -1166,7 +2114,7 @@ impl ObjectCaches {
                 self.samplers.insert_negative(*key, err.clone());
                 err
             })?;
-        counters.note_create();
+        counters.note_create(CreateSite::Sampler);
         if let Some(old) = self.samplers.insert(*key, sampler) {
             pools.dispose(&ctx.device, DeferredHandle::Sampler(old));
         }
@@ -1181,6 +2129,7 @@ impl ObjectCaches {
         &mut self,
         ctx: &DeviceContext,
         key: &PipelineKey,
+        pipeline_object: Option<&super::types::PipelineObjectIdentity>,
         vert_module: vk::ShaderModule,
         // The post-relocation words `vert_module` was built from. Read only to
         // answer how wide this shader's stage-in reads are, and only on a host
@@ -1196,12 +2145,27 @@ impl ObjectCaches {
         counters: &EngineCounters,
         pools: &mut ResourcePools,
     ) -> Result<vk::Pipeline, DrawError> {
+        if let Some(identity) = pipeline_object {
+            if let Some(pipeline) = self.pipeline_objects.get(identity, key) {
+                counters.pipeline_hits.fetch_add(1, Ordering::Relaxed);
+                counters
+                    .pipeline_object_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(pipeline);
+            }
+        }
         if let Some(err) = self.pipelines.get_negative(key) {
             counters.pipeline_misses.fetch_add(1, Ordering::Relaxed);
             return Err(err);
         }
-        if let Some(&p) = self.pipelines.get(key) {
+        if let Some((p, front)) = self.pipelines.get_routed(key) {
             counters.pipeline_hits.fetch_add(1, Ordering::Relaxed);
+            if front {
+                counters.pipeline_front_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(identity) = pipeline_object {
+                self.pipeline_objects.remember(identity, key, p);
+            }
             return Ok(p);
         }
         counters.pipeline_misses.fetch_add(1, Ordering::Relaxed);
@@ -1436,26 +2400,14 @@ impl ObjectCaches {
             .cull_mode(translate::raster::vk_cull_mode(key.cull_mode))
             .front_face(translate::raster::vk_front_face(key.front_face_ccw))
             .line_width(1.0);
-        // Pinned rather than unknown, and every render target this backend
-        // allocates is single-sampled, so honouring a count would need the
-        // attachment path to carry one too.
-        //
         // `rasterSampleCount` is a property of `MTLRenderPipelineDescriptor`,
         // so it reaches this device inside the type-7 pipeline's own
-        // compact-TLV block, which is the *only* route to it: the render-pass
-        // attachment record on the wire carries a resolve ref and no count, and
-        // the texture objects are met through the kernel's object list, whose
-        // descriptor has no such field either. That tag is now read —
-        // `PIPELINE_TAG_RASTER_SAMPLE_COUNT` — and a count this line cannot
-        // meet is named as `pipeline_raster_sample_count_degraded` rather than
-        // defaulted in silence. So the demand for multisampled attachments is
-        // now measurable, which is what widening this would need first.
-        //
-        // A pass that states a sample count *without* an attachment carrying
-        // one — `defaultRasterSampleCount` — is refused rather than rasterized
-        // here, as `StreamDrawDrop::PassRasterSampleCountUnsupported`.
+        // compact-TLV block. The pass key carries that decoded count, and the
+        // render-pass attachment is created with the same value; unsupported
+        // count/attachment combinations are refused before either object is
+        // built.
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            .rasterization_samples(vk_sample_count(key.pass.0.sample_count));
         // One blend attachment state per color attachment; Vulkan requires the
         // count to match the render pass. Every slot uses its own decoded
         // blend, slot 0 from `key.blend` and slot n from
@@ -1491,7 +2443,7 @@ impl ObjectCaches {
             }
         };
         let mut blend_att = vec![attachment_blend(key.blend, key.color_write_mask[0])];
-        for slot in 0..key.pass.secondary_count as usize {
+        for slot in 0..key.pass.secondary_count() {
             blend_att.push(attachment_blend(
                 key.secondary_blend[slot],
                 key.color_write_mask[slot + 1],
@@ -1543,7 +2495,10 @@ impl ObjectCaches {
             .layout(pipeline_layout)
             .render_pass(render_pass)
             .subpass(0);
-        if key.pass.depth.is_some() {
+        if key.feedback_colors != 0 {
+            gpci = gpci.flags(vk::PipelineCreateFlags::COLOR_ATTACHMENT_FEEDBACK_LOOP_EXT);
+        }
+        if key.pass.has_depth() {
             gpci = gpci.depth_stencil_state(&depth_stencil);
         }
         // The third call that compiles a module this device assembled, and the
@@ -1575,12 +2530,15 @@ impl ObjectCaches {
             self.pipelines.insert_negative(key.clone(), err.clone());
             err
         })?[0];
-        counters.note_create();
+        counters.note_create(CreateSite::GraphicsPipeline);
         // A fresh pipeline compile grew the VkPipelineCache — persist it so
         // the next boot warm-starts (file write is off-thread, debounced).
         ctx.persist_pipeline_cache();
         if let Some(old) = self.pipelines.insert(key.clone(), pipe) {
             pools.dispose(&ctx.device, DeferredHandle::Pipeline(old));
+        }
+        if let Some(identity) = pipeline_object {
+            self.pipeline_objects.remember(identity, key, pipe);
         }
         Ok(pipe)
     }
@@ -1600,7 +2558,7 @@ impl ObjectCaches {
                 .fetch_add(1, Ordering::Relaxed);
             return Err(err);
         }
-        if let Some(&p) = self.compute_pipelines.get(key) {
+        if let Some(p) = self.compute_pipelines.get(key) {
             counters
                 .compute_pipeline_hits
                 .fetch_add(1, Ordering::Relaxed);
@@ -1630,7 +2588,8 @@ impl ObjectCaches {
             Ok(breadcrumb) => breadcrumb,
             Err(hit) => {
                 let err = self.note_quarantined("create_compute_pipelines", &hit);
-                self.compute_pipelines.insert_negative(key.clone(), err.clone());
+                self.compute_pipelines
+                    .insert_negative(key.clone(), err.clone());
                 return Err(err);
             }
         };
@@ -1644,7 +2603,7 @@ impl ObjectCaches {
                 .insert_negative(key.clone(), err.clone());
             err
         })?[0];
-        counters.note_create();
+        counters.note_create(CreateSite::ComputePipeline);
         // Same warm-start persistence as the graphics path.
         ctx.persist_pipeline_cache();
         if let Some(old) = self.compute_pipelines.insert(key.clone(), pipe) {
@@ -1657,6 +2616,325 @@ impl ObjectCaches {
 #[cfg(test)]
 mod object_cache_tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct CountingKey {
+        value: u32,
+        hashes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PartialEq for CountingKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.value == other.value
+        }
+    }
+
+    impl Eq for CountingKey {}
+
+    impl std::hash::Hash for CountingKey {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.hashes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.value.hash(state);
+        }
+    }
+
+    #[test]
+    fn an_empty_negative_cache_does_not_hash_the_object_key() {
+        let hashes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let key = CountingKey {
+            value: 7,
+            hashes: std::sync::Arc::clone(&hashes),
+        };
+        let mut cache: ObjectCache<CountingKey, u32> = ObjectCache::new();
+
+        assert_eq!(cache.get_negative(&key), None);
+        assert_eq!(hashes.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        cache.insert_negative(
+            CountingKey {
+                value: 9,
+                hashes: std::sync::Arc::clone(&hashes),
+            },
+            DrawError::VkCall(VkCall::new(
+                VkOp::CachesCreateShaderModule,
+                vk::Result::ERROR_UNKNOWN,
+            )),
+        );
+        hashes.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(cache.get_negative(&key), None);
+        assert_eq!(hashes.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn push_layout_selection_uses_the_device_limit_and_keeps_the_fallback() {
+        let caps = crate::backend::vulkan::caps::PushDescriptorCaps {
+            max_descriptors: 32,
+        };
+        let layout = |counts: &[u32]| LayoutKey {
+            bindings: counts
+                .iter()
+                .enumerate()
+                .map(|(binding, &count)| BindingSig {
+                    binding: binding as u32,
+                    ty: vk::DescriptorType::STORAGE_BUFFER.as_raw() as u32,
+                    stages: vk::ShaderStageFlags::COMPUTE.as_raw(),
+                    count,
+                })
+                .collect(),
+        };
+        assert!(layout(&[16, 16]).uses_push_descriptors(caps));
+        assert!(!layout(&[16, 17]).uses_push_descriptors(caps));
+        assert!(!layout(&[]).uses_push_descriptors(caps));
+    }
+
+    /// Pipeline and live-pass compatibility exclude load actions but retain
+    /// attachment formats and subpass shape.
+    #[test]
+    fn pass_compatibility_ignores_only_load_actions() {
+        let mut clear = PassKey::single(false, vk::Format::B8G8R8A8_UNORM);
+        clear.secondary_count = 1;
+        clear.secondary[0] = SecondaryAttachKey {
+            format: vk::Format::R16G16_SFLOAT,
+            load: false,
+        };
+        clear.depth = Some(DepthAttachKey {
+            load: false,
+            stencil: true,
+        });
+
+        let mut load = clear;
+        load.load_seed = true;
+        load.secondary[0].load = true;
+        load.depth.as_mut().unwrap().load = true;
+        assert_eq!(clear.compatibility(), load.compatibility());
+
+        let mut different_format = load;
+        different_format.secondary[0].format = vk::Format::R32_SFLOAT;
+        assert_ne!(clear.compatibility(), different_format.compatibility());
+
+        let mut different_subpass = load;
+        different_subpass.color_input = true;
+        assert_ne!(clear.compatibility(), different_subpass.compatibility());
+
+        let mut different_depth = load;
+        different_depth.depth.as_mut().unwrap().stencil = false;
+        assert_ne!(clear.compatibility(), different_depth.compatibility());
+    }
+
+    /// `first_difference` answers `None` on exactly the pairs that compare
+    /// equal, which is what makes `passcompat_*` a partition of
+    /// `passdiff_compat` rather than a second opinion about it.
+    ///
+    /// This is the property that matters, and it is not the same as "every
+    /// field has a variant": a field the destructure names but the body forgets
+    /// to compare would still let two unequal keys answer `None`, and the caller
+    /// would then charge the *next* echo field — reporting a framebuffer change
+    /// where an attachment shape moved. So the assertion is over mutations, one
+    /// per field, and it is made in both directions.
+    #[test]
+    fn every_compatibility_difference_is_named_and_equal_keys_name_none() {
+        let mut base = PassKey::single(false, vk::Format::B8G8R8A8_UNORM);
+        base.secondary_count = 1;
+        base.secondary[0] = SecondaryAttachKey {
+            format: vk::Format::R16G16_SFLOAT,
+            load: false,
+        };
+        base.depth = Some(DepthAttachKey {
+            load: false,
+            stencil: true,
+        });
+        base.sample_count = 1;
+
+        assert_eq!(
+            base.compatibility().first_difference(base.compatibility()),
+            None
+        );
+
+        // A load action is erased by `compatibility`, so it is not a difference
+        // — the one mutation below that must answer `None`.
+        /// One named mutation of a [`PassKey`] and the difference it must
+        /// produce. `None` for a mutation `compatibility` erases.
+        type Mutation = (&'static str, fn(&mut PassKey), Option<PassCompatField>);
+        let mutations: &[Mutation] = &[
+            ("load actions", |k| {
+                k.load_seed = true;
+                k.secondary[0].load = true;
+                k.depth.as_mut().unwrap().load = true;
+            }, None),
+            ("color0 format", |k| k.color0_format = vk::Format::R8G8B8A8_UNORM,
+             Some(PassCompatField::Color0Format)),
+            ("secondary count", |k| k.secondary_count = 2,
+             Some(PassCompatField::SecondaryCount)),
+            ("secondary format", |k| k.secondary[0].format = vk::Format::R32_SFLOAT,
+             Some(PassCompatField::SecondaryFormat)),
+            ("depth", |k| k.depth = None, Some(PassCompatField::Depth)),
+            ("host accessible", |k| k.host_accessible_color0 = true,
+             Some(PassCompatField::HostAccessibleColor0)),
+            ("color input", |k| k.color_input = true, Some(PassCompatField::ColorInput)),
+            // Feedback is a property of the draw, and it makes two passes
+            // incompatible only on the arm where it still moves a layout. On the
+            // shipping arm `compatibility` erases it, which is what stops a
+            // feedback draw closing the render pass an ordinary one opened.
+            ("feedback", |k| k.feedback_colors = 1,
+             if color_feedback_layout() == color0_pass_exit_layout() {
+                 None
+             } else {
+                 Some(PassCompatField::FeedbackColors)
+             }),
+            ("sample count", |k| k.sample_count = 4, Some(PassCompatField::SampleCount)),
+            ("resolve", |k| k.multisample_resolve = true,
+             Some(PassCompatField::MultisampleResolve)),
+        ];
+
+        for (name, mutate, expected) in mutations {
+            let mut moved = base;
+            mutate(&mut moved);
+            let (a, b) = (base.compatibility(), moved.compatibility());
+            assert_eq!(a.first_difference(b), *expected, "{name}");
+            assert_eq!(b.first_difference(a), *expected, "{name}, reversed");
+            // The partition itself: `None` iff equal, on every input above.
+            assert_eq!(
+                a.first_difference(b).is_none(),
+                a == b,
+                "{name}: a named difference and key equality must agree"
+            );
+        }
+    }
+
+    /// Framebuffers bind attachment views, not load actions, layouts, or
+    /// dependencies. A transport change on the same retained attachment must
+    /// therefore keep the framebuffer, while a changed input-attachment shape
+    /// must not.
+    #[test]
+    fn framebuffer_compatibility_ignores_transport_and_dependency_state() {
+        let plain = PassKey::single(false, vk::Format::B8G8R8A8_UNORM);
+        let mut transported = plain;
+        transported.load_seed = true;
+        transported.host_accessible_color0 = true;
+        transported.feedback_colors = 1;
+
+        assert_eq!(
+            plain.framebuffer_compatibility(),
+            transported.framebuffer_compatibility()
+        );
+        assert_ne!(plain.compatibility(), transported.compatibility());
+
+        let mut input = transported;
+        input.color_input = true;
+        assert_ne!(
+            plain.framebuffer_compatibility(),
+            input.framebuffer_compatibility()
+        );
+    }
+
+    #[test]
+    fn layout_bindings_coalesce_array_elements_and_refuse_conflicting_shapes() {
+        let sig = |count| BindingSig {
+            binding: 32,
+            ty: vk::DescriptorType::SAMPLED_IMAGE.as_raw() as u32,
+            stages: vk::ShaderStageFlags::COMPUTE.as_raw(),
+            count,
+        };
+        assert_eq!(
+            canonicalize_layout_bindings(vec![sig(8), sig(8)]),
+            Ok(vec![sig(8)])
+        );
+        assert!(matches!(
+            canonicalize_layout_bindings(vec![sig(8), sig(4)]),
+            Err(super::super::DrawError::Unsupported(
+                super::super::reason::DrawReason::DescriptorBindingConflict {
+                    binding: 32,
+                    first_count: 8,
+                    second_count: 4,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    fn unnormalized_key() -> SamplerStateKey {
+        use super::super::types::{
+            SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
+            SamplerMipFilter,
+        };
+        SamplerStateKey {
+            min_filter: SamplerFilter::Nearest,
+            mag_filter: SamplerFilter::Linear,
+            mip_filter: SamplerMipFilter::Linear,
+            address_mode_u: SamplerAddressMode::Repeat,
+            address_mode_v: SamplerAddressMode::MirrorRepeat,
+            address_mode_w: SamplerAddressMode::Repeat,
+            border_color: SamplerBorderColor::TransparentBlack,
+            compare_function: SamplerCompareFunction::Never,
+            lod_min: 1.0f32.to_bits(),
+            lod_max: 8.0f32.to_bits(),
+            max_anisotropy: 16,
+            unnormalized_coordinates: true,
+        }
+    }
+
+    /// Every constraint `vkCreateSampler` puts on `unnormalizedCoordinates`, on a
+    /// key that violates all of them at once. Without the conform this builds a
+    /// sampler whose behaviour is undefined rather than wrong, so there is no
+    /// error code and no log line to notice it by.
+    #[test]
+    fn an_unnormalized_sampler_is_conformed_on_every_constraint_vulkan_states() {
+        use super::super::types::{SamplerAddressMode, SamplerFilter, SamplerMipFilter};
+        let got = vulkan_conformed_sampler(&unnormalized_key()).expect("no compare function");
+        // -01072: minFilter == magFilter, and it is magFilter that survives.
+        assert_eq!(got.min_filter, SamplerFilter::Linear);
+        assert_eq!(got.mag_filter, SamplerFilter::Linear);
+        // -01073
+        assert_eq!(got.mip_filter, SamplerMipFilter::Nearest);
+        // -01074
+        assert_eq!(f32::from_bits(got.lod_min), 0.0);
+        assert_eq!(f32::from_bits(got.lod_max), 0.0);
+        // -01075, U and V only.
+        assert_eq!(got.address_mode_u, SamplerAddressMode::ClampToEdge);
+        assert_eq!(got.address_mode_v, SamplerAddressMode::ClampToEdge);
+        assert_eq!(got.address_mode_w, SamplerAddressMode::Repeat);
+        // -01076
+        assert_eq!(got.max_anisotropy, 1);
+        assert!(got.unnormalized_coordinates);
+    }
+
+    /// A clamping mode the guest chose deliberately is kept, so the conform
+    /// cannot be read as "unnormalized means clamp-to-edge".
+    #[test]
+    fn a_conformed_unnormalized_sampler_keeps_a_clamp_mode_that_was_already_legal() {
+        use super::super::types::SamplerAddressMode;
+        let mut key = unnormalized_key();
+        key.address_mode_u = SamplerAddressMode::ClampToZero;
+        key.address_mode_v = SamplerAddressMode::ClampToBorderColor;
+        let got = vulkan_conformed_sampler(&key).expect("no compare function");
+        assert_eq!(got.address_mode_u, SamplerAddressMode::ClampToZero);
+        assert_eq!(got.address_mode_v, SamplerAddressMode::ClampToBorderColor);
+    }
+
+    /// `-01077` is the one constraint that is not observationally neutral, so it
+    /// is a named refusal and not a repair.
+    #[test]
+    fn an_unnormalized_sampler_with_a_compare_function_is_refused_by_name() {
+        use super::super::types::SamplerCompareFunction;
+        use crate::observe::Decline as _;
+        let mut key = unnormalized_key();
+        key.compare_function = SamplerCompareFunction::LessEqual;
+        let reason = vulkan_conformed_sampler(&key).expect_err("compare is refused");
+        assert_eq!(reason.slug(), "sampler_unnormalized_compare");
+    }
+
+    /// The conform is gated on the unnormalized bit and touches nothing else — a
+    /// normalized sampler with mips, anisotropy, repeat addressing and a compare
+    /// function is what the great majority of guest binds are.
+    #[test]
+    fn a_normalized_sampler_passes_through_the_conform_untouched() {
+        use super::super::types::SamplerCompareFunction;
+        let mut key = unnormalized_key();
+        key.unnormalized_coordinates = false;
+        key.compare_function = SamplerCompareFunction::Less;
+        assert_eq!(vulkan_conformed_sampler(&key).expect("normalized"), key);
+    }
 
     #[test]
     fn vertex_format_widening_names_both_formats_and_attribute() {
@@ -1727,9 +3005,10 @@ mod object_cache_tests {
         }
         assert_eq!(
             c.get(&0),
-            Some(&0xC0FFEE),
+            Some(0xC0FFEE),
             "the hot first entry is still served after 4095 later ones"
         );
+        assert_eq!(c.get_routed(&0), Some((0xC0FFEE, true)));
         assert_eq!(c.map.len(), 4096, "every distinct key retained");
     }
 
@@ -1745,7 +3024,57 @@ mod object_cache_tests {
             Some(10),
             "the displaced handle comes back for disposal"
         );
-        assert_eq!(c.get(&1), Some(&20));
+        assert_eq!(c.get(&1), Some(20));
+    }
+
+    #[test]
+    fn clearing_the_cache_forgets_the_front_value_with_the_owned_object() {
+        let mut c: ObjectCache<u32, u32> = ObjectCache::new();
+        c.insert(1, 20);
+        assert_eq!(c.get_routed(&1), Some((20, true)));
+
+        c.clear();
+
+        assert_eq!(c.get_routed(&1), None);
+        assert!(c.front.is_none());
+    }
+
+    #[test]
+    fn retained_object_front_requires_the_same_identity_and_exact_variant() {
+        let mut index: ObjectVariantIndex<u32, u32> = ObjectVariantIndex::default();
+        let first = super::super::types::PipelineObjectIdentity::new();
+        let second = super::super::types::PipelineObjectIdentity::new();
+
+        index.remember(&first, &7, 70);
+        assert_eq!(index.get(&first, &7), Some(70));
+        assert_eq!(index.get(&first, &8), None, "a Vulkan-only variant differs");
+        assert_eq!(
+            index.get(&second, &7),
+            None,
+            "equal content under another guest object is not this object's front"
+        );
+
+        index.remember(&first, &8, 80);
+        assert_eq!(index.get(&first, &7), None, "one exact last variant");
+        assert_eq!(index.get(&first, &8), Some(80));
+    }
+
+    #[test]
+    fn retained_object_front_reaps_dead_identities_without_capacity_eviction() {
+        let mut index: ObjectVariantIndex<u32, u32> = ObjectVariantIndex::default();
+        let first = super::super::types::PipelineObjectIdentity::new();
+        index.remember(&first, &1, 10);
+        assert_eq!(index.map.len(), 1);
+        drop(first);
+
+        let second = super::super::types::PipelineObjectIdentity::new();
+        index.remember(&second, &2, 20);
+        assert_eq!(index.map.len(), 1, "the expired object's weak entry went");
+        assert_eq!(index.get(&second, &2), Some(20));
+
+        index.clear();
+        assert!(index.map.is_empty());
+        assert_eq!(index.get(&second, &2), None);
     }
 
     #[test]
@@ -1763,7 +3092,7 @@ mod object_cache_tests {
         assert!(c.get_negative(&7).is_some());
         c.insert(7, 42);
         assert!(c.get_negative(&7).is_none(), "promotion clears negative");
-        assert_eq!(c.get(&7), Some(&42));
+        assert_eq!(c.get(&7), Some(42));
     }
 
     #[test]
@@ -1866,7 +3195,7 @@ mod object_cache_tests {
 
         // The memory came back, so this time the create succeeds.
         c.insert(key, 0x5EED);
-        assert_eq!(c.get(&key), Some(&0x5EED));
+        assert_eq!(c.get(&key), Some(0x5EED));
     }
 
     /// The index is keyed on the *allocation*, not on the contents, and that is
@@ -1881,7 +3210,11 @@ mod object_cache_tests {
         let mut index = ShaderDigestIndex::default();
         let words = std::sync::Arc::new(vec![0x0723_0203u32, 0x0001_0000, 0x000d_000b]);
         let twin = std::sync::Arc::new((*words).clone());
-        let digest = Digest128 { a: 0xA1, b: 0xB2, len: 3 };
+        let digest = Digest128 {
+            a: 0xA1,
+            b: 0xB2,
+            len: 3,
+        };
 
         assert_eq!(index.get(&words), None, "nothing walked yet");
         index.insert(&words, digest);
@@ -1931,7 +3264,14 @@ mod object_cache_tests {
             .map(|i| std::sync::Arc::new(vec![i as u32]))
             .collect();
         for (i, words) in held.iter().enumerate() {
-            index.insert(words, Digest128 { a: i as u64, b: 0, len: 1 });
+            index.insert(
+                words,
+                Digest128 {
+                    a: i as u64,
+                    b: 0,
+                    len: 1,
+                },
+            );
         }
         assert_eq!(index.map.len(), SHADER_DIGEST_ENTRIES);
         assert!(index.get(&held[0]).is_some());
@@ -1945,5 +3285,382 @@ mod object_cache_tests {
             index.get(&held[0]).is_none(),
             "and the reset is total, so nothing survives to be answered stale"
         );
+    }
+
+    /// Every pass shape states the colour scope on **both** external
+    /// dependencies, because declaring one explicit external dependency for any
+    /// reason removes the implicit one from every attachment.
+    ///
+    /// This is the check the previous shape could not pass. It built the pair
+    /// only for a depth pass and named depth-stencil stages and accesses alone,
+    /// so on `(depth, _)` the colour attachment's transitions were ordered
+    /// against nothing — which the synchronization validation layer reported at
+    /// both `vkCmdBeginRenderPass` and `vkCmdEndRenderPass`. Asserting the
+    /// colour terms across all four shapes is what stops a future edit adding a
+    /// The narrow probe removes the transfer and sampler destinations and
+    /// changes nothing else — in particular it keeps the colour-attachment
+    /// destination, which is the one consumer that deliberately issues no
+    /// barrier of its own.
+    ///
+    /// `super::exec::pass_exit_needs_no_barrier` drops the next draw's barrier
+    /// when it renders into the same target, and the only thing that then orders
+    /// that draw's writes after this pass's is the outgoing dependency. So a
+    /// narrowing that took `COLOR_ATTACHMENT_OUTPUT` out of the destination
+    /// scope would be a write-after-write hazard on the most common draw in the
+    /// device, and it would be silent. The source scope must not move either:
+    /// what is being priced is the *visibility* request, not the ordering one.
+    ///
+    /// See [`crate::env::PASS_EXIT_NARROW`] for what the probe is asking and for
+    /// the validation-layer run it owes before it could ever be a default.
+    #[test]
+    fn the_narrow_pass_exit_keeps_the_consumer_that_issues_no_barrier() {
+        for has_depth in [false, true] {
+            for color_input in [false, true] {
+                let wide = external_dependencies(has_depth, color_input, false, false)[1];
+                let narrow = external_dependencies(has_depth, color_input, false, true)[1];
+                let shape = format!("depth={has_depth} color_input={color_input}");
+
+                assert_eq!(
+                    (narrow.src_stage_mask, narrow.src_access_mask),
+                    (wide.src_stage_mask, wide.src_access_mask),
+                    "{shape}: the probe prices visibility and must not weaken ordering"
+                );
+                assert!(
+                    narrow
+                        .dst_stage_mask
+                        .contains(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                        && narrow
+                            .dst_access_mask
+                            .contains(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+                    "{shape}: the next draw into this target issues no barrier of \
+                     its own, so its stage must survive the narrowing"
+                );
+                assert!(
+                    !narrow
+                        .dst_stage_mask
+                        .contains(vk::PipelineStageFlags::TRANSFER)
+                        && !narrow
+                            .dst_stage_mask
+                            .contains(vk::PipelineStageFlags::FRAGMENT_SHADER),
+                    "{shape}: the probe removes exactly the two destinations whose \
+                     consumers barrier for themselves"
+                );
+                assert!(
+                    wide.dst_stage_mask
+                        .contains(vk::PipelineStageFlags::TRANSFER)
+                        && wide
+                            .dst_stage_mask
+                            .contains(vk::PipelineStageFlags::FRAGMENT_SHADER),
+                    "{shape}: and the shipping arm is unchanged, or the probe is \
+                     measuring against itself"
+                );
+                if has_depth {
+                    assert!(
+                        narrow
+                            .dst_stage_mask
+                            .contains(vk::PipelineStageFlags::LATE_FRAGMENT_TESTS),
+                        "{shape}: depth is an attachment stage and stays"
+                    );
+                }
+            }
+        }
+    }
+
+    /// dependency for one attachment class and dropping the others again.
+    #[test]
+    fn both_external_dependencies_name_the_colour_scope_in_every_pass_shape() {
+        for has_depth in [false, true] {
+            for color_input in [false, true] {
+                for host_accessible in [false, true] {
+                    // The shipping scope. The probe arm has its own test.
+                    let [incoming, outgoing] =
+                        external_dependencies(has_depth, color_input, host_accessible, false);
+                    let shape = format!(
+                        "depth={has_depth} color_input={color_input} host={host_accessible}"
+                    );
+
+                    // Incoming: the transition into the attachment layout has to be
+                    // ordered against the loadOp that writes it.
+                    assert!(
+                        incoming
+                            .dst_stage_mask
+                            .contains(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT),
+                        "{shape}: the loadOp clear runs at COLOR_ATTACHMENT_OUTPUT"
+                    );
+                    assert!(
+                        incoming
+                            .dst_access_mask
+                            .contains(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+                        "{shape}: and it is a colour write"
+                    );
+
+                    // Outgoing: the final transition has to be ordered against the
+                    // subpass's own store, and the store made visible to the copy
+                    // that reads the target after the pass.
+                    assert!(
+                        outgoing
+                            .src_stage_mask
+                            .contains(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT),
+                        "{shape}: the store runs at COLOR_ATTACHMENT_OUTPUT"
+                    );
+                    assert!(
+                        outgoing
+                            .src_access_mask
+                            .contains(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+                        "{shape}: and it is a colour write"
+                    );
+                    assert!(
+                        outgoing
+                            .dst_stage_mask
+                            .contains(vk::PipelineStageFlags::TRANSFER)
+                            && outgoing
+                                .dst_access_mask
+                                .contains(vk::AccessFlags::TRANSFER_READ),
+                        "{shape}: a reader still barriers slot 0 into TRANSFER_SRC_OPTIMAL \
+                     for itself, and this is the scope its transition orders against"
+                    );
+
+                    // Depth is stated only where the pass has a depth attachment —
+                    // the fix is to add the missing class, not to name every class
+                    // on every pass.
+                    assert_eq!(
+                        incoming
+                            .dst_access_mask
+                            .contains(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE),
+                        has_depth,
+                        "{shape}: depth terms follow the depth attachment"
+                    );
+
+                    // Framebuffer fetch reads attachment 0 in the fragment stage, so
+                    // the entry transition must be visible to that read as well.
+                    assert_eq!(
+                        incoming
+                            .dst_access_mask
+                            .contains(vk::AccessFlags::INPUT_ATTACHMENT_READ),
+                        color_input,
+                        "{shape}: input-attachment terms follow the fetch"
+                    );
+                    assert_eq!(
+                        incoming
+                            .src_stage_mask
+                            .contains(vk::PipelineStageFlags::HOST)
+                            && incoming
+                                .src_access_mask
+                                .contains(vk::AccessFlags::HOST_WRITE),
+                        host_accessible,
+                        "{shape}: host writes source only a host-accessible attachment"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_host_accessible_primary_stays_general_between_every_pass_shape() {
+        let mut key = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
+        key.host_accessible_color0 = true;
+        for color_input in [false, true] {
+            for feedback in [false, true] {
+                key.color_input = color_input;
+                key.feedback_colors = u8::from(feedback);
+                assert_eq!(
+                    key.color_layout(0),
+                    if feedback {
+                        color_feedback_layout()
+                    } else {
+                        vk::ImageLayout::GENERAL
+                    }
+                );
+                assert_eq!(key.color_final_layout(0), vk::ImageLayout::GENERAL);
+            }
+        }
+        // Host accessibility is a property of slot 0 only, so a secondary is an
+        // ordinary colour slot and rests where every ordinary colour slot does.
+        assert_eq!(key.color_layout(1), color0_pass_exit_layout());
+    }
+
+    /// The pass key is the single source of truth for every place that names an
+    /// attachment layout, and a feedback slot names the one
+    /// [`color_feedback_layout`] answers at both ends of the pass.
+    ///
+    /// Asserted against that function rather than against a spelled layout, so it
+    /// states the relation on both arms: under the shipping layout every slot is
+    /// in the *same* layout feedback or not, and under
+    /// [`crate::env::COLOR_GENERAL`]`=off` the feedback slots separate because
+    /// `COLOR_ATTACHMENT_OPTIMAL` admits no feedback loop. The failure it guards
+    /// is a descriptor and a subpass reference naming one image differently,
+    /// which is undefined behaviour reported nowhere.
+    #[test]
+    fn feedback_attachment_layout_is_derived_consistently_from_the_mask() {
+        let mut key = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
+        key.color_input = true;
+        key.feedback_colors = (1 << 0) | (1 << 3);
+
+        for index in 0..=MAX_SECONDARY_ATTACH {
+            let feedback = index == 0 || index == 3;
+            assert_eq!(key.color_feedback(index), feedback);
+            let want = if feedback {
+                color_feedback_layout()
+            } else {
+                color0_pass_exit_layout()
+            };
+            assert_eq!(key.color_layout(index), want);
+            assert_eq!(key.color_final_layout(index), want);
+        }
+        assert!(!key.color_feedback(u8::BITS as usize));
+
+        // Whatever the arm, the layout a feedback slot lands in must be one a
+        // feedback loop is legal in. This is the check that would have caught the
+        // shipping defect: with the resting layout moved to GENERAL, the slot was
+        // still being placed in the extension layout while the image sat in
+        // GENERAL.
+        assert!(layout_admits_color_feedback(color_feedback_layout()));
+    }
+
+    /// One layout for a colour target means one for a sampled one too.
+    ///
+    /// The whole point of the repair: while the resting layout admits a feedback
+    /// loop, a slot the guest samples and a slot it does not are in the *same*
+    /// layout, so the render pass declares no transition for either and a
+    /// framebuffer built for one serves the other.
+    #[test]
+    fn a_sampled_colour_slot_rests_where_every_other_colour_slot_rests() {
+        if layout_admits_color_feedback(color0_pass_exit_layout()) {
+            assert_eq!(color_feedback_layout(), color0_pass_exit_layout());
+        } else {
+            // The ablation arm, where the contract forces the second layout back.
+            assert_eq!(
+                color_feedback_layout(),
+                vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+            );
+        }
+    }
+
+    /// A render pass may only vary in ways
+    /// [`PassKey::framebuffer_compatibility`] preserves, and dependencies are not
+    /// among the things Vulkan's compatibility rule spares.
+    ///
+    /// `feedback_colors` is erased by that key, so the feedback self-dependency
+    /// must be declared on every pass rather than only on feedback ones — a
+    /// conditional one made `dependencyCount` differ between two passes the key
+    /// called interchangeable, which is what the validation layer reported as
+    /// `VUID-VkRenderPassBeginInfo-renderPass-00904` on a driven Maps boot.
+    #[test]
+    fn the_dependency_count_does_not_move_with_anything_the_framebuffer_key_erases() {
+        let base = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
+        for feedback in [0u8, 1, (1 << 0) | (1 << 3)] {
+            for host_accessible in [false, true] {
+                let mut key = base;
+                key.feedback_colors = feedback;
+                key.host_accessible_color0 = host_accessible;
+                assert_eq!(
+                    key.framebuffer_compatibility(),
+                    base.framebuffer_compatibility(),
+                    "the framebuffer key must erase these"
+                );
+                // Same framebuffer key ⇒ the passes must agree on dependency
+                // count, because a framebuffer built against one is used with the
+                // other.
+                assert_eq!(
+                    pass_dependency_count(key),
+                    pass_dependency_count(base),
+                    "feedback={feedback} host_accessible={host_accessible}"
+                );
+            }
+        }
+    }
+
+    /// The dependency list a pass of this shape is built with, counted without a
+    /// device. Mirrors the `deps` construction in `get_or_create_render_pass`.
+    fn pass_dependency_count(key: PassKey) -> usize {
+        external_dependencies(
+            key.depth.is_some(),
+            key.color_input,
+            key.host_accessible_color0,
+            pass_exit_scope_narrow(),
+        )
+        .len()
+            + usize::from(key.color_input)
+            + 1
+    }
+
+    /// Erasing feedback from the pass key must not erase it from the device.
+    ///
+    /// `compatibility()` drops `feedback_colors` on the shipping arm so a feedback
+    /// draw can continue an ordinary draw's render pass. The create flag
+    /// `VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT` is what makes
+    /// that draw legal, it is fixed at pipeline creation, and it is therefore the
+    /// one thing that must **not** follow the field out of the pass key. This
+    /// asserts the split: same pass compatibility, different pipeline key.
+    ///
+    /// Without it, the pass-merge win silently turns every feedback draw into a
+    /// sampled read of an attachment it is writing with no feedback loop enabled.
+    #[test]
+    fn feedback_leaves_pass_compatibility_without_leaving_the_pipeline() {
+        let plain = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
+        let mut feeds = plain;
+        feeds.feedback_colors = 1;
+
+        if color_feedback_layout() == color0_pass_exit_layout() {
+            assert_eq!(
+                plain.compatibility(),
+                feeds.compatibility(),
+                "a feedback draw must be able to continue an ordinary draw's pass"
+            );
+        }
+        // Whatever the pass key did, the draw's own answer is still reachable and
+        // is what the pipeline key is built from.
+        assert_eq!(plain.feedback_colors, 0);
+        assert_eq!(feeds.feedback_colors, 1);
+    }
+
+    /// A subpass self-dependency sourced in a framebuffer-space stage may name
+    /// only framebuffer-space stages as its destination
+    /// (`VUID-VkSubpassDependency-srcSubpass-06809`). `VERTEX_SHADER` is not one,
+    /// and naming it made every render pass this device created invalid.
+    #[test]
+    fn the_feedback_self_dependency_stays_in_framebuffer_space() {
+        const FRAMEBUFFER_SPACE: vk::PipelineStageFlags =
+            vk::PipelineStageFlags::from_raw(
+                vk::PipelineStageFlags::FRAGMENT_SHADER.as_raw()
+                    | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS.as_raw()
+                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS.as_raw()
+                    | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT.as_raw(),
+            );
+        assert!(FRAMEBUFFER_SPACE.contains(COLOR_FEEDBACK_SRC.0));
+        assert!(FRAMEBUFFER_SPACE.contains(COLOR_FEEDBACK_DST.0));
+
+        // The in-pass barrier in `exec` is built from these same two constants,
+        // which is what keeps it inside what the self-dependency declares.
+        let dep = color_feedback_self_dependency(color_feedback_layout());
+        assert_eq!(dep.src_stage_mask, COLOR_FEEDBACK_SRC.0);
+        assert_eq!(dep.dst_stage_mask, COLOR_FEEDBACK_DST.0);
+        assert!(dep.dependency_flags.contains(vk::DependencyFlags::BY_REGION));
+        assert_eq!(dep.src_subpass, dep.dst_subpass);
+    }
+
+    /// An ordinary colour slot names one layout at all three points a pass can
+    /// name one — the `initialLayout` a `LOAD` names, the subpass reference, and
+    /// the `finalLayout` — so the pass performs no transition of its own at
+    /// either end and the registry's record of where the image was left is the
+    /// layout it is actually in.
+    ///
+    /// This is the relation, not a restatement of a constant: it holds for
+    /// whatever [`color0_pass_exit_layout`] answers, including under
+    /// [`crate::env::COLOR_GENERAL`], which is the whole reason that answer is a
+    /// function. It fails if any of the three grows a second spelling — which is
+    /// how the MRT secondary arm in `exec` came to publish a hand-written
+    /// `COLOR_ATTACHMENT_OPTIMAL` beside a feedback arm that derived.
+    #[test]
+    fn an_ordinary_colour_slot_enters_and_leaves_a_pass_at_one_layout() {
+        let key = PassKey::single(true, vk::Format::B8G8R8A8_UNORM);
+        for index in 0..=MAX_SECONDARY_ATTACH {
+            assert_eq!(key.color_layout(index), color0_pass_exit_layout(), "{index}");
+            assert_eq!(
+                key.color_final_layout(index),
+                color0_pass_exit_layout(),
+                "{index}"
+            );
+        }
     }
 }

@@ -53,7 +53,7 @@
 //! PTE-corruption class the surface page-ownership guards exist for.
 //! It applied to the dma-buf and it applies here.
 //!
-//! # One import per RAMBlock, for the lifetime of the VM
+//! # RAMBlock imports and packed task-buffer aliases
 //!
 //! GPA → HVA is linear *within* a RAMBlock, so one import covers every guest
 //! page in it and a resource becomes an `(offset, len)` pair rather than a page
@@ -62,13 +62,138 @@
 //! it is why a scattered surface is not un-importable: it is N slices over one
 //! import.
 //!
-//! **Do not import per resource.** The extension does not guarantee that
-//! importing the same host allocation twice into one device works, and
-//! re-importing per draw pays the driver's `get_user_pages` thousands of times a
-//! second for an answer that never changes.
+//! A task buffer whose physical pages are scattered has no single range inside
+//! a RAMBlock. On a host that can construct a stable packed alias, that alias is
+//! a second kind of import: one per live `(task, buffer reference)`, sliced for
+//! every offset bind and retired with the reference or its mappings. Importing
+//! the alias is optional; a driver may refuse it and the existing gather remains
+//! the correctness path. It is never attempted per draw.
 
 use crate::contract::checked::align_up_u64;
 use crate::observe::{Decline, Emit};
+
+/// Exact physical footprint retained with one imported guest allocation.
+///
+/// `pages` is the allocation order required by alias and ownership checks;
+/// `runs` is the same set partitioned into physically contiguous stretches.
+/// Deriving the partition once makes a resource—not each Store consumer—the
+/// authority on how its scattered pages fit together.
+///
+/// `ascending` is that same set a third time, sorted and deduplicated, and it
+/// exists because [`Self::contains_page`] is asked far more often than a
+/// footprint is built. See that method for why the run partition is the wrong
+/// index for a membership question.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuestPageFootprint {
+    pages: std::sync::Arc<[u64]>,
+    runs: std::sync::Arc<[std::ops::Range<usize>]>,
+    ascending: std::sync::Arc<[u64]>,
+    page_size: u64,
+}
+
+impl GuestPageFootprint {
+    pub(crate) fn new(pages: std::sync::Arc<[u64]>, page_size: u64) -> Option<Self> {
+        if pages.is_empty() || !page_size.is_power_of_two() {
+            return None;
+        }
+        let runs = reims_vgpu_paging::runs::contig_page_runs(&pages, page_size).into();
+        let mut ascending = pages.to_vec();
+        ascending.sort_unstable();
+        ascending.dedup();
+        Some(Self {
+            pages,
+            runs,
+            ascending: ascending.into(),
+            page_size,
+        })
+    }
+
+    pub fn pages(&self) -> &[u64] {
+        &self.pages
+    }
+
+    pub fn runs(&self) -> &[std::ops::Range<usize>] {
+        &self.runs
+    }
+
+    pub fn page_size(&self) -> u64 {
+        self.page_size
+    }
+
+    /// Whether both values retain the same admitted allocation.
+    ///
+    /// Physical-page equality is not allocation identity: a recycled page list
+    /// can describe a later allocation. Resource-owned clones retain the same
+    /// `Arc`, so pointer identity gives the outstanding-write ledger an O(1)
+    /// deduplication key without inventing a second allocation id.
+    #[cfg(feature = "backend-vulkan")]
+    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+        self.page_size == other.page_size && std::sync::Arc::ptr_eq(&self.pages, &other.pages)
+    }
+
+    /// Whether this allocation contains one page-aligned physical address.
+    ///
+    /// A run holds exactly the pages `pages[run]`, contiguous by construction,
+    /// so "inside this run's byte range at page alignment" and "equal to one of
+    /// this run's pages" are the same predicate. The question is membership and
+    /// nothing else, so the index for it is the sorted page set, not the run
+    /// partition — the runs describe how the pages *abut*, which no membership
+    /// test needs to know.
+    ///
+    /// That distinction is worth a whole allocation. The scan this replaced was
+    /// O(runs) per page, and the runs are not few: a compositor mapping of 2040
+    /// pages lands in 511 of them. Read against a page list rather than a single
+    /// page — which is what the outstanding-write ledger does — the scan was
+    /// O(pages x runs) and measured 5.2 ms per ask on a driven Maps leg, 42 asks
+    /// a second. It is now a binary search.
+    #[cfg(feature = "backend-vulkan")]
+    pub(crate) fn contains_page(&self, gpa: u64) -> bool {
+        self.ascending.binary_search(&gpa).is_ok()
+    }
+
+    /// The lowest and highest physical page this allocation holds, or `None` for
+    /// an empty footprint — which [`Self::new`] refuses, so this is `Some` for
+    /// every value that exists.
+    ///
+    /// Exposed so a caller comparing a whole page *list* against this footprint
+    /// can reject the common no-overlap case on two comparisons instead of one
+    /// binary search per page. A span test can only ever answer "cannot
+    /// overlap"; an overlap of spans still has to be settled by
+    /// [`Self::contains_page`], so this narrows work and never a verdict.
+    #[cfg(feature = "backend-vulkan")]
+    pub(crate) fn page_span(&self) -> Option<(u64, u64)> {
+        Some((*self.ascending.first()?, *self.ascending.last()?))
+    }
+
+    pub(crate) fn pages_arc(&self) -> std::sync::Arc<[u64]> {
+        std::sync::Arc::clone(&self.pages)
+    }
+
+    /// Visit the exact physical byte runs reached by an allocation-relative
+    /// byte window. Scatter gaps are never joined.
+    pub fn visit_window(&self, off: u64, len: u64, mut visit: impl FnMut(u64, u64)) {
+        if len == 0 {
+            return;
+        }
+        let end = off.saturating_add(len);
+        let first_page = off / self.page_size;
+        let last_page_exclusive = ((end - 1) / self.page_size).saturating_add(1);
+        for run in self.runs.iter() {
+            let start = run.start.max(first_page as usize);
+            let stop = run.end.min(last_page_exclusive as usize);
+            if start >= stop {
+                continue;
+            }
+            let logical_base = (run.start as u64).saturating_mul(self.page_size);
+            let logical_lo = off.max((start as u64).saturating_mul(self.page_size));
+            let logical_hi = end.min((stop as u64).saturating_mul(self.page_size));
+            let physical_lo = self.pages[run.start].saturating_add(logical_lo - logical_base);
+            if logical_lo < logical_hi {
+                visit(physical_lo, logical_hi - logical_lo);
+            }
+        }
+    }
+}
 
 /// One RAMBlock as the host shim describes it: where it starts in guest physical
 /// address space, where QEMU mapped it, and how long it is.
@@ -169,6 +294,11 @@ pub enum GuestRamError {
     /// than restrictive, and refused so the copying rails run instead of a rail
     /// whose every import is over budget.
     ImportBudgetEmpty,
+    /// A backend published a span ceiling smaller than its own import
+    /// granularity: no chunk of a RAMBlock could be both inside the ceiling and
+    /// a whole number of granules, so the rail has no legal import size at all.
+    /// Broken rather than restrictive, and refused so the copying rails run.
+    ImportSpanMaxBelowGranularity { span_max: u64, align: u64 },
     /// A zero-length slice. Nothing binds a zero-length range, and admitting one
     /// would make `offset == len` a legal reference to the byte past the end.
     SliceEmpty,
@@ -204,6 +334,9 @@ impl Decline for GuestRamError {
             Self::AlignmentNotPowerOfTwo { .. } => "guest_ram_alignment_not_power_of_two",
             Self::AlignmentUnsatisfiable { .. } => "guest_ram_alignment_unsatisfiable",
             Self::ImportBudgetEmpty => "guest_ram_import_budget_empty",
+            Self::ImportSpanMaxBelowGranularity { .. } => {
+                "guest_ram_import_span_max_below_granularity"
+            }
             Self::SliceEmpty => "guest_ram_slice_empty",
             Self::SliceOverflow { .. } => "guest_ram_slice_overflow",
             Self::SliceEndPastImport { .. } => "guest_ram_slice_end_past_import",
@@ -220,12 +353,19 @@ impl Decline for GuestRamError {
             | Self::SliceEmpty
             | Self::ImportBudgetEmpty => Vec::new(),
             Self::RegionWraps { host_va, len } => {
-                vec![("host_va", format!("{host_va:#x}")), ("len", len.to_string())]
+                vec![
+                    ("host_va", format!("{host_va:#x}")),
+                    ("len", len.to_string()),
+                ]
             }
             Self::AlignmentNotPowerOfTwo { align } => vec![("align", align.to_string())],
             Self::AlignmentUnsatisfiable { align, len } => {
                 vec![("align", align.to_string()), ("len", len.to_string())]
             }
+            Self::ImportSpanMaxBelowGranularity { span_max, align } => vec![
+                ("span_max", span_max.to_string()),
+                ("align", align.to_string()),
+            ],
             Self::SliceOverflow { offset, len } => {
                 vec![("offset", offset.to_string()), ("len", len.to_string())]
             }
@@ -275,11 +415,11 @@ impl GuestRamError {
     }
 }
 
-/// One RAMBlock, imported once, and the only thing that can name a byte in it.
+/// One bounded host allocation, and the only thing that can name a byte in it.
 ///
-/// Created at device init and held for the VM's lifetime. Not per draw, not per
-/// window, not per resource — see the module doc for why re-importing is both
-/// unsupported and expensive.
+/// A RAMBlock form is created at device init and held for the VM's lifetime. A
+/// packed task-buffer form is created once per live guest buffer reference. Both
+/// are sliced by checked relative offsets; neither is created per draw/window.
 ///
 /// The backend's handle for the import (a `VkDeviceMemory` and its whole-region
 /// `VkBuffer`, or an `MTLBuffer`) lives beside this in the backend, keyed by
@@ -290,8 +430,13 @@ impl GuestRamError {
 #[derive(Debug)]
 pub struct GuestRamImport {
     id: ImportId,
-    /// Guest physical address of the first byte *covered*, after any trim.
-    gpa_base: u64,
+    /// Set once the guest allocation lifetime ends. The identity is never
+    /// reusable, and a stale child holding this object may not recreate a
+    /// backend import after retirement.
+    retired: std::sync::atomic::AtomicBool,
+    /// Guest physical address of the first byte covered, when this is a
+    /// RAMBlock import. A packed task-VA alias has no linear GPA coordinate.
+    gpa_base: Option<u64>,
     /// Host virtual address of the first byte covered, after any trim. The
     /// address handed to the backend's import call, and never a subrange of it.
     host_base: usize,
@@ -365,8 +510,48 @@ impl GuestRamImport {
 
         Ok(Self {
             id: ImportId::allocate(),
-            gpa_base: region.gpa_base + head,
+            retired: std::sync::atomic::AtomicBool::new(false),
+            gpa_base: Some(region.gpa_base + head),
             host_base: host_base as usize,
+            len,
+            align,
+        })
+    }
+
+    /// Bound an already-packed, stable host allocation for backend import.
+    ///
+    /// Unlike [`Self::new`], this allocation has no guest-physical coordinate:
+    /// its consecutive host pages may name arbitrary GPAs in one task's virtual
+    /// order. It can therefore be sliced only by relative offset, never through
+    /// [`Self::slice_for_gpa`]. The host owns the mapping and must keep it live
+    /// until the backend device has released every import made from it.
+    pub fn new_host_allocation(
+        host_base: usize,
+        len: u64,
+        align: u64,
+    ) -> Result<Self, GuestRamError> {
+        if align == 0 || !align.is_power_of_two() {
+            return Err(GuestRamError::AlignmentNotPowerOfTwo { align }.report());
+        }
+        if host_base == 0 {
+            return Err(GuestRamError::RegionUnmapped.report());
+        }
+        if len == 0 {
+            return Err(GuestRamError::RegionEmpty.report());
+        }
+        let host = host_base as u64;
+        host.checked_add(len)
+            .filter(|end| *end <= usize::MAX as u64)
+            .ok_or(GuestRamError::RegionWraps { host_va: host, len })
+            .map_err(GuestRamError::report)?;
+        if !host.is_multiple_of(align) || !len.is_multiple_of(align) {
+            return Err(GuestRamError::AlignmentUnsatisfiable { align, len }.report());
+        }
+        Ok(Self {
+            id: ImportId::allocate(),
+            retired: std::sync::atomic::AtomicBool::new(false),
+            gpa_base: None,
+            host_base,
             len,
             align,
         })
@@ -377,8 +562,21 @@ impl GuestRamImport {
         self.id
     }
 
+    /// End this allocation identity. Existing backend children may finish,
+    /// but no new child or import may be created from it afterward.
+    pub(crate) fn retire(&self) {
+        self.retired
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the allocation identity has ended and may no longer acquire new
+    /// backend children.
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Guest physical address of the first byte covered.
-    pub fn gpa_base(&self) -> u64 {
+    pub fn gpa_base(&self) -> Option<u64> {
         self.gpa_base
     }
 
@@ -411,7 +609,8 @@ impl GuestRamImport {
 
     /// Whether `gpa` falls inside the covered span.
     pub fn contains_gpa(&self, gpa: u64) -> bool {
-        gpa >= self.gpa_base && gpa - self.gpa_base < self.len
+        self.gpa_base
+            .is_some_and(|base| gpa >= base && gpa - base < self.len)
     }
 
     /// The only constructor of a [`GuestSlice`].
@@ -461,13 +660,21 @@ impl GuestRamImport {
     /// [`Self::slice`] addressed by guest physical address, which is how every
     /// decoded resource names its bytes.
     pub fn slice_for_gpa(&self, gpa: u64, len: u64) -> Result<GuestSlice, GuestRamError> {
+        let Some(gpa_base) = self.gpa_base else {
+            return Err(GuestRamError::GpaOutsideImport {
+                gpa,
+                gpa_base: 0,
+                len: self.len,
+            }
+            .report());
+        };
         let outside = GuestRamError::GpaOutsideImport {
             gpa,
-            gpa_base: self.gpa_base,
+            gpa_base,
             len: self.len,
         };
         let offset = gpa
-            .checked_sub(self.gpa_base)
+            .checked_sub(gpa_base)
             .ok_or(outside)
             .map_err(GuestRamError::report)?;
         if offset >= self.len {
@@ -584,6 +791,10 @@ static GRANULARITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// [`latch_import_limits`] for why the two are one call.
 static IMPORT_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The largest single import the active backend will ask a driver for, or 0
+/// before any backend has published. Published and withdrawn with the two above.
+static IMPORT_SPAN_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Publish the import limits a freshly created device resolved to: the
 /// granularity every import must meet, and the largest single import the device
 /// could hold.
@@ -603,7 +814,7 @@ static IMPORT_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// those masks name arbitrary bytes rather than refusing. A zero `budget` is
 /// refused with it: a device that can import guest RAM and holds nothing is not
 /// a device this rail can run on, and the honest answer is the copying rails.
-pub fn latch_import_limits(align: u64, budget: u64) {
+pub fn latch_import_limits(align: u64, budget: u64, span_max: u64) {
     if align == 0 || !align.is_power_of_two() {
         Emit::decline(EVENT, &GuestRamError::AlignmentNotPowerOfTwo { align }).fail();
         forget_import_limits();
@@ -614,14 +825,44 @@ pub fn latch_import_limits(align: u64, budget: u64) {
         forget_import_limits();
         return;
     }
+    // A span ceiling below the granularity cannot produce a single importable
+    // chunk, so it is the same refusal as an unusable alignment wearing a
+    // different number. Refused rather than clamped: clamping would import at a
+    // size the device's own limits said no to.
+    if span_max < align {
+        Emit::decline(
+            EVENT,
+            &GuestRamError::ImportSpanMaxBelowGranularity { span_max, align },
+        )
+        .fail();
+        forget_import_limits();
+        return;
+    }
     GRANULARITY.store(align, std::sync::atomic::Ordering::Relaxed);
     IMPORT_BUDGET.store(budget, std::sync::atomic::Ordering::Relaxed);
+    IMPORT_SPAN_MAX.store(span_max, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Withdraw the published limits: no device can import guest RAM.
 pub fn forget_import_limits() {
     GRANULARITY.store(0, std::sync::atomic::Ordering::Relaxed);
     IMPORT_BUDGET.store(0, std::sync::atomic::Ordering::Relaxed);
+    IMPORT_SPAN_MAX.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The largest single import the active backend will ask a driver for, or `None`
+/// before any backend has published.
+///
+/// Distinct from [`import_budget`], which bounds the *sum* of every live import
+/// against the roomiest heap. This bounds one `vkAllocateMemory`, and a RAMBlock
+/// longer than it is imported in several — see
+/// [`crate::backend::vulkan::caps::host_pointer::IMPORT_SPAN_CEILING`] for the
+/// driver defect that makes a single large import unsafe.
+pub fn import_span_max() -> Option<u64> {
+    match IMPORT_SPAN_MAX.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        span => Some(span),
+    }
 }
 
 /// The largest single import the active backend can hold, or `None` when no
@@ -703,6 +944,44 @@ impl GuestRef {
     pub fn requested(&self) -> u64 {
         self.slice.requested()
     }
+
+    /// Store one guest-visible word through this reference's checked host
+    /// mapping.
+    ///
+    /// Completion handling uses this only after the queue point governing the
+    /// reference has completed. Keeping the address derivation here preserves
+    /// the module's central invariant: callers never receive a raw host pointer
+    /// or reconstruct `host_base + offset` themselves.
+    #[cfg(feature = "backend-vulkan")]
+    pub(crate) fn store_u32_release(&self, value: u32) -> bool {
+        if self.requested() < std::mem::size_of::<u32>() as u64 {
+            return false;
+        }
+        let Ok(bound) = self.bound() else {
+            return false;
+        };
+        let Some(byte_offset) = bound.offset.checked_add(self.head()) else {
+            return false;
+        };
+        let Some(address) = self.import.host_base().checked_add(byte_offset as usize) else {
+            return false;
+        };
+        if !address.is_multiple_of(std::mem::align_of::<std::sync::atomic::AtomicU32>()) {
+            return false;
+        }
+        // SAFETY: `GuestRamImport::new` validates the RAMBlock mapping and
+        // `bound()` proves this four-byte word is inside it. The Arc held by
+        // `GuestRef` keeps the import identity live through the store. The
+        // guest polls the aligned word concurrently, so an atomic release store
+        // prevents a torn value and orders the write before its interrupt.
+        unsafe {
+            (address as *const std::sync::atomic::AtomicU32)
+                .as_ref()
+                .expect("validated guest RAM address")
+                .store(value.to_le(), std::sync::atomic::Ordering::Release);
+        }
+        true
+    }
 }
 
 /// What a backend binds: a byte range inside one import, already checked.
@@ -734,6 +1013,90 @@ mod tests {
             align,
         )
         .expect("region is aligned and non-empty")
+    }
+
+    #[test]
+    fn a_page_footprint_derives_physical_runs_once_and_windows_them_exactly() {
+        let pages: std::sync::Arc<[u64]> =
+            [0x1000, 0x2000, 0x9000, 0xa000, 0xb000].into();
+        let footprint = GuestPageFootprint::new(pages, 0x1000).expect("valid footprint");
+        assert_eq!(footprint.runs(), &[0..2, 2..5]);
+
+        let mut visited = Vec::new();
+        footprint.visit_window(0x1800, 0x3000, |gpa, len| visited.push((gpa, len)));
+        assert_eq!(
+            visited,
+            vec![(0x2800, 0x800), (0x9000, 0x2800)],
+            "the allocation window follows physical runs without filling their gap"
+        );
+    }
+
+    /// Allocation order is the guest's, and it is not ascending: a page list
+    /// walks a resource's virtual pages, whose physical addresses arrive in
+    /// whatever order the guest allocator handed them out. The run partition
+    /// coped with that by construction — it never assumed an order — so the
+    /// sorted membership index beside it has to be built from a copy rather
+    /// than by asserting the list is already sorted.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn membership_holds_when_allocation_order_descends() {
+        let pages: std::sync::Arc<[u64]> = [0x9000, 0x3000, 0x8000, 0x1000, 0x2000].into();
+        let footprint = GuestPageFootprint::new(pages, 0x1000).expect("valid footprint");
+        for gpa in [0x1000, 0x2000, 0x3000, 0x8000, 0x9000] {
+            assert!(footprint.contains_page(gpa), "{gpa:#x} was allocated");
+        }
+        for gpa in [0x0, 0x4000, 0x7000, 0xa000] {
+            assert!(!footprint.contains_page(gpa), "{gpa:#x} was not");
+        }
+        assert_eq!(
+            footprint.page_span(),
+            Some((0x1000, 0x9000)),
+            "the span is of the addresses, not of the allocation order"
+        );
+        assert_eq!(
+            footprint.pages(),
+            [0x9000, 0x3000, 0x8000, 0x1000, 0x2000],
+            "the allocation order alias and ownership checks need is untouched"
+        );
+    }
+
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn a_page_footprint_answers_membership_without_filling_scatter_gaps() {
+        let pages: std::sync::Arc<[u64]> = [0x1000, 0x2000, 0x9000, 0xa000].into();
+        let footprint = GuestPageFootprint::new(pages, 0x1000).expect("valid footprint");
+        assert!(footprint.contains_page(0x1000));
+        assert!(footprint.contains_page(0xa000));
+        assert!(!footprint.contains_page(0x5000));
+        assert!(!footprint.contains_page(0x9800), "only whole guest pages belong");
+        assert_eq!(footprint.page_span(), Some((0x1000, 0xa000)));
+
+        let clone = footprint.clone();
+        assert!(footprint.same_allocation(&clone));
+        let recycled = GuestPageFootprint::new(footprint.pages().into(), 0x1000)
+            .expect("same addresses can describe a later allocation");
+        assert!(
+            !footprint.same_allocation(&recycled),
+            "equal addresses are not allocation lifetime identity"
+        );
+    }
+
+    #[test]
+    fn a_page_footprint_rejects_an_empty_or_non_page_geometry() {
+        assert!(GuestPageFootprint::new(std::sync::Arc::from([]), 0x1000).is_none());
+        assert!(GuestPageFootprint::new(std::sync::Arc::from([0x1000]), 0).is_none());
+        assert!(GuestPageFootprint::new(std::sync::Arc::from([0x1000]), 0x1800).is_none());
+    }
+
+    #[test]
+    fn retirement_is_monotonic_on_the_allocation_identity() {
+        let import = import(0x4000, 0x1000);
+        let id = import.id();
+        assert!(!import.is_retired());
+        import.retire();
+        import.retire();
+        assert!(import.is_retired());
+        assert_eq!(import.id(), id, "retirement never creates a new identity");
     }
 
     /// The bound, at the byte it exists for. A two-byte slice starting at the
@@ -843,7 +1206,13 @@ mod tests {
     fn a_slice_is_widened_to_the_granularity_and_says_by_how_much() {
         let import = import(0x2000, 0x1000);
         let slice = import.slice(5, 4).expect("inside");
-        assert_eq!(import.resolve(&slice), Ok(BoundRange { offset: 0, len: 0x1000 }));
+        assert_eq!(
+            import.resolve(&slice),
+            Ok(BoundRange {
+                offset: 0,
+                len: 0x1000
+            })
+        );
         assert_eq!(slice.head(), 5);
         assert_eq!(slice.requested(), 4);
         assert_eq!(slice.bound_len(), 0x1000);
@@ -890,7 +1259,7 @@ mod tests {
             len: 0x4000,
         };
         let import = GuestRamImport::new(region, 0x1000).expect("trims to fit");
-        assert_eq!(import.gpa_base(), region.gpa_base + 0x800);
+        assert_eq!(import.gpa_base(), Some(region.gpa_base + 0x800));
         assert_eq!(import.host_base(), 0x7f00_0000_1000);
         assert_eq!(import.len(), 0x3000);
 
@@ -902,9 +1271,31 @@ mod tests {
             import.slice_for_gpa(region.gpa_base + 0x800 + 0x3000, 4),
             Err(GuestRamError::GpaOutsideImport { .. })
         ));
-        assert!(import.slice_for_gpa(import.gpa_base(), 4).is_ok());
-        assert!(import.contains_gpa(import.gpa_base()));
+        let gpa_base = import.gpa_base().expect("RAMBlock coordinate");
+        assert!(import.slice_for_gpa(gpa_base, 4).is_ok());
+        assert!(import.contains_gpa(gpa_base));
         assert!(!import.contains_gpa(region.gpa_base));
+    }
+
+    /// A packed task-address alias is bounded like RAM, but deliberately has no
+    /// GPA interpretation: adjacent bytes may come from unrelated guest frames.
+    #[test]
+    fn a_packed_host_allocation_slices_only_by_relative_offset() {
+        let import = GuestRamImport::new_host_allocation(0x7f00_0000_0000, 0x4000, 0x1000)
+            .expect("aligned stable allocation");
+        assert_eq!(import.gpa_base(), None);
+        let slice = import.slice(0x1800, 0x800).expect("inside allocation");
+        assert_eq!(
+            import.resolve(&slice),
+            Ok(BoundRange {
+                offset: 0x1000,
+                len: 0x1000,
+            })
+        );
+        assert!(matches!(
+            import.slice_for_gpa(0x1800, 0x800),
+            Err(GuestRamError::GpaOutsideImport { .. })
+        ));
     }
 
     /// A block the granularity cannot fit in is refused by name, rather than
@@ -985,6 +1376,30 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn a_guest_reference_stores_only_inside_its_checked_word() {
+        let mut words = [0u32; 4];
+        let import = std::sync::Arc::new(
+            GuestRamImport::new_host_allocation(
+                words.as_mut_ptr() as usize,
+                std::mem::size_of_val(&words) as u64,
+                std::mem::align_of_val(&words) as u64,
+            )
+            .expect("aligned test allocation"),
+        );
+        let slice = import
+            .slice(
+                std::mem::size_of::<u32>() as u64,
+                std::mem::size_of::<u32>() as u64,
+            )
+            .expect("second word");
+        let guest = GuestRef::new(import, slice).expect("matching import");
+
+        assert!(guest.store_u32_release(0x1234_5678));
+        assert_eq!(words, [0, 0x1234_5678u32.to_le(), 0, 0]);
+    }
+
     /// One slug per check. Two checks sharing a slug is the defect the decline
     /// vocabulary exists to prevent: you watch it fire and still cannot tell
     /// which bound refused.
@@ -993,10 +1408,7 @@ mod tests {
         let all = [
             GuestRamError::RegionEmpty,
             GuestRamError::RegionUnmapped,
-            GuestRamError::RegionWraps {
-                host_va: 0,
-                len: 0,
-            },
+            GuestRamError::RegionWraps { host_va: 0, len: 0 },
             GuestRamError::AlignmentNotPowerOfTwo { align: 0 },
             GuestRamError::AlignmentUnsatisfiable { align: 0, len: 0 },
             GuestRamError::SliceEmpty,
@@ -1009,7 +1421,10 @@ mod tests {
                 aligned_end: 0,
                 import_len: 0,
             },
-            GuestRamError::SliceForeignImport { slice: 0, import: 0 },
+            GuestRamError::SliceForeignImport {
+                slice: 0,
+                import: 0,
+            },
             GuestRamError::GpaOutsideImport {
                 gpa: 0,
                 gpa_base: 0,
