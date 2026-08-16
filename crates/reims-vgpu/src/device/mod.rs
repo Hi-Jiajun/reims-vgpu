@@ -781,8 +781,18 @@ fn vbl_contended_pulse(slot: &BoundDevice) {
 /// their after-drain semantics behind `try_lock`.
 pub fn device_pop_action(id: u64) -> Option<HostAction> {
     let slot = device_slot(id)?;
-    if let Some(a) = slot.prompt_actions.lock().pop_front() {
-        return Some(a);
+    {
+        let mut q = slot.prompt_actions.lock();
+        if let Some(a) = q.pop_front() {
+            // The hop this closes is enqueue-to-BH, so it is banked when the
+            // queue empties rather than per action: an IRQ pulse behind a cursor
+            // move waited for the same BH and would double-count. See
+            // `irq_wait_us`.
+            if q.is_empty() {
+                crate::runtime::drain::note_irq_delivered();
+            }
+            return Some(a);
+        }
     }
     let mut d = slot.inner.try_lock()?;
     d.actions.pop_front()

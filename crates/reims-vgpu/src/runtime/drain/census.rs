@@ -1539,6 +1539,27 @@ pub(crate) struct DrainDutyCensus {
     /// entry whose `idle` cannot be measured and is dropped rather than
     /// attributed to a zero origin.
     gap_last_exit_us: std::sync::atomic::AtomicU64,
+    /// How long a prompt `HostAction` — an IRQ pulse or a cursor move — sits in
+    /// the slot queue between being enqueued here and the QEMU action BH popping
+    /// it.
+    ///
+    /// This is the one candidate for `gap_idle_us` that is **ours**. The drain
+    /// worker parks on a condvar until the guest doorbells, and the guest cannot
+    /// doorbell until it has been interrupted; the interrupt is enqueued on the
+    /// prompt queue and raised on the QEMU main loop, one `qemu_bh_schedule`
+    /// later. If that hop costs hundreds of microseconds under load, the
+    /// worker's idle is a main-loop round trip this device causes rather than
+    /// the guest thinking — and the two have opposite repairs.
+    ///
+    /// `max` beside the total because a mean over a thousand pulses hides the
+    /// tail, and the tail is what a frame waits on.
+    irq_wait_us: std::sync::atomic::AtomicU64,
+    irq_waits: std::sync::atomic::AtomicU64,
+    irq_wait_max_us: std::sync::atomic::AtomicU64,
+    /// `observe::elapsed_us()` at which the prompt queue stopped being empty, or
+    /// zero while it is empty. The *oldest* undelivered action is the one whose
+    /// wait matters, so arming over a non-empty queue leaves this alone.
+    irq_armed_us: std::sync::atomic::AtomicU64,
     drain_us: std::sync::atomic::AtomicU64,
     publish_us: std::sync::atomic::AtomicU64,
     draw_us: std::sync::atomic::AtomicU64,
@@ -1717,6 +1738,30 @@ impl DrainDutyCensus {
                 .fetch_add(entry_us.saturating_sub(last), Relaxed);
         }
         entry_us
+    }
+
+    /// The prompt queue has gone from empty to holding something at `now_us`.
+    ///
+    /// Idempotent while the queue stays non-empty: the first arm is the oldest
+    /// undelivered action and is the one whose wait the BH hop costs.
+    pub(crate) fn note_irq_armed(&self, now_us: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _ = self
+            .irq_armed_us
+            .compare_exchange(0, now_us.max(1), Relaxed, Relaxed);
+    }
+
+    /// The BH has emptied the prompt queue at `now_us`; bank the hop.
+    pub(crate) fn note_irq_delivered(&self, now_us: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let armed = self.irq_armed_us.swap(0, Relaxed);
+        if armed == 0 {
+            return;
+        }
+        let waited = now_us.saturating_sub(armed);
+        self.irq_wait_us.fetch_add(waited, Relaxed);
+        self.irq_waits.fetch_add(1, Relaxed);
+        self.irq_wait_max_us.fetch_max(waited, Relaxed);
     }
 
     /// Bank the device-lock wait of an entry that went on to run a tranche.
@@ -2104,6 +2149,11 @@ impl DrainDutyCensus {
         let gap_lock = self.gap_lock_us.swap(0, Relaxed);
         let gap_skip = self.gap_skip_us.swap(0, Relaxed);
         let gap_post = self.gap_post_us.swap(0, Relaxed);
+        // Beside the gap they are a candidate cause of, not on a line of their
+        // own: the question is only ever "is `gap_idle_us` this?".
+        let irq_wait = self.irq_wait_us.swap(0, Relaxed);
+        let irq_waits = self.irq_waits.swap(0, Relaxed);
+        let irq_wait_max = self.irq_wait_max_us.swap(0, Relaxed);
         let busy = drain.saturating_add(publish);
         let duty = busy as f64 / (win_ms as f64 * 1000.0);
         Some(format!(
@@ -2111,6 +2161,7 @@ impl DrainDutyCensus {
              duty={duty:.3} drain_us={drain} publish_us={publish} max_tranche_us={max} \
              gap_idle_us={gap_idle} gap_lock_us={gap_lock} gap_skip_us={gap_skip} \
              gap_post_us={gap_post} \
+             irq_wait_us={irq_wait} irq_waits={irq_waits} irq_wait_max_us={irq_wait_max} \
              draw_us={draw} draws={draws} compute_us={compute} computes={computes} \
              flush_us={flush} flushes={flushes} max_flush_us={max_flush} \
              tail_us={tail} boundary_us={boundary} \
@@ -3293,6 +3344,20 @@ pub fn note_drain_lock_wait(us: u64) {
     DRAIN_DUTY.note_gap_lock(us);
 }
 
+/// A prompt `HostAction` has just been pushed onto an empty prompt queue.
+///
+/// Process-global, like every counter here: this device is instantiated once per
+/// QEMU process, and a second slot would fold its pulses into the first's mean
+/// rather than corrupt it.
+pub fn note_irq_armed() {
+    DRAIN_DUTY.note_irq_armed(crate::observe::elapsed_us());
+}
+
+/// The QEMU action BH has just emptied the prompt queue.
+pub fn note_irq_delivered() {
+    DRAIN_DUTY.note_irq_delivered(crate::observe::elapsed_us());
+}
+
 /// Close a drain entry: everything since `busy_end_us` is post-tranche work, or
 /// the whole entry is a skip when it never took the lock.
 ///
@@ -3586,6 +3651,52 @@ mod drain_gap_tests {
                 + field("busy_us"),
             last_exit - t0,
             "a span banked into no bucket reads as a shortfall here: {line}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod irq_wait_tests {
+    use super::DrainDutyCensus;
+
+    /// The delivery clock measures the **oldest** undelivered prompt action, and
+    /// banks one wait per emptying of the queue.
+    ///
+    /// Both halves matter. Re-arming over a non-empty queue would restart the
+    /// clock and report the newest pulse's wait, which is not the one a frame is
+    /// blocked behind; banking per action instead of per emptying would count
+    /// the same BH hop once for every action that rode it.
+    #[test]
+    fn the_delivery_clock_times_the_oldest_action_and_banks_once_per_hop() {
+        let c = DrainDutyCensus::default();
+        c.note_irq_armed(1_000);
+        // A second pulse joining a queue that is already waiting does not
+        // restart the clock.
+        c.note_irq_armed(1_040);
+        c.note_irq_delivered(1_300);
+        // A delivery with nothing armed banks nothing — the BH runs on its own
+        // cadence and finds the queue empty far more often than not.
+        c.note_irq_delivered(1_400);
+        c.note_irq_armed(2_000);
+        c.note_irq_delivered(2_050);
+
+        assert!(c.note(0, 0, 1).is_none(), "the first call arms the window");
+        let line = c
+            .note(0, 0, 1 + super::DRAIN_DUTY_REPORT_MS)
+            .expect("the window is due");
+        let field = |name: &str| -> u64 {
+            line.split_whitespace()
+                .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+                .unwrap_or_else(|| panic!("{name} is on the line: {line}"))
+                .parse()
+                .expect("a microsecond count")
+        };
+        assert_eq!(field("irq_waits"), 2, "one per emptying, not one per action");
+        assert_eq!(field("irq_wait_us"), 300 + 50);
+        assert_eq!(
+            field("irq_wait_max_us"),
+            300,
+            "the tail is what a frame waits on, so it is reported and not averaged away"
         );
     }
 }

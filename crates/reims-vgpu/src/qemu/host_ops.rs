@@ -391,6 +391,15 @@ impl HostOps for QemuHost<'_> {
                 // number decides a boot's frame rate.
                 let coalesced = q.iter().any(|a| a.kind == action.kind);
                 if !coalesced {
+                    // Arm the delivery clock while the queue lock is held, so
+                    // the stamp cannot be taken after the BH has already popped
+                    // this action on another thread. See `irq_wait_us`: the
+                    // guest cannot doorbell the drain worker until this pulse
+                    // reaches it, so this hop is the one candidate for
+                    // `gap_idle_us` that is ours.
+                    if q.is_empty() {
+                        crate::runtime::drain::note_irq_armed();
+                    }
                     q.push_back(action);
                 }
                 drop(q);
@@ -403,6 +412,9 @@ impl HostOps for QemuHost<'_> {
             HostActionKind::CursorUpdate => {
                 let mut q = prompt.lock();
                 q.retain(|a| a.kind != HostActionKind::CursorUpdate);
+                if q.is_empty() {
+                    crate::runtime::drain::note_irq_armed();
+                }
                 q.push_back(action);
                 drop(q);
                 self.notify_actions();
