@@ -105,6 +105,62 @@ fn rt_type4_base_format(format: u16, mapping_id: u32) -> Option<u16> {
     None
 }
 
+/// The format a type-4 colour attachment is **declared** in.
+///
+/// A type-5 object is a texture view over the surface allocation, and its format
+/// is attachment state: the UNORM and sRGB spellings name identical stored bytes
+/// and differ only in the fixed-function conversion the hardware applies on
+/// render writes. The guest declared that view, so the view's format is the
+/// contract and the base mapping's is what a surface bound without one falls
+/// back to. A type-8 view is a further reinterpretation asked for on top, so it
+/// outranks the type-5 record when both are present.
+///
+/// # Why this stopped answering the base mapping's format
+///
+/// It used to answer `base_fmt` for every type-5 view, on the ground that
+/// honouring the view would fork the resident — the guest binds one surface
+/// through both spellings, and a second spelling that missed would retire the
+/// resident and recreate it empty, alternating two half-filled images frame to
+/// frame. That was a real hazard and it is no longer one:
+/// `translate::pixel::ResidentFormat` carries the allocation and the declaration
+/// as one value, `ResidentTargetSlot::reusable_for` compares only its
+/// `allocation()` (which folds `_SRGB` onto `_UNORM`), the image is created
+/// `MUTABLE_FORMAT` in the allocation format, and the attachment gets its own
+/// view in `declared()`. One allocation, a view per interpretation — which is
+/// what Metal's contract describes. The type-2/3 linear GVA targets have been
+/// attaching sRGB through that same machinery all along; only this resolve was
+/// still throwing the qualifier away, so a surface the guest declared sRGB was
+/// rendered into without the linear-to-sRGB encode on write.
+///
+/// # The geometry half is deliberately not honoured
+///
+/// A type-5 view is taken only where it agrees with the base *extent*, because
+/// the resolve this feeds takes the base mapping's geometry. A view describing a
+/// different grid is one this device is not honouring at all, and lifting its
+/// format alone would attach a reinterpretation to a grid that is not its own —
+/// the row-byte-equivalent quarter-width `RGBA32Uint` view over the desktop
+/// target is exactly that shape. That population is
+/// `rt_type5_view_differs_geometry`; it has never been observed on any boot, and
+/// it still resolves through the base.
+///
+/// A view format whose texel is a different *width* from the base's is not a
+/// reinterpretation of one allocation at all, so [`effective_view_sample_format`]
+/// refuses it and the base format stands.
+fn rt_type4_declared_format(
+    base_fmt: u16,
+    base_extent: (u32, u32),
+    type5_view: Option<objects::Type5TextureView>,
+    view_fmt_override: Option<u16>,
+) -> u16 {
+    let (base_w, base_h) = base_extent;
+    let type5_declared = type5_view
+        .filter(|view| view.width == base_w && view.height == base_h)
+        .map(|view| view.pixel_format)
+        .filter(|&fmt| fmt != 0);
+    effective_view_sample_format(base_fmt, view_fmt_override.or(type5_declared))
+        .unwrap_or(base_fmt)
+}
+
 /// Report a type-5 colour attachment whose view record disagrees with the base
 /// mapping it is resolved through.
 ///
@@ -135,26 +191,39 @@ fn rt_type4_base_format(format: u16, mapping_id: u32) -> Option<u16> {
 /// rendered at the wrong geometry, which no other counter in this path could
 /// report.
 ///
-/// # It stopped being zero, and the two populations under it need separating
+/// # It stopped being zero, and the format half is now honoured
 ///
 /// A driven macos-11 boot on the Intel iGPU host, 2026-08-12, read `same` 1 271
 /// and `differs` **1**: `sid=56 view=1024x768 fmt=0x51 base=1024x768 fmt=0x50`.
 /// Geometry agrees; the *format* does not, and 0x50/0x51 are `BGRA8Unorm` and
-/// `BGRA8Unorm_sRGB`. So this device renders into a target the guest declared as
-/// sRGB using a UNORM attachment, and the hardware's linear-to-sRGB encode on
-/// write does not happen — the stored pixels are the shader's linear values,
+/// `BGRA8Unorm_sRGB`. So this device rendered into a target the guest declared
+/// as sRGB using a UNORM attachment, and the hardware's linear-to-sRGB encode on
+/// write never happened — the stored pixels were the shader's linear values,
 /// displayed as though they were sRGB.
 ///
-/// That is a smaller and much safer repair than the geometry one this doc warns
-/// against — the two formats are the same bytes per texel, so nothing about the
-/// window moves — but it is one firing, and the risk that decides it is not
-/// visible in this counter: if the *same* surface also resolves `same`
-/// elsewhere, honouring the view would key two residents on one surface and the
-/// frame would alternate between them, which is a worse defect than the one
-/// being fixed. So the two populations are counted apart first
-/// (`rt_type5_view_differs_format_only` against `..._geometry`, which sum to
-/// `..._differs`), because they have different fixes, different risks, and one
-/// of them has still never been seen.
+/// A driven macos-13 boot, 2026-08-16, reproduced it twice at icon size:
+/// `sid=64` and `sid=26`, both `view=300x300 fmt=0x51 base=300x300 fmt=0x50`,
+/// with `same` 37 657, `..._geometry` 0 and `..._sid_both_ways` 0. The same
+/// boot's guest is the one bug-03 is reported against, and a macos-26 boot on
+/// the same tree declares no sRGB format at all — its window server composites
+/// in extended-range half-float — which is the report's own "renders fine in
+/// macOS 15".
+///
+/// **The resolve now honours the view's format**, so the format half of this
+/// counter no longer measures a loss; it measures how often the two spellings
+/// are used, which is worth keeping. The forked-resident hazard the repair was
+/// waiting on is gone: `ResidentFormat` carries the allocation and declaration
+/// as one value and `ResidentTargetSlot::reusable_for` compares only the
+/// allocation, so both spellings reach one image with a view each.
+///
+/// **`..._geometry` is still a live healthy zero and is still a loss.** It has
+/// never been observed on any boot, it is the population this doc's warning was
+/// always really about — the quarter-width `RGBA32Uint` view over the desktop
+/// target — and a view describing a different grid still resolves through the
+/// base. `..._sid_both_ways` stays too: it no longer gates anything, but a
+/// surface bound both ways is what exercises the view swap, so a non-zero there
+/// is the reading that says the swap is being taken rather than merely
+/// available.
 fn note_rt_type5_view(
     view: Option<objects::Type5TextureView>,
     surface_id: u32,
@@ -834,29 +903,12 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             }
             .at(resolved_ref),
         )?;
-        // A type-5 object is a texture view over the surface allocation, and its
-        // format is attachment state: UNORM and sRGB views name identical stored
-        // bytes but different fixed-function conversion on render writes. So
-        // honouring it is a real repair — and it is not this line's to make.
-        //
-        // Resolving through the *view* format forks the resident, because the
-        // engine keys a colour resident on the format it is asked for
-        // (`ResidentTargetSlot::reusable_for`) and the guest binds one surface
-        // through both spellings. The second spelling misses, retires the
-        // resident and recreates it empty, so the two interpretations alternate
-        // frame to frame and each carries half the content — a content defect
-        // traded for a colour one. `note_rt_type5_view`'s doc names the reading
-        // that licenses the repair (`rt_type5_view_sid_both_ways` at zero) and
-        // it has never been taken.
-        //
-        // The repair this is waiting on is one allocation with a view per
-        // interpretation, which is what Metal's contract describes and what
-        // `translate::pixel::storage_format` and `Pools::registry_sample_view`
-        // already express for the attachment and sampled rails. Until the
-        // primary single-RT resident can swap its attachment view without
-        // recreating its image, resolve through the base mapping and let
-        // `rt_type5_view_differs_format_only` keep reporting the loss.
-        let fmt = effective_view_sample_format(base_fmt, view_fmt_override).unwrap_or(base_fmt);
+        let fmt = rt_type4_declared_format(
+            base_fmt,
+            (base_w, base_h),
+            type5_view,
+            view_fmt_override,
+        );
         if pixel_format::render_target_bpp(fmt).is_none() {
             return Err(C::Type4Format { surface_id, fmt }.at(resolved_ref));
         }
@@ -1089,6 +1141,102 @@ mod tests {
         assert_eq!(rt_type4_base_format(0, 12), None);
         assert_eq!(rt_type4_base_format(0, 11), None);
         assert_eq!(store_route_count("rt_base_fmt_declined"), before + 3);
+    }
+
+    /// A type-5 view's declared format reaches the colour attachment, so the
+    /// hardware performs the linear-to-sRGB encode the guest asked for.
+    ///
+    /// This is the write half of the sRGB round trip. Metal stores `E(L)` into an
+    /// sRGB-declared attachment and returns `L` when the same surface is sampled
+    /// through an sRGB view; this device used to store `L` and — once the sampled
+    /// rails learned to decode — return `D(L)`, which is darker. Both halves have
+    /// to agree, and the base mapping's format is not the declaration.
+    ///
+    /// The live shape is `view=300x300 fmt=0x51 base=300x300 fmt=0x50`, seen twice
+    /// on a driven macos-13 boot at icon size.
+    #[test]
+    fn a_type5_views_declared_format_is_what_the_colour_attachment_attaches() {
+        use crate::contract::pixel_format::{
+            MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_RGBA16_FLOAT,
+        };
+        use crate::runtime::objects::Type5TextureView;
+
+        let extent = (300u32, 300u32);
+        let view = |w, h, fmt| {
+            Some(Type5TextureView {
+                pixel_format: fmt,
+                width: w,
+                height: h,
+                depth: 1,
+                plane_index: 0,
+            })
+        };
+
+        // The defect: an sRGB view over a linear base must attach sRGB.
+        assert_eq!(
+            rt_type4_declared_format(
+                MTL_FORMAT_BGRA8_UNORM,
+                extent,
+                view(300, 300, MTL_FORMAT_BGRA8_UNORM_SRGB),
+                None
+            ),
+            MTL_FORMAT_BGRA8_UNORM_SRGB
+        );
+        // A surface bound without a view keeps the mapping's own format.
+        assert_eq!(
+            rt_type4_declared_format(MTL_FORMAT_BGRA8_UNORM, extent, None, None),
+            MTL_FORMAT_BGRA8_UNORM
+        );
+        // A view that agrees says nothing new.
+        assert_eq!(
+            rt_type4_declared_format(
+                MTL_FORMAT_BGRA8_UNORM,
+                extent,
+                view(300, 300, MTL_FORMAT_BGRA8_UNORM),
+                None
+            ),
+            MTL_FORMAT_BGRA8_UNORM
+        );
+        // A view describing a different grid is not honoured at all: this resolve
+        // takes the base mapping's geometry, so lifting the format alone would
+        // attach a reinterpretation to a grid that is not its own.
+        assert_eq!(
+            rt_type4_declared_format(
+                MTL_FORMAT_BGRA8_UNORM,
+                extent,
+                view(75, 300, MTL_FORMAT_RGBA16_FLOAT),
+                None
+            ),
+            MTL_FORMAT_BGRA8_UNORM
+        );
+        // A same-extent view whose texel is a different width is not a
+        // reinterpretation of one allocation, and the base format stands.
+        assert_eq!(
+            rt_type4_declared_format(
+                MTL_FORMAT_BGRA8_UNORM,
+                extent,
+                view(300, 300, MTL_FORMAT_RGBA16_FLOAT),
+                None
+            ),
+            MTL_FORMAT_BGRA8_UNORM
+        );
+        // A zero format is the type-5 decoder saying it has none, not a
+        // declaration of format zero.
+        assert_eq!(
+            rt_type4_declared_format(MTL_FORMAT_BGRA8_UNORM, extent, view(300, 300, 0), None),
+            MTL_FORMAT_BGRA8_UNORM
+        );
+        // A type-8 view is a further reinterpretation the guest asked for on top,
+        // so it outranks the type-5 record.
+        assert_eq!(
+            rt_type4_declared_format(
+                MTL_FORMAT_BGRA8_UNORM,
+                extent,
+                view(300, 300, MTL_FORMAT_BGRA8_UNORM_SRGB),
+                Some(MTL_FORMAT_BGRA8_UNORM)
+            ),
+            MTL_FORMAT_BGRA8_UNORM
+        );
     }
 
     /// A type-5 colour attachment must be scored on whether its view agrees with
