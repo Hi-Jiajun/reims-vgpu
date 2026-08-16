@@ -216,6 +216,32 @@ fn rt_type4_declared_format(
 /// as one value and `ResidentTargetSlot::reusable_for` compares only the
 /// allocation, so both spellings reach one image with a view each.
 ///
+/// # It is not what `bugs/bug-03` is, and that took a pixel comparison to say
+///
+/// The paragraph above reads like an identification and it is not one. Two
+/// driven macos-13 boots from one snapshot, one on the tree carrying both halves
+/// of the sRGB round trip and one on the tree before either, with System
+/// Settings opened and photographed in **both appearances**:
+///
+/// ```text
+///                    identical   >4 levels   max channel delta
+/// light  icons        99.6 %       0.000 %          1
+/// dark   icons        99.1 %       0.000 %          1
+/// ```
+///
+/// A maximum channel difference of one level over the sidebar icons is
+/// dithering, not a colour space. **The two commits change no pixel bug-03 is
+/// about**, in either appearance, and the report still reproduces on the later
+/// tree — the dark-mode icons are the reporter's washed-out pale squares on
+/// both builds.
+///
+/// Neither is this counter in play on the boot that reproduces it: the dark
+/// macos-13 boot reads `same` only, with `differs` absent entirely, and
+/// `runtime::census::srgb_census` emits nothing across its six sites. So the
+/// extra encode `bugs/bug-03` measures enters somewhere neither this rail nor
+/// that census watches, and the type-5 view divergence — real, and worth
+/// honouring on its own terms — is not its road.
+///
 /// **`..._geometry` is still a live healthy zero and is still a loss.** It has
 /// never been observed on any boot, it is the population this doc's warning was
 /// always really about — the quarter-width `RGBA32Uint` view over the desktop
@@ -248,17 +274,27 @@ fn note_rt_type5_view(
         return;
     }
     crate::runtime::drain::note_store_route("rt_type5_view_differs");
-    crate::runtime::drain::note_store_route(if view.width == base_w && view.height == base_h {
-        "rt_type5_view_differs_format_only"
+    // Which half diverged decides both the counter and what the fail line says
+    // happened, so it is asked once. The two halves no longer have the same
+    // answer — the format is honoured and the geometry is not — and a single
+    // sentence covering both was accurate only while neither was.
+    let (route, disposition) = if view.width == base_w && view.height == base_h {
+        (
+            "rt_type5_view_differs_format_only",
+            "the colour attachment is resolved in the view's format",
+        )
     } else {
-        "rt_type5_view_differs_geometry"
-    });
+        (
+            "rt_type5_view_differs_geometry",
+            "the colour attachment is resolved with the base mapping's geometry, not the view's",
+        )
+    };
+    crate::runtime::drain::note_store_route(route);
     note_differed(surface_id);
     if crate::observe::first_sight("rt_type5_view_differs", surface_id as u64) {
         crate::observe::fail(format!(
             "rt_type5_view_differs sid={surface_id} view={}x{} fmt={:#x} plane={} \
-             base={base_w}x{base_h} fmt={base_fmt:#x} (the colour attachment is \
-             resolved with the base mapping's geometry, not the view's)",
+             base={base_w}x{base_h} fmt={base_fmt:#x} ({disposition})",
             view.width, view.height, view.pixel_format, view.plane_index
         ));
     }

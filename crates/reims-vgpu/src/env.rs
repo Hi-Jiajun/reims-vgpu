@@ -860,22 +860,18 @@ pub const PASS_CHURN: &str = "REIMS_VGPU_PASS_CHURN";
 /// per Store, which is exactly the regime where the answer is not obvious from
 /// either side.
 ///
-/// # It cannot price that yet, because `off` is broken and this is how we found out
+/// # The frame loss this switch was built to find, and its repair
 ///
-/// **On a driven macos-13 Maps boot, `off` loses the entire map.** The
-/// screenshot is Apple Maps with its sidebar, toolbar, scale bar and compass
-/// drawn and the map view flat ocean; `on` from the same probe minute is a map.
-/// The arms do **not** produce the same pixels, so no timing taken across them
-/// means anything until that is repaired.
-///
-/// That is the switch earning its keep on its first boot, because the arm it
-/// breaks is not hypothetical: `linear_target_import::create` refuses
+/// The arm is not hypothetical: `linear_target_import::create` refuses
 /// `UnsupportedTopology` on every discrete GPU and `HostImportUnavailable` on
 /// any host without `VK_EXT_external_memory_host`, so this is the shipping
-/// render-target rail for those hosts and it loses the guest's frame. It was
-/// invisible because this host always takes the shared rail.
+/// render-target rail for those hosts. It used to lose the guest's frame, and
+/// that was invisible because this host always takes the shared rail.
 ///
-/// What a driven boot says, once
+/// **What it read when it was broken.** A driven macos-13 Maps boot lost the
+/// entire map — the screenshot was Apple Maps with its sidebar, toolbar, scale
+/// bar and compass drawn and the map view flat ocean, against a map on `on` from
+/// the same probe minute. Once
 /// `backend::vulkan::engine::reason::TargetReadDecline::UnknownIdentity` was
 /// given fields:
 ///
@@ -885,16 +881,45 @@ pub const PASS_CHURN: &str = "REIMS_VGPU_PASS_CHURN";
 /// read_target_unknown_identity asked_gen=1 held_gen=none  mapping=33 1136x880
 /// ```
 ///
-/// with `target_evicts=0`. So the dominant case is neither eviction nor the
-/// stale-key case the second line shows: the identity the writeback names was
-/// never in the registry at all. Everything else follows from it — the guest's
-/// pages stay stale, so the sampled rail re-uploads them
+/// with `target_evicts=0`. So the dominant case was neither eviction nor the
+/// stale-key case the second line shows: the identity the writeback named was
+/// never in the registry at all. Everything else followed from it — the guest's
+/// pages stayed stale, so the sampled rail re-uploaded them
 /// (`passmerge_outside_sampled_upload` 609 378 against 590 on the default arm),
-/// and a sampled upload cannot happen inside a render pass, so the boot ends at
+/// and a sampled upload cannot happen inside a render pass, so the boot ended at
 /// 0.94 pass begins per draw and 42 us of GPU a draw against 10.8.
 ///
-/// Repair that before quoting either arm's timing. Then the question above
-/// becomes answerable, and this switch is how it gets answered.
+/// **Both halves of that were closed, by two changes aimed at other reports.**
+/// The `held_gen=N-1` half is the debt rebuilding its identity from the
+/// mapping's generation *now* instead of carrying the one the draw registered —
+/// see [`crate::runtime::writeback_debt::WritebackDebt::identity`]. The
+/// `held_gen=none` half is a released resource whose resident held the only copy
+/// of a frame being collected before the debt was paid — see
+/// `ResidentTargetSlot::released_and_collectable`'s third term.
+///
+/// One driven macos-13 Maps boot an arm, from one snapshot, reads:
+///
+/// ```text
+/// arm    disabled_by_env  read_target_unknown_identity  render_store_lost  wbdebt_pay_lost
+/// off                  7                             0                  0                0
+/// on                   0                             0                  0                0
+/// ```
+///
+/// so the gate took and the whole refusal chain is gone. The re-upload storm
+/// went with it: `passmerge_outside_sampled_upload` reads 1102 on `off` against
+/// 3 on `on`, where it was 609 378 against 590. The residual is not loss — on
+/// this arm the copy-out into the guest's pages is the rail, so some re-upload
+/// is the work rather than a symptom.
+///
+/// **The pixel half of that claim is still open, and not because it failed.**
+/// Apple Maps fetched no tiles on *either* arm of that pair, so both screenshots
+/// are the same flat canvas and the comparison env.rs was built on could not be
+/// reproduced in either direction. What is established is that the named
+/// refusals are at zero; what is not is a same-pixels verdict. Take that with
+/// the undriven pairing `AGENTS.md` prescribes for the guest-import arms — one
+/// snapshot, both arms to the Dock, drive nothing, screenshot — before quoting
+/// either arm's timing, because a whole window rendering on one arm and black on
+/// the other is a shape no counter here reports.
 pub const SHARED_TARGET: &str = "REIMS_VGPU_SHARED_TARGET";
 
 /// **Probe, default off.** On, every render pass's outgoing `VK_SUBPASS_EXTERNAL`
