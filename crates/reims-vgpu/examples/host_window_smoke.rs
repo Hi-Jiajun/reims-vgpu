@@ -15,7 +15,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use reims_vgpu::host_window::present::{spawn, Frame, FrameSlot, WindowConfig, WindowWaker};
+use reims_vgpu::host_window::present::{
+    spawn, Frame, FrameSlot, WindowConfig, WindowMode, WindowWaker,
+};
 
 fn main() {
     let (w, h) = (960u32, 600u32);
@@ -50,6 +52,7 @@ fn main() {
             title: "reims_vgpu host-window smoke".to_string(),
             width: w,
             height: h,
+            mode: WindowMode::requested(),
         },
         on_input,
         frames,

@@ -124,12 +124,65 @@ const MAX_ENGINE_REATTACHES: u32 = crate::backend::vulkan::engine::MAX_DEVICE_RE
 /// on those hosts this alarm is the expected steady state rather than a fault.
 const GUEST_RESIZE_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// What geometry the host window asks the window system for, and therefore
+/// whether it may ask again later.
+///
+/// A type rather than a `bool` on [`WindowConfig`] because it carries two rules
+/// that have to stay together: what [`ApplicationHandler::resumed`] requests at
+/// creation, and whether [`guest_resize_request`] may ask for a native content
+/// resize afterwards. A window given the whole monitor cannot honour the second,
+/// and splitting the pair would leave a full-screen window requesting sizes it
+/// can never be granted — each request holding presentation until
+/// [`GUEST_RESIZE_WARN_AFTER`] and then reporting `native_resize_not_applied`
+/// about a window that is behaving exactly as asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowMode {
+    /// An ordinary decorated window at [`WindowConfig`]'s extent, which tracks
+    /// the guest's display mode. The default.
+    Sized,
+    /// The whole monitor the window opens on, undecorated — winit's
+    /// `Fullscreen::Borderless`, which on Linux is a borderless full-screen
+    /// window on both X11 and Wayland. The guest frame is letterboxed into it by
+    /// the same [`super::viewport`] arithmetic that already handles a window the
+    /// guest's mode does not fit.
+    Borderless,
+}
+
+impl WindowMode {
+    /// What [`crate::env::FULLSCREEN`] asks for.
+    ///
+    /// The parse is [`crate::env`]'s; what is decided here is what each of its
+    /// four answers means for a window. `Unrecognized` is the one worth naming:
+    /// an operator who wrote `REIMS_VGPU_FULLSCREEN=yes-please` gets a sized
+    /// window, and without a line saying the value was rejected they read that
+    /// as the switch not working.
+    pub fn requested() -> Self {
+        match crate::env::read(crate::env::FULLSCREEN) {
+            (crate::env::Switch::On, _) => Self::Borderless,
+            (crate::env::Switch::Unrecognized, value) => {
+                crate::observe::Emit::decline(
+                    "host_window_init",
+                    &WindowError::FullscreenValue(value.unwrap_or_default()),
+                )
+                .fail();
+                Self::Sized
+            }
+            _ => Self::Sized,
+        }
+    }
+}
+
 /// Window creation parameters.
+///
+/// `mode` is resolved from the environment by whoever builds the config rather
+/// than read inside the event loop, so the value a boot ran is on the config the
+/// window was started with and there is one place it is decided.
 #[derive(Clone, Debug)]
 pub struct WindowConfig {
     pub title: String,
     pub width: u32,
     pub height: u32,
+    pub mode: WindowMode,
 }
 
 impl Default for WindowConfig {
@@ -138,6 +191,7 @@ impl Default for WindowConfig {
             title: "Reims vGPU".to_string(),
             width: 1280,
             height: 800,
+            mode: WindowMode::requested(),
         }
     }
 }
@@ -312,15 +366,25 @@ fn pointer_report(
 }
 
 /// Whether a newly observed guest frame geometry should request a native
-/// content resize: only on a geometry change, and only when the window does
-/// not already match. User-driven host resizing stays untouched until the
-/// guest picks another mode.
+/// content resize: only on a geometry change, only when the window does not
+/// already match, and only when the window's geometry is this device's to ask
+/// about at all. User-driven host resizing stays untouched until the guest picks
+/// another mode.
+///
+/// [`WindowMode::Borderless`] never requests. The window has the monitor, so
+/// there is no size to be granted, and asking is not merely futile: every
+/// request holds presentation for [`GUEST_RESIZE_WARN_AFTER`] and then reports
+/// `native_resize_not_applied`, which is a fail-visible line about a window doing
+/// what the operator asked it to do. The guest's mode reaches the screen
+/// letterboxed by [`super::viewport`] instead, exactly as it does on a tiling
+/// compositor that refuses the request on its own.
 fn guest_resize_request(
+    mode: WindowMode,
     observed: Option<(u32, u32)>,
     incoming: (u32, u32),
     window: (u32, u32),
 ) -> bool {
-    observed != Some(incoming) && incoming != window
+    mode == WindowMode::Sized && observed != Some(incoming) && incoming != window
 }
 
 /// How a `Resized` event answers an outstanding guest-driven request, or
@@ -436,6 +500,11 @@ pub enum WindowError {
     /// Engine-attach: `window_present_attach` (engine swapchain) failed. The
     /// refusal that ends the window, on every platform.
     AttachEngine(String),
+    /// [`crate::env::FULLSCREEN`] was set to something that is neither an on nor
+    /// an off spelling. The window opens sized; the value is quoted so the
+    /// operator can see what the parse rejected. The one variant here that does
+    /// not end anything.
+    FullscreenValue(String),
 }
 
 impl WindowError {
@@ -450,7 +519,8 @@ impl WindowError {
             | Self::CreateNativeWindow(d)
             | Self::AttachDisplayHandle(d)
             | Self::AttachWindowHandle(d)
-            | Self::AttachEngine(d) => Some(d),
+            | Self::AttachEngine(d)
+            | Self::FullscreenValue(d) => Some(d),
             Self::AlreadyOwned { .. }
             | Self::NoRegisteredWindow { .. }
             | Self::WrongOwner { .. } => None,
@@ -477,6 +547,7 @@ impl crate::observe::Decline for WindowError {
             Self::AttachDisplayHandle(_) => "window_attach_display_handle",
             Self::AttachWindowHandle(_) => "window_attach_window_handle",
             Self::AttachEngine(_) => "window_attach_engine",
+            Self::FullscreenValue(_) => "window_fullscreen_unrecognized",
         }
     }
 
@@ -776,12 +847,24 @@ impl ApplicationHandler<FramePublished> for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
+        let mut attrs = Window::default_attributes()
             .with_title(self.config.title.clone())
             .with_inner_size(winit::dpi::PhysicalSize::new(
                 self.config.width,
                 self.config.height,
             ));
+        if self.config.mode == WindowMode::Borderless {
+            // `None` means "the monitor this window opens on", which is the only
+            // answer available before the window exists — winit has no monitor
+            // handle to name until the window system has placed it, and picking
+            // one from `available_monitors()` would be this device choosing a
+            // display the operator did not.
+            //
+            // The inner size above stays: it is what the window falls back to if
+            // the window system declines the full-screen request, and it is the
+            // size a later `set_fullscreen(None)` would restore.
+            attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+        }
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -1285,7 +1368,7 @@ impl App {
         };
         let size = window.inner_size();
         let actual = (size.width.max(1), size.height.max(1));
-        let request = guest_resize_request(self.guest_extent, incoming, actual);
+        let request = guest_resize_request(self.config.mode, self.guest_extent, incoming, actual);
         self.guest_extent = Some(incoming);
         if !request {
             return;
@@ -1560,6 +1643,7 @@ mod tests {
             WindowError::AttachDisplayHandle("no display handle".into()),
             WindowError::AttachWindowHandle("no window handle".into()),
             WindowError::AttachEngine("swapchain unavailable".into()),
+            WindowError::FullscreenValue("borderless please".into()),
         ]
     }
 
@@ -1577,6 +1661,7 @@ mod tests {
             WindowError::AttachDisplayHandle(_) => "AttachDisplayHandle",
             WindowError::AttachWindowHandle(_) => "AttachWindowHandle",
             WindowError::AttachEngine(_) => "AttachEngine",
+            WindowError::FullscreenValue(_) => "FullscreenValue",
         }
     }
 
@@ -1636,10 +1721,13 @@ mod tests {
     /// drawn. Re-adding a presenter here means re-adding that family, and this
     /// count is what makes that a deliberate act.
     ///
-    /// The ten: building the event loop, running it (one variant per entry
+    /// The eleven: building the event loop, running it (one variant per entry
     /// point), the three ways the single process window can be claimed by the
-    /// wrong device, creating the native window, and the three steps of the
-    /// engine attach.
+    /// wrong device, creating the native window, the three steps of the engine
+    /// attach, and the geometry the operator asked for being unreadable. That
+    /// last one is the only variant that ends nothing, and it belongs here for
+    /// the same reason as the rest: it is a statement about bringing the window
+    /// up, made once, before there is a window.
     #[test]
     fn the_window_types_only_its_own_lifecycle_refusals() {
         use crate::observe::Decline as _;
@@ -1652,7 +1740,7 @@ mod tests {
         );
         assert_eq!(
             names.len(),
-            10,
+            11,
             "WindowError carries {} variants; a presenter-shaped family here is \
              a second rail that no fail line distinguishes",
             names.len()
@@ -1677,26 +1765,110 @@ mod tests {
 
     #[test]
     fn guest_geometry_change_requests_one_matching_native_resize() {
+        use WindowMode::Sized;
         // First frame at the window's own size: no request.
-        assert!(!guest_resize_request(None, (1920, 1080), (1920, 1080)));
+        assert!(!guest_resize_request(
+            Sized,
+            None,
+            (1920, 1080),
+            (1920, 1080)
+        ));
         // Guest mode change away from the window size: request once.
         assert!(guest_resize_request(
+            Sized,
             Some((1920, 1080)),
             (1440, 1080),
             (1920, 1080)
         ));
         // Same guest geometry re-observed: no duplicate request.
         assert!(!guest_resize_request(
+            Sized,
             Some((1440, 1080)),
             (1440, 1080),
             (1920, 1080)
         ));
         // Window already matches the new mode: nothing to do.
         assert!(!guest_resize_request(
+            Sized,
             Some((1920, 1080)),
             (1440, 1080),
             (1440, 1080)
         ));
+    }
+
+    /// A full-screen window never asks the window system for a size, whatever
+    /// the guest does with its display mode.
+    ///
+    /// The case that matters is the middle one of the four above — a real guest
+    /// mode change, away from the window's extent, which is the only input that
+    /// requests at all. Under [`WindowMode::Borderless`] it must not, because a
+    /// request that cannot be granted holds presentation for
+    /// [`GUEST_RESIZE_WARN_AFTER`] and then logs `native_resize_not_applied`
+    /// against a window that is full screen because it was told to be.
+    #[test]
+    fn a_borderless_window_never_requests_a_native_resize() {
+        use WindowMode::Borderless;
+        assert!(!guest_resize_request(
+            Borderless,
+            Some((1920, 1080)),
+            (1440, 1080),
+            (1920, 1080)
+        ));
+        assert!(!guest_resize_request(
+            Borderless,
+            None,
+            (1280, 1024),
+            (3840, 2160)
+        ));
+    }
+
+    /// Every spelling an operator might reach for, in both directions, plus the
+    /// two that are not answers. A switch that silently reads as its default is
+    /// one an operator sets and watches do nothing — and here the default is the
+    /// *quiet* arm, so a mis-parse is indistinguishable from not having set it.
+    #[test]
+    fn the_fullscreen_switch_is_borderless_only_when_it_says_on() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mode = |value: Option<&str>| {
+            // SAFETY: the lock above serializes every mutation of this variable
+            // in this process, and it is removed before the guard drops.
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(crate::env::FULLSCREEN, v),
+                    None => std::env::remove_var(crate::env::FULLSCREEN),
+                }
+            }
+            let out = WindowMode::requested();
+            unsafe { std::env::remove_var(crate::env::FULLSCREEN) };
+            out
+        };
+        for on in ["1", "on", "true", "yes", "ON", " on "] {
+            assert_eq!(mode(Some(on)), WindowMode::Borderless, "{on}");
+        }
+        for off in ["0", "off", "false", "no"] {
+            assert_eq!(mode(Some(off)), WindowMode::Sized, "{off}");
+        }
+        // Unset, exported empty, and a value the parse rejects all leave the
+        // window sized. The last one is the one that also gets a fail line.
+        assert_eq!(mode(None), WindowMode::Sized);
+        assert_eq!(mode(Some("")), WindowMode::Sized);
+        assert_eq!(mode(Some("borderless")), WindowMode::Sized);
+    }
+
+    /// The refusal an unrecognized value emits keeps its own slug and quotes
+    /// what was rejected, so `REIMS_VGPU_FULLSCREEN=fullscreen` is greppable in
+    /// the fail log rather than reading as an unset variable.
+    #[test]
+    fn an_unrecognized_fullscreen_value_names_itself_and_its_text() {
+        use crate::observe::Decline as _;
+        let error = WindowError::FullscreenValue("fullscreen".to_owned());
+        assert_eq!(error.slug(), "window_fullscreen_unrecognized");
+        assert_eq!(
+            error.fields(),
+            vec![("detail", "fullscreen".to_owned())],
+            "the rejected value has to reach the line"
+        );
     }
 
     /// The presenter's `aspect_fit` is not platform-gated, so the pointer

@@ -1050,6 +1050,26 @@ pub const PASS_EXIT_NARROW: &str = "REIMS_VGPU_PASS_EXIT_NARROW";
 /// arm is one switch and not a family of them.
 pub const COLOR_GENERAL: &str = "REIMS_VGPU_COLOR_GENERAL";
 
+/// **Default off.** `on` asks the window system to give the host presentation
+/// window the whole monitor it opens on, with no decorations — on Linux (X11 and
+/// Wayland alike) that is a borderless full-screen window, which is what winit's
+/// `Fullscreen::Borderless` maps to there.
+///
+/// It changes nothing the guest observes and it grants this device no capability:
+/// the window geometry is a request to the *host's* window system, the presenter
+/// aspect-fits the guest frame into whatever geometry it ends up with, and the
+/// pointer maps through that same viewport. A compositor that refuses the
+/// request leaves an ordinary sized window and nothing else changes.
+///
+/// The one behavioral term it carries is the guest-driven native resize. A
+/// full-screen window cannot honour one, so the window stops asking: a guest
+/// mode change would otherwise sit out the full resize hold and then log
+/// `native_resize_not_applied` about a refusal the operator asked for. The guest
+/// still gets its mode — letterboxed into the monitor — which is the same
+/// outcome a tiling compositor already produces. `host_window::present`'s
+/// `WindowMode` owns both halves.
+pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
+
 /// **A count, not a switch.** How many draws one command buffer may carry,
 /// narrowing the active memory-topology batch policy. Read through [`count`],
 /// so a value above that device's default is refused rather than obeyed.
@@ -1187,7 +1207,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 26] = [
+pub const ALL: [&str; 27] = [
     COLOR_GENERAL,
     LAZY_WRITEBACK,
     SLAB_RETAIN,
@@ -1224,6 +1244,7 @@ pub const ALL: [&str; 26] = [
     LAYOUT_CHURN,
     PASS_CHURN,
     SHARED_TARGET,
+    FULLSCREEN,
 ];
 
 /// Every variable read as a [`count`] rather than as a [`Switch`].

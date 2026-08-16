@@ -118,7 +118,7 @@ pub(crate) struct EarlyFb {
 /// [`publish_window_frame`], called by the drain. Idempotent; `true` on success.
 #[cfg(feature = "host-window")]
 pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
-    use crate::host_window::present::{FrameSlot, InputSink, WindowConfig, WindowWaker};
+    use crate::host_window::present::{FrameSlot, InputSink, WindowConfig, WindowMode, WindowWaker};
     let Some(slot) = device_slot(id) else {
         return false;
     };
@@ -164,6 +164,9 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
         } else {
             height
         },
+        // Resolved here, once, on the thread that starts the window: the mode is
+        // an operator's answer about this boot, not a per-frame question.
+        mode: WindowMode::requested(),
     };
     let stop: crate::host_window::present::StopFlag =
         Arc::new(std::sync::atomic::AtomicBool::new(false));
