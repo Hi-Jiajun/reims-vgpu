@@ -487,7 +487,11 @@ pub enum TargetReadDecline {
     /// stated rather than inferred — which is what the bare variant made
     /// impossible when `REIMS_VGPU_SHARED_TARGET=off` lost every Maps frame to
     /// it.
-    UnknownIdentity { asked: u64, held: Option<u64> },
+    UnknownIdentity {
+        asked: u64,
+        held: Option<u64>,
+        how: super::types::TargetKeyDivergence,
+    },
     /// The readback's resident has never had content written.
     NoReadyContent,
     /// Vulkan cannot copy a multisample image directly to a buffer. The image
@@ -522,7 +526,8 @@ impl Decline for TargetReadDecline {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::UnknownIdentity { asked, held } => vec![
+            Self::UnknownIdentity { asked, held, how } => vec![
+                ("diverges", how.label().to_string()),
                 ("asked_gen", asked.to_string()),
                 (
                     "held_gen",
@@ -763,6 +768,7 @@ mod tests {
             TargetReadDecline::UnknownIdentity {
                 asked: 7,
                 held: None,
+                how: crate::backend::vulkan::engine::TargetKeyDivergence::Absent,
             },
             TargetReadDecline::NoReadyContent,
             TargetReadDecline::MultisampleImage { sample_count: 2 },
@@ -786,13 +792,16 @@ mod tests {
     /// was.
     #[test]
     fn an_absent_resident_says_whether_the_target_exists_under_another_key() {
+        use crate::backend::vulkan::engine::TargetKeyDivergence;
         let nothing = TargetReadDecline::UnknownIdentity {
             asked: 4,
             held: None,
+            how: TargetKeyDivergence::Absent,
         };
         let stale = TargetReadDecline::UnknownIdentity {
             asked: 4,
             held: Some(5),
+            how: TargetKeyDivergence::Generation,
         };
         // One slug, because it is one check. What separates them is the
         // payload, which is what `Emit::decline` puts on the line — `Display`
@@ -802,6 +811,7 @@ mod tests {
         assert_eq!(
             nothing.fields(),
             vec![
+                ("diverges", "absent".to_string()),
                 ("asked_gen", "4".to_string()),
                 ("held_gen", "none".to_string())
             ]
@@ -809,6 +819,7 @@ mod tests {
         assert_eq!(
             stale.fields(),
             vec![
+                ("diverges", "generation".to_string()),
                 ("asked_gen", "4".to_string()),
                 ("held_gen", "5".to_string())
             ]

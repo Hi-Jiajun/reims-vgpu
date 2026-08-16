@@ -1728,6 +1728,52 @@ impl Default for TargetIdentity {
     }
 }
 
+/// Why a registry lookup missed, given the closest key the registry does hold.
+///
+/// A miss is not one finding. The registry is keyed by whole
+/// [`TargetIdentity`], so every field of it can be the reason, and each has a
+/// different repair: a namespace difference is two producers disagreeing about
+/// which object this is, a geometry difference is a surface that resized under
+/// a caller holding the old extent, a generation difference is a key that moved
+/// between the draw and the reader, and `Other` is a format. Reporting the miss
+/// without saying which sent one session hunting a stale generation that was
+/// the minority case.
+///
+/// Ordered from coarsest to finest, and answered as the *first* difference
+/// rather than the only one — the same rule
+/// [`super::pools::PassEchoField`] states for its own ladder, and for the same
+/// reason: two identities in different namespaces are not about one object, so
+/// nothing finer about them is worth reporting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetKeyDivergence {
+    /// Nothing in the registry names this object at all.
+    Absent,
+    /// The registry holds this id in a different namespace — a mapping id
+    /// against a texture ref, a GVA against a surface.
+    Namespace,
+    /// Same object, different extent.
+    Geometry,
+    /// Same object and extent, and the key moved.
+    Generation,
+    /// Same object and extent, and re-generating still does not match. The only
+    /// field left is the format, and a new field would land here too rather
+    /// than be misreported as one of the above.
+    Other,
+}
+
+impl TargetKeyDivergence {
+    /// The name this goes on the fail line as.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Namespace => "namespace",
+            Self::Geometry => "geometry",
+            Self::Generation => "generation",
+            Self::Other => "other",
+        }
+    }
+}
+
 impl TargetIdentity {
     pub fn width(&self) -> u32 {
         match self {
@@ -1754,6 +1800,43 @@ impl TargetIdentity {
             | Self::Gva { generation, .. } => *generation,
             Self::Anonymous { .. } => 0,
         }
+    }
+
+    /// Which namespace this identity is in, and what names it there.
+    ///
+    /// Two identities with the same answer are about the same guest object; two
+    /// with different answers cannot be, whatever else they agree on. That is
+    /// what splits "the registry holds nothing for this key" into "it holds
+    /// nothing for this object" and "it holds this object under a key differing
+    /// in geometry, format or generation" — see [`TargetKeyDivergence`].
+    ///
+    /// The discriminant is folded in rather than returned beside the value: a
+    /// mapping id 7 and a texture ref 7 are different objects, and a bare `u64`
+    /// would call them one.
+    pub fn namespaced_id(&self) -> (u8, u64) {
+        match self {
+            Self::Surface { id, .. } => (0, u64::from(*id)),
+            Self::Texture { ref_, .. } => (1, u64::from(*ref_)),
+            Self::Gva { gva, .. } => (2, *gva),
+            Self::Anonymous { slot } => (3, *slot),
+        }
+    }
+
+    /// How `held` differs from this identity, for a registry lookup that missed.
+    pub fn diverges_from(&self, held: &Self) -> TargetKeyDivergence {
+        if self.namespaced_id() != held.namespaced_id() {
+            return TargetKeyDivergence::Namespace;
+        }
+        if (self.width(), self.height()) != (held.width(), held.height()) {
+            return TargetKeyDivergence::Geometry;
+        }
+        // Whatever is left is spared by re-generation or it is not. Asked with
+        // `PartialEq` so a field this enum gains lands in `Other` rather than
+        // being reported as a generation difference it is not.
+        if self.with_generation(held.generation()) == *held {
+            return TargetKeyDivergence::Generation;
+        }
+        TargetKeyDivergence::Other
     }
 
     /// The same target named at a different generation.
@@ -2221,6 +2304,71 @@ mod tests {
         // than being given one it has nowhere to keep.
         let anonymous = TargetIdentity::Anonymous { slot: 99 };
         assert_eq!(anonymous.with_generation(9), anonymous);
+    }
+
+    /// The four ways a registry key can miss are told apart, and the ladder is
+    /// answered coarsest-first: two identities in different namespaces are not
+    /// about one object, so nothing finer about them is reported. A miss that
+    /// named none of these sent one session hunting the generation case, which
+    /// turned out to be the minority.
+    #[test]
+    fn a_registry_miss_names_which_field_moved() {
+        let asked = TargetIdentity::Surface {
+            id: 7,
+            width: 1920,
+            height: 1080,
+            generation: 2,
+            format: translate::pixel::SCANOUT_FORMAT,
+        };
+        assert_eq!(
+            asked.diverges_from(&asked.with_generation(1)),
+            TargetKeyDivergence::Generation
+        );
+        assert_eq!(
+            asked.diverges_from(&TargetIdentity::Surface {
+                id: 7,
+                width: 1920,
+                height: 900,
+                generation: 2,
+                format: translate::pixel::SCANOUT_FORMAT,
+            }),
+            TargetKeyDivergence::Geometry
+        );
+        assert_eq!(
+            asked.diverges_from(&TargetIdentity::Texture {
+                ref_: 7,
+                width: 1920,
+                height: 1080,
+                generation: 2,
+                stencil: false,
+            }),
+            TargetKeyDivergence::Namespace
+        );
+        // A format change is what is left once the object, the extent and the
+        // generation all agree — and so is any field this enum gains, which is
+        // the point of asking the last question with `PartialEq`.
+        assert_eq!(
+            asked.diverges_from(&TargetIdentity::Surface {
+                id: 7,
+                width: 1920,
+                height: 1080,
+                generation: 2,
+                format: vk::Format::R16G16B16A16_SFLOAT,
+            }),
+            TargetKeyDivergence::Other
+        );
+        // Namespace outranks everything: a texture ref that happens to equal a
+        // mapping id must not be reported as a resize of it.
+        assert_eq!(
+            asked.diverges_from(&TargetIdentity::Texture {
+                ref_: 7,
+                width: 8,
+                height: 8,
+                generation: 99,
+                stencil: false,
+            }),
+            TargetKeyDivergence::Namespace
+        );
     }
 
     #[test]

@@ -71,7 +71,7 @@ pub use types::{
     SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource, ScissorResource,
     SecondaryColorTarget, SeedOrder,
     StencilFaceOps, StencilOp, StencilState, StorageBufferResource, StorageImageFormat,
-    TargetIdentity, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
+    TargetIdentity, TargetKeyDivergence, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
     ViewportResource, VisibilityResultMode, WindowPresentSource, COLOR_INPUT_BINDING,
 };
 pub(crate) use vk_call::{VkCall, VkOp};
@@ -4402,10 +4402,12 @@ fn resident_read_snapshot(
         // The near-miss scan runs only here, on the refusal, and it is what
         // makes the refusal diagnosable: a target that exists under a different
         // generation and one that does not exist at all are opposite defects.
+        let (how, held) = pools.registry_key_divergence(identity);
         return Err(DrawError::TargetRead(
             reason::TargetReadDecline::UnknownIdentity {
                 asked: identity.generation(),
-                held: pools.registry_generation_near(identity),
+                held,
+                how,
             },
         ));
     };

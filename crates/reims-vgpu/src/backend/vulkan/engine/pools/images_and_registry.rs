@@ -6,6 +6,7 @@
 //! resource lifetime.
 
 use super::*;
+use crate::backend::vulkan::engine::types::TargetKeyDivergence;
 
 /// Band observed intervals between sampled uses. This is a reuse-distance
 /// diagnostic only; no residency decision reads it.
@@ -638,11 +639,35 @@ impl ResourcePools {
     ///
     /// A linear scan, on a refusal path only: the registry's own
     /// `registry_pressure` census reads a peak of about thirty slots.
-    pub(crate) fn registry_generation_near(&self, identity: &TargetIdentity) -> Option<u64> {
-        self.registry.keys().find_map(|held| {
-            let generation = held.generation();
-            (identity.with_generation(generation) == *held).then_some(generation)
-        })
+    ///
+    /// It also names *how* the closest key differs, because "the generation
+    /// moved" is only one of four ways it can and a boot reading `held=none`
+    /// cannot tell "nothing names this object" from "this object is registered
+    /// under a different extent or namespace". See
+    /// [`crate::backend::vulkan::engine::TargetKeyDivergence`].
+    pub(crate) fn registry_key_divergence(
+        &self,
+        identity: &TargetIdentity,
+    ) -> (TargetKeyDivergence, Option<u64>) {
+        // The finest difference is the closest key, so the ladder is ranked and
+        // minimised over rather than short-circuited: a registry holding both a
+        // resized entry and a re-generated one should report the re-generated
+        // one, whichever the hash map yields first.
+        let rank = |d: TargetKeyDivergence| match d {
+            TargetKeyDivergence::Generation => 0,
+            TargetKeyDivergence::Other => 1,
+            TargetKeyDivergence::Geometry => 2,
+            TargetKeyDivergence::Namespace => 3,
+            TargetKeyDivergence::Absent => 4,
+        };
+        self.registry
+            .keys()
+            .map(|held| (identity.diverges_from(held), Some(held.generation())))
+            // A key in another namespace is not about this object at all, so it
+            // is not a near miss — reporting one would claim the target exists.
+            .filter(|(d, _)| *d != TargetKeyDivergence::Namespace)
+            .min_by_key(|(d, _)| rank(*d))
+            .unwrap_or((TargetKeyDivergence::Absent, None))
     }
 
     /// Return the exact-format sampled view requested for a resident image.
