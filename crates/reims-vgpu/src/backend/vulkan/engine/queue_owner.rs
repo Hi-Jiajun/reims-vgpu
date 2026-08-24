@@ -251,6 +251,7 @@ impl QueueOwner {
     /// gap in the queue-owner FIFO.  Packaging the pair is what lets the caller
     /// release the engine lock after enqueue without allowing guest work to
     /// appear between the semaphore signal and its consumer.
+    #[cfg(feature = "host-window")]
     pub(crate) fn enqueue_present(
         &self,
         transaction: super::context::PresentTransaction<'_>,
