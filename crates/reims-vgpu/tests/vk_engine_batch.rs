@@ -90,6 +90,98 @@ fn is_zero(px: &[u8]) -> bool {
     px == [0, 0, 0, 0]
 }
 
+/// Mapping retirement can be the last guest event. The heartbeat must submit
+/// the tail batch, observe its fence, release the graveyard parent, and return
+/// the constructed alias without relying on another draw to advance the ring.
+#[test]
+fn heartbeat_retires_a_guest_alias_after_its_fence_without_another_draw() {
+    use reims_vgpu::runtime::guest_ram::{granularity, GuestRamImport};
+    use reims_vgpu::runtime::host::{HostAction, HostOps};
+
+    #[derive(Default)]
+    struct UnmapHost {
+        calls: u64,
+    }
+    impl HostOps for UnmapHost {
+        fn mono_ns(&self) -> u64 {
+            0
+        }
+        fn enqueue(&mut self, _action: HostAction) {}
+        fn schedule_bh(&mut self) {}
+        fn unmap_pages(&mut self, _ptr: usize, _len: usize) {
+            self.calls += 1;
+        }
+    }
+
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_499,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let req = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    if let Err(error) = engine::execute_draw_request(&req) {
+        let message = error.to_string();
+        if skip_if_no_gpu(&message) {
+            eprintln!("skipping: {message}");
+            return;
+        }
+        panic!("opening draw: {message}");
+    }
+    let Some(align) = granularity() else {
+        eprintln!("skipping: this host cannot import guest RAM");
+        engine::test_quiesce_ring();
+        return;
+    };
+
+    let len = align * 2;
+    let backing = vec![0u8; usize::try_from(len + align).expect("test allocation fits")];
+    let base = (backing.as_ptr() as usize).next_multiple_of(align as usize);
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(base, len, align)
+            .expect("aligned synthetic host allocation"),
+    );
+    assert_eq!(
+        engine::warm_guest_ram_imports(&[std::sync::Arc::clone(&import)]),
+        (1, len),
+        "the production HostRamImports table must own the alias"
+    );
+
+    let mut host = UnmapHost::default();
+    let mut state = reims_vgpu::model::DeviceState::new(
+        reims_vgpu::model::DeviceId::default(),
+        12,
+    );
+    state.retired_guest_imports.push(import.id());
+    state.retired_views.push((base, len as usize));
+    reims_vgpu::runtime::mapper::flush_retired_views(&mut state, &mut host);
+    assert_eq!(
+        host.calls, 0,
+        "retiring the mapping must not unmap through a live batch"
+    );
+
+    for tick in 0..10_000 {
+        engine::maintain_resources(10_000 + tick);
+        if reims_vgpu::runtime::mapper::drain_deferred_unmaps(&mut host) != 0 {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        host.calls, 1,
+        "heartbeat fence retirement must terminally destroy and return the alias"
+    );
+    assert_eq!(
+        reims_vgpu::runtime::mapper::drain_deferred_unmaps(&mut host),
+        0,
+        "the terminal release is published exactly once"
+    );
+    engine::test_quiesce_ring();
+}
+
 const W: u32 = 64;
 const H: u32 = 64;
 

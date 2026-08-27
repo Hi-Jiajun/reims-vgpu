@@ -575,6 +575,27 @@ impl ResourcePools {
         self.trim_dead_guest_sampled(&ctx.device, IDLE_RECYCLE_TRIM_PER_PASS);
     }
 
+    /// Submit a tail batch and retire every completed ring slot without waiting.
+    ///
+    /// Graveyard entries are fenced against the slots open when they were
+    /// parked. This periodic edge is required even after guest work stops: a
+    /// signalled fence is only a host-visible fact until slot retirement clears
+    /// that slot from the graveyard masks.
+    pub(crate) unsafe fn advance_graveyard_maintenance(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+    ) -> Result<usize, DrawError> {
+        unsafe { self.batch_flush(ctx, counters)? };
+        unsafe {
+            self.retire_signaled_slots(
+                ctx,
+                counters,
+                DeviceLostOp::PoolsFenceStatusMaintenance,
+            )
+        }
+    }
+
     /// Cumulative transient sampled/snapshot pool recycle diagnostics:
     /// `(free_hits, free_allocs, recycle_admits, recycle_cap_drops)`.
     /// Merged into `CounterSnapshot` by `engine::counter_snapshot`.
@@ -1407,6 +1428,34 @@ impl ResourcePools {
         Ok(())
     }
 
+    /// Retire the oldest contiguous run of completed submissions. Never waits
+    /// on an unsignalled fence, so it is suitable for the periodic heartbeat.
+    unsafe fn retire_signaled_slots(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+        status_op: DeviceLostOp,
+    ) -> Result<usize, DrawError> {
+        let mut retired = 0;
+        let n = self.slots.len();
+        for step in 1..=n {
+            let index = (self.cur + step) % n;
+            if self.slots[index].pending.is_none() {
+                continue;
+            }
+            let signaled = ctx
+                .device
+                .get_fence_status(self.slots[index].fence)
+                .map_err(|e| Self::wait_error(counters, e, status_op))?;
+            if !signaled {
+                break;
+            }
+            unsafe { self.retire_slot(ctx, counters, index)? };
+            retired += 1;
+        }
+        Ok(retired)
+    }
+
     /// The open batch's command buffer and the fence [`Self::batch_flush`] will
     /// submit it with, for a caller that wants to append to the run rather than
     /// end it.
@@ -1457,23 +1506,13 @@ impl ResourcePools {
         // `break` on the first unsignaled slot is load-bearing: reaping out of
         // order can drop `in_flight` to 0 while later slots still run, which
         // would let `gpu_work_open()` admit a graveyard drain under live work.
-        let n = self.slots.len();
-        for step in 1..=n {
-            let index = (self.cur + step) % n;
-            if self.slots[index].pending.is_none() {
-                continue;
-            }
-            let signaled = ctx
-                .device
-                .get_fence_status(self.slots[index].fence)
-                .map_err(|e| {
-                    Self::wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry)
-                })?;
-            if !signaled {
-                break;
-            }
-            self.retire_slot(ctx, counters, index)?;
-        }
+        unsafe {
+            self.retire_signaled_slots(
+                ctx,
+                counters,
+                DeviceLostOp::PoolsFenceStatusBeginEntry,
+            )?
+        };
         let next = (self.cur + 1) % self.slots.len();
         if self.slots[next].pending.is_some() {
             // Count as a "block" only when the fence is genuinely unsignaled

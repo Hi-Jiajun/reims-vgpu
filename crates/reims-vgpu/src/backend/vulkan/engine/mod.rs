@@ -4683,6 +4683,14 @@ pub fn maintain_resources(now_ms: u64) {
     let Some(ctx) = owner.ctx.as_ref() else {
         return;
     };
+    let result = unsafe { pools.advance_graveyard_maintenance(ctx, counters) };
+    if let Err(error) = result {
+        if matches!(error, DrawError::DeviceLost(_)) {
+            device_lost::note_device_lost_seen();
+        }
+        crate::observe::Emit::decline("vk_maintenance", &error).fail_once(0);
+        return;
+    }
     unsafe {
         pools.advance_registry_maintenance(ctx, counters, now_ms);
     }
