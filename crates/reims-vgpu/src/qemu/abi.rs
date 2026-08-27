@@ -92,8 +92,8 @@ use std::slice;
 /// [[host-window]]). The symbol is always present; when the staticlib was built
 /// without the `host-window` feature it returns `REIMS_VGPU_QEMU_ERR_STATE` so the C
 /// shim falls back to QEMU's own display.
-/// v19 adds the read-only packed-page alias census to [`ReimsVgpuHostOps`].
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 19;
+/// v20 gives `map_pages` a structured per-call failure output.
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 20;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -911,6 +911,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_abi_header_agrees_on_the_map_pages_failure_stages() {
+        for (name, ours) in [
+            ("REIMS_VGPU_MAP_PAGES_FAILURE_NONE", 0),
+            ("REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION", 1),
+            ("REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS", 2),
+            ("REIMS_VGPU_MAP_PAGES_FAILURE_INVALID_GUEST_PAGE", 3),
+        ] {
+            assert_eq!(header_define(name), ours, "{name} has drifted");
+        }
+    }
+
     /// The five entry-point return codes agree with the shim header.
     ///
     /// `REIMS_VGPU_QEMU_OK` is the one that matters most and reads the most
@@ -1045,6 +1057,17 @@ mod tests {
         assert_eq!(std::mem::offset_of!(PageAliasCensus, live_pages), 16);
         assert_eq!(std::mem::offset_of!(PageAliasCensus, created), 24);
         assert_eq!(std::mem::offset_of!(PageAliasCensus, destroyed), 32);
+    }
+
+    #[test]
+    fn the_abi_header_agrees_on_the_map_pages_failure_layout() {
+        use crate::qemu::host_ops::ReimsVgpuMapPagesFailure;
+
+        assert_eq!(std::mem::size_of::<ReimsVgpuMapPagesFailure>(), 16);
+        assert_eq!(std::mem::align_of::<ReimsVgpuMapPagesFailure>(), 8);
+        assert_eq!(std::mem::offset_of!(ReimsVgpuMapPagesFailure, stage), 0);
+        assert_eq!(std::mem::offset_of!(ReimsVgpuMapPagesFailure, host_errno), 4);
+        assert_eq!(std::mem::offset_of!(ReimsVgpuMapPagesFailure, page_index), 8);
     }
 
 
