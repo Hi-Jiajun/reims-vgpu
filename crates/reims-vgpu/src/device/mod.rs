@@ -721,6 +721,7 @@ pub fn device_poll(id: u64) -> bool {
     #[cfg(feature = "backend-vulkan")]
     {
         crate::backend::vulkan::engine::maintain_resources(crate::observe::elapsed_ms() as u64);
+        crate::runtime::mapper::drain_deferred_unmaps(&mut host);
     }
     // Pre-boundary early-console → host window (headless-safe: the heartbeat
     // drives poll even under -display none). No-op post-boundary or with no

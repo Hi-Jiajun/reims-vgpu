@@ -146,6 +146,13 @@ mod pass_echo_delta_order {
 }
 
 impl ResourcePools {
+    pub(crate) fn host_ram_import_alias(
+        &self,
+        import_id: crate::runtime::guest_ram::ImportId,
+    ) -> Option<(usize, usize)> {
+        self.host_ram_imports.alias(import_id)
+    }
+
     /// End one guest parent allocation's backend lifetime. If child images are
     /// still live, their deferred destruction releases it after the last fence.
     pub(crate) unsafe fn retire_guest_import(

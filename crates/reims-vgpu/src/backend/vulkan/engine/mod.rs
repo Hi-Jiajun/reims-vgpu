@@ -309,6 +309,25 @@ impl EngineState {
 
 static ENGINE: Lazy<Mutex<EngineState>> = Lazy::new(|| Mutex::new(EngineState::new()));
 
+/// Host aliases whose Vulkan buffer and imported memory have both been
+/// destroyed. The QEMU callback stays outside the backend; the device heartbeat
+/// drains this queue through its own HostOps context.
+static RELEASED_HOST_ALIASES: Lazy<Mutex<Vec<(usize, usize)>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
+
+fn release_host_alias(alias: (usize, usize)) {
+    RELEASED_HOST_ALIASES.lock().push(alias);
+}
+
+pub fn take_released_host_aliases() -> Vec<(usize, usize)> {
+    std::mem::take(&mut *RELEASED_HOST_ALIASES.lock())
+}
+
+#[cfg(test)]
+pub(crate) fn publish_released_host_alias_for_test(alias: (usize, usize)) {
+    release_host_alias(alias);
+}
+
 /// Whether the current device owns a recorded batch that has not been
 /// submitted yet.
 ///
@@ -2247,12 +2266,16 @@ pub fn retire_resident_storage_content(identity: &crate::model::ComputeStorageRe
 /// allocation ends. Existing child images keep the import until their own
 /// fence-safe retirement; an allocation with no children enters the same
 /// graveyard immediately so already-recorded buffer accesses finish first.
-pub fn retire_guest_import(import_id: crate::runtime::guest_ram::ImportId) {
+pub fn retire_guest_import(
+    import_id: crate::runtime::guest_ram::ImportId,
+) -> Option<(usize, usize)> {
     let mut guard = lock_engine();
     let Some(device) = guard.owner.ctx.as_ref().map(|ctx| ctx.device.clone()) else {
-        return;
+        return None;
     };
+    let alias = guard.pools.host_ram_import_alias(import_id);
     unsafe { guard.pools.retire_guest_import(&device, import_id) };
+    alias
 }
 
 /// A synchronous compute writeback landed this resident's output in the guest's

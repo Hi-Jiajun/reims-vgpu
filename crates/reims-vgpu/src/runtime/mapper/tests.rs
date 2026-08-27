@@ -1226,7 +1226,7 @@ fn a_surface_colliding_with_several_control_structures_names_the_first() {
 }
 
 #[test]
-fn stable_importable_views_wait_for_device_exit_instead_of_mapping_retirement() {
+fn stable_view_without_a_vulkan_import_unmaps_at_mapping_retirement() {
     let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
     state.retired_views.push((0x1000, 0x2000));
     let mut host = crate::runtime::FakeHost::new();
@@ -1235,7 +1235,22 @@ fn stable_importable_views_wait_for_device_exit_instead_of_mapping_retirement() 
     super::flush_retired_views(&mut state, &mut host);
 
     assert!(state.retired_views.is_empty());
+    assert_eq!(host.unmap_pages_calls, 1);
+}
+
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn vulkan_alias_unmaps_only_after_terminal_destruction_is_published() {
+    let mut host = crate::runtime::FakeHost::new();
+
+    assert_eq!(super::drain_deferred_unmaps(&mut host), 0);
     assert_eq!(host.unmap_pages_calls, 0);
+
+    crate::backend::vulkan::engine::publish_released_host_alias_for_test((0x1000, 0x2000));
+    assert_eq!(super::drain_deferred_unmaps(&mut host), 1);
+    assert_eq!(host.unmap_pages_calls, 1);
+    assert_eq!(super::drain_deferred_unmaps(&mut host), 0);
+    assert_eq!(host.unmap_pages_calls, 1, "an alias is returned exactly once");
 }
 
 #[test]

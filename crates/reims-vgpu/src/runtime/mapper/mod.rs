@@ -1484,30 +1484,50 @@ pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
     // first. Existing child images and recorded buffers hold it through their
     // fence-safe retirement; only then is the matching host view unmapped.
     #[cfg(feature = "backend-vulkan")]
-    for import in state.retired_guest_imports.drain(..) {
-        crate::backend::vulkan::engine::retire_guest_import(import);
-    }
+    let backend_owned: std::collections::HashSet<_> = state
+        .retired_guest_imports
+        .drain(..)
+        .filter_map(crate::backend::vulkan::engine::retire_guest_import)
+        .collect();
     #[cfg(not(feature = "backend-vulkan"))]
     state.retired_guest_imports.clear();
-    if host.map_pages_stable() {
-        // Stopgap until the backend can return an alias only after
-        // `DeferredHandle::GuestAllocation` reaches terminal destruction.
-        // A stable view may back a Vulkan host-pointer import whose child
-        // images and open submission slots outlive this mapping retirement;
-        // unmapping it here invalidates that import. Keep it until the shim's
-        // device-exit cleanup, matching the pre-release behaviour while the
-        // alias-pressure census measures the resulting session lifetime.
-        state.retired_views.clear();
-    } else {
-        for (ptr, len) in state.retired_views.drain(..) {
-            host.unmap_pages(ptr, len);
+
+    #[cfg(feature = "backend-vulkan")]
+    let mut released: std::collections::HashSet<_> =
+        crate::backend::vulkan::engine::take_released_host_aliases()
+            .into_iter()
+            .collect();
+    for alias @ (ptr, len) in state.retired_views.drain(..) {
+        #[cfg(feature = "backend-vulkan")]
+        if backend_owned.contains(&alias) {
+            continue;
         }
+        #[cfg(feature = "backend-vulkan")]
+        released.remove(&alias);
+        host.unmap_pages(ptr, len);
+    }
+    #[cfg(feature = "backend-vulkan")]
+    for (ptr, len) in released {
+        host.unmap_pages(ptr, len);
     }
     // Same shape and the same reason: a guest-write token is host-side state
     // for a page list that no longer exists, and only the host can free it.
     for token in state.retired_guest_write_tokens.drain(..) {
         host.untrack_guest_writes(token);
     }
+}
+
+/// Return Vulkan aliases whose terminal fence-safe destruction has completed
+/// to the host. Called from the device heartbeat so release does not depend on
+/// another guest mapping event arriving.
+#[cfg(feature = "backend-vulkan")]
+pub fn drain_deferred_unmaps<H: HostOps>(host: &mut H) -> usize {
+    let released = crate::backend::vulkan::engine::take_released_host_aliases();
+    let count = released.len();
+    for (ptr, len) in released {
+        host.unmap_pages(ptr, len);
+    }
+    count
 }
 
 /// The live guest-write token for this mapping's current page list, asking the

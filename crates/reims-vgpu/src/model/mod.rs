@@ -56,9 +56,7 @@ impl<B: Backend> Device<B> {
         self.backend.reset();
         let views = self.state.take_all_host_views();
         let count = views.len();
-        for (ptr, len) in views {
-            host.unmap_pages(ptr, len);
-        }
+        self.state.retired_views.extend(views);
         // Before `reset`, not after: `take_all_host_views` parks the detached
         // guest-write tokens in `retired_guest_write_tokens`, and `reset`
         // replaces `DeviceState` wholesale — so a token still sitting there is
