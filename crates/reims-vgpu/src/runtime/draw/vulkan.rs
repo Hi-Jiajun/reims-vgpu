@@ -9150,7 +9150,7 @@ fn type11_render_identity(
 }
 
 /// Stable shared allocation behind the type-11 primary attachment, if this
-/// host can retain the mapping view for the device lifetime.
+/// host can retain the mapping view until its explicit retirement.
 ///
 /// The mapping revalidation inside `ensure_contig_view` is part of the answer:
 /// it retires an alias when the guest has recycled any of its pages, and that

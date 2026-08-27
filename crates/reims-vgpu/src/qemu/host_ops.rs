@@ -91,14 +91,13 @@ pub struct ReimsVgpuHostOps {
     /// thread. Distinct from `schedule_bh` (drain-worker wake): prompt actions
     /// (IRQ pulses, cursor moves) must be deliverable mid-drain.
     pub notify_actions: Option<unsafe extern "C" fn(ctx: *mut c_void)>,
-    /// 1 when `map_pages` owes no release: the pointer is guest RAM itself and
-    /// stays valid for the device lifetime, so a caller may hold it
-    /// indefinitely and `unmap_pages` has nothing to free.
+    /// 1 when a `map_pages` result remains valid until its matching
+    /// `unmap_pages` call, so a caller may retain it in a GPU import.
     ///
-    /// Both shims answer **0** because either may return a caller-owned packed
-    /// alias for a fragmented list. A contiguous run can still be a borrowed
-    /// RAMBlock pointer; `unmap_pages` recognizes those by their absence from
-    /// the shim's live-view registry and leaves them alone.
+    /// x86 answers **1**: direct RAMBlock pointers remain borrowed, while a
+    /// fragmented list's packed alias remains valid until explicit retirement.
+    /// `unmap_pages` recognizes direct pointers by their absence from the
+    /// shim's live-view registry and leaves them alone. arm64 answers **0**.
     ///
     /// It used to also license retaining the pointer inside a cached host-pointer
     /// import, which is where the stronger promise came from — MMIO could claim

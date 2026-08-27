@@ -1476,14 +1476,13 @@ fn revalidate_timing_is_slow(elapsed_us: u64) -> bool {
 /// Release contiguous views whose page tables changed.
 ///
 /// A GPU object can retain a view only when [`HostOps::map_pages_stable`]
-/// promises the address for the device lifetime; `unmap_pages` is a no-op on
-/// exactly that host. A transient view is never admitted to a backend import,
-/// so its only users are CPU copies that finish inside their own call.
+/// promises the address until explicit retirement. A transient view is never
+/// admitted to a backend import, so its only users are CPU copies that finish
+/// inside their own call.
 pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
     // The backend allocation aliases the host view, so revoke the GPU parent
     // first. Existing child images and recorded buffers hold it through their
-    // fence-safe retirement; the host view is stable on every backend that can
-    // import it, making `unmap_pages` a no-op there until device teardown.
+    // fence-safe retirement; only then is the matching host view unmapped.
     #[cfg(feature = "backend-vulkan")]
     for import in state.retired_guest_imports.drain(..) {
         crate::backend::vulkan::engine::retire_guest_import(import);

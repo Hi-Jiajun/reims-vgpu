@@ -454,10 +454,9 @@ pub trait HostOps {
     /// Release a view obtained from [`HostOps::map_pages`].
     fn unmap_pages(&mut self, _ptr: usize, _len: usize) {}
 
-    /// True when [`HostOps::map_pages`] returns a **stable** alias of guest
-    /// RAM: the pointer stays valid for the device lifetime,
-    /// [`HostOps::unmap_pages`] is a no-op, and the address is never recycled
-    /// for unrelated memory.
+    /// True when [`HostOps::map_pages`] returns an alias that remains valid
+    /// until its matching [`HostOps::unmap_pages`] call, so it may back a
+    /// retained GPU import.
     ///
     /// This is a claim about a CPU-side *view* only, and says nothing about the
     /// GPU rail: guest RAM reaches the GPU by importing the spans

@@ -280,8 +280,8 @@ typedef struct ReimsVgpuHostOps {
     int (*map_pages)(void *ctx, const uint64_t *gpas, size_t count,
                      void **out_ptr, ReimsVgpuMapPagesFailure *failure);
     /*
-     * Release a transient view from map_pages (len = count * page size).
-     * No-op when map_pages_stable is 1.
+     * Release a view from map_pages (len = count * page size). A shim may
+     * ignore borrowed direct-RAM pointers while releasing constructed aliases.
      */
     void (*unmap_pages)(void *ctx, void *ptr, size_t len);
     /*
@@ -321,10 +321,9 @@ typedef struct ReimsVgpuHostOps {
      */
     void (*notify_actions)(void *ctx);
     /*
-     * 1 if map_pages returns a *stable* alias of guest RAM: the pointer stays
-     * valid for the device lifetime, unmap_pages is a no-op, and the address
-     * is never recycled for other memory. 0 if the view is a transient mapping
-     * that unmap_pages tears down.
+     * 1 if map_pages returns an alias the caller may retain until its matching
+     * unmap_pages call. 0 if the view may be used only synchronously and cannot
+     * back a retained GPU import.
      *
      * Base guest RAM reaches the GPU through the spans guest_ram_regions names,
      * independently of this flag. A resource-shaped packed import may retain a
