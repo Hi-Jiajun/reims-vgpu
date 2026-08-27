@@ -4734,6 +4734,13 @@ pub fn counter_snapshot() -> CounterSnapshot {
     let (reg_peak, reg_peak_bytes) = eng.pools.registry_pressure_stats();
     snap.registry_non_pinned_peak = reg_peak;
     snap.registry_non_pinned_peak_bytes = reg_peak_bytes;
+    let levels = eng.pools.registry_levels();
+    snap.registry_current_count = levels.current.count as u64;
+    snap.registry_current_bytes = levels.current.bytes;
+    snap.registry_recoverable_count = levels.recoverable.count as u64;
+    snap.registry_recoverable_bytes = levels.recoverable.bytes;
+    snap.registry_pinned_count = levels.pinned.count as u64;
+    snap.registry_pinned_bytes = levels.pinned.bytes;
     let (sole_peak, sole_peak_bytes) = eng.pools.registry_sole_copy_stats();
     snap.registry_sole_copy_peak = sole_peak;
     snap.registry_sole_copy_peak_bytes = sole_peak_bytes;

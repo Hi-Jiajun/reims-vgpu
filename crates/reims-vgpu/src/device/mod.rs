@@ -594,6 +594,7 @@ pub fn device_drain(id: u64) -> bool {
     #[cfg(feature = "host-window")]
     window_publish::publish_window_frame(&slot, &mut device.state);
     crate::runtime::drain::note_drain_tranche(
+        &host,
         drain_us,
         publish_started.elapsed().as_micros() as u64,
     );

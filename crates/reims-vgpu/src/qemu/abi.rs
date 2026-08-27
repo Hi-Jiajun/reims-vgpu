@@ -92,7 +92,8 @@ use std::slice;
 /// [[host-window]]). The symbol is always present; when the staticlib was built
 /// without the `host-window` feature it returns `REIMS_VGPU_QEMU_ERR_STATE` so the C
 /// shim falls back to QEMU's own display.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 18;
+/// v19 adds the read-only packed-page alias census to [`ReimsVgpuHostOps`].
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 19;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -1008,6 +1009,42 @@ mod tests {
         assert_eq!(std::mem::offset_of!(GuestRamRegion, gpa_base), 0);
         assert_eq!(std::mem::offset_of!(GuestRamRegion, host_va), 8);
         assert_eq!(std::mem::offset_of!(GuestRamRegion, len), 16);
+    }
+
+    #[test]
+    fn the_abi_header_agrees_on_the_page_alias_census_layout() {
+        use crate::runtime::host::PageAliasCensus;
+
+        const HEADER: &str = include_str!("../../include/reims_vgpu_qemu_abi.h");
+        let body = HEADER
+            .split_once("typedef struct ReimsVgpuPageAliasCensus {")
+            .expect("the header must declare ReimsVgpuPageAliasCensus")
+            .1
+            .split_once('}')
+            .expect("the declaration must be closed")
+            .0;
+        let fields: Vec<&str> = body
+            .split(';')
+            .map(str::trim)
+            .filter(|field| !field.is_empty())
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                "uint64_t live",
+                "uint64_t live_bytes",
+                "uint64_t live_pages",
+                "uint64_t created",
+                "uint64_t destroyed",
+            ]
+        );
+        assert_eq!(std::mem::size_of::<PageAliasCensus>(), 40);
+        assert_eq!(std::mem::align_of::<PageAliasCensus>(), 8);
+        assert_eq!(std::mem::offset_of!(PageAliasCensus, live), 0);
+        assert_eq!(std::mem::offset_of!(PageAliasCensus, live_bytes), 8);
+        assert_eq!(std::mem::offset_of!(PageAliasCensus, live_pages), 16);
+        assert_eq!(std::mem::offset_of!(PageAliasCensus, created), 24);
+        assert_eq!(std::mem::offset_of!(PageAliasCensus, destroyed), 32);
     }
 
 

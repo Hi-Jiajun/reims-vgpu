@@ -8,6 +8,17 @@
 #[cfg(test)]
 use std::collections::BTreeMap;
 
+/// Packed page views currently owned by the host shim.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PageAliasCensus {
+    pub live: u64,
+    pub live_bytes: u64,
+    pub live_pages: u64,
+    pub created: u64,
+    pub destroyed: u64,
+}
+
 /// Guest-physical memory access error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemError {
@@ -457,6 +468,12 @@ pub trait HostOps {
     /// declared stability keeps the portable CPU writeback.
     fn map_pages_stable(&self) -> bool {
         false
+    }
+
+    /// Current packed-alias levels and cumulative lifetime totals. `None`
+    /// means this host does not construct or cannot report such aliases.
+    fn page_alias_census(&self) -> Option<PageAliasCensus> {
+        None
     }
 
     /// Where guest RAM lives in this process, as stable spans held for the VM's

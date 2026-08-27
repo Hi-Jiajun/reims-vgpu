@@ -7,6 +7,7 @@
 
 use crate::runtime::host::{
     GuestRamRegionsError, HostAction, HostActionKind, HostMemory, HostOps, MemError,
+    PageAliasCensus,
 };
 use std::collections::VecDeque;
 use std::os::raw::{c_int, c_void};
@@ -72,13 +73,10 @@ pub struct ReimsVgpuHostOps {
     /// stays valid for the device lifetime, so a caller may hold it
     /// indefinitely and `unmap_pages` has nothing to free.
     ///
-    /// The two shims answer differently and the difference is real. x86 PCI
-    /// answers **1**: a contiguous run is the RAMBlock pointer, while a
-    /// fragmented list becomes a retained packed alias over the shared RAM
-    /// backing; both live until device teardown. arm MMIO answers **0**: a
-    /// contiguous run gets the direct HVA, but a fragmented one gets a packed
-    /// `mach_vm_remap` view with caller-owned lifetime, and a bare pointer
-    /// cannot say which it is.
+    /// Both shims answer **0** because either may return a caller-owned packed
+    /// alias for a fragmented list. A contiguous run can still be a borrowed
+    /// RAMBlock pointer; `unmap_pages` recognizes those by their absence from
+    /// the shim's live-view registry and leaves them alone.
     ///
     /// It used to also license retaining the pointer inside a cached host-pointer
     /// import, which is where the stronger promise came from — MMIO could claim
@@ -120,6 +118,8 @@ pub struct ReimsVgpuHostOps {
             max: usize,
         ) -> i64,
     >,
+    pub page_alias_census:
+        Option<unsafe extern "C" fn(ctx: *mut c_void, out: *mut PageAliasCensus) -> i32>,
 }
 
 // SAFETY: QEMU keeps the table valid for the device lifetime; callbacks only
@@ -155,6 +155,7 @@ impl ReimsVgpuHostOps {
             untrack_guest_writes: None,
             guest_write_gen: None,
             guest_written_pages: None,
+            page_alias_census: None,
             is_ram_gpa: None,
             guest_ram_regions: None,
             notify_actions: None,
@@ -549,6 +550,13 @@ impl HostOps for QemuHost<'_> {
 
     fn map_pages_stable(&self) -> bool {
         self.ops.map_pages_stable != 0
+    }
+
+    fn page_alias_census(&self) -> Option<PageAliasCensus> {
+        let callback = self.ops.page_alias_census?;
+        let mut out = PageAliasCensus::default();
+        // SAFETY: `out` is writable for this call and QEMU owns the live ctx.
+        (unsafe { callback(self.ops.ctx, &mut out) } == 0).then_some(out)
     }
 
     fn guest_ram_regions(

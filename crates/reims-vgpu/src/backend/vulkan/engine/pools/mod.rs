@@ -1611,6 +1611,14 @@ pub(crate) struct NonPinnedTotals {
     pub bytes: u64,
 }
 
+/// Instantaneous resident-registry populations, all measured from one walk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RegistryLevels {
+    pub current: NonPinnedTotals,
+    pub recoverable: NonPinnedTotals,
+    pub pinned: NonPinnedTotals,
+}
+
 /// Where a registry-resident image sits, and what put it there, as one value.
 ///
 /// The two halves are inseparable because reading either one alone is the bug
