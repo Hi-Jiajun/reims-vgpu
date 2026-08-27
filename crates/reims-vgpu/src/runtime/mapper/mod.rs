@@ -1489,8 +1489,19 @@ pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
     }
     #[cfg(not(feature = "backend-vulkan"))]
     state.retired_guest_imports.clear();
-    for (ptr, len) in state.retired_views.drain(..) {
-        host.unmap_pages(ptr, len);
+    if host.map_pages_stable() {
+        // Stopgap until the backend can return an alias only after
+        // `DeferredHandle::GuestAllocation` reaches terminal destruction.
+        // A stable view may back a Vulkan host-pointer import whose child
+        // images and open submission slots outlive this mapping retirement;
+        // unmapping it here invalidates that import. Keep it until the shim's
+        // device-exit cleanup, matching the pre-release behaviour while the
+        // alias-pressure census measures the resulting session lifetime.
+        state.retired_views.clear();
+    } else {
+        for (ptr, len) in state.retired_views.drain(..) {
+            host.unmap_pages(ptr, len);
+        }
     }
     // Same shape and the same reason: a guest-write token is host-side state
     // for a page list that no longer exists, and only the host can free it.

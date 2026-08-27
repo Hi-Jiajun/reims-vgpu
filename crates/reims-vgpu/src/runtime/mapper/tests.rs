@@ -1224,3 +1224,28 @@ fn a_surface_colliding_with_several_control_structures_names_the_first() {
         Some((0x660_000, "task_directory"))
     );
 }
+
+#[test]
+fn stable_importable_views_wait_for_device_exit_instead_of_mapping_retirement() {
+    let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
+    state.retired_views.push((0x1000, 0x2000));
+    let mut host = crate::runtime::FakeHost::new();
+    host.stable_map_pages = true;
+
+    super::flush_retired_views(&mut state, &mut host);
+
+    assert!(state.retired_views.is_empty());
+    assert_eq!(host.unmap_pages_calls, 0);
+}
+
+#[test]
+fn transient_views_still_unmap_at_mapping_retirement() {
+    let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
+    state.retired_views.push((0x1000, 0x2000));
+    let mut host = crate::runtime::FakeHost::new();
+
+    super::flush_retired_views(&mut state, &mut host);
+
+    assert!(state.retired_views.is_empty());
+    assert_eq!(host.unmap_pages_calls, 1);
+}

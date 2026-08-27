@@ -707,6 +707,8 @@ pub struct FakeHost {
     pub stable_map_pages: bool,
     /// Number of HostOps page-import attempts (test proxy for import amplification).
     pub map_pages_calls: u64,
+    /// Number of page views the runtime explicitly retired.
+    pub unmap_pages_calls: u64,
     /// Half-open GPA ranges this host reports as **not** guest RAM, so a test
     /// can model device memory — a PCI BAR — and not only mapped vs unmapped.
     ///
@@ -1631,6 +1633,7 @@ impl HostOps for FakeHost {
     }
 
     fn unmap_pages(&mut self, ptr: usize, len: usize) {
+        self.unmap_pages_calls += 1;
         // A bounce view is a heap copy on every platform, so it is released the
         // same way on every platform — and it must be checked first, because
         // handing one to `mach_vm_deallocate` would free memory Mach never
