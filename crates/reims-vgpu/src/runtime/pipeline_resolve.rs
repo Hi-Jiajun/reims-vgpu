@@ -174,7 +174,9 @@ pub struct ResolvedRenderPipeline {
 pub(crate) fn retained_pipeline_with_desc_for_test(
     desc: RenderPipelineDescriptor,
 ) -> Arc<ResolvedRenderPipeline> {
-    use metal2vulkan::reflect::{ShaderReflection, ShaderStage, REFLECTION_VERSION};
+    use metal2vulkan::reflect::{
+        DescriptorLayout, ShaderReflection, ShaderStage, REFLECTION_VERSION,
+    };
 
     let reflection = |stage| {
         Arc::new(ShaderReflection {
@@ -196,6 +198,10 @@ pub(crate) fn retained_pipeline_with_desc_for_test(
             implicit_imageblock_attachments: vec![],
             fragment_imageblock: None,
             datalayout: None,
+            descriptor_layout: DescriptorLayout::default(),
+            kernel_dispatch: None,
+            runtime_sampler_specializations: vec![],
+            runtime_storage_image_specializations: vec![],
             function_constants: vec![],
         })
     };

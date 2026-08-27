@@ -1,12 +1,14 @@
 //! SPIR-V set-0 binding relocation for metal2vulkan + the internal Vulkan engine (Linux product).
 //!
 //! metal2vulkan decorates every stage independently at DescriptorSet 0, in bands
-//! 32 apart. [`widen_sampled_bands`] rewrites those into the device's own, wider
-//! layout once per shader — buffers `[0,32)`, textures `[32,160)`, samplers
-//! `[160,192)`, ColorInput / framebuffer fetch `[192,200)` — because a 32-wide
-//! texture band cannot hold the 128 indices Apple's serializer emits. The two
-//! numberings and why they differ are laid out in full below the constants; read
-//! that before touching a band, because reflection stays in the translator's
+//! 32 apart. Since reflection ABI v22 the translator's bands are non-overlapping
+//! and match the device's layout — buffers `[0,32)`, textures `[32,160)`, samplers
+//! `[160,192)`, ColorInput / framebuffer fetch `[192,200)` — so
+//! [`widen_sampled_bands`] is currently an identity pass. The widen machinery is
+//! preserved because the translator's constants are imported, not re-declared,
+//! and a future layout divergence would make it load-bearing again. The two
+//! numberings and why they (now) agree are laid out in full below the constants;
+//! read that before touching a band, because reflection stays in the translator's
 //! numbering while the SPIR-V moves to the device's.
 //!
 //! Everything after the widen is stated in device numbering. The engine builds
@@ -117,33 +119,41 @@ const SAMPLED_RESOURCE_BINDING_BASE: u32 = 32;
 const STORAGE_CLASS_UNIFORM_CONSTANT: u32 = 0;
 
 // ---------------------------------------------------------------------------
-// Two numberings, and why they are not the same one
+// Two numberings, and why they are (now) the same one
 // ---------------------------------------------------------------------------
 //
 // `metal2vulkan` emits its own bands, 32 apart, and they are the *input* to this
 // module. They are imported from the translator rather than re-declared, so a
 // change on that side fails this build instead of silently disagreeing.
 //
-// Those bands are too narrow: Metal's texture argument table is 128 entries and
-// Apple's serializer emits up to that (`bind_limit::TEXTURE`), so a texture at
-// index 40 would decorate binding 72 — the same number the translator gives
-// sampler 8. The device therefore uses a *wider* layout, and
-// [`widen_sampled_bands`] rewrites the translator's output into it once per
-// shader. Textures do not move (their base is the same in both), so every
-// consumer keyed on `TEXTURE_BINDING_BASE + metal_index` is unaffected; the
-// sampler and ColorInput bands move up out of the texture band's way.
+// Before reflection ABI v22 the translator's bands were 32 apart and overlapped:
+// textures `[32,64)`, samplers `[64,96)`, ColorInput `[96,104)`. A texture at
+// index 40 would decorate binding 72 — the same number the translator gave
+// sampler 8. [`widen_sampled_bands`] existed to rewrite those into a *wider*
+// device layout — textures `[32,160)`, samplers `[160,192)`, ColorInput
+// `[192,200)` — so the 128-entry texture table Apple's serializer can emit
+// (`bind_limit::TEXTURE`) would fit without aliasing a sampler.
+//
+// v22 ("Fix descriptor binding band collisions") replaced the overlapping bases
+// with checked, non-overlapping bands shared by emission and reflection. The
+// translator's layout now matches the device's exactly, so
+// [`SAMPLED_TAIL_WIDEN_OFFSET`] is 0 and [`widen_sampled_bands`] is an identity
+// pass. The widen machinery is preserved because the translator's bands are
+// still imported, not re-declared, and a future layout divergence would make it
+// load-bearing again.
 //
 //   class        translator emits   device uses      width
 //   buffers      [0, 32)            [0, 32)          32   (Metal's table is 31)
-//   textures     [32, 64)           [32, 160)        128  (Metal's table, exactly)
-//   samplers     [64, 96)           [160, 192)       32   (Metal's table is 16)
-//   ColorInput   [96, 104)          [192, 200)       8    (MRT ≤ 8)
+//   textures     [32, 160)          [32, 160)        128  (Metal's table, exactly)
+//   samplers     [160, 192)         [160, 192)       32   (Metal's table is 16)
+//   ColorInput   [192, 200)         [192, 200)       8    (MRT ≤ 8)
 //
 // The rewrite is keyed on the SPIR-V *type* behind each variable
-// ([`variable_classes`]), never on the number, which is what lets it separate a
-// texture at 72 from a sampler at 72. That also means it repairs a module in
-// which the translator gave both the same binding: two variables that collided
-// as one number come out as two.
+// ([`variable_classes`]), never on the number. Under the old overlapping bands
+// that was what let it separate a texture at 72 from a sampler at 72 — two
+// variables that collided as one number came out as two. With the non-overlapping
+// bands the collision cannot arise, but the type-keyed design remains so a future
+// overlap is caught and handled the same way.
 pub use metal2vulkan::reflect::{
     COLOR_INPUT_BINDING_BASE as M2V_COLOR_INPUT_BINDING_BASE,
     SAMPLER_BINDING_BASE as M2V_SAMPLER_BINDING_BASE,
@@ -158,9 +168,10 @@ pub use metal2vulkan::reflect::{
 pub const TEXTURE_BINDING_BASE: u32 = M2V_TEXTURE_BINDING_BASE;
 /// Device sampler band base (Metal sampler index N → binding 160+N).
 ///
-/// 160 rather than the translator's 64, so the texture band below it is 128 wide
-/// — exactly Metal's texture argument table, and exactly what Apple's serializer
-/// is entitled to emit.
+/// Equal to `M2V_SAMPLER_BINDING_BASE` by construction since reflection ABI v22
+/// made the translator's bands non-overlapping. Before v22 the translator used
+/// 64, so this device constant widened the band to 160 to give the 128-entry
+/// texture table room; the widen offset (`SAMPLED_TAIL_WIDEN_OFFSET`) is now 0.
 pub const SAMPLER_BINDING_BASE: u32 = 160;
 /// Device ColorInput band base: `air.render_target` INPUT params (framebuffer
 /// fetch, `dest_N`) emit `SubpassData` images, which the translator numbers from
@@ -173,7 +184,9 @@ pub const COLOR_INPUT_BINDING_BASE: u32 = 192;
 /// How far [`widen_sampled_bands`] moves a sampler or ColorInput decoration.
 ///
 /// One offset for both bands, so their spacing is preserved and the widen is a
-/// single translation rather than a per-class table.
+/// single translation rather than a per-class table. Since reflection ABI v22 the
+/// translator's sampler and ColorInput bases match the device's, so this is 0 and
+/// the widen is an identity pass.
 pub const SAMPLED_TAIL_WIDEN_OFFSET: u32 = SAMPLER_BINDING_BASE - M2V_SAMPLER_BINDING_BASE;
 const _: () = assert!(
     COLOR_INPUT_BINDING_BASE - M2V_COLOR_INPUT_BINDING_BASE == SAMPLED_TAIL_WIDEN_OFFSET,
@@ -2064,22 +2077,26 @@ pub fn offset_fragment_buffer_bindings(words: &mut [u32]) -> usize {
     )
 }
 
-/// Rewrite a freshly translated module from the translator's narrow bands into
-/// the device's wide ones: sampler and ColorInput bindings +=
-/// [`SAMPLED_TAIL_WIDEN_OFFSET`]. Textures do not move.
+/// Rewrite a freshly translated module from the translator's bands into the
+/// device's: sampler and ColorInput bindings += [`SAMPLED_TAIL_WIDEN_OFFSET`].
+/// Textures do not move.
 ///
 /// Run once per shader, before anything reads a binding number and before either
 /// fragment relocation, so every consumer downstream sees one numbering.
 ///
-/// # This is what makes texture indices 32..127 reachable
+/// Since reflection ABI v22 the translator's bands are non-overlapping and match
+/// the device's, so [`SAMPLED_TAIL_WIDEN_OFFSET`] is 0 and this is an identity
+/// pass. The pass is kept because the translator's constants are imported rather
+/// than re-declared, and a future layout divergence would make it load-bearing
+/// again.
 ///
-/// The translator's bands are 32 apart, so it decorates Metal texture 40 with
-/// binding 72 — the number it also gives sampler 8. Every index at or above 32
-/// was therefore refused upstream, and Apple's serializer emits up to 128
-/// (`bind_limit::TEXTURE`). Moving the two tail bands up leaves the texture band
-/// 128 wide, and the texture decorations are already correct in it.
+/// # What this pass did before v22, and why the type key matters
 ///
-/// # Why it cannot mis-file a binding
+/// The translator's old bands were 32 apart, so it decorated Metal texture 40
+/// with binding 72 — the number it also gave sampler 8. Every index at or above
+/// 32 was therefore refused upstream, and Apple's serializer emits up to 128
+/// (`bind_limit::TEXTURE`). Moving the two tail bands up left the texture band
+/// 128 wide, and the texture decorations were already correct in it.
 ///
 /// The class comes from the variable's SPIR-V type, not its number
 /// ([`variable_classes`]): a texture is an `OpTypeImage` whose `Dim` is not
@@ -2087,7 +2104,9 @@ pub fn offset_fragment_buffer_bindings(words: &mut [u32]) -> usize {
 /// image. So the pass separates a texture at 72 from a sampler at 72 exactly.
 /// It also *repairs* a module in which the translator gave both the same number
 /// — two variables that arrived colliding leave as two — which is the one shape
-/// the narrow bands could not express at all.
+/// the narrow bands could not express at all. With the non-overlapping v22 bands
+/// the collision cannot arise, but the type-keyed design remains so a future
+/// overlap is caught and handled the same way.
 ///
 /// The band predicate is the fallback for a variable the type walk could not
 /// name, and it is only consulted then; each such fallback is reported as
@@ -2211,10 +2230,16 @@ pub fn reflected_storage_image_format(
 
     let format = texture_shape_for_binding(reflection, binding)?.storage_format?;
     Some(match format {
+        TextureFormat::R8 => ImageFormat::R8Unorm,
+        TextureFormat::Rgba8 => ImageFormat::Rgba8Unorm,
         TextureFormat::R16f => ImageFormat::R16Float,
+        TextureFormat::R16ui => ImageFormat::Unsupported(16),
         TextureFormat::Rg16f => ImageFormat::Rg16Float,
         TextureFormat::R32f => ImageFormat::R32Float,
+        TextureFormat::R32i => ImageFormat::Unsupported(17),
         TextureFormat::R32ui => ImageFormat::R32ui,
+        TextureFormat::Rgba32i => ImageFormat::Unsupported(18),
+        TextureFormat::Rgba32ui => ImageFormat::Rgba32Uint,
         TextureFormat::Rgba32f => ImageFormat::Rgba32Float,
         TextureFormat::Rgba16f => ImageFormat::Rgba16Float,
         TextureFormat::Rgba8ui => ImageFormat::Rgba8Uint,
@@ -2227,11 +2252,12 @@ pub fn reflected_storage_image_format(
 /// names, as opposed to a sampler, a buffer, or a framebuffer-fetch input.
 ///
 /// The kind is checked as well as the binding because reflection reports the
-/// *translator's* numbering, whose bands are 32 apart: Metal texture 64 and
-/// ColorInput 0 are both binding 96 there, and both carry a `texture_shape`. The
-/// SPIR-V has no such ambiguity — [`widen_sampled_bands`] separated the two —
-/// but a lookup into reflection still has to say which one it meant, and the
-/// kind is the field that says it.
+/// *translator's* numbering. Before v22 the translator's bands were 32 apart,
+/// so Metal texture 64 and ColorInput 0 were both binding 96 there, and both
+/// carried a `texture_shape`; [`widen_sampled_bands`] separated the two. With
+/// the non-overlapping v22 bands the collision cannot arise, but a lookup into
+/// reflection still has to say which one it meant, and the kind is the field
+/// that says it.
 fn is_texture_kind(kind: ResourceKind) -> bool {
     matches!(
         kind,
@@ -3852,8 +3878,8 @@ mod more_tests {
     use metal2vulkan::meta::{FunctionConstant, TextureComponent, TextureShape};
     use metal2vulkan::reflect::{
         BufferByteRange, BufferFootprint, BufferIndexSource, BufferStrideTerm, BufferStridedAccess,
-        DescriptorLocation, ResourceBinding, ResourceKind, ShaderReflection, ShaderStage,
-        REFLECTION_VERSION,
+        DescriptorLayout, DescriptorLocation, ResourceBinding, ResourceKind, ShaderReflection,
+        ShaderStage, REFLECTION_VERSION,
     };
 
     fn empty_reflection(stage: ShaderStage) -> ShaderReflection {
@@ -3876,6 +3902,10 @@ mod more_tests {
             implicit_imageblock_attachments: vec![],
             fragment_imageblock: None,
             datalayout: None,
+            descriptor_layout: DescriptorLayout::default(),
+            kernel_dispatch: None,
+            runtime_sampler_specializations: vec![],
+            runtime_storage_image_specializations: vec![],
             function_constants: vec![],
         }
     }
@@ -4913,33 +4943,43 @@ mod more_tests {
         vec![0x0723_0203, 0x0001_0000, 0, 512, 0]
     }
 
-    /// The collision that used to bound the texture table, and the widen that
-    /// resolves it.
+    /// The translator's bands are non-overlapping, so a texture and a sampler at
+    /// their natural translator bindings are already at distinct device bindings
+    /// and [`widen_sampled_bands`] is a no-op.
     ///
-    /// metal2vulkan puts texture `N` at `32+N` and sampler `N` at `64+N`, so
-    /// texture 40 and sampler 8 are both binding 72 — one number for two
-    /// descriptors, which is a module the narrow bands cannot express at all.
-    /// The SPIR-V type tells them apart, and [`widen_sampled_bands`] acts on the
-    /// type: the two arrive as one number and leave as two. That is what makes
-    /// texture indices 32..127 reachable rather than merely countable.
+    /// metal2vulkan v22 replaced the old 32-apart overlapping bands (textures
+    /// `[32,64)`, samplers `[64,96)`) with checked, non-overlapping bands shared
+    /// by emission and reflection: textures `[32,160)`, samplers `[160,192)`.
+    /// The old layout made texture 40 and sampler 8 both land on binding 72 — one
+    /// number for two descriptors. [`widen_sampled_bands`] existed to separate
+    /// them by moving the sampler up to 168. With the new layout the sampler
+    /// starts at 168, so [`SAMPLED_TAIL_WIDEN_OFFSET`] is 0 and the widen is an
+    /// identity pass. This test pins that: a colliding pair can no longer be
+    /// constructed from valid translator indices, and the widen does not move
+    /// either variable.
     #[test]
-    fn a_texture_and_a_sampler_sharing_one_binding_are_separated_by_the_widen() {
+    fn a_texture_and_a_sampler_at_their_natural_bands_are_already_distinct() {
         const IMAGE: u32 = 10;
         const SAMPLER: u32 = 11;
-        const COLLIDING: u32 = M2V_TEXTURE_BINDING_BASE + 40;
-        const _: () = assert!(COLLIDING == M2V_SAMPLER_BINDING_BASE + 8);
+        // The translator's texture and sampler bands no longer overlap.
+        const TEXTURE_BINDING: u32 = M2V_TEXTURE_BINDING_BASE + 40;
+        const SAMPLER_BINDING: u32 = M2V_SAMPLER_BINDING_BASE + 8;
+        const _: () = assert!(TEXTURE_BINDING != SAMPLER_BINDING);
+        const _: () = assert!(SAMPLED_TAIL_WIDEN_OFFSET == 0);
 
         let mut words = module_header();
         words.extend(image_type(IMAGE, 1));
         words.extend([(2u32 << 16) | OP_TYPE_SAMPLER as u32, SAMPLER]);
-        words.extend(typed_descriptor(30, IMAGE, COLLIDING));
-        words.extend(typed_descriptor(31, SAMPLER, COLLIDING));
+        words.extend(typed_descriptor(30, IMAGE, TEXTURE_BINDING));
+        words.extend(typed_descriptor(31, SAMPLER, SAMPLER_BINDING));
 
         let classes = variable_classes(&words);
         assert_eq!(classes[30], Some(BindingClass::Texture));
         assert_eq!(classes[31], Some(BindingClass::Sampler));
 
-        assert_eq!(widen_sampled_bands(&mut words), 1, "only the sampler moves");
+        // The widen still touches every sampler/ColorInput variable, but with
+        // SAMPLED_TAIL_WIDEN_OFFSET == 0 it is an identity pass — nothing moves.
+        widen_sampled_bands(&mut words);
         let binding_of = |var: u32| {
             let mut i = HEADER_WORDS;
             let mut found = None;
@@ -4958,8 +4998,7 @@ mod more_tests {
             }
             found.expect("every descriptor here carries a Binding decoration")
         };
-        // The texture keeps the translator's number, which is already correct in
-        // a 128-wide band; the sampler moves out from under it.
+        // Both keep the translator's number, which is already the device's.
         assert_eq!(binding_of(30), TEXTURE_BINDING_BASE + 40);
         assert_eq!(binding_of(31), SAMPLER_BINDING_BASE + 8);
         assert_ne!(binding_of(30), binding_of(31));
