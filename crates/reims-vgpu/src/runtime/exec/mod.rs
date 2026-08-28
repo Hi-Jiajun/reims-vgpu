@@ -3617,6 +3617,39 @@ fn finish_stream<M: HostMemory + HostOps>(
                     out.clears_applied, out.metal_draws_fail, saw_nometal as u8
                 ));
             }
+        } else if out.metal_draws_fail > 0 && !acc.clears.is_empty() {
+            // **The guard above is packet-wide, and this is the population it
+            // cannot see.** A packet where one record's draw landed and
+            // another's failed takes this arm: `metal_draws_ok` is non-zero, so
+            // no clear is applied for the record that failed, and the
+            // `draw_fail_clear_fallback` line above does not fire either. That
+            // attachment's guest pages keep whatever they held before — the
+            // previous frame's content when the two records target different
+            // attachments, which is a stale frame rather than a clear.
+            //
+            // Recorded rather than repaired. Applying the clears here would
+            // overwrite the *successful* record's rendered pixels whenever the
+            // two records share one attachment, which is the common case and is
+            // the reason the guard was written packet-wide. The repair is a
+            // per-attachment guard — apply the clear only for attachments whose
+            // own records failed — and it is not worth writing against a
+            // population nobody has measured. This counter is that measurement:
+            // read it on a driven boot before changing the guard.
+            crate::runtime::drain::note_store_route("clear_fallback_skipped_partial_packet");
+            crate::runtime::drain::note_store_route_n(
+                "clear_fallback_skipped_partial_packet_clears",
+                acc.clears_reaching_guest_pages().count() as u64,
+            );
+            if crate::observe::first_sight("clear_fallback_skipped_partial", u64::from(task_id)) {
+                crate::observe::fail(format!(
+                    "clear_fallback_skipped_partial task={task_id} draws_ok={} draws_fail={} \
+                     clears={} (a packet with both a landed and a failed draw applies no \
+                     clear for the failed one; its attachment keeps the previous frame)",
+                    out.metal_draws_ok,
+                    out.metal_draws_fail,
+                    acc.clears_reaching_guest_pages().count()
+                ));
+            }
         }
     }
 }

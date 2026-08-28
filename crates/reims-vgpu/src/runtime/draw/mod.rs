@@ -4954,80 +4954,13 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
         bpr,
         format,
         rgba,
-        SourceRows::Distinct,
         allowed,
     )
 }
 
-/// Land a solid colour into a GVA render target.
-///
-/// One tight RGBA8 row is built and handed to the same writer every full-image
-/// landing uses, with [`SourceRows::Repeated`] — so the format conversion runs
-/// once for the whole surface instead of once per row, and the caller never
-/// materialises an image at all.
-///
-/// This is the CLEAR seed's whole path. Everything it lands is `w * h` copies of
-/// one word; the previous route built that word into a full-surface buffer,
-/// re-converted each of its identical rows into the destination format, and
-/// copied them one at a time. `clear_seed_gva_us` measured **118 ms a second for
-/// 175 MB** on the load probe's `blur=40` dial, which is 0.7 GB/s for a copy.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the same target GVA and native row geometry every GVA writer takes"
-)]
-// The CLEAR seed at the head of a draw chain is the only caller, and it is the
-// Vulkan rail's; the Metal rail seeds through its own encoder.
-#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
-pub(crate) fn write_gva_solid8<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    task_id: u32,
-    gva: u64,
-    width: u32,
-    height: u32,
-    bpr: u32,
-    format: u16,
-    clear: &[f64; 4],
-) -> Result<(), crate::runtime::host::MemError> {
-    let row = pixel_format::solid_rgba8(width, 1, clear);
-    write_gva_rows_within(
-        state,
-        host,
-        task_id,
-        gva,
-        width,
-        height,
-        bpr,
-        format,
-        &row,
-        SourceRows::Repeated,
-        None,
-    )
-}
-
-/// Whether the source buffer holds one row per destination row, or a single row
-/// every destination row is a copy of.
-///
-/// The distinction is worth a type because it decides how many *format
-/// conversions* the write performs, and that is the whole cost of a solid
-/// landing: a CLEAR seed converts one 7 KiB row and then converts it again for
-/// every one of a thousand identical rows. Measured on the load probe's
-/// `blur=40` dial, `clear_seed_gva_us` was **118 ms a second for 175 MB** —
-/// 0.7 GB/s, where the copy alone would be an order of magnitude faster.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SourceRows {
-    /// `height` rows of `width` RGBA8 texels, one per destination row.
-    Distinct,
-    /// One row of `width` RGBA8 texels, written to every destination row.
-    ///
-    /// Constructed only by [`write_gva_solid8`], which the Metal rail does not
-    /// reach — the two arms seed a CLEAR through different encoders.
-    #[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
-    Repeated,
-}
-
-/// [`write_gva_rgba8_within`] and [`write_gva_solid8_within`] share this body;
-/// [`SourceRows`] is the only difference between them.
+/// The one full-image GVA writer. Every destination row has its own source
+/// row: the solid-colour variant that shared this body existed only for the
+/// eager CLEAR seed, which was this device's own invention and is gone.
 #[allow(
     clippy::too_many_arguments,
     reason = "the archive writer mirrors the target GVA and native row geometry"
@@ -5042,7 +4975,6 @@ fn write_gva_rows_within<M: HostMemory + HostOps>(
     bpr: u32,
     format: u16,
     rgba: &[u8],
-    rows: SourceRows,
     allowed: crate::runtime::gva_view::WindowPages<'_>,
 ) -> Result<(), crate::runtime::host::MemError> {
     use crate::runtime::host::MemError;
@@ -5056,26 +4988,13 @@ fn write_gva_rows_within<M: HostMemory + HostOps>(
         return Err(MemError::BadArgs);
     }
     let rgba_row = (width as usize).saturating_mul(RGBA8_BPP as usize);
-    // A repeated source is one row however tall the destination is, which is
-    // also what makes its conversion a one-off below.
-    let src_stride = match rows {
-        SourceRows::Distinct => rgba_row,
-        SourceRows::Repeated => 0,
-    };
-    let need = match rows {
-        SourceRows::Distinct => rgba_row.saturating_mul(height as usize),
-        SourceRows::Repeated => rgba_row,
-    };
+    let src_stride = rgba_row;
+    let need = rgba_row.saturating_mul(height as usize);
     if rgba.len() < need {
         return Err(MemError::BadArgs);
     }
     let span = (height as u64).saturating_mul(bpr as u64);
     let mut row = vec![0u8; tight as usize];
-    // A repeated source converts once and every destination row is that same
-    // conversion; a distinct source converts per row. Tracked rather than
-    // branched on inside the loop so the two forms cannot answer differently
-    // about *which* row is in `row` at any point.
-    let mut converted = false;
     // Guest writes resolve through a fresh PT walk at write time — never a
     // cached view (stale-view heap-corruption class; see
     // `gva_view::write_span_within`) —
@@ -5087,14 +5006,11 @@ fn write_gva_rows_within<M: HostMemory + HostOps>(
         let (base, avail) = (span_map.ptr, span_map.avail);
         let mut res = Ok(());
         for y in 0..height as usize {
-            if !converted || src_stride != 0 {
-                let at = y * src_stride;
-                let src = &rgba[at..at + rgba_row];
-                if !pixel_format::convert_rgba8_to_row(format, src, width, &mut row) {
-                    res = Err(MemError::BadArgs);
-                    break;
-                }
-                converted = true;
+            let at = y * src_stride;
+            let src = &rgba[at..at + rgba_row];
+            if !pixel_format::convert_rgba8_to_row(format, src, width, &mut row) {
+                res = Err(MemError::BadArgs);
+                break;
             }
             let off = y.saturating_mul(bpr as usize);
             if off + row.len() > avail {
@@ -5111,13 +5027,10 @@ fn write_gva_rows_within<M: HostMemory + HostOps>(
     }
     // Fragmented GVA: multi-import each converted row via `write_span_within`.
     for y in 0..height as usize {
-        if !converted || src_stride != 0 {
-            let at = y * src_stride;
-            let src = &rgba[at..at + rgba_row];
-            if !pixel_format::convert_rgba8_to_row(format, src, width, &mut row) {
-                return Err(MemError::BadArgs);
-            }
-            converted = true;
+        let at = y * src_stride;
+        let src = &rgba[at..at + rgba_row];
+        if !pixel_format::convert_rgba8_to_row(format, src, width, &mut row) {
+            return Err(MemError::BadArgs);
         }
         let row_gva = gva.saturating_add((y as u64).saturating_mul(bpr as u64));
         if let Err(err) = crate::runtime::gva_view::write_span_within(

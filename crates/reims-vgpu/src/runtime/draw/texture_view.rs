@@ -602,6 +602,14 @@ pub(crate) enum LinearLoadRefusal {
     PaddedRowUnreadable { row: u32 },
     /// The format has a bytes-per-pixel but no row conversion to RGBA8.
     RowConvertUnsupported { format: u16 },
+    /// Two faces of one cube texture read back in different layouts.
+    ///
+    /// One descriptor names one pixel format, so the six faces cannot legally
+    /// differ. A disagreement is this loader's own defect rather than the
+    /// guest's, and it is named rather than folded into a format refusal so the
+    /// log says which face disagreed instead of reporting a format of zero that
+    /// no guest ever sent.
+    CubeFaceLayoutMismatch { face: u32 },
 }
 
 impl crate::observe::Decline for LinearLoadRefusal {
@@ -622,6 +630,7 @@ impl crate::observe::Decline for LinearLoadRefusal {
             Self::TightImageUnreadable => "linear_load_tight_image_unreadable",
             Self::PaddedRowUnreadable { .. } => "linear_load_padded_row_unreadable",
             Self::RowConvertUnsupported { .. } => "linear_load_row_convert_unsupported",
+            Self::CubeFaceLayoutMismatch { .. } => "linear_load_cube_face_layout_mismatch",
         }
     }
 
@@ -644,6 +653,7 @@ impl crate::observe::Decline for LinearLoadRefusal {
                 vec![("end", end.to_string()), ("alloc", allocation.to_string())]
             }
             Self::PaddedRowUnreadable { row } => vec![("row", row.to_string())],
+            Self::CubeFaceLayoutMismatch { face } => vec![("face", face.to_string())],
             _ => Vec::new(),
         }
     }
@@ -715,9 +725,15 @@ pub(crate) fn load_cube_faces<M: HostMemory + HostOps>(
     /// seven, and the engine refuses `cube` images whose layer count is not
     /// exactly this.
     const CUBE_FACES: u32 = 6;
-    let mut packed: Vec<u8> = Vec::new();
-    let mut format: Option<SampledByteFormat> = None;
-    for face in 0..CUBE_FACES {
+    // Face zero is read first so the format and the whole capacity are known
+    // before the loop, which is what lets the six faces pack with one
+    // allocation and leaves no "no face was read" case to invent a refusal for.
+    let (first_bytes, format) =
+        load_linear_texture_impl(state, host, task_id, texture_ref, 0, 0, None, native, site)?;
+    let mut packed: Vec<u8> = Vec::with_capacity(first_bytes.len() * CUBE_FACES as usize);
+    packed.extend_from_slice(&first_bytes);
+    drop(first_bytes);
+    for face in 1..CUBE_FACES {
         let (bytes, byte_format) = load_linear_texture_impl(
             state,
             host,
@@ -729,30 +745,14 @@ pub(crate) fn load_cube_faces<M: HostMemory + HostOps>(
             native,
             site,
         )?;
-        match format {
-            None => {
-                // Sized once, from the first face: the five remaining reads of
-                // one descriptor cannot legally differ in length.
-                packed.reserve_exact(bytes.len() * (CUBE_FACES as usize - 1));
-                format = Some(byte_format);
-            }
-            Some(first) => {
-                // One descriptor, one format — a disagreement here is this
-                // loader's own bug, not the guest's, so it is a refusal rather
-                // than a debug assertion that vanishes in release.
-                if first.layout() != byte_format.layout() {
-                    return Err(LinearLoadRefusal::RowConvertUnsupported {
-                        format: 0,
-                    });
-                }
-            }
+        // One descriptor, one format — a disagreement here is this loader's own
+        // bug, not the guest's, so it is a named refusal rather than a debug
+        // assertion that vanishes in release.
+        if format.layout() != byte_format.layout() {
+            return Err(LinearLoadRefusal::CubeFaceLayoutMismatch { face });
         }
         packed.extend_from_slice(&bytes);
     }
-    let format = format.ok_or(LinearLoadRefusal::ZeroExtent {
-        width: 0,
-        height: 0,
-    })?;
     Ok((packed, format))
 }
 

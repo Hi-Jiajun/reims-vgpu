@@ -2084,31 +2084,6 @@ fn unorm8_to_f16_lut() -> &'static [u16; 256] {
     })
 }
 
-/// Restate a semantic-RGBA8 frame as `layout`'s own texels.
-///
-/// The render-target seed's counterpart to [`convert_rgba8_to_row`], keyed on a
-/// [`TexelLayout`] rather than on a guest format because the caller is the
-/// engine and what it holds is the *attachment's* layout.
-///
-/// # Why a colour attachment needs this at all
-///
-/// A CPU `MTLLoadActionLoad` seed is staged into a buffer and copied into the
-/// attachment, and a Vulkan buffer→image copy converts nothing: it reads the
-/// image format's texel width per pixel, straight out of the buffer. While
-/// every render target was eight bits per channel the seed was already those
-/// bytes and the only question was the channel order. A wider attachment reads
-/// twice as many bytes per texel as an RGBA8 seed provides, walks off the end
-/// of the staging slot, and seeds the frame with whatever followed it.
-///
-/// `false` for a layout no colour attachment can be created at, so the caller
-/// declines by name rather than staging a frame of the wrong size. Exhaustive
-/// over [`TexelLayout`] on purpose — a new layout that becomes renderable has
-/// to say here how its seed is written.
-///
-/// The expansion is lossy in the direction that was already lost: the seed
-/// arrives with eight bits per channel whatever this writes it as. What it buys
-/// is that the seed lands as the attachment's texels instead of as a quarter of
-/// them, and the *rendering* on top of it keeps the full range.
 /// Bit position of each channel in `MTLPixelFormatBGR10A2Unorm`'s texel word.
 ///
 /// One little-endian 32-bit word: blue in bits 0..9, green in 10..19, red in
@@ -2178,6 +2153,31 @@ fn rgba8_to_bgr10a2_word(rgba: [u8; COMPONENT_COUNT]) -> u32 {
         | channel(rgba[COMPONENT_B]) << BGR10A2_BLUE_SHIFT
 }
 
+/// Restate a semantic-RGBA8 frame as `layout`'s own texels.
+///
+/// The render-target seed's counterpart to [`convert_rgba8_to_row`], keyed on a
+/// [`TexelLayout`] rather than on a guest format because the caller is the
+/// engine and what it holds is the *attachment's* layout.
+///
+/// # Why a colour attachment needs this at all
+///
+/// A CPU `MTLLoadActionLoad` seed is staged into a buffer and copied into the
+/// attachment, and a Vulkan buffer→image copy converts nothing: it reads the
+/// image format's texel width per pixel, straight out of the buffer. While
+/// every render target was eight bits per channel the seed was already those
+/// bytes and the only question was the channel order. A wider attachment reads
+/// twice as many bytes per texel as an RGBA8 seed provides, walks off the end
+/// of the staging slot, and seeds the frame with whatever followed it.
+///
+/// `false` for a layout no colour attachment can be created at, so the caller
+/// declines by name rather than staging a frame of the wrong size. Exhaustive
+/// over [`TexelLayout`] on purpose — a new layout that becomes renderable has
+/// to say here how its seed is written.
+///
+/// The expansion is lossy in the direction that was already lost: the seed
+/// arrives with eight bits per channel whatever this writes it as. What it buys
+/// is that the seed lands as the attachment's texels instead of as a quarter of
+/// them, and the *rendering* on top of it keeps the full range.
 pub fn expand_rgba8_to_texel(
     layout: TexelLayout,
     src_rgba: &[u8],

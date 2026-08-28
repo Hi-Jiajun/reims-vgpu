@@ -1861,7 +1861,9 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
         )
     {
         crate::observe::fail(format!(
-            "texture_desc_mip_field_undecoded value={undecoded:#04x}              levels={} len={} (the byte above the mip-level count carries              something this device does not decode; the count is the low byte              and the body length confirms it)",
+            "texture_desc_mip_field_undecoded value={undecoded:#04x} levels={} len={} \
+             (the byte above the mip-level count carries something this device does \
+             not decode; the count is the low byte and the body length confirms it)",
             out.mipmap_level_count,
             bytes.len()
         ));

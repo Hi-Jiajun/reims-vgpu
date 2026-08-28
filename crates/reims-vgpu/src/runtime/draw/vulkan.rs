@@ -8,7 +8,6 @@
 //! parent's imports, which this half shares.
 
 use super::*;
-use crate::contract::pixel_format::solid_bgra8;
 
 /// Vulkan image shape for a reflected Metal sampled-image dimensionality.
 ///
@@ -112,132 +111,29 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         return (EncodeStatus::BadArgs("draw_vk_no_color_target"), None);
     };
 
-    let mut any_store = false;
-    // The seeded solid colour of attachment 0, as its recipe rather than as its
-    // pixels.
-    //
-    // This used to be the `Vec<u8>` itself, built by `solid_rgba8` inside the
-    // seed loop. Only one of this function's five exits returns it — the
-    // clear-only one at the bottom, where the record encoded no draw — and the
-    // three that matter under compositing (`chain_resident_established`, an armed
-    // Store, a real `draw_rgba`) each return something else and dropped it
-    // unread. On a macos-11 Safari-torture leg the seed loop landed 2.87 GB of
-    // solid colour through `write_gva_solid8`, which converts one row and repeats
-    // it; the full-surface image built beside it was the same 2.87 GB of
-    // allocate-and-fill, and 188 ms of the leg's 892 ms `prep_seed_us` sat
-    // outside both landing spans, which is where it was.
-    //
-    // Held as `(width, height, colour)` so the recipe costs a few words and the
-    // exit that wants pixels calls the same constructor with the same arguments.
-    let mut color0_solid: Option<(u32, u32, [f64; 4])> = None;
     // The engine draw's own refusal slug, kept so the skipped-draw tail can name
     // why its draws were skipped instead of guessing. `None` means the engine
     // draw was never attempted — this record carried no pipeline or no vertices.
     let mut engine_refusal: Option<&'static str> = None;
-    // Solid CLEAR seed Stores only when this record owns guest writeback
-    // (last of a serialized chain, or unified always-writeback).
-    //
-    // The recipe capture for the clear-only exit is *outside* the landing gate:
-    // that exit hands the clear colour to the next record's seed whether or not
-    // this device eagerly writes it into guest pages, and capturing it inside
-    // the gate is how turning the eager write off would silently break record
-    // chaining too.
-    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::PrepSeed);
-    if writeback_guest {
-        if let Some(c0) = colors.first() {
-            if crate::contract::pass_action::store_action_publishes_single_sample(c0.store_action)
-                && (c0.load_action == MTL_LOAD_ACTION_CLEAR
-                    || c0.load_action == MTL_LOAD_ACTION_DONT_CARE)
-                && c0.width != 0
-                && c0.height != 0
-            {
-                color0_solid = Some((c0.width, c0.height, c0.clear_color));
-            }
-        }
-    }
-    if writeback_guest && clear_seed_enabled() {
-        for c in colors.iter() {
-            // Reports an out-of-contract value; the gate below is unchanged, and
-            // it is the site that disagrees with this module's writeback loop
-            // about what such a value means. See `super::store_action_in_contract`.
-            let _ = super::store_action_in_contract(req.pipeline_ref, c.store_action);
-            if !crate::contract::pass_action::store_action_publishes_single_sample(c.store_action) {
-                continue;
-            }
-            if c.load_action != MTL_LOAD_ACTION_CLEAR && c.load_action != MTL_LOAD_ACTION_DONT_CARE
-            {
-                // Load/composite needs real encode (metal2vulkan) — skip Store.
-                continue;
-            }
-            if c.width == 0 || c.height == 0 {
-                continue;
-            }
-            // Which branch this loop actually takes, how many bytes it lands and
-            // what the landing costs. `prep_seed_us` is 8.6 µs of a 41 µs chain
-            // on the `blur=40` dial and rebuilding the images without their two
-            // redundant passes did not move it by a hundredth, so the cost is in
-            // one of these two writes and there was no reading that said which.
-            let seed_kb = u64::from(c.width)
-                .saturating_mul(u64::from(c.height))
-                .saturating_mul(u64::from(RGBA8_BPP))
-                / 1024;
-            let ok = if c.target_gva != 0 {
-                let _span = StoreCostSpan::new("clear_seed_gva_us");
-                crate::runtime::drain::note_store_route("clear_seed_gva");
-                crate::runtime::drain::note_store_route_n("clear_seed_gva_kb", seed_kb);
-                // A solid landing, so the writer converts one row rather than
-                // this surface's thousand identical ones. The full RGBA image
-                // above is built for `color0_rgba` and is not this write's
-                // source.
-                write_gva_solid8(
-                    state,
-                    host,
-                    req.task_id,
-                    c.target_gva,
-                    c.width,
-                    c.height,
-                    c.row_stride,
-                    c.format,
-                    &c.clear_color,
-                )
-                .is_ok()
-            } else if c.mapping_id != 0 {
-                // Type-11 CLEAR. `write_bgra8` takes guest scanout order and
-                // converts to the mapping's native format per row; it handles a
-                // fragmented mapping too, staging native rows and landing them
-                // through `mapper::write_mapping_bytes`. (A comment here used to
-                // call it contig-only, which it has not been.)
-                //
-                // Built from the swapped *pixel* rather than by exchanging the
-                // channels of the RGBA image: a solid image is one repeated
-                // word, so the exchange belongs to the word and doing it per
-                // texel cost an allocation and two passes over the whole
-                // surface. See `contract::pixel_format::solid_bgra8`.
-                let _span = StoreCostSpan::new("clear_seed_t11_us");
-                crate::runtime::drain::note_store_route("clear_seed_t11");
-                crate::runtime::drain::note_store_route_n("clear_seed_t11_kb", seed_kb);
-                let bgra = solid_bgra8(c.width, c.height, &c.clear_color);
-                let stride = c.width.saturating_mul(RGBA8_BPP);
-                mapping_write::write_bgra8(
-                    state,
-                    host,
-                    c.mapping_id,
-                    &bgra,
-                    stride,
-                    c.width,
-                    c.height,
-                )
-            } else {
-                false
-            };
-            if ok {
-                any_store = true;
-                crate::observe::line(format!(
-                    "linux_clear_store mid={} gva={:#x} {}x{} pipe={} load={}",
-                    c.mapping_id, c.target_gva, c.width, c.height, req.pipeline_ref, c.load_action
-                ));
-            }
-        }
+    // This device used to write the whole clear frame into the guest's own pages
+    // here, ahead of any GPU work, and hand the clear on as the next record's
+    // seed. Nothing in the contract asks for the write: the guest states its
+    // clear in the render-pass descriptor and this device decodes it, so a clear
+    // is pass state, not a guest-memory write that has to land early. The write
+    // was this device's own. It cost ~550 ms of every drain second on a driven
+    // 3D workload and it put pixels in a page a display swap could read before
+    // the draw that replaces them — the hazard `runtime::exec::finish_stream`
+    // already declines to create, by applying clears only to streams that will
+    // not draw. `finish_stream` is now the only thing that lands a pass clear in
+    // guest memory, after the work that might have replaced it.
+
+    // An out-of-contract store action is reported where a record's colour
+    // attachments are first walked. That walk used to be the eager seed's loop;
+    // with the seed gone this is it, and the report is kept because a store
+    // action this device cannot name is a decoded value going unhonoured — see
+    // `super::store_action_in_contract`.
+    for c in colors.iter() {
+        let _ = super::store_action_in_contract(req.pipeline_ref, c.store_action);
     }
 
     // Pages the eager GVA fallback below is allowed to reach, resolved
@@ -742,12 +638,11 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         }
     }
 
-    // The skipped-draw census sits above the `any_store` split, because the
-    // split no longer decides whether a draw was skipped — only whether a CLEAR
-    // seed happened to land first. When the eager seed was unconditional this
-    // block lived inside the seeded arm, and turning the seed off (its default
-    // now) silently retired the only instrument that counts what an engine
-    // refusal costs the guest.
+    // The skipped-draw census is unconditional. It used to live inside the
+    // seeded arm, where whether a draw was counted as skipped depended on
+    // whether a CLEAR seed happened to land first — so removing the seed would
+    // have retired the only instrument that counts what an engine refusal costs
+    // the guest.
     if req.vertex_count > 0 || req.indexed.is_some() {
         // This used to end in the literal `(m2v pending)`, which was a
         // hardcoded guess and was wrong. The tail is reached whenever the
@@ -796,33 +691,12 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             u64::from(req.vertex_count),
         );
     }
-    if any_store {
-        // The one exit that hands the seed on: this record encoded no draw, so
-        // the solid colour it landed *is* this chain's colour-0 content, and the
-        // next record loads it as its seed. Built here rather than in the loop
-        // above because the four exits before this one return without it.
-        //
-        // The route is what says the deferral is worth having: read it against
-        // `clear_seed_gva` + `clear_seed_t11`, which count the seeds, and the
-        // difference is the full-surface images that used to be built and
-        // dropped. A boot where the two are equal has nothing to save here.
-        (
-            EncodeStatus::Ok,
-            color0_solid.map(|(w, h, clear)| {
-                crate::runtime::drain::note_store_route("clear_seed_color0_image");
-                crate::runtime::drain::note_store_route_n(
-                    "clear_seed_color0_image_kb",
-                    u64::from(w)
-                        .saturating_mul(u64::from(h))
-                        .saturating_mul(u64::from(RGBA8_BPP))
-                        / 1024,
-                );
-                solid_rgba8(w, h, &clear)
-            }),
-        )
-    } else {
-        (EncodeStatus::NoMetal("draw_vk_nothing_stored"), None)
-    }
+    // Nothing in this record reached the guest's pages: it encoded no draw, and
+    // this device no longer pre-writes a clear frame here. The clear itself is
+    // not lost — `runtime::exec::finish_stream` applies the pass's clears once
+    // the packet ends, which is where a clear belongs, after the work that might
+    // have replaced it rather than before it.
+    (EncodeStatus::NoMetal("draw_vk_nothing_stored"), None)
 }
 
 /// Sampled texture source + geometry for an engine draw.
@@ -9242,11 +9116,50 @@ pub(super) fn depth_chain_identity(
     //
     // The high bit keeps this out of the engine's other `Anonymous` slots,
     // which count up from zero.
+    //
+    // The four fields are stated as shifts rather than open-coded because two
+    // of them are one bit apart from colliding and nothing else compares them:
+    // `height` sits directly below `width`, and `width` directly below the tag.
+    // The assertion is what holds that true — a widened dimension field or a
+    // moved tag fails the build here instead of handing two different passes
+    // one identity.
+    const SLOT_TAG_BIT: u32 = 63;
+    const SLOT_WIDTH_SHIFT: u32 = 32;
+    const SLOT_HEIGHT_SHIFT: u32 = 1;
+    const SLOT_STENCIL_SHIFT: u32 = 0;
+    /// Bits each dimension is packed into, and therefore the extent this slot
+    /// can express at all.
+    const SLOT_DIM_BITS: u32 = 31;
+    const _: () = assert!(
+        SLOT_STENCIL_SHIFT < SLOT_HEIGHT_SHIFT
+            && SLOT_HEIGHT_SHIFT + SLOT_DIM_BITS <= SLOT_WIDTH_SHIFT
+            && SLOT_WIDTH_SHIFT + SLOT_DIM_BITS <= SLOT_TAG_BIT
+    );
+    // An extent past the field width would wrap into the field above it, which
+    // is the one way this identity can be *wrong* rather than merely absent:
+    // two passes of different shapes would resolve one resident. No host
+    // advertises a `maxImageDimension2D` within three orders of magnitude of
+    // this, so reaching it means the extent is not a real one — decline the
+    // shared identity by name and let the record take a transient, which is
+    // what it did before this identity existed.
+    if width >> SLOT_DIM_BITS != 0 || height >> SLOT_DIM_BITS != 0 {
+        if crate::observe::first_sight(
+            "depth_chain_identity_extent_unrepresentable",
+            u64::from(width) << 32 | u64::from(height),
+        ) {
+            crate::observe::fail(format!(
+                "depth_chain_identity_extent_unrepresentable width={width} height={height} \
+                 dim_bits={SLOT_DIM_BITS} (anonymous depth falls back to a per-record \
+                 transient; inter-record occlusion is not shared for this pass)"
+            ));
+        }
+        return None;
+    }
     Some(crate::backend::vulkan::engine::TargetIdentity::Anonymous {
-        slot: (1u64 << 63)
-            | (u64::from(width) << 32)
-            | (u64::from(height) << 1)
-            | u64::from(with_stencil),
+        slot: (1u64 << SLOT_TAG_BIT)
+            | (u64::from(width) << SLOT_WIDTH_SHIFT)
+            | (u64::from(height) << SLOT_HEIGHT_SHIFT)
+            | (u64::from(with_stencil) << SLOT_STENCIL_SHIFT),
     })
 }
 
@@ -12152,49 +12065,4 @@ mod vulkan_split_tests {
         map_one_gva_page(&mut host, 5);
         assert_eq!(gen_of(&mut host), gen_a);
     }
-}
-
-/// Whether the CLEAR-seed Store at the head of a draw chain runs, for this
-/// process.
-///
-/// Read once. The arms differ in what reaches the guest's pages, so a boot that
-/// flipped it midway would be two devices in one log.
-///
-/// # The default is now OFF, and the argument is structural, not a timing
-///
-/// The eager seed pre-writes every writeback-owning record's full clear frame
-/// into guest pages before the engine runs — ~3.7 MB a pass, measured at
-/// **~550 ms of every drain-thread second** on a driven Asphalt 8 race, the
-/// single largest cost left on the rail after the BC gather landed. Both jobs
-/// it was doing are done elsewhere:
-///
-/// * **Success**: the record's own Store covers the identical extent
-///   (`store_gva_frame_direct` and the type-11 writeback both land the whole
-///   `width x height`), so every seeded byte was overwritten.
-/// * **Failure**: `runtime::exec`'s fallback applies the pass's clears through
-///   `apply_clear` whenever a packet lands zero draws — "for any draw-fail
-///   class, not only NoMetal", per its own comment — which is the case the
-///   seed's early landing was insurance for.
-///
-/// The chaining recipe (`color0_solid`) is captured outside this gate, so the
-/// clear-only exit still hands the next record its seed either way.
-///
-/// What the OFF arm genuinely gives up: a packet where an *early* record's
-/// engine draw succeeds and a *later* record fails leaves the target holding
-/// the early records' rendered content instead of the clear — which is more of
-/// the guest's work on screen, not less. `REIMS_VGPU_CLEAR_SEED=on` restores
-/// the old eager write for an A/B; damage from either arm is only visible in a
-/// photograph, so hold the arm for the whole boot the photograph is of.
-fn clear_seed_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let (state, value) = crate::env::read(crate::env::CLEAR_SEED);
-        let on = matches!(state, crate::env::Switch::On);
-        crate::observe::off(format!(
-            "clear_seed on={on} switch={state:?} value={}",
-            value.unwrap_or_else(|| "<unset>".into())
-        ));
-        on
-    })
 }
