@@ -843,7 +843,8 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
         identity: None,
         swizzle: Default::default(),
     });
-    req.samplers.push(SamplerResource::normalized_default(64));
+    req.samplers
+        .push(SamplerResource::normalized_default(160));
 
     let outcome = engine::execute_draw_request(&req);
     if let Err(e) = &outcome {

@@ -1389,11 +1389,11 @@ mod tests {
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let shader = synth_shader(Stage::Fragment, bytes);
 
-        // The stored module is the widened one: the sampler moved out of the
-        // texture band's way, the buffer and texture did not move at all.
+        // The translator's v22 layout is already wide, so the compatibility
+        // pass leaves all three bindings unchanged.
         let mut widened = words.clone();
         let moved = crate::runtime::spirv_bind::widen_sampled_bands(&mut widened);
-        assert_eq!(moved, 1, "only the sampler band moves");
+        assert_eq!(moved, 0, "the translator and device layouts agree");
         assert_eq!(*shader.words, widened);
         assert_eq!(shader.words[8], 3);
         assert_eq!(shader.words[12], M2V_TEXTURE_BINDING_BASE + 8);

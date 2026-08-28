@@ -85,6 +85,8 @@ pub(crate) struct BindingSig {
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct LayoutKey {
     pub bindings: Vec<BindingSig>,
+    /// Reflected compute push-constant byte range. Graphics layouts carry none.
+    pub push_constant: Option<(u32, u32)>,
 }
 
 impl LayoutKey {
@@ -1698,10 +1700,22 @@ impl ObjectCaches {
         } else {
             vec![dsl]
         };
+        let push_ranges: Vec<_> = key
+            .push_constant
+            .map(|(offset, size)| {
+                vk::PushConstantRange::default()
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                    .offset(offset)
+                    .size(size)
+            })
+            .into_iter()
+            .collect();
         let pl = ctx
             .device
             .create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts),
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&layouts)
+                    .push_constant_ranges(&push_ranges),
                 None,
             )
             .map_err(|e| {
@@ -2682,6 +2696,7 @@ mod object_cache_tests {
                     count,
                 })
                 .collect(),
+            push_constant: None,
         };
         assert!(layout(&[16, 16]).uses_push_descriptors(caps));
         assert!(!layout(&[16, 17]).uses_push_descriptors(caps));

@@ -1138,8 +1138,8 @@ fn metal_icb_inheritance_line_keeps_pipeline_and_sanitized_driver_detail() {
 #[cfg(feature = "backend-vulkan")]
 fn shader_pull_reflection(bindings: &[u32]) -> metal2vulkan::reflect::ShaderReflection {
     use metal2vulkan::reflect::{
-        BufferExtent, DescriptorLayout, DescriptorLocation, ResourceBinding, ResourceKind,
-        ShaderReflection, ShaderStage, VertexBuiltins, REFLECTION_VERSION,
+        BufferExtent, DescriptorLocation, ResourceBinding, ResourceKind, ShaderReflection,
+        ShaderStage, VertexBuiltins, REFLECTION_VERSION,
     };
     ShaderReflection {
         reflection_version: REFLECTION_VERSION,
@@ -1189,10 +1189,6 @@ fn shader_pull_reflection(bindings: &[u32]) -> metal2vulkan::reflect::ShaderRefl
         implicit_imageblock_attachments: vec![],
         fragment_imageblock: None,
         datalayout: None,
-        descriptor_layout: DescriptorLayout::default(),
-        kernel_dispatch: None,
-        runtime_sampler_specializations: vec![],
-        runtime_storage_image_specializations: vec![],
         function_constants: vec![],
     }
 }

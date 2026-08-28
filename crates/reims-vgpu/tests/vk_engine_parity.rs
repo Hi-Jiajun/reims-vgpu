@@ -2148,8 +2148,8 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         .collect::<Vec<_>>();
     assert_eq!(
         reims_vgpu::runtime::spirv_bind::widen_sampled_bands(&mut frag),
-        1,
-        "fixture has one sampler in the translator's narrow tail band"
+        0,
+        "the translator already emits the device's full sampler band"
     );
     assert_eq!(
         reims_vgpu::runtime::spirv_bind::offset_fragment_sampled_resource_bindings(&mut frag),
