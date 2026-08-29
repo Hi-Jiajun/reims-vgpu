@@ -1224,8 +1224,17 @@ impl FlushRail {
 /// `fresh` counts a new key **reaching** the publish, not a frame landing in the
 /// window's slot: the four ways the publish itself can still fail after that
 /// point already have their own census in
-/// [`crate::runtime::census::present_proxy::window_publish`], and duplicating
+/// [`crate::runtime::census::present_proxy::host_window_publish`], and duplicating
 /// them here would give two counters that could disagree.
+///
+/// The two therefore emit under **different tags**, and that is load-bearing
+/// rather than cosmetic. Both once wrote `window_publish`, differing only in
+/// `win_ms=`/`fresh=` against `window_ms=`/`published=`, so a `grep
+/// window_publish` returned one interleaved series of two censuses that this
+/// doc goes out of its way to say must not be conflated. Every consumer today
+/// keys on the field names and so survives it, but a reader does not: the
+/// collision cost a session a verification detour before it was noticed. One
+/// tag, one census.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WindowPublish {
     /// A frame key not yet published reached the publish.
