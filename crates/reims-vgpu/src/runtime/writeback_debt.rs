@@ -877,11 +877,12 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
         // The split is emitted beside the total, so
         // `_resolved + _unresolved == wbdebt_texture_owes_nothing` is checkable
         // on the census itself.
-        crate::runtime::drain::note_store_route(match state.names_live_mapping(task_id, texture_ref)
-        {
-            true => "wbdebt_texture_owes_nothing_resolved",
-            false => "wbdebt_texture_owes_nothing_unresolved",
-        });
+        crate::runtime::drain::note_store_route(
+            match state.names_live_mapping(task_id, texture_ref) {
+                true => "wbdebt_texture_owes_nothing_resolved",
+                false => "wbdebt_texture_owes_nothing_unresolved",
+            },
+        );
         crate::runtime::drain::note_store_route("wbdebt_texture_owes_nothing");
     }
 }
@@ -1336,8 +1337,9 @@ pub fn settle_for_texture<M: HostMemory + HostOps>(
     let (tasks, page_shift, page_size) = (&state.tasks, state.page_shift, state.page_size());
     crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(site, || {
         let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
-        let gpas =
-            crate::runtime::gva_mem::task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift);
+        let gpas = crate::runtime::gva_mem::task_gva_page_gpas(
+            host, tasks, task_id, gva, span, page_shift,
+        );
         (gpas.len() as u64 == want).then_some(gpas)
     });
 }
@@ -1405,7 +1407,6 @@ pub fn submit_for_resources<M: HostMemory + HostOps>(
         pay_for_texture(state, host, task_id, object_id);
     }
 }
-
 
 /// Run the Store the debt stands for, now.
 ///
@@ -1695,10 +1696,20 @@ mod tests {
     fn arming_past_the_bound_evicts_the_oldest_and_says_so() {
         let mut pending = PendingWritebacks::default();
         for id in 0..MAX_DEBTS as u32 {
-            assert_eq!(pending.arm(id, ident(id, 64, 64, 1), 64, 64, 1), None, "under the bound");
+            assert_eq!(
+                pending.arm(id, ident(id, 64, 64, 1), 64, 64, 1),
+                None,
+                "under the bound"
+            );
         }
         assert_eq!(pending.len(), MAX_DEBTS);
-        let evicted = pending.arm(MAX_DEBTS as u32, ident(MAX_DEBTS as u32, 64, 64, 1), 64, 64, 1);
+        let evicted = pending.arm(
+            MAX_DEBTS as u32,
+            ident(MAX_DEBTS as u32, 64, 64, 1),
+            64,
+            64,
+            1,
+        );
         assert_eq!(
             evicted,
             Some(WritebackKey::Mapping(0)),
@@ -1923,7 +1934,11 @@ mod tests {
                 "arming one level must not supersede another"
             );
         }
-        assert_eq!(pending.take_gva(key).len(), 3, "the resource owes all three");
+        assert_eq!(
+            pending.take_gva(key).len(),
+            3,
+            "the resource owes all three"
+        );
     }
 
     /// A guest validity transition after the Store makes guest memory newer
@@ -1981,7 +1996,9 @@ mod tests {
         // emptiness check and neither counter is reached. Mapping 7 owes; the
         // three references below are about other surfaces.
         assert_eq!(
-            state.pending_writebacks.arm(7, ident(7, 64, 64, 1), 64, 64, 1),
+            state
+                .pending_writebacks
+                .arm(7, ident(7, 64, 64, 1), 64, 64, 1),
             None
         );
         // Reference 21 names mapping 9 through the per-task registration, and
@@ -2036,8 +2053,18 @@ mod tests {
     fn asynchronous_resource_synchronization_submits_only_named_objects() {
         let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
         let mut host = crate::runtime::FakeHost::new();
-        assert_eq!(state.pending_writebacks.arm(7, ident(7, 64, 64, 1), 64, 64, 1), None);
-        assert_eq!(state.pending_writebacks.arm(8, ident(8, 64, 64, 1), 64, 64, 1), None);
+        assert_eq!(
+            state
+                .pending_writebacks
+                .arm(7, ident(7, 64, 64, 1), 64, 64, 1),
+            None
+        );
+        assert_eq!(
+            state
+                .pending_writebacks
+                .arm(8, ident(8, 64, 64, 1), 64, 64, 1),
+            None
+        );
         submit_for_resources(&mut state, &mut host, 1, &[7]);
         assert!(state.pending_writebacks.get(7).is_none());
         assert!(state.pending_writebacks.get(8).is_some());

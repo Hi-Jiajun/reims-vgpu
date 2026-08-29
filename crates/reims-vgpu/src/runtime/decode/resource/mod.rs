@@ -1881,10 +1881,7 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
         .copied()
         .unwrap_or(0);
     if undecoded != 0
-        && crate::observe::first_sight(
-            "texture_desc_mip_field_undecoded",
-            u64::from(undecoded),
-        )
+        && crate::observe::first_sight("texture_desc_mip_field_undecoded", u64::from(undecoded))
     {
         crate::observe::fail(format!(
             "texture_desc_mip_field_undecoded value={undecoded:#04x} levels={} len={} \
@@ -4182,7 +4179,8 @@ fn parse_compute_stage_input_section(
     if attr_count == 0 && layout_count == 0 {
         return Ok(None);
     }
-    if attr_count > MAX_COMPUTE_STAGE_INPUT_ATTRS || layout_count > MAX_COMPUTE_STAGE_INPUT_LAYOUTS {
+    if attr_count > MAX_COMPUTE_STAGE_INPUT_ATTRS || layout_count > MAX_COMPUTE_STAGE_INPUT_LAYOUTS
+    {
         return Err(DecodeStatus::ErrUnsupported("stage_input_over_cap"));
     }
 

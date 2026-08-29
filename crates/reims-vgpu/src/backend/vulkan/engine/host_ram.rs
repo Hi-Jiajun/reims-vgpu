@@ -512,10 +512,8 @@ unsafe fn import_ramblock(
     // guest's bytes instead, and no `vkAllocateMemory` the specification forbids
     // is ever issued — which is the difference between the two drivers this was
     // reported on, one of which returns success and then loses the device.
-    let pick = picked.map_err(|refusal| HostRamDecline::NoImportableMemoryType {
-        host_base,
-        refusal,
-    })?;
+    let pick =
+        picked.map_err(|refusal| HostRamDecline::NoImportableMemoryType { host_base, refusal })?;
     let memory_type_index = pick.index;
     let alloc_started = Instant::now();
 

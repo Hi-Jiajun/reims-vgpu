@@ -1395,12 +1395,7 @@ fn land_gva_frame_bytes<M: HostMemory + HostOps>(
         Some(pages.membership()),
     )
     .map_err(|err| GvaWritebackDecline::CopiedWriteRefused { err })?;
-    crate::runtime::surface_cache::forget_gva_copies(
-        state,
-        task_id,
-        c0.target_gva,
-        texture_ref,
-    );
+    crate::runtime::surface_cache::forget_gva_copies(state, task_id, c0.target_gva, texture_ref);
     Ok(extent)
 }
 
@@ -1518,12 +1513,7 @@ fn store_gva_frame_direct<M: HostMemory + HostOps>(
         .map_err(|inner| GvaWritebackDecline::Engine { inner })?;
     // Nothing here leaves a host copy of the frame, so neither GVA-keyed cache
     // may go on naming one.
-    crate::runtime::surface_cache::forget_gva_copies(
-        state,
-        task_id,
-        c0.target_gva,
-        texture_ref,
-    );
+    crate::runtime::surface_cache::forget_gva_copies(state, task_id, c0.target_gva, texture_ref);
     // The copy means this image has stopped being the only place these pixels
     // exist, so the reclaim paths may take it — the same handover
     // `store_render_frame` performs in `finish`.
@@ -1617,8 +1607,16 @@ mod gva_copying_arm_tests {
         let (mut host, mut state) = fixture();
         let rgba = frame();
         let pages = licence_for(1);
-        let extent = land_gva_frame_bytes(&mut state, &mut host, 1, &request(), 0, crate::runtime::draw::FrameRows::Rgba8(&rgba), &pages)
-            .expect("the licensed page is writable");
+        let extent = land_gva_frame_bytes(
+            &mut state,
+            &mut host,
+            1,
+            &request(),
+            0,
+            crate::runtime::draw::FrameRows::Rgba8(&rgba),
+            &pages,
+        )
+        .expect("the licensed page is writable");
         assert_eq!(
             extent,
             u64::from(H - 1) * u64::from(BPR) + u64::from(W) * 4,
@@ -1654,8 +1652,16 @@ mod gva_copying_arm_tests {
         let rgba = frame();
         // A licence naming some other page of the same task.
         let pages = licence_for(5);
-        let refusal = land_gva_frame_bytes(&mut state, &mut host, 1, &request(), 0, crate::runtime::draw::FrameRows::Rgba8(&rgba), &pages)
-            .expect_err("the destination page is outside the licence");
+        let refusal = land_gva_frame_bytes(
+            &mut state,
+            &mut host,
+            1,
+            &request(),
+            0,
+            crate::runtime::draw::FrameRows::Rgba8(&rgba),
+            &pages,
+        )
+        .expect_err("the destination page is outside the licence");
         assert_eq!(
             crate::observe::Decline::slug(&refusal),
             "gvawb_copied_write_refused",
@@ -1665,7 +1671,11 @@ mod gva_copying_arm_tests {
         let mut got = [0u8; (W * 4) as usize];
         crate::runtime::host::HostMemory::read_gpa(&host, gpa, &mut got)
             .expect("the destination page is guest RAM");
-        assert_eq!(got, [0u8; (W * 4) as usize], "nothing may have been written");
+        assert_eq!(
+            got,
+            [0u8; (W * 4) as usize],
+            "nothing may have been written"
+        );
     }
 }
 

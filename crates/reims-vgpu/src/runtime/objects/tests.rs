@@ -211,7 +211,11 @@ fn task_lifetime_retires_all_of_its_resource_objects() {
 
     assert!(state.delete_task(1));
     assert!(state.task_resources.get(1, 1).is_none());
-    assert_eq!(ld32(&resource.descriptor), 9, "an outstanding host owner remains valid");
+    assert_eq!(
+        ld32(&resource.descriptor),
+        9,
+        "an outstanding host owner remains valid"
+    );
 }
 
 #[test]
@@ -484,7 +488,11 @@ fn an_l10r_surface_resolves_as_a_packed_ten_bit_colour_attachment() {
     // Step one: the FourCC names a Metal format at all. A zero here is the
     // refusal the resolve turns into a dropped colour attachment.
     let mtl = iosurface_pixel_format_to_mtl(surf.pixel_format);
-    assert_eq!(mtl, pf::MTL_FORMAT_BGR10A2_UNORM, "'l10r' must name BGR10A2Unorm");
+    assert_eq!(
+        mtl,
+        pf::MTL_FORMAT_BGR10A2_UNORM,
+        "'l10r' must name BGR10A2Unorm"
+    );
 
     // Step two: that format is one this device will render into, which is what
     // `translate::pixel::color_attachment` derives its answer from. Both steps
@@ -504,7 +512,10 @@ fn an_l10r_surface_resolves_as_a_packed_ten_bit_colour_attachment() {
     // The row stride the surface declared is the tight stride for this format at
     // this width, so the reading above is the surface's own and not an
     // assumption about what a packed word costs.
-    assert_eq!(pf::tight_row_bytes(surf.width, mtl), Some(surf.bytes_per_row));
+    assert_eq!(
+        pf::tight_row_bytes(surf.width, mtl),
+        Some(surf.bytes_per_row)
+    );
 }
 
 #[test]

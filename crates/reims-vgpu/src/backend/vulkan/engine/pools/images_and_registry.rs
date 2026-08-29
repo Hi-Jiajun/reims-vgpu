@@ -732,7 +732,11 @@ impl ResourcePools {
         if slot.format.allocation() == format {
             return Ok(Some(slot.view));
         }
-        if let Some((_, view)) = slot.alternate_views.iter().find(|(held, _)| *held == format) {
+        if let Some((_, view)) = slot
+            .alternate_views
+            .iter()
+            .find(|(held, _)| *held == format)
+        {
             return Ok(Some(*view));
         }
         let view = unsafe {
@@ -988,10 +992,9 @@ impl ResourcePools {
                 // not is exactly the case the fast path must *not* take: the
                 // framebuffer it would hand back was built over the previous
                 // interpretation's view.
-                let attachment = unsafe {
-                    self.registry_view(ctx, &identity, format.declared(), counters)?
-                }
-                .expect("the slot reused on the line above is still registered");
+                let attachment =
+                    unsafe { self.registry_view(ctx, &identity, format.declared(), counters)? }
+                        .expect("the slot reused on the line above is still registered");
                 let slot = self.registry.get(&identity).unwrap();
                 if slot.framebuffer_compatibility == Some(framebuffer_compatibility)
                     && slot.format == format
@@ -1259,8 +1262,7 @@ impl ResourcePools {
                         }
                         ResidentMemory::GuestImported { guest } => {
                             ctx.device.destroy_image(image, None);
-                            if let Some(parent) =
-                                self.host_ram_imports.release_child(&guest.import)
+                            if let Some(parent) = self.host_ram_imports.release_child(&guest.import)
                             {
                                 parent.destroy(&ctx.device);
                             }
@@ -1383,10 +1385,9 @@ impl ResourcePools {
                     .gpu_load_hits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let image = slot.image;
-                let view = unsafe {
-                    self.registry_view(ctx, &identity, format.declared(), counters)?
-                }
-                .expect("the slot reused on the line above is still registered");
+                let view =
+                    unsafe { self.registry_view(ctx, &identity, format.declared(), counters)? }
+                        .expect("the slot reused on the line above is still registered");
                 return Ok((image, view));
             }
             // Geometry / gen / allocation mismatch → destroy and recreate.
@@ -1753,8 +1754,9 @@ impl ResourcePools {
             crate::runtime::drain::note_store_route("adhoc_fb_hit");
             return Ok(*fb);
         }
-        let fb =
-            unsafe { self.create_mrt_framebuffer(ctx, render_pass, views, width, height, counters) }?;
+        let fb = unsafe {
+            self.create_mrt_framebuffer(ctx, render_pass, views, width, height, counters)
+        }?;
         crate::runtime::drain::note_store_route("adhoc_fb_miss");
         self.ad_hoc_framebuffers.insert(key, fb);
         Ok(fb)
@@ -3787,7 +3789,11 @@ pub(super) mod pin_count_tests {
             "clock still advances when throttled"
         );
         assert!(pools.plan_idle_maintenance(t0 + MAINTENANCE_INTERVAL_MS));
-        assert_eq!(pools.registry.len(), 2, "maintenance owns no live residents");
+        assert_eq!(
+            pools.registry.len(),
+            2,
+            "maintenance owns no live residents"
+        );
     }
 
     /// A maintenance pass cannot shrink a live registry, regardless of its size.
@@ -3837,9 +3843,15 @@ pub(super) mod pin_count_tests {
         }
         // Uploads stop: the gate reopens after the usual consecutive passes.
         for _ in 0..(SETTLED_PASSES_FOR_BUFFER_TRIM - 1) {
-            assert!(!pools.note_maintenance_settled(), "counter restarted from zero");
+            assert!(
+                !pools.note_maintenance_settled(),
+                "counter restarted from zero"
+            );
         }
-        assert!(pools.note_maintenance_settled(), "settled once uploads stopped");
+        assert!(
+            pools.note_maintenance_settled(),
+            "settled once uploads stopped"
+        );
     }
 
     /// The HOST_VISIBLE buffer trim gate: only permitted after
@@ -3861,12 +3873,21 @@ pub(super) mod pin_count_tests {
         assert!(pools.note_maintenance_settled(), "stays settled");
         // Upload activity resets the counter.
         pools.staging_hits += 1;
-        assert!(!pools.note_maintenance_settled(), "uploads reset settled state");
+        assert!(
+            !pools.note_maintenance_settled(),
+            "uploads reset settled state"
+        );
         // …and the gate stays closed until the run rebuilds.
         for _ in 0..(SETTLED_PASSES_FOR_BUFFER_TRIM - 1) {
-            assert!(!pools.note_maintenance_settled(), "counter restarted from zero");
+            assert!(
+                !pools.note_maintenance_settled(),
+                "counter restarted from zero"
+            );
         }
-        assert!(pools.note_maintenance_settled(), "settled again after rebuild");
+        assert!(
+            pools.note_maintenance_settled(),
+            "settled again after rebuild"
+        );
     }
 
     /// The presented target passed as `display` is stamped to the current clock

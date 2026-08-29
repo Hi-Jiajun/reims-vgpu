@@ -807,8 +807,7 @@ impl TexelLayout {
             | Self::Bc5RgSnorm
             | Self::Bc6hRgbFloat
             | Self::Bc6hRgbUfloat
-            | Self::Bc7Rgba
-            => true,
+            | Self::Bc7Rgba => true,
         }
     }
 
@@ -946,7 +945,9 @@ impl TexelLayout {
         let block = self.block();
         let across = u64::from(block.blocks_across(width));
         let down = u64::from(block.block_rows(height));
-        across.checked_mul(down)?.checked_mul(u64::from(block.bytes))
+        across
+            .checked_mul(down)?
+            .checked_mul(u64::from(block.bytes))
     }
 
     /// Bytes occupied by one texel in guest linear storage — or by one **4x4
@@ -1065,8 +1066,7 @@ impl TexelLayout {
             | Self::Bc5RgSnorm
             | Self::Bc6hRgbFloat
             | Self::Bc6hRgbUfloat
-            | Self::Bc7Rgba
-            => false,
+            | Self::Bc7Rgba => false,
         }
     }
 
@@ -1113,8 +1113,7 @@ impl TexelLayout {
             | Self::Bc5RgSnorm
             | Self::Bc6hRgbFloat
             | Self::Bc6hRgbUfloat
-            | Self::Bc7Rgba
-            => false,
+            | Self::Bc7Rgba => false,
         }
     }
 
@@ -1156,7 +1155,11 @@ impl TexelLayout {
     pub fn has_srgb_encoding(self) -> bool {
         matches!(
             self,
-            Self::Rgba8 | Self::Bgra8 | Self::Bc1Rgba | Self::Bc2Rgba | Self::Bc3Rgba
+            Self::Rgba8
+                | Self::Bgra8
+                | Self::Bc1Rgba
+                | Self::Bc2Rgba
+                | Self::Bc3Rgba
                 | Self::Bc7Rgba
         )
     }
@@ -2016,14 +2019,14 @@ impl ColorNumericType {
 pub fn render_target_numeric_type(format: u16) -> Option<ColorNumericType> {
     Some(match format {
         MTL_FORMAT_RGBA8_UNORM
-            | MTL_FORMAT_RGBA8_UNORM_SRGB
-            | MTL_FORMAT_BGRA8_UNORM
-            | MTL_FORMAT_BGRA8_UNORM_SRGB
-            | MTL_FORMAT_RGBA16_FLOAT
-            | MTL_FORMAT_RG16_FLOAT
-            | MTL_FORMAT_R16_FLOAT
-            | MTL_FORMAT_R8_UNORM
-            | MTL_FORMAT_BGR10A2_UNORM => ColorNumericType::Float,
+        | MTL_FORMAT_RGBA8_UNORM_SRGB
+        | MTL_FORMAT_BGRA8_UNORM
+        | MTL_FORMAT_BGRA8_UNORM_SRGB
+        | MTL_FORMAT_RGBA16_FLOAT
+        | MTL_FORMAT_RG16_FLOAT
+        | MTL_FORMAT_R16_FLOAT
+        | MTL_FORMAT_R8_UNORM
+        | MTL_FORMAT_BGR10A2_UNORM => ColorNumericType::Float,
         MTL_FORMAT_RG16_UINT => ColorNumericType::Uint,
         _ => return None,
     })
@@ -2599,7 +2602,10 @@ pub fn expand_rgba8_to_texel(
             for i in 0..px {
                 let (s, d) = (i * RGBA8_BPP as usize, i * RGBA16F_BPP as usize);
                 for c in 0..4 {
-                    st16(&mut dst[d + c * 2..d + c * 2 + 2], lut[src_rgba[s + c] as usize]);
+                    st16(
+                        &mut dst[d + c * 2..d + c * 2 + 2],
+                        lut[src_rgba[s + c] as usize],
+                    );
                 }
             }
         }
@@ -2613,9 +2619,15 @@ pub fn expand_rgba8_to_texel(
             let lut = unorm8_to_f16_lut();
             let chans = (layout.bytes_per_texel() / 2) as usize;
             for i in 0..px {
-                let (s, d) = (i * RGBA8_BPP as usize, i * layout.bytes_per_texel() as usize);
+                let (s, d) = (
+                    i * RGBA8_BPP as usize,
+                    i * layout.bytes_per_texel() as usize,
+                );
                 for c in 0..chans {
-                    st16(&mut dst[d + c * 2..d + c * 2 + 2], lut[src_rgba[s + c] as usize]);
+                    st16(
+                        &mut dst[d + c * 2..d + c * 2 + 2],
+                        lut[src_rgba[s + c] as usize],
+                    );
                 }
             }
         }
@@ -2680,8 +2692,7 @@ pub fn expand_rgba8_to_texel(
         | TexelLayout::Bc5RgSnorm
         | TexelLayout::Bc6hRgbFloat
         | TexelLayout::Bc6hRgbUfloat
-        | TexelLayout::Bc7Rgba
-        => return false,
+        | TexelLayout::Bc7Rgba => return false,
     }
     true
 }
@@ -2745,7 +2756,10 @@ pub fn narrow_texel_to_rgba8(
             let lut = f16_to_unorm8_lut();
             let chans = (layout.bytes_per_texel() / 2) as usize;
             for i in 0..px {
-                let (s, d) = (i * layout.bytes_per_texel() as usize, i * RGBA8_BPP as usize);
+                let (s, d) = (
+                    i * layout.bytes_per_texel() as usize,
+                    i * RGBA8_BPP as usize,
+                );
                 for c in 0..chans {
                     let h = u16::from_le_bytes([src[s + c * 2], src[s + c * 2 + 1]]);
                     dst_rgba[d + c] = lut[h as usize];
@@ -2801,8 +2815,7 @@ pub fn narrow_texel_to_rgba8(
         | TexelLayout::Bc5RgSnorm
         | TexelLayout::Bc6hRgbFloat
         | TexelLayout::Bc6hRgbUfloat
-        | TexelLayout::Bc7Rgba
-        => return false,
+        | TexelLayout::Bc7Rgba => return false,
     }
     true
 }
@@ -3545,13 +3558,9 @@ mod tests {
             "the two uint16 channels are values, not float or unorm bit patterns"
         );
 
-        let narrowed = solid_clear_image(
-            MTL_FORMAT_RG16_UINT,
-            1,
-            1,
-            &[65_536.0, 65_537.0, 0.0, 0.0],
-        )
-        .expect("RG16Uint clear with values wider than a channel");
+        let narrowed =
+            solid_clear_image(MTL_FORMAT_RG16_UINT, 1, 1, &[65_536.0, 65_537.0, 0.0, 0.0])
+                .expect("RG16Uint clear with values wider than a channel");
         assert_eq!(
             narrowed.pixels(),
             [0u16.to_le_bytes(), 1u16.to_le_bytes()].concat(),
@@ -3595,7 +3604,10 @@ mod tests {
     #[test]
     fn each_capability_mask_is_dense_in_its_own_vocabulary() {
         for (mask, count) in [
-            (CapabilityMask::RenderTarget, TexelLayout::RENDER_TARGET_COUNT),
+            (
+                CapabilityMask::RenderTarget,
+                TexelLayout::RENDER_TARGET_COUNT,
+            ),
             (CapabilityMask::SampledFilter, TexelLayout::FILTER_COUNT),
         ] {
             let mut seen = Vec::new();
@@ -3669,9 +3681,8 @@ mod tests {
             });
             // Renderable, single-channel, and named by neither table above —
             // admitted for macOS 26's blur intermediate.
-            let single_channel_float = (format == MTL_FORMAT_R16_FLOAT).then_some(
-                TexelLayout::R16Float,
-            );
+            let single_channel_float =
+                (format == MTL_FORMAT_R16_FLOAT).then_some(TexelLayout::R16Float);
             let layout = store_texel_order(format)
                 .or(from_class)
                 .or(single_channel_float)
@@ -3846,7 +3857,12 @@ mod tests {
         // Rail two: the readback narrow. One channel out, the rest filled the
         // way a shader sampling it reads them.
         let mut back = vec![0u8; (w as usize) * RGBA8_BPP as usize];
-        assert!(narrow_texel_to_rgba8(TexelLayout::R8, &native, w, &mut back));
+        assert!(narrow_texel_to_rgba8(
+            TexelLayout::R8,
+            &native,
+            w,
+            &mut back
+        ));
         assert_eq!(back[0], 77);
         assert_eq!(back[1], 0);
         assert_eq!(back[2], 0);
@@ -4340,7 +4356,9 @@ mod tests {
     #[test]
     fn a_wide_seed_expands_to_the_same_bytes_the_row_converter_writes() {
         const PIXELS: u32 = 4;
-        let src: Vec<u8> = (0..PIXELS * RGBA8_BPP).map(|i| (i * 7 % 256) as u8).collect();
+        let src: Vec<u8> = (0..PIXELS * RGBA8_BPP)
+            .map(|i| (i * 7 % 256) as u8)
+            .collect();
 
         let mut viaraw = vec![0u8; (PIXELS * RGBA16F_BPP) as usize];
         assert!(convert_rgba8_to_row(
@@ -4587,7 +4605,9 @@ mod tests {
         // And the whole-frame wrappers agree with the per-texel pair, so a
         // caller cannot be served a different conversion by going through the
         // row functions the rails actually call.
-        let rgba: Vec<u8> = (0u8..=63).flat_map(|v| [v, 255 - v, v << 2, 0xff]).collect();
+        let rgba: Vec<u8> = (0u8..=63)
+            .flat_map(|v| [v, 255 - v, v << 2, 0xff])
+            .collect();
         let pixels = (rgba.len() / 4) as u32;
         let mut packed = vec![0u8; rgba.len()];
         assert!(expand_rgba8_to_texel(

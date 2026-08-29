@@ -896,14 +896,7 @@ pub(crate) struct ObjectCaches {
 }
 
 struct ObjectVariantIndex<K, V> {
-    map: HashMap<
-        std::num::NonZeroU64,
-        (
-            std::sync::Weak<super::types::PipelineObjectLife>,
-            K,
-            V,
-        ),
-    >,
+    map: HashMap<std::num::NonZeroU64, (std::sync::Weak<super::types::PipelineObjectLife>, K, V)>,
 }
 
 impl<K, V> Default for ObjectVariantIndex<K, V> {
@@ -925,11 +918,7 @@ impl<K: Clone + Eq, V: Copy> ObjectVariantIndex<K, V> {
     /// draw for nothing. A `Weak` reads `strong_count() == 0` exactly when its
     /// value has been dropped, which is the same question `upgrade().is_none()`
     /// asked.
-    fn get(
-        &mut self,
-        identity: &super::types::PipelineObjectIdentity,
-        key: &K,
-    ) -> Option<V> {
+    fn get(&mut self, identity: &super::types::PipelineObjectIdentity, key: &K) -> Option<V> {
         let id = identity.id();
         let (life, held_key, pipeline) = self.map.get(&id)?;
         if life.strong_count() == 0 {
@@ -939,12 +928,7 @@ impl<K: Clone + Eq, V: Copy> ObjectVariantIndex<K, V> {
         (held_key == key).then_some(*pipeline)
     }
 
-    fn remember(
-        &mut self,
-        identity: &super::types::PipelineObjectIdentity,
-        key: &K,
-        value: V,
-    ) {
+    fn remember(&mut self, identity: &super::types::PipelineObjectIdentity, key: &K, value: V) {
         let id = identity.id();
         if !self.map.contains_key(&id) {
             // Object construction is rare. Reap identities whose runtime
@@ -1163,7 +1147,9 @@ fn external_dependencies(
     // Weakening this to the attachment stages makes that skip a missing
     // dependency, which is a stale frame and no error.
     let (in_dst_stages, mut in_dst_access) = (
-        attach_stages | vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+        attach_stages
+            | vk::PipelineStageFlags::VERTEX_SHADER
+            | vk::PipelineStageFlags::FRAGMENT_SHADER,
         attach_writes | attach_reads | vk::AccessFlags::SHADER_READ,
     );
     if color_input {
@@ -1678,8 +1664,8 @@ impl ObjectCaches {
                 .bindings(&bindings)
                 .push_next(&mut flags);
             if key.uses_push_descriptors(ctx.caps.push_descriptor) {
-                create_info = create_info
-                    .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR);
+                create_info =
+                    create_info.flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR);
             }
             let d = ctx
                 .device
@@ -2757,34 +2743,64 @@ mod object_cache_tests {
         /// produce. `None` for a mutation `compatibility` erases.
         type Mutation = (&'static str, fn(&mut PassKey), Option<PassCompatField>);
         let mutations: &[Mutation] = &[
-            ("load actions", |k| {
-                k.load_seed = true;
-                k.secondary[0].load = true;
-                k.depth.as_mut().unwrap().load = true;
-            }, None),
-            ("color0 format", |k| k.color0_format = vk::Format::R8G8B8A8_UNORM,
-             Some(PassCompatField::Color0Format)),
-            ("secondary count", |k| k.secondary_count = 2,
-             Some(PassCompatField::SecondaryCount)),
-            ("secondary format", |k| k.secondary[0].format = vk::Format::R32_SFLOAT,
-             Some(PassCompatField::SecondaryFormat)),
+            (
+                "load actions",
+                |k| {
+                    k.load_seed = true;
+                    k.secondary[0].load = true;
+                    k.depth.as_mut().unwrap().load = true;
+                },
+                None,
+            ),
+            (
+                "color0 format",
+                |k| k.color0_format = vk::Format::R8G8B8A8_UNORM,
+                Some(PassCompatField::Color0Format),
+            ),
+            (
+                "secondary count",
+                |k| k.secondary_count = 2,
+                Some(PassCompatField::SecondaryCount),
+            ),
+            (
+                "secondary format",
+                |k| k.secondary[0].format = vk::Format::R32_SFLOAT,
+                Some(PassCompatField::SecondaryFormat),
+            ),
             ("depth", |k| k.depth = None, Some(PassCompatField::Depth)),
-            ("host accessible", |k| k.host_accessible_color0 = true,
-             Some(PassCompatField::HostAccessibleColor0)),
-            ("color input", |k| k.color_input = true, Some(PassCompatField::ColorInput)),
+            (
+                "host accessible",
+                |k| k.host_accessible_color0 = true,
+                Some(PassCompatField::HostAccessibleColor0),
+            ),
+            (
+                "color input",
+                |k| k.color_input = true,
+                Some(PassCompatField::ColorInput),
+            ),
             // Feedback is a property of the draw, and it makes two passes
             // incompatible only on the arm where it still moves a layout. On the
             // shipping arm `compatibility` erases it, which is what stops a
             // feedback draw closing the render pass an ordinary one opened.
-            ("feedback", |k| k.feedback_colors = 1,
-             if color_feedback_layout() == color0_pass_exit_layout() {
-                 None
-             } else {
-                 Some(PassCompatField::FeedbackColors)
-             }),
-            ("sample count", |k| k.sample_count = 4, Some(PassCompatField::SampleCount)),
-            ("resolve", |k| k.multisample_resolve = true,
-             Some(PassCompatField::MultisampleResolve)),
+            (
+                "feedback",
+                |k| k.feedback_colors = 1,
+                if color_feedback_layout() == color0_pass_exit_layout() {
+                    None
+                } else {
+                    Some(PassCompatField::FeedbackColors)
+                },
+            ),
+            (
+                "sample count",
+                |k| k.sample_count = 4,
+                Some(PassCompatField::SampleCount),
+            ),
+            (
+                "resolve",
+                |k| k.multisample_resolve = true,
+                Some(PassCompatField::MultisampleResolve),
+            ),
         ];
 
         for (name, mutate, expected) in mutations {
@@ -3620,13 +3636,12 @@ mod object_cache_tests {
     /// and naming it made every render pass this device created invalid.
     #[test]
     fn the_feedback_self_dependency_stays_in_framebuffer_space() {
-        const FRAMEBUFFER_SPACE: vk::PipelineStageFlags =
-            vk::PipelineStageFlags::from_raw(
-                vk::PipelineStageFlags::FRAGMENT_SHADER.as_raw()
-                    | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS.as_raw()
-                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS.as_raw()
-                    | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT.as_raw(),
-            );
+        const FRAMEBUFFER_SPACE: vk::PipelineStageFlags = vk::PipelineStageFlags::from_raw(
+            vk::PipelineStageFlags::FRAGMENT_SHADER.as_raw()
+                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS.as_raw()
+                | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS.as_raw()
+                | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT.as_raw(),
+        );
         assert!(FRAMEBUFFER_SPACE.contains(COLOR_FEEDBACK_SRC.0));
         assert!(FRAMEBUFFER_SPACE.contains(COLOR_FEEDBACK_DST.0));
 
@@ -3635,7 +3650,9 @@ mod object_cache_tests {
         let dep = color_feedback_self_dependency(color_feedback_layout());
         assert_eq!(dep.src_stage_mask, COLOR_FEEDBACK_SRC.0);
         assert_eq!(dep.dst_stage_mask, COLOR_FEEDBACK_DST.0);
-        assert!(dep.dependency_flags.contains(vk::DependencyFlags::BY_REGION));
+        assert!(dep
+            .dependency_flags
+            .contains(vk::DependencyFlags::BY_REGION));
         assert_eq!(dep.src_subpass, dep.dst_subpass);
     }
 
@@ -3655,7 +3672,11 @@ mod object_cache_tests {
     fn an_ordinary_colour_slot_enters_and_leaves_a_pass_at_one_layout() {
         let key = PassKey::single(true, vk::Format::B8G8R8A8_UNORM);
         for index in 0..=MAX_SECONDARY_ATTACH {
-            assert_eq!(key.color_layout(index), color0_pass_exit_layout(), "{index}");
+            assert_eq!(
+                key.color_layout(index),
+                color0_pass_exit_layout(),
+                "{index}"
+            );
             assert_eq!(
                 key.color_final_layout(index),
                 color0_pass_exit_layout(),

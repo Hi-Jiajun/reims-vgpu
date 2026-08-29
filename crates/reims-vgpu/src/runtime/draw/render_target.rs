@@ -157,8 +157,7 @@ fn rt_type4_declared_format(
         .filter(|view| view.width == base_w && view.height == base_h)
         .map(|view| view.pixel_format)
         .filter(|&fmt| fmt != 0);
-    effective_view_sample_format(base_fmt, view_fmt_override.or(type5_declared))
-        .unwrap_or(base_fmt)
+    effective_view_sample_format(base_fmt, view_fmt_override.or(type5_declared)).unwrap_or(base_fmt)
 }
 
 /// Report a type-5 colour attachment whose view record disagrees with the base
@@ -778,13 +777,13 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     // number, which is what keeps the type-11 and type-4 rungs — neither of
     // which has a mip layout — refusing an attachment level as loudly as they
     // already refuse a view level.
-    let level = view_level
-        .checked_add(att.level)
-        .ok_or(C::LevelOverflow {
+    let level = view_level.checked_add(att.level).ok_or(
+        C::LevelOverflow {
             view_level,
             attachment_level: att.level,
         }
-        .at(resolved_ref))?;
+        .at(resolved_ref),
+    )?;
     if resolved_ref == 0 {
         return Err(C::ViewBaseUnbound.at(resolved_ref));
     }
@@ -939,12 +938,8 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             }
             .at(resolved_ref),
         )?;
-        let fmt = rt_type4_declared_format(
-            base_fmt,
-            (base_w, base_h),
-            type5_view,
-            view_fmt_override,
-        );
+        let fmt =
+            rt_type4_declared_format(base_fmt, (base_w, base_h), type5_view, view_fmt_override);
         if pixel_format::render_target_bpp(fmt).is_none() {
             return Err(C::Type4Format { surface_id, fmt }.at(resolved_ref));
         }

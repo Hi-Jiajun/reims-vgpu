@@ -187,15 +187,18 @@ struct BufferGatherRoles {
 impl BufferGatherRoles {
     fn of(req: &DrawRequest) -> Self {
         let mut entries: Vec<((usize, u64, u64), BufferGatherRole)> = Vec::with_capacity(
-            req.vertex_attributes.len() + req.storage_buffers.len() + req.indexed.is_some() as usize,
+            req.vertex_attributes.len()
+                + req.storage_buffers.len()
+                + req.indexed.is_some() as usize,
         );
         // `entry`-shaped, so a content allocation named twice in one draw stays
         // one physical operation carrying both roles.
-        let mut merge = |key, seed: BufferGatherRole, add: fn(&mut BufferGatherRole)| {
-            match entries.iter_mut().find(|(held, _)| *held == key) {
-                Some((_, role)) => add(role),
-                None => entries.push((key, seed)),
-            }
+        let mut merge = |key, seed: BufferGatherRole, add: fn(&mut BufferGatherRole)| match entries
+            .iter_mut()
+            .find(|(held, _)| *held == key)
+        {
+            Some((_, role)) => add(role),
+            None => entries.push((key, seed)),
         };
         for content in req.vertex_attributes.iter().map(|r| &r.content) {
             merge(CbBind::key_of(content), BufferGatherRole::VERTEX, |role| {
@@ -1994,9 +1997,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                             },
                         ));
                     }
-                    (planes - 1) * storage_rows * stride
-                        + (storage_rows - 1) * stride
-                        + tight_row
+                    (planes - 1) * storage_rows * stride + (storage_rows - 1) * stride + tight_row
                 };
                 if src.total_len as usize != run_expected {
                     return Err(DrawError::DrawValidation(
@@ -2009,9 +2010,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 }
                 let sum: u64 = src.runs.iter().map(|r| r.len).sum();
                 let covered = src.source_offset.checked_add(src.total_len);
-                if src.total_len == 0
-                    || src.runs.is_empty()
-                    || covered.is_none_or(|end| end > sum)
+                if src.total_len == 0 || src.runs.is_empty() || covered.is_none_or(|end| end > sum)
                 {
                     return Err(DrawError::DrawValidation(
                         DrawValidationDecline::GuestSampleCoverage {
@@ -4211,7 +4210,9 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     if dset.is_some() {
         ctx.device.update_descriptor_sets(&descriptor_writes, &[]);
-        counters.descriptor_set_updates.fetch_add(1, Ordering::Relaxed);
+        counters
+            .descriptor_set_updates
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     phase.enter(super::draw_phase::Phase::RecordBegin);
@@ -5108,15 +5109,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // Only if this command buffer is not already carrying it — the three
     // `dynstate_*` skips below hang off this one call, because a pipeline change
     // is what invalidates them. See `super::pools::CbGraphicsState`.
-    unsafe {
-        pools.bind_graphics_pipeline(
-            &ctx.device,
-            cb,
-            counters,
-            pipeline,
-            pipeline_layout,
-        )
-    };
+    unsafe { pools.bind_graphics_pipeline(&ctx.device, cb, counters, pipeline, pipeline_layout) };
     if let Some((pool, flags)) = occlusion {
         ctx.device.cmd_begin_query(cb, pool, 0, flags);
     }
@@ -5203,16 +5196,16 @@ pub(crate) unsafe fn execute_draw_inner(
                 range: info.range,
             },
         ));
-        push_state.extend(sampled.iter().zip(&sampled_infos).map(
-            |(image, info)| super::pools::PushDescriptorBinding::Image {
+        push_state.extend(sampled.iter().zip(&sampled_infos).map(|(image, info)| {
+            super::pools::PushDescriptorBinding::Image {
                 binding: image.binding(),
                 array_element: image.array_element(),
                 ty: vk::DescriptorType::SAMPLED_IMAGE,
                 sampler: info.sampler,
                 view: info.image_view,
                 layout: info.image_layout,
-            },
-        ));
+            }
+        }));
         push_state.extend(sampler_handles.iter().zip(&sampler_infos).map(
             |((binding, _), info)| super::pools::PushDescriptorBinding::Image {
                 binding: *binding,
@@ -5255,7 +5248,9 @@ pub(crate) unsafe fn execute_draw_inner(
             &[dset],
             &[],
         );
-        counters.descriptor_set_binds.fetch_add(1, Ordering::Relaxed);
+        counters
+            .descriptor_set_binds
+            .fetch_add(1, Ordering::Relaxed);
     }
     phase.enter(super::draw_phase::Phase::RecordDraw);
     unsafe { pools.bind_vertex_buffers(&ctx.device, cb, counters, &vertex_bufs) };
@@ -5597,7 +5592,10 @@ pub(crate) unsafe fn execute_draw_inner(
                 // `color0_pass_exit_layout` exists to remove — a registry record
                 // naming a layout the pass did not leave the image in is a later
                 // barrier's wrong `oldLayout`.
-                pools.registry_mark_ready_at(identity, pass_key.color_final_layout(attachment_index));
+                pools.registry_mark_ready_at(
+                    identity,
+                    pass_key.color_final_layout(attachment_index),
+                );
             }
         }
     }
@@ -6529,7 +6527,9 @@ mod tests {
                 .is_none(),
             "two stretches are two ranges and a bind names one"
         );
-        assert!(source_over(window_runs(&[]), 0, 0).single_stretch().is_none());
+        assert!(source_over(window_runs(&[]), 0, 0)
+            .single_stretch()
+            .is_none());
     }
 
     /// A window inside a lone stretch binds at the window's first byte, not at
@@ -6547,7 +6547,10 @@ mod tests {
     fn a_window_inside_a_lone_stretch_skips_to_its_own_first_byte() {
         let src = source_over(window_runs(&[(0, 0, 0x8000)]), 0x100, 0x4000);
         let stretch = src.single_stretch().expect("one stretch holds the window");
-        assert_eq!(stretch.skip, 0x100, "the plane offset inside the allocation");
+        assert_eq!(
+            stretch.skip, 0x100,
+            "the plane offset inside the allocation"
+        );
         assert_eq!(stretch.window_offset, 0);
         assert_eq!(stretch.len, 0x4000, "the window, not the whole stretch");
     }
@@ -6556,11 +6559,9 @@ mod tests {
     /// bind is refused rather than reading past the allocation.
     #[test]
     fn a_window_past_the_end_of_its_lone_stretch_does_not_bind() {
-        assert!(
-            source_over(window_runs(&[(0, 0, 0x1000)]), 0xf00, 0x200)
-                .single_stretch()
-                .is_none()
-        );
+        assert!(source_over(window_runs(&[(0, 0, 0x1000)]), 0xf00, 0x200)
+            .single_stretch()
+            .is_none());
     }
 
     /// Two offsets into one retained resource are distinct command-buffer
@@ -6620,7 +6621,11 @@ mod tests {
     #[test]
     fn window_stretches_tile_the_window_and_skip_what_it_does_not_reach() {
         let src = source_over(
-            window_runs(&[(0, 0, 0x1000), (0x1000, 0x2000, 0x1000), (0x2000, 0x4000, 0x1000)]),
+            window_runs(&[
+                (0, 0, 0x1000),
+                (0x1000, 0x2000, 0x1000),
+                (0x2000, 0x4000, 0x1000),
+            ]),
             0x800,
             0x1000,
         );
@@ -6719,8 +6724,13 @@ mod tests {
         assert_eq!(roles.len(), 4, "shared content must stay one operation");
         assert_eq!(roles.role(keys[0]), Some(BufferGatherRole::VERTEX));
         assert_eq!(roles.role(keys[1]), Some(BufferGatherRole::STORAGE));
-        assert!(roles.role(keys[2]).expect("shared was classified").is_shared());
-        let index = roles.role(keys[3]).expect("the index buffer was classified");
+        assert!(roles
+            .role(keys[2])
+            .expect("shared was classified")
+            .is_shared());
+        let index = roles
+            .role(keys[3])
+            .expect("the index buffer was classified");
         assert!(index.includes_index());
         assert_eq!(index.index_alignment, Some(2));
         // The table answers only about this draw's binds. An unclassified key
@@ -6782,10 +6792,7 @@ mod tests {
             index_alignment: None,
         };
         assert_eq!(buffer_bind_offset_alignment(shared, 4), 4);
-        assert!(96u64.is_multiple_of(buffer_bind_offset_alignment(
-            BufferGatherRole::STORAGE,
-            4,
-        )));
+        assert!(96u64.is_multiple_of(buffer_bind_offset_alignment(BufferGatherRole::STORAGE, 4,)));
     }
 
     /// The two re-basings a gather region does, at the values that make them
@@ -7052,14 +7059,16 @@ mod tests {
     /// than sample. A new variant that nothing here mentions fails to compile,
     /// which is the point: each one is a rail that can leave a resident in a
     /// state some barrier has to name.
-    fn every_access() -> [ResidentAccess; 6] { [
-        ResidentAccess::Untouched,
-        ResidentAccess::ColorWrite(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
-        ResidentAccess::ColorWrite(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
-        ResidentAccess::ColorFeedback(vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT),
-        ResidentAccess::shader_read(false),
-        ResidentAccess::transfer_read(false),
-    ] }
+    fn every_access() -> [ResidentAccess; 6] {
+        [
+            ResidentAccess::Untouched,
+            ResidentAccess::ColorWrite(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+            ResidentAccess::ColorWrite(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+            ResidentAccess::ColorFeedback(vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT),
+            ResidentAccess::shader_read(false),
+            ResidentAccess::transfer_read(false),
+        ]
+    }
 
     fn target_sample(identity: super::super::types::TargetIdentity) -> SampledImageResource {
         SampledImageResource {
@@ -7430,11 +7439,10 @@ mod tests {
     fn integer_attachment_clears_use_integer_union_members() {
         use crate::contract::pixel_format::MTL_FORMAT_RG16_UINT;
 
-        let attachment = crate::backend::vulkan::translate::pixel::color_attachment(
-            MTL_FORMAT_RG16_UINT,
-        )
-        .unwrap()
-        .0;
+        let attachment =
+            crate::backend::vulkan::translate::pixel::color_attachment(MTL_FORMAT_RG16_UINT)
+                .unwrap()
+                .0;
 
         let req = DrawRequest {
             color_attachment: Some(attachment.with_clear([1.0, 2.0, 65_535.0, 0.0])),
@@ -7775,7 +7783,10 @@ mod tests {
         assert!(validate_v1(&req).is_ok());
 
         let short = index_buffer_req(buffer_guest_runs(&[5], 5, 0));
-        assert_eq!(validation_slug(&short), "vk_draw_validate_index_bytes_short");
+        assert_eq!(
+            validation_slug(&short),
+            "vk_draw_validate_index_bytes_short"
+        );
 
         let uncovered = index_buffer_req(buffer_guest_runs(&[5], 6, 0));
         assert_eq!(

@@ -967,9 +967,7 @@ fn enforce_gva_cache_cap(state: &mut DeviceState, protect: u64) {
     let mut by_touch: Vec<(u64, u64)> = state
         .host_gva_surfaces
         .iter()
-        .filter(|(gva, e)| {
-            **gva != protect && e.guest_holds_bytes
-        })
+        .filter(|(gva, e)| **gva != protect && e.guest_holds_bytes)
         .map(|(&gva, e)| (e.last_touch, gva))
         .collect();
     by_touch.sort_unstable();
@@ -1096,12 +1094,7 @@ pub fn evict_gva(state: &mut DeviceState, gva: u64) {
 /// Once a writer publishes new pixels into the guest pages, those pages are
 /// authoritative. Keeping either the address-keyed copy or the object-keyed
 /// copy would let a later sample observe the frame that preceded the write.
-pub fn forget_gva_copies(
-    state: &mut DeviceState,
-    task_id: u32,
-    target_gva: u64,
-    texture_ref: u32,
-) {
+pub fn forget_gva_copies(state: &mut DeviceState, task_id: u32, target_gva: u64, texture_ref: u32) {
     evict_gva(state, target_gva);
     if texture_ref != 0 {
         evict_texture(state, task_id, texture_ref);
@@ -1304,11 +1297,7 @@ pub fn gva_backing_state<H: HostMemory>(
     let recorded = backing.first_gpa;
     // Same liveness test the walk itself applies: present in the table AND
     // flagged active. A dead task's page table cannot answer the question.
-    let Some(task) = state
-        .tasks
-        .get(backing.task_id)
-        .filter(|t| t.active)
-    else {
+    let Some(task) = state.tasks.get(backing.task_id).filter(|t| t.active) else {
         return GvaBackingState::Unrecorded;
     };
     match crate::runtime::gva_mem::translate_task_gva(host, task, gva, page_shift) {

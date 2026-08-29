@@ -62,18 +62,18 @@ pub(crate) use host_ram::GuestWriteDecline;
 pub use types::viewport_slot_count;
 pub use types::{
     BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorAttachmentState, ColorClearValue,
-    ColorWriteMask, ComputeBufferResource, ComputeOutput, ComputeRequest, ComputeResidentSampleBind,
-    ComputeSampledImageResource,
-    ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
-    DrawError, DrawOutput, DrawRequest, FillMode, GuestRun, GuestRunSource, GuestSampledBacking,
-    GuestTargetBacking, GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource,
-    PipelineObjectIdentity, PrimitiveTopology, SampledByteOrigin, SampledContentIdentity,
-    SampledImageResource, SampledSource, SamplerAddressMode, SamplerBorderColor,
-    SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource, ScissorResource,
-    SecondaryColorTarget, SeedOrder,
+    ColorWriteMask, ComputeBufferResource, ComputeOutput, ComputeRequest,
+    ComputeResidentSampleBind, ComputeSampledImageResource, ComputeStorageImageResource,
+    ComputeStorageResidency, CullMode, DepthClipMode, DepthState, DrawError, DrawOutput,
+    DrawRequest, FillMode, GuestRun, GuestRunSource, GuestSampledBacking, GuestTargetBacking,
+    GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource, PipelineObjectIdentity,
+    PrimitiveTopology, SampledByteOrigin, SampledContentIdentity, SampledImageResource,
+    SampledSource, SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
+    SamplerMipFilter, SamplerResource, ScissorResource, SecondaryColorTarget, SeedOrder,
     StencilFaceOps, StencilOp, StencilState, StorageBufferResource, StorageImageFormat,
-    TargetIdentity, TargetKeyDivergence, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
-    ViewportResource, VisibilityResultMode, WindowPresentSource, COLOR_INPUT_BINDING,
+    TargetIdentity, TargetKeyDivergence, VertexAttributeFormat, VertexAttributeResource,
+    VertexStepFunction, ViewportResource, VisibilityResultMode, WindowPresentSource,
+    COLOR_INPUT_BINDING,
 };
 pub(crate) use vk_call::{VkCall, VkOp};
 #[cfg(feature = "host-window")]
@@ -1445,9 +1445,7 @@ fn arm_guest_write_pages(pages: &[u64]) {
 
 /// Record one resource-owned allocation that an outstanding GPU Store writes.
 /// Repeated writes through the same admitted resource add no ledger work.
-fn arm_guest_write_footprint(
-    footprint: &crate::runtime::guest_ram::GuestPageFootprint,
-) {
+fn arm_guest_write_footprint(footprint: &crate::runtime::guest_ram::GuestPageFootprint) {
     let Ok(mut f) = GUEST_WRITE_PAGES.lock() else {
         return;
     };
@@ -1512,11 +1510,9 @@ pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
             }
             _ => false,
         }
-    }) || f.allocations.iter().any(|a| {
-        match a.page_span() {
-            Some(span) if !disjoint_span(span) => pages.iter().any(|p| a.contains_page(*p)),
-            _ => false,
-        }
+    }) || f.allocations.iter().any(|a| match a.page_span() {
+        Some(span) if !disjoint_span(span) => pages.iter().any(|p| a.contains_page(*p)),
+        _ => false,
     });
     if hit {
         GuestWriteReach::Overlap
@@ -1708,8 +1704,8 @@ pub fn write_completion_stamp(
         }));
     };
     let had_batch = pools.batch_open_recording().is_some();
-    let deferred = had_batch
-        && completion.queue_for_next_submission(index, guest_ref.clone(), value);
+    let deferred =
+        had_batch && completion.queue_for_next_submission(index, guest_ref.clone(), value);
     if !deferred {
         // A full pending ring cannot wait while this thread owns the open
         // command buffer: submitting it is what lets completions retire. This
@@ -1889,9 +1885,7 @@ fn resident_present_decision(
     };
     match pools::slot_present_decline(slot, width, height) {
         None => Ok(()),
-        Some(pools::ResidentPresentDecline::ContentNotReady) => {
-            Err("winpub_content_not_ready")
-        }
+        Some(pools::ResidentPresentDecline::ContentNotReady) => Err("winpub_content_not_ready"),
         Some(pools::ResidentPresentDecline::ScanoutOrder) => Err("winpub_scanout_order"),
         Some(pools::ResidentPresentDecline::Geometry) => Err("winpub_geometry"),
     }
@@ -2466,9 +2460,7 @@ pub fn supports_storage_image_write_without_format() -> bool {
 /// mandated for the integer layouts this device names, so the bind is
 /// admissible without a query and the filter mask is not this layout's
 /// question.
-pub fn supports_sampled_layout_bind(
-    layout: crate::contract::pixel_format::TexelLayout,
-) -> bool {
+pub fn supports_sampled_layout_bind(layout: crate::contract::pixel_format::TexelLayout) -> bool {
     if layout.is_integer() {
         return true;
     }
@@ -5351,7 +5343,11 @@ mod guest_write_footprint_tests {
         arm_guest_write_footprint(&allocation.clone());
         {
             let held = GUEST_WRITE_PAGES.lock().expect("ledger lock");
-            assert_eq!(held.allocations.len(), 1, "one admitted allocation identity");
+            assert_eq!(
+                held.allocations.len(),
+                1,
+                "one admitted allocation identity"
+            );
             assert!(held.armed.is_empty(), "no copied page-list shadow");
         }
         assert_eq!(guest_writes_reaching(&[0x9000]), GuestWriteReach::Overlap);
@@ -5502,8 +5498,14 @@ mod guest_write_footprint_tests {
     fn a_reader_clear_of_the_armed_span_is_disjoint_from_either_side() {
         clear_guest_write_pages();
         arm_guest_write_pages(&[0x8000, 0x9000, 0xa000]);
-        assert_eq!(guest_writes_reaching(&[0x6000, 0x7000]), GuestWriteReach::Disjoint);
-        assert_eq!(guest_writes_reaching(&[0xb000, 0xc000]), GuestWriteReach::Disjoint);
+        assert_eq!(
+            guest_writes_reaching(&[0x6000, 0x7000]),
+            GuestWriteReach::Disjoint
+        );
+        assert_eq!(
+            guest_writes_reaching(&[0xb000, 0xc000]),
+            GuestWriteReach::Disjoint
+        );
         assert_eq!(
             guest_writes_reaching(&[0x7000, 0x8000]),
             GuestWriteReach::Overlap,

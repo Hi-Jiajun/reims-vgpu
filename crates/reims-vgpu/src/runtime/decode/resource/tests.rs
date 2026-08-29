@@ -1614,7 +1614,11 @@ fn the_mip_level_count_is_one_byte_and_its_neighbour_is_another_field() {
     let cap = crate::observe::FailCapture::start();
     let d = decode_texture_descriptor(&b).expect("the descriptor decodes");
     assert_eq!(d.mipmap_level_count, LEVELS as u32);
-    assert_eq!(d.levels.len(), LEVELS, "every level the body carries is read");
+    assert_eq!(
+        d.levels.len(),
+        LEVELS,
+        "every level the body carries is read"
+    );
     assert_eq!(
         d.declared_pixel_format(),
         Some(MTL_FORMAT_BGRA8_UNORM),
@@ -1635,7 +1639,10 @@ fn the_mip_level_count_is_one_byte_and_its_neighbour_is_another_field() {
         .iter()
         .find(|l| l.starts_with("texture_desc_mip_field_undecoded"))
         .expect("a non-zero undecoded field must be reported once");
-    assert!(note.contains("value=0x80") && note.contains("levels=7"), "{note}");
+    assert!(
+        note.contains("value=0x80") && note.contains("levels=7"),
+        "{note}"
+    );
 }
 
 /// A mip level the descriptor named but the body does not reach is a drop,

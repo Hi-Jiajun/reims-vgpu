@@ -1876,10 +1876,7 @@ fn copy_row_region<M: HostMemory + HostOps>(
         window_started.elapsed().as_micros() as u64,
     );
     let rows_started = std::time::Instant::now();
-    crate::runtime::drain::note_store_route_n(
-        "blit_rows_n",
-        row_count.saturating_mul(image_count),
-    );
+    crate::runtime::drain::note_store_route_n("blit_rows_n", row_count.saturating_mul(image_count));
     let mut row_buf = vec![0u8; row_len];
     for z in 0..image_count {
         let src_plane = src_base
@@ -3003,10 +3000,7 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
         "blit_t2b_stage_us",
         stage_rows_started.elapsed().as_micros() as u64,
     );
-    crate::runtime::drain::note_store_route_n(
-        "blit_t2b_stage_rows",
-        copy_h.saturating_mul(copy_d),
-    );
+    crate::runtime::drain::note_store_route_n("blit_t2b_stage_rows", copy_h.saturating_mul(copy_d));
     BlitStatus::Ok
 }
 
@@ -3090,14 +3084,34 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     // even come through the extent helper, which made it the quieter of two
     // quiet paths.
     let (Some(copy_w), Some(_)) = (
-        copy_extent("t2t_src", "w", cmd.source_size.width, src.width() as u64 - sox),
-        copy_extent("t2t_dst", "w", cmd.source_size.width, dst.width() as u64 - dox),
+        copy_extent(
+            "t2t_src",
+            "w",
+            cmd.source_size.width,
+            src.width() as u64 - sox,
+        ),
+        copy_extent(
+            "t2t_dst",
+            "w",
+            cmd.source_size.width,
+            dst.width() as u64 - dox,
+        ),
     ) else {
         return br(BlitStatus::Bounds, "t2t_extent_oob");
     };
     let (Some(copy_h), Some(_)) = (
-        copy_extent("t2t_src", "h", cmd.source_size.height, src.height() as u64 - soy),
-        copy_extent("t2t_dst", "h", cmd.source_size.height, dst.height() as u64 - doy),
+        copy_extent(
+            "t2t_src",
+            "h",
+            cmd.source_size.height,
+            src.height() as u64 - soy,
+        ),
+        copy_extent(
+            "t2t_dst",
+            "h",
+            cmd.source_size.height,
+            dst.height() as u64 - doy,
+        ),
     ) else {
         return br(BlitStatus::Bounds, "t2t_extent_oob");
     };
@@ -3105,8 +3119,18 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         0
     } else {
         let (Some(d), Some(_)) = (
-            copy_extent("t2t_src", "d", cmd.source_size.depth, src.depth() as u64 - soz),
-            copy_extent("t2t_dst", "d", cmd.source_size.depth, dst.depth() as u64 - doz),
+            copy_extent(
+                "t2t_src",
+                "d",
+                cmd.source_size.depth,
+                src.depth() as u64 - soz,
+            ),
+            copy_extent(
+                "t2t_dst",
+                "d",
+                cmd.source_size.depth,
+                dst.depth() as u64 - doz,
+            ),
         ) else {
             return br(BlitStatus::Bounds, "t2t_extent_oob");
         };
@@ -3520,10 +3544,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         "blit_t2t_stage_us",
         t2t_stage_started.elapsed().as_micros() as u64,
     );
-    crate::runtime::drain::note_store_route_n(
-        "blit_t2t_stage_rows",
-        copy_h.saturating_mul(copy_d),
-    );
+    crate::runtime::drain::note_store_route_n("blit_t2t_stage_rows", copy_h.saturating_mul(copy_d));
     BlitStatus::Ok
 }
 
@@ -4082,9 +4103,7 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
             };
             // Same allocation overlap check (conservative).
             if sl.base_gva == dl.base_gva {
-                let span = row_bytes
-                    .saturating_mul(rows)
-                    .saturating_mul(image_count);
+                let span = row_bytes.saturating_mul(rows).saturating_mul(image_count);
                 if ranges_overlap(src_off, span, dst_off, span) {
                     return br(BlitStatus::Overlap, "sl_overlap");
                 }

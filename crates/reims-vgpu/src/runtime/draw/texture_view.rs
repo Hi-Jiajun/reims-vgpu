@@ -419,9 +419,16 @@ pub(super) fn resolve_texture_view<M: HostMemory + HostOps>(
 /// table was simply missing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ViewSampleRefusal {
-    BaseUndeclared { base: u16 },
-    ViewUndeclared { view: u16 },
-    WidthMismatch { base_bpp: u32, view_bpp: u32 },
+    BaseUndeclared {
+        base: u16,
+    },
+    ViewUndeclared {
+        view: u16,
+    },
+    WidthMismatch {
+        base_bpp: u32,
+        view_bpp: u32,
+    },
     /// The two formats occupy the same bytes per addressable unit but address a
     /// different **grid** of texels with them — one is block-compressed and the
     /// other is not.
@@ -1023,9 +1030,8 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // Counted in rows of storage rather than rows of texels, so a
     // block-compressed level does not claim four times its own extent and get
     // refused against the allocation the guest sized correctly.
-    let storage_rows = pixel_format::tight_row_count(h, base_fmt).ok_or(R::FormatBppUnknown {
-        format: base_fmt,
-    })?;
+    let storage_rows = pixel_format::tight_row_count(h, base_fmt)
+        .ok_or(R::FormatBppUnknown { format: base_fmt })?;
     // One face-stride per slice past the level base. The stride is a whole
     // image *including* its final row's padding — the packing rule is
     // contiguous images, so face N+1 starts where face N's allocation ends,
@@ -1060,7 +1066,13 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // Census, pay, settle — the whole obligation of a CPU read of one named
     // resource's guest bytes. See `writeback_debt::settle_for_texture`.
     crate::runtime::writeback_debt::settle_for_texture(
-        state, host, task_id, texture_ref, gva, span, site,
+        state,
+        host,
+        task_id,
+        texture_ref,
+        gva,
+        span,
+        site,
     );
     // Tight display textures are the common compositor source. Read the whole
     // image with one task-root/cache lifetime: the row loop below otherwise
@@ -1149,7 +1161,10 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
             return Err(R::RowConvertUnsupported { format: sample_fmt });
         }
     }
-    Ok((rgba, SampledByteFormat::from_source(TexelLayout::Rgba8, sample_fmt)))
+    Ok((
+        rgba,
+        SampledByteFormat::from_source(TexelLayout::Rgba8, sample_fmt),
+    ))
 }
 
 ///
@@ -1210,7 +1225,8 @@ where
         return Ok((bytes, SampledByteFormat::from_source(layout, sample_format)));
     }
     if native_len == rgba_len
-        && pixel_format::sampled_class(sample_format) == Some(pixel_format::SampledClass::Bgra8Unorm)
+        && pixel_format::sampled_class(sample_format)
+            == Some(pixel_format::SampledClass::Bgra8Unorm)
     {
         // A channel exchange, which moves no value across the transfer
         // function: the bytes stay encoded exactly as the guest stored them.
@@ -1400,7 +1416,10 @@ mod texture_view_split_tests {
                 None,
                 "{format:#x} must not be bound on a host that cannot sample it"
             );
-            assert_eq!(linear_native_upload_format(format, NativeUploads::NONE), None);
+            assert_eq!(
+                linear_native_upload_format(format, NativeUploads::NONE),
+                None
+            );
         }
         // The gate is per family, not per call: an uncompressed format is
         // unaffected by it in either direction.
