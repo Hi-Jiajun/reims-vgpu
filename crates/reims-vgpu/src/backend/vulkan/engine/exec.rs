@@ -187,15 +187,18 @@ struct BufferGatherRoles {
 impl BufferGatherRoles {
     fn of(req: &DrawRequest) -> Self {
         let mut entries: Vec<((usize, u64, u64), BufferGatherRole)> = Vec::with_capacity(
-            req.vertex_attributes.len() + req.storage_buffers.len() + req.indexed.is_some() as usize,
+            req.vertex_attributes.len()
+                + req.storage_buffers.len()
+                + req.indexed.is_some() as usize,
         );
         // `entry`-shaped, so a content allocation named twice in one draw stays
         // one physical operation carrying both roles.
-        let mut merge = |key, seed: BufferGatherRole, add: fn(&mut BufferGatherRole)| {
-            match entries.iter_mut().find(|(held, _)| *held == key) {
-                Some((_, role)) => add(role),
-                None => entries.push((key, seed)),
-            }
+        let mut merge = |key, seed: BufferGatherRole, add: fn(&mut BufferGatherRole)| match entries
+            .iter_mut()
+            .find(|(held, _)| *held == key)
+        {
+            Some((_, role)) => add(role),
+            None => entries.push((key, seed)),
         };
         for content in req.vertex_attributes.iter().map(|r| &r.content) {
             merge(CbBind::key_of(content), BufferGatherRole::VERTEX, |role| {
@@ -1870,11 +1873,18 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        // Footprint of one texel of the image's own format. `None` means a
-        // format whose bytes are not one number per texel (block-compressed,
-        // multi-planar) reached a rail that sizes a linear buffer — decline by
-        // name rather than compute a wrong length.
-        let Some(texel) = super::super::translate::pixel::bytes_per_texel(image.format) else {
+        // Storage grid of the image's own format. `None` means a format whose
+        // footprint this table cannot describe at all (multi-planar) reached a
+        // rail that sizes a linear buffer — decline by name rather than compute
+        // a wrong length.
+        //
+        // The **grid** and not a bytes-per-texel, because a block-compressed
+        // image is a legitimate sampled bind and its buffer is a quarter as wide
+        // and a quarter as tall in blocks as it is in texels. Sizing one per
+        // texel over-counts by sixteen and refuses the guest's own
+        // correctly-sized bytes as `SampledBytesLength` — which is a refusal
+        // wearing the name of a guest error.
+        let Some(block) = super::super::translate::pixel::vk_block_geometry(image.format) else {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::SampledNoLinearTexelFootprint {
                     binding: image.binding,
@@ -1882,22 +1892,21 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         };
-        let texel = texel as usize;
         // Four factors, so the widening the operands already carry is not
         // enough — see the target-seed check above for why two of them exhaust
         // a u64 on their own. `contract::extent` owns the checked form.
-        let Some(expected) = crate::contract::extent::tight_layered_image_bytes(
+        let Some(expected) = crate::contract::extent::tight_layered_block_bytes(
             image.width,
             image.height,
             image.layers,
-            texel,
+            block,
         ) else {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::UnrepresentableImageBytes {
                     width: image.width,
                     height: image.height,
                     layers: image.layers,
-                    bytes_per_texel: texel as u32,
+                    bytes_per_texel: block.bytes,
                 },
             ));
         };
@@ -1943,12 +1952,42 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                         },
                     ));
                 }
+                // Every count below is in units of the image's storage grid —
+                // rows of blocks and bytes per block — which for an
+                // uncompressed format is exactly the texel arithmetic this
+                // always was (a 1x1 block whose bytes are the bytes-per-texel).
+                // `bufferRowLength` stays Vulkan's unit, texels: the stride in
+                // bytes is `(row_length / block.width) * block.bytes`, and a
+                // row length that does not divide into whole blocks cannot
+                // describe a compressed row at all, so it refuses as a stride
+                // defect rather than rounding into a shifted image.
+                let texel = block.bytes as usize;
                 let planes = image.layers as usize;
+                let storage_rows = block.block_rows(image.height) as usize;
+                let tight_row = block.blocks_across(image.width) as usize * texel;
+                if storage_rows == 0 || tight_row == 0 {
+                    return Err(DrawError::DrawValidation(
+                        DrawValidationDecline::SampledZeroGeometry {
+                            binding: image.binding,
+                            width: image.width,
+                            height: image.height,
+                            layers: image.layers,
+                        },
+                    ));
+                }
                 let run_expected = if src.row_length_texels == 0 {
                     expected
                 } else {
-                    let stride = src.row_length_texels as usize * texel;
-                    let tight_row = image.width as usize * texel;
+                    if !src.row_length_texels.is_multiple_of(block.width) {
+                        return Err(DrawError::DrawValidation(
+                            DrawValidationDecline::GuestSampleRowStride {
+                                binding: image.binding,
+                                stride: src.row_length_texels as usize,
+                                tight_row,
+                            },
+                        ));
+                    }
+                    let stride = (src.row_length_texels / block.width) as usize * texel;
                     if stride < tight_row {
                         return Err(DrawError::DrawValidation(
                             DrawValidationDecline::GuestSampleRowStride {
@@ -1958,9 +1997,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                             },
                         ));
                     }
-                    (planes - 1) * image.height as usize * stride
-                        + (image.height as usize - 1) * stride
-                        + tight_row
+                    (planes - 1) * storage_rows * stride + (storage_rows - 1) * stride + tight_row
                 };
                 if src.total_len as usize != run_expected {
                     return Err(DrawError::DrawValidation(
@@ -1973,9 +2010,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 }
                 let sum: u64 = src.runs.iter().map(|r| r.len).sum();
                 let covered = src.source_offset.checked_add(src.total_len);
-                if src.total_len == 0
-                    || src.runs.is_empty()
-                    || covered.is_none_or(|end| end > sum)
+                if src.total_len == 0 || src.runs.is_empty() || covered.is_none_or(|end| end > sum)
                 {
                     return Err(DrawError::DrawValidation(
                         DrawValidationDecline::GuestSampleCoverage {
@@ -2632,7 +2667,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // Slot 0's view supplies the attachment format. The identity names the
     // allocation behind it; treating those as the same question loses Metal's
     // compatible-format texture views (most visibly UNORM versus sRGB).
-    let color0_format = req.color_attachment_format.unwrap_or_else(|| {
+    let color0_format = req.color_attachment.map(|a| a.format()).unwrap_or_else(|| {
         req.target_identity
             .as_ref()
             .map(|id| id.resident_format())
@@ -2962,7 +2997,7 @@ pub(crate) unsafe fn execute_draw_inner(
             ));
         }
         pass_key.secondary[i] = SecondaryAttachKey {
-            format: sec.format,
+            format: sec.attachment.format(),
             load: sec.load,
         };
     }
@@ -3351,7 +3386,13 @@ pub(crate) unsafe fn execute_draw_inner(
     phase.enter(super::draw_phase::Phase::StageSeed);
     let seed_wide = seed_bytes.and_then(|rgba8| {
         let layout = crate::backend::vulkan::translate::pixel::texel_layout_of(color0_format)?;
-        if layout.bytes_per_texel() == crate::contract::pixel_format::RGBA8_BPP {
+        // Four-byte *colour*, not four bytes. A seed is eight-bit RGBA, and a
+        // four-byte texel that is not one of the two colour orders — a packed
+        // ten-bit word, an integer pair — cannot be staged as though it were:
+        // the copy converts nothing, so the attachment would be seeded with the
+        // seed's bytes reinterpreted. The wide arm below restates the seed in
+        // the attachment's texel, or refuses by name when it cannot.
+        if layout.is_four_byte_color() {
             return None;
         }
         Some((rgba8, layout))
@@ -4170,7 +4211,9 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     if dset.is_some() {
         ctx.device.update_descriptor_sets(&descriptor_writes, &[]);
-        counters.descriptor_set_updates.fetch_add(1, Ordering::Relaxed);
+        counters
+            .descriptor_set_updates
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     phase.enter(super::draw_phase::Phase::RecordBegin);
@@ -5067,15 +5110,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // Only if this command buffer is not already carrying it — the three
     // `dynstate_*` skips below hang off this one call, because a pipeline change
     // is what invalidates them. See `super::pools::CbGraphicsState`.
-    unsafe {
-        pools.bind_graphics_pipeline(
-            &ctx.device,
-            cb,
-            counters,
-            pipeline,
-            pipeline_layout,
-        )
-    };
+    unsafe { pools.bind_graphics_pipeline(&ctx.device, cb, counters, pipeline, pipeline_layout) };
     if let Some((pool, flags)) = occlusion {
         ctx.device.cmd_begin_query(cb, pool, 0, flags);
     }
@@ -5162,16 +5197,16 @@ pub(crate) unsafe fn execute_draw_inner(
                 range: info.range,
             },
         ));
-        push_state.extend(sampled.iter().zip(&sampled_infos).map(
-            |(image, info)| super::pools::PushDescriptorBinding::Image {
+        push_state.extend(sampled.iter().zip(&sampled_infos).map(|(image, info)| {
+            super::pools::PushDescriptorBinding::Image {
                 binding: image.binding(),
                 array_element: image.array_element(),
                 ty: vk::DescriptorType::SAMPLED_IMAGE,
                 sampler: info.sampler,
                 view: info.image_view,
                 layout: info.image_layout,
-            },
-        ));
+            }
+        }));
         push_state.extend(sampler_handles.iter().zip(&sampler_infos).map(
             |((binding, _), info)| super::pools::PushDescriptorBinding::Image {
                 binding: *binding,
@@ -5214,7 +5249,9 @@ pub(crate) unsafe fn execute_draw_inner(
             &[dset],
             &[],
         );
-        counters.descriptor_set_binds.fetch_add(1, Ordering::Relaxed);
+        counters
+            .descriptor_set_binds
+            .fetch_add(1, Ordering::Relaxed);
     }
     phase.enter(super::draw_phase::Phase::RecordDraw);
     unsafe { pools.bind_vertex_buffers(&ctx.device, cb, counters, &vertex_bufs) };
@@ -5556,7 +5593,10 @@ pub(crate) unsafe fn execute_draw_inner(
                 // `color0_pass_exit_layout` exists to remove — a registry record
                 // naming a layout the pass did not leave the image in is a later
                 // barrier's wrong `oldLayout`.
-                pools.registry_mark_ready_at(identity, pass_key.color_final_layout(attachment_index));
+                pools.registry_mark_ready_at(
+                    identity,
+                    pass_key.color_final_layout(attachment_index),
+                );
             }
         }
     }
@@ -5791,13 +5831,29 @@ pub(crate) unsafe fn execute_draw_inner(
             format: color0_format,
         }),
     )?;
-    let (pixels, pixels_bgra) = super::narrow_readback_to_rgba8(
+    let (pixels, texel) = super::narrow_readback_to_rgba8(
         out,
         layout,
         color0_format,
         (req.width as u64) * (req.height as u64),
         output_bgra,
     )?;
+    // This rail hands its bytes to `M2vDrawSpan::Pixels`, whose every consumer
+    // reads eight-bit colour, so a native texel is refused here exactly as it
+    // was before the narrowing learned to carry one. The native bytes are
+    // useful only to a guest destination of the identical layout, and that is
+    // the GVA Store's rail rather than this one.
+    let pixels_bgra = match texel {
+        super::ReadbackTexel::Rgba8 => false,
+        super::ReadbackTexel::Bgra8 => true,
+        super::ReadbackTexel::Native(_) => {
+            return Err(DrawError::TargetRead(
+                super::reason::TargetReadDecline::TexelNotFourBytes {
+                    format: super::readback_vk_format(layout),
+                },
+            ))
+        }
+    };
 
     Ok(DrawOutput {
         pixels,
@@ -5905,7 +5961,7 @@ unsafe fn ad_hoc_attachment_views(
             sec.height,
             1,
             sec.identity.generation(),
-            sec.format,
+            sec.attachment.format(),
             counters,
         )?;
         views.push(view);
@@ -5927,17 +5983,21 @@ unsafe fn ad_hoc_attachment_views(
 /// runtime met it instead by allocating a whole-attachment RGBA8 bitmap of the
 /// requested colour and handing it over as a CPU seed, which also resolved the
 /// pass to LOAD. The clear now travels as
-/// [`super::types::DrawRequest::target_clear`], the same shape the secondaries
-/// have always used.
+/// [`super::types::DrawRequest::color_attachment`], already paired with its
+/// format by attachment translation.
 fn clear_values(req: &DrawRequest) -> Vec<vk::ClearValue> {
     let mut clear = vec![vk::ClearValue {
-        color: vk::ClearColorValue {
-            float32: req.target_clear,
-        },
+        // With no declared attachment the clear is transparent black. Every
+        // Vulkan union member represents that value with the same zero bits.
+        color: req
+            .color_attachment
+            .map(|a| a.clear())
+            .unwrap_or_default()
+            .vk(),
     }];
     for sec in &req.secondary_targets {
         clear.push(vk::ClearValue {
-            color: vk::ClearColorValue { float32: sec.clear },
+            color: sec.attachment.clear().vk(),
         });
     }
     if let Some(d) = &req.depth {
@@ -6468,7 +6528,9 @@ mod tests {
                 .is_none(),
             "two stretches are two ranges and a bind names one"
         );
-        assert!(source_over(window_runs(&[]), 0, 0).single_stretch().is_none());
+        assert!(source_over(window_runs(&[]), 0, 0)
+            .single_stretch()
+            .is_none());
     }
 
     /// A window inside a lone stretch binds at the window's first byte, not at
@@ -6486,7 +6548,10 @@ mod tests {
     fn a_window_inside_a_lone_stretch_skips_to_its_own_first_byte() {
         let src = source_over(window_runs(&[(0, 0, 0x8000)]), 0x100, 0x4000);
         let stretch = src.single_stretch().expect("one stretch holds the window");
-        assert_eq!(stretch.skip, 0x100, "the plane offset inside the allocation");
+        assert_eq!(
+            stretch.skip, 0x100,
+            "the plane offset inside the allocation"
+        );
         assert_eq!(stretch.window_offset, 0);
         assert_eq!(stretch.len, 0x4000, "the window, not the whole stretch");
     }
@@ -6495,11 +6560,9 @@ mod tests {
     /// bind is refused rather than reading past the allocation.
     #[test]
     fn a_window_past_the_end_of_its_lone_stretch_does_not_bind() {
-        assert!(
-            source_over(window_runs(&[(0, 0, 0x1000)]), 0xf00, 0x200)
-                .single_stretch()
-                .is_none()
-        );
+        assert!(source_over(window_runs(&[(0, 0, 0x1000)]), 0xf00, 0x200)
+            .single_stretch()
+            .is_none());
     }
 
     /// Two offsets into one retained resource are distinct command-buffer
@@ -6559,7 +6622,11 @@ mod tests {
     #[test]
     fn window_stretches_tile_the_window_and_skip_what_it_does_not_reach() {
         let src = source_over(
-            window_runs(&[(0, 0, 0x1000), (0x1000, 0x2000, 0x1000), (0x2000, 0x4000, 0x1000)]),
+            window_runs(&[
+                (0, 0, 0x1000),
+                (0x1000, 0x2000, 0x1000),
+                (0x2000, 0x4000, 0x1000),
+            ]),
             0x800,
             0x1000,
         );
@@ -6658,8 +6725,13 @@ mod tests {
         assert_eq!(roles.len(), 4, "shared content must stay one operation");
         assert_eq!(roles.role(keys[0]), Some(BufferGatherRole::VERTEX));
         assert_eq!(roles.role(keys[1]), Some(BufferGatherRole::STORAGE));
-        assert!(roles.role(keys[2]).expect("shared was classified").is_shared());
-        let index = roles.role(keys[3]).expect("the index buffer was classified");
+        assert!(roles
+            .role(keys[2])
+            .expect("shared was classified")
+            .is_shared());
+        let index = roles
+            .role(keys[3])
+            .expect("the index buffer was classified");
         assert!(index.includes_index());
         assert_eq!(index.index_alignment, Some(2));
         // The table answers only about this draw's binds. An unclassified key
@@ -6721,10 +6793,7 @@ mod tests {
             index_alignment: None,
         };
         assert_eq!(buffer_bind_offset_alignment(shared, 4), 4);
-        assert!(96u64.is_multiple_of(buffer_bind_offset_alignment(
-            BufferGatherRole::STORAGE,
-            4,
-        )));
+        assert!(96u64.is_multiple_of(buffer_bind_offset_alignment(BufferGatherRole::STORAGE, 4,)));
     }
 
     /// The two re-basings a gather region does, at the values that make them
@@ -6991,14 +7060,16 @@ mod tests {
     /// than sample. A new variant that nothing here mentions fails to compile,
     /// which is the point: each one is a rail that can leave a resident in a
     /// state some barrier has to name.
-    fn every_access() -> [ResidentAccess; 6] { [
-        ResidentAccess::Untouched,
-        ResidentAccess::ColorWrite(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
-        ResidentAccess::ColorWrite(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
-        ResidentAccess::ColorFeedback(vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT),
-        ResidentAccess::shader_read(false),
-        ResidentAccess::transfer_read(false),
-    ] }
+    fn every_access() -> [ResidentAccess; 6] {
+        [
+            ResidentAccess::Untouched,
+            ResidentAccess::ColorWrite(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+            ResidentAccess::ColorWrite(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+            ResidentAccess::ColorFeedback(vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT),
+            ResidentAccess::shader_read(false),
+            ResidentAccess::transfer_read(false),
+        ]
+    }
 
     fn target_sample(identity: super::super::types::TargetIdentity) -> SampledImageResource {
         SampledImageResource {
@@ -7046,7 +7117,7 @@ mod tests {
         non_plain.arrayed = true;
         assert_eq!(feedback_color_index(&req, &non_plain, true), None);
 
-        let secondary = secondary_with_clear([0.0; 4]);
+        let secondary = secondary_with_clear(super::super::types::ColorClearValue::default());
         let secondary_identity = secondary.identity.clone();
         req.secondary_targets.push(secondary);
         assert_eq!(
@@ -7262,7 +7333,18 @@ mod tests {
 
     /// A secondary colour attachment that clears to `clear`; every other field
     /// is irrelevant to the clear-value vector and takes a neutral value.
-    fn secondary_with_clear(clear: [f32; 4]) -> super::super::types::SecondaryColorTarget {
+    fn secondary_with_clear(
+        clear: super::super::types::ColorClearValue,
+    ) -> super::super::types::SecondaryColorTarget {
+        secondary_with_attachment(super::super::types::ColorAttachmentState::new(
+            crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+            clear,
+        ))
+    }
+
+    fn secondary_with_attachment(
+        attachment: super::super::types::ColorAttachmentState,
+    ) -> super::super::types::SecondaryColorTarget {
         super::super::types::SecondaryColorTarget {
             identity: super::super::types::TargetIdentity::Surface {
                 id: 1,
@@ -7273,8 +7355,7 @@ mod tests {
             },
             width: 16,
             height: 16,
-            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
-            clear,
+            attachment,
             load: false,
             blend: None,
             color_write_mask: Default::default(),
@@ -7298,10 +7379,17 @@ mod tests {
     #[test]
     fn every_attachment_takes_its_own_clear_and_the_primary_takes_the_guests() {
         let req = DrawRequest {
-            target_clear: [0.25, 0.5, 0.75, 1.0],
+            color_attachment: Some(super::super::types::ColorAttachmentState::new(
+                crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+                super::super::types::ColorClearValue::Float([0.25, 0.5, 0.75, 1.0]),
+            )),
             secondary_targets: vec![
-                secondary_with_clear([1.0, 0.0, 0.0, 1.0]),
-                secondary_with_clear([0.0, 1.0, 0.0, 0.5]),
+                secondary_with_clear(super::super::types::ColorClearValue::Float([
+                    1.0, 0.0, 0.0, 1.0,
+                ])),
+                secondary_with_clear(super::super::types::ColorClearValue::Float([
+                    0.0, 1.0, 0.0, 0.5,
+                ])),
             ],
             depth: Some(super::super::types::DepthState {
                 // No guest depth texture: this synthetic request exercises the
@@ -7342,6 +7430,34 @@ mod tests {
         let clear = clear_values(&DrawRequest::default());
         assert_eq!(clear.len(), 1, "no secondaries and no depth is one entry");
         unsafe { assert_eq!(clear[0].color.float32, [0.0; 4]) };
+    }
+
+    /// Integer attachments select Vulkan's integer clear member on every MRT
+    /// slot. Reading the same union through `float32` was the old bug: `1.0`
+    /// became the integer bit pattern `1065353216` instead of the integer value
+    /// `1`.
+    #[test]
+    fn integer_attachment_clears_use_integer_union_members() {
+        use crate::contract::pixel_format::MTL_FORMAT_RG16_UINT;
+
+        let attachment =
+            crate::backend::vulkan::translate::pixel::color_attachment(MTL_FORMAT_RG16_UINT)
+                .unwrap()
+                .0;
+
+        let req = DrawRequest {
+            color_attachment: Some(attachment.with_clear([1.0, 2.0, 65_535.0, 0.0])),
+            secondary_targets: vec![secondary_with_attachment(
+                attachment.with_clear([5.0, 6.0, 7.0, 8.0]),
+            )],
+            ..DrawRequest::default()
+        };
+
+        let clear = clear_values(&req);
+        unsafe {
+            assert_eq!(clear[0].color.uint32, [1, 2, 65_535, 0]);
+            assert_eq!(clear[1].color.uint32, [5, 6, 7, 8]);
+        }
     }
 
     /// This draw's own snapshot copy is recorded after the registry's access is
@@ -7668,7 +7784,10 @@ mod tests {
         assert!(validate_v1(&req).is_ok());
 
         let short = index_buffer_req(buffer_guest_runs(&[5], 5, 0));
-        assert_eq!(validation_slug(&short), "vk_draw_validate_index_bytes_short");
+        assert_eq!(
+            validation_slug(&short),
+            "vk_draw_validate_index_bytes_short"
+        );
 
         let uncovered = index_buffer_req(buffer_guest_runs(&[5], 6, 0));
         assert_eq!(

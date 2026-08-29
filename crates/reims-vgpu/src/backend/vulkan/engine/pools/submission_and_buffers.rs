@@ -1840,7 +1840,10 @@ impl ResourcePools {
         let Some(open) = self.open_pass.take() else {
             return;
         };
-        debug_assert_eq!(open.cb, cb, "open render pass belongs to another command buffer");
+        debug_assert_eq!(
+            open.cb, cb,
+            "open render pass belongs to another command buffer"
+        );
         unsafe { device.cmd_end_render_pass(open.cb) };
     }
 
@@ -2350,13 +2353,16 @@ impl ResourcePools {
             .fetch_add(requested.len() as u64, Ordering::Relaxed);
 
         g.vertex_scratch.clear();
-        g.vertex_scratch.extend(requested.iter().map(|(binding, bound)| {
-            super::VertexBufferBinding {
-                binding: *binding,
-                buffer: bound.buffer,
-                offset: bound.offset,
-            }
-        }));
+        g.vertex_scratch
+            .extend(
+                requested
+                    .iter()
+                    .map(|(binding, bound)| super::VertexBufferBinding {
+                        binding: *binding,
+                        buffer: bound.buffer,
+                        offset: bound.offset,
+                    }),
+            );
         super::normalize_vertex_bindings(&mut g.vertex_scratch);
         counters
             .vertex_buffer_bind_emitted
@@ -2388,9 +2394,7 @@ impl ResourcePools {
     }
 
     /// Scratch in which the next draw normalizes its push-descriptor state.
-    pub(crate) fn push_descriptor_scratch(
-        &mut self,
-    ) -> &mut Vec<super::PushDescriptorBinding> {
+    pub(crate) fn push_descriptor_scratch(&mut self) -> &mut Vec<super::PushDescriptorBinding> {
         self.cb_graphics.push_scratch.clear();
         &mut self.cb_graphics.push_scratch
     }
@@ -2403,12 +2407,7 @@ impl ResourcePools {
         counters: &EngineCounters,
     ) -> bool {
         let g = &mut self.cb_graphics;
-        if super::push_descriptors_match(
-            g.push_layout,
-            &g.push_bindings,
-            layout,
-            &g.push_scratch,
-        ) {
+        if super::push_descriptors_match(g.push_layout, &g.push_bindings, layout, &g.push_scratch) {
             counters
                 .descriptor_push_held
                 .fetch_add(1, Ordering::Relaxed);
@@ -3743,12 +3742,7 @@ impl ResourcePools {
         counters: &EngineCounters,
     ) -> Result<SampledSlot, DrawError> {
         unsafe {
-            self.acquire_sampled_for(
-                ctx,
-                sk,
-                counters,
-                SampledTransientUse::AttachmentSnapshot,
-            )
+            self.acquire_sampled_for(ctx, sk, counters, SampledTransientUse::AttachmentSnapshot)
         }
     }
 
@@ -3782,9 +3776,7 @@ impl ResourcePools {
             let handles = slot.handles();
             match use_ {
                 SampledTransientUse::Upload => self.sampled_live.push(slot),
-                SampledTransientUse::AttachmentSnapshot => {
-                    self.attachment_snapshot_live.push(slot)
-                }
+                SampledTransientUse::AttachmentSnapshot => self.attachment_snapshot_live.push(slot),
             }
             return Ok(handles);
         }
@@ -3896,9 +3888,7 @@ impl ResourcePools {
         let handles = slot.handles();
         match use_ {
             SampledTransientUse::Upload => self.sampled_live.push(slot),
-            SampledTransientUse::AttachmentSnapshot => {
-                self.attachment_snapshot_live.push(slot)
-            }
+            SampledTransientUse::AttachmentSnapshot => self.attachment_snapshot_live.push(slot),
         }
         Ok(handles)
     }
@@ -6657,9 +6647,7 @@ mod scatter_descriptor_sets_do_not_alias {
         let mut pools = ResourcePools::new();
         pools.configure_batch_capacity(super::DISCRETE_BATCH_MAX_DRAWS);
 
-        let expected = super::attachment_snapshot_batch_cap(
-            super::DISCRETE_BATCH_MAX_DRAWS,
-        );
+        let expected = super::attachment_snapshot_batch_cap(super::DISCRETE_BATCH_MAX_DRAWS);
         assert_eq!(pools.batch_max_draws, super::DISCRETE_BATCH_MAX_DRAWS);
         assert_eq!(pools.attachment_snapshot_free.per_key, expected);
         assert_eq!(pools.attachment_snapshot_free.total, expected);

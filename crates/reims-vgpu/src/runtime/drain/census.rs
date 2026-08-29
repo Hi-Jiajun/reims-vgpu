@@ -1224,8 +1224,17 @@ impl FlushRail {
 /// `fresh` counts a new key **reaching** the publish, not a frame landing in the
 /// window's slot: the four ways the publish itself can still fail after that
 /// point already have their own census in
-/// [`crate::runtime::census::present_proxy::window_publish`], and duplicating
+/// [`crate::runtime::census::present_proxy::host_window_publish`], and duplicating
 /// them here would give two counters that could disagree.
+///
+/// The two therefore emit under **different tags**, and that is load-bearing
+/// rather than cosmetic. Both once wrote `window_publish`, differing only in
+/// `win_ms=`/`fresh=` against `window_ms=`/`published=`, so a `grep
+/// window_publish` returned one interleaved series of two censuses that this
+/// doc goes out of its way to say must not be conflated. Every consumer today
+/// keys on the field names and so survives it, but a reader does not: the
+/// collision cost a session a verification detour before it was noticed. One
+/// tag, one census.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WindowPublish {
     /// A frame key not yet published reached the publish.
@@ -3160,7 +3169,7 @@ fn emit_chain_phase() {
     crate::observe::off(format!(
         "chain_phase chains={} prep_us={} pipeline_us={} pl_gen_us={} pl_desc_us={} \
          pl_mtlb_us={} pl_air_us={} pl_xlate_us={} binds_us={} sampled_us={} \
-         seed_us={} assemble_us={} engine_us={} store_us={} prep_seed_us={} \
+         seed_us={} assemble_us={} engine_us={} store_us={} \
          prep_pages_us={} asm_target_us={} asm_depth_us={} asm_trail_us={} max_us={}",
         w.chains,
         w.prep_us,
@@ -3176,7 +3185,6 @@ fn emit_chain_phase() {
         w.assemble_us,
         w.engine_us,
         w.store_us,
-        w.prep_seed_us,
         w.prep_pages_us,
         w.assemble_target_us,
         w.assemble_depth_us,
@@ -3694,7 +3702,7 @@ fn take_store_routes() -> Option<String> {
 
 #[cfg(test)]
 mod drain_gap_tests {
-    use super::{DRAIN_DUTY_REPORT_MS, DrainDutyCensus, PostSweep};
+    use super::{DrainDutyCensus, PostSweep, DRAIN_DUTY_REPORT_MS};
 
     /// The four gap buckets plus `busy_us` account for the whole window.
     ///
@@ -3818,7 +3826,11 @@ mod irq_wait_tests {
                 .parse()
                 .expect("a microsecond count")
         };
-        assert_eq!(field("irq_waits"), 2, "one per emptying, not one per action");
+        assert_eq!(
+            field("irq_waits"),
+            2,
+            "one per emptying, not one per action"
+        );
         assert_eq!(field("irq_wait_us"), 300 + 50);
         assert_eq!(
             field("irq_wait_max_us"),

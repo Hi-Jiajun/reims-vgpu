@@ -405,7 +405,10 @@ pub fn note_host_reach(state: &DeviceState, key: GvaTargetKey) {
     let Some(e) = state.gva_store_witness.entries.get(&key) else {
         return;
     };
-    let reach = state.host_writes.epoch().saturating_sub(e.host_epoch_at_store);
+    let reach = state
+        .host_writes
+        .epoch()
+        .saturating_sub(e.host_epoch_at_store);
     crate::runtime::drain::note_store_route(if reach < 64 {
         "gvaw_reach_lt64"
     } else if reach < 512 {

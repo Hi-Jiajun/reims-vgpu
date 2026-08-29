@@ -1031,13 +1031,22 @@ impl StampLedger {
         if self.owed.get(&slot).is_some_and(|v| wait.satisfied_by(*v)) {
             return UnmetSource::Coalesced;
         }
-        if self.written.get(&slot).is_some_and(|v| wait.satisfied_by(*v)) {
+        if self
+            .written
+            .get(&slot)
+            .is_some_and(|v| wait.satisfied_by(*v))
+        {
             return UnmetSource::Queued;
         }
         UnmetSource::Absent
     }
 
-    fn fold(map: &mut std::collections::BTreeMap<u32, u32>, slot: u32, value: u32, page_bytes: u64) {
+    fn fold(
+        map: &mut std::collections::BTreeMap<u32, u32>,
+        slot: u32,
+        value: u32,
+        page_bytes: u64,
+    ) {
         let slot = stamp_slot_index(slot);
         if stamp_slot_offset(slot, page_bytes).is_none() {
             return;
@@ -2907,8 +2916,20 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
     let (height_f32, height_mm) = display_dimension_mm(DISPLAY_HEIGHT_MM);
     shared_w16(host, gpa, DISPLAY_DESC_WIDTH_MM, width_mm, psz);
     shared_w16(host, gpa, DISPLAY_DESC_HEIGHT_MM, height_mm, psz);
-    shared_w32(host, gpa, DISPLAY_DESC_WIDTH_MM_F32, width_f32.to_bits(), psz);
-    shared_w32(host, gpa, DISPLAY_DESC_HEIGHT_MM_F32, height_f32.to_bits(), psz);
+    shared_w32(
+        host,
+        gpa,
+        DISPLAY_DESC_WIDTH_MM_F32,
+        width_f32.to_bits(),
+        psz,
+    );
+    shared_w32(
+        host,
+        gpa,
+        DISPLAY_DESC_HEIGHT_MM_F32,
+        height_f32.to_bits(),
+        psz,
+    );
     shared_w32(host, gpa, DISPLAY_DESC_FEATURES, 0, psz);
 
     // HW cursor capability so the guest doorbells glyph/show/move.
@@ -5040,11 +5061,9 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     // the latch above until this drain ends. That window is the
                     // only one a repair could shorten.
                     let page_bytes = state.page_size();
-                    state.stamp_ledger.owe(
-                        stamp_index_slot,
-                        packet.completion_stamp,
-                        page_bytes,
-                    );
+                    state
+                        .stamp_ledger
+                        .owe(stamp_index_slot, packet.completion_stamp, page_bytes);
                 } else {
                     let stamp_started = std::time::Instant::now();
                     write_stamp(state, host, stamp_index, packet.completion_stamp);

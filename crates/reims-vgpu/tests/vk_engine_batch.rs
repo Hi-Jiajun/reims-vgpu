@@ -257,7 +257,8 @@ fn batched_draws_compose_and_flush_on_read() {
 
     let px = engine::read_target(&identity)
         .expect("read_target flushes the batch")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     let after = engine::counter_snapshot().delta_since(&before);
     assert_eq!(after.batch_flushes, 1, "read_target submitted the batch");
     assert_eq!(
@@ -323,7 +324,8 @@ fn one_metal_encoder_continues_one_vulkan_render_pass() {
 
     let px = engine::read_target(&identity)
         .expect("flush continued pass")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     let delta = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
         delta.render_pass_continuations, 1,
@@ -384,7 +386,8 @@ fn one_multisample_encoder_resolves_after_its_last_draw() {
 
     let px = engine::read_target(&identity)
         .expect("close and resolve the multisample encoder")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     let delta = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
         delta.render_pass_continuations, 1,
@@ -437,7 +440,10 @@ fn stored_multisample_target_survives_for_a_later_encoder() {
         stencil: None,
     });
     match engine::execute_draw_request(&first) {
-        Ok(out) => assert!(out.pixels.is_empty(), "stored multisample target stays GPU-resident"),
+        Ok(out) => assert!(
+            out.pixels.is_empty(),
+            "stored multisample target stays GPU-resident"
+        ),
         Err(e) => {
             let msg = e.to_string();
             if skip_if_no_gpu(&msg) {
@@ -520,7 +526,10 @@ fn cross_target_draws_share_one_command_buffer_and_land_in_their_own_images() {
     assert_eq!(mid.batch_flushes, 0, "and nothing has consumed either yet");
 
     // A drew the left half; the read is what flushes the shared batch.
-    let px = engine::read_target(&a).expect("read A").into_rgba8();
+    let px = engine::read_target(&a)
+        .expect("read A")
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     let left = ((10 * W + 8) * 4) as usize;
     let right = ((10 * W + W / 2 + 8) * 4) as usize;
     assert!(
@@ -535,7 +544,10 @@ fn cross_target_draws_share_one_command_buffer_and_land_in_their_own_images() {
     );
 
     // B drew the right half, out of the same command buffer.
-    let px = engine::read_target(&b).expect("read B").into_rgba8();
+    let px = engine::read_target(&b)
+        .expect("read B")
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     assert!(
         is_zero(&px[left..left + 4]),
         "B left half = {:?}",
@@ -701,7 +713,8 @@ fn batched_guest_runs_buffer_snapshots_at_record() {
 
     let px = engine::read_target(&identity)
         .expect("read_target flushes the batch")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     for y in [0u32, H / 2, H - 1] {
         let i = ((y * W + W / 4) * 4) as usize;
         assert!(
@@ -858,7 +871,8 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
     outcome.expect("a CPU-gathered guest-run sampled draw must execute");
     let px = engine::read_target(&identity)
         .expect("read_target flushes the batch")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     engine::test_quiesce_ring();
     // The gather reads the page during `execute_draw_request`, so the page must
     // outlive that call and only that call.
@@ -1229,7 +1243,8 @@ void main() {{
     engine::execute_draw_request(&req).expect("the gathered draw");
     let px = engine::read_target(&identity)
         .expect("read_target flushes the batch")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
 
     let d = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
@@ -1409,7 +1424,8 @@ void main() {{
     engine::execute_draw_request(&req).expect("the fallback draw");
     let px = engine::read_target(&identity)
         .expect("read_target flushes the batch")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
 
     let d = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
@@ -1572,7 +1588,8 @@ void main() {{
     engine::execute_draw_request(&req).expect("the in-place draw");
     let px = engine::read_target(&identity)
         .expect("read_target flushes the batch")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
 
     let d = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
@@ -1643,8 +1660,7 @@ fn an_index_window_is_bound_in_place_without_a_cpu_copy() {
     let base = backing.as_ptr() as u64 + pad;
     let start = (pad + SOURCE_OFFSET) as usize;
     for (slot, index) in [0u16, 1, 2].into_iter().enumerate() {
-        backing[start + slot * 2..start + slot * 2 + 2]
-            .copy_from_slice(&index.to_le_bytes());
+        backing[start + slot * 2..start + slot * 2 + 2].copy_from_slice(&index.to_le_bytes());
     }
 
     let import = std::sync::Arc::new(
@@ -1690,15 +1706,23 @@ fn an_index_window_is_bound_in_place_without_a_cpu_copy() {
     engine::execute_draw_request(&req).expect("repeated indexed draw");
     let px = engine::read_target(&identity)
         .expect("read_target flushes the indexed draw")
-        .into_rgba8();
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
 
     let d = engine::counter_snapshot().delta_since(&before);
     assert_eq!(d.buffer_guest_index_imports, 1, "index source: {d:?}");
-    assert_eq!(d.buffer_guest_index_import_bytes, INDEX_BYTES, "index source: {d:?}");
+    assert_eq!(
+        d.buffer_guest_index_import_bytes, INDEX_BYTES,
+        "index source: {d:?}"
+    );
     assert_eq!(d.buffer_index_bind_reuses, 1, "index source: {d:?}");
     assert_eq!(d.buffer_guest_gathers, 0, "index source: {d:?}");
     assert_eq!(d.buffer_snapshot_binds, 0, "index source: {d:?}");
     let i = (((H / 2) * W + W / 4) * 4) as usize;
-    assert!(is_frag_color(&px[i..i + 4]), "indexed pixel = {:?}", &px[i..i + 4]);
+    assert!(
+        is_frag_color(&px[i..i + 4]),
+        "indexed pixel = {:?}",
+        &px[i..i + 4]
+    );
     engine::test_quiesce_ring();
 }

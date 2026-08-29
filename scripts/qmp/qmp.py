@@ -16,7 +16,9 @@ GUI helpers (usb-kbd + usb-tablet on the vmapple machine; cocoa is observability
   scripts/qmp/qmp.py move X Y
   scripts/qmp/qmp.py drag X1 Y1 X2 Y2 [X3 Y3 ...]  # left-button rubber-band drag through points
       QMP_DRAG_STEPS=N    sub-moves interpolated per segment (default 8)
-      QMP_DRAG_HOLD_S=F   seconds between sub-moves (default 0.02)
+      QMP_DRAG_HOLD_S=F   seconds between sub-moves (default 0.02; 0 = socket rate)
+      prints moves_s, the pointer rate the guest actually saw -- a ceiling on
+      the frames any pointer-tracking pan can contain. See drag().
   scripts/qmp/qmp.py size                     # "WIDTH HEIGHT" of the guest display
   scripts/qmp/qmp.py key NAME[+NAME...] ...   # e.g. key ret, key meta_l+q
   scripts/qmp/qmp.py wheel [up|down] [N] [dt] # N wheel ticks, dt seconds apart (one connection)
@@ -221,19 +223,54 @@ def send_button(qmp: Qmp, down: bool):
 def drag(qmp: Qmp, points, width: int, height: int, steps: int = 8, hold_s: float = 0.02):
     """Press left button at points[0], glide through the rest (button held),
     release at the last. Interpolates `steps` sub-moves per segment so the guest
-    sees a continuous drag (rubber-band selection), not two teleports."""
+    sees a continuous drag (rubber-band selection), not two teleports.
+
+    Returns `(moves, seconds)` for the held glide alone -- the press, its settle
+    and the release sit outside the timed window.
+
+    That pair is not diagnostics, it is half of any frame rate measured across a
+    drag. An app that pans by tracking the pointer redraws per motion event, so
+    it cannot produce more distinct views than it was sent: `moves` is a ceiling
+    on the frames such a phase can contain, whatever the device could have
+    drawn. A caller that reports frames without reporting this is quoting
+    whichever of the two is smaller and cannot say which.
+
+    `hold_s` does not set the rate on its own. Every sub-move is a synchronous
+    QMP round-trip -- `Qmp.execute` blocks on the reply, and QEMU answers from
+    the main loop it also runs the device on -- so the achieved rate is
+    `1 / (hold_s + rtt)`. Read that rate; do not assume it in either direction.
+    Measured x86/PCI, macos-15, bare desktop: `rtt` is **0.7-0.9 ms**, so the
+    default `hold_s` dominates and this call achieves ~77/s in-glide. A session
+    that instead assumed a ~20 ms round-trip talked itself into believing a
+    28 fps app was bounded by this loop, which the first measurement refuted.
+
+    **The returned rate is in-glide, and a caller looping this process does not
+    achieve it.** The timed window covers the sub-moves only; spawning
+    `qmp.py` costs ~0.14 s, so a caller invoking one circuit per iteration pays
+    that between every circuit. A 20 s arm of 24-point circuits at the default
+    `hold_s` moved 1080 points -- 77/s in-glide but **54/s sustained**, and at
+    `hold_s=0` the gap is 1490 against 151. Pass the whole path as one
+    invocation, and divide `moves` by your own wall clock for the sustained
+    figure.
+    """
     if len(points) < 2:
         raise ValueError("drag needs at least two points")
     send_pointer(qmp, points[0][0], points[0][1], width, height)
     send_button(qmp, True)
     time.sleep(0.05)
+    moves = 0
+    started = time.monotonic()
     for (x0, y0), (x1, y1) in zip(points, points[1:]):
         for s in range(1, steps + 1):
             x = x0 + (x1 - x0) * s // steps
             y = y0 + (y1 - y0) * s // steps
             send_pointer(qmp, x, y, width, height)
-            time.sleep(hold_s)
+            moves += 1
+            if hold_s:
+                time.sleep(hold_s)
+    elapsed = time.monotonic() - started
     send_button(qmp, False)
+    return moves, elapsed
 
 
 def char_keys(ch: str):
@@ -349,8 +386,12 @@ def main(argv: list[str]) -> int:
         # (steps * hold_s per segment) the two cannot be told apart.
         steps = int(os.environ.get("QMP_DRAG_STEPS", "8"))
         hold_s = float(os.environ.get("QMP_DRAG_HOLD_S", "0.02"))
-        drag(qmp, points, w, h, steps=steps, hold_s=hold_s)
-        print(f"drag {points} steps={steps} hold_s={hold_s} ok")
+        moves, secs = drag(qmp, points, w, h, steps=steps, hold_s=hold_s)
+        rate = moves / secs if secs > 0 else 0.0
+        print(
+            f"drag {points} steps={steps} hold_s={hold_s} "
+            f"moves={moves} secs={secs:.2f} moves_s={rate:.1f} ok"
+        )
         return 0
 
     if mode == "wheel":

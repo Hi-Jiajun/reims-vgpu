@@ -96,8 +96,8 @@ fn a_tight_window_names_the_pages_its_texels_occupy() {
     // 1920x1080 BGRA8, tight, starting at offset 0 of a 4 KiB-page guest.
     let (page, bpr) = (4096u64, 1920 * 4u32);
     let span = u64::from(bpr) * 1080;
-    let plan =
-        plan_guest_window(usize::MAX, page, 0, span, bpr, 1920, RGBA8_BPP).expect("a tight window plans");
+    let plan = plan_guest_window(usize::MAX, page, 0, span, bpr, 1920, RGBA8_BPP)
+        .expect("a tight window plans");
     assert_eq!(plan.first_page, 0);
     assert_eq!(plan.last_page, ((span - 1) / page) as usize);
     assert_eq!(plan.in_page, 0);
@@ -136,8 +136,10 @@ fn a_window_starting_inside_a_page_carries_the_offset_and_not_the_mapping_one() 
 fn the_same_window_spans_fewer_pages_on_a_sixteen_kilobyte_guest() {
     let bpr = 1024 * 4u32;
     let span = u64::from(bpr) * 64;
-    let x86 = plan_guest_window(usize::MAX, 4096, 0, span, bpr, 1024, RGBA8_BPP).expect("plans on x86");
-    let arm = plan_guest_window(usize::MAX, 16384, 0, span, bpr, 1024, RGBA8_BPP).expect("plans on arm64");
+    let x86 =
+        plan_guest_window(usize::MAX, 4096, 0, span, bpr, 1024, RGBA8_BPP).expect("plans on x86");
+    let arm = plan_guest_window(usize::MAX, 16384, 0, span, bpr, 1024, RGBA8_BPP)
+        .expect("plans on arm64");
     assert_eq!(x86.pages(), arm.pages() * 4);
 }
 
@@ -149,8 +151,16 @@ fn the_same_window_spans_fewer_pages_on_a_sixteen_kilobyte_guest() {
 #[test]
 fn a_padded_pitch_becomes_a_row_length_in_texels() {
     let bpr = 2048 * 4u32;
-    let plan =
-        plan_guest_window(usize::MAX, 4096, 0, u64::from(bpr) * 4, bpr, 1600, RGBA8_BPP).expect("plans");
+    let plan = plan_guest_window(
+        usize::MAX,
+        4096,
+        0,
+        u64::from(bpr) * 4,
+        bpr,
+        1600,
+        RGBA8_BPP,
+    )
+    .expect("plans");
     assert_eq!(plan.row_length_texels, 2048);
 }
 
@@ -338,7 +348,6 @@ fn unskipped_returns_exactly_the_bytes_no_range_covers() {
         vec![(12, 16), (18, 28)]
     );
 }
-
 
 /// A rect taller than the window it names is refused on **both** storage
 /// shapes, and writes nothing past the window.
@@ -814,23 +823,21 @@ fn a_skipping_write_supersedes_the_debt_instead_of_paying_it_over_the_skip() {
 
     // The whole-frame writer is unchanged and still pays: it has no ranges to
     // protect, and a debt left standing there would be read straight past.
-    assert!(
-        state
-            .pending_writebacks
-            .arm(
+    assert!(state
+        .pending_writebacks
+        .arm(
+            7,
+            crate::runtime::writeback_debt::test_resident_identity(
                 7,
-                crate::runtime::writeback_debt::test_resident_identity(
-                    7,
-                    W,
-                    H,
-                    u64::from(map_generation),
-                ),
                 W,
                 H,
-                map_generation,
-            )
-            .is_none()
-    );
+                u64::from(map_generation),
+            ),
+            W,
+            H,
+            map_generation,
+        )
+        .is_none());
     assert!(write_bgra8(&mut state, &mut host, 7, &frame, W * 4, W, H));
     assert_eq!(
         count("wbdebt_paid_named"),

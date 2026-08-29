@@ -1148,7 +1148,11 @@ dependencies = [
  "reims-vgpu-paging",
  "reims-vgpu-wire",
  "serde_json",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
  "winit",
+ "x11-dl",
 ]
 
 [[package]]

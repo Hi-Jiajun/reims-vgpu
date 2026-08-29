@@ -868,7 +868,9 @@ struct VertexBufferBinding {
 /// Duplicate bindings have already been rejected by draw validation.
 fn normalize_vertex_bindings(wanted: &mut [VertexBufferBinding]) {
     wanted.sort_unstable_by_key(|entry| entry.binding);
-    debug_assert!(wanted.windows(2).all(|pair| pair[0].binding != pair[1].binding));
+    debug_assert!(wanted
+        .windows(2)
+        .all(|pair| pair[0].binding != pair[1].binding));
 }
 
 /// End index of the maximal consecutive binding run beginning at `start`.
@@ -1837,9 +1839,7 @@ impl ResidentMemory {
         }
     }
 
-    pub(crate) fn guest_footprint(
-        &self,
-    ) -> Option<crate::runtime::guest_ram::GuestPageFootprint> {
+    pub(crate) fn guest_footprint(&self) -> Option<crate::runtime::guest_ram::GuestPageFootprint> {
         match self {
             Self::GuestImported { guest, .. } => Some(guest.footprint.clone()),
             Self::Recyclable(_) => None,
@@ -2911,9 +2911,7 @@ const fn batch_default_draws(
 /// Called only while an uninitialized pool is being attached to its device.
 /// The chosen cap is then a field on that pool, so neither the environment nor
 /// topology is re-read on the draw path.
-fn batch_max_draws(
-    topology: crate::backend::vulkan::caps::memory_topology::MemoryTopology,
-) -> u64 {
+fn batch_max_draws(topology: crate::backend::vulkan::caps::memory_topology::MemoryTopology) -> u64 {
     let default = batch_default_draws(topology);
     let cap = match crate::env::count(crate::env::BATCH_DRAWS, default) {
         crate::env::Count::Narrowed(n) => n,
@@ -4112,7 +4110,13 @@ mod resident_reuse_tests {
         );
         assert!(!secondary.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(bgra)));
         assert!(
-            secondary.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(vk::Format::R16G16_SFLOAT)),
+            secondary.reusable_for(
+                64,
+                32,
+                1,
+                7,
+                translate::pixel::ResidentFormat::of(vk::Format::R16G16_SFLOAT)
+            ),
             "the secondary path must still get its own slot back"
         );
     }
@@ -4172,12 +4176,30 @@ mod resident_reuse_tests {
         let rgba = translate::pixel::resident_color(false);
         let s = slot(64, 32, 7, rgba);
         assert!(s.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(rgba)));
-        assert!(!s.reusable_for(65, 32, 1, 7, translate::pixel::ResidentFormat::of(rgba)), "width");
-        assert!(!s.reusable_for(64, 33, 1, 7, translate::pixel::ResidentFormat::of(rgba)), "height");
-        assert!(!s.reusable_for(64, 32, 1, 8, translate::pixel::ResidentFormat::of(rgba)), "generation");
-        assert!(!s.reusable_for(64, 32, 2, 7, translate::pixel::ResidentFormat::of(rgba)), "sample count");
         assert!(
-            !s.reusable_for(64, 32, 1, 7, translate::pixel::ResidentFormat::of(translate::pixel::resident_color(true))),
+            !s.reusable_for(65, 32, 1, 7, translate::pixel::ResidentFormat::of(rgba)),
+            "width"
+        );
+        assert!(
+            !s.reusable_for(64, 33, 1, 7, translate::pixel::ResidentFormat::of(rgba)),
+            "height"
+        );
+        assert!(
+            !s.reusable_for(64, 32, 1, 8, translate::pixel::ResidentFormat::of(rgba)),
+            "generation"
+        );
+        assert!(
+            !s.reusable_for(64, 32, 2, 7, translate::pixel::ResidentFormat::of(rgba)),
+            "sample count"
+        );
+        assert!(
+            !s.reusable_for(
+                64,
+                32,
+                1,
+                7,
+                translate::pixel::ResidentFormat::of(translate::pixel::resident_color(true))
+            ),
             "format still separates the two bgra orders"
         );
     }
@@ -4235,21 +4257,13 @@ mod vertex_binding_bulk_tests {
 
     #[test]
     fn attributes_are_sorted_by_binding_without_losing_values() {
-        let mut wanted = vec![
-            binding(3, 30, 3),
-            binding(1, 10, 1),
-            binding(2, 20, 200),
-        ];
+        let mut wanted = vec![binding(3, 30, 3), binding(1, 10, 1), binding(2, 20, 200)];
 
         normalize_vertex_bindings(&mut wanted);
 
         assert_eq!(
             wanted,
-            vec![
-                binding(1, 10, 1),
-                binding(2, 20, 200),
-                binding(3, 30, 3),
-            ]
+            vec![binding(1, 10, 1), binding(2, 20, 200), binding(3, 30, 3),]
         );
         assert_eq!(vertex_binding_run_end(&wanted, 0), 3);
     }
@@ -4276,9 +4290,7 @@ mod vertex_binding_bulk_tests {
 
 #[cfg(test)]
 mod dynamic_state_match_tests {
-    use super::{
-        push_descriptors_match, scissors_match, viewports_match, PushDescriptorBinding,
-    };
+    use super::{push_descriptors_match, scissors_match, viewports_match, PushDescriptorBinding};
     use ash::vk;
     use ash::vk::Handle;
 
@@ -4386,7 +4398,12 @@ mod dynamic_state_match_tests {
             offset: 64,
             range: 128,
         };
-        assert!(push_descriptors_match(Some(layout), &[binding], layout, &[binding]));
+        assert!(push_descriptors_match(
+            Some(layout),
+            &[binding],
+            layout,
+            &[binding]
+        ));
         assert!(!push_descriptors_match(
             Some(vk::PipelineLayout::from_raw(8)),
             &[binding],

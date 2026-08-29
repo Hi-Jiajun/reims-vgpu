@@ -4464,7 +4464,7 @@ fn guest_numeric_class(guest: crate::backend::vulkan::engine::StorageImageFormat
         | V::Rgb10a2Unorm
         | V::Bgr10a2Unorm
         | V::Rg11b10Float => 0,
-        V::Rgba16Uint | V::Rgba8Uint | V::Rgba32Uint | V::R32Uint => 1,
+        V::Rgba16Uint | V::Rgba8Uint | V::Rgba32Uint | V::R32Uint | V::Rg16Uint => 1,
         V::Rgba8Sint | V::R32Sint => 2,
     }
 }
@@ -4578,6 +4578,10 @@ fn specialized_storage_image_format(
         | V::Rgb9e5Ufloat
         | V::R16Unorm
         | V::Rg16Unorm
+        // The integer member of that family, sampled-only for the same reason
+        // and not for its class: `STORAGE_IMAGE` is no more mandatory for
+        // `R16G16_UINT` than for `R16G16_UNORM`.
+        | V::Rg16Uint
         | V::Rgba16Unorm
         // The packed 32-bit colour formats join them: Vulkan mandates no
         // `STORAGE_IMAGE` support for any of the three, and one of them is not

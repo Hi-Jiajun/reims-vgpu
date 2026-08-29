@@ -1440,16 +1440,16 @@ impl WindowPresenter {
 
         let direct = selected.is_some();
         match submission {
-            super::context::PresentSubmission::Complete(result) => self.finish_present(
-                FinishedWindowPresent {
+            super::context::PresentSubmission::Complete(result) => {
+                self.finish_present(FinishedWindowPresent {
                     result,
                     acquire_suboptimal,
                     direct,
                     width: self.extent.width,
                     height: self.extent.height,
                     swapchain_images: self.images.len(),
-                },
-            ),
+                })
+            }
             super::context::PresentSubmission::Pending(wait) => {
                 Ok(WindowPresentDispatch::Pending(PendingWindowPresent {
                     wait,
@@ -1493,13 +1493,15 @@ impl WindowPresenter {
                     self.suboptimal_streak = 0;
                 }
                 self.note_cadence(true, finished.direct);
-                Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Presented {
-                    direct: finished.direct,
-                    width: finished.width,
-                    height: finished.height,
-                    swapchain_images: finished.swapchain_images,
-                    suboptimal,
-                }))
+                Ok(WindowPresentDispatch::Complete(
+                    WindowPresentOutcome::Presented {
+                        direct: finished.direct,
+                        width: finished.width,
+                        height: finished.height,
+                        swapchain_images: finished.swapchain_images,
+                        suboptimal,
+                    },
+                ))
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.recreate_pending = true;

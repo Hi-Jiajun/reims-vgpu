@@ -652,7 +652,9 @@ pub(crate) unsafe fn execute_compute_inner(
     }
     if dset.is_some() {
         ctx.device.update_descriptor_sets(&descriptor_writes, &[]);
-        counters.descriptor_set_updates.fetch_add(1, Ordering::Relaxed);
+        counters
+            .descriptor_set_updates
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     // The ring slot's CB retired at begin_entry and its fence is unsignaled —
@@ -900,7 +902,9 @@ pub(crate) unsafe fn execute_compute_inner(
             &[dset],
             &[],
         );
-        counters.descriptor_set_binds.fetch_add(1, Ordering::Relaxed);
+        counters
+            .descriptor_set_binds
+            .fetch_add(1, Ordering::Relaxed);
     }
     if let Some((offset, threads)) = req.threads_per_grid_push {
         let bytes = std::slice::from_raw_parts(threads.as_ptr().cast::<u8>(), 12);

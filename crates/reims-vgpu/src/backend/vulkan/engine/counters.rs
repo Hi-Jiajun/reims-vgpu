@@ -1003,11 +1003,7 @@ impl EngineCounters {
         }
     }
 
-    pub(super) fn note_buffer_guest_import(
-        &self,
-        bytes: u64,
-        role: super::exec::BufferGatherRole,
-    ) {
+    pub(super) fn note_buffer_guest_import(&self, bytes: u64, role: super::exec::BufferGatherRole) {
         self.buffer_guest_imports.fetch_add(1, Ordering::Relaxed);
         self.buffer_guest_import_bytes
             .fetch_add(bytes, Ordering::Relaxed);

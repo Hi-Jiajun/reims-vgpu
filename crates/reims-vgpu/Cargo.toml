@@ -33,6 +33,10 @@ host-window = [
     "dep:winit",
     "dep:ash-window",
     "dep:raw-window-handle",
+    "dep:wayland-client",
+    "dep:wayland-backend",
+    "dep:wayland-protocols",
+    "dep:x11-dl",
     "backend-vulkan",
 ]
 
@@ -51,6 +55,21 @@ metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan.git", rev = "
 winit = { version = "0.30", optional = true }
 ash-window = { version = "0.13", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
+
+# Keyboard shortcut capture for the host window (`host_window::capture`). The
+# desktop consumes chords before any client sees them; taking them back is a
+# per-window-system request, not something the windowing library exposes.
+#
+# Every one of these is already in the dependency graph as a transitive of
+# `winit` at the same version, so this adds no new code to the build — it only
+# names what this crate calls directly. `wayland-backend`'s `client_system` arm
+# is what `Backend::from_foreign_display` lives in, and it is the arm `winit`
+# itself selects, so both halves share one libwayland connection.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+wayland-client = { version = "0.31", optional = true }
+wayland-backend = { version = "0.3", features = ["client_system"], optional = true }
+wayland-protocols = { version = "0.32", features = ["client", "unstable"], optional = true }
+x11-dl = { version = "2.21", optional = true }
 
 # Metal encode is macOS-only; `backend-metal` is rejected on any other host.
 [target.'cfg(target_os = "macos")'.dependencies]

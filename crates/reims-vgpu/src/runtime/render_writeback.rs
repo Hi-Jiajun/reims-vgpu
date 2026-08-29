@@ -685,6 +685,8 @@ settle_sites! {
     MappingBgra8Write => "settle_mapping_bgra8_write",
     /// `mapping_write::write_rgba8_image_changed`.
     MappingRgba8Write => "settle_mapping_rgba8_write",
+    /// `mapping_write::write_native_image`.
+    MappingNativeImageWrite => "settle_mapping_native_image_write",
     /// `mapping_write::write_raw_rows`.
     MappingRawRowsWrite => "settle_mapping_raw_rows_write",
     /// `mapping_write::read_raw_rows`.
@@ -943,16 +945,33 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
             crate::runtime::drain::note_store_route("render_flush_copied");
             match crate::backend::vulkan::engine::read_target(identity) {
                 Ok(rb) => {
-                    // Shared rather than owned outright: the write's tail
-                    // publishes this frame to the surface cache, and a cache
-                    // entry holds its frame behind an `Arc` precisely so the two
-                    // can name one allocation instead of copying it.
-                    let bytes = std::sync::Arc::new(rb.into_bgra8());
-                    let len = bytes.len();
-                    let ok = crate::runtime::mapping_write::write_bgra8_owned(
-                        state, host, mapping_id, &bytes, bpr, width, height,
-                    );
-                    (ok, len)
+                    // A mapping is scanout-ordered eight-bit colour, so a native
+                    // readback has nothing this rail can land. Named rather than
+                    // reinterpreted — the bytes are a texel the mapping cannot
+                    // mean.
+                    let texel = rb.texel;
+                    match rb.into_bgra8() {
+                        Some(scanout) => {
+                            // Shared rather than owned outright: the write's
+                            // tail publishes this frame to the surface cache,
+                            // and a cache entry holds its frame behind an `Arc`
+                            // precisely so the two can name one allocation
+                            // instead of copying it.
+                            let bytes = std::sync::Arc::new(scanout);
+                            let len = bytes.len();
+                            let ok = crate::runtime::mapping_write::write_bgra8_owned(
+                                state, host, mapping_id, &bytes, bpr, width, height,
+                            );
+                            (ok, len)
+                        }
+                        None => {
+                            crate::observe::fail(format!(
+                                "render_store_lost reason=readback_texel_not_scanout \
+                                 mapping={mapping_id} geom={width}x{height} texel={texel:?}"
+                            ));
+                            (false, 0)
+                        }
+                    }
                 }
                 Err(e) => {
                     // Typed, for the reason the lease decline above is: this is
@@ -1285,10 +1304,48 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     // pass and not the no-op this comment used to claim. Both spellings of that
     // declaration must reach the same answer; `ResidentReadSnapshot::bgra` is
     // where they do, and where they did not.
-    let rgba = crate::backend::vulkan::engine::read_target(identity)
-        .map_err(|inner| GvaWritebackDecline::CopiedReadRefused { inner })?
-        .into_rgba8();
-    let extent = land_gva_frame_bytes(state, host, task_id, c0, texture_ref, &rgba, pages)?;
+    let readback = crate::backend::vulkan::engine::read_target(identity)
+        .map_err(|inner| GvaWritebackDecline::CopiedReadRefused { inner })?;
+    // Two ways to land a frame, and which one is decided by what the readback
+    // actually holds rather than by what this rail wishes it held.
+    //
+    // A native frame is the resident's own texel, carried out because no
+    // eight-bit narrowing of it exists. It lands verbatim **only** when the
+    // destination is that same layout — `store_texel_order`'s question, the one
+    // the GPU-direct arm has always asked. That is what lets a destination with
+    // no eight-bit form take the copying rail at all, so a host without the
+    // guest-RAM import serves it instead of losing every frame of it.
+    let extent = match readback.texel.native_layout() {
+        Some(layout) => {
+            if crate::contract::pixel_format::store_texel_order(c0.format) != Some(layout) {
+                return Err(GvaWritebackDecline::FormatNeedsConversion { format: c0.format });
+            }
+            crate::runtime::drain::note_store_route("gva_flush_copied_native");
+            land_gva_frame_bytes(
+                state,
+                host,
+                task_id,
+                c0,
+                texture_ref,
+                crate::runtime::draw::FrameRows::Native(&readback.pixels),
+                pages,
+            )?
+        }
+        None => {
+            let Some(rgba) = readback.into_rgba8() else {
+                return Err(GvaWritebackDecline::FormatNeedsConversion { format: c0.format });
+            };
+            land_gva_frame_bytes(
+                state,
+                host,
+                task_id,
+                c0,
+                texture_ref,
+                crate::runtime::draw::FrameRows::Rgba8(&rgba),
+                pages,
+            )?
+        }
+    };
     crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
     crate::runtime::drain::note_store_route("gva_flush_copied");
     Ok(extent)
@@ -1314,7 +1371,7 @@ fn land_gva_frame_bytes<M: HostMemory + HostOps>(
     task_id: u32,
     c0: &crate::runtime::draw::ColorRtRequest,
     texture_ref: u32,
-    rgba: &[u8],
+    frame: crate::runtime::draw::FrameRows<'_>,
     pages: &crate::runtime::draw::StoreTargetPages,
 ) -> Result<u64, GvaWritebackDecline> {
     // The destination extent in the destination's own bytes, which is what the
@@ -1325,7 +1382,7 @@ fn land_gva_frame_bytes<M: HostMemory + HostOps>(
     };
     let extent =
         u64::from(c0.height.saturating_sub(1)) * u64::from(c0.row_stride) + u64::from(tight);
-    crate::runtime::draw::write_gva_rgba8_within(
+    crate::runtime::draw::write_gva_frame_within(
         state,
         host,
         task_id,
@@ -1334,26 +1391,12 @@ fn land_gva_frame_bytes<M: HostMemory + HostOps>(
         c0.height,
         c0.row_stride,
         c0.format,
-        rgba,
+        frame,
         Some(pages.membership()),
     )
     .map_err(|err| GvaWritebackDecline::CopiedWriteRefused { err })?;
-    forget_gva_host_copies(state, task_id, c0.target_gva, texture_ref);
+    crate::runtime::surface_cache::forget_gva_copies(state, task_id, c0.target_gva, texture_ref);
     Ok(extent)
-}
-
-/// Drop every host-side copy of a GVA target's pixels.
-///
-/// Both arms of [`store_gva_frame`] end here: once the guest's pages hold the
-/// frame they are the only place it exists, and a cache entry left behind would
-/// serve a later sample the previous Store's bytes. One function rather than two
-/// copies of the pair, because a copied rule is the next divergence.
-#[cfg(feature = "backend-vulkan")]
-fn forget_gva_host_copies(state: &mut DeviceState, task_id: u32, target_gva: u64, texture_ref: u32) {
-    crate::runtime::surface_cache::evict_gva(state, target_gva);
-    if texture_ref != 0 {
-        crate::runtime::surface_cache::evict_texture(state, task_id, texture_ref);
-    }
 }
 
 /// Copy `identity`'s pixels into the guest pages behind a type-2/3 render
@@ -1470,7 +1513,7 @@ fn store_gva_frame_direct<M: HostMemory + HostOps>(
         .map_err(|inner| GvaWritebackDecline::Engine { inner })?;
     // Nothing here leaves a host copy of the frame, so neither GVA-keyed cache
     // may go on naming one.
-    forget_gva_host_copies(state, task_id, c0.target_gva, texture_ref);
+    crate::runtime::surface_cache::forget_gva_copies(state, task_id, c0.target_gva, texture_ref);
     // The copy means this image has stopped being the only place these pixels
     // exist, so the reclaim paths may take it — the same handover
     // `store_render_frame` performs in `finish`.
@@ -1564,8 +1607,16 @@ mod gva_copying_arm_tests {
         let (mut host, mut state) = fixture();
         let rgba = frame();
         let pages = licence_for(1);
-        let extent = land_gva_frame_bytes(&mut state, &mut host, 1, &request(), 0, &rgba, &pages)
-            .expect("the licensed page is writable");
+        let extent = land_gva_frame_bytes(
+            &mut state,
+            &mut host,
+            1,
+            &request(),
+            0,
+            crate::runtime::draw::FrameRows::Rgba8(&rgba),
+            &pages,
+        )
+        .expect("the licensed page is writable");
         assert_eq!(
             extent,
             u64::from(H - 1) * u64::from(BPR) + u64::from(W) * 4,
@@ -1601,8 +1652,16 @@ mod gva_copying_arm_tests {
         let rgba = frame();
         // A licence naming some other page of the same task.
         let pages = licence_for(5);
-        let refusal = land_gva_frame_bytes(&mut state, &mut host, 1, &request(), 0, &rgba, &pages)
-            .expect_err("the destination page is outside the licence");
+        let refusal = land_gva_frame_bytes(
+            &mut state,
+            &mut host,
+            1,
+            &request(),
+            0,
+            crate::runtime::draw::FrameRows::Rgba8(&rgba),
+            &pages,
+        )
+        .expect_err("the destination page is outside the licence");
         assert_eq!(
             crate::observe::Decline::slug(&refusal),
             "gvawb_copied_write_refused",
@@ -1612,7 +1671,11 @@ mod gva_copying_arm_tests {
         let mut got = [0u8; (W * 4) as usize];
         crate::runtime::host::HostMemory::read_gpa(&host, gpa, &mut got)
             .expect("the destination page is guest RAM");
-        assert_eq!(got, [0u8; (W * 4) as usize], "nothing may have been written");
+        assert_eq!(
+            got,
+            [0u8; (W * 4) as usize],
+            "nothing may have been written"
+        );
     }
 }
 

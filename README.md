@@ -163,6 +163,38 @@ Arm bring-up is **in-tree**: Virtualization.framework via Homebrew **`macosvm`**
 - Device/backend work lives in `crates/reims-vgpu` + the thin shims in `vendor/qemu`; rebuild QEMU after
   product changes before claiming a live boot result.
 
+### The host window takes your keyboard shortcuts
+
+On the `reims-vgpu-pci` / `reims-vgpu-mmio` device the guest is displayed in a window this project
+owns, and while that window has keyboard focus it asks the host desktop to **stop acting on its own
+shortcuts** so they reach the guest instead. Without that the desktop consumes them first: a stock
+Plasma session claims 63 `Meta`/`Alt`/`Ctrl` combinations, and because a macOS guest reads host
+`Meta` as `Cmd`, that covers most of what the guest expects — `Cmd+A`, `Cmd+V`, `Cmd+Q`, `Cmd+W`,
+`Cmd+1`…`Cmd+9`, and `Alt+Tab`.
+
+**Press `Ctrl+Alt+Esc` to release the grab.** While it is held your own `Alt+Tab` goes to the guest,
+so this is how you get back to the host desktop. The chord is consumed rather than forwarded, and the
+grab re-arms by itself the next time you focus the window — it is an escape hatch, not a mode you
+have to remember you are in. The guest's own `Cmd+Option+Esc` (Force Quit) carries no `Ctrl` and is
+forwarded to the guest untouched.
+
+The window says so on stderr the first time it captures, and records it in the always-on log:
+
+```text
+window_capture_engaged mechanism=wayland_shortcuts_inhibit release=Ctrl+Alt+Esc
+```
+
+How much can be captured depends on the host, and the log names which mechanism a boot got:
+
+| Host | Mechanism | Coverage |
+|---|---|---|
+| Wayland | `zwp_keyboard_shortcuts_inhibit_v1` | full, when the compositor implements it |
+| X11 | `XGrabKeyboard` | full, unless another client holds the keyboard |
+| macOS | `NSApplicationPresentationDisableProcessSwitching` | partial — `Cmd+Tab` and `Cmd+H` only; the window server keeps its reserved chords |
+
+A host that cannot capture at all still runs; it emits a `window_capture_*` reason on
+`/tmp/reims-vgpu-fail.log` rather than silently dropping the keys.
+
 ### Environment overrides
 
 Set on the boot command; every one is optional and every default is "let the device decide". The

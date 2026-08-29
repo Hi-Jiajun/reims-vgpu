@@ -604,7 +604,10 @@ impl GatherWitness {
 /// Every run's `host_ptr` must be a live mapping of at least `len` bytes — the
 /// same precondition the gather itself relies on, read at the same point in the
 /// draw.
-pub(crate) unsafe fn fold_runs(runs: &[crate::backend::vulkan::engine::GuestRun], span: u64) -> u128 {
+pub(crate) unsafe fn fold_runs(
+    runs: &[crate::backend::vulkan::engine::GuestRun],
+    span: u64,
+) -> u128 {
     let mut a: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut b: u64 = 0xc2b2_ae3d_27d4_eb4f;
     let mut remaining = span;
@@ -1534,7 +1537,16 @@ mod tests {
             let mut host = crate::runtime::host::FakeHost::new();
             let mut w = witness_auditing(density);
             (0..6)
-                .map(|_| observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()))
+                .map(|_| {
+                    observe(
+                        &mut w,
+                        &mut host,
+                        KEY,
+                        one_page(&GPAS, &runs),
+                        QUIET,
+                        next_gen(),
+                    )
+                })
                 .filter(|seen| seen.audit == ContentAudit::Agreed)
                 .count()
         };
