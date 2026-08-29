@@ -30,6 +30,7 @@ use crate::runtime::host::HostMemory;
 use crate::runtime::texture;
 use std::sync::Arc;
 
+pub mod retired_entry;
 pub mod slot_recheck;
 
 /// Fail-visible, de-duplicated per `(task_id, ref)`, for the type-11 resolve
@@ -1332,6 +1333,9 @@ fn list_entry<M: HostMemory>(
             // list once held. One atomic bit — see `slot_recheck::ResolvedBits`
             // for why this path cannot take a lock.
             if lookup == ListLookup::Named {
+                // What this ref meant while the guest still held it. Read again
+                // only if the slot is later found freed — see `retired_entry`.
+                retired_entry::remember(state, task_id, ref_, entry);
                 slot_recheck::note_ref_resolved(task_id, ref_);
                 // The control for the banding below, and the reason it is worth
                 // reading: a miss skewing late says nothing unless the hits do
@@ -1358,6 +1362,20 @@ fn list_entry<M: HostMemory>(
                     crate::runtime::drain::tranche_elapsed_us(),
                 );
                 if miss == ListMiss::SlotEmpty {
+                    // A zero slot is a *freed* index, not an unpublished one:
+                    // the guest allocates a ref as the first free index and
+                    // reuses it, so the packet that named this ref named it
+                    // while it was live. Answer with what it meant then. A slot
+                    // the guest has already handed to another object does not
+                    // reach here at all — it reads non-empty and the live entry
+                    // above wins — so this can only fill the gap between a free
+                    // and its reuse.
+                    if let Some(entry) = retired_entry::recall(state, task_id, ref_) {
+                        crate::runtime::drain::note_store_route(
+                            "list_miss_slot_empty_served_retired",
+                        );
+                        return Some(entry);
+                    }
                     note_slot_empty_claimants(state, host, task_id, ref_);
                     // The unconfounded half of the same question — see
                     // `slot_recheck` for why the claimant search above cannot

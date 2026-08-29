@@ -2847,6 +2847,9 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         // that *ended*, and a slot still waiting is skipped by every sweep it
         // survives, so without this line the misses and the verdicts do not
         // reconcile and the difference reads as lost records.
+        if let Some(retired) = crate::runtime::objects::retired_entry::census() {
+            crate::observe::off(retired);
+        }
         if let Some(watching) = crate::runtime::objects::slot_recheck::outstanding_census() {
             crate::observe::off(watching);
         }

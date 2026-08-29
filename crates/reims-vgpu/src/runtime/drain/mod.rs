@@ -296,6 +296,10 @@ fn apply_delete_object(state: &mut DeviceState, channel_id: u32, payload: &[u8],
         return;
     };
     let object_ref = rec.object_ref.get();
+    // The guest is done with this ref, and the next object it creates may be
+    // handed the same index. Whatever the ref used to mean stops being an
+    // answer here, before any later packet can be given it.
+    crate::runtime::objects::retired_entry::retire_ref(state, task_id, object_ref);
     note_store_route(delete_object_kind_route(op.opcode()));
     if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_SAMPLER_STATE {
         let retired = state.task_sampler_states.delete(task_id, object_ref);
@@ -496,6 +500,9 @@ fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Optio
     // their explicit delete/task lifetime; this packet does not destroy them.
     // Both FIFOs reach this.
     crate::runtime::writeback_debt::retire_gva_for_task(state, task_id);
+    // Every ref is an index into the list being replaced, so none of them
+    // names anything in the new one.
+    crate::runtime::objects::retired_entry::retire_task(state, task_id);
     note_bb_retired(
         "bb_retire_set_object_list",
         state.retire_bound_buffers_for_task(task_id),

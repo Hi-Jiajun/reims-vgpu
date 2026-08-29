@@ -2309,6 +2309,18 @@ impl NamedMappings {
 #[derive(Debug)]
 pub struct DeviceState {
     pub id: DeviceId,
+    /// What each `(task, ref)` last resolved to in this device's object lists.
+    ///
+    /// Per device, and not a process-wide table, for the reason two-device reset
+    /// isolation exists at all: task ids and refs are small dense integers that
+    /// every device reuses, so one shared table would let one device answer for
+    /// another's ref. It dies with the `DeviceState`, which is the reset.
+    ///
+    /// Behind a `Mutex` because the resolver reads `&DeviceState` — see
+    /// `runtime::objects::retired_entry` for what is kept and why it is only
+    /// ever consulted for a slot the guest has freed.
+    pub retired_object_entries:
+        std::sync::Mutex<std::collections::HashMap<(u32, u32), crate::runtime::decode::resource::ListObjectEntry>>,
     /// Guest page shift for PFN↔GPA wire math (12 = x86, 14 = arm64e).
     pub page_shift: u32,
     pub gfx: GfxRegs,
@@ -2746,6 +2758,7 @@ impl DeviceState {
     pub fn new(id: DeviceId, page_shift: u32) -> Self {
         Self {
             id,
+            retired_object_entries: Default::default(),
             page_shift,
             gfx: GfxRegs::default(),
             iosfc: IosfcRegs::default(),
