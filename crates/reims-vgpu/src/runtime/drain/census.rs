@@ -2792,7 +2792,12 @@ pub fn note_drain_setup(ns: u64) {
 }
 
 /// Accumulate one completed drain tranche; emits at most once per second.
-pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
+///
+/// Takes the device because one of the censuses below reports a level held on
+/// it rather than in a process-wide latch — see
+/// [`crate::runtime::objects::retired_entry::census`] for why that level cannot
+/// be a static.
+pub fn note_drain_tranche(state: &crate::model::DeviceState, drain_us: u64, publish_us: u64) {
     if let Some(line) = DRAIN_DUTY.note(drain_us, publish_us, crate::observe::elapsed_ms() as u64) {
         crate::observe::off(line);
         // Immediately after `drain_duty`, so the two read as one record: the
@@ -2852,13 +2857,18 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         if let Some(outstanding) = crate::runtime::objects::type4_backing_outstanding_census() {
             crate::observe::off(outstanding);
         }
+        // Beside the miss it answers: `list_miss_slot_empty` counts the empty
+        // slots and `list_miss_slot_empty_served_retired` the subset this
+        // answered, so `served` here must equal that route and `unknown` the
+        // difference. A level that climbs without `served` climbing is refs the
+        // guest holds and never frees.
+        if let Some(retired) = crate::runtime::objects::retired_entry::census(state) {
+            crate::observe::off(retired);
+        }
         // The same reason and the same place: `store_routes` counts the watches
         // that *ended*, and a slot still waiting is skipped by every sweep it
         // survives, so without this line the misses and the verdicts do not
         // reconcile and the difference reads as lost records.
-        if let Some(retired) = crate::runtime::objects::retired_entry::census() {
-            crate::observe::off(retired);
-        }
         if let Some(watching) = crate::runtime::objects::slot_recheck::outstanding_census() {
             crate::observe::off(watching);
         }
@@ -3148,7 +3158,7 @@ fn emit_chain_phase() {
     crate::observe::off(format!(
         "chain_phase chains={} prep_us={} pipeline_us={} pl_gen_us={} pl_desc_us={} \
          pl_mtlb_us={} pl_air_us={} pl_xlate_us={} binds_us={} sampled_us={} \
-         seed_us={} assemble_us={} engine_us={} store_us={} prep_seed_us={} \
+         seed_us={} assemble_us={} engine_us={} store_us={} \
          prep_pages_us={} asm_target_us={} asm_depth_us={} asm_trail_us={} max_us={}",
         w.chains,
         w.prep_us,
@@ -3164,7 +3174,6 @@ fn emit_chain_phase() {
         w.assemble_us,
         w.engine_us,
         w.store_us,
-        w.prep_seed_us,
         w.prep_pages_us,
         w.assemble_target_us,
         w.assemble_depth_us,

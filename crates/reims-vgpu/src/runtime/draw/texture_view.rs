@@ -844,13 +844,23 @@ impl NativeUploads {
         float32: false,
     };
 
-    /// Every native layout the loaders can produce.
+    /// Every native layout the loaders can produce — every gate open at once.
     ///
-    /// Test-only on purpose. Production reaches this answer through
-    /// `native_uploads_for_host`, which asks the host whether it can filter the
-    /// half-float formats; a constant that says yes without asking is exactly
-    /// the shape that would let a capability go unchecked.
-    #[cfg(test)]
+    /// **Never bind anything with this.** Production reaches its answer through
+    /// `native_uploads_for_host`, which asks the host; a constant that says yes
+    /// without asking is exactly the shape that lets a capability go unchecked.
+    /// Its two legitimate uses are a test fixture and one half of
+    /// [`native_bind_is_host_gated`]'s comparison, which asks whether an answer
+    /// *depends* on the host and binds nothing.
+    ///
+    /// It is one constant rather than two because it was two: an
+    /// `EVERY_GATE_OPEN` sitting beside this was a field-for-field copy with
+    /// nothing comparing them, so a fifth gate set here and forgotten there
+    /// would make `native_bind_is_host_gated` compare two equal answers, report
+    /// `false`, and skip asking the host — reproducing exactly the `RGBA32Float`
+    /// defect that function exists to have fixed. `AGENTS.md`: derive, don't
+    /// duplicate and compare.
+    #[cfg(any(test, feature = "backend-vulkan"))]
     pub const ALL: Self = Self {
         bgra8: true,
         float16: true,
@@ -859,28 +869,19 @@ impl NativeUploads {
     };
 }
 
-/// Every gate open at once — a **probe**, never a grant.
-///
-/// [`NativeUploads::ALL`] is test-only on purpose, because a constant that says
-/// yes without asking is the shape that lets a capability go unchecked. This
-/// exists for the opposite purpose and is private to that use: it is one half of
-/// a comparison that asks whether an answer *depends* on the host, and nothing
-/// binds anything with it.
-#[cfg(feature = "backend-vulkan")]
-const EVERY_GATE_OPEN: NativeUploads = NativeUploads {
-    bgra8: true,
-    float16: true,
-    block_compressed: true,
-    float32: true,
-};
-
 /// Whether [`linear_native_upload_format`]'s answer for `sample_format` depends
 /// on what the host can do.
 ///
 /// The question `native_uploads_for` needs before deciding whether to take the
 /// engine lock, and it is **derived** rather than listed: the answer is computed
-/// with every gate shut and again with every gate open, and a format whose
-/// answer moves is one whose bind is host-gated.
+/// with every *host-gated* capability shut and again with every one open, and a
+/// format whose answer moves is one whose bind is host-gated.
+///
+/// The shut arm is [`NativeUploads::BGRA8`] rather than [`NativeUploads::NONE`]
+/// deliberately, and the difference is only `bgra8`, which is not a host gate at
+/// all — it is the loader's own eight-bit swap and is always available. Shutting
+/// it would make every BGRA8 format read as host-gated and send each one through
+/// the engine lock for an answer that cannot change.
 ///
 /// It used to be approximated by [`pixel_format::narrows_to_unorm8`], which
 /// answers a different question — whether a format's *CPU* arm is lossy. The two
@@ -891,7 +892,7 @@ const EVERY_GATE_OPEN: NativeUploads = NativeUploads {
 #[cfg(feature = "backend-vulkan")]
 pub(crate) fn native_bind_is_host_gated(sample_format: u16) -> bool {
     linear_native_upload_format(sample_format, NativeUploads::BGRA8)
-        != linear_native_upload_format(sample_format, EVERY_GATE_OPEN)
+        != linear_native_upload_format(sample_format, NativeUploads::ALL)
 }
 
 /// When a sampled format's guest bytes are ALREADY in the final upload order —
@@ -930,6 +931,15 @@ pub(crate) fn linear_native_upload_format(
         SampledClass::Rgba16Float if native.float16 => TexelLayout::Rgba16Float,
         SampledClass::Rg16Float if native.float16 => TexelLayout::Rg16Float,
         SampledClass::Rgba32Float if native.float32 => TexelLayout::Rgba32Float,
+        // Ungated, like `Rgba8Unorm` and unlike every layout above it. Vulkan
+        // mandates `SAMPLED_IMAGE` for `R16G16_UINT`, and the one capability
+        // the other native layouts are gated on — linear filtering — is not a
+        // question an integer layout is asked: it is sampled with
+        // `VK_FILTER_NEAREST` by construction. So there is nothing to gate on,
+        // and no CPU arm to fall back to either: `convert_row_to_rgba8` has no
+        // arm for an integer texel and must not gain one, so a `None` here is
+        // not a slower rail, it is `RowConvertUnsupported` and a lost sample.
+        SampledClass::Rg16Uint => TexelLayout::Rg16Uint,
         _ => return None,
     })
 }

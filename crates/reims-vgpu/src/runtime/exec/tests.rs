@@ -5049,6 +5049,21 @@ fn a_clear_publishes_through_the_resolve_texture_for_both_resolving_store_action
         ClearPublish::Direct
     );
 
+    // **And it keeps it even when a resolve texture is named**, which is a
+    // deliberate narrowing and the one case a reader is most likely to assume
+    // went the other way. The retarget used to key on `resolve_texture_ref != 0`
+    // alone, so a descriptor that set `resolveTexture` alongside
+    // `MTLStoreActionStore` landed its clear in the resolve texture at level
+    // zero — a different surface from the one the guest declared. The store
+    // action is what says whether a resolve happens; a resolve texture the
+    // action does not name is not this pass's destination.
+    assert_eq!(
+        clear_publish_target(&att(MTL_STORE_ACTION_STORE, 4, 3)),
+        ClearPublish::Direct,
+        "a non-resolving store publishes into the texture it declared, whatever \
+         resolve texture the descriptor also carries"
+    );
+
     // A resolve with nowhere to resolve into is still a named refusal, for both
     // actions. This is the half that must NOT be lost by admitting the pair
     // above.

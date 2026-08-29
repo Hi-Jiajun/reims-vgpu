@@ -20,6 +20,7 @@ PID_FILTER=""
 WINDOW_FILTER=""
 MATCH_FILTER=""
 ALLOW_ANY=0
+ALLOW_INEXACT=0
 ALLOW_BLACK=0
 INCLUDE_DECORATIONS=0
 SCRIPT_NAME="screenshot-when-kde-plasma-host"
@@ -57,6 +58,13 @@ Options:
   --any               Allow falling back to the largest qemu-class window when
                       the selector matches nothing. Off by default: the silent
                       fallback used to capture the WRONG VM's window.
+  --inexact           With no selector, allow a SUBSTRING caption match when no
+                      window carries the caption exactly. Off by default: the
+                      case that reaches it is the guest window being absent, and
+                      a substring match then prefers any larger window whose
+                      title merely mentions this device -- which captured a chat
+                      client and reported success. Only for a build whose window
+                      caption genuinely differs from the shipping one.
   --allow-black       Exit 0 even if the capture is uniformly black. Off by
                       default: a black frame is treated as a failed capture.
   --decorations       Include window decorations (default: content only)
@@ -67,7 +75,9 @@ host-owned window is selected by an EXACT caption match -- the normal case needs
 no selector. Exact, because a substring match also admits any unrelated window
 that merely mentions this device in its title, and the area ranking below then
 prefers it for being bigger; that captured a chat window instead of the guest.
-If nothing carries the caption exactly, the substring match is used and warns.
+If nothing carries the caption exactly this FAILS, naming every candidate; pass
+--inexact to allow the substring match (it warns), or --window/--pid to name the
+window outright.
 Among windows passing a selector, the largest wins (QEMU may expose a small
 serial console alongside the GPU display).
 
@@ -125,6 +135,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --any)
       ALLOW_ANY=1
+      shift
+      ;;
+    --inexact)
+      ALLOW_INEXACT=1
       shift
       ;;
     --allow-black)
@@ -301,6 +315,7 @@ const wantId = ${WANT_ID_JS};
 const wantMatch = ${WANT_MATCH_JS};
 const defaultTitle = ${DEFAULT_TITLE_JS};
 const allowAny = ${ALLOW_ANY};
+const allowInexact = ${ALLOW_INEXACT};
 const strictPid = ${STRICT_PID_JS};
 
 function isQemu(c) {
@@ -358,10 +373,15 @@ if (typeof wantId !== "undefined") {
     // the WindowConfig with it), so equality identifies it and a mention cannot
     // spoof it.
     pool = clients.filter(function (c) { return String(c.caption || "") === defaultTitle; });
-    if (pool.length === 0) {
-        // A caption that gained a suffix is still worth finding, but that
-        // selection is ambiguous by construction, so it says so rather than
-        // silently ranking by area again.
+    if (pool.length === 0 && allowInexact) {
+        // Opt-in only. A substring fallback is the original defect with a
+        // warning attached: the case that reaches it is the guest window being
+        // *absent* — a VM that died, or a boot that lost the hostfwd race —
+        // which is exactly when an unrelated window mentioning this device wins
+        // the area ranking and the probe photographs the operator's screen,
+        // reports FOUND and exits 0. Failing is the safe default because a
+        // missing guest display is a real result and a picture of something
+        // else is not; --inexact is for a build whose caption genuinely differs.
         pool = clients.filter(function (c) { return textHas(c, defaultTitle); });
         if (pool.length > 0) {
             console.info(token + ":INEXACT selector=" + selector
@@ -422,9 +442,10 @@ done
 
 CANDIDATES="$(printf '%s\n' "$ALL_LINES" | grep ":CAND " || true)"
 
-# An inexact default selection is the shape that once captured a chat window
-# whose title mentioned this device. It still returns an image, so the warning
-# has to reach the operator rather than only the journal.
+# An inexact selection is the shape that once captured a chat window whose title
+# mentioned this device. It is opt-in now, so reaching this means the operator
+# asked for it -- but it still returns an image, so the warning has to reach the
+# operator rather than only the journal.
 INEXACT_LINE="$(printf '%s\n' "$ALL_LINES" | grep ":INEXACT" || true)"
 if [[ -n "$INEXACT_LINE" ]]; then
   printf '%s: %s\n' "$SCRIPT_NAME" "${INEXACT_LINE#*:INEXACT }" >&2
@@ -444,7 +465,8 @@ if [[ "$FOUND_LINE" == *":NONE"* ]]; then
   die "selector matched no window — refusing to capture a different one. \
 Re-run with --window <id> from the candidates above (the only selector that \
 separates two concurrent VMs), --match <caption-substring> for a non-default \
-window, or --any to accept the largest qemu window. \
+window, --inexact to allow a substring match on the default caption, or --any \
+to accept the largest qemu window. \
 (A headless/-display none QEMU has no window unless the host-owned window is on.)"
 fi
 if [[ "$FOUND_LINE" == *":ACTIVATEFAIL"* ]]; then

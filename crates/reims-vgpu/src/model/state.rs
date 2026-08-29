@@ -3252,6 +3252,13 @@ impl DeviceState {
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         // New directory ⇒ old GVA HostOps views alias the wrong PT — retire.
         self.retire_task_gva_views(task_id);
+        // A ref is an index into an object list, so the whole namespace belongs
+        // to the generation of the task that published it. A redefine ends that
+        // generation, and between it and the new one's first `CmdSetObjectList`
+        // a freed slot would otherwise be answered from the previous
+        // generation's entries — the cross-namespace answer this map is kept
+        // per device to prevent, one scope in.
+        crate::runtime::objects::retired_entry::retire_task(self, task_id);
         self.tasks
             .define(task_id, TaskEntry::define(length, directory_pfn));
     }
@@ -3310,6 +3317,13 @@ impl DeviceState {
         // HostOps views we held (does not touch host_gva_surfaces encode).
         // Runtime flushes retired_views via HostOps::unmap_pages.
         self.retire_task_gva_views(task_id);
+        // Same lifetime, same reason as on a redefine: the object list this
+        // task's refs index goes away with the task, so every entry remembered
+        // under it stops naming anything. Without this a task the guest deletes
+        // and never redefines holds its entries for the life of the
+        // `DeviceState`, which is the leak the map's "no capacity, no eviction"
+        // design makes unbounded rather than merely stale.
+        crate::runtime::objects::retired_entry::retire_task(self, task_id);
         // The two observation ledgers keyed by task id go with it, exactly as
         // they do on a redefine. Both were reachable only through `define_task`
         // before, which cleaned them up whenever an id came back — so a task the

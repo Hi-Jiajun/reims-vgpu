@@ -296,10 +296,15 @@ fn apply_delete_object(state: &mut DeviceState, channel_id: u32, payload: &[u8],
         return;
     };
     let object_ref = rec.object_ref.get();
-    // The guest is done with this ref, and the next object it creates may be
-    // handed the same index. Whatever the ref used to mean stops being an
-    // answer here, before any later packet can be given it.
-    crate::runtime::objects::retired_entry::retire_ref(state, task_id, object_ref);
+    // **No `retired_entry::retire_ref` here, and the section above is why.**
+    // This ref is in the serializer's per-kind space; `retired_entry` is keyed
+    // by the kernel object-list ref, and equal integers across those spaces are
+    // unrelated. Retiring on this number would evict whatever object-list entry
+    // happened to share the integer — the same wrong-namespace eviction that
+    // measurement rules out for `DeviceState::delete_object` two paragraphs up,
+    // and it would drop exactly the packets the retained entry exists to keep.
+    // The object-list namespace is retired where it is defined, by
+    // `CmdSetObjectList`.
     note_store_route(delete_object_kind_route(op.opcode()));
     if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_SAMPLER_STATE {
         let retired = state.task_sampler_states.delete(task_id, object_ref);

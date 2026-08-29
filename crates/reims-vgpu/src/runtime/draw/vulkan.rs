@@ -4267,11 +4267,14 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
         }
         Ok((layout, _decline, components)) => {
             // Every layout is asked about, not just the one that was known to
-            // be optional. This rail hands the guest's bytes to a sampler that
-            // interpolates them, so "can this host filter this format" is a
-            // question about the layout, and a table indexed by the layout
-            // cannot be missing an entry for one that was added later.
-            if !engine::supports_sampled_layout_linear_filter(layout) {
+            // be optional. This rail hands the guest's bytes to a sampler, so
+            // "may this host bind this format to one" is a question about the
+            // layout, and a table indexed by the layout cannot be missing an
+            // entry for one that was added later. The engine owns the whole
+            // answer — for most layouts it is the linear-filter query, and for
+            // an integer one it is not, which is why the two terms are not
+            // reassembled here.
+            if !engine::supports_sampled_layout_bind(layout) {
                 crate::runtime::drain::note_store_route("zc_lin_layout_unfilterable");
                 return None;
             }
@@ -8039,14 +8042,30 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // colour LOAD seed resolutions, and 0 serves plus 0 misses
                     // at that door in every one.
                     if matches!(declared, LoadAction::DontCare) {
+                        // The widened arm's own instrument, and it is a counter
+                        // rather than the latched line below it. DontCare now
+                        // walks the same doors as a Load — a provenance seed
+                        // clone, or `resolve_type11_load_seed` reading the
+                        // surface out of guest memory — and that work is new
+                        // per pass, so both outcomes are counted or nothing
+                        // says how often the widening pays or what it costs.
+                        // `note_load_seed_outcome`'s own counters cannot serve:
+                        // they are the LOAD-only signal below.
+                        let served = target_rgba8.is_some() || target_guest_seed.is_some();
+                        crate::runtime::drain::note_store_route(if served {
+                            "dontcare_seed_served"
+                        } else {
+                            "dontcare_seed_empty"
+                        });
                         // The residual DontCare: no door held this surface's
                         // prior contents, so the pass key still reads "no seed"
                         // and `caches.rs` still resolves it to CLEAR. Reported
                         // here rather than for every DontCare, because the ones
-                        // that found a door now preserve — so this line counts
-                        // the cases that still cost the guest its contents
-                        // instead of counting the whole population.
-                        if target_rgba8.is_none() && target_guest_seed.is_none() {
+                        // that found a door now preserve — so this names the
+                        // cases that still cost the guest its contents instead
+                        // of the whole population. Latched per pipeline; the
+                        // counter above is what has the size.
+                        if !served {
                             super::note_load_action_dont_care(req.pipeline_ref, w, h);
                         }
                     } else {

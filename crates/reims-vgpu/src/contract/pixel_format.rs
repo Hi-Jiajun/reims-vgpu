@@ -644,6 +644,26 @@ pub enum TexelLayout {
     Bc7Rgba,
 }
 
+/// Which of the two per-layout capability masks a question belongs to.
+///
+/// Carried as a type rather than as the `bool` this started out as, for the
+/// reason `AGENTS.md` gives for every selector this crate owns: a `bool`
+/// parameter named for one of its two values reads correctly at the definition
+/// and ambiguously at every call, and adding a third mask would silently widen
+/// one arm of an `if` instead of failing the build in the `match` below.
+///
+/// The two spans are deliberately different — see
+/// [`TexelLayout::is_render_target_layout`] and
+/// [`TexelLayout::needs_sampled_filter_query`] for what each asks and why
+/// sharing one index space cost the bit budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapabilityMask {
+    /// Layouts this device creates a colour attachment at.
+    RenderTarget,
+    /// Layouts whose sampled bind must ask the host about linear filtering.
+    SampledFilter,
+}
+
 impl TexelLayout {
     /// Every layout, so a sweep over the vocabulary is derived rather than
     /// hand-listed.
@@ -740,21 +760,26 @@ impl TexelLayout {
         }
     }
 
-    /// Whether this layout stores a 4x4 block per addressable unit.
-    ///
-    /// Exhaustive rather than a range test on [`Self::index`]: the positions are
-    /// an implementation detail of the table above and a new uncompressed layout
-    /// appended after the BC block would silently join the compressed set.
     /// Whether this layout's channels are read as integers rather than as a
     /// value in a continuous range.
     ///
     /// The distinction the eight-bit conversion rails and the capability masks
     /// both turn on: an integer texel is a count, so there is no unorm8 byte
     /// that stands for it and no meaning to interpolating between two of them.
+    /// It is also what separates the two questions a colour attachment is
+    /// asked — Vulkan mandates no `COLOR_ATTACHMENT_BLEND` on an integer
+    /// format, so requiring blend of one would refuse every host, while
+    /// `COLOR_ATTACHMENT` itself is a real and answerable question. See
+    /// `caps::device_features`'s per-layout colour-attachment probe.
     pub const fn is_integer(self) -> bool {
         matches!(self, Self::Rg16Uint)
     }
 
+    /// Whether this layout stores a 4x4 block per addressable unit.
+    ///
+    /// Exhaustive rather than a range test on [`Self::index`]: the positions are
+    /// an implementation detail of the table above and a new uncompressed layout
+    /// appended after the BC block would silently join the compressed set.
     pub const fn is_block_compressed(self) -> bool {
         match self {
             Self::Rgba8
@@ -787,30 +812,29 @@ impl TexelLayout {
         }
     }
 
-    /// Whether a colour attachment of this layout can be **blended**.
-    ///
-    /// One of the two per-layout capability vocabularies, and deliberately not
-    /// the same one as [`Self::needs_sampled_filter_query`]. The two masks
-    /// answer different questions about different sets and used to share one
-    /// index space, which sized both by the union and wasted every bit where
-    /// they disagree — a `u64` published lock-free has none to spare.
-    ///
-    /// A layout is in this set when this device can render into it at all,
-    /// which is [`render_target_bpp`]'s question, and when blending is a
-    /// question worth asking of it. Integer layouts are excluded: Vulkan
-    /// permits no blending on an integer attachment, so the bit could only ever
-    /// hold one value. Block-compressed layouts are excluded because no host
-    /// renders into one and `render_target_bpp` has no arm for them.
-    pub const fn is_blendable_attachment(self) -> bool {
-        !self.is_block_compressed() && !self.is_integer() && self.is_render_target_layout()
-    }
-
     /// Whether this layout is one this device will render into.
     ///
     /// The layout-side spelling of [`render_target_bpp`]'s admission set. It is
     /// a `const fn` over the layouts rather than a second list of formats, and
     /// `the_two_render_target_vocabularies_name_the_same_layouts` holds it
     /// against that function so the two cannot drift.
+    ///
+    /// It is also one of the two per-layout capability vocabularies, and
+    /// deliberately not the same one as [`Self::needs_sampled_filter_query`].
+    /// The two masks answer different questions about different sets and used
+    /// to share one index space, which sized both by the union and wasted every
+    /// bit where they disagree — a `u64` published lock-free has none to spare.
+    ///
+    /// **The set is every layout this device renders into, integer ones
+    /// included, and that is load-bearing.** This vocabulary was briefly
+    /// narrowed to the *blendable* layouts, which excluded the integer one —
+    /// so `engine::render_target_layout_supported` had no bit to read for
+    /// `Rg16Uint`, answered `false`, and every `RG16Uint` render target was
+    /// built at the neutral eight-bit format instead of its own. Both Store
+    /// arms then refused it: the GPU-direct one on `ResidentFormatMismatch`
+    /// and the copying one in the row converter, which has no integer arm by
+    /// design. A mask whose vocabulary is narrower than the question its reader
+    /// asks does not decline, it answers wrongly.
     pub const fn is_render_target_layout(self) -> bool {
         matches!(
             self,
@@ -843,20 +867,23 @@ impl TexelLayout {
 
     /// How many layouts each mask spans, counted from [`Self::ALL`] so neither
     /// can fall behind the vocabulary.
-    pub const BLEND_COUNT: usize = Self::count_where(true);
-    /// See [`Self::BLEND_COUNT`].
-    pub const FILTER_COUNT: usize = Self::count_where(false);
+    pub const RENDER_TARGET_COUNT: usize = Self::count_where(CapabilityMask::RenderTarget);
+    /// See [`Self::RENDER_TARGET_COUNT`].
+    pub const FILTER_COUNT: usize = Self::count_where(CapabilityMask::SampledFilter);
 
-    const fn count_where(blend: bool) -> usize {
+    /// Whether `self` occupies a bit of `mask`.
+    const fn in_mask(self, mask: CapabilityMask) -> bool {
+        match mask {
+            CapabilityMask::RenderTarget => self.is_render_target_layout(),
+            CapabilityMask::SampledFilter => self.needs_sampled_filter_query(),
+        }
+    }
+
+    const fn count_where(mask: CapabilityMask) -> usize {
         let mut count = 0;
         let mut i = 0;
         while i < Self::ALL.len() {
-            let member = if blend {
-                Self::ALL[i].is_blendable_attachment()
-            } else {
-                Self::ALL[i].needs_sampled_filter_query()
-            };
-            if member {
+            if Self::ALL[i].in_mask(mask) {
                 count += 1;
             }
             i += 1;
@@ -864,29 +891,22 @@ impl TexelLayout {
         count
     }
 
-    /// This layout's bit in the blend mask, or `None` when the mask has no
-    /// question about it.
-    pub fn blend_index(self) -> Option<usize> {
-        self.index_where(true)
+    /// This layout's bit in the render-target mask, or `None` when the mask has
+    /// no question about it.
+    pub fn render_target_index(self) -> Option<usize> {
+        self.index_where(CapabilityMask::RenderTarget)
     }
 
     /// This layout's bit in the sampled-filter mask, or `None` when the mask
     /// has no question about it.
     pub fn filter_index(self) -> Option<usize> {
-        self.index_where(false)
+        self.index_where(CapabilityMask::SampledFilter)
     }
 
     /// Walks [`Self::ALL`] rather than keeping a second ordering: one list, one
     /// order, nothing to drift.
-    fn index_where(self, blend: bool) -> Option<usize> {
-        let member = |l: Self| {
-            if blend {
-                l.is_blendable_attachment()
-            } else {
-                l.needs_sampled_filter_query()
-            }
-        };
-        if !member(self) {
+    fn index_where(self, mask: CapabilityMask) -> Option<usize> {
+        if !self.in_mask(mask) {
             return None;
         }
         let mut index = 0;
@@ -894,13 +914,18 @@ impl TexelLayout {
             if *layout == self {
                 return Some(index);
             }
-            if member(*layout) {
+            if layout.in_mask(mask) {
                 index += 1;
             }
         }
         None
     }
 
+    /// Bytes one tightly-packed row of `width` texels of this layout occupies.
+    ///
+    /// One row of **blocks** for a compressed layout, so a caller comparing a
+    /// guest row stride against "one tight row of the upload layout" gets the
+    /// right answer for both families from one expression. `None` on overflow.
     pub fn tight_row_bytes(self, width: u32) -> Option<u32> {
         let block = self.block();
         block.blocks_across(width).checked_mul(block.bytes)
@@ -1879,32 +1904,42 @@ pub fn storage_selector(format: u16) -> Option<StorageImageSelector> {
 /// that function's doc states: a missing arm there is a performance bug, not a
 /// loss, and the byte-copy rail declines by name to the CPU converter above.
 ///
-/// # `RG16_UINT` is measured, wanted, and still not here
+/// # `RG16_UINT` is here, and it is the member that changed what admission means
 ///
 /// A macos-15 x86/Vulkan boot declares linear `RG16Uint` colour attachments and
-/// loses every pass that names one — seven dropped clears and thirty-two
-/// unresolved MRT slots in a single boot. So it clears the measurement bar the
-/// paragraph above sets, and it is still refused, because admission carries an
-/// obligation it cannot meet.
+/// used to lose every pass that named one, refused at `draw::render_target`'s
+/// `rt_linear_format` rung.
 ///
+/// It could not be admitted by adding a table entry.
 /// `the_renderable_set_is_one_answer_and_every_member_survives_both_rails` is
-/// where that obligation is written down: an admitted format must survive the
+/// where the obligation is written down: every member above survives the
 /// readback narrow, the CPU `Load` seed expansion and the CPU `Store` row
 /// converter, all three of which pass a texel through eight-bit RGBA. An
 /// integer texel has no eight-bit form — a clear colour of `1.0` is the integer
-/// `1`, not `255` and not `65535` — so every one of the three would have to
-/// invent bytes. Admitting it anyway would render correctly on this host and
-/// lose every frame on a host with no guest-RAM import, silently, which is the
-/// failure that test's own comment describes.
+/// `1`, not `255` and not `65535` — so all three would have had to invent
+/// bytes, and a format admitted on those terms renders correctly on a host with
+/// the guest-RAM import and loses every frame, silently, on one without.
 ///
-/// The fix is therefore not an entry in this list. It is a render-target path
-/// that carries the destination texel end to end instead of funnelling through
-/// RGBA8, at which point the byte copy serves this format exactly and the three
-/// rails above stop being the only route. Until then the refusal is
-/// `rt_linear_format`, and it is accurate: this device will not render into it.
-/// Everything *else* about the format is now known — its width, its layout, its
-/// Vulkan spelling, its sampled and dispatch rails — so a guest that samples one
-/// or binds one to a dispatch is served rather than refused.
+/// So the rail was built instead of the exemption. A render Store now carries
+/// the destination's own texel end to end — [`store_texel_order`] on the
+/// GPU-direct arm, and `draw::FrameRows::Native` over
+/// `engine::ReadbackTexel::Native` on the copying arm — so the byte copy serves
+/// this format exactly on both, and neither invents a byte. That test asserts
+/// the alternative rather than skipping: a renderable layout that narrows to
+/// RGBA8 owes the three eight-bit rails, and one that does not owes the native
+/// one.
+///
+/// Two consequences worth carrying, because both have already cost a boot:
+///
+/// * The layout must be in the render-target capability vocabulary
+///   ([`TexelLayout::is_render_target_layout`]), not in a *blend* one. Vulkan
+///   mandates no `COLOR_ATTACHMENT_BLEND` for an integer format, so a mask that
+///   asks about blending has no bit to hold this layout's answer and reads
+///   `false` — which builds the resident at eight bits and loses the frame at a
+///   later rung under a different name.
+/// * The CPU `Load` seed still has no integer arm, so a LOAD-action pass on
+///   such a target refuses by name (`SeedFormatUnwritable`) and loses its prior
+///   contents. The Store does not.
 ///
 /// sRGB variants share storage bpp with their unorm counterparts (Metal texture
 /// view rules).
@@ -2150,24 +2185,6 @@ pub fn f64_to_unorm8(value: f64) -> u8 {
 /// every arm.
 pub fn solid_rgba8(w: u32, h: u32, clear: &[f64; 4]) -> Vec<u8> {
     solid_image8(w, h, unorm8_rgba(clear))
-}
-
-/// [`solid_rgba8`] with the red and blue channels exchanged — the same image a
-/// caller used to obtain by building the RGBA one and swapping every texel of
-/// it, which is what a type-11 mapping's native order needs.
-///
-/// Building it directly is the point. A CLEAR seed that lands in a mapping used
-/// to cost two allocations and four passes over the image — zero the RGBA
-/// buffer, fill it, zero the BGRA buffer, read the first while writing the
-/// second — for a result that is one repeated word. On the load probe's
-/// `blur=40` dial the seed loop moved 140 MB a second this way and `prep_seed_us`
-/// was **8.6 µs of a 41 µs chain, 21 % of it and second only to the engine**.
-///
-/// The channel exchange belongs to the *pixel*, not to the image, so the whole
-/// of it is the argument this function computes.
-pub fn solid_bgra8(w: u32, h: u32, clear: &[f64; 4]) -> Vec<u8> {
-    let [r, g, b, a] = unorm8_rgba(clear);
-    solid_image8(w, h, [b, g, r, a])
 }
 
 /// The clear colour as one unorm8 RGBA texel.
@@ -3371,24 +3388,30 @@ mod tests {
     /// The two capability masks span two vocabularies, and each is dense in its
     /// own.
     ///
-    /// They ask different questions of different sets — blending a colour
+    /// They ask different questions of different sets — creating a colour
     /// attachment, and filtering a sampled texel — and sharing one index space
     /// sized both by the union. This holds each index dense and distinct inside
     /// its own count, which is what `DeviceCapabilitySnapshot` sizes its fields
-    /// by, and pins the two exclusions that are contract facts rather than
+    /// by, and pins the exclusions that are contract facts rather than
     /// omissions.
+    ///
+    /// The integer assertions below are the regression pin. This vocabulary was
+    /// briefly the *blendable* layouts, which put `Rg16Uint` in neither mask —
+    /// so `engine::render_target_layout_supported` had no bit to read for it,
+    /// answered `false`, and every `RG16Uint` render target was built at the
+    /// neutral eight-bit format and then lost by both Store arms. An integer
+    /// layout must be in the render-target mask and out of the filter one.
     #[test]
     fn each_capability_mask_is_dense_in_its_own_vocabulary() {
-        for (blend, count) in [
-            (true, TexelLayout::BLEND_COUNT),
-            (false, TexelLayout::FILTER_COUNT),
+        for (mask, count) in [
+            (CapabilityMask::RenderTarget, TexelLayout::RENDER_TARGET_COUNT),
+            (CapabilityMask::SampledFilter, TexelLayout::FILTER_COUNT),
         ] {
             let mut seen = Vec::new();
             for layout in TexelLayout::ALL {
-                let index = if blend {
-                    layout.blend_index()
-                } else {
-                    layout.filter_index()
+                let index = match mask {
+                    CapabilityMask::RenderTarget => layout.render_target_index(),
+                    CapabilityMask::SampledFilter => layout.filter_index(),
                 };
                 let Some(i) = index else { continue };
                 assert!(i < count, "{layout:?} indexes past its own count");
@@ -3398,26 +3421,31 @@ mod tests {
             assert_eq!(seen.len(), count);
         }
 
-        // Integer layouts are in neither: Vulkan permits no blending and no
-        // linear filtering on an integer format, so a bit could hold one value.
-        assert!(!TexelLayout::Rg16Uint.is_blendable_attachment());
+        // An integer layout is rendered into and never filtered. Both halves
+        // matter: the first is the bit that was missing, and the second is why
+        // it cannot simply ride the other mask.
+        assert!(
+            TexelLayout::Rg16Uint.is_render_target_layout(),
+            "an integer colour attachment must carry a render-target bit, or              the resident falls back to eight bits and both Stores refuse it"
+        );
+        assert!(TexelLayout::Rg16Uint.render_target_index().is_some());
         assert!(!TexelLayout::Rg16Uint.needs_sampled_filter_query());
-        assert_eq!(TexelLayout::Rg16Uint.blend_index(), None);
         assert_eq!(TexelLayout::Rg16Uint.filter_index(), None);
 
         // Block-compressed layouts are in neither, for two different reasons —
         // no host renders into one, and their linear filtering is mandated.
-        assert!(!TexelLayout::Bc7Rgba.is_blendable_attachment());
+        assert!(!TexelLayout::Bc7Rgba.is_render_target_layout());
+        assert_eq!(TexelLayout::Bc7Rgba.render_target_index(), None);
         assert!(!TexelLayout::Bc7Rgba.needs_sampled_filter_query());
 
         // The vocabularies genuinely differ, which is the whole point: a
         // four-channel float is sampled and filtered but never rendered into,
         // and a normalized colour order is both.
         assert!(TexelLayout::Rgba32Float.needs_sampled_filter_query());
-        assert!(!TexelLayout::Rgba32Float.is_blendable_attachment());
+        assert!(!TexelLayout::Rgba32Float.is_render_target_layout());
         assert!(TexelLayout::Bgra8.needs_sampled_filter_query());
-        assert!(TexelLayout::Bgra8.is_blendable_attachment());
-        const { assert!(TexelLayout::BLEND_COUNT < TexelLayout::FILTER_COUNT) };
+        assert!(TexelLayout::Bgra8.is_render_target_layout());
+        const { assert!(TexelLayout::RENDER_TARGET_COUNT < TexelLayout::FILTER_COUNT) };
     }
 
     /// The layout-side render-target set and [`render_target_bpp`] name the
@@ -3425,8 +3453,8 @@ mod tests {
     ///
     /// Two spellings of one admission — one over `TexelLayout`, one over
     /// `MTLPixelFormat` — and nothing else compares them. A format admitted by
-    /// one and not the other is a blend bit read for a layout this device never
-    /// renders into, or withheld from one it does.
+    /// one and not the other is a capability bit read for a layout this device
+    /// never renders into, or withheld from one it does.
     #[test]
     fn the_two_render_target_vocabularies_name_the_same_layouts() {
         let mut from_formats: Vec<TexelLayout> = Vec::new();
@@ -4779,7 +4807,7 @@ mod tests {
 
 #[cfg(test)]
 mod solid_fill_tests {
-    use super::{solid_bgra8, solid_rgba8};
+    use super::solid_rgba8;
 
     /// The one-pass fill produces exactly what walking texels produced.
     ///
@@ -4823,34 +4851,6 @@ mod solid_fill_tests {
                 walk(w, h, px),
                 "rgba {w}x{h} must match the texel walk"
             );
-        }
-    }
-
-    /// The BGRA builder equals swapping the RGBA one, which is how its only
-    /// caller used to obtain it.
-    ///
-    /// Fails if the exchange is applied to the wrong pair — the alpha channel
-    /// and the green channel both stay put, so a transposition that moved one
-    /// of them would pass a test that only checked the length.
-    #[test]
-    fn the_bgra_seed_equals_the_rgba_seed_with_red_and_blue_exchanged() {
-        for clear in [
-            [0.0_f64, 0.0, 0.0, 1.0],
-            [1.0, 0.0, 0.0, 1.0],
-            [0.0, 0.0, 1.0, 0.5],
-            [0.1, 0.2, 0.3, 0.4],
-        ] {
-            for (w, h) in [(1, 1), (4, 4), (13, 5)] {
-                let mut swapped = solid_rgba8(w, h, &clear);
-                for px in swapped.chunks_exact_mut(4) {
-                    px.swap(0, 2);
-                }
-                assert_eq!(
-                    solid_bgra8(w, h, &clear),
-                    swapped,
-                    "bgra {w}x{h} clear={clear:?}"
-                );
-            }
         }
     }
 }

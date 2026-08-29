@@ -410,10 +410,11 @@ const CAP_LAYOUT_SHIFT: u32 = CAP_MAX_DIMENSION_BITS;
 /// The two per-layout masks span **different vocabularies**, each sized by its
 /// own.
 ///
-/// They answer different questions about different sets — whether a colour
-/// attachment of a layout blends, and whether sampling it filters linearly —
-/// and they used to share one index space, so both were sized by the union and
-/// every layout only one of them cared about cost two bits instead of one.
+/// They answer different questions about different sets — whether this device
+/// may create a colour attachment at a layout, and whether sampling it filters
+/// linearly — and they used to share one index space, so both were sized by the
+/// union and every layout only one of them cared about cost two bits instead of
+/// one.
 ///
 /// The assertion below has now failed the build three times: when the ten BC
 /// layouts were declared, when the first integer colour layout was, and when a
@@ -422,13 +423,24 @@ const CAP_LAYOUT_SHIFT: u32 = CAP_MAX_DIMENSION_BITS;
 /// genuinely needs a filter bit — which is what showed that the sharing, rather
 /// than any one layout, was what cost the budget.
 ///
-/// Widening is not on the table: this is published through a `static
+/// **Narrowing a vocabulary below the question its reader asks is not a saving,
+/// it is a wrong answer.** The render-target mask was briefly the *blendable*
+/// layouts rather than the renderable ones, which left the integer layout with
+/// no bit; [`DeviceCapabilitySnapshot::render_target_layout_supported`] then
+/// read `false` for it and every `RG16Uint` target was built at the neutral
+/// eight-bit format and lost by both Store arms. The vocabulary is now
+/// `TexelLayout::is_render_target_layout` — exactly the set the reader asks
+/// about — and `caps::device_features` demands `COLOR_ATTACHMENT_BLEND` only of
+/// the layouts that can blend.
+///
+/// Widening the word is not on the table: this is published through a `static
 /// AtomicU64` and there is no lock-free word above it. See
-/// `TexelLayout::is_blendable_attachment` and
+/// `TexelLayout::is_render_target_layout` and
 /// `TexelLayout::needs_sampled_filter_query` for the two sets.
-const CAP_BLEND_COUNT: u32 = crate::contract::pixel_format::TexelLayout::BLEND_COUNT as u32;
+const CAP_RENDER_TARGET_COUNT: u32 =
+    crate::contract::pixel_format::TexelLayout::RENDER_TARGET_COUNT as u32;
 const CAP_FILTER_COUNT: u32 = crate::contract::pixel_format::TexelLayout::FILTER_COUNT as u32;
-const CAP_GPU_ONLY_BIT: u32 = CAP_LAYOUT_SHIFT + CAP_BLEND_COUNT;
+const CAP_GPU_ONLY_BIT: u32 = CAP_LAYOUT_SHIFT + CAP_RENDER_TARGET_COUNT;
 const CAP_SAMPLED_FILTER_SHIFT: u32 = CAP_GPU_ONLY_BIT + 1;
 const CAP_PUBLISHED_BIT: u32 = CAP_SAMPLED_FILTER_SHIFT + CAP_FILTER_COUNT;
 /// Whether this device can sample the BC block-compressed families.
@@ -459,8 +471,8 @@ impl DeviceCapabilitySnapshot {
         // mask by its own index over its own part of it, so enumerating the
         // array would put a layout's answer in another layout's bit.
         for layout in crate::contract::pixel_format::TexelLayout::ALL {
-            if let Some(bit) = layout.blend_index() {
-                if features.color_attachment_blend[layout.index()] {
+            if let Some(bit) = layout.render_target_index() {
+                if features.color_attachment[layout.index()] {
                     word |= 1_u64 << (CAP_LAYOUT_SHIFT + bit as u32);
                 }
             }
@@ -488,12 +500,12 @@ impl DeviceCapabilitySnapshot {
         self,
         layout: crate::contract::pixel_format::TexelLayout,
     ) -> bool {
-        let Some(bit) = layout.blend_index() else {
-            // A layout this device does not render into, or an integer one that
-            // cannot blend. `pixel_format::render_target_bpp` refuses the first
-            // before the resolve reaches here, and Vulkan permits no blending on
-            // an integer attachment — so `false` keeps both true instead of
-            // reading a bit the word does not carry.
+        let Some(bit) = layout.render_target_index() else {
+            // A layout this device does not render into at all.
+            // `pixel_format::render_target_bpp` refuses it before the resolve
+            // reaches here, so `false` keeps that true instead of reading a bit
+            // the word does not carry. The mask spans every renderable layout,
+            // integer ones included, so this arm no longer swallows one.
             return false;
         };
         self.0 & (1_u64 << (CAP_LAYOUT_SHIFT + bit as u32)) != 0
@@ -523,7 +535,19 @@ impl DeviceCapabilitySnapshot {
             return None;
         }
         let Some(bit) = layout.filter_index() else {
-            // Vulkan's mandatory-format table requires
+            // Two layouts leave this mask and they leave it with opposite
+            // answers, so the arm has to split rather than return one value for
+            // "no bit".
+            if layout.is_integer() {
+                // Vulkan permits no `VK_FILTER_LINEAR` on an integer format, so
+                // the answer is statically no — which is what
+                // `TexelLayout::needs_sampled_filter_query`'s own doc says.
+                // Reporting `true` here claimed a filtering capability no
+                // driver advertises and disagreed with the unpublished arm
+                // below, which reads the array and answers `false`.
+                return Some(false);
+            }
+            // Block-compressed. Vulkan's mandatory-format table requires
             // `SAMPLED_IMAGE_FILTER_LINEAR` of every BC format on a device that
             // enables `textureCompressionBC`, and that feature is what admits
             // the format at `translate::pixel::sampled_pixels` in the first
@@ -578,7 +602,7 @@ mod device_capability_snapshot_tests {
             max_image_dimension_2d: 16_384,
             ..Default::default()
         };
-        features.color_attachment_blend[TexelLayout::Rgba16Float.index()] = true;
+        features.color_attachment[TexelLayout::Rgba16Float.index()] = true;
         features.sampled_linear_filter[TexelLayout::Rgba16Float.index()] = true;
 
         let snapshot = DeviceCapabilitySnapshot::from_parts(
@@ -606,6 +630,58 @@ mod device_capability_snapshot_tests {
             },
         );
         assert!(!narrowed.deferred_gpu_only_content_allowed());
+    }
+
+    /// An integer colour attachment carries a render-target bit and answers
+    /// `false` — never `true` — about linear filtering.
+    ///
+    /// Both halves are regressions this pins. The render-target mask was
+    /// briefly the *blendable* layouts, so `Rg16Uint` had no bit at all: the
+    /// snapshot answered `false` however the host was probed, every `RG16Uint`
+    /// resident was created at the neutral eight-bit format, and both Store
+    /// arms then refused the frame — the GPU-direct one on
+    /// `ResidentFormatMismatch` and the copying one in a row converter that has
+    /// no integer arm by design. In the same change the filter arm's `None`
+    /// case returned `Some(true)` for anything without a bit, which had been
+    /// written for the block-compressed layouts alone, so this device claimed a
+    /// `VK_FILTER_LINEAR` on an integer format that no driver advertises and
+    /// that the unpublished arm answers `false` for.
+    #[test]
+    fn an_integer_colour_attachment_is_renderable_and_never_filterable() {
+        let mut features = crate::backend::vulkan::caps::device_features::DeviceFeatures {
+            max_image_dimension_2d: 16_384,
+            ..Default::default()
+        };
+        features.color_attachment[TexelLayout::Rg16Uint.index()] = true;
+        // Set deliberately, to prove the answer below does not come from it: a
+        // host cannot advertise this and the snapshot must not read it.
+        features.sampled_linear_filter[TexelLayout::Rg16Uint.index()] = true;
+
+        let snapshot = DeviceCapabilitySnapshot::from_parts(
+            &features,
+            crate::backend::vulkan::caps::DriverQuirk::default(),
+        );
+        assert!(
+            snapshot.render_target_layout_supported(TexelLayout::Rg16Uint),
+            "a host that reports COLOR_ATTACHMENT for the integer layout must              be believed, or its resident falls back to eight bits"
+        );
+        assert_eq!(
+            snapshot.sampled_layout_linear_filter_if_published(TexelLayout::Rg16Uint),
+            Some(false),
+            "no host advertises linear filtering of an integer format"
+        );
+
+        // The other half of the same word still works: a host that does not
+        // report the attachment gets a `false`, so this is a real query and not
+        // a constant.
+        let unsupported = DeviceCapabilitySnapshot::from_parts(
+            &crate::backend::vulkan::caps::device_features::DeviceFeatures {
+                max_image_dimension_2d: 16_384,
+                ..Default::default()
+            },
+            crate::backend::vulkan::caps::DriverQuirk::default(),
+        );
+        assert!(!unsupported.render_target_layout_supported(TexelLayout::Rg16Uint));
     }
 }
 
@@ -2119,9 +2195,9 @@ pub fn note_resident_content_copied_out(identity: &TargetIdentity) -> bool {
 /// the answer for those two has to be constant.
 ///
 /// Anything wider is a real question and is asked of the device:
-/// [`crate::backend::vulkan::caps::device_features::DeviceFeatures::color_attachment_blend`]
-/// holds one probe per [`TexelLayout`] for `COLOR_ATTACHMENT` *and*
-/// `COLOR_ATTACHMENT_BLEND` under optimal tiling. No device yet resolved
+/// [`crate::backend::vulkan::caps::device_features::DeviceFeatures::color_attachment`]
+/// holds one probe per [`TexelLayout`] for `COLOR_ATTACHMENT` under optimal
+/// tiling, plus `COLOR_ATTACHMENT_BLEND` for every layout that can blend. No device yet resolved
 /// answers `false`, which narrows to the format the target would have had
 /// anyway — an override or an unresolved device may never widen what the
 /// device does.
@@ -2373,6 +2449,31 @@ pub fn supports_storage_image_write_without_format() -> bool {
     }
 }
 
+/// Whether a native sampled bind of `layout` is admissible on this host.
+///
+/// The one door every native sampled rail asks, because "may I bind this" and
+/// "can this host filter this linearly" are the same question for most layouts
+/// and are not the same question for all of them. Keeping the second at the
+/// call site made an integer layout unbindable the moment the filter answer
+/// became truthful.
+///
+/// An integer layout is sampled with `VK_FILTER_NEAREST` — linear filtering is
+/// not merely unsupported for one, it is undefined, and Metal forbids it too,
+/// so a guest's own validation has already made the sampler nearest before the
+/// texture reaches this device (the same relationship a draw's primitive type
+/// has with its pipeline's declared topology class). `SAMPLED_IMAGE` is
+/// mandated for the integer layouts this device names, so the bind is
+/// admissible without a query and the filter mask is not this layout's
+/// question.
+pub fn supports_sampled_layout_bind(
+    layout: crate::contract::pixel_format::TexelLayout,
+) -> bool {
+    if layout.is_integer() {
+        return true;
+    }
+    supports_sampled_layout_linear_filter(layout)
+}
+
 /// Whether the bound device can sample this guest texel layout's Vulkan format
 /// with **linear** filtering.
 ///
@@ -2404,7 +2505,14 @@ pub fn supports_sampled_layout_linear_filter(
     } = &mut *guard;
     match owner.ensure(counters) {
         Ok(ctx) => {
-            if layout.is_block_compressed() {
+            if layout.is_integer() {
+                // No `VK_FILTER_LINEAR` on an integer format, ever. Stated here
+                // as well as in the published snapshot because the two arms
+                // answer the same question and a divergence between them is
+                // invisible: this one runs only before the first device has
+                // published.
+                false
+            } else if layout.is_block_compressed() {
                 // Mandated by the spec wherever the family is available at all,
                 // so there is nothing in this array to read and its BC entries
                 // are never written. Same answer the published snapshot gives.
@@ -4438,14 +4546,14 @@ const RESIDENT_READ_BYTES_PER_TEXEL: u32 = 4;
 /// The fallback is unreachable for a real resident (an image exists only at a
 /// format these tables know) and is the four this code used to assume rather
 /// than a panic, on the same grounds as [`GuestPageTarget::bytes_per_texel`].
-/// The Vulkan spelling of a layout, for a decline that has only the layout.
-fn readback_vk_format(layout: TexelLayout) -> ash::vk::Format {
-    crate::backend::vulkan::translate::pixel::vk_texel_layout(layout)
-}
-
 fn readback_bytes_per_texel(format: ash::vk::Format) -> u32 {
     crate::backend::vulkan::translate::pixel::bytes_per_texel(format)
         .unwrap_or(RESIDENT_READ_BYTES_PER_TEXEL)
+}
+
+/// The Vulkan spelling of a layout, for a decline that has only the layout.
+fn readback_vk_format(layout: TexelLayout) -> ash::vk::Format {
+    crate::backend::vulkan::translate::pixel::vk_texel_layout(layout)
 }
 
 /// Bring a readback taken at the attachment's own texel width down to the RGBA8
