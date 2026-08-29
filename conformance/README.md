@@ -24,8 +24,8 @@ verdict rather than diffing hundreds of lines by eye:
 ```sh
 conformance/verdict.py --native baselines/native-apple-m4-macos15.txt \
   --guest /tmp/conf-out/conformance.txt \
-  --translation-errors expectations/translation-errors.txt \
-  --driver-errors expectations/driver-errors.txt
+  --translation-errors expectations/macos-13/translation-errors.txt \
+  --driver-errors expectations/macos-13/driver-errors.txt
 ```
 
 It is stricter than the eye in two directions the eye is bad at. A case that
@@ -49,9 +49,18 @@ is green natively.
 
 ## Failure ownership is part of the verdict
 
-`expectations/translation-errors.txt` and `expectations/driver-errors.txt` are
-separate inventories. One case name goes on each line; `#` starts the required
-diagnosis. A name in both files is `DUPLICATE-CLASSIFICATION` and fails scoring.
+`expectations/<rail>/translation-errors.txt` and
+`expectations/<rail>/driver-errors.txt` are separate inventories. One case name
+goes on each line; `#` starts the required diagnosis. A name in both files is
+`DUPLICATE-CLASSIFICATION` and fails scoring.
+
+**They are per rail, and a rail is a driver.** `macos-13` and `macos-15` are two
+different guest drivers running the same battery, so a case one of them fails
+says nothing about the other, and neither does a case one of them passes. An
+entry established on one rail may not be copied to another to make a sweep
+green; it has to be re-established there, against that rail's own control. A
+rail with no inventory directory is refused by the runner rather than scored
+against a neighbour's debt.
 
 A translation entry names its gitignored `bugs/` handoff package, containing the
 AIR reproducer and translator evidence. A driver entry names the violated Metal
@@ -100,7 +109,7 @@ conformance/
     Support.swift     the library, pipelines, readback, helpers
     cases/*.swift     the case bodies, one file per rail or family
   baselines/          native runs, one per oracle host
-  expectations/       separate translation and driver inventories
+  expectations/<rail>/  separate translation and driver inventories, per rail
   verdict.py          scores a guest run against the native one
   run-native.sh       build and run on the oracle
   run-guest.sh        boot a rail and run the same source in the guest
@@ -137,10 +146,9 @@ fail log beside the results:
 conformance/run-guest.sh /tmp/conf-out
 ```
 
-The guest runner is pinned to the macos-15 rail. Environment passes through, so
-an ablation arm is
+`RAIL` selects the guest rail and defaults to `macos-13`. Environment passes
+through, so an ablation arm is
 `REIMS_VGPU_GUEST_IMPORT=off conformance/run-guest.sh /tmp/conf-off`.
-Any other `RAIL` value is rejected.
 
 For a fast, shaderless gate of the integer-clear contract, use
 `CONFORMANCE_MODE=integer-clear`. Use `CONFORMANCE_MODE=topology` for the
