@@ -2309,18 +2309,6 @@ impl NamedMappings {
 #[derive(Debug)]
 pub struct DeviceState {
     pub id: DeviceId,
-    /// What each `(task, ref)` last resolved to in this device's object lists.
-    ///
-    /// Per device, and not a process-wide table, for the reason two-device reset
-    /// isolation exists at all: task ids and refs are small dense integers that
-    /// every device reuses, so one shared table would let one device answer for
-    /// another's ref. It dies with the `DeviceState`, which is the reset.
-    ///
-    /// Behind a `Mutex` because the resolver reads `&DeviceState` — see
-    /// `runtime::objects::retired_entry` for what is kept and why it is only
-    /// ever consulted for a slot the guest has freed.
-    pub retired_object_entries:
-        std::sync::Mutex<std::collections::HashMap<(u32, u32), crate::runtime::decode::resource::ListObjectEntry>>,
     /// Guest page shift for PFN↔GPA wire math (12 = x86, 14 = arm64e).
     pub page_shift: u32,
     pub gfx: GfxRegs,
@@ -2758,7 +2746,6 @@ impl DeviceState {
     pub fn new(id: DeviceId, page_shift: u32) -> Self {
         Self {
             id,
-            retired_object_entries: Default::default(),
             page_shift,
             gfx: GfxRegs::default(),
             iosfc: IosfcRegs::default(),
@@ -3252,13 +3239,6 @@ impl DeviceState {
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         // New directory ⇒ old GVA HostOps views alias the wrong PT — retire.
         self.retire_task_gva_views(task_id);
-        // A ref is an index into an object list, so the whole namespace belongs
-        // to the generation of the task that published it. A redefine ends that
-        // generation, and between it and the new one's first `CmdSetObjectList`
-        // a freed slot would otherwise be answered from the previous
-        // generation's entries — the cross-namespace answer this map is kept
-        // per device to prevent, one scope in.
-        crate::runtime::objects::retired_entry::retire_task(self, task_id);
         self.tasks
             .define(task_id, TaskEntry::define(length, directory_pfn));
     }
@@ -3317,13 +3297,6 @@ impl DeviceState {
         // HostOps views we held (does not touch host_gva_surfaces encode).
         // Runtime flushes retired_views via HostOps::unmap_pages.
         self.retire_task_gva_views(task_id);
-        // Same lifetime, same reason as on a redefine: the object list this
-        // task's refs index goes away with the task, so every entry remembered
-        // under it stops naming anything. Without this a task the guest deletes
-        // and never redefines holds its entries for the life of the
-        // `DeviceState`, which is the leak the map's "no capacity, no eviction"
-        // design makes unbounded rather than merely stale.
-        crate::runtime::objects::retired_entry::retire_task(self, task_id);
         // The two observation ledgers keyed by task id go with it, exactly as
         // they do on a redefine. Both were reachable only through `define_task`
         // before, which cleaned them up whenever an id came back — so a task the

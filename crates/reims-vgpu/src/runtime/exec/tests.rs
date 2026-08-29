@@ -5000,23 +5000,9 @@ fn a_clear_seeds_the_pass_for_any_store_action_and_publishes_only_for_store() {
     );
 }
 
-/// A clear-only pass publishes through its resolve texture for **both**
-/// resolve-carrying store actions, not just one of them.
-///
-/// `MTLLoadActionClear` with no draws leaves every sample holding `clearColor`,
-/// so resolving those samples yields exactly `clearColor`. That makes
-/// `StoreAndMultisampleResolve` and `MultisampleResolve` identical in what they
-/// publish to the single-sample surface the guest scans out; they differ only in
-/// whether the multisample texture is additionally retained, which this path
-/// does not publish and the guest does not scan out.
-///
-/// `StoreAndMultisampleResolve` used to be refused by name immediately above the
-/// code that already retargeted its sibling correctly, so the clear was dropped.
-/// A driven macos-13 app sweep fired that refusal 27 times on one attachment
-/// pair (`source=4 resolve=3`) — each one a clear the guest asked for and did
-/// not get, on the only rail that still lands a pass clear in guest memory.
+/// The two resolve-carrying actions have different publication contracts.
 #[test]
-fn a_clear_publishes_through_the_resolve_texture_for_both_resolving_store_actions() {
+fn a_clear_distinguishes_resolve_only_from_store_and_resolve() {
     use crate::contract::pass_action::{
         MTL_STORE_ACTION_DONT_CARE, MTL_STORE_ACTION_MULTISAMPLE_RESOLVE,
         MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
@@ -5030,16 +5016,38 @@ fn a_clear_publishes_through_the_resolve_texture_for_both_resolving_store_action
         ..Default::default()
     };
 
-    // The pair the sweep actually sent.
     assert_eq!(
         clear_publish_target(&att(MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE, 4, 3)),
-        ClearPublish::Resolved(3),
-        "a store-and-resolve clear publishes into its resolve texture"
+        ClearPublish::StoredAndResolved {
+            source: 4,
+            resolve: 3
+        },
+        "store-and-resolve retains the multisample source and publishes the resolve"
+    );
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    assert!(
+        !apply_clear(
+            &mut state,
+            &mut host,
+            1,
+            &att(MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE, 4, 3),
+        ),
+        "the single-sample clear rail must not claim both destinations were published"
+    );
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert!(
+        log.lines().any(|line| {
+            line.contains("reason=clear_store_and_multisample_resolve_unsupported")
+                && line.contains("source=4")
+                && line.contains("resolve=3")
+        }),
+        "the unsupported two-destination clear must be fail-visible"
     );
     assert_eq!(
         clear_publish_target(&att(MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, 4, 3)),
         ClearPublish::Resolved(3),
-        "its sibling has always published there, and the two must agree"
+        "resolve-only publishes only the single-sample destination"
     );
 
     // A plain single-sample store keeps the attachment the guest declared,
@@ -5087,5 +5095,29 @@ fn a_clear_publishes_through_the_resolve_texture_for_both_resolving_store_action
     assert_eq!(
         clear_publish_target(&att(MTL_STORE_ACTION_STORE, 0, 0)),
         ClearPublish::NotPublished
+    );
+}
+
+/// A successful draw in an earlier render stream does not suppress the clear
+/// fallback for a later stream whose own draw failed.
+#[test]
+fn clear_fallback_draw_accounting_is_scoped_to_one_render_stream() {
+    let at_entry = (7, 3);
+    let mut out = ExecResult {
+        metal_draws_ok: 7,
+        metal_draws_fail: 4,
+        ..Default::default()
+    };
+    assert_eq!(
+        stream_draw_delta(&out, at_entry),
+        StreamDrawDelta { ok: 0, fail: 1 },
+        "the earlier streams' seven successful draws are not this stream's success"
+    );
+
+    out.metal_draws_ok += 1;
+    assert_eq!(
+        stream_draw_delta(&out, at_entry),
+        StreamDrawDelta { ok: 1, fail: 1 },
+        "a draw that lands in this stream suppresses its destructive fallback"
     );
 }

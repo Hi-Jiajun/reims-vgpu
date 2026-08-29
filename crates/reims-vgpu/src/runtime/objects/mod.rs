@@ -30,7 +30,6 @@ use crate::runtime::host::HostMemory;
 use crate::runtime::texture;
 use std::sync::Arc;
 
-pub mod retired_entry;
 pub mod slot_recheck;
 
 /// Fail-visible, de-duplicated per `(task_id, ref)`, for the type-11 resolve
@@ -1223,28 +1222,11 @@ pub enum ListMiss {
     Undecodable,
     /// The slot read and is zero. Not a device failure.
     ///
-    /// # Freed, not unpublished
-    ///
-    /// This was read as "the entry has not been written yet — a race with the
-    /// guest publishing the object", and [`slot_recheck`] was built to watch
-    /// such a slot fill. It does not fill. On a driven macos-13 app sweep the
-    /// watch landed **zero of 147** verdicts on a slot that later held an
-    /// entry; every verdict that landed at all was the list page going away.
-    /// Half the misses were on refs that had **already resolved** in the same
-    /// task, which an unpublished slot cannot explain and a freed one does.
-    ///
-    /// So the reading is that the guest freed the index: it allocates a ref by
-    /// taking the first slot whose word is zero and reuses it, so a zero slot
-    /// is one between two tenancies. [`retired_entry`] answers from that
-    /// reading, and only here — a slot already handed to another object reads
-    /// non-empty and the live entry wins.
-    ///
-    /// The residual is the window this cannot see: a slot freed, reallocated,
-    /// and read before the guest's twelve-byte entry lands is zero for a ref
-    /// that already names something new. `slot_recheck` is the instrument that
-    /// would report it, which is why it keeps sampling these slots even when
-    /// the recall serves them. A non-zero fill rate there is the signal to
-    /// retire the recall, not a curiosity.
+    /// Object refs are reusable indices: deletion clears the indexed slot and
+    /// allocation may assign that same index to a later object. The packet does
+    /// not carry the index generation, so neither an earlier entry nor a later
+    /// one can answer for a zero slot. The lookup must miss until the current
+    /// tenant is present in the list.
     SlotEmpty,
 }
 
@@ -1353,18 +1335,6 @@ fn list_entry<M: HostMemory>(
             // finding an owner, which says nothing about what this task's own
             // list once held.
             if lookup == ListLookup::Named {
-                // What this ref meant while the guest still held it. Read again
-                // only if the slot is later found freed — see `retired_entry`.
-                //
-                // This is the one lock on the resolve success path, and it is
-                // here because the thing being kept is a twelve-byte entry that
-                // no atomic can hold. `slot_recheck::note_ref_resolved` below
-                // is the counter-example rather than the precedent — it keeps
-                // one bit and `ResolvedBits` is lock-free precisely so this
-                // path stayed uncontended, which is why `remember` does the
-                // least it can and the census counts the level at tranche end
-                // rather than storing it here.
-                retired_entry::remember(state, task_id, ref_, entry);
                 slot_recheck::note_ref_resolved(task_id, ref_);
                 // The control for the banding below, and the reason it is worth
                 // reading: a miss skewing late says nothing unless the hits do
@@ -1391,33 +1361,13 @@ fn list_entry<M: HostMemory>(
                     crate::runtime::drain::tranche_elapsed_us(),
                 );
                 if miss == ListMiss::SlotEmpty {
-                    // Both instruments run first and unconditionally, whatever
-                    // the recall below answers. They measure the *slot*, not the
-                    // packet's outcome, and gating them on a miss the store
-                    // could not answer would leave them reading zero exactly
-                    // when the population is largest — `slot_recheck` in
-                    // particular is the only thing that can still contradict the
-                    // freed reading this recall is built on, so it must keep
-                    // sampling the slots that recall serves.
+                    // Both instruments measure the slot, not the packet's
+                    // outcome, so they run before this miss is returned.
                     note_slot_empty_claimants(state, host, task_id, ref_);
                     // The unconfounded half of the same question — see
                     // `slot_recheck` for why the claimant search above cannot
                     // settle it and this can.
                     slot_recheck::note_slot_empty(state, host, task_id, ref_);
-                    // A zero slot is a *freed* index rather than an unpublished
-                    // one — see [`ListMiss::SlotEmpty`] for the measurement that
-                    // settled which, and for the residual window it does not
-                    // cover. The guest allocates a ref as the first free index,
-                    // so the packet that named this ref named it while it was
-                    // live; answer with what it meant then. A slot the guest has
-                    // already handed to another object does not reach here at
-                    // all — it reads non-empty and the live entry above wins.
-                    if let Some(entry) = retired_entry::recall(state, task_id, ref_) {
-                        crate::runtime::drain::note_store_route(
-                            "list_miss_slot_empty_served_retired",
-                        );
-                        return Some(entry);
-                    }
                 }
             }
             None

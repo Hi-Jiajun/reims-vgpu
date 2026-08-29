@@ -2384,52 +2384,29 @@ fn a_claimant_count_is_banded_against_the_tasks_that_could_have_claimed() {
     assert_eq!(band(0, 0), "list_miss_slot_empty_claimed_nowhere");
 }
 
-/// A freed slot still answers for the packet that named the ref while it was
-/// live, and a **reused** slot never does.
-///
-/// The guest allocates a ref as the first free index of a dense array and hands
-/// the same index out again after a free, so a ref is not a stable name. This
-/// device resolves refs on the drain thread, which is not when the packet naming
-/// them was submitted, and a slot the guest has since freed reads as zero — the
-/// `SlotEmpty` miss that was the whole of one driven macos-13 app sweep's lost
-/// clears (147 of them, 73 on refs that had resolved before).
-///
-/// Both halves are asserted together because they are one rule. Answering from
-/// the retired entry is only sound *because* a reassigned slot reads non-empty
-/// and the live entry wins; a change that let the remembered entry win over a
-/// live read would pass the first half and hand the guest another object's
-/// descriptor under the second.
-///
-/// The third half is the namespace. Retirement is by **task**, because a ref is
-/// an index into that task's object list — there is no per-ref retirement, and
-/// there deliberately is not: `CmdDeleteObject` carries a ref in the
-/// serializer's own space, and retiring on it evicts whichever object-list
-/// entry happens to share the integer.
+/// A zero reusable slot has no resolvable tenant, even when an earlier tenant
+/// was observed successfully.
 #[test]
-fn a_freed_slot_answers_for_the_ref_it_held_and_a_reused_one_does_not() {
-    use crate::runtime::objects::retired_entry;
-
+fn a_freed_or_between_tenants_slot_never_answers_from_an_earlier_generation() {
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
     let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
     let slot = data_gpa + 12; // ref 1, at `ref * 12`
 
-    let live = lookup_list_entry(&state, &host, 1, 1).expect("the published ref resolves");
-    assert_eq!(live.object_type, 11);
-    assert_eq!(live.descriptor_gva, 0x40);
+    let first = lookup_list_entry(&state, &host, 1, 1).expect("the published ref resolves");
+    assert_eq!((first.object_type, first.descriptor_gva), (11, 0x40));
 
-    // The guest frees the slot: its twelve bytes go to zero.
+    // Deletion clears the index. The packet has no generation with which to
+    // prove that the first tenant, rather than a later one, is the answer.
     let _ = host.write_gpa(slot, &[0u8; 12]);
-    let after_free =
-        lookup_list_entry(&state, &host, 1, 1).expect("a freed slot answers for what it held");
     assert_eq!(
-        after_free, live,
-        "the packet named this ref while it was live and must still resolve it"
+        lookup_list_entry(&state, &host, 1, 1),
+        None,
+        "a zero reusable slot cannot name its earlier tenant"
     );
 
-    // The guest hands the same index to a different object. The live read is
-    // non-empty, so it decides and the remembered entry must not be consulted.
+    // A later allocation reuses the same index for another object.
     let mut reused = [0u8; 12];
     st32(&mut reused[0..], 2u32 | (0x30u32 << 8));
     reused[4..12].copy_from_slice(&0x80u64.to_le_bytes());
@@ -2441,56 +2418,11 @@ fn a_freed_slot_answers_for_the_ref_it_held_and_a_reused_one_does_not() {
         "a reused index must resolve to its new object, never the retired one"
     );
 
-    // The task's object list goes away — a replacement list, a redefine or a
-    // teardown, all one event to this store. Every ref in it was an index into
-    // that list, so none of them has a remembered answer any more and a slot
-    // that then reads empty is a real miss again.
+    // Clearing the reused tenant must not resurrect either generation.
     let _ = host.write_gpa(slot, &[0u8; 12]);
-    retired_entry::retire_task(&state, 1);
     assert_eq!(
         lookup_list_entry(&state, &host, 1, 1),
         None,
-        "a retired namespace must not keep answering"
+        "a second empty tenancy gap cannot resurrect the first or second object"
     );
-}
-
-/// Tearing a task down retires its remembered entries, and so does redefining
-/// it.
-///
-/// Neither did. `CmdSetObjectList` was the only event wired to the store, so a
-/// task the guest deleted and never reused held every entry for the life of the
-/// `DeviceState` — an unbounded leak in a map whose whole design is "no
-/// capacity, no eviction" — and a redefined task id could be answered from the
-/// previous generation's namespace between the redefine and the new list.
-///
-/// Asserted through the map itself rather than through a resolve, because a
-/// torn-down task misses with `TaskInactive` long before the recall is
-/// consulted: the leak is invisible to `lookup_list_entry` by construction,
-/// which is exactly why it survived.
-#[test]
-fn a_deleted_or_redefined_task_keeps_no_remembered_entries() {
-    use crate::runtime::objects::retired_entry;
-
-    for redefine in [false, true] {
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        setup_task_with_list(&mut host, &mut state);
-        lookup_list_entry(&state, &host, 1, 1).expect("the published ref resolves");
-        assert_eq!(
-            retired_entry::live(&state),
-            1,
-            "a successful named resolve is remembered"
-        );
-
-        if redefine {
-            state.define_task(1, 1 << PAGE_SHIFT_ARM64E, 9);
-        } else {
-            state.delete_task(1);
-        }
-        assert_eq!(
-            retired_entry::live(&state),
-            0,
-            "the object list these refs index went away with the task"
-        );
-    }
 }

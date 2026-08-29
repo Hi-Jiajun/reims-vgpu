@@ -3111,6 +3111,19 @@ fn apply_binds<T: Copy, B: Clone>(
     cleared
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StreamDrawDelta {
+    ok: u32,
+    fail: u32,
+}
+
+fn stream_draw_delta(out: &ExecResult, at_entry: (u32, u32)) -> StreamDrawDelta {
+    StreamDrawDelta {
+        ok: out.metal_draws_ok.saturating_sub(at_entry.0),
+        fail: out.metal_draws_fail.saturating_sub(at_entry.1),
+    }
+}
+
 fn finish_stream<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -3118,6 +3131,8 @@ fn finish_stream<M: HostMemory + HostOps>(
     out: &mut ExecResult,
     acc: &StreamAccum,
 ) {
+    let draws_at_entry = (out.metal_draws_ok, out.metal_draws_fail);
+    let clears_at_entry = out.clears_applied;
     // Opens in `Prelude` and is charged to whichever part is open until it
     // drops, so the six tile this function rather than sampling it. See
     // [`finish_phase`] for what the split is for.
@@ -3605,49 +3620,18 @@ fn finish_stream<M: HostMemory + HostOps>(
         // CLEAR seed — not a content heuristic). Applies for any draw-fail
         // class, not only NoMetal: mrt_request fail used to skip this and left
         // mid pages empty → nz_swing thrash on x86 Linux product.
-        if out.metal_draws_ok == 0 && !acc.clears.is_empty() {
+        let stream_draws = stream_draw_delta(out, draws_at_entry);
+        if stream_draws.ok == 0 && !acc.clears.is_empty() {
             for att in acc.clears_reaching_guest_pages() {
                 if apply_clear(state, host, task_id, att) {
                     out.clears_applied = out.clears_applied.saturating_add(1);
                 }
             }
-            if out.clears_applied > 0 || saw_nometal || out.metal_draws_fail > 0 {
+            let stream_clears = out.clears_applied.saturating_sub(clears_at_entry);
+            if stream_clears > 0 || saw_nometal || stream_draws.fail > 0 {
                 crate::observe::fail(format!(
                     "draw_fail_clear_fallback task={task_id} clears={} draws_fail={} nometal={}",
-                    out.clears_applied, out.metal_draws_fail, saw_nometal as u8
-                ));
-            }
-        } else if out.metal_draws_fail > 0 && !acc.clears.is_empty() {
-            // **The guard above is packet-wide, and this is the population it
-            // cannot see.** A packet where one record's draw landed and
-            // another's failed takes this arm: `metal_draws_ok` is non-zero, so
-            // no clear is applied for the record that failed, and the
-            // `draw_fail_clear_fallback` line above does not fire either. That
-            // attachment's guest pages keep whatever they held before — the
-            // previous frame's content when the two records target different
-            // attachments, which is a stale frame rather than a clear.
-            //
-            // Recorded rather than repaired. Applying the clears here would
-            // overwrite the *successful* record's rendered pixels whenever the
-            // two records share one attachment, which is the common case and is
-            // the reason the guard was written packet-wide. The repair is a
-            // per-attachment guard — apply the clear only for attachments whose
-            // own records failed — and it is not worth writing against a
-            // population nobody has measured. This counter is that measurement:
-            // read it on a driven boot before changing the guard.
-            crate::runtime::drain::note_store_route("clear_fallback_skipped_partial_packet");
-            crate::runtime::drain::note_store_route_n(
-                "clear_fallback_skipped_partial_packet_clears",
-                acc.clears_reaching_guest_pages().count() as u64,
-            );
-            if crate::observe::first_sight("clear_fallback_skipped_partial", u64::from(task_id)) {
-                crate::observe::fail(format!(
-                    "clear_fallback_skipped_partial task={task_id} draws_ok={} draws_fail={} \
-                     clears={} (a packet with both a landed and a failed draw applies no \
-                     clear for the failed one; its attachment keeps the previous frame)",
-                    out.metal_draws_ok,
-                    out.metal_draws_fail,
-                    acc.clears_reaching_guest_pages().count()
+                    stream_clears, stream_draws.fail, saw_nometal as u8
                 ));
             }
         }
@@ -4145,6 +4129,10 @@ enum ClearPublish {
     Direct,
     /// Publish into the resolve texture instead of the multisample one.
     Resolved(u32),
+    /// Preserve the multisample attachment and publish its resolved value.
+    /// These are two distinct destinations and neither substitutes for the
+    /// other.
+    StoredAndResolved { source: u32, resolve: u32 },
     /// This store action publishes no single-sample result, or there is no
     /// attachment texture at all. Not a loss: the guest asked for nothing.
     NotPublished,
@@ -4153,31 +4141,47 @@ enum ClearPublish {
     ResolveTargetMissing,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StoreAndResolveClearDecline {
+    source: u32,
+    resolve: u32,
+}
+
+impl crate::observe::Decline for StoreAndResolveClearDecline {
+    fn slug(&self) -> &'static str {
+        "clear_store_and_multisample_resolve_unsupported"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("source", self.source.to_string()),
+            ("resolve", self.resolve.to_string()),
+        ]
+    }
+}
+
 /// Which texture a clear-only pass's colour attachment publishes into.
 ///
-/// `MTLLoadActionClear` with no draws leaves **every sample** of the attachment
-/// holding `clearColor`, so resolving those samples yields exactly `clearColor`.
-/// Both resolve-carrying store actions therefore publish the same single-sample
-/// result, into `resolveTexture`, and they differ only in whether the
-/// multisample texture is *also* retained — which is not the surface this path
-/// publishes and not one the guest scans out.
-///
-/// That is why `MTLStoreActionStoreAndMultisampleResolve` is handled here rather
-/// than refused. It used to be refused by name while the code immediately below
-/// already did the right thing for its sibling: retarget the write to
-/// `resolveTexture`. On a driven macos-13 app sweep that refusal fired 27 times
-/// on one attachment pair, each one a clear the guest asked for and did not get.
+/// `MTLLoadActionClear` with no draws leaves every sample holding `clearColor`,
+/// so a multisample resolve publishes that colour into `resolveTexture`.
+/// `MTLStoreActionStoreAndMultisampleResolve` additionally preserves the source
+/// attachment; it is therefore a distinct two-destination result.
 fn clear_publish_target(att: &ColorAttachment) -> ClearPublish {
     if att.texture_ref == 0 || !store_action_publishes_single_sample(att.store_action) {
         return ClearPublish::NotPublished;
     }
-    let resolves = matches!(
+    if matches!(
         att.store_action,
         MTL_STORE_ACTION_MULTISAMPLE_RESOLVE | MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE
-    );
-    if resolves {
+    ) {
         if att.resolve_texture_ref == 0 {
             return ClearPublish::ResolveTargetMissing;
+        }
+        if att.store_action == MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE {
+            return ClearPublish::StoredAndResolved {
+                source: att.texture_ref,
+                resolve: att.resolve_texture_ref,
+            };
         }
         return ClearPublish::Resolved(att.resolve_texture_ref);
     }
@@ -4203,6 +4207,19 @@ fn apply_clear<M: HostMemory + HostOps>(
             store_action: MTL_STORE_ACTION_STORE,
             ..*att
         },
+        ClearPublish::StoredAndResolved { source, resolve } => {
+            // This helper can publish one single-sample texture. Writing only
+            // `resolve` would silently discard the independently retained
+            // multisample `source`, while treating the source as a linear image
+            // would write only one sample. Refuse the unsupported pair as one
+            // contract operation.
+            crate::observe::Emit::decline(
+                "render_clear",
+                &StoreAndResolveClearDecline { source, resolve },
+            )
+            .fail();
+            return false;
+        }
         ClearPublish::NotPublished => return false,
         ClearPublish::ResolveTargetMissing => {
             crate::observe::fail(format!(

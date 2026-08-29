@@ -2793,11 +2793,7 @@ pub fn note_drain_setup(ns: u64) {
 
 /// Accumulate one completed drain tranche; emits at most once per second.
 ///
-/// Takes the device because one of the censuses below reports a level held on
-/// it rather than in a process-wide latch — see
-/// [`crate::runtime::objects::retired_entry::census`] for why that level cannot
-/// be a static.
-pub fn note_drain_tranche(state: &crate::model::DeviceState, drain_us: u64, publish_us: u64) {
+pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
     if let Some(line) = DRAIN_DUTY.note(drain_us, publish_us, crate::observe::elapsed_ms() as u64) {
         crate::observe::off(line);
         // Immediately after `drain_duty`, so the two read as one record: the
@@ -2856,14 +2852,6 @@ pub fn note_drain_tranche(state: &crate::model::DeviceState, drain_us: u64, publ
         // refusal that never recovered is only visible as the residue.
         if let Some(outstanding) = crate::runtime::objects::type4_backing_outstanding_census() {
             crate::observe::off(outstanding);
-        }
-        // Beside the miss it answers: `list_miss_slot_empty` counts the empty
-        // slots and `list_miss_slot_empty_served_retired` the subset this
-        // answered, so `served` here must equal that route and `unknown` the
-        // difference. A level that climbs without `served` climbing is refs the
-        // guest holds and never frees.
-        if let Some(retired) = crate::runtime::objects::retired_entry::census(state) {
-            crate::observe::off(retired);
         }
         // The same reason and the same place: `store_routes` counts the watches
         // that *ended*, and a slot still waiting is skipped by every sweep it
