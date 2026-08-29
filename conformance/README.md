@@ -72,6 +72,41 @@ It is not a place to put a case that fails on the oracle too. That is
 `SUITE-BUG`, the expectation is wrong, and listing it hides a bug in the battery
 rather than one in the device.
 
+## The oracle says right; only the control says backwards
+
+`verdict.py` asks the native oracle whether a guest result is *correct*.
+`ratchet.py` asks an identified control run whether a candidate moved
+*backwards*. They are different questions and a change has to answer both.
+
+```sh
+conformance/ratchet.py \
+  --control  runs/control/conformance.txt  --control-device  runs/control/device.log \
+  --candidate runs/cand/conformance.txt    --candidate-device runs/cand/device.log
+```
+
+The distinction is load-bearing on a rail whose debt is not yet classified. Such
+a rail reads to the oracle scorer as scores of unexplained failures, and will
+until every one has an established owner. That is honest, and it also means the
+oracle scorer is red for *every* candidate on that rail and so cannot tell one
+that broke something from one that broke nothing. The control can: it already
+contains the debt, so a candidate reproducing it exactly has preserved the
+device's behavior whether or not anyone has yet written down whose fault it is.
+
+Classifying a failure and detecting a regression are therefore separate jobs,
+and only the second one gates a commit.
+
+It scores the workflow's transition table, and two things no case comparison
+can see. A name in only one of the two runs is a regression rather than a
+missing row -- coverage that moved is the failure this catches. And the device's
+own typed reasons are counted on both sides, so a candidate that keeps every
+pixel and doubles the fence timeouts is red on that alone.
+
+One reading it hands back rather than decides: a case that fails in both runs
+with a *different* detail is `CHANGED-DETAIL` and does not fail the run, because
+nothing in a `CASE` line separates the typed reason from its payload. The same
+defect described differently and a different defect wearing the same name look
+identical here, and only a reader who knows the case can say which it is.
+
 ## A case name must mean the same thing on both hosts
 
 `minimumLinearTextureAlignment` is 16 on an M-series device and 256 on Apple's
@@ -111,6 +146,7 @@ conformance/
   baselines/          native runs, one per oracle host
   expectations/<rail>/  separate translation and driver inventories, per rail
   verdict.py          scores a guest run against the native one
+  ratchet.py          scores a candidate guest run against a control guest run
   run-native.sh       build and run on the oracle
   run-guest.sh        boot a rail and run the same source in the guest
   build/              binaries; gitignored
