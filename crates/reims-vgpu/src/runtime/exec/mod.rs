@@ -4245,12 +4245,6 @@ fn apply_clear<M: HostMemory + HostOps>(
         return false;
     };
     let c0 = req.colors.first().unwrap_or_else(|| unreachable!());
-    #[cfg(feature = "backend-vulkan")]
-    match draw::publish_clear_only_gva(state, host, task_id, req.clone(), att.clear_color) {
-        draw::ClearOnlyPublication::Resident => return true,
-        draw::ClearOnlyPublication::Failed => return false,
-        draw::ClearOnlyPublication::CpuRequired => {}
-    }
     // Format and clear representation are one contract decision. Continuous
     // colour keeps the semantic RGBA8 carrier the existing converters consume;
     // integer targets carry their own texels, where `1` remains the integer 1.

@@ -2148,24 +2148,11 @@ fn clear_only_rg16uint_publishes_native_linear_gva_rows() {
     );
     assert!(
         crate::runtime::surface_cache::get_texture(&state, 1, texture_ref, width, height).is_none(),
-        "the object-keyed copy must not outlive the authoritative resident clear"
+        "the object-keyed copy must not outlive pixels published to guest pages"
     );
     assert!(
         !crate::runtime::surface_cache::has_gva(&state, target_gva, width, height),
-        "the GVA-keyed copy must not outlive the authoritative resident clear"
-    );
-
-    // Stream completion publishes the resident in queue order. Guest bytes are
-    // materialized only when a reader names the resource, exactly as for a draw
-    // Store; settle before inspecting those bytes as the guest would.
-    crate::runtime::writeback_debt::settle_for_texture(
-        &mut state,
-        &mut host,
-        1,
-        texture_ref,
-        target_gva,
-        u64::from(row_stride) * u64::from(height),
-        crate::runtime::render_writeback::SettleSite::LinearTextureSampled,
+        "the GVA-keyed copy must not outlive pixels published to guest pages"
     );
 
     read_task_gva_by_id(

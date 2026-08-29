@@ -441,33 +441,6 @@ impl ColorAttachmentState {
     }
 }
 
-/// One clear-only render pass over a protocol-keyed colour target.
-///
-/// A clear with no draw calls is still attachment work: it has the same target
-/// lifetime, queue ordering and Store visibility as a pass containing draws.
-/// Carrying it as an engine request keeps those properties owned by the
-/// resident registry instead of publishing a second, CPU-side version of the
-/// target beside it.
-#[derive(Clone, Debug)]
-pub struct ClearRequest {
-    pub identity: TargetIdentity,
-    pub attachment: ColorAttachmentState,
-    /// Sample count declared by the attachment texture.
-    pub sample_count: u32,
-    pub guest_target_memory: Option<GuestTargetMemory>,
-    /// Whether an admitted guest-backed target publishes a guest Store.
-    pub record_guest_store: bool,
-}
-
-/// Publication facts from a clear-only pass, matching the subset a draw Store
-/// needs after it records its render pass.
-#[derive(Clone, Debug, Default)]
-pub struct ClearOutput {
-    pub target_guest_backed: bool,
-    pub guest_store_recorded: bool,
-    pub guest_store_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint>,
-}
-
 /// Inputs for one offscreen draw. Engine receives resolved bytes + post-reloc SPIR-V only.
 #[derive(Debug, Default)]
 pub struct DrawRequest {

@@ -61,8 +61,7 @@ pub(crate) use facade_decline::EngineFacadeDecline;
 pub(crate) use host_ram::GuestWriteDecline;
 pub use types::viewport_slot_count;
 pub use types::{
-    BlendFactor, BlendOp, BlendStateResource, BufferContent, ClearOutput, ClearRequest,
-    ColorAttachmentState, ColorClearValue,
+    BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorAttachmentState, ColorClearValue,
     ColorWriteMask, ComputeBufferResource, ComputeOutput, ComputeRequest, ComputeResidentSampleBind,
     ComputeSampledImageResource,
     ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
@@ -1193,30 +1192,6 @@ pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> 
     }
 }
 
-/// Execute one clear-only render pass against the persistent engine.
-pub fn execute_clear_request(req: &ClearRequest) -> Result<ClearOutput, DrawError> {
-    let mut guard = lock_engine();
-    let EngineState {
-        ref mut owner,
-        ref mut caches,
-        ref mut pools,
-        ref counters,
-        ..
-    } = &mut *guard;
-    let result = unsafe { exec::execute_clear_inner(owner, caches, pools, counters, req) };
-    match result {
-        Ok(out) => {
-            guard.owner.note_work_completed();
-            Ok(out)
-        }
-        Err(DrawError::DeviceLost(decline)) => {
-            guard.on_device_lost();
-            Err(DrawError::DeviceLost(decline))
-        }
-        Err(e) => Err(e),
-    }
-}
-
 /// Submit any open deferred draw batch (draw batching increment 1). Called at
 /// the end of every drain tranche so batched work never idles unsubmitted
 /// while the worker sleeps; every in-engine consumer path (reads, compute,
@@ -2233,25 +2208,6 @@ pub fn render_target_layout_supported(layout: crate::contract::pixel_format::Tex
         return true;
     }
     device_capabilities().render_target_layout_supported(layout)
-}
-
-/// Resolve the host device before minting a capability-dependent render-target
-/// identity.
-///
-/// Wider target formats deliberately answer conservatively before a device is
-/// known. A producer that is about to retain such a target must establish the
-/// device first, or the same allocation can be keyed once at the conservative
-/// format and again at the supported one after its first submission.
-pub fn resolve_render_target_capabilities() -> Result<(), DrawError> {
-    let mut guard = lock_engine();
-    let EngineState {
-        ref mut owner,
-        ref mut pools,
-        ref counters,
-        ..
-    } = &mut *guard;
-    let ctx = owner.ensure(counters)?;
-    unsafe { pools.ensure_init(ctx, counters) }
 }
 
 pub fn deferred_gpu_only_content_allowed() -> bool {
