@@ -484,6 +484,42 @@ mod tests {
         }
     }
 
+    /// The advertised chord must be the one the recogniser actually accepts.
+    ///
+    /// `UNGRAB_CHORD` is what the operator is told — on stderr and in the
+    /// `window_capture_engaged` census line — at the moment their desktop
+    /// shortcuts stop working. If the string and the recogniser ever disagreed,
+    /// the operator would be holding a keyboard grab with printed instructions
+    /// that do not release it. This drives the recogniser with exactly the keys
+    /// the string names, so the two cannot drift.
+    #[test]
+    fn the_advertised_chord_is_the_one_that_releases() {
+        let named: Vec<&str> = UNGRAB_CHORD.split('+').collect();
+        assert_eq!(named, vec!["Ctrl", "Alt", "Esc"], "chord spelling changed");
+
+        let code = |part: &str| match part {
+            "Ctrl" => key::LEFTCTRL,
+            "Alt" => key::LEFTALT,
+            "Esc" => key::ESC,
+            other => panic!("no evdev code wired for advertised chord part {other:?}"),
+        };
+        let mut kb = Keyboard::new();
+        kb.focus(true);
+        assert!(kb.is_grabbed());
+        // Press exactly what the advertised string names, in the order it names
+        // them; the last one must be what releases the grab.
+        let mut effect = KeyEffect::nothing();
+        for part in &named {
+            effect = kb.key(code(part), true);
+        }
+        assert_eq!(
+            effect.grab,
+            Some(Grab::Released),
+            "pressing the advertised chord {UNGRAB_CHORD} must release the grab"
+        );
+        assert!(!kb.is_grabbed());
+    }
+
     /// The guest's own Force Quit (Cmd+Option+Esc, pressed on the host as
     /// Meta+Alt+Esc) carries no Ctrl, so it is not the ungrab chord and must
     /// reach the guest whole — including while the grab is held, which is

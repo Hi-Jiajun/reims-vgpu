@@ -125,6 +125,11 @@ impl Decline for CaptureMode {
 /// that builds its capture and is then never focused logs exactly what a working
 /// capture logs, and the operator's real question — "did the guest ever get my
 /// Cmd key" — is answered by neither the mode line nor the silence after it.
+///
+/// The line carries the release chord because this is the moment the operator's
+/// desktop shortcuts stop working. A grab whose escape hatch is documented only
+/// in this crate's source is a grab the operator cannot get out of, so the
+/// chord is emitted where they are already looking rather than left to be found.
 pub struct CaptureEngaged(pub &'static str);
 
 impl Decline for CaptureEngaged {
@@ -133,7 +138,12 @@ impl Decline for CaptureEngaged {
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
-        vec![("mechanism", self.0.to_string())]
+        vec![
+            ("mechanism", self.0.to_string()),
+            // Read from the constant the recogniser itself uses, so the message
+            // and the chord that actually works cannot drift apart.
+            ("release", super::keyboard::UNGRAB_CHORD.to_string()),
+        ]
     }
 }
 

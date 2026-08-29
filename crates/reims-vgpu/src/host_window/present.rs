@@ -1179,6 +1179,16 @@ impl App {
                     &CaptureEngaged(mechanism),
                 )
                 .off();
+                // Also on stderr, once. This is the instant the operator's own
+                // desktop shortcuts stop working; the fail log is the wrong
+                // place to learn how to get them back, because reading it is
+                // itself a thing you need a working desktop to do.
+                eprintln!(
+                    "reims-vgpu-window: keyboard captured ({mechanism}) — \
+                     the guest now receives Cmd/Alt/Super chords. \
+                     Press {} to release it.",
+                    super::keyboard::UNGRAB_CHORD
+                );
             }
             Ok(()) => {}
         }
