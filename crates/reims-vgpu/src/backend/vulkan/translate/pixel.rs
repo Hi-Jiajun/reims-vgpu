@@ -22,7 +22,7 @@
 use ash::vk;
 
 use super::reason::TranslateReason;
-use crate::backend::vulkan::engine::StorageImageFormat;
+use crate::backend::vulkan::engine::{ColorAttachmentState, ColorClearValue, StorageImageFormat};
 use crate::contract::pixel_format::{
     self, SampledByteFormat, StorageImageSelector, SwizzlePlan, SwizzleSource, TexelLayout,
     COMPONENT_A, COMPONENT_B, COMPONENT_G, COMPONENT_R,
@@ -57,6 +57,33 @@ pub struct PixelFormat {
     /// non-identity only where the Vulkan 1.2 baseline has no equivalent
     /// format (see `A8Unorm`).
     pub components: SwizzlePlan,
+}
+
+/// A colour-renderable Metal format translated together with the numeric type
+/// its clear value must use.
+///
+/// Vulkan keeps the image format and clear union member in separate API
+/// objects, but they are one contract decision. Carrying them together keeps
+/// an integer attachment from being created correctly and then cleared through
+/// the float member later in command emission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColorAttachmentFormat {
+    pub vk: vk::Format,
+    numeric: pixel_format::ColorNumericType,
+}
+
+impl ColorAttachmentFormat {
+    /// Lower Metal's double-precision clear carrier using this attachment's
+    /// declared numeric interpretation.
+    pub fn clear_value(self, components: [f64; 4]) -> ColorClearValue {
+        ColorClearValue::from_components(self.numeric, components)
+    }
+
+    /// Bind this format to its clear value without exposing two independently
+    /// mutable fields to the engine request.
+    pub fn with_clear(self, components: [f64; 4]) -> ColorAttachmentState {
+        ColorAttachmentState::new(self.vk, self.clear_value(components))
+    }
 }
 
 impl PixelFormat {
@@ -638,12 +665,11 @@ pub fn has_bgra_order(format: vk::Format) -> bool {
 /// commit can half-land.
 pub fn color_attachment(
     mtl: u16,
-) -> Result<(vk::Format, Option<TranslateReason>), TranslateReason> {
+) -> Result<(ColorAttachmentFormat, Option<TranslateReason>), TranslateReason> {
     let f = translate(mtl)?;
-    if pixel_format::render_target_bpp(mtl).is_none() {
-        return Err(TranslateReason::NoColorAttachmentFormat(mtl));
-    }
-    Ok((f.vk, None))
+    let numeric = pixel_format::render_target_numeric_type(mtl)
+        .ok_or(TranslateReason::NoColorAttachmentFormat(mtl))?;
+    Ok((ColorAttachmentFormat { vk: f.vk, numeric }, None))
 }
 
 /// The engine's storage-image format for a contract [`StorageImageSelector`].
@@ -1679,7 +1705,7 @@ mod tests {
 
             let (format, decline) = color_attachment(mtl).unwrap();
             assert!(matches!(
-                format,
+                format.vk,
                 vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
             ));
             assert_eq!(decline, None, "colour attachment must preserve sRGB");
@@ -1873,7 +1899,7 @@ mod tests {
             let Ok((attachment, _)) = color_attachment(mtl) else {
                 continue;
             };
-            let allocation = ResidentFormat::of(attachment).allocation();
+            let allocation = ResidentFormat::of(attachment.vk).allocation();
             assert!(
                 texel_layout_of(allocation).is_some(),
                 "renderable {mtl:#x} allocates as {allocation:?}, which no \
@@ -1930,11 +1956,11 @@ mod tests {
             TexelLayout::Rgba8
         );
         assert_eq!(
-            color_attachment(p::MTL_FORMAT_BGRA8_UNORM_SRGB).unwrap().0,
+            color_attachment(p::MTL_FORMAT_BGRA8_UNORM_SRGB).unwrap().0.vk,
             vk::Format::B8G8R8A8_SRGB
         );
         assert_eq!(
-            color_attachment(p::MTL_FORMAT_RGBA8_UNORM_SRGB).unwrap().0,
+            color_attachment(p::MTL_FORMAT_RGBA8_UNORM_SRGB).unwrap().0.vk,
             vk::Format::R8G8B8A8_SRGB
         );
         // …and each one hands back the decline that loss owes, so the hold is
@@ -1972,9 +1998,15 @@ mod tests {
     /// would silently start quantizing a count into a fraction.
     #[test]
     fn an_integer_colour_attachment_is_served_by_the_native_rail_only() {
-        let (format, decline) = color_attachment(p::MTL_FORMAT_RG16_UINT).unwrap();
+        let (attachment, decline) = color_attachment(p::MTL_FORMAT_RG16_UINT).unwrap();
+        let format = attachment.vk;
         assert_eq!(format, vk::Format::R16G16_UINT);
         assert_eq!(decline, None);
+        assert_eq!(
+            attachment.clear_value([1.0, 2.0, 65_535.0, 0.0]),
+            ColorClearValue::Uint([1, 2, 65_535, 0]),
+            "the clear is a numeric conversion, not the float bit pattern"
+        );
         assert_eq!(bytes_per_texel(format), Some(p::RG16_BPP));
         // Its own Vulkan format, distinct from the sibling it shares bytes
         // with: one format for both would read every texel as a fraction of
@@ -2004,6 +2036,15 @@ mod tests {
             &mut back
         ));
         assert!(!p::solid_color_reaches_texel(p::MTL_FORMAT_RG16_UINT));
+    }
+
+    #[test]
+    fn continuous_colour_attachments_keep_semantic_float_clears() {
+        let attachment = color_attachment(p::MTL_FORMAT_BGRA8_UNORM_SRGB).unwrap().0;
+        assert_eq!(
+            attachment.clear_value([0.25, 0.5, 0.75, 1.0]),
+            ColorClearValue::Float([0.25, 0.5, 0.75, 1.0])
+        );
     }
 
     /// The engine rails carry exactly the layouts they are built for, and the
@@ -2397,7 +2438,7 @@ mod tests {
             if !admitted {
                 continue;
             }
-            let format = color_attachment(mtl).unwrap().0;
+            let format = color_attachment(mtl).unwrap().0.vk;
             // Readback moves stored texels and therefore reasons about the
             // linear sibling's byte layout; an sRGB image view changes the
             // shader conversion, not those bytes.

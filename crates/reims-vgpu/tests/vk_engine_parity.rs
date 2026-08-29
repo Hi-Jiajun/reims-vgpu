@@ -10,10 +10,11 @@
 
 use metal2vulkan::passes::Stage;
 use reims_vgpu::backend::vulkan::engine::{
-    self, BlendFactor, BlendOp, BlendStateResource, BufferContent, CullMode, DepthState, DrawRequest,
-    IndexType, IndexedDrawResource, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
-    SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
-    StencilFaceOps, StencilOp, StencilState, StorageBufferResource, TargetIdentity,
+    self, BlendFactor, BlendOp, BlendStateResource, BufferContent, CullMode, DepthState,
+    DrawRequest, IndexType, IndexedDrawResource, PrimitiveTopology,
+    SampledContentIdentity, SampledImageResource, SampledSource, SamplerCompareFunction,
+    SamplerResource, ScissorResource, SecondaryColorTarget, StencilFaceOps, StencilOp, StencilState,
+    StorageBufferResource, TargetIdentity,
     VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
     VisibilityResultMode, MAX_DEVICE_RECREATES,
 };
@@ -25,6 +26,16 @@ use reims_vgpu::backend::vulkan::engine::{
 /// place and makes a test that wants a different format say so.
 const SURFACE_TEST_FORMAT: ash::vk::Format =
     reims_vgpu::backend::vulkan::translate::pixel::SCANOUT_FORMAT;
+
+fn color_attachment(
+    format: u16,
+    clear: [f64; 4],
+) -> reims_vgpu::backend::vulkan::engine::ColorAttachmentState {
+    reims_vgpu::backend::vulkan::translate::pixel::color_attachment(format)
+        .expect("test attachment format is renderable")
+        .0
+        .with_clear(clear)
+}
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -3459,8 +3470,10 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
         identity: secondary.clone(),
         width: 16,
         height: 16,
-        format: ash::vk::Format::R8G8B8A8_UNORM,
-        clear: [0.0, 0.0, 1.0, 1.0],
+        attachment: color_attachment(
+            reims_vgpu::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+            [0.0, 0.0, 1.0, 1.0],
+        ),
         load: false,
         // Unblended: this parity case checks the attachment is written at
         // all, not how it composites.
@@ -3550,8 +3563,10 @@ fn mrt_rg16float_secondary_builds_and_renders() {
         identity: mask.clone(),
         width: 32,
         height: 32,
-        format: ash::vk::Format::R16G16_SFLOAT,
-        clear: [1.0, 0.5, 0.0, 0.0],
+        attachment: color_attachment(
+            reims_vgpu::contract::pixel_format::MTL_FORMAT_RG16_FLOAT,
+            [1.0, 0.5, 0.0, 0.0],
+        ),
         load: false,
         // Unblended: this is the vibrancy coverage-mask shape, and a mask is a
         // raw store. Which is exactly why every secondary used to be forced
@@ -3617,8 +3632,10 @@ fn depth_and_mrt_secondary_render_in_one_pass() {
             identity: secondary.clone(),
             width: w,
             height: h,
-            format: ash::vk::Format::R8G8B8A8_UNORM,
-            clear: [0.0, 0.0, 1.0, 1.0],
+            attachment: color_attachment(
+                reims_vgpu::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+                [0.0, 0.0, 1.0, 1.0],
+            ),
             load: false,
             blend: None,
             color_write_mask: Default::default(),

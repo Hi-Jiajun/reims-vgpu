@@ -1959,23 +1959,35 @@ pub fn storage_selector(format: u16) -> Option<StorageImageSelector> {
 /// and conflating the two is what made a missing width read as a missing
 /// capability.
 pub fn render_target_bpp(format: u16) -> Option<u32> {
-    if !is_render_target_format(format) {
-        return None;
-    }
+    render_target_numeric_type(format)?;
     // Every admitted member has a width, because admission is a strictly
     // smaller set than the width table. A member without one is a bug in this
     // list rather than a format to refuse quietly.
     bytes_per_pixel(format)
 }
 
-/// Whether this device will serve `format` as a colour render target.
+/// The numeric interpretation of a colour render target's channels.
 ///
-/// The admission set [`render_target_bpp`]'s doc argues for, spelled once so the
-/// width and the capability cannot drift apart. Adding a member here is the
-/// three-conversion commitment that doc describes, not a table entry.
-fn is_render_target_format(format: u16) -> bool {
-    matches!(
-        format,
+/// This is also the admission set [`render_target_bpp`]'s doc argues for. A
+/// caller cannot learn that a format is renderable without also learning which
+/// numeric class its clear value and fragment output use, so an integer member
+/// cannot accidentally inherit the continuous-colour representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorNumericType {
+    Float,
+    Uint,
+    Sint,
+}
+
+/// Return the numeric type for every colour render target this device serves.
+///
+/// Adding a member here is the three-conversion commitment
+/// [`render_target_bpp`] describes, not just a table entry. The return value is
+/// deliberately richer than a boolean: Vulkan clear values are a union, and
+/// choosing its float member for a `Uint` attachment reinterprets `1.0` as the
+/// integer bit pattern `1065353216`.
+pub fn render_target_numeric_type(format: u16) -> Option<ColorNumericType> {
+    Some(match format {
         MTL_FORMAT_RGBA8_UNORM
             | MTL_FORMAT_RGBA8_UNORM_SRGB
             | MTL_FORMAT_BGRA8_UNORM
@@ -1984,9 +1996,10 @@ fn is_render_target_format(format: u16) -> bool {
             | MTL_FORMAT_RG16_FLOAT
             | MTL_FORMAT_R16_FLOAT
             | MTL_FORMAT_R8_UNORM
-            | MTL_FORMAT_BGR10A2_UNORM
-            | MTL_FORMAT_RG16_UINT
-    )
+            | MTL_FORMAT_BGR10A2_UNORM => ColorNumericType::Float,
+        MTL_FORMAT_RG16_UINT => ColorNumericType::Uint,
+        _ => return None,
+    })
 }
 
 /// The texel layout a render Store's destination stores its texels in, or

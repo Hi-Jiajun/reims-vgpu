@@ -6182,15 +6182,15 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
         // Unknown wire format stays unknown — never guess a secondary layout —
         // and a known format whose sRGB qualifier this attachment cannot carry
         // says so instead of folding silently.
-        let format = match translate::pixel::color_attachment(c.format) {
-            Ok((format, decline)) => {
+        let attachment = match translate::pixel::color_attachment(c.format) {
+            Ok((attachment, decline)) => {
                 if decline.is_some() {
                     srgb_census::note_downgrade(
                         srgb_census::site::SECONDARY_COLOR_TARGET,
                         c.format,
                     );
                 }
-                format
+                attachment
             }
             Err(_) => {
                 crate::runtime::census::present_proxy::note_secondary_mrt_drop(
@@ -6204,6 +6204,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
                 });
             }
         };
+        let format = attachment.vk;
         // Identity mirrors the primary namespaces: type-2/3 linear GVA, else
         // type-11 surface.
         //
@@ -6333,12 +6334,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
             // becomes a clear over live content.
             super::note_load_action_dont_care(pipeline.object_id, c.width, c.height);
         }
-        let clear = [
-            c.clear_color[0] as f32,
-            c.clear_color[1] as f32,
-            c.clear_color[2] as f32,
-            c.clear_color[3] as f32,
-        ];
+        let attachment = attachment.with_clear(c.clear_color);
         // This slot's own blend, resolved exactly as the Metal arm resolves it:
         // find the pipeline's attachment entry for this Metal slot. No
         // `or_else(first())` fallback here — the Metal path has one for its
@@ -6378,8 +6374,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
             identity,
             width: c.width,
             height: c.height,
-            format,
-            clear,
+            attachment,
             load,
             blend,
             color_write_mask,
@@ -7259,7 +7254,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                             .and_then(|color| {
                                                 translate::pixel::color_attachment(color.format)
                                                     .ok()
-                                                    .map(|resolved| resolved.0)
+                                                    .map(|resolved| resolved.0.vk)
                                             })
                                             .unwrap_or_else(|| identity.resident_format()),
                                     ),
@@ -7752,7 +7747,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // does it, which is what `MTLLoadActionClear` asks for.
         let mut target_rgba8: Option<std::sync::Arc<Vec<u8>>> = None;
         let mut target_guest_seed = None;
-        let mut target_clear = [0.0f32; 4];
+        let mut target_clear = [0.0f64; 4];
         let mut seed_order = crate::backend::vulkan::engine::SeedOrder::Rgba8;
         let gpu_only_content_allowed =
             crate::backend::vulkan::engine::deferred_gpu_only_content_allowed();
@@ -7981,12 +7976,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // what the guest asked for, and would spend an allocation, a
                     // channel exchange and a staged upload writing one constant
                     // into every texel.
-                    target_clear = [
-                        c0.clear_color[0] as f32,
-                        c0.clear_color[1] as f32,
-                        c0.clear_color[2] as f32,
-                        c0.clear_color[3] as f32,
-                    ];
+                    target_clear = c0.clear_color;
                 }
                 LoadAction::Load | LoadAction::DontCare => {
                     // Which door this pass took, so a pass that ends with no
@@ -8293,7 +8283,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             .unwrap_or(true);
         resources.target_rgba8 = target_rgba8;
         resources.target_guest_seed = target_guest_seed;
-        resources.target_clear = target_clear;
         resources.target_seed_order = seed_order;
         // A Store reads back; anything else skips it.
         //
@@ -8954,15 +8943,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         resources.height = h;
         resources.vertex_count = vertex_count;
         if let Some(c0) = req.colors.first() {
-            resources.color_attachment_format = Some(
-                translate::pixel::color_attachment(c0.format)
-                    .map_err(|reason| {
-                        DrawError::Unsupported(
-                            crate::backend::vulkan::engine::reason::DrawReason::ColorAttachmentFormat(reason),
-                        )
-                    })?
-                    .0,
-            );
+            let (attachment, _) = translate::pixel::color_attachment(c0.format).map_err(|reason| {
+                DrawError::Unsupported(
+                    crate::backend::vulkan::engine::reason::DrawReason::ColorAttachmentFormat(reason),
+                )
+            })?;
+            resources.color_attachment = Some(attachment.with_clear(target_clear));
         }
         // Attachment-count census, taken before the MRT gate rather than inside
         // it. `build_secondary_targets` returns empty for a single-attachment
@@ -10049,7 +10035,7 @@ pub(crate) fn gva_resident_format(format: u16) -> ash::vk::Format {
     let Ok((attachment, _)) = pixel::color_attachment(format) else {
         return pixel::RESIDENT_RGBA_FORMAT;
     };
-    let allocation = pixel::ResidentFormat::of(attachment).allocation();
+    let allocation = pixel::ResidentFormat::of(attachment.vk).allocation();
     match pixel::texel_layout_of(allocation) {
         // Capability, never an API-version assumption: the host is asked whether
         // it renders to and blends this layout.

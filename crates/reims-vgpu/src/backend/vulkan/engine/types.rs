@@ -371,6 +371,76 @@ impl PipelineObjectIdentity {
     }
 }
 
+/// A colour-attachment clear after the attachment's numeric type is known.
+///
+/// Vulkan represents these three cases as members of a union. Keeping a bare
+/// `[f32; 4]` in [`DrawRequest`] lets an integer attachment reach the float
+/// member and turns the float's bits into an integer value. This enum makes
+/// that mismatch unrepresentable at the engine boundary: translation chooses
+/// the variant from the decoded pixel format, and execution only lowers it to
+/// the corresponding Vulkan union member.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ColorClearValue {
+    Float([f32; 4]),
+    Uint([u32; 4]),
+    Sint([i32; 4]),
+}
+
+impl ColorClearValue {
+    /// Convert Metal's double-precision component carrier according to the
+    /// attachment's declared numeric type.
+    pub(crate) fn from_components(
+        numeric: crate::contract::pixel_format::ColorNumericType,
+        components: [f64; 4],
+    ) -> Self {
+        use crate::contract::pixel_format::ColorNumericType;
+        match numeric {
+            ColorNumericType::Float => Self::Float(components.map(|v| v as f32)),
+            ColorNumericType::Uint => Self::Uint(components.map(|v| v as u32)),
+            ColorNumericType::Sint => Self::Sint(components.map(|v| v as i32)),
+        }
+    }
+
+    pub(crate) fn vk(self) -> vk::ClearColorValue {
+        match self {
+            Self::Float(float32) => vk::ClearColorValue { float32 },
+            Self::Uint(uint32) => vk::ClearColorValue { uint32 },
+            Self::Sint(int32) => vk::ClearColorValue { int32 },
+        }
+    }
+}
+
+impl Default for ColorClearValue {
+    fn default() -> Self {
+        Self::Float([0.0; 4])
+    }
+}
+
+/// One colour attachment's format and clear value as a single engine input.
+///
+/// Fields are private because the pair is constructed by pixel-format
+/// translation. This prevents a request from pairing an integer image format
+/// with a float clear (or the reverse) after translation chose them together.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColorAttachmentState {
+    format: vk::Format,
+    clear: ColorClearValue,
+}
+
+impl ColorAttachmentState {
+    pub(crate) fn new(format: vk::Format, clear: ColorClearValue) -> Self {
+        Self { format, clear }
+    }
+
+    pub fn format(self) -> vk::Format {
+        self.format
+    }
+
+    pub(crate) fn clear(self) -> ColorClearValue {
+        self.clear
+    }
+}
+
 /// Inputs for one offscreen draw. Engine receives resolved bytes + post-reloc SPIR-V only.
 #[derive(Debug, Default)]
 pub struct DrawRequest {
@@ -460,13 +530,16 @@ pub struct DrawRequest {
     pub color_write_mask: ColorWriteMask,
     /// Protocol-derived target identity for GPU residency (workstream D).
     pub target_identity: Option<TargetIdentity>,
-    /// Format of colour attachment zero's texture view.
+    /// Format and clear value of colour attachment zero's texture view.
     ///
     /// This can differ from [`TargetIdentity::resident_format`] without naming
     /// another allocation. Metal texture views over one surface commonly use
     /// the linear and sRGB members of one format-compatibility class; Vulkan
-    /// represents that distinction on the image view and render pass.
-    pub color_attachment_format: Option<vk::Format>,
+    /// represents that distinction on the image view and render pass. The
+    /// paired clear keeps continuous and normalized formats as semantic floats,
+    /// while integer formats carry integer values rather than float bit
+    /// patterns. `None` means the ordinary format fallback and a zero clear.
+    pub color_attachment: Option<ColorAttachmentState>,
     /// Stable shared allocation that may back the primary resident image
     /// directly.
     ///
@@ -489,28 +562,10 @@ pub struct DrawRequest {
     /// seeding the attachment from the CPU. Requires that resident to exist.
     ///
     /// This, [`Self::target_rgba8`], [`Self::target_guest_seed`] and
-    /// [`DrawRequest::target_clear`] are the whole load action, and they are
+    /// [`DrawRequest::color_attachment`] are the whole load action, and they are
     /// ordered: `load_from_target` wins, else exactly one seed is copied, else
-    /// the attachment clears to `target_clear`.
+    /// the attachment clears to [`Self::color_attachment`]'s value.
     pub load_from_target: bool,
-    /// Clear value for the primary colour attachment, in semantic float
-    /// channels — the same shape [`SecondaryColorTarget::clear`] has carried all
-    /// along, and consulted only when the pass resolves to `loadOp = CLEAR`.
-    ///
-    /// This used to not exist. The primary's `VkClearValue` was `[0, 0, 0, 0]`
-    /// unconditionally, so a `MTLLoadActionClear` with a colour could not be
-    /// expressed — and the runtime met the contract by allocating a
-    /// whole-attachment RGBA8 bitmap of that solid colour on the CPU, handing it
-    /// over as `target_rgba8`, and paying a channel exchange and a staged upload
-    /// to put a constant into every texel. That also forced the pass key to a
-    /// LOAD pass, because a present seed is what `load_seed` means, so a draw
-    /// that asked to discard its attachment loaded it instead.
-    ///
-    /// Floats rather than the unorm8 the seed quantised to, which is what the
-    /// contract says: an sRGB attachment takes its clear in linear space and the
-    /// driver encodes it, where the byte path wrote pre-quantised values past
-    /// the encode entirely.
-    pub target_clear: [f32; 4],
     /// When true, skip full-frame readback (non-Store / ticket path). Content
     /// remains on the GPU under `target_identity` when provided.
     pub skip_readback: bool,
@@ -702,15 +757,13 @@ pub struct SecondaryColorTarget {
     pub identity: TargetIdentity,
     pub width: u32,
     pub height: u32,
-    /// Attachment format, already resolved from the guest's `MTLPixelFormat` by
-    /// `translate::pixel::color_attachment`. A real `VkFormat` rather than a
-    /// three-way enum, so the render pass, the pipeline key and the image agree
-    /// by construction and an sRGB attachment is expressible the day the rail
-    /// flips.
-    pub format: vk::Format,
-    /// Clear value used when `load` is false (semantic float channels).
-    pub clear: [f32; 4],
-    /// true ⇒ LOAD the existing resident content; false ⇒ CLEAR to `clear`.
+    /// Attachment format and clear, resolved together from the guest's
+    /// `MTLPixelFormat` by `translate::pixel::color_attachment`. Keeping the
+    /// pair opaque makes the render pass, image and Vulkan clear union member
+    /// agree by construction.
+    pub attachment: ColorAttachmentState,
+    /// true ⇒ LOAD the existing resident content; false ⇒ CLEAR to this
+    /// attachment's paired clear value.
     pub load: bool,
     /// This slot's own blend state, from the pipeline's per-attachment blend
     /// descriptor. `None` ⇒ the slot writes unblended.
@@ -2279,8 +2332,10 @@ mod tests {
             identity: surface(2),
             width: 64,
             height: 64,
-            format: vk::Format::B8G8R8A8_UNORM,
-            clear: [0.0; 4],
+            attachment: ColorAttachmentState::new(
+                vk::Format::B8G8R8A8_UNORM,
+                ColorClearValue::default(),
+            ),
             load: false,
             blend: None,
             color_write_mask: ColorWriteMask::default(),

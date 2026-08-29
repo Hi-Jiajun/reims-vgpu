@@ -61,8 +61,9 @@ pub(crate) use facade_decline::EngineFacadeDecline;
 pub(crate) use host_ram::GuestWriteDecline;
 pub use types::viewport_slot_count;
 pub use types::{
-    BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask, ComputeBufferResource,
-    ComputeOutput, ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource,
+    BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorAttachmentState, ColorClearValue,
+    ColorWriteMask, ComputeBufferResource, ComputeOutput, ComputeRequest, ComputeResidentSampleBind,
+    ComputeSampledImageResource,
     ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
     DrawError, DrawOutput, DrawRequest, FillMode, GuestRun, GuestRunSource, GuestSampledBacking,
     GuestTargetBacking, GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource,
@@ -4811,7 +4812,8 @@ mod resident_read_order_tests {
         ] {
             let attachment = pixel::color_attachment(format)
                 .expect("a renderable eight-bit format")
-                .0;
+                .0
+                .vk;
             let readback = TargetReadback {
                 pixels: stored.clone(),
                 texel: ReadbackTexel::eight_bit(snapshot(attachment).bgra()),
