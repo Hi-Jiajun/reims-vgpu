@@ -4138,42 +4138,80 @@ fn land_chain_before_abandon<M: HostMemory + HostOps>(
     dirty_color_targets(state, host, task_id, &acc.color_targets);
 }
 
+/// Where a clear-only pass publishes its single-sample result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClearPublish {
+    /// Publish into the attachment's own texture, exactly as declared.
+    Direct,
+    /// Publish into the resolve texture instead of the multisample one.
+    Resolved(u32),
+    /// This store action publishes no single-sample result, or there is no
+    /// attachment texture at all. Not a loss: the guest asked for nothing.
+    NotPublished,
+    /// A resolve-carrying store action naming no resolve texture. The guest
+    /// asked for a resolve and gave nowhere to put it.
+    ResolveTargetMissing,
+}
+
+/// Which texture a clear-only pass's colour attachment publishes into.
+///
+/// `MTLLoadActionClear` with no draws leaves **every sample** of the attachment
+/// holding `clearColor`, so resolving those samples yields exactly `clearColor`.
+/// Both resolve-carrying store actions therefore publish the same single-sample
+/// result, into `resolveTexture`, and they differ only in whether the
+/// multisample texture is *also* retained — which is not the surface this path
+/// publishes and not one the guest scans out.
+///
+/// That is why `MTLStoreActionStoreAndMultisampleResolve` is handled here rather
+/// than refused. It used to be refused by name while the code immediately below
+/// already did the right thing for its sibling: retarget the write to
+/// `resolveTexture`. On a driven macos-13 app sweep that refusal fired 27 times
+/// on one attachment pair, each one a clear the guest asked for and did not get.
+fn clear_publish_target(att: &ColorAttachment) -> ClearPublish {
+    if att.texture_ref == 0 || !store_action_publishes_single_sample(att.store_action) {
+        return ClearPublish::NotPublished;
+    }
+    let resolves = matches!(
+        att.store_action,
+        MTL_STORE_ACTION_MULTISAMPLE_RESOLVE | MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE
+    );
+    if resolves {
+        if att.resolve_texture_ref == 0 {
+            return ClearPublish::ResolveTargetMissing;
+        }
+        return ClearPublish::Resolved(att.resolve_texture_ref);
+    }
+    ClearPublish::Direct
+}
+
 fn apply_clear<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     att: &ColorAttachment,
 ) -> bool {
-    if att.texture_ref == 0 || !store_action_publishes_single_sample(att.store_action) {
-        return false;
-    }
-    if att.store_action == MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE {
-        crate::observe::fail(format!(
-            "render_clear reason=clear_store_and_multisample_resolve_unsupported \
-             source={} resolve={}",
-            att.texture_ref, att.resolve_texture_ref
-        ));
-        return false;
-    }
-    if att.store_action == MTL_STORE_ACTION_MULTISAMPLE_RESOLVE
-        && att.resolve_texture_ref == 0
-    {
-        crate::observe::fail(format!(
-            "render_clear reason=clear_multisample_resolve_target_missing source={}",
-            att.texture_ref
-        ));
-        return false;
-    }
-    let target = if att.resolve_texture_ref != 0 {
-        ColorAttachment {
-            texture_ref: att.resolve_texture_ref,
+    let target = match clear_publish_target(att) {
+        // Declared single-sample: published exactly as the guest stated it,
+        // level and all.
+        ClearPublish::Direct => *att,
+        // A resolve: the clear lands in the resolve texture as an ordinary
+        // single-sample store. Level zero because a resolve target has one.
+        ClearPublish::Resolved(texture_ref) => ColorAttachment {
+            texture_ref,
             resolve_texture_ref: 0,
             level: 0,
             store_action: MTL_STORE_ACTION_STORE,
             ..*att
+        },
+        ClearPublish::NotPublished => return false,
+        ClearPublish::ResolveTargetMissing => {
+            crate::observe::fail(format!(
+                "render_clear reason=clear_multisample_resolve_target_missing source={} \
+                 store={}",
+                att.texture_ref, att.store_action
+            ));
+            return false;
         }
-    } else {
-        *att
     };
     // Prefer full draw-path resolve (type-11 or type-2/3 GVA wallpaper targets).
     let Some(req) =

@@ -4999,3 +4999,78 @@ fn a_clear_seeds_the_pass_for_any_store_action_and_publishes_only_for_store() {
          guest pages would be inventing content the guest declined"
     );
 }
+
+/// A clear-only pass publishes through its resolve texture for **both**
+/// resolve-carrying store actions, not just one of them.
+///
+/// `MTLLoadActionClear` with no draws leaves every sample holding `clearColor`,
+/// so resolving those samples yields exactly `clearColor`. That makes
+/// `StoreAndMultisampleResolve` and `MultisampleResolve` identical in what they
+/// publish to the single-sample surface the guest scans out; they differ only in
+/// whether the multisample texture is additionally retained, which this path
+/// does not publish and the guest does not scan out.
+///
+/// `StoreAndMultisampleResolve` used to be refused by name immediately above the
+/// code that already retargeted its sibling correctly, so the clear was dropped.
+/// A driven macos-13 app sweep fired that refusal 27 times on one attachment
+/// pair (`source=4 resolve=3`) — each one a clear the guest asked for and did
+/// not get, on the only rail that still lands a pass clear in guest memory.
+#[test]
+fn a_clear_publishes_through_the_resolve_texture_for_both_resolving_store_actions() {
+    use crate::contract::pass_action::{
+        MTL_STORE_ACTION_DONT_CARE, MTL_STORE_ACTION_MULTISAMPLE_RESOLVE,
+        MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
+    };
+
+    let att = |store: u16, texture_ref: u32, resolve_texture_ref: u32| ColorAttachment {
+        texture_ref,
+        resolve_texture_ref,
+        store_action: store,
+        load_action: MTL_LOAD_ACTION_CLEAR,
+        ..Default::default()
+    };
+
+    // The pair the sweep actually sent.
+    assert_eq!(
+        clear_publish_target(&att(MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE, 4, 3)),
+        ClearPublish::Resolved(3),
+        "a store-and-resolve clear publishes into its resolve texture"
+    );
+    assert_eq!(
+        clear_publish_target(&att(MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, 4, 3)),
+        ClearPublish::Resolved(3),
+        "its sibling has always published there, and the two must agree"
+    );
+
+    // A plain single-sample store keeps the attachment the guest declared,
+    // level and all — it is not retargeted.
+    assert_eq!(
+        clear_publish_target(&att(MTL_STORE_ACTION_STORE, 4, 0)),
+        ClearPublish::Direct
+    );
+
+    // A resolve with nowhere to resolve into is still a named refusal, for both
+    // actions. This is the half that must NOT be lost by admitting the pair
+    // above.
+    for store in [
+        MTL_STORE_ACTION_MULTISAMPLE_RESOLVE,
+        MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
+    ] {
+        assert_eq!(
+            clear_publish_target(&att(store, 4, 0)),
+            ClearPublish::ResolveTargetMissing,
+            "a resolve naming no resolve texture has nowhere to publish"
+        );
+    }
+
+    // Nothing to publish: an action that keeps no single sample, and no
+    // attachment at all. Neither is a loss.
+    assert_eq!(
+        clear_publish_target(&att(MTL_STORE_ACTION_DONT_CARE, 4, 3)),
+        ClearPublish::NotPublished
+    );
+    assert_eq!(
+        clear_publish_target(&att(MTL_STORE_ACTION_STORE, 0, 0)),
+        ClearPublish::NotPublished
+    );
+}
