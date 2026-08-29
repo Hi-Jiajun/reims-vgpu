@@ -4230,6 +4230,26 @@ fn apply_clear<M: HostMemory + HostOps>(
         return false;
     };
     let c0 = req.colors.first().unwrap_or_else(|| unreachable!());
+    // Every rail below carries the clear colour as eight-bit RGBA, and a target
+    // whose texel cannot express that — an integer attachment, where a unorm8
+    // byte stands for no particular integer — would otherwise fail anonymously
+    // in the row converter two calls down and return a bare `false`.
+    //
+    // No admitted render target reaches this today: the same eight-bit
+    // obligation is what keeps an integer format out of
+    // `pixel_format::render_target_bpp` in the first place, and
+    // `the_renderable_set_is_one_answer_and_every_member_survives_both_rails`
+    // holds that. It is here so the assumption is a named refusal rather than
+    // an unwritten one, and so that the format admitted the day that rail is
+    // rebuilt cannot lose a clear silently on its way in.
+    if !crate::contract::pixel_format::solid_color_reaches_texel(c0.format) {
+        note_clear_dropped(
+            "target_texel_not_solid_expressible",
+            att.texture_ref,
+            "clear colour has no representation in the target's texel",
+        );
+        return false;
+    }
     let w = c0.width;
     let h = c0.height;
     let rgba = solid_rgba8(w, h, &att.clear_color);

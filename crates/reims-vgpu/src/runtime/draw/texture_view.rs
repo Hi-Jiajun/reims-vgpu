@@ -609,6 +609,12 @@ pub(crate) enum LinearLoadRefusal {
     /// guest's, and it is named rather than folded into a format refusal so the
     /// log says which face disagreed instead of reporting a format of zero that
     /// no guest ever sent.
+    ///
+    /// Carries the same gate as [`load_cube_faces`], its only constructor. The
+    /// cube loader is Vulkan-only, so without this the variant is dead on the
+    /// Metal arm — which `-D warnings` reports, and only on the arm a Linux
+    /// host has to cross-compile to see.
+    #[cfg(feature = "backend-vulkan")]
     CubeFaceLayoutMismatch { face: u32 },
 }
 
@@ -630,6 +636,7 @@ impl crate::observe::Decline for LinearLoadRefusal {
             Self::TightImageUnreadable => "linear_load_tight_image_unreadable",
             Self::PaddedRowUnreadable { .. } => "linear_load_padded_row_unreadable",
             Self::RowConvertUnsupported { .. } => "linear_load_row_convert_unsupported",
+            #[cfg(feature = "backend-vulkan")]
             Self::CubeFaceLayoutMismatch { .. } => "linear_load_cube_face_layout_mismatch",
         }
     }
@@ -653,6 +660,7 @@ impl crate::observe::Decline for LinearLoadRefusal {
                 vec![("end", end.to_string()), ("alloc", allocation.to_string())]
             }
             Self::PaddedRowUnreadable { row } => vec![("row", row.to_string())],
+            #[cfg(feature = "backend-vulkan")]
             Self::CubeFaceLayoutMismatch { face } => vec![("face", face.to_string())],
             _ => Vec::new(),
         }

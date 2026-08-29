@@ -4944,7 +4944,7 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
     rgba: &[u8],
     allowed: crate::runtime::gva_view::WindowPages<'_>,
 ) -> Result<(), crate::runtime::host::MemError> {
-    write_gva_rows_within(
+    write_gva_frame_within(
         state,
         host,
         task_id,
@@ -4953,19 +4953,57 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
         height,
         bpr,
         format,
-        rgba,
+        FrameRows::Rgba8(rgba),
         allowed,
     )
 }
 
-/// The one full-image GVA writer. Every destination row has its own source
-/// row: the solid-colour variant that shared this body existed only for the
-/// eager CLEAR seed, which was this device's own invention and is gone.
+/// What a frame's source rows are, on their way into the guest's own pages.
+///
+/// A Store lands one of two things, and which one is not a property of the
+/// guest's destination — it is a property of what the resident held and whether
+/// the readback could narrow it. Naming both here is what lets the copying rail
+/// serve a destination whose texel has no eight-bit form at all: the RGBA8 arm
+/// converts per row, and the native arm is a memcpy because the bytes are
+/// already the destination's.
+///
+/// The native arm is only ever reached when the frame's layout and the
+/// destination's are the same layout — `store_texel_order`'s question, which the
+/// GPU-direct rail has always asked and the copying rail could not.
+pub(crate) enum FrameRows<'a> {
+    /// Semantic RGBA8, converted into the destination's texel one row at a time.
+    Rgba8(&'a [u8]),
+    /// Already the destination's texel, copied verbatim.
+    ///
+    /// Produced only by the Vulkan Store's readback, the one rail that can hand
+    /// back a resident's own texel. The Metal arm has no producer for it and the
+    /// writer below still has to name it.
+    #[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+    Native(&'a [u8]),
+}
+
+impl<'a> FrameRows<'a> {
+    fn bytes(&self) -> &'a [u8] {
+        match *self {
+            Self::Rgba8(b) | Self::Native(b) => b,
+        }
+    }
+
+    /// Bytes one source row occupies, which is the destination's tight row for
+    /// the native arm and always four bytes a texel for the RGBA8 one.
+    fn source_row_bytes(&self, width: u32, tight: u32) -> usize {
+        match self {
+            Self::Rgba8(_) => (width as usize).saturating_mul(RGBA8_BPP as usize),
+            Self::Native(_) => tight as usize,
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
-    reason = "the archive writer mirrors the target GVA and native row geometry"
+    reason = "mirrors the target GVA and native row geometry"
 )]
-fn write_gva_rows_within<M: HostMemory + HostOps>(
+pub(crate) fn write_gva_frame_within<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
@@ -4974,7 +5012,7 @@ fn write_gva_rows_within<M: HostMemory + HostOps>(
     height: u32,
     bpr: u32,
     format: u16,
-    rgba: &[u8],
+    frame: FrameRows<'_>,
     allowed: crate::runtime::gva_view::WindowPages<'_>,
 ) -> Result<(), crate::runtime::host::MemError> {
     use crate::runtime::host::MemError;
@@ -4987,10 +5025,10 @@ fn write_gva_rows_within<M: HostMemory + HostOps>(
     if bpr < tight {
         return Err(MemError::BadArgs);
     }
-    let rgba_row = (width as usize).saturating_mul(RGBA8_BPP as usize);
-    let src_stride = rgba_row;
-    let need = rgba_row.saturating_mul(height as usize);
-    if rgba.len() < need {
+    let src = frame.bytes();
+    let src_stride = frame.source_row_bytes(width, tight);
+    let need = src_stride.saturating_mul(height as usize);
+    if src.len() < need {
         return Err(MemError::BadArgs);
     }
     let span = (height as u64).saturating_mul(bpr as u64);
@@ -5007,40 +5045,60 @@ fn write_gva_rows_within<M: HostMemory + HostOps>(
         let mut res = Ok(());
         for y in 0..height as usize {
             let at = y * src_stride;
-            let src = &rgba[at..at + rgba_row];
-            if !pixel_format::convert_rgba8_to_row(format, src, width, &mut row) {
-                res = Err(MemError::BadArgs);
-                break;
-            }
+            let out_row: &[u8] = match frame {
+                FrameRows::Rgba8(rgba) => {
+                    if !pixel_format::convert_rgba8_to_row(
+                        format,
+                        &rgba[at..at + src_stride],
+                        width,
+                        &mut row,
+                    ) {
+                        res = Err(MemError::BadArgs);
+                        break;
+                    }
+                    &row
+                }
+                FrameRows::Native(native) => &native[at..at + src_stride],
+            };
             let off = y.saturating_mul(bpr as usize);
-            if off + row.len() > avail {
+            if off + out_row.len() > avail {
                 res = Err(MemError::RunOutOfRange);
                 break;
             }
             // SAFETY: map_fresh_span covers `span`.
             unsafe {
-                std::ptr::copy_nonoverlapping(row.as_ptr(), base.add(off), row.len());
+                std::ptr::copy_nonoverlapping(out_row.as_ptr(), base.add(off), out_row.len());
             }
         }
         crate::runtime::gva_view::unmap_fresh_span(host, span_map);
         return res;
     }
-    // Fragmented GVA: multi-import each converted row via `write_span_within`.
+    // Fragmented GVA: multi-import each row via `write_span_within`.
     for y in 0..height as usize {
         let at = y * src_stride;
-        let src = &rgba[at..at + rgba_row];
-        if !pixel_format::convert_rgba8_to_row(format, src, width, &mut row) {
-            return Err(MemError::BadArgs);
-        }
+        let out_row: &[u8] = match frame {
+            FrameRows::Rgba8(rgba) => {
+                if !pixel_format::convert_rgba8_to_row(
+                    format,
+                    &rgba[at..at + src_stride],
+                    width,
+                    &mut row,
+                ) {
+                    return Err(MemError::BadArgs);
+                }
+                &row
+            }
+            FrameRows::Native(native) => &native[at..at + src_stride],
+        };
         let row_gva = gva.saturating_add((y as u64).saturating_mul(bpr as u64));
         if let Err(err) = crate::runtime::gva_view::write_span_within(
-            state, host, task_id, row_gva, &row, allowed,
+            state, host, task_id, row_gva, out_row, allowed,
         ) {
             let reason = crate::observe::Decline::slug(&err);
             crate::observe::fail(format!(
                 "gva_write fail reason={reason} task={task_id} gva={row_gva:#x} span={span:#x} \
-                 row={y} rowlen={:#x} (rgba8 multi)",
-                row.len()
+                 row={y} rowlen={:#x} (multi)",
+                out_row.len()
             ));
             return Err(err);
         }

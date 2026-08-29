@@ -3386,7 +3386,13 @@ pub(crate) unsafe fn execute_draw_inner(
     phase.enter(super::draw_phase::Phase::StageSeed);
     let seed_wide = seed_bytes.and_then(|rgba8| {
         let layout = crate::backend::vulkan::translate::pixel::texel_layout_of(color0_format)?;
-        if layout.bytes_per_texel() == crate::contract::pixel_format::RGBA8_BPP {
+        // Four-byte *colour*, not four bytes. A seed is eight-bit RGBA, and a
+        // four-byte texel that is not one of the two colour orders — a packed
+        // ten-bit word, an integer pair — cannot be staged as though it were:
+        // the copy converts nothing, so the attachment would be seeded with the
+        // seed's bytes reinterpreted. The wide arm below restates the seed in
+        // the attachment's texel, or refuses by name when it cannot.
+        if layout.is_four_byte_color() {
             return None;
         }
         Some((rgba8, layout))
@@ -5826,13 +5832,29 @@ pub(crate) unsafe fn execute_draw_inner(
             format: color0_format,
         }),
     )?;
-    let (pixels, pixels_bgra) = super::narrow_readback_to_rgba8(
+    let (pixels, texel) = super::narrow_readback_to_rgba8(
         out,
         layout,
         color0_format,
         (req.width as u64) * (req.height as u64),
         output_bgra,
     )?;
+    // This rail hands its bytes to `M2vDrawSpan::Pixels`, whose every consumer
+    // reads eight-bit colour, so a native texel is refused here exactly as it
+    // was before the narrowing learned to carry one. The native bytes are
+    // useful only to a guest destination of the identical layout, and that is
+    // the GVA Store's rail rather than this one.
+    let pixels_bgra = match texel {
+        super::ReadbackTexel::Rgba8 => false,
+        super::ReadbackTexel::Bgra8 => true,
+        super::ReadbackTexel::Native(_) => {
+            return Err(DrawError::TargetRead(
+                super::reason::TargetReadDecline::TexelNotFourBytes {
+                    format: super::readback_vk_format(layout),
+                },
+            ))
+        }
+    };
 
     Ok(DrawOutput {
         pixels,

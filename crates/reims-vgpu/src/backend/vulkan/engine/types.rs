@@ -1556,6 +1556,20 @@ pub enum StorageImageFormat {
     /// `R16_UNORM`, so it is reachable by the same single route for the same
     /// reason.
     Rg16Unorm,
+    /// Two-channel sixteen-bit **unsigned integer**; **sampled-image only**, on
+    /// [`Self::Rg16Unorm`]'s terms and for a different guest.
+    ///
+    /// `MTLPixelFormatRG16Uint`. A macos-15 guest renders into linear textures
+    /// of this format, so a shader that reads one back binds it here. It shares
+    /// its bytes with the normalized member above and nothing else: an integer
+    /// texel is a count, so it is neither blended as an attachment nor filtered
+    /// when sampled, and both of `DeviceCapabilitySnapshot`'s per-layout masks
+    /// skip it for that reason.
+    ///
+    /// `STORAGE_IMAGE` is not mandatory for `R16G16_UINT`, so it is reachable
+    /// by the same single route as the normalized members and for the same
+    /// reason.
+    Rg16Uint,
     /// Four-channel sixteen-bit normalized; **sampled-image only**, the widest
     /// member of the same family.
     ///
@@ -1600,7 +1614,7 @@ impl StorageImageFormat {
             Self::Rgba16Float | Self::Rgba16Uint => 8,
             Self::Rg16Float => 4,
             Self::Rgba16Unorm => 8,
-            Self::Rg16Unorm => 4,
+            Self::Rg16Unorm | Self::Rg16Uint => 4,
             Self::R16Float | Self::Rg8Unorm | Self::R16Unorm => 2,
             Self::R8Unorm => 1,
             Self::Rgba8Uint

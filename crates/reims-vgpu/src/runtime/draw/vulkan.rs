@@ -9528,7 +9528,17 @@ fn merge_guest_writes_into_pages<M: HostMemory + HostOps>(
             return false;
         }
     };
-    let bgra = readback.into_bgra8();
+    // The guest mapping this merges into is scanout-ordered eight-bit colour,
+    // so a native readback has nothing to merge and says so rather than writing
+    // a texel the mapping cannot mean.
+    let texel = readback.texel;
+    let Some(bgra) = readback.into_bgra8() else {
+        crate::observe::fail(format!(
+            "sampled_resident_merge_fail mid={mapping_id} {width}x{height} \
+             stage=readback reason=readback_texel_not_scanout texel={texel:?}"
+        ));
+        return false;
+    };
     let stride = width.saturating_mul(RGBA8_BPP);
     if !mapping_write::write_bgra8_skipping(
         state,
@@ -9996,7 +10006,17 @@ pub(crate) fn read_resident_chain(
         // — `ResidentReadSnapshot::bgra` answered "not BGRA" for the sRGB
         // spelling — so the comment documented the defect instead of catching
         // it, and the Store below exchanged R and B on its way into guest pages.
-        Ok(rb) => Some(rb.into_rgba8()),
+        Ok(rb) => {
+            let texel = rb.texel;
+            let landed = rb.into_rgba8();
+            if landed.is_none() {
+                crate::observe::fail(format!(
+                    "chain_resident_land_fail reason=readback_texel_not_rgba8 \
+                     target={identity:?} texel={texel:?}"
+                ));
+            }
+            landed
+        }
         Err(e) => {
             crate::observe::fail(format!(
                 "chain_resident_land_fail reason=read_target target={identity:?} \
