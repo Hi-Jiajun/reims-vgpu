@@ -1,0 +1,119 @@
+# Guest failures owned outside shader translation.
+#
+# One case name per line, followed by a comment naming the violated API
+# relation and the driver owner or rail. An unexplained mismatch does not
+# belong here: establish its owner first. Remove an entry when the scorer says
+# FIXED-DRIVER.
+
+# Buffer-backed textures are refused before the compute shader is translated
+# or submitted (`compute_buffer_texture_unsupported`).
+linear_r8Unorm_64x16_pitch_tight # sampled buffer texture refused before translation
+linear_r8Unorm_64x16_pitch_tight_sampled # sampled buffer texture refused before translation
+linear_a8Unorm_64x16_pitch_tight # sampled buffer texture refused before translation
+linear_a8Unorm_64x16_pitch_tight_sampled # sampled buffer texture refused before translation
+linear_rg8Unorm_64x16_pitch_tight # sampled buffer texture refused before translation
+linear_rg8Unorm_64x16_pitch_tight_sampled # sampled buffer texture refused before translation
+linear_rgba8Unorm_64x16_pitch_tight # sampled buffer texture refused before translation
+linear_rgba8Unorm_64x16_pitch_tight_sampled # sampled buffer texture refused before translation
+linear_bgra8Unorm_64x16_pitch_tight # sampled buffer texture refused before translation
+linear_bgra8Unorm_64x16_pitch_tight_sampled # sampled buffer texture refused before translation
+linear_a8Unorm_218x16_pitch_256 # sampled buffer texture refused before translation
+linear_bgra8Unorm_60x8_pitch_256 # sampled buffer texture refused before translation
+linear_r8Unorm_54x16_pitch_tight_plus1 # sampled buffer texture refused before translation
+linear_r8Unorm_54x16_pitch_tight_plus2 # sampled buffer texture refused before translation
+linear_a8Unorm_54x16_pitch_tight_plus1 # sampled buffer texture refused before translation
+linear_a8Unorm_54x16_pitch_tight_plus2 # sampled buffer texture refused before translation
+linear_rg8Unorm_54x16_pitch_tight_plus1 # sampled buffer texture refused before translation
+linear_rg8Unorm_54x16_pitch_tight_plus2 # sampled buffer texture refused before translation
+linear_rgba8Unorm_54x16_pitch_tight_plus1 # sampled buffer texture refused before translation
+linear_rgba8Unorm_54x16_pitch_tight_plus2 # sampled buffer texture refused before translation
+linear_bgra8Unorm_54x16_pitch_tight_plus1 # sampled buffer texture refused before translation
+linear_bgra8Unorm_54x16_pitch_tight_plus2 # sampled buffer texture refused before translation
+incremental_r8Unorm_compute_first_read # sampled buffer texture refused before translation
+incremental_a8Unorm_compute_first_read # sampled buffer texture refused before translation
+incremental_rg8Unorm_compute_first_read # sampled buffer texture refused before translation
+incremental_rgba8Unorm_compute_first_read # sampled buffer texture refused before translation
+incremental_bgra8Unorm_compute_first_read # sampled buffer texture refused before translation
+buffer_backed_alias_incompatible_widths # buffer storage image refused before translation
+buffer_backed_alias_partial_row_range # buffer storage image refused before translation
+offset_oracle_256x16_pitch_tight_compute # sampled buffer texture refused before translation
+offset_oracle_250x16_pitch_tight_compute # sampled buffer texture refused before translation
+offset_oracle_218x16_pitch_tight_compute # sampled buffer texture refused before translation
+offset_oracle_54x16_pitch_tight_plus1_compute # sampled buffer texture refused before translation
+offset_alias_a8Unorm_54x16_x4 # sampled buffer texture refused before translation
+offset_alias_rgba8Unorm_32x32_x3 # sampled buffer texture refused before translation
+
+# The active multisample failure is a driver refusal before translation. The
+# latent translator defect behind it remains packaged in bugs/.
+msaa4_color_store_no_resolve # unstageable_multisampled before translation
+
+# Depth/stencil attachment state or contents are lost in the device model. The
+# distinguishing colour shaders pass elsewhere; the log also names a depth
+# LOAD with no resident content.
+depth_attachment_isolated_across_tasks # task-local depth content aliases or disappears
+depth_attachment_clear_without_test_state # stored depth clear is absent on later LOAD
+stencil_attachment_clear_without_test_state # stored stencil clear is absent on later test
+stencil_only_attachment_clear_without_test_state # stencil-only attachment clear is absent
+combined_depth_stencil_default_buffer_copy_selects_depth # blit selects the wrong aspect bytes
+
+# Levels above zero are absent through both shaderless blit and exact texel
+# fetch; the explicit-LOD sample failures are downstream of the missing levels.
+mip_fetch_level_1_size32 # level 1 bytes absent
+mip_sample_level_1_size32 # level 1 storage absent before sampling
+mip_fetch_level_2_size16 # level 2 bytes absent
+mip_sample_level_2_size16 # level 2 storage absent before sampling
+mip_fetch_level_3_size8 # level 3 bytes absent
+mip_sample_level_3_size8 # level 3 storage absent before sampling
+mip_fetch_level_4_size4 # level 4 bytes absent
+mip_sample_level_4_size4 # level 4 storage absent before sampling
+mip_fetch_level_5_size2 # level 5 bytes absent
+mip_sample_level_5_size2 # level 5 storage absent before sampling
+mip_fetch_level_6_size1 # level 6 bytes absent
+mip_sample_level_6_size1 # level 6 storage absent before sampling
+mip_blit_level_1_size32 # shaderless blit sees no level 1 bytes
+mip_blit_level_2_size16 # shaderless blit sees no level 2 bytes
+mip_blit_level_3_size8 # shaderless blit sees no level 3 bytes
+mip_blit_level_4_size4 # shaderless blit sees no level 4 bytes
+mip_blit_level_5_size2 # shaderless blit sees no level 5 bytes
+mip_blit_level_6_size1 # shaderless blit sees no level 6 bytes
+
+# `dispatchThreads` is widened to whole threadgroups by the command execution
+# rail. The divisible control passes and every non-divisible grid runs threads
+# outside the API extent.
+dispatch_threads_grid_218x16_tg8 # 96 threads ran past the requested width
+dispatch_threads_grid_54x15_tg8 # threads ran past both requested dimensions
+dispatch_threads_grid_57x9_tg8 # threads ran past both requested dimensions
+dispatch_threads_grid_31x31_tg16 # threads ran past both requested dimensions
+
+# Shared-target content ownership failures. Paired IOSurface cases using the
+# same translated shaders pass, so the changing term is the device backing rail.
+cpu_write_after_render_64x32 # first GPU Store is lost before the CPU update
+cpu_write_after_render_256x64 # first GPU Store is lost before the CPU update
+srt_cpu_write_then_sample_60x32 # shared target loses its GPU-produced half
+srt_cpu_write_then_sample_256x64 # shared target loses its GPU-produced half
+srt_cpu_write_then_sample_1000x40 # shared target loses its GPU-produced half
+
+# Device API/state reporting; neither result executes translated GPU code.
+indirect_command_reset_copy_optimize # device reports indirect command buffers unavailable
+pipeline_information_lifetime # pipeline construction-owned information reports zero
+
+# The render path drops the declared array slice and samples slice zero.
+texture_view_array_slice_64x32x3_s1 # texture view base slice 1 dropped
+texture_view_array_slice_64x32x3_s2 # texture view base slice 2 dropped
+
+# A8 replacement reaches a format refusal in device texture staging before the
+# observer can execute.
+replace_a8Unorm_compute_first_read # A8 sampled format refused before translation
+
+# A buffer-backed render target arrives as a texture view; the target resolver
+# rejects that object type and the following shaderless blit sees untouched bytes.
+srt_blit_buffer_backed_512x512 # rt_wrong_type followed by view_desc_decode
+
+# Direct indexed draw semantics. Both index widths and byte offsets match the
+# shared-shader control when baseVertex is zero. Either width fails only when
+# the signed base is -1, so the driver loses or misapplies baseVertex. General
+# non-indexed baseInstance passes; only the indexed base-instance opcode is
+# accepted without an executor and produces no pixels.
+draw_indexed_uint16_base_vertex_minus1 # signed baseVertex is lost or misapplied
+draw_indexed_uint32_offset_4_base_vertex_minus1 # signed baseVertex is lost or misapplied
+draw_indexed_two_instances_base_instance_5 # indexed base-instance opcode accepted without executor
