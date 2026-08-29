@@ -62,18 +62,18 @@ pub(crate) use host_ram::GuestWriteDecline;
 pub use types::viewport_slot_count;
 pub use types::{
     BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorAttachmentState, ColorClearValue,
-    ColorWriteMask, ComputeBufferResource, ComputeOutput, ComputeRequest,
-    ComputeResidentSampleBind, ComputeSampledImageResource, ComputeStorageImageResource,
-    ComputeStorageResidency, CullMode, DepthClipMode, DepthState, DrawError, DrawOutput,
-    DrawRequest, FillMode, GuestRun, GuestRunSource, GuestSampledBacking, GuestTargetBacking,
-    GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource, PipelineObjectIdentity,
-    PrimitiveTopology, SampledByteOrigin, SampledContentIdentity, SampledImageResource,
-    SampledSource, SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
-    SamplerMipFilter, SamplerResource, ScissorResource, SecondaryColorTarget, SeedOrder,
-    StencilFaceOps, StencilOp, StencilState, StorageBufferResource, StorageImageFormat,
-    TargetIdentity, TargetKeyDivergence, VertexAttributeFormat, VertexAttributeResource,
-    VertexStepFunction, ViewportResource, VisibilityResultMode, WindowPresentSource,
-    COLOR_INPUT_BINDING,
+    ColorWriteMask, ComputeBufferResource, ComputeImageDestination, ComputeImageResult,
+    ComputeOutput, ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource,
+    ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
+    DrawError, DrawOutput, DrawRequest, FillMode, GuestRun, GuestRunSource, GuestSampledBacking,
+    GuestTargetBacking, GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource,
+    PipelineObjectIdentity, PrimitiveTopology, SampledByteOrigin, SampledContentIdentity,
+    SampledImageResource, SampledSource, SamplerAddressMode, SamplerBorderColor,
+    SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource, ScissorResource,
+    SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
+    StorageBufferResource, StorageImageFormat, TargetIdentity, TargetKeyDivergence,
+    VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
+    VisibilityResultMode, WindowPresentSource, COLOR_INPUT_BINDING,
 };
 pub(crate) use vk_call::{VkCall, VkOp};
 #[cfg(feature = "host-window")]
