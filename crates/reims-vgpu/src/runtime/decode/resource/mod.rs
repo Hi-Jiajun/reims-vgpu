@@ -2292,14 +2292,39 @@ pub fn decode_depth_stencil_descriptor(
     // unidentified (Metal substitutes default faces before serialize). Keep the
     // product field names; source the bit from the same byte the view exposes.
     let state = body.depth_state;
+    let front_stencil_enabled = (state & DEPTH_STENCIL_FRONT_STENCIL_ENABLED as u8) != 0;
+    let back_stencil_enabled = (state & DEPTH_STENCIL_BACK_STENCIL_ENABLED as u8) != 0;
+    // A face block is only meaningful behind its own enable bit, and reading it
+    // otherwise reads the guest's stale ring.
+    //
+    // The paragraph above says Metal substitutes default faces before it
+    // serializes, so both blocks are always written. That is not true of every
+    // record: Apple's own capture of a descriptor whose front face is absent
+    // leaves the front block untouched, and the bytes under it on a real wire
+    // are whatever the ring last held. Decoding them made one record decode two
+    // ways depending on noise, which is the property
+    // `no_decoder_reads_a_bit_apples_serializer_never_wrote` exists to hold.
+    //
+    // Gating changes no execution — every consumer already reads a face only
+    // behind the same bit (`runtime::draw::vulkan`'s stencil block,
+    // `backend::metal::render`) — it removes the nondeterminism ahead of them,
+    // so the decoded record is a function of what the serializer wrote.
     Ok(DepthStencilDescriptor {
         depth_stencil_id: body.object_ref.get(),
         depth_compare_function: body.depth_compare_function() as u32,
         depth_write_enabled: body.depth_write_enabled(),
-        front_stencil_enabled: (state & DEPTH_STENCIL_FRONT_STENCIL_ENABLED as u8) != 0,
-        back_stencil_enabled: (state & DEPTH_STENCIL_BACK_STENCIL_ENABLED as u8) != 0,
-        front_face: face_from_wire(&body.front),
-        back_face: face_from_wire(&body.back),
+        front_stencil_enabled,
+        back_stencil_enabled,
+        front_face: if front_stencil_enabled {
+            face_from_wire(&body.front)
+        } else {
+            DepthStencilFace::default()
+        },
+        back_face: if back_stencil_enabled {
+            face_from_wire(&body.back)
+        } else {
+            DepthStencilFace::default()
+        },
     })
 }
 
