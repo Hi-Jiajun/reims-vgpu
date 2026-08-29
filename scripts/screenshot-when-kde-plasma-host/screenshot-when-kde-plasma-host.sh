@@ -29,6 +29,10 @@ SCRIPT_NAME="screenshot-when-kde-plasma-host"
 # common case needs no selector at all -- asking the caller to pass a string the
 # tree already knows is what --match used to do, and it could not disambiguate
 # two VMs anyway (both windows carry this same caption; use --window for that).
+#
+# Matched by equality, never as a substring: this is a short human-readable
+# product name, so other applications carry it in their titles as ordinary text.
+# See the default branch of the KWin script below for what that cost.
 DEFAULT_TITLE="Reims vGPU"
 
 usage() {
@@ -59,9 +63,13 @@ Options:
   -h, --help          Show this help
 
 Selector precedence: --window, then --pid, then --match. With none given, the
-host-owned window is selected by its known caption -- the normal case needs no
-selector. Among windows passing a selector, the largest wins (QEMU may expose a
-small serial console alongside the GPU display).
+host-owned window is selected by an EXACT caption match -- the normal case needs
+no selector. Exact, because a substring match also admits any unrelated window
+that merely mentions this device in its title, and the area ranking below then
+prefers it for being bigger; that captured a chat window instead of the guest.
+If nothing carries the caption exactly, the substring match is used and warns.
+Among windows passing a selector, the largest wins (QEMU may expose a small
+serial console alongside the GPU display).
 
 Works from an SSH tty by attaching to the user's active Wayland session.
 Prints the output path on stdout.
@@ -338,7 +346,29 @@ if (typeof wantId !== "undefined") {
     pool = clients.filter(function (c) { return textHas(c, wantMatch); });
 } else {
     selector = "(default: caption \"" + defaultTitle + "\")";
-    pool = clients.filter(function (c) { return textHas(c, defaultTitle); });
+    // Exact caption, not a substring. textHas() tests caption AND resourceClass
+    // for a substring, so ANY window that merely mentions this device passes it
+    // -- a chat client whose channel is named after the project is the case that
+    // actually happened -- and the area ranking below then prefers that window
+    // *because* it is bigger than a 1920x1080 guest display. The capture
+    // succeeded, reported FOUND, and photographed the host's screen: a wrong
+    // measurement and whatever was on it, written into a probe's outdir.
+    //
+    // The host-owned window's caption is this string exactly (present.rs builds
+    // the WindowConfig with it), so equality identifies it and a mention cannot
+    // spoof it.
+    pool = clients.filter(function (c) { return String(c.caption || "") === defaultTitle; });
+    if (pool.length === 0) {
+        // A caption that gained a suffix is still worth finding, but that
+        // selection is ambiguous by construction, so it says so rather than
+        // silently ranking by area again.
+        pool = clients.filter(function (c) { return textHas(c, defaultTitle); });
+        if (pool.length > 0) {
+            console.info(token + ":INEXACT selector=" + selector
+                + " no window captioned exactly \"" + defaultTitle
+                + "\"; fell back to a substring match over " + pool.length + " window(s)");
+        }
+    }
 }
 
 if (pool.length === 0 && allowAny) {
@@ -391,6 +421,15 @@ for _try in 1 2 3 4 5 6 7 8 9 10; do
 done
 
 CANDIDATES="$(printf '%s\n' "$ALL_LINES" | grep ":CAND " || true)"
+
+# An inexact default selection is the shape that once captured a chat window
+# whose title mentioned this device. It still returns an image, so the warning
+# has to reach the operator rather than only the journal.
+INEXACT_LINE="$(printf '%s\n' "$ALL_LINES" | grep ":INEXACT" || true)"
+if [[ -n "$INEXACT_LINE" ]]; then
+  printf '%s: %s\n' "$SCRIPT_NAME" "${INEXACT_LINE#*:INEXACT }" >&2
+  printf '%s: pass --window <id> or --pid <qemu pid> if this is not the guest display.\n' "$SCRIPT_NAME" >&2
+fi
 
 if [[ -z "$FOUND_LINE" ]]; then
   die "KWin script produced no result (journalctl empty / delayed); is kwin_wayland logging to the user journal?"
