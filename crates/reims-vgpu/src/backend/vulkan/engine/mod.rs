@@ -407,22 +407,30 @@ struct DeviceCapabilitySnapshot(u64);
 
 const CAP_MAX_DIMENSION_BITS: u32 = u32::BITS;
 const CAP_LAYOUT_SHIFT: u32 = CAP_MAX_DIMENSION_BITS;
-/// Both per-layout masks span the **mask-queryable** vocabulary only.
+/// The two per-layout masks span **different vocabularies**, each sized by its
+/// own.
 ///
-/// Two masks of the full `TexelLayout::ALL` do not fit beside a `u32` dimension
-/// and three flags in one word, and the assertion below is what says so. It has
-/// failed the build twice — once when the ten BC layouts were declared, once
-/// when the first integer colour layout was — and both times the fix was to
-/// narrow the vocabulary rather than widen the word, because both times it was
-/// pointing at a layout these masks have no question about. Widening is not on
-/// the table anyway: this is published through a `static AtomicU64`, and there
-/// is no lock-free word above it. See `TexelLayout::is_mask_queryable` for
-/// which layouts are in and why.
-const CAP_LAYOUT_COUNT: u32 =
-    crate::contract::pixel_format::TexelLayout::MASK_QUERYABLE_COUNT as u32;
-const CAP_GPU_ONLY_BIT: u32 = CAP_LAYOUT_SHIFT + CAP_LAYOUT_COUNT;
+/// They answer different questions about different sets — whether a colour
+/// attachment of a layout blends, and whether sampling it filters linearly —
+/// and they used to share one index space, so both were sized by the union and
+/// every layout only one of them cared about cost two bits instead of one.
+///
+/// The assertion below has now failed the build three times: when the ten BC
+/// layouts were declared, when the first integer colour layout was, and when a
+/// four-channel float *sampled* layout was. The first two were answered by
+/// narrowing the shared vocabulary. The third could not be — that layout
+/// genuinely needs a filter bit — which is what showed that the sharing, rather
+/// than any one layout, was what cost the budget.
+///
+/// Widening is not on the table: this is published through a `static
+/// AtomicU64` and there is no lock-free word above it. See
+/// `TexelLayout::is_blendable_attachment` and
+/// `TexelLayout::needs_sampled_filter_query` for the two sets.
+const CAP_BLEND_COUNT: u32 = crate::contract::pixel_format::TexelLayout::BLEND_COUNT as u32;
+const CAP_FILTER_COUNT: u32 = crate::contract::pixel_format::TexelLayout::FILTER_COUNT as u32;
+const CAP_GPU_ONLY_BIT: u32 = CAP_LAYOUT_SHIFT + CAP_BLEND_COUNT;
 const CAP_SAMPLED_FILTER_SHIFT: u32 = CAP_GPU_ONLY_BIT + 1;
-const CAP_PUBLISHED_BIT: u32 = CAP_SAMPLED_FILTER_SHIFT + CAP_LAYOUT_COUNT;
+const CAP_PUBLISHED_BIT: u32 = CAP_SAMPLED_FILTER_SHIFT + CAP_FILTER_COUNT;
 /// Whether this device can sample the BC block-compressed families.
 ///
 /// One bit for the whole family, because Vulkan gates BC1 through BC7 behind one
@@ -447,18 +455,19 @@ impl DeviceCapabilitySnapshot {
     ) -> Self {
         let mut word = u64::from(features.max_image_dimension_2d);
         // Walked by layout rather than by array position: the feature arrays are
-        // indexed by `TexelLayout::index()` over the whole vocabulary and the
-        // masks by `mask_index()` over part of it, so enumerating the
+        // indexed by `TexelLayout::index()` over the whole vocabulary and each
+        // mask by its own index over its own part of it, so enumerating the
         // array would put a layout's answer in another layout's bit.
         for layout in crate::contract::pixel_format::TexelLayout::ALL {
-            let Some(bit) = layout.mask_index() else {
-                continue;
-            };
-            if features.color_attachment_blend[layout.index()] {
-                word |= 1_u64 << (CAP_LAYOUT_SHIFT + bit as u32);
+            if let Some(bit) = layout.blend_index() {
+                if features.color_attachment_blend[layout.index()] {
+                    word |= 1_u64 << (CAP_LAYOUT_SHIFT + bit as u32);
+                }
             }
-            if features.sampled_linear_filter[layout.index()] {
-                word |= 1_u64 << (CAP_SAMPLED_FILTER_SHIFT + bit as u32);
+            if let Some(bit) = layout.filter_index() {
+                if features.sampled_linear_filter[layout.index()] {
+                    word |= 1_u64 << (CAP_SAMPLED_FILTER_SHIFT + bit as u32);
+                }
             }
         }
         if !quirks.guest_pages_stay_authoritative {
@@ -479,12 +488,12 @@ impl DeviceCapabilitySnapshot {
         self,
         layout: crate::contract::pixel_format::TexelLayout,
     ) -> bool {
-        let Some(bit) = layout.mask_index() else {
-            // No host renders into a block-compressed format, and this device
-            // does not ask it to: `pixel_format::render_target_bpp` has no BC
-            // arm, so the resolve refuses one before reaching here. Answering
-            // `false` keeps that true instead of reading a bit the word does not
-            // carry.
+        let Some(bit) = layout.blend_index() else {
+            // A layout this device does not render into, or an integer one that
+            // cannot blend. `pixel_format::render_target_bpp` refuses the first
+            // before the resolve reaches here, and Vulkan permits no blending on
+            // an integer attachment — so `false` keeps both true instead of
+            // reading a bit the word does not carry.
             return false;
         };
         self.0 & (1_u64 << (CAP_LAYOUT_SHIFT + bit as u32)) != 0
@@ -513,7 +522,7 @@ impl DeviceCapabilitySnapshot {
         if self.0 & (1_u64 << CAP_PUBLISHED_BIT) == 0 {
             return None;
         }
-        let Some(bit) = layout.mask_index() else {
+        let Some(bit) = layout.filter_index() else {
             // Vulkan's mandatory-format table requires
             // `SAMPLED_IMAGE_FILTER_LINEAR` of every BC format on a device that
             // enables `textureCompressionBC`, and that feature is what admits

@@ -4878,17 +4878,17 @@ fn native_scratch_to_upload(
 /// answer for — so keying on it is the same rule stated once, not a fast path
 /// that could disagree with the slow one.
 fn native_uploads_for(sample_format: u16) -> NativeUploads {
-    // A compressed format has to ask, and it is not in `narrows_to_unorm8`'s
-    // set: that set is the formats whose CPU arm is *lossy*, and a BC format has
-    // no CPU arm at all. Asked first so the keyed fast path below keeps meaning
-    // what its doc says it means.
-    if pixel_format::is_block_compressed(sample_format) {
+    // One question, derived from the loader itself rather than approximated by
+    // a second list. `native_bind_is_host_gated` compares the loader's answer
+    // with every gate shut against its answer with every gate open, so the set
+    // that has to take the engine lock is exactly the set whose bind the host
+    // decides — the compressed families, the half-float layouts, and the
+    // four-channel float one whose omission from the old proxy cost every draw
+    // that sampled it.
+    if native_bind_is_host_gated(sample_format) {
         return native_uploads_asking_host();
     }
-    if !pixel_format::narrows_to_unorm8(sample_format) {
-        return NativeUploads::BGRA8;
-    }
-    native_uploads_asking_host()
+    NativeUploads::BGRA8
 }
 
 /// The same answer for a caller that does not yet know the guest format.
@@ -4912,6 +4912,12 @@ fn native_uploads_asking_host() -> NativeUploads {
         // texture_compression_bc`. A per-family flag would be ten fields nobody
         // could point at a host that needed them.
         block_compressed: engine::supports_block_compressed_sampled(),
+        // Its own flag rather than riding on `float16`: Vulkan mandates
+        // `SAMPLED_IMAGE` for `R32G32B32A32_SFLOAT` and does **not** mandate
+        // `SAMPLED_IMAGE_FILTER_LINEAR`, where both half-float layouts carry the
+        // filter by mandate. So this one is genuinely a per-host answer and the
+        // conjunction above would hide it.
+        float32: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba32Float),
         ..NativeUploads::BGRA8
     }
 }

@@ -802,6 +802,20 @@ pub(crate) struct NativeUploads {
     /// for the whole family. Desktop GPUs have it; Apple GPUs carry ASTC
     /// instead and read `false`.
     pub block_compressed: bool,
+    /// Upload guest four-channel `float32` (`RGBA32Float`) at its own sixteen
+    /// bytes, as `R32G32B32A32_SFLOAT`.
+    ///
+    /// Like [`Self::block_compressed`] and unlike [`Self::float16`], this is not
+    /// a choice between an exact rail and a lossy one — it is the **only** rail.
+    /// [`pixel_format::TexelLayout::Rgba32Float`] has no CPU loader arm and must
+    /// not gain one, so a host that clears this flag loses the texture and says
+    /// so rather than quantising a lookup table to unorm8.
+    ///
+    /// Set from `supports_sampled_layout_linear_filter(Rgba32Float)`: Vulkan
+    /// mandates `SAMPLED_IMAGE` for the format but not
+    /// `SAMPLED_IMAGE_FILTER_LINEAR`, so the filter is measured rather than
+    /// assumed.
+    pub float32: bool,
 }
 
 impl NativeUploads {
@@ -811,6 +825,7 @@ impl NativeUploads {
         bgra8: false,
         float16: false,
         block_compressed: false,
+        float32: false,
     };
 
     /// Native BGRA8 only — the answer this parameter carried when it was a
@@ -826,6 +841,7 @@ impl NativeUploads {
         bgra8: true,
         float16: false,
         block_compressed: false,
+        float32: false,
     };
 
     /// Every native layout the loaders can produce.
@@ -839,7 +855,43 @@ impl NativeUploads {
         bgra8: true,
         float16: true,
         block_compressed: true,
+        float32: true,
     };
+}
+
+/// Every gate open at once — a **probe**, never a grant.
+///
+/// [`NativeUploads::ALL`] is test-only on purpose, because a constant that says
+/// yes without asking is the shape that lets a capability go unchecked. This
+/// exists for the opposite purpose and is private to that use: it is one half of
+/// a comparison that asks whether an answer *depends* on the host, and nothing
+/// binds anything with it.
+#[cfg(feature = "backend-vulkan")]
+const EVERY_GATE_OPEN: NativeUploads = NativeUploads {
+    bgra8: true,
+    float16: true,
+    block_compressed: true,
+    float32: true,
+};
+
+/// Whether [`linear_native_upload_format`]'s answer for `sample_format` depends
+/// on what the host can do.
+///
+/// The question `native_uploads_for` needs before deciding whether to take the
+/// engine lock, and it is **derived** rather than listed: the answer is computed
+/// with every gate shut and again with every gate open, and a format whose
+/// answer moves is one whose bind is host-gated.
+///
+/// It used to be approximated by [`pixel_format::narrows_to_unorm8`], which
+/// answers a different question — whether a format's *CPU* arm is lossy. The two
+/// coincided for exactly as long as every capability-gated layout also had a
+/// lossy CPU arm. `RGBA32Float` broke that: its bind is host-gated and it has no
+/// CPU arm at all, so the proxy said "no need to ask", the host was never asked,
+/// and every draw sampling one was refused.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn native_bind_is_host_gated(sample_format: u16) -> bool {
+    linear_native_upload_format(sample_format, NativeUploads::BGRA8)
+        != linear_native_upload_format(sample_format, EVERY_GATE_OPEN)
 }
 
 /// When a sampled format's guest bytes are ALREADY in the final upload order —
@@ -877,6 +929,7 @@ pub(crate) fn linear_native_upload_format(
         SampledClass::Bgra8Unorm if native.bgra8 => TexelLayout::Bgra8,
         SampledClass::Rgba16Float if native.float16 => TexelLayout::Rgba16Float,
         SampledClass::Rg16Float if native.float16 => TexelLayout::Rg16Float,
+        SampledClass::Rgba32Float if native.float32 => TexelLayout::Rgba32Float,
         _ => return None,
     })
 }

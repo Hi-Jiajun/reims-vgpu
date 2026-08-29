@@ -286,6 +286,7 @@ pub fn sampled_pixels(
         vk::Format::R16_UNORM => TexelLayout::R16Unorm,
         vk::Format::R16G16_UNORM => TexelLayout::Rg16Unorm,
         vk::Format::R16G16_UINT => TexelLayout::Rg16Uint,
+        vk::Format::R32G32B32A32_SFLOAT => TexelLayout::Rgba32Float,
         // The half-float colour layouts. A recent macOS window server
         // composites in `MTLPixelFormatRGBA16Float`, and every such bind used to
         // land on the CPU re-read rung and be quantized to unorm8 on the way in
@@ -336,6 +337,7 @@ pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
         TexelLayout::R16Unorm => vk::Format::R16_UNORM,
         TexelLayout::Rg16Unorm => vk::Format::R16G16_UNORM,
         TexelLayout::Rg16Uint => vk::Format::R16G16_UINT,
+        TexelLayout::Rgba32Float => vk::Format::R32G32B32A32_SFLOAT,
         TexelLayout::Rgba16Unorm => vk::Format::R16G16B16A16_UNORM,
         TexelLayout::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
         TexelLayout::Rg16Float => vk::Format::R16G16_SFLOAT,
@@ -2245,6 +2247,13 @@ mod tests {
                 p::MTL_FORMAT_RG16_UINT,
                 p::MTL_FORMAT_RGBA16_UNORM,
                 p::MTL_FORMAT_RGBA16_FLOAT,
+                // Four-channel `float32`. A macos-15 guest binds 1x1 and 4x1
+                // linear textures of it to a **vertex** sampler and every draw
+                // that did was refused, because this crate had no layout for the
+                // format at all. It is sampled-and-dispatched only: it never
+                // appears in the colour list below, and it has no CPU narrowing
+                // arm by design — see `TexelLayout::Rgba32Float`.
+                p::MTL_FORMAT_RGBA32_FLOAT,
             ]
         );
         let color: Vec<u16> = EXPECTED

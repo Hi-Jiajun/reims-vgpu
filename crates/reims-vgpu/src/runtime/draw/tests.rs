@@ -2086,6 +2086,71 @@ fn a_padded_half_float_row_copies_straight_through_at_eight_bytes_a_texel() {
     );
 }
 
+/// A four-channel `float32` sampled texture binds natively, and only natively.
+///
+/// The macos-15 defect: a guest binds 1x1 and 4x1 `RGBA32Float` linear textures
+/// to a **vertex** sampler, and every draw that did was refused with
+/// `draw_prepare_texture_resolve_missing` because this crate had no layout for
+/// the format. It has one now, and the rails it may take are deliberately
+/// narrow — the native bind or a named refusal, never a conversion.
+#[test]
+fn a_four_channel_float_sampled_texture_is_native_or_refused() {
+    assert_eq!(
+        linear_native_upload_format(pixel_format::MTL_FORMAT_RGBA32_FLOAT, NativeUploads::ALL),
+        Some(TexelLayout::Rgba32Float)
+    );
+    assert_eq!(
+        linear_native_upload_format(pixel_format::MTL_FORMAT_RGBA32_FLOAT, NativeUploads::BGRA8),
+        None,
+        "a host that cannot filter it must not get a native bind"
+    );
+    assert_eq!(TexelLayout::Rgba32Float.bytes_per_texel(), 16);
+    // No CPU arm, and that is the point rather than a gap: narrowing an f32
+    // texel to unorm8 clamps to [0,1] and quantises to 256 levels, which for a
+    // vertex-stage lookup table is silent data loss with no bound. A host that
+    // cannot serve it refuses instead.
+    assert!(!TexelLayout::Rgba32Float.has_cpu_loader_arm());
+    assert!(!pixel_format::narrows_to_unorm8(
+        pixel_format::MTL_FORMAT_RGBA32_FLOAT
+    ));
+}
+
+/// The host-gated set is derived from the loader, not approximated by a second
+/// list.
+///
+/// `native_uploads_for` takes the engine lock only for formats whose bind the
+/// host decides. That used to be approximated by `narrows_to_unorm8` — "is this
+/// format's CPU arm lossy" — which is a different question, and the two agreed
+/// only while every gated layout also had a lossy CPU arm. `RGBA32Float` has a
+/// gated bind and **no** CPU arm, so the proxy answered "no need to ask", the
+/// host was never asked, and the sample was refused.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn the_host_gated_sampled_formats_are_the_ones_whose_bind_the_host_decides() {
+    for gated in [
+        pixel_format::MTL_FORMAT_RGBA32_FLOAT,
+        pixel_format::MTL_FORMAT_RGBA16_FLOAT,
+        pixel_format::MTL_FORMAT_RG16_FLOAT,
+        pixel_format::MTL_FORMAT_BC7_RGBA_UNORM,
+    ] {
+        assert!(
+            super::texture_view::native_bind_is_host_gated(gated),
+            "{gated:#x} has a host-gated native bind and must ask"
+        );
+    }
+    // The unconditional ones must keep the lock-free fast path.
+    for ungated in [
+        pixel_format::MTL_FORMAT_RGBA8_UNORM,
+        pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        pixel_format::MTL_FORMAT_R8_UNORM,
+    ] {
+        assert!(
+            !super::texture_view::native_bind_is_host_gated(ungated),
+            "{ungated:#x} would take the engine lock for an answer that cannot change"
+        );
+    }
+}
+
 #[test]
 fn tight_rgba_linear_load_preserves_native_bytes() {
     let native = [1, 2, 3, 4, 5, 6, 7, 8];
