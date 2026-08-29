@@ -52,6 +52,7 @@ use crate::runtime::fence_exec::{self, FenceStatus};
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
+use crate::runtime::mapper::RectStride;
 use crate::runtime::mapping_write;
 use crate::runtime::objects;
 use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
@@ -1258,20 +1259,15 @@ fn read_texture_rect<M: HostMemory + HostOps>(
         return Err(br(BlitStatus::Capacity, "rd_rect_buf_cap"));
     }
     match tex {
-        TextureBacking::Linear(_) => {
-            for y in 0..row_count {
-                let at = (y * row_bytes) as usize;
-                read_texture_row(
-                    state,
-                    host,
-                    task_id,
-                    tex,
-                    origin,
-                    y,
-                    row_bytes,
-                    &mut buf[at..at + row_bytes as usize],
-                )?;
-            }
+        TextureBacking::Linear(t) => {
+            let (gva, rect) = linear_rect(t, origin, row_bytes, row_count, "rd_rect_linear_shape")?;
+            crate::runtime::gva_view::read_rect(state, host, task_id, gva, rect, buf)
+                .map_err(|_| br(BlitStatus::GuestIo, "rd_rect_linear_io"))?;
+            crate::runtime::drain::note_store_route("blit_rect_linear_read_walk");
+            crate::runtime::drain::note_store_route_n(
+                "blit_rect_linear_read_rows_hoisted",
+                row_count.saturating_sub(1),
+            );
             Ok(())
         }
         TextureBacking::Type11(t) => {
@@ -1296,6 +1292,59 @@ fn read_texture_rect<M: HostMemory + HostOps>(
             Ok(())
         }
     }
+}
+
+/// A linear level's rectangle as the GVA rail's own shape: where it starts and
+/// how its rows are laid out.
+///
+/// This is the linear endpoint's missing rect description. The type-11 endpoint
+/// has had one since it landed — [`mapping_write::write_rect_raw_at`] and
+/// friends — while the linear endpoint had only [`write_texture_row`] and
+/// [`read_texture_row`], so [`write_texture_rect`] and [`read_texture_rect`]
+/// each served a rectangle by re-entering the GVA rail `row_count` times. Every
+/// one of those re-entries walks the task page table afresh for a row of the
+/// same allocation, so all but the first re-derive an answer already in hand. A
+/// driven macos-13 boot charged that loop 906.7 ms of a 916.6 ms
+/// texture-to-texture rail across 118 464 rows — about 7.6 us for a 4 KiB row,
+/// which is the walk and not the bytes.
+///
+/// **The stride is the contract's, not an observation.**
+/// [`LinearTextureLevel::texel_offset`]'s `y` term is exactly `y * row_stride`,
+/// so consecutive rows of one rectangle are `row_stride` apart by construction.
+/// That makes the whole rectangle one [`RectStride`] over one span, which is
+/// what lets a single walk place every row.
+///
+/// Only the last row's offset is resolved alongside the first. That is not a
+/// two-endpoint sample of a range: `texel_offset` is affine and increasing in
+/// `y`, and its only `y` bound is `y < height`, so the largest `y` is the one
+/// that can fail and checking it checks them all.
+fn linear_rect(
+    t: &LinearTextureLevel,
+    origin: Point,
+    row_bytes: u64,
+    row_count: u64,
+    site: &'static str,
+) -> Result<(u64, RectStride), BlitStatus> {
+    let Point {
+        x: ox,
+        y: oy,
+        z: oz,
+    } = origin;
+    let last_y = oy
+        .checked_add(row_count.saturating_sub(1))
+        .ok_or_else(|| br(BlitStatus::Bounds, site))?;
+    let first = t
+        .texel_offset(ox, oy, oz)
+        .ok_or_else(|| br(BlitStatus::Bounds, site))?;
+    t.texel_offset(ox, last_y, oz)
+        .ok_or_else(|| br(BlitStatus::Bounds, site))?;
+    let gva = t
+        .base_gva
+        .checked_add(first)
+        .ok_or_else(|| br(BlitStatus::Bounds, site))?;
+    let rect = RectStride::new(t.row_stride, row_bytes, row_count)
+        .ok_or_else(|| br(BlitStatus::Bounds, site))?;
+    Ok((gva, rect))
 }
 
 /// Write a whole `row_bytes`-wide, `row_count`-tall rectangle at `origin` from
@@ -1329,21 +1378,17 @@ fn write_texture_rect<M: HostMemory + HostOps>(
         return Err(br(BlitStatus::Capacity, "wr_rect_buf_cap"));
     }
     match tex {
-        TextureBacking::Linear(_) => {
-            for y in 0..row_count {
-                let at = (y * row_bytes) as usize;
-                write_texture_row(
-                    state,
-                    host,
-                    task_id,
-                    tex,
-                    origin,
-                    y,
-                    row_bytes,
-                    &buf[at..at + row_bytes as usize],
-                    allowed,
-                )?;
-            }
+        TextureBacking::Linear(t) => {
+            let (gva, rect) = linear_rect(t, origin, row_bytes, row_count, "wr_rect_linear_shape")?;
+            crate::runtime::gva_view::write_rect_within(
+                state, host, task_id, gva, rect, buf, allowed,
+            )
+            .map_err(|_| br(BlitStatus::GuestIo, "wr_rect_linear_io"))?;
+            crate::runtime::drain::note_store_route("blit_rect_linear_walk");
+            crate::runtime::drain::note_store_route_n(
+                "blit_rect_linear_rows_hoisted",
+                row_count.saturating_sub(1),
+            );
             Ok(())
         }
         TextureBacking::Type11(t) => {
@@ -3503,6 +3548,25 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     // slice/level form carried, and there a driven Maps leg charged the row loop
     // 30.15 s of a 30.28 s rail. See [`read_texture_rect`] for what a per-row
     // call into the mapping rail re-pays.
+    // Whether a GPU-side copy could serve this pair at all, and if not, which
+    // term stops it. `engine::copy_target_to_guest_pages` takes no source
+    // rectangle: it copies level 0 of the resident whole, at origin zero, into
+    // a destination whose geometry is the resident's own. So a type-11 source
+    // going to a linear destination is reachable only when both ends are the
+    // whole plane at the origin, and the split below says how much of this
+    // population that is. Instrument only — nothing here branches on it, and the
+    // staging loop runs the same either way.
+    if src.is_type11() && !dst.is_type11() {
+        let whole_src =
+            sox == 0 && soy == 0 && copy_w == src.width() as u64 && copy_h == src.height() as u64;
+        let whole_dst =
+            dox == 0 && doy == 0 && copy_w == dst.width() as u64 && copy_h == dst.height() as u64;
+        crate::runtime::drain::note_store_route(match (whole_src, whole_dst) {
+            (true, true) => "blit_t2t_t11_whole_plane",
+            (true, false) => "blit_t2t_t11_dst_partial",
+            (false, _) => "blit_t2t_t11_src_partial",
+        });
+    }
     let t2t_stage_started = std::time::Instant::now();
     let mut staged = vec![0u8; row_bytes.saturating_mul(copy_h) as usize];
     for z in 0..copy_d {
