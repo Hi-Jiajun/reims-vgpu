@@ -1389,7 +1389,14 @@ fn a_compressed_level_addresses_blocks_in_both_axes() {
         block: pf::block_geometry(pf::MTL_FORMAT_BC3_RGBA).expect("bc3 has a grid"),
         pixel_format: pf::MTL_FORMAT_BC3_RGBA,
     };
-    assert_eq!(bc3.block, BlockGeometry { width: 4, height: 4, bytes: 16 });
+    assert_eq!(
+        bc3.block,
+        BlockGeometry {
+            width: 4,
+            height: 4,
+            bytes: 16
+        }
+    );
     assert_eq!(
         bc3.bytes_per_image(),
         Some(4096),
@@ -1420,7 +1427,14 @@ fn a_compressed_level_addresses_blocks_in_both_axes() {
         block: pf::block_geometry(MTL_FORMAT_RGBA8_UNORM).expect("rgba8 has a grid"),
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
     };
-    assert_eq!(rgba.block, BlockGeometry { width: 1, height: 1, bytes: 4 });
+    assert_eq!(
+        rgba.block,
+        BlockGeometry {
+            width: 1,
+            height: 1,
+            bytes: 4
+        }
+    );
     assert_eq!(rgba.bytes_per_image(), Some(256 * 4));
     assert_eq!(rgba.texel_offset(3, 2, 0), Some(2 * 256 + 3 * 4));
 }
@@ -2406,7 +2420,11 @@ fn blit_geometry_helpers_clamp_bpp_and_aspect() {
         None,
         "one past the edge refuses; it used to return 100 and copy less"
     );
-    assert_eq!(copy_extent("t", "w", 150, 100), None, "and so does far past");
+    assert_eq!(
+        copy_extent("t", "w", 150, 100),
+        None,
+        "and so does far past"
+    );
 
     // texture_storage_bpp: full-texel storage size per format; unknown fails.
     assert_eq!(texture_storage_bpp(MTL_FORMAT_BGRA8_UNORM), Ok(4));

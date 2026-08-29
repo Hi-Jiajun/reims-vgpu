@@ -3288,8 +3288,7 @@ impl DeviceState {
         );
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
-        self.host_texture_surfaces
-            .retain(|&(t, _), _| t != task_id);
+        self.host_texture_surfaces.retain(|&(t, _), _| t != task_id);
         // Clear texture→mapping latches for this task.
         self.texture_to_mapping.retain(|&(t, _), _| t != task_id);
         // GVA encode cache retained until Unmap of that range.

@@ -1023,13 +1023,9 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     // the view/surface paths (which would mis-decode the opcode-9 descriptor).
     // `resource` (when supplied by the caller) serves every classification and
     // descriptor consumer below from the one retained object.
-    if let Some(bt) = buffer_texture_descriptor(
-        state,
-        host,
-        task_id,
-        texture_ref,
-        resource.as_deref(),
-    ) {
+    if let Some(bt) =
+        buffer_texture_descriptor(state, host, task_id, texture_ref, resource.as_deref())
+    {
         // The opcode-9 descriptor's own pixel format. The loader converts to
         // RGBA8 order and decodes nothing, so the transfer function the guest
         // declared is still the one these bytes carry.
@@ -1066,9 +1062,8 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     let mut is_type5 = false;
     let mut type5_view: Option<objects::Type5TextureView> = None;
     let mut surface: Option<u32> = None;
-    let resolved_resource = resource.or_else(|| {
-        objects::resolve_resource(state, host, task_id, texture_ref).ok()
-    });
+    let resolved_resource =
+        resource.or_else(|| objects::resolve_resource(state, host, task_id, texture_ref).ok());
     if let Some(resource) = resolved_resource.as_ref() {
         let entry = resource.entry;
         if entry.object_type == objects::OBJECT_TYPE_REF_TEXTURE {
@@ -1222,12 +1217,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 if guest_allocation_sample_is_direct(resident_backing, may_bind_resident) {
                     crate::runtime::drain::note_store_route("t11rung_resident");
                     let format = resident_id.resident_format();
-                    return Some((
-                        w,
-                        h,
-                        mid,
-                        SampledSourceRequest::Target(resident_id, format),
-                    ));
+                    return Some((w, h, mid, SampledSourceRequest::Target(resident_id, format)));
                 }
 
                 // What the hypervisor can say about the guest's own stores into
@@ -3002,11 +2992,9 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
                     .ok()?,
                 );
                 let whole = import.slice(head, backing.size).ok()?;
-                let guest = crate::runtime::guest_ram::GuestRef::new(
-                    std::sync::Arc::clone(&import),
-                    whole,
-                )
-                .ok()?;
+                let guest =
+                    crate::runtime::guest_ram::GuestRef::new(std::sync::Arc::clone(&import), whole)
+                        .ok()?;
                 (import, head, guest)
             }
         };
@@ -3020,12 +3008,10 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
                 host_ptr: host_base.checked_add(head as usize)?,
                 len: backing.size,
             }]),
-            pages: std::sync::Arc::new(vec![
-                crate::runtime::guest_ram_map::GuestWindowRun {
-                    window_offset: 0,
-                    guest,
-                },
-            ]),
+            pages: std::sync::Arc::new(vec![crate::runtime::guest_ram_map::GuestWindowRun {
+                window_offset: 0,
+                guest,
+            }]),
         }))
     })()
     .unwrap_or_else(unavailable);
@@ -3107,13 +3093,7 @@ pub(super) fn direct_linear_sample_from_packed(
     native_components: pixel_format::SwizzlePlan,
     owner: crate::model::TaskResourceLifetimeRef,
 ) -> Option<SampledSourceRequest> {
-    let direct_image = sampled_backing_from_packed(
-        packed,
-        level_offset,
-        row_pitch,
-        span,
-        owner,
-    )?;
+    let direct_image = sampled_backing_from_packed(packed, level_offset, row_pitch, span, owner)?;
     Some(SampledSourceRequest::GuestRuns(
         crate::backend::vulkan::engine::GuestRunSource {
             runs: std::sync::Arc::clone(&packed.runs),
@@ -3264,9 +3244,7 @@ pub(super) fn strided_level_extent(
     let row_length_texels = if bpr == tight {
         0
     } else {
-        u32::try_from(bpr / bytes)
-            .ok()?
-            .checked_mul(block.width)?
+        u32::try_from(bpr / bytes).ok()?.checked_mul(block.width)?
     };
     let preceding_planes = u64::from(layout.planes() - 1)
         .checked_mul(bpr)?
@@ -3424,12 +3402,10 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
         backing,
         PackedResourceRail::Buffer,
     ) {
-        let packed = state.bound_buffers.packed_available(
-            task_id,
-            buffer_ref,
-            backing.gva,
-            backing.size,
-        )?;
+        let packed =
+            state
+                .bound_buffers
+                .packed_available(task_id, buffer_ref, backing.gva, backing.size)?;
         if let Some(bound) = slice_packed_buffer(packed, offset, span) {
             crate::runtime::drain::note_store_route("zc_buffer_imported");
             return Some(bound);
@@ -3664,8 +3640,9 @@ fn load_buffer_content_resolved<M: HostMemory + HostOps>(
             return Some(content);
         }
     }
-    let bytes =
-        read_buffer_bytes_resolved(state, host, task_id, buffer_ref, backing, offset, extent_cap)?;
+    let bytes = read_buffer_bytes_resolved(
+        state, host, task_id, buffer_ref, backing, offset, extent_cap,
+    )?;
     Some(crate::backend::vulkan::engine::BufferContent::from(bytes))
 }
 
@@ -3682,9 +3659,7 @@ pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
     extent_cap: Option<u64>,
 ) -> Option<crate::backend::vulkan::engine::BufferContent> {
     if allow_zero_copy {
-        if let Some(content) =
-            held_buffer_content(state, task_id, buffer_ref, offset, extent_cap)
-        {
+        if let Some(content) = held_buffer_content(state, task_id, buffer_ref, offset, extent_cap) {
             return Some(content);
         }
     }
@@ -4241,47 +4216,50 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // rail no longer has to refuse a format for having one.
     let (native, sampled_vk_format, native_components) =
         match translate::pixel::sampled_pixels(declared_format) {
-        // Deduped per declared format, which is a handful of values a boot
-        // enumerates in a handful of lines. The number is the guest's own
-        // `MTLPixelFormat` ordinal, so it names the format without this device
-        // having to hold a second spelling of Apple's table.
-        // The reason is kept, not discarded. `Err` here has three causes that
-        // want three different repairs — the format is outside the decode
-        // contract, the contract defines it but no rail names a byte layout for
-        // it, or the layout exists but its channels need a swizzle — and a
-        // single count reads the same for all three. The sub-route is the
-        // reason's own slug, so it cannot drift from the taxonomy in
-        // `translate::reason`, and the total is still recorded beside it so the
-        // split adds up.
-        Err(reason) => {
-            crate::runtime::drain::note_store_route("zc_lin_format_no_layout");
-            crate::runtime::drain::note_store_route(zc_lin_no_layout_route(reason));
-            if crate::observe::first_sight("zc_lin_format_no_layout", u64::from(declared_format)) {
-                crate::observe::off(format!(
-                    "zc_lin_format_no_layout fmt={declared_format:#x} {reason} \
+            // Deduped per declared format, which is a handful of values a boot
+            // enumerates in a handful of lines. The number is the guest's own
+            // `MTLPixelFormat` ordinal, so it names the format without this device
+            // having to hold a second spelling of Apple's table.
+            // The reason is kept, not discarded. `Err` here has three causes that
+            // want three different repairs — the format is outside the decode
+            // contract, the contract defines it but no rail names a byte layout for
+            // it, or the layout exists but its channels need a swizzle — and a
+            // single count reads the same for all three. The sub-route is the
+            // reason's own slug, so it cannot drift from the taxonomy in
+            // `translate::reason`, and the total is still recorded beside it so the
+            // split adds up.
+            Err(reason) => {
+                crate::runtime::drain::note_store_route("zc_lin_format_no_layout");
+                crate::runtime::drain::note_store_route(zc_lin_no_layout_route(reason));
+                if crate::observe::first_sight(
+                    "zc_lin_format_no_layout",
+                    u64::from(declared_format),
+                ) {
+                    crate::observe::off(format!(
+                        "zc_lin_format_no_layout fmt={declared_format:#x} {reason} \
                      (no sampled TexelLayout; the bind falls to the CPU \
                      re-read + memcmp rung)"
-                ));
-            }
-            return None;
-        }
-        Ok((layout, _decline, components)) => {
-            // Every layout is asked about, not just the one that was known to
-            // be optional. This rail hands the guest's bytes to a sampler, so
-            // "may this host bind this format to one" is a question about the
-            // layout, and a table indexed by the layout cannot be missing an
-            // entry for one that was added later. The engine owns the whole
-            // answer — for most layouts it is the linear-filter query, and for
-            // an integer one it is not, which is why the two terms are not
-            // reassembled here.
-            if !engine::supports_sampled_layout_bind(layout) {
-                crate::runtime::drain::note_store_route("zc_lin_layout_unfilterable");
+                    ));
+                }
                 return None;
             }
-            let format = translate::pixel::translate(declared_format).ok()?.vk;
-            (layout, format, components)
-        }
-    };
+            Ok((layout, _decline, components)) => {
+                // Every layout is asked about, not just the one that was known to
+                // be optional. This rail hands the guest's bytes to a sampler, so
+                // "may this host bind this format to one" is a question about the
+                // layout, and a table indexed by the layout cannot be missing an
+                // entry for one that was added later. The engine owns the whole
+                // answer — for most layouts it is the linear-filter query, and for
+                // an integer one it is not, which is why the two terms are not
+                // reassembled here.
+                if !engine::supports_sampled_layout_bind(layout) {
+                    crate::runtime::drain::note_store_route("zc_lin_layout_unfilterable");
+                    return None;
+                }
+                let format = translate::pixel::translate(declared_format).ok()?.vk;
+                (layout, format, components)
+            }
+        };
     // The block-compressed layouts ride this rail in their own units — see
     // `strided_level_extent`, which speaks the layout's storage grid. The
     // refusal that used to sit here ("falling to the CPU rail costs one upload
@@ -4364,12 +4342,11 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // the task resource.
     if available && planes == 1 {
         let backing = allocation.as_ref()?;
-        if let Some(packed) = state.bound_buffers.packed_available(
-            task_id,
-            texture_ref,
-            backing.gva,
-            backing.size,
-        ) {
+        if let Some(packed) =
+            state
+                .bound_buffers
+                .packed_available(task_id, texture_ref, backing.gva, backing.size)
+        {
             if let Some(request) = direct_linear_sample_from_packed(
                 packed,
                 layout.offset,
@@ -5347,10 +5324,7 @@ pub(super) fn load_linear_from_host_caches<M: HostMemory + HostOps>(
         // format against the same `gva=`; this names the read's. Latched per
         // (gva, format) so a steady bind stays at one line and a *change* of
         // interpretation still surfaces.
-        if crate::observe::first_sight(
-            "lin_serve_fmt",
-            gva ^ (u64::from(tex.pixel_format) << 48),
-        ) {
+        if crate::observe::first_sight("lin_serve_fmt", gva ^ (u64::from(tex.pixel_format) << 48)) {
             crate::observe::off(format!(
                 "lin_serve_fmt task={task_id} ref={texture_ref} gva={gva:#x} {w}x{h} \
                  fmt={:#x} bytes={byte_format:?}",
@@ -6324,11 +6298,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
                 crate::backend::vulkan::engine::resident_content_ready(&identity)
             }
         };
-        if matches!(
-            declared,
-            crate::contract::pass_action::LoadAction::DontCare
-        ) && !load
-        {
+        if matches!(declared, crate::contract::pass_action::LoadAction::DontCare) && !load {
             // Reported only where it still costs the guest: a DontCare whose
             // resident cannot answer for the attachment is the one that still
             // becomes a clear over live content.
@@ -6567,7 +6537,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 color.map_or(0, |color| color.format),
                 color.map_or(0, |color| color.load_action),
                 color.map_or(0, |color| color.store_action),
-                req.depth_attach.as_ref().map_or(0, |depth| depth.texture_ref),
+                req.depth_attach
+                    .as_ref()
+                    .map_or(0, |depth| depth.texture_ref),
             ));
         }
     }
@@ -7438,7 +7410,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // which is how the first live cube bind actually arrived: an
                 // RGBA8 cube rode the gather and the reload is what serves it.
                 let (source, sampled_vk_format, byte_origin, bytes_identity, tw, th) = if !cube {
-                    (source, sampled_vk_format, byte_origin, bytes_identity, tw, th)
+                    (
+                        source,
+                        sampled_vk_format,
+                        byte_origin,
+                        bytes_identity,
+                        tw,
+                        th,
+                    )
                 } else {
                     if source_is_target {
                         return Err(DrawError::DrawPreparation(
@@ -8165,7 +8144,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 },
             ));
         }
-        if let Some(color) = req.colors.first().filter(|color| color.multisample_source_ref != 0) {
+        if let Some(color) = req
+            .colors
+            .first()
+            .filter(|color| color.multisample_source_ref != 0)
+        {
             use crate::contract::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
             if color.store_action != MTL_STORE_ACTION_MULTISAMPLE_RESOLVE {
                 return Err(DrawError::Unsupported(
@@ -8279,7 +8262,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let store_is_store = req
             .colors
             .first()
-            .map(|c| crate::contract::pass_action::store_action_publishes_single_sample(c.store_action))
+            .map(|c| {
+                crate::contract::pass_action::store_action_publishes_single_sample(c.store_action)
+            })
             .unwrap_or(true);
         resources.target_rgba8 = target_rgba8;
         resources.target_guest_seed = target_guest_seed;
@@ -8943,11 +8928,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         resources.height = h;
         resources.vertex_count = vertex_count;
         if let Some(c0) = req.colors.first() {
-            let (attachment, _) = translate::pixel::color_attachment(c0.format).map_err(|reason| {
-                DrawError::Unsupported(
-                    crate::backend::vulkan::engine::reason::DrawReason::ColorAttachmentFormat(reason),
-                )
-            })?;
+            let (attachment, _) =
+                translate::pixel::color_attachment(c0.format).map_err(|reason| {
+                    DrawError::Unsupported(
+                        crate::backend::vulkan::engine::reason::DrawReason::ColorAttachmentFormat(
+                            reason,
+                        ),
+                    )
+                })?;
             resources.color_attachment = Some(attachment.with_clear(target_clear));
         }
         // Attachment-count census, taken before the MRT gate rather than inside
@@ -10039,9 +10027,7 @@ pub(crate) fn gva_resident_format(format: u16) -> ash::vk::Format {
     match pixel::texel_layout_of(allocation) {
         // Capability, never an API-version assumption: the host is asked whether
         // it renders to and blends this layout.
-        Some(layout)
-            if crate::backend::vulkan::engine::render_target_layout_supported(layout) =>
-        {
+        Some(layout) if crate::backend::vulkan::engine::render_target_layout_supported(layout) => {
             allocation
         }
         _ => pixel::RESIDENT_RGBA_FORMAT,
@@ -10328,9 +10314,10 @@ fn arm_surface_writeback_debt<M: HostMemory + HostOps>(
     crate::backend::vulkan::engine::stamp_resident_content_epoch(identity, epoch);
     // Armed before the eviction is paid, so the ledger never holds two debts for
     // one mapping and the payment below cannot be the one just armed.
-    let evicted = state
-        .pending_writebacks
-        .arm(mapping_id, identity.clone(), width, height, map_generation);
+    let evicted =
+        state
+            .pending_writebacks
+            .arm(mapping_id, identity.clone(), width, height, map_generation);
     if let Some(evicted) = evicted {
         crate::runtime::drain::note_store_route("wbdebt_evicted");
         if !crate::runtime::writeback_debt::pay_key(state, host, evicted) {
@@ -10472,7 +10459,15 @@ mod vulkan_split_tests {
         // All zeroes over the same cached span: the loss, and still a member of
         // the population it is a subset of.
         let blank = vec![0u8; (w * h * 4) as usize];
-        note_guest_rung_blank(&state, &host, 1, 9, (gva, w, h), &blank, SampledByteFormat::synthesised(TexelLayout::Rgba8));
+        note_guest_rung_blank(
+            &state,
+            &host,
+            1,
+            9,
+            (gva, w, h),
+            &blank,
+            SampledByteFormat::synthesised(TexelLayout::Rgba8),
+        );
         assert_eq!(store_route_count("lin_rung_host_entry"), entries + 2);
         assert_eq!(
             store_route_count("lin_rung_blank_with_host_entry"),
@@ -12077,7 +12072,10 @@ mod vulkan_split_tests {
             Some(TargetIdentity::Texture { ref_: 42, .. })
         ));
         // And no colour extent is still no identity: nothing sizes the buffer.
-        assert_eq!(depth_chain_identity(&DrawEncodeRequest::default(), false), None);
+        assert_eq!(
+            depth_chain_identity(&DrawEncodeRequest::default(), false),
+            None
+        );
     }
 
     #[test]
@@ -12090,7 +12088,13 @@ mod vulkan_split_tests {
         // drive that choice one-to-one.
         let cube = sampled_image_shape(SampledImageKind::Cube).expect("cube is expressible");
         assert_eq!(
-            (cube.cube, cube.arrayed, cube.volume, cube.one_dim, cube.layers),
+            (
+                cube.cube,
+                cube.arrayed,
+                cube.volume,
+                cube.one_dim,
+                cube.layers
+            ),
             (true, false, false, false, 6)
         );
         // A cube array needs 6*n layers and n is a descriptor field this

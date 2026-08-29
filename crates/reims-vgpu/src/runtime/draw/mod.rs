@@ -1980,10 +1980,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         crate::observe::fail(format!(
             "metal_draw reason=draw_mtl_multisample_resolve_unsupported pipe={} \
              source={} resolve={} store_action={}",
-            req.pipeline_ref,
-            color.multisample_source_ref,
-            color.texture_ref,
-            color.store_action
+            req.pipeline_ref, color.multisample_source_ref, color.texture_ref, color.store_action
         ));
         return (
             EncodeStatus::BadArgs("draw_mtl_multisample_resolve_unsupported"),
@@ -5503,13 +5500,7 @@ fn seed_color_load<M: HostMemory + HostOps>(
         let cached = if gva_served {
             crate::runtime::surface_cache::get_gva(state, target_gva, width, height)
         } else if ref_served {
-            crate::runtime::surface_cache::get_texture(
-                state,
-                task_id,
-                texture_ref,
-                width,
-                height,
-            )
+            crate::runtime::surface_cache::get_texture(state, task_id, texture_ref, width, height)
         } else {
             None
         };
@@ -5563,14 +5554,24 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
     // Opcode-9 buffer-backed texture (type-8): sample the source buffer directly.
     if let Some(bt) = buffer_texture_descriptor(state, host, task_id, texture_ref, None) {
         let source = bt.desc.pixel_format;
-        return load_buffer_texture_rgba(state, host, task_id, texture_ref, &bt)
-            .map(|(_, _, r)| (r, SampledByteFormat::from_source(TexelLayout::Rgba8, source)));
+        return load_buffer_texture_rgba(state, host, task_id, texture_ref, &bt).map(
+            |(_, _, r)| {
+                (
+                    r,
+                    SampledByteFormat::from_source(TexelLayout::Rgba8, source),
+                )
+            },
+        );
     }
     // Type-11 path via resolve.
     if let Some(mid) = objects::resolve_type11_ref(state, host, task_id, texture_ref) {
         let source = mapping_declared_format(state, mid, None);
-        return load_type11_mapping_rgba(state, host, mid, None)
-            .map(|(_, _, r)| (r, SampledByteFormat::from_source(TexelLayout::Rgba8, source)));
+        return load_type11_mapping_rgba(state, host, mid, None).map(|(_, _, r)| {
+            (
+                r,
+                SampledByteFormat::from_source(TexelLayout::Rgba8, source),
+            )
+        });
     }
     // Type-8 view → base texture + mip + format. The view's SWIZZLE is
     // deliberately not consulted here: it is a property of the view, not of the
@@ -5589,8 +5590,12 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
             return None;
         }
         let source = mapping_declared_format(state, mid, fmt_override);
-        return load_type11_mapping_rgba(state, host, mid, fmt_override)
-            .map(|(_, _, r)| (r, SampledByteFormat::from_source(TexelLayout::Rgba8, source)));
+        return load_type11_mapping_rgba(state, host, mid, fmt_override).map(|(_, _, r)| {
+            (
+                r,
+                SampledByteFormat::from_source(TexelLayout::Rgba8, source),
+            )
+        });
     }
     // The only rung here that can answer in anything but RGBA8. The three above
     // convert unconditionally — `load_buffer_texture_rgba` and
@@ -5835,8 +5840,8 @@ mod load_action_contract_tests {
 mod store_action_contract_tests {
     use super::store_action_in_contract;
     use crate::contract::pass_action::{
-        MTL_STORE_ACTION_DONT_CARE, MTL_STORE_ACTION_MULTISAMPLE_RESOLVE,
-        MTL_STORE_ACTION_STORE, MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
+        MTL_STORE_ACTION_DONT_CARE, MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, MTL_STORE_ACTION_STORE,
+        MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
     };
 
     /// The sibling of `a_load_action_outside_mtlloadaction_is_named_not_swallowed`,

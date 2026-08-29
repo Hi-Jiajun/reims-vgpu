@@ -1193,11 +1193,7 @@ pub fn synchronize_guest_backed_resident(
         })?
     };
 
-    mapper::note_physical_page_write_footprint(
-        &footprint,
-        base_off,
-        span_end - base_off,
-    );
+    mapper::note_physical_page_write_footprint(&footprint, base_off, span_end - base_off);
     state.host_writes.note_footprint(&footprint);
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);

@@ -11,12 +11,11 @@
 use metal2vulkan::passes::Stage;
 use reims_vgpu::backend::vulkan::engine::{
     self, BlendFactor, BlendOp, BlendStateResource, BufferContent, CullMode, DepthState,
-    DrawRequest, IndexType, IndexedDrawResource, PrimitiveTopology,
-    SampledContentIdentity, SampledImageResource, SampledSource, SamplerCompareFunction,
-    SamplerResource, ScissorResource, SecondaryColorTarget, StencilFaceOps, StencilOp, StencilState,
-    StorageBufferResource, TargetIdentity,
-    VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
-    VisibilityResultMode, MAX_DEVICE_RECREATES,
+    DrawRequest, IndexType, IndexedDrawResource, PrimitiveTopology, SampledContentIdentity,
+    SampledImageResource, SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource,
+    SecondaryColorTarget, StencilFaceOps, StencilOp, StencilState, StorageBufferResource,
+    TargetIdentity, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
+    ViewportResource, VisibilityResultMode, MAX_DEVICE_RECREATES,
 };
 /// The resident format every `TargetIdentity::Surface` in this file is built at.
 ///
@@ -786,7 +785,8 @@ fn depth_test_honored_on_resident_target_path() {
         }
         let px = engine::read_target(&identity)
             .expect("read resident depth target")
-            .into_rgba8().expect("an eight-bit colour readback");
+            .into_rgba8()
+            .expect("an eight-bit colour readback");
         Some(triangle_covered(&px, w, h))
     };
 
@@ -1425,7 +1425,8 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
     engine::execute_draw_request(&alias).expect("resident alias feedback");
     let out = engine::read_target(&identity)
         .expect("read native feedback result after deferred draw")
-        .into_rgba8().expect("an eight-bit colour readback");
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     assert_fullscreen_fragment_color("resident_sample_alias", &out, 16, 16);
     let delta = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
@@ -1677,7 +1678,8 @@ fn warm_non_store_zero_readback_seed_create_alloc() {
     // fence first, so it returns the exact content of the skipped-wait draw.
     let px = engine::read_target(&identity)
         .expect("read_target after warm")
-        .into_rgba8().expect("an eight-bit colour readback");
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     assert_fullscreen_fragment_color("read_target", &px, 16, 16);
 }
 
@@ -2256,17 +2258,27 @@ fn reflected_static_sampler_descriptor_samples_texture() {
     assert!(second.pixels.is_empty());
     let pixels = engine::read_target(&target)
         .expect("read repeated static sampler target")
-        .into_rgba8().expect("an eight-bit colour readback");
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     let descriptors = engine::counter_snapshot().delta_since(&before);
     if descriptors.descriptor_set_updates == 0 {
-        assert_eq!(descriptors.descriptor_pushes, 1, "first draw pushes: {descriptors:?}");
+        assert_eq!(
+            descriptors.descriptor_pushes, 1,
+            "first draw pushes: {descriptors:?}"
+        );
         assert_eq!(
             descriptors.descriptor_push_held, 1,
             "the exact repeated state is retained by the command buffer: {descriptors:?}"
         );
     } else {
-        assert_eq!(descriptors.descriptor_set_updates, 2, "fallback updates: {descriptors:?}");
-        assert_eq!(descriptors.descriptor_set_binds, 2, "fallback binds: {descriptors:?}");
+        assert_eq!(
+            descriptors.descriptor_set_updates, 2,
+            "fallback updates: {descriptors:?}"
+        );
+        assert_eq!(
+            descriptors.descriptor_set_binds, 2,
+            "fallback binds: {descriptors:?}"
+        );
         assert_eq!(descriptors.descriptor_pushes, 0);
         assert_eq!(descriptors.descriptor_push_held, 0);
     }
@@ -2632,7 +2644,8 @@ fn partial_draw_preserves_a_native_guest_target_seed() {
     }
     let rgba = engine::read_target(&identity)
         .expect("read guest-seeded target")
-        .into_rgba8().expect("an eight-bit colour readback");
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     let outside = ((h / 2) * w + w / 2) as usize * 4;
     assert_eq!(
         &rgba[outside..outside + 4],
@@ -2770,7 +2783,8 @@ fn a_bgra_ordered_seed_lands_the_same_pixels_as_the_rgba_ordered_one() {
         Some(
             engine::read_target(&identity)
                 .expect("read seed-order target")
-                .into_rgba8().expect("an eight-bit colour readback"),
+                .into_rgba8()
+                .expect("an eight-bit colour readback"),
         )
     };
 
@@ -2882,7 +2896,8 @@ fn skip_readback_store_then_load_from_target_preserves_content() {
     engine::execute_draw_request(&store2).expect("store2 LoadFromTarget");
     let px = engine::read_target(&identity)
         .expect("read_target after progressive Stores")
-        .into_rgba8().expect("an eight-bit colour readback");
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     assert_fullscreen_fragment_color("progressive_skip_readback", &px, 16, 16);
     // No seed_uploads on pass 2 (LoadFromTarget, not CPU seed).
     // Counters are process-global; just ensure content survived.
@@ -3187,7 +3202,8 @@ fn gva_deferred_store_flush_read_matches_sync_store() {
     let before_flush = engine::counter_snapshot();
     let p_flush = engine::read_target(&identity)
         .expect("flush read_target")
-        .into_rgba8().expect("an eight-bit colour readback");
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     let df = engine::counter_snapshot().delta_since(&before_flush);
     // The flush's copy is a resident read, not a draw readback — the two are
     // counted apart so that moving a copy from one rail to the other cannot look
@@ -3361,11 +3377,13 @@ fn alternating_target_no_readback_draws_stay_in_flight_and_read_back_exact() {
     // Boundary reads retire the in-flight work and see the final content.
     let px = engine::read_target(&id_a)
         .expect("ring boundary read a")
-        .into_rgba8().expect("an eight-bit colour readback");
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     assert_fullscreen_fragment_color("ring_read_a", &px, 16, 16);
     let px = engine::read_target(&id_b)
         .expect("ring boundary read b")
-        .into_rgba8().expect("an eight-bit colour readback");
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
     assert_fullscreen_fragment_color("ring_read_b", &px, 16, 16);
 }
 

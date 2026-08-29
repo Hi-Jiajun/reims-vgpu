@@ -1017,8 +1017,7 @@ mod tests {
 
     #[test]
     fn a_page_footprint_derives_physical_runs_once_and_windows_them_exactly() {
-        let pages: std::sync::Arc<[u64]> =
-            [0x1000, 0x2000, 0x9000, 0xa000, 0xb000].into();
+        let pages: std::sync::Arc<[u64]> = [0x1000, 0x2000, 0x9000, 0xa000, 0xb000].into();
         let footprint = GuestPageFootprint::new(pages, 0x1000).expect("valid footprint");
         assert_eq!(footprint.runs(), &[0..2, 2..5]);
 
@@ -1068,7 +1067,10 @@ mod tests {
         assert!(footprint.contains_page(0x1000));
         assert!(footprint.contains_page(0xa000));
         assert!(!footprint.contains_page(0x5000));
-        assert!(!footprint.contains_page(0x9800), "only whole guest pages belong");
+        assert!(
+            !footprint.contains_page(0x9800),
+            "only whole guest pages belong"
+        );
         assert_eq!(footprint.page_span(), Some((0x1000, 0xa000)));
 
         let clone = footprint.clone();

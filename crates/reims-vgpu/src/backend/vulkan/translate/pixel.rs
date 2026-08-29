@@ -205,9 +205,7 @@ pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {
         p::MTL_FORMAT_BC4_R_SNORM => linear(vk::Format::BC4_SNORM_BLOCK, p::BC_BLOCK_BYTES_8),
         p::MTL_FORMAT_BC5_RG_UNORM => linear(vk::Format::BC5_UNORM_BLOCK, p::BC_BLOCK_BYTES_16),
         p::MTL_FORMAT_BC5_RG_SNORM => linear(vk::Format::BC5_SNORM_BLOCK, p::BC_BLOCK_BYTES_16),
-        p::MTL_FORMAT_BC6H_RGB_FLOAT => {
-            linear(vk::Format::BC6H_SFLOAT_BLOCK, p::BC_BLOCK_BYTES_16)
-        }
+        p::MTL_FORMAT_BC6H_RGB_FLOAT => linear(vk::Format::BC6H_SFLOAT_BLOCK, p::BC_BLOCK_BYTES_16),
         p::MTL_FORMAT_BC6H_RGB_UFLOAT => {
             linear(vk::Format::BC6H_UFLOAT_BLOCK, p::BC_BLOCK_BYTES_16)
         }
@@ -1188,19 +1186,58 @@ mod tests {
             (p::MTL_FORMAT_A8_UNORM, "needs a component mapping"),
             (p::MTL_FORMAT_RGBA8_UNORM_SRGB, "would downgrade unrecorded"),
             (p::MTL_FORMAT_BGRA8_UNORM_SRGB, "would downgrade unrecorded"),
-            (p::MTL_FORMAT_BC1_RGBA, "no block-compressed storage image exists"),
-            (p::MTL_FORMAT_BC1_RGBA_SRGB, "no block-compressed storage image exists"),
-            (p::MTL_FORMAT_BC2_RGBA, "no block-compressed storage image exists"),
-            (p::MTL_FORMAT_BC2_RGBA_SRGB, "no block-compressed storage image exists"),
-            (p::MTL_FORMAT_BC3_RGBA, "no block-compressed storage image exists"),
-            (p::MTL_FORMAT_BC3_RGBA_SRGB, "no block-compressed storage image exists"),
-            (p::MTL_FORMAT_BC4_R_UNORM, "no block-compressed storage image exists"),
-            (p::MTL_FORMAT_BC4_R_SNORM, "no block-compressed storage image exists"),
-            (p::MTL_FORMAT_BC5_RG_UNORM, "no block-compressed storage image exists"),
-            (p::MTL_FORMAT_BC5_RG_SNORM, "no block-compressed storage image exists"),
-            (p::MTL_FORMAT_BC6H_RGB_FLOAT, "no block-compressed storage image exists"),
-            (p::MTL_FORMAT_BC6H_RGB_UFLOAT, "no block-compressed storage image exists"),
-            (p::MTL_FORMAT_BC7_RGBA_UNORM, "no block-compressed storage image exists"),
+            (
+                p::MTL_FORMAT_BC1_RGBA,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC1_RGBA_SRGB,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC2_RGBA,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC2_RGBA_SRGB,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC3_RGBA,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC3_RGBA_SRGB,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC4_R_UNORM,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC4_R_SNORM,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC5_RG_UNORM,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC5_RG_SNORM,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC6H_RGB_FLOAT,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC6H_RGB_UFLOAT,
+                "no block-compressed storage image exists",
+            ),
+            (
+                p::MTL_FORMAT_BC7_RGBA_UNORM,
+                "no block-compressed storage image exists",
+            ),
             (
                 p::MTL_FORMAT_BC7_RGBA_UNORM_SRGB,
                 "no block-compressed storage image exists",
@@ -1224,7 +1261,10 @@ mod tests {
         // contract does not define it — an undefined value would satisfy the
         // sweep above for the wrong reason.
         for &(mtl, why) in EXCEPTIONS {
-            assert!(translate(mtl).is_ok(), "{mtl:#x} is a defined format ({why})");
+            assert!(
+                translate(mtl).is_ok(),
+                "{mtl:#x} is a defined format ({why})"
+            );
         }
 
         // The ten-bit biplanar video planes travel together: a shader samples
@@ -1772,14 +1812,8 @@ mod tests {
     #[test]
     fn the_cpu_sampled_rail_lands_where_the_zero_copy_rail_does() {
         for (mtl, expected) in [
-            (
-                p::MTL_FORMAT_RGBA8_UNORM_SRGB,
-                vk::Format::R8G8B8A8_SRGB,
-            ),
-            (
-                p::MTL_FORMAT_BGRA8_UNORM_SRGB,
-                vk::Format::B8G8R8A8_SRGB,
-            ),
+            (p::MTL_FORMAT_RGBA8_UNORM_SRGB, vk::Format::R8G8B8A8_SRGB),
+            (p::MTL_FORMAT_BGRA8_UNORM_SRGB, vk::Format::B8G8R8A8_SRGB),
         ] {
             let (layout, _, _) = sampled_pixels(mtl).expect("both sRGB orders sample");
             let bytes = SampledByteFormat::from_source(layout, mtl);
@@ -1956,11 +1990,17 @@ mod tests {
             TexelLayout::Rgba8
         );
         assert_eq!(
-            color_attachment(p::MTL_FORMAT_BGRA8_UNORM_SRGB).unwrap().0.vk,
+            color_attachment(p::MTL_FORMAT_BGRA8_UNORM_SRGB)
+                .unwrap()
+                .0
+                .vk,
             vk::Format::B8G8R8A8_SRGB
         );
         assert_eq!(
-            color_attachment(p::MTL_FORMAT_RGBA8_UNORM_SRGB).unwrap().0.vk,
+            color_attachment(p::MTL_FORMAT_RGBA8_UNORM_SRGB)
+                .unwrap()
+                .0
+                .vk,
             vk::Format::R8G8B8A8_SRGB
         );
         // …and each one hands back the decline that loss owes, so the hold is
@@ -2026,9 +2066,19 @@ mod tests {
         const PX: u32 = 4;
         let wide = vec![0u8; PX as usize * p::RG16_BPP as usize];
         let mut rgba = vec![0u8; PX as usize * p::RGBA8_BPP as usize];
-        assert!(!p::narrow_texel_to_rgba8(TexelLayout::Rg16Uint, &wide, PX, &mut rgba));
+        assert!(!p::narrow_texel_to_rgba8(
+            TexelLayout::Rg16Uint,
+            &wide,
+            PX,
+            &mut rgba
+        ));
         let mut back = wide.clone();
-        assert!(!p::expand_rgba8_to_texel(TexelLayout::Rg16Uint, &rgba, PX, &mut back));
+        assert!(!p::expand_rgba8_to_texel(
+            TexelLayout::Rg16Uint,
+            &rgba,
+            PX,
+            &mut back
+        ));
         assert!(!p::convert_rgba8_to_row(
             p::MTL_FORMAT_RG16_UINT,
             &rgba,
@@ -2203,8 +2253,9 @@ mod tests {
     fn expected_names_every_format_the_table_translates() {
         let listed: std::collections::BTreeSet<u16> =
             EXPECTED.iter().map(|(mtl, ..)| *mtl).collect();
-        let translated: std::collections::BTreeSet<u16> =
-            (0..=u16::MAX).filter(|mtl| translate(*mtl).is_ok()).collect();
+        let translated: std::collections::BTreeSet<u16> = (0..=u16::MAX)
+            .filter(|mtl| translate(*mtl).is_ok())
+            .collect();
         assert_eq!(
             translated, listed,
             "translate accepts formats EXPECTED does not name (or the reverse), so they are \

@@ -1122,23 +1122,22 @@ impl DeviceContext {
         // One region per ring slot, for the reason `TimestampProbe`'s doc gives:
         // the guest-page writeback submits without waiting, so two of its copies
         // can be in flight at once and a shared region is reset under the first.
-        let timestamps = scale
-            .and_then(|scale| {
-                let ci = vk::QueryPoolCreateInfo::default()
-                    .query_type(vk::QueryType::TIMESTAMP)
-                    .query_count(TimestampProbe::PER_SLOT * super::pools::RING_DEPTH as u32);
-                device
-                    .create_query_pool(&ci, None)
-                    .map(|pool| TimestampProbe { pool, scale })
-                    .map_err(|e| {
-                        crate::observe::Emit::decline(
-                            "vk_timestamp_pool",
-                            &VkCall::new(VkOp::ContextCreateQueryPool, e),
-                        )
-                        .fail_once(0);
-                    })
-                    .ok()
-            });
+        let timestamps = scale.and_then(|scale| {
+            let ci = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::TIMESTAMP)
+                .query_count(TimestampProbe::PER_SLOT * super::pools::RING_DEPTH as u32);
+            device
+                .create_query_pool(&ci, None)
+                .map(|pool| TimestampProbe { pool, scale })
+                .map_err(|e| {
+                    crate::observe::Emit::decline(
+                        "vk_timestamp_pool",
+                        &VkCall::new(VkOp::ContextCreateQueryPool, e),
+                    )
+                    .fail_once(0);
+                })
+                .ok()
+        });
         let draw_spans = scale
             .filter(|_| crate::env::read(crate::env::GPU_SPANS).0 != crate::env::Switch::Off)
             .and_then(|scale| {
@@ -1694,7 +1693,10 @@ impl DeviceContext {
             .wait_dst_stage_mask(transaction.wait_stages)
             .command_buffers(transaction.command_buffers)
             .signal_semaphores(transaction.signal_semaphores);
-        unsafe { self.device.queue_submit(self.queue(), &[info], transaction.fence) }?;
+        unsafe {
+            self.device
+                .queue_submit(self.queue(), &[info], transaction.fence)
+        }?;
         let waits = [transaction.present_wait];
         let swapchains = [transaction.swapchain];
         let indices = [transaction.image_index];

@@ -360,8 +360,7 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
         let mapping = state.mappings.get_mut(&mid).unwrap();
         mapping.page_entries = (0..pages)
             .map(|i| {
-                ((((gpa0 >> PAGE_SHIFT_X86) as u32) + i) << PAGE_ENTRY_PFN_SHIFT)
-                    | PAGE_ENTRY_VALID
+                ((((gpa0 >> PAGE_SHIFT_X86) as u32) + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
             })
             .collect();
     }
@@ -388,14 +387,7 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
         type11_resource.lifetime_ref(),
     )
     .expect("the mapping's color plane is sampleable");
-    let SampledSourceRequest::GuestRuns(
-        type11,
-        _,
-        type11_format,
-        _,
-        type11_identity,
-        ..
-    ) = type11
+    let SampledSourceRequest::GuestRuns(type11, _, type11_format, _, type11_identity, ..) = type11
     else {
         panic!("the mapping stays guest-backed")
     };
@@ -425,7 +417,8 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
         type5_resource.lifetime_ref(),
     )
     .expect("the serialized plane view is sampleable");
-    let SampledSourceRequest::GuestRuns(type5, _, type5_format, _, type5_identity, ..) = type5 else {
+    let SampledSourceRequest::GuestRuns(type5, _, type5_format, _, type5_identity, ..) = type5
+    else {
         panic!("the plane view stays guest-backed")
     };
     assert_eq!(type5_format, ash::vk::Format::B8G8R8A8_UNORM);
@@ -480,9 +473,8 @@ fn small_mapping_sampled_plane_uses_its_direct_resource() {
     let gpa = 0x4200_0000u64;
     host.map_range(gpa, page as usize, 0);
     assert!(state.map_surface(mid));
-    state.mappings.get_mut(&mid).unwrap().page_entries = vec![
-        ((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT | PAGE_ENTRY_VALID,
-    ];
+    state.mappings.get_mut(&mid).unwrap().page_entries =
+        vec![((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT | PAGE_ENTRY_VALID];
     assert!(state.set_mapping_geom(mid, width, height, MTL_FORMAT_BGRA8_UNORM));
     crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
     let resource = crate::model::TaskResource::new(Default::default(), std::sync::Arc::from([]));
@@ -2211,11 +2203,15 @@ fn a_mappings_declared_format_answers_for_every_mapping() {
         },
     );
     assert_eq!(mapping_declared_format(&state, 7, None), 0xfffe);
-    assert!(!pixel_format::is_srgb(mapping_declared_format(&state, 7, None)));
+    assert!(!pixel_format::is_srgb(mapping_declared_format(
+        &state, 7, None
+    )));
     // A declared sRGB surface reaches the bind as sRGB.
     state.mappings.get_mut(&7).expect("just inserted").format =
         pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB;
-    assert!(pixel_format::is_srgb(mapping_declared_format(&state, 7, None)));
+    assert!(pixel_format::is_srgb(mapping_declared_format(
+        &state, 7, None
+    )));
     // A type-8 view's format is what the guest says it is reading, so it wins
     // over the mapping's own — including when it takes the sRGB back off.
     assert_eq!(
@@ -2298,10 +2294,7 @@ fn the_cpu_upload_rails_carry_the_srgb_transfer_function_to_the_bind() {
     )
     .expect("native sRGB BGRA sample loads");
     assert_eq!(native_fmt.layout(), TexelLayout::Bgra8);
-    assert_eq!(
-        vk_sampled_bytes(native_fmt),
-        ash::vk::Format::B8G8R8A8_SRGB
-    );
+    assert_eq!(vk_sampled_bytes(native_fmt), ash::vk::Format::B8G8R8A8_SRGB);
 
     // A linear source must reach the linear spelling, or every bind decodes
     // twice and the fix is worse than the bug it replaced.
@@ -2978,7 +2971,10 @@ fn mrt_draw_request_gets_attachment_samples_from_the_bound_pipeline_before_encod
     let req = single_rt_draw_request(&mut state, &mut host, 7, att)
         .expect("matching source and resolve geometry is representable");
     assert_eq!(req.colors[0].sample_count, 4);
-    assert_eq!(req.colors[0].texture_ref, 43, "the published resolve target");
+    assert_eq!(
+        req.colors[0].texture_ref, 43,
+        "the published resolve target"
+    );
     assert_eq!(
         req.colors[0].multisample_source_ref, 42,
         "the multisample source retains its own identity"
@@ -3331,7 +3327,11 @@ fn a_cube_texture_loads_six_faces_in_slice_order() {
         format.layout(),
         crate::contract::pixel_format::TexelLayout::Rgba8
     );
-    assert_eq!(bytes.len(), face_bytes * 6, "six tight faces, in one buffer");
+    assert_eq!(
+        bytes.len(),
+        face_bytes * 6,
+        "six tight faces, in one buffer"
+    );
     for face in 0u8..6 {
         let seg = &bytes[face as usize * face_bytes..(face as usize + 1) * face_bytes];
         assert!(
@@ -4502,9 +4502,15 @@ fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
         threaded_resource.is_some(),
         "type-5 fixture must expose a resource to thread"
     );
-    let (tw, th, tmid, tsrc) =
-        resolve_sampled_source(&mut state, &mut host, 1, texture_ref, threaded_resource, true)
-            .expect("threaded-resource sample must resolve");
+    let (tw, th, tmid, tsrc) = resolve_sampled_source(
+        &mut state,
+        &mut host,
+        1,
+        texture_ref,
+        threaded_resource,
+        true,
+    )
+    .expect("threaded-resource sample must resolve");
     assert_eq!(
         (tw, th, tmid),
         (width, height, sampled_mid),
@@ -5566,9 +5572,7 @@ fn texture_ref_cache_geom_mismatch_does_not_hit_get_texture() {
     full[3] = 255;
     host_cache_store_rgba8(&mut state, 0, tex_ref, 1920, 1152, &full);
     // Exact geom hit
-    assert!(
-        crate::runtime::surface_cache::get_texture(&state, 0, tex_ref, 1920, 1152).is_some()
-    );
+    assert!(crate::runtime::surface_cache::get_texture(&state, 0, tex_ref, 1920, 1152).is_some());
     // Wrong geom (type-3 L0 recycle) miss
     assert!(crate::runtime::surface_cache::get_texture(&state, 0, tex_ref, 115, 16).is_none());
     // surface_id map must stay empty for texture_ref stores
@@ -5903,7 +5907,8 @@ fn sampled_plane_keeps_the_packed_allocation_and_checks_its_extent() {
         resource.lifetime_ref(),
     )
     .expect("the retained allocation directly supplies this plane");
-    let super::vulkan::SampledSourceRequest::GuestRuns(source, _, _, 1, None, _, _) = request else {
+    let super::vulkan::SampledSourceRequest::GuestRuns(source, _, _, 1, None, _, _) = request
+    else {
         panic!("a direct single plane has no copied-content identity")
     };
     assert_eq!(
@@ -6152,8 +6157,7 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
     let armed = sync_store_allowed_pages(&state, &host, 1, Some(&c0), true)
         .expect("a resolvable GVA target must be bounded");
     let mut resolve = c0.clone();
-    resolve.store_action =
-        crate::contract::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
+    resolve.store_action = crate::contract::pass_action::MTL_STORE_ACTION_MULTISAMPLE_RESOLVE;
     assert!(
         sync_store_allowed_pages(&state, &host, 1, Some(&resolve), true).is_some(),
         "a resolve publishes into the same guest destination and needs the same bound"
@@ -7094,8 +7098,8 @@ fn an_anonymous_depth_extent_past_its_field_width_declines_instead_of_aliasing()
         ..DrawEncodeRequest::default()
     };
 
-    let real = depth_chain_identity(&req(3, 1), false)
-        .expect("a representable pass geometry keys a slot");
+    let real =
+        depth_chain_identity(&req(3, 1), false).expect("a representable pass geometry keys a slot");
     let carrying_height = depth_chain_identity(&req(2, (1u32 << 31) | 1), false);
     assert_eq!(
         carrying_height, None,
@@ -7122,7 +7126,6 @@ fn an_anonymous_depth_extent_past_its_field_width_declines_instead_of_aliasing()
         "a maximal real attachment must still share its pass's depth"
     );
 }
-
 
 /// Only a texture gap the fragment module statically uses is substituted for.
 ///
@@ -7263,7 +7266,9 @@ fn a_buffer_read_pays_the_frame_its_reference_owes_before_reading_the_pages() {
     // The read itself has no guest pages behind it and answers `None`. That is
     // deliberate: the payment is owed *before* the bytes are touched, so a
     // failing read must not be able to excuse a skipped one.
-    let _ = read_buffer_bytes_resolved(&mut state, &mut host, task_id, buffer_ref, &backing, 0, None);
+    let _ = read_buffer_bytes_resolved(
+        &mut state, &mut host, task_id, buffer_ref, &backing, 0, None,
+    );
 
     assert!(
         state.pending_writebacks.get(buffer_ref).is_none(),

@@ -1092,10 +1092,8 @@ impl BufferContent {
                     // read races guest CPU writes exactly like the staging
                     // path's `read_task_gva_by_id` copy does.
                     unsafe {
-                        let slice = std::slice::from_raw_parts(
-                            (run.host_ptr as *const u8).add(within),
-                            n,
-                        );
+                        let slice =
+                            std::slice::from_raw_parts((run.host_ptr as *const u8).add(within), n);
                         out.extend_from_slice(slice);
                     }
                 }

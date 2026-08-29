@@ -1950,11 +1950,7 @@ pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
             let Some(footprint) = &m.contig_footprint else {
                 return None;
             };
-            return Some((
-                m.contig_ptr,
-                m.contig_len,
-                footprint.pages_arc(),
-            ));
+            return Some((m.contig_ptr, m.contig_len, footprint.pages_arc()));
         }
         // The negative verdict caches on exactly the key that makes the
         // positive one above safe. Re-deriving it per call collected the page
@@ -2063,9 +2059,9 @@ pub(crate) fn note_mapping_write_footprint(
     let page_size = state.page_size();
     let page_shift = state.page_shift;
     note_page_write_footprint(page_size, off, len, |i| {
-        m.page_entries.get(i).map(|&entry| {
-            crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift)
-        })
+        m.page_entries
+            .get(i)
+            .map(|&entry| crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift))
     });
 }
 

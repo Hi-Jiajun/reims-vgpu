@@ -1732,7 +1732,10 @@ pub fn declared_binding_numbers_memoized(
     let declared: std::sync::Arc<[u32]> = std::sync::Arc::from(declared_binding_numbers(words));
     memo.insert(
         key,
-        (std::sync::Arc::clone(words), std::sync::Arc::clone(&declared)),
+        (
+            std::sync::Arc::clone(words),
+            std::sync::Arc::clone(&declared),
+        ),
     );
     declared
 }
