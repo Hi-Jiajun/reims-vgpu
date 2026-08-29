@@ -685,6 +685,8 @@ settle_sites! {
     MappingBgra8Write => "settle_mapping_bgra8_write",
     /// `mapping_write::write_rgba8_image_changed`.
     MappingRgba8Write => "settle_mapping_rgba8_write",
+    /// `mapping_write::write_native_image`.
+    MappingNativeImageWrite => "settle_mapping_native_image_write",
     /// `mapping_write::write_raw_rows`.
     MappingRawRowsWrite => "settle_mapping_raw_rows_write",
     /// `mapping_write::read_raw_rows`.
@@ -1393,22 +1395,13 @@ fn land_gva_frame_bytes<M: HostMemory + HostOps>(
         Some(pages.membership()),
     )
     .map_err(|err| GvaWritebackDecline::CopiedWriteRefused { err })?;
-    forget_gva_host_copies(state, task_id, c0.target_gva, texture_ref);
+    crate::runtime::surface_cache::forget_gva_copies(
+        state,
+        task_id,
+        c0.target_gva,
+        texture_ref,
+    );
     Ok(extent)
-}
-
-/// Drop every host-side copy of a GVA target's pixels.
-///
-/// Both arms of [`store_gva_frame`] end here: once the guest's pages hold the
-/// frame they are the only place it exists, and a cache entry left behind would
-/// serve a later sample the previous Store's bytes. One function rather than two
-/// copies of the pair, because a copied rule is the next divergence.
-#[cfg(feature = "backend-vulkan")]
-fn forget_gva_host_copies(state: &mut DeviceState, task_id: u32, target_gva: u64, texture_ref: u32) {
-    crate::runtime::surface_cache::evict_gva(state, target_gva);
-    if texture_ref != 0 {
-        crate::runtime::surface_cache::evict_texture(state, task_id, texture_ref);
-    }
 }
 
 /// Copy `identity`'s pixels into the guest pages behind a type-2/3 render
@@ -1525,7 +1518,12 @@ fn store_gva_frame_direct<M: HostMemory + HostOps>(
         .map_err(|inner| GvaWritebackDecline::Engine { inner })?;
     // Nothing here leaves a host copy of the frame, so neither GVA-keyed cache
     // may go on naming one.
-    forget_gva_host_copies(state, task_id, c0.target_gva, texture_ref);
+    crate::runtime::surface_cache::forget_gva_copies(
+        state,
+        task_id,
+        c0.target_gva,
+        texture_ref,
+    );
     // The copy means this image has stopped being the only place these pixels
     // exist, so the reclaim paths may take it — the same handover
     // `store_render_frame` performs in `finish`.

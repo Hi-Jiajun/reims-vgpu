@@ -34,6 +34,8 @@ pub enum SurfaceWriteRefusal {
     Geometry { width: u32, height: u32 },
     /// The source's row pitch cannot hold `width` BGRA8 texels.
     SourceStride { src_stride: u32, width: u32 },
+    /// A native source row is narrower than the destination's own packed row.
+    NativeSourceStride { src_stride: u32, row_bytes: u32 },
     /// No such mapping. The surface went away between the arm and the landing.
     MappingAbsent,
     /// The mapping is unmapped or has no page list, so there is nowhere to write.
@@ -58,6 +60,9 @@ pub enum SurfaceWriteRefusal {
     PagesNotOurs,
     /// The format has no packed row length, so there is no rect to write.
     FormatRowLength { format: u16 },
+    /// Native bytes name a different format from the mapping window they would
+    /// be copied into.
+    NativeFormatMismatch { source: u16, mapping: u16 },
     /// The source buffer ends before the row this write is up to.
     SourceShort { need: usize, have: usize, row: u32 },
     /// A row would not convert into the mapping's pixel format.
@@ -83,12 +88,14 @@ impl crate::observe::decline::Decline for SurfaceWriteRefusal {
         match self {
             Self::Geometry { .. } => "surface_write_geometry",
             Self::SourceStride { .. } => "surface_write_source_stride",
+            Self::NativeSourceStride { .. } => "surface_write_native_source_stride",
             Self::MappingAbsent => "surface_write_mapping_absent",
             Self::MappingNotResident => "surface_write_mapping_not_resident",
             Self::GeometryMoved { .. } => "surface_write_geometry_moved",
             Self::WindowUnresolved { .. } => "surface_write_window_unresolved",
             Self::PagesNotOurs => "surface_write_pages_not_ours",
             Self::FormatRowLength { .. } => "surface_write_format_row_length",
+            Self::NativeFormatMismatch { .. } => "surface_write_native_format_mismatch",
             Self::SourceShort { .. } => "surface_write_source_short",
             Self::RowConvert { .. } => "surface_write_row_convert",
             Self::FrameExtent { .. } => "surface_write_frame_extent",
@@ -109,6 +116,13 @@ impl crate::observe::decline::Decline for SurfaceWriteRefusal {
                 ("src_stride", src_stride.to_string()),
                 ("need", (width.saturating_mul(RGBA8_BPP)).to_string()),
             ],
+            Self::NativeSourceStride {
+                src_stride,
+                row_bytes,
+            } => vec![
+                ("src_stride", src_stride.to_string()),
+                ("need", row_bytes.to_string()),
+            ],
             Self::MappingAbsent | Self::MappingNotResident | Self::PagesNotOurs => Vec::new(),
             Self::GeometryMoved {
                 latched_width,
@@ -128,6 +142,10 @@ impl crate::observe::decline::Decline for SurfaceWriteRefusal {
                 ("fmt", format!("{format:#x}")),
             ],
             Self::FormatRowLength { format } => vec![("fmt", format!("{format:#x}"))],
+            Self::NativeFormatMismatch { source, mapping } => vec![
+                ("source_fmt", format!("{source:#x}")),
+                ("mapping_fmt", format!("{mapping:#x}")),
+            ],
             Self::SourceShort { need, have, row } => vec![
                 ("need", need.to_string()),
                 ("have", have.to_string()),
@@ -1905,6 +1923,147 @@ fn rgba8_row_to_native(format: u16, rgba_row: &[u8], width: u32, native: &mut [u
         return true;
     }
     convert_rgba8_to_row(format, rgba_row, width, native)
+}
+
+/// Write rows already encoded as a type-11 mapping's native pixel format.
+///
+/// Unlike [`write_raw_rows`], this resolves the texture's sample window inside
+/// an IOSurface allocation: its base offset and row pitch come from the mapping
+/// descriptor, and row padding is left untouched. Unlike
+/// [`write_rgba8_image_changed`], it performs no colour conversion because the
+/// source bytes already are the destination texels.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the mapping writer keeps source rows and destination geometry explicit"
+)]
+pub fn write_native_image<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    src: &[u8],
+    src_stride: u32,
+    width: u32,
+    height: u32,
+    format: u16,
+) -> bool {
+    if !scanout_extent_ok(width, height) {
+        return refuse(mapping_id, SurfaceWriteRefusal::Geometry { width, height });
+    }
+    let Some(tight) = pixel_format::tight_row_bytes(width, format) else {
+        return refuse(mapping_id, SurfaceWriteRefusal::FormatRowLength { format });
+    };
+    if src_stride < tight {
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::NativeSourceStride {
+                src_stride,
+                row_bytes: tight,
+            },
+        );
+    }
+    let Some(need) = (height as usize)
+        .checked_sub(1)
+        .and_then(|rows| (src_stride as usize).checked_mul(rows))
+        .and_then(|prefix| prefix.checked_add(tight as usize))
+    else {
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::FrameExtent {
+                bpr: src_stride as usize,
+                height,
+            },
+        );
+    };
+    if src.len() < need {
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::SourceShort {
+                need,
+                have: src.len(),
+                row: height.saturating_sub(1),
+            },
+        );
+    }
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return refuse(mapping_id, SurfaceWriteRefusal::MappingAbsent);
+    };
+    if !m.mapped || m.page_entries.is_empty() {
+        return refuse(mapping_id, SurfaceWriteRefusal::MappingNotResident);
+    }
+    let (mw, mh, mapping_format) = mapping_write_geometry(m, width, height);
+    if mw != width || mh != height {
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::GeometryMoved {
+                latched_width: mw,
+                latched_height: mh,
+                frame_width: width,
+                frame_height: height,
+            },
+        );
+    }
+    if mapping_format != format {
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::NativeFormatMismatch {
+                source: format,
+                mapping: mapping_format,
+            },
+        );
+    }
+    let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, mapping_format) else {
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::WindowUnresolved {
+                width: mw,
+                height: mh,
+                format: mapping_format,
+            },
+        );
+    };
+
+    crate::runtime::writeback_debt::settle_for_mapping(
+        state,
+        host,
+        mapping_id,
+        crate::runtime::render_writeback::SettleSite::MappingNativeImageWrite,
+    );
+    let Some(vouched) = vouch_for_write(state, host, mapping_id, "native_image") else {
+        return refuse(mapping_id, SurfaceWriteRefusal::PagesNotOurs);
+    };
+    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched) {
+        // SAFETY: the revalidated contiguous view covers `span_end`.
+        let base = unsafe { (ptr as *mut u8).add(base_off as usize) };
+        for y in 0..height as usize {
+            let src_off = y * src_stride as usize;
+            let dst = unsafe { base.add(y * bpr as usize) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr().add(src_off), dst, tight as usize);
+            }
+        }
+    } else {
+        for y in 0..height as usize {
+            let src_off = y * src_stride as usize;
+            let row_off = base_off.saturating_add((y as u64).saturating_mul(u64::from(bpr)));
+            let row = &src[src_off..src_off + tight as usize];
+            if !mapper::write_mapping_bytes(state, host, mapping_id, row_off, row, &vouched) {
+                return refuse(
+                    mapping_id,
+                    SurfaceWriteRefusal::MapperWrite {
+                        lo: row_off,
+                        len: row.len(),
+                    },
+                );
+            }
+        }
+    }
+    state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
+    let _ = state.mark_mapping_written(mapping_id);
+    // Native integer texels have no BGRA host-cache representation. Guest pages
+    // are authoritative after this write, so an older cache entry must retire.
+    crate::runtime::surface_cache::forget(state, mapping_id);
+    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+    true
 }
 
 /// Write tightly packed raw rows into a mapping (depth32float / stencil8).

@@ -2002,6 +2002,184 @@ fn finish_stream_clear_only_branch_without_draws() {
     assert_eq!(out.metal_draws_fail, 0);
 }
 
+/// A clear-only integer attachment publishes the integer components themselves.
+///
+/// The GPU draw path already carries the clear as a typed union member. This
+/// exercises the other publication path: no draw exists, so `finish_stream`
+/// must materialize the result directly in the type-11 mapping's native texels.
+#[test]
+fn clear_only_rg16uint_publishes_native_guest_texels() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::{MTL_FORMAT_RG16_UINT, RG16_BPP};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let (task_id, texture_ref, mapping_id) = (1u32, 0x91u32, 17u32);
+    let pfn = 0x71u32;
+    let page = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(page, 1usize << PAGE_SHIFT_ARM64E, 0xcc);
+
+    assert!(state.map_surface(mapping_id));
+    {
+        let mapping = state.mappings.get_mut(&mapping_id).expect("mapping");
+        mapping.mapped = true;
+        mapping.mapping_internal = 1;
+        mapping.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 2, 2, MTL_FORMAT_RG16_UINT));
+    state
+        .texture_to_mapping
+        .insert((task_id, texture_ref), mapping_id);
+
+    let (_, row_stride, _) = mapping_write::type11_sample_window(
+        state.mappings.get(&mapping_id).expect("mapping"),
+        2,
+        2,
+        MTL_FORMAT_RG16_UINT,
+    )
+    .expect("the type-11 texture has a sample window");
+    assert!(row_stride >= 2 * RG16_BPP);
+
+    let mut acc = StreamAccum::default();
+    acc.clears.push(ColorAttachment {
+        texture_ref,
+        load_action: MTL_LOAD_ACTION_CLEAR,
+        store_action: MTL_STORE_ACTION_STORE,
+        clear_color: [1.0, 258.0, 65_535.0, 0.0],
+        ..Default::default()
+    });
+    let mut out = ExecResult::default();
+    finish_stream(&mut state, &mut host, task_id, &mut out, &acc);
+
+    assert_eq!(out.clears_applied, 1, "the clear-only Store must publish");
+    let expected = [1u16.to_le_bytes(), 258u16.to_le_bytes()]
+        .concat()
+        .repeat(2);
+    for y in 0..2u64 {
+        let mut row = vec![0u8; expected.len()];
+        host.read_gpa(page + y * u64::from(row_stride), &mut row)
+            .expect("read clear result");
+        assert_eq!(row, expected, "row {y} keeps the integer clear values");
+    }
+    if row_stride > 2 * RG16_BPP {
+        let mut padding = [0u8; 1];
+        host.read_gpa(page + u64::from(2 * RG16_BPP), &mut padding)
+            .expect("read row padding");
+        assert_eq!(padding, [0xcc], "the writer must not clear row padding");
+    }
+}
+
+/// The same clear representation reaches a linear type-2/3 target, including
+/// its guest-declared row pitch rather than a tightly packed substitute.
+#[test]
+fn clear_only_rg16uint_publishes_native_linear_gva_rows() {
+    use crate::contract::pixel_format::MTL_FORMAT_RG16_UINT;
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
+        OBJECT_TYPE_TEXTURE, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_PIXEL_FORMAT,
+        TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_WIDTH,
+    };
+    use crate::runtime::gva_mem::{
+        define_task_pages_arm64e, read_task_gva_by_id, write_task_gva_arm64e,
+    };
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    define_task_pages_arm64e(&mut host, &mut state, 4, 16);
+    assert!(state.set_object_list(1, 0, 256));
+
+    let (texture_ref, handle, width, height, row_stride) = (200u32, 8u32, 2u32, 2u32, 16u32);
+    let target_gva = (handle as u64) << PAGE_SHIFT_ARM64E;
+    let mut prior = vec![0xcc; (row_stride * height) as usize];
+    write_task_gva_arm64e(&mut host, &state.tasks[1], target_gva, &prior);
+    crate::runtime::surface_cache::store_texture(
+        &mut state,
+        1,
+        texture_ref,
+        width,
+        height,
+        vec![0x11; (width * height * 4) as usize],
+        target_gva,
+    );
+    crate::runtime::surface_cache::store_gva_owned(
+        &mut state,
+        target_gva,
+        width,
+        height,
+        vec![0x22; (width * height * 4) as usize],
+        OBJECT_TYPE_TEXTURE,
+        None,
+        true,
+    );
+
+    let mut desc = vec![0u8; TEXTURE_DESC_BASE_LEN];
+    st64(
+        &mut desc[LINEAR_DESC_SIZE..],
+        u64::from(row_stride) * u64::from(height),
+    );
+    st32(&mut desc[LINEAR_DESC_HANDLE..], handle);
+    st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], row_stride);
+    st32(&mut desc[TEXTURE_DESC_WIDTH..], width);
+    st32(&mut desc[TEXTURE_DESC_HEIGHT..], height);
+    st16(&mut desc[TEXTURE_DESC_PIXEL_FORMAT..], MTL_FORMAT_RG16_UINT);
+    let desc_gva = 0x280u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
+    let entry_off = list_object_entry_offset(texture_ref, 256).expect("object-list ref");
+    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut entry,
+        (OBJECT_TYPE_TEXTURE as u32) | ((desc.len() as u32) << 8),
+    );
+    entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], entry_off, &entry);
+
+    let mut acc = StreamAccum::default();
+    acc.clears.push(ColorAttachment {
+        texture_ref,
+        load_action: MTL_LOAD_ACTION_CLEAR,
+        store_action: MTL_STORE_ACTION_STORE,
+        clear_color: [1.0, 258.0, 0.0, 0.0],
+        ..Default::default()
+    });
+    let mut out = ExecResult::default();
+    finish_stream(&mut state, &mut host, 1, &mut out, &acc);
+    assert_eq!(
+        out.clears_applied, 1,
+        "the linear clear-only Store must publish"
+    );
+    assert!(
+        crate::runtime::surface_cache::get_texture(&state, 1, texture_ref, width, height).is_none(),
+        "the object-keyed copy must not outlive pixels published to guest pages"
+    );
+    assert!(
+        !crate::runtime::surface_cache::has_gva(&state, target_gva, width, height),
+        "the GVA-keyed copy must not outlive pixels published to guest pages"
+    );
+
+    read_task_gva_by_id(
+        &host,
+        &state.tasks,
+        1,
+        target_gva,
+        &mut prior,
+        PAGE_SHIFT_ARM64E,
+    )
+    .expect("read linear clear result");
+    let expected = [1u16.to_le_bytes(), 258u16.to_le_bytes()]
+        .concat()
+        .repeat(width as usize);
+    assert_eq!(&prior[..expected.len()], expected);
+    assert_eq!(
+        &prior[row_stride as usize..row_stride as usize + expected.len()],
+        expected
+    );
+    assert!(
+        prior[expected.len()..row_stride as usize]
+            .iter()
+            .all(|&byte| byte == 0xcc),
+        "the clear must leave guest row padding untouched"
+    );
+}
+
 #[test]
 fn finish_stream_with_draws_skips_guest_clear_prelude() {
     use crate::runtime::decode::render::ColorAttachment;

@@ -393,11 +393,11 @@ impl ColorClearValue {
         numeric: crate::contract::pixel_format::ColorNumericType,
         components: [f64; 4],
     ) -> Self {
-        use crate::contract::pixel_format::ColorNumericType;
-        match numeric {
-            ColorNumericType::Float => Self::Float(components.map(|v| v as f32)),
-            ColorNumericType::Uint => Self::Uint(components.map(|v| v as u32)),
-            ColorNumericType::Sint => Self::Sint(components.map(|v| v as i32)),
+        use crate::contract::pixel_format::ClearComponents;
+        match numeric.clear_components(components) {
+            ClearComponents::Float(values) => Self::Float(values),
+            ClearComponents::Uint(values) => Self::Uint(values),
+            ClearComponents::Sint(values) => Self::Sint(values),
         }
     }
 

@@ -1979,6 +1979,33 @@ pub enum ColorNumericType {
     Sint,
 }
 
+/// A decoded clear after its attachment's numeric class chose the backend
+/// clear-value carrier.
+///
+/// The integer carriers are deliberately 32-bit even when the destination's
+/// channels are narrower. That is the render API contract: the backend narrows
+/// a clear to the attachment format from this carrier, so CPU publication must
+/// start from the same value rather than cast the decoded double straight to a
+/// destination channel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ClearComponents {
+    Float([f32; COMPONENT_COUNT]),
+    Uint([u32; COMPONENT_COUNT]),
+    Sint([i32; COMPONENT_COUNT]),
+}
+
+impl ColorNumericType {
+    /// Convert Metal's double-precision component carrier into the typed clear
+    /// value consumed by the backend and CPU publication rails.
+    pub fn clear_components(self, components: [f64; COMPONENT_COUNT]) -> ClearComponents {
+        match self {
+            Self::Float => ClearComponents::Float(components.map(|value| value as f32)),
+            Self::Uint => ClearComponents::Uint(components.map(|value| value as u32)),
+            Self::Sint => ClearComponents::Sint(components.map(|value| value as i32)),
+        }
+    }
+}
+
 /// Return the numeric type for every colour render target this device serves.
 ///
 /// Adding a member here is the three-conversion commitment
@@ -2198,6 +2225,120 @@ pub fn f64_to_unorm8(value: f64) -> u8 {
 /// every arm.
 pub fn solid_rgba8(w: u32, h: u32, clear: &[f64; 4]) -> Vec<u8> {
     solid_image8(w, h, unorm8_rgba(clear))
+}
+
+/// How a CPU-published clear image carries its pixels.
+///
+/// Continuous-colour attachments keep the existing semantic RGBA8 carrier and
+/// are converted by the destination writer. Integer attachments have no such
+/// carrier: their component values are counts rather than fractions, so their
+/// image is already encoded as the destination's native texels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClearImageEncoding {
+    Rgba8,
+    Native,
+}
+
+/// A clear-only render result ready to be published into guest memory.
+///
+/// The encoding and bytes are produced together from the admitted render-target
+/// format. Callers can therefore choose the converted or native writer without
+/// reconstructing the numeric-format rule that chose the bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClearImage {
+    encoding: ClearImageEncoding,
+    pixels: Vec<u8>,
+    row_bytes: u32,
+}
+
+impl ClearImage {
+    pub fn encoding(&self) -> ClearImageEncoding {
+        self.encoding
+    }
+
+    pub fn pixels(&self) -> &[u8] {
+        &self.pixels
+    }
+
+    pub fn row_bytes(&self) -> u32 {
+        self.row_bytes
+    }
+}
+
+/// Lower a render-target clear into the representation guest-memory writers
+/// can publish without changing its numeric meaning.
+///
+/// This is the CPU counterpart to the backend's format-aware clear value. A
+/// format admitted by [`render_target_numeric_type`] must have an arm here: a
+/// clear-only pass has no GPU draw from which to obtain a frame, so this image
+/// is the pass result.
+pub fn solid_clear_image(
+    format: u16,
+    width: u32,
+    height: u32,
+    clear: &[f64; COMPONENT_COUNT],
+) -> Option<ClearImage> {
+    let numeric = render_target_numeric_type(format)?;
+    match numeric.clear_components(*clear) {
+        ClearComponents::Float(_) => {
+            let row_bytes = width.checked_mul(RGBA8_BPP)?;
+            let pixels = solid_rgba8(width, height, clear);
+            let need = (row_bytes as usize).checked_mul(height as usize)?;
+            (pixels.len() == need).then_some(ClearImage {
+                encoding: ClearImageEncoding::Rgba8,
+                pixels,
+                row_bytes,
+            })
+        }
+        ClearComponents::Uint(components) => match format {
+            MTL_FORMAT_RG16_UINT => {
+                let mut bytes = [0u8; RG16_BPP as usize];
+                st16(&mut bytes[0..2], components[COMPONENT_R] as u16);
+                st16(&mut bytes[2..4], components[COMPONENT_G] as u16);
+                solid_native_clear_image(format, width, height, &bytes)
+            }
+            _ => None,
+        },
+        ClearComponents::Sint(_) => None,
+    }
+}
+
+fn solid_native_clear_image(
+    format: u16,
+    width: u32,
+    height: u32,
+    texel: &[u8],
+) -> Option<ClearImage> {
+    let row_bytes = tight_row_bytes(width, format)?;
+    let bpp = bytes_per_pixel(format)? as usize;
+    if texel.len() != bpp {
+        return None;
+    }
+    let texels = (width as usize).checked_mul(height as usize)?;
+    let need = texels.checked_mul(bpp)?;
+    let pixels = solid_bytes(need, texel)?;
+    Some(ClearImage {
+        encoding: ClearImageEncoding::Native,
+        pixels,
+        row_bytes,
+    })
+}
+
+/// Fill exactly `len` bytes with whole copies of `unit`.
+fn solid_bytes(len: usize, unit: &[u8]) -> Option<Vec<u8>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    if unit.is_empty() || !len.is_multiple_of(unit.len()) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(len);
+    bytes.extend_from_slice(unit);
+    while bytes.len() < len {
+        let take = (len - bytes.len()).min(bytes.len());
+        bytes.extend_from_within(..take);
+    }
+    Some(bytes)
 }
 
 /// The clear colour as one unorm8 RGBA texel.
@@ -2714,18 +2855,13 @@ pub fn texel_to_rgba8(format: u16, src: &[u8]) -> Option<[u8; 4]> {
     Some(rgba)
 }
 
-/// Whether a solid colour can be written into one texel of `format`.
+/// Whether a semantic RGBA8 colour can be written into one texel of `format`.
 ///
-/// Asked by the clear rails before they build an RGBA8 image they may not be
-/// able to convert. It **probes [`rgba8_to_texel`] itself** rather than listing
-/// the formats that have an arm, so the two cannot drift: the answer is the
-/// converter's own, obtained by running it on a scratch texel.
-///
-/// A `false` here is a real refusal and not a slow path. Every clear rail in
-/// this device funnels a clear colour through eight-bit RGBA, and for a format
-/// with no arm there is nothing further down to fall to — see
-/// [`TexelLayout::Rg16Uint`], the layout this exists to keep honest, where the
-/// conversion is not merely lossy but meaningless.
+/// It **probes [`rgba8_to_texel`] itself** rather than listing the formats that
+/// have an arm, so the two cannot drift. This is specifically the eight-bit
+/// conversion rail's answer, not clear admission: [`solid_clear_image`] carries
+/// integer clear values as native texels and deliberately returns an image for
+/// [`TexelLayout::Rg16Uint`] while this predicate remains false.
 pub fn solid_color_reaches_texel(format: u16) -> bool {
     let Some(bpp) = bytes_per_pixel(format) else {
         return false;
@@ -3348,14 +3484,13 @@ mod tests {
         assert_eq!(admitted, 10, "the admitted colour render target formats");
     }
 
-    /// An integer texel has no eight-bit solid colour, and the clear rails must
-    /// find that out before they build one.
+    /// An integer texel has no semantic eight-bit solid colour.
     ///
     /// The predicate probes the converter rather than listing formats, so this
     /// asserts the behaviour the clear path actually depends on: a `false` for
     /// the integer target and a `true` for every colour order that has an arm.
     #[test]
-    fn a_solid_clear_colour_has_no_representation_in_an_integer_texel() {
+    fn an_integer_clear_cannot_take_the_semantic_rgba8_conversion_rail() {
         assert!(!solid_color_reaches_texel(MTL_FORMAT_RG16_UINT));
         // Its own family's normalized and float members are unaffected: they go
         // through the same rail and keep their arms.
@@ -3379,6 +3514,49 @@ mod tests {
                 "{format:#x}: the probe and the converter disagree"
             );
         }
+    }
+
+    /// Every admitted target can publish a clear-only result, and the integer
+    /// member keeps its native component values all the way to the bytes.
+    #[test]
+    fn every_admitted_render_target_has_a_format_aware_clear_image() {
+        let clear = [1.0, 258.0, 65_535.0, 0.0];
+        let mut admitted = 0;
+        for format in 0..=u16::MAX {
+            if render_target_bpp(format).is_none() {
+                continue;
+            }
+            admitted += 1;
+            let image = solid_clear_image(format, 2, 2, &clear)
+                .unwrap_or_else(|| panic!("render target {format:#x} cannot publish its clear"));
+            assert_eq!(image.pixels().len(), image.row_bytes() as usize * 2);
+        }
+        assert_eq!(admitted, 10, "the admitted colour render target formats");
+
+        let integer = solid_clear_image(MTL_FORMAT_RG16_UINT, 2, 2, &clear)
+            .expect("RG16Uint is an admitted render target");
+        assert_eq!(integer.encoding(), ClearImageEncoding::Native);
+        assert_eq!(integer.row_bytes(), 2 * RG16_BPP);
+        assert_eq!(
+            integer.pixels(),
+            [1u16.to_le_bytes(), 258u16.to_le_bytes()]
+                .concat()
+                .repeat(4),
+            "the two uint16 channels are values, not float or unorm bit patterns"
+        );
+
+        let narrowed = solid_clear_image(
+            MTL_FORMAT_RG16_UINT,
+            1,
+            1,
+            &[65_536.0, 65_537.0, 0.0, 0.0],
+        )
+        .expect("RG16Uint clear with values wider than a channel");
+        assert_eq!(
+            narrowed.pixels(),
+            [0u16.to_le_bytes(), 1u16.to_le_bytes()].concat(),
+            "the CPU rail must narrow the same uint32 carrier as the GPU clear"
+        );
     }
 
     /// The byte copy must carry the integer target, because nothing else can.

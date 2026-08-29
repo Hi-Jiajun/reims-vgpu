@@ -11,9 +11,7 @@ use crate::contract::pass_action::{
     MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, MTL_STORE_ACTION_STORE,
     MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
 };
-use crate::contract::pixel_format::{
-    f64_to_unorm8, solid_rgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
-};
+use crate::contract::pixel_format::{self, ClearImageEncoding};
 use crate::model::DeviceState;
 use crate::runtime::blit_exec::{self, BlitStatus};
 use crate::runtime::compute_exec::{self, ComputeStatus};
@@ -4247,63 +4245,74 @@ fn apply_clear<M: HostMemory + HostOps>(
         return false;
     };
     let c0 = req.colors.first().unwrap_or_else(|| unreachable!());
-    // Every rail below carries the clear colour as eight-bit RGBA, and a target
-    // whose texel cannot express that — an integer attachment, where a unorm8
-    // byte stands for no particular integer — would otherwise fail anonymously
-    // in the row converter two calls down and return a bare `false`.
-    //
-    // No admitted render target reaches this today: the same eight-bit
-    // obligation is what keeps an integer format out of
-    // `pixel_format::render_target_bpp` in the first place, and
-    // `the_renderable_set_is_one_answer_and_every_member_survives_both_rails`
-    // holds that. It is here so the assumption is a named refusal rather than
-    // an unwritten one, and so that the format admitted the day that rail is
-    // rebuilt cannot lose a clear silently on its way in.
-    if !crate::contract::pixel_format::solid_color_reaches_texel(c0.format) {
+    // Format and clear representation are one contract decision. Continuous
+    // colour keeps the semantic RGBA8 carrier the existing converters consume;
+    // integer targets carry their own texels, where `1` remains the integer 1.
+    let Some(clear) =
+        pixel_format::solid_clear_image(c0.format, c0.width, c0.height, &att.clear_color)
+    else {
         note_clear_dropped(
-            "target_texel_not_solid_expressible",
+            "target_clear_image_unrepresentable",
             att.texture_ref,
-            "clear colour has no representation in the target's texel",
+            "the admitted target has no CPU clear representation",
         );
         return false;
-    }
-    let w = c0.width;
-    let h = c0.height;
-    let rgba = solid_rgba8(w, h, &att.clear_color);
+    };
     if c0.target_gva != 0 {
-        return draw::write_gva_rgba8(
+        let frame = match clear.encoding() {
+            ClearImageEncoding::Rgba8 => draw::FrameRows::Rgba8(clear.pixels()),
+            ClearImageEncoding::Native => draw::FrameRows::Native(clear.pixels()),
+        };
+        let ok = draw::write_gva_frame_within(
             state,
             host,
             task_id,
             c0.target_gva,
-            w,
-            h,
+            c0.width,
+            c0.height,
             c0.row_stride,
             c0.format,
-            &rgba,
+            frame,
+            None,
         )
         .is_ok();
+        if ok {
+            crate::runtime::surface_cache::forget_gva_copies(
+                state,
+                task_id,
+                c0.target_gva,
+                att.texture_ref,
+            );
+        }
+        return ok;
     }
     if c0.mapping_id == 0 {
         return false;
     }
-    let r = f64_to_unorm8(att.clear_color[0]);
-    let g = f64_to_unorm8(att.clear_color[1]);
-    let b = f64_to_unorm8(att.clear_color[2]);
-    let a = f64_to_unorm8(att.clear_color[3]);
-    let px = [b, g, r, a];
-    let stride = w.saturating_mul(RGBA8_BPP);
-    let mut img = vec![0u8; (stride as usize).saturating_mul(h as usize)];
-    for y in 0..h as usize {
-        for x in 0..w as usize {
-            let o = y * stride as usize + x * 4;
-            img[o..o + 4].copy_from_slice(&px);
-        }
+    let ok = match clear.encoding() {
+        ClearImageEncoding::Rgba8 => mapping_write::write_rgba8_image_changed(
+            state,
+            host,
+            c0.mapping_id,
+            clear.pixels(),
+            None,
+            c0.width,
+            c0.height,
+        ),
+        ClearImageEncoding::Native => mapping_write::write_native_image(
+            state,
+            host,
+            c0.mapping_id,
+            clear.pixels(),
+            clear.row_bytes(),
+            c0.width,
+            c0.height,
+            c0.format,
+        ),
+    };
+    if ok {
+        state.note_surface_clear(c0.mapping_id);
     }
-    let _ = MTL_FORMAT_BGRA8_UNORM;
-    let ok = mapping_write::write_bgra8(state, host, c0.mapping_id, &img, stride, w, h);
-    // host_cache also updated inside write_bgra8 (surface_cache::store).
-    state.note_surface_clear(c0.mapping_id);
     ok
 }
 
