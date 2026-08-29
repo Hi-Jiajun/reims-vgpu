@@ -1301,6 +1301,32 @@ pub const PIPELINE_TAG_DEPTH_ATTACH_FORMAT: u8 = 0x09;
 /// `MTLPixelFormat`. The stencil half of [`PIPELINE_TAG_DEPTH_ATTACH_FORMAT`],
 /// and benign for the same reason.
 pub const PIPELINE_TAG_STENCIL_ATTACH_FORMAT: u8 = 0x0a;
+/// `MTLRenderPipelineDescriptor.inputPrimitiveTopology`, an
+/// `MTLPrimitiveTopologyClass`.
+///
+/// The *class* of primitive the pipeline is compiled for — `Unspecified`,
+/// `Point`, `Line` or `Triangle` — and not a primitive type. See
+/// [`RENDER_PIPELINE_TAGS_BENIGN`] for why this device does not apply it.
+///
+/// # How it was placed
+///
+/// Three independent readings agree, which is worth recording because the tag
+/// numbering is the serializer's own and not a straight enumeration of the
+/// descriptor's properties:
+///
+/// * **Position.** It sits between [`PIPELINE_TAG_STENCIL_ATTACH_FORMAT`] and
+///   [`PIPELINE_TAG_MAX_TESSELLATION_FACTOR`], and `inputPrimitiveTopology` is
+///   the property the header declares between those two.
+/// * **Value.** The only value observed is `3`, which is
+///   `MTLPrimitiveTopologyClassTriangle`. Every other candidate property in that
+///   span is a `BOOL` or a sample count, and neither can be three.
+/// * **Company.** It appears on exactly one descriptor shape, the one that also
+///   carries [`PIPELINE_TAG_MAX_TESSELLATION_FACTOR`],
+///   [`PIPELINE_TAG_TESSELLATION_FACTOR_STEP_FUNCTION`] and
+///   [`PIPELINE_TAG_TESSELLATION_OUTPUT_WINDING_ORDER`] — and Metal requires a
+///   tessellated pipeline to declare a topology class rather than leave it
+///   `Unspecified`, which is why a tessellation pipeline is where it shows up.
+pub const PIPELINE_TAG_INPUT_PRIMITIVE_TOPOLOGY: u8 = 0x0b;
 /// `MTLRenderPipelineDescriptor.maxTessellationFactor`.
 pub const PIPELINE_TAG_MAX_TESSELLATION_FACTOR: u8 = 0x0d;
 /// `MTLRenderPipelineDescriptor.tessellationFactorStepFunction`.
@@ -2475,16 +2501,29 @@ pub const PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET: u8 = 0x03;
 ///   change what the guest observes; the attachment it observes is the one its
 ///   own pass named.
 ///
+/// * [`PIPELINE_TAG_INPUT_PRIMITIVE_TOPOLOGY`] declares the *class* of primitive
+///   the pipeline is compiled for. It does not select one: every draw record
+///   carries its own `MTLPrimitiveType`, which
+///   `translate::raster::primitive_topology` turns into the
+///   `VkPipelineInputAssemblyStateCreateInfo` topology, so the class restates
+///   what the draw already names — the same relationship the two attachment
+///   formats above have with the pass descriptor. Metal requires a draw's
+///   primitive type to belong to the class its pipeline declared, so the two
+///   cannot disagree without the guest's own validation having rejected the
+///   draw first. Dropping it cannot change what the guest observes; the topology
+///   it observes is the one its own draw named.
+///
 /// **`rasterizationEnabled` and `alphaToCoverageEnabled` are deliberately not
 /// here.** They are two of the three the old doc named as silently defaulted,
 /// and neither has appeared in this block on a driven boot. If one arrives it
 /// must refuse rather than be waved through. The third,
 /// [`PIPELINE_TAG_RASTER_SAMPLE_COUNT`], is now read — it is consumed on both
 /// shapes and carried to the backend render-pass and pipeline keys.
-const RENDER_PIPELINE_TAGS_BENIGN: [u8; 5] = [
+const RENDER_PIPELINE_TAGS_BENIGN: [u8; 6] = [
     RENDER_PIPELINE_TAG_LABEL,
     PIPELINE_TAG_DEPTH_ATTACH_FORMAT,
     PIPELINE_TAG_STENCIL_ATTACH_FORMAT,
+    PIPELINE_TAG_INPUT_PRIMITIVE_TOPOLOGY,
     // The two legacy fixed-function *values* whose enables stay refused. See
     // the reading under `note_pipeline_tlv_fields` for what measured them and
     // `PIPELINE_TAG_ALPHA_TEST_ENABLED` for why the pairing is what licenses

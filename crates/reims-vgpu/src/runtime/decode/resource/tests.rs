@@ -1887,6 +1887,53 @@ fn a_pipeline_with_legacy_alpha_test_and_logic_op_values_decodes() {
 /// render without it. Asserted against
 /// `RENDER_PIPELINE_TAGS_STILL_REFUSED` so adding one to the benign list fails
 /// here instead of silently rendering a frame the guest did not ask for.
+/// A tessellated pipeline that declares its topology class still decodes.
+///
+/// The measurement: a driven macos-15 boot refused **112 render pipelines** — 92
+/// distinct refs on one task — every one of them
+/// `desc_decode … decode=res_pipeline_field_unread`, because the descriptor
+/// carried tag `0x0b` and this decoder had no name for it. A pipeline that fails
+/// to load takes every draw that would have used it.
+///
+/// The tag is `inputPrimitiveTopology`, and it is benign because the topology a
+/// draw actually rasterizes at comes from the draw record. This asserts the
+/// decode succeeds *and* that the value is genuinely not consulted, by decoding
+/// the same descriptor at two different topology classes and requiring the same
+/// result.
+#[test]
+fn a_declared_input_primitive_topology_does_not_refuse_the_pipeline() {
+    let decode_at = |topology: u32| {
+        let mut b = vec![0u8; 16 + 1 + 6 + 6];
+        let blen = b.len() as u32;
+        st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+        st32(&mut b[4..], blen);
+        st32(&mut b[8..], 9);
+        b[16] = 2;
+        b[17] = PIPELINE_TAG_VERTEX_FUNC;
+        b[18] = 4;
+        st32(&mut b[19..], 2);
+        b[23] = PIPELINE_TAG_INPUT_PRIMITIVE_TOPOLOGY;
+        b[24] = 4;
+        st32(&mut b[25..], topology);
+        decode_render_pipeline_descriptor(&b)
+    };
+
+    // 3 is `MTLPrimitiveTopologyClassTriangle`, the only value observed on a
+    // live guest, and 0 is `Unspecified`.
+    let triangle = decode_at(3).expect("a declared topology class is not a refusal");
+    let unspecified = decode_at(0).expect("nor is an unspecified one");
+    assert_eq!(
+        triangle, unspecified,
+        "the class must not reach the decoded pipeline: the topology a draw \
+         rasterizes at comes from its own primitive type"
+    );
+
+    assert!(RENDER_PIPELINE_TAGS_BENIGN.contains(&PIPELINE_TAG_INPUT_PRIMITIVE_TOPOLOGY));
+    // Benign is not the same as unknown: a tag nobody has argued for still
+    // refuses, which is what keeps this list a decision rather than a default.
+    assert!(!RENDER_PIPELINE_TAGS_BENIGN.contains(&0x6d));
+}
+
 #[test]
 fn an_alpha_test_or_logic_op_enable_is_still_refused() {
     for enable in RENDER_PIPELINE_TAGS_STILL_REFUSED {
