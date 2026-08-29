@@ -12,10 +12,11 @@ Correctness comes from implementing the decoded API contract. Work proceeds in t
 
 1. establish the observation and the exact build that produced it;
 2. recover and state the relevant API contract;
-3. identify the owning type or state machine and a contract-derived regression test;
-4. implement;
-5. validate on the affected pathway and rail;
-6. commit only after the required validation is clean.
+3. identify the owning type or state machine;
+4. hand the established contract to focused regression evidence;
+5. implement only after that evidence is red on the identified control;
+6. prove the repair, run the compatibility ratchet, and replay the original interaction;
+7. commit only after every applicable gate is clean.
 
 A request to “fix,” “boot,” “finish,” or “commit” does not skip an earlier gate. Urgency is not
 authority to guess. If a contract term is unknown, recover it or emit a typed refusal; do not invent
@@ -42,7 +43,20 @@ The workflow in this section is a gate, not advice. Follow it for protocol, life
 memory, synchronization, performance, and visual changes. Mechanical refactors may omit steps that
 cannot affect behavior, but must still preserve the relevant invariants and pass their verification.
 
-### 1. Freeze and identify the observation
+The API contract and the conformance suite have different authority. Contract recovery establishes
+what behavior is lawful; conformance records established behavior so a later candidate cannot move
+backwards. A conformance result may prove that an implementation differs, but it never supplies a
+missing field meaning, ordering rule, lifetime, or other contract term.
+
+The native oracle is green; the guest suite need not be. Classified guest failures are explicit
+compatibility debt inherited by later work, not an obligation for the next increment to repair.
+The conformance gate is a transition gate: preserve existing passing behavior and do not worsen,
+hide, or lose coverage of existing debt. Unchanged classified debt does not block an unrelated
+candidate.
+
+### Contract phase: establish API truth
+
+#### 1. Freeze and identify the observation
 
 Before editing product code:
 
@@ -57,7 +71,7 @@ Before editing product code:
 Never classify a run as “before” or “after” from wall-clock timestamps. Prove which artifacts the
 process loaded.
 
-### 2. Create a boot identity record
+#### 2. Create a boot identity record
 
 Every boot used as evidence needs a manifest in `journal/` or an equivalent gitignored run
 directory. Record at least:
@@ -80,7 +94,7 @@ Ensure the prior VM is gone before starting another. Clear `/tmp/reims-vgpu-fail
 boot; it appends across processes. Wait for the new device log as well as the guest before driving a
 probe, so an old VM cannot answer SSH for a failed new boot.
 
-### 3. Establish a real baseline
+#### 3. Establish a real baseline
 
 For a visual, protocol, performance, synchronization, or lifetime regression, build and run the
 parent or other agreed control before the candidate. Use the same pathway, rail, snapshot, backend,
@@ -92,7 +106,7 @@ Build controls in an isolated copy without changing this shared checkout. Do not
 If the baseline cannot be run or the defect cannot be reproduced, say so. Instrument the defect
 class and keep claims narrow; do not replace a missing baseline with an explanation.
 
-### 4. Make the contract checkpoint
+#### 4. Make the contract checkpoint
 
 Before editing product code, write a short checkpoint in the user-visible progress update and in a
 gitignored investigation note. It must contain:
@@ -119,7 +133,7 @@ End the checkpoint with `CONTRACT GATE: PASS` only when every decision-affecting
 Otherwise write `CONTRACT GATE: BLOCKED`, continue contract recovery or implement a typed refusal,
 and do not edit guest-visible behavior.
 
-### 5. Recover missing contract terms before design
+#### 5. Recover missing contract terms before design
 
 Static reverse engineering is a legitimate and expected way to recover an unclear interface.
 Locally available headers, symbols, strings, disassembly, call graphs, struct layouts, field access,
@@ -137,7 +151,7 @@ When the contract remains unknown, implement a typed refusal on the always-on fa
 infer the answer from timing, arrival order, object id, name, allocation size, address range, pixel
 content, frame count, or any other correlate.
 
-### 6. Trace asynchronous contracts end to end
+#### 6. Trace asynchronous contracts end to end
 
 Queue submission is not guest completion. For commands involving GPU work, guest memory, resource
 reuse, interrupts, or fences, trace the whole lifetime before choosing a design:
@@ -160,10 +174,50 @@ An implementation is not structural if these obligations are assembled opportuni
 call site. Put them in the command transaction, lifetime type, resolver, or state machine that owns
 them.
 
-### 7. Write the contract-derived test first
+### Handoff phase: encode the established contract
+
+#### 7. Write the contract-derived regression evidence first
 
 The regression test must express the external invariant, not the proposed mechanism. It must fail
 without the change or be accompanied by a demonstrated proxy that does.
+
+Do not begin this handoff while `CONTRACT GATE` is blocked. The test encodes the contract recovered
+above; it does not discover the contract or make an unsupported design acceptable.
+
+Use two layers when both are expressible:
+
+- an owner-level test for the invariant in the Rust type, resolver, transaction, or state machine;
+- a case in `conformance/` for an externally visible Metal relation that the native oracle and an
+  unmodified guest can both execute.
+
+A new conformance case that serves as repair evidence must pass on the named native oracle and fail
+in raw guest output on the identified control before product code changes. Record `PASS`, `FAIL`,
+`SKIP`, refusal, timeout, and not-run separately. A classified expected failure keeps the suite
+operable while recording known debt; it does not turn the raw failure into passing behavior. A
+coverage-only case may already pass on both native and guest; it expands the ratchet, but it cannot
+serve as the red witness for a repair.
+
+When a conformance case exposes a pre-existing defect, freeze it as a test-only checkpoint with its
+native result, identified guest failure, and established translation-or-driver owner. Do not mix
+the first observation of the failure with the product repair. Never add an expected-failure entry
+to excuse a failure first produced by the candidate.
+
+For a visual defect, preserve two independent witnesses before implementation:
+
+1. the original unmodified-guest interaction, automated with host-driven input and host-owned frame
+   capture; and
+2. the focused contract case that passes natively and fails on the affected guest baseline.
+
+For animation, transparency, or presentation timing, capture a bounded frame sequence and state the
+relation across frames; one convenient screenshot is not the symptom. The focused contract case
+must reach the established seam responsible for the interaction. Similar pixels, a nearby opcode,
+or a case that happens to fail is not correlation.
+
+End the handoff checkpoint with `REGRESSION GATE: PASS` only when the focused test and every
+applicable visual witness reliably distinguish the identified control from the required behavior.
+Otherwise write `REGRESSION GATE: BLOCKED` and improve the observation or harness before editing
+product behavior. A blocked regression gate does not undo a passed contract gate: the contract may
+be known even though it is not yet guarded. Do not invent a proxy merely to begin implementation.
 
 For asynchronous lifetime work, exercise release or reuse at the completion boundary and assert
 that no read, write, debt, or callback can escape past it. A test that only checks the final pixels
@@ -181,7 +235,9 @@ The one allowed source comparison is the C ABI header against Rust constants thr
 `qemu::abi::header_define`, because neither language can include the other representation.
 Coverage instruments such as `scripts/runtime-dead` are also allowed; they measure execution.
 
-### 8. Implement only the established contract
+### Implementation phase: change only established behavior
+
+#### 8. Implement only the established contract
 
 Every branch must be justified by a decoded guest field, header constant, `sizeof`/`offsetof`,
 serializer output, calling convention, or measured host capability.
@@ -201,21 +257,58 @@ New behavior belongs in the existing owner. If the owning type cannot express it
 Do not add a flag around a resolver, a second lookup after it, a fixup pass, or a special branch in
 front of the general path.
 
-### 9. Validate in layers
+### Regression phase: prove the repair without moving backwards
+
+#### 9. Validate in layers
 
 Run, in order:
 
-1. the focused regression test;
-2. nearby subsystem tests;
-3. the full affected backend suite, serially;
-4. affected clippy and feature-matrix arms;
-5. the baseline and candidate VM boots on the exact pathway and rail;
-6. the original interaction plus a release/reuse stress case when lifetime is involved.
+1. the focused owner-level regression test;
+2. the focused conformance case against the native oracle and identified guest control;
+3. nearby subsystem tests;
+4. the full affected backend suite, serially;
+5. affected clippy and feature-matrix arms;
+6. the complete affected conformance battery against identified control and candidate boots;
+7. the original interaction on the exact pathway and rail;
+8. a release/reuse stress case when lifetime is involved.
+
+The focused case proves the intended repair. The complete conformance battery is a compatibility
+ratchet and must not be reduced to the focused subset. On the same pathway, rail, snapshot, backend,
+environment, and capability set, interpret transitions as follows:
+
+| Identified control | Candidate | Verdict |
+|---|---|---|
+| `PASS` | `PASS` | preserved |
+| `PASS` | `FAIL`, `SKIP`, not-covered, or not-run | regression |
+| known owned `FAIL` | the same owned failure | unchanged debt |
+| known owned `FAIL` | `PASS` | improvement; remove the expectation |
+| known owned `FAIL` | different failure, `SKIP`, or not-run | regression |
+| capability `SKIP` | the same capability `SKIP` | unchanged applicability |
+| capability `SKIP` | `PASS` | improvement |
+| capability `SKIP` | `FAIL` or not-run | regression |
+
+Missing names, duplicate names, unexplained failures, duplicate ownership, and claimed rails that
+were not reached are regressions. Expected-failure inventories are debt ledgers, not baselines that
+a candidate may rewrite. A candidate may remove an expectation only after the raw case passes.
+“Same failure” means the same case, result class, canonical typed reason, and claimed rail; changing
+diagnostic payload alone is not a regression.
+
+An ownership correction is not a candidate transition. Make it in a separate evidence-only commit
+with no product behavior change, preserve the raw failing result, establish the new owner, and state
+why the prior classification was unsupported. The correction must move the case atomically between
+the translation and driver/device inventories; it must never leave the case in both or neither.
+
+The current conformance runner is scoped to the x86 macOS / Linux Vulkan pathway and the macos-15
+rail. It is mandatory for guest-visible changes that can affect that pathway, including shared
+decode, contract, runtime, memory, synchronization, rendering, or Vulkan execution. It does not
+prove another pathway or rail; validate those separately when they are affected.
 
 Synthetic tests do not replace a live boot for a defect that appears only in an unmodified guest.
-A screenshot does not replace a behavioral or log-level gate.
+A focused conformance pass does not replace the complete compatibility ratchet. Neither conformance
+gate replaces the original visual interaction, and a screenshot does not replace a behavioral or
+log-level gate.
 
-### 10. Catastrophic failures invalidate the candidate
+#### 10. Catastrophic failures invalidate the candidate
 
 Any of the following makes a candidate ineligible to commit:
 
@@ -235,7 +328,7 @@ Do not layer a second repair onto the failed design until the failure mechanism 
 properly identified control demonstrates it is independent. A green unit suite does not override a
 catastrophic VM result.
 
-### 11. Repeat before claiming success
+#### 11. Repeat before claiming success
 
 Never report a fix from the first green boot. Repeat the passing candidate at least three times for
 freeze, panic, or intermittent visual failures, and check a second relevant rail when the contract
@@ -255,6 +348,8 @@ State exactly what was verified. One workload, host, pathway, and rail proves on
   execution, presentation, and Metal/Vulkan policy.
 - `crates/reims-vgpu/src/observe/`: typed failure and census emission.
 - `crates/reims-vgpu-wire`: derived wire views; its own `AGENTS.md` also applies.
+- `conformance/`: native-oracle Metal cases, macos-15 guest runner, and separate translation and
+  driver debt inventories. It preserves established compatibility; it does not define API truth.
 - `vm/`: snapshot-revert boot scripts and rail selection.
 - `bugs/`: gitignored handoff packages for translator defects.
 
@@ -385,6 +480,33 @@ For performance work:
 
 ## Tests and build verification
 
+### Metal conformance
+
+Follow `conformance/README.md` for the oracle, focused modes, manifests, ownership scoring, and
+failure interpretation.
+
+When conformance source or its native expectation changes, run the full battery on the named
+native oracle first. The tracked native baseline must contain every case exactly once and every
+applicable case must pass before guest output can establish a device defect.
+
+For every guest-visible behavior change capable of affecting x86 macOS / Linux Vulkan, run the
+complete macos-15 battery on both the identified control and candidate. Preserve both output
+directories and manifests. Score both against the same native baseline and compare their raw
+per-case transitions using the ratchet in step 9. Focused modes are for establishing and repeating
+one repair; they do not replace the complete battery.
+
+The guest suite is allowed to contain classified failures. A clean conformance gate means a clean
+control-to-candidate transition: zero new or worsened failures, unexplained results, missing cases,
+duplicates, mis-owned cases, or catastrophic runs. It does not mean every raw guest case passed,
+and it does not require the current worker to repair unrelated classified debt. Report pass,
+classified failure, capability skip, and not-run counts separately.
+
+Do not refresh the native baseline, add an expected failure, or weaken a case from candidate output.
+Native expectation changes come only from the native oracle. New guest debt comes only from an
+identified control in a test-only change.
+
+### Rust tests
+
 Run Rust tests serially; GPU-touching tests are not safe in parallel.
 
 ```sh
@@ -483,11 +605,26 @@ Do not commit a behavior change unless:
 
 - its contract checkpoint is complete with no unsupported decisions;
 - a focused contract-derived regression test fails without it and passes with it;
+- every applicable focused repair conformance case passes natively, fails on the identified guest
+  control, and passes on the candidate;
+- the complete affected conformance battery has no worsening transition and no unexplained result;
 - `cargo fmt` has been run for every affected Rust workspace and its `--check` passes;
 - affected tests and clippy arms pass;
 - the affected live pathway and rail pass when the defect requires a VM;
+- the original interaction passes on the candidate when the defect was observed visually or only in
+  an unmodified guest;
 - no candidate boot produced an unexplained catastrophic failure;
 - the working tree contains no accidental or unrelated changes.
+
+A conformance-only commit may record a pre-existing guest failure without repairing it only when the
+case passes on the native oracle, raw guest output fails on an identified control, ownership is
+established, the expected-failure entry explains that owner, and no product behavior changes. That
+exception records debt; it does not authorize a behavior commit to add new debt.
+
+A conformance-only commit may also correct an existing ownership classification when preserved raw
+evidence identifies the same failure, new evidence establishes the replacement owner and disproves
+the old classification, the inventory move is atomic, and no product behavior, case logic, or
+native expectation changes.
 
 The commit body must state:
 
