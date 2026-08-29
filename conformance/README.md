@@ -95,6 +95,17 @@ device's behavior whether or not anyone has yet written down whose fault it is.
 Classifying a failure and detecting a regression are therefore separate jobs,
 and only the second one gates a commit.
 
+**Give it more than one control.** The cases on this rail are reproducible and
+the device log is not: two back-to-back macos-13 controls of the same build
+agreed on all 290 case results exactly and still disagreed on their typed-reason
+counts, `stamp_wait_timeout` among them. `--control` may be repeated, and a
+repeated control measures the rail's variance instead of assuming it away -- a
+candidate inside the envelope has not moved. With one control the tool says so
+in its totals rather than leaving a reader to infer it. A case the controls
+themselves disagree about is `CONTROL-UNSTABLE` and is dropped from scoring,
+because charging a candidate for the rail's own noise is the same error in the
+other direction.
+
 It scores the workflow's transition table, and two things no case comparison
 can see. A name in only one of the two runs is a regression rather than a
 missing row -- coverage that moved is the failure this catches. And the device's

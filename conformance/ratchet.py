@@ -38,7 +38,16 @@ reader who knows the case can say which.
 
 The device's own log is compared too. A candidate that keeps every pixel and
 doubles the fence timeouts has moved backwards, and no case comparison can see
-it.
+it. That comparison needs more than one control, because the log is not
+reproducible the way the cases are: two back-to-back macos-13 controls of the
+same build agreed on all 290 case results exactly and still disagreed on their
+typed-reason counts, `stamp_wait_timeout` among them. So `--control` may be
+given more than once, and a repeated control establishes an envelope rather than
+a number. A candidate inside the envelope has not moved; outside it, it has.
+
+One control is accepted and says so in the totals. It cannot separate a
+regression from run-to-run variance in the log, and a reader should not have to
+infer that from the absence of a second `--control`.
 """
 
 import argparse
@@ -109,9 +118,19 @@ def parse_device(path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--control", required=True, help="identified control run's conformance.txt")
+    ap.add_argument(
+        "--control",
+        required=True,
+        action="append",
+        help="identified control run's conformance.txt; repeat for an envelope",
+    )
     ap.add_argument("--candidate", required=True, help="candidate run's conformance.txt")
-    ap.add_argument("--control-device", help="the control's device.log")
+    ap.add_argument(
+        "--control-device",
+        action="append",
+        default=[],
+        help="a control's device.log, in the same order as its --control",
+    )
     ap.add_argument("--candidate-device", help="the candidate's device.log")
     ap.add_argument(
         "--quiet",
@@ -120,11 +139,28 @@ def main():
     )
     args = ap.parse_args()
 
-    control, control_dev, control_dupes = parse_cases(args.control)
+    parsed = [parse_cases(path) for path in args.control]
+    control, control_dev, control_dupes = parsed[0]
     candidate, candidate_dev, candidate_dupes = parse_cases(args.candidate)
 
     regressions, improvements, changed, lines = [], [], [], []
     tally = collections.Counter()
+
+    # A case the controls themselves disagree about has no control reading to
+    # score a candidate against, and scoring it anyway would charge the
+    # candidate for the rail's own variance. Drop it from the comparison and say
+    # so, because a silently unscored case is the failure this whole tool is
+    # about.
+    unstable = set()
+    for other, _, _ in parsed[1:]:
+        for name in set(control) | set(other):
+            if control.get(name) != other.get(name):
+                unstable.add(name)
+    for name in sorted(unstable):
+        readings = " | ".join(str(p[0].get(name)) for p in parsed)
+        changed.append(f"CONTROL-UNSTABLE {name} -- not scored; controls said {readings}")
+        control.pop(name, None)
+        candidate.pop(name, None)
 
     for name in control_dupes:
         regressions.append(f"DUPLICATE-IN-CONTROL {name}")
@@ -170,18 +206,25 @@ def main():
             f"DEVICE-CHANGED -- control {control_dev!r} candidate {candidate_dev!r}"
         )
 
-    before_log = parse_device(args.control_device)
+    # The envelope every control run put this reason inside. A candidate within
+    # it has not moved; the width is the rail's own variance, measured rather
+    # than assumed.
+    before_logs = [parse_device(path) for path in args.control_device]
     after_log = parse_device(args.candidate_device)
-    for reason in sorted(set(before_log) | set(after_log)):
-        b, a = before_log[reason], after_log[reason]
-        if b == a:
+    reasons = set(after_log)
+    for log in before_logs:
+        reasons |= set(log)
+    for reason in sorted(reasons):
+        seen = [log[reason] for log in before_logs] or [0]
+        lo, hi = min(seen), max(seen)
+        a = after_log[reason]
+        if lo <= a <= hi:
             continue
-        worse = a > b
-        catastrophic = bool(CATASTROPHIC.search(reason))
-        line = f"DEVICE-REASON {reason} -- control {b} candidate {a}"
-        if worse and catastrophic:
+        envelope = str(lo) if lo == hi else f"{lo}..{hi}"
+        line = f"DEVICE-REASON {reason} -- control {envelope} candidate {a}"
+        if a > hi and CATASTROPHIC.search(reason):
             regressions.append(line + " (a catastrophic class got worse)")
-        elif worse:
+        elif a > hi:
             changed.append(line)
         else:
             improvements.append(line + " (fewer)")
@@ -196,15 +239,22 @@ def main():
         lines.append("")
     print("\n".join(lines))
     print(
-        f"control   {len(control)} cases from {control_dev}\n"
+        f"control   {len(control)} cases from {control_dev}"
+        f" ({len(parsed)} control run{'s' if len(parsed) != 1 else ''})\n"
         f"candidate {len(candidate)} cases from {candidate_dev}"
     )
+    if len(before_logs) < 2:
+        print(
+            "note: fewer than two control device logs, so a moved typed-reason "
+            "count cannot be told from run-to-run variance"
+        )
     print(
         f"preserved {tally['preserved']}, "
         f"unchanged debt {tally['unchanged debt']}, "
         f"unchanged applicability {tally['unchanged applicability']}, "
         f"improvements {len(improvements)}, "
         f"changed detail {len(changed)}, "
+        f"control-unstable {len(unstable)}, "
         f"regressions {len(regressions)}"
     )
     # An improvement is not a failure, but it is not nothing either: the ledger
