@@ -602,6 +602,20 @@ pub(crate) enum LinearLoadRefusal {
     PaddedRowUnreadable { row: u32 },
     /// The format has a bytes-per-pixel but no row conversion to RGBA8.
     RowConvertUnsupported { format: u16 },
+    /// Two faces of one cube texture read back in different layouts.
+    ///
+    /// One descriptor names one pixel format, so the six faces cannot legally
+    /// differ. A disagreement is this loader's own defect rather than the
+    /// guest's, and it is named rather than folded into a format refusal so the
+    /// log says which face disagreed instead of reporting a format of zero that
+    /// no guest ever sent.
+    ///
+    /// Carries the same gate as [`load_cube_faces`], its only constructor. The
+    /// cube loader is Vulkan-only, so without this the variant is dead on the
+    /// Metal arm — which `-D warnings` reports, and only on the arm a Linux
+    /// host has to cross-compile to see.
+    #[cfg(feature = "backend-vulkan")]
+    CubeFaceLayoutMismatch { face: u32 },
 }
 
 impl crate::observe::Decline for LinearLoadRefusal {
@@ -622,6 +636,8 @@ impl crate::observe::Decline for LinearLoadRefusal {
             Self::TightImageUnreadable => "linear_load_tight_image_unreadable",
             Self::PaddedRowUnreadable { .. } => "linear_load_padded_row_unreadable",
             Self::RowConvertUnsupported { .. } => "linear_load_row_convert_unsupported",
+            #[cfg(feature = "backend-vulkan")]
+            Self::CubeFaceLayoutMismatch { .. } => "linear_load_cube_face_layout_mismatch",
         }
     }
 
@@ -644,6 +660,8 @@ impl crate::observe::Decline for LinearLoadRefusal {
                 vec![("end", end.to_string()), ("alloc", allocation.to_string())]
             }
             Self::PaddedRowUnreadable { row } => vec![("row", row.to_string())],
+            #[cfg(feature = "backend-vulkan")]
+            Self::CubeFaceLayoutMismatch { face } => vec![("face", face.to_string())],
             _ => Vec::new(),
         }
     }
@@ -715,9 +733,15 @@ pub(crate) fn load_cube_faces<M: HostMemory + HostOps>(
     /// seven, and the engine refuses `cube` images whose layer count is not
     /// exactly this.
     const CUBE_FACES: u32 = 6;
-    let mut packed: Vec<u8> = Vec::new();
-    let mut format: Option<SampledByteFormat> = None;
-    for face in 0..CUBE_FACES {
+    // Face zero is read first so the format and the whole capacity are known
+    // before the loop, which is what lets the six faces pack with one
+    // allocation and leaves no "no face was read" case to invent a refusal for.
+    let (first_bytes, format) =
+        load_linear_texture_impl(state, host, task_id, texture_ref, 0, 0, None, native, site)?;
+    let mut packed: Vec<u8> = Vec::with_capacity(first_bytes.len() * CUBE_FACES as usize);
+    packed.extend_from_slice(&first_bytes);
+    drop(first_bytes);
+    for face in 1..CUBE_FACES {
         let (bytes, byte_format) = load_linear_texture_impl(
             state,
             host,
@@ -729,30 +753,14 @@ pub(crate) fn load_cube_faces<M: HostMemory + HostOps>(
             native,
             site,
         )?;
-        match format {
-            None => {
-                // Sized once, from the first face: the five remaining reads of
-                // one descriptor cannot legally differ in length.
-                packed.reserve_exact(bytes.len() * (CUBE_FACES as usize - 1));
-                format = Some(byte_format);
-            }
-            Some(first) => {
-                // One descriptor, one format — a disagreement here is this
-                // loader's own bug, not the guest's, so it is a refusal rather
-                // than a debug assertion that vanishes in release.
-                if first.layout() != byte_format.layout() {
-                    return Err(LinearLoadRefusal::RowConvertUnsupported {
-                        format: 0,
-                    });
-                }
-            }
+        // One descriptor, one format — a disagreement here is this loader's own
+        // bug, not the guest's, so it is a named refusal rather than a debug
+        // assertion that vanishes in release.
+        if format.layout() != byte_format.layout() {
+            return Err(LinearLoadRefusal::CubeFaceLayoutMismatch { face });
         }
         packed.extend_from_slice(&bytes);
     }
-    let format = format.ok_or(LinearLoadRefusal::ZeroExtent {
-        width: 0,
-        height: 0,
-    })?;
     Ok((packed, format))
 }
 
@@ -794,6 +802,20 @@ pub(crate) struct NativeUploads {
     /// for the whole family. Desktop GPUs have it; Apple GPUs carry ASTC
     /// instead and read `false`.
     pub block_compressed: bool,
+    /// Upload guest four-channel `float32` (`RGBA32Float`) at its own sixteen
+    /// bytes, as `R32G32B32A32_SFLOAT`.
+    ///
+    /// Like [`Self::block_compressed`] and unlike [`Self::float16`], this is not
+    /// a choice between an exact rail and a lossy one — it is the **only** rail.
+    /// [`pixel_format::TexelLayout::Rgba32Float`] has no CPU loader arm and must
+    /// not gain one, so a host that clears this flag loses the texture and says
+    /// so rather than quantising a lookup table to unorm8.
+    ///
+    /// Set from `supports_sampled_layout_linear_filter(Rgba32Float)`: Vulkan
+    /// mandates `SAMPLED_IMAGE` for the format but not
+    /// `SAMPLED_IMAGE_FILTER_LINEAR`, so the filter is measured rather than
+    /// assumed.
+    pub float32: bool,
 }
 
 impl NativeUploads {
@@ -803,6 +825,7 @@ impl NativeUploads {
         bgra8: false,
         float16: false,
         block_compressed: false,
+        float32: false,
     };
 
     /// Native BGRA8 only — the answer this parameter carried when it was a
@@ -818,20 +841,58 @@ impl NativeUploads {
         bgra8: true,
         float16: false,
         block_compressed: false,
+        float32: false,
     };
 
-    /// Every native layout the loaders can produce.
+    /// Every native layout the loaders can produce — every gate open at once.
     ///
-    /// Test-only on purpose. Production reaches this answer through
-    /// `native_uploads_for_host`, which asks the host whether it can filter the
-    /// half-float formats; a constant that says yes without asking is exactly
-    /// the shape that would let a capability go unchecked.
-    #[cfg(test)]
+    /// **Never bind anything with this.** Production reaches its answer through
+    /// `native_uploads_for_host`, which asks the host; a constant that says yes
+    /// without asking is exactly the shape that lets a capability go unchecked.
+    /// Its two legitimate uses are a test fixture and one half of
+    /// [`native_bind_is_host_gated`]'s comparison, which asks whether an answer
+    /// *depends* on the host and binds nothing.
+    ///
+    /// It is one constant rather than two because it was two: an
+    /// `EVERY_GATE_OPEN` sitting beside this was a field-for-field copy with
+    /// nothing comparing them, so a fifth gate set here and forgotten there
+    /// would make `native_bind_is_host_gated` compare two equal answers, report
+    /// `false`, and skip asking the host — reproducing exactly the `RGBA32Float`
+    /// defect that function exists to have fixed. `AGENTS.md`: derive, don't
+    /// duplicate and compare.
+    #[cfg(any(test, feature = "backend-vulkan"))]
     pub const ALL: Self = Self {
         bgra8: true,
         float16: true,
         block_compressed: true,
+        float32: true,
     };
+}
+
+/// Whether [`linear_native_upload_format`]'s answer for `sample_format` depends
+/// on what the host can do.
+///
+/// The question `native_uploads_for` needs before deciding whether to take the
+/// engine lock, and it is **derived** rather than listed: the answer is computed
+/// with every *host-gated* capability shut and again with every one open, and a
+/// format whose answer moves is one whose bind is host-gated.
+///
+/// The shut arm is [`NativeUploads::BGRA8`] rather than [`NativeUploads::NONE`]
+/// deliberately, and the difference is only `bgra8`, which is not a host gate at
+/// all — it is the loader's own eight-bit swap and is always available. Shutting
+/// it would make every BGRA8 format read as host-gated and send each one through
+/// the engine lock for an answer that cannot change.
+///
+/// It used to be approximated by [`pixel_format::narrows_to_unorm8`], which
+/// answers a different question — whether a format's *CPU* arm is lossy. The two
+/// coincided for exactly as long as every capability-gated layout also had a
+/// lossy CPU arm. `RGBA32Float` broke that: its bind is host-gated and it has no
+/// CPU arm at all, so the proxy said "no need to ask", the host was never asked,
+/// and every draw sampling one was refused.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn native_bind_is_host_gated(sample_format: u16) -> bool {
+    linear_native_upload_format(sample_format, NativeUploads::BGRA8)
+        != linear_native_upload_format(sample_format, NativeUploads::ALL)
 }
 
 /// When a sampled format's guest bytes are ALREADY in the final upload order —
@@ -869,6 +930,16 @@ pub(crate) fn linear_native_upload_format(
         SampledClass::Bgra8Unorm if native.bgra8 => TexelLayout::Bgra8,
         SampledClass::Rgba16Float if native.float16 => TexelLayout::Rgba16Float,
         SampledClass::Rg16Float if native.float16 => TexelLayout::Rg16Float,
+        SampledClass::Rgba32Float if native.float32 => TexelLayout::Rgba32Float,
+        // Ungated, like `Rgba8Unorm` and unlike every layout above it. Vulkan
+        // mandates `SAMPLED_IMAGE` for `R16G16_UINT`, and the one capability
+        // the other native layouts are gated on — linear filtering — is not a
+        // question an integer layout is asked: it is sampled with
+        // `VK_FILTER_NEAREST` by construction. So there is nothing to gate on,
+        // and no CPU arm to fall back to either: `convert_row_to_rgba8` has no
+        // arm for an integer texel and must not gain one, so a `None` here is
+        // not a slower rail, it is `RowConvertUnsupported` and a lost sample.
+        SampledClass::Rg16Uint => TexelLayout::Rg16Uint,
         _ => return None,
     })
 }

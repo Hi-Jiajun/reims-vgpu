@@ -1301,6 +1301,32 @@ pub const PIPELINE_TAG_DEPTH_ATTACH_FORMAT: u8 = 0x09;
 /// `MTLPixelFormat`. The stencil half of [`PIPELINE_TAG_DEPTH_ATTACH_FORMAT`],
 /// and benign for the same reason.
 pub const PIPELINE_TAG_STENCIL_ATTACH_FORMAT: u8 = 0x0a;
+/// `MTLRenderPipelineDescriptor.inputPrimitiveTopology`, an
+/// `MTLPrimitiveTopologyClass`.
+///
+/// The *class* of primitive the pipeline is compiled for — `Unspecified`,
+/// `Point`, `Line` or `Triangle` — and not a primitive type. See
+/// [`RENDER_PIPELINE_TAGS_BENIGN`] for why this device does not apply it.
+///
+/// # How it was placed
+///
+/// Three independent readings agree, which is worth recording because the tag
+/// numbering is the serializer's own and not a straight enumeration of the
+/// descriptor's properties:
+///
+/// * **Position.** It sits between [`PIPELINE_TAG_STENCIL_ATTACH_FORMAT`] and
+///   [`PIPELINE_TAG_MAX_TESSELLATION_FACTOR`], and `inputPrimitiveTopology` is
+///   the property the header declares between those two.
+/// * **Value.** The only value observed is `3`, which is
+///   `MTLPrimitiveTopologyClassTriangle`. Every other candidate property in that
+///   span is a `BOOL` or a sample count, and neither can be three.
+/// * **Company.** It appears on exactly one descriptor shape, the one that also
+///   carries [`PIPELINE_TAG_MAX_TESSELLATION_FACTOR`],
+///   [`PIPELINE_TAG_TESSELLATION_FACTOR_STEP_FUNCTION`] and
+///   [`PIPELINE_TAG_TESSELLATION_OUTPUT_WINDING_ORDER`] — and Metal requires a
+///   tessellated pipeline to declare a topology class rather than leave it
+///   `Unspecified`, which is why a tessellation pipeline is where it shows up.
+pub const PIPELINE_TAG_INPUT_PRIMITIVE_TOPOLOGY: u8 = 0x0b;
 /// `MTLRenderPipelineDescriptor.maxTessellationFactor`.
 pub const PIPELINE_TAG_MAX_TESSELLATION_FACTOR: u8 = 0x0d;
 /// `MTLRenderPipelineDescriptor.tessellationFactorStepFunction`.
@@ -1861,7 +1887,9 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
         )
     {
         crate::observe::fail(format!(
-            "texture_desc_mip_field_undecoded value={undecoded:#04x}              levels={} len={} (the byte above the mip-level count carries              something this device does not decode; the count is the low byte              and the body length confirms it)",
+            "texture_desc_mip_field_undecoded value={undecoded:#04x} levels={} len={} \
+             (the byte above the mip-level count carries something this device does \
+             not decode; the count is the low byte and the body length confirms it)",
             out.mipmap_level_count,
             bytes.len()
         ));
@@ -2264,14 +2292,39 @@ pub fn decode_depth_stencil_descriptor(
     // unidentified (Metal substitutes default faces before serialize). Keep the
     // product field names; source the bit from the same byte the view exposes.
     let state = body.depth_state;
+    let front_stencil_enabled = (state & DEPTH_STENCIL_FRONT_STENCIL_ENABLED as u8) != 0;
+    let back_stencil_enabled = (state & DEPTH_STENCIL_BACK_STENCIL_ENABLED as u8) != 0;
+    // A face block is only meaningful behind its own enable bit, and reading it
+    // otherwise reads the guest's stale ring.
+    //
+    // The paragraph above says Metal substitutes default faces before it
+    // serializes, so both blocks are always written. That is not true of every
+    // record: Apple's own capture of a descriptor whose front face is absent
+    // leaves the front block untouched, and the bytes under it on a real wire
+    // are whatever the ring last held. Decoding them made one record decode two
+    // ways depending on noise, which is the property
+    // `no_decoder_reads_a_bit_apples_serializer_never_wrote` exists to hold.
+    //
+    // Gating changes no execution — every consumer already reads a face only
+    // behind the same bit (`runtime::draw::vulkan`'s stencil block,
+    // `backend::metal::render`) — it removes the nondeterminism ahead of them,
+    // so the decoded record is a function of what the serializer wrote.
     Ok(DepthStencilDescriptor {
         depth_stencil_id: body.object_ref.get(),
         depth_compare_function: body.depth_compare_function() as u32,
         depth_write_enabled: body.depth_write_enabled(),
-        front_stencil_enabled: (state & DEPTH_STENCIL_FRONT_STENCIL_ENABLED as u8) != 0,
-        back_stencil_enabled: (state & DEPTH_STENCIL_BACK_STENCIL_ENABLED as u8) != 0,
-        front_face: face_from_wire(&body.front),
-        back_face: face_from_wire(&body.back),
+        front_stencil_enabled,
+        back_stencil_enabled,
+        front_face: if front_stencil_enabled {
+            face_from_wire(&body.front)
+        } else {
+            DepthStencilFace::default()
+        },
+        back_face: if back_stencil_enabled {
+            face_from_wire(&body.back)
+        } else {
+            DepthStencilFace::default()
+        },
     })
 }
 
@@ -2473,16 +2526,29 @@ pub const PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET: u8 = 0x03;
 ///   change what the guest observes; the attachment it observes is the one its
 ///   own pass named.
 ///
+/// * [`PIPELINE_TAG_INPUT_PRIMITIVE_TOPOLOGY`] declares the *class* of primitive
+///   the pipeline is compiled for. It does not select one: every draw record
+///   carries its own `MTLPrimitiveType`, which
+///   `translate::raster::primitive_topology` turns into the
+///   `VkPipelineInputAssemblyStateCreateInfo` topology, so the class restates
+///   what the draw already names — the same relationship the two attachment
+///   formats above have with the pass descriptor. Metal requires a draw's
+///   primitive type to belong to the class its pipeline declared, so the two
+///   cannot disagree without the guest's own validation having rejected the
+///   draw first. Dropping it cannot change what the guest observes; the topology
+///   it observes is the one its own draw named.
+///
 /// **`rasterizationEnabled` and `alphaToCoverageEnabled` are deliberately not
 /// here.** They are two of the three the old doc named as silently defaulted,
 /// and neither has appeared in this block on a driven boot. If one arrives it
 /// must refuse rather than be waved through. The third,
 /// [`PIPELINE_TAG_RASTER_SAMPLE_COUNT`], is now read — it is consumed on both
 /// shapes and carried to the backend render-pass and pipeline keys.
-const RENDER_PIPELINE_TAGS_BENIGN: [u8; 5] = [
+const RENDER_PIPELINE_TAGS_BENIGN: [u8; 6] = [
     RENDER_PIPELINE_TAG_LABEL,
     PIPELINE_TAG_DEPTH_ATTACH_FORMAT,
     PIPELINE_TAG_STENCIL_ATTACH_FORMAT,
+    PIPELINE_TAG_INPUT_PRIMITIVE_TOPOLOGY,
     // The two legacy fixed-function *values* whose enables stay refused. See
     // the reading under `note_pipeline_tlv_fields` for what measured them and
     // `PIPELINE_TAG_ALPHA_TEST_ENABLED` for why the pairing is what licenses

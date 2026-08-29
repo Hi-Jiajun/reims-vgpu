@@ -61,8 +61,9 @@ pub(crate) use facade_decline::EngineFacadeDecline;
 pub(crate) use host_ram::GuestWriteDecline;
 pub use types::viewport_slot_count;
 pub use types::{
-    BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask, ComputeBufferResource,
-    ComputeOutput, ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource,
+    BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorAttachmentState, ColorClearValue,
+    ColorWriteMask, ComputeBufferResource, ComputeOutput, ComputeRequest, ComputeResidentSampleBind,
+    ComputeSampledImageResource,
     ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
     DrawError, DrawOutput, DrawRequest, FillMode, GuestRun, GuestRunSource, GuestSampledBacking,
     GuestTargetBacking, GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource,
@@ -407,21 +408,42 @@ struct DeviceCapabilitySnapshot(u64);
 
 const CAP_MAX_DIMENSION_BITS: u32 = u32::BITS;
 const CAP_LAYOUT_SHIFT: u32 = CAP_MAX_DIMENSION_BITS;
-/// Both per-layout masks span the **uncompressed** vocabulary only.
+/// The two per-layout masks span **different vocabularies**, each sized by its
+/// own.
 ///
-/// Two masks of the full `TexelLayout::ALL` no longer fit beside a `u32`
-/// dimension and two flags in one word, and the assertion below is what said so
-/// — it failed the build the moment the ten BC layouts were declared, which is
-/// exactly what a `const` relation is for. Narrowing rather than widening is
-/// also the right answer on the merits: a block-compressed layout is never a
-/// colour attachment, and Vulkan's mandatory-format table already guarantees it
-/// linear filtering wherever `textureCompressionBC` is enabled. See
-/// `TexelLayout::UNCOMPRESSED_COUNT`.
-const CAP_LAYOUT_COUNT: u32 =
-    crate::contract::pixel_format::TexelLayout::UNCOMPRESSED_COUNT as u32;
-const CAP_GPU_ONLY_BIT: u32 = CAP_LAYOUT_SHIFT + CAP_LAYOUT_COUNT;
+/// They answer different questions about different sets — whether this device
+/// may create a colour attachment at a layout, and whether sampling it filters
+/// linearly — and they used to share one index space, so both were sized by the
+/// union and every layout only one of them cared about cost two bits instead of
+/// one.
+///
+/// The assertion below has now failed the build three times: when the ten BC
+/// layouts were declared, when the first integer colour layout was, and when a
+/// four-channel float *sampled* layout was. The first two were answered by
+/// narrowing the shared vocabulary. The third could not be — that layout
+/// genuinely needs a filter bit — which is what showed that the sharing, rather
+/// than any one layout, was what cost the budget.
+///
+/// **Narrowing a vocabulary below the question its reader asks is not a saving,
+/// it is a wrong answer.** The render-target mask was briefly the *blendable*
+/// layouts rather than the renderable ones, which left the integer layout with
+/// no bit; [`DeviceCapabilitySnapshot::render_target_layout_supported`] then
+/// read `false` for it and every `RG16Uint` target was built at the neutral
+/// eight-bit format and lost by both Store arms. The vocabulary is now
+/// `TexelLayout::is_render_target_layout` — exactly the set the reader asks
+/// about — and `caps::device_features` demands `COLOR_ATTACHMENT_BLEND` only of
+/// the layouts that can blend.
+///
+/// Widening the word is not on the table: this is published through a `static
+/// AtomicU64` and there is no lock-free word above it. See
+/// `TexelLayout::is_render_target_layout` and
+/// `TexelLayout::needs_sampled_filter_query` for the two sets.
+const CAP_RENDER_TARGET_COUNT: u32 =
+    crate::contract::pixel_format::TexelLayout::RENDER_TARGET_COUNT as u32;
+const CAP_FILTER_COUNT: u32 = crate::contract::pixel_format::TexelLayout::FILTER_COUNT as u32;
+const CAP_GPU_ONLY_BIT: u32 = CAP_LAYOUT_SHIFT + CAP_RENDER_TARGET_COUNT;
 const CAP_SAMPLED_FILTER_SHIFT: u32 = CAP_GPU_ONLY_BIT + 1;
-const CAP_PUBLISHED_BIT: u32 = CAP_SAMPLED_FILTER_SHIFT + CAP_LAYOUT_COUNT;
+const CAP_PUBLISHED_BIT: u32 = CAP_SAMPLED_FILTER_SHIFT + CAP_FILTER_COUNT;
 /// Whether this device can sample the BC block-compressed families.
 ///
 /// One bit for the whole family, because Vulkan gates BC1 through BC7 behind one
@@ -446,18 +468,19 @@ impl DeviceCapabilitySnapshot {
     ) -> Self {
         let mut word = u64::from(features.max_image_dimension_2d);
         // Walked by layout rather than by array position: the feature arrays are
-        // indexed by `TexelLayout::index()` over the whole vocabulary and the
-        // masks by `uncompressed_index()` over part of it, so enumerating the
+        // indexed by `TexelLayout::index()` over the whole vocabulary and each
+        // mask by its own index over its own part of it, so enumerating the
         // array would put a layout's answer in another layout's bit.
         for layout in crate::contract::pixel_format::TexelLayout::ALL {
-            let Some(bit) = layout.uncompressed_index() else {
-                continue;
-            };
-            if features.color_attachment_blend[layout.index()] {
-                word |= 1_u64 << (CAP_LAYOUT_SHIFT + bit as u32);
+            if let Some(bit) = layout.render_target_index() {
+                if features.color_attachment[layout.index()] {
+                    word |= 1_u64 << (CAP_LAYOUT_SHIFT + bit as u32);
+                }
             }
-            if features.sampled_linear_filter[layout.index()] {
-                word |= 1_u64 << (CAP_SAMPLED_FILTER_SHIFT + bit as u32);
+            if let Some(bit) = layout.filter_index() {
+                if features.sampled_linear_filter[layout.index()] {
+                    word |= 1_u64 << (CAP_SAMPLED_FILTER_SHIFT + bit as u32);
+                }
             }
         }
         if !quirks.guest_pages_stay_authoritative {
@@ -478,12 +501,12 @@ impl DeviceCapabilitySnapshot {
         self,
         layout: crate::contract::pixel_format::TexelLayout,
     ) -> bool {
-        let Some(bit) = layout.uncompressed_index() else {
-            // No host renders into a block-compressed format, and this device
-            // does not ask it to: `pixel_format::render_target_bpp` has no BC
-            // arm, so the resolve refuses one before reaching here. Answering
-            // `false` keeps that true instead of reading a bit the word does not
-            // carry.
+        let Some(bit) = layout.render_target_index() else {
+            // A layout this device does not render into at all.
+            // `pixel_format::render_target_bpp` refuses it before the resolve
+            // reaches here, so `false` keeps that true instead of reading a bit
+            // the word does not carry. The mask spans every renderable layout,
+            // integer ones included, so this arm no longer swallows one.
             return false;
         };
         self.0 & (1_u64 << (CAP_LAYOUT_SHIFT + bit as u32)) != 0
@@ -512,8 +535,20 @@ impl DeviceCapabilitySnapshot {
         if self.0 & (1_u64 << CAP_PUBLISHED_BIT) == 0 {
             return None;
         }
-        let Some(bit) = layout.uncompressed_index() else {
-            // Vulkan's mandatory-format table requires
+        let Some(bit) = layout.filter_index() else {
+            // Two layouts leave this mask and they leave it with opposite
+            // answers, so the arm has to split rather than return one value for
+            // "no bit".
+            if layout.is_integer() {
+                // Vulkan permits no `VK_FILTER_LINEAR` on an integer format, so
+                // the answer is statically no — which is what
+                // `TexelLayout::needs_sampled_filter_query`'s own doc says.
+                // Reporting `true` here claimed a filtering capability no
+                // driver advertises and disagreed with the unpublished arm
+                // below, which reads the array and answers `false`.
+                return Some(false);
+            }
+            // Block-compressed. Vulkan's mandatory-format table requires
             // `SAMPLED_IMAGE_FILTER_LINEAR` of every BC format on a device that
             // enables `textureCompressionBC`, and that feature is what admits
             // the format at `translate::pixel::sampled_pixels` in the first
@@ -568,7 +603,7 @@ mod device_capability_snapshot_tests {
             max_image_dimension_2d: 16_384,
             ..Default::default()
         };
-        features.color_attachment_blend[TexelLayout::Rgba16Float.index()] = true;
+        features.color_attachment[TexelLayout::Rgba16Float.index()] = true;
         features.sampled_linear_filter[TexelLayout::Rgba16Float.index()] = true;
 
         let snapshot = DeviceCapabilitySnapshot::from_parts(
@@ -596,6 +631,58 @@ mod device_capability_snapshot_tests {
             },
         );
         assert!(!narrowed.deferred_gpu_only_content_allowed());
+    }
+
+    /// An integer colour attachment carries a render-target bit and answers
+    /// `false` — never `true` — about linear filtering.
+    ///
+    /// Both halves are regressions this pins. The render-target mask was
+    /// briefly the *blendable* layouts, so `Rg16Uint` had no bit at all: the
+    /// snapshot answered `false` however the host was probed, every `RG16Uint`
+    /// resident was created at the neutral eight-bit format, and both Store
+    /// arms then refused the frame — the GPU-direct one on
+    /// `ResidentFormatMismatch` and the copying one in a row converter that has
+    /// no integer arm by design. In the same change the filter arm's `None`
+    /// case returned `Some(true)` for anything without a bit, which had been
+    /// written for the block-compressed layouts alone, so this device claimed a
+    /// `VK_FILTER_LINEAR` on an integer format that no driver advertises and
+    /// that the unpublished arm answers `false` for.
+    #[test]
+    fn an_integer_colour_attachment_is_renderable_and_never_filterable() {
+        let mut features = crate::backend::vulkan::caps::device_features::DeviceFeatures {
+            max_image_dimension_2d: 16_384,
+            ..Default::default()
+        };
+        features.color_attachment[TexelLayout::Rg16Uint.index()] = true;
+        // Set deliberately, to prove the answer below does not come from it: a
+        // host cannot advertise this and the snapshot must not read it.
+        features.sampled_linear_filter[TexelLayout::Rg16Uint.index()] = true;
+
+        let snapshot = DeviceCapabilitySnapshot::from_parts(
+            &features,
+            crate::backend::vulkan::caps::DriverQuirk::default(),
+        );
+        assert!(
+            snapshot.render_target_layout_supported(TexelLayout::Rg16Uint),
+            "a host that reports COLOR_ATTACHMENT for the integer layout must              be believed, or its resident falls back to eight bits"
+        );
+        assert_eq!(
+            snapshot.sampled_layout_linear_filter_if_published(TexelLayout::Rg16Uint),
+            Some(false),
+            "no host advertises linear filtering of an integer format"
+        );
+
+        // The other half of the same word still works: a host that does not
+        // report the attachment gets a `false`, so this is a real query and not
+        // a constant.
+        let unsupported = DeviceCapabilitySnapshot::from_parts(
+            &crate::backend::vulkan::caps::device_features::DeviceFeatures {
+                max_image_dimension_2d: 16_384,
+                ..Default::default()
+            },
+            crate::backend::vulkan::caps::DriverQuirk::default(),
+        );
+        assert!(!unsupported.render_target_layout_supported(TexelLayout::Rg16Uint));
     }
 }
 
@@ -2109,9 +2196,9 @@ pub fn note_resident_content_copied_out(identity: &TargetIdentity) -> bool {
 /// the answer for those two has to be constant.
 ///
 /// Anything wider is a real question and is asked of the device:
-/// [`crate::backend::vulkan::caps::device_features::DeviceFeatures::color_attachment_blend`]
-/// holds one probe per [`TexelLayout`] for `COLOR_ATTACHMENT` *and*
-/// `COLOR_ATTACHMENT_BLEND` under optimal tiling. No device yet resolved
+/// [`crate::backend::vulkan::caps::device_features::DeviceFeatures::color_attachment`]
+/// holds one probe per [`TexelLayout`] for `COLOR_ATTACHMENT` under optimal
+/// tiling, plus `COLOR_ATTACHMENT_BLEND` for every layout that can blend. No device yet resolved
 /// answers `false`, which narrows to the format the target would have had
 /// anyway — an override or an unresolved device may never widen what the
 /// device does.
@@ -2363,6 +2450,31 @@ pub fn supports_storage_image_write_without_format() -> bool {
     }
 }
 
+/// Whether a native sampled bind of `layout` is admissible on this host.
+///
+/// The one door every native sampled rail asks, because "may I bind this" and
+/// "can this host filter this linearly" are the same question for most layouts
+/// and are not the same question for all of them. Keeping the second at the
+/// call site made an integer layout unbindable the moment the filter answer
+/// became truthful.
+///
+/// An integer layout is sampled with `VK_FILTER_NEAREST` — linear filtering is
+/// not merely unsupported for one, it is undefined, and Metal forbids it too,
+/// so a guest's own validation has already made the sampler nearest before the
+/// texture reaches this device (the same relationship a draw's primitive type
+/// has with its pipeline's declared topology class). `SAMPLED_IMAGE` is
+/// mandated for the integer layouts this device names, so the bind is
+/// admissible without a query and the filter mask is not this layout's
+/// question.
+pub fn supports_sampled_layout_bind(
+    layout: crate::contract::pixel_format::TexelLayout,
+) -> bool {
+    if layout.is_integer() {
+        return true;
+    }
+    supports_sampled_layout_linear_filter(layout)
+}
+
 /// Whether the bound device can sample this guest texel layout's Vulkan format
 /// with **linear** filtering.
 ///
@@ -2394,7 +2506,14 @@ pub fn supports_sampled_layout_linear_filter(
     } = &mut *guard;
     match owner.ensure(counters) {
         Ok(ctx) => {
-            if layout.is_block_compressed() {
+            if layout.is_integer() {
+                // No `VK_FILTER_LINEAR` on an integer format, ever. Stated here
+                // as well as in the published snapshot because the two arms
+                // answer the same question and a divergence between them is
+                // invisible: this one runs only before the first device has
+                // published.
+                false
+            } else if layout.is_block_compressed() {
                 // Mandated by the spec wherever the family is available at all,
                 // so there is nothing in this array to read and its BC entries
                 // are never written. Same answer the published snapshot gives.
@@ -2478,8 +2597,21 @@ pub fn read_resident_bgra(identity: &TargetIdentity, need: usize) -> Option<Vec<
     }
     let mut px = match read_target_inner(identity) {
         // `into_bgra8` is a no-op for a resident already in scanout order, which
-        // is every one this rail sees on a boot measured so far.
-        Ok(rb) => rb.into_bgra8(),
+        // is every one this rail sees on a boot measured so far. A native frame
+        // has no scanout order at all — there is nothing to present — so it
+        // declines here rather than handing the window a reinterpreted texel.
+        Ok(rb) => {
+            let texel = rb.texel;
+            match rb.into_bgra8() {
+                Some(px) => px,
+                None => {
+                    crate::observe::off(format!(
+                        "present_capture reason=readback_texel_not_scanout texel={texel:?}"
+                    ));
+                    return None;
+                }
+            }
+        }
         Err(e) => {
             let mut emit = crate::observe::Emit::decline("present_capture", &e);
             for (key, value) in draw_execution::identity_fields(identity) {
@@ -2908,20 +3040,77 @@ unsafe fn copy_image_level0_to_host_delivered(
 /// crate was watching for.
 pub struct TargetReadback {
     pub pixels: Vec<u8>,
-    /// BGRA8 when true, semantic RGBA8 otherwise.
-    pub bgra: bool,
+    /// What one texel of [`Self::pixels`] is.
+    pub texel: ReadbackTexel,
+}
+
+use crate::contract::pixel_format::TexelLayout;
+
+/// What one texel of a frame this engine hands out is.
+///
+/// This replaced a bare `bgra: bool`, which could only distinguish the two
+/// eight-bit colour orders and therefore **assumed** every frame was one of
+/// them. Four rails made that assumption by testing a texel's *width* — a
+/// four-byte texel was taken to be eight-bit colour — and four bytes is not
+/// that question. `Bgr10a2Unorm` is four bytes of packed ten-bit channels and
+/// was passed out raw and then re-packed by `rgba8_to_texel` as though its
+/// bytes were unorm8, which lands a corrupted frame in guest memory on any host
+/// that takes the copying rail. The distinction the contract already had a name
+/// for is [`TexelLayout::is_four_byte_color`], and this type is that name
+/// travelling with the bytes instead of being re-derived at each consumer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadbackTexel {
+    /// Four bytes, R, G, B, A — what every eight-bit consumer speaks.
+    Rgba8,
+    /// Four bytes, B, G, R, A — the guest's scanout order.
+    Bgra8,
+    /// The resident's own layout, carried out untouched because no eight-bit
+    /// narrowing of it exists.
+    ///
+    /// Only a consumer writing into a destination of this *same* layout may
+    /// take these bytes; anything that wants colour must decline. That is not a
+    /// restriction invented here — it is what `store_texel_order` already asks
+    /// of the GPU-direct rail, answered for the copying one.
+    Native(TexelLayout),
+}
+
+impl ReadbackTexel {
+    /// The eight-bit colour order a four-byte-colour resident was read in.
+    pub fn eight_bit(bgra: bool) -> Self {
+        if bgra {
+            Self::Bgra8
+        } else {
+            Self::Rgba8
+        }
+    }
+
+    /// The layout these bytes are in when they are nobody's colour, else `None`.
+    pub fn native_layout(self) -> Option<TexelLayout> {
+        match self {
+            Self::Native(layout) => Some(layout),
+            Self::Rgba8 | Self::Bgra8 => None,
+        }
+    }
 }
 
 impl TargetReadback {
     /// The frame in semantic RGBA8, exchanging R and B only when it is not
     /// already in that order.
-    pub fn into_rgba8(mut self) -> Vec<u8> {
-        if self.bgra {
-            for px in self.pixels.chunks_exact_mut(4) {
-                px.swap(0, 2);
+    ///
+    /// `None` for a native frame, which has no eight-bit form. Every caller
+    /// that needs colour must name that refusal rather than reinterpret the
+    /// bytes, which is the whole reason this returns an `Option`.
+    pub fn into_rgba8(mut self) -> Option<Vec<u8>> {
+        match self.texel {
+            ReadbackTexel::Native(_) => None,
+            ReadbackTexel::Rgba8 => Some(self.pixels),
+            ReadbackTexel::Bgra8 => {
+                for px in self.pixels.chunks_exact_mut(4) {
+                    px.swap(0, 2);
+                }
+                Some(self.pixels)
             }
         }
-        self.pixels
     }
 
     /// The frame in guest scanout order (BGRA8), exchanging only when needed.
@@ -2931,13 +3120,17 @@ impl TargetReadback {
     /// caller has to know which namespace it is reading: a `Surface` resident is
     /// already BGRA and this is a no-op, and a resident that is not stays correct
     /// instead of landing R and B exchanged in guest memory.
-    pub fn into_bgra8(mut self) -> Vec<u8> {
-        if !self.bgra {
-            for px in self.pixels.chunks_exact_mut(4) {
-                px.swap(0, 2);
+    pub fn into_bgra8(mut self) -> Option<Vec<u8>> {
+        match self.texel {
+            ReadbackTexel::Native(_) => None,
+            ReadbackTexel::Bgra8 => Some(self.pixels),
+            ReadbackTexel::Rgba8 => {
+                for px in self.pixels.chunks_exact_mut(4) {
+                    px.swap(0, 2);
+                }
+                Some(self.pixels)
             }
         }
-        self.pixels
     }
 }
 
@@ -3028,7 +3221,9 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
     // — the bytes the caller reads are the slot's. Bounded rather than
     // converted, and named so a firing says which rail could not serve.
     let (snap, layout) = readback_snapshot(pools, identity)?;
-    if layout.bytes_per_texel() != RESIDENT_READ_BYTES_PER_TEXEL {
+    // Four-byte *colour*, not four bytes: the caller reads these bytes as
+    // RGBA8 or BGRA8 and a packed or integer four-byte texel is neither.
+    if !layout.is_four_byte_color() {
         return Err(DrawError::TargetRead(
             reason::TargetReadDecline::TexelNotFourBytes {
                 format: snap.format,
@@ -4357,6 +4552,11 @@ fn readback_bytes_per_texel(format: ash::vk::Format) -> u32 {
         .unwrap_or(RESIDENT_READ_BYTES_PER_TEXEL)
 }
 
+/// The Vulkan spelling of a layout, for a decline that has only the layout.
+fn readback_vk_format(layout: TexelLayout) -> ash::vk::Format {
+    crate::backend::vulkan::translate::pixel::vk_texel_layout(layout)
+}
+
 /// Bring a readback taken at the attachment's own texel width down to the RGBA8
 /// every consumer of drawn pixels speaks.
 ///
@@ -4371,32 +4571,45 @@ fn readback_bytes_per_texel(format: ash::vk::Format) -> u32 {
 /// loses the frame outright, where before a render target could be wide the same
 /// frame was merely quantized on its way through an eight-bit resident.
 ///
-/// Returns the bytes and the channel order they are in — `narrow_texel_to_rgba8`
-/// produces semantic RGBA8 whatever the resident's order was, so a narrowed
-/// frame owes no exchange and says so.
+/// Returns the bytes and [`ReadbackTexel`] saying what they are.
+///
+/// Three answers, and the middle one used to be the only one that was not a
+/// guess. A four-byte **colour** resident is handed back in the order it was
+/// read; anything with an eight-bit narrowing is narrowed to semantic RGBA8;
+/// anything else keeps its own texel and is labelled [`ReadbackTexel::Native`]
+/// so that no consumer can read it as colour by accident.
+///
+/// The first arm used to test `bytes_per_texel() == 4`, which is a width and not
+/// a vocabulary — it passed `Bgr10a2Unorm`'s packed ten-bit words out labelled
+/// as eight-bit colour, and the CPU Store converter then re-packed them from
+/// channels that were never there.
+///
+/// The third arm used to be an error. Refusing lost the frame outright; a native
+/// label loses nothing, because the one consumer that can use such bytes — a
+/// guest destination of the identical layout — is exactly the case
+/// `store_texel_order` admits, and every other consumer still declines by name
+/// through [`TargetReadback::into_rgba8`].
 fn narrow_readback_to_rgba8(
     out: Vec<u8>,
     layout: crate::contract::pixel_format::TexelLayout,
-    format: ash::vk::Format,
+    _format: ash::vk::Format,
     pixels: u64,
     bgra: bool,
-) -> Result<(Vec<u8>, bool), DrawError> {
-    if layout.bytes_per_texel() == RESIDENT_READ_BYTES_PER_TEXEL {
-        return Ok((out, bgra));
+) -> Result<(Vec<u8>, ReadbackTexel), DrawError> {
+    if layout.is_four_byte_color() {
+        return Ok((out, ReadbackTexel::eight_bit(bgra)));
     }
     let count = u32::try_from(pixels).unwrap_or(u32::MAX);
     let mut narrowed = vec![0u8; (pixels * u64::from(RESIDENT_READ_BYTES_PER_TEXEL)) as usize];
     if !crate::contract::pixel_format::narrow_texel_to_rgba8(layout, &out, count, &mut narrowed) {
-        return Err(DrawError::TargetRead(
-            reason::TargetReadDecline::TexelNotFourBytes { format },
-        ));
+        return Ok((out, ReadbackTexel::Native(layout)));
     }
     // Visible, because it is a fidelity loss and not just a slow path: the
     // frame this returns carries eight bits of a channel the guest asked for
     // sixteen of. A non-zero reading names the population that would be
     // repaired by teaching this rail's consumers the wider texel.
     crate::runtime::drain::note_store_route("target_read_narrowed");
-    Ok((narrowed, false))
+    Ok((narrowed, ReadbackTexel::Rgba8))
 }
 
 /// The `srcAccessMask` a resident color target's readback must drain.
@@ -4599,12 +4812,13 @@ mod resident_read_order_tests {
         ] {
             let attachment = pixel::color_attachment(format)
                 .expect("a renderable eight-bit format")
-                .0;
+                .0
+                .vk;
             let readback = TargetReadback {
                 pixels: stored.clone(),
-                bgra: snapshot(attachment).bgra(),
+                texel: ReadbackTexel::eight_bit(snapshot(attachment).bgra()),
             };
-            let rgba = readback.into_rgba8();
+            let rgba = readback.into_rgba8().expect("an eight-bit colour readback");
             let mut landed = vec![0u8; stored.len()];
             assert!(
                 pf::convert_rgba8_to_row(format, &rgba, PIXELS, &mut landed),
@@ -4732,9 +4946,9 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
         counters.note_target_read(rb_size);
         // A wide resident is quantized here rather than refused; see
         // `narrow_readback_to_rgba8` for why that direction is the safe one.
-        let (pixels, bgra) =
+        let (pixels, texel) =
             narrow_readback_to_rgba8(out, layout, snap.format, pixels, snap.bgra())?;
-        Ok(TargetReadback { pixels, bgra })
+        Ok(TargetReadback { pixels, texel })
     }
 }
 
@@ -5614,26 +5828,37 @@ mod readback_width_tests {
         for &layout in TexelLayout::ALL {
             let format = crate::backend::vulkan::translate::pixel::vk_texel_layout(layout);
             let sized = (PIXELS * u64::from(readback_bytes_per_texel(format))) as usize;
-            match narrow_readback_to_rgba8(vec![0u8; sized], layout, format, PIXELS, true) {
-                Ok((pixels, bgra)) => {
+            let (pixels, texel) =
+                narrow_readback_to_rgba8(vec![0u8; sized], layout, format, PIXELS, true)
+                    .expect("the narrowing no longer refuses; it labels");
+            match texel {
+                // A four-byte colour resident is handed back untouched, so it
+                // keeps the order it was read in.
+                ReadbackTexel::Bgra8 => {
+                    assert!(
+                        layout.is_four_byte_color(),
+                        "{layout:?}: reported scanout order for a texel that is not colour"
+                    );
+                    assert_eq!(pixels.len(), sized);
+                }
+                // Narrowed to semantic RGBA8, which owes no exchange.
+                ReadbackTexel::Rgba8 => {
+                    assert!(
+                        !layout.is_four_byte_color(),
+                        "{layout:?}: a colour resident should keep its own order"
+                    );
                     assert_eq!(
                         pixels.len(),
                         (PIXELS * u64::from(RESIDENT_READ_BYTES_PER_TEXEL)) as usize,
-                        "{layout:?}: a consumer of drawn pixels reads RGBA8"
-                    );
-                    // A four-byte layout is handed back untouched, so it keeps
-                    // the order it was read in; a narrowed one is semantic RGBA8
-                    // and owes no exchange. Both rails pass this straight on.
-                    assert_eq!(
-                        bgra,
-                        layout.bytes_per_texel() == RESIDENT_READ_BYTES_PER_TEXEL,
-                        "{layout:?}: reported the wrong channel order for its rail"
+                        "{layout:?}: a narrowed frame is RGBA8"
                     );
                 }
-                Err(_) => {
-                    // Refused. It must be the layout and not the size, so hand
-                    // the same narrowing a buffer no sizing error could make too
-                    // small and require the same answer.
+                // No eight-bit form. The bytes are the resident's own and stay
+                // that width, and the layout must really have no narrowing —
+                // asked with a buffer no sizing error could make too small.
+                ReadbackTexel::Native(named) => {
+                    assert_eq!(named, layout);
+                    assert_eq!(pixels.len(), sized, "{layout:?}: native keeps its width");
                     let mut dst = vec![0u8; (PIXELS * 4) as usize];
                     assert!(
                         !crate::contract::pixel_format::narrow_texel_to_rgba8(

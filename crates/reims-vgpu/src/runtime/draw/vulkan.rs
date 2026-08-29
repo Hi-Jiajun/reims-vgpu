@@ -8,7 +8,6 @@
 //! parent's imports, which this half shares.
 
 use super::*;
-use crate::contract::pixel_format::solid_bgra8;
 
 /// Vulkan image shape for a reflected Metal sampled-image dimensionality.
 ///
@@ -112,132 +111,29 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         return (EncodeStatus::BadArgs("draw_vk_no_color_target"), None);
     };
 
-    let mut any_store = false;
-    // The seeded solid colour of attachment 0, as its recipe rather than as its
-    // pixels.
-    //
-    // This used to be the `Vec<u8>` itself, built by `solid_rgba8` inside the
-    // seed loop. Only one of this function's five exits returns it — the
-    // clear-only one at the bottom, where the record encoded no draw — and the
-    // three that matter under compositing (`chain_resident_established`, an armed
-    // Store, a real `draw_rgba`) each return something else and dropped it
-    // unread. On a macos-11 Safari-torture leg the seed loop landed 2.87 GB of
-    // solid colour through `write_gva_solid8`, which converts one row and repeats
-    // it; the full-surface image built beside it was the same 2.87 GB of
-    // allocate-and-fill, and 188 ms of the leg's 892 ms `prep_seed_us` sat
-    // outside both landing spans, which is where it was.
-    //
-    // Held as `(width, height, colour)` so the recipe costs a few words and the
-    // exit that wants pixels calls the same constructor with the same arguments.
-    let mut color0_solid: Option<(u32, u32, [f64; 4])> = None;
     // The engine draw's own refusal slug, kept so the skipped-draw tail can name
     // why its draws were skipped instead of guessing. `None` means the engine
     // draw was never attempted — this record carried no pipeline or no vertices.
     let mut engine_refusal: Option<&'static str> = None;
-    // Solid CLEAR seed Stores only when this record owns guest writeback
-    // (last of a serialized chain, or unified always-writeback).
-    //
-    // The recipe capture for the clear-only exit is *outside* the landing gate:
-    // that exit hands the clear colour to the next record's seed whether or not
-    // this device eagerly writes it into guest pages, and capturing it inside
-    // the gate is how turning the eager write off would silently break record
-    // chaining too.
-    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::PrepSeed);
-    if writeback_guest {
-        if let Some(c0) = colors.first() {
-            if crate::contract::pass_action::store_action_publishes_single_sample(c0.store_action)
-                && (c0.load_action == MTL_LOAD_ACTION_CLEAR
-                    || c0.load_action == MTL_LOAD_ACTION_DONT_CARE)
-                && c0.width != 0
-                && c0.height != 0
-            {
-                color0_solid = Some((c0.width, c0.height, c0.clear_color));
-            }
-        }
-    }
-    if writeback_guest && clear_seed_enabled() {
-        for c in colors.iter() {
-            // Reports an out-of-contract value; the gate below is unchanged, and
-            // it is the site that disagrees with this module's writeback loop
-            // about what such a value means. See `super::store_action_in_contract`.
-            let _ = super::store_action_in_contract(req.pipeline_ref, c.store_action);
-            if !crate::contract::pass_action::store_action_publishes_single_sample(c.store_action) {
-                continue;
-            }
-            if c.load_action != MTL_LOAD_ACTION_CLEAR && c.load_action != MTL_LOAD_ACTION_DONT_CARE
-            {
-                // Load/composite needs real encode (metal2vulkan) — skip Store.
-                continue;
-            }
-            if c.width == 0 || c.height == 0 {
-                continue;
-            }
-            // Which branch this loop actually takes, how many bytes it lands and
-            // what the landing costs. `prep_seed_us` is 8.6 µs of a 41 µs chain
-            // on the `blur=40` dial and rebuilding the images without their two
-            // redundant passes did not move it by a hundredth, so the cost is in
-            // one of these two writes and there was no reading that said which.
-            let seed_kb = u64::from(c.width)
-                .saturating_mul(u64::from(c.height))
-                .saturating_mul(u64::from(RGBA8_BPP))
-                / 1024;
-            let ok = if c.target_gva != 0 {
-                let _span = StoreCostSpan::new("clear_seed_gva_us");
-                crate::runtime::drain::note_store_route("clear_seed_gva");
-                crate::runtime::drain::note_store_route_n("clear_seed_gva_kb", seed_kb);
-                // A solid landing, so the writer converts one row rather than
-                // this surface's thousand identical ones. The full RGBA image
-                // above is built for `color0_rgba` and is not this write's
-                // source.
-                write_gva_solid8(
-                    state,
-                    host,
-                    req.task_id,
-                    c.target_gva,
-                    c.width,
-                    c.height,
-                    c.row_stride,
-                    c.format,
-                    &c.clear_color,
-                )
-                .is_ok()
-            } else if c.mapping_id != 0 {
-                // Type-11 CLEAR. `write_bgra8` takes guest scanout order and
-                // converts to the mapping's native format per row; it handles a
-                // fragmented mapping too, staging native rows and landing them
-                // through `mapper::write_mapping_bytes`. (A comment here used to
-                // call it contig-only, which it has not been.)
-                //
-                // Built from the swapped *pixel* rather than by exchanging the
-                // channels of the RGBA image: a solid image is one repeated
-                // word, so the exchange belongs to the word and doing it per
-                // texel cost an allocation and two passes over the whole
-                // surface. See `contract::pixel_format::solid_bgra8`.
-                let _span = StoreCostSpan::new("clear_seed_t11_us");
-                crate::runtime::drain::note_store_route("clear_seed_t11");
-                crate::runtime::drain::note_store_route_n("clear_seed_t11_kb", seed_kb);
-                let bgra = solid_bgra8(c.width, c.height, &c.clear_color);
-                let stride = c.width.saturating_mul(RGBA8_BPP);
-                mapping_write::write_bgra8(
-                    state,
-                    host,
-                    c.mapping_id,
-                    &bgra,
-                    stride,
-                    c.width,
-                    c.height,
-                )
-            } else {
-                false
-            };
-            if ok {
-                any_store = true;
-                crate::observe::line(format!(
-                    "linux_clear_store mid={} gva={:#x} {}x{} pipe={} load={}",
-                    c.mapping_id, c.target_gva, c.width, c.height, req.pipeline_ref, c.load_action
-                ));
-            }
-        }
+    // This device used to write the whole clear frame into the guest's own pages
+    // here, ahead of any GPU work, and hand the clear on as the next record's
+    // seed. Nothing in the contract asks for the write: the guest states its
+    // clear in the render-pass descriptor and this device decodes it, so a clear
+    // is pass state, not a guest-memory write that has to land early. The write
+    // was this device's own. It cost ~550 ms of every drain second on a driven
+    // 3D workload and it put pixels in a page a display swap could read before
+    // the draw that replaces them — the hazard `runtime::exec::finish_stream`
+    // already declines to create, by applying clears only to streams that will
+    // not draw. `finish_stream` is now the only thing that lands a pass clear in
+    // guest memory, after the work that might have replaced it.
+
+    // An out-of-contract store action is reported where a record's colour
+    // attachments are first walked. That walk used to be the eager seed's loop;
+    // with the seed gone this is it, and the report is kept because a store
+    // action this device cannot name is a decoded value going unhonoured — see
+    // `super::store_action_in_contract`.
+    for c in colors.iter() {
+        let _ = super::store_action_in_contract(req.pipeline_ref, c.store_action);
     }
 
     // Pages the eager GVA fallback below is allowed to reach, resolved
@@ -742,12 +638,11 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         }
     }
 
-    // The skipped-draw census sits above the `any_store` split, because the
-    // split no longer decides whether a draw was skipped — only whether a CLEAR
-    // seed happened to land first. When the eager seed was unconditional this
-    // block lived inside the seeded arm, and turning the seed off (its default
-    // now) silently retired the only instrument that counts what an engine
-    // refusal costs the guest.
+    // The skipped-draw census is unconditional. It used to live inside the
+    // seeded arm, where whether a draw was counted as skipped depended on
+    // whether a CLEAR seed happened to land first — so removing the seed would
+    // have retired the only instrument that counts what an engine refusal costs
+    // the guest.
     if req.vertex_count > 0 || req.indexed.is_some() {
         // This used to end in the literal `(m2v pending)`, which was a
         // hardcoded guess and was wrong. The tail is reached whenever the
@@ -796,33 +691,12 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             u64::from(req.vertex_count),
         );
     }
-    if any_store {
-        // The one exit that hands the seed on: this record encoded no draw, so
-        // the solid colour it landed *is* this chain's colour-0 content, and the
-        // next record loads it as its seed. Built here rather than in the loop
-        // above because the four exits before this one return without it.
-        //
-        // The route is what says the deferral is worth having: read it against
-        // `clear_seed_gva` + `clear_seed_t11`, which count the seeds, and the
-        // difference is the full-surface images that used to be built and
-        // dropped. A boot where the two are equal has nothing to save here.
-        (
-            EncodeStatus::Ok,
-            color0_solid.map(|(w, h, clear)| {
-                crate::runtime::drain::note_store_route("clear_seed_color0_image");
-                crate::runtime::drain::note_store_route_n(
-                    "clear_seed_color0_image_kb",
-                    u64::from(w)
-                        .saturating_mul(u64::from(h))
-                        .saturating_mul(u64::from(RGBA8_BPP))
-                        / 1024,
-                );
-                solid_rgba8(w, h, &clear)
-            }),
-        )
-    } else {
-        (EncodeStatus::NoMetal("draw_vk_nothing_stored"), None)
-    }
+    // Nothing in this record reached the guest's pages: it encoded no draw, and
+    // this device no longer pre-writes a clear frame here. The clear itself is
+    // not lost — `runtime::exec::finish_stream` applies the pass's clears once
+    // the packet ends, which is where a clear belongs, after the work that might
+    // have replaced it rather than before it.
+    (EncodeStatus::NoMetal("draw_vk_nothing_stored"), None)
 }
 
 /// Sampled texture source + geometry for an engine draw.
@@ -4393,11 +4267,14 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
         }
         Ok((layout, _decline, components)) => {
             // Every layout is asked about, not just the one that was known to
-            // be optional. This rail hands the guest's bytes to a sampler that
-            // interpolates them, so "can this host filter this format" is a
-            // question about the layout, and a table indexed by the layout
-            // cannot be missing an entry for one that was added later.
-            if !engine::supports_sampled_layout_linear_filter(layout) {
+            // be optional. This rail hands the guest's bytes to a sampler, so
+            // "may this host bind this format to one" is a question about the
+            // layout, and a table indexed by the layout cannot be missing an
+            // entry for one that was added later. The engine owns the whole
+            // answer — for most layouts it is the linear-filter query, and for
+            // an integer one it is not, which is why the two terms are not
+            // reassembled here.
+            if !engine::supports_sampled_layout_bind(layout) {
                 crate::runtime::drain::note_store_route("zc_lin_layout_unfilterable");
                 return None;
             }
@@ -5004,17 +4881,17 @@ fn native_scratch_to_upload(
 /// answer for — so keying on it is the same rule stated once, not a fast path
 /// that could disagree with the slow one.
 fn native_uploads_for(sample_format: u16) -> NativeUploads {
-    // A compressed format has to ask, and it is not in `narrows_to_unorm8`'s
-    // set: that set is the formats whose CPU arm is *lossy*, and a BC format has
-    // no CPU arm at all. Asked first so the keyed fast path below keeps meaning
-    // what its doc says it means.
-    if pixel_format::is_block_compressed(sample_format) {
+    // One question, derived from the loader itself rather than approximated by
+    // a second list. `native_bind_is_host_gated` compares the loader's answer
+    // with every gate shut against its answer with every gate open, so the set
+    // that has to take the engine lock is exactly the set whose bind the host
+    // decides — the compressed families, the half-float layouts, and the
+    // four-channel float one whose omission from the old proxy cost every draw
+    // that sampled it.
+    if native_bind_is_host_gated(sample_format) {
         return native_uploads_asking_host();
     }
-    if !pixel_format::narrows_to_unorm8(sample_format) {
-        return NativeUploads::BGRA8;
-    }
-    native_uploads_asking_host()
+    NativeUploads::BGRA8
 }
 
 /// The same answer for a caller that does not yet know the guest format.
@@ -5038,6 +4915,12 @@ fn native_uploads_asking_host() -> NativeUploads {
         // texture_compression_bc`. A per-family flag would be ten fields nobody
         // could point at a host that needed them.
         block_compressed: engine::supports_block_compressed_sampled(),
+        // Its own flag rather than riding on `float16`: Vulkan mandates
+        // `SAMPLED_IMAGE` for `R32G32B32A32_SFLOAT` and does **not** mandate
+        // `SAMPLED_IMAGE_FILTER_LINEAR`, where both half-float layouts carry the
+        // filter by mandate. So this one is genuinely a per-host answer and the
+        // conjunction above would hide it.
+        float32: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba32Float),
         ..NativeUploads::BGRA8
     }
 }
@@ -6299,15 +6182,15 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
         // Unknown wire format stays unknown — never guess a secondary layout —
         // and a known format whose sRGB qualifier this attachment cannot carry
         // says so instead of folding silently.
-        let format = match translate::pixel::color_attachment(c.format) {
-            Ok((format, decline)) => {
+        let attachment = match translate::pixel::color_attachment(c.format) {
+            Ok((attachment, decline)) => {
                 if decline.is_some() {
                     srgb_census::note_downgrade(
                         srgb_census::site::SECONDARY_COLOR_TARGET,
                         c.format,
                     );
                 }
-                format
+                attachment
             }
             Err(_) => {
                 crate::runtime::census::present_proxy::note_secondary_mrt_drop(
@@ -6321,6 +6204,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
                 });
             }
         };
+        let format = attachment.vk;
         // Identity mirrors the primary namespaces: type-2/3 linear GVA, else
         // type-11 surface.
         //
@@ -6411,19 +6295,46 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
                 reason: crate::runtime::census::present_proxy::MrtDrop::AliasesPrimary,
             });
         }
-        // Same three-into-two collapse as the primary slot below: a secondary
-        // attachment's DontCare reaches the engine as "no seed", which its pass
-        // key spells as CLEAR.
-        if c.load_action == MTL_LOAD_ACTION_DONT_CARE {
+        // A secondary attachment opens with the same 28-byte prefix as the
+        // primary and the depth slot, so its load action carries the same
+        // meaning — see
+        // [`crate::contract::pass_action::LoadAction::preserves_prior_contents`].
+        //
+        // It has no seed door of its own: this key bit is the whole decision.
+        // So what stands in for "were the prior contents resolved" is the
+        // registry's own record of whether the resident holds this identity's
+        // pixels, and that record is load-bearing rather than cautious — the
+        // target pool recycles an image across surfaces and inserts the
+        // recycled slot `content_ready=false` precisely because its bytes
+        // belong to the previous tenant. A LOAD taken without it composites
+        // this pass onto another surface's picture.
+        //
+        // The two preserving actions differ only in where they land when the
+        // registry cannot answer, and they differ because the contract's
+        // strictness differs. A Load *requires* the prior contents, so it still
+        // loads and `load_seed_lost` is what names the shortfall. A DontCare
+        // merely *permits* them, so with nothing to preserve it falls back to
+        // the clear — which is legal for it, and is the arm that cannot leak a
+        // previous tenant.
+        let declared = crate::contract::pass_action::LoadAction::from_declared(c.load_action);
+        let load = match declared {
+            crate::contract::pass_action::LoadAction::Clear => false,
+            crate::contract::pass_action::LoadAction::Load => true,
+            crate::contract::pass_action::LoadAction::DontCare => {
+                crate::backend::vulkan::engine::resident_content_ready(&identity)
+            }
+        };
+        if matches!(
+            declared,
+            crate::contract::pass_action::LoadAction::DontCare
+        ) && !load
+        {
+            // Reported only where it still costs the guest: a DontCare whose
+            // resident cannot answer for the attachment is the one that still
+            // becomes a clear over live content.
             super::note_load_action_dont_care(pipeline.object_id, c.width, c.height);
         }
-        let load = c.load_action == MTL_LOAD_ACTION_LOAD;
-        let clear = [
-            c.clear_color[0] as f32,
-            c.clear_color[1] as f32,
-            c.clear_color[2] as f32,
-            c.clear_color[3] as f32,
-        ];
+        let attachment = attachment.with_clear(c.clear_color);
         // This slot's own blend, resolved exactly as the Metal arm resolves it:
         // find the pipeline's attachment entry for this Metal slot. No
         // `or_else(first())` fallback here — the Metal path has one for its
@@ -6463,8 +6374,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
             identity,
             width: c.width,
             height: c.height,
-            format,
-            clear,
+            attachment,
             load,
             blend,
             color_write_mask,
@@ -7344,7 +7254,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                             .and_then(|color| {
                                                 translate::pixel::color_attachment(color.format)
                                                     .ok()
-                                                    .map(|resolved| resolved.0)
+                                                    .map(|resolved| resolved.0.vk)
                                             })
                                             .unwrap_or_else(|| identity.resident_format()),
                                     ),
@@ -7837,7 +7747,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // does it, which is what `MTLLoadActionClear` asks for.
         let mut target_rgba8: Option<std::sync::Arc<Vec<u8>>> = None;
         let mut target_guest_seed = None;
-        let mut target_clear = [0.0f32; 4];
+        let mut target_clear = [0.0f64; 4];
         let mut seed_order = crate::backend::vulkan::engine::SeedOrder::Rgba8;
         let gpu_only_content_allowed =
             crate::backend::vulkan::engine::deferred_gpu_only_content_allowed();
@@ -8033,28 +7943,42 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // `load_action` was already folded to DontCare above for anything
             // out of contract, so this fold is exact and the two spellings
             // cannot disagree.
-            let (declared_n, declared_area) =
-                crate::contract::pass_action::LoadAction::from_declared(load_action).census_routes();
+            use crate::contract::pass_action::LoadAction;
+            let declared = LoadAction::from_declared(load_action);
+            let (declared_n, declared_area) = declared.census_routes();
             crate::runtime::drain::note_store_route(declared_n);
             crate::runtime::drain::note_store_route_n(declared_area, declared_px);
-            match load_action {
-                MTL_LOAD_ACTION_LOAD if chain_load_from_target => {
+            // Load and DontCare share every arm below, and that sharing is the
+            // contract rather than a shortcut. `MTLLoadActionDontCare` says the
+            // prior contents are *undefined*, and undefined permits any
+            // contents — including the ones already there. Preserving is
+            // therefore a legal realization of DontCare, and it is the one the
+            // guest relies on: it declares DontCare and then redraws only its
+            // damage rect, because on Apple hardware the texture memory
+            // persists. `backend::metal::render` passes the same wire word
+            // straight to Metal, which preserves, so seeding here is what stops
+            // the two backends from disagreeing about one attachment prefix.
+            //
+            // Clearing is also legal, and it is what this arm used to do by
+            // falling through with no seed — `PassKey::single` reads "no seed"
+            // and `caches.rs` resolves it to `AttachmentLoadOp::CLEAR`. That
+            // wrote a definite colour over live guest content: every pass the
+            // guest declared DontCare on, and no other, which is why a boot's
+            // `passbegin_clear` ran exactly `color0_declared_dontcare` above
+            // the clears the guest actually asked for.
+            match declared {
+                LoadAction::Load | LoadAction::DontCare if chain_load_from_target => {
                     // Resident target carries the chain; no CPU seed bytes.
                 }
-                MTL_LOAD_ACTION_CLEAR => {
+                LoadAction::Clear => {
                     // The pass clears the attachment. No seed: a seed would
                     // resolve this pass key to LOAD, which is the opposite of
                     // what the guest asked for, and would spend an allocation, a
                     // channel exchange and a staged upload writing one constant
                     // into every texel.
-                    target_clear = [
-                        c0.clear_color[0] as f32,
-                        c0.clear_color[1] as f32,
-                        c0.clear_color[2] as f32,
-                        c0.clear_color[3] as f32,
-                    ];
+                    target_clear = c0.clear_color;
                 }
-                MTL_LOAD_ACTION_LOAD => {
+                LoadAction::Load | LoadAction::DontCare => {
                     // Which door this pass took, so a pass that ends with no
                     // seed says which source was supposed to have one. A LOAD
                     // means the guest is compositing *onto what is already
@@ -8107,25 +8031,48 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // independently driven x86/Vulkan boots: 1 558, 395 and 295
                     // colour LOAD seed resolutions, and 0 serves plus 0 misses
                     // at that door in every one.
-                    note_load_seed_outcome(
-                        seed_door,
-                        target_rgba8.is_some() || target_guest_seed.is_some(),
-                        c0,
-                        w,
-                        h,
-                    );
+                    if matches!(declared, LoadAction::DontCare) {
+                        // The widened arm's own instrument, and it is a counter
+                        // rather than the latched line below it. DontCare now
+                        // walks the same doors as a Load — a provenance seed
+                        // clone, or `resolve_type11_load_seed` reading the
+                        // surface out of guest memory — and that work is new
+                        // per pass, so both outcomes are counted or nothing
+                        // says how often the widening pays or what it costs.
+                        // `note_load_seed_outcome`'s own counters cannot serve:
+                        // they are the LOAD-only signal below.
+                        let served = target_rgba8.is_some() || target_guest_seed.is_some();
+                        crate::runtime::drain::note_store_route(if served {
+                            "dontcare_seed_served"
+                        } else {
+                            "dontcare_seed_empty"
+                        });
+                        // The residual DontCare: no door held this surface's
+                        // prior contents, so the pass key still reads "no seed"
+                        // and `caches.rs` still resolves it to CLEAR. Reported
+                        // here rather than for every DontCare, because the ones
+                        // that found a door now preserve — so this names the
+                        // cases that still cost the guest its contents instead
+                        // of the whole population. Latched per pipeline; the
+                        // counter above is what has the size.
+                        if !served {
+                            super::note_load_action_dont_care(req.pipeline_ref, w, h);
+                        }
+                    } else {
+                        // `load_seed_lost` stays a LOAD-only signal. A LOAD that
+                        // arrives empty is the previous frame of that layer
+                        // being dropped; a DontCare that arrives empty is what
+                        // the guest declared, and folding the two together would
+                        // retire the one counter that names the defect.
+                        note_load_seed_outcome(
+                            seed_door,
+                            target_rgba8.is_some() || target_guest_seed.is_some(),
+                            c0,
+                            w,
+                            h,
+                        );
+                    }
                 }
-                // DontCare: the guest declared the prior contents undefined, so
-                // arriving with no seed is the contract rather than a loss. It
-                // is still not what the guest asked for — no seed makes this
-                // pass key indistinguishable from a Clear, and `caches.rs`
-                // resolves that key to `AttachmentLoadOp::CLEAR`. Its own arm,
-                // so the third value of a three-valued enum stops sharing the
-                // catch-all with the out-of-contract one two lines above.
-                MTL_LOAD_ACTION_DONT_CARE => {
-                    super::note_load_action_dont_care(req.pipeline_ref, w, h);
-                }
-                _ => {}
             }
         }
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
@@ -8336,7 +8283,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             .unwrap_or(true);
         resources.target_rgba8 = target_rgba8;
         resources.target_guest_seed = target_guest_seed;
-        resources.target_clear = target_clear;
         resources.target_seed_order = seed_order;
         // A Store reads back; anything else skips it.
         //
@@ -8476,7 +8422,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             resources.guest_target_memory = type11_guest_backing;
             resources.load_guest_target_backing = resources.guest_target_memory.is_some()
                 && req.colors.first().is_some_and(|color| {
-                    color.load_action == MTL_LOAD_ACTION_LOAD && color.target_seed_rgba.is_none()
+                    // Same admission as `type11_load_is_a_seed_candidate`, and
+                    // for the same reason: a DontCare that this device can
+                    // serve prior contents for must be served them, or the
+                    // attachment starts at a colour nothing asked for.
+                    crate::contract::pass_action::LoadAction::from_declared(color.load_action)
+                        .preserves_prior_contents()
+                        && color.target_seed_rgba.is_none()
                 });
         }
         // Type-11 Load used to have a GPU rail here — ~170 lines of front-frame
@@ -8718,7 +8670,25 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 write_enable: ds.depth_write_enabled,
                                 compare,
                                 clear_value,
-                                load: load_action == MTL_LOAD_ACTION_LOAD,
+                                // The depth slot opens with the same 28-byte
+                                // attachment prefix as the colour slots, so its
+                                // action means the same thing: DontCare permits
+                                // the prior contents, and asking for them is
+                                // what stops a pass that tests against earlier
+                                // depth from starting at the clear value. See
+                                // `LoadAction::preserves_prior_contents`.
+                                //
+                                // Widening the *ask* is safe here precisely
+                                // because honouring it is not decided here:
+                                // `honours_load` below gates on the depth
+                                // resident actually holding content and
+                                // degrades to CLEAR by name, so a DontCare with
+                                // nothing behind it cannot load an undefined
+                                // image.
+                                load: crate::contract::pass_action::LoadAction::from_declared(
+                                    load_action,
+                                )
+                                .preserves_prior_contents(),
                                 stencil,
                             });
                         }
@@ -8973,15 +8943,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         resources.height = h;
         resources.vertex_count = vertex_count;
         if let Some(c0) = req.colors.first() {
-            resources.color_attachment_format = Some(
-                translate::pixel::color_attachment(c0.format)
-                    .map_err(|reason| {
-                        DrawError::Unsupported(
-                            crate::backend::vulkan::engine::reason::DrawReason::ColorAttachmentFormat(reason),
-                        )
-                    })?
-                    .0,
-            );
+            let (attachment, _) = translate::pixel::color_attachment(c0.format).map_err(|reason| {
+                DrawError::Unsupported(
+                    crate::backend::vulkan::engine::reason::DrawReason::ColorAttachmentFormat(reason),
+                )
+            })?;
+            resources.color_attachment = Some(attachment.with_clear(target_clear));
         }
         // Attachment-count census, taken before the MRT gate rather than inside
         // it. `build_secondary_targets` returns empty for a single-attachment
@@ -9242,11 +9209,50 @@ pub(super) fn depth_chain_identity(
     //
     // The high bit keeps this out of the engine's other `Anonymous` slots,
     // which count up from zero.
+    //
+    // The four fields are stated as shifts rather than open-coded because two
+    // of them are one bit apart from colliding and nothing else compares them:
+    // `height` sits directly below `width`, and `width` directly below the tag.
+    // The assertion is what holds that true — a widened dimension field or a
+    // moved tag fails the build here instead of handing two different passes
+    // one identity.
+    const SLOT_TAG_BIT: u32 = 63;
+    const SLOT_WIDTH_SHIFT: u32 = 32;
+    const SLOT_HEIGHT_SHIFT: u32 = 1;
+    const SLOT_STENCIL_SHIFT: u32 = 0;
+    /// Bits each dimension is packed into, and therefore the extent this slot
+    /// can express at all.
+    const SLOT_DIM_BITS: u32 = 31;
+    const _: () = assert!(
+        SLOT_STENCIL_SHIFT < SLOT_HEIGHT_SHIFT
+            && SLOT_HEIGHT_SHIFT + SLOT_DIM_BITS <= SLOT_WIDTH_SHIFT
+            && SLOT_WIDTH_SHIFT + SLOT_DIM_BITS <= SLOT_TAG_BIT
+    );
+    // An extent past the field width would wrap into the field above it, which
+    // is the one way this identity can be *wrong* rather than merely absent:
+    // two passes of different shapes would resolve one resident. No host
+    // advertises a `maxImageDimension2D` within three orders of magnitude of
+    // this, so reaching it means the extent is not a real one — decline the
+    // shared identity by name and let the record take a transient, which is
+    // what it did before this identity existed.
+    if width >> SLOT_DIM_BITS != 0 || height >> SLOT_DIM_BITS != 0 {
+        if crate::observe::first_sight(
+            "depth_chain_identity_extent_unrepresentable",
+            u64::from(width) << 32 | u64::from(height),
+        ) {
+            crate::observe::fail(format!(
+                "depth_chain_identity_extent_unrepresentable width={width} height={height} \
+                 dim_bits={SLOT_DIM_BITS} (anonymous depth falls back to a per-record \
+                 transient; inter-record occlusion is not shared for this pass)"
+            ));
+        }
+        return None;
+    }
     Some(crate::backend::vulkan::engine::TargetIdentity::Anonymous {
-        slot: (1u64 << 63)
-            | (u64::from(width) << 32)
-            | (u64::from(height) << 1)
-            | u64::from(with_stencil),
+        slot: (1u64 << SLOT_TAG_BIT)
+            | (u64::from(width) << SLOT_WIDTH_SHIFT)
+            | (u64::from(height) << SLOT_HEIGHT_SHIFT)
+            | (u64::from(with_stencil) << SLOT_STENCIL_SHIFT),
     })
 }
 
@@ -9386,12 +9392,20 @@ fn type11_guest_target_backing<H: HostMemory + HostOps>(
     })
 }
 
-/// Whether this record's color0 LOAD is one the resident could serve at all —
-/// it must be a LOAD, and no explicit seed may already have been selected for
-/// it by RT provenance. Separate from the currency question so the two counters
-/// on the branch below divide candidates, not all draws.
-fn type11_load_is_a_seed_candidate(c0: &ColorRtRequest) -> bool {
-    c0.load_action == MTL_LOAD_ACTION_LOAD && c0.target_seed_rgba.is_none()
+/// Whether this record's color0 load is one the resident could serve at all —
+/// it must be an action that composites onto the attachment's prior contents,
+/// and no explicit seed may already have been selected for it by RT provenance.
+/// Separate from the currency question so the two counters on the branch below
+/// divide candidates, not all draws.
+///
+/// DontCare qualifies alongside Load: see
+/// [`crate::contract::pass_action::LoadAction::preserves_prior_contents`] for
+/// why undefined contents permit the prior ones, and why serving them is what
+/// keeps this arm agreeing with the Metal one.
+pub(super) fn type11_load_is_a_seed_candidate(c0: &ColorRtRequest) -> bool {
+    crate::contract::pass_action::LoadAction::from_declared(c0.load_action)
+        .preserves_prior_contents()
+        && c0.target_seed_rgba.is_none()
 }
 
 /// The `(resident, mapping epoch)` pair a record's type-11 LOAD has to compare to
@@ -9615,7 +9629,17 @@ fn merge_guest_writes_into_pages<M: HostMemory + HostOps>(
             return false;
         }
     };
-    let bgra = readback.into_bgra8();
+    // The guest mapping this merges into is scanout-ordered eight-bit colour,
+    // so a native readback has nothing to merge and says so rather than writing
+    // a texel the mapping cannot mean.
+    let texel = readback.texel;
+    let Some(bgra) = readback.into_bgra8() else {
+        crate::observe::fail(format!(
+            "sampled_resident_merge_fail mid={mapping_id} {width}x{height} \
+             stage=readback reason=readback_texel_not_scanout texel={texel:?}"
+        ));
+        return false;
+    };
     let stride = width.saturating_mul(RGBA8_BPP);
     if !mapping_write::write_bgra8_skipping(
         state,
@@ -10011,7 +10035,7 @@ pub(crate) fn gva_resident_format(format: u16) -> ash::vk::Format {
     let Ok((attachment, _)) = pixel::color_attachment(format) else {
         return pixel::RESIDENT_RGBA_FORMAT;
     };
-    let allocation = pixel::ResidentFormat::of(attachment).allocation();
+    let allocation = pixel::ResidentFormat::of(attachment.vk).allocation();
     match pixel::texel_layout_of(allocation) {
         // Capability, never an API-version assumption: the host is asked whether
         // it renders to and blends this layout.
@@ -10083,7 +10107,17 @@ pub(crate) fn read_resident_chain(
         // — `ResidentReadSnapshot::bgra` answered "not BGRA" for the sRGB
         // spelling — so the comment documented the defect instead of catching
         // it, and the Store below exchanged R and B on its way into guest pages.
-        Ok(rb) => Some(rb.into_rgba8()),
+        Ok(rb) => {
+            let texel = rb.texel;
+            let landed = rb.into_rgba8();
+            if landed.is_none() {
+                crate::observe::fail(format!(
+                    "chain_resident_land_fail reason=readback_texel_not_rgba8 \
+                     target={identity:?} texel={texel:?}"
+                ));
+            }
+            landed
+        }
         Err(e) => {
             crate::observe::fail(format!(
                 "chain_resident_land_fail reason=read_target target={identity:?} \
@@ -12152,49 +12186,4 @@ mod vulkan_split_tests {
         map_one_gva_page(&mut host, 5);
         assert_eq!(gen_of(&mut host), gen_a);
     }
-}
-
-/// Whether the CLEAR-seed Store at the head of a draw chain runs, for this
-/// process.
-///
-/// Read once. The arms differ in what reaches the guest's pages, so a boot that
-/// flipped it midway would be two devices in one log.
-///
-/// # The default is now OFF, and the argument is structural, not a timing
-///
-/// The eager seed pre-writes every writeback-owning record's full clear frame
-/// into guest pages before the engine runs — ~3.7 MB a pass, measured at
-/// **~550 ms of every drain-thread second** on a driven Asphalt 8 race, the
-/// single largest cost left on the rail after the BC gather landed. Both jobs
-/// it was doing are done elsewhere:
-///
-/// * **Success**: the record's own Store covers the identical extent
-///   (`store_gva_frame_direct` and the type-11 writeback both land the whole
-///   `width x height`), so every seeded byte was overwritten.
-/// * **Failure**: `runtime::exec`'s fallback applies the pass's clears through
-///   `apply_clear` whenever a packet lands zero draws — "for any draw-fail
-///   class, not only NoMetal", per its own comment — which is the case the
-///   seed's early landing was insurance for.
-///
-/// The chaining recipe (`color0_solid`) is captured outside this gate, so the
-/// clear-only exit still hands the next record its seed either way.
-///
-/// What the OFF arm genuinely gives up: a packet where an *early* record's
-/// engine draw succeeds and a *later* record fails leaves the target holding
-/// the early records' rendered content instead of the clear — which is more of
-/// the guest's work on screen, not less. `REIMS_VGPU_CLEAR_SEED=on` restores
-/// the old eager write for an A/B; damage from either arm is only visible in a
-/// photograph, so hold the arm for the whole boot the photograph is of.
-fn clear_seed_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let (state, value) = crate::env::read(crate::env::CLEAR_SEED);
-        let on = matches!(state, crate::env::Switch::On);
-        crate::observe::off(format!(
-            "clear_seed on={on} switch={state:?} value={}",
-            value.unwrap_or_else(|| "<unset>".into())
-        ));
-        on
-    })
 }

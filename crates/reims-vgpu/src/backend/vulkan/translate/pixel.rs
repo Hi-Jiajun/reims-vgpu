@@ -22,7 +22,7 @@
 use ash::vk;
 
 use super::reason::TranslateReason;
-use crate::backend::vulkan::engine::StorageImageFormat;
+use crate::backend::vulkan::engine::{ColorAttachmentState, ColorClearValue, StorageImageFormat};
 use crate::contract::pixel_format::{
     self, SampledByteFormat, StorageImageSelector, SwizzlePlan, SwizzleSource, TexelLayout,
     COMPONENT_A, COMPONENT_B, COMPONENT_G, COMPONENT_R,
@@ -57,6 +57,33 @@ pub struct PixelFormat {
     /// non-identity only where the Vulkan 1.2 baseline has no equivalent
     /// format (see `A8Unorm`).
     pub components: SwizzlePlan,
+}
+
+/// A colour-renderable Metal format translated together with the numeric type
+/// its clear value must use.
+///
+/// Vulkan keeps the image format and clear union member in separate API
+/// objects, but they are one contract decision. Carrying them together keeps
+/// an integer attachment from being created correctly and then cleared through
+/// the float member later in command emission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColorAttachmentFormat {
+    pub vk: vk::Format,
+    numeric: pixel_format::ColorNumericType,
+}
+
+impl ColorAttachmentFormat {
+    /// Lower Metal's double-precision clear carrier using this attachment's
+    /// declared numeric interpretation.
+    pub fn clear_value(self, components: [f64; 4]) -> ColorClearValue {
+        ColorClearValue::from_components(self.numeric, components)
+    }
+
+    /// Bind this format to its clear value without exposing two independently
+    /// mutable fields to the engine request.
+    pub fn with_clear(self, components: [f64; 4]) -> ColorAttachmentState {
+        ColorAttachmentState::new(self.vk, self.clear_value(components))
+    }
 }
 
 impl PixelFormat {
@@ -132,6 +159,7 @@ pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {
         p::MTL_FORMAT_RG8_UNORM => linear(vk::Format::R8G8_UNORM, 2),
         p::MTL_FORMAT_RG8_UINT => linear(vk::Format::R8G8_UINT, 2),
         p::MTL_FORMAT_RG16_UNORM => linear(vk::Format::R16G16_UNORM, 4),
+        p::MTL_FORMAT_RG16_UINT => linear(vk::Format::R16G16_UINT, 4),
         p::MTL_FORMAT_R32_UINT => linear(vk::Format::R32_UINT, 4),
         p::MTL_FORMAT_R32_SINT => linear(vk::Format::R32_SINT, 4),
         p::MTL_FORMAT_R32_FLOAT => linear(vk::Format::R32_SFLOAT, 4),
@@ -284,6 +312,8 @@ pub fn sampled_pixels(
         // with mandatory linear filtering, so neither needs a capability gate.
         vk::Format::R16_UNORM => TexelLayout::R16Unorm,
         vk::Format::R16G16_UNORM => TexelLayout::Rg16Unorm,
+        vk::Format::R16G16_UINT => TexelLayout::Rg16Uint,
+        vk::Format::R32G32B32A32_SFLOAT => TexelLayout::Rgba32Float,
         // The half-float colour layouts. A recent macOS window server
         // composites in `MTLPixelFormatRGBA16Float`, and every such bind used to
         // land on the CPU re-read rung and be quantized to unorm8 on the way in
@@ -333,6 +363,8 @@ pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
         TexelLayout::R32Float => vk::Format::R32_SFLOAT,
         TexelLayout::R16Unorm => vk::Format::R16_UNORM,
         TexelLayout::Rg16Unorm => vk::Format::R16G16_UNORM,
+        TexelLayout::Rg16Uint => vk::Format::R16G16_UINT,
+        TexelLayout::Rgba32Float => vk::Format::R32G32B32A32_SFLOAT,
         TexelLayout::Rgba16Unorm => vk::Format::R16G16B16A16_UNORM,
         TexelLayout::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
         TexelLayout::Rg16Float => vk::Format::R16G16_SFLOAT,
@@ -633,12 +665,11 @@ pub fn has_bgra_order(format: vk::Format) -> bool {
 /// commit can half-land.
 pub fn color_attachment(
     mtl: u16,
-) -> Result<(vk::Format, Option<TranslateReason>), TranslateReason> {
+) -> Result<(ColorAttachmentFormat, Option<TranslateReason>), TranslateReason> {
     let f = translate(mtl)?;
-    if pixel_format::render_target_bpp(mtl).is_none() {
-        return Err(TranslateReason::NoColorAttachmentFormat(mtl));
-    }
-    Ok((f.vk, None))
+    let numeric = pixel_format::render_target_numeric_type(mtl)
+        .ok_or(TranslateReason::NoColorAttachmentFormat(mtl))?;
+    Ok((ColorAttachmentFormat { vk: f.vk, numeric }, None))
 }
 
 /// The engine's storage-image format for a contract [`StorageImageSelector`].
@@ -768,6 +799,7 @@ pub fn sampled_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
     let sampled_only = match mtl {
         pf::MTL_FORMAT_R16_UNORM => StorageImageFormat::R16Unorm,
         pf::MTL_FORMAT_RG16_UNORM => StorageImageFormat::Rg16Unorm,
+        pf::MTL_FORMAT_RG16_UINT => StorageImageFormat::Rg16Uint,
         pf::MTL_FORMAT_RGBA16_UNORM => StorageImageFormat::Rgba16Unorm,
         pf::MTL_FORMAT_RGB10A2_UNORM => StorageImageFormat::Rgb10a2Unorm,
         pf::MTL_FORMAT_BGR10A2_UNORM => StorageImageFormat::Bgr10a2Unorm,
@@ -891,6 +923,7 @@ pub fn vk_storage_image(format: StorageImageFormat) -> vk::Format {
         StorageImageFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
         StorageImageFormat::Bgra8Unorm => vk::Format::B8G8R8A8_UNORM,
         StorageImageFormat::Rg16Float => vk::Format::R16G16_SFLOAT,
+        StorageImageFormat::Rg16Uint => vk::Format::R16G16_UINT,
         StorageImageFormat::R8Unorm => vk::Format::R8_UNORM,
         StorageImageFormat::Rg8Unorm => vk::Format::R8G8_UNORM,
         StorageImageFormat::Rgba32Uint => vk::Format::R32G32B32A32_UINT,
@@ -1470,6 +1503,12 @@ mod tests {
             TransferFunction::Linear,
         ),
         (
+            p::MTL_FORMAT_RG16_UINT,
+            vk::Format::R16G16_UINT,
+            4,
+            TransferFunction::Linear,
+        ),
+        (
             p::MTL_FORMAT_RGBA16_UNORM,
             vk::Format::R16G16B16A16_UNORM,
             8,
@@ -1666,7 +1705,7 @@ mod tests {
 
             let (format, decline) = color_attachment(mtl).unwrap();
             assert!(matches!(
-                format,
+                format.vk,
                 vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
             ));
             assert_eq!(decline, None, "colour attachment must preserve sRGB");
@@ -1860,7 +1899,7 @@ mod tests {
             let Ok((attachment, _)) = color_attachment(mtl) else {
                 continue;
             };
-            let allocation = ResidentFormat::of(attachment).allocation();
+            let allocation = ResidentFormat::of(attachment.vk).allocation();
             assert!(
                 texel_layout_of(allocation).is_some(),
                 "renderable {mtl:#x} allocates as {allocation:?}, which no \
@@ -1917,11 +1956,11 @@ mod tests {
             TexelLayout::Rgba8
         );
         assert_eq!(
-            color_attachment(p::MTL_FORMAT_BGRA8_UNORM_SRGB).unwrap().0,
+            color_attachment(p::MTL_FORMAT_BGRA8_UNORM_SRGB).unwrap().0.vk,
             vk::Format::B8G8R8A8_SRGB
         );
         assert_eq!(
-            color_attachment(p::MTL_FORMAT_RGBA8_UNORM_SRGB).unwrap().0,
+            color_attachment(p::MTL_FORMAT_RGBA8_UNORM_SRGB).unwrap().0.vk,
             vk::Format::R8G8B8A8_SRGB
         );
         // …and each one hands back the decline that loss owes, so the hold is
@@ -1940,6 +1979,72 @@ mod tests {
             assert_ne!(f.vk, f.linear_vk);
             assert_eq!(bytes_per_texel(f.vk), bytes_per_texel(f.linear_vk));
         }
+    }
+
+    /// A linear `RG16Uint` guest attachment is served end to end, and never
+    /// through an eight-bit intermediate.
+    ///
+    /// The macos-15 defect. The format was absent from this crate entirely — no
+    /// constant, no width, no layout — so a guest that rendered into one lost
+    /// the whole pass and a guest that sampled one was refused as
+    /// `unknown_pixel_format`.
+    ///
+    /// What makes it renderable is not an entry in a table: it is that both
+    /// Store rails can land its texel without inventing a byte. The GPU-direct
+    /// arm always could, given `store_texel_order`; the copying arm learned to,
+    /// once a readback carried [`ReadbackTexel`] instead of a bare "is it
+    /// BGRA" flag. The eight-bit rails must stay shut, and that is asserted
+    /// here rather than described, because an arm added to one of them later
+    /// would silently start quantizing a count into a fraction.
+    #[test]
+    fn an_integer_colour_attachment_is_served_by_the_native_rail_only() {
+        let (attachment, decline) = color_attachment(p::MTL_FORMAT_RG16_UINT).unwrap();
+        let format = attachment.vk;
+        assert_eq!(format, vk::Format::R16G16_UINT);
+        assert_eq!(decline, None);
+        assert_eq!(
+            attachment.clear_value([1.0, 2.0, 65_535.0, 0.0]),
+            ColorClearValue::Uint([1, 2, 65_535, 0]),
+            "the clear is a numeric conversion, not the float bit pattern"
+        );
+        assert_eq!(bytes_per_texel(format), Some(p::RG16_BPP));
+        // Its own Vulkan format, distinct from the sibling it shares bytes
+        // with: one format for both would read every texel as a fraction of
+        // full scale and paint a wrong frame rather than refuse one.
+        assert_ne!(format, translate(p::MTL_FORMAT_RG16_UNORM).unwrap().vk);
+        assert_eq!(texel_layout_of(format), Some(TexelLayout::Rg16Uint));
+        assert_eq!(vk_texel_layout(TexelLayout::Rg16Uint), format);
+        // Sampled and dispatch rails carry it too.
+        assert!(sampled_pixels(p::MTL_FORMAT_RG16_UINT).is_ok());
+        assert!(sampled_image(p::MTL_FORMAT_RG16_UINT).is_ok());
+        // The native Store rail is the one that lands it, on both arms.
+        assert_eq!(
+            p::store_texel_order(p::MTL_FORMAT_RG16_UINT),
+            Some(TexelLayout::Rg16Uint)
+        );
+        // And every eight-bit rail stays shut, in both directions.
+        const PX: u32 = 4;
+        let wide = vec![0u8; PX as usize * p::RG16_BPP as usize];
+        let mut rgba = vec![0u8; PX as usize * p::RGBA8_BPP as usize];
+        assert!(!p::narrow_texel_to_rgba8(TexelLayout::Rg16Uint, &wide, PX, &mut rgba));
+        let mut back = wide.clone();
+        assert!(!p::expand_rgba8_to_texel(TexelLayout::Rg16Uint, &rgba, PX, &mut back));
+        assert!(!p::convert_rgba8_to_row(
+            p::MTL_FORMAT_RG16_UINT,
+            &rgba,
+            PX,
+            &mut back
+        ));
+        assert!(!p::solid_color_reaches_texel(p::MTL_FORMAT_RG16_UINT));
+    }
+
+    #[test]
+    fn continuous_colour_attachments_keep_semantic_float_clears() {
+        let attachment = color_attachment(p::MTL_FORMAT_BGRA8_UNORM_SRGB).unwrap().0;
+        assert_eq!(
+            attachment.clear_value([0.25, 0.5, 0.75, 1.0]),
+            ColorClearValue::Float([0.25, 0.5, 0.75, 1.0])
+        );
     }
 
     /// The engine rails carry exactly the layouts they are built for, and the
@@ -2176,8 +2281,20 @@ mod tests {
                 // the_table_translates` is what surfaced that.
                 p::MTL_FORMAT_R16_UNORM,
                 p::MTL_FORMAT_RG16_UNORM,
+                // Its integer sibling, sampled on the same terms. It is *not*
+                // in the colour list below, which is the distinction this
+                // format exists in the tables to make: known and sampleable,
+                // and still not something this device renders into.
+                p::MTL_FORMAT_RG16_UINT,
                 p::MTL_FORMAT_RGBA16_UNORM,
                 p::MTL_FORMAT_RGBA16_FLOAT,
+                // Four-channel `float32`. A macos-15 guest binds 1x1 and 4x1
+                // linear textures of it to a **vertex** sampler and every draw
+                // that did was refused, because this crate had no layout for the
+                // format at all. It is sampled-and-dispatched only: it never
+                // appears in the colour list below, and it has no CPU narrowing
+                // arm by design — see `TexelLayout::Rgba32Float`.
+                p::MTL_FORMAT_RGBA32_FLOAT,
             ]
         );
         let color: Vec<u16> = EXPECTED
@@ -2221,6 +2338,20 @@ mod tests {
                 // decline it and this rail is where that decline appears. The
                 // NVIDIA host it was measured on advertises it.
                 p::MTL_FORMAT_BGR10A2_UNORM,
+                // The first **integer** colour attachment, and the one that
+                // could not be admitted by adding a table entry. A macos-15
+                // guest renders into linear `RG16Uint` targets, and every pass
+                // naming one was refused as `rt_resolve reason=rt_linear_format`
+                // — seven dropped clears and thirty-two unresolved MRT slots in
+                // one boot.
+                //
+                // The three eight-bit conversion arms the members above needed
+                // are the arms this format must never have: an integer texel is
+                // a count, so there is no unorm8 byte that stands for it. It is
+                // renderable because the *native* rail exists instead — the
+                // GPU-direct copy and, since the readback learned to carry its
+                // own texel, the copying arm as well.
+                p::MTL_FORMAT_RG16_UINT,
                 // Admitted since the two arms became one answer. The contract
                 // has said a half-float render target is renderable since one
                 // could be created at that format; only this side still refused
@@ -2307,7 +2438,7 @@ mod tests {
             if !admitted {
                 continue;
             }
-            let format = color_attachment(mtl).unwrap().0;
+            let format = color_attachment(mtl).unwrap().0.vk;
             // Readback moves stored texels and therefore reasons about the
             // linear sibling's byte layout; an sRGB image view changes the
             // shader conversion, not those bytes.
@@ -2321,10 +2452,31 @@ mod tests {
             const PX: u32 = 4;
             let wide = vec![0u8; PX as usize * layout.bytes_per_texel() as usize];
             let mut rgba = vec![0u8; PX as usize * p::RGBA8_BPP as usize];
-            assert!(
-                p::narrow_texel_to_rgba8(layout, &wide, PX, &mut rgba),
-                "{mtl:#x}: renderable as {layout:?}, which no readback rail can narrow"
-            );
+            // A format whose texel has no eight-bit form owes none of the three
+            // eight-bit rails — it owes the **native** one instead, which is
+            // `store_texel_order` naming this same layout. That is a whole rail
+            // and not an exemption: the GPU-direct arm copies the resident into
+            // the guest's pages, and the copying arm lands the readback's own
+            // texel verbatim through `FrameRows::Native`, so both routes serve
+            // it exactly and neither invents a byte.
+            //
+            // Asserting the alternative rather than skipping is the point. A
+            // renderable format that satisfies neither set is the silent
+            // frame-loss this test was written to catch.
+            if !p::narrow_texel_to_rgba8(layout, &wide, PX, &mut rgba) {
+                assert_eq!(
+                    p::store_texel_order(mtl),
+                    Some(layout),
+                    "{mtl:#x}: renderable as {layout:?}, which neither narrows to \
+                     RGBA8 nor is a native byte-copy destination — so no rail lands it"
+                );
+                assert!(
+                    !p::solid_color_reaches_texel(mtl),
+                    "{mtl:#x}: has no readback narrowing but does take a solid \
+                     colour, so the two eight-bit tables disagree about it"
+                );
+                continue;
+            }
             let mut back = wide.clone();
             assert!(
                 p::expand_rgba8_to_texel(layout, &rgba, PX, &mut back),

@@ -1091,6 +1091,23 @@ pub fn evict_gva(state: &mut DeviceState, gva: u64) {
     }
 }
 
+/// Drop both host-side pixel copies that can name one linear texture target.
+///
+/// Once a writer publishes new pixels into the guest pages, those pages are
+/// authoritative. Keeping either the address-keyed copy or the object-keyed
+/// copy would let a later sample observe the frame that preceded the write.
+pub fn forget_gva_copies(
+    state: &mut DeviceState,
+    task_id: u32,
+    target_gva: u64,
+    texture_ref: u32,
+) {
+    evict_gva(state, target_gva);
+    if texture_ref != 0 {
+        evict_texture(state, task_id, texture_ref);
+    }
+}
+
 /// Entry count and resident bytes of one host-side pixel cache.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CacheLevel {

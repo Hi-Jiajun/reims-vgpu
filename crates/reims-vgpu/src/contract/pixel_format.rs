@@ -71,6 +71,12 @@ pub const MTL_FORMAT_RG8_UINT: u16 = 0x21;
 /// `MTLPixelFormatRG16Unorm`. The chroma half of [`MTL_FORMAT_R16_UNORM`],
 /// as [`MTL_FORMAT_RG8_UNORM`] is of [`MTL_FORMAT_R8_UNORM`].
 pub const MTL_FORMAT_RG16_UNORM: u16 = 0x3c;
+/// `MTLPixelFormatRG16Uint`. The integer member of the RG16 family, the same
+/// four bytes as its `Unorm` and `Float` siblings — a family's members share a
+/// width and differ only in how the word is read.
+pub const MTL_FORMAT_RG16_UINT: u16 = 0x3f;
+/// `MTLPixelFormatRG16Sint`. Four bytes, for the reason above.
+pub const MTL_FORMAT_RG16_SINT: u16 = 0x40;
 pub const MTL_FORMAT_R32_UINT: u16 = 0x35;
 pub const MTL_FORMAT_R32_SINT: u16 = 0x36;
 pub const MTL_FORMAT_R32_FLOAT: u16 = 0x37;
@@ -430,6 +436,24 @@ pub enum SampledClass {
     /// nothing here moves such a bind to the CPU, which could not serve it
     /// anyway — its channels do not sit on byte boundaries.
     Bgr10a2Unorm,
+    /// The two `uint16` channels `MTLPixelFormatRG16Uint` stores a texel in.
+    ///
+    /// Declared for the cross-check, on [`Self::Bgr10a2Unorm`]'s terms and for
+    /// its reason: [`store_texel_order`] admits that format because the byte
+    /// copy is the only rail that can land it, and this is the independent
+    /// statement of the same byte layout that
+    /// `a_byte_copy_destination_is_the_texel_every_other_table_agrees_it_is`
+    /// holds it against.
+    ///
+    /// It is **not** a CPU upload class and there is no rail that would make it
+    /// one: an integer texel has no eight-bit expansion, which is the whole of
+    /// [`TexelLayout::Rg16Uint`]'s argument. A sampled bind of this format takes
+    /// the native rail.
+    Rg16Uint,
+    /// Four `float32` channels, the widest sampled texel this device binds.
+    ///
+    /// See [`TexelLayout::Rgba32Float`] for why it is native-or-nothing.
+    Rgba32Float,
 }
 
 /// The byte layout of one guest texel on the sampled rails, independent of any
@@ -491,6 +515,44 @@ pub enum TexelLayout {
     /// 4 bytes/texel — the chroma half of [`Self::R16Unorm`], sampled natively as
     /// `R16G16_UNORM`. Four bytes wide but **not** a colour order.
     Rg16Unorm,
+    /// 16 bytes/texel, four `float32` channels, sampled natively as
+    /// `R32G32B32A32_SFLOAT`.
+    ///
+    /// A macos-15 guest binds tiny linear textures of this format to a **vertex**
+    /// sampler — 1x1 and 4x1, `bytesPerRow` exactly `width * 16` — and the whole
+    /// draw was refused because this crate had no layout for it.
+    ///
+    /// It has **no CPU loader arm and must not gain one**, and that is a
+    /// stronger statement than the half-float layouts' lossiness. Narrowing an
+    /// `f32` texel to unorm8 clamps to `[0,1]` and quantises to 256 levels, and
+    /// [`narrows_to_unorm8`]'s own doc says what that costs a texture whose
+    /// texels are not colours: "a lookup table, a coordinate pair, a chain of
+    /// offsets — it is data loss with no upper bound on the consequence, and it
+    /// is silent, because the conversion succeeds". A 1x1 four-channel float
+    /// sampled in a vertex shader is that texture. So the native bind is the
+    /// only rail, and a host that cannot filter the format declines by name
+    /// rather than quantising the guest's numbers.
+    ///
+    /// The native bind is capability-gated for a real reason: Vulkan mandates
+    /// `SAMPLED_IMAGE` for `R32G32B32A32_SFLOAT` but **not**
+    /// `SAMPLED_IMAGE_FILTER_LINEAR`, so the filter is measured from the device
+    /// through the sampled-filter mask rather than assumed.
+    Rgba32Float,
+    /// 4 bytes/texel, two `uint16` channels, sampled natively as `R16G16_UINT`.
+    ///
+    /// The same bytes as [`Self::Rg16Unorm`] and a different reading of them,
+    /// which is why it is a layout of its own rather than a spelling of that
+    /// one: the two disagree about what a texel *means* everywhere a value
+    /// crosses between integer and normalized, and the map to a backend format
+    /// is total, so a shared variant would have to pick one and be wrong for
+    /// the other.
+    ///
+    /// It has no [`rgba8_to_texel`] arm and must not gain one. An unorm8
+    /// intermediate cannot express an integer texel — a clear colour of `1.0`
+    /// is the integer `1` here, not `255` and not `65535` — so every rail that
+    /// funnels through eight-bit colour has to decline for this layout rather
+    /// than convert. The byte copy is exact and is the rail that serves it.
+    Rg16Uint,
     /// 8 bytes/texel, four `float16` channels in R,G,B,A order, sampled
     /// natively as `R16G16B16A16_SFLOAT`.
     ///
@@ -582,6 +644,26 @@ pub enum TexelLayout {
     Bc7Rgba,
 }
 
+/// Which of the two per-layout capability masks a question belongs to.
+///
+/// Carried as a type rather than as the `bool` this started out as, for the
+/// reason `AGENTS.md` gives for every selector this crate owns: a `bool`
+/// parameter named for one of its two values reads correctly at the definition
+/// and ambiguously at every call, and adding a third mask would silently widen
+/// one arm of an `if` instead of failing the build in the `match` below.
+///
+/// The two spans are deliberately different — see
+/// [`TexelLayout::is_render_target_layout`] and
+/// [`TexelLayout::needs_sampled_filter_query`] for what each asks and why
+/// sharing one index space cost the bit budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapabilityMask {
+    /// Layouts this device creates a colour attachment at.
+    RenderTarget,
+    /// Layouts whose sampled bind must ask the host about linear filtering.
+    SampledFilter,
+}
+
 impl TexelLayout {
     /// Every layout, so a sweep over the vocabulary is derived rather than
     /// hand-listed.
@@ -600,6 +682,8 @@ impl TexelLayout {
         Self::R32Float,
         Self::R16Unorm,
         Self::Rg16Unorm,
+        Self::Rg16Uint,
+        Self::Rgba32Float,
         Self::Rgba16Float,
         Self::Rg16Float,
         Self::Rgba16Unorm,
@@ -636,22 +720,24 @@ impl TexelLayout {
             Self::R32Float => 5,
             Self::R16Unorm => 6,
             Self::Rg16Unorm => 7,
-            Self::Rgba16Float => 8,
-            Self::Rg16Float => 9,
-            Self::Rgba16Unorm => 10,
-            Self::Rgb10a2Unorm => 11,
-            Self::Bgr10a2Unorm => 12,
-            Self::Rg11b10Float => 13,
-            Self::Bc1Rgba => 14,
-            Self::Bc2Rgba => 15,
-            Self::Bc3Rgba => 16,
-            Self::Bc4RUnorm => 17,
-            Self::Bc4RSnorm => 18,
-            Self::Bc5RgUnorm => 19,
-            Self::Bc5RgSnorm => 20,
-            Self::Bc6hRgbFloat => 21,
-            Self::Bc6hRgbUfloat => 22,
-            Self::Bc7Rgba => 23,
+            Self::Rg16Uint => 8,
+            Self::Rgba32Float => 9,
+            Self::Rgba16Float => 10,
+            Self::Rg16Float => 11,
+            Self::Rgba16Unorm => 12,
+            Self::Rgb10a2Unorm => 13,
+            Self::Bgr10a2Unorm => 14,
+            Self::Rg11b10Float => 15,
+            Self::Bc1Rgba => 16,
+            Self::Bc2Rgba => 17,
+            Self::Bc3Rgba => 18,
+            Self::Bc4RUnorm => 19,
+            Self::Bc4RSnorm => 20,
+            Self::Bc5RgUnorm => 21,
+            Self::Bc5RgSnorm => 22,
+            Self::Bc6hRgbFloat => 23,
+            Self::Bc6hRgbUfloat => 24,
+            Self::Bc7Rgba => 25,
         }
     }
 
@@ -674,6 +760,21 @@ impl TexelLayout {
         }
     }
 
+    /// Whether this layout's channels are read as integers rather than as a
+    /// value in a continuous range.
+    ///
+    /// The distinction the eight-bit conversion rails and the capability masks
+    /// both turn on: an integer texel is a count, so there is no unorm8 byte
+    /// that stands for it and no meaning to interpolating between two of them.
+    /// It is also what separates the two questions a colour attachment is
+    /// asked — Vulkan mandates no `COLOR_ATTACHMENT_BLEND` on an integer
+    /// format, so requiring blend of one would refuse every host, while
+    /// `COLOR_ATTACHMENT` itself is a real and answerable question. See
+    /// `caps::device_features`'s per-layout colour-attachment probe.
+    pub const fn is_integer(self) -> bool {
+        matches!(self, Self::Rg16Uint)
+    }
+
     /// Whether this layout stores a 4x4 block per addressable unit.
     ///
     /// Exhaustive rather than a range test on [`Self::index`]: the positions are
@@ -689,6 +790,8 @@ impl TexelLayout {
             | Self::R32Float
             | Self::R16Unorm
             | Self::Rg16Unorm
+            | Self::Rg16Uint
+            | Self::Rgba32Float
             | Self::Rgba16Float
             | Self::Rg16Float
             | Self::Rgba16Unorm
@@ -709,42 +812,101 @@ impl TexelLayout {
         }
     }
 
-    /// How many of [`Self::ALL`] address one texel at a time.
+    /// Whether this layout is one this device will render into.
     ///
-    /// Counted from `ALL` rather than written down, so it cannot fall behind the
-    /// vocabulary. It exists because `backend::vulkan::engine`'s
-    /// `DeviceCapabilitySnapshot` packs **two** per-layout bitmasks into one
-    /// atomically-published `u64`, and two masks of the full vocabulary no
-    /// longer fit — the `const` assertion there is what said so when the BC
-    /// families were added, which is the whole reason that assertion exists.
+    /// The layout-side spelling of [`render_target_bpp`]'s admission set. It is
+    /// a `const fn` over the layouts rather than a second list of formats, and
+    /// `the_two_render_target_vocabularies_name_the_same_layouts` holds it
+    /// against that function so the two cannot drift.
     ///
-    /// Narrowing the masks rather than widening the word is right on the merits
-    /// and not only on the bit budget: both masks answer questions a
-    /// block-compressed layout is never asked. One is colour-attachment blend,
-    /// and no BC format is a colour attachment on any host. The other is
-    /// sampled linear filtering, which Vulkan's mandatory-format table
-    /// *requires* for every BC format on a device that enables
-    /// `textureCompressionBC` — so there is nothing to query.
-    pub const UNCOMPRESSED_COUNT: usize = {
+    /// It is also one of the two per-layout capability vocabularies, and
+    /// deliberately not the same one as [`Self::needs_sampled_filter_query`].
+    /// The two masks answer different questions about different sets and used
+    /// to share one index space, which sized both by the union and wasted every
+    /// bit where they disagree — a `u64` published lock-free has none to spare.
+    ///
+    /// **The set is every layout this device renders into, integer ones
+    /// included, and that is load-bearing.** This vocabulary was briefly
+    /// narrowed to the *blendable* layouts, which excluded the integer one —
+    /// so `engine::render_target_layout_supported` had no bit to read for
+    /// `Rg16Uint`, answered `false`, and every `RG16Uint` render target was
+    /// built at the neutral eight-bit format instead of its own. Both Store
+    /// arms then refused it: the GPU-direct one on `ResidentFormatMismatch`
+    /// and the copying one in the row converter, which has no integer arm by
+    /// design. A mask whose vocabulary is narrower than the question its reader
+    /// asks does not decline, it answers wrongly.
+    pub const fn is_render_target_layout(self) -> bool {
+        matches!(
+            self,
+            Self::Rgba8
+                | Self::Bgra8
+                | Self::R8
+                | Self::R16Float
+                | Self::Rg16Float
+                | Self::Rgba16Float
+                | Self::Bgr10a2Unorm
+                | Self::Rg16Uint
+        )
+    }
+
+    /// Whether a sampled bind of this layout must ask the host about linear
+    /// filtering.
+    ///
+    /// The other capability vocabulary. Two layouts are excluded and neither is
+    /// an omission:
+    ///
+    /// - **Block-compressed.** Vulkan's mandatory-format table *requires*
+    ///   `SAMPLED_IMAGE_FILTER_LINEAR` of every BC format on a device that
+    ///   enables `textureCompressionBC`, and that feature is what admits the
+    ///   format in the first place. There is nothing to query.
+    /// - **Integer.** Vulkan permits no `VK_FILTER_LINEAR` on an integer
+    ///   format, so the answer is statically "no".
+    pub const fn needs_sampled_filter_query(self) -> bool {
+        !self.is_block_compressed() && !self.is_integer()
+    }
+
+    /// How many layouts each mask spans, counted from [`Self::ALL`] so neither
+    /// can fall behind the vocabulary.
+    pub const RENDER_TARGET_COUNT: usize = Self::count_where(CapabilityMask::RenderTarget);
+    /// See [`Self::RENDER_TARGET_COUNT`].
+    pub const FILTER_COUNT: usize = Self::count_where(CapabilityMask::SampledFilter);
+
+    /// Whether `self` occupies a bit of `mask`.
+    const fn in_mask(self, mask: CapabilityMask) -> bool {
+        match mask {
+            CapabilityMask::RenderTarget => self.is_render_target_layout(),
+            CapabilityMask::SampledFilter => self.needs_sampled_filter_query(),
+        }
+    }
+
+    const fn count_where(mask: CapabilityMask) -> usize {
         let mut count = 0;
         let mut i = 0;
         while i < Self::ALL.len() {
-            if !Self::ALL[i].is_block_compressed() {
+            if Self::ALL[i].in_mask(mask) {
                 count += 1;
             }
             i += 1;
         }
         count
-    };
+    }
 
-    /// This layout's position among the uncompressed layouts, or `None` for a
-    /// block-compressed one.
-    ///
-    /// Walks [`Self::ALL`] rather than keeping a second ordering, for
-    /// [`Self::UNCOMPRESSED_COUNT`]'s reason: one list, one order, nothing to
-    /// drift.
-    pub fn uncompressed_index(self) -> Option<usize> {
-        if self.is_block_compressed() {
+    /// This layout's bit in the render-target mask, or `None` when the mask has
+    /// no question about it.
+    pub fn render_target_index(self) -> Option<usize> {
+        self.index_where(CapabilityMask::RenderTarget)
+    }
+
+    /// This layout's bit in the sampled-filter mask, or `None` when the mask
+    /// has no question about it.
+    pub fn filter_index(self) -> Option<usize> {
+        self.index_where(CapabilityMask::SampledFilter)
+    }
+
+    /// Walks [`Self::ALL`] rather than keeping a second ordering: one list, one
+    /// order, nothing to drift.
+    fn index_where(self, mask: CapabilityMask) -> Option<usize> {
+        if !self.in_mask(mask) {
             return None;
         }
         let mut index = 0;
@@ -752,7 +914,7 @@ impl TexelLayout {
             if *layout == self {
                 return Some(index);
             }
-            if !layout.is_block_compressed() {
+            if layout.in_mask(mask) {
                 index += 1;
             }
         }
@@ -808,7 +970,8 @@ impl TexelLayout {
             Self::R16Float => R16F_BPP,
             Self::R32Float => R32F_BPP,
             Self::R16Unorm => R16_BPP,
-            Self::Rg16Unorm => RG16_BPP,
+            Self::Rg16Unorm | Self::Rg16Uint => RG16_BPP,
+            Self::Rgba32Float => RGBA32_BPP,
             Self::Rgba16Float => RGBA16F_BPP,
             Self::Rg16Float => RG16F_BPP,
             Self::Bc1Rgba => BC_BLOCK_BYTES_8,
@@ -872,10 +1035,18 @@ impl TexelLayout {
             // The three packed 32-bit colour layouts answer `false` for a third
             // reason: their channels do not sit on byte boundaries at all, so
             // there is nothing for a byte-shaped loader to pick up.
+            //
+            // `Rg16Uint` answers `false` for a fourth reason, and it is the
+            // only one of the four that is about meaning rather than width: an
+            // eight-bit loader would have to decide what integer a unorm8 byte
+            // stands for, and there is no answer — the guest's texel is a count,
+            // not a fraction of full scale.
             Self::R16Float
             | Self::R32Float
             | Self::R16Unorm
             | Self::Rg16Unorm
+            | Self::Rg16Uint
+            | Self::Rgba32Float
             | Self::Rgba16Unorm
             | Self::Rgb10a2Unorm
             | Self::Bgr10a2Unorm
@@ -924,6 +1095,8 @@ impl TexelLayout {
             | Self::R32Float
             | Self::R16Unorm
             | Self::Rg16Unorm
+            | Self::Rg16Uint
+            | Self::Rgba32Float
             | Self::Rgba16Unorm
             | Self::Rgb10a2Unorm
             | Self::Bgr10a2Unorm
@@ -1189,7 +1362,7 @@ pub fn bytes_per_pixel(format: u16) -> Option<u32> {
         | MTL_FORMAT_RG8_UINT
         | MTL_FORMAT_DEPTH16_UNORM => RG8_BPP,
         MTL_FORMAT_R16_UNORM => R16_BPP,
-        MTL_FORMAT_RG16_UNORM => RG16_BPP,
+        MTL_FORMAT_RG16_UNORM | MTL_FORMAT_RG16_UINT | MTL_FORMAT_RG16_SINT => RG16_BPP,
         MTL_FORMAT_RG16_FLOAT => RG16F_BPP,
         MTL_FORMAT_RGBA8_UNORM
         | MTL_FORMAT_RGBA8_UNORM_SRGB
@@ -1624,6 +1797,8 @@ pub fn sampled_class(format: u16) -> Option<SampledClass> {
         MTL_FORMAT_RGBA16_FLOAT => SampledClass::Rgba16Float,
         MTL_FORMAT_RG16_FLOAT => SampledClass::Rg16Float,
         MTL_FORMAT_BGR10A2_UNORM => SampledClass::Bgr10a2Unorm,
+        MTL_FORMAT_RG16_UINT => SampledClass::Rg16Uint,
+        MTL_FORMAT_RGBA32_FLOAT => SampledClass::Rgba32Float,
         _ => return None,
     })
 }
@@ -1729,17 +1904,127 @@ pub fn storage_selector(format: u16) -> Option<StorageImageSelector> {
 /// that function's doc states: a missing arm there is a performance bug, not a
 /// loss, and the byte-copy rail declines by name to the CPU converter above.
 ///
+/// # `RG16_UINT` is here, and it is the member that changed what admission means
+///
+/// A macos-15 x86/Vulkan boot declares linear `RG16Uint` colour attachments and
+/// used to lose every pass that named one, refused at `draw::render_target`'s
+/// `rt_linear_format` rung.
+///
+/// It could not be admitted by adding a table entry.
+/// `the_renderable_set_is_one_answer_and_every_member_survives_both_rails` is
+/// where the obligation is written down: every member above survives the
+/// readback narrow, the CPU `Load` seed expansion and the CPU `Store` row
+/// converter, all three of which pass a texel through eight-bit RGBA. An
+/// integer texel has no eight-bit form — a clear colour of `1.0` is the integer
+/// `1`, not `255` and not `65535` — so all three would have had to invent
+/// bytes, and a format admitted on those terms renders correctly on a host with
+/// the guest-RAM import and loses every frame, silently, on one without.
+///
+/// So the rail was built instead of the exemption. A render Store now carries
+/// the destination's own texel end to end — [`store_texel_order`] on the
+/// GPU-direct arm, and `draw::FrameRows::Native` over
+/// `engine::ReadbackTexel::Native` on the copying arm — so the byte copy serves
+/// this format exactly on both, and neither invents a byte. That test asserts
+/// the alternative rather than skipping: a renderable layout that narrows to
+/// RGBA8 owes the three eight-bit rails, and one that does not owes the native
+/// one.
+///
+/// Two consequences worth carrying, because both have already cost a boot:
+///
+/// * The layout must be in the render-target capability vocabulary
+///   ([`TexelLayout::is_render_target_layout`]), not in a *blend* one. Vulkan
+///   mandates no `COLOR_ATTACHMENT_BLEND` for an integer format, so a mask that
+///   asks about blending has no bit to hold this layout's answer and reads
+///   `false` — which builds the resident at eight bits and loses the frame at a
+///   later rung under a different name.
+/// * The CPU `Load` seed still has no integer arm, so a LOAD-action pass on
+///   such a target refuses by name (`SeedFormatUnwritable`) and loses its prior
+///   contents. The Store does not.
+///
 /// sRGB variants share storage bpp with their unorm counterparts (Metal texture
 /// view rules).
+///
+/// # The width is derived, never re-listed
+///
+/// This used to spell out a bytes-per-texel for each member, which made it the
+/// third independent transcription of a width [`bytes_per_pixel`] already owns
+/// — the exact second spelling [`block_geometry`]'s doc says it exists to avoid
+/// having. The two agreed when this was written and nothing held them there.
+///
+/// So the width now comes from [`bytes_per_pixel`] and this function answers
+/// only the question that is its own: **will this device serve `format` as a
+/// colour render target**. That question is genuinely narrower than "is the
+/// width known" — the contract defines a width for every format in its table,
+/// including depth and block-compressed ones no colour attachment may name —
+/// and conflating the two is what made a missing width read as a missing
+/// capability.
 pub fn render_target_bpp(format: u16) -> Option<u32> {
+    render_target_numeric_type(format)?;
+    // Every admitted member has a width, because admission is a strictly
+    // smaller set than the width table. A member without one is a bug in this
+    // list rather than a format to refuse quietly.
+    bytes_per_pixel(format)
+}
+
+/// The numeric interpretation of a colour render target's channels.
+///
+/// This is also the admission set [`render_target_bpp`]'s doc argues for. A
+/// caller cannot learn that a format is renderable without also learning which
+/// numeric class its clear value and fragment output use, so an integer member
+/// cannot accidentally inherit the continuous-colour representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorNumericType {
+    Float,
+    Uint,
+    Sint,
+}
+
+/// A decoded clear after its attachment's numeric class chose the backend
+/// clear-value carrier.
+///
+/// The integer carriers are deliberately 32-bit even when the destination's
+/// channels are narrower. That is the render API contract: the backend narrows
+/// a clear to the attachment format from this carrier, so CPU publication must
+/// start from the same value rather than cast the decoded double straight to a
+/// destination channel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ClearComponents {
+    Float([f32; COMPONENT_COUNT]),
+    Uint([u32; COMPONENT_COUNT]),
+    Sint([i32; COMPONENT_COUNT]),
+}
+
+impl ColorNumericType {
+    /// Convert Metal's double-precision component carrier into the typed clear
+    /// value consumed by the backend and CPU publication rails.
+    pub fn clear_components(self, components: [f64; COMPONENT_COUNT]) -> ClearComponents {
+        match self {
+            Self::Float => ClearComponents::Float(components.map(|value| value as f32)),
+            Self::Uint => ClearComponents::Uint(components.map(|value| value as u32)),
+            Self::Sint => ClearComponents::Sint(components.map(|value| value as i32)),
+        }
+    }
+}
+
+/// Return the numeric type for every colour render target this device serves.
+///
+/// Adding a member here is the three-conversion commitment
+/// [`render_target_bpp`] describes, not just a table entry. The return value is
+/// deliberately richer than a boolean: Vulkan clear values are a union, and
+/// choosing its float member for a `Uint` attachment reinterprets `1.0` as the
+/// integer bit pattern `1065353216`.
+pub fn render_target_numeric_type(format: u16) -> Option<ColorNumericType> {
     Some(match format {
-        MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => RGBA8_BPP,
-        MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => BGRA8_BPP,
-        MTL_FORMAT_RGBA16_FLOAT => RGBA16F_BPP,
-        MTL_FORMAT_RG16_FLOAT => RG16F_BPP,
-        MTL_FORMAT_R16_FLOAT => R16F_BPP,
-        MTL_FORMAT_R8_UNORM => R8_BPP,
-        MTL_FORMAT_BGR10A2_UNORM => RGBA8_BPP,
+        MTL_FORMAT_RGBA8_UNORM
+            | MTL_FORMAT_RGBA8_UNORM_SRGB
+            | MTL_FORMAT_BGRA8_UNORM
+            | MTL_FORMAT_BGRA8_UNORM_SRGB
+            | MTL_FORMAT_RGBA16_FLOAT
+            | MTL_FORMAT_RG16_FLOAT
+            | MTL_FORMAT_R16_FLOAT
+            | MTL_FORMAT_R8_UNORM
+            | MTL_FORMAT_BGR10A2_UNORM => ColorNumericType::Float,
+        MTL_FORMAT_RG16_UINT => ColorNumericType::Uint,
         _ => return None,
     })
 }
@@ -1808,6 +2093,14 @@ pub fn store_texel_order(format: u16) -> Option<TexelLayout> {
         // identical `VK_FORMAT_A2R10G10B10_UNORM_PACK32` word the guest's
         // destination does, so the copy converts nothing.
         MTL_FORMAT_BGR10A2_UNORM => TexelLayout::Bgr10a2Unorm,
+        // The integer colour target, and the member whose absence here would be
+        // a **loss** rather than a slow path. Every other member declines to the
+        // CPU converter; this one has no CPU converter to decline to, because
+        // [`rgba8_to_texel`] has no arm for an integer texel and must not gain
+        // one. The byte copy is its only rail, on the GPU-direct arm and on the
+        // copying arm alike — which is why the copying arm learned to carry a
+        // native frame rather than always an eight-bit one.
+        MTL_FORMAT_RG16_UINT => TexelLayout::Rg16Uint,
         _ => return None,
     })
 }
@@ -1934,22 +2227,118 @@ pub fn solid_rgba8(w: u32, h: u32, clear: &[f64; 4]) -> Vec<u8> {
     solid_image8(w, h, unorm8_rgba(clear))
 }
 
-/// [`solid_rgba8`] with the red and blue channels exchanged — the same image a
-/// caller used to obtain by building the RGBA one and swapping every texel of
-/// it, which is what a type-11 mapping's native order needs.
+/// How a CPU-published clear image carries its pixels.
 ///
-/// Building it directly is the point. A CLEAR seed that lands in a mapping used
-/// to cost two allocations and four passes over the image — zero the RGBA
-/// buffer, fill it, zero the BGRA buffer, read the first while writing the
-/// second — for a result that is one repeated word. On the load probe's
-/// `blur=40` dial the seed loop moved 140 MB a second this way and `prep_seed_us`
-/// was **8.6 µs of a 41 µs chain, 21 % of it and second only to the engine**.
+/// Continuous-colour attachments keep the existing semantic RGBA8 carrier and
+/// are converted by the destination writer. Integer attachments have no such
+/// carrier: their component values are counts rather than fractions, so their
+/// image is already encoded as the destination's native texels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClearImageEncoding {
+    Rgba8,
+    Native,
+}
+
+/// A clear-only render result ready to be published into guest memory.
 ///
-/// The channel exchange belongs to the *pixel*, not to the image, so the whole
-/// of it is the argument this function computes.
-pub fn solid_bgra8(w: u32, h: u32, clear: &[f64; 4]) -> Vec<u8> {
-    let [r, g, b, a] = unorm8_rgba(clear);
-    solid_image8(w, h, [b, g, r, a])
+/// The encoding and bytes are produced together from the admitted render-target
+/// format. Callers can therefore choose the converted or native writer without
+/// reconstructing the numeric-format rule that chose the bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClearImage {
+    encoding: ClearImageEncoding,
+    pixels: Vec<u8>,
+    row_bytes: u32,
+}
+
+impl ClearImage {
+    pub fn encoding(&self) -> ClearImageEncoding {
+        self.encoding
+    }
+
+    pub fn pixels(&self) -> &[u8] {
+        &self.pixels
+    }
+
+    pub fn row_bytes(&self) -> u32 {
+        self.row_bytes
+    }
+}
+
+/// Lower a render-target clear into the representation guest-memory writers
+/// can publish without changing its numeric meaning.
+///
+/// This is the CPU counterpart to the backend's format-aware clear value. A
+/// format admitted by [`render_target_numeric_type`] must have an arm here: a
+/// clear-only pass has no GPU draw from which to obtain a frame, so this image
+/// is the pass result.
+pub fn solid_clear_image(
+    format: u16,
+    width: u32,
+    height: u32,
+    clear: &[f64; COMPONENT_COUNT],
+) -> Option<ClearImage> {
+    let numeric = render_target_numeric_type(format)?;
+    match numeric.clear_components(*clear) {
+        ClearComponents::Float(_) => {
+            let row_bytes = width.checked_mul(RGBA8_BPP)?;
+            let pixels = solid_rgba8(width, height, clear);
+            let need = (row_bytes as usize).checked_mul(height as usize)?;
+            (pixels.len() == need).then_some(ClearImage {
+                encoding: ClearImageEncoding::Rgba8,
+                pixels,
+                row_bytes,
+            })
+        }
+        ClearComponents::Uint(components) => match format {
+            MTL_FORMAT_RG16_UINT => {
+                let mut bytes = [0u8; RG16_BPP as usize];
+                st16(&mut bytes[0..2], components[COMPONENT_R] as u16);
+                st16(&mut bytes[2..4], components[COMPONENT_G] as u16);
+                solid_native_clear_image(format, width, height, &bytes)
+            }
+            _ => None,
+        },
+        ClearComponents::Sint(_) => None,
+    }
+}
+
+fn solid_native_clear_image(
+    format: u16,
+    width: u32,
+    height: u32,
+    texel: &[u8],
+) -> Option<ClearImage> {
+    let row_bytes = tight_row_bytes(width, format)?;
+    let bpp = bytes_per_pixel(format)? as usize;
+    if texel.len() != bpp {
+        return None;
+    }
+    let texels = (width as usize).checked_mul(height as usize)?;
+    let need = texels.checked_mul(bpp)?;
+    let pixels = solid_bytes(need, texel)?;
+    Some(ClearImage {
+        encoding: ClearImageEncoding::Native,
+        pixels,
+        row_bytes,
+    })
+}
+
+/// Fill exactly `len` bytes with whole copies of `unit`.
+fn solid_bytes(len: usize, unit: &[u8]) -> Option<Vec<u8>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    if unit.is_empty() || !len.is_multiple_of(unit.len()) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(len);
+    bytes.extend_from_slice(unit);
+    while bytes.len() < len {
+        let take = (len - bytes.len()).min(bytes.len());
+        bytes.extend_from_within(..take);
+    }
+    Some(bytes)
 }
 
 /// The clear colour as one unorm8 RGBA texel.
@@ -2084,31 +2473,6 @@ fn unorm8_to_f16_lut() -> &'static [u16; 256] {
     })
 }
 
-/// Restate a semantic-RGBA8 frame as `layout`'s own texels.
-///
-/// The render-target seed's counterpart to [`convert_rgba8_to_row`], keyed on a
-/// [`TexelLayout`] rather than on a guest format because the caller is the
-/// engine and what it holds is the *attachment's* layout.
-///
-/// # Why a colour attachment needs this at all
-///
-/// A CPU `MTLLoadActionLoad` seed is staged into a buffer and copied into the
-/// attachment, and a Vulkan buffer→image copy converts nothing: it reads the
-/// image format's texel width per pixel, straight out of the buffer. While
-/// every render target was eight bits per channel the seed was already those
-/// bytes and the only question was the channel order. A wider attachment reads
-/// twice as many bytes per texel as an RGBA8 seed provides, walks off the end
-/// of the staging slot, and seeds the frame with whatever followed it.
-///
-/// `false` for a layout no colour attachment can be created at, so the caller
-/// declines by name rather than staging a frame of the wrong size. Exhaustive
-/// over [`TexelLayout`] on purpose — a new layout that becomes renderable has
-/// to say here how its seed is written.
-///
-/// The expansion is lossy in the direction that was already lost: the seed
-/// arrives with eight bits per channel whatever this writes it as. What it buys
-/// is that the seed lands as the attachment's texels instead of as a quarter of
-/// them, and the *rendering* on top of it keeps the full range.
 /// Bit position of each channel in `MTLPixelFormatBGR10A2Unorm`'s texel word.
 ///
 /// One little-endian 32-bit word: blue in bits 0..9, green in 10..19, red in
@@ -2178,6 +2542,31 @@ fn rgba8_to_bgr10a2_word(rgba: [u8; COMPONENT_COUNT]) -> u32 {
         | channel(rgba[COMPONENT_B]) << BGR10A2_BLUE_SHIFT
 }
 
+/// Restate a semantic-RGBA8 frame as `layout`'s own texels.
+///
+/// The render-target seed's counterpart to [`convert_rgba8_to_row`], keyed on a
+/// [`TexelLayout`] rather than on a guest format because the caller is the
+/// engine and what it holds is the *attachment's* layout.
+///
+/// # Why a colour attachment needs this at all
+///
+/// A CPU `MTLLoadActionLoad` seed is staged into a buffer and copied into the
+/// attachment, and a Vulkan buffer→image copy converts nothing: it reads the
+/// image format's texel width per pixel, straight out of the buffer. While
+/// every render target was eight bits per channel the seed was already those
+/// bytes and the only question was the channel order. A wider attachment reads
+/// twice as many bytes per texel as an RGBA8 seed provides, walks off the end
+/// of the staging slot, and seeds the frame with whatever followed it.
+///
+/// `false` for a layout no colour attachment can be created at, so the caller
+/// declines by name rather than staging a frame of the wrong size. Exhaustive
+/// over [`TexelLayout`] on purpose — a new layout that becomes renderable has
+/// to say here how its seed is written.
+///
+/// The expansion is lossy in the direction that was already lost: the seed
+/// arrives with eight bits per channel whatever this writes it as. What it buys
+/// is that the seed lands as the attachment's texels instead of as a quarter of
+/// them, and the *rendering* on top of it keeps the full range.
 pub fn expand_rgba8_to_texel(
     layout: TexelLayout,
     src_rgba: &[u8],
@@ -2274,6 +2663,8 @@ pub fn expand_rgba8_to_texel(
         | TexelLayout::R32Float
         | TexelLayout::R16Unorm
         | TexelLayout::Rg16Unorm
+        | TexelLayout::Rg16Uint
+        | TexelLayout::Rgba32Float
         | TexelLayout::Rgba16Unorm
         | TexelLayout::Rgb10a2Unorm
         | TexelLayout::Rg11b10Float => return false,
@@ -2394,6 +2785,8 @@ pub fn narrow_texel_to_rgba8(
         | TexelLayout::R32Float
         | TexelLayout::R16Unorm
         | TexelLayout::Rg16Unorm
+        | TexelLayout::Rg16Uint
+        | TexelLayout::Rgba32Float
         | TexelLayout::Rgba16Unorm
         | TexelLayout::Rgb10a2Unorm
         | TexelLayout::Rg11b10Float => return false,
@@ -2460,6 +2853,25 @@ pub fn texel_to_rgba8(format: u16, src: &[u8]) -> Option<[u8; 4]> {
         _ => return None,
     }
     Some(rgba)
+}
+
+/// Whether a semantic RGBA8 colour can be written into one texel of `format`.
+///
+/// It **probes [`rgba8_to_texel`] itself** rather than listing the formats that
+/// have an arm, so the two cannot drift. This is specifically the eight-bit
+/// conversion rail's answer, not clear admission: [`solid_clear_image`] carries
+/// integer clear values as native texels and deliberately returns an image for
+/// [`TexelLayout::Rg16Uint`] while this predicate remains false.
+pub fn solid_color_reaches_texel(format: u16) -> bool {
+    let Some(bpp) = bytes_per_pixel(format) else {
+        return false;
+    };
+    // Widest texel the contract defines, so the probe never short-slices.
+    let mut probe = [0u8; RGBA32_BPP as usize];
+    let Some(cell) = probe.get_mut(..bpp as usize) else {
+        return false;
+    };
+    rgba8_to_texel(format, [0, 0, 0, 0], cell)
 }
 
 pub fn rgba8_to_texel(format: u16, rgba: [u8; 4], dst: &mut [u8]) -> bool {
@@ -3009,7 +3421,10 @@ mod tests {
         // intermediate and an eight-bit coverage/mask layer.
         assert_eq!(render_target_bpp(MTL_FORMAT_R16_FLOAT), Some(R16F_BPP));
         assert_eq!(render_target_bpp(MTL_FORMAT_R8_UNORM), Some(R8_BPP));
-        // Integer / non-color formats stay fail-closed.
+        // `RG16_UINT` is admitted on a macos-15 measurement, so "integer" is no
+        // longer the reason a format is out — a family resemblance to an
+        // admitted member still is not a reason to be in. `RGBA8_UINT` has
+        // never been observed as a guest colour attachment and stays out.
         assert_eq!(render_target_bpp(MTL_FORMAT_RGBA8_UINT), None);
         assert_eq!(render_target_bpp(MTL_FORMAT_A8_UNORM), None);
         // Sampled but not renderable, so "has a layout" is not "is a colour
@@ -3017,6 +3432,268 @@ mod tests {
         // one half of.
         assert_eq!(render_target_bpp(MTL_FORMAT_R32_FLOAT), None);
         assert_eq!(render_target_bpp(MTL_FORMAT_RG8_UNORM), None);
+    }
+
+    /// A linear `RG16Uint` colour attachment resolves, and its width is the one
+    /// the widths table already held.
+    ///
+    /// The measurement: on a macos-15 x86/Vulkan boot the guest declares linear
+    /// `RG16Uint` colour attachments, and every pass naming one was refused at
+    /// `draw::render_target`'s `rt_linear_format` rung — seven dropped clears
+    /// and thirty-two unresolved MRT slots in one boot. The format was absent
+    /// from this crate entirely: not a constant, not a width, not a layout.
+    #[test]
+    fn an_integer_colour_target_is_admitted_at_the_width_the_table_already_knew() {
+        assert_eq!(MTL_FORMAT_RG16_UINT, 63, "MTLPixelFormatRG16Uint");
+        assert_eq!(bytes_per_pixel(MTL_FORMAT_RG16_UINT), Some(RG16_BPP));
+        assert_eq!(render_target_bpp(MTL_FORMAT_RG16_UINT), Some(RG16_BPP));
+        // The family shares a width, which is why the widths table groups it.
+        assert_eq!(
+            bytes_per_pixel(MTL_FORMAT_RG16_UINT),
+            bytes_per_pixel(MTL_FORMAT_RG16_UNORM)
+        );
+        assert_eq!(
+            bytes_per_pixel(MTL_FORMAT_RG16_SINT),
+            bytes_per_pixel(MTL_FORMAT_RG16_FLOAT)
+        );
+    }
+
+    /// Admission never invents a width: it takes the one [`bytes_per_pixel`]
+    /// holds.
+    ///
+    /// This is the relation that replaced a hand-written per-member width list.
+    /// It is the only thing standing between the two spellings now, so it walks
+    /// the whole `u16` space rather than a list a new member could be left off.
+    #[test]
+    fn every_admitted_render_target_takes_its_width_from_the_one_widths_table() {
+        let mut admitted = 0;
+        for format in 0..=u16::MAX {
+            let Some(bpp) = render_target_bpp(format) else {
+                continue;
+            };
+            admitted += 1;
+            assert_eq!(
+                Some(bpp),
+                bytes_per_pixel(format),
+                "{format:#x} is admitted as a render target at a width \
+                 `bytes_per_pixel` does not agree with"
+            );
+        }
+        // A guard on the walk itself: an admission set that silently emptied
+        // would satisfy every assertion above.
+        assert_eq!(admitted, 10, "the admitted colour render target formats");
+    }
+
+    /// An integer texel has no semantic eight-bit solid colour.
+    ///
+    /// The predicate probes the converter rather than listing formats, so this
+    /// asserts the behaviour the clear path actually depends on: a `false` for
+    /// the integer target and a `true` for every colour order that has an arm.
+    #[test]
+    fn an_integer_clear_cannot_take_the_semantic_rgba8_conversion_rail() {
+        assert!(!solid_color_reaches_texel(MTL_FORMAT_RG16_UINT));
+        // Its own family's normalized and float members are unaffected: they go
+        // through the same rail and keep their arms.
+        assert!(solid_color_reaches_texel(MTL_FORMAT_RG16_FLOAT));
+        assert!(solid_color_reaches_texel(MTL_FORMAT_BGRA8_UNORM));
+        assert!(solid_color_reaches_texel(MTL_FORMAT_RGBA8_UNORM));
+        assert!(solid_color_reaches_texel(MTL_FORMAT_RGBA16_FLOAT));
+        // And it stays in step with the converter it probes, which is the
+        // whole point of probing rather than listing.
+        let mut cell = [0u8; RGBA32_BPP as usize];
+        for format in [
+            MTL_FORMAT_RG16_UINT,
+            MTL_FORMAT_RG16_FLOAT,
+            MTL_FORMAT_BGRA8_UNORM,
+            MTL_FORMAT_R8_UNORM,
+        ] {
+            let bpp = bytes_per_pixel(format).expect("a width") as usize;
+            assert_eq!(
+                solid_color_reaches_texel(format),
+                rgba8_to_texel(format, [1, 2, 3, 4], &mut cell[..bpp]),
+                "{format:#x}: the probe and the converter disagree"
+            );
+        }
+    }
+
+    /// Every admitted target can publish a clear-only result, and the integer
+    /// member keeps its native component values all the way to the bytes.
+    #[test]
+    fn every_admitted_render_target_has_a_format_aware_clear_image() {
+        let clear = [1.0, 258.0, 65_535.0, 0.0];
+        let mut admitted = 0;
+        for format in 0..=u16::MAX {
+            if render_target_bpp(format).is_none() {
+                continue;
+            }
+            admitted += 1;
+            let image = solid_clear_image(format, 2, 2, &clear)
+                .unwrap_or_else(|| panic!("render target {format:#x} cannot publish its clear"));
+            assert_eq!(image.pixels().len(), image.row_bytes() as usize * 2);
+        }
+        assert_eq!(admitted, 10, "the admitted colour render target formats");
+
+        let integer = solid_clear_image(MTL_FORMAT_RG16_UINT, 2, 2, &clear)
+            .expect("RG16Uint is an admitted render target");
+        assert_eq!(integer.encoding(), ClearImageEncoding::Native);
+        assert_eq!(integer.row_bytes(), 2 * RG16_BPP);
+        assert_eq!(
+            integer.pixels(),
+            [1u16.to_le_bytes(), 258u16.to_le_bytes()]
+                .concat()
+                .repeat(4),
+            "the two uint16 channels are values, not float or unorm bit patterns"
+        );
+
+        let narrowed = solid_clear_image(
+            MTL_FORMAT_RG16_UINT,
+            1,
+            1,
+            &[65_536.0, 65_537.0, 0.0, 0.0],
+        )
+        .expect("RG16Uint clear with values wider than a channel");
+        assert_eq!(
+            narrowed.pixels(),
+            [0u16.to_le_bytes(), 1u16.to_le_bytes()].concat(),
+            "the CPU rail must narrow the same uint32 carrier as the GPU clear"
+        );
+    }
+
+    /// The byte copy must carry the integer target, because nothing else can.
+    ///
+    /// For every other member of [`store_texel_order`] a missing arm is a
+    /// performance bug — the CPU converter serves it instead. For this one the
+    /// CPU converter has no arm and must not gain one, so an absent arm here
+    /// would be a silent loss of the guest's draw.
+    #[test]
+    fn the_integer_colour_target_reaches_the_exact_rail_and_no_other() {
+        assert_eq!(
+            store_texel_order(MTL_FORMAT_RG16_UINT),
+            Some(TexelLayout::Rg16Uint)
+        );
+        assert!(!TexelLayout::Rg16Uint.has_cpu_loader_arm());
+        assert!(TexelLayout::Rg16Uint.is_integer());
+        assert_eq!(TexelLayout::Rg16Uint.bytes_per_texel(), RG16_BPP);
+    }
+
+    /// The two capability masks span two vocabularies, and each is dense in its
+    /// own.
+    ///
+    /// They ask different questions of different sets — creating a colour
+    /// attachment, and filtering a sampled texel — and sharing one index space
+    /// sized both by the union. This holds each index dense and distinct inside
+    /// its own count, which is what `DeviceCapabilitySnapshot` sizes its fields
+    /// by, and pins the exclusions that are contract facts rather than
+    /// omissions.
+    ///
+    /// The integer assertions below are the regression pin. This vocabulary was
+    /// briefly the *blendable* layouts, which put `Rg16Uint` in neither mask —
+    /// so `engine::render_target_layout_supported` had no bit to read for it,
+    /// answered `false`, and every `RG16Uint` render target was built at the
+    /// neutral eight-bit format and then lost by both Store arms. An integer
+    /// layout must be in the render-target mask and out of the filter one.
+    #[test]
+    fn each_capability_mask_is_dense_in_its_own_vocabulary() {
+        for (mask, count) in [
+            (CapabilityMask::RenderTarget, TexelLayout::RENDER_TARGET_COUNT),
+            (CapabilityMask::SampledFilter, TexelLayout::FILTER_COUNT),
+        ] {
+            let mut seen = Vec::new();
+            for layout in TexelLayout::ALL {
+                let index = match mask {
+                    CapabilityMask::RenderTarget => layout.render_target_index(),
+                    CapabilityMask::SampledFilter => layout.filter_index(),
+                };
+                let Some(i) = index else { continue };
+                assert!(i < count, "{layout:?} indexes past its own count");
+                assert!(!seen.contains(&i), "{layout:?} reuses index {i}");
+                seen.push(i);
+            }
+            assert_eq!(seen.len(), count);
+        }
+
+        // An integer layout is rendered into and never filtered. Both halves
+        // matter: the first is the bit that was missing, and the second is why
+        // it cannot simply ride the other mask.
+        assert!(
+            TexelLayout::Rg16Uint.is_render_target_layout(),
+            "an integer colour attachment must carry a render-target bit, or              the resident falls back to eight bits and both Stores refuse it"
+        );
+        assert!(TexelLayout::Rg16Uint.render_target_index().is_some());
+        assert!(!TexelLayout::Rg16Uint.needs_sampled_filter_query());
+        assert_eq!(TexelLayout::Rg16Uint.filter_index(), None);
+
+        // Block-compressed layouts are in neither, for two different reasons —
+        // no host renders into one, and their linear filtering is mandated.
+        assert!(!TexelLayout::Bc7Rgba.is_render_target_layout());
+        assert_eq!(TexelLayout::Bc7Rgba.render_target_index(), None);
+        assert!(!TexelLayout::Bc7Rgba.needs_sampled_filter_query());
+
+        // The vocabularies genuinely differ, which is the whole point: a
+        // four-channel float is sampled and filtered but never rendered into,
+        // and a normalized colour order is both.
+        assert!(TexelLayout::Rgba32Float.needs_sampled_filter_query());
+        assert!(!TexelLayout::Rgba32Float.is_render_target_layout());
+        assert!(TexelLayout::Bgra8.needs_sampled_filter_query());
+        assert!(TexelLayout::Bgra8.is_render_target_layout());
+        const { assert!(TexelLayout::RENDER_TARGET_COUNT < TexelLayout::FILTER_COUNT) };
+    }
+
+    /// The layout-side render-target set and [`render_target_bpp`] name the
+    /// same thing.
+    ///
+    /// Two spellings of one admission — one over `TexelLayout`, one over
+    /// `MTLPixelFormat` — and nothing else compares them. A format admitted by
+    /// one and not the other is a capability bit read for a layout this device
+    /// never renders into, or withheld from one it does.
+    #[test]
+    fn the_two_render_target_vocabularies_name_the_same_layouts() {
+        let mut from_formats: Vec<TexelLayout> = Vec::new();
+        for format in 0..=u16::MAX {
+            if render_target_bpp(format).is_none() {
+                continue;
+            }
+            // Exhaustive on the sampled classes on purpose: a new one must say
+            // which layout it is before a renderable format can reach this
+            // vocabulary.
+            let from_class = sampled_class(format).map(|class| match class {
+                SampledClass::Rgba8Unorm => TexelLayout::Rgba8,
+                SampledClass::Bgra8Unorm => TexelLayout::Bgra8,
+                SampledClass::A8Unorm | SampledClass::R8Unorm => TexelLayout::R8,
+                SampledClass::Rg8Unorm => TexelLayout::Rg8,
+                SampledClass::Rgba16Float => TexelLayout::Rgba16Float,
+                SampledClass::Rg16Float => TexelLayout::Rg16Float,
+                SampledClass::Bgr10a2Unorm => TexelLayout::Bgr10a2Unorm,
+                SampledClass::Rg16Uint => TexelLayout::Rg16Uint,
+                SampledClass::Rgba32Float => TexelLayout::Rgba32Float,
+            });
+            // Renderable, single-channel, and named by neither table above —
+            // admitted for macOS 26's blur intermediate.
+            let single_channel_float = (format == MTL_FORMAT_R16_FLOAT).then_some(
+                TexelLayout::R16Float,
+            );
+            let layout = store_texel_order(format)
+                .or(from_class)
+                .or(single_channel_float)
+                .unwrap_or_else(|| panic!("{format:#x} is renderable with no layout"));
+            if !from_formats.contains(&layout) {
+                from_formats.push(layout);
+            }
+        }
+        for layout in &from_formats {
+            assert!(
+                layout.is_render_target_layout(),
+                "{layout:?} is renderable by format but not by layout"
+            );
+        }
+        for layout in TexelLayout::ALL {
+            if layout.is_render_target_layout() {
+                assert!(
+                    from_formats.contains(layout),
+                    "{layout:?} claims to be a render target but no admitted format maps to it"
+                );
+            }
+        }
     }
 
     /// RG16Float MRT slots (vibrancy UI tile masks) must admit as color RTs so
@@ -3371,6 +4048,8 @@ mod tests {
                 TexelLayout::R32Float => MTL_FORMAT_R32_FLOAT,
                 TexelLayout::R16Unorm => MTL_FORMAT_R16_UNORM,
                 TexelLayout::Rg16Unorm => MTL_FORMAT_RG16_UNORM,
+                TexelLayout::Rg16Uint => MTL_FORMAT_RG16_UINT,
+                TexelLayout::Rgba32Float => MTL_FORMAT_RGBA32_FLOAT,
                 TexelLayout::Rgba16Float => MTL_FORMAT_RGBA16_FLOAT,
                 TexelLayout::Rg16Float => MTL_FORMAT_RG16_FLOAT,
                 TexelLayout::Rgba16Unorm => MTL_FORMAT_RGBA16_UNORM,
@@ -3831,6 +4510,7 @@ mod tests {
                     TexelLayout::Bgra8 => SampledClass::Bgra8Unorm,
                     TexelLayout::Rgba16Float => SampledClass::Rgba16Float,
                     TexelLayout::Bgr10a2Unorm => SampledClass::Bgr10a2Unorm,
+                    TexelLayout::Rg16Uint => SampledClass::Rg16Uint,
                     // Named rather than defaulted. This arm used to be
                     // `_ => SampledClass::Bgra8Unorm`, which was true only while
                     // the admitted set was {Rgba8, Bgra8, Rgba16Float}: the next
@@ -4318,7 +4998,7 @@ mod tests {
 
 #[cfg(test)]
 mod solid_fill_tests {
-    use super::{solid_bgra8, solid_rgba8};
+    use super::solid_rgba8;
 
     /// The one-pass fill produces exactly what walking texels produced.
     ///
@@ -4362,34 +5042,6 @@ mod solid_fill_tests {
                 walk(w, h, px),
                 "rgba {w}x{h} must match the texel walk"
             );
-        }
-    }
-
-    /// The BGRA builder equals swapping the RGBA one, which is how its only
-    /// caller used to obtain it.
-    ///
-    /// Fails if the exchange is applied to the wrong pair — the alpha channel
-    /// and the green channel both stay put, so a transposition that moved one
-    /// of them would pass a test that only checked the length.
-    #[test]
-    fn the_bgra_seed_equals_the_rgba_seed_with_red_and_blue_exchanged() {
-        for clear in [
-            [0.0_f64, 0.0, 0.0, 1.0],
-            [1.0, 0.0, 0.0, 1.0],
-            [0.0, 0.0, 1.0, 0.5],
-            [0.1, 0.2, 0.3, 0.4],
-        ] {
-            for (w, h) in [(1, 1), (4, 4), (13, 5)] {
-                let mut swapped = solid_rgba8(w, h, &clear);
-                for px in swapped.chunks_exact_mut(4) {
-                    px.swap(0, 2);
-                }
-                assert_eq!(
-                    solid_bgra8(w, h, &clear),
-                    swapped,
-                    "bgra {w}x{h} clear={clear:?}"
-                );
-            }
         }
     }
 }

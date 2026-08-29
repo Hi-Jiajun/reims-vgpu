@@ -990,7 +990,11 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     }
     let base_fmt = tex.pixel_format;
     let fmt = effective_view_sample_format(base_fmt, view_fmt_override).unwrap_or(base_fmt);
-    // Refuses a format with no known bytes-per-texel; the value is not needed.
+    // Refuses a format this device will not render into; the width it returns
+    // is not needed here. That is a narrower question than "is the width known"
+    // — the contract defines a width for depth and block-compressed formats no
+    // colour attachment may name — and conflating the two is what made a
+    // missing width read as a missing capability. See `render_target_bpp`.
     if pixel_format::render_target_bpp(fmt).is_none() {
         return Err(C::LinearFormat { fmt }.at(resolved_ref));
     }

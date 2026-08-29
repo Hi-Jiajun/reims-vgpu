@@ -1224,8 +1224,17 @@ impl FlushRail {
 /// `fresh` counts a new key **reaching** the publish, not a frame landing in the
 /// window's slot: the four ways the publish itself can still fail after that
 /// point already have their own census in
-/// [`crate::runtime::census::present_proxy::window_publish`], and duplicating
+/// [`crate::runtime::census::present_proxy::host_window_publish`], and duplicating
 /// them here would give two counters that could disagree.
+///
+/// The two therefore emit under **different tags**, and that is load-bearing
+/// rather than cosmetic. Both once wrote `window_publish`, differing only in
+/// `win_ms=`/`fresh=` against `window_ms=`/`published=`, so a `grep
+/// window_publish` returned one interleaved series of two censuses that this
+/// doc goes out of its way to say must not be conflated. Every consumer today
+/// keys on the field names and so survives it, but a reader does not: the
+/// collision cost a session a verification detour before it was noticed. One
+/// tag, one census.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WindowPublish {
     /// A frame key not yet published reached the publish.
@@ -2783,6 +2792,7 @@ pub fn note_drain_setup(ns: u64) {
 }
 
 /// Accumulate one completed drain tranche; emits at most once per second.
+///
 pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
     if let Some(line) = DRAIN_DUTY.note(drain_us, publish_us, crate::observe::elapsed_ms() as u64) {
         crate::observe::off(line);
@@ -3136,7 +3146,7 @@ fn emit_chain_phase() {
     crate::observe::off(format!(
         "chain_phase chains={} prep_us={} pipeline_us={} pl_gen_us={} pl_desc_us={} \
          pl_mtlb_us={} pl_air_us={} pl_xlate_us={} binds_us={} sampled_us={} \
-         seed_us={} assemble_us={} engine_us={} store_us={} prep_seed_us={} \
+         seed_us={} assemble_us={} engine_us={} store_us={} \
          prep_pages_us={} asm_target_us={} asm_depth_us={} asm_trail_us={} max_us={}",
         w.chains,
         w.prep_us,
@@ -3152,7 +3162,6 @@ fn emit_chain_phase() {
         w.assemble_us,
         w.engine_us,
         w.store_us,
-        w.prep_seed_us,
         w.prep_pages_us,
         w.assemble_target_us,
         w.assemble_depth_us,

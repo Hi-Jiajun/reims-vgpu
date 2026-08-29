@@ -2383,3 +2383,46 @@ fn a_claimant_count_is_banded_against_the_tasks_that_could_have_claimed() {
     assert_eq!(band(0, 1), "list_miss_slot_empty_claimed_nowhere");
     assert_eq!(band(0, 0), "list_miss_slot_empty_claimed_nowhere");
 }
+
+/// A zero reusable slot has no resolvable tenant, even when an earlier tenant
+/// was observed successfully.
+#[test]
+fn a_freed_or_between_tenants_slot_never_answers_from_an_earlier_generation() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let slot = data_gpa + 12; // ref 1, at `ref * 12`
+
+    let first = lookup_list_entry(&state, &host, 1, 1).expect("the published ref resolves");
+    assert_eq!((first.object_type, first.descriptor_gva), (11, 0x40));
+
+    // Deletion clears the index. The packet has no generation with which to
+    // prove that the first tenant, rather than a later one, is the answer.
+    let _ = host.write_gpa(slot, &[0u8; 12]);
+    assert_eq!(
+        lookup_list_entry(&state, &host, 1, 1),
+        None,
+        "a zero reusable slot cannot name its earlier tenant"
+    );
+
+    // A later allocation reuses the same index for another object.
+    let mut reused = [0u8; 12];
+    st32(&mut reused[0..], 2u32 | (0x30u32 << 8));
+    reused[4..12].copy_from_slice(&0x80u64.to_le_bytes());
+    let _ = host.write_gpa(slot, &reused);
+    let now = lookup_list_entry(&state, &host, 1, 1).expect("the reused slot resolves");
+    assert_eq!(
+        (now.object_type, now.descriptor_gva),
+        (2, 0x80),
+        "a reused index must resolve to its new object, never the retired one"
+    );
+
+    // Clearing the reused tenant must not resurrect either generation.
+    let _ = host.write_gpa(slot, &[0u8; 12]);
+    assert_eq!(
+        lookup_list_entry(&state, &host, 1, 1),
+        None,
+        "a second empty tenancy gap cannot resurrect the first or second object"
+    );
+}

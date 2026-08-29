@@ -1220,9 +1220,13 @@ pub enum ListMiss {
     Unreadable(crate::runtime::host::MemError),
     /// The sixteen bytes read and are not an object-list entry.
     Undecodable,
-    /// The slot read and is zero: the list is where the guest said and this
-    /// entry has not been written yet. Not a device failure — a race with the
-    /// guest publishing the object.
+    /// The slot read and is zero. Not a device failure.
+    ///
+    /// Object refs are reusable indices: deletion clears the indexed slot and
+    /// allocation may assign that same index to a later object. The packet does
+    /// not carry the index generation, so neither an earlier entry nor a later
+    /// one can answer for a zero slot. The lookup must miss until the current
+    /// tenant is present in the list.
     SlotEmpty,
 }
 
@@ -1329,8 +1333,7 @@ fn list_entry<M: HostMemory>(
         Ok(entry) => {
             // Only a ref the guest named: a probe's success is the search
             // finding an owner, which says nothing about what this task's own
-            // list once held. One atomic bit — see `slot_recheck::ResolvedBits`
-            // for why this path cannot take a lock.
+            // list once held.
             if lookup == ListLookup::Named {
                 slot_recheck::note_ref_resolved(task_id, ref_);
                 // The control for the banding below, and the reason it is worth
@@ -1358,6 +1361,8 @@ fn list_entry<M: HostMemory>(
                     crate::runtime::drain::tranche_elapsed_us(),
                 );
                 if miss == ListMiss::SlotEmpty {
+                    // Both instruments measure the slot, not the packet's
+                    // outcome, so they run before this miss is returned.
                     note_slot_empty_claimants(state, host, task_id, ref_);
                     // The unconfounded half of the same question — see
                     // `slot_recheck` for why the claimant search above cannot

@@ -2086,6 +2086,71 @@ fn a_padded_half_float_row_copies_straight_through_at_eight_bytes_a_texel() {
     );
 }
 
+/// A four-channel `float32` sampled texture binds natively, and only natively.
+///
+/// The macos-15 defect: a guest binds 1x1 and 4x1 `RGBA32Float` linear textures
+/// to a **vertex** sampler, and every draw that did was refused with
+/// `draw_prepare_texture_resolve_missing` because this crate had no layout for
+/// the format. It has one now, and the rails it may take are deliberately
+/// narrow — the native bind or a named refusal, never a conversion.
+#[test]
+fn a_four_channel_float_sampled_texture_is_native_or_refused() {
+    assert_eq!(
+        linear_native_upload_format(pixel_format::MTL_FORMAT_RGBA32_FLOAT, NativeUploads::ALL),
+        Some(TexelLayout::Rgba32Float)
+    );
+    assert_eq!(
+        linear_native_upload_format(pixel_format::MTL_FORMAT_RGBA32_FLOAT, NativeUploads::BGRA8),
+        None,
+        "a host that cannot filter it must not get a native bind"
+    );
+    assert_eq!(TexelLayout::Rgba32Float.bytes_per_texel(), 16);
+    // No CPU arm, and that is the point rather than a gap: narrowing an f32
+    // texel to unorm8 clamps to [0,1] and quantises to 256 levels, which for a
+    // vertex-stage lookup table is silent data loss with no bound. A host that
+    // cannot serve it refuses instead.
+    assert!(!TexelLayout::Rgba32Float.has_cpu_loader_arm());
+    assert!(!pixel_format::narrows_to_unorm8(
+        pixel_format::MTL_FORMAT_RGBA32_FLOAT
+    ));
+}
+
+/// The host-gated set is derived from the loader, not approximated by a second
+/// list.
+///
+/// `native_uploads_for` takes the engine lock only for formats whose bind the
+/// host decides. That used to be approximated by `narrows_to_unorm8` — "is this
+/// format's CPU arm lossy" — which is a different question, and the two agreed
+/// only while every gated layout also had a lossy CPU arm. `RGBA32Float` has a
+/// gated bind and **no** CPU arm, so the proxy answered "no need to ask", the
+/// host was never asked, and the sample was refused.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn the_host_gated_sampled_formats_are_the_ones_whose_bind_the_host_decides() {
+    for gated in [
+        pixel_format::MTL_FORMAT_RGBA32_FLOAT,
+        pixel_format::MTL_FORMAT_RGBA16_FLOAT,
+        pixel_format::MTL_FORMAT_RG16_FLOAT,
+        pixel_format::MTL_FORMAT_BC7_RGBA_UNORM,
+    ] {
+        assert!(
+            super::texture_view::native_bind_is_host_gated(gated),
+            "{gated:#x} has a host-gated native bind and must ask"
+        );
+    }
+    // The unconditional ones must keep the lock-free fast path.
+    for ungated in [
+        pixel_format::MTL_FORMAT_RGBA8_UNORM,
+        pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        pixel_format::MTL_FORMAT_R8_UNORM,
+    ] {
+        assert!(
+            !super::texture_view::native_bind_is_host_gated(ungated),
+            "{ungated:#x} would take the engine lock for an answer that cannot change"
+        );
+    }
+}
+
 #[test]
 fn tight_rgba_linear_load_preserves_native_bytes() {
     let native = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -3711,102 +3776,6 @@ fn view_format_reinterprets_bgra_storage_as_rgba() {
     let mut out = [0u8; 4];
     assert!(pixel_format::convert_row_to_rgba8(fmt, &raw, 1, &mut out));
     assert_eq!(out, [10, 20, 30, 40]);
-}
-
-/// A solid landing puts the same bytes in the guest's pages as the full-image
-/// one it replaced.
-///
-/// The repeated-row writer converts once and copies that conversion to every
-/// destination row, where the full-image writer converted each of its identical
-/// rows. Those are two spellings of one result and this asserts they agree, over
-/// a destination whose row stride is wider than its tight row — the case where a
-/// stride mistake in the repeated path would write the right bytes to the wrong
-/// offsets and a tight-stride test would not see it.
-///
-/// Fails without the change only in the direction that matters: it is the
-/// equivalence, not the speed, that a future edit to `SourceRows` could break.
-#[test]
-fn a_solid_gva_landing_matches_the_full_image_landing_it_replaced() {
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::contract::pixel_format::{solid_rgba8, MTL_FORMAT_BGRA8_UNORM};
-    use crate::runtime::host::FakeHost;
-
-    // Two identical guests, so the two writers land into two byte-for-byte
-    // equal address spaces and the comparison is of the writes alone.
-    fn guest(page_shift: u32) -> (FakeHost, DeviceState) {
-        let mut host = FakeHost::new();
-        let dir_gpa = 2u64 << page_shift;
-        let root_gpa = 3u64 << page_shift;
-        host.map_range(dir_gpa, 0x20, 0);
-        host.map_range(root_gpa, 1 << page_shift, 0);
-        // Eight data pages, contiguous, so the destination span resolves whole.
-        for p in 0..8u64 {
-            host.map_range((5 + p) << page_shift, 1 << page_shift, 0);
-        }
-        let mut d = [0u8; 8];
-        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
-        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-        let _ = host.write_gpa(dir_gpa, &d);
-        for p in 0..8u64 {
-            st32(&mut d[..4], (5 + p) as u32);
-            let _ = host.write_gpa(root_gpa + (1 + p) * 4, &d[..4]);
-        }
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        state.page_shift = page_shift;
-        state.define_task(1, 0x1000, 2);
-        (host, state)
-    }
-
-    let page_shift = PAGE_SHIFT_X86;
-    let gva = 1u64 << page_shift;
-    let (w, h) = (7u32, 5u32);
-    let bpr = 64u32; // wider than the 28-byte tight row, on purpose
-    let clear = [0.2_f64, 0.4, 0.6, 1.0];
-
-    let (mut h1, mut s1) = guest(page_shift);
-    assert!(
-        write_gva_solid8(
-            &mut s1,
-            &mut h1,
-            1,
-            gva,
-            w,
-            h,
-            bpr,
-            MTL_FORMAT_BGRA8_UNORM,
-            &clear
-        )
-        .is_ok(),
-        "the solid landing must succeed"
-    );
-
-    let (mut h2, mut s2) = guest(page_shift);
-    let full = solid_rgba8(w, h, &clear);
-    assert!(
-        write_gva_rgba8(
-            &mut s2,
-            &mut h2,
-            1,
-            gva,
-            w,
-            h,
-            bpr,
-            MTL_FORMAT_BGRA8_UNORM,
-            &full
-        )
-        .is_ok(),
-        "the full-image landing must succeed"
-    );
-
-    let span = (h as usize) * (bpr as usize);
-    let mut a = vec![0u8; span];
-    let mut b = vec![0u8; span];
-    assert!(gva_mem::read_task_gva(&h1, &s1.tasks[1], gva, &mut a, page_shift).is_ok());
-    assert!(gva_mem::read_task_gva(&h2, &s2.tasks[1], gva, &mut b, page_shift).is_ok());
-    assert_eq!(a, b, "the two landings must be byte-identical");
-    // …and not both empty, which would make the assertion above vacuous.
-    assert!(a.iter().any(|&x| x != 0), "the landing wrote something");
 }
 
 /// Regression: type-2/3 GVA Stores must walk with device page_shift (x86=12).
@@ -7097,6 +7066,64 @@ fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
     );
 }
 
+/// An anonymous depth extent past its packed field width declines rather than
+/// aliasing onto another pass's slot.
+///
+/// The slot packs `height` in the 31 bits directly below `width`, so a height
+/// that overflows its field carries into width's low bit and two genuinely
+/// different pass shapes pack to one word: `(w=3, h=1)` and
+/// `(w=2, h=2^31 + 1)` are the smallest such pair. Sharing a depth resident
+/// between them is the one way this identity can be actively wrong rather than
+/// merely absent, so the extent is bounded and the out-of-range case takes the
+/// per-record transient it took before the identity existed.
+///
+/// No host advertises a `maxImageDimension2D` anywhere near this, which is why
+/// the bound is a refusal and not a clamp: reaching it means the extent is not
+/// a real one.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn an_anonymous_depth_extent_past_its_field_width_declines_instead_of_aliasing() {
+    use crate::runtime::draw::vulkan::depth_chain_identity;
+
+    let req = |w: u32, h: u32| DrawEncodeRequest {
+        colors: vec![ColorRtRequest {
+            width: w,
+            height: h,
+            ..Default::default()
+        }],
+        ..DrawEncodeRequest::default()
+    };
+
+    let real = depth_chain_identity(&req(3, 1), false)
+        .expect("a representable pass geometry keys a slot");
+    let carrying_height = depth_chain_identity(&req(2, (1u32 << 31) | 1), false);
+    assert_eq!(
+        carrying_height, None,
+        "a height past its field must decline the shared identity"
+    );
+    assert_ne!(
+        Some(real),
+        carrying_height,
+        "two different pass shapes must never pack to one depth slot"
+    );
+
+    // The same for width, whose field ends one bit below the tag that keeps
+    // these slots out of the engine's other anonymous namespace.
+    assert_eq!(
+        depth_chain_identity(&req(1u32 << 31, 720), false),
+        None,
+        "a width past its field must decline too"
+    );
+
+    // The bound is nowhere near a real extent: the largest attachment any host
+    // admits still keys a slot.
+    assert!(
+        depth_chain_identity(&req(16384, 16384), false).is_some(),
+        "a maximal real attachment must still share its pass's depth"
+    );
+}
+
+
 /// Only a texture gap the fragment module statically uses is substituted for.
 ///
 /// The three narrowings are the whole content of the rule and each one fails in
@@ -7303,5 +7330,60 @@ fn the_buffer_backed_texture_rail_pays_for_its_texture_reference() {
     assert!(
         state.pending_writebacks.get(texture_ref).is_none(),
         "the sampled bind never asked the ledger what its texture reference owed"
+    );
+}
+
+/// A DontCare colour attachment is still a candidate to be served its prior
+/// contents.
+///
+/// The behavioural half of `only_a_clear_refuses_the_attachments_prior_contents`.
+/// Without it a DontCare record never reaches a seed door, the request arrives
+/// at the engine with no seed, `PassKey::single` reads that as "no seed" and
+/// `caches.rs` spells the attachment `AttachmentLoadOp::CLEAR` — so every texel
+/// the pass does not itself draw becomes the record's clear colour. On a driven
+/// macos-15 boot that showed up as `passbegin_clear` running exactly
+/// `color0_declared_dontcare` above the clears the guest actually asked for, on
+/// every boot it was measured.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_dontcare_colour_attachment_is_still_served_its_prior_contents() {
+    use crate::contract::pass_action::{
+        MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_DONT_CARE, MTL_LOAD_ACTION_LOAD,
+    };
+    use crate::runtime::draw::vulkan::type11_load_is_a_seed_candidate;
+
+    let mut c0 = ColorRtRequest {
+        load_action: MTL_LOAD_ACTION_LOAD,
+        target_seed_rgba: None,
+        ..Default::default()
+    };
+    assert!(
+        type11_load_is_a_seed_candidate(&c0),
+        "a LOAD has always been a candidate"
+    );
+
+    c0.load_action = MTL_LOAD_ACTION_DONT_CARE;
+    assert!(
+        type11_load_is_a_seed_candidate(&c0),
+        "DontCare declares the prior contents undefined, and undefined permits \
+         the prior contents — the guest redraws only its damage rect and relies \
+         on the rest surviving, which is what the Metal arm gives it"
+    );
+
+    c0.load_action = MTL_LOAD_ACTION_CLEAR;
+    assert!(
+        !type11_load_is_a_seed_candidate(&c0),
+        "a Clear must not be served a seed: resolving one would spell the pass \
+         key LOAD and silently ignore the clear the guest asked for"
+    );
+
+    // An explicit seed chosen by RT provenance still wins over the resident, on
+    // DontCare exactly as on LOAD: the two gates are independent and widening
+    // the action must not widen this one.
+    c0.load_action = MTL_LOAD_ACTION_DONT_CARE;
+    c0.target_seed_rgba = Some(vec![0u8; 4]);
+    assert!(
+        !type11_load_is_a_seed_candidate(&c0),
+        "an explicit provenance seed still excludes the resident candidate"
     );
 }

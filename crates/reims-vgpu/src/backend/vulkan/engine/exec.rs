@@ -2668,7 +2668,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // Slot 0's view supplies the attachment format. The identity names the
     // allocation behind it; treating those as the same question loses Metal's
     // compatible-format texture views (most visibly UNORM versus sRGB).
-    let color0_format = req.color_attachment_format.unwrap_or_else(|| {
+    let color0_format = req.color_attachment.map(|a| a.format()).unwrap_or_else(|| {
         req.target_identity
             .as_ref()
             .map(|id| id.resident_format())
@@ -2997,7 +2997,7 @@ pub(crate) unsafe fn execute_draw_inner(
             ));
         }
         pass_key.secondary[i] = SecondaryAttachKey {
-            format: sec.format,
+            format: sec.attachment.format(),
             load: sec.load,
         };
     }
@@ -3386,7 +3386,13 @@ pub(crate) unsafe fn execute_draw_inner(
     phase.enter(super::draw_phase::Phase::StageSeed);
     let seed_wide = seed_bytes.and_then(|rgba8| {
         let layout = crate::backend::vulkan::translate::pixel::texel_layout_of(color0_format)?;
-        if layout.bytes_per_texel() == crate::contract::pixel_format::RGBA8_BPP {
+        // Four-byte *colour*, not four bytes. A seed is eight-bit RGBA, and a
+        // four-byte texel that is not one of the two colour orders — a packed
+        // ten-bit word, an integer pair — cannot be staged as though it were:
+        // the copy converts nothing, so the attachment would be seeded with the
+        // seed's bytes reinterpreted. The wide arm below restates the seed in
+        // the attachment's texel, or refuses by name when it cannot.
+        if layout.is_four_byte_color() {
             return None;
         }
         Some((rgba8, layout))
@@ -5826,13 +5832,29 @@ pub(crate) unsafe fn execute_draw_inner(
             format: color0_format,
         }),
     )?;
-    let (pixels, pixels_bgra) = super::narrow_readback_to_rgba8(
+    let (pixels, texel) = super::narrow_readback_to_rgba8(
         out,
         layout,
         color0_format,
         (req.width as u64) * (req.height as u64),
         output_bgra,
     )?;
+    // This rail hands its bytes to `M2vDrawSpan::Pixels`, whose every consumer
+    // reads eight-bit colour, so a native texel is refused here exactly as it
+    // was before the narrowing learned to carry one. The native bytes are
+    // useful only to a guest destination of the identical layout, and that is
+    // the GVA Store's rail rather than this one.
+    let pixels_bgra = match texel {
+        super::ReadbackTexel::Rgba8 => false,
+        super::ReadbackTexel::Bgra8 => true,
+        super::ReadbackTexel::Native(_) => {
+            return Err(DrawError::TargetRead(
+                super::reason::TargetReadDecline::TexelNotFourBytes {
+                    format: super::readback_vk_format(layout),
+                },
+            ))
+        }
+    };
 
     Ok(DrawOutput {
         pixels,
@@ -5940,7 +5962,7 @@ unsafe fn ad_hoc_attachment_views(
             sec.height,
             1,
             sec.identity.generation(),
-            sec.format,
+            sec.attachment.format(),
             counters,
         )?;
         views.push(view);
@@ -5962,17 +5984,21 @@ unsafe fn ad_hoc_attachment_views(
 /// runtime met it instead by allocating a whole-attachment RGBA8 bitmap of the
 /// requested colour and handing it over as a CPU seed, which also resolved the
 /// pass to LOAD. The clear now travels as
-/// [`super::types::DrawRequest::target_clear`], the same shape the secondaries
-/// have always used.
+/// [`super::types::DrawRequest::color_attachment`], already paired with its
+/// format by attachment translation.
 fn clear_values(req: &DrawRequest) -> Vec<vk::ClearValue> {
     let mut clear = vec![vk::ClearValue {
-        color: vk::ClearColorValue {
-            float32: req.target_clear,
-        },
+        // With no declared attachment the clear is transparent black. Every
+        // Vulkan union member represents that value with the same zero bits.
+        color: req
+            .color_attachment
+            .map(|a| a.clear())
+            .unwrap_or_default()
+            .vk(),
     }];
     for sec in &req.secondary_targets {
         clear.push(vk::ClearValue {
-            color: vk::ClearColorValue { float32: sec.clear },
+            color: sec.attachment.clear().vk(),
         });
     }
     if let Some(d) = &req.depth {
@@ -7081,7 +7107,7 @@ mod tests {
         non_plain.arrayed = true;
         assert_eq!(feedback_color_index(&req, &non_plain, true), None);
 
-        let secondary = secondary_with_clear([0.0; 4]);
+        let secondary = secondary_with_clear(super::super::types::ColorClearValue::default());
         let secondary_identity = secondary.identity.clone();
         req.secondary_targets.push(secondary);
         assert_eq!(
@@ -7297,7 +7323,18 @@ mod tests {
 
     /// A secondary colour attachment that clears to `clear`; every other field
     /// is irrelevant to the clear-value vector and takes a neutral value.
-    fn secondary_with_clear(clear: [f32; 4]) -> super::super::types::SecondaryColorTarget {
+    fn secondary_with_clear(
+        clear: super::super::types::ColorClearValue,
+    ) -> super::super::types::SecondaryColorTarget {
+        secondary_with_attachment(super::super::types::ColorAttachmentState::new(
+            crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+            clear,
+        ))
+    }
+
+    fn secondary_with_attachment(
+        attachment: super::super::types::ColorAttachmentState,
+    ) -> super::super::types::SecondaryColorTarget {
         super::super::types::SecondaryColorTarget {
             identity: super::super::types::TargetIdentity::Surface {
                 id: 1,
@@ -7308,8 +7345,7 @@ mod tests {
             },
             width: 16,
             height: 16,
-            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
-            clear,
+            attachment,
             load: false,
             blend: None,
             color_write_mask: Default::default(),
@@ -7333,10 +7369,17 @@ mod tests {
     #[test]
     fn every_attachment_takes_its_own_clear_and_the_primary_takes_the_guests() {
         let req = DrawRequest {
-            target_clear: [0.25, 0.5, 0.75, 1.0],
+            color_attachment: Some(super::super::types::ColorAttachmentState::new(
+                crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+                super::super::types::ColorClearValue::Float([0.25, 0.5, 0.75, 1.0]),
+            )),
             secondary_targets: vec![
-                secondary_with_clear([1.0, 0.0, 0.0, 1.0]),
-                secondary_with_clear([0.0, 1.0, 0.0, 0.5]),
+                secondary_with_clear(super::super::types::ColorClearValue::Float([
+                    1.0, 0.0, 0.0, 1.0,
+                ])),
+                secondary_with_clear(super::super::types::ColorClearValue::Float([
+                    0.0, 1.0, 0.0, 0.5,
+                ])),
             ],
             depth: Some(super::super::types::DepthState {
                 // No guest depth texture: this synthetic request exercises the
@@ -7377,6 +7420,35 @@ mod tests {
         let clear = clear_values(&DrawRequest::default());
         assert_eq!(clear.len(), 1, "no secondaries and no depth is one entry");
         unsafe { assert_eq!(clear[0].color.float32, [0.0; 4]) };
+    }
+
+    /// Integer attachments select Vulkan's integer clear member on every MRT
+    /// slot. Reading the same union through `float32` was the old bug: `1.0`
+    /// became the integer bit pattern `1065353216` instead of the integer value
+    /// `1`.
+    #[test]
+    fn integer_attachment_clears_use_integer_union_members() {
+        use crate::contract::pixel_format::MTL_FORMAT_RG16_UINT;
+
+        let attachment = crate::backend::vulkan::translate::pixel::color_attachment(
+            MTL_FORMAT_RG16_UINT,
+        )
+        .unwrap()
+        .0;
+
+        let req = DrawRequest {
+            color_attachment: Some(attachment.with_clear([1.0, 2.0, 65_535.0, 0.0])),
+            secondary_targets: vec![secondary_with_attachment(
+                attachment.with_clear([5.0, 6.0, 7.0, 8.0]),
+            )],
+            ..DrawRequest::default()
+        };
+
+        let clear = clear_values(&req);
+        unsafe {
+            assert_eq!(clear[0].color.uint32, [1, 2, 65_535, 0]);
+            assert_eq!(clear[1].color.uint32, [5, 6, 7, 8]);
+        }
     }
 
     /// This draw's own snapshot copy is recorded after the registry's access is

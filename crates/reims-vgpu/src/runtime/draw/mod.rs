@@ -3064,38 +3064,46 @@ pub(crate) fn load_action_in_contract(pipeline_ref: u32, load_action: u16) -> bo
     false
 }
 
-/// Report an *in-contract* `MTLLoadActionDontCare`, which the Vulkan arm cannot
-/// spell and raises to a clear.
+/// Report the **residual** in-contract `MTLLoadActionDontCare` — one this
+/// device could find no prior contents for, so the Vulkan arm still raises it
+/// to a clear.
 ///
 /// [`load_action_in_contract`] only speaks for the fourth value and above. The
-/// three inside the set are where the two encode arms part:
+/// three inside the set are where the two encode arms used to part:
 ///
 /// - `backend::metal::render`'s `color_rt_load_action` has a DontCare arm and
 ///   passes it through, so Metal gets the attachment the guest asked for and
 ///   skips the load entirely.
-/// - The Vulkan engine's render-pass key carries `load_seed: bool`, derived from
-///   whether a seed was *resolved* rather than from the guest's ordinal, so
-///   DontCare and Clear reach `caches.rs` as the same key and both become
-///   `vk::AttachmentLoadOp::CLEAR` against the record's clear colour.
+/// - The Vulkan engine's render-pass key carries `load_seed: bool`, derived
+///   from whether a seed was *resolved* rather than from the guest's ordinal.
 ///   `vk::AttachmentLoadOp::DONT_CARE` is unreachable for a colour or depth
-///   attachment on that arm.
+///   attachment on that arm, so a DontCare that arrives with no seed keys the
+///   same as a Clear and `caches.rs` resolves it to
+///   `vk::AttachmentLoadOp::CLEAR` against the record's clear colour.
 ///
-/// Clearing satisfies DontCare — the contract permits any contents — so this is
-/// not lost guest work and the line is on the OFF channel. What it is not is
-/// free: the substitution costs a full-surface clear per pass, and it replaces
+/// **That is no longer the whole population, and this line is what changed
+/// with it.** A DontCare now enters the same seed doors as a Load, because
+/// undefined permits the prior contents and preserving is the realization the
+/// guest relies on — see
+/// [`crate::contract::pass_action::LoadAction::preserves_prior_contents`]. The
+/// count that argued for that widening was this one: a driven macos-15 boot ran
+/// `passbegin_clear` exactly `color0_declared_dontcare` above the clears the
+/// guest asked for, an identity rather than a correlation, which also proved
+/// every DontCare pass took the clear arm.
+///
+/// So this now reports only the cases where a door came back empty. Clearing
+/// still satisfies DontCare — the contract permits any contents — so it is not
+/// lost guest work and the line stays on the OFF channel. What it is not is
+/// free: the substitution costs a full-surface clear per pass and replaces
 /// Metal's undefined contents with one specific value, which a guest that only
 /// partly covers the attachment would see.
 ///
-/// Nothing is changed here, deliberately. Plumbing the ordinal through to the
-/// pass key is a behaviour change on the pathway that renders, and the first
-/// thing needed is a reading of whether a guest sends DontCare at all — the same
-/// answer [`store_action_in_contract`]'s doc asks for on the adjacent wire word.
-/// A non-zero count here is the argument for widening the key; a zero says the
-/// bool was always enough.
-///
-/// Latched on `(pipeline, slug)` like its siblings: a guest that means DontCare
-/// means it every frame, and repetition would carry nothing the first line did
-/// not.
+/// **This is a latched line and not a counter**, so do not read it as the size
+/// of the residual population. It is `degrade_log_first(pipeline, slug)` —
+/// one message per pipeline, because a guest that means DontCare means it
+/// every frame. The counts live on the census: `color0_declared_dontcare` is
+/// the declared population and `dontcare_seed_served`/`dontcare_seed_empty`
+/// split it by whether a door answered.
 #[cfg(feature = "backend-vulkan")]
 pub(crate) fn note_load_action_dont_care(pipeline_ref: u32, width: u32, height: u32) {
     if degrade_log_first(pipeline_ref, "load_action_dont_care_cleared") {
@@ -4944,7 +4952,7 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
     rgba: &[u8],
     allowed: crate::runtime::gva_view::WindowPages<'_>,
 ) -> Result<(), crate::runtime::host::MemError> {
-    write_gva_rows_within(
+    write_gva_frame_within(
         state,
         host,
         task_id,
@@ -4953,86 +4961,57 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
         height,
         bpr,
         format,
-        rgba,
-        SourceRows::Distinct,
+        FrameRows::Rgba8(rgba),
         allowed,
     )
 }
 
-/// Land a solid colour into a GVA render target.
+/// What a frame's source rows are, on their way into the guest's own pages.
 ///
-/// One tight RGBA8 row is built and handed to the same writer every full-image
-/// landing uses, with [`SourceRows::Repeated`] — so the format conversion runs
-/// once for the whole surface instead of once per row, and the caller never
-/// materialises an image at all.
+/// A Store lands one of two things, and which one is not a property of the
+/// guest's destination — it is a property of what the resident held and whether
+/// the readback could narrow it. Naming both here is what lets the copying rail
+/// serve a destination whose texel has no eight-bit form at all: the RGBA8 arm
+/// converts per row, and the native arm is a memcpy because the bytes are
+/// already the destination's.
 ///
-/// This is the CLEAR seed's whole path. Everything it lands is `w * h` copies of
-/// one word; the previous route built that word into a full-surface buffer,
-/// re-converted each of its identical rows into the destination format, and
-/// copied them one at a time. `clear_seed_gva_us` measured **118 ms a second for
-/// 175 MB** on the load probe's `blur=40` dial, which is 0.7 GB/s for a copy.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the same target GVA and native row geometry every GVA writer takes"
-)]
-// The CLEAR seed at the head of a draw chain is the only caller, and it is the
-// Vulkan rail's; the Metal rail seeds through its own encoder.
-#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
-pub(crate) fn write_gva_solid8<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    task_id: u32,
-    gva: u64,
-    width: u32,
-    height: u32,
-    bpr: u32,
-    format: u16,
-    clear: &[f64; 4],
-) -> Result<(), crate::runtime::host::MemError> {
-    let row = pixel_format::solid_rgba8(width, 1, clear);
-    write_gva_rows_within(
-        state,
-        host,
-        task_id,
-        gva,
-        width,
-        height,
-        bpr,
-        format,
-        &row,
-        SourceRows::Repeated,
-        None,
-    )
-}
-
-/// Whether the source buffer holds one row per destination row, or a single row
-/// every destination row is a copy of.
-///
-/// The distinction is worth a type because it decides how many *format
-/// conversions* the write performs, and that is the whole cost of a solid
-/// landing: a CLEAR seed converts one 7 KiB row and then converts it again for
-/// every one of a thousand identical rows. Measured on the load probe's
-/// `blur=40` dial, `clear_seed_gva_us` was **118 ms a second for 175 MB** —
-/// 0.7 GB/s, where the copy alone would be an order of magnitude faster.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SourceRows {
-    /// `height` rows of `width` RGBA8 texels, one per destination row.
-    Distinct,
-    /// One row of `width` RGBA8 texels, written to every destination row.
+/// The native arm is only ever reached when the frame's layout and the
+/// destination's are the same layout — `store_texel_order`'s question, which the
+/// GPU-direct rail has always asked and the copying rail could not.
+pub(crate) enum FrameRows<'a> {
+    /// Semantic RGBA8, converted into the destination's texel one row at a time.
+    Rgba8(&'a [u8]),
+    /// Already the destination's texel, copied verbatim.
     ///
-    /// Constructed only by [`write_gva_solid8`], which the Metal rail does not
-    /// reach — the two arms seed a CLEAR through different encoders.
+    /// Produced only by the Vulkan Store's readback, the one rail that can hand
+    /// back a resident's own texel. The Metal arm has no producer for it and the
+    /// writer below still has to name it.
     #[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
-    Repeated,
+    Native(&'a [u8]),
 }
 
-/// [`write_gva_rgba8_within`] and [`write_gva_solid8_within`] share this body;
-/// [`SourceRows`] is the only difference between them.
+impl<'a> FrameRows<'a> {
+    fn bytes(&self) -> &'a [u8] {
+        match *self {
+            Self::Rgba8(b) | Self::Native(b) => b,
+        }
+    }
+
+    /// Bytes one source row occupies, which is the destination's tight row for
+    /// the native arm and always four bytes a texel for the RGBA8 one.
+    fn source_row_bytes(&self, width: u32, tight: u32) -> usize {
+        match self {
+            Self::Rgba8(_) => (width as usize).saturating_mul(RGBA8_BPP as usize),
+            Self::Native(_) => tight as usize,
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
-    reason = "the archive writer mirrors the target GVA and native row geometry"
+    reason = "mirrors the target GVA and native row geometry"
 )]
-fn write_gva_rows_within<M: HostMemory + HostOps>(
+pub(crate) fn write_gva_frame_within<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
@@ -5041,8 +5020,7 @@ fn write_gva_rows_within<M: HostMemory + HostOps>(
     height: u32,
     bpr: u32,
     format: u16,
-    rgba: &[u8],
-    rows: SourceRows,
+    frame: FrameRows<'_>,
     allowed: crate::runtime::gva_view::WindowPages<'_>,
 ) -> Result<(), crate::runtime::host::MemError> {
     use crate::runtime::host::MemError;
@@ -5055,27 +5033,21 @@ fn write_gva_rows_within<M: HostMemory + HostOps>(
     if bpr < tight {
         return Err(MemError::BadArgs);
     }
-    let rgba_row = (width as usize).saturating_mul(RGBA8_BPP as usize);
-    // A repeated source is one row however tall the destination is, which is
-    // also what makes its conversion a one-off below.
-    let src_stride = match rows {
-        SourceRows::Distinct => rgba_row,
-        SourceRows::Repeated => 0,
-    };
-    let need = match rows {
-        SourceRows::Distinct => rgba_row.saturating_mul(height as usize),
-        SourceRows::Repeated => rgba_row,
-    };
-    if rgba.len() < need {
+    let src = frame.bytes();
+    let src_stride = frame.source_row_bytes(width, tight);
+    let need = src_stride.saturating_mul(height as usize);
+    if src.len() < need {
         return Err(MemError::BadArgs);
     }
     let span = (height as u64).saturating_mul(bpr as u64);
-    let mut row = vec![0u8; tight as usize];
-    // A repeated source converts once and every destination row is that same
-    // conversion; a distinct source converts per row. Tracked rather than
-    // branched on inside the loop so the two forms cannot answer differently
-    // about *which* row is in `row` at any point.
-    let mut converted = false;
+    // Only the RGBA8 arm converts into a scratch row; the native arm's bytes
+    // are already the destination's texel and are copied straight out of the
+    // frame, so it must not pay an allocation per Store for a buffer it never
+    // reads.
+    let mut row = match frame {
+        FrameRows::Rgba8(_) => vec![0u8; tight as usize],
+        FrameRows::Native(_) => Vec::new(),
+    };
     // Guest writes resolve through a fresh PT walk at write time — never a
     // cached view (stale-view heap-corruption class; see
     // `gva_view::write_span_within`) —
@@ -5087,47 +5059,61 @@ fn write_gva_rows_within<M: HostMemory + HostOps>(
         let (base, avail) = (span_map.ptr, span_map.avail);
         let mut res = Ok(());
         for y in 0..height as usize {
-            if !converted || src_stride != 0 {
-                let at = y * src_stride;
-                let src = &rgba[at..at + rgba_row];
-                if !pixel_format::convert_rgba8_to_row(format, src, width, &mut row) {
-                    res = Err(MemError::BadArgs);
-                    break;
+            let at = y * src_stride;
+            let out_row: &[u8] = match frame {
+                FrameRows::Rgba8(rgba) => {
+                    if !pixel_format::convert_rgba8_to_row(
+                        format,
+                        &rgba[at..at + src_stride],
+                        width,
+                        &mut row,
+                    ) {
+                        res = Err(MemError::BadArgs);
+                        break;
+                    }
+                    &row
                 }
-                converted = true;
-            }
+                FrameRows::Native(native) => &native[at..at + src_stride],
+            };
             let off = y.saturating_mul(bpr as usize);
-            if off + row.len() > avail {
+            if off + out_row.len() > avail {
                 res = Err(MemError::RunOutOfRange);
                 break;
             }
             // SAFETY: map_fresh_span covers `span`.
             unsafe {
-                std::ptr::copy_nonoverlapping(row.as_ptr(), base.add(off), row.len());
+                std::ptr::copy_nonoverlapping(out_row.as_ptr(), base.add(off), out_row.len());
             }
         }
         crate::runtime::gva_view::unmap_fresh_span(host, span_map);
         return res;
     }
-    // Fragmented GVA: multi-import each converted row via `write_span_within`.
+    // Fragmented GVA: multi-import each row via `write_span_within`.
     for y in 0..height as usize {
-        if !converted || src_stride != 0 {
-            let at = y * src_stride;
-            let src = &rgba[at..at + rgba_row];
-            if !pixel_format::convert_rgba8_to_row(format, src, width, &mut row) {
-                return Err(MemError::BadArgs);
+        let at = y * src_stride;
+        let out_row: &[u8] = match frame {
+            FrameRows::Rgba8(rgba) => {
+                if !pixel_format::convert_rgba8_to_row(
+                    format,
+                    &rgba[at..at + src_stride],
+                    width,
+                    &mut row,
+                ) {
+                    return Err(MemError::BadArgs);
+                }
+                &row
             }
-            converted = true;
-        }
+            FrameRows::Native(native) => &native[at..at + src_stride],
+        };
         let row_gva = gva.saturating_add((y as u64).saturating_mul(bpr as u64));
         if let Err(err) = crate::runtime::gva_view::write_span_within(
-            state, host, task_id, row_gva, &row, allowed,
+            state, host, task_id, row_gva, out_row, allowed,
         ) {
             let reason = crate::observe::Decline::slug(&err);
             crate::observe::fail(format!(
                 "gva_write fail reason={reason} task={task_id} gva={row_gva:#x} span={span:#x} \
-                 row={y} rowlen={:#x} (rgba8 multi)",
-                row.len()
+                 row={y} rowlen={:#x} (multi)",
+                out_row.len()
             ));
             return Err(err);
         }
