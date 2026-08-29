@@ -7332,3 +7332,58 @@ fn the_buffer_backed_texture_rail_pays_for_its_texture_reference() {
         "the sampled bind never asked the ledger what its texture reference owed"
     );
 }
+
+/// A DontCare colour attachment is still a candidate to be served its prior
+/// contents.
+///
+/// The behavioural half of `only_a_clear_refuses_the_attachments_prior_contents`.
+/// Without it a DontCare record never reaches a seed door, the request arrives
+/// at the engine with no seed, `PassKey::single` reads that as "no seed" and
+/// `caches.rs` spells the attachment `AttachmentLoadOp::CLEAR` — so every texel
+/// the pass does not itself draw becomes the record's clear colour. On a driven
+/// macos-15 boot that showed up as `passbegin_clear` running exactly
+/// `color0_declared_dontcare` above the clears the guest actually asked for, on
+/// every boot it was measured.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_dontcare_colour_attachment_is_still_served_its_prior_contents() {
+    use crate::contract::pass_action::{
+        MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_DONT_CARE, MTL_LOAD_ACTION_LOAD,
+    };
+    use crate::runtime::draw::vulkan::type11_load_is_a_seed_candidate;
+
+    let mut c0 = ColorRtRequest {
+        load_action: MTL_LOAD_ACTION_LOAD,
+        target_seed_rgba: None,
+        ..Default::default()
+    };
+    assert!(
+        type11_load_is_a_seed_candidate(&c0),
+        "a LOAD has always been a candidate"
+    );
+
+    c0.load_action = MTL_LOAD_ACTION_DONT_CARE;
+    assert!(
+        type11_load_is_a_seed_candidate(&c0),
+        "DontCare declares the prior contents undefined, and undefined permits \
+         the prior contents — the guest redraws only its damage rect and relies \
+         on the rest surviving, which is what the Metal arm gives it"
+    );
+
+    c0.load_action = MTL_LOAD_ACTION_CLEAR;
+    assert!(
+        !type11_load_is_a_seed_candidate(&c0),
+        "a Clear must not be served a seed: resolving one would spell the pass \
+         key LOAD and silently ignore the clear the guest asked for"
+    );
+
+    // An explicit seed chosen by RT provenance still wins over the resident, on
+    // DontCare exactly as on LOAD: the two gates are independent and widening
+    // the action must not widen this one.
+    c0.load_action = MTL_LOAD_ACTION_DONT_CARE;
+    c0.target_seed_rgba = Some(vec![0u8; 4]);
+    assert!(
+        !type11_load_is_a_seed_candidate(&c0),
+        "an explicit provenance seed still excludes the resident candidate"
+    );
+}

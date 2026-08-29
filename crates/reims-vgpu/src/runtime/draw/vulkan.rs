@@ -6291,13 +6291,45 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
                 reason: crate::runtime::census::present_proxy::MrtDrop::AliasesPrimary,
             });
         }
-        // Same three-into-two collapse as the primary slot below: a secondary
-        // attachment's DontCare reaches the engine as "no seed", which its pass
-        // key spells as CLEAR.
-        if c.load_action == MTL_LOAD_ACTION_DONT_CARE {
+        // A secondary attachment opens with the same 28-byte prefix as the
+        // primary and the depth slot, so its load action carries the same
+        // meaning — see
+        // [`crate::contract::pass_action::LoadAction::preserves_prior_contents`].
+        //
+        // It has no seed door of its own: this key bit is the whole decision.
+        // So what stands in for "were the prior contents resolved" is the
+        // registry's own record of whether the resident holds this identity's
+        // pixels, and that record is load-bearing rather than cautious — the
+        // target pool recycles an image across surfaces and inserts the
+        // recycled slot `content_ready=false` precisely because its bytes
+        // belong to the previous tenant. A LOAD taken without it composites
+        // this pass onto another surface's picture.
+        //
+        // The two preserving actions differ only in where they land when the
+        // registry cannot answer, and they differ because the contract's
+        // strictness differs. A Load *requires* the prior contents, so it still
+        // loads and `load_seed_lost` is what names the shortfall. A DontCare
+        // merely *permits* them, so with nothing to preserve it falls back to
+        // the clear — which is legal for it, and is the arm that cannot leak a
+        // previous tenant.
+        let declared = crate::contract::pass_action::LoadAction::from_declared(c.load_action);
+        let load = match declared {
+            crate::contract::pass_action::LoadAction::Clear => false,
+            crate::contract::pass_action::LoadAction::Load => true,
+            crate::contract::pass_action::LoadAction::DontCare => {
+                crate::backend::vulkan::engine::resident_content_ready(&identity)
+            }
+        };
+        if matches!(
+            declared,
+            crate::contract::pass_action::LoadAction::DontCare
+        ) && !load
+        {
+            // Reported only where it still costs the guest: a DontCare whose
+            // resident cannot answer for the attachment is the one that still
+            // becomes a clear over live content.
             super::note_load_action_dont_care(pipeline.object_id, c.width, c.height);
         }
-        let load = c.load_action == MTL_LOAD_ACTION_LOAD;
         let clear = [
             c.clear_color[0] as f32,
             c.clear_color[1] as f32,
@@ -7913,15 +7945,34 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // `load_action` was already folded to DontCare above for anything
             // out of contract, so this fold is exact and the two spellings
             // cannot disagree.
-            let (declared_n, declared_area) =
-                crate::contract::pass_action::LoadAction::from_declared(load_action).census_routes();
+            use crate::contract::pass_action::LoadAction;
+            let declared = LoadAction::from_declared(load_action);
+            let (declared_n, declared_area) = declared.census_routes();
             crate::runtime::drain::note_store_route(declared_n);
             crate::runtime::drain::note_store_route_n(declared_area, declared_px);
-            match load_action {
-                MTL_LOAD_ACTION_LOAD if chain_load_from_target => {
+            // Load and DontCare share every arm below, and that sharing is the
+            // contract rather than a shortcut. `MTLLoadActionDontCare` says the
+            // prior contents are *undefined*, and undefined permits any
+            // contents — including the ones already there. Preserving is
+            // therefore a legal realization of DontCare, and it is the one the
+            // guest relies on: it declares DontCare and then redraws only its
+            // damage rect, because on Apple hardware the texture memory
+            // persists. `backend::metal::render` passes the same wire word
+            // straight to Metal, which preserves, so seeding here is what stops
+            // the two backends from disagreeing about one attachment prefix.
+            //
+            // Clearing is also legal, and it is what this arm used to do by
+            // falling through with no seed — `PassKey::single` reads "no seed"
+            // and `caches.rs` resolves it to `AttachmentLoadOp::CLEAR`. That
+            // wrote a definite colour over live guest content: every pass the
+            // guest declared DontCare on, and no other, which is why a boot's
+            // `passbegin_clear` ran exactly `color0_declared_dontcare` above
+            // the clears the guest actually asked for.
+            match declared {
+                LoadAction::Load | LoadAction::DontCare if chain_load_from_target => {
                     // Resident target carries the chain; no CPU seed bytes.
                 }
-                MTL_LOAD_ACTION_CLEAR => {
+                LoadAction::Clear => {
                     // The pass clears the attachment. No seed: a seed would
                     // resolve this pass key to LOAD, which is the opposite of
                     // what the guest asked for, and would spend an allocation, a
@@ -7934,7 +7985,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         c0.clear_color[3] as f32,
                     ];
                 }
-                MTL_LOAD_ACTION_LOAD => {
+                LoadAction::Load | LoadAction::DontCare => {
                     // Which door this pass took, so a pass that ends with no
                     // seed says which source was supposed to have one. A LOAD
                     // means the guest is compositing *onto what is already
@@ -7987,25 +8038,32 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // independently driven x86/Vulkan boots: 1 558, 395 and 295
                     // colour LOAD seed resolutions, and 0 serves plus 0 misses
                     // at that door in every one.
-                    note_load_seed_outcome(
-                        seed_door,
-                        target_rgba8.is_some() || target_guest_seed.is_some(),
-                        c0,
-                        w,
-                        h,
-                    );
+                    if matches!(declared, LoadAction::DontCare) {
+                        // The residual DontCare: no door held this surface's
+                        // prior contents, so the pass key still reads "no seed"
+                        // and `caches.rs` still resolves it to CLEAR. Reported
+                        // here rather than for every DontCare, because the ones
+                        // that found a door now preserve — so this line counts
+                        // the cases that still cost the guest its contents
+                        // instead of counting the whole population.
+                        if target_rgba8.is_none() && target_guest_seed.is_none() {
+                            super::note_load_action_dont_care(req.pipeline_ref, w, h);
+                        }
+                    } else {
+                        // `load_seed_lost` stays a LOAD-only signal. A LOAD that
+                        // arrives empty is the previous frame of that layer
+                        // being dropped; a DontCare that arrives empty is what
+                        // the guest declared, and folding the two together would
+                        // retire the one counter that names the defect.
+                        note_load_seed_outcome(
+                            seed_door,
+                            target_rgba8.is_some() || target_guest_seed.is_some(),
+                            c0,
+                            w,
+                            h,
+                        );
+                    }
                 }
-                // DontCare: the guest declared the prior contents undefined, so
-                // arriving with no seed is the contract rather than a loss. It
-                // is still not what the guest asked for — no seed makes this
-                // pass key indistinguishable from a Clear, and `caches.rs`
-                // resolves that key to `AttachmentLoadOp::CLEAR`. Its own arm,
-                // so the third value of a three-valued enum stops sharing the
-                // catch-all with the out-of-contract one two lines above.
-                MTL_LOAD_ACTION_DONT_CARE => {
-                    super::note_load_action_dont_care(req.pipeline_ref, w, h);
-                }
-                _ => {}
             }
         }
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
@@ -8356,7 +8414,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             resources.guest_target_memory = type11_guest_backing;
             resources.load_guest_target_backing = resources.guest_target_memory.is_some()
                 && req.colors.first().is_some_and(|color| {
-                    color.load_action == MTL_LOAD_ACTION_LOAD && color.target_seed_rgba.is_none()
+                    // Same admission as `type11_load_is_a_seed_candidate`, and
+                    // for the same reason: a DontCare that this device can
+                    // serve prior contents for must be served them, or the
+                    // attachment starts at a colour nothing asked for.
+                    crate::contract::pass_action::LoadAction::from_declared(color.load_action)
+                        .preserves_prior_contents()
+                        && color.target_seed_rgba.is_none()
                 });
         }
         // Type-11 Load used to have a GPU rail here — ~170 lines of front-frame
@@ -8598,7 +8662,25 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 write_enable: ds.depth_write_enabled,
                                 compare,
                                 clear_value,
-                                load: load_action == MTL_LOAD_ACTION_LOAD,
+                                // The depth slot opens with the same 28-byte
+                                // attachment prefix as the colour slots, so its
+                                // action means the same thing: DontCare permits
+                                // the prior contents, and asking for them is
+                                // what stops a pass that tests against earlier
+                                // depth from starting at the clear value. See
+                                // `LoadAction::preserves_prior_contents`.
+                                //
+                                // Widening the *ask* is safe here precisely
+                                // because honouring it is not decided here:
+                                // `honours_load` below gates on the depth
+                                // resident actually holding content and
+                                // degrades to CLEAR by name, so a DontCare with
+                                // nothing behind it cannot load an undefined
+                                // image.
+                                load: crate::contract::pass_action::LoadAction::from_declared(
+                                    load_action,
+                                )
+                                .preserves_prior_contents(),
                                 stencil,
                             });
                         }
@@ -9305,12 +9387,20 @@ fn type11_guest_target_backing<H: HostMemory + HostOps>(
     })
 }
 
-/// Whether this record's color0 LOAD is one the resident could serve at all —
-/// it must be a LOAD, and no explicit seed may already have been selected for
-/// it by RT provenance. Separate from the currency question so the two counters
-/// on the branch below divide candidates, not all draws.
-fn type11_load_is_a_seed_candidate(c0: &ColorRtRequest) -> bool {
-    c0.load_action == MTL_LOAD_ACTION_LOAD && c0.target_seed_rgba.is_none()
+/// Whether this record's color0 load is one the resident could serve at all —
+/// it must be an action that composites onto the attachment's prior contents,
+/// and no explicit seed may already have been selected for it by RT provenance.
+/// Separate from the currency question so the two counters on the branch below
+/// divide candidates, not all draws.
+///
+/// DontCare qualifies alongside Load: see
+/// [`crate::contract::pass_action::LoadAction::preserves_prior_contents`] for
+/// why undefined contents permit the prior ones, and why serving them is what
+/// keeps this arm agreeing with the Metal one.
+pub(super) fn type11_load_is_a_seed_candidate(c0: &ColorRtRequest) -> bool {
+    crate::contract::pass_action::LoadAction::from_declared(c0.load_action)
+        .preserves_prior_contents()
+        && c0.target_seed_rgba.is_none()
 }
 
 /// The `(resident, mapping epoch)` pair a record's type-11 LOAD has to compare to

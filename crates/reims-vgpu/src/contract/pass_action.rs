@@ -92,6 +92,33 @@ impl LoadAction {
         }
     }
 
+    /// Whether a pass with this action composites onto the attachment's prior
+    /// contents, so this device has to resolve those contents rather than let
+    /// the attachment begin at a value it invented.
+    ///
+    /// True for `Load`, which says so, and for `DontCare`, which does not
+    /// forbid it. DontCare declares the prior contents **undefined**, and
+    /// undefined permits *any* contents — including the ones already there. So
+    /// preserving is a legal realization of DontCare and clearing is the only
+    /// reading that destroys, which is what a two-valued `LOAD vs CLEAR`
+    /// spelling silently picks. The guest relies on the preserving reading: it
+    /// declares DontCare and then redraws only its damage rect, because on
+    /// Apple hardware the texture memory persists, and
+    /// `backend::metal::render` hands the same wire word to Metal, which
+    /// preserves. A Vulkan arm that clears therefore disagrees with the Metal
+    /// arm about one attachment prefix.
+    ///
+    /// A `match` rather than a `matches!` so a fourth action fails the build
+    /// here, once, instead of being folded into whichever side the caller's
+    /// catch-all happened to take.
+    #[must_use]
+    pub fn preserves_prior_contents(self) -> bool {
+        match self {
+            Self::Load | Self::DontCare => true,
+            Self::Clear => false,
+        }
+    }
+
     /// The census pair for this action: how many records declared it, and how
     /// many attachment pixels those records covered.
     ///
@@ -222,6 +249,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Clear is the only action that refuses the attachment's prior contents.
+    ///
+    /// The pin that stops the Vulkan arm going back to a two-valued
+    /// `LOAD vs CLEAR` spelling. Folding DontCare onto Clear is what wrote a
+    /// definite colour over live guest content on every pass the guest declared
+    /// undefined — measured on a driven macos-15 boot as a `passbegin_clear`
+    /// that ran exactly `color0_declared_dontcare` above the clears the guest
+    /// actually asked for, on all five boots it was checked on.
+    ///
+    /// The out-of-contract case rides along deliberately: `from_declared` folds
+    /// an unknown ordinal to DontCare, so an unknown action now preserves
+    /// rather than clears. Preserving cannot destroy what the guest did not ask
+    /// to have destroyed, and the value is still reported by name where it is
+    /// decoded.
+    #[test]
+    fn only_a_clear_refuses_the_attachments_prior_contents() {
+        assert!(
+            LoadAction::Load.preserves_prior_contents(),
+            "Load composites onto what is already there"
+        );
+        assert!(
+            LoadAction::DontCare.preserves_prior_contents(),
+            "DontCare declares the prior contents undefined, and undefined \
+             permits the prior contents — so preserving is legal, and it is \
+             what the Metal arm does with the same wire word"
+        );
+        assert!(
+            !LoadAction::Clear.preserves_prior_contents(),
+            "a Clear must still clear: the guest asked for its clear value"
+        );
+        assert!(
+            LoadAction::from_declared(u16::MAX).preserves_prior_contents(),
+            "an out-of-contract ordinal folds to DontCare, and must therefore \
+             preserve rather than destroy"
+        );
     }
 
     /// The six census route names are distinct, and each count is paired with
