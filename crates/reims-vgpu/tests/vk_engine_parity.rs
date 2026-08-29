@@ -2889,6 +2889,62 @@ fn skip_readback_store_then_load_from_target_preserves_content() {
     assert!(engine::resident_content_ready(&identity));
 }
 
+/// A pass with no draw calls still publishes through the target resident. The
+/// following LOAD must observe that clear in queue order; publishing guest bytes
+/// beside the registry would leave this resident holding the older frame.
+#[test]
+fn clear_only_pass_is_the_next_resident_load() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let (w, h) = (16, 16);
+    let identity = TargetIdentity::Gva {
+        gva: 0x2e00_0000,
+        width: w,
+        height: h,
+        generation: 9,
+        format: ash::vk::Format::R8G8B8A8_UNORM,
+    };
+    let request = engine::ClearRequest {
+        identity: identity.clone(),
+        attachment: color_attachment(
+            reims_vgpu::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+            [0.2, 0.4, 0.6, 1.0],
+        ),
+        sample_count: 1,
+        guest_target_memory: None,
+        record_guest_store: false,
+    };
+    match engine::execute_clear_request(&request) {
+        Ok(_) => {}
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {
+            eprintln!("SKIP clear-only resident: {e}");
+            return;
+        }
+        Err(e) => panic!("clear-only resident: {e}"),
+    }
+
+    // A zero-invocation pass preserves the loaded attachment and reads it back,
+    // isolating the value supplied by the preceding clear-only pass.
+    let mut load = engine_req(&v, &f, w, h);
+    load.vertex_count = 0;
+    load.target_identity = Some(identity);
+    load.load_from_target = true;
+    load.color_attachment = Some(color_attachment(
+        reims_vgpu::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+        [0.0; 4],
+    ));
+    let pixels = engine::execute_draw_request(&load)
+        .expect("load after clear-only pass")
+        .pixels;
+    assert_eq!(pixels.len(), (w * h * 4) as usize);
+    for pixel in pixels.chunks_exact(4) {
+        assert!(near(pixel[0], 51), "red = {}", pixel[0]);
+        assert!(near(pixel[1], 102), "green = {}", pixel[1]);
+        assert!(near(pixel[2], 153), "blue = {}", pixel[2]);
+        assert!(near(pixel[3], 255), "alpha = {}", pixel[3]);
+    }
+}
+
 /// Cross-boot retained-frame lock: a device reset must evict identity-keyed
 /// resident images even when the next guest reuses the same id/generation.
 #[test]

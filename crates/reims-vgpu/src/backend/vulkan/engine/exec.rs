@@ -2621,6 +2621,111 @@ fn guest_store_footprint_to_record(
     (requested && guest_backed).then_some(footprint).flatten()
 }
 
+/// Record a clear-only pass through the same resident and queue transaction as
+/// a draw. The render pass itself performs the clear; no pipeline or geometry
+/// exists for this operation.
+pub(crate) unsafe fn execute_clear_inner(
+    owner: &mut ContextOwner,
+    caches: &mut ObjectCaches,
+    pools: &mut ResourcePools,
+    counters: &EngineCounters,
+    req: &super::types::ClearRequest,
+) -> Result<super::types::ClearOutput, DrawError> {
+    let width = req.identity.width();
+    let height = req.identity.height();
+    if width == 0 || height == 0 {
+        return Err(DrawError::DrawValidation(
+            DrawValidationDecline::ZeroTargetGeometry {
+                width,
+                height,
+            },
+        ));
+    }
+    let ctx = owner.ensure(counters)?;
+    pools.ensure_init(ctx, counters)?;
+
+    // Claiming an entry flushes an open draw batch first. The clear is then a
+    // later submission on the same queue, which is the attachment ordering the
+    // decoded stream states.
+    let (cb, fence) = pools.begin_entry(ctx, counters)?;
+    let mut pass_key = PassKey::single(false, req.attachment.format());
+    let sample_count = req.sample_count.max(1);
+    pass_key.sample_count = sample_count;
+    pass_key.host_accessible_color0 = req.guest_target_memory.is_some();
+    let render_pass = caches.get_or_create_pass(ctx, pass_key, counters, pools)?;
+    let compatibility = pass_key.framebuffer_compatibility();
+    let generation = req.identity.generation();
+    let (framebuffer, target_guest_backed, target_guest_footprint) = {
+        let (target, _) = pools.registry_ensure(
+            ctx,
+            req.identity.clone(),
+            width,
+            height,
+            sample_count,
+            render_pass,
+            compatibility,
+            generation,
+            req.attachment.format(),
+            req.guest_target_memory.clone(),
+            counters,
+        )?;
+        (
+            target.framebuffer,
+            target.memory.is_guest_imported(),
+            target.memory.guest_footprint(),
+        )
+    };
+
+    let clear = [vk::ClearValue {
+        color: req.attachment.clear().vk(),
+    }];
+    let begin = vk::RenderPassBeginInfo::default()
+        .render_pass(render_pass)
+        .framebuffer(framebuffer)
+        .render_area(vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width,
+                height,
+            },
+        })
+        .clear_values(&clear);
+    ctx.device
+        .cmd_begin_render_pass(cb, &begin, vk::SubpassContents::INLINE);
+    ctx.device.cmd_end_render_pass(cb);
+    ctx.device
+        .end_command_buffer(cb)
+        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecEndCb, e)))?;
+    let cbs = [cb];
+    match ctx.submit_guest_work(&cbs, fence) {
+        Ok(()) => {}
+        Err(e) if e == vk::Result::ERROR_DEVICE_LOST => {
+            return Err(DrawError::DeviceLost(DeviceLostDecline::Driver {
+                op: DeviceLostOp::DrawSubmit,
+                result: e,
+            }));
+        }
+        Err(e) => return Err(DrawError::VkCall(VkCall::new(VkOp::ExecSubmit, e))),
+    }
+
+    pools.registry_mark_ready_at(&req.identity, pass_key.color_final_layout(0));
+    let guest_store_footprint = guest_store_footprint_to_record(
+        req.record_guest_store,
+        target_guest_backed,
+        target_guest_footprint,
+    );
+    if let Some(footprint) = guest_store_footprint.as_ref() {
+        super::record_guest_write_footprint_debt(pools, &req.identity, footprint);
+    }
+    let sealed = pools.seal_entry(Vec::new(), Vec::new());
+    pools.finish_entry_async(&ctx.device, sealed);
+    Ok(super::types::ClearOutput {
+        target_guest_backed,
+        guest_store_recorded: guest_store_footprint.is_some(),
+        guest_store_footprint,
+    })
+}
+
 pub(crate) unsafe fn execute_draw_inner(
     owner: &mut ContextOwner,
     caches: &mut ObjectCaches,

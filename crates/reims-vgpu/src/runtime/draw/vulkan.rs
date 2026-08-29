@@ -9987,6 +9987,108 @@ pub(crate) fn gva_chain_identity(
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClearOnlyPublication {
+    /// The clear is resident GPU work and its Store is host-authoritative.
+    Resident,
+    /// This attachment has no protocol lifetime that can retain a resident.
+    CpuRequired,
+    /// The resident operation was attempted and failed visibly.
+    Failed,
+}
+
+fn clear_only_gva_can_be_resident(texture_ref: u32, generation: u64) -> bool {
+    texture_ref != 0 && generation != 0
+}
+
+#[cfg(test)]
+mod clear_only_publication_tests {
+    use super::clear_only_gva_can_be_resident;
+
+    #[test]
+    fn only_a_protocol_owned_gva_lifetime_can_retain_a_clear() {
+        assert!(clear_only_gva_can_be_resident(7, 11));
+        assert!(!clear_only_gva_can_be_resident(0, 11));
+        assert!(!clear_only_gva_can_be_resident(7, 0));
+    }
+}
+
+/// Publish a clear-only GVA pass through the resident target transaction.
+///
+/// The resource generation is resolved before the engine request and carried
+/// unchanged into the writeback debt, so the clear, a later attachment LOAD and
+/// a sampled bind all name one image. Targets without a retained resource
+/// identity stay on the synchronous CPU path; there is no lifetime on which a
+/// host-authoritative Store could be hung.
+pub(crate) fn publish_clear_only_gva<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    mut req: DrawEncodeRequest,
+    clear_color: [f64; 4],
+) -> ClearOnlyPublication {
+    let Some(c0) = req.colors.first() else {
+        return ClearOnlyPublication::CpuRequired;
+    };
+    if c0.target_gva == 0 || c0.mapping_id != 0 {
+        return ClearOnlyPublication::CpuRequired;
+    }
+    if c0.texture_ref == 0 {
+        return ClearOnlyPublication::CpuRequired;
+    }
+    if let Err(error) = crate::backend::vulkan::engine::resolve_render_target_capabilities() {
+        crate::observe::fail(format!(
+            "render_clear reason=vulkan_target_capabilities_unavailable target={:#x} \
+             texture={} error={error}",
+            c0.target_gva, c0.texture_ref
+        ));
+        return ClearOnlyPublication::Failed;
+    }
+    req.gva_alloc_gen = gva_alloc_generation(state, host, &req);
+    let c0 = req.colors.first().expect("the colour target was checked above");
+    if !clear_only_gva_can_be_resident(c0.texture_ref, req.gva_alloc_gen) {
+        return ClearOnlyPublication::CpuRequired;
+    }
+    let Some(identity) = gva_chain_identity(&req) else {
+        return ClearOnlyPublication::CpuRequired;
+    };
+    let attachment = match translate::pixel::color_attachment(c0.format) {
+        Ok((format, _)) => format.with_clear(clear_color),
+        Err(reason) => {
+            crate::observe::Emit::decline("render_clear", &reason)
+                .field("target", format!("{:#x}", c0.target_gva))
+                .field("format", c0.format)
+                .fail();
+            return ClearOnlyPublication::Failed;
+        }
+    };
+    let request = crate::backend::vulkan::engine::ClearRequest {
+        identity: identity.clone(),
+        attachment,
+        sample_count: c0.sample_count,
+        guest_target_memory: None,
+        record_guest_store: false,
+    };
+    if let Err(error) = crate::backend::vulkan::engine::execute_clear_request(&request) {
+        crate::observe::fail(format!(
+            "render_clear reason=vulkan_resident_clear_failed target={:#x} \
+             texture={} {}x{} error={error}",
+            c0.target_gva, c0.texture_ref, c0.width, c0.height
+        ));
+        return ClearOnlyPublication::Failed;
+    }
+    if !crate::runtime::writeback_debt::arm_gva(state, host, task_id, c0, &identity) {
+        crate::observe::fail(format!(
+            "render_clear reason=vulkan_resident_store_unowned target={:#x} \
+             texture={} generation={}",
+            c0.target_gva, c0.texture_ref, req.gva_alloc_gen
+        ));
+        return ClearOnlyPublication::Failed;
+    }
+    crate::runtime::drain::note_store_route("clear_only_gva_resident");
+    ClearOnlyPublication::Resident
+}
+
 /// The format the resident behind a GVA render target must hold: the one the
 /// guest declared for that attachment.
 ///
