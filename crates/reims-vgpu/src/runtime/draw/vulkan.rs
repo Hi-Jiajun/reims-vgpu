@@ -389,9 +389,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             // takes ownership of that buffer, and a closure capturing it by
             // reference would pin it in place — which is the whole cost this
             // rail is removing.
-            fn rgb_stats(rgba: &[u8]) -> (usize, u8) {
-                let (nz, max, _) = crate::observe::rgba_rgb_stats(rgba);
-                (nz, max)
+            fn rgb_stats(rgba: &[u8]) -> (usize, u8, u8) {
+                let s = crate::observe::rgba_rgb_stats(rgba);
+                (s.rgb_nz, s.max_rgb, s.mean_rgb)
             }
             let ok = if c0.mapping_id != 0 {
                 // Unconditional. This used to be `if
@@ -472,27 +472,29 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         if crate::observe::draw_log_enabled() {
                             // Order-independent: both fields reduce over the three
                             // colour channels, so an R/B exchange cannot move them.
-                            let (rgb_nz, max_rgb) = rgb_stats(&bgra);
+                            let (rgb_nz, max_rgb, mean_rgb) = rgb_stats(&bgra);
                             crate::observe::line(format!(
-                                "linux_m2v_store mid={} {}x{} pipe={} import=0 reason=cpu_portability pages=1 rgb_nz={} max={}",
+                                "linux_m2v_store mid={} {}x{} pipe={} import=0 reason=cpu_portability pages=1 rgb_nz={} max={} mean_rgb={}",
                                 c0.mapping_id,
                                 c0.width,
                                 c0.height,
                                 req.pipeline_ref,
                                 rgb_nz,
-                                max_rgb
+                                max_rgb,
+                                mean_rgb
                             ));
                         }
                     } else {
-                        let (rgb_nz, max_rgb) = rgb_stats(&bgra);
+                        let (rgb_nz, max_rgb, mean_rgb) = rgb_stats(&bgra);
                         crate::observe::fail(format!(
-                            "linux_m2v_store mid={} {}x{} pipe={} reason=cpu_portability_write_fail rgb_nz={} max={} fmt={:#x}",
+                            "linux_m2v_store mid={} {}x{} pipe={} reason=cpu_portability_write_fail rgb_nz={} max={} mean_rgb={} fmt={:#x}",
                             c0.mapping_id,
                             c0.width,
                             c0.height,
                             req.pipeline_ref,
                             rgb_nz,
                             max_rgb,
+                            mean_rgb,
                             c0.format
                         ));
                     }
@@ -590,14 +592,14 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         true,
                     );
                 }
-                let (rgb_nz, max_rgb) = rgb_stats(&rgba);
+                let (rgb_nz, max_rgb, mean_rgb) = rgb_stats(&rgba);
                 // A Store that lands is expected control flow and belongs on
                 // the census channel, not the failure one — "non-OFF lines are
                 // the failures" is the rule the whole always-on log is triaged
                 // by. Only the loss gets a failure line, and it carries the
                 // census fields so nothing has to be correlated across two.
                 crate::observe::off(format!(
-                    "m2v_store_gva gva={:#x} {}x{} pipe={} tex_ref={} load={} ok={} rgb_nz={} max_rgb={} bpr={}",
+                    "m2v_store_gva gva={:#x} {}x{} pipe={} tex_ref={} load={} ok={} rgb_nz={} max_rgb={} mean_rgb={} bpr={}",
                     c0.target_gva,
                     c0.width,
                     c0.height,
@@ -607,11 +609,12 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     gva_ok as u8,
                     rgb_nz,
                     max_rgb,
+                    mean_rgb,
                     c0.row_stride
                 ));
                 if !gva_ok {
                     crate::observe::fail(format!(
-                        "linux_m2v_store lost gva={:#x} {}x{} pipe={} tex_ref={} rgb_nz={} max={} bpr={}",
+                        "linux_m2v_store lost gva={:#x} {}x{} pipe={} tex_ref={} rgb_nz={} max={} mean_rgb={} bpr={}",
                         c0.target_gva,
                         c0.width,
                         c0.height,
@@ -619,6 +622,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         c0.texture_ref,
                         rgb_nz,
                         max_rgb,
+                        mean_rgb,
                         c0.row_stride
                     ));
                 }
@@ -626,10 +630,10 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             } else {
                 // No target to write: the frame is lost, so this one is a
                 // failure line and there is no census twin to correlate with.
-                let (rgb_nz, max_rgb) = rgb_stats(&rgba);
+                let (rgb_nz, max_rgb, mean_rgb) = rgb_stats(&rgba);
                 crate::observe::fail(format!(
-                    "linux_m2v_store no_target pipe={} tex_ref={} rgb_nz={} max={}",
-                    req.pipeline_ref, c0.texture_ref, rgb_nz, max_rgb
+                    "linux_m2v_store no_target pipe={} tex_ref={} rgb_nz={} max={} mean_rgb={}",
+                    req.pipeline_ref, c0.texture_ref, rgb_nz, max_rgb, mean_rgb
                 ));
                 false
             };
@@ -2468,7 +2472,8 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
         if !crate::observe::draw_log_enabled() {
             return;
         }
-        let (nz, max, _) = crate::observe::rgba_rgb_stats(rgba);
+        let s = crate::observe::rgba_rgb_stats(rgba);
+        let (nz, max) = (s.rgb_nz, s.max_rgb);
         crate::observe::line(format!(
             "type5_draw_view ok task={task_id} ref={texture_ref} sid={mapping_id} map_gen={map_gen} view={}x{} fmt={:#x} bpp={bpp} base={base_w}x{base_h} base_fmt={base_fmt:#x} off={base_off} bpr={surface_bpr} span_end={span_end} src={generation_source} rgb_nz={nz} max_rgb={max}",
             view.width,

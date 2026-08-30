@@ -742,10 +742,33 @@ unsafe fn bgra_present_stats_sse2(bgra: &[u8]) -> (usize, u8, usize, u8, [u8; 4]
     }
 }
 
-/// Same for tight RGBA8 (m2v encode output).
-pub fn rgba_rgb_stats(rgba: &[u8]) -> (usize, u8, [u8; 4]) {
+/// Same for tight RGBA8 (m2v encode output), plus the mean.
+///
+/// # Why a count of non-zero pixels was not enough
+///
+/// `rgb_nz` counts pixels with `max(R,G,B) > 0`, and that separates a surface
+/// with content from one that is black. It cannot separate a surface with
+/// content from one that is uniformly **white**, because both saturate it: a
+/// 1920x1080 store of live desktop and a 1920x1080 store of flat `0xff` both
+/// report about 2 073 600. The defect this rail is read for is a plane that
+/// comes up uniform white, so the one distinction the record could not make was
+/// the one being looked for -- ten labelled boots were scored on `rgb_nz` and
+/// the white and painted populations overlapped completely.
+///
+/// The mean makes it. Flat white is 255, and this rail's painted desktop
+/// measures near 100 in the same units, so the two are far apart and the
+/// comparison needs no threshold chosen in advance. It is the mean of the same
+/// per-pixel `max(R,G,B)` the other two fields are computed from, in the same
+/// pass, so the three cannot describe different pixels.
+///
+/// Accumulated in `u64`: a 4K surface has more pixels than `u32` can sum at 255
+/// each, and a saturating `u32` would report the brightest surfaces as darker
+/// than they are -- silently, and only for the largest ones.
+pub fn rgba_rgb_stats(rgba: &[u8]) -> RgbaRgbStats {
     let mut rgb_nz = 0usize;
     let mut max_rgb = 0u8;
+    let mut sum = 0u64;
+    let mut count = 0u64;
     let px0 = if rgba.len() >= 4 {
         [rgba[0], rgba[1], rgba[2], rgba[3]]
     } else {
@@ -759,8 +782,45 @@ pub fn rgba_rgb_stats(rgba: &[u8]) -> (usize, u8, [u8; 4]) {
         if m > max_rgb {
             max_rgb = m;
         }
+        sum += u64::from(m);
+        count += 1;
     }
-    (rgb_nz, max_rgb, px0)
+    RgbaRgbStats {
+        rgb_nz,
+        max_rgb,
+        px0,
+        // Zero pixels means no evidence about brightness, and 0 is the only
+        // answer that does not invent one. `rgb_nz` is 0 beside it, so a reader
+        // can tell an empty buffer from a black one.
+        //
+        // The quotient cannot exceed 255 -- every term summed is a `u8` and
+        // there are `count` of them -- so the narrowing is exact rather than
+        // saturating, and stating it as a `u8::try_from` keeps that an
+        // assertion instead of a silent truncation if the accumulation ever
+        // changes shape.
+        mean_rgb: sum
+            .checked_div(count)
+            .and_then(|m| u8::try_from(m).ok())
+            .unwrap_or(0),
+    }
+}
+
+/// What one tight RGBA8 buffer looks like, as the four numbers that travel
+/// together.
+///
+/// A tuple grew to four members and the third and fourth were both plausible
+/// as either position at a call site. Named fields make the emit sites read as
+/// what they print.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RgbaRgbStats {
+    /// Pixels with `max(R,G,B) > 0`.
+    pub rgb_nz: usize,
+    /// Largest `max(R,G,B)` over the buffer.
+    pub max_rgb: u8,
+    /// First pixel, RGBA.
+    pub px0: [u8; 4],
+    /// Mean `max(R,G,B)`; 255 is flat white and this rail's desktop is near 100.
+    pub mean_rgb: u8,
 }
 
 #[cfg(test)]
@@ -968,5 +1028,51 @@ mod tests {
         let (rgb_nz, max_rgb, _) = bgra_rgb_stats(&bgra);
         assert_eq!(rgb_nz, 1);
         assert_eq!(max_rgb, 100);
+    }
+
+    /// A flat white surface and a painted one are the two this record has to
+    /// tell apart, and the non-zero count cannot.
+    ///
+    /// This is the measurement written down: ten labelled boots of the
+    /// blank-field defect were scored on `rgb_nz` and the white and painted
+    /// populations overlapped completely, because both saturate a count of
+    /// pixels with any colour in them. The mean separates them by more than a
+    /// hundred, so no threshold has to be chosen in advance.
+    #[test]
+    fn a_flat_white_surface_is_distinguishable_from_a_painted_one_only_by_the_mean() {
+        let white = vec![0xff_u8; 4 * 64];
+        let mut painted = vec![0u8; 4 * 64];
+        for (i, px) in painted.chunks_exact_mut(4).enumerate() {
+            // Values in this rail's painted range, varied so the buffer is not
+            // itself flat -- a flat grey would make the test pass for the wrong
+            // reason.
+            px[0] = 90 + (i as u8 % 21);
+            px[1] = px[0];
+            px[2] = px[0];
+            px[3] = 0xff;
+        }
+
+        let w = rgba_rgb_stats(&white);
+        let p = rgba_rgb_stats(&painted);
+
+        assert_eq!(
+            w.rgb_nz, p.rgb_nz,
+            "the non-zero count cannot separate these, which is why the mean exists"
+        );
+        assert_eq!(w.mean_rgb, 255, "flat white is the top of the range");
+        assert!(
+            p.mean_rgb < 130,
+            "a painted desktop must land far below white: {}",
+            p.mean_rgb
+        );
+    }
+
+    /// An empty buffer reports no brightness rather than inventing one.
+    #[test]
+    fn an_empty_buffer_reports_a_zero_mean_beside_a_zero_count() {
+        let stats = rgba_rgb_stats(&[]);
+        assert_eq!(stats.mean_rgb, 0);
+        assert_eq!(stats.rgb_nz, 0);
+        assert_eq!(stats.px0, [0, 0, 0, 0]);
     }
 }
