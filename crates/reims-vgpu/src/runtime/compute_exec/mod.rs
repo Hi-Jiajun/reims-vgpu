@@ -1929,6 +1929,138 @@ pub(crate) fn resident_serve(
     .then_some(ResidentServe::Sample(key, mirror_generation))
 }
 
+/// Stage an opcode-9 buffer-backed texture: tight raw texels read out of the
+/// type-1 buffer the guest named, at its declared offset and row pitch.
+///
+/// The contract is `newTextureWithBuffer:descriptor:offset:bytesPerRow:` — the
+/// texels *are* the buffer's bytes, reinterpreted through the embedded texture
+/// descriptor. [`crate::runtime::draw`] executes the same record for the draw
+/// rail; this is its compute twin and reads the same fields the same way,
+/// because one wire form with two disagreeing readers is the defect shape this
+/// repository keeps finding. This arm used to refuse the form outright.
+///
+/// Unlike the draw twin this does **not** convert to RGBA8. [`StagedTexture`]
+/// carries `pixel_format` beside `bytes`, so the native texels survive; the
+/// draw arm narrows because its consumer takes RGBA8, and reports the loss as
+/// `buftex_narrowed`. Here there is no loss to report.
+///
+/// De-pitching is the whole of the work: the guest's rows are `bytes_per_row`
+/// apart and only the leading tight row is texels. The rest is padding the
+/// guest may have written anything into, and folding it into the image is
+/// exactly the failure the conformance battery fills padding with a distinct
+/// pattern to catch.
+fn stage_buffer_texture<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    binding: u32,
+    is_storage: bool,
+    bt: &crate::runtime::decode::resource::BufferTextureDescriptor,
+) -> Result<StagedTexture, ComputeStatus> {
+    let (width, height) = (bt.desc.width, bt.desc.height);
+    if width == 0 || height == 0 {
+        crate::observe::fail(format!(
+            "compute_stage_tex buftex_fail reason=zero_geom ref={texture_ref} buf={} {width}x{height}",
+            bt.buffer_ref
+        ));
+        return Err(ComputeStatus::Unsupported("compute_buftex_zero_geom"));
+    }
+    // A storage binding would have to write *back* through the buffer, which is
+    // a destination contract this arm has no evidence for: no case in the
+    // battery binds a buffer-backed texture writable, and inventing a writeback
+    // here would widen the repair past what it can show. Refused under its own
+    // name so the two questions stay separable in the log.
+    if is_storage {
+        crate::observe::fail(format!(
+            "compute_stage_tex buftex_fail reason=storage_destination ref={texture_ref} buf={} {width}x{height}",
+            bt.buffer_ref
+        ));
+        return Err(ComputeStatus::Unsupported(
+            "compute_buffer_texture_storage_unsupported",
+        ));
+    }
+    let format = if bt.desc.pixel_format != 0 {
+        bt.desc.pixel_format
+    } else {
+        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+    };
+    let Some(tight) = pixel_format::tight_row_bytes(width, format) else {
+        crate::observe::fail(format!(
+            "compute_stage_tex buftex_fail reason=unknown_fmt ref={texture_ref} buf={} fmt={format:#x} {width}x{height}",
+            bt.buffer_ref
+        ));
+        return Err(ComputeStatus::Unsupported("compute_buftex_fmt"));
+    };
+    // A declared `bytesPerRow` of 0 means tight rows — the API default a
+    // single-row or unpadded texture serializes as. Same reading as the draw
+    // twin; the two arms must not differ on it.
+    let bpr = if bt.bytes_per_row == 0 {
+        u64::from(tight)
+    } else {
+        bt.bytes_per_row
+    };
+    if bpr < u64::from(tight) {
+        crate::observe::fail(format!(
+            "compute_stage_tex buftex_fail reason=bpr_short ref={texture_ref} buf={} bpr={bpr} tight={tight} {width}x{height} fmt={format:#x}",
+            bt.buffer_ref
+        ));
+        return Err(ComputeStatus::Unsupported("compute_buftex_bpr_short"));
+    }
+    // The span the guest's rows actually occupy. Every row is `bpr` apart, but
+    // the last one only needs its texels: demanding a full trailing pitch would
+    // refuse a texture whose final row sits at the very end of the allocation.
+    let Some(span) = bpr
+        .checked_mul(u64::from(height) - 1)
+        .and_then(|s| s.checked_add(u64::from(tight)))
+        .and_then(|s| usize::try_from(s).ok())
+    else {
+        crate::observe::fail(format!(
+            "compute_stage_tex buftex_fail reason=span_overflow ref={texture_ref} buf={} bpr={bpr} {width}x{height}",
+            bt.buffer_ref
+        ));
+        return Err(ComputeStatus::Unsupported("compute_buftex_span"));
+    };
+    // A buffer-backed texture is two contract references over one allocation —
+    // the type-8 texture the guest binds and the type-1 buffer that owns the
+    // storage — and a debt may be armed under either. The draw twin pays for
+    // both; so does this.
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
+    let raw = read_buffer_window(state, host, task_id, bt.buffer_ref, bt.offset, span)?;
+
+    let tight = tight as usize;
+    let bpr = bpr as usize;
+    let mut bytes = vec![0u8; tight * height as usize];
+    for y in 0..height as usize {
+        let src = y * bpr;
+        bytes[y * tight..(y + 1) * tight].copy_from_slice(&raw[src..src + tight]);
+    }
+    crate::observe::off(format!(
+        "compute_stage_tex buftex_ok ref={texture_ref} buf={} fmt={format:#x} {width}x{height} off={} bpr={bpr} tight={tight}",
+        bt.buffer_ref, bt.offset
+    ));
+    Ok(StagedTexture {
+        binding,
+        #[cfg(feature = "backend-vulkan")]
+        array_element: 0,
+        #[cfg(feature = "backend-vulkan")]
+        descriptor_count: 1,
+        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+        texture_ref,
+        pixel_format: format,
+        storage_selector: pixel_format::storage_selector(format),
+        width,
+        height,
+        bytes,
+        is_storage,
+        #[cfg(feature = "backend-vulkan")]
+        residency: None,
+        #[cfg(feature = "backend-vulkan")]
+        serve: None,
+        writeback: TextureWriteback::None,
+    })
+}
+
 /// Load tight raw texels for a compute texture binding (type-2/3, type-5→surface, or type-11).
 ///
 /// Type-5 (`RefTextureHandle`) is the live CI wallpaper path (`compute_stage_tex … ot=5`).
@@ -1954,6 +2086,8 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     let mut view_level = 0;
     let mut view_pixel_format = None;
     let mut heap_texture = None;
+    let mut buffer_texture: Option<crate::runtime::decode::resource::BufferTextureDescriptor> =
+        None;
     // A linear texture object (type-2/3) must resolve through its own
     // descriptor, never through the mapping registry: its numeric ref shares
     // the id space with type-4 surface mids, so the `mappings.contains(ref)`
@@ -2039,13 +2173,24 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             } else if opcode == TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE
                 || opcode == TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE
             {
-                crate::observe::fail(format!(
-                    "compute_stage_tex view_fail reason=buffer_texture_unsupported ref={texture_ref} opcode={opcode} desc_len={}",
-                    desc.len()
-                ));
-                return Err(ComputeStatus::Unsupported(
-                    "compute_buffer_texture_unsupported",
-                ));
+                // The same wire form `runtime::draw` decodes and executes, read
+                // through the same decoder. This arm used to refuse it.
+                let bt =
+                    match crate::runtime::decode::resource::decode_buffer_texture_descriptor(&desc)
+                    {
+                        Ok(bt) => bt,
+                        Err(error) => {
+                            crate::observe::Emit::decline("compute_stage_tex_buftex", &error)
+                                .field("ref", texture_ref)
+                                .field("opcode", format!("{opcode:#x}"))
+                                .field("len", desc.len())
+                                .fail();
+                            return Err(ComputeStatus::MissingTexture(
+                                "compute_stage_tex_buftex_desc",
+                            ));
+                        }
+                    };
+                buffer_texture = Some(bt);
             } else {
                 let view = match crate::runtime::draw::resolve_texture_view_reasoned(
                     state,
@@ -2082,6 +2227,9 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 view_pixel_format = view.pixel_format;
             }
         }
+    }
+    if let Some(bt) = buffer_texture {
+        return stage_buffer_texture(state, host, task_id, texture_ref, binding, is_storage, &bt);
     }
     if let Some((heap_ref, use_offset, offset, descriptor)) = heap_texture {
         if descriptor.texture_type != 2

@@ -1090,11 +1090,13 @@ const HEAP_TEXTURE_WIDE_OFFSET: usize = OP_HDR + offset_of!(w_heap::NewHeapTextu
 // and the body is {u64 offset, u64 bytesPerRow, embedded MTLTextureDescriptor}.
 pub const TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE: u32 = w_backed::OPCODE_BUFFER_TEXTURE;
 #[cfg(test)]
-const BUF_TEX_DESC_BUFFER_REF: usize = OP_HDR + offset_of!(w_backed::BufferTextureBody, buffer_ref);
+pub(crate) const BUF_TEX_DESC_BUFFER_REF: usize =
+    OP_HDR + offset_of!(w_backed::BufferTextureBody, buffer_ref);
 #[cfg(test)]
-const BUF_TEX_DESC_OFFSET: usize = OP_HDR + offset_of!(w_backed::BufferTextureBody, offset);
+pub(crate) const BUF_TEX_DESC_OFFSET: usize =
+    OP_HDR + offset_of!(w_backed::BufferTextureBody, offset);
 #[cfg(test)]
-const BUF_TEX_DESC_BYTES_PER_ROW: usize =
+pub(crate) const BUF_TEX_DESC_BYTES_PER_ROW: usize =
     OP_HDR + offset_of!(w_backed::BufferTextureBody, bytes_per_row);
 // The embedded `PGSerializedTextureDescriptor` is not named here at all: there
 // is one decoder for it and everything inside it is at that decoder's own
@@ -1107,7 +1109,8 @@ pub const BUF_TEX_MIN_LEN: usize = w_backed::BUFFER_TEXTURE_TOTAL_LEN as usize;
 // the descriptor keep their offsets; only the descriptor widens.
 pub const TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE: u32 = w_backed::OPCODE_BUFFER_TEXTURE_WIDE;
 #[cfg(test)]
-const BUF_TEX_WIDE_DESC_BODY: usize = OP_HDR + offset_of!(w_backed::BufferTextureWideBody, desc);
+pub(crate) const BUF_TEX_WIDE_DESC_BODY: usize =
+    OP_HDR + offset_of!(w_backed::BufferTextureWideBody, desc);
 pub const BUF_TEX_WIDE_LEN: usize = w_backed::BUFFER_TEXTURE_WIDE_TOTAL_LEN as usize;
 // MTLTextureType values (Metal.framework Headers/MTLTextureType.h).
 pub const TEXTURE_VIEW_MTL_TYPE_1D: u16 = 0;

@@ -2911,3 +2911,144 @@ fn a_sampled_image_the_kernel_uses_and_the_guest_left_empty_gets_a_neutral_textu
     // invented back into the list.
     assert_eq!(neutral_sampled_image_bindings(&spirv, &[99]), vec![33]);
 }
+
+/// A buffer-backed texture (opcode 9) bound to a compute *read* is staged from
+/// the type-1 buffer's own bytes, de-pitched to tight rows in its native
+/// format.
+///
+/// This arm refused the whole wire form until now, while `runtime::draw`
+/// decoded and executed it — two execution arms disagreeing about one record.
+///
+/// The row padding carries a value that appears nowhere in the texels, because
+/// the failure this guards against is not "no bytes" but "the padding folded
+/// into the image", which produces a plausible picture that is wrong by one
+/// stride per row. The conformance battery fills padding the same way and for
+/// the same reason.
+#[test]
+fn a_buffer_backed_texture_stages_its_texels_without_the_row_padding() {
+    use crate::contract::endian::st16;
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        BUF_TEX_DESC_BUFFER_REF, BUF_TEX_DESC_BYTES_PER_ROW, BUF_TEX_DESC_OFFSET,
+        BUF_TEX_WIDE_DESC_BODY, BUF_TEX_WIDE_LEN, TEXTURE_VIEW_DESC_LEN, TEXTURE_VIEW_DESC_OPCODE,
+        TEXTURE_VIEW_DESC_TEXTURE_REF, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
+    };
+    use reims_vgpu_wire::ops::texture::WideTextureDescriptorBody as W;
+
+    const W_TEXELS: usize = 4;
+    const H_ROWS: usize = 3;
+    const BPP: usize = 4; // BGRA8Unorm
+    const TIGHT: usize = W_TEXELS * BPP;
+    const PITCH: usize = TIGHT + 8; // eight bytes of padding per row
+    const PAD: u8 = 0xEE;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
+
+    // Texel bytes are position-dependent so a row served from the wrong offset
+    // is a different value, not merely a shifted one.
+    let mut pixels = vec![PAD; PITCH * H_ROWS];
+    for y in 0..H_ROWS {
+        for x in 0..TIGHT {
+            pixels[y * PITCH + x] = (y * 0x10 + x) as u8;
+        }
+    }
+    let buf_gva = 5u64 << RESOURCE_PAGE_SHIFT;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &pixels);
+
+    // Type-1 buffer object naming that storage.
+    let mut bdesc = vec![0u8; 16];
+    st64(&mut bdesc[0..], (PITCH * H_ROWS) as u64);
+    st32(&mut bdesc[8..], 5);
+    let bdesc_gva = 0x180u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], bdesc_gva, &bdesc);
+    {
+        let off = list_object_entry_offset(7, 32).unwrap();
+        let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(&mut le[0..], (OBJECT_TYPE_BUFFER as u32) | (16u32 << 8));
+        le[4..12].copy_from_slice(&bdesc_gva.to_le_bytes());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
+    }
+
+    // Type-8 buffer-backed texture record over it.
+    let mut body = vec![0u8; crate::runtime::heap_query::WIDE_TEXTURE_BODY_LEN];
+    body[std::mem::offset_of!(W, type_and_flags)] = 0x02; // 2D
+    st16(
+        &mut body[std::mem::offset_of!(W, pixel_format)..],
+        MTL_FORMAT_BGRA8_UNORM,
+    );
+    st32(&mut body[std::mem::offset_of!(W, width)..], W_TEXELS as u32);
+    st32(&mut body[std::mem::offset_of!(W, height)..], H_ROWS as u32);
+    st32(&mut body[std::mem::offset_of!(W, depth)..], 1);
+    st16(&mut body[std::mem::offset_of!(W, mipmap_level_count)..], 1);
+    st16(&mut body[std::mem::offset_of!(W, sample_count)..], 1);
+    st16(&mut body[std::mem::offset_of!(W, array_length)..], 1);
+
+    let mut rec = vec![0u8; BUF_TEX_WIDE_LEN];
+    st32(
+        &mut rec[TEXTURE_VIEW_DESC_OPCODE..],
+        TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
+    );
+    st32(&mut rec[TEXTURE_VIEW_DESC_LEN..], BUF_TEX_WIDE_LEN as u32);
+    st32(&mut rec[TEXTURE_VIEW_DESC_TEXTURE_REF..], 21);
+    st32(&mut rec[BUF_TEX_DESC_BUFFER_REF..], 7);
+    rec[BUF_TEX_DESC_OFFSET..BUF_TEX_DESC_OFFSET + 8].copy_from_slice(&0u64.to_le_bytes());
+    rec[BUF_TEX_DESC_BYTES_PER_ROW..BUF_TEX_DESC_BYTES_PER_ROW + 8]
+        .copy_from_slice(&(PITCH as u64).to_le_bytes());
+    rec[BUF_TEX_WIDE_DESC_BODY..].copy_from_slice(&body);
+
+    let rec_gva = 0x280u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], rec_gva, &rec);
+    {
+        let off = list_object_entry_offset(21, 32).unwrap();
+        let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(
+            &mut le[0..],
+            (crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VIEW as u32)
+                | ((rec.len() as u32) << 8),
+        );
+        le[4..12].copy_from_slice(&rec_gva.to_le_bytes());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
+    }
+
+    let staged = stage_texture_raw(&mut state, &mut host, 1, 21, 0, false)
+        .expect("a buffer-backed texture is a wire form this device decodes");
+
+    assert_eq!(staged.width, W_TEXELS as u32);
+    assert_eq!(staged.height, H_ROWS as u32);
+    assert_eq!(
+        staged.pixel_format, MTL_FORMAT_BGRA8_UNORM,
+        "the native format survives; this arm does not narrow to RGBA8"
+    );
+    assert_eq!(
+        staged.bytes.len(),
+        TIGHT * H_ROWS,
+        "the staged image is tight, not the guest's padded span"
+    );
+    assert!(
+        !staged.bytes.contains(&PAD),
+        "row padding must not reach the image"
+    );
+    for y in 0..H_ROWS {
+        for x in 0..TIGHT {
+            assert_eq!(
+                staged.bytes[y * TIGHT + x],
+                (y * 0x10 + x) as u8,
+                "row {y} byte {x} came from the wrong offset"
+            );
+        }
+    }
+
+    // The destination half is a separate contract with no evidence behind it,
+    // so a writable binding of the same record still refuses, under its own
+    // name rather than the retired blanket one.
+    match stage_texture_raw(&mut state, &mut host, 1, 21, 0, true) {
+        Err(ComputeStatus::Unsupported(slug)) => {
+            assert_eq!(slug, "compute_buffer_texture_storage_unsupported")
+        }
+        Err(other) => panic!("a storage binding must refuse by name, got {other:?}"),
+        Ok(_) => panic!("a storage binding must refuse; this arm has no destination contract"),
+    }
+}
