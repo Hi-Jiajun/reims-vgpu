@@ -1384,7 +1384,7 @@ fn field_patch_verdict(mean: f32, sd: f32) -> &'static str {
 /// The last field pattern reported for each large sampled surface, so the
 /// witness below reports a change rather than a sample.
 static SAMPLED_FIELD_LAST: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<u32, u64>>,
+    std::sync::Mutex<std::collections::HashMap<(u32, u64), u64>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Texels of a sampled surface below which it is not worth asking this
@@ -1418,26 +1418,82 @@ pub fn note_sampled_surface_field<M: HostMemory>(
     texture_ref: u32,
     route: &str,
 ) {
-    if mapping_id == 0 {
+    let Some(window) = SampledFieldWindow::of_mapping(state, mapping_id) else {
+        return;
+    };
+    note_sampled_surface_field_window(state, host, mapping_id, texture_ref, route, window);
+}
+
+/// The texels a sampled bind reads out of one mapping, and where they sit in it.
+///
+/// A whole-surface bind takes its window from the mapping's own declared
+/// geometry. A serialized view over one plane of a multiplanar surface cannot:
+/// the mapping declares the surface's FourCC and the surface's height, and the
+/// plane the bind names has its own format, extent and offset. Handing the
+/// witness a window instead of a mapping is what lets both say what they read
+/// through the same code, and it is why the video planes were silently absent
+/// from this record -- a FourCC has no `bytes_per_pixel` and the mapping-derived
+/// path gave up before it sampled anything.
+#[derive(Clone, Copy)]
+pub struct SampledFieldWindow {
+    /// Texels across, in the bind's own view.
+    pub width: u32,
+    /// Texels down, in the bind's own view.
+    pub height: u32,
+    /// The format these texels are in, for the record rather than for the read.
+    pub format: u32,
+    /// Byte offset of the first texel within the mapping.
+    pub base_off: u64,
+    /// Bytes per row.
+    pub bpr: u32,
+    /// Bytes per texel.
+    pub bpp: u32,
+}
+
+impl SampledFieldWindow {
+    /// The window a whole-surface bind reads: the mapping's own geometry.
+    pub fn of_mapping(state: &DeviceState, mapping_id: u32) -> Option<Self> {
+        let (width, height, format) = state.mappings.get(&mapping_id).and_then(|m| {
+            (m.has_geom && m.mapped)
+                .then_some((m.width, m.height, m.format))
+                .filter(|(_, _, f)| *f != 0)
+        })?;
+        let bpp = pixel_format::bytes_per_pixel(format)?;
+        let (base_off, bpr, _) = state.mappings.get(&mapping_id).and_then(|m| {
+            crate::runtime::mapping_write::type11_sample_window(m, width, height, format)
+        })?;
+        Some(Self {
+            width,
+            height,
+            format: u32::from(format),
+            base_off,
+            bpr,
+            bpp,
+        })
+    }
+}
+
+/// [`note_sampled_surface_field`] over an explicitly named window, for a bind
+/// whose texels are not the mapping's own geometry.
+pub fn note_sampled_surface_field_window<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+    texture_ref: u32,
+    route: &str,
+    window: SampledFieldWindow,
+) {
+    let SampledFieldWindow {
+        width,
+        height,
+        format,
+        base_off,
+        bpr,
+        bpp,
+    } = window;
+    if mapping_id == 0 || u64::from(width) * u64::from(height) < SAMPLED_FIELD_MIN_TEXELS {
         return;
     }
-    let Some((width, height, format)) = state.mappings.get(&mapping_id).and_then(|m| {
-        (m.has_geom && m.mapped)
-            .then_some((m.width, m.height, m.format))
-            .filter(|(w, h, f)| {
-                *f != 0 && u64::from(*w) * u64::from(*h) >= SAMPLED_FIELD_MIN_TEXELS
-            })
-    }) else {
-        return;
-    };
-    let Some(bpp) = pixel_format::bytes_per_pixel(format) else {
-        return;
-    };
-    let Some((base_off, bpr, _)) = state.mappings.get(&mapping_id).and_then(|m| {
-        crate::runtime::mapping_write::type11_sample_window(m, width, height, format)
-    }) else {
-        return;
-    };
     let page_shift = state.page_shift;
     let Some(gpas) = state.mappings.get(&mapping_id).map(|m| {
         m.page_entries
@@ -1508,7 +1564,7 @@ pub fn note_sampled_surface_field<M: HostMemory>(
         let mut last = SAMPLED_FIELD_LAST
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        last.insert(mapping_id, pattern) != Some(pattern)
+        last.insert((mapping_id, base_off), pattern) != Some(pattern)
     };
     if !changed {
         return;
@@ -1529,8 +1585,8 @@ pub fn note_sampled_surface_field<M: HostMemory>(
     let ring = String::new();
     crate::observe::off(format!(
         "sampled_surface_field mid={mapping_id} ref={texture_ref} {width}x{height} \
-         fmt={format:#x} route={route} patches=[{report}] first=0x{first_texel}{ring} \
-         (guest pages, no settle)"
+         fmt={format:#x} off={base_off:#x} bpr={bpr} route={route} patches=[{report}] \
+         first=0x{first_texel}{ring} (guest pages, no settle)"
     ));
 }
 

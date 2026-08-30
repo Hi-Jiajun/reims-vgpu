@@ -1160,6 +1160,39 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 })
                 .unwrap_or(true);
             if needs_materialization {
+                // What this bind reads, before either arm decides how to carry
+                // it. The window is the *view's* -- a plane of a multiplanar
+                // surface has its own format, extent and offset, and the
+                // mapping-derived window cannot describe it, which is why the
+                // video planes were absent from this record.
+                if let Some(bpp) = crate::contract::pixel_format::bytes_per_pixel(view.pixel_format)
+                {
+                    if let Some((base_off, bpr, _)) = state.mappings.get(&mid).and_then(|m| {
+                        crate::runtime::mapping_write::type5_sample_window(
+                            m,
+                            view.plane_index,
+                            view.width,
+                            view.height,
+                            view.pixel_format,
+                        )
+                    }) {
+                        crate::runtime::scanout::note_sampled_surface_field_window(
+                            state,
+                            &*host,
+                            mid,
+                            texture_ref,
+                            "type5_view",
+                            crate::runtime::scanout::SampledFieldWindow {
+                                width: view.width,
+                                height: view.height,
+                                format: u32::from(view.pixel_format),
+                                base_off,
+                                bpr,
+                                bpp,
+                            },
+                        );
+                    }
+                }
                 // Zero-copy the decoded plane straight from guest pages when
                 // it samples byte-identically (video NV12 R8/RG8, BGRA8/
                 // RGBA8). This bypasses the ~1.5 MB/plane/frame CPU read +
