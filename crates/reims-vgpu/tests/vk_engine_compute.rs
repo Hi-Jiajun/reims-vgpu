@@ -1526,3 +1526,66 @@ fn compute_sampled_resident_bind_refuses_a_pyramid() {
         "unexpected error: {text}"
     );
 }
+
+/// `A8Unorm` samples in a dispatch as `(0, 0, 0, a)`, not as its byte in red.
+///
+/// The Vulkan 1.2 baseline has no single-channel alpha format, so the byte rides
+/// in `R8_UNORM` and a view component mapping puts it back. Both halves have to
+/// be right: the engine format has to stay distinct from `R8Unorm`, which it
+/// shares that `VkFormat` with, and the sampled view has to bind the mapping.
+/// Getting the second wrong is silent — the shader reads a plausible non-zero
+/// value in the wrong channel.
+#[test]
+fn compute_sampled_a8unorm_arrives_in_alpha() {
+    let _g = engine_test_session();
+    let Some(words) = assemble_spvasm(SAMPLED_IMAGE_FETCH_KERNEL, "a8unorm_fetch") else {
+        return;
+    };
+    let w = 4u32;
+    let h = 4u32;
+    // Not 0x00 or 0xff: a mapping that dropped the channel entirely and one that
+    // filled it with ONE both answer those.
+    const BYTE: u8 = 0x80;
+    let req = ComputeRequest {
+        spirv: words,
+        entry: "main".into(),
+        grid: [1, 1, 1],
+        storage_buffers: vec![ComputeBufferResource {
+            binding: 0,
+            bytes: vec![0; 16],
+            writable: true,
+        }],
+        sampled_images: vec![ComputeSampledImageResource {
+            binding: 32,
+            array_element: 0,
+            descriptor_count: 1,
+            format: StorageImageFormat::A8Unorm,
+            width: w,
+            height: h,
+            mip_levels: 1,
+            bytes: vec![BYTE; (w * h) as usize],
+            resident_bind: None,
+        }],
+        samplers: vec![],
+        storage_images: vec![],
+    };
+    let Some(out) = engine_or_skip("a8unorm_fetch", &req) else {
+        return;
+    };
+    let got: Vec<f32> = out.buffers[0]
+        .bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let want_alpha = f32::from(BYTE) / 255.0;
+    assert!(
+        got[0] == 0.0 && got[1] == 0.0 && got[2] == 0.0,
+        "A8Unorm has no colour channels; got rgb {:?} — the byte was sampled as red",
+        &got[..3]
+    );
+    assert!(
+        (got[3] - want_alpha).abs() < 1.0 / 255.0,
+        "alpha: got {}, want {want_alpha}",
+        got[3]
+    );
+}

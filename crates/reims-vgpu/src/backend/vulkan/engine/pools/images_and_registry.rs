@@ -154,6 +154,25 @@ impl ResourcePools {
                 ctx.device.destroy_image(image, None);
                 DrawError::VkCall(VkCall::new(VkOp::PoolsBindStorageImage, e))
             })?;
+        // A guest format whose channels do not sit identically on its Vulkan
+        // format samples through a component mapping instead of being rewritten
+        // on the CPU. Only a *sampled* view may carry one: Vulkan requires the
+        // identity mapping on a storage-image view, and no format admitted to
+        // that role has a non-identity plan, so a storage key that somehow named
+        // one is a contradiction and is refused rather than built.
+        let plan = translate::pixel::storage_image_components(key.format);
+        let components = if key.sampled_only {
+            translate::pixel::vk_component_mapping(&plan)
+        } else {
+            if !crate::contract::pixel_format::swizzle_is_identity(&plan) {
+                ctx.device.free_memory(memory, None);
+                ctx.device.destroy_image(image, None);
+                return Err(DrawError::Unsupported(
+                    reason::DrawReason::StorageImageNeedsComponentMapping { format: key.format },
+                ));
+            }
+            translate::pixel::vk_component_mapping(&plan)
+        };
         let view = ctx
             .device
             .create_image_view(
@@ -161,6 +180,7 @@ impl ResourcePools {
                     .image(image)
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(format)
+                    .components(components)
                     .subresource_range(super::super::color_subresource_range_levels(
                         key.mip_levels,
                     )),

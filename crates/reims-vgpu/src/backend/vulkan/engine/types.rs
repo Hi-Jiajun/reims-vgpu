@@ -1713,6 +1713,20 @@ pub enum StorageImageFormat {
     Bgra8Unorm,
     Rg16Float,
     R8Unorm,
+    /// Metal `A8Unorm`: one byte, presenting `(0, 0, 0, a)`.
+    ///
+    /// Its own member rather than [`Self::R8Unorm`], which it shares a
+    /// `VkFormat` with, because the difference between them is not the format
+    /// but the component mapping its view needs — and
+    /// `translate::pixel::vk_component_mapping` states the rule this follows: the
+    /// plan is a property of the *Metal* format, so a rail that has reduced a
+    /// format to a host one can no longer derive it. This enum is that
+    /// reduction, so the distinction has to survive it.
+    ///
+    /// Sampled only. `contract::pixel_format::storage_selector` has no entry for
+    /// this format, and a Vulkan storage-image view must carry an identity
+    /// mapping, so a storage image of it is refused rather than built.
+    A8Unorm,
     Rg8Unorm,
     Rgba32Uint,
     R32Uint,
@@ -1809,7 +1823,7 @@ impl StorageImageFormat {
             Self::Rgba16Unorm => 8,
             Self::Rg16Unorm | Self::Rg16Uint => 4,
             Self::R16Float | Self::Rg8Unorm | Self::R16Unorm => 2,
-            Self::R8Unorm => 1,
+            Self::R8Unorm | Self::A8Unorm => 1,
             Self::Rgba8Uint
             | Self::Rgba8Sint
             | Self::Rgba8Unorm

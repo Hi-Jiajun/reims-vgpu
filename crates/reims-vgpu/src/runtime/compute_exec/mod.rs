@@ -5159,6 +5159,7 @@ fn guest_numeric_class(guest: crate::backend::vulkan::engine::StorageImageFormat
         | V::Rgba16Unorm
         | V::Rgb10a2Unorm
         | V::Bgr10a2Unorm
+        | V::A8Unorm
         | V::Rg11b10Float => 0,
         V::Rgba16Uint | V::Rgba8Uint | V::Rgba32Uint | V::R32Uint | V::Rg16Uint => 1,
         V::Rgba8Sint | V::R32Sint => 2,
@@ -5284,6 +5285,10 @@ fn specialized_storage_image_format(
         // in the mandatory table at all.
         | V::Rgb10a2Unorm
         | V::Bgr10a2Unorm
+        // `A8Unorm` joins them by contract rather than by capability:
+        // `storage_selector` has no entry for it, so no guest storage binding
+        // can name it and its view mapping would be illegal on one.
+        | V::A8Unorm
         | V::Rg11b10Float => {
             return Err("spirv_sampled_only_format_as_storage");
         }

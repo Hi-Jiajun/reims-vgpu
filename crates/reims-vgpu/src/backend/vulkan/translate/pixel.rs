@@ -845,6 +845,11 @@ pub fn sampled_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
     // `unknown_pixel_format` rather than as a missing layout, exactly as
     // `storage_image` does for the same reason.
     let sampled_only = match mtl {
+        // `(0, 0, 0, a)` in one byte. It has no storage selector and no Vulkan
+        // 1.2 format of its own, so it rides `R8_UNORM` with the mapping
+        // `storage_image_components` supplies — the same one the draw rail
+        // already binds it through.
+        pf::MTL_FORMAT_A8_UNORM => StorageImageFormat::A8Unorm,
         pf::MTL_FORMAT_R16_UNORM => StorageImageFormat::R16Unorm,
         pf::MTL_FORMAT_RG16_UNORM => StorageImageFormat::Rg16Unorm,
         pf::MTL_FORMAT_RG16_UINT => StorageImageFormat::Rg16Uint,
@@ -973,6 +978,9 @@ pub fn vk_storage_image(format: StorageImageFormat) -> vk::Format {
         StorageImageFormat::Rg16Float => vk::Format::R16G16_SFLOAT,
         StorageImageFormat::Rg16Uint => vk::Format::R16G16_UINT,
         StorageImageFormat::R8Unorm => vk::Format::R8_UNORM,
+        // Shares `R8_UNORM` with `R8Unorm`; what separates them is the view
+        // component mapping, which `storage_image_components` answers.
+        StorageImageFormat::A8Unorm => vk::Format::R8_UNORM,
         StorageImageFormat::Rg8Unorm => vk::Format::R8G8_UNORM,
         StorageImageFormat::Rgba32Uint => vk::Format::R32G32B32A32_UINT,
         StorageImageFormat::R32Uint => vk::Format::R32_UINT,
@@ -985,6 +993,28 @@ pub fn vk_storage_image(format: StorageImageFormat) -> vk::Format {
         StorageImageFormat::Rgb10a2Unorm => vk::Format::A2B10G10R10_UNORM_PACK32,
         StorageImageFormat::Bgr10a2Unorm => vk::Format::A2R10G10B10_UNORM_PACK32,
         StorageImageFormat::Rg11b10Float => vk::Format::B10G11R11_UFLOAT_PACK32,
+    }
+}
+
+/// The view component mapping a sampled image of this engine format needs.
+///
+/// One member has a non-identity answer: [`StorageImageFormat::A8Unorm`], whose
+/// byte rides in `R8_UNORM` and has to be put back in alpha. Everything else is
+/// identity, because [`translate`] gives a non-identity plan to that Metal
+/// format alone.
+///
+/// This is the *reduced* end of the same fact [`translate`] states, so a test
+/// holds the two equal rather than letting this become a second opinion about
+/// where `A8Unorm`'s byte lives.
+///
+/// A **storage** image view must not take this: Vulkan requires an identity
+/// mapping on a storage-image view, and no format reaching that role has a
+/// non-identity plan — `storage_selector` has no entry for `A8Unorm`. The
+/// caller that builds views asserts that pairing rather than trusting it.
+pub fn storage_image_components(format: StorageImageFormat) -> SwizzlePlan {
+    match format {
+        StorageImageFormat::A8Unorm => ALPHA_IN_RED,
+        _ => pixel_format::swizzle_identity(),
     }
 }
 
@@ -1061,6 +1091,71 @@ pub fn has_identity_components(mtl: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every Metal format a dispatch samples binds the component mapping
+    /// `translate` states for it — not one the reduction to
+    /// [`StorageImageFormat`] lost on the way.
+    ///
+    /// The reduction is where the plan goes missing. `A8Unorm` and `R8Unorm`
+    /// are one `VkFormat`, and only the first needs its byte moved back into
+    /// alpha, so an enum that named the format alone could not tell a rail which
+    /// mapping to bind — and the compute rail refused `A8Unorm` outright for
+    /// exactly that reason, taking ten conformance cases with it. This sweeps
+    /// the whole 16-bit space rather than naming that one format, because the
+    /// next format with a non-identity plan must not be able to slip through the
+    /// same hole quietly.
+    #[test]
+    fn every_sampled_dispatch_format_binds_the_plan_its_metal_format_states() {
+        for mtl in 0..=u16::MAX {
+            let Ok(engine) = sampled_image(mtl) else {
+                continue;
+            };
+            let stated = translate(mtl)
+                .expect("a format sampled_image admitted must translate")
+                .components;
+            assert_eq!(
+                storage_image_components(engine),
+                stated,
+                "{mtl:#x} samples as {engine:?} but would bind the wrong channels"
+            );
+        }
+    }
+
+    /// `A8Unorm` reaches a dispatch, and it reaches it as alpha.
+    ///
+    /// The named case of the sweep above, spelled out because the failure it
+    /// guards is silent: sampling the byte as **red** returns a plausible
+    /// non-zero value in the wrong channel, which reads like a working texture.
+    #[test]
+    fn a8unorm_samples_in_a_dispatch_with_its_byte_in_alpha() {
+        use crate::contract::pixel_format as p;
+        let engine =
+            sampled_image(p::MTL_FORMAT_A8_UNORM).expect("A8Unorm is sampleable in a dispatch");
+        assert_ne!(
+            engine,
+            StorageImageFormat::R8Unorm,
+            "A8Unorm must not reduce to R8Unorm: they share a VkFormat and \
+             differ only in the mapping, so collapsing them loses the mapping"
+        );
+        assert_eq!(vk_storage_image(engine), vk::Format::R8_UNORM);
+        assert_eq!(engine.bytes_per_texel(), 1);
+        let mapping = vk_component_mapping(&storage_image_components(engine));
+        assert_eq!(
+            (mapping.r, mapping.g, mapping.b, mapping.a),
+            (
+                vk::ComponentSwizzle::ZERO,
+                vk::ComponentSwizzle::ZERO,
+                vk::ComponentSwizzle::ZERO,
+                vk::ComponentSwizzle::R,
+            ),
+            "Metal A8Unorm presents (0, 0, 0, a)"
+        );
+        assert_eq!(
+            storage_image_components(StorageImageFormat::R8Unorm),
+            p::swizzle_identity(),
+            "its VkFormat twin keeps the identity mapping"
+        );
+    }
     use super::*;
     use crate::observe::Decline;
     use pixel_format as p;
@@ -1268,12 +1363,14 @@ mod tests {
     /// The exceptions are listed rather than tolerated, because each is a real
     /// decision this rail cannot yet express:
     ///
-    /// - `A8Unorm` needs its channel plan. [`sampled_pixels`] hands back a
-    ///   [`SwizzlePlan`] that puts the single byte in alpha; a
-    ///   [`StorageImageFormat`] carries no component mapping, so admitting it
-    ///   here would sample the byte as **red**. A wrong sample is worse than a
-    ///   named refusal, so it stays refused until the compute request can carry
-    ///   a plan.
+    /// `A8Unorm` used to head this list — it needs its channel plan, and a
+    /// [`StorageImageFormat`] carried no component mapping, so admitting it
+    /// would have sampled the single byte as **red**. It is admitted now
+    /// because the enum carries the distinction: [`StorageImageFormat::A8Unorm`]
+    /// is its own member sharing `R8_UNORM` with
+    /// [`StorageImageFormat::R8Unorm`], and [`storage_image_components`] is the
+    /// plan the sampled view binds.
+    ///
     /// - The two `*_SRGB` orders would have to bind their linear sibling, which
     ///   is the [`TranslateReason::SrgbDowngraded`] loss [`srgb_decline`]
     ///   documents. This rail's `Result` has nowhere to record it, and
@@ -1303,7 +1400,6 @@ mod tests {
     #[test]
     fn a_texture_the_graphics_rail_samples_is_not_refused_by_the_compute_one() {
         const EXCEPTIONS: &[(u16, &str)] = &[
-            (p::MTL_FORMAT_A8_UNORM, "needs a component mapping"),
             (p::MTL_FORMAT_RGBA8_UNORM_SRGB, "would downgrade unrecorded"),
             (p::MTL_FORMAT_BGRA8_UNORM_SRGB, "would downgrade unrecorded"),
             (
