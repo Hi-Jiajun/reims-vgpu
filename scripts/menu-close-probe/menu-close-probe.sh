@@ -126,11 +126,31 @@ MENU_X=${MENU_X:-1450}; MENU_Y=${MENU_Y:-250}
 # the dismiss click cannot land inside it and choose an item.
 AWAY_X=${AWAY_X:-1750}; AWAY_Y=${AWAY_Y:-900}
 
+# How long the menu is given to finish opening before anything is measured.
+#
+# One constant because it was two, and the two disagreed. The settled-open
+# reference waited 1.2 s after the right-click; every timed trial waited 0.9 s.
+# The menu is still animating open at 0.9 s, so a *fully open* menu photographed
+# by a trial read 199.697 against a 193.06 reference -- a 6.6 gap with nothing
+# closing -- and the aim, looking for a frame that matched neither settled state,
+# accepted that as the close animation at its very first offset. Every trial then
+# photographed a static open menu and scored zero new black, which reads as
+# CLEAN. Two spellings of "the menu is open" is the same defect as two spellings
+# of the dismiss schedule, one stage earlier.
+OPEN_SETTLE="${OPEN_SETTLE:-1.2}"
+
 shot() { "$SHOT" -o "$1" >/dev/null 2>&1; }
 open_menu()    { python3 "$QMP" rclick "$MENU_X" "$MENU_Y" >/dev/null 2>&1; }
 dismiss_menu() { python3 "$QMP" click "$AWAY_X" "$AWAY_Y" >/dev/null 2>&1; }
-# Mean of a crop, x255.
-crop_mean() { magick "$1" -crop "$2" +repage -format '%[fx:mean*255]' info: 2>/dev/null; }
+# Mean of a crop, x255, over colour only.
+#
+# `-alpha off` because the captures are `srgba` and `%[fx:mean]` averages all
+# four channels, so a constant opaque alpha was contributing a fixed 255 to every
+# reading and compressing the thing being measured: this rail's closed desktop
+# and open menu separate by 134 on colour and by only 100 with alpha folded in.
+# It also makes this reading and the scoring metric describe the same channels,
+# which is the reason worth more than the sensitivity.
+crop_mean() { magick "$1" -crop "$2" +repage -alpha off -format '%[fx:mean*255]' info: 2>/dev/null; }
 
 # The scoring metric, as two functions the self-test and the real measurement
 # both call.
@@ -233,13 +253,19 @@ respond to a synthetic black rectangle, so no verdict from it means anything"
 fi
 
 # ---- 0. The two settled states this run is scored against.
+# Each state twice, and each time through a full open-or-dismiss cycle rather
+# than two shots of one standing menu. The variation that matters is the one
+# between trials -- each trial opens its own menu -- and two captures 0.5 s apart
+# of a single menu measure the capture path instead. On this rail that read
+# exactly 0.000 twice over, a noise floor that flattered the calibration and
+# missed the 6.6 the trials actually saw.
 dismiss_menu; sleep 1.5
 shot "$OUT/closed.png"
-sleep 0.5
-shot "$OUT/closed2.png"
-open_menu; sleep 1.2
+open_menu; sleep "$OPEN_SETTLE"
 shot "$OUT/open.png"
-sleep 0.5
+dismiss_menu; sleep 1.5
+shot "$OUT/closed2.png"
+open_menu; sleep "$OPEN_SETTLE"
 shot "$OUT/open2.png"
 dismiss_menu; sleep 1.2
 [ -s "$OUT/closed.png" ] && [ -s "$OUT/open.png" ] || {
@@ -374,7 +400,7 @@ echo "menu-close-probe: self-test all-black frame classifies as $CLS_BLACK (want
 # first and starts the capture O seconds after. Both are the same timeline.
 grab_at() {
   local o="$1" out="$2"
-  open_menu; sleep 0.9
+  open_menu; sleep "$OPEN_SETTLE"
   if awk -v o="$o" 'BEGIN{ exit !(o < 0) }'; then
     ( sleep "${o#-}"; dismiss_menu ) &
     shot "$out"; wait
