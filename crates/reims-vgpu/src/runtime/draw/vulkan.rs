@@ -1046,6 +1046,53 @@ pub(super) fn sampled_texture_descriptor<M: HostMemory>(
 /// has no question to answer. `t11sample_ready_guest_allocation` and
 /// `t11sample_ready_device_allocation` keep that population measurable. The
 /// copied resident retains every rung and witness below.
+/// A `(task, texture ref)` a bind resolved through.
+type SampledRefKey = (u32, u32);
+
+/// What one resolved to: mapping, and the view extent bound for it.
+type SampledRefBacking = (u32, u32, u32);
+
+/// The last resolution reported for each `(task, texture ref)`, so a change of
+/// backing is reportable and a steady bind is silent.
+static SAMPLED_REF_BACKING_LAST: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<SampledRefKey, SampledRefBacking>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Report what a texture ref resolves to, on every change of backing or extent.
+fn note_sampled_ref_backing(
+    state: &crate::model::DeviceState,
+    task_id: u32,
+    texture_ref: u32,
+    width: u32,
+    height: u32,
+    mapping_id: u32,
+    route: &str,
+) {
+    let now = (mapping_id, width, height);
+    let prior = {
+        let mut last = SAMPLED_REF_BACKING_LAST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        last.insert((task_id, texture_ref), now)
+    };
+    if prior == Some(now) {
+        return;
+    }
+    let (mw, mh, mfmt) = state
+        .mappings
+        .get(&mapping_id)
+        .map(|m| (m.width, m.height, m.format))
+        .unwrap_or((0, 0, 0));
+    let was = match prior {
+        Some((pmid, pw, ph)) => format!(" was=mid{pmid}:{pw}x{ph}"),
+        None => String::new(),
+    };
+    crate::observe::off(format!(
+        "sampled_ref_backing task={task_id} ref={texture_ref} view={width}x{height} \
+         mid={mapping_id} map={mw}x{mh} map_fmt={mfmt:#x} route={route}{was}"
+    ));
+}
+
 pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -7597,48 +7644,31 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             ));
                         };
                         let (rw, rh, mid, src) = loaded;
-                        // What a texture ref resolved to, once per
-                        // (ref, backing, extent). The plane draw ring records
-                        // the refs a pass sampled, and a ref is only a number:
-                        // when a full-screen layer turns uniform on the first
-                        // draw to bind two new refs, "what are those two" had no
-                        // record at any size. The field witness below answers it
-                        // only for surfaces of a megapixel or more.
+                        // What a texture ref resolved to, reported whenever it
+                        // changes. The plane draw ring records the refs a pass
+                        // sampled, and a ref is only a number: a layer turns
+                        // uniform on the first draw to bind refs it has never
+                        // bound before, and on this rail those same refs resolve
+                        // to a 242x5 texture minutes earlier and to a 3840x2160
+                        // video plane later. Which of the two a pass sampled is
+                        // the whole question, and a first-sight latch cannot
+                        // answer it -- only a record of every change can.
                         if frag_stage {
                             let route = match &src {
                                 SampledSourceRequest::Bytes(..) => "bytes",
                                 SampledSourceRequest::Target(..) => "target",
                                 SampledSourceRequest::GuestRuns(..) => "guest_runs",
                             };
-                            let disc = u64::from(texture_ref) << 32
-                                | u64::from(rw) << 16
-                                | u64::from(rh as u16);
-                            if crate::observe::first_sight("sampled_ref_backing", disc) {
-                                let (mfmt, mw, mh) = state
-                                    .mappings
-                                    .get(&mid)
-                                    .map(|m| (m.format, m.width, m.height))
-                                    .unwrap_or((0, 0, 0));
-                                crate::observe::off(format!(
-                                    "sampled_ref_backing ref={texture_ref} view={rw}x{rh} \
-                                     mid={mid} map={mw}x{mh} map_fmt={mfmt:#x} route={route}"
-                                ));
-                            }
+                            note_sampled_ref_backing(
+                                state,
+                                req.task_id,
+                                texture_ref,
+                                rw,
+                                rh,
+                                mid,
+                                route,
+                            );
                         }
-                        // What this bind reads, beside what the plane it draws
-                        // into ends up holding. Large surfaces only; latched on
-                        // change of the field pattern.
-                        crate::runtime::scanout::note_sampled_surface_field(
-                            state,
-                            &*host,
-                            mid,
-                            texture_ref,
-                            match &src {
-                                SampledSourceRequest::Bytes(..) => "bytes",
-                                SampledSourceRequest::Target(..) => "target",
-                                SampledSourceRequest::GuestRuns(..) => "guest_runs",
-                            },
-                        );
                         (rw, rh, src)
                     }
                 };
