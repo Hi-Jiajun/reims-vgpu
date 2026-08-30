@@ -1381,6 +1381,145 @@ fn field_patch_verdict(mean: f32, sd: f32) -> &'static str {
     }
 }
 
+/// The last field pattern reported for each large sampled surface, so the
+/// witness below reports a change rather than a sample.
+static SAMPLED_FIELD_LAST: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u32, u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Texels of a sampled surface below which it is not worth asking this
+/// question. The subject is a full-screen compositor layer; a glyph atlas or an
+/// icon is a different population and there are thousands of them per frame.
+const SAMPLED_FIELD_MIN_TEXELS: u64 = 1 << 20;
+
+/// What a large sampled surface's own guest pages hold at the moment a draw
+/// binds it.
+///
+/// [`note_present_field_witness`] answers the same question for the plane a
+/// present names, which says what the composite *produced*. This says what the
+/// composite *read*, and the two together separate a composite that published a
+/// blank field from one that faithfully published a blank source: a full-screen
+/// desktop layer whose own pages are uniform cannot produce a painted plane, and
+/// a painted source under a uniform plane moves the question to the pass.
+///
+/// The mean is over every byte of the texel rather than over three colour bytes,
+/// because these surfaces are not all four-byte colour — the wallpaper layer on
+/// this rail is `RGBA16Float` — and "is this uniform `0xff`" is answerable in
+/// any layout while "what colour is it" is not. The first texel's bytes ride
+/// along so a uniform field names the byte that filled it.
+///
+/// Reads guest pages and settles nothing, for [`note_present_field_witness`]'s
+/// reason: settling here would make the instrument cause the visibility it is
+/// trying to observe.
+pub fn note_sampled_surface_field<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+    texture_ref: u32,
+    route: &str,
+) {
+    if mapping_id == 0 {
+        return;
+    }
+    let Some((width, height, format)) = state.mappings.get(&mapping_id).and_then(|m| {
+        (m.has_geom && m.mapped)
+            .then_some((m.width, m.height, m.format))
+            .filter(|(w, h, f)| {
+                *f != 0 && u64::from(*w) * u64::from(*h) >= SAMPLED_FIELD_MIN_TEXELS
+            })
+    }) else {
+        return;
+    };
+    let Some(bpp) = pixel_format::bytes_per_pixel(format) else {
+        return;
+    };
+    let Some((base_off, bpr, _)) = state.mappings.get(&mapping_id).and_then(|m| {
+        crate::runtime::mapping_write::type11_sample_window(m, width, height, format)
+    }) else {
+        return;
+    };
+    let page_shift = state.page_shift;
+    let Some(gpas) = state.mappings.get(&mapping_id).map(|m| {
+        m.page_entries
+            .iter()
+            .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift))
+            .collect::<Vec<u64>>()
+    }) else {
+        return;
+    };
+    if gpas.is_empty() {
+        return;
+    }
+    let page = state.page_size();
+    let read = bpp.min(4) as usize;
+    let mut report = String::new();
+    let mut first_texel = String::new();
+    let mut verdicts: Vec<u8> = Vec::with_capacity(FIELD_PATCHES.len());
+    for (i, (fx, fy)) in FIELD_PATCHES.iter().enumerate() {
+        let cx = (width as f32 * fx) as u32;
+        let cy = (height as f32 * fy) as u32;
+        let x0 = cx.saturating_sub(FIELD_PATCH_SIDE / 2).min(width - 1);
+        let y0 = cy.saturating_sub(FIELD_PATCH_SIDE / 2).min(height - 1);
+        let mut samples = [0f32; (FIELD_PATCH_SIDE * FIELD_PATCH_SIDE) as usize];
+        let mut n = 0usize;
+        for dy in 0..FIELD_PATCH_SIDE {
+            for dx in 0..FIELD_PATCH_SIDE {
+                let (x, y) = (x0 + dx, y0 + dy);
+                if x >= width || y >= height {
+                    continue;
+                }
+                let off = base_off + u64::from(y) * u64::from(bpr) + u64::from(x) * u64::from(bpp);
+                let Some(&gpa) = gpas.get((off / page) as usize) else {
+                    continue;
+                };
+                let mut texel = [0u8; 4];
+                if host
+                    .read_gpa(gpa + (off % page), &mut texel[..read])
+                    .is_err()
+                {
+                    continue;
+                }
+                if first_texel.is_empty() {
+                    first_texel = texel[..read].iter().map(|b| format!("{b:02x}")).collect();
+                }
+                samples[n] = texel[..read].iter().map(|b| f32::from(*b)).sum::<f32>() / read as f32;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            continue;
+        }
+        let mean = samples[..n].iter().sum::<f32>() / n as f32;
+        let sd = (samples[..n].iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n as f32).sqrt();
+        let verdict = field_patch_verdict(mean, sd);
+        verdicts.push(verdict.as_bytes()[0]);
+        if i != 0 {
+            report.push(',');
+        }
+        report.push_str(&format!("{verdict}:{mean:.0}/{sd:.0}"));
+    }
+    if verdicts.is_empty() {
+        return;
+    }
+    let pattern = verdicts
+        .iter()
+        .fold(0u64, |acc, v| (acc << 8) | u64::from(*v));
+    let changed = {
+        let mut last = SAMPLED_FIELD_LAST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        last.insert(mapping_id, pattern) != Some(pattern)
+    };
+    if !changed {
+        return;
+    }
+    crate::observe::off(format!(
+        "sampled_surface_field mid={mapping_id} ref={texture_ref} {width}x{height} \
+         fmt={format:#x} route={route} patches=[{report}] first=0x{first_texel} \
+         (guest pages, no settle)"
+    ));
+}
+
 /// The presented plane's own guest pages, sampled in the desktop background
 /// field, as a witness independent of the frame the host window shows.
 ///

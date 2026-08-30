@@ -7563,7 +7563,21 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 },
                             ));
                         };
-                        let (rw, rh, _mid, src) = loaded;
+                        let (rw, rh, mid, src) = loaded;
+                        // What this bind reads, beside what the plane it draws
+                        // into ends up holding. Large surfaces only; latched on
+                        // change of the field pattern.
+                        crate::runtime::scanout::note_sampled_surface_field(
+                            state,
+                            &*host,
+                            mid,
+                            texture_ref,
+                            match &src {
+                                SampledSourceRequest::Bytes(..) => "bytes",
+                                SampledSourceRequest::Target(..) => "target",
+                                SampledSourceRequest::GuestRuns(..) => "guest_runs",
+                            },
+                        );
                         (rw, rh, src)
                     }
                 };
