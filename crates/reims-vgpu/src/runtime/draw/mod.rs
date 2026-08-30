@@ -4375,6 +4375,8 @@ pub(crate) fn publish_surface_store<M: HostMemory + HostOps>(
     height: u32,
     format: u16,
 ) {
+    #[cfg(feature = "backend-vulkan")]
+    note_plane_store_published(mapping_id);
     state.note_surface_composite(mapping_id);
     state.note_dense_frame_published(mapping_id, width, height);
     crate::runtime::scanout::note_front_buffer_writeback(
@@ -4597,6 +4599,58 @@ pub(crate) static PLANE_DRAW_RING: std::sync::LazyLock<
 #[cfg(feature = "backend-vulkan")]
 const PLANE_DRAW_RING_DEPTH: usize = 24;
 
+/// Planes whose most recent draw was the multi-quad one, and whether a Store
+/// has published for them since.
+///
+/// # The question this exists to answer
+///
+/// On rail macos-15 the desktop background comes up flat white on about two
+/// boots in three. Everything else composites correctly, and every boot-total
+/// differential run against it separates nothing: the same typed reasons, the
+/// same `store_routes`, the same surfaces, the same page geometry on a white
+/// boot and a painted one.
+///
+/// What *is* established: the guest issues the wallpaper draw on a white boot
+/// (`plane_draw_multi_quad` 963 white against 734 painted -- more, not fewer),
+/// the presented plane's own guest pages hold uniform `0xff`, and no door
+/// reports losing a seed (`load_seed_lost` 0, `present_unbacked` 0). And on
+/// three of three boots where pointer damage did not repair the screen,
+/// rebuilding the guest's wallpaper layer did -- while damaging the desktop
+/// with pointer motion never did, because macOS composites the background once
+/// and then relies on it persisting.
+///
+/// That narrows it to one question, which no existing record answers: **did the
+/// multi-quad draw's Store publish for the plane it drew into?** A boot-total
+/// count cannot answer it, because the same plane also receives hundreds of
+/// six-vertex draws that publish normally; the join has to be per plane and per
+/// draw shape.
+///
+/// So this holds one bit per plane -- "the last draw into it was the multi-quad
+/// one, and nothing has published since" -- and the counters below split the
+/// multi-quad population by whether a publish followed. Bounded by the number
+/// of live planes, which is the guest's swap chain (five or six), and entries
+/// are removed when their plane publishes.
+#[cfg(feature = "backend-vulkan")]
+static PLANE_MULTIQUAD_PENDING: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<u32>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Note that a Store published for `mapping_id`, closing any multi-quad draw
+/// waiting on it.
+///
+/// Called from [`publish_surface_store`], which is the one place a Store
+/// becomes visible in the plane's guest pages -- `note_present_backing` advances
+/// there and it is what `present_unbacked` reads.
+#[cfg(feature = "backend-vulkan")]
+fn note_plane_store_published(mapping_id: u32) {
+    let mut pending = PLANE_MULTIQUAD_PENDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if pending.remove(&mapping_id) {
+        crate::runtime::drain::note_store_route("plane_multiquad_published");
+    }
+}
+
 /// Drain and format the remembered passes for one plane.
 #[cfg(feature = "backend-vulkan")]
 pub(crate) fn take_plane_draw_ring(mapping_id: u32) -> String {
@@ -4632,11 +4686,24 @@ pub(crate) fn record_plane_draw(req: &DrawEncodeRequest) {
     // multi-quad draw. "Did the wallpaper draw reach this device at all" is then
     // a counter comparison between a white boot and a painted one, which no
     // record could answer before.
-    crate::runtime::drain::note_store_route(if req.vertex_count > 6 {
+    let multi_quad = req.vertex_count > 6;
+    crate::runtime::drain::note_store_route(if multi_quad {
         "plane_draw_multi_quad"
     } else {
         "plane_draw_single_quad"
     });
+    // Arm the join. A multi-quad draw marks its plane; the next publish for that
+    // plane disarms it and counts. A plane armed twice without a publish in
+    // between counts once and says so, because two draws lost is the same
+    // observation as one until something publishes.
+    {
+        let mut pending = PLANE_MULTIQUAD_PENDING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if multi_quad && !pending.insert(color.mapping_id) {
+            crate::runtime::drain::note_store_route("plane_multiquad_redrawn_unpublished");
+        }
+    }
     let shape = PlaneDrawShape::of(req);
     let mut ring = PLANE_DRAW_RING
         .lock()
