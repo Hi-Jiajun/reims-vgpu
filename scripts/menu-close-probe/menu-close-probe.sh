@@ -1,13 +1,39 @@
 #!/usr/bin/env bash
-# menu-close-probe.sh [TRIALS] — photograph the dock context menu's close-in
+# menu-close-probe.sh [TRIALS] — photograph a context menu's close-in
 # animation and say whether the region it vacates is the desktop or is black.
 #
 # Usage:
 #   scripts/menu-close-probe/menu-close-probe.sh [TRIALS]
 #     QPID=PID     the guest to drive (default: the one running qemu-system-x86_64)
 #     OUT=DIR      where frames land (default: $TMPDIR/menu-close-probe)
-#     ICON_X/Y     the dock icon to right-click, in guest pixels
+#     MENU_X/Y     empty desktop point to right-click, in guest pixels
 #     AWAY_X/Y     where to click to dismiss, in guest pixels
+#
+# # Why this no longer right-clicks the dock
+#
+# It did, at a coordinate documented as "the Finder icon, leftmost in the dock".
+# On this rail's current snapshot that coordinate is not Finder, and the
+# snapshot boots with an application window already open and frontmost — so the
+# probe's other anchor, "somewhere with no window and no menu", was beside that
+# window rather than on bare desktop. Five consecutive boots reported "the menu
+# box did not change when the menu opened" and exited saying nothing. Reading
+# the captures afterwards: no context menu was ever created. The right-click
+# raised an application; the dismiss click sent it behind Finder.
+#
+# Both anchors were positional guesses about a desktop this probe cannot see in
+# advance, and dock layout is exactly the thing that moves between snapshots,
+# guest versions and running-application sets.
+#
+# A **desktop** right-click removes the guess. macOS opens the desktop context
+# menu with its corner at the cursor, so the menu's rectangle is derived from
+# the coordinate this script itself clicked rather than measured off a dock. The
+# interaction is one step removed from the reported one — the report names a
+# dock icon's menu — but the defect is a property of the menu layer's close-in
+# animation and not of which menu it is, and this is the version of it that can
+# actually be aimed. What is lost is stated rather than papered over: if the
+# defect turns out to be specific to a dock menu, this probe will read CLEAN and
+# be wrong, and the dock variant then has to be aimed by survey rather than by
+# assumption.
 #
 # Exits 0 VERDICT=CLEAN, 1 VERDICT=BLACK_RECTANGLE, 2 when the run did not
 # sample the animation and therefore says nothing about the device.
@@ -73,21 +99,40 @@ if [ -z "${QPID:-}" ]; then
 fi
 [ -n "$QPID" ] || { echo "menu-close-probe: no running guest"; exit 2; }
 
-# The Finder icon, leftmost in the dock, in GUEST pixels on this rail's
-# 1920x1080 desktop. Verified against a capture: the dock strip's icons run from
-# capture x 205 to x 1075 at y 688 on a 1280x719 capture, and 333,1033 is the
-# Finder icon's centre in guest coordinates.
-ICON_X=${ICON_X:-333}; ICON_Y=${ICON_Y:-1033}
-# Somewhere with no window and no menu, to dismiss into.
-AWAY_X=${AWAY_X:-1700}; AWAY_Y=${AWAY_Y:-400}
+# A right-click on this rail has been observed killing the guest about four
+# seconds later, so every stage below has to be able to say "the guest went
+# away" rather than scoring the frames it happened to collect. A dead guest
+# produces frozen, identical captures, and identical captures score as no new
+# black at all — which reads as CLEAN. That is the one wrong answer this probe
+# must not give, because it would report the defect repaired by a boot that died
+# before it could show it.
+SER="$(ls -t "$REPO"/vm/disks/run/serial-*.log 2>/dev/null | head -1)"
+SER_MARK=0
+[ -n "$SER" ] && SER_MARK="$(wc -c < "$SER")"
+guest_gone() {
+  kill -0 "$QPID" 2>/dev/null || return 0
+  [ -n "$SER" ] || return 1
+  tail -c +"$((SER_MARK + 1))" "$SER" 2>/dev/null \
+    | grep -q 'Debugger called: <panic>\|panic(cpu '
+}
+
+# Where to open the desktop context menu, in GUEST pixels on this rail's
+# 1920x1080 desktop. Chosen with room for the menu to open down-and-right
+# without meeting a screen edge — macOS flips the menu to the other side of the
+# cursor when it would not fit, which would move the rectangle out from under
+# the crop derived below.
+MENU_X=${MENU_X:-1450}; MENU_Y=${MENU_Y:-250}
+# Somewhere with no window and no menu, to dismiss into. Far from the menu, so
+# the dismiss click cannot land inside it and choose an item.
+AWAY_X=${AWAY_X:-1750}; AWAY_Y=${AWAY_Y:-900}
 
 shot() { "$SHOT" --pid "$QPID" -o "$1" >/dev/null 2>&1; }
-open_menu()    { python3 "$QMP" rclick "$ICON_X" "$ICON_Y" >/dev/null 2>&1; }
+open_menu()    { python3 "$QMP" rclick "$MENU_X" "$MENU_Y" >/dev/null 2>&1; }
 dismiss_menu() { python3 "$QMP" click "$AWAY_X" "$AWAY_Y" >/dev/null 2>&1; }
 # Mean of a crop, x255.
 crop_mean() { magick "$1" -crop "$2" +repage -format '%[fx:mean*255]' info: 2>/dev/null; }
 
-echo "menu-close-probe: qemu=$QPID icon=$ICON_X,$ICON_Y trials=$TRIALS"
+echo "menu-close-probe: qemu=$QPID menu=$MENU_X,$MENU_Y away=$AWAY_X,$AWAY_Y trials=$TRIALS"
 
 # ---- 0. The two settled states this run is scored against.
 dismiss_menu; sleep 1.5
@@ -98,27 +143,28 @@ dismiss_menu; sleep 1.2
 [ -s "$OUT/closed.png" ] && [ -s "$OUT/open.png" ] || {
   echo "menu-close-probe: could not capture the host window"; exit 2; }
 
-# ---- 1. The menu's rectangle, anchored to the icon that opens it.
+# ---- 1. The menu's rectangle, derived from the click that opens it.
 #
 # Not by differencing two captures. That was tried and it does not work here:
 # the two are 1.5 s apart on a live desktop that is repainting damage rects the
 # whole time, so the changed-pixel bounding box came back 1279x704 — the whole
 # screen — and on a boot with the blank-field defect the field itself is
-# churning between the frames. The menu's position is not actually unknown: it
-# pops up directly above the icon that was right-clicked, and that icon is where
-# this script clicked.
+# churning between the frames.
 #
-# Measured against a capture of this rail: the Finder icon's centre is capture
-# x 222 for guest x 333, and the menu occupies capture x 178..305, y 498..668 —
-# so 45 left of the icon centre, 130 wide, and 170 tall ending 20 above the dock
-# icons' row. Expressed against the capture's own dimensions so a different
-# capture cap does not silently move it.
+# The desktop context menu opens with its top-left corner at the cursor, so the
+# rectangle follows from `MENU_X,MENU_Y` by construction rather than by
+# measurement. The crop is inset from that corner and kept well inside the
+# smallest menu this desktop produces, because what is being scored is the
+# region the animation vacates — a crop that overhangs the menu scores desktop
+# that never had a menu over it, in both directions.
+#
+# Expressed against the capture's own dimensions so a different capture cap does
+# not silently move it.
 read -r CAPW CAPH <<<"$(magick identify -format '%w %h' "$OUT/closed.png")"
-CROP="$(awk -v ix="$ICON_X" -v iy="$ICON_Y" -v cw="$CAPW" -v ch="$CAPH" 'BEGIN{
-  cx = int(ix * cw / 1920); cy = int(iy * ch / 1080);
-  x = cx - 45; if (x < 0) x = 0;
-  y = cy - 190; if (y < 0) y = 0;
-  printf "130x170+%d+%d", x, y }')"
+CROP="$(awk -v mx="$MENU_X" -v my="$MENU_Y" -v cw="$CAPW" -v ch="$CAPH" 'BEGIN{
+  x = int((mx + 15) * cw / 1920); y = int((my + 15) * ch / 1080);
+  w = int(150 * cw / 1920); h = int(150 * ch / 1080);
+  printf "%dx%d+%d+%d", w, h, x, y }')"
 BASE="$(crop_mean "$OUT/closed.png" "$CROP")"
 OPEN="$(crop_mean "$OUT/open.png" "$CROP")"
 echo "menu-close-probe: menu box=$CROP  no_menu_mean=$BASE  menu_open_mean=$OPEN"
@@ -128,6 +174,11 @@ echo "menu-close-probe: menu box=$CROP  no_menu_mean=$BASE  menu_open_mean=$OPEN
 # boot and 96.1 against 147.5 on another — and a signed test passes on one and
 # fails on the other for no reason that concerns the guest.
 awk -v b="$BASE" -v o="$OPEN" 'BEGIN{ d = b - o; if (d < 0) d = -d; exit !(d > 8) }' || {
+  if guest_gone; then
+    echo "menu-close-probe: VERDICT=GUEST_GONE — the guest died during the \
+opening captures; this run says nothing about the animation"
+    exit 2
+  fi
   echo "menu-close-probe: the menu box did not change when the menu opened \
 (no_menu=$BASE menu_open=$OPEN); the right-click may not have opened one"
   exit 2; }
@@ -174,6 +225,13 @@ for i in $(seq 1 "$TRIALS"); do
   ( sleep "$BESTD"; dismiss_menu ) &
   shot "$OUT/frames/t-$i.png"; wait
   [ -s "$OUT/frames/t-$i.png" ] || continue
+  # Scored only while the guest is still the thing being photographed. A frame
+  # grabbed after it died is a photograph of a frozen host window.
+  if guest_gone; then
+    echo "menu-close-probe: guest went away during trial $i; scoring the \
+$N trial(s) that preceded it"
+    break
+  fi
   N=$((N + 1))
   M="$(crop_mean "$OUT/frames/t-$i.png" "$CROP")"
   # near-black in this frame AND not near-black in the no-menu frame
@@ -187,6 +245,11 @@ for i in $(seq 1 "$TRIALS"); do
   sleep 0.6
 done
 
+if [ "$N" -eq 0 ]; then
+  echo "menu-close-probe: VERDICT=GUEST_GONE — no trial completed against a \
+live guest"
+  exit 2
+fi
 echo "menu-close-probe: $N frames in $OUT/frames"
 echo "menu-close-probe: worst new-black fraction=$WORST (trial $WORSTI) over box $CROP"
 # A tenth of the menu's own box turning black that was not black before is not
