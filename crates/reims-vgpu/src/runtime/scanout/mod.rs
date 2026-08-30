@@ -1549,12 +1549,19 @@ pub fn note_present_field_witness<M: HostMemory>(
     // paints the flat field are the *same* pass, and the wallpaper transition is
     // the only place the first one can be seen. Draining is not a loss here --
     // the ring refills from the next frame's draws.
+    //
+    // Drained on the heartbeat as well, and this is the half of the record that
+    // decides between the two live readings of the white field. A plane that
+    // goes uniform white and stays that way produces no further change, so a
+    // change-only drain says nothing at all about the interval that matters --
+    // exactly the interval in which the defect is resident. On the heartbeat
+    // the drain answers, every stride: `draws=0` means the guest stopped
+    // compositing into this plane, and a non-zero count against an unchanged
+    // uniform field means the guest kept drawing and this device did not
+    // publish it. Those have opposite repairs and no other record separates
+    // them.
     #[cfg(feature = "backend-vulkan")]
-    let ring = changed
-        .then(|| crate::runtime::draw::take_plane_draw_ring(mapping_id))
-        .filter(|r| !r.is_empty())
-        .map(|r| format!(" passes=[{r}]"))
-        .unwrap_or_default();
+    let ring = crate::runtime::draw::take_plane_draw_ring(mapping_id).to_string();
     // The ring is filled by the Vulkan draw encode; there is no such record on
     // the Metal arm, so the field is simply absent there rather than empty.
     #[cfg(not(feature = "backend-vulkan"))]

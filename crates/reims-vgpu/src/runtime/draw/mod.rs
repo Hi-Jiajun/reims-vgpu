@@ -4591,8 +4591,31 @@ impl PlaneDrawShape {
 /// at the compositor's draw rate.
 #[cfg(feature = "backend-vulkan")]
 pub(crate) static PLANE_DRAW_RING: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<u32, std::collections::VecDeque<String>>>,
+    std::sync::Mutex<std::collections::HashMap<u32, PlaneDrawWindow>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// What one plane received since its ring was last drained.
+///
+/// # Why the arrival count is not the length of the ring
+///
+/// The ring keeps the last [`PLANE_DRAW_RING_DEPTH`] passes so a full drain
+/// stays readable, and the compositor sends more than that between two drains
+/// whenever it is busy. A reader who counted the remembered passes would read
+/// a plane receiving sixty draws and a plane receiving exactly twenty-four as
+/// the same number, and the question the drain exists to answer -- *is the
+/// guest still drawing into this plane at all* -- is precisely a question about
+/// arrivals rather than about the remembered tail. So the count is kept beside
+/// the ring, incremented on every arrival, and reset with it: `arrivals` is
+/// always the true number and `passes` is the tail of it, which the drain says
+/// explicitly whenever the two disagree.
+#[cfg(feature = "backend-vulkan")]
+#[derive(Default)]
+pub(crate) struct PlaneDrawWindow {
+    /// Draws into this plane since the last drain, never truncated.
+    arrivals: u64,
+    /// The most recent [`PLANE_DRAW_RING_DEPTH`] of them, formatted.
+    passes: std::collections::VecDeque<String>,
+}
 
 /// Passes remembered per plane. Enough to cover a compositor frame's layers
 /// without letting an idle plane hold an unbounded history.
@@ -4653,13 +4676,53 @@ fn note_plane_store_published(mapping_id: u32) {
 
 /// Drain and format the remembered passes for one plane.
 #[cfg(feature = "backend-vulkan")]
-pub(crate) fn take_plane_draw_ring(mapping_id: u32) -> String {
+/// A plane that received nothing since the last drain returns
+/// `arrivals = 0` with no passes, and that is the answer the drain is for --
+/// it distinguishes a guest that stopped compositing into this plane from a
+/// device that dropped what the guest composited. Both look identical in a
+/// field sample and in every boot-total counter.
+pub(crate) fn take_plane_draw_ring(mapping_id: u32) -> PlaneDrawDrain {
     let mut ring = PLANE_DRAW_RING
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    ring.remove(&mapping_id)
-        .map(|passes| passes.into_iter().collect::<Vec<_>>().join(" "))
-        .unwrap_or_default()
+    let window = ring.remove(&mapping_id).unwrap_or_default();
+    PlaneDrawDrain {
+        arrivals: window.arrivals,
+        passes: window.passes.into_iter().collect::<Vec<_>>().join(" "),
+    }
+}
+
+/// One plane's arrivals and remembered tail, taken together.
+///
+/// The two travel as one value because reading either alone is misleading: an
+/// empty tail with a non-zero count means the formatting was dropped, and a
+/// non-empty tail with a count above [`PLANE_DRAW_RING_DEPTH`] is a tail rather
+/// than the whole window.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) struct PlaneDrawDrain {
+    /// Draws that arrived for this plane since the previous drain.
+    pub(crate) arrivals: u64,
+    /// The remembered tail of those draws, space separated.
+    pub(crate) passes: String,
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl std::fmt::Display for PlaneDrawDrain {
+    /// Renders the drain so the count is always present and the tail says when
+    /// it is one.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, " draws={}", self.arrivals)?;
+        if self.arrivals == 0 {
+            return Ok(());
+        }
+        let truncated = self.arrivals > PLANE_DRAW_RING_DEPTH as u64;
+        write!(
+            f,
+            " passes=[{}{}]",
+            if truncated { "..." } else { "" },
+            self.passes
+        )
+    }
 }
 
 /// Remember one draw into a full-screen plane.
@@ -4708,7 +4771,9 @@ pub(crate) fn record_plane_draw(req: &DrawEncodeRequest) {
     let mut ring = PLANE_DRAW_RING
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let passes = ring.entry(color.mapping_id).or_default();
+    let window = ring.entry(color.mapping_id).or_default();
+    window.arrivals = window.arrivals.saturating_add(1);
+    let passes = &mut window.passes;
     if passes.len() == PLANE_DRAW_RING_DEPTH {
         passes.pop_front();
     }

@@ -7867,3 +7867,58 @@ fn a_span_can_be_named_without_asking_whether_its_guest_pages_are_current() {
          statement about guest writes"
     );
 }
+
+/// A plane that received more draws than the ring remembers still reports how
+/// many arrived.
+///
+/// The drain exists to answer "is the guest still compositing into this plane",
+/// and the ring's own length cannot answer it: it saturates at
+/// `PLANE_DRAW_RING_DEPTH`, so a busy plane and a plane receiving exactly that
+/// many draws read identically. The count is the answer and the passes are a
+/// tail of it, which is why they drain together.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_planes_drain_counts_every_arrival_even_past_the_ring_it_remembers() {
+    // A mapping id no other test in this process shares, because the ring is
+    // process-wide and keyed by it.
+    let mapping_id = 0x0dda_1e01;
+    let sends = PLANE_DRAW_RING_DEPTH as u64 + 7;
+    for _ in 0..sends {
+        record_plane_draw(&DrawEncodeRequest {
+            pipeline_ref: 5,
+            vertex_count: 12,
+            colors: vec![ColorRtRequest {
+                mapping_id,
+                width: 1920,
+                height: 1080,
+                ..ColorRtRequest::default()
+            }],
+            ..DrawEncodeRequest::default()
+        });
+    }
+
+    let drain = take_plane_draw_ring(mapping_id);
+    assert_eq!(
+        drain.arrivals, sends,
+        "every draw into the plane must be counted, not only the remembered tail"
+    );
+    let rendered = drain.to_string();
+    assert!(
+        rendered.starts_with(&format!(" draws={sends} passes=[...")),
+        "a truncated tail must say so beside its true count: {rendered}"
+    );
+
+    // Draining resets the window, so the next interval measures itself rather
+    // than inheriting this one. Without that, "the guest stopped drawing" is
+    // unsayable: the count would never return to zero.
+    let after = take_plane_draw_ring(mapping_id);
+    assert_eq!(
+        after.arrivals, 0,
+        "a drained plane starts its next window empty"
+    );
+    assert_eq!(
+        after.to_string(),
+        " draws=0",
+        "a plane that received nothing reports the count and no tail"
+    );
+}
