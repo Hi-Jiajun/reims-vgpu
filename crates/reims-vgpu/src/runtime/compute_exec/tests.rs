@@ -1598,6 +1598,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
     let gva = 0x101000u64;
     let rgba = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
     let staged = StagedTexture {
+        multisample_target: None,
         mip_levels: 1,
         binding: 32,
         #[cfg(feature = "backend-vulkan")]
@@ -2331,6 +2332,7 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
         bpp: 4,
     };
     let staged = |writeback, residency| StagedTexture {
+        multisample_target: None,
         mip_levels: 1,
         binding: 32,
         #[cfg(feature = "backend-vulkan")]
@@ -2768,6 +2770,7 @@ fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
     const HEAP_TEXTURES: u32 = 4 * STORAGE_RESIDENCY_WINDOWS_PER_MAPPING as u32;
 
     let staged = |key: ComputeStorageResidencyKey| StagedTexture {
+        multisample_target: None,
         mip_levels: 1,
         binding: 33,
         #[cfg(feature = "backend-vulkan")]

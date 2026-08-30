@@ -3910,7 +3910,7 @@ fn load_index_content_reason<M: HostMemory + HostOps>(
 /// order the registry keys a resident on — and because two callers assembling
 /// the same five by hand is how they come to disagree about one of them.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct GvaSpan {
+pub(crate) struct GvaSpan {
     pub texture_ref: u32,
     pub gva: u64,
     pub row_stride: u32,
@@ -3928,7 +3928,7 @@ pub(super) struct GvaSpan {
 /// since the Store, and one is a target the engine no longer holds. Each caller
 /// names them on its own census routes — the rule is shared, the vocabulary is
 /// not, so a reading says which rung refused as well as why.
-pub(super) enum GvaResidentRefusal {
+pub(crate) enum GvaResidentRefusal {
     /// The resource has no complete initial transfer backing, so it has no
     /// usable resident identity yet.
     NoGeneration,
@@ -3983,25 +3983,33 @@ fn gva_resident_ready(
     ready
 }
 
-/// The one currency test behind every GVA resident shortcut: does the engine
-/// still hold, under this span's own identity, what the render Store published
-/// into these guest pages?
+/// Name the engine resident a render Store into this GVA span would have
+/// published into, without asking whether the guest's own bytes still agree
+/// with it.
 ///
-/// Two rails ask it — the sampled bind below and the colour LOAD seed — and it
-/// is written once because a copied version of this rule is the next
-/// divergence. The callers differ only in what they do with the answer.
+/// This is the identity half of [`gva_resident_if_current`], which is written
+/// here rather than inlined there because two rails need different halves of
+/// that function and a copied derivation of a registry key is the next
+/// divergence. `None` is the same condition that function reports as
+/// `GvaResidentRefusal::NoGeneration`: a degenerate span, or a resource with no
+/// complete allocation backing to name.
 ///
-/// A named resource uses its stable host-texture generation and retained
-/// transfer backing. The page-set fallback remains only for an attachment with
-/// no resource reference and therefore no protocol lifetime to carry.
-pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
+/// Which of the two doors a caller takes is a property of the shape it is
+/// binding, not a preference. A single-sample GVA target has a second copy of
+/// its pixels — the guest pages themselves — so substituting the resident for
+/// them requires the currency test. A multisample target has no such second
+/// copy: no rail of this device writes a multisample target's guest pages, and
+/// this device is the only reader of them. For that shape the witness has
+/// nothing to compare and can only decline for want of an answer, so the rail
+/// that binds it names the resident here and lets the engine's own
+/// `MultisampleSample*` declines carry the absent-or-unready hazard at bind
+/// time.
+pub(crate) fn gva_span_identity<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     span: GvaSpan,
-) -> Result<crate::backend::vulkan::engine::TargetIdentity, GvaResidentRefusal> {
-    use crate::runtime::gva_store_witness::{reach, GvaTargetKey};
-
+) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
     let GvaSpan {
         texture_ref,
         gva,
@@ -4011,7 +4019,7 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
         format,
     } = span;
     if gva == 0 || w == 0 || h == 0 {
-        return Err(GvaResidentRefusal::NoGeneration);
+        return None;
     }
     let span_bytes = u64::from(row_stride).saturating_mul(u64::from(h));
     let generation = if texture_ref != 0 {
@@ -4029,16 +4037,39 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
         gva_span_alloc_generation(state, host, task_id, gva, row_stride, h)
     };
     if generation == 0 {
-        return Err(GvaResidentRefusal::NoGeneration);
+        return None;
     }
-    let resident_format = gva_resident_format(format);
-    let identity = crate::backend::vulkan::engine::TargetIdentity::Gva {
+    Some(crate::backend::vulkan::engine::TargetIdentity::Gva {
         gva,
         width: w,
         height: h,
         generation,
-        format: resident_format,
-    };
+        format: gva_resident_format(format),
+    })
+}
+
+/// The one currency test behind every GVA resident shortcut: does the engine
+/// still hold, under this span's own identity, what the render Store published
+/// into these guest pages?
+///
+/// Two rails ask it — the sampled bind below and the colour LOAD seed — and it
+/// is written once because a copied version of this rule is the next
+/// divergence. The callers differ only in what they do with the answer.
+///
+/// A named resource uses its stable host-texture generation and retained
+/// transfer backing. The page-set fallback remains only for an attachment with
+/// no resource reference and therefore no protocol lifetime to carry.
+pub(crate) fn gva_resident_if_current<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    span: GvaSpan,
+) -> Result<crate::backend::vulkan::engine::TargetIdentity, GvaResidentRefusal> {
+    use crate::runtime::gva_store_witness::{reach, GvaTargetKey};
+
+    let texture_ref = span.texture_ref;
+    let identity =
+        gva_span_identity(state, host, task_id, span).ok_or(GvaResidentRefusal::NoGeneration)?;
     // An unpaid Store says the guest pages are deliberately stale and this
     // image is authoritative. The older witness below answers the opposite
     // state: a Store was copied out and both locations still agree. Keeping
@@ -4049,22 +4080,16 @@ pub(super) fn gva_resident_if_current<M: HostMemory + HostOps>(
             .then_some(identity)
             .ok_or(GvaResidentRefusal::NoResident);
     }
-    let verdict = reach(
-        state,
-        host,
-        GvaTargetKey {
-            gva,
-            generation,
-            width: w,
-            height: h,
-            // From the identity built just above, not from `resident_format`
-            // again. `GvaTargetKey::of` builds this same key from the same
-            // identity on the other side of the witness, and the two must
-            // agree — a channel order written by hand at two sites is how they
-            // stop agreeing.
-            bgra: identity.is_bgra(),
-        },
-    );
+    // From the identity built just above, through the key's own constructor.
+    // `GvaTargetKey::of` is what builds this key on the other side of the
+    // witness, and the two must agree — a key written out by hand at one of the
+    // two sites is how they stop agreeing. It cannot decline here: it declines
+    // only for a zero gva or generation, which `gva_span_identity` has already
+    // refused to produce an identity for.
+    let Some(key) = GvaTargetKey::of(&identity) else {
+        return Err(GvaResidentRefusal::NoGeneration);
+    };
+    let verdict = reach(state, host, key);
     if !verdict.is_quiet() {
         return Err(GvaResidentRefusal::Wrote(verdict));
     }

@@ -11,8 +11,8 @@
 
 use reims_vgpu::backend::vulkan::engine::{
     self, ComputeBufferResource, ComputeRequest, ComputeResidentSampleBind,
-    ComputeSampledImageResource, ComputeStorageImageResource, ComputeStorageResidency,
-    StorageImageFormat,
+    ComputeSampledImageResource, ComputeSampledSource, ComputeStorageImageResource,
+    ComputeStorageResidency, StorageImageFormat,
 };
 use reims_vgpu::model::ComputeStorageResidencyKey;
 use std::path::PathBuf;
@@ -964,8 +964,7 @@ fn compute_sampled_resident_copy_and_lost_resident() {
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
-            bytes: vec![0u8; (w * h * 4) as usize],
-            resident_bind: Some(ComputeResidentSampleBind {
+            source: ComputeSampledSource::ResidentCopy(ComputeResidentSampleBind {
                 identity,
                 generation,
             }),
@@ -1048,8 +1047,7 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
             format: StorageImageFormat::Rgba32Float,
             width: 1,
             height: 1,
-            bytes,
-            resident_bind: None,
+            source: ComputeSampledSource::Bytes(bytes),
         }],
         samplers: vec![],
         storage_images: vec![],
@@ -1073,7 +1071,7 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
     // RGB9E5 has no writable-storage selector in the guest ABI, but it is a
     // valid sampled texture. Zero packed RGB decodes to (0, 0, 0, 1).
     req.sampled_images[0].format = StorageImageFormat::Rgb9e5Ufloat;
-    req.sampled_images[0].bytes = vec![0; 4];
+    req.sampled_images[0].source = ComputeSampledSource::Bytes(vec![0; 4]);
     let Some(out) = engine_or_skip("compute sampled RGB9E5 image", &req) else {
         return;
     };
@@ -1100,7 +1098,8 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
     };
     req.spirv = words;
     req.sampled_images[0].format = StorageImageFormat::R32Uint;
-    req.sampled_images[0].bytes = 0x1234_5678u32.to_le_bytes().to_vec();
+    req.sampled_images[0].source =
+        ComputeSampledSource::Bytes(0x1234_5678u32.to_le_bytes().to_vec());
     let Some(out) = engine_or_skip("compute sampled R32Uint image", &req) else {
         return;
     };
@@ -1442,8 +1441,7 @@ fn compute_sampled_image_serves_every_declared_mip_level() {
                 width: BASE,
                 height: BASE,
                 mip_levels: LEVELS,
-                bytes: bytes.clone(),
-                resident_bind: None,
+                source: ComputeSampledSource::Bytes(bytes.clone()),
             }],
             samplers: vec![],
             storage_images: vec![],
@@ -1495,8 +1493,7 @@ fn compute_sampled_resident_bind_refuses_a_pyramid() {
             width: 8,
             height: 8,
             mip_levels: 4,
-            bytes: vec![0u8; 8 * 8 * 4 + 4 * 4 * 4 + 2 * 2 * 4 + 4],
-            resident_bind: Some(ComputeResidentSampleBind {
+            source: ComputeSampledSource::ResidentCopy(ComputeResidentSampleBind {
                 identity: ComputeStorageResidencyKey {
                     mapping_id: 94,
                     map_generation: 1,
@@ -1563,8 +1560,7 @@ fn compute_sampled_a8unorm_arrives_in_alpha() {
             width: w,
             height: h,
             mip_levels: 1,
-            bytes: vec![BYTE; (w * h) as usize],
-            resident_bind: None,
+            source: ComputeSampledSource::Bytes(vec![BYTE; (w * h) as usize]),
         }],
         samplers: vec![],
         storage_images: vec![],

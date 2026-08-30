@@ -7764,3 +7764,106 @@ fn a_preserving_gva_attachment_reaches_the_encoder_able_to_preserve() {
          the opposite of what it asked for"
     );
 }
+
+/// The two GVA resident doors part company exactly at the witness, and the one
+/// without it can answer where the one with it cannot.
+///
+/// [`vulkan::gva_span_identity`] names the resident a Store into a span would
+/// have published into. [`vulkan::gva_resident_if_current`] asks that same
+/// question and then additionally asks whether the guest's own copy of those
+/// pixels still agrees. The second question only exists because a single-sample
+/// GVA target *has* a second copy; a multisample target does not, so the rail
+/// that binds one takes the first door.
+///
+/// The failure this catches is that door being quietly re-plumbed through the
+/// witness — which is precisely what the multisample compute bind did on its
+/// first attempt, and it cost the guest every `texture2d_ms` dispatch: the
+/// witness had observed no write at all, `is_quiet()` is false for "cannot
+/// answer", and the bind was refused for want of an answer to a question with
+/// no second copy behind it.
+///
+/// There is no engine in a unit test, so the currency door cannot reach `Ok`
+/// here by construction. That is not what is under test: what is under test is
+/// that the identity door does not inherit that refusal, and that the two still
+/// share one derivation — `None` from the first must mean exactly
+/// `NoGeneration` from the second, on the same span, because the second is
+/// written in terms of the first.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_span_can_be_named_without_asking_whether_its_guest_pages_are_current() {
+    use crate::contract::endian::st32;
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::draw::vulkan::{gva_resident_if_current, gva_span_identity};
+    use crate::runtime::draw::{GvaResidentRefusal, GvaSpan};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let dir_pfn = 2u32;
+    let root_pfn = 3u32;
+    let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range((root_pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    assert!(host.write_gpa(dir_gpa, &d).is_ok());
+    for i in 0..4u32 {
+        let pfn = 4 + i;
+        host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, pfn);
+        assert!(host
+            .write_gpa(
+                ((root_pfn as u64) << PAGE_SHIFT_ARM64E) + (i as u64) * 4,
+                &pte
+            )
+            .is_ok());
+    }
+    state.define_task(1, 0x1000, dir_pfn);
+
+    // An anonymous span — no texture reference, so its identity comes from the
+    // page set alone and this test needs no object list to carry a lifetime.
+    let span = GvaSpan {
+        texture_ref: 0,
+        gva: 1u64 << PAGE_SHIFT_ARM64E,
+        row_stride: 32,
+        width: 8,
+        height: 8,
+        format: MTL_FORMAT_BGRA8_UNORM,
+    };
+
+    let named = gva_span_identity(&mut state, &mut host, 1, span)
+        .expect("a fully resolved page span names an allocation");
+    match gva_resident_if_current(&mut state, &mut host, 1, span) {
+        Ok(_) => panic!("no engine holds this identity, so the currency door cannot admit it"),
+        Err(GvaResidentRefusal::NoGeneration) => panic!(
+            "the currency door refused for want of a name, but the identity door \
+             produced one from the same span — the two derivations have diverged"
+        ),
+        Err(GvaResidentRefusal::Wrote(_) | GvaResidentRefusal::NoResident) => {}
+    }
+
+    // Repeating the naming is stable: a registry key that moved between two
+    // reads of one unchanged span would miss the resident the render created.
+    assert_eq!(
+        gva_span_identity(&mut state, &mut host, 1, span),
+        Some(named),
+        "one span names one allocation"
+    );
+
+    // And the two doors still agree about what cannot be named at all.
+    let unnameable = GvaSpan { gva: 0, ..span };
+    assert_eq!(
+        gva_span_identity(&mut state, &mut host, 1, unnameable),
+        None
+    );
+    assert!(
+        matches!(
+            gva_resident_if_current(&mut state, &mut host, 1, unnameable),
+            Err(GvaResidentRefusal::NoGeneration)
+        ),
+        "an unnameable span is `NoGeneration` on the currency door, not a \
+         statement about guest writes"
+    );
+}

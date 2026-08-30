@@ -1705,14 +1705,48 @@ pub struct ComputeSampledImageResource {
     /// [`crate::contract::extent::tight_pyramid_spans`] — `1` for every
     /// binding but a guest mip chain sampled by an explicit LOD.
     pub mip_levels: u32,
-    pub bytes: Vec<u8>,
-    /// When set, `bytes` is a zero placeholder: the engine seeds the sampled
-    /// image with a device-local copy of the named resident storage image
-    /// instead of uploading from the host (see [`ComputeResidentSampleBind`]).
+    /// Where this binding's texels come from.
     ///
-    /// Only ever set for a single-level binding: a resident is one window at
-    /// one level, so seeding a pyramid from it would leave levels 1.. empty.
-    pub resident_bind: Option<ComputeResidentSampleBind>,
+    /// One field rather than a `Vec<u8>` beside an `Option<ComputeResidentSampleBind>`,
+    /// for the reason [`ComputeSampledImageResource`]'s sibling
+    /// `StagedTexture::serve` already gives: those were the tag and the payload
+    /// of an enum stored apart, so every producer had to build both halves and
+    /// nothing made a producer that set one without the other fail to compile.
+    /// The third source below could not be expressed at all in that shape — it
+    /// has no bytes, valid or placeholder.
+    pub source: ComputeSampledSource,
+}
+
+/// Where a compute sampled binding's texels come from.
+#[derive(Clone, Debug)]
+pub enum ComputeSampledSource {
+    /// Host bytes uploaded into a pooled transient: every level the binding
+    /// declares, base first, tightly packed by
+    /// [`crate::contract::extent::tight_pyramid_spans`].
+    Bytes(Vec<u8>),
+    /// A device-local copy from the named resident storage image into a pooled
+    /// transient (copy-on-sample: the transient never aliases the live
+    /// resident, so the same dispatch may storage-write it).
+    ///
+    /// Only ever a single-level binding: a resident is one window at one level,
+    /// so seeding a pyramid from it would leave levels 1.. empty.
+    ///
+    /// The copy's byte weight is *derived* from the binding's own geometry
+    /// rather than carried. It used to travel as a zero-filled `Vec<u8>` of
+    /// exactly that length, which the request validation then checked against
+    /// the same derivation — a value that cannot disagree, checked as if it
+    /// could.
+    ResidentCopy(ComputeResidentSampleBind),
+    /// A retained multisample render target, bound through its own registry
+    /// view.
+    ///
+    /// Nothing is allocated, uploaded, or copied for this source, and that is
+    /// the contract rather than an optimisation: [`SampledResource::multisampled`]
+    /// states that such an image "can only come from a retained multisample
+    /// target; linear bytes cannot be uploaded into one with a buffer-to-image
+    /// copy". A Metal kernel reaches it by declaring
+    /// `texture2d_ms<T, access::read>` and calling `read(coord, sample)`.
+    MultisampleTarget(TargetIdentity),
 }
 
 /// Pixel formats the product compute path maps. Storage and sampled images
