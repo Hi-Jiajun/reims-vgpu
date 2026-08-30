@@ -137,6 +137,9 @@ textureViewIdentityCase(64, 32)
 textureViewIdentityCase(256, 64)
 textureViewArraySliceCase(64, 32, slices: 3)
 textureViewOverSurfaceCase(64, 32)
+selfCopyOverlapRowShiftCase()
+selfCopyOverlapColumnShiftCase()
+selfCopyDisjointCase()
 textureViewOverSurfaceCase(256, 64)
 
 if texPipeline == nil {

@@ -138,6 +138,9 @@ CASE texture_view_array_slice_64x32x3_s1 PASS 64x32 slice=1 matched
 CASE texture_view_array_slice_64x32x3_s2 PASS 64x32 slice=2 matched
 CASE texture_view_over_surface_64x32_base PASS 64x32 slice=0 matched
 CASE texture_view_over_surface_64x32_view PASS 64x32 slice=0 matched
+CASE self_copy_overlap_row_shift_14 PASS the overlapping copy read its source before writing its destination
+CASE self_copy_overlap_column_shift_12 PASS the overlapping copy read its source before writing its destination
+CASE self_copy_disjoint_control PASS the overlapping copy read its source before writing its destination
 CASE texture_view_over_surface_256x64_base PASS 256x64 slice=0 matched
 CASE texture_view_over_surface_256x64_view PASS 256x64 slice=0 matched
 CASE fragsample_a8Unorm_54x16_pitch_64_first_draw PASS 864 texels exact through the rasterizer
@@ -292,5 +295,5 @@ ROUTE srt_blit_iosurface_source_1920x1080_x4 sl_gpu_landed
 CASE srt_blit_iosurface_source_1920x1080_x4 PASS every surface-to-surface copy moved its own frame's pixels
 CASE srt_blit_buffer_backed_512x512 PASS the copy out of a buffer-backed source moved what the render had written
 CASE command_buffer_cross_queue_shared_event_visibility PASS producer=4 consumer=4 completed_without_host_release=true visible=true
-SUMMARY cases=290 failures=0 skipped=0
+SUMMARY cases=293 failures=0 skipped=0
 DEVICE name=Apple M4 unified=true
