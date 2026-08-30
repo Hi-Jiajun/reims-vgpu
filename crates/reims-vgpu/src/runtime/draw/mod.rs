@@ -4440,6 +4440,62 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
 ///
 /// Full-screen planes only. A pass over a scratch offscreen answers a different
 /// question and there are thousands of them.
+/// The part of a draw the plane ring keeps: how much geometry it submitted and
+/// what it was clipped to. A pass that covers the whole plane and one clipped to
+/// a window's own rect are the two answers that matter when a plane's whole
+/// field changes at once, and neither is recoverable from the pipeline id.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) struct PlaneDrawShape {
+    pub vertex_count: u32,
+    pub scissor: String,
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl PlaneDrawShape {
+    pub(crate) fn of(req: &DrawEncodeRequest) -> Self {
+        let scissor = req
+            .scissors
+            .first()
+            .map(|s| format!("s{}+{}+{}x{}", s.x, s.y, s.width, s.height))
+            .unwrap_or_else(|| "s-none".to_string());
+        Self {
+            vertex_count: req.vertex_count,
+            scissor,
+        }
+    }
+}
+
+/// The last few passes that rendered into each full-screen plane.
+///
+/// The latched census below reports which *declarations* exist; it cannot
+/// report which pass ran at a particular moment, because a compositor re-runs
+/// the same pipelines every frame and the latch fires once. The field witness
+/// knows the present at which a plane's field turns uniform, and the question
+/// that moment raises is "what drew into it just now" -- so the passes are kept
+/// in a bounded ring and printed when that happens, rather than logged per draw
+/// at the compositor's draw rate.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) static PLANE_DRAW_RING: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u32, std::collections::VecDeque<String>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Passes remembered per plane. Enough to cover a compositor frame's layers
+/// without letting an idle plane hold an unbounded history.
+#[cfg(feature = "backend-vulkan")]
+const PLANE_DRAW_RING_DEPTH: usize = 24;
+
+/// Drain and format the remembered passes for one plane.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn take_plane_draw_ring(mapping_id: u32) -> String {
+    let mut ring = PLANE_DRAW_RING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ring.remove(&mapping_id)
+        .map(|passes| passes.into_iter().collect::<Vec<_>>().join(" "))
+        .unwrap_or_default()
+}
+
+#[cfg(feature = "backend-vulkan")]
 pub(crate) fn note_compositor_plane_pass(
     color: &ColorRtRequest,
     width: u32,
@@ -4447,11 +4503,27 @@ pub(crate) fn note_compositor_plane_pass(
     pipeline_ref: u32,
     seed_served: bool,
     seed_door: &str,
+    draw: PlaneDrawShape,
 ) {
     let (mapping_id, load_action, clear_color) =
         (color.mapping_id, color.load_action, &color.clear_color);
     if mapping_id == 0 || width < 1024 || height < 1024 {
         return;
+    }
+    {
+        let mut ring = PLANE_DRAW_RING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let passes = ring.entry(mapping_id).or_default();
+        if passes.len() == PLANE_DRAW_RING_DEPTH {
+            passes.pop_front();
+        }
+        passes.push_back(format!(
+            "p{pipeline_ref}/v{}/{}/l{load_action:#x}/{}",
+            draw.vertex_count,
+            draw.scissor,
+            if seed_served { "seed" } else { "noseed" }
+        ));
     }
     let disc = (u64::from(mapping_id) << 40)
         | (u64::from(pipeline_ref) << 9)

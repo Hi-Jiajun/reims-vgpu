@@ -8105,6 +8105,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         req.pipeline_ref,
                         target_rgba8.is_some() || target_guest_seed.is_some(),
                         seed_door,
+                        crate::runtime::draw::PlaneDrawShape::of(req),
                     );
                     if matches!(declared, LoadAction::DontCare) {
                         // The widened arm's own instrument, and it is a counter

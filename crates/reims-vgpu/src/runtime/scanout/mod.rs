@@ -1540,9 +1540,22 @@ pub fn note_present_field_witness<M: HostMemory>(
     if !changed && !heartbeat {
         return;
     }
+    // Only when a plane's field newly reads uniform: that is the transition the
+    // ring exists to explain, and draining it on every change would empty it on
+    // the ordinary black-to-wallpaper one.
+    #[cfg(feature = "backend-vulkan")]
+    let ring = (changed && blank as usize == FIELD_PATCHES.len())
+        .then(|| crate::runtime::draw::take_plane_draw_ring(mapping_id))
+        .filter(|r| !r.is_empty())
+        .map(|r| format!(" passes=[{r}]"))
+        .unwrap_or_default();
+    // The ring is filled by the Vulkan draw encode; there is no such record on
+    // the Metal arm, so the field is simply absent there rather than empty.
+    #[cfg(not(feature = "backend-vulkan"))]
+    let ring = String::new();
     crate::observe::off(format!(
         "present_field_witness mid={mapping_id} {width}x{height} map_gen={map_gen} \
-         epoch={epoch} seq={seq} why={} unpainted={blank}/4 patches=[{report}] \
+         epoch={epoch} seq={seq} why={} unpainted={blank}/4 patches=[{report}]{ring} \
          (guest pages, no settle)",
         if changed { "changed" } else { "heartbeat" }
     ));
