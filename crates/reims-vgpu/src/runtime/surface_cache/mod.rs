@@ -1353,6 +1353,25 @@ pub enum GvaSeedVerdict {
     Unmapped,
     /// Nothing recorded, or the recording task is gone.
     Unrecorded,
+    /// The guest's own pages hold these same bytes, so this copy can only be
+    /// older than they are and never newer.
+    ///
+    /// Nothing in this map witnesses a guest CPU write — see
+    /// [`crate::model::HostSurface::guest_holds_bytes`], where that gap is
+    /// recorded. For an entry the guest's pages do *not* hold, the gap is a
+    /// price worth paying: the copy is the only place those pixels exist and
+    /// refusing it loses them. For an entry they do hold, there is nothing to
+    /// buy. Both sources start equal, only one of them tracks the guest CPU,
+    /// and the guest may write it with no device operation at all — so serving
+    /// the copy can differ from the truth only in the direction of the past.
+    ///
+    /// Live shape of that difference: a Store lands the frame in the guest's
+    /// pages and publishes it here, the guest CPU rasterizes into part of the
+    /// layer, and the next pass's `MTLLoadActionLoad` seed takes this copy and
+    /// loses everything the CPU wrote. The pass then Stores the result back
+    /// over the guest's own bytes, so the loss is not a stale read that the
+    /// next frame corrects — it is written into the layer.
+    GuestHolds,
 }
 
 impl GvaSeedVerdict {
@@ -1365,6 +1384,7 @@ impl GvaSeedVerdict {
             Self::Moved => "gva_seed_refused_moved",
             Self::Unmapped => "gva_seed_refused_unmapped",
             Self::Unrecorded => "gva_seed_refused_unrecorded",
+            Self::GuestHolds => "gva_seed_refused_guest_holds",
         }
     }
 }
@@ -1386,6 +1406,12 @@ pub fn gva_seed_verdict<H: HostMemory>(
     // question about another task's memory, however fresh it says the pages are.
     if backing.task_id != task_id {
         return GvaSeedVerdict::OtherTask;
+    }
+    // Before freshness, because it is not a freshness question: an entry the
+    // guest's pages also hold has no answer this door needs. See
+    // [`GvaSeedVerdict::GuestHolds`].
+    if entry.guest_holds_bytes {
+        return GvaSeedVerdict::GuestHolds;
     }
     match gva_backing_state(state, host, gva) {
         GvaBackingState::Same => GvaSeedVerdict::Admit,

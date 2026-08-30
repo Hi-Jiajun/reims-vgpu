@@ -1261,7 +1261,25 @@ crate::observe::decline::decline_display!(GvaWritebackDecline);
 /// transfer backing. `pages == None` is therefore still `Unlicensed` on both
 /// arms: there is no authorisation to write anywhere, and a copy is not a
 /// second opinion about that.
+/// # What `skip` is
+///
+/// Bytes from `c0.target_gva` this store may not write, because the guest's own
+/// memory holds something newer there. Every eager caller passes `&[]`: a Store
+/// landing at the moment it is issued has nothing to make room for. The
+/// deferred caller can have something, and the empty slice is the wrong answer
+/// for it — see `writeback_debt::pay_gva`.
+///
+/// A non-empty `skip` forces the copying rail. The GPU-direct arm copies the
+/// resident into the plane as one image region and has no way to exclude pages
+/// from it, so a caller that must exclude some pays the readback. That is the
+/// right price: the alternative is losing one of the two writers, and it is
+/// paid only when the hypervisor has actually reported a guest write into a
+/// plane this device still owes a frame for.
 #[cfg(feature = "backend-vulkan")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the store's own parameters, plus the bytes its owner may not overwrite"
+)]
 pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1270,8 +1288,14 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     c0: &crate::runtime::draw::ColorRtRequest,
     texture_ref: u32,
     pages: Option<&crate::runtime::draw::StoreTargetPages>,
+    skip: crate::runtime::mapping_write::SkipRanges<'_>,
 ) -> Result<u64, GvaWritebackDecline> {
-    let direct = store_gva_frame_direct(state, host, task_id, identity, c0, texture_ref, pages);
+    let direct = if skip.is_empty() {
+        store_gva_frame_direct(state, host, task_id, identity, c0, texture_ref, pages)
+    } else {
+        crate::runtime::drain::note_store_route("gva_flush_skipping");
+        Err(GvaWritebackDecline::Unlicensed)
+    };
     let decline = match direct {
         Ok(extent) => {
             crate::runtime::drain::note_store_route("gva_flush_gpu_direct");
@@ -1330,6 +1354,7 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
                 texture_ref,
                 crate::runtime::draw::FrameRows::Native(&readback.pixels),
                 pages,
+                skip,
             )?
         }
         None => {
@@ -1344,6 +1369,7 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
                 texture_ref,
                 crate::runtime::draw::FrameRows::Rgba8(&rgba),
                 pages,
+                skip,
             )?
         }
     };
@@ -1366,6 +1392,10 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
 /// inside `gva_view`, so the two arms leave the same witness behind and a
 /// decline is invisible to every reader of `gather_witness`.
 #[cfg(feature = "backend-vulkan")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the destination's geometry, plus the bytes its owner may not overwrite"
+)]
 fn land_gva_frame_bytes<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1374,6 +1404,7 @@ fn land_gva_frame_bytes<M: HostMemory + HostOps>(
     texture_ref: u32,
     frame: crate::runtime::draw::FrameRows<'_>,
     pages: &crate::runtime::draw::StoreTargetPages,
+    skip: crate::runtime::mapping_write::SkipRanges<'_>,
 ) -> Result<u64, GvaWritebackDecline> {
     // The destination extent in the destination's own bytes, which is what the
     // direct arm returns too — the two rails must agree about how much guest
@@ -1383,7 +1414,7 @@ fn land_gva_frame_bytes<M: HostMemory + HostOps>(
     };
     let extent =
         u64::from(c0.height.saturating_sub(1)) * u64::from(c0.row_stride) + u64::from(tight);
-    crate::runtime::draw::write_gva_frame_within(
+    crate::runtime::draw::write_gva_frame_within_skipping(
         state,
         host,
         task_id,
@@ -1394,6 +1425,7 @@ fn land_gva_frame_bytes<M: HostMemory + HostOps>(
         c0.format,
         frame,
         Some(pages.membership()),
+        skip,
     )
     .map_err(|err| GvaWritebackDecline::CopiedWriteRefused { err })?;
     crate::runtime::surface_cache::forget_gva_copies(state, task_id, c0.target_gva, texture_ref);
@@ -1783,6 +1815,7 @@ mod gva_copying_arm_tests {
             0,
             crate::runtime::draw::FrameRows::Rgba8(&rgba),
             &pages,
+            &[],
         )
         .expect("the licensed page is writable");
         assert_eq!(
@@ -1828,6 +1861,7 @@ mod gva_copying_arm_tests {
             0,
             crate::runtime::draw::FrameRows::Rgba8(&rgba),
             &pages,
+            &[],
         )
         .expect_err("the destination page is outside the licence");
         assert_eq!(
@@ -1843,6 +1877,60 @@ mod gva_copying_arm_tests {
             got,
             [0u8; (W * 4) as usize],
             "nothing may have been written"
+        );
+    }
+
+    /// A deferred frame landing over pages the guest CPU wrote in between keeps
+    /// both writers.
+    ///
+    /// This is the external relation `cpu_write_after_render` asks for. A
+    /// `.shared` texture's storage is guest RAM and the GPU and the guest CPU
+    /// are both writers of it; Metal's guarantee is per region, so a CPU write
+    /// into one part of a layer the GPU rendered leaves the rest of the GPU's
+    /// work standing. A writeback with no third answer had only two, and both
+    /// destroy a writer: land the whole frame and the guest's bytes are gone,
+    /// drop it and everything the GPU rendered is gone.
+    #[test]
+    fn a_landed_frame_leaves_the_bytes_the_guest_wrote_alone() {
+        let (mut host, mut state) = fixture();
+        let gpa = (DATA_BASE_PFN + 1) << PAGE_SHIFT_ARM64E;
+        // What the guest CPU put in row 1 after the render and before this
+        // payment. Distinct from every byte of the frame.
+        let guest_row = [0xEFu8; (W * 4) as usize];
+        crate::runtime::host::HostMemory::write_gpa(&mut host, gpa + u64::from(BPR), &guest_row)
+            .expect("the destination page is guest RAM");
+
+        let rgba = frame();
+        let pages = licence_for(1);
+        // Row 1's bytes, in the same coordinate system the row offsets are in.
+        let skip = [(u64::from(BPR), u64::from(BPR) + u64::from(W) * 4)];
+        land_gva_frame_bytes(
+            &mut state,
+            &mut host,
+            1,
+            &request(),
+            0,
+            crate::runtime::draw::FrameRows::Rgba8(&rgba),
+            &pages,
+            &skip,
+        )
+        .expect("the licensed page is writable");
+
+        let mut got0 = [0u8; (W * 4) as usize];
+        crate::runtime::host::HostMemory::read_gpa(&host, gpa, &mut got0)
+            .expect("the destination page is guest RAM");
+        assert_eq!(
+            &got0[..],
+            &rgba[..(W * 4) as usize],
+            "the device's own row must still land"
+        );
+
+        let mut got1 = [0u8; (W * 4) as usize];
+        crate::runtime::host::HostMemory::read_gpa(&host, gpa + u64::from(BPR), &mut got1)
+            .expect("the destination page is guest RAM");
+        assert_eq!(
+            got1, guest_row,
+            "the guest's own row must survive the payment"
         );
     }
 }

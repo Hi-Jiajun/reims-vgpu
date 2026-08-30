@@ -456,7 +456,7 @@ pub type SkipRanges<'a> = &'a [(u64, u64)];
 /// differently — one pokes a host view in place, the other stages a frame and
 /// hands runs to the mapper — and the only thing they must agree on is *which
 /// bytes are excluded*. Two open-coded walks would be two chances to disagree.
-fn unskipped(start: u64, end: u64, skip: SkipRanges<'_>) -> Vec<(u64, u64)> {
+pub(crate) fn unskipped(start: u64, end: u64, skip: SkipRanges<'_>) -> Vec<(u64, u64)> {
     if skip.is_empty() {
         return if start < end {
             vec![(start, end)]

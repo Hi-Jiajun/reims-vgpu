@@ -5039,6 +5039,50 @@ pub(crate) fn write_gva_frame_within<M: HostMemory + HostOps>(
     frame: FrameRows<'_>,
     allowed: crate::runtime::gva_view::WindowPages<'_>,
 ) -> Result<(), crate::runtime::host::MemError> {
+    write_gva_frame_within_skipping(
+        state,
+        host,
+        task_id,
+        gva,
+        width,
+        height,
+        bpr,
+        format,
+        frame,
+        allowed,
+        &[],
+    )
+}
+
+/// [`write_gva_frame_within`], leaving `skip` untouched.
+///
+/// `skip` is in bytes from `gva`, ascending and disjoint — the same coordinate
+/// system `bpr` and the row offsets below are in, and the GVA spelling of
+/// [`crate::runtime::mapping_write::SkipRanges`]. It exists for the one caller
+/// that has a third answer to give: a deferred writeback landing a frame the
+/// device rendered into pages the guest CPU wrote part of in between. Writing
+/// the whole frame loses the guest's stores and dropping it loses the device's;
+/// `skip` names the bytes the guest's own memory keeps.
+///
+/// Every other caller passes `&[]` and lands the frame whole, which is what a
+/// Store with no intervening guest write means.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the target GVA and native row geometry, plus the bytes its owner may not overwrite"
+)]
+pub(crate) fn write_gva_frame_within_skipping<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    gva: u64,
+    width: u32,
+    height: u32,
+    bpr: u32,
+    format: u16,
+    frame: FrameRows<'_>,
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
+    skip: crate::runtime::mapping_write::SkipRanges<'_>,
+) -> Result<(), crate::runtime::host::MemError> {
     use crate::runtime::host::MemError;
     if gva == 0 || width == 0 || height == 0 || bpr == 0 {
         return Err(MemError::BadArgs);
@@ -5096,9 +5140,24 @@ pub(crate) fn write_gva_frame_within<M: HostMemory + HostOps>(
                 res = Err(MemError::RunOutOfRange);
                 break;
             }
-            // SAFETY: map_fresh_span covers `span`.
-            unsafe {
-                std::ptr::copy_nonoverlapping(out_row.as_ptr(), base.add(off), out_row.len());
+            // One forward walk per row through the shared range subtraction, so
+            // this rail and the mapping writer cannot come to disagree about
+            // which bytes are excluded.
+            for (from, to) in crate::runtime::mapping_write::unskipped(
+                off as u64,
+                (off + out_row.len()) as u64,
+                skip,
+            ) {
+                let (at, len) = ((from as usize) - off, (to - from) as usize);
+                // SAFETY: map_fresh_span covers `span`, and `from`/`to` are a
+                // sub-range of this row, which the bound above put inside it.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        out_row[at..].as_ptr(),
+                        base.add(from as usize),
+                        len,
+                    );
+                }
             }
         }
         crate::runtime::gva_view::unmap_fresh_span(host, span_map);
@@ -5121,17 +5180,23 @@ pub(crate) fn write_gva_frame_within<M: HostMemory + HostOps>(
             }
             FrameRows::Native(native) => &native[at..at + src_stride],
         };
-        let row_gva = gva.saturating_add((y as u64).saturating_mul(bpr as u64));
-        if let Err(err) = crate::runtime::gva_view::write_span_within(
-            state, host, task_id, row_gva, out_row, allowed,
-        ) {
-            let reason = crate::observe::Decline::slug(&err);
-            crate::observe::fail(format!(
-                "gva_write fail reason={reason} task={task_id} gva={row_gva:#x} span={span:#x} \
-                 row={y} rowlen={:#x} (multi)",
-                out_row.len()
-            ));
-            return Err(err);
+        let row_off = (y as u64).saturating_mul(bpr as u64);
+        for (from, to) in
+            crate::runtime::mapping_write::unskipped(row_off, row_off + out_row.len() as u64, skip)
+        {
+            let run_gva = gva.saturating_add(from);
+            let run = &out_row[(from - row_off) as usize..(to - row_off) as usize];
+            if let Err(err) = crate::runtime::gva_view::write_span_within(
+                state, host, task_id, run_gva, run, allowed,
+            ) {
+                let reason = crate::observe::Decline::slug(&err);
+                crate::observe::fail(format!(
+                    "gva_write fail reason={reason} task={task_id} gva={run_gva:#x} span={span:#x} \
+                     row={y} rowlen={:#x} (multi)",
+                    run.len()
+                ));
+                return Err(err);
+            }
         }
     }
     Ok(())
@@ -5483,17 +5548,38 @@ fn seed_color_load<M: HostMemory + HostOps>(
         // rule is the measured one, not a cautious guess.
         let gva_present = target_gva != 0
             && crate::runtime::surface_cache::has_gva(state, target_gva, width, height);
-        let gva_served = gva_present && {
+        let gva_verdict = gva_present.then(|| {
             let verdict =
                 crate::runtime::surface_cache::gva_seed_verdict(state, host, task_id, target_gva);
             crate::runtime::drain::note_store_route(verdict.route());
-            !matches!(
-                verdict,
-                crate::runtime::surface_cache::GvaSeedVerdict::OtherTask
-                    | crate::runtime::surface_cache::GvaSeedVerdict::Moved
+            verdict
+        });
+        let gva_served = matches!(
+            gva_verdict,
+            Some(
+                crate::runtime::surface_cache::GvaSeedVerdict::Admit
+                    | crate::runtime::surface_cache::GvaSeedVerdict::Unmapped
+                    | crate::runtime::surface_cache::GvaSeedVerdict::Unrecorded
             )
-        };
+        );
+        // The ref door is the GVA door's fallback, so it may not be the more
+        // permissive of the two. `GuestHolds` is a statement about *this
+        // address*: the guest's own pages hold these bytes and track the guest
+        // CPU, which no host-side copy does. The two caches are stored from one
+        // call over one frame, so serving the ref entry here is serving the
+        // refused entry under another key.
+        //
+        // The other refusals do not travel. `OtherTask` and `Moved` are
+        // statements about the GVA *entry* — whose address space it was recorded
+        // in, and whether the address still names those pages — and the ref
+        // door's own `source_gva` test already answers the same question for
+        // its own entry.
+        let ref_blocked = matches!(
+            gva_verdict,
+            Some(crate::runtime::surface_cache::GvaSeedVerdict::GuestHolds)
+        );
         let ref_served = !gva_served
+            && !ref_blocked
             && texture_ref != 0
             && target_gva != 0
             && crate::runtime::surface_cache::texture_source_gva(

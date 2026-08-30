@@ -85,14 +85,6 @@ dispatch_threads_grid_54x15_tg8 # threads ran past both requested dimensions
 dispatch_threads_grid_57x9_tg8 # threads ran past both requested dimensions
 dispatch_threads_grid_31x31_tg16 # threads ran past both requested dimensions
 
-# Shared-target content ownership failures. Paired IOSurface cases using the
-# same translated shaders pass, so the changing term is the device backing rail.
-cpu_write_after_render_64x32 # first GPU Store is lost before the CPU update
-cpu_write_after_render_256x64 # first GPU Store is lost before the CPU update
-srt_cpu_write_then_sample_60x32 # shared target loses its GPU-produced half
-srt_cpu_write_then_sample_256x64 # shared target loses its GPU-produced half
-srt_cpu_write_then_sample_1000x40 # shared target loses its GPU-produced half
-
 # Device API/state reporting; neither result executes translated GPU code.
 indirect_command_reset_copy_optimize # device reports indirect command buffers unavailable
 pipeline_information_lifetime # pipeline construction-owned information reports zero
