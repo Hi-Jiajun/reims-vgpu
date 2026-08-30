@@ -438,6 +438,15 @@ pub struct TextureDescriptor {
     pub height: u32,
     pub depth: u32,
     pub pixel_format: u16,
+    /// Texture sample count, when the trailer proved to be laid out as this
+    /// decoder believes; `None` otherwise.
+    ///
+    /// `None` is not "one". A caller that needs a sample count and finds `None`
+    /// has not been told the texture is single-sample — it has been told this
+    /// descriptor did not establish one, which is a different fact and must not
+    /// be resolved by guessing. The provisional this replaces was a hardcoded
+    /// `1`, and a hardcoded `1` cannot be told apart from a decoded one.
+    pub sample_count: Option<u32>,
     /// Per-mip layouts (index 0 = L0). Empty if geometry incomplete.
     pub levels: Vec<TextureLevelLayout>,
 }
@@ -574,6 +583,27 @@ pub const TEXTURE_LEVEL_WIDTH: usize = 24;
 pub const TEXTURE_LEVEL_HEIGHT: usize = 28;
 pub const TEXTURE_LEVEL_DEPTH: usize = 32;
 pub const TEXTURE_DESC_PIXEL_FORMAT: usize = 86;
+/// Sample count, `u16`, in the descriptor trailer.
+///
+/// Raw `MTLTextureDescriptor.sampleCount` — 1, 2, 4, 8 — not a log2 and not an
+/// index. The producer narrows an `NSUInteger` to 16 bits here and refuses a
+/// value that would not survive it, so everything a guest can legally send
+/// round-trips exactly.
+///
+/// Derived from [`TEXTURE_DESC_PIXEL_FORMAT`] rather than written as `102`,
+/// because the two live in the same packed trailer at a fixed distance and both
+/// move together when the trailer does. A layout change that moved one and not
+/// the other is not a thing that can happen; a constant written twice would let
+/// this file claim it had.
+pub const TEXTURE_DESC_SAMPLE_COUNT: usize = TEXTURE_DESC_PIXEL_FORMAT + 16;
+/// Width/height/depth as the **trailer** repeats them, `u32` each.
+///
+/// The descriptor states its extent twice: once in the level-0 record
+/// ([`TEXTURE_DESC_WIDTH`]) and once here. That redundancy is the only check
+/// available on whether this trailer is laid out the way this decoder believes
+/// — see [`TextureDescriptor::sample_count`]. Same derivation rule as above.
+pub const TEXTURE_DESC_TRAILER_WIDTH: usize = TEXTURE_DESC_PIXEL_FORMAT + 2;
+pub const TEXTURE_DESC_TRAILER_HEIGHT: usize = TEXTURE_DESC_PIXEL_FORMAT + 6;
 #[cfg(test)]
 pub(crate) const TEXTURE_DESC_BASE_LEN: usize = 116;
 /// Mip level records this device will read from a texture descriptor.
@@ -2016,6 +2046,7 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
     let pf_off = TEXTURE_DESC_PIXEL_FORMAT + format_shift;
     if bytes.len() >= pf_off + 2 {
         out.pixel_format = ld16(&bytes[pf_off..]);
+        out.sample_count = decode_trailer_sample_count(bytes, format_shift, out.width, out.height);
     } else if crate::observe::first_sight("texture_desc_format_unreachable", levels as u64) {
         // No fallback to the unshifted offset. The fallback's own length test
         // was `TEXTURE_DESC_PIXEL_FORMAT + 2`, so for a single-mip body it
@@ -2033,6 +2064,97 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
         ));
     }
     Ok(out)
+}
+
+/// Read the trailer's sample count, but only once the trailer has proved it is
+/// the trailer this decoder thinks it is.
+///
+/// # Why this is guarded rather than simply read
+///
+/// The sample count sits in a packed trailer whose position this decoder knows
+/// through one anchor, the pixel format. That anchor is measured-correct on the
+/// rails in use. But the trailer has a second, wider form, and under it *every*
+/// field including the pixel format shifts — so a rail that used the wider form
+/// would not announce itself by failing here; it would quietly hand back a
+/// number read from the middle of two other fields. A sample count is not a
+/// value that can be sanity-checked by looking at it: 1, 2, 4 and 8 are all
+/// plausible and so are many misreads.
+///
+/// What can be checked is that the descriptor states its extent **twice** — once
+/// in the level-0 record and once in this trailer — and the two are independent
+/// reads of the same texture. If they agree, the trailer is where this decoder
+/// believes and the sample count beside them is the sample count. If they
+/// disagree, the layout assumption is wrong and no field in this trailer may be
+/// trusted, so the sample count is withheld rather than guessed.
+///
+/// The check costs two `u32` loads and is the difference between a decoded
+/// value and a plausible one.
+fn decode_trailer_sample_count(
+    bytes: &[u8],
+    format_shift: usize,
+    level0_width: u32,
+    level0_height: u32,
+) -> Option<u32> {
+    let w_off = TEXTURE_DESC_TRAILER_WIDTH + format_shift;
+    let h_off = TEXTURE_DESC_TRAILER_HEIGHT + format_shift;
+    let sc_off = TEXTURE_DESC_SAMPLE_COUNT + format_shift;
+    if bytes.len() < sc_off + 2 {
+        return None;
+    }
+    // A descriptor that named no extent cannot corroborate one, so it cannot
+    // establish the layout either. Withholding is the whole point.
+    if level0_width == 0 || level0_height == 0 {
+        return None;
+    }
+    let trailer_w = ld32(&bytes[w_off..]);
+    let trailer_h = ld32(&bytes[h_off..]);
+    if trailer_w != level0_width || trailer_h != level0_height {
+        if crate::observe::first_sight(
+            "texture_desc_trailer_disagrees",
+            (u64::from(level0_width) << 32) | u64::from(level0_height),
+        ) {
+            crate::observe::fail(format!(
+                "texture_desc_trailer_disagrees level0={level0_width}x{level0_height} \
+                 trailer={trailer_w}x{trailer_h} shift={format_shift} len={} \
+                 (the trailer repeats the extent, and it does not match, so this \
+                 descriptor is not laid out as this decoder reads it -- sample \
+                 count withheld rather than read from the wrong offset)",
+                bytes.len()
+            ));
+        }
+        crate::runtime::drain::note_store_route("texture_desc_trailer_disagrees");
+        return None;
+    }
+    crate::runtime::drain::note_store_route("texture_desc_trailer_corroborated");
+    let samples = u32::from(ld16(&bytes[sc_off..]));
+    // A histogram rather than a flag, because the question this field was
+    // recovered to answer is not "does any texture declare MSAA" but "does the
+    // one this device promotes to four samples declare four". A count of
+    // `texture_desc_samples_gt1` that stayed at zero across a boot would answer
+    // it; so would one that matched the promotion count. Nothing else in the
+    // log can currently distinguish a real multisample texture from this
+    // device's own inference.
+    crate::runtime::drain::note_store_route(match samples {
+        0 => "texture_desc_samples_0",
+        1 => "texture_desc_samples_1",
+        2 => "texture_desc_samples_2",
+        4 => "texture_desc_samples_4",
+        8 => "texture_desc_samples_8",
+        _ => "texture_desc_samples_other",
+    });
+    if samples != 1
+        && crate::observe::first_sight(
+            "texture_desc_multisample",
+            (u64::from(samples) << 40) | (u64::from(level0_width) << 20) | u64::from(level0_height),
+        )
+    {
+        crate::observe::off(format!(
+            "texture_desc_multisample samples={samples} {level0_width}x{level0_height} \
+             shift={format_shift} (the texture itself declares this; compare against \
+             attachment_sample_count_override, whose target_samples is a provisional 1)"
+        ));
+    }
+    Some(samples)
 }
 
 pub fn decode_function_descriptor(bytes: &[u8]) -> Result<FunctionDescriptor, DecodeStatus> {

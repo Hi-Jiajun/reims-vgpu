@@ -6967,6 +6967,10 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
         height,
         depth: 1,
         pixel_format: MTL_FORMAT_BGRA8_UNORM,
+        // This rig builds the descriptor directly rather than decoding one, so
+        // it states no sample count -- which is the honest value for a
+        // descriptor nothing corroborated.
+        sample_count: None,
         levels: vec![TextureLevelLayout {
             offset: 0,
             size: span,

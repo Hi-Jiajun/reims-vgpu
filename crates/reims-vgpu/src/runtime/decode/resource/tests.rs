@@ -1405,6 +1405,68 @@ fn iosurface_type11() {
     }
 }
 
+/// The trailer's sample count is read only when the trailer corroborates the
+/// extent the level records already gave.
+///
+/// The sample count is a value no sanity check can validate on its own — 1, 2,
+/// 4 and 8 are all plausible, and so is a misread. What makes it trustworthy is
+/// that the descriptor states its extent twice, in two independently written
+/// places, and this decoder reads both. So the test is written the same way the
+/// decode is: build a descriptor whose two extents agree and require the sample
+/// count, then move one of them and require the sample count to be *withheld* —
+/// not defaulted to 1, which is the value it would silently look correct as.
+#[test]
+fn a_sample_count_is_read_only_from_a_trailer_that_corroborates_the_extent() {
+    use crate::contract::endian::{st16, st64};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    let build = |trailer_w: u32, samples: u16| {
+        let mut b = vec![0u8; TEXTURE_DESC_BASE_LEN];
+        st64(&mut b[0..], 0x10000);
+        st32(&mut b[8..], 0x10);
+        st32(&mut b[TEXTURE_DESC_ROW_STRIDE..], 1200);
+        st32(&mut b[TEXTURE_DESC_WIDTH..], 300);
+        st32(&mut b[TEXTURE_DESC_HEIGHT..], 300);
+        st16(&mut b[TEXTURE_DESC_PIXEL_FORMAT..], MTL_FORMAT_BGRA8_UNORM);
+        st32(&mut b[TEXTURE_DESC_TRAILER_WIDTH..], trailer_w);
+        st32(&mut b[TEXTURE_DESC_TRAILER_HEIGHT..], 300);
+        st16(&mut b[TEXTURE_DESC_SAMPLE_COUNT..], samples);
+        b
+    };
+
+    for samples in [1u16, 2, 4, 8] {
+        let d = decode_texture_descriptor(&build(300, samples)).unwrap();
+        assert_eq!(
+            d.sample_count,
+            Some(u32::from(samples)),
+            "a corroborated trailer states its sample count as a raw count"
+        );
+    }
+
+    // The trailer disagrees about the width, so this descriptor is not laid out
+    // the way the decoder reads it and nothing in the trailer may be believed.
+    let d = decode_texture_descriptor(&build(301, 4)).unwrap();
+    assert_eq!(
+        d.sample_count, None,
+        "a trailer that contradicts the level records establishes no sample \
+         count, and `None` must not be softened into `Some(1)` -- a caller that \
+         cannot tell those apart is the provisional this replaced"
+    );
+    // The extent itself still decodes: only the trailer is in doubt.
+    assert_eq!(d.width, 300);
+    assert_eq!(d.height, 300);
+}
+
+/// The two trailer offsets are fixed distances from the anchor, so a change to
+/// the anchor moves all three together and cannot desynchronise them.
+#[test]
+fn the_trailer_offsets_are_derived_from_one_anchor() {
+    const _: () = assert!(TEXTURE_DESC_TRAILER_WIDTH == TEXTURE_DESC_PIXEL_FORMAT + 2);
+    const _: () = assert!(TEXTURE_DESC_TRAILER_HEIGHT == TEXTURE_DESC_PIXEL_FORMAT + 6);
+    const _: () = assert!(TEXTURE_DESC_SAMPLE_COUNT == TEXTURE_DESC_PIXEL_FORMAT + 16);
+    // And all of them fit the body whose length the decoder already knows.
+    const _: () = assert!(TEXTURE_DESC_SAMPLE_COUNT + 2 <= TEXTURE_DESC_BASE_LEN);
+}
+
 #[test]
 fn linear_texture_geometry() {
     use crate::contract::endian::{st16, st64};
