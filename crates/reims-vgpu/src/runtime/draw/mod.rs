@@ -5013,9 +5013,57 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             // CPU reads per battery, and that latency is enough to flip cases
             // built to race.
             //
-            // So the repair has to be **cost-negative**, and the shape that is
-            // sits one layer down: `PassKey.load_seed` is a `bool` and the
-            // contract it represents has three values. Preserve, clear to the
+            // # A cost-negative variant was also built, and it hung too
+            //
+            // The obvious answer to "the CPU seed is what costs" is to preserve
+            // from the resident instead: the price of preserving is the seed
+            // *upload*, and when the pixels are already in the engine resident
+            // there is nothing to upload -- `PassKey`'s seeded arm spells
+            // `vk::AttachmentLoadOp::LOAD` against the attachment's existing
+            // layout, which is what `chain_load_from_target` already does for a
+            // render chain. That arm costs strictly *less* than the branch it
+            // replaces: it removes a full-surface clear write and adds no read.
+            // It is lawful for DontCare specifically, because undefined permits
+            // any contents, so a resident that is stale against a guest CPU
+            // write needs none of the currency reconciliation a LOAD would.
+            //
+            // It was implemented in `draw::vulkan`'s seedless-DontCare arm,
+            // scoped to GVA targets, and it worked: one battery measured
+            // `dontcare_resident_preserved` 47, `dontcare_resident_absent` 12,
+            // and `draw_partial_preserving_unseeded` down from ~78 to 5.
+            //
+            // **And it hung in exactly the same place** --
+            // `srt_blit_after_render_1920x1080`, rc=124 after the 600 s probe
+            // timeout, immediately after `srt_blit_after_render_1024x768`
+            // passed, the identical signature the seed variant produced.
+            //
+            // That is the reading to carry forward, because it retires the
+            // latency explanation the seed variant suggested. Two variants with
+            // opposite cost profiles -- one adding full-frame CPU reads, one
+            // removing full-surface clear writes -- hang at the same case. So
+            // either routing a DontCare GVA pass to preserve *by any door*
+            // disturbs that case, or the case is flaky and both candidates were
+            // unlucky. The counts do not separate those: 3 anomalies across 8
+            // candidate batteries against 0 across 4 control batteries, which
+            // is suggestive and not significant.
+            //
+            // Whoever takes this next should establish which, and the cheapest
+            // way is to bound the control: run the control battery enough times
+            // to give `srt_blit_after_render_1920x1080` a fair chance to hang on
+            // its own. A control hang settles it as inherited raciness in a case
+            // whose own source says its repeated whole-target draws exist "so
+            // the GPU is still working when the copy behind them is decoded".
+            // Absent that, the mechanism has to be understood before either
+            // variant can land -- start from the hung run's device log, where
+            // the device is idle (`drain_duty duty=0.002`, no submissions, no
+            // typed failure) behind a `stamp_wait_timeout` on a 2.6 s
+            // `gpu_span busy_max_us`, and a control run reached the same
+            // escalated stamp pattern without hanging.
+            //
+            // # The remaining untried shape
+            //
+            // `PassKey.load_seed` is a `bool` and the contract it represents has
+            // three values. Preserve, clear to the
             // guest's colour, and undefined collapse two-into-one, and
             // `caches.rs` resolves the collapsed value to `CLEAR`. Spelling a
             // seedless DontCare `vk::AttachmentLoadOp::DONT_CARE` instead is
