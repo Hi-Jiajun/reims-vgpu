@@ -243,15 +243,55 @@ impl FloodWindow {
     }
 }
 
+/// How often the writer thread reports on itself. One second, the same census
+/// interval every other levels line in this device shares, so a `log_writer`
+/// row reads against the `store_routes` and `drain_duty` rows beside it.
+const WRITER_BEAT_MS: u64 = 1_000;
+
+/// Whether the writer should emit its heartbeat now.
+///
+/// A pure function of `(last, now)` for the same reason
+/// `released_pages::claim_census_interval` is: a rate gate written inline
+/// against the clock can only be checked by a boot. Unlike that one this has a
+/// single caller on a single thread, so it needs no atomic — but it does need
+/// to be checkable, because the whole value of the beat is its cadence.
+fn writer_beat_due(last_ms: u128, now_ms: u128) -> bool {
+    now_ms.saturating_sub(last_ms) >= u128::from(WRITER_BEAT_MS)
+}
+
 /// Background log writer (product builds). A single thread owns both sink files
 /// behind buffered writers; producers only push a formatted line onto an mpsc
 /// channel. The thread batch-drains (block on one, then greedily take the rest)
 /// and flushes after each batch, so failure visibility trails real time by at
 /// most one drain cycle while the hot path stays syscall-free.
+///
+/// # Why it reports on itself
+///
+/// Every line is stamped at **enqueue**, so a log that ends at `t=29 682` while
+/// the process lived to 38 s has two readings and the file cannot tell them
+/// apart: the device stopped emitting, or this thread fell behind and its
+/// backlog died with the process. That is not a hypothetical distinction —
+/// those eight seconds are the eight seconds before a guest kernel panic on the
+/// host-pointer-import rail, so which reading is right decides whether any
+/// instrument can see that defect at all.
+///
+/// So the writer emits a `log_writer` row of its own, stamped with its own
+/// clock at write time and carrying the exact queue depth. It is written
+/// directly rather than enqueued — a heartbeat that queued behind the backlog it
+/// is measuring would report the backlog's clock, not its own. Read it as:
+///
+/// - beat present, `queued` small, then the file ends → the device stopped
+///   emitting, and the last producer line is where it stopped;
+/// - beat present, `queued` climbing → this thread is behind, and everything
+///   after the last written line was lost with the process.
+///
+/// The wait is a timeout rather than a block, so an idle device still beats. A
+/// silent writer and a silent device must not look alike.
 #[cfg(not(test))]
 mod writer {
     use super::{draw_log_path, fail_log_path, Sink};
     use std::io::{BufWriter, Write};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{Receiver, Sender};
     use std::sync::OnceLock;
 
@@ -287,16 +327,47 @@ mod writer {
             .map(BufWriter::new)
     }
 
+    /// Messages enqueued and not yet written. `mpsc` has no depth of its own, so
+    /// the two ends keep it between them: one relaxed add beside a channel send
+    /// the hot path was already paying for, and one relaxed subtract on the
+    /// writer. Exact, and it is the discriminator the heartbeat exists to carry.
+    static QUEUED: AtomicU64 = AtomicU64::new(0);
+
     fn writer_loop(rx: Receiver<Msg>, fail_path: String, draw_path: String) {
         let mut fail = open(&fail_path);
         let mut draw = open(&draw_path);
         let mut flood = super::FloodWindow::new(super::elapsed_ms());
-        // Block for the next line, then greedily drain everything already
-        // queued before a single flush — one syscall amortizes a whole burst.
-        while let Ok(first) = rx.recv() {
-            write_watched(&mut fail, &mut draw, &mut flood, first);
-            while let Ok(m) = rx.try_recv() {
-                write_watched(&mut fail, &mut draw, &mut flood, m);
+        let mut last_beat_ms = super::elapsed_ms();
+        let mut wrote_since_beat = 0u64;
+        // Wait for the next line with a timeout, then greedily drain everything
+        // already queued before a single flush — one syscall amortizes a whole
+        // burst. The timeout is what lets an idle device still beat.
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(super::WRITER_BEAT_MS)) {
+                Ok(first) => {
+                    write_watched(&mut fail, &mut draw, &mut flood, first);
+                    wrote_since_beat += 1;
+                    while let Ok(m) = rx.try_recv() {
+                        write_watched(&mut fail, &mut draw, &mut flood, m);
+                        wrote_since_beat += 1;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                // Every producer is gone, which for this process means shutdown.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            let now = super::elapsed_ms();
+            if super::writer_beat_due(last_beat_ms, now) {
+                if let Some(w) = fail.as_mut() {
+                    let _ = writeln!(
+                        w,
+                        "OFF log_writer wrote={wrote_since_beat} queued={} beat_ms={} t={now}",
+                        QUEUED.load(Ordering::Relaxed),
+                        now.saturating_sub(last_beat_ms),
+                    );
+                }
+                last_beat_ms = now;
+                wrote_since_beat = 0;
             }
             if let Some(w) = fail.as_mut() {
                 let _ = w.flush();
@@ -347,6 +418,7 @@ mod writer {
             let _ = w.write_all(line.as_bytes());
             let _ = w.write_all(b"\n");
         }
+        QUEUED.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Push one already-timestamped line to the background writer. Lock-free and
@@ -356,7 +428,11 @@ mod writer {
             Sink::Fail => Msg::Fail(line),
             Sink::Draw => Msg::Draw(line),
         };
-        let _ = sender().send(msg);
+        QUEUED.fetch_add(1, Ordering::Relaxed);
+        if sender().send(msg).is_err() {
+            // No writer to reach it, so it is not queued either.
+            QUEUED.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -839,6 +915,46 @@ mod tests {
         assert_eq!(rgb_nz, 0);
         assert_eq!(max_rgb, 0);
         assert_eq!(px0, [0, 0, 0, 255]);
+    }
+
+    /// The writer's heartbeat is a census line, not a per-batch one.
+    ///
+    /// It is emitted from the writer's drain loop, which on a driven boot wakes
+    /// hundreds of times a second, so without this gate the beat would be a
+    /// flood in the file it exists to make readable — the same failure
+    /// `released_pages::note_levels` was built to avoid. A second's worth of
+    /// wake-ups yields one line.
+    #[test]
+    fn a_seconds_worth_of_writer_wakeups_beats_once() {
+        let base = 5_000u128;
+        assert!(
+            !writer_beat_due(base, base),
+            "no time has passed, so nothing is due"
+        );
+        let due = (1..1000)
+            .filter(|i| writer_beat_due(base, base + i))
+            .count();
+        assert_eq!(due, 0, "a wake-up inside the interval must not beat");
+        assert!(
+            writer_beat_due(base, base + u128::from(WRITER_BEAT_MS)),
+            "the wake-up that reaches the next interval beats"
+        );
+    }
+
+    /// An idle writer still beats, and it beats once per interval rather than
+    /// once per interval it slept through.
+    ///
+    /// This is the reading the whole line exists for: a device that has stopped
+    /// emitting must look different from a writer that has stopped writing, and
+    /// it only can if the beat survives silence.
+    #[test]
+    fn a_long_silence_is_still_due_exactly_once_per_interval() {
+        let base = 0u128;
+        assert!(writer_beat_due(base, base + 10_000), "silence is still due");
+        // The caller advances `last` to `now`, so the interval after a long
+        // silence is measured from the beat, not from the silence's start.
+        assert!(!writer_beat_due(10_000, 10_500));
+        assert!(writer_beat_due(10_000, 11_000));
     }
 
     #[test]
