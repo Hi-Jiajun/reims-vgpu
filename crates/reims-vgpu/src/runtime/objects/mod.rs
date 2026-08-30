@@ -1686,12 +1686,23 @@ fn note_stale_task_resource<M: HostMemory>(
     let Some(entry) = lookup_list_entry(state, host, task_id, obj_ref) else {
         return;
     };
-    if entry == cached.entry {
+    // The entry is half the snapshot. The other half is the descriptor bytes it
+    // points at, and a serializer that rewrites a descriptor in place leaves the
+    // entry byte-identical -- same type, same length, same address -- while the
+    // object it describes becomes a different surface, plane or extent. A
+    // witness that compared only the entry would call that agreement.
+    let live_descriptor = read_descriptor(state, host, task_id, &entry);
+    let descriptor_moved = live_descriptor
+        .as_ref()
+        .is_some_and(|bytes| bytes.as_slice() != &*cached.descriptor);
+    if entry == cached.entry && !descriptor_moved {
         return;
     }
     let disc = crate::backend::hash::hash_u64(
         u64::from(task_id) << 32 | u64::from(obj_ref),
-        entry.descriptor_gva ^ (u64::from(entry.object_type) << 56),
+        entry.descriptor_gva
+            ^ (u64::from(entry.object_type) << 56)
+            ^ (u64::from(descriptor_moved) << 63),
     );
     if !crate::observe::first_sight("task_resource_stale", disc) {
         return;
@@ -1699,6 +1710,7 @@ fn note_stale_task_resource<M: HostMemory>(
     crate::observe::fail(format!(
         "task_resource_stale task={task_id} ref={obj_ref} \
          cached=[type={} len={} gva={:#x}] list=[type={} len={} gva={:#x}] \
+         desc_moved={descriptor_moved} \
          (the guest overwrote the slot and the cached resolution outlived it)",
         cached.entry.object_type,
         cached.entry.descriptor_length,
