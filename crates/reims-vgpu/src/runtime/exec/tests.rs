@@ -5350,3 +5350,146 @@ fn clear_fallback_draw_accounting_is_scoped_to_one_render_stream() {
         "a draw that lands in this stream suppresses its destructive fallback"
     );
 }
+
+/// A multisample colour attachment has no single-sample linear publication.
+///
+/// # The contract
+///
+/// On rail macos-15 the guest renders 300x300 tiles into type-2/3 linear
+/// textures whose descriptors declare `sampleCount = 4`, and it sizes those
+/// allocations to match: the boot's `gva_view_fragmented ... pages=352` at two
+/// separate targets fixes `height * bpr` inside `(351, 352] * 4096`, which for
+/// `height = 300` admits one plausible stride — `4800`, exactly four times the
+/// single-sample tight row of a 300-wide BGRA8 texture. Ordinary single-sample
+/// 300x300 surfaces in the same boot report `bpr=1216`.
+///
+/// So the guest strided that span for four samples per pixel, and this device
+/// has never established what the samples' layout inside it is. A single-sample
+/// image written there is not a partial answer, it is the wrong content: it
+/// fills 1200 of every 4800 bytes and leaves the rest.
+///
+/// `apply_clear`'s sibling arm already states the rule for
+/// `StoreAndMultisampleResolve` — "treating the source as a linear image would
+/// write only one sample" — and could not apply it to a plain `Store`, because
+/// `clear_publish_target` decides from the store action alone and never sees a
+/// sample count.
+///
+/// # What this guards
+///
+/// The clear fallback is reached exactly when the draw's Store was refused, and
+/// on this rail that refusal is `read_target_multisample_image`, which is
+/// itself correct. What followed it was a solid beige or near-black 300x300
+/// clear written over the guest's four-sample pages, twice a boot.
+#[test]
+fn a_multisample_linear_target_keeps_its_guest_bytes_instead_of_a_one_sample_clear() {
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
+        OBJECT_TYPE_TEXTURE, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT, TEXTURE_DESC_PIXEL_FORMAT,
+        TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_SAMPLE_COUNT, TEXTURE_DESC_TRAILER_HEIGHT,
+        TEXTURE_DESC_TRAILER_WIDTH, TEXTURE_DESC_WIDTH,
+    };
+    use crate::runtime::gva_mem::{
+        define_task_pages_arm64e, read_task_gva_by_id, write_task_gva_arm64e,
+    };
+
+    // Both arms of one comparison: the same texture, the same clear, differing
+    // only in the sample count its descriptor declares. Single-sample must keep
+    // publishing — this narrows the clear rail, it does not close it.
+    let published = |sample_count: u16| -> (bool, Vec<u8>) {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        define_task_pages_arm64e(&mut host, &mut state, 4, 16);
+        assert!(state.set_object_list(1, 0, 256));
+
+        // Four samples per pixel in the stride, as the rail's own span
+        // arithmetic gives it: `bpr = samples * width * 4`.
+        let (texture_ref, handle, width, height) = (200u32, 8u32, 2u32, 2u32);
+        let row_stride = u32::from(sample_count) * width * 4;
+        let target_gva = (handle as u64) << PAGE_SHIFT_ARM64E;
+        let mut pages = vec![0xcc; (row_stride * height) as usize];
+        write_task_gva_arm64e(&mut host, &state.tasks[1], target_gva, &pages);
+
+        let mut desc = vec![0u8; TEXTURE_DESC_BASE_LEN];
+        st64(
+            &mut desc[LINEAR_DESC_SIZE..],
+            u64::from(row_stride) * u64::from(height),
+        );
+        st32(&mut desc[LINEAR_DESC_HANDLE..], handle);
+        st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], row_stride);
+        st32(&mut desc[TEXTURE_DESC_WIDTH..], width);
+        st32(&mut desc[TEXTURE_DESC_HEIGHT..], height);
+        st16(
+            &mut desc[TEXTURE_DESC_PIXEL_FORMAT..],
+            MTL_FORMAT_BGRA8_UNORM,
+        );
+        // The trailer states the extent a second time, and the decode returns
+        // the sample count only when the two statements agree.
+        st32(&mut desc[TEXTURE_DESC_TRAILER_WIDTH..], width);
+        st32(&mut desc[TEXTURE_DESC_TRAILER_HEIGHT..], height);
+        st16(&mut desc[TEXTURE_DESC_SAMPLE_COUNT..], sample_count);
+        let desc_gva = 0x280u64;
+        write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
+        let entry_off = list_object_entry_offset(texture_ref, 256).expect("object-list ref");
+        let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(
+            &mut entry,
+            (OBJECT_TYPE_TEXTURE as u32) | ((desc.len() as u32) << 8),
+        );
+        entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], entry_off, &entry);
+
+        let mut acc = StreamAccum::default();
+        acc.clears.push(ColorAttachment {
+            texture_ref,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            store_action: MTL_STORE_ACTION_STORE,
+            clear_color: [1.0, 1.0, 1.0, 1.0],
+            ..Default::default()
+        });
+        let mut out = ExecResult::default();
+        finish_stream(&mut state, &mut host, 1, &mut out, &acc);
+        read_task_gva_by_id(
+            &host,
+            &state.tasks,
+            1,
+            target_gva,
+            &mut pages,
+            PAGE_SHIFT_ARM64E,
+        )
+        .expect("read the target's guest pages");
+        (out.clears_applied == 1, pages)
+    };
+
+    let (one_published, one_pages) = published(1);
+    assert!(
+        one_published,
+        "a single-sample linear Store still publishes its clear"
+    );
+    assert!(
+        one_pages.contains(&0xff),
+        "the single-sample arm must actually have written the clear, or the \
+         multisample arm below proves nothing"
+    );
+
+    let (four_published, four_pages) = published(4);
+    assert!(
+        !four_published,
+        "a four-sample attachment has no single-sample linear publication"
+    );
+    assert!(
+        four_pages.iter().all(|&byte| byte == 0xcc),
+        "the guest's four-sample span must be left exactly as it was found, not \
+         overwritten with one sample's worth of clear colour"
+    );
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert!(
+        log.lines().any(|line| {
+            line.contains("reason=clear_multisample_source_not_linear")
+                && line.contains("samples=4")
+        }),
+        "the refused publication must be fail-visible: a clear this device drops \
+         silently is the one outcome the ground rules forbid"
+    );
+}
