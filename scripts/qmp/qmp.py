@@ -306,8 +306,7 @@ def send_keys(qmp: Qmp, qcodes):
 CAPTURE_DISABLED = """\
 qmp.py {mode} is disabled -- use the host screenshot helper instead:
 
-  macOS host: scripts/screenshot-when-macos-host/screenshot-when-macos-host.sh out.png
-  KDE Plasma host: scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh -o out.png
+  scripts/screenshot/screenshot.sh -o out.png
 
 Why: screendump reads QEMU's DisplaySurface and can only see frames copied into
 QEMU's address space. With the host-owned window (REIMS_VGPU_WINDOW=1, QEMU at

@@ -80,7 +80,7 @@
 # desktop that is repainting between the two frames.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-SHOT="$REPO/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh"
+SHOT="$REPO/scripts/screenshot/screenshot.sh"
 QMP="$REPO/scripts/qmp/qmp.py"
 
 TRIALS="${1:-24}"
@@ -126,7 +126,7 @@ MENU_X=${MENU_X:-1450}; MENU_Y=${MENU_Y:-250}
 # the dismiss click cannot land inside it and choose an item.
 AWAY_X=${AWAY_X:-1750}; AWAY_Y=${AWAY_Y:-900}
 
-shot() { "$SHOT" --pid "$QPID" -o "$1" >/dev/null 2>&1; }
+shot() { "$SHOT" -o "$1" >/dev/null 2>&1; }
 open_menu()    { python3 "$QMP" rclick "$MENU_X" "$MENU_Y" >/dev/null 2>&1; }
 dismiss_menu() { python3 "$QMP" click "$AWAY_X" "$AWAY_Y" >/dev/null 2>&1; }
 # Mean of a crop, x255.

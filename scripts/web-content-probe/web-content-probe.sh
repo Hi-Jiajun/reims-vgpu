@@ -56,7 +56,7 @@ GUEST="${GUEST:-macos-vm}"
 PORT="${PROBE_PORT:-8997}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-SHOT="$REPO_ROOT/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh"
+SHOT="$REPO_ROOT/scripts/screenshot/screenshot.sh"
 SERVER="$REPO_ROOT/scripts/browser-probe/probe_server.py"
 
 while [ $# -gt 0 ]; do

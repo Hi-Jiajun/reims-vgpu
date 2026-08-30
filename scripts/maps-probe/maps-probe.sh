@@ -32,7 +32,7 @@ OUT="${1:?outdir}"; SECS="${2:-40}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export QMP_SOCK="${QMP_SOCK:-$REPO/vm/disks/run/qmp.sock}"
 Q="$REPO/scripts/qmp/qmp.py"
-SHOT="$REPO/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh"
+SHOT="$REPO/scripts/screenshot/screenshot.sh"
 FAILLOG=/tmp/reims-vgpu-fail.log
 mkdir -p "$OUT"
 
