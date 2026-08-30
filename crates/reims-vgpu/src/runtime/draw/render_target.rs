@@ -348,10 +348,26 @@ pub(super) struct ResolvedRenderTarget {
     /// Bytes per row of the target (archive `bpr`).
     pub(super) row_stride: u32,
     pub(super) format: u16,
-    /// Attachment samples requested for this encode. Linear texture resource
-    /// dimensions do not retain the creation descriptor's sample count, so the
-    /// Vulkan encode replaces this provisional single-sample value with the
-    /// bound pipeline's raster sample count before constructing an image.
+    /// Attachment samples this target's own declaration asks for.
+    ///
+    /// For a type-2/3 linear texture this is the descriptor's decoded sample
+    /// count — the texture says what it is, and on rail macos-15 four textures a
+    /// boot say four. It was a hardcoded provisional `1` until that field was
+    /// recovered, and the provisional was indistinguishable from a decoded one:
+    /// `attachment_sample_count_override` reported `target_samples=1` against a
+    /// pipeline's `4` on every boot and could not say which side was the
+    /// invention.
+    ///
+    /// It stays `1` on the two paths whose target is a *mapping* rather than a
+    /// texture (type-11 and type-4 surfaces). Those carry no creation
+    /// descriptor, so nothing there declares a sample count and `1` is the
+    /// display contract's own default rather than a stand-in for an unread
+    /// field.
+    ///
+    /// The Vulkan encode still takes the bound pipeline's raster sample count
+    /// when the pipeline declares one, because Metal requires the two to agree
+    /// and the pipeline is the one that must; this is what that agreement is
+    /// checked against.
     pub(super) sample_count: u32,
 }
 
@@ -1102,7 +1118,15 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         height: h,
         row_stride: bpr,
         format: fmt,
-        sample_count: 1,
+        // The texture's own declaration when it made one. `None` means this
+        // descriptor established no sample count -- not that the texture is
+        // single-sample -- but an attachment has to be built with some number,
+        // and one is the only one that is safe to build with: it is what every
+        // path here did before the field was recovered, so a descriptor that
+        // says nothing keeps exactly the behaviour it had. The distinction is
+        // not lost, because `decode_trailer_sample_count` emits
+        // `texture_desc_trailer_disagrees` on the way to `None`.
+        sample_count: tex.sample_count.unwrap_or(1).max(1),
     })
 }
 
