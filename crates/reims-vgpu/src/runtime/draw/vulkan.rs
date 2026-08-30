@@ -5579,6 +5579,51 @@ fn note_type11_elision_extent(w: u32, h: u32) {
 /// trace in a census this large will not be found by adding another counter to
 /// these rails; the next instrument has to observe surface *content* across the
 /// transition, not the routes taken to produce it.
+/// Where a partial draw belongs once the declared load action is read as a
+/// contract term instead of an ordinal, or `None` when the action does not
+/// promise the prior contents at all.
+///
+/// A `Clear` returns `None`: destroying the texels outside the scissor is
+/// exactly what the guest asked for, so it has no place in a population whose
+/// whole subject is unasked-for destruction.
+///
+/// Everything else — `Load`, `DontCare`, and any ordinal outside the declared
+/// set, which [`LoadAction::from_declared`] folds to `DontCare` — promises the
+/// prior contents, and splits by whether this pass actually had them:
+///
+/// - `from_target`: the engine resident carries them and the pass keys
+///   `LoadOp::LoadFromTarget`. Preserved.
+/// - `seeded`: a CPU seed resolved and will be uploaded. Preserved.
+/// - neither: the pass key reads "no seed", `caches.rs` resolves that to
+///   `AttachmentLoadOp::CLEAR`, and every texel outside the scissor is
+///   destroyed. **This is the defect arm**, and it is the number to read.
+///
+/// Total over the load action so a new ordinal cannot fall out of the census:
+/// `from_declared` has no failure case, and the only escape is the deliberate
+/// `Clear` one above.
+fn preserving_partial_route(
+    load_action: Option<u16>,
+    seeded: bool,
+    from_target: bool,
+) -> Option<&'static str> {
+    use crate::contract::pass_action::LoadAction;
+    // An absent action is the same unknown the ordinal match spells
+    // `draw_partial_load_unknown`, and the contract's own answer for an unknown
+    // is DontCare — which preserves. Folding it in rather than dropping it is
+    // what keeps this population total.
+    let declared = LoadAction::from_declared(load_action.unwrap_or(MTL_LOAD_ACTION_DONT_CARE));
+    if !declared.preserves_prior_contents() {
+        return None;
+    }
+    Some(if from_target {
+        "draw_partial_preserving_from_target"
+    } else if seeded {
+        "draw_partial_preserving_seeded"
+    } else {
+        "draw_partial_preserving_unseeded"
+    })
+}
+
 fn note_draw_coverage(
     scissor: ScissorRect,
     target_w: u32,
@@ -5627,6 +5672,37 @@ fn note_draw_coverage(
         Some(MTL_LOAD_ACTION_DONT_CARE) => "draw_partial_dontcare",
         _ => "draw_partial_load_unknown",
     });
+    // The same population again, split by the *contract* rather than by the
+    // ordinal, because the ordinal split above contradicts
+    // [`LoadAction::preserves_prior_contents`] and hides the arm it was built
+    // to catch.
+    //
+    // The buckets above call `draw_partial_load_unseeded` "the one arm that is
+    // a defect" and route every DontCare to `draw_partial_dontcare` with the
+    // sentence "undefined outside the scissor by declaration". That sentence is
+    // the reading this device has already rejected everywhere else: DontCare
+    // declares the prior contents undefined, undefined *permits* the prior
+    // contents, `backend::metal::render` hands the same wire word to Metal
+    // which preserves, and the seed block above therefore walks DontCare
+    // through the same doors as a Load. A DontCare that finds no door still
+    // keys "no seed" and `caches.rs` still resolves that to
+    // `AttachmentLoadOp::CLEAR` — so a *partial* draw on it destroys every
+    // texel it did not cover, which is the identical defect
+    // `draw_partial_load_unseeded` names, wearing the other ordinal's name and
+    // counted as benign.
+    //
+    // Derived from `LoadAction::from_declared` so the two cannot drift apart a
+    // second time, and so the out-of-contract ordinals — which fold to DontCare
+    // and must therefore preserve, but which the ordinal match sends to
+    // `draw_partial_load_unknown` — are inside the population rather than
+    // beside it.
+    //
+    // Additive: every counter above keeps its name, its meaning and its
+    // history. This is a second route on the same draw, so the two sets are
+    // read together and neither replaces the other.
+    if let Some(route) = preserving_partial_route(load_action, seeded, from_target) {
+        crate::runtime::drain::note_store_route(route);
+    }
     // How much of the surface this draw's scissor actually covers.
     //
     // The deferred render flush copies the whole attachment on every landing,
@@ -10548,6 +10624,65 @@ mod vulkan_split_tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
+
+    /// Every load action that promises the prior contents and arrives with
+    /// none of them lands in one bucket, whichever ordinal it was spelled with.
+    ///
+    /// This is the relation the ordinal census got wrong. `MTLLoadActionLoad`
+    /// with no seed was named a defect and `MTLLoadActionDontCare` with no seed
+    /// was named benign, but the two resolve to the identical Vulkan
+    /// `AttachmentLoadOp::CLEAR` and destroy the identical texels — the pass
+    /// key cannot even tell them apart by the time `caches.rs` reads it. The
+    /// authority for that is `LoadAction::preserves_prior_contents`, so the
+    /// bucket is derived from it and this test sweeps the ordinal space rather
+    /// than listing the three names: an ordinal added to the declared set, or a
+    /// fourth one arriving from the wire, must not be able to leave the
+    /// population silently.
+    #[test]
+    fn every_preserving_load_action_with_no_prior_contents_shares_one_bucket() {
+        use crate::contract::pass_action::LoadAction;
+        // The declared set plus a sweep past its top, which is where an
+        // out-of-contract ordinal comes from; `from_declared` folds those to
+        // DontCare, and DontCare preserves.
+        let ordinals: Vec<Option<u16>> =
+            (0u16..=8).map(Some).chain([Some(u16::MAX), None]).collect();
+        for action in ordinals {
+            let declared =
+                LoadAction::from_declared(action.unwrap_or(super::MTL_LOAD_ACTION_DONT_CARE));
+            let route = super::preserving_partial_route(action, false, false);
+            if declared.preserves_prior_contents() {
+                assert_eq!(
+                    route,
+                    Some("draw_partial_preserving_unseeded"),
+                    "{action:?} promises the prior contents and has none, so it \
+                     destroys what it did not draw and belongs in the defect bucket"
+                );
+            } else {
+                assert_eq!(
+                    route, None,
+                    "{action:?} asked for its texels to be destroyed, so it is \
+                     not unasked-for destruction"
+                );
+            }
+        }
+        // And the two ways a preserving pass can actually hold its prior
+        // contents are kept apart from that bucket and from each other, so a
+        // rail going dark shows up as its own count falling rather than as the
+        // defect count staying flat.
+        for action in [
+            Some(super::MTL_LOAD_ACTION_LOAD),
+            Some(super::MTL_LOAD_ACTION_DONT_CARE),
+        ] {
+            assert_eq!(
+                super::preserving_partial_route(action, false, true),
+                Some("draw_partial_preserving_from_target")
+            );
+            assert_eq!(
+                super::preserving_partial_route(action, true, false),
+                Some("draw_partial_preserving_seeded")
+            );
+        }
+    }
 
     #[test]
     fn a_sampled_guest_allocation_does_not_enter_copy_currency_checks() {
