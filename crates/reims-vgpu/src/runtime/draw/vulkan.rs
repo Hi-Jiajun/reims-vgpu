@@ -5770,6 +5770,30 @@ fn note_draw_coverage(
     // read together and neither replaces the other.
     if let Some(route) = preserving_partial_route(load_action, seeded, from_target) {
         crate::runtime::drain::note_store_route(route);
+        // And what it costs, in the only unit the cost is proportional to.
+        //
+        // A record count cannot rank this population: a boot's small scratch
+        // targets outnumber its full-screen compositor layers by orders of
+        // magnitude, so a count is dominated by the passes whose answer does
+        // not matter. The number that says whether a guest can see this is the
+        // area the pass overwrote *without being asked to* — the attachment
+        // minus the rectangle the draw actually covered — because that is
+        // exactly the set of texels that held guest content before the pass and
+        // hold `[0.0; 4]` after it.
+        //
+        // Only for the unseeded arm. The other two preserved their contents, so
+        // their uncovered area is not destroyed and adding it here would price
+        // the rail working as if it were the defect — the same mistake
+        // `from_target` was added above to undo.
+        if route == "draw_partial_preserving_unseeded" {
+            let target = (target_w as u64).saturating_mul(target_h as u64);
+            let covered = (scissor.width.min(target_w) as u64)
+                .saturating_mul(scissor.height.min(target_h) as u64);
+            crate::runtime::drain::note_store_route_n(
+                "draw_partial_preserving_unseeded_lost_texels",
+                target.saturating_sub(covered),
+            );
+        }
     }
     // How much of the surface this draw's scissor actually covers.
     //
@@ -10692,6 +10716,88 @@ mod vulkan_split_tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
+
+    /// A DontCare partial draw prices its loss as the area it overwrote
+    /// without being asked to, and a preserved one prices nothing.
+    ///
+    /// The area is the reading, not the record count: a boot's small scratch
+    /// targets outnumber its full-screen compositor layers by orders of
+    /// magnitude, so a count is dominated by the passes whose answer does not
+    /// matter. Asserted as a delta because the census map is process-global and
+    /// the rest of the suite shares it.
+    ///
+    /// The second half is the one that would have caught the original defect's
+    /// mirror image. Pricing a draw whose prior contents *were* preserved would
+    /// report the rail working as if it were the loss — which is exactly what
+    /// scoring `target_rgba8.is_some()` alone did to the LOAD population, and
+    /// it produced a 519 715-strong "defect" that was not one.
+    #[test]
+    fn a_dontcare_partial_draw_is_priced_by_the_area_it_destroyed() {
+        use crate::runtime::drain::store_route_count;
+        const LOST: &str = "draw_partial_preserving_unseeded_lost_texels";
+        // A 100x100 target with a 10x10 draw in it: 10 000 - 100 = 9 900 texels
+        // held guest content before the pass and hold `[0.0; 4]` after it.
+        let scissor = ScissorRect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let before = store_route_count(LOST);
+        note_draw_coverage(
+            scissor,
+            100,
+            100,
+            Some(super::MTL_LOAD_ACTION_DONT_CARE),
+            false,
+            false,
+        );
+        assert_eq!(
+            store_route_count(LOST),
+            before + 9_900,
+            "the loss is the attachment minus the rectangle the draw covered"
+        );
+
+        // The identical draw, with its prior contents on the engine resident.
+        // Nothing was destroyed, so nothing is priced.
+        let held = store_route_count(LOST);
+        note_draw_coverage(
+            scissor,
+            100,
+            100,
+            Some(super::MTL_LOAD_ACTION_DONT_CARE),
+            false,
+            true,
+        );
+        note_draw_coverage(
+            scissor,
+            100,
+            100,
+            Some(super::MTL_LOAD_ACTION_LOAD),
+            true,
+            false,
+        );
+        assert_eq!(
+            store_route_count(LOST),
+            held,
+            "a pass that kept its prior contents lost none of them"
+        );
+
+        // And a Clear, which asked for those texels to be destroyed.
+        note_draw_coverage(
+            scissor,
+            100,
+            100,
+            Some(super::MTL_LOAD_ACTION_CLEAR),
+            false,
+            false,
+        );
+        assert_eq!(
+            store_route_count(LOST),
+            held,
+            "a Clear got the destruction it asked for and is not a loss"
+        );
+    }
 
     /// A draw the engine made and a draw the engine refused do not report the
     /// same sentence, and neither reports "not attempted".
