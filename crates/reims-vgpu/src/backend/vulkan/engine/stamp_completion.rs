@@ -590,12 +590,7 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
             match unsafe { device.wait_semaphores(&info, super::context::FENCE_TIMEOUT_NS) } {
                 Ok(()) => true,
                 Err(vk::Result::TIMEOUT) => {
-                    crate::observe::fail(format!(
-                        "stamp_wait_timeout reason=stamp_wait_timeout index={} value={} \
-                     (the submission carrying this stamp's word has not executed within the \
-                     fence deadline; announcing it anyway so the guest is not left asleep)",
-                        waiting.index, timeline
-                    ));
+                    note_wait_timeout(device, semaphore, shared, &waiting, timeline);
                     false
                 }
                 Err(e) => {
@@ -618,6 +613,15 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
                 }
             };
         let stopping = shared.stop.load(Ordering::Acquire);
+        if !completed && !stopping {
+            // Size the population the guest can never be told about. The word
+            // is dropped here and the entry is popped below, so this stamp is
+            // gone: a guest sleeping on it wakes on the announcement, re-reads
+            // an unchanged word, and sleeps again on its own one-second
+            // deadline, forever, unless some *later* stamp for the same slot
+            // publishes a value that covers it.
+            crate::runtime::drain::census::note_store_route("stamp_word_abandoned");
+        }
         if should_publish(completed, stopping) && !publish_stamp_word(&waiting) {
             crate::observe::fail(format!(
                 "stamp_cpu_store_failed reason=stamp_cpu_store_failed index={} value={:#x} \
@@ -639,6 +643,55 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
             return;
         }
     }
+}
+
+/// Report a stamp whose timeline point did not arrive within the fence
+/// deadline, and say **which of the two very different things** happened.
+///
+/// The deadline alone does not distinguish them, and they have opposite
+/// repairs:
+///
+/// * `counter` has not reached `value`, but `queued` has — the submission was
+///   handed to the ordered queue owner and the GPU has not run it yet. That is
+///   a slow or wedged queue, and waiting longer would eventually publish a
+///   correct word.
+/// * `counter` has not reached `value` and neither has `queued` — the point was
+///   *reserved* and never handed to the owner at all. Nothing in flight will
+///   ever signal it. `submit_guest_work`'s contract says "a later successful
+///   value may legally skip the unused reservation", and that is sound only
+///   while later work keeps arriving: `vkWaitSemaphores` is a `>=` wait, so any
+///   higher signal releases the waiter. A guest blocked in `waitForStamp` is
+///   precisely a guest that has stopped producing that later work, so for the
+///   stamp that wedges it the skip is not repaired by anything.
+///
+/// Recorded rather than repaired, because the repair differs per branch and no
+/// preserved run yet names which one wedged it. The counters are summable
+/// `store_routes` entries; the line is per-occurrence and always-on.
+fn note_wait_timeout(
+    device: &ash::Device,
+    semaphore: vk::Semaphore,
+    shared: &Shared,
+    waiting: &Waiting,
+    timeline: u64,
+) {
+    let counter = unsafe { device.get_semaphore_counter_value(semaphore) }.ok();
+    let reserved = shared.next_value.load(Ordering::Acquire);
+    let queued = shared.latest_queued.load(Ordering::Acquire);
+    let route = if queued >= timeline {
+        "stamp_timeout_queued_not_run"
+    } else {
+        "stamp_timeout_never_submitted"
+    };
+    crate::runtime::drain::census::note_store_route(route);
+    crate::observe::fail(format!(
+        "stamp_wait_timeout reason=stamp_wait_timeout index={} value={timeline} counter={} \
+         reserved={reserved} queued={queued} class={route} \
+         (the submission carrying this stamp's word has not executed within the fence \
+         deadline; announcing it anyway so the guest is not left asleep, but the word is \
+         NOT published and this entry is dropped, so no later completion can still deliver it)",
+        waiting.index,
+        counter.map_or_else(|| "unknown".to_string(), |v| v.to_string()),
+    ));
 }
 
 fn should_publish(completed: bool, stopping: bool) -> bool {
