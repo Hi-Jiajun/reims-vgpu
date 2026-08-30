@@ -3752,8 +3752,101 @@ pub(super) fn record_guest_write_footprint_debt(
     footprint: &crate::runtime::guest_ram::GuestPageFootprint,
 ) {
     pools.note_guest_write_recorded(GuestWriteSource::ResidentTarget(identity));
+    note_store_destination(footprint);
     arm_guest_write_footprint(footprint);
     GUEST_WRITE_DEBT.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// The destination a resident store publishes into, reported when it changes.
+///
+/// The counterpart to `present_field_witness`'s page span, and the two exist to
+/// be read against each other. A boot in which the presented plane's field is
+/// uniform while stores keep publishing has two candidate readings -- the
+/// content stored is itself uniform, or the store and the present disagree about
+/// which guest pages the plane is -- and the second is settled by comparing the
+/// page set a store lands in with the page set the present reads. Both numbers
+/// were already inside this device and neither was emitted beside the other.
+///
+/// Reported on change rather than per store because it is the destination that
+/// is the question, and it moves rarely: this rail records hundreds of stores
+/// per second into a handful of surfaces, so a per-store line would be a flood
+/// that says the same thing. Recorded here, in the function that arms the
+/// ledger, so the destination named and the destination armed cannot drift.
+/// Whether this store publishes into a different allocation than the last one
+/// reported.
+///
+/// Allocation identity, not page values: a page list can be recycled, so equal
+/// addresses do not mean the same surface, and `same_allocation` is the identity
+/// the outstanding-write ledger already deduplicates on. Split out from the
+/// emitter so the suppression rule can be stated as a test rather than inferred
+/// from the shape of a log.
+fn store_destination_changed(
+    last: Option<&crate::runtime::guest_ram::GuestPageFootprint>,
+    now: &crate::runtime::guest_ram::GuestPageFootprint,
+) -> bool {
+    !matches!(last, Some(l) if l.same_allocation(now))
+}
+
+#[cfg(test)]
+mod store_destination_tests {
+    use super::*;
+    use crate::runtime::guest_ram::GuestPageFootprint;
+
+    fn fp(pages: &[u64]) -> GuestPageFootprint {
+        GuestPageFootprint::new(pages.into(), 0x1000).expect("valid footprint")
+    }
+
+    #[test]
+    fn a_recycled_page_list_is_a_new_destination_and_a_retained_one_is_not() {
+        let first = fp(&[0x1000, 0x2000]);
+        // The same retained allocation, cloned the way the resident hands it to
+        // the ledger. Reporting this again would be the flood the suppression
+        // exists to stop.
+        assert!(
+            !store_destination_changed(Some(&first), &first.clone()),
+            "a retained allocation is the same destination"
+        );
+        // The same page addresses, built again: a recycled list describing a
+        // later allocation. Suppressing this would hide a destination change
+        // behind equal numbers, which is the one thing this record must not do.
+        assert!(
+            store_destination_changed(Some(&first), &fp(&[0x1000, 0x2000])),
+            "equal page addresses are not allocation identity"
+        );
+        assert!(
+            store_destination_changed(Some(&first), &fp(&[0x9000])),
+            "a different page set is a different destination"
+        );
+        assert!(
+            store_destination_changed(None, &first),
+            "the first store of a process has nothing to be the same as"
+        );
+    }
+}
+
+fn note_store_destination(footprint: &crate::runtime::guest_ram::GuestPageFootprint) {
+    static LAST: std::sync::Mutex<Option<crate::runtime::guest_ram::GuestPageFootprint>> =
+        std::sync::Mutex::new(None);
+    let Ok(mut last) = LAST.lock() else {
+        return;
+    };
+    if !store_destination_changed(last.as_ref(), footprint) {
+        return;
+    }
+    *last = Some(footprint.clone());
+    drop(last);
+    let pages = footprint.pages();
+    let Some(&first) = pages.first() else {
+        return;
+    };
+    crate::observe::off(format!(
+        "store_destination pages={} first={:#x} last={:#x} runs={} page_size={:#x}",
+        pages.len(),
+        first,
+        pages.last().copied().unwrap_or(first),
+        footprint.runs().len(),
+        footprint.page_size(),
+    ));
 }
 
 /// Report the exact binding equation for one live packed guest surface.

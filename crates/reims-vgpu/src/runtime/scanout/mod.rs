@@ -1566,10 +1566,46 @@ pub fn note_present_field_witness<M: HostMemory>(
     // the Metal arm, so the field is simply absent there rather than empty.
     #[cfg(not(feature = "backend-vulkan"))]
     let ring = String::new();
+    // What the outstanding-write ledger says about the very pages just read.
+    //
+    // This witness reads guest pages without settling, which is deliberate --
+    // settling here would make the instrument cause the visibility it is trying
+    // to observe. But that also means a uniform field is two different findings
+    // wearing one number, and the whole blank-field investigation turns on which
+    // one it is:
+    //
+    // * `Overlap` -- a writeback is in flight into these pages. The bytes read
+    //   are then simply pre-write bytes, and the field being uniform says
+    //   nothing about what the guest composited. The question moves to whether
+    //   whatever presents this plane settles before it reads.
+    // * `Disjoint` -- nothing outstanding lands here at all. The stores this
+    //   boot records are landing in some other page set, so the plane being
+    //   published and the plane being presented are not the same pages.
+    // * `Unnamed` -- the ledger overflowed or raced and cannot say. Not evidence
+    //   either way, and counted separately so it cannot be read as `Disjoint`.
+    //
+    // Those three have different repairs, and no record on this rail separated
+    // them: a plane that reads uniform white with 409 stores publishing into it
+    // is consistent with all three.
+    #[cfg(feature = "backend-vulkan")]
+    let reach = format!(
+        " write_reach={:?}",
+        crate::backend::vulkan::engine::guest_writes_reaching(&gpas)
+    );
+    #[cfg(not(feature = "backend-vulkan"))]
+    let reach = String::new();
+    // The page span, so a store record naming its destination and this record
+    // naming the presented plane can be compared without either having to know
+    // about the other. First and last of the mapping's own order, not of the
+    // sorted set: that is the order the window's offsets index.
+    let span = match (gpas.first(), gpas.last()) {
+        (Some(f), Some(l)) => format!(" pages={} first={f:#x} last={l:#x}", gpas.len()),
+        _ => String::new(),
+    };
     crate::observe::off(format!(
         "present_field_witness mid={mapping_id} {width}x{height} map_gen={map_gen} \
-         epoch={epoch} seq={seq} why={} unpainted={blank}/4 patches=[{report}]{ring} \
-         (guest pages, no settle)",
+         epoch={epoch} seq={seq} why={} unpainted={blank}/4 patches=[{report}]{ring}\
+         {reach}{span} (guest pages, no settle)",
         if changed { "changed" } else { "heartbeat" }
     ));
 }
