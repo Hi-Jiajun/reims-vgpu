@@ -7668,6 +7668,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 mid,
                                 route,
                             );
+                            // And what it held: a whole-surface bind reads the
+                            // mapping's own geometry, which is the shape every
+                            // full-screen compositor layer on this rail takes.
+                            crate::runtime::scanout::note_sampled_surface_field(
+                                state,
+                                &*host,
+                                mid,
+                                texture_ref,
+                                route,
+                            );
                         }
                         (rw, rh, src)
                     }
