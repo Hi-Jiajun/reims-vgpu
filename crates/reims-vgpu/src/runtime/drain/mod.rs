@@ -3731,21 +3731,16 @@ fn note_released_or_remapped<H: HostMemory + HostOps>(
     if pages.is_empty() {
         return;
     }
-    let now_us = crate::observe::elapsed_us();
-    let DeviceState {
-        host_writes,
-        released_pages: watch,
-        ..
-    } = state;
+    let writes = &mut state.host_writes;
     match family {
         MapFamily::UnmapMemory => {
             for gpa in pages {
-                watch.release(host_writes, task_id, gpa, now_us);
+                writes.release_page(gpa);
             }
         }
         _ => {
             for gpa in pages {
-                watch.remapped(gpa);
+                writes.remap_page(gpa);
             }
         }
     }
