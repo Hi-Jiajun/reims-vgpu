@@ -4960,6 +4960,69 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                 seed = Some(solid_rgba8(mw, mh, &att.clear_color));
             }
         } else if att.load_action == MTL_LOAD_ACTION_LOAD && mapping_id == 0 {
+            // # This arm compares an ordinal, and the contract term is wider
+            //
+            // `MTLLoadActionDontCare` also promises the prior contents --
+            // undefined permits them, `backend::metal::render` hands the same
+            // wire word to Metal which preserves them, and the guest declares
+            // DontCare and then redraws only its damage rectangle.
+            // `contract::pass_action::LoadAction::preserves_prior_contents`
+            // states that term and answers true for both ordinals. The seed
+            // block in `draw::vulkan` was widened to it, and the
+            // secondary-attachment path in the same file spells it directly as
+            // `LoadAction::DontCare => resident_content_ready(&identity)`.
+            // This arm was not.
+            //
+            // What that costs, measured on rail macos-15: a GVA attachment
+            // declaring DontCare falls past here with no seed and with
+            // `gva_load_from_resident` false, and every downstream door is then
+            // shut to it -- `honour_gva_load_elision` returns on the flag, the
+            // seed block's mapping door is guarded by `mapping_id != 0`, and
+            // `target_seed_rgba` is `None`. `PassKey::single` reads "no seed",
+            // `caches.rs` resolves that to `vk::AttachmentLoadOp::CLEAR`, and
+            // every texel outside the draw's scissor becomes `target_clear` --
+            // untouched at `[0.0; 4]`, transparent black, because that variable
+            // is assigned only in the `Clear` arm. Boot s5: 461 partial draws
+            // and 2 107 399 texels, over live guest content.
+            //
+            // # Why the one-line widening is not the repair
+            //
+            // Replacing this ordinal test with `preserves_prior_contents()` was
+            // built and measured, and it does remove the whole defect: across
+            // three candidate conformance batteries `dontcare_seed_empty`,
+            // `draw_partial_preserving_unseeded` and its lost-texel total were
+            // all **zero**, against 211 012 and 298 602 lost texels on two
+            // control batteries, with `dontcare_seed_served` rising 16 -> 31.
+            //
+            // It also regressed the compatibility ratchet. Over five candidate
+            // batteries against four control batteries on rail macos-15:
+            //
+            //   candidate  1 run hung 600 s at `srt_blit_after_render_1920x1080`
+            //              (6 cases NOT-RUN, one of them previously classified)
+            //   candidate  1 run `srt_blit_iosurface_source_1920x1080_x4`
+            //              REGRESSION, stale_frames=2/4, 576 wrong texels
+            //   control    4 runs clean, 293/293, 19/19 driver, 0 unexplained
+            //
+            // Both failures are in the deliberately racy heavy 1920x1080 blit
+            // family, whose own source says its repeated whole-target draws
+            // exist "so the GPU is still working when the copy behind them is
+            // decoded". The mechanism is cost, not staleness: `gvaseed_chained`
+            // is unchanged between the arms (195-347 control against 176-308
+            // candidate), so the widening is not electing more resident
+            // elisions -- it is paying ~15 extra full-frame `seed_color_load`
+            // CPU reads per battery, and that latency is enough to flip cases
+            // built to race.
+            //
+            // So the repair has to be **cost-negative**, and the shape that is
+            // sits one layer down: `PassKey.load_seed` is a `bool` and the
+            // contract it represents has three values. Preserve, clear to the
+            // guest's colour, and undefined collapse two-into-one, and
+            // `caches.rs` resolves the collapsed value to `CLEAR`. Spelling a
+            // seedless DontCare `vk::AttachmentLoadOp::DONT_CARE` instead is
+            // lawful, writes none of the attachment, and is *cheaper* than the
+            // full-surface clear it replaces -- so it removes the invented
+            // colour without adding the latency that flipped those cases.
+            //
             // GVA linear target: ephemeral host RT needs a CPU seed (archive
             // reims_vgpu_backend_metal; NULL seed → Metal Clear invent, still encode).
             // Type-11 is seeded later instead, at the attachment site in

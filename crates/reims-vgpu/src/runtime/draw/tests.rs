@@ -7546,3 +7546,198 @@ fn an_attachment_sample_count_taken_from_the_pipeline_names_where_the_samples_go
     assert_eq!(store_route_count(BELOW), before.2 + 1);
     assert_eq!(store_route_count(NO_RESOLVE), before.0 + 1);
 }
+
+/// A GVA colour attachment that promised to keep its prior contents arrives at
+/// the encoder with a way to keep them, whichever ordinal it promised with.
+///
+/// This is the external invariant behind
+/// `LoadAction::preserves_prior_contents`. `MTLLoadActionDontCare` declares the
+/// prior contents undefined, undefined *permits* the prior contents, and the
+/// direct-Metal arm hands the same wire word to Metal, which preserves them —
+/// so the guest declares DontCare and redraws only its damage rectangle. A
+/// request that reaches the Vulkan encoder with neither a CPU seed nor
+/// `gva_load_from_resident` has no way to honour that: `PassKey::single` reads
+/// "no seed", `caches.rs` resolves it to `vk::AttachmentLoadOp::CLEAR`, and
+/// every texel outside the draw's scissor becomes the untouched `[0.0; 4]`
+/// default — transparent black over live guest content.
+///
+/// Asserted for **both** preserving ordinals rather than for DontCare alone,
+/// because the defect was precisely that the two were not treated as one term:
+/// the GVA arm tested `att.load_action == MTL_LOAD_ACTION_LOAD` while the seed
+/// block beside it, and the secondary-attachment path in the same file, had
+/// both already been widened to the contract. Testing only the broken ordinal
+/// would let the pair drift apart again in the other direction.
+///
+/// Clear is asserted too, and asserted to be *different*: a Clear must not
+/// carry the attachment's prior texels, because that is the opposite of what
+/// the guest asked for.
+///
+/// # Ignored, because the invariant is not met yet
+///
+/// This is a written-down contract obligation this device does not currently
+/// satisfy, not a guard on behaviour it has. The DontCare assertion fails
+/// today: `mrt_draw_request`'s GVA arm tests
+/// `att.load_action == MTL_LOAD_ACTION_LOAD` rather than the contract term, so
+/// a DontCare on a GVA target reaches the encoder with no door open and the
+/// pass keys to `vk::AttachmentLoadOp::CLEAR`. Measured on rail macos-15,
+/// boot s5: 461 partial draws and 2 107 399 texels a boot overwritten with
+/// `[0.0; 4]` over live guest content.
+///
+/// It is `#[ignore]` rather than deleted or inverted because it is the red
+/// witness the repair has to turn green, and because inverting it would pin
+/// the defect as if it were the contract. Run it with
+/// `cargo test -- --ignored a_preserving_gva_attachment`.
+///
+/// **The obvious repair is not the one to make**, and the arm's own
+/// documentation in `runtime/draw/mod.rs` carries the measurement that shows
+/// why: widening this ordinal test to `preserves_prior_contents()` removes the
+/// defect completely (three candidate batteries at zero lost texels against two
+/// control batteries at 211 012 and 298 602) and regresses the compatibility
+/// ratchet, because it pays ~15 extra full-frame CPU seed reads per battery and
+/// that latency flips the deliberately racy 1920x1080 blit cases. The repair
+/// has to be cost-negative; see that comment for the shape.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+#[ignore = "contract obligation not yet met: a DontCare GVA attachment keys the pass to CLEAR"]
+fn a_preserving_gva_attachment_reaches_the_encoder_able_to_preserve() {
+    use crate::contract::endian::{st16, st32, st64};
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::render::ColorAttachment;
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, TEXTURE_DESC_BASE_LEN,
+        TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
+        TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
+    };
+
+    // Same guest-page rig as `a_gva_load_from_resident_draw_with_no_resident_
+    // puts_the_seed_back`: a tight 4x2 BGRA8 linear texture whose texels are
+    // really in guest pages, so "a seed was resolved" means the attachment was
+    // actually read and not merely that a flag was set.
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let (dir_pfn, root_pfn) = (2u32, 3u32);
+    let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
+    let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    assert!(host.write_gpa(dir_gpa, &d).is_ok());
+    for i in 0..4u32 {
+        let pfn = 4 + i;
+        host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, pfn);
+        assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
+    }
+    state.define_task(1, 0x1000, dir_pfn);
+    assert!(state.set_object_list(1, 0, 32));
+
+    let tex_ref = 6u32;
+    let body = TEXTURE_DESC_BASE_LEN;
+    let mut b = vec![0u8; body];
+    st64(&mut b[0..], 0x1000);
+    st32(&mut b[8..], 1);
+    st16(&mut b[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 1);
+    st32(&mut b[TEXTURE_DESC_USED_SIZE..], 16 * 2);
+    st32(&mut b[TEXTURE_DESC_ROW_STRIDE..], 16);
+    st32(&mut b[TEXTURE_DESC_WIDTH..], 4);
+    st32(&mut b[TEXTURE_DESC_WIDTH + 4..], 2);
+    st16(&mut b[TEXTURE_DESC_PIXEL_FORMAT..], MTL_FORMAT_BGRA8_UNORM);
+    let desc_gva = 0x200u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &b);
+    let off = list_object_entry_offset(tex_ref, 32).unwrap();
+    let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut le[0..],
+        (crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE as u32) | ((body as u32) << 8),
+    );
+    le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
+    let texel_gva = 1u64 << PAGE_SHIFT_ARM64E;
+    write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        texel_gva,
+        &[7u8, 5, 3, 255].repeat(8),
+    );
+
+    // Can this request's colour 0 preserve what the attachment already holds?
+    //
+    // Either door counts: a CPU seed read out of the attachment's own guest
+    // pages, or `gva_load_from_resident`, the flag saying the seed was
+    // deliberately skipped because the engine resident holds those contents.
+    // With neither, `PassKey::single` reads "no seed".
+    //
+    // A `Clear` also arrives with a seed on this path, and that seed is not
+    // preservation — it is `solid_rgba8` of the guest's own clear colour, built
+    // by the arm above this one. So the seed is compared against that solid
+    // fill rather than merely counted: preserving means carrying the
+    // *attachment's* texels, and this rig writes a distinctive `[7,5,3,255]`
+    // into them precisely so the two cannot be confused.
+    let mut preservation = |load_action: u16| -> (bool, bool) {
+        let req = crate::runtime::draw::mrt_draw_request(
+            &mut state,
+            &mut host,
+            1,
+            0,
+            &[(
+                0,
+                ColorAttachment {
+                    texture_ref: tex_ref,
+                    load_action,
+                    store_action: MTL_STORE_ACTION_STORE,
+
+                    ..Default::default()
+                },
+            )],
+            &[],
+            crate::contract::draw::DrawArgs {
+                vertex_count: 3,
+                instance_count: 1,
+                ..Default::default()
+            },
+        )
+        .expect("the attachment resolves, so a request must be built");
+        let c0 = req.colors.first().expect("colour 0 was attached");
+        // The attachment's own texels, as `seed_color_load` would return them:
+        // BGRA in guest pages becomes RGBA here, so [7,5,3,255] reads back as
+        // [3,5,7,255].
+        let carries_attachment = c0
+            .target_seed_rgba
+            .as_ref()
+            .is_some_and(|s| s.chunks_exact(4).all(|px| px == [3u8, 5, 7, 255]));
+        (
+            carries_attachment || req.gva_load_from_resident,
+            c0.target_seed_rgba.is_some(),
+        )
+    };
+
+    assert!(
+        preservation(MTL_LOAD_ACTION_LOAD).0,
+        "a declared LOAD must reach the encoder able to preserve"
+    );
+    assert!(
+        preservation(MTL_LOAD_ACTION_DONT_CARE).0,
+        "MTLLoadActionDontCare permits the prior contents and the guest relies \
+         on that -- it redraws only its damage rect. A DontCare that reaches \
+         the encoder with no seed and no resident flag keys the pass to \
+         AttachmentLoadOp::CLEAR, and every texel outside the scissor becomes \
+         transparent black over live guest content"
+    );
+    let (clear_preserves, clear_seeded) = preservation(MTL_LOAD_ACTION_CLEAR);
+    assert!(
+        clear_seeded,
+        "a Clear on a GVA target still carries its solid clear-colour seed, \
+         built by the arm above the one under test -- this assertion is here so \
+         that arm cannot be broken silently by a change to this one"
+    );
+    assert!(
+        !clear_preserves,
+        "a Clear must NOT reach the encoder carrying the attachment's prior \
+         texels: the guest asked for its clear value, and preserving would be \
+         the opposite of what it asked for"
+    );
+}
