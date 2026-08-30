@@ -1338,3 +1338,176 @@ pub fn early_scanout_target(state: &DeviceState) -> Option<(u32, u32, u32, u32)>
 
 #[cfg(test)]
 mod tests;
+
+/// Fractions of the frame that a settled macOS desktop paints with wallpaper:
+/// outside every restored window, and clear of the menu bar and the dock.
+///
+/// Fractions rather than pixels so one set describes any presented geometry;
+/// the same four are what the host-side grader crops, so a device record and a
+/// screenshot verdict can be read against each other without a scale factor.
+const FIELD_PATCHES: [(f32, f32); 4] = [(0.10, 0.22), (0.10, 0.72), (0.90, 0.22), (0.90, 0.72)];
+
+/// Texels per side of each sampled patch. 4 x 8 x 8 texels is the whole cost of
+/// this witness.
+const FIELD_PATCH_SIDE: u32 = 8;
+
+/// Presents between samples once the power-of-two spacing has opened up.
+const FIELD_WITNESS_STRIDE: u64 = 64;
+
+/// What one background patch of the presented plane's guest pages holds.
+///
+/// The three that are not `Painted` are all fields nothing composited into, and
+/// they are kept apart because they say different things about who left them:
+/// `Black` is guest memory in the state the guest allocated it, `White` is
+/// something that wrote `0xff` over it, and `Flat` is a uniform colour that is
+/// neither.
+fn field_patch_verdict(mean: f32, sd: f32) -> &'static str {
+    if sd >= 12.0 {
+        "painted"
+    } else if mean > 200.0 {
+        "white"
+    } else if mean < 40.0 {
+        "black"
+    } else {
+        "flat"
+    }
+}
+
+/// The presented plane's own guest pages, sampled in the desktop background
+/// field, as a witness independent of the frame the host window shows.
+///
+/// The presented frame comes from the host surface cache or the GPU resident
+/// and never from guest pages ([`capture_present_frame`]), so the guest's copy
+/// of the same plane is the one reading that can say which of the two holds a
+/// blank field. On this rail a boot's background is sometimes the union of the
+/// compositor's damage rectangles over a uniform field nothing wrote; guest
+/// pages blank means the guest composited that field, and guest pages painted
+/// means this device presented something the guest's own copy did not contain.
+/// Nothing else on any channel separates those two.
+///
+/// **Reads texels and settles nothing.** The obvious instrument — reading the
+/// whole mapping through [`read_mapping_bgra8`] — pays a writeback settle, and
+/// landing deferred work into these pages is one of the repairs a blank field
+/// could need, so that instrument would report the frame it had just fixed.
+/// This walks the page list and reads the patches directly.
+///
+/// The mean is taken over the three colour bytes and skips byte 3, which is
+/// alpha in both BGRA8 and RGBA8 — so the reading does not depend on which of
+/// the two the plane declares, and no channel order has to be resolved here.
+pub fn note_present_field_witness<M: HostMemory>(
+    state: &mut DeviceState,
+    host: &M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+) {
+    if mapping_id == 0 || !scanout_extent_ok(width, height) {
+        return;
+    }
+    // Power-of-two spacing for the early boot, and a fixed stride after it.
+    // Power-of-two alone is readable from the first present onward and bounded
+    // by log2 of the present count (`maybe_log_capture_sampling`'s reason), but
+    // it is the wrong shape for this question: the defect is a property of the
+    // *settled* desktop, and by then the gaps are thousands of presents wide, so
+    // the one window that matters gets one or two samples. The stride restores a
+    // steady rate there and costs a bounded ~1 line/s at this rail's present
+    // rate.
+    let seq = state.present.present_epoch.saturating_add(1);
+    if !seq.is_power_of_two() && !seq.is_multiple_of(FIELD_WITNESS_STRIDE) {
+        return;
+    }
+    let Some((window, format, map_gen, epoch)) = state.mappings.get(&mapping_id).map(|m| {
+        let format = if m.format == 0 {
+            pixel_format::MTL_FORMAT_BGRA8_UNORM
+        } else {
+            m.format
+        };
+        (
+            crate::runtime::mapping_write::type11_sample_window(m, width, height, format),
+            format,
+            m.map_generation,
+            m.surface_content_epoch,
+        )
+    }) else {
+        return;
+    };
+    let Some((base_off, bpr, _)) = window else {
+        return;
+    };
+    let Some(bpp) = pixel_format::bytes_per_pixel(format) else {
+        return;
+    };
+    // The page list as it already stands, never a resolve. `mapping_page_gpas`
+    // would revalidate first, and a revalidate can run a resolve — which is a
+    // decision this witness would then have caused rather than observed. A
+    // mapping whose pages are not resolved at this present is simply not
+    // sampled; that is a gap in the record and not a change to the device.
+    let page_shift = state.page_shift;
+    let Some(gpas) = state
+        .mappings
+        .get(&mapping_id)
+        .filter(|m| m.mapped)
+        .map(|m| {
+            m.page_entries
+                .iter()
+                .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift))
+                .collect::<Vec<u64>>()
+        })
+    else {
+        return;
+    };
+    if gpas.is_empty() {
+        return;
+    }
+    let page = state.page_size();
+    let mut report = String::new();
+    let mut blank = 0u32;
+    for (i, (fx, fy)) in FIELD_PATCHES.iter().enumerate() {
+        let cx = (width as f32 * fx) as u32;
+        let cy = (height as f32 * fy) as u32;
+        let x0 = cx.saturating_sub(FIELD_PATCH_SIDE / 2).min(width - 1);
+        let y0 = cy.saturating_sub(FIELD_PATCH_SIDE / 2).min(height - 1);
+        let mut texels = [0f32; (FIELD_PATCH_SIDE * FIELD_PATCH_SIDE) as usize];
+        let mut n = 0usize;
+        for dy in 0..FIELD_PATCH_SIDE {
+            for dx in 0..FIELD_PATCH_SIDE {
+                let (x, y) = (x0 + dx, y0 + dy);
+                if x >= width || y >= height {
+                    continue;
+                }
+                let off = base_off + u64::from(y) * u64::from(bpr) + u64::from(x) * u64::from(bpp);
+                let Some(&gpa) = gpas.get((off / page) as usize) else {
+                    continue;
+                };
+                let mut texel = [0u8; 4];
+                if host.read_gpa(gpa + (off % page), &mut texel).is_err() {
+                    continue;
+                }
+                texels[n] = (f32::from(texel[0]) + f32::from(texel[1]) + f32::from(texel[2])) / 3.0;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            continue;
+        }
+        let mean = texels[..n].iter().sum::<f32>() / n as f32;
+        let sd = (texels[..n].iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n as f32).sqrt();
+        // The same reading the host-side grader takes: a field nothing wrote is
+        // uniform as well as bright, and uniformity is what separates it from a
+        // pale wallpaper. Uniform-and-dark is equally a field nothing wrote, so
+        // the count is of unpainted patches and the verdict names which kind.
+        let verdict = field_patch_verdict(mean, sd);
+        if verdict != "painted" {
+            blank += 1;
+        }
+        if i != 0 {
+            report.push(',');
+        }
+        report.push_str(&format!("{verdict}:{mean:.0}/{sd:.0}"));
+    }
+    crate::observe::off(format!(
+        "present_field_witness mid={mapping_id} {width}x{height} map_gen={map_gen} \
+         epoch={epoch} seq={seq} unpainted={blank}/4 patches=[{report}] \
+         (guest pages, no settle)"
+    ));
+}

@@ -658,9 +658,37 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         // ranks fail-channel lines on that key, and the underlying slug is
         // already counted once at its own emitter. Naming it twice would
         // make one refusal read as two.
+        // The target and its clear, because the cost of this refusal is not the
+        // draw count: `runtime::exec::finish_stream` still applies the pass's
+        // clear once the packet ends, so a record that reaches here publishes a
+        // flat clear colour over whatever the skipped draws would have drawn.
+        // Without the target named, a refusal on a scratch offscreen and one on
+        // the compositor's own full-screen plane read identically — and only the
+        // second is a desktop the guest never composited.
+        let (target, clear) = req
+            .colors
+            .first()
+            .map(|c| {
+                (
+                    format!(
+                        "mid={} gva={:#x} {}x{} load={:#x} store={:#x}",
+                        c.mapping_id,
+                        c.target_gva,
+                        c.width,
+                        c.height,
+                        c.load_action,
+                        c.store_action
+                    ),
+                    format!(
+                        "[{:.3},{:.3},{:.3},{:.3}]",
+                        c.clear_color[0], c.clear_color[1], c.clear_color[2], c.clear_color[3]
+                    ),
+                )
+            })
+            .unwrap_or_else(|| ("no_color_target".to_string(), "none".to_string()));
         crate::observe::fail(format!(
             "linux_clear_store draws_skipped reason=draws_skipped_after_engine_refusal \
-             pipe={} vtx={} refused_by={}",
+             pipe={} vtx={} refused_by={} {target} clear={clear}",
             req.pipeline_ref,
             req.vertex_count,
             engine_refusal.unwrap_or("engine_draw_not_attempted")

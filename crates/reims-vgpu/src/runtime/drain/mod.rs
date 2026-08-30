@@ -3387,6 +3387,9 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         state.present.height = h;
         state.present.generation = gen;
         log_present_page_identity(state, mapping, w, h);
+        // Independent of everything below: the guest's own copy of the plane
+        // this present names, sampled where the desktop background belongs.
+        crate::runtime::scanout::note_present_field_witness(state, &*host, mapping, w, h);
         // Every present takes one route: capture the surface the transaction
         // named. A ClearOnly present — one whose named mid's most recent write
         // was a `display_clear`/CLEAR Store rather than a draw — used to take a
