@@ -4674,22 +4674,82 @@ fn note_plane_store_published(mapping_id: u32) {
     }
 }
 
-/// Drain and format the remembered passes for one plane.
+/// Which witness is asking, because two of them ask about the same plane rings
+/// for different questions and neither may consume the other's window.
+///
+/// [`crate::runtime::scanout::note_present_field_witness`] asks about the plane
+/// a present names; `note_sampled_surface_field` asks about a full-screen layer
+/// a draw sampled, and on this rail the compositor's presented planes are also
+/// sampled layers. A single destructive drain gave whichever witness fired
+/// first the whole window and the other one `draws=0` — which is exactly the
+/// reading that separates "a pass produced this field" from "nothing drew into
+/// this surface", so the shared drain manufactured the more alarming of the two
+/// answers.
 #[cfg(feature = "backend-vulkan")]
-/// A plane that received nothing since the last drain returns
-/// `arrivals = 0` with no passes, and that is the answer the drain is for --
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum PlaneDrawReader {
+    /// The plane a present named.
+    PresentedPlane,
+    /// A full-screen layer a draw sampled.
+    SampledLayer,
+}
+
+/// Each reader's last-seen arrival count per plane, so every reader gets its own
+/// window over one shared ring.
+#[cfg(feature = "backend-vulkan")]
+static PLANE_DRAW_CURSOR: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(PlaneDrawReader, u32), u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Format the passes remembered for one plane, and the arrivals since this
+/// reader last asked.
+#[cfg(feature = "backend-vulkan")]
+/// A plane that received nothing since this reader's last read returns
+/// `arrivals = 0` with no passes, and that is the answer the read is for --
 /// it distinguishes a guest that stopped compositing into this plane from a
 /// device that dropped what the guest composited. Both look identical in a
 /// field sample and in every boot-total counter.
-pub(crate) fn take_plane_draw_ring(mapping_id: u32) -> PlaneDrawDrain {
-    let mut ring = PLANE_DRAW_RING
+pub(crate) fn read_plane_draw_ring(reader: PlaneDrawReader, mapping_id: u32) -> PlaneDrawDrain {
+    let (total, passes) = {
+        let ring = PLANE_DRAW_RING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match ring.get(&mapping_id) {
+            Some(window) => (
+                window.arrivals,
+                window.passes.iter().cloned().collect::<Vec<_>>().join(" "),
+            ),
+            None => (0, String::new()),
+        }
+    };
+    let mut cursor = PLANE_DRAW_CURSOR
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let window = ring.remove(&mapping_id).unwrap_or_default();
+    let seen = cursor.insert((reader, mapping_id), total).unwrap_or(0);
     PlaneDrawDrain {
-        arrivals: window.arrivals,
-        passes: window.passes.into_iter().collect::<Vec<_>>().join(" "),
+        // Saturating because a recycled mapping id restarts its ring at zero
+        // while a reader still holds the predecessor's count; the answer then is
+        // "nothing since you asked", never a negative window.
+        arrivals: total.saturating_sub(seen),
+        passes,
     }
+}
+
+/// Drop one plane's ring and every reader's cursor over it.
+///
+/// Called where the guest releases the mapping, so the ring is bounded by the
+/// live compositor surfaces rather than by every id the boot has ever used, and
+/// so a recycled id cannot inherit its predecessor's passes.
+#[cfg(feature = "backend-vulkan")]
+pub fn forget_plane_draw_ring(mapping_id: u32) {
+    PLANE_DRAW_RING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&mapping_id);
+    PLANE_DRAW_CURSOR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|(_, mid), _| *mid != mapping_id);
 }
 
 /// One plane's arrivals and remembered tail, taken together.
@@ -4697,10 +4757,11 @@ pub(crate) fn take_plane_draw_ring(mapping_id: u32) -> PlaneDrawDrain {
 /// The two travel as one value because reading either alone is misleading: an
 /// empty tail with a non-zero count means the formatting was dropped, and a
 /// non-empty tail with a count above [`PLANE_DRAW_RING_DEPTH`] is a tail rather
-/// than the whole window.
+/// than the whole window. The tail is the ring's, so it can reach further back
+/// than this reader's own window when the count is small.
 #[cfg(feature = "backend-vulkan")]
 pub(crate) struct PlaneDrawDrain {
-    /// Draws that arrived for this plane since the previous drain.
+    /// Draws that arrived for this plane since this reader's previous read.
     pub(crate) arrivals: u64,
     /// The remembered tail of those draws, space separated.
     pub(crate) passes: String,

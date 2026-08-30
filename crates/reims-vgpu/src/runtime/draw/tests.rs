@@ -7897,7 +7897,7 @@ fn a_planes_drain_counts_every_arrival_even_past_the_ring_it_remembers() {
         });
     }
 
-    let drain = take_plane_draw_ring(mapping_id);
+    let drain = read_plane_draw_ring(PlaneDrawReader::PresentedPlane, mapping_id);
     assert_eq!(
         drain.arrivals, sends,
         "every draw into the plane must be counted, not only the remembered tail"
@@ -7908,13 +7908,30 @@ fn a_planes_drain_counts_every_arrival_even_past_the_ring_it_remembers() {
         "a truncated tail must say so beside its true count: {rendered}"
     );
 
-    // Draining resets the window, so the next interval measures itself rather
-    // than inheriting this one. Without that, "the guest stopped drawing" is
-    // unsayable: the count would never return to zero.
-    let after = take_plane_draw_ring(mapping_id);
+    // A reader's window closes where it read, so the next interval measures
+    // itself rather than inheriting this one. Without that, "the guest stopped
+    // drawing" is unsayable: the count would never return to zero.
+    let after = read_plane_draw_ring(PlaneDrawReader::PresentedPlane, mapping_id);
     assert_eq!(
         after.arrivals, 0,
-        "a drained plane starts its next window empty"
+        "a plane read twice starts its next window empty"
+    );
+    // And the other witness's window is its own: it has never read this plane,
+    // so every arrival is still ahead of it. A single destructive drain gave
+    // the second reader `draws=0` — the reading that says nothing drew into a
+    // surface, manufactured by the reader that got there first.
+    let other = read_plane_draw_ring(PlaneDrawReader::SampledLayer, mapping_id);
+    assert_eq!(
+        other.arrivals, sends,
+        "one witness's read must not consume another's window"
+    );
+    // Released with the mapping: the ring is bounded by live compositor
+    // surfaces, and a recycled id starts empty for every reader.
+    forget_plane_draw_ring(mapping_id);
+    assert_eq!(
+        read_plane_draw_ring(PlaneDrawReader::SampledLayer, mapping_id).arrivals,
+        0,
+        "a released mapping's ring and cursors go with it"
     );
     assert_eq!(
         after.to_string(),

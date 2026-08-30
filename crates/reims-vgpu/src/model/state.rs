@@ -3010,6 +3010,11 @@ impl DeviceState {
     }
 
     fn forget_compositor_mapping(&mut self, mapping_id: u32) {
+        // The plane draw ring is keyed by mapping id and read by two witnesses,
+        // so it is dropped with the mapping: bounded by the live compositor
+        // surfaces, and a recycled id cannot inherit a predecessor's passes.
+        #[cfg(feature = "backend-vulkan")]
+        crate::runtime::draw::forget_plane_draw_ring(mapping_id);
         // Prune the dense-frame seq: a recycled mapping id must not inherit a
         // stale predecessor's dense seq.
         self.present.dense_frame_seq.remove(&mapping_id);
