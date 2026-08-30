@@ -4519,8 +4519,38 @@ pub(crate) fn record_plane_draw(req: &DrawEncodeRequest) {
     if passes.len() == PLANE_DRAW_RING_DEPTH {
         passes.pop_front();
     }
+    // The clear colour rides along only for a pass that declares CLEAR. That is
+    // the one case where the colour is what the attachment ends up holding
+    // wherever the draw does not cover, and it is not otherwise recorded: the
+    // latched census reports it, but only from the colour-seed site, which a
+    // pass whose seed is elided never reaches -- so the full-screen CLEAR passes
+    // are exactly the ones missing from it.
+    let clear = if color.load_action == crate::contract::pass_action::MTL_LOAD_ACTION_CLEAR {
+        format!(
+            "/c[{:.3},{:.3},{:.3},{:.3}]",
+            color.clear_color[0], color.clear_color[1], color.clear_color[2], color.clear_color[3]
+        )
+    } else {
+        String::new()
+    };
+    // What the fragment stage samples, because a full-screen quad that fills the
+    // plane with one flat colour is either a solid-colour pass or a textured
+    // pass whose texture resolved to a single value, and those are opposite
+    // defects. Refs only: the ring is a breadcrumb and the identity of a ref is
+    // recoverable from the records that already name it.
+    let textures = req
+        .fragment_textures
+        .iter()
+        .filter(|t| t.texture_ref != 0)
+        .map(|t| t.texture_ref.to_string())
+        .collect::<Vec<_>>();
+    let textures = if textures.is_empty() {
+        "/t-none".to_string()
+    } else {
+        format!("/t{}", textures.join("."))
+    };
     passes.push_back(format!(
-        "p{}/v{}/{}/l{:#x}",
+        "p{}/v{}/{}/l{:#x}{clear}{textures}",
         req.pipeline_ref, shape.vertex_count, shape.scissor, color.load_action
     ));
 }
