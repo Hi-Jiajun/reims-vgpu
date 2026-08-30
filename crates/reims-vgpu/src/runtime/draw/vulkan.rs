@@ -7597,6 +7597,34 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             ));
                         };
                         let (rw, rh, mid, src) = loaded;
+                        // What a texture ref resolved to, once per
+                        // (ref, backing, extent). The plane draw ring records
+                        // the refs a pass sampled, and a ref is only a number:
+                        // when a full-screen layer turns uniform on the first
+                        // draw to bind two new refs, "what are those two" had no
+                        // record at any size. The field witness below answers it
+                        // only for surfaces of a megapixel or more.
+                        if frag_stage {
+                            let route = match &src {
+                                SampledSourceRequest::Bytes(..) => "bytes",
+                                SampledSourceRequest::Target(..) => "target",
+                                SampledSourceRequest::GuestRuns(..) => "guest_runs",
+                            };
+                            let disc = u64::from(texture_ref) << 32
+                                | u64::from(rw) << 16
+                                | u64::from(rh as u16);
+                            if crate::observe::first_sight("sampled_ref_backing", disc) {
+                                let (mfmt, mw, mh) = state
+                                    .mappings
+                                    .get(&mid)
+                                    .map(|m| (m.format, m.width, m.height))
+                                    .unwrap_or((0, 0, 0));
+                                crate::observe::off(format!(
+                                    "sampled_ref_backing ref={texture_ref} view={rw}x{rh} \
+                                     mid={mid} map={mw}x{mh} map_fmt={mfmt:#x} route={route}"
+                                ));
+                            }
+                        }
                         // What this bind reads, beside what the plane it draws
                         // into ends up holding. Large surfaces only; latched on
                         // change of the field pattern.
