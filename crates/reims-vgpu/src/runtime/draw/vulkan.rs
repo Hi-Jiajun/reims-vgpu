@@ -8552,6 +8552,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // out-of-contract compare) are dropped fail-visibly, deduped per
         // (pipe,slug) so 3D content cannot flood the log.
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::AssembleDepth);
+        // The test half only. The attachment is assembled from this and the
+        // pass's own declaration together, below — see `depth_state_for` for why
+        // deciding it here was the defect.
+        let mut depth_test: Option<DepthTest> = None;
         if req.depth_stencil_ref != 0 {
             let ds = match load_depth_stencil_descriptor(
                 state,
@@ -8582,35 +8586,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 if !depth_stencil_descriptor_is_trivial(&ds) {
                     match translate::raster::compare_function(ds.depth_compare_function).ok() {
                         Some(compare) => {
-                            let (clear_value, load_action) = req
-                                .depth_attach
-                                .as_ref()
-                                .map(|d| (d.clear_depth as f32, d.load_action))
-                                .unwrap_or((1.0, MTL_LOAD_ACTION_CLEAR));
-                            // A record that continues a serialized render pass
-                            // shares the pass's depth attachment with the
-                            // records before it, so it LOADs whatever they
-                            // tested and wrote — the exact rule the record loop
-                            // already forces on every colour attachment at
-                            // `di > 0`, and depth was the attachment it missed.
-                            // Without it each record re-CLEARed (or re-created)
-                            // the depth buffer and inter-record occlusion was
-                            // lost. `honours_load` still gates on the resident
-                            // actually holding content, so a chain whose first
-                            // record failed degrades to CLEAR by name instead
-                            // of loading an undefined image.
-                            let load_action = if req.continues_render_pass {
-                                MTL_LOAD_ACTION_LOAD
-                            } else {
-                                load_action
-                            };
-                            // `MTLLoadActionLoad` is carried through as the
-                            // guest wrote it. Whether it can be *honoured* is
-                            // not decidable here — it needs the depth resident's
-                            // own content state, which only the engine holds —
-                            // so the engine makes that call and names the
-                            // degradation when it cannot. See
-                            // `pools::registry_mark_depth_ready`.
                             // Stencil test: engaged when either face is enabled.
                             // A face that is *not* enabled maps to Metal's
                             // documented `MTLStencilDescriptor` default (compare
@@ -8621,26 +8596,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             // fail-visibly (unknown wire stays unknown); depth is
                             // still honored.
                             let stencil = if ds.front_stencil_enabled || ds.back_stencil_enabled {
-                                use crate::backend::vulkan::engine::{
-                                    SamplerCompareFunction, StencilFaceOps, StencilOp, StencilState,
-                                };
-                                const PASS_THROUGH: StencilFaceOps = StencilFaceOps {
-                                    compare: SamplerCompareFunction::Always,
-                                    fail_op: StencilOp::Keep,
-                                    depth_fail_op: StencilOp::Keep,
-                                    pass_op: StencilOp::Keep,
-                                    read_mask: 0xFFFF_FFFF,
-                                    write_mask: 0xFFFF_FFFF,
-                                };
+                                use crate::backend::vulkan::engine::StencilState;
                                 let front = if ds.front_stencil_enabled {
                                     engine_stencil_face(&ds.front_face)
                                 } else {
-                                    Ok(PASS_THROUGH)
+                                    Ok(STENCIL_PASS_THROUGH)
                                 };
                                 let back = if ds.back_stencil_enabled {
                                     engine_stencil_face(&ds.back_face)
                                 } else {
-                                    Ok(PASS_THROUGH)
+                                    Ok(STENCIL_PASS_THROUGH)
                                 };
                                 // Name the field that failed, not just "a
                                 // stencil op somewhere did". `TranslateReason`
@@ -8705,31 +8670,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             } else {
                                 None
                             };
-                            resources.depth = Some(crate::backend::vulkan::engine::DepthState {
-                                identity: depth_chain_identity(req, stencil.is_some()),
-                                test_enable: true,
+                            depth_test = Some(DepthTest {
                                 write_enable: ds.depth_write_enabled,
                                 compare,
-                                clear_value,
-                                // The depth slot opens with the same 28-byte
-                                // attachment prefix as the colour slots, so its
-                                // action means the same thing: DontCare permits
-                                // the prior contents, and asking for them is
-                                // what stops a pass that tests against earlier
-                                // depth from starting at the clear value. See
-                                // `LoadAction::preserves_prior_contents`.
-                                //
-                                // Widening the *ask* is safe here precisely
-                                // because honouring it is not decided here:
-                                // `honours_load` below gates on the depth
-                                // resident actually holding content and
-                                // degrades to CLEAR by name, so a DontCare with
-                                // nothing behind it cannot load an undefined
-                                // image.
-                                load: crate::contract::pass_action::LoadAction::from_declared(
-                                    load_action,
-                                )
-                                .preserves_prior_contents(),
                                 stencil,
                             });
                         }
@@ -8751,6 +8694,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     }
                 }
             }
+        }
+        // Either half is enough to need an attachment: a bound test needs
+        // somewhere to test against, and a pass that declared a depth
+        // attachment owns its clear and its store whether or not any draw in it
+        // binds a state.
+        if needs_depth_attachment(req, &depth_test) {
+            resources.depth = Some(depth_state_for(req, depth_test));
         }
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         // The `fixed_gap` anomaly — decoded fixed-function state the Vulkan
@@ -9215,6 +9165,141 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
 ///
 /// Geometry and aspect changes still recreate the image, through
 /// `ResidentTargetSlot::reusable_for` and the `stencil` field of the key.
+/// The per-draw half of a depth attachment: what a bound `MTLDepthStencilState`
+/// says about the test.
+///
+/// `None` is Metal's **default** depth-stencil state — compare Always, writes
+/// off — which is what a draw that binds no state gets. That default is a test
+/// which changes nothing; it is not the absence of an attachment.
+pub(super) struct DepthTest {
+    pub write_enable: bool,
+    pub compare: crate::backend::vulkan::engine::SamplerCompareFunction,
+    pub stencil: Option<crate::backend::vulkan::engine::StencilState>,
+}
+
+/// Metal's documented `MTLStencilDescriptor` default: compare Always, every op
+/// Keep, full masks. A face that does nothing.
+///
+/// Used for two different absences, and they are the same absence. A bound state
+/// with one face disabled leaves that face at this default rather than at its
+/// raw decoded bytes, which for a disabled face need not be initialized. A pass
+/// that declares a stencil attachment while nothing binds a stencil test gets
+/// this for both faces — see [`depth_state_for`], which is where the attachment
+/// and the test stopped being the same question.
+const STENCIL_PASS_THROUGH: crate::backend::vulkan::engine::StencilFaceOps =
+    crate::backend::vulkan::engine::StencilFaceOps {
+        compare: crate::backend::vulkan::engine::SamplerCompareFunction::Always,
+        fail_op: crate::backend::vulkan::engine::StencilOp::Keep,
+        depth_fail_op: crate::backend::vulkan::engine::StencilOp::Keep,
+        pass_op: crate::backend::vulkan::engine::StencilOp::Keep,
+        read_mask: 0xFFFF_FFFF,
+        write_mask: 0xFFFF_FFFF,
+    };
+
+/// Whether a record needs a depth attachment at all.
+///
+/// **This is the rule that was wrong.** It used to be `test.is_some()` alone —
+/// spelled as the shape of the code rather than as a predicate, so there was
+/// nothing to assert against — and a pass that declared a depth attachment while
+/// binding no depth-stencil state answered `false`. Its clear and its store were
+/// then never encoded, and the pass that loaded that depth afterwards tested
+/// against values the guest never wrote. See [`depth_state_for`] for why the two
+/// terms are independent.
+fn needs_depth_attachment(req: &DrawEncodeRequest, test: &Option<DepthTest>) -> bool {
+    test.is_some() || req.depth_attach.is_some() || req.stencil_attach.is_some()
+}
+
+/// The depth attachment a record carries.
+///
+/// **Two independent Metal states decide this, and only one of them used to.**
+/// The render pass descriptor owns the *attachment*: which texture, which load
+/// action, which clear value, which store action. `MTLDepthStencilState` owns
+/// the *test*: the compare function and the write enable. Neither implies the
+/// other.
+///
+/// This device built a depth attachment only when a non-trivial depth-stencil
+/// state was bound, so a pass that declared `loadAction = .clear` and bound no
+/// state — which is lawful, and is what a pass that only wants to *establish*
+/// depth for a later pass does — got no attachment at all. Its clear and its
+/// store never happened, and the next pass loaded whatever was there and tested
+/// against the wrong values. `depth_stencil_descriptor_is_trivial` reasons
+/// entirely about occlusion, which is why the omission reads as correct at the
+/// call site: dropping a test that always passes is sound, and dropping the
+/// pass's own clear alongside it is not.
+///
+/// So the two halves are assembled here, once. `test` absent means Metal's
+/// default state, which disables the test and the writes and leaves everything
+/// the pass declared untouched.
+fn depth_state_for(
+    req: &DrawEncodeRequest,
+    test: Option<DepthTest>,
+) -> crate::backend::vulkan::engine::DepthState {
+    use crate::backend::vulkan::engine::SamplerCompareFunction;
+
+    let (clear_value, load_action) = req
+        .depth_attach
+        .as_ref()
+        .map(|d| (d.clear_depth as f32, d.load_action))
+        .unwrap_or((1.0, MTL_LOAD_ACTION_CLEAR));
+    // A record that continues a serialized render pass shares the pass's depth
+    // attachment with the records before it, so it LOADs whatever they tested
+    // and wrote — the exact rule the record loop already forces on every colour
+    // attachment at `di > 0`, and depth was the attachment it missed. Without
+    // it each record re-CLEARed (or re-created) the depth buffer and
+    // inter-record occlusion was lost. `honours_load` still gates on the
+    // resident actually holding content, so a chain whose first record failed
+    // degrades to CLEAR by name instead of loading an undefined image.
+    let load_action = if req.continues_render_pass {
+        MTL_LOAD_ACTION_LOAD
+    } else {
+        load_action
+    };
+    // **The aspect is the pass's, the test is the state's.** `DepthState::stencil`
+    // answers both — whether the image carries a STENCIL aspect at all, and what
+    // the stencil test does — so deriving it from the bound state alone gave a
+    // pass that declared a stencil attachment a depth-only image. Its clear
+    // could not land, and the next pass, which did bind a stencil test, asked
+    // for the combined image: a different resident, holding nothing. That is the
+    // `depth_load reason=depth_load_without_content 8x8 stencil=1` a macos-13
+    // battery logs.
+    //
+    // So a declared stencil attachment with no bound test gets a test that does
+    // nothing, over an attachment that is still cleared and still stored.
+    let stencil = test.as_ref().and_then(|t| t.stencil).or_else(|| {
+        req.stencil_attach
+            .as_ref()
+            .map(|s| crate::backend::vulkan::engine::StencilState {
+                front: STENCIL_PASS_THROUGH,
+                back: STENCIL_PASS_THROUGH,
+                reference_front: 0,
+                reference_back: 0,
+                clear_value: s.clear_stencil,
+            })
+    });
+    crate::backend::vulkan::engine::DepthState {
+        identity: depth_chain_identity(req, stencil.is_some()),
+        test_enable: test.is_some(),
+        write_enable: test.as_ref().is_some_and(|t| t.write_enable),
+        compare: test
+            .as_ref()
+            .map_or(SamplerCompareFunction::Always, |t| t.compare),
+        clear_value,
+        // The depth slot opens with the same 28-byte attachment prefix as the
+        // colour slots, so its action means the same thing: DontCare permits the
+        // prior contents, and asking for them is what stops a pass that tests
+        // against earlier depth from starting at the clear value. See
+        // `LoadAction::preserves_prior_contents`.
+        //
+        // Widening the *ask* is safe here precisely because honouring it is not
+        // decided here: `honours_load` gates on the depth resident actually
+        // holding content and degrades to CLEAR by name, so a DontCare with
+        // nothing behind it cannot load an undefined image.
+        load: crate::contract::pass_action::LoadAction::from_declared(load_action)
+            .preserves_prior_contents(),
+        stencil,
+    }
+}
+
 pub(super) fn depth_chain_identity(
     req: &DrawEncodeRequest,
     with_stencil: bool,
@@ -12133,6 +12218,234 @@ mod vulkan_split_tests {
         assert_eq!(
             depth_chain_identity(&DrawEncodeRequest::default(), false),
             None
+        );
+    }
+
+    /// A pass owns its depth clear and its store whether or not a draw in it
+    /// binds a depth-stencil state.
+    ///
+    /// The two are independent Metal states. This device assembled the
+    /// attachment only from the bound state, so a pass that declared
+    /// `loadAction = .clear`, `clearDepth = 0`, `storeAction = .store` and bound
+    /// no state produced no attachment at all: its clear never ran, its store
+    /// never ran, and the next pass tested against whatever was left. That is
+    /// exactly `depth_attachment_clear_without_test_state`, which fails on the
+    /// guest and passes natively.
+    ///
+    /// The default state Metal supplies when none is bound is a test that always
+    /// passes with writes off — which is what is asserted here alongside the
+    /// clear value the pass declared.
+    #[test]
+    fn a_declared_depth_clear_survives_a_draw_that_binds_no_depth_stencil_state() {
+        use crate::backend::vulkan::engine::{SamplerCompareFunction, TargetIdentity};
+
+        let mut req = DrawEncodeRequest::default();
+        req.colors.push(ColorRtRequest {
+            width: 8,
+            height: 8,
+            ..Default::default()
+        });
+        req.depth_attach = Some(crate::runtime::decode::render::DepthAttachment {
+            texture_ref: 7,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            clear_depth: 0.0,
+            ..Default::default()
+        });
+
+        // The red witness. On the control the rule was `test.is_some()` alone,
+        // so this exact request — a declared depth attachment with no bound
+        // state — answered `false` and no attachment was encoded.
+        assert!(
+            needs_depth_attachment(&req, &None),
+            "a pass that declares a depth attachment needs one, bound state or not"
+        );
+
+        let depth = depth_state_for(&req, None);
+        assert_eq!(
+            depth.clear_value, 0.0,
+            "the pass declared the clear value; nothing else may choose it"
+        );
+        assert!(
+            !depth.load,
+            "a declared CLEAR must not be turned into a LOAD of prior contents"
+        );
+        assert!(
+            matches!(
+                depth.identity,
+                Some(TargetIdentity::Texture { ref_: 7, .. })
+            ),
+            "the pass named a depth texture, so the attachment is that guest resource"
+        );
+        assert!(
+            !depth.test_enable && !depth.write_enable,
+            "Metal's default state tests nothing and writes nothing"
+        );
+        assert_eq!(depth.compare, SamplerCompareFunction::Always);
+        assert!(depth.stencil.is_none());
+    }
+
+    /// A pass that declares a stencil attachment gets one, even though nothing
+    /// binds a stencil test.
+    ///
+    /// `DepthState::stencil` answers two questions — does the image carry a
+    /// STENCIL aspect, and what does the stencil test do — and deriving it from
+    /// the bound state alone answered the first with the second. The pass that
+    /// declared the attachment got a depth-only image, so its stencil clear had
+    /// nowhere to land; the pass that later bound a stencil test asked for the
+    /// combined image and found a different resident holding nothing. A macos-13
+    /// battery logs that as
+    /// `depth_load reason=depth_load_without_content 8x8 stencil=1`.
+    #[test]
+    fn a_declared_stencil_attachment_carries_its_aspect_without_a_bound_test() {
+        use crate::backend::vulkan::engine::SamplerCompareFunction;
+
+        let mut req = DrawEncodeRequest::default();
+        req.colors.push(ColorRtRequest {
+            width: 8,
+            height: 8,
+            ..Default::default()
+        });
+        req.stencil_attach = Some(crate::runtime::decode::render::StencilAttachment {
+            texture_ref: 11,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            clear_stencil: 3,
+            ..Default::default()
+        });
+
+        assert!(
+            needs_depth_attachment(&req, &None),
+            "a declared stencil attachment needs an attachment of its own"
+        );
+        let depth = depth_state_for(&req, None);
+        let stencil = depth
+            .stencil
+            .expect("the pass declared a stencil attachment, so the image carries the aspect");
+        assert_eq!(
+            stencil.clear_value, 3,
+            "the pass declared the stencil clear value"
+        );
+        assert_eq!(
+            (stencil.front.compare, stencil.back.compare),
+            (
+                SamplerCompareFunction::Always,
+                SamplerCompareFunction::Always
+            ),
+            "no bound test means a test that does nothing, not a test that rejects"
+        );
+        assert_eq!(stencil.front, STENCIL_PASS_THROUGH);
+        assert_eq!(stencil.back, STENCIL_PASS_THROUGH);
+    }
+
+    /// A bound stencil test wins over the pass's no-op default — the pass
+    /// supplies the aspect, the state supplies the test, and the state is only
+    /// consulted for the second.
+    #[test]
+    fn a_bound_stencil_test_is_not_replaced_by_the_passs_default() {
+        use crate::backend::vulkan::engine::{
+            SamplerCompareFunction, StencilFaceOps, StencilOp, StencilState,
+        };
+
+        let mut req = DrawEncodeRequest::default();
+        req.colors.push(ColorRtRequest {
+            width: 8,
+            height: 8,
+            ..Default::default()
+        });
+        req.stencil_attach = Some(crate::runtime::decode::render::StencilAttachment {
+            texture_ref: 11,
+            clear_stencil: 3,
+            ..Default::default()
+        });
+        let bound = StencilState {
+            front: StencilFaceOps {
+                compare: SamplerCompareFunction::Equal,
+                fail_op: StencilOp::Keep,
+                depth_fail_op: StencilOp::Keep,
+                pass_op: StencilOp::Replace,
+                read_mask: 0xFF,
+                write_mask: 0xFF,
+            },
+            back: STENCIL_PASS_THROUGH,
+            reference_front: 5,
+            reference_back: 6,
+            clear_value: 3,
+        };
+        let depth = depth_state_for(
+            &req,
+            Some(DepthTest {
+                write_enable: false,
+                compare: SamplerCompareFunction::Always,
+                stencil: Some(bound),
+            }),
+        );
+        assert_eq!(depth.stencil, Some(bound));
+    }
+
+    /// A bound test still carries its own compare and write enable, and still
+    /// takes the pass's clear value rather than a default.
+    #[test]
+    fn a_bound_depth_test_keeps_its_compare_and_the_passs_clear() {
+        use crate::backend::vulkan::engine::SamplerCompareFunction;
+
+        let mut req = DrawEncodeRequest::default();
+        req.colors.push(ColorRtRequest {
+            width: 8,
+            height: 8,
+            ..Default::default()
+        });
+        req.depth_attach = Some(crate::runtime::decode::render::DepthAttachment {
+            texture_ref: 3,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            clear_depth: 0.25,
+            ..Default::default()
+        });
+
+        let depth = depth_state_for(
+            &req,
+            Some(DepthTest {
+                write_enable: true,
+                compare: SamplerCompareFunction::Less,
+                stencil: None,
+            }),
+        );
+        assert!(depth.test_enable && depth.write_enable);
+        assert_eq!(depth.compare, SamplerCompareFunction::Less);
+        assert_eq!(depth.clear_value, 0.25);
+    }
+
+    /// A record continuing a serialized pass loads what the records before it
+    /// wrote, on both halves — the rule is the pass's, not the bound state's.
+    #[test]
+    fn a_continued_record_loads_prior_depth_with_or_without_a_bound_test() {
+        use crate::backend::vulkan::engine::SamplerCompareFunction;
+
+        let mut req = DrawEncodeRequest::default();
+        req.colors.push(ColorRtRequest {
+            width: 8,
+            height: 8,
+            ..Default::default()
+        });
+        req.depth_attach = Some(crate::runtime::decode::render::DepthAttachment {
+            texture_ref: 9,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            ..Default::default()
+        });
+        req.continues_render_pass = true;
+
+        assert!(
+            depth_state_for(&req, None).load,
+            "a continued record must not re-clear the depth the pass already has"
+        );
+        assert!(
+            depth_state_for(
+                &req,
+                Some(DepthTest {
+                    write_enable: false,
+                    compare: SamplerCompareFunction::Less,
+                    stencil: None,
+                }),
+            )
+            .load
         );
     }
 
