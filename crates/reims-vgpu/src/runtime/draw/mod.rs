@@ -3054,7 +3054,18 @@ pub(crate) struct AttachmentSampleCounts {
     /// `MTLRenderPipelineDescriptor.rasterSampleCount` of the bound pipeline,
     /// or `None` when the pipeline could not be resolved.
     pub pipeline: Option<u32>,
-    /// The destination texture's own immutable creation sample count.
+    /// What [`super::render_target::ResolvedRenderTarget`] carried.
+    ///
+    /// **Not the texture's creation sample count**, and reading it as one is a
+    /// mistake this record has already caused once. That field is a hardcoded
+    /// `1` at every one of its construction sites, because a linear texture
+    /// resource's dimensions do not retain the creation descriptor's sample
+    /// count — the field's own documentation says so, and says the Vulkan
+    /// encode is expected to replace the provisional value with the pipeline's.
+    ///
+    /// So `pipeline != target` is *not* evidence that the guest's texture is
+    /// single-sample. It is only evidence that the pipeline declared more than
+    /// one sample, which is the case worth naming here for the reason below.
     pub target: u32,
     /// What this device gave the attachment. Today: the pipeline's, when it has
     /// one.
@@ -3067,12 +3078,14 @@ pub(crate) struct AttachmentSampleCounts {
 /// # Why this needs a record
 ///
 /// Metal requires a pipeline's `rasterSampleCount` to equal the sample count of
-/// every colour attachment it renders into, so reading the count off the
-/// pipeline is normally a restatement of what the texture already says. When
-/// the two disagree, it is not: the destination is single-sample and this
-/// device has promoted it to a multisample attachment on the pipeline's word.
+/// every colour attachment it renders into, and this device recovers that count
+/// from the pipeline because the resolved target cannot carry it (see
+/// [`AttachmentSampleCounts::target`]). So this record does not report a
+/// disagreement between the guest's two declarations — it cannot see the
+/// texture's declaration at all. What it reports is the passes that end up
+/// multisampled, and where their samples are meant to go.
 ///
-/// That promotion has a downstream cost the promotion site cannot see. The
+/// That matters because it has a downstream cost the site cannot see. The
 /// engine creates the resident at the promoted count, the draw succeeds, and
 /// then `resident_read_snapshot` refuses to read a `sample_count != 1` resident
 /// back — so nothing is stored, `runtime::exec::finish_stream` applies the
@@ -3081,11 +3094,20 @@ pub(crate) struct AttachmentSampleCounts {
 /// the skipped-draw tail was corrected it was reported as an engine refusal
 /// that never happened.
 ///
-/// So the question this record exists to answer is exactly one: **did the guest
-/// declare the multisample, or did this device invent it?** A record where
-/// `target` is 1 and `pipeline` is greater, with no `resolve_texture_ref`, is
-/// the second — a promotion with nowhere to resolve to, which is not a shape
-/// Metal can express and which this device should refuse rather than lose.
+/// Measured on rail macos-15, boot s4: **two** records in a whole boot, both
+/// `pipeline_samples=4 resolve_ref=0 store=0x1` on 300x300 linear GVA targets,
+/// and they are the same two passes the corrected skipped-draw tail reports as
+/// `engine_drew_store_lost_it`. Two out of a boot's several hundred pipelines
+/// is also what says the pipeline's count is decoded correctly rather than
+/// misread: `raster_sample_count` comes from a TLV tag, and a misread tag would
+/// not be this rare.
+///
+/// So the guest really does run a 4x pass here, and the open question is no
+/// longer "who invented the multisample" — it is **what the guest expects to
+/// find in those guest pages afterwards**. Metal writes nothing to a linear
+/// buffer for a multisample `MTLStoreActionStore`; this device writes the
+/// pass's clear colour there. Neither this record nor any other establishes
+/// which the guest reads, and until one does, no repair here is supportable.
 ///
 /// Latched per `(pipeline, texture)`: a guest that means this means it every
 /// frame, and the population's size belongs to a counter, not to this line.
@@ -3110,9 +3132,9 @@ pub(crate) fn note_attachment_sample_count_override(
     crate::runtime::drain::note_store_route(if att.resolve_texture_ref != 0 {
         "attach_samples_from_pipeline_with_resolve"
     } else if pipeline > counts.target {
-        "attach_samples_promoted_no_resolve"
+        "attach_samples_multisample_no_resolve"
     } else {
-        "attach_samples_demoted"
+        "attach_samples_below_provisional"
     });
     if crate::observe::first_sight(
         "attachment_sample_count_override",

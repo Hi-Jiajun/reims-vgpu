@@ -5699,6 +5699,7 @@ fn note_draw_coverage(
     load_action: Option<u16>,
     seeded: bool,
     from_target: bool,
+    guest_backed: bool,
 ) {
     let covers = scissor.covers(target_w, target_h);
     crate::runtime::drain::note_store_route(if covers {
@@ -5793,6 +5794,29 @@ fn note_draw_coverage(
                 "draw_partial_preserving_unseeded_lost_texels",
                 target.saturating_sub(covered),
             );
+            // And split by whether the target has guest-visible backing,
+            // because that is exactly the line between a repair that is safe
+            // and one that is not.
+            //
+            // The prior contents this pass needed are on the engine resident.
+            // Loading them back is only unambiguous when nothing outside this
+            // device can have changed the surface since the resident was
+            // published — and the one writer this device cannot see is the
+            // guest's own CPU writing the surface's pages. A target with a
+            // type-11 mapping or a task GVA has such pages, and reusing its
+            // resident without the currency query is the documented fixpoint
+            // where "renders correctly for a few frames then stays corrupted"
+            // comes from.
+            //
+            // A target with neither has no guest pages at all, so it has no
+            // guest-side writer, and its resident is the *only* place its prior
+            // contents exist. For that subset the resident is authoritative by
+            // construction and there is nothing to reconcile.
+            crate::runtime::drain::note_store_route(if guest_backed {
+                "draw_partial_preserving_unseeded_guest_backed"
+            } else {
+                "draw_partial_preserving_unseeded_resident_only"
+            });
         }
     }
     // How much of the surface this draw's scissor actually covers.
@@ -8453,6 +8477,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 req.colors.first().map(|c| c.load_action),
                 target_rgba8.is_some() || target_guest_seed.is_some(),
                 chain_load_from_target,
+                // Guest-visible backing is a type-11 mapping or a task GVA, and
+                // the two are exclusive — `ColorRtRequest::target_gva` documents
+                // that. Either one means the surface has pages the guest's own
+                // CPU can write without this device seeing it.
+                req.colors
+                    .first()
+                    .is_some_and(|c| c.mapping_id != 0 || c.target_gva != 0),
             );
         }
         // The mode is the guest's raw `MTLVisibilityResultMode`; the engine
@@ -10751,6 +10782,7 @@ mod vulkan_split_tests {
             Some(super::MTL_LOAD_ACTION_DONT_CARE),
             false,
             false,
+            false,
         );
         assert_eq!(
             store_route_count(LOST),
@@ -10768,6 +10800,7 @@ mod vulkan_split_tests {
             Some(super::MTL_LOAD_ACTION_DONT_CARE),
             false,
             true,
+            false,
         );
         note_draw_coverage(
             scissor,
@@ -10775,6 +10808,7 @@ mod vulkan_split_tests {
             100,
             Some(super::MTL_LOAD_ACTION_LOAD),
             true,
+            false,
             false,
         );
         assert_eq!(
@@ -10791,11 +10825,50 @@ mod vulkan_split_tests {
             Some(super::MTL_LOAD_ACTION_CLEAR),
             false,
             false,
+            false,
         );
         assert_eq!(
             store_route_count(LOST),
             held,
             "a Clear got the destruction it asked for and is not a loss"
+        );
+
+        // The loss is also split by whether the target has guest-visible
+        // backing, and that split is the line between a repair that is safe and
+        // one that is not: a target with no guest pages has no guest-side
+        // writer, so its resident is the only place its prior contents exist
+        // and is authoritative by construction. One with pages needs the
+        // currency query, and reusing its resident without one is the
+        // documented "corrupts and stays corrupted" fixpoint.
+        const BACKED: &str = "draw_partial_preserving_unseeded_guest_backed";
+        const RESIDENT: &str = "draw_partial_preserving_unseeded_resident_only";
+        let (b0, r0) = (store_route_count(BACKED), store_route_count(RESIDENT));
+        note_draw_coverage(
+            scissor,
+            100,
+            100,
+            Some(super::MTL_LOAD_ACTION_DONT_CARE),
+            false,
+            false,
+            true,
+        );
+        assert_eq!(store_route_count(BACKED), b0 + 1);
+        assert_eq!(store_route_count(RESIDENT), r0);
+        note_draw_coverage(
+            scissor,
+            100,
+            100,
+            Some(super::MTL_LOAD_ACTION_DONT_CARE),
+            false,
+            false,
+            false,
+        );
+        assert_eq!(store_route_count(BACKED), b0 + 1);
+        assert_eq!(
+            store_route_count(RESIDENT),
+            r0 + 1,
+            "the two halves of the loss are counted apart, so the safe subset \
+             can be sized before it is repaired"
         );
     }
 
@@ -11072,6 +11145,7 @@ mod vulkan_split_tests {
             None,
             false,
             false,
+            false,
         );
         note_draw_coverage(
             ScissorRect {
@@ -11083,6 +11157,7 @@ mod vulkan_split_tests {
             1000,
             1000,
             None,
+            false,
             false,
             false,
         );
@@ -11105,6 +11180,7 @@ mod vulkan_split_tests {
             1000,
             1000,
             None,
+            false,
             false,
             false,
         );
@@ -11130,6 +11206,7 @@ mod vulkan_split_tests {
             None,
             false,
             false,
+            false,
         );
         note_draw_coverage(
             ScissorRect {
@@ -11141,6 +11218,7 @@ mod vulkan_split_tests {
             1000,
             1000,
             None,
+            false,
             false,
             false,
         );
@@ -11192,6 +11270,7 @@ mod vulkan_split_tests {
                 None,
                 false,
                 false,
+                false,
             );
             assert_eq!(
                 store_route_count(slug),
@@ -11215,6 +11294,7 @@ mod vulkan_split_tests {
             None,
             false,
             false,
+            false,
         );
         assert_eq!(
             store_route_count("draw_scissor_area_gt50"),
@@ -11233,6 +11313,7 @@ mod vulkan_split_tests {
             0,
             0,
             None,
+            false,
             false,
             false,
         );

@@ -7464,23 +7464,28 @@ fn a_dontcare_colour_attachment_is_still_served_its_prior_contents() {
     );
 }
 
-/// A colour attachment whose sample count came from the pipeline rather than
-/// from the destination texture is split by whether the samples have anywhere
-/// to go.
+/// A pass that ends up multisampled is named, and split by where its samples
+/// are meant to go.
 ///
-/// Metal requires a pipeline's `rasterSampleCount` to equal the sample count of
-/// every colour attachment it renders into, so the two agreeing is the normal
-/// case and carries no record — asserted here as the first arm, because a
-/// census that fired on every draw would be unreadable and would cost a store
-/// route per attachment per draw.
+/// The count comes from the pipeline because the resolved target cannot carry
+/// it — `ResolvedRenderTarget::sample_count` is a hardcoded provisional `1` at
+/// every construction site, since a linear texture resource's dimensions do not
+/// retain the creation descriptor's sample count. So this census does not
+/// compare two guest declarations; it reports the passes whose pipeline
+/// declared more than one sample, which is the rare case and the costly one.
 ///
-/// The three arms that remain are kept apart because they have different
-/// owners. A promotion **with** a resolve texture is a shape this device can
-/// still land. A promotion **without** one has nowhere to put the samples: the
-/// engine creates the resident multisampled, the draw succeeds, and
+/// A pipeline that matches the provisional value is the overwhelming majority
+/// and carries no record — asserted here as the first arm, because a census
+/// firing on every attachment of every draw would cost a store route per
+/// attachment per draw and could not be read.
+///
+/// The three remaining arms are kept apart because they have different owners.
+/// Multisample **with** a resolve texture is a shape this device can land.
+/// Multisample **without** one has nowhere to put the samples: the engine
+/// creates the resident multisampled, the draw succeeds, and
 /// `resident_read_snapshot` then refuses to read a `sample_count != 1` resident
 /// back, so the rendered tile reaches the guest as the pass's flat clear. A
-/// demotion is the opposite disagreement and is neither.
+/// pipeline below the provisional value is neither, and should not exist.
 ///
 /// Delta form, because the census map is process-global and the rest of the
 /// suite shares it.
@@ -7491,14 +7496,14 @@ fn an_attachment_sample_count_taken_from_the_pipeline_names_where_the_samples_go
     use crate::runtime::drain::store_route_count;
     use crate::runtime::draw::{note_attachment_sample_count_override, AttachmentSampleCounts};
 
-    const PROMOTED: &str = "attach_samples_promoted_no_resolve";
+    const NO_RESOLVE: &str = "attach_samples_multisample_no_resolve";
     const WITH_RESOLVE: &str = "attach_samples_from_pipeline_with_resolve";
-    const DEMOTED: &str = "attach_samples_demoted";
+    const BELOW: &str = "attach_samples_below_provisional";
 
     let before = (
-        store_route_count(PROMOTED),
+        store_route_count(NO_RESOLVE),
         store_route_count(WITH_RESOLVE),
-        store_route_count(DEMOTED),
+        store_route_count(BELOW),
     );
     let att = |resolve_ref: u32| ColorAttachment {
         texture_ref: 7,
@@ -7516,28 +7521,28 @@ fn an_attachment_sample_count_taken_from_the_pipeline_names_where_the_samples_go
     note_attachment_sample_count_override(12, att(0), counts_of(None, 1), (300, 300), (0, 0));
     assert_eq!(
         (
-            store_route_count(PROMOTED),
+            store_route_count(NO_RESOLVE),
             store_route_count(WITH_RESOLVE),
-            store_route_count(DEMOTED),
+            store_route_count(BELOW),
         ),
         before,
         "a pipeline that agrees with its attachment, and one that could not be \
          resolved at all, are not disagreements"
     );
 
-    // Promotion with nowhere to resolve to: the defect shape.
+    // Multisample with nowhere to resolve to: the shape that loses the tile.
     note_attachment_sample_count_override(13, att(0), counts_of(Some(4), 1), (300, 300), (0, 0));
-    assert_eq!(store_route_count(PROMOTED), before.0 + 1);
+    assert_eq!(store_route_count(NO_RESOLVE), before.0 + 1);
     assert_eq!(store_route_count(WITH_RESOLVE), before.1);
-    assert_eq!(store_route_count(DEMOTED), before.2);
+    assert_eq!(store_route_count(BELOW), before.2);
 
-    // Promotion with a declared resolve texture is a different owner.
+    // Multisample with a declared resolve texture is a different owner.
     note_attachment_sample_count_override(14, att(9), counts_of(Some(4), 1), (300, 300), (0, 0));
-    assert_eq!(store_route_count(PROMOTED), before.0 + 1);
+    assert_eq!(store_route_count(NO_RESOLVE), before.0 + 1);
     assert_eq!(store_route_count(WITH_RESOLVE), before.1 + 1);
 
-    // And the opposite disagreement is neither of those.
+    // And a pipeline below the provisional value is neither of those.
     note_attachment_sample_count_override(15, att(0), counts_of(Some(1), 4), (300, 300), (0, 0));
-    assert_eq!(store_route_count(DEMOTED), before.2 + 1);
-    assert_eq!(store_route_count(PROMOTED), before.0 + 1);
+    assert_eq!(store_route_count(BELOW), before.2 + 1);
+    assert_eq!(store_route_count(NO_RESOLVE), before.0 + 1);
 }
