@@ -7668,6 +7668,37 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 mid,
                                 route,
                             );
+                            // Which draw consumed a full-screen source, so a
+                            // record of what a source held can be joined to the
+                            // pass that read it. The plane ring names the refs a
+                            // pass sampled and the field witnesses name what a
+                            // source held; neither says which pass read which
+                            // source, and the wallpaper's two video planes are
+                            // read by one pass out of a frame's worth.
+                            if u64::from(rw) * u64::from(rh) >= 1 << 20 {
+                                let target = req
+                                    .colors
+                                    .first()
+                                    .map(|c| (c.mapping_id, c.width, c.height))
+                                    .unwrap_or((0, 0, 0));
+                                let disc = crate::backend::hash::hash_u64(
+                                    u64::from(req.pipeline_ref) << 32 | u64::from(texture_ref),
+                                    u64::from(target.0) << 32 | u64::from(mid),
+                                );
+                                if crate::observe::first_sight("sampled_full_screen_consumer", disc)
+                                {
+                                    crate::observe::off(format!(
+                                        "sampled_full_screen_consumer pipe={} ref={texture_ref} \
+                                         src_mid={mid} src={rw}x{rh} target_mid={} \
+                                         target={}x{} vtx={} route={route}",
+                                        req.pipeline_ref,
+                                        target.0,
+                                        target.1,
+                                        target.2,
+                                        req.vertex_count,
+                                    ));
+                                }
+                            }
                             // And what it held: a whole-surface bind reads the
                             // mapping's own geometry, which is the shape every
                             // full-screen compositor layer on this rail takes.
