@@ -179,6 +179,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // `surface_store_armed`, and it returns through the same door.
     let mut gva_store_armed = false;
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
+        crate::runtime::draw::record_plane_draw(req);
         req.chain_resident_established = false;
         match try_metal2vulkan_draw(state, host, req, writeback_guest) {
             Ok(M2vDrawSpan::Pixels { bytes, bgra }) => {
@@ -8105,7 +8106,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         req.pipeline_ref,
                         target_rgba8.is_some() || target_guest_seed.is_some(),
                         seed_door,
-                        crate::runtime::draw::PlaneDrawShape::of(req),
                     );
                     if matches!(declared, LoadAction::DontCare) {
                         // The widened arm's own instrument, and it is a counter

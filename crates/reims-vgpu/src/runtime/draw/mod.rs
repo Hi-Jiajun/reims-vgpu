@@ -4495,6 +4495,36 @@ pub(crate) fn take_plane_draw_ring(mapping_id: u32) -> String {
         .unwrap_or_default()
 }
 
+/// Remember one draw into a full-screen plane.
+///
+/// Called from the draw encode's own entry, which every draw reaches. The
+/// latched census below sits at the colour-seed site instead, and that site is
+/// skipped whenever the type-11 seed is elided — which is the overwhelming
+/// majority of passes (about 1 000 elided against 50 provided on a boot), so a
+/// ring filled there recorded one pass out of a frame's worth and missed
+/// whichever one it was supposed to name.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn record_plane_draw(req: &DrawEncodeRequest) {
+    let Some(color) = req.colors.first() else {
+        return;
+    };
+    if color.mapping_id == 0 || color.width < 1024 || color.height < 1024 {
+        return;
+    }
+    let shape = PlaneDrawShape::of(req);
+    let mut ring = PLANE_DRAW_RING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let passes = ring.entry(color.mapping_id).or_default();
+    if passes.len() == PLANE_DRAW_RING_DEPTH {
+        passes.pop_front();
+    }
+    passes.push_back(format!(
+        "p{}/v{}/{}/l{:#x}",
+        req.pipeline_ref, shape.vertex_count, shape.scissor, color.load_action
+    ));
+}
+
 #[cfg(feature = "backend-vulkan")]
 pub(crate) fn note_compositor_plane_pass(
     color: &ColorRtRequest,
@@ -4503,28 +4533,13 @@ pub(crate) fn note_compositor_plane_pass(
     pipeline_ref: u32,
     seed_served: bool,
     seed_door: &str,
-    draw: PlaneDrawShape,
 ) {
     let (mapping_id, load_action, clear_color) =
         (color.mapping_id, color.load_action, &color.clear_color);
     if mapping_id == 0 || width < 1024 || height < 1024 {
         return;
     }
-    {
-        let mut ring = PLANE_DRAW_RING
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let passes = ring.entry(mapping_id).or_default();
-        if passes.len() == PLANE_DRAW_RING_DEPTH {
-            passes.pop_front();
-        }
-        passes.push_back(format!(
-            "p{pipeline_ref}/v{}/{}/l{load_action:#x}/{}",
-            draw.vertex_count,
-            draw.scissor,
-            if seed_served { "seed" } else { "noseed" }
-        ));
-    }
+
     let disc = (u64::from(mapping_id) << 40)
         | (u64::from(pipeline_ref) << 9)
         | (u64::from(load_action & 0xff) << 1)
