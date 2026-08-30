@@ -132,7 +132,74 @@ dismiss_menu() { python3 "$QMP" click "$AWAY_X" "$AWAY_Y" >/dev/null 2>&1; }
 # Mean of a crop, x255.
 crop_mean() { magick "$1" -crop "$2" +repage -format '%[fx:mean*255]' info: 2>/dev/null; }
 
+# The scoring metric, as two functions the self-test and the real measurement
+# both call.
+#
+# They are functions rather than two spellings of the same magick pipeline
+# because the two spellings are exactly what went wrong: the mask was built with
+# one polarity and scored as if it had the other, and nothing could catch that
+# while the self-test built its own mask. Sharing the derivation means a
+# self-test that passes is a statement about the pipeline the verdict is
+# computed with, not about a copy of it.
+
+# White where the reference frame is **not** near-black: the region a later
+# frame could newly darken. CROP may be empty for a whole image.
+base_mask() {
+  local src="$1" crop="$2" out="$3"
+  if [ -n "$crop" ]; then
+    magick "$src" -crop "$crop" +repage -threshold 6% "$out" 2>/dev/null
+  else
+    magick "$src" -threshold 6% "$out" 2>/dev/null
+  fi
+}
+
+# Fraction of the box that is near-black in this frame and was not near-black in
+# the reference. `Darken` is `min`, so intersecting "dark now" with "was not dark
+# before" is the difference this probe is named for.
+new_black_frac() {
+  local frame="$1" crop="$2" mask="$3"
+  if [ -n "$crop" ]; then
+    magick "$frame" -crop "$crop" +repage -threshold 6% -negate \
+      "$mask" -compose Darken -composite -format '%[fx:mean]' info: 2>/dev/null
+  else
+    magick "$frame" -threshold 6% -negate \
+      "$mask" -compose Darken -composite -format '%[fx:mean]' info: 2>/dev/null
+  fi
+}
+
 echo "menu-close-probe: qemu=$QPID menu=$MENU_X,$MENU_Y away=$AWAY_X,$AWAY_Y trials=$TRIALS"
+
+# ---- 0a. Prove the scoring metric can see the defect, before trusting a verdict.
+#
+# This probe has now shipped two scoring metrics that could not measure
+# anything. The first used `%[fx:mean(lightness)<0.06]`, which is not a magick
+# expression, so the column was empty on every frame. The second composited
+# against a mask of the wrong polarity and returned the wallpaper's own dark
+# fraction for every trial of every boot -- 0.0829293 on four boots across two
+# binaries, candidate and control alike. Both failed *silently*, and both
+# reported CLEAN, which is the defect's own answer.
+#
+# A verdict of CLEAN is only worth reading from an instrument that would have
+# said BLACK_RECTANGLE if the rectangle were there. So the metric is run
+# against a synthetic frame that is half black, on every invocation, and the run
+# is abandoned if it does not measure what it was built to measure. This costs
+# two 100x100 images and no guest interaction.
+self_test() {
+  local d="$OUT/selftest"
+  mkdir -p "$d"
+  magick -size 100x100 xc:'rgb(150,150,150)' "$d/base.png" 2>/dev/null || return 1
+  magick "$d/base.png" -fill black -draw 'rectangle 0,0 49,99' "$d/half.png" 2>/dev/null || return 1
+  base_mask "$d/base.png" "" "$d/mask.png" || return 1
+  local got
+  got="$(new_black_frac "$d/half.png" "" "$d/mask.png")"
+  echo "menu-close-probe: self-test half-black frame scores ${got:-<none>} (want ~0.50)"
+  awk -v g="${got:-0}" 'BEGIN{ exit !(g > 0.45 && g < 0.55) }'
+}
+if ! self_test; then
+  echo "menu-close-probe: VERDICT=METRIC_BLIND — the scoring metric does not \
+respond to a synthetic black rectangle, so no verdict from it means anything"
+  exit 2
+fi
 
 # ---- 0. The two settled states this run is scored against.
 dismiss_menu; sleep 1.5
@@ -218,7 +285,21 @@ echo "menu-close-probe: aiming at delay=$BESTD (mid-animation mean=$BESTM)"
 # reads near-black honestly, and subtracting the no-menu frame is what keeps the
 # probe from reporting the desktop as the defect.
 mkdir -p "$OUT/frames"
-magick "$OUT/closed.png" -crop "$CROP" +repage -threshold 6% -negate "$OUT/basemask.png"
+# White where the no-menu frame is **not** near-black.
+#
+# The `-negate` that used to be here made this "white where the no-menu frame
+# *is* near-black", and the `Darken` composite below then measured
+# `near-black now AND near-black before` -- the intersection, not the
+# difference. Over a static wallpaper crop that quantity does not depend on the
+# trial frame at all, so it returned the same number for every trial of every
+# boot: 0.0829293, the wallpaper's own dark fraction, on four boots across two
+# different binaries. The probe could not see a black rectangle and reported
+# CLEAN regardless.
+#
+# Demonstrated rather than reasoned: a synthetic frame with half the box painted
+# black scores 0 under the old pipeline and 0.50 under this one. That case is
+# `self_test` below, and it now runs on every invocation.
+base_mask "$OUT/closed.png" "$CROP" "$OUT/basemask.png"
 WORST=0; WORSTI=""; N=0
 for i in $(seq 1 "$TRIALS"); do
   open_menu; sleep 0.9
@@ -235,9 +316,7 @@ $N trial(s) that preceded it"
   N=$((N + 1))
   M="$(crop_mean "$OUT/frames/t-$i.png" "$CROP")"
   # near-black in this frame AND not near-black in the no-menu frame
-  BLACK="$(magick "$OUT/frames/t-$i.png" -crop "$CROP" +repage -threshold 6% -negate \
-             "$OUT/basemask.png" -compose Darken -composite \
-             -format '%[fx:mean]' info: 2>/dev/null)"
+  BLACK="$(new_black_frac "$OUT/frames/t-$i.png" "$CROP" "$OUT/basemask.png")"
   echo "trial=$i mean=$M new_black_frac=$BLACK"
   if awk -v a="$BLACK" -v b="$WORST" 'BEGIN{ exit !(a > b) }'; then
     WORST="$BLACK"; WORSTI="$i"
