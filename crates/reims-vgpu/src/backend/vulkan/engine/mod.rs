@@ -97,10 +97,21 @@ use types::ComputeError;
 /// writing it out again. Callers with a real array range or a depth aspect
 /// still spell theirs out; those are saying something.
 pub(crate) fn color_subresource_range() -> ash::vk::ImageSubresourceRange {
+    color_subresource_range_levels(1)
+}
+
+/// [`color_subresource_range`] over a whole mip pyramid rather than one level.
+///
+/// A transition that names fewer levels than the image has leaves the rest in
+/// `UNDEFINED`, and a later read of one of those levels is reading a layout
+/// nothing put content into. Every barrier on a multi-level image therefore
+/// takes this, and the single-level spelling above is this with `1` so the two
+/// cannot describe different things.
+pub(crate) fn color_subresource_range_levels(levels: u32) -> ash::vk::ImageSubresourceRange {
     ash::vk::ImageSubresourceRange {
         aspect_mask: ash::vk::ImageAspectFlags::COLOR,
         base_mip_level: 0,
-        level_count: 1,
+        level_count: levels.max(1),
         base_array_layer: 0,
         layer_count: 1,
     }

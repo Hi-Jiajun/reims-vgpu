@@ -48,6 +48,7 @@ struct PreparedSampledImage {
     resident_src: Option<(vk::Image, super::pools::ResidentAccess)>,
     width: u32,
     height: u32,
+    mip_levels: u32,
 }
 
 /// Post-dispatch copy destination for one storage image.
@@ -121,7 +122,7 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        if img.width == 0 || img.height == 0 {
+        if img.width == 0 || img.height == 0 || img.mip_levels == 0 {
             return Err(DrawError::ComputeValidation(
                 ComputeValidationDecline::SampledZeroGeometry {
                     binding: img.binding,
@@ -130,9 +131,16 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        let expected = (img.width as usize)
-            .saturating_mul(img.height as usize)
-            .saturating_mul(img.format.bytes_per_texel());
+        // The whole pyramid, not the base: `bytes` carries every level the
+        // binding declares, and checking only the base would let a request
+        // through whose upper levels the copy then reads past the end of.
+        let expected = crate::contract::extent::tight_pyramid_bytes(
+            img.width,
+            img.height,
+            img.mip_levels,
+            img.format.bytes_per_texel(),
+        )
+        .unwrap_or(usize::MAX);
         if img.bytes.len() != expected {
             return Err(DrawError::ComputeValidation(
                 ComputeValidationDecline::SampledBytesLength {
@@ -433,8 +441,21 @@ pub(crate) unsafe fn execute_compute_inner(
             height: resource.height,
             format: resource.format,
             sampled_only: true,
+            mip_levels: resource.mip_levels.max(1),
         };
         let img = pools.acquire_storage_image(ctx, key, counters)?;
+        if resource.resident_bind.is_some() && resource.mip_levels > 1 {
+            // A resident is one window at one level. Seeding a pyramid's base
+            // from it would leave every level above it empty, which reads as a
+            // texture whose upper levels were never written — the exact defect
+            // the pyramid is here to repair.
+            return Err(DrawError::ComputeExecution(
+                ComputeExecutionDecline::ResidentSampleIsNotAPyramid {
+                    binding: resource.binding,
+                    mip_levels: resource.mip_levels,
+                },
+            ));
+        }
         let (upload, resident_src) = if let Some(bind) = resource.resident_bind {
             // The caller skipped the guest read; the placeholder bytes must
             // never reach the GPU. Every mismatch names the check that
@@ -485,6 +506,7 @@ pub(crate) unsafe fn execute_compute_inner(
             resident_src,
             width: resource.width,
             height: resource.height,
+            mip_levels: resource.mip_levels.max(1),
         });
     }
 
@@ -502,6 +524,8 @@ pub(crate) unsafe fn execute_compute_inner(
             height: resource.height,
             format: resource.format,
             sampled_only: false,
+            // A compute write names one level, so a storage image is one level.
+            mip_levels: 1,
         };
         let (img, initial_access, generation_match) = if let Some(residency) = resource.residency {
             let resident = pools.acquire_resident_storage_image(
@@ -685,7 +709,9 @@ pub(crate) unsafe fn execute_compute_inner(
     // → SHADER_READ_ONLY_OPTIMAL.
     for prepared in &sampled_slots {
         let img = &prepared.img;
-        let range = super::color_subresource_range();
+        // Every level of the pyramid, not just the base: a level left in
+        // `UNDEFINED` reads as a level nothing ever wrote.
+        let range = super::color_subresource_range_levels(prepared.mip_levels);
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -703,13 +729,37 @@ pub(crate) unsafe fn execute_compute_inner(
             &barrier,
         );
         if let Some(st) = &prepared.upload {
-            let copy = [vk::BufferImageCopy::default()
-                .image_subresource(super::color_subresource_layers())
-                .image_extent(vk::Extent3D {
-                    width: prepared.width,
-                    height: prepared.height,
-                    depth: 1,
-                })];
+            // One region per level, at the offset the *producer* packed it at.
+            // Both ends read `tight_pyramid_spans`, so neither computes a
+            // layout of its own and the two cannot drift.
+            let Some(spans) = crate::contract::extent::tight_pyramid_spans(
+                prepared.width,
+                prepared.height,
+                prepared.mip_levels,
+                prepared.img.key.format.bytes_per_texel(),
+            ) else {
+                return Err(DrawError::ComputeExecution(
+                    ComputeExecutionDecline::SampledPyramidLayout {
+                        binding: prepared.binding,
+                        width: prepared.width,
+                        height: prepared.height,
+                        mip_levels: prepared.mip_levels,
+                    },
+                ));
+            };
+            let copy: Vec<_> = spans
+                .iter()
+                .map(|span| {
+                    vk::BufferImageCopy::default()
+                        .buffer_offset(span.offset as u64)
+                        .image_subresource(super::color_subresource_layers().mip_level(span.level))
+                        .image_extent(vk::Extent3D {
+                            width: span.width,
+                            height: span.height,
+                            depth: 1,
+                        })
+                })
+                .collect();
             ctx.device.cmd_copy_buffer_to_image(
                 cb,
                 st.buffer,
@@ -762,7 +812,11 @@ pub(crate) unsafe fn execute_compute_inner(
                     .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
                     .new_layout(src_access.layout())
                     .image(src_image)
-                    .subresource_range(range)];
+                    // The *source* resident's range, which is one level —
+                    // `range` above describes this binding's own pyramid and
+                    // naming it here would transition levels `src_image` has
+                    // not got.
+                    .subresource_range(super::color_subresource_range())];
                 ctx.device.cmd_pipeline_barrier(
                     cb,
                     vk::PipelineStageFlags::TRANSFER,
@@ -1256,6 +1310,7 @@ mod tests {
 
     fn resident_sample_resource() -> ComputeSampledImageResource {
         ComputeSampledImageResource {
+            mip_levels: 1,
             binding: 32,
             array_element: 0,
             descriptor_count: 1,
@@ -1271,6 +1326,7 @@ mod tests {
     }
     fn resident_sample_key() -> StorageImageKey {
         StorageImageKey {
+            mip_levels: 1,
             width: 1,
             height: 1,
             format: StorageImageFormat::Rgba8Unorm,
@@ -1380,6 +1436,7 @@ mod tests {
             entry: "main".into(),
             grid: [1, 1, 1],
             sampled_images: vec![ComputeSampledImageResource {
+                mip_levels: 1,
                 binding: 32,
                 array_element: 0,
                 descriptor_count: 1,

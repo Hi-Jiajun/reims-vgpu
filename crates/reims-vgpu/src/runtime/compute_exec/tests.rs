@@ -944,6 +944,7 @@ fn a_format_with_no_storage_selector_refuses_the_same_way_from_every_rail() {
         // no entry for it by design, which is exactly the class this refuses.
         pixel_format: crate::contract::pixel_format::MTL_FORMAT_R32_FLOAT,
         storage_selector: None,
+        mip_levels: 1,
         width: 4,
         height: 4,
         bytes: vec![0; 64],
@@ -1597,6 +1598,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
     let gva = 0x101000u64;
     let rgba = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
     let staged = StagedTexture {
+        mip_levels: 1,
         binding: 32,
         #[cfg(feature = "backend-vulkan")]
         array_element: 0,
@@ -2329,6 +2331,7 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
         bpp: 4,
     };
     let staged = |writeback, residency| StagedTexture {
+        mip_levels: 1,
         binding: 32,
         #[cfg(feature = "backend-vulkan")]
         array_element: 0,
@@ -2765,6 +2768,7 @@ fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
     const HEAP_TEXTURES: u32 = 4 * STORAGE_RESIDENCY_WINDOWS_PER_MAPPING as u32;
 
     let staged = |key: ComputeStorageResidencyKey| StagedTexture {
+        mip_levels: 1,
         binding: 33,
         #[cfg(feature = "backend-vulkan")]
         array_element: 0,
@@ -3051,4 +3055,160 @@ fn a_buffer_backed_texture_stages_its_texels_without_the_row_padding() {
         Err(other) => panic!("a storage binding must refuse by name, got {other:?}"),
         Ok(_) => panic!("a storage binding must refuse; this arm has no destination contract"),
     }
+}
+
+/// A guest mip chain reaches the compute rail as a whole pyramid, level by
+/// level, and not as its base with the levels above it missing.
+///
+/// The external invariant: `read(coord, lod)` and `sample(_, _, level(lod))`
+/// name a level of the chain the descriptor declares. Staging only level 0
+/// answers the first with nothing and the second with level 0's texels at every
+/// LOD — which is exactly what the rail did, and what the six `mip_fetch_level_*`
+/// and six `mip_sample_level_*` cases each read back.
+///
+/// Every level is filled with a constant that names it, so a level served from
+/// the wrong offset holds a *neighbour's* marker rather than plausible noise,
+/// and each level's rows are padded past its texels so a level read with
+/// another level's stride is a different value and not merely a shifted one.
+#[test]
+fn a_declared_mip_chain_stages_every_level_and_not_only_its_base() {
+    use crate::contract::endian::{st16, st32, st64};
+    use crate::contract::extent::mip_extent;
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_TYPE_TEXTURE, TEXTURE_DESC_BASE_LEN,
+        TEXTURE_DESC_HEIGHT, TEXTURE_DESC_LEVEL_RECORDS, TEXTURE_DESC_MIPMAP_LEVEL_COUNT,
+        TEXTURE_DESC_MIP_LEVEL_RECORD_LEN, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
+        TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH, TEXTURE_LEVEL_HEIGHT, TEXTURE_LEVEL_OFFSET,
+        TEXTURE_LEVEL_ROW_STRIDE, TEXTURE_LEVEL_SIZE, TEXTURE_LEVEL_WIDTH,
+    };
+
+    const BASE: u32 = 8;
+    const LEVELS: u32 = 4; // 8, 4, 2, 1
+    const BPP: u32 = 4; // BGRA8Unorm
+    const PAD: u8 = 0xEE;
+    // Each level's rows are wider than its texels, so a level read at another
+    // level's pitch reads padding.
+    let stride = |level: u32| (mip_extent(BASE, level) * BPP + 16) as u64;
+    let marker = |level: u32| (0x10 + level * 0x11) as u8;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
+
+    // Lay the pyramid out in guest pages: every level at its own offset, its
+    // rows padded, filled with its own marker.
+    let handle = 5u64;
+    let base_gva = handle << RESOURCE_PAGE_SHIFT;
+    let mut offsets = Vec::new();
+    let mut image = Vec::new();
+    for level in 0..LEVELS {
+        offsets.push(image.len() as u64);
+        let h = mip_extent(BASE, level);
+        let mut level_bytes = vec![PAD; (stride(level) * u64::from(h)) as usize];
+        for y in 0..h as usize {
+            let row = y * stride(level) as usize;
+            for x in 0..(mip_extent(BASE, level) * BPP) as usize {
+                level_bytes[row + x] = marker(level);
+            }
+        }
+        image.extend_from_slice(&level_bytes);
+    }
+    let allocation_size = image.len() as u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], base_gva, &image);
+
+    // The type-2 descriptor that declares it: geometry prefix for level 0 and
+    // one 36-byte record for each level after it.
+    let desc_len =
+        TEXTURE_DESC_BASE_LEN + (LEVELS as usize - 1) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    let mut desc = vec![0u8; desc_len];
+    st64(&mut desc[LINEAR_DESC_SIZE..], allocation_size);
+    st64(&mut desc[LINEAR_DESC_HANDLE..], handle);
+    desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT] = LEVELS as u8;
+    st32(
+        &mut desc[TEXTURE_DESC_USED_SIZE..],
+        (stride(0) * u64::from(BASE)) as u32,
+    );
+    st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], stride(0) as u32);
+    st32(&mut desc[TEXTURE_DESC_WIDTH..], BASE);
+    st32(&mut desc[TEXTURE_DESC_HEIGHT..], BASE);
+    for level in 1..LEVELS {
+        let rec =
+            TEXTURE_DESC_LEVEL_RECORDS + (level as usize - 1) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+        let side = mip_extent(BASE, level);
+        st64(
+            &mut desc[rec + TEXTURE_LEVEL_OFFSET..],
+            offsets[level as usize],
+        );
+        st64(
+            &mut desc[rec + TEXTURE_LEVEL_SIZE..],
+            stride(level) * u64::from(side),
+        );
+        st64(&mut desc[rec + TEXTURE_LEVEL_ROW_STRIDE..], stride(level));
+        st32(&mut desc[rec + TEXTURE_LEVEL_WIDTH..], side);
+        st32(&mut desc[rec + TEXTURE_LEVEL_HEIGHT..], side);
+    }
+    let pf_off =
+        TEXTURE_DESC_PIXEL_FORMAT + (LEVELS as usize - 1) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    st16(&mut desc[pf_off..], MTL_FORMAT_BGRA8_UNORM);
+
+    let desc_gva = 0x2000u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
+    {
+        let off = list_object_entry_offset(11, 32).unwrap();
+        let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(
+            &mut le[0..],
+            (OBJECT_TYPE_TEXTURE as u32) | ((desc.len() as u32) << 8),
+        );
+        le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
+    }
+
+    let staged = stage_texture_raw(&mut state, &mut host, 1, 11, 0, false)
+        .expect("a declared mip chain is a wire form this device decodes");
+
+    assert_eq!(staged.width, BASE);
+    assert_eq!(staged.height, BASE);
+    assert_eq!(
+        staged.mip_levels, LEVELS,
+        "every level the descriptor declares is staged"
+    );
+    let spans =
+        crate::contract::extent::tight_pyramid_spans(BASE, BASE, LEVELS, BPP as usize).unwrap();
+    let want_len = spans.last().map(|l| l.offset + l.len).unwrap();
+    assert_eq!(
+        staged.bytes.len(),
+        want_len,
+        "the staged pyramid is tightly packed, not the guest's padded span"
+    );
+    assert!(
+        !staged.bytes.contains(&PAD),
+        "row padding must not reach the image"
+    );
+    for span in &spans {
+        let level_bytes = &staged.bytes[span.offset..span.offset + span.len];
+        assert!(
+            level_bytes.iter().all(|b| *b == marker(span.level)),
+            "level {} holds {:#04x}..; every byte must be its own marker {:#04x}",
+            span.level,
+            level_bytes[0],
+            marker(span.level)
+        );
+    }
+
+    // A storage binding of the same texture stays at the base: a compute write
+    // names one level, and the writeback window describes one.
+    let written = stage_texture_raw(&mut state, &mut host, 1, 11, 0, true)
+        .expect("the same texture stages as a storage destination");
+    assert_eq!(
+        written.mip_levels, 1,
+        "a storage binding is one level, whatever the chain declares"
+    );
+    assert_eq!(
+        written.bytes.len(),
+        (BASE * BASE * BPP) as usize,
+        "a storage binding stages the base alone"
+    );
 }

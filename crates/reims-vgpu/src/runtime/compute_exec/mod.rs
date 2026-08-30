@@ -1630,6 +1630,16 @@ pub(crate) struct StagedTexture {
     pub storage_selector: Option<pixel_format::StorageImageSelector>,
     pub width: u32,
     pub height: u32,
+    /// How many mip levels `bytes` carries, base first, packed tightly by
+    /// [`crate::contract::extent::tight_pyramid_spans`].
+    ///
+    /// `1` on every rail but the type-2/3 linear one, and `1` there too for a
+    /// storage binding or a view that already names a level: a compute write
+    /// names one level and a levelled view exposes one. Where it is greater,
+    /// `width`/`height` remain level 0's extent and every other level's is
+    /// `mip_extent(width, n)` — the pyramid is a derivation of this geometry
+    /// and not a second one, so no level's extent is stored twice.
+    pub mip_levels: u32,
     pub bytes: Vec<u8>,
     pub is_storage: bool,
     #[cfg(feature = "backend-vulkan")]
@@ -1720,6 +1730,17 @@ pub(crate) fn split_staged_textures(
                 len: t.bytes.len(),
             });
         } else {
+            if t.mip_levels > 1 {
+                // `ReimsVgpuComputeSampledImage` carries one level's texels, so
+                // this rail would bind the base and answer every
+                // `read(coord, lod)` above it with nothing. Refuse by name
+                // rather than serve a pyramid flattened to its base.
+                crate::observe::fail(format!(
+                    "compute_stage_tex metal_fail reason=sampled_mip_levels task={task_id}                      pipe={pipeline_ref} bind={} levels={} {}x{}",
+                    t.binding, t.mip_levels, t.width, t.height
+                ));
+                return Err(ComputeStatus::Unsupported("metal_sampled_mip_levels"));
+            }
             sampled.push(ReimsVgpuComputeSampledImage::unswizzled(
                 t.binding,
                 selector,
@@ -2049,6 +2070,8 @@ fn stage_buffer_texture<M: HostMemory + HostOps>(
         texture_ref,
         pixel_format: format,
         storage_selector: pixel_format::storage_selector(format),
+        // A buffer-backed texture view is one level of one buffer.
+        mip_levels: 1,
         width,
         height,
         bytes,
@@ -2323,6 +2346,9 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             texture_ref,
             pixel_format: format,
             storage_selector,
+            // The heap arm refuses a descriptor declaring more than one level
+            // above, so a heap texture reaching here is single-level.
+            mip_levels: 1,
             width,
             height,
             bytes: vec![0; need],
@@ -2769,6 +2795,8 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             texture_ref,
             pixel_format: stage_fmt,
             storage_selector,
+            // Metal forbids a mipmapped IOSurface texture.
+            mip_levels: 1,
             width,
             height,
             bytes,
@@ -2896,18 +2924,80 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             format!("{w}x{h} bpp={bpp}"),
         );
     };
-    // The identity every cache question below asks about. Built once so the
-    // resident probe, the flush-and-serve, and the plain serve cannot drift
-    // from each other.
-    let window = crate::runtime::surface_cache::LinearWindow {
-        task_id,
-        texture_ref: stage_ref,
+    // Which levels of the guest's declared chain this binding serves.
+    //
+    // A storage write names one level and a levelled view already exposes one,
+    // so both stay at the base. Everything else stages the declared pyramid,
+    // because `read(coord, lod)` and `sample(_, _, level(lod))` name a level of
+    // it and an image built with only the base answers the first with nothing
+    // and the second with level 0.
+    let mut level_sources = vec![LinearLevelSource {
         gva,
-        pixel_format: stage_format,
-        width: w,
-        height: h,
         row_stride: layout.row_stride,
+    }];
+    if !is_storage && view_level == 0 {
+        level_sources.extend(linear_extra_levels(
+            &tex,
+            state.page_shift,
+            w,
+            h,
+            bpp,
+            texture_ref,
+        ));
+    }
+    let Some(pyramid) = crate::contract::extent::tight_pyramid_spans(
+        w,
+        h,
+        level_sources.len() as u32,
+        bpp as usize,
+    ) else {
+        return linear_fail(
+            ComputeStatus::Unsupported("linear_tex_pyramid_layout"),
+            format!("{w}x{h} bpp={bpp} levels={}", level_sources.len()),
+        );
     };
+    let Some(pyramid_need) = pyramid
+        .last()
+        .and_then(|last| last.offset.checked_add(last.len))
+    else {
+        return linear_fail(
+            ComputeStatus::Unsupported("linear_tex_pyramid_span"),
+            format!("{w}x{h} bpp={bpp} levels={}", level_sources.len()),
+        );
+    };
+    // Level 0 of the packed pyramid and the single image this window already
+    // sized are two independent derivations of one length — `tight * h` here,
+    // `mip_extent(w, 0) * mip_extent(h, 0) * bpp` there. If they ever
+    // disagreed, the upload would be apportioned to levels by a layout the
+    // reader below does not share, and level 1 would hold level 0's tail.
+    if pyramid.first().map(|base| base.len) != Some(need) {
+        return linear_fail(
+            ComputeStatus::Unsupported("linear_tex_pyramid_base"),
+            format!(
+                "base={:?} need={need} {w}x{h} bpp={bpp}",
+                pyramid.first().map(|base| base.len)
+            ),
+        );
+    }
+    // The identity every cache question below asks about. One derivation so
+    // the resident probe, the flush-and-serve, the plain serve and the
+    // per-level read cannot drift from each other — and so a level's cache key
+    // is that level's own rows and extent rather than the base's.
+    let level_window = |source: &LinearLevelSource,
+                        span: &crate::contract::extent::MipLevelSpan| {
+        crate::runtime::surface_cache::LinearWindow {
+            task_id,
+            texture_ref: stage_ref,
+            gva: source.gva,
+            pixel_format: stage_format,
+            width: span.width,
+            height: span.height,
+            row_stride: source.row_stride,
+        }
+    };
+    // Only the base can be resident: a resident is one window at one level.
+    #[cfg(feature = "backend-vulkan")]
+    let window = level_window(&level_sources[0], &pyramid[0]);
     // Linear-window residency identity — mirrors the host_linear_textures
     // entry exactly. Absent when the stride overflows the key field (no live
     // class; such a window simply stays on the bytes path).
@@ -2926,7 +3016,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             stage_format,
         )
     });
-    let mut bytes = vec![0u8; need];
+    let mut bytes = vec![0u8; pyramid_need];
     #[cfg_attr(
         not(feature = "backend-vulkan"),
         allow(
@@ -2952,7 +3042,16 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         _ => None,
     };
     #[cfg(feature = "backend-vulkan")]
-    let serve = resident.and_then(|(_, _, serve)| serve);
+    // A resident is one window at one level, so it can only answer for the
+    // base. Serving a pyramid from it would leave every level above the base
+    // unwritten — which is exactly the defect the pyramid repairs — so a
+    // multi-level binding reads its own bytes and the engine refuses the pair
+    // outright as `vk_compute_exec_resident_sample_is_not_a_pyramid`.
+    let serve = if level_sources.len() > 1 {
+        None
+    } else {
+        resident.and_then(|(_, _, serve)| serve)
+    };
     #[cfg(not(feature = "backend-vulkan"))]
     let serve: Option<ResidentServe> = None;
     if let Some(generation) = serve.and_then(ResidentServe::seed_generation) {
@@ -2968,65 +3067,24 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     }
     if serve.is_some() || have_bytes {
         // Engine resident serves this window; no cache/guest read.
-    } else if let Some(cached) = crate::runtime::surface_cache::get_linear_texture(state, &window) {
-        bytes.copy_from_slice(cached);
-        crate::observe::off(format!(
-            "compute_stage_tex linear_cache task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={w}x{h} row_stride={}",
-            stage_format, layout.row_stride
-        ));
     } else {
-        // The bulk/row reads below walk raw task GVAs; a Store's
-        // guest-page write is submitted and not waited on.
-        crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
-        crate::runtime::render_writeback::settle_guest_writes(
-            crate::runtime::render_writeback::SettleSite::ComputeStageTexture,
-        );
-        if read_linear_texture_bulk(
-            state,
-            host,
-            task_id,
-            gva,
-            layout.row_stride,
-            tight,
-            h,
-            &mut bytes,
-        ) {
-            // One cached-view walk for the whole span (render-path bulk analog).
-        } else {
-            let mut row = vec![0u8; tight];
-            for y in 0..h {
-                let row_gva = gva
-                    .checked_add((y as u64).checked_mul(layout.row_stride).ok_or(
-                        ComputeStatus::GuestIo("compute_stage_tex_linear_row_offset"),
-                    )?)
-                    .ok_or(ComputeStatus::GuestIo("compute_stage_tex_linear_row_gva"))?;
-                if let Err(e) = gva_mem::read_task_gva_by_id(
-                    host,
-                    &state.tasks,
-                    task_id,
-                    row_gva,
-                    &mut row,
-                    state.page_shift,
-                ) {
-                    // First failing row only — full walk status for one-boot diagnosis.
-                    if y == 0 {
-                        let walk = gva_mem::diagnose_gva_walk(
-                            host,
-                            &state.tasks,
-                            task_id,
-                            row_gva,
-                            state.page_shift,
-                        );
-                        crate::observe::fail(format!(
-                            "compute_stage_tex_gva task={task_id} ref={texture_ref} gva={row_gva:#x} y=0 page_shift={} err={e:?} | {walk}",
-                            state.page_shift
-                        ));
-                    }
-                    return Err(ComputeStatus::GuestIo("compute_stage_tex_linear_row_read"));
-                }
-                let off = (y as usize) * tight;
-                bytes[off..off + tight].copy_from_slice(&row);
-            }
+        // Level 0 is the window built above; every level after it is the same
+        // read against that level's own rows, so the cache is consulted per
+        // level and one level's bytes can never answer for another's.
+        for (span, source) in pyramid.iter().zip(level_sources.iter()) {
+            let level_tight = span.len / span.height.max(1) as usize;
+            read_linear_level(
+                state,
+                host,
+                task_id,
+                texture_ref,
+                &level_window(source, span),
+                source.gva,
+                source.row_stride,
+                level_tight,
+                span.height,
+                &mut bytes[span.offset..span.offset + span.len],
+            )?;
         }
     }
     let writeback = if is_storage {
@@ -3082,6 +3140,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         texture_ref,
         pixel_format: stage_format,
         storage_selector,
+        // The levels actually placed, which is the declared count when the
+        // descriptor places all of them and a reported-short prefix when it
+        // does not.
+        mip_levels: level_sources.len() as u32,
         width: w,
         height: h,
         bytes,
@@ -3092,6 +3154,158 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         serve,
         writeback,
     })
+}
+
+/// Fill `dst` with one linear texture level's tight rows, from the surface
+/// cache when it still holds this exact window and from guest pages otherwise.
+///
+/// Its own function because a mip chain reads the same thing once per level
+/// against a different `gva`, `row_stride` and extent, and a loop that inlined
+/// this would have been the place where level `n` was read with level 0's
+/// stride.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a level is its own window, gva, stride, extent and destination, and \
+              collapsing them into a struct here would hide which of them a caller varies"
+)]
+fn read_linear_level<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    window: &crate::runtime::surface_cache::LinearWindow,
+    gva: u64,
+    row_stride: u64,
+    tight: usize,
+    height: u32,
+    dst: &mut [u8],
+) -> Result<(), ComputeStatus> {
+    if let Some(cached) = crate::runtime::surface_cache::get_linear_texture(state, window) {
+        if cached.len() == dst.len() {
+            dst.copy_from_slice(cached);
+            crate::observe::off(format!(
+                "compute_stage_tex linear_cache task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={}x{height} row_stride={row_stride}",
+                window.pixel_format, window.width
+            ));
+            return Ok(());
+        }
+        // A cache entry keyed to this window whose length is not this window's
+        // is a key that stopped identifying its contents. Read the guest pages
+        // rather than serve it, and say so — silently trusting it is how one
+        // level's texels would reach another's.
+        crate::observe::fail(format!(
+            "compute_stage_tex linear_cache_len task={task_id} ref={texture_ref} gva={gva:#x} cached={} want={}",
+            cached.len(),
+            dst.len()
+        ));
+    }
+    // The bulk/row reads below walk raw task GVAs; a Store's
+    // guest-page write is submitted and not waited on.
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::ComputeStageTexture,
+    );
+    if read_linear_texture_bulk(state, host, task_id, gva, row_stride, tight, height, dst) {
+        // One cached-view walk for the whole span (render-path bulk analog).
+        return Ok(());
+    }
+    let mut row = vec![0u8; tight];
+    for y in 0..height {
+        let row_gva = gva
+            .checked_add(
+                (y as u64)
+                    .checked_mul(row_stride)
+                    .ok_or(ComputeStatus::GuestIo(
+                        "compute_stage_tex_linear_row_offset",
+                    ))?,
+            )
+            .ok_or(ComputeStatus::GuestIo("compute_stage_tex_linear_row_gva"))?;
+        if let Err(e) = gva_mem::read_task_gva_by_id(
+            host,
+            &state.tasks,
+            task_id,
+            row_gva,
+            &mut row,
+            state.page_shift,
+        ) {
+            // First failing row only — full walk status for one-boot diagnosis.
+            if y == 0 {
+                let walk = gva_mem::diagnose_gva_walk(
+                    host,
+                    &state.tasks,
+                    task_id,
+                    row_gva,
+                    state.page_shift,
+                );
+                crate::observe::fail(format!(
+                    "compute_stage_tex_gva task={task_id} ref={texture_ref} gva={row_gva:#x} y=0 page_shift={} err={e:?} | {walk}",
+                    state.page_shift
+                ));
+            }
+            return Err(ComputeStatus::GuestIo("compute_stage_tex_linear_row_read"));
+        }
+        let off = (y as usize) * tight;
+        dst[off..off + tight].copy_from_slice(&row);
+    }
+    Ok(())
+}
+
+/// One level of a linear texture as this rail stages it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LinearLevelSource {
+    gva: u64,
+    row_stride: u64,
+}
+
+/// Levels 1.. of a type-2/3 texture's declared mip chain, as far as the
+/// descriptor actually places them.
+///
+/// The prefix, not the set: a level that will not resolve makes every level
+/// above it unreachable too, because the packed pyramid the host image is built
+/// from has no way to express a hole. Truncation is dropped guest work, so it is
+/// reported by name rather than left to read as a texture that simply has fewer
+/// levels.
+///
+/// Extents are checked against [`crate::contract::extent::mip_extent`] because
+/// the packed layout is derived from the base geometry alone; a level whose
+/// declared extent disagrees would be read at one size and copied at another.
+fn linear_extra_levels(
+    tex: &crate::runtime::decode::resource::TextureDescriptor,
+    page_shift: u32,
+    base_width: u32,
+    base_height: u32,
+    bpp: u32,
+    texture_ref: u32,
+) -> Vec<LinearLevelSource> {
+    let declared = tex.mipmap_level_count.max(1);
+    let mut out = Vec::new();
+    for level in 1..declared {
+        let want_w = crate::contract::extent::mip_extent(base_width, level);
+        let want_h = crate::contract::extent::mip_extent(base_height, level);
+        let refuse = |reason: &str, detail: String| {
+            crate::observe::fail(format!(
+                "compute_stage_tex mip_truncated reason={reason} ref={texture_ref} level={level}                  staged={} declared={declared} want={want_w}x{want_h} {detail}",
+                level
+            ));
+        };
+        let Some((level_gva, layout)) = tex.level_gva(level, page_shift) else {
+            refuse("no_level", String::new());
+            break;
+        };
+        if layout.width != want_w || layout.height != want_h {
+            refuse("extent", format!("got={}x{}", layout.width, layout.height));
+            break;
+        }
+        if layout.row_stride < u64::from(want_w).saturating_mul(u64::from(bpp)) {
+            refuse("stride_lt_tight", format!("stride={}", layout.row_stride));
+            break;
+        }
+        out.push(LinearLevelSource {
+            gva: level_gva,
+            row_stride: layout.row_stride,
+        });
+    }
+    out
 }
 
 /// Read a strided linear texture span through one cached GVA view (a single
@@ -4474,6 +4688,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 format: sampled_fmt,
                 width: t.width,
                 height: t.height,
+                mip_levels: t.mip_levels,
                 bytes: std::mem::take(&mut t.bytes),
                 resident_bind: t.serve.and_then(ResidentServe::sample_source).map(
                     |(identity, generation)| {
@@ -4523,6 +4738,8 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             format: crate::backend::vulkan::engine::StorageImageFormat::Rgba8Unorm,
             width: NEUTRAL_SAMPLED_IMAGE_EXTENT,
             height: NEUTRAL_SAMPLED_IMAGE_EXTENT,
+            // A stand-in for a binding the guest left empty is one level.
+            mip_levels: 1,
             bytes: pixel_format::solid_rgba8(
                 NEUTRAL_SAMPLED_IMAGE_EXTENT,
                 NEUTRAL_SAMPLED_IMAGE_EXTENT,

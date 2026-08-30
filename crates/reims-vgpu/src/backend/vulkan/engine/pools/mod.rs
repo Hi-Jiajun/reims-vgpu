@@ -1488,6 +1488,14 @@ pub(crate) struct StorageImageKey {
     pub format: StorageImageFormat,
     /// Read-only sampled descriptor instead of writable storage descriptor.
     pub sampled_only: bool,
+    /// Levels the image holds, `1` for everything but a sampled guest mip
+    /// chain.
+    ///
+    /// Part of the key, not a property set after the fact: a pooled image is
+    /// recycled by key, so a one-level free slot handed to a seven-level
+    /// request would answer `read(coord, 3)` with nothing at all — which is
+    /// indistinguishable from a texture whose upper levels were never written.
+    pub mip_levels: u32,
 }
 
 #[derive(Clone, Copy)]

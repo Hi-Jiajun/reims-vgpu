@@ -87,7 +87,7 @@ impl ResourcePools {
                         height: key.height.max(1),
                         depth: 1,
                     })
-                    .mip_levels(1)
+                    .mip_levels(key.mip_levels.max(1))
                     .array_layers(1)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
@@ -161,7 +161,9 @@ impl ResourcePools {
                     .image(image)
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(format)
-                    .subresource_range(color_subresource_range()),
+                    .subresource_range(super::super::color_subresource_range_levels(
+                        key.mip_levels,
+                    )),
                 None,
             )
             .map_err(|e| {

@@ -41,6 +41,19 @@ pub enum ComputeExecutionDecline {
         width: u32,
         height: u32,
     },
+    /// A sampled binding named both a resident source and more than one mip
+    /// level. A resident is one window at one level, so the copy could only
+    /// fill the base and every level above it would sample as unwritten.
+    ResidentSampleIsNotAPyramid { binding: u32, mip_levels: u32 },
+    /// A sampled binding's geometry and level count admit no packed pyramid
+    /// layout — a zero extent, a zero texel size, or an overflow. The upload
+    /// bytes cannot be apportioned to levels, so nothing is copied.
+    SampledPyramidLayout {
+        binding: u32,
+        width: u32,
+        height: u32,
+        mip_levels: u32,
+    },
     ResidentSeedGenerationLost {
         binding: u32,
         identity: ComputeStorageResidencyKey,
@@ -106,6 +119,10 @@ impl Decline for ComputeExecutionDecline {
             Self::SeedSkippedWithoutResidency { .. } => {
                 "vk_compute_exec_seed_skipped_without_residency"
             }
+            Self::ResidentSampleIsNotAPyramid { .. } => {
+                "vk_compute_exec_resident_sample_is_not_a_pyramid"
+            }
+            Self::SampledPyramidLayout { .. } => "vk_compute_exec_sampled_pyramid_layout",
             Self::ResidentSeedGenerationLost { .. } => {
                 "vk_compute_exec_resident_seed_generation_lost"
             }
@@ -182,6 +199,24 @@ impl Decline for ComputeExecutionDecline {
                 ("binding", binding.to_string()),
                 ("resource_width", width.to_string()),
                 ("resource_height", height.to_string()),
+            ],
+            Self::ResidentSampleIsNotAPyramid {
+                binding,
+                mip_levels,
+            } => vec![
+                ("binding", binding.to_string()),
+                ("mip_levels", mip_levels.to_string()),
+            ],
+            Self::SampledPyramidLayout {
+                binding,
+                width,
+                height,
+                mip_levels,
+            } => vec![
+                ("binding", binding.to_string()),
+                ("resource_width", width.to_string()),
+                ("resource_height", height.to_string()),
+                ("mip_levels", mip_levels.to_string()),
             ],
             Self::ResidentSeedGenerationLost {
                 binding,
@@ -315,6 +350,16 @@ mod tests {
                 width: 64,
                 height: 32,
             },
+            ComputeExecutionDecline::ResidentSampleIsNotAPyramid {
+                binding: 34,
+                mip_levels: 7,
+            },
+            ComputeExecutionDecline::SampledPyramidLayout {
+                binding: 34,
+                width: 64,
+                height: 32,
+                mip_levels: 7,
+            },
             ComputeExecutionDecline::ResidentSeedGenerationLost {
                 binding: 34,
                 identity: identity(),
@@ -351,7 +396,11 @@ mod tests {
         // a pooled readback the runtime owns. Five more went with the
         // non-2D image shape: the compute rail stages one flat plane window
         // per binding and has no slice or depth axis to refuse.
-        assert_eq!(before, 6, "the compute executor's reason census moved");
+        //
+        // Back up to 8 with the sampled mip pyramid: a resident source cannot
+        // answer for a multi-level binding, and a geometry that admits no
+        // packed level layout has no way to apportion its upload.
+        assert_eq!(before, 8, "the compute executor's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate compute-execution slug");
     }
 

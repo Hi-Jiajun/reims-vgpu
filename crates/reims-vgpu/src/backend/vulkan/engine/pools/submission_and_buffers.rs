@@ -5172,6 +5172,7 @@ mod recycle_tests {
             memory: vk::DeviceMemory::null(),
             view: vk::ImageView::null(),
             key: StorageImageKey {
+                mip_levels: 1,
                 width: w,
                 height: h,
                 format: StorageImageFormat::default(),
@@ -5595,6 +5596,7 @@ mod recycle_tests {
         let pinned = admit_compute_resident(&mut pools, 1, 0, true);
         let unpinned = admit_compute_resident(&mut pools, 2, 0, false);
         let same = StorageImageKey {
+            mip_levels: 1,
             width: 8,
             height: 8,
             format: StorageImageFormat::default(),

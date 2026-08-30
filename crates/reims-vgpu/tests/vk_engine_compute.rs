@@ -153,6 +153,15 @@ const SAMPLED_IMAGE_FETCH_KERNEL: &str = r#"
                OpFunctionEnd
 "#;
 
+/// [`SAMPLED_IMAGE_FETCH_KERNEL`] with the fetch's explicit LOD named.
+///
+/// The level is in the instruction, not in a sampler's LOD computation, so a
+/// device that serves the wrong level here has the wrong *bytes* in that level
+/// and is not losing an LOD on the sampling path.
+fn sampled_image_fetch_lod_kernel(lod: u32) -> String {
+    SAMPLED_IMAGE_FETCH_KERNEL.replace("Lod %uint_0", &format!("Lod %uint_{lod}"))
+}
+
 fn storage_image_write_red_kernel(spirv_image_format: &str) -> String {
     KERNEL_TEMPLATE.replace("{FMT}", spirv_image_format)
 }
@@ -948,6 +957,7 @@ fn compute_sampled_resident_copy_and_lost_resident() {
             writable: true,
         }],
         sampled_images: vec![ComputeSampledImageResource {
+            mip_levels: 1,
             binding: 32,
             array_element: 0,
             descriptor_count: 1,
@@ -1031,6 +1041,7 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
             writable: true,
         }],
         sampled_images: vec![ComputeSampledImageResource {
+            mip_levels: 1,
             binding: 32,
             array_element: 0,
             descriptor_count: 1,
@@ -1374,5 +1385,144 @@ fn a_short_bind_cannot_read_the_tail_of_the_slot_it_was_given() {
         "a read past this bind's 100 bytes returned {seen:#010x} — the descriptor \
          range let the shader reach the pooled slot's tail, which still holds the \
          previous bind's bytes"
+    );
+}
+
+/// Every level of a sampled mip pyramid reaches the device, at its own extent
+/// and its own bytes.
+///
+/// The runtime packs a guest mip chain into one upload, base first, and the
+/// engine apportions it to levels. If it built a single-level image — which it
+/// did — an `OpImageFetch ... Lod n` for any `n > 0` returns nothing at all,
+/// which is indistinguishable from a texture whose upper levels were never
+/// written. The layout is spelled out here by hand rather than taken from
+/// `tight_pyramid_spans`, so this checks the engine against the contract and
+/// not against the producer's copy of it.
+#[test]
+fn compute_sampled_image_serves_every_declared_mip_level() {
+    let _g = engine_test_session();
+    const BASE: u32 = 8;
+    const LEVELS: u32 = 4; // 8, 4, 2, 1
+                           // Marker bytes are all four channels of one level, chosen so a level served
+                           // from a neighbour's offset reads as that neighbour and not as noise.
+    let marker = |level: u32| (0x10 + level * 0x11) as u8;
+
+    let mut bytes = Vec::new();
+    let mut extents = Vec::new();
+    for level in 0..LEVELS {
+        let side = (BASE >> level).max(1);
+        extents.push(side);
+        bytes.extend(std::iter::repeat_n(
+            marker(level),
+            (side * side * 4) as usize,
+        ));
+    }
+
+    for level in 0..LEVELS {
+        let Some(words) = assemble_spvasm(
+            &sampled_image_fetch_lod_kernel(level),
+            &format!("mip_fetch_lod_{level}"),
+        ) else {
+            return;
+        };
+        let req = ComputeRequest {
+            spirv: words,
+            entry: "main".into(),
+            grid: [1, 1, 1],
+            storage_buffers: vec![ComputeBufferResource {
+                binding: 0,
+                bytes: vec![0; 16],
+                writable: true,
+            }],
+            sampled_images: vec![ComputeSampledImageResource {
+                binding: 32,
+                array_element: 0,
+                descriptor_count: 1,
+                format: StorageImageFormat::Rgba8Unorm,
+                width: BASE,
+                height: BASE,
+                mip_levels: LEVELS,
+                bytes: bytes.clone(),
+                resident_bind: None,
+            }],
+            samplers: vec![],
+            storage_images: vec![],
+        };
+        let Some(out) = engine_or_skip(&format!("mip_level_{level}"), &req) else {
+            return;
+        };
+        let got: Vec<f32> = out.buffers[0]
+            .bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let want = f32::from(marker(level)) / 255.0;
+        for (channel, value) in got.iter().enumerate() {
+            assert!(
+                (value - want).abs() < 1.0 / 255.0,
+                "level {level} channel {channel}: got {value}, want {want} \
+                 (level {level} is {}x{} and its marker is {:#04x})",
+                extents[level as usize],
+                extents[level as usize],
+                marker(level)
+            );
+        }
+    }
+}
+
+/// A resident source is one window at one level, so pairing it with a pyramid
+/// is refused by name rather than served as a base with empty levels above it.
+#[test]
+fn compute_sampled_resident_bind_refuses_a_pyramid() {
+    let _g = engine_test_session();
+    let Some(words) = assemble_spvasm(SAMPLED_IMAGE_FETCH_KERNEL, "resident_pyramid") else {
+        return;
+    };
+    let req = ComputeRequest {
+        spirv: words,
+        entry: "main".into(),
+        grid: [1, 1, 1],
+        storage_buffers: vec![ComputeBufferResource {
+            binding: 0,
+            bytes: vec![0; 16],
+            writable: true,
+        }],
+        sampled_images: vec![ComputeSampledImageResource {
+            binding: 32,
+            array_element: 0,
+            descriptor_count: 1,
+            format: StorageImageFormat::Rgba8Unorm,
+            width: 8,
+            height: 8,
+            mip_levels: 4,
+            bytes: vec![0u8; 8 * 8 * 4 + 4 * 4 * 4 + 2 * 2 * 4 + 4],
+            resident_bind: Some(ComputeResidentSampleBind {
+                identity: ComputeStorageResidencyKey {
+                    mapping_id: 94,
+                    map_generation: 1,
+                    surface_offset: 0,
+                    surface_bpr: 32,
+                    span_end: 256,
+                    width: 8,
+                    height: 8,
+                    pixel_format: 0x46,
+                    texture_ref: 0,
+                },
+                generation: 1,
+            }),
+        }],
+        samplers: vec![],
+        storage_images: vec![],
+    };
+    let err = engine::execute_compute_request(&req)
+        .expect_err("a resident source cannot answer for a pyramid");
+    let text = err.to_string();
+    if skip_if_no_gpu(&text) {
+        eprintln!("SKIP resident_pyramid: no GPU ({text})");
+        return;
+    }
+    assert!(
+        text.contains("vk_compute_exec_resident_sample_is_not_a_pyramid"),
+        "unexpected error: {text}"
     );
 }
