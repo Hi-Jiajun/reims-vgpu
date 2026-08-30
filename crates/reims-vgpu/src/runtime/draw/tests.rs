@@ -7463,3 +7463,81 @@ fn a_dontcare_colour_attachment_is_still_served_its_prior_contents() {
         "an explicit provenance seed still excludes the resident candidate"
     );
 }
+
+/// A colour attachment whose sample count came from the pipeline rather than
+/// from the destination texture is split by whether the samples have anywhere
+/// to go.
+///
+/// Metal requires a pipeline's `rasterSampleCount` to equal the sample count of
+/// every colour attachment it renders into, so the two agreeing is the normal
+/// case and carries no record — asserted here as the first arm, because a
+/// census that fired on every draw would be unreadable and would cost a store
+/// route per attachment per draw.
+///
+/// The three arms that remain are kept apart because they have different
+/// owners. A promotion **with** a resolve texture is a shape this device can
+/// still land. A promotion **without** one has nowhere to put the samples: the
+/// engine creates the resident multisampled, the draw succeeds, and
+/// `resident_read_snapshot` then refuses to read a `sample_count != 1` resident
+/// back, so the rendered tile reaches the guest as the pass's flat clear. A
+/// demotion is the opposite disagreement and is neither.
+///
+/// Delta form, because the census map is process-global and the rest of the
+/// suite shares it.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn an_attachment_sample_count_taken_from_the_pipeline_names_where_the_samples_go() {
+    use crate::runtime::decode::render::ColorAttachment;
+    use crate::runtime::drain::store_route_count;
+    use crate::runtime::draw::{note_attachment_sample_count_override, AttachmentSampleCounts};
+
+    const PROMOTED: &str = "attach_samples_promoted_no_resolve";
+    const WITH_RESOLVE: &str = "attach_samples_from_pipeline_with_resolve";
+    const DEMOTED: &str = "attach_samples_demoted";
+
+    let before = (
+        store_route_count(PROMOTED),
+        store_route_count(WITH_RESOLVE),
+        store_route_count(DEMOTED),
+    );
+    let att = |resolve_ref: u32| ColorAttachment {
+        texture_ref: 7,
+        resolve_texture_ref: resolve_ref,
+        ..Default::default()
+    };
+    let counts_of = |pipeline: Option<u32>, target: u32| AttachmentSampleCounts {
+        pipeline,
+        target,
+        resolved: pipeline.unwrap_or(target),
+    };
+
+    // Agreement, and an unresolvable pipeline, are both silent.
+    note_attachment_sample_count_override(11, att(0), counts_of(Some(4), 4), (300, 300), (0, 0));
+    note_attachment_sample_count_override(12, att(0), counts_of(None, 1), (300, 300), (0, 0));
+    assert_eq!(
+        (
+            store_route_count(PROMOTED),
+            store_route_count(WITH_RESOLVE),
+            store_route_count(DEMOTED),
+        ),
+        before,
+        "a pipeline that agrees with its attachment, and one that could not be \
+         resolved at all, are not disagreements"
+    );
+
+    // Promotion with nowhere to resolve to: the defect shape.
+    note_attachment_sample_count_override(13, att(0), counts_of(Some(4), 1), (300, 300), (0, 0));
+    assert_eq!(store_route_count(PROMOTED), before.0 + 1);
+    assert_eq!(store_route_count(WITH_RESOLVE), before.1);
+    assert_eq!(store_route_count(DEMOTED), before.2);
+
+    // Promotion with a declared resolve texture is a different owner.
+    note_attachment_sample_count_override(14, att(9), counts_of(Some(4), 1), (300, 300), (0, 0));
+    assert_eq!(store_route_count(PROMOTED), before.0 + 1);
+    assert_eq!(store_route_count(WITH_RESOLVE), before.1 + 1);
+
+    // And the opposite disagreement is neither of those.
+    note_attachment_sample_count_override(15, att(0), counts_of(Some(1), 4), (300, 300), (0, 0));
+    assert_eq!(store_route_count(DEMOTED), before.2 + 1);
+    assert_eq!(store_route_count(PROMOTED), before.0 + 1);
+}

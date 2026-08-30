@@ -3047,6 +3047,97 @@ pub fn load_composite_premult_one_omsa(draw_rgba: &[u8], seed_rgba: &[u8]) -> (V
     feature = "backend-vulkan",
     all(feature = "backend-metal", target_os = "macos")
 ))]
+/// The three sample counts in play when a colour attachment is resolved, named
+/// so the record below cannot transpose two of them.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) struct AttachmentSampleCounts {
+    /// `MTLRenderPipelineDescriptor.rasterSampleCount` of the bound pipeline,
+    /// or `None` when the pipeline could not be resolved.
+    pub pipeline: Option<u32>,
+    /// The destination texture's own immutable creation sample count.
+    pub target: u32,
+    /// What this device gave the attachment. Today: the pipeline's, when it has
+    /// one.
+    pub resolved: u32,
+}
+
+/// Report a colour attachment whose sample count this device took from the
+/// **pipeline** while the destination texture declared a different one.
+///
+/// # Why this needs a record
+///
+/// Metal requires a pipeline's `rasterSampleCount` to equal the sample count of
+/// every colour attachment it renders into, so reading the count off the
+/// pipeline is normally a restatement of what the texture already says. When
+/// the two disagree, it is not: the destination is single-sample and this
+/// device has promoted it to a multisample attachment on the pipeline's word.
+///
+/// That promotion has a downstream cost the promotion site cannot see. The
+/// engine creates the resident at the promoted count, the draw succeeds, and
+/// then `resident_read_snapshot` refuses to read a `sample_count != 1` resident
+/// back — so nothing is stored, `runtime::exec::finish_stream` applies the
+/// pass's clear, and a rendered tile reaches the guest as a flat colour. On
+/// this rail that is measured at twice per boot on 300x300 targets, and until
+/// the skipped-draw tail was corrected it was reported as an engine refusal
+/// that never happened.
+///
+/// So the question this record exists to answer is exactly one: **did the guest
+/// declare the multisample, or did this device invent it?** A record where
+/// `target` is 1 and `pipeline` is greater, with no `resolve_texture_ref`, is
+/// the second — a promotion with nowhere to resolve to, which is not a shape
+/// Metal can express and which this device should refuse rather than lose.
+///
+/// Latched per `(pipeline, texture)`: a guest that means this means it every
+/// frame, and the population's size belongs to a counter, not to this line.
+/// The counter is beside it and is not conditioned on first sight.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn note_attachment_sample_count_override(
+    pipeline_ref: u32,
+    att: ColorAttachment,
+    counts: AttachmentSampleCounts,
+    geom: (u32, u32),
+    dest: (u32, u64),
+) {
+    let Some(pipeline) = counts.pipeline else {
+        return;
+    };
+    if pipeline == counts.target {
+        return;
+    }
+    // Split at the emitter, because the two halves have different owners. A
+    // promotion with a resolve texture declared is a shape this device can
+    // still land; one without has nowhere for the samples to go.
+    crate::runtime::drain::note_store_route(if att.resolve_texture_ref != 0 {
+        "attach_samples_from_pipeline_with_resolve"
+    } else if pipeline > counts.target {
+        "attach_samples_promoted_no_resolve"
+    } else {
+        "attach_samples_demoted"
+    });
+    if crate::observe::first_sight(
+        "attachment_sample_count_override",
+        (u64::from(pipeline_ref) << 32) | u64::from(att.texture_ref),
+    ) {
+        crate::observe::off(format!(
+            "attachment_sample_count_override pipe={pipeline_ref} tex_ref={} \
+             resolve_ref={} pipeline_samples={pipeline} target_samples={} \
+             resolved_samples={} load={:#x} store={:#x} {}x{} mid={} gva={:#x} \
+             (Metal requires these to agree; a promotion with no resolve \
+              texture has nowhere to put the samples)",
+            att.texture_ref,
+            att.resolve_texture_ref,
+            counts.target,
+            counts.resolved,
+            att.load_action,
+            att.store_action,
+            geom.0,
+            geom.1,
+            dest.0,
+            dest.1,
+        ));
+    }
+}
+
 pub(crate) fn load_action_in_contract(pipeline_ref: u32, load_action: u16) -> bool {
     if is_declared_load_action(load_action) {
         return true;
@@ -4786,6 +4877,18 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
         let attachment_sample_count = pipeline_sample_count.unwrap_or(target_sample_count);
         #[cfg(not(feature = "backend-vulkan"))]
         let attachment_sample_count = target_sample_count;
+        #[cfg(feature = "backend-vulkan")]
+        note_attachment_sample_count_override(
+            pipeline_ref,
+            att,
+            AttachmentSampleCounts {
+                pipeline: pipeline_sample_count,
+                target: target_sample_count,
+                resolved: attachment_sample_count,
+            },
+            (mw, mh),
+            (mapping_id, gva),
+        );
         if base_w == 0 {
             base_w = mw;
             base_h = mh;
