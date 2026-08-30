@@ -82,7 +82,7 @@ mod sampled_identity_switch {
 #[cfg(test)]
 mod pass_echo_delta_order {
     use super::super::{PassEcho, ResourcePools};
-    use crate::backend::vulkan::engine::caches::PassKey;
+    use crate::backend::vulkan::engine::caches::{Color0Load, PassKey};
     use crate::backend::vulkan::engine::pools::PassEchoField;
     use ash::vk;
     use ash::vk::Handle as _;
@@ -92,7 +92,7 @@ mod pass_echo_delta_order {
     /// extent)` — so a shape change brings a new handle with it exactly as it
     /// does on the draw path, which is the whole condition under test.
     fn echo(image: u64, host_accessible: bool) -> PassEcho {
-        let mut key = PassKey::single(true, vk::Format::B8G8R8A8_UNORM);
+        let mut key = PassKey::single(Color0Load::Preserve, vk::Format::B8G8R8A8_UNORM);
         key.host_accessible_color0 = host_accessible;
         PassEcho {
             cb: vk::CommandBuffer::null(),

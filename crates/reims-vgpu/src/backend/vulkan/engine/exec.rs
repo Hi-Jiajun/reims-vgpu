@@ -7,8 +7,8 @@ use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 
 use super::caches::{
-    canonicalize_layout_bindings, AttrKey, BindingSig, LayoutKey, ObjectCaches, PassKey,
-    PipelineKey, SecondaryAttachKey, MAX_SECONDARY_ATTACH,
+    canonicalize_layout_bindings, AttrKey, BindingSig, Color0Load, LayoutKey, ObjectCaches,
+    PassKey, PipelineKey, SecondaryAttachKey, MAX_SECONDARY_ATTACH,
 };
 use super::context::ContextOwner;
 use super::counters::{CreateSite, EngineCounters};
@@ -2976,13 +2976,26 @@ pub(crate) unsafe fn execute_draw_inner(
     } else {
         req.target_rgba8.as_ref().map(|v| v.as_slice())
     };
-    let mut pass_key = PassKey::single(
-        load_uses_gpu_content
-            || seed_bytes.is_some()
-            || req.target_guest_seed.is_some()
-            || req.seed_from_target.is_some(),
-        color0_format,
-    );
+    // Three questions, not one: can this device offer prior contents, and if
+    // not, did the guest ask for a clear or merely permit undefined contents?
+    // The second question used to have no representation here, so both answers
+    // resolved to `CLEAR` and an unseeded preserving pass was cleared to a
+    // colour the guest never supplied. See [`Color0Load`].
+    let color0_load = if load_uses_gpu_content
+        || seed_bytes.is_some()
+        || req.target_guest_seed.is_some()
+        || req.seed_from_target.is_some()
+    {
+        Color0Load::Preserve
+    } else if req
+        .color0_declared
+        .is_some_and(|declared| declared.preserves_prior_contents())
+    {
+        Color0Load::Undefined
+    } else {
+        Color0Load::Clear
+    };
+    let mut pass_key = PassKey::single(color0_load, color0_format);
     pass_key.host_accessible_color0 = req.guest_target_memory.is_some();
     for (i, sec) in req.secondary_targets.iter().enumerate() {
         if i >= MAX_SECONDARY_ATTACH {
@@ -3482,7 +3495,7 @@ pub(crate) unsafe fn execute_draw_inner(
     let ordinary_ad_hoc_framebuffer = is_mrt || req.depth.is_some() || req.color_input;
     let ad_hoc_framebuffer = ordinary_ad_hoc_framebuffer || req.multisample_resolve;
     let (primary_pass, primary_pass_compatibility) = if ad_hoc_framebuffer {
-        let mut color_only = PassKey::single(pass_key.load_seed, pass_key.color0_format);
+        let mut color_only = PassKey::single(pass_key.color0_load, pass_key.color0_format);
         color_only.host_accessible_color0 = pass_key.host_accessible_color0;
         (
             caches.get_or_create_pass(ctx, color_only, counters, pools)?,
@@ -5052,10 +5065,17 @@ pub(crate) unsafe fn execute_draw_inner(
         // outside-pass command closes whatever the predecessor left open.
         unsafe { pools.close_open_pass(&ctx.device, cb) };
         crate::runtime::drain::note_store_route(pass_begin_area_band(req.width, req.height));
-        crate::runtime::drain::note_store_route(if pass_key.load_seed {
-            "passbegin_load"
-        } else {
-            "passbegin_clear"
+        // Three buckets, because the key now has three answers. Folding
+        // `Undefined` into either existing counter would move counts between
+        // two populations that were already being read, and the whole point of
+        // the repair is that those passes used to be counted as clears and
+        // written as clears. `passbegin_undefined` rising while
+        // `passbegin_clear` falls by the same amount is the repair's own
+        // witness in the always-on log.
+        crate::runtime::drain::note_store_route(match pass_key.color0_load {
+            Color0Load::Preserve => "passbegin_load",
+            Color0Load::Clear => "passbegin_clear",
+            Color0Load::Undefined => "passbegin_undefined",
         });
         // Whether this pass's colour0 names guest backing at all, which is the
         // denominator every reading of `REIMS_VGPU_SHARED_TARGET` needs:
@@ -7346,7 +7366,7 @@ mod tests {
     /// The primary's entry was a hard-coded transparent black, so the only way
     /// to honour a colour was to allocate a whole-attachment RGBA8 image of it,
     /// exchange its channels and stage it to the GPU — per draw, for a constant.
-    /// That also set `target_rgba8`, which is what `load_seed` means, so the
+    /// That also set `target_rgba8`, which is what a preserving `color0_load` means, so the
     /// pass resolved to LOAD and a draw asking to discard its attachment loaded
     /// it instead.
     ///

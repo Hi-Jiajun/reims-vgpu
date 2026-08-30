@@ -7596,6 +7596,25 @@ fn an_attachment_sample_count_taken_from_the_pipeline_names_where_the_samples_go
 /// ratchet, because it pays ~15 extra full-frame CPU seed reads per battery and
 /// that latency flips the deliberately racy 1920x1080 blit cases. The repair
 /// has to be cost-negative; see that comment for the shape.
+///
+/// # What has since been repaired, and why this stays ignored
+///
+/// `PassKey` no longer collapses the contract's three load actions onto one
+/// bit. A preserving pass that arrives with no prior contents now keys to
+/// [`crate::backend::vulkan::engine::caches::Color0Load::Undefined`] and
+/// resolves to `vk::AttachmentLoadOp::DONT_CARE`, so the invented `[0.0; 4]`
+/// is gone: this device no longer writes a colour the guest never supplied.
+///
+/// That is a different obligation from the one asserted below. This test asks
+/// whether the request reaches the encoder **able to preserve** — with a seed
+/// or with `gva_load_from_resident` — and it still does not. `DONT_CARE`
+/// against the attachment's resting layout asks for no transition and so in
+/// practice leaves the memory alone, but Vulkan does not promise that, and a
+/// promise is what this assertion is about. The remaining repair is the
+/// cost-negative one: when the engine resident already holds the target's
+/// contents, elect `Color0Load::Preserve` rather than `Undefined`, which costs
+/// strictly less than the clear it replaced and *guarantees* the preservation.
+/// Until that arm exists this stays red, and stays the witness for it.
 #[cfg(feature = "backend-vulkan")]
 #[test]
 #[ignore = "contract obligation not yet met: a DontCare GVA attachment keys the pass to CLEAR"]

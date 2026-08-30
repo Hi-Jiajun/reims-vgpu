@@ -566,11 +566,28 @@ pub struct DrawRequest {
     /// Load the live GPU image for [`DrawRequest::target_identity`] instead of
     /// seeding the attachment from the CPU. Requires that resident to exist.
     ///
-    /// This, [`Self::target_rgba8`], [`Self::target_guest_seed`] and
-    /// [`DrawRequest::color_attachment`] are the whole load action, and they are
-    /// ordered: `load_from_target` wins, else exactly one seed is copied, else
-    /// the attachment clears to [`Self::color_attachment`]'s value.
+    /// This, [`Self::target_rgba8`], [`Self::target_guest_seed`],
+    /// [`Self::color0_declared`] and [`DrawRequest::color_attachment`] are the
+    /// whole load action, and they are ordered: `load_from_target` wins, else
+    /// exactly one seed is copied, else `color0_declared` decides between
+    /// clearing to [`Self::color_attachment`]'s value and beginning the pass
+    /// undefined.
     pub load_from_target: bool,
+    /// The load action the **guest** declared for slot 0, independent of
+    /// whether this device found any prior contents to honour it with.
+    ///
+    /// The seed fields above say what this device *can* offer; this says what
+    /// the guest *asked for*, and they are different questions. Without it the
+    /// engine cannot tell a pass that asked to clear from a pass that promised
+    /// to keep its contents and arrived with none — and it then has to invent a
+    /// colour for both. See [`super::caches::Color0Load`].
+    ///
+    /// `None` means the caller did not state one, which is a different fact
+    /// from "the guest asked for a clear"; the engine keeps its historical
+    /// answer for it and clears. Only a caller that has decoded a real load
+    /// action fills this in, so an unfilled request cannot silently acquire a
+    /// preserving reading it was never given evidence for.
+    pub color0_declared: Option<crate::contract::pass_action::LoadAction>,
     /// When true, skip full-frame readback (non-Store / ticket path). Content
     /// remains on the GPU under `target_identity` when provided.
     pub skip_readback: bool,

@@ -5060,16 +5060,30 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             // `gpu_span busy_max_us`, and a control run reached the same
             // escalated stamp pattern without hanging.
             //
-            // # The remaining untried shape
+            // # The shape that was taken
             //
-            // `PassKey.load_seed` is a `bool` and the contract it represents has
-            // three values. Preserve, clear to the
-            // guest's colour, and undefined collapse two-into-one, and
-            // `caches.rs` resolves the collapsed value to `CLEAR`. Spelling a
-            // seedless DontCare `vk::AttachmentLoadOp::DONT_CARE` instead is
-            // lawful, writes none of the attachment, and is *cheaper* than the
-            // full-surface clear it replaces -- so it removes the invented
-            // colour without adding the latency that flipped those cases.
+            // `PassKey.load_seed` was a `bool` and the contract it represents
+            // has three values: preserve, clear to the guest's colour, and
+            // undefined. Two collapsed onto `false` and `caches.rs` resolved
+            // `false` to `CLEAR`. It is now
+            // `backend::vulkan::engine::caches::Color0Load`, and a seedless
+            // preserving pass keys to `Undefined` and resolves to
+            // `vk::AttachmentLoadOp::DONT_CARE` against the attachment's
+            // resting layout -- lawful, writing none of the attachment, and
+            // *cheaper* than the full-surface clear it replaces, so it removes
+            // the invented colour without adding the latency that flipped those
+            // cases.
+            //
+            // This arm is therefore left comparing an ordinal on purpose. It
+            // decides whether to spend a CPU seed read, and that is the cost
+            // the two withdrawn variants were withdrawn for; the colour the
+            // guest never supplied is no longer downstream of it. What remains
+            // open is the cost-negative preserving arm: when the engine
+            // resident already holds this target's contents, the request could
+            // elect `Color0Load::Preserve` and *guarantee* what `DONT_CARE`
+            // only makes likely. Its witness is
+            // `a_preserving_gva_attachment_reaches_the_encoder_able_to_preserve`,
+            // still `#[ignore]`.
             //
             // GVA linear target: ephemeral host RT needs a CPU seed (archive
             // reims_vgpu_backend_metal; NULL seed → Metal Clear invent, still encode).

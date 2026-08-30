@@ -3012,7 +3012,7 @@ pub(super) mod pin_count_tests {
     fn new_resident(framebuffer: vk::Framebuffer, render_pass: vk::RenderPass) -> NewResident {
         let framebuffer_compatibility = (framebuffer != vk::Framebuffer::null()).then(|| {
             crate::backend::vulkan::engine::caches::PassKey::single(
-                false,
+                crate::backend::vulkan::engine::caches::Color0Load::Clear,
                 translate::pixel::SCANOUT_FORMAT,
             )
             .framebuffer_compatibility()

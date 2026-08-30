@@ -8671,6 +8671,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // its four counters, nor its `else` arm, appears anywhere in the
         // always-on log across every boot it holds. Every type-11 Store either
         // skips its readback or is not a writeback Store.
+        // What the guest asked for, carried alongside what this device managed
+        // to offer. The engine decides between clearing and beginning the pass
+        // undefined from this; without it a pass that promised to keep its
+        // contents and arrived with none was indistinguishable from a real
+        // clear, and both were cleared to `[0.0; 4]` -- a colour no guest field
+        // supplies. See `backend::vulkan::engine::caches::Color0Load`.
+        resources.color0_declared = req
+            .colors
+            .first()
+            .map(|c| crate::contract::pass_action::LoadAction::from_declared(c.load_action));
         if chain_load_from_target {
             // The GVA Load elision validated its own identity and is the only
             // rail here whose target is not also claimed by a Store rail: a pass
@@ -10934,9 +10944,13 @@ mod vulkan_split_tests {
     ///
     /// This is the relation the ordinal census got wrong. `MTLLoadActionLoad`
     /// with no seed was named a defect and `MTLLoadActionDontCare` with no seed
-    /// was named benign, but the two resolve to the identical Vulkan
-    /// `AttachmentLoadOp::CLEAR` and destroy the identical texels — the pass
-    /// key cannot even tell them apart by the time `caches.rs` reads it. The
+    /// was named benign, but the two resolve to the identical Vulkan load op
+    /// and reach the attachment with the identical nothing — the pass key
+    /// cannot tell them apart by the time `caches.rs` reads it, and until
+    /// `Color0Load` replaced the old `load_seed: bool` that op was `CLEAR` and
+    /// they destroyed the identical texels. The bucket outlives that repair:
+    /// it counts passes that promised prior contents and had none, which is
+    /// still the population, whatever the engine then does with it. The
     /// authority for that is `LoadAction::preserves_prior_contents`, so the
     /// bucket is derived from it and this test sweeps the ordinal space rather
     /// than listing the three names: an ordinal added to the declared set, or a
