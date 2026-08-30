@@ -4424,6 +4424,53 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
     EncodeStatus::NoMetal("icb_exec_no_metal_build")
 }
 
+/// What a pass declares for a full-screen compositor plane: its load action and,
+/// when it clears, the colour it clears to.
+///
+/// On the macos-15 rail a boot's desktop background is sometimes a flat field in
+/// the plane's own guest pages, with one rectangle of correct wallpaper in it.
+/// A flat field is what a CLEAR leaves behind, and `exec::finish_stream` applies
+/// a pass's clear whenever the pass will not draw — but no record said what
+/// colour any of these passes clears to, so "the field is this pass's clear" and
+/// "the field is something else entirely" could not be told apart.
+///
+/// Latched per `(mapping, pipeline, load action)`: a compositor re-runs the same
+/// pass on the same plane every frame, and the interesting reading is which
+/// declarations exist at all, which is a small set.
+///
+/// Full-screen planes only. A pass over a scratch offscreen answers a different
+/// question and there are thousands of them.
+pub(crate) fn note_compositor_plane_pass(
+    color: &ColorRtRequest,
+    width: u32,
+    height: u32,
+    pipeline_ref: u32,
+    seed_served: bool,
+    seed_door: &str,
+) {
+    let (mapping_id, load_action, clear_color) =
+        (color.mapping_id, color.load_action, &color.clear_color);
+    if mapping_id == 0 || width < 1024 || height < 1024 {
+        return;
+    }
+    let disc = (u64::from(mapping_id) << 40)
+        | (u64::from(pipeline_ref) << 9)
+        | (u64::from(load_action & 0xff) << 1)
+        | u64::from(seed_served);
+    if !crate::observe::first_sight("compositor_plane_pass", disc) {
+        return;
+    }
+    crate::observe::off(format!(
+        "compositor_plane_pass mid={mapping_id} {width}x{height} pipe={pipeline_ref} \
+         load={load_action:#x} clear=[{:.3},{:.3},{:.3},{:.3}] seed={} door={seed_door}",
+        clear_color[0],
+        clear_color[1],
+        clear_color[2],
+        clear_color[3],
+        if seed_served { "served" } else { "empty" }
+    ));
+}
+
 /// Resolve color texture ref → mapping geometry for a draw request.
 #[allow(
     clippy::too_many_arguments,

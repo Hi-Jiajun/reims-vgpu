@@ -8094,6 +8094,18 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // independently driven x86/Vulkan boots: 1 558, 395 and 295
                     // colour LOAD seed resolutions, and 0 serves plus 0 misses
                     // at that door in every one.
+                    // What this pass declares for a full-screen compositor
+                    // plane, recorded where the load action has been resolved
+                    // rather than where it was decoded — the request builder
+                    // this rail takes does not pass through the MRT path.
+                    crate::runtime::draw::note_compositor_plane_pass(
+                        c0,
+                        w,
+                        h,
+                        req.pipeline_ref,
+                        target_rgba8.is_some() || target_guest_seed.is_some(),
+                        seed_door,
+                    );
                     if matches!(declared, LoadAction::DontCare) {
                         // The widened arm's own instrument, and it is a counter
                         // rather than the latched line below it. DontCare now

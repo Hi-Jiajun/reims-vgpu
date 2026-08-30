@@ -1351,6 +1351,14 @@ const FIELD_PATCHES: [(f32, f32); 4] = [(0.10, 0.22), (0.10, 0.72), (0.90, 0.22)
 /// this witness.
 const FIELD_PATCH_SIDE: u32 = 8;
 
+/// The last field pattern reported for each presented plane, so the witness can
+/// report a change rather than a sample. Keyed by mapping id: two planes of one
+/// swap chain hold different frames and a shared slot would report every
+/// alternation between them as a change.
+static FIELD_WITNESS_LAST: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u32, u32>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 /// Presents between samples once the power-of-two spacing has opened up.
 const FIELD_WITNESS_STRIDE: u64 = 64;
 
@@ -1404,6 +1412,19 @@ pub fn note_present_field_witness<M: HostMemory>(
     if mapping_id == 0 || !scanout_extent_ok(width, height) {
         return;
     }
+    // Sampled on every present, reported only when the answer changes.
+    //
+    // The defect this exists for is a *transition*: the plane's field is black
+    // for the whole early boot, then one composite makes it wallpaper or makes
+    // it a uniform 0xff field, and it never moves again. A heartbeat can only
+    // bracket that moment by however wide its spacing happens to be, and the
+    // spacing that keeps a heartbeat cheap is exactly what makes the bracket
+    // useless — the first sighting of the white field sat 7 000 presents after
+    // the last sighting of the black one. Emitting on change costs the same 256
+    // texel reads and names the present itself.
+    //
+    // The heartbeat is kept beside it so a field that never changes still says
+    // so, and so a reader can tell "nothing changed" from "nothing looked".
     // Power-of-two spacing for the early boot, and a fixed stride after it.
     // Power-of-two alone is readable from the first present onward and bounded
     // by log2 of the present count (`maybe_log_capture_sampling`'s reason), but
@@ -1413,9 +1434,7 @@ pub fn note_present_field_witness<M: HostMemory>(
     // steady rate there and costs a bounded ~1 line/s at this rail's present
     // rate.
     let seq = state.present.present_epoch.saturating_add(1);
-    if !seq.is_power_of_two() && !seq.is_multiple_of(FIELD_WITNESS_STRIDE) {
-        return;
-    }
+    let heartbeat = seq.is_power_of_two() || seq.is_multiple_of(FIELD_WITNESS_STRIDE);
     let Some((window, format, map_gen, epoch)) = state.mappings.get(&mapping_id).map(|m| {
         let format = if m.format == 0 {
             pixel_format::MTL_FORMAT_BGRA8_UNORM
@@ -1462,6 +1481,7 @@ pub fn note_present_field_witness<M: HostMemory>(
     let page = state.page_size();
     let mut report = String::new();
     let mut blank = 0u32;
+    let mut verdicts: Vec<u8> = Vec::with_capacity(FIELD_PATCHES.len());
     for (i, (fx, fy)) in FIELD_PATCHES.iter().enumerate() {
         let cx = (width as f32 * fx) as u32;
         let cy = (height as f32 * fy) as u32;
@@ -1497,6 +1517,7 @@ pub fn note_present_field_witness<M: HostMemory>(
         // pale wallpaper. Uniform-and-dark is equally a field nothing wrote, so
         // the count is of unpainted patches and the verdict names which kind.
         let verdict = field_patch_verdict(mean, sd);
+        verdicts.push(verdict.as_bytes()[0]);
         if verdict != "painted" {
             blank += 1;
         }
@@ -1505,9 +1526,24 @@ pub fn note_present_field_witness<M: HostMemory>(
         }
         report.push_str(&format!("{verdict}:{mean:.0}/{sd:.0}"));
     }
+    // The four verdicts as one word, so "did this plane's field change" is a
+    // comparison and not a string diff.
+    let pattern = verdicts
+        .iter()
+        .fold(0u32, |acc, v| (acc << 8) | u32::from(*v));
+    let changed = {
+        let mut last = FIELD_WITNESS_LAST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        last.insert(mapping_id, pattern) != Some(pattern)
+    };
+    if !changed && !heartbeat {
+        return;
+    }
     crate::observe::off(format!(
         "present_field_witness mid={mapping_id} {width}x{height} map_gen={map_gen} \
-         epoch={epoch} seq={seq} unpainted={blank}/4 patches=[{report}] \
-         (guest pages, no settle)"
+         epoch={epoch} seq={seq} why={} unpainted={blank}/4 patches=[{report}] \
+         (guest pages, no settle)",
+        if changed { "changed" } else { "heartbeat" }
     ));
 }
