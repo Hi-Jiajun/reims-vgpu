@@ -252,31 +252,126 @@ opening captures; this run says nothing about the animation"
 
 # ---- 2. Aim the capture so its grab lands inside the fade.
 #
-# Wanted: a dismiss delay whose frame is strictly between the two settled
-# states. Scanned rather than bisected because the response is not monotone at
-# the edges, and eight captures cost under fifteen seconds. Compared with
-# `mid_between` so the test does not assume which of the two states is brighter.
+# The quantity that decides whether a frame lands in the fade is the offset
+# between the dismiss click and the moment the capture *grabs*, and the probe
+# controls neither directly. It controls when it starts the capture; the grab
+# happens an unknown latency L later, inside the helper.
+#
+# So the aim is over a **signed** offset O = (capture start) - (dismiss), and
+# the grab lands at O + L after the dismiss. Sweeping O across a range wider
+# than L + fade is what guarantees the fade is crossed, and nothing here needs
+# to know L.
+#
+# The previous sweep could not do that. It only ever started the capture first
+# and dismissed 0.34-0.50 s later -- O in [-0.50, -0.34], a 0.16 s window, all
+# of it before the grab. Every frame it took was of a fully open menu, and it
+# said so: five delays returned mean 199.697 to six digits, the same image five
+# times, and the probe then refused. Widening and signing the offset is the
+# whole repair.
+# Whether a frame is neither settled state -- which is what "caught the
+# animation" means, and it is deliberately *not* "between them".
+#
+# Betweenness was the obvious spelling and it is blind to this probe's own
+# defect. The frame the probe exists to catch is a black rectangle where the
+# menu was: on this rail that reads near 0 against a 92.6 closed desktop and a
+# 193 open menu, so it is below *both* settled states, not between them. A
+# betweenness test classifies it as "closed", the aim then never finds the
+# animation on a defective boot, and the one boot that had the defect is the one
+# the probe refuses to score. Distance from each settled state is the question;
+# the direction of the excursion is not.
 mid_between() {
   awk -v m="$1" -v a="$2" -v b="$3" 'BEGIN{
-    lo = (a < b ? a : b); hi = (a < b ? b : a);
-    exit !(m > lo + 3 && m < hi - 3) }'
+    da = (m > a ? m - a : a - m); db = (m > b ? m - b : b - m);
+    exit !(da > 3 && db > 3) }'
 }
-BESTD=""; BESTM=""
-for D in 0.34 0.38 0.42 0.46 0.50; do
-  open_menu; sleep 0.9
-  ( sleep "$D"; dismiss_menu ) &
-  shot "$OUT/aim-$D.png"; wait
-  M="$(crop_mean "$OUT/aim-$D.png" "$CROP")"
-  echo "menu-close-probe: aim delay=$D mean=$M"
-  if mid_between "$M" "$BASE" "$OPEN"; then BESTD="$D"; BESTM="$M"; fi
-  sleep 0.8
-done
-if [ -z "$BESTD" ]; then
-  echo "menu-close-probe: no delay landed inside the fade; the animation was \
-not sampled and this run says nothing about the defect"
+# Which settled state a frame reads as, or MID when it is between them.
+classify() {
+  local m="$1"
+  if mid_between "$m" "$BASE" "$OPEN"; then echo MID; return; fi
+  awk -v m="$m" -v b="$BASE" -v o="$OPEN" 'BEGIN{
+    db = (m > b ? m - b : b - m); do_ = (m > o ? m - o : o - m);
+    print (db <= do_ ? "BASE" : "OPEN") }'
+}
+# The classifier's own positive control, run against the two settled means this
+# boot actually measured rather than against constants.
+#
+# A frame that is entirely black is what the defect looks like, so the
+# classifier must call it "caught the animation". If it calls it OPEN or BASE
+# the aim below cannot find the fade on a defective boot and the probe would
+# refuse precisely where it is needed. Checked here, after BASE and OPEN are
+# known, because the answer depends on them.
+CLS_BLACK="$(classify 0)"
+if [ "$CLS_BLACK" != MID ]; then
+  echo "menu-close-probe: VERDICT=METRIC_BLIND — an all-black frame classifies \
+as $CLS_BLACK against base=$BASE open=$OPEN, so the aim cannot see the defect"
   exit 2
 fi
-echo "menu-close-probe: aiming at delay=$BESTD (mid-animation mean=$BESTM)"
+echo "menu-close-probe: self-test all-black frame classifies as $CLS_BLACK (want MID)"
+
+# One trial at signed offset O, leaving the frame in $1 and its mean on stdout.
+#
+# O < 0 starts the capture |O| seconds before the dismiss; O >= 0 dismisses
+# first and starts the capture O seconds after. Both are the same timeline.
+grab_at() {
+  local o="$1" out="$2"
+  open_menu; sleep 0.9
+  if awk -v o="$o" 'BEGIN{ exit !(o < 0) }'; then
+    ( sleep "${o#-}"; dismiss_menu ) &
+    shot "$out"; wait
+  else
+    dismiss_menu
+    awk -v o="$o" 'BEGIN{ exit !(o > 0) }' && sleep "$o"
+    shot "$out"
+  fi
+  crop_mean "$out"  "$CROP"
+}
+
+# Coarse scan first, wide enough to bracket any plausible grab latency.
+BESTD=""; BESTM=""; SEEN_OPEN=""; SEEN_BASE=""
+for D in -0.40 -0.20 0.00 0.10 0.20 0.30 0.45; do
+  M="$(grab_at "$D" "$OUT/aim-$D.png")"
+  [ -n "$M" ] || continue
+  C="$(classify "$M")"
+  echo "menu-close-probe: aim offset=$D mean=$M $C"
+  case "$C" in
+    MID)  BESTD="$D"; BESTM="$M"; break ;;
+    OPEN) SEEN_OPEN="$D" ;;
+    BASE) [ -z "$SEEN_BASE" ] && SEEN_BASE="$D" ;;
+  esac
+  if guest_gone; then
+    echo "menu-close-probe: VERDICT=GUEST_GONE — the guest died during aiming"
+    exit 2
+  fi
+  sleep 0.6
+done
+
+# No coarse offset landed inside the fade, but if one read OPEN and a later one
+# read BASE the transition is between them, and bisection finds it. Without that
+# bracket there is nothing to bisect and the probe must refuse.
+if [ -z "$BESTD" ] && [ -n "$SEEN_OPEN" ] && [ -n "$SEEN_BASE" ]; then
+  LO="$SEEN_OPEN"; HI="$SEEN_BASE"
+  for _ in 1 2 3 4; do
+    MIDO="$(awk -v a="$LO" -v b="$HI" 'BEGIN{ printf "%.3f", (a + b) / 2 }')"
+    M="$(grab_at "$MIDO" "$OUT/aim-b$MIDO.png")"
+    [ -n "$M" ] || break
+    C="$(classify "$M")"
+    echo "menu-close-probe: aim bisect offset=$MIDO mean=$M $C"
+    case "$C" in
+      MID)  BESTD="$MIDO"; BESTM="$M"; break ;;
+      OPEN) LO="$MIDO" ;;
+      BASE) HI="$MIDO" ;;
+    esac
+    sleep 0.6
+  done
+fi
+
+if [ -z "$BESTD" ]; then
+  echo "menu-close-probe: no offset landed inside the fade (open at \
+'${SEEN_OPEN:-none}', closed at '${SEEN_BASE:-none}'); the animation was not \
+sampled and this run says nothing about the defect"
+  exit 2
+fi
+echo "menu-close-probe: aiming at offset=$BESTD (mid-animation mean=$BESTM)"
 
 # ---- 3. Repeat, and score how dark the vacated region got.
 #
@@ -300,11 +395,12 @@ mkdir -p "$OUT/frames"
 # black scores 0 under the old pipeline and 0.50 under this one. That case is
 # `self_test` below, and it now runs on every invocation.
 base_mask "$OUT/closed.png" "$CROP" "$OUT/basemask.png"
-WORST=0; WORSTI=""; N=0
+WORST=0; WORSTI=""; N=0; INFADE=0
 for i in $(seq 1 "$TRIALS"); do
-  open_menu; sleep 0.9
-  ( sleep "$BESTD"; dismiss_menu ) &
-  shot "$OUT/frames/t-$i.png"; wait
+  # The same timeline the aim was chosen on. Re-deriving it here with a
+  # different spelling is how the aim and the measurement come to disagree
+  # about what `$BESTD` means, so both go through `grab_at`.
+  M="$(grab_at "$BESTD" "$OUT/frames/t-$i.png")"
   [ -s "$OUT/frames/t-$i.png" ] || continue
   # Scored only while the guest is still the thing being photographed. A frame
   # grabbed after it died is a photograph of a frozen host window.
@@ -314,10 +410,17 @@ $N trial(s) that preceded it"
     break
   fi
   N=$((N + 1))
-  M="$(crop_mean "$OUT/frames/t-$i.png" "$CROP")"
+  # Whether *this* frame caught the animation, not merely whether the aim once
+  # did. The offset is fixed but the guest's response to it is not, so trials
+  # drift onto the settled closed frame -- which is uniformly not-new-black and
+  # scores zero. A run in which every trial drifted has photographed no
+  # animation, and reporting CLEAN from it would be the probe answering a
+  # question it never asked.
+  C="$(classify "$M")"
+  [ "$C" = MID ] && INFADE=$((INFADE + 1))
   # near-black in this frame AND not near-black in the no-menu frame
   BLACK="$(new_black_frac "$OUT/frames/t-$i.png" "$CROP" "$OUT/basemask.png")"
-  echo "trial=$i mean=$M new_black_frac=$BLACK"
+  echo "trial=$i mean=$M $C new_black_frac=$BLACK"
   if awk -v a="$BLACK" -v b="$WORST" 'BEGIN{ exit !(a > b) }'; then
     WORST="$BLACK"; WORSTI="$i"
   fi
@@ -329,7 +432,12 @@ if [ "$N" -eq 0 ]; then
 live guest"
   exit 2
 fi
-echo "menu-close-probe: $N frames in $OUT/frames"
+echo "menu-close-probe: $N frames in $OUT/frames, $INFADE inside the fade"
+if [ "$INFADE" -eq 0 ]; then
+  echo "menu-close-probe: VERDICT=ANIMATION_NOT_SAMPLED — $N trials ran and \
+none caught the close animation, so this run says nothing about the defect"
+  exit 2
+fi
 echo "menu-close-probe: worst new-black fraction=$WORST (trial $WORSTI) over box $CROP"
 # A tenth of the menu's own box turning black that was not black before is not
 # wallpaper and is not the menu's material.
