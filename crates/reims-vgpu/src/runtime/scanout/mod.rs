@@ -1540,11 +1540,17 @@ pub fn note_present_field_witness<M: HostMemory>(
     if !changed && !heartbeat {
         return;
     }
-    // Only when a plane's field newly reads uniform: that is the transition the
-    // ring exists to explain, and draining it on every change would empty it on
-    // the ordinary black-to-wallpaper one.
+    // On every change, not only on a change into a uniform field.
+    //
+    // Restricting it to uniform fields was meant to protect the ring from being
+    // drained by the ordinary black-to-wallpaper transition, but that
+    // transition is half the measurement: the question the ring exists to
+    // answer is whether the pass that paints the wallpaper and the pass that
+    // paints the flat field are the *same* pass, and the wallpaper transition is
+    // the only place the first one can be seen. Draining is not a loss here --
+    // the ring refills from the next frame's draws.
     #[cfg(feature = "backend-vulkan")]
-    let ring = (changed && blank as usize == FIELD_PATCHES.len())
+    let ring = changed
         .then(|| crate::runtime::draw::take_plane_draw_ring(mapping_id))
         .filter(|r| !r.is_empty())
         .map(|r| format!(" passes=[{r}]"))
