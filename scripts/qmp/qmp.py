@@ -13,6 +13,7 @@ Raw QMP:
 
 GUI helpers (usb-kbd + usb-tablet on the vmapple machine; cocoa is observability only):
   scripts/qmp/qmp.py click X Y [--double]     # guest-pixel coords
+  scripts/qmp/qmp.py rclick X Y               # right button (dock context menus)
   scripts/qmp/qmp.py move X Y
   scripts/qmp/qmp.py drag X1 Y1 X2 Y2 [X3 Y3 ...]  # left-button rubber-band drag through points
       QMP_DRAG_STEPS=N    sub-moves interpolated per segment (default 8)
@@ -197,7 +198,8 @@ def display_size(qmp: Qmp) -> tuple[int, int]:
         os.unlink(png)
 
 
-def send_pointer(qmp: Qmp, x: int, y: int, width: int, height: int, buttons=()):
+def send_pointer(qmp: Qmp, x: int, y: int, width: int, height: int, buttons=(),
+                 button: str = "left"):
     ax = int(x * TABLET_MAX / max(width - 1, 1))
     ay = int(y * TABLET_MAX / max(height - 1, 1))
     move = [
@@ -207,16 +209,20 @@ def send_pointer(qmp: Qmp, x: int, y: int, width: int, height: int, buttons=()):
     qmp.cmd("input-send-event", {"events": move})
     for down in buttons:
         time.sleep(0.05)
-        qmp.cmd(
-            "input-send-event",
-            {"events": [{"type": "btn", "data": {"down": down, "button": "left"}}]},
-        )
+        send_button(qmp, down, button)
 
 
-def send_button(qmp: Qmp, down: bool):
+def send_button(qmp: Qmp, down: bool, button: str = "left"):
+    """Press or release one pointer button.
+
+    `button` is the QMP `InputButton` name. The right one is not a convenience:
+    a dock context menu is only reachable with it, and the menu's close-in
+    animation is a reported defect, so a driver that speaks only `left` cannot
+    drive that interaction at all.
+    """
     qmp.cmd(
         "input-send-event",
-        {"events": [{"type": "btn", "data": {"down": down, "button": "left"}}]},
+        {"events": [{"type": "btn", "data": {"down": down, "button": button}}]},
     )
 
 
@@ -356,7 +362,7 @@ def main(argv: list[str]) -> int:
         print(f"{w} {h}")
         return 0
 
-    if mode in ("click", "move"):
+    if mode in ("click", "move", "rclick"):
         if len(args) < 2:
             print(__doc__)
             return 2
@@ -364,6 +370,8 @@ def main(argv: list[str]) -> int:
         w, h = display_size(qmp)
         if mode == "move":
             send_pointer(qmp, x, y, w, h)
+        elif mode == "rclick":
+            send_pointer(qmp, x, y, w, h, buttons=(True, False), button="right")
         else:
             clicks = 2 if "--double" in args else 1
             for i in range(clicks):

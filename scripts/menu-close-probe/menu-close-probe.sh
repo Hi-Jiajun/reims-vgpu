@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# menu-close-probe.sh [TRIALS] — photograph the dock context menu's close-in
+# animation and say whether the region it vacates is the desktop or is black.
+#
+# Usage:
+#   scripts/menu-close-probe/menu-close-probe.sh [TRIALS]
+#     QPID=PID     the guest to drive (default: the one running qemu-system-x86_64)
+#     OUT=DIR      where frames land (default: $TMPDIR/menu-close-probe)
+#     ICON_X/Y     the dock icon to right-click, in guest pixels
+#     AWAY_X/Y     where to click to dismiss, in guest pixels
+#
+# Exits 0 VERDICT=CLEAN, 1 VERDICT=BLACK_RECTANGLE, 2 when the run did not
+# sample the animation and therefore says nothing about the device.
+#
+# The reported symptom is "right-click something in the dock, then left-click to
+# dismiss, and a BLACK RECTANGLE is left behind for the duration of the close
+# animation, where the desktop should show through".
+#
+# # Why the first version of this probe never produced a reading
+#
+# It captured "immediately and repeatedly" after the dismiss click and reported
+# the darkest frame. Three things were wrong with that, and each alone was
+# fatal:
+#
+#   1. The host capture costs **1 427 ms** on this rig (six timed captures,
+#      8 562 ms). The animation is ~250 ms. A loop of captures cannot sample it;
+#      every frame lands after it is over, which is why every trial reported the
+#      identical mean.
+#   2. `dark=%[fx:mean(lightness)<0.06]` is not a magick expression —
+#      `mean(...)` is not an fx operator — so that column was empty on every
+#      frame of every run and the probe's actual verdict never computed.
+#   3. The menu rectangle was a hardcoded guess. It does not have to be.
+#
+# # What replaces it: aim the capture instead of chasing the animation
+#
+# The capture's ~1 427 ms is nearly all setup; the frame is grabbed **late**,
+# about 500 ms in. Measured by starting a capture and opening the menu 150 ms
+# later — the menu is in the resulting frame, so the grab is after that — and
+# then scanning the dismiss delay:
+#
+#   dismiss at 0.20 s  mean 124.7   already closed
+#   dismiss at 0.42 s  mean 130.3   closing
+#   dismiss at 0.46 s  mean 151.0   mid-animation
+#   dismiss at 0.50 s  mean 161.4   still open
+#   (menu open 161.4, no menu 231.6)
+#
+# So the animation is reachable: start the capture, wait, *then* dismiss, and
+# the grab lands inside the fade. This probe bisects for that delay per boot
+# rather than assuming it, because it is a property of the host's compositor
+# and not of the guest.
+#
+# The rectangle is anchored to the icon rather than differenced out of two
+# captures; see the note above section 1 for why differencing cannot work on a
+# desktop that is repainting between the two frames.
+set -uo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SHOT="$REPO/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh"
+QMP="$REPO/scripts/qmp/qmp.py"
+
+TRIALS="${1:-24}"
+OUT="${OUT:-${TMPDIR:-/tmp}/menu-close-probe}"
+mkdir -p "$OUT"
+
+# QPID from the caller when there is one, otherwise found by argv[0]. Never by
+# `pgrep -f` on a pattern: that also matches any shell whose command line
+# mentions qemu, which is how a probe once picked its own caller as the guest.
+if [ -z "${QPID:-}" ]; then
+  QPID=""
+  for p in $(pgrep -f qemu-system-x86_64 2>/dev/null); do
+    exe="$(tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null | head -1)"
+    case "$exe" in */qemu-system-x86_64|qemu-system-x86_64) QPID="$p"; break ;; esac
+  done
+fi
+[ -n "$QPID" ] || { echo "menu-close-probe: no running guest"; exit 2; }
+
+# The Finder icon, leftmost in the dock, in GUEST pixels on this rail's
+# 1920x1080 desktop. Verified against a capture: the dock strip's icons run from
+# capture x 205 to x 1075 at y 688 on a 1280x719 capture, and 333,1033 is the
+# Finder icon's centre in guest coordinates.
+ICON_X=${ICON_X:-333}; ICON_Y=${ICON_Y:-1033}
+# Somewhere with no window and no menu, to dismiss into.
+AWAY_X=${AWAY_X:-1700}; AWAY_Y=${AWAY_Y:-400}
+
+shot() { "$SHOT" --pid "$QPID" -o "$1" >/dev/null 2>&1; }
+open_menu()    { python3 "$QMP" rclick "$ICON_X" "$ICON_Y" >/dev/null 2>&1; }
+dismiss_menu() { python3 "$QMP" click "$AWAY_X" "$AWAY_Y" >/dev/null 2>&1; }
+# Mean of a crop, x255.
+crop_mean() { magick "$1" -crop "$2" +repage -format '%[fx:mean*255]' info: 2>/dev/null; }
+
+echo "menu-close-probe: qemu=$QPID icon=$ICON_X,$ICON_Y trials=$TRIALS"
+
+# ---- 0. The two settled states this run is scored against.
+dismiss_menu; sleep 1.5
+shot "$OUT/closed.png"
+open_menu; sleep 1.2
+shot "$OUT/open.png"
+dismiss_menu; sleep 1.2
+[ -s "$OUT/closed.png" ] && [ -s "$OUT/open.png" ] || {
+  echo "menu-close-probe: could not capture the host window"; exit 2; }
+
+# ---- 1. The menu's rectangle, anchored to the icon that opens it.
+#
+# Not by differencing two captures. That was tried and it does not work here:
+# the two are 1.5 s apart on a live desktop that is repainting damage rects the
+# whole time, so the changed-pixel bounding box came back 1279x704 — the whole
+# screen — and on a boot with the blank-field defect the field itself is
+# churning between the frames. The menu's position is not actually unknown: it
+# pops up directly above the icon that was right-clicked, and that icon is where
+# this script clicked.
+#
+# Measured against a capture of this rail: the Finder icon's centre is capture
+# x 222 for guest x 333, and the menu occupies capture x 178..305, y 498..668 —
+# so 45 left of the icon centre, 130 wide, and 170 tall ending 20 above the dock
+# icons' row. Expressed against the capture's own dimensions so a different
+# capture cap does not silently move it.
+read -r CAPW CAPH <<<"$(magick identify -format '%w %h' "$OUT/closed.png")"
+CROP="$(awk -v ix="$ICON_X" -v iy="$ICON_Y" -v cw="$CAPW" -v ch="$CAPH" 'BEGIN{
+  cx = int(ix * cw / 1920); cy = int(iy * ch / 1080);
+  x = cx - 45; if (x < 0) x = 0;
+  y = cy - 190; if (y < 0) y = 0;
+  printf "130x170+%d+%d", x, y }')"
+BASE="$(crop_mean "$OUT/closed.png" "$CROP")"
+OPEN="$(crop_mean "$OUT/open.png" "$CROP")"
+echo "menu-close-probe: menu box=$CROP  no_menu_mean=$BASE  menu_open_mean=$OPEN"
+# Absolute, not signed. The menu is a light material, so it reads *darker* than
+# the white field of a blank-desktop boot and *lighter* than the dark foliage of
+# a painted one. Both were measured on this rail — 231.6 against 157.5 on one
+# boot and 96.1 against 147.5 on another — and a signed test passes on one and
+# fails on the other for no reason that concerns the guest.
+awk -v b="$BASE" -v o="$OPEN" 'BEGIN{ d = b - o; if (d < 0) d = -d; exit !(d > 8) }' || {
+  echo "menu-close-probe: the menu box did not change when the menu opened \
+(no_menu=$BASE menu_open=$OPEN); the right-click may not have opened one"
+  exit 2; }
+
+# ---- 2. Aim the capture so its grab lands inside the fade.
+#
+# Wanted: a dismiss delay whose frame is strictly between the two settled
+# states. Scanned rather than bisected because the response is not monotone at
+# the edges, and eight captures cost under fifteen seconds. Compared with
+# `mid_between` so the test does not assume which of the two states is brighter.
+mid_between() {
+  awk -v m="$1" -v a="$2" -v b="$3" 'BEGIN{
+    lo = (a < b ? a : b); hi = (a < b ? b : a);
+    exit !(m > lo + 3 && m < hi - 3) }'
+}
+BESTD=""; BESTM=""
+for D in 0.34 0.38 0.42 0.46 0.50; do
+  open_menu; sleep 0.9
+  ( sleep "$D"; dismiss_menu ) &
+  shot "$OUT/aim-$D.png"; wait
+  M="$(crop_mean "$OUT/aim-$D.png" "$CROP")"
+  echo "menu-close-probe: aim delay=$D mean=$M"
+  if mid_between "$M" "$BASE" "$OPEN"; then BESTD="$D"; BESTM="$M"; fi
+  sleep 0.8
+done
+if [ -z "$BESTD" ]; then
+  echo "menu-close-probe: no delay landed inside the fade; the animation was \
+not sampled and this run says nothing about the defect"
+  exit 2
+fi
+echo "menu-close-probe: aiming at delay=$BESTD (mid-animation mean=$BESTM)"
+
+# ---- 3. Repeat, and score how dark the vacated region got.
+#
+# The score is the fraction of the menu box that is near-black in the frame but
+# was NOT near-black with no menu on screen. A wallpaper with dark foliage in it
+# reads near-black honestly, and subtracting the no-menu frame is what keeps the
+# probe from reporting the desktop as the defect.
+mkdir -p "$OUT/frames"
+magick "$OUT/closed.png" -crop "$CROP" +repage -threshold 6% -negate "$OUT/basemask.png"
+WORST=0; WORSTI=""; N=0
+for i in $(seq 1 "$TRIALS"); do
+  open_menu; sleep 0.9
+  ( sleep "$BESTD"; dismiss_menu ) &
+  shot "$OUT/frames/t-$i.png"; wait
+  [ -s "$OUT/frames/t-$i.png" ] || continue
+  N=$((N + 1))
+  M="$(crop_mean "$OUT/frames/t-$i.png" "$CROP")"
+  # near-black in this frame AND not near-black in the no-menu frame
+  BLACK="$(magick "$OUT/frames/t-$i.png" -crop "$CROP" +repage -threshold 6% -negate \
+             "$OUT/basemask.png" -compose Darken -composite \
+             -format '%[fx:mean]' info: 2>/dev/null)"
+  echo "trial=$i mean=$M new_black_frac=$BLACK"
+  if awk -v a="$BLACK" -v b="$WORST" 'BEGIN{ exit !(a > b) }'; then
+    WORST="$BLACK"; WORSTI="$i"
+  fi
+  sleep 0.6
+done
+
+echo "menu-close-probe: $N frames in $OUT/frames"
+echo "menu-close-probe: worst new-black fraction=$WORST (trial $WORSTI) over box $CROP"
+# A tenth of the menu's own box turning black that was not black before is not
+# wallpaper and is not the menu's material.
+if awk -v w="$WORST" 'BEGIN{ exit !(w > 0.10) }'; then
+  echo "menu-close-probe: VERDICT=BLACK_RECTANGLE"; exit 1
+fi
+echo "menu-close-probe: VERDICT=CLEAN"
