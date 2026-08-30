@@ -144,26 +144,44 @@ crop_mean() { magick "$1" -crop "$2" +repage -format '%[fx:mean*255]' info: 2>/d
 
 # White where the reference frame is **not** near-black: the region a later
 # frame could newly darken. CROP may be empty for a whole image.
+# `-alpha off -colorspace Gray` before the threshold, and it is not tidying.
+#
+# The host captures are `srgba`: four channels, alpha included. `-negate` on the
+# scoring side negates *every* channel, alpha with the rest, so a thresholded
+# frame came out fully transparent and compositing it over the mask left the
+# mask untouched. The score then read back as the mask's own mean -- 0.917071 on
+# every trial of this boot, a constant again, and this time a constant large
+# enough to be reported as BLACK_RECTANGLE.
+#
+# The previous self-test could not catch it because it built its images with
+# `xc:` and no alpha, so the one channel that broke the metric was the one
+# channel the test did not have. Flattening to a single grey channel first
+# removes the whole class rather than the instance.
 base_mask() {
   local src="$1" crop="$2" out="$3"
   if [ -n "$crop" ]; then
-    magick "$src" -crop "$crop" +repage -threshold 6% "$out" 2>/dev/null
+    magick "$src" -crop "$crop" +repage -alpha off -colorspace Gray -threshold 6% "$out" 2>/dev/null
   else
-    magick "$src" -threshold 6% "$out" 2>/dev/null
+    magick "$src" -alpha off -colorspace Gray -threshold 6% "$out" 2>/dev/null
   fi
 }
 
 # Fraction of the box that is near-black in this frame and was not near-black in
 # the reference. `Darken` is `min`, so intersecting "dark now" with "was not dark
 # before" is the difference this probe is named for.
+# `-evaluate-sequence min` rather than a `Darken` composite. Darken *is* min, but
+# as a composite it is an alpha-aware blend of a source onto a destination, and
+# the intersection wanted here is neither -- it is min over two masks that happen
+# to be images. Stated as a sequence operator it cannot be quietly turned into a
+# no-op by an alpha channel arriving from a different capture helper.
 new_black_frac() {
   local frame="$1" crop="$2" mask="$3"
   if [ -n "$crop" ]; then
-    magick "$frame" -crop "$crop" +repage -threshold 6% -negate \
-      "$mask" -compose Darken -composite -format '%[fx:mean]' info: 2>/dev/null
+    magick "$frame" -crop "$crop" +repage -alpha off -colorspace Gray -threshold 6% -negate \
+      "$mask" -evaluate-sequence min -format '%[fx:mean]' info: 2>/dev/null
   else
-    magick "$frame" -threshold 6% -negate \
-      "$mask" -compose Darken -composite -format '%[fx:mean]' info: 2>/dev/null
+    magick "$frame" -alpha off -colorspace Gray -threshold 6% -negate \
+      "$mask" -evaluate-sequence min -format '%[fx:mean]' info: 2>/dev/null
   fi
 }
 
@@ -187,13 +205,26 @@ echo "menu-close-probe: qemu=$QPID menu=$MENU_X,$MENU_Y away=$AWAY_X,$AWAY_Y tri
 self_test() {
   local d="$OUT/selftest"
   mkdir -p "$d"
-  magick -size 100x100 xc:'rgb(150,150,150)' "$d/base.png" 2>/dev/null || return 1
-  magick "$d/base.png" -fill black -draw 'rectangle 0,0 49,99' "$d/half.png" 2>/dev/null || return 1
+  # Four channels, because the host captures have four and the metric's last
+  # two defects both lived in a channel the synthetic images did not have.
+  # `PNG32:` forces alpha to survive the write.
+  #
+  # The reference darkens its top half and the frame darkens its left half, so
+  # the intersection is one quadrant: the answer is 0.25 while *both* operands
+  # measure 0.50. That separation is the point. A half-black frame against an
+  # all-white mask scores 0.50 -- and so does simply returning one operand
+  # untouched, which is exactly what the broken pipeline did, so the old test
+  # passed on a metric that could not see the frame at all. On these images the
+  # old pipeline scores 0.75 and this one scores 0.25.
+  magick -size 100x100 xc:'rgba(150,150,150,1)' -alpha set \
+    -fill black -draw 'rectangle 0,0 99,49' "PNG32:$d/base.png" 2>/dev/null || return 1
+  magick -size 100x100 xc:'rgba(150,150,150,1)' -alpha set \
+    -fill black -draw 'rectangle 0,0 49,99' "PNG32:$d/half.png" 2>/dev/null || return 1
   base_mask "$d/base.png" "" "$d/mask.png" || return 1
   local got
   got="$(new_black_frac "$d/half.png" "" "$d/mask.png")"
-  echo "menu-close-probe: self-test half-black frame scores ${got:-<none>} (want ~0.50)"
-  awk -v g="${got:-0}" 'BEGIN{ exit !(g > 0.45 && g < 0.55) }'
+  echo "menu-close-probe: self-test quadrant frame scores ${got:-<none>} (want ~0.25, each operand 0.50)"
+  awk -v g="${got:-0}" 'BEGIN{ exit !(g > 0.20 && g < 0.30) }'
 }
 if ! self_test; then
   echo "menu-close-probe: VERDICT=METRIC_BLIND — the scoring metric does not \
@@ -204,8 +235,12 @@ fi
 # ---- 0. The two settled states this run is scored against.
 dismiss_menu; sleep 1.5
 shot "$OUT/closed.png"
+sleep 0.5
+shot "$OUT/closed2.png"
 open_menu; sleep 1.2
 shot "$OUT/open.png"
+sleep 0.5
+shot "$OUT/open2.png"
 dismiss_menu; sleep 1.2
 [ -s "$OUT/closed.png" ] && [ -s "$OUT/open.png" ] || {
   echo "menu-close-probe: could not capture the host window"; exit 2; }
@@ -235,6 +270,31 @@ CROP="$(awk -v mx="$MENU_X" -v my="$MENU_Y" -v cw="$CAPW" -v ch="$CAPH" 'BEGIN{
 BASE="$(crop_mean "$OUT/closed.png" "$CROP")"
 OPEN="$(crop_mean "$OUT/open.png" "$CROP")"
 echo "menu-close-probe: menu box=$CROP  no_menu_mean=$BASE  menu_open_mean=$OPEN"
+
+# How far a settled state moves when nothing is happening, measured rather than
+# assumed. Each state is captured twice, 0.5 s apart, with no input in between.
+#
+# The tolerance this feeds used to be a flat 3, and 3 was too tight: this rail's
+# open menu measured 193.06 at calibration and 199.697 a few seconds later, a
+# 6.6 drift with the menu simply sitting there. Every later capture of a fully
+# open menu therefore read as "neither settled state", the aim declared the
+# animation found at its first offset, and all six trials photographed a static
+# open menu. A tolerance that does not come from the noise is a guess about a
+# desktop the probe can just look at.
+BASE2="$(crop_mean "$OUT/closed2.png" "$CROP")"
+OPEN2="$(crop_mean "$OUT/open2.png" "$CROP")"
+TOL="$(awk -v a="$BASE" -v b="$BASE2" -v c="$OPEN" -v d="$OPEN2" 'BEGIN{
+  n1 = (a > b ? a - b : b - a); n2 = (c > d ? c - d : d - c);
+  n = (n1 > n2 ? n1 : n2); t = 2 * n + 3; if (t < 4) t = 4; printf "%.2f", t }')"
+echo "menu-close-probe: settled noise closed=$BASE/$BASE2 open=$OPEN/$OPEN2 -> tolerance=$TOL"
+# Two states the noise cannot tell apart cannot be a fade either, and every
+# verdict below would be a reading of the noise.
+if ! awk -v b="$BASE" -v o="$OPEN" -v t="$TOL" 'BEGIN{
+  d = (b > o ? b - o : o - b); exit !(d > 3 * t) }'; then
+  echo "menu-close-probe: VERDICT=METRIC_BLIND — open and closed are \
+$BASE vs $OPEN, not separated by three times the $TOL noise floor"
+  exit 2
+fi
 # Absolute, not signed. The menu is a light material, so it reads *darker* than
 # the white field of a blank-desktop boot and *lighter* than the dark foliage of
 # a painted one. Both were measured on this rail — 231.6 against 157.5 on one
@@ -280,9 +340,9 @@ opening captures; this run says nothing about the animation"
 # the probe refuses to score. Distance from each settled state is the question;
 # the direction of the excursion is not.
 mid_between() {
-  awk -v m="$1" -v a="$2" -v b="$3" 'BEGIN{
+  awk -v m="$1" -v a="$2" -v b="$3" -v t="$TOL" 'BEGIN{
     da = (m > a ? m - a : a - m); db = (m > b ? m - b : b - m);
-    exit !(da > 3 && db > 3) }'
+    exit !(da > t && db > t) }'
 }
 # Which settled state a frame reads as, or MID when it is between them.
 classify() {
