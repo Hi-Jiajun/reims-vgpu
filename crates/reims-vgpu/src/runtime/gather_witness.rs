@@ -292,7 +292,7 @@
 //! outside the host-write record — fired tens to hundreds of times per boot, so
 //! sampling costs the alarm latency and not its reach.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use crate::contract::fnv;
 
@@ -330,7 +330,7 @@ impl GatherRail {
 /// (the type-11 and type-5 rails). Those two rails can name the same
 /// `(mid, base_off)` for a single-plane surface, and that is harmless — same
 /// mapping, same offset and same span is the same bytes.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum GatherKey {
     /// A texture window addressed through a task's GVA space.
     TaskGva { task_id: u32, gva: u64 },
@@ -453,7 +453,7 @@ struct Entry {
 /// Per-device witness state: one entry per sampled window seen.
 #[derive(Debug)]
 pub struct GatherWitness {
-    entries: BTreeMap<GatherKey, Entry>,
+    entries: HashMap<GatherKey, Entry>,
     /// Monotonic bind ordinal, stamped into [`Entry::last_seen`].
     binds: u64,
     /// How often this device's content audit is allowed to compare.
@@ -468,7 +468,7 @@ pub struct GatherWitness {
 impl Default for GatherWitness {
     fn default() -> Self {
         Self {
-            entries: BTreeMap::new(),
+            entries: HashMap::new(),
             binds: 0,
             audit: AuditDensity::from_env(),
         }
@@ -631,10 +631,14 @@ impl GatherWitness {
         &mut self,
         host: &mut M,
     ) -> Option<(GatherKey, u64)> {
+        // `(last_seen, key)`, not `last_seen` alone: entries armed without a
+        // bind share ordinal 0, and the victim of a tie must not depend on how
+        // the table happens to be laid out. `GatherKey` is `Ord` for exactly
+        // this, and the ordering is total, so the choice is reproducible.
         let victim = self
             .entries
             .iter()
-            .min_by_key(|(_, entry)| entry.last_seen)
+            .min_by_key(|(key, entry)| (entry.last_seen, **key))
             .map(|(key, _)| *key)?;
         let entry = self.entries.remove(&victim)?;
         if entry.token != 0 {
@@ -2377,5 +2381,89 @@ mod tests {
         // An empty table has nothing to name, and must not invent one.
         let mut empty = GatherWitness::default();
         assert!(empty.evict_oldest(&mut host).is_none());
+    }
+
+    /// Windows can share a bind ordinal — an armed entry that was never bound
+    /// carries 0, and so does every other one. Recency alone cannot separate
+    /// them, so the victim would otherwise be whichever the table happened to
+    /// visit first. The eviction record names a window; a name that changes
+    /// between two runs over the same entry set is not attributable to a
+    /// workload, and the window that pays the re-gather would change with it.
+    #[test]
+    fn an_eviction_breaks_a_recency_tie_by_the_window_it_names() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        let buf = vec![0x5au8; PAGE];
+        let runs = [run_over(&buf)];
+
+        let key_at = |i: u64| GatherKey::Mapping {
+            mid: 11,
+            base_off: i * PAGE as u64,
+        };
+        let gpas_at = |i: u64| [(64 + i) * PAGE as u64];
+
+        // Insert the same four windows in two opposite orders, flatten recency
+        // so all four tie, and drain each table. Two orders, one verdict.
+        let drain = |order: &[u64]| {
+            let mut host = crate::runtime::host::FakeHost::new();
+            let mut w = GatherWitness::default();
+            for &i in order {
+                let gpas = gpas_at(i);
+                observe(
+                    &mut w,
+                    &mut host,
+                    key_at(i),
+                    one_page(&gpas, &runs),
+                    QUIET,
+                    next_gen(),
+                );
+            }
+            for entry in w.entries.values_mut() {
+                entry.last_seen = 0;
+            }
+            let mut dropped = Vec::new();
+            while let Some((key, _)) = w.evict_oldest(&mut host) {
+                dropped.push(key);
+            }
+            dropped
+        };
+
+        let forwards = drain(&[0, 1, 2, 3]);
+        let backwards = drain(&[3, 2, 1, 0]);
+        assert_eq!(
+            forwards,
+            vec![key_at(0), key_at(1), key_at(2), key_at(3)],
+            "a tie is broken by the window's own name, ascending"
+        );
+        assert_eq!(
+            forwards, backwards,
+            "the victim of a tie depended on insertion order, so it is not reproducible"
+        );
+
+        // The tie-break must not outrank recency: a window bound since is never
+        // the victim while an unbound one is present.
+        let mut w = GatherWitness::default();
+        for i in 0..2u64 {
+            let gpas = gpas_at(i);
+            observe(
+                &mut w,
+                &mut host,
+                key_at(i),
+                one_page(&gpas, &runs),
+                QUIET,
+                next_gen(),
+            );
+        }
+        w.entries
+            .get_mut(&key_at(0))
+            .expect("window 0 was observed")
+            .last_seen = 7;
+        let (victim, _) = w
+            .evict_oldest(&mut host)
+            .expect("a populated table has a window to drop");
+        assert_eq!(
+            victim,
+            key_at(1),
+            "the lower name outranked the older bind ordinal"
+        );
     }
 }
