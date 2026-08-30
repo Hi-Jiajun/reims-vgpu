@@ -1513,9 +1513,19 @@ pub fn note_sampled_surface_field<M: HostMemory>(
     if !changed {
         return;
     }
+    // The draws that went into this surface since the last change of its field,
+    // for [`note_present_field_witness`]'s reason and drained the same way: a
+    // full-screen layer that turns uniform is either a pass that produced a
+    // uniform result or a surface nothing drew into, and the ring is what
+    // separates them. These layers are not the plane a present names, so the
+    // present witness never drains their rings and nothing else does either.
+    #[cfg(feature = "backend-vulkan")]
+    let ring = crate::runtime::draw::take_plane_draw_ring(mapping_id).to_string();
+    #[cfg(not(feature = "backend-vulkan"))]
+    let ring = String::new();
     crate::observe::off(format!(
         "sampled_surface_field mid={mapping_id} ref={texture_ref} {width}x{height} \
-         fmt={format:#x} route={route} patches=[{report}] first=0x{first_texel} \
+         fmt={format:#x} route={route} patches=[{report}] first=0x{first_texel}{ring} \
          (guest pages, no settle)"
     ));
 }
