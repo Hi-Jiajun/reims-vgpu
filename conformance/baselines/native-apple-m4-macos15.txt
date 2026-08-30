@@ -66,6 +66,7 @@ CASE rt_pipeline PASS solid_fs pipeline built
 CASE rt_render_then_sample PASS 4096 texels are the drawn colour
 CASE rt_blit_to_buffer PASS 4096 texels exact through blit
 CASE msaa4_color_store_no_resolve PASS 64 pixels retained four distinct samples
+CASE msaa4_color_store_host_sample_count PASS 64 pixels retained four distinct samples
 CASE depth_attachment_clear_without_test_state PASS stored depth clear rejected the later draw
 CASE depth_test_less_without_attachment PASS z=0 compared against the absent attachment value
 CASE depth_test_equal_without_attachment PASS z=0 compared against the absent attachment value
@@ -295,5 +296,5 @@ ROUTE srt_blit_iosurface_source_1920x1080_x4 sl_gpu_landed
 CASE srt_blit_iosurface_source_1920x1080_x4 PASS every surface-to-surface copy moved its own frame's pixels
 CASE srt_blit_buffer_backed_512x512 PASS the copy out of a buffer-backed source moved what the render had written
 CASE command_buffer_cross_queue_shared_event_visibility PASS producer=4 consumer=4 completed_without_host_release=true visible=true
-SUMMARY cases=293 failures=0 skipped=0
+SUMMARY cases=294 failures=0 skipped=0
 DEVICE name=Apple M4 unified=true
