@@ -4511,6 +4511,19 @@ pub(crate) fn record_plane_draw(req: &DrawEncodeRequest) {
     if color.mapping_id == 0 || color.width < 1024 || color.height < 1024 {
         return;
     }
+    // Always-on and summable, because the ring only prints on a field change and
+    // a plane that goes white and stays white produces no later change to print
+    // at. The split is by vertex count because that is what separates the two
+    // populations on this rail: the login transition fills the plane with
+    // repeated six-vertex quads, and the wallpaper arrives as a single
+    // multi-quad draw. "Did the wallpaper draw reach this device at all" is then
+    // a counter comparison between a white boot and a painted one, which no
+    // record could answer before.
+    crate::runtime::drain::note_store_route(if req.vertex_count > 6 {
+        "plane_draw_multi_quad"
+    } else {
+        "plane_draw_single_quad"
+    });
     let shape = PlaneDrawShape::of(req);
     let mut ring = PLANE_DRAW_RING
         .lock()
