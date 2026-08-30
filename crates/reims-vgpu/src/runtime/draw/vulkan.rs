@@ -111,10 +111,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         return (EncodeStatus::BadArgs("draw_vk_no_color_target"), None);
     };
 
-    // The engine draw's own refusal slug, kept so the skipped-draw tail can name
-    // why its draws were skipped instead of guessing. `None` means the engine
-    // draw was never attempted — this record carried no pipeline or no vertices.
-    let mut engine_refusal: Option<&'static str> = None;
+    // What the engine draw did, kept so the skipped-draw tail can name why its
+    // draws were skipped instead of guessing.
+    let mut engine_outcome = EngineDrawOutcome::NotAttempted;
     // This device used to write the whole clear frame into the guest's own pages
     // here, ahead of any GPU work, and hand the clear on as the next record's
     // seed. Nothing in the contract asks for the write: the guest states its
@@ -181,7 +180,16 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
         crate::runtime::draw::record_plane_draw(req);
         req.chain_resident_established = false;
-        match try_metal2vulkan_draw(state, host, req, writeback_guest) {
+        let engine = try_metal2vulkan_draw(state, host, req, writeback_guest);
+        // Set from the result itself rather than inside the arms, because the
+        // arms are where this went wrong: the refusal slug was assigned only in
+        // `Err`, every `Ok` arm left it `None`, and the tail spelled `None`
+        // "engine_draw_not_attempted". A draw that the engine *made* and whose
+        // Store then lost therefore reported an engine refusal that never
+        // happened. Deriving the outcome from the one value that knows makes
+        // that class of drift unrepresentable.
+        engine_outcome = EngineDrawOutcome::of(&engine);
+        match engine {
             Ok(M2vDrawSpan::Pixels { bytes, bgra }) => {
                 draw_rgba = Some(bytes);
                 draw_bgra = bgra;
@@ -312,7 +320,6 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 // makes the skipped-draw line unreadable on its own: this fires
                 // once per (reason, pipeline) and the tail fires once per
                 // packet, so a hundred skipped draws sit behind one decline.
-                engine_refusal = Some(crate::observe::Decline::slug(&e));
                 linux_m2v_draw_failure(&e, req).fail_once(req.pipeline_ref as u64);
             }
         }
@@ -692,7 +699,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
              pipe={} vtx={} refused_by={} {target} clear={clear}",
             req.pipeline_ref,
             req.vertex_count,
-            engine_refusal.unwrap_or("engine_draw_not_attempted")
+            engine_outcome.slug()
         ));
         // The line above dedupes on `(pipeline, slug)` and the count does
         // not, so the two answer different questions and only this one can
@@ -5579,6 +5586,67 @@ fn note_type11_elision_extent(w: u32, h: u32) {
 /// trace in a census this large will not be found by adding another counter to
 /// these rails; the next instrument has to observe surface *content* across the
 /// transition, not the routes taken to produce it.
+/// What the engine draw did, for the skipped-draw tail to name.
+///
+/// The tail — `linux_clear_store draws_skipped` — is reached whenever a record
+/// with vertices ends without storing anything, and its `refused_by=` field is
+/// the only thing that says why. It used to read one `Option<&'static str>`
+/// that was assigned in the engine draw's `Err` arm and nowhere else, and to
+/// spell the `None` case `engine_draw_not_attempted`. That made three different
+/// histories print the same sentence, and two of them were false: a record whose
+/// engine draw *succeeded* and whose Store then dropped the result reported an
+/// engine refusal that never happened, and a record the engine answered with no
+/// colour-0 geometry reported the same.
+///
+/// The distinction is not cosmetic. "The engine would not draw this" and "the
+/// engine drew this and the Store lost it" have different owners, different
+/// repairs, and different costs to the guest, and the first reading sends the
+/// reader into the translator for a defect that is in the Store rail.
+///
+/// One value carries the whole history, built from the engine's own result, so
+/// the assignment cannot go missing from an arm again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EngineDrawOutcome {
+    /// The gate never ran the draw: this record carried no pipeline, or no
+    /// vertices and no index buffer.
+    NotAttempted,
+    /// The engine declined, and this is the typed slug of the decline. The
+    /// draws this record would have made are lost to that refusal.
+    Refused(&'static str),
+    /// The engine drew. Reaching the tail after this means the **Store** lost
+    /// the result, not the draw — `runtime::exec::finish_stream` will then
+    /// apply the pass's clear over pixels that were successfully rendered.
+    Drew,
+    /// The engine answered with no span because the record declared no colour-0
+    /// geometry. Neither a refusal nor a completed draw.
+    NoColorGeometry,
+}
+
+impl EngineDrawOutcome {
+    /// Read the outcome off the engine's own result, so no arm of the match
+    /// below can forget to record itself.
+    fn of(result: &Result<M2vDrawSpan, DrawError>) -> Self {
+        match result {
+            Ok(M2vDrawSpan::None) => Self::NoColorGeometry,
+            Ok(_) => Self::Drew,
+            Err(e) => Self::Refused(crate::observe::Decline::slug(e)),
+        }
+    }
+
+    /// The `refused_by=` value. A refusal reports its own slug — deliberately
+    /// not spelled `reason=`, because the census ranks fail-channel lines on
+    /// that key and the underlying slug is already counted once at its own
+    /// emitter, so naming it twice would make one refusal read as two.
+    fn slug(self) -> &'static str {
+        match self {
+            Self::NotAttempted => "engine_draw_not_attempted",
+            Self::Refused(slug) => slug,
+            Self::Drew => "engine_drew_store_lost_it",
+            Self::NoColorGeometry => "engine_draw_no_color0_geom",
+        }
+    }
+}
+
 /// Where a partial draw belongs once the declared load action is read as a
 /// contract term instead of an ordinal, or `None` when the action does not
 /// promise the prior contents at all.
@@ -10624,6 +10692,63 @@ mod vulkan_split_tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
+
+    /// A draw the engine made and a draw the engine refused do not report the
+    /// same sentence, and neither reports "not attempted".
+    ///
+    /// This is the relation the skipped-draw tail got wrong. Its `refused_by=`
+    /// came from an `Option<&'static str>` assigned in the engine draw's `Err`
+    /// arm and nowhere else, and `None` printed `engine_draw_not_attempted` —
+    /// so a record whose engine draw *succeeded* and whose Store then dropped
+    /// the result claimed an engine refusal that never happened, and sent
+    /// whoever read it into the translator for a defect in the Store rail.
+    ///
+    /// Asserted over the engine's own `Result`, because that is where the
+    /// outcome is now read from: an arm of the match cannot forget to record
+    /// itself, since no arm records anything. The four histories are held
+    /// pairwise distinct rather than spot-checked, because the defect was
+    /// exactly two of them collapsing onto a third's name.
+    #[test]
+    fn the_skipped_draw_tail_tells_a_refused_draw_from_one_the_store_lost() {
+        use super::EngineDrawOutcome;
+        let drew = EngineDrawOutcome::of(&Ok(M2vDrawSpan::Pixels {
+            bytes: vec![0; 4],
+            bgra: false,
+        }));
+        let no_geom = EngineDrawOutcome::of(&Ok(M2vDrawSpan::None));
+        let refused = EngineDrawOutcome::of(&Err(DrawError::TargetRead(
+            crate::backend::vulkan::engine::reason::TargetReadDecline::NoReadyContent,
+        )));
+
+        assert_eq!(drew, EngineDrawOutcome::Drew);
+        assert_eq!(no_geom, EngineDrawOutcome::NoColorGeometry);
+        assert!(matches!(refused, EngineDrawOutcome::Refused(_)));
+
+        // A refusal reports the decline's own slug, so the tail names the check
+        // that declined rather than the fact that something did.
+        assert_eq!(
+            refused.slug(),
+            crate::observe::Decline::slug(&DrawError::TargetRead(
+                crate::backend::vulkan::engine::reason::TargetReadDecline::NoReadyContent,
+            )),
+        );
+
+        let slugs = [
+            EngineDrawOutcome::NotAttempted.slug(),
+            refused.slug(),
+            drew.slug(),
+            no_geom.slug(),
+        ];
+        for (i, a) in slugs.iter().enumerate() {
+            for b in &slugs[i + 1..] {
+                assert_ne!(
+                    a, b,
+                    "two histories with different owners and different repairs \
+                     must not print one sentence: {slugs:?}"
+                );
+            }
+        }
+    }
 
     /// Every load action that promises the prior contents and arrives with
     /// none of them lands in one bucket, whichever ordinal it was spelled with.
