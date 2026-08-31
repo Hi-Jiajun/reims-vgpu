@@ -228,6 +228,15 @@ struct Staged {
 }
 
 struct Presenter {
+    /// The `NSView` the layer hangs under.
+    ///
+    /// Held so a resize can re-read the backing scale factor — see
+    /// [`Self::set_drawable_size`]. Not owned: the window that vended it
+    /// outlives this presenter, because the window detaches from `exiting`
+    /// before it drops the view, and the pointer never leaves the thread the
+    /// presenter lives on (a raw pointer in a `thread_local` is exactly that
+    /// claim, checked).
+    view: *mut Object,
     layer: MetalLayer,
     pipeline: RenderPipelineState,
     sampler: SamplerState,
@@ -330,8 +339,8 @@ impl Presenter {
         // because the window detaches from `exiting` before it drops the view.
         // Every selector here is AppKit's or CoreAnimation's, and this runs on
         // the loop's thread, which on macOS is the main thread they require.
+        let view: *mut Object = handle.ns_view.as_ptr().cast();
         unsafe {
-            let view: *mut Object = handle.ns_view.as_ptr().cast();
             // A **sublayer** of the view's own layer, not a replacement for it.
             // `setLayer:` makes a view layer-hosted, and `winit`'s view is
             // already layer-backed — AppKit owns that layer, sizes it, and is
@@ -362,6 +371,7 @@ impl Presenter {
         }
 
         Ok(Self {
+            view,
             layer,
             pipeline,
             sampler: cached_default_sampler(device),
@@ -370,12 +380,24 @@ impl Presenter {
         })
     }
 
+    /// Match the drawables to the size the window system actually granted.
+    ///
+    /// The scale is re-read with the size, and that is the case worth naming:
+    /// dragging the window between a Retina display and an external one changes
+    /// the backing factor, winit answers with a `Resized` in the new display's
+    /// pixels, and a layer still holding the old `contentsScale` would show the
+    /// whole desktop scaled by the ratio between them. One event, one pair of
+    /// facts, set together.
     fn set_drawable_size(&mut self, width: u32, height: u32) {
         let size = (width.max(1), height.max(1));
         if size == self.drawable {
             return;
         }
         self.drawable = size;
+        // SAFETY: `view` is this presenter's own, alive for as long as it — see
+        // the field's doc.
+        let scale = unsafe { view_backing_scale(self.view) };
+        self.layer.set_contents_scale(scale);
         self.layer
             .set_drawable_size(CGSize::new(f64::from(size.0), f64::from(size.1)));
     }
