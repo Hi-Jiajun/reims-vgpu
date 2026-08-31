@@ -22,7 +22,7 @@ pub mod engine;
 pub mod translate;
 
 use crate::backend::{Backend, GuestWriteReach};
-use crate::model::{ComputeStorageResidencyKey, DeviceState};
+use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
 use crate::runtime::blit_exec::{self, BlitStatus, LinearTextureLevel, Type11Texture};
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus};
 use crate::runtime::compute_session::ComputeSession;
@@ -31,6 +31,7 @@ use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::draw::{self, DrawEncodeRequest, EncodeStatus};
 use crate::runtime::guest_ram::ImportId;
 use crate::runtime::host::{HostMemory, HostOps};
+use crate::runtime::scanout;
 
 /// The Vulkan rail's [`Backend`] handle.
 ///
@@ -203,6 +204,40 @@ impl Backend for VulkanBackend {
 
     fn note_blit_t11_resident(&self, state: &DeviceState, mapping_id: u32) {
         blit_exec::vulkan::note_blit_t11_resident(state, mapping_id);
+    }
+
+    /// This rail runs on anything from a discrete part to an iGPU sitting at the
+    /// Vulkan floor, so it reflects the bound device rather than asserting a
+    /// table. That is the case a fixed table gets wrong, and it gets it wrong in
+    /// the direction the guest cannot recover from — the reply is asked once per
+    /// boot and kept for the life of it.
+    fn device_info_limits(&self) -> DeviceInfoLimits {
+        engine::device_info_limits()
+    }
+
+    fn compute_threadgroup_limits(&self) -> (u32, u32) {
+        engine::compute_threadgroup_limits()
+    }
+
+    fn present_resident_carries(
+        &self,
+        state: &DeviceState,
+        mapping: u32,
+        width: u32,
+        height: u32,
+    ) -> Option<bool> {
+        scanout::vulkan::present_resident_carries(state, mapping, width, height)
+    }
+
+    fn try_capture_from_resident(
+        &self,
+        state: &mut DeviceState,
+        buf: &mut Vec<u8>,
+        mapping_id: u32,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        scanout::vulkan::try_capture_from_resident(state, buf, mapping_id, width, height)
     }
 }
 

@@ -10,7 +10,7 @@
 
 use crate::backend::metal::runtime::system_device;
 use crate::backend::Backend;
-use crate::model::DeviceState;
+use crate::model::{DeviceInfoLimits, DeviceState};
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus};
 use crate::runtime::compute_session::{self, ComputeSession};
 use crate::runtime::decode::compute::Command as ComputeCommand;
@@ -107,17 +107,6 @@ impl Backend for MetalBackend {
         compute_exec::metal::execute_dispatch_metal(state, host, task_id, acc, cmd, Some(rail))
     }
 
-    // The rest of `Backend` takes the trait's defaults, and each default is the
-    // accurate statement for this rail rather than a stub:
-    //
-    // * The two blit fast paths and the resident census — no resident registry
-    //   to copy out of or to count.
-    // * The guest-memory group — this rail's Store is a host copy that has
-    //   already executed when it returns, so nothing is ever outstanding, it
-    //   holds no alias of guest RAM past the call, and it pins no linear
-    //   resident to release.
-    // * The cadence pair — nothing is batched or deferred, so there is nothing
-    //   for the heartbeat or the drain tail to flush.
     fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
         &self,
         state: &mut DeviceState,
@@ -136,6 +125,43 @@ impl Backend for MetalBackend {
             range_length,
         )
     }
+
+    /// This rail serves an Apple GPU to an Apple guest, so the table's own
+    /// values already describe the executing device and there is nothing to
+    /// reduce. Saturating rather than reflecting is deliberate: every one of
+    /// these keys bounds what the guest's *own* Metal will then ask this device
+    /// to run, and the guest's Metal is the same framework version running on
+    /// the same silicon, so a smaller number here would refuse work the host
+    /// can execute. The rail that has to reduce is the one whose host GPU is
+    /// not the guest's — see [`crate::backend::vulkan::VulkanBackend`].
+    fn device_info_limits(&self) -> DeviceInfoLimits {
+        DeviceInfoLimits {
+            max_sample_count: u32::MAX,
+            d24_stencil8: true,
+            max_threads_per_threadgroup: [u32::MAX; 3],
+            max_threadgroup_memory_bytes: u32::MAX,
+            native_fp16: true,
+        }
+    }
+
+    /// Apple GPUs report 1024 and 32 across every family the arm64 pathway
+    /// targets, and by the argument in [`Self::device_info_limits`] the GPU
+    /// behind this rail is one of them.
+    fn compute_threadgroup_limits(&self) -> (u32, u32) {
+        (1024, 32)
+    }
+
+    // The rest of `Backend` takes the trait's defaults, and each default is the
+    // accurate statement for this rail rather than a stub:
+    //
+    // * The two blit fast paths, the resident census, and the two present
+    //   questions — no resident registry to copy out of, to count, or to ask.
+    // * The guest-memory group — this rail's Store is a host copy that has
+    //   already executed when it returns, so nothing is ever outstanding, it
+    //   holds no alias of guest RAM past the call, and it pins no linear
+    //   resident to release.
+    // * The cadence pair — nothing is batched or deferred, so there is nothing
+    //   for the heartbeat or the drain tail to flush.
 }
 
 #[cfg(test)]

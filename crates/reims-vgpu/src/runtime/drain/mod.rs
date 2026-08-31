@@ -3,6 +3,7 @@
 //! Prefer structure correctness over full exec.c coverage: known root/child
 //! control-plane ops update device state; unknown opcodes are recorded visibly.
 
+use crate::backend::Backend as _;
 use crate::contract::endian::{ld16, ld32, ld64, st16, st32};
 use crate::contract::iosurface_pages::{
     MAPPER_REQUEST_ENTRY_LEN, MAPPER_REQUEST_MAP, MAPPER_REQUEST_MAPPING_ID, MAPPER_REQUEST_TYPE,
@@ -1930,30 +1931,6 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     }
 }
 
-/// What the GPU behind this host can execute, for the device-info keys that
-/// describe the GPU rather than the protocol.
-///
-/// The Metal backend serves an Apple GPU to an Apple guest, so the table's own
-/// values already describe the executing device and there is nothing to reduce.
-/// The Vulkan backend runs on anything from a discrete part to an iGPU at the
-/// Vulkan floor, which is exactly the case a fixed table gets wrong.
-fn device_info_limits() -> crate::model::DeviceInfoLimits {
-    #[cfg(not(feature = "backend-vulkan"))]
-    {
-        crate::model::DeviceInfoLimits {
-            max_sample_count: u32::MAX,
-            d24_stencil8: true,
-            max_threads_per_threadgroup: [u32::MAX; 3],
-            max_threadgroup_memory_bytes: u32::MAX,
-            native_fp16: true,
-        }
-    }
-    #[cfg(feature = "backend-vulkan")]
-    {
-        crate::backend::vulkan::engine::device_info_limits()
-    }
-}
-
 /// Answer `CmdGetDeviceInfo` into the guest's reply page.
 ///
 /// Two guest words bound this reply and they bound different things.
@@ -1997,7 +1974,13 @@ fn reply_device_info<H: HostMemory + HostOps>(
         ));
         return Err(MemError::BadArgs);
     }
-    let limits = device_info_limits();
+    // What the GPU behind this host can execute, for the keys that describe the
+    // GPU rather than the protocol. Asked of the rail because the answer is a
+    // property of the executing device: one rail serves an Apple GPU to an
+    // Apple guest and has nothing to reduce, the other runs on anything from a
+    // discrete part to an iGPU at the Vulkan floor, which is exactly the case a
+    // fixed table gets wrong.
+    let limits = crate::backend::selected().device_info_limits();
     let served = crate::model::device_info_caps(&limits, version);
     // Withhold every key the guest just said it does not parse. This is not a
     // reduction of what the device can do — a key the guest discards on arrival
@@ -2232,13 +2215,8 @@ const COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY: u32 = 4;
 /// wrong for any kernel that declares threadgroup memory, and that only
 /// reflection can make it right.
 fn compute_info_caps() -> [(u32, u32); 3] {
-    // Apple GPUs report 1024 and 32 across every family the arm64 pathway
-    // targets, and the Metal backend serves an Apple GPU to an Apple guest.
-    #[cfg(not(feature = "backend-vulkan"))]
-    let (max_total_threads, thread_execution_width) = (1024, 32);
-    #[cfg(feature = "backend-vulkan")]
     let (max_total_threads, thread_execution_width) =
-        crate::backend::vulkan::engine::compute_threadgroup_limits();
+        crate::backend::selected().compute_threadgroup_limits();
     [
         (COMPUTE_INFO_KEY_MAX_TOTAL_THREADS, max_total_threads),
         (
@@ -3449,7 +3427,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // the arm, so only on a present the structural gate has already refused —
         // four times in that boot, not 60 times a second.
         if let Some(backing) = state.note_present_backing(mapping) {
-            let carried = present_resident_carries(state, mapping, w, h);
+            let carried = crate::backend::selected().present_resident_carries(state, mapping, w, h);
             let emit = crate::observe::Emit::decline("present_unbacked", &backing)
                 .field("mid", mapping)
                 .field("geom", format!("{w}x{h}"))
@@ -5427,43 +5405,6 @@ pub fn signal_display_vbl<H: HostMemory + HostOps>(
 /// One line per second, one atomic load per field. Emitted from the same window
 /// as `drain_duty` so the two divide against each other; a delta on its own
 /// clock would not.
-/// Would a resident carry the present this mapping names, at this geometry?
-///
-/// `Some(true)` a presentable resident exists, `Some(false)` none does — so a
-/// present with no guest-page frame behind it shows black — and `None` on a
-/// backend with no target registry to ask, where the honest answer is that this
-/// build cannot tell.
-///
-/// It asks through [`crate::backend::vulkan::engine::resident_presentable`],
-/// which shares `pools::slot_presentable` with the window presenter's own
-/// selection. Sharing the rule is the point rather than tidiness: a looser
-/// predicate here would report a frame as carried that the presenter then
-/// refuses, which is a disagreement neither call site can see on its own — the
-/// same shape as the publish/present split that once blanked the window.
-#[cfg(feature = "backend-vulkan")]
-fn present_resident_carries(
-    state: &crate::model::DeviceState,
-    mapping: u32,
-    width: u32,
-    height: u32,
-) -> Option<bool> {
-    let identity =
-        crate::runtime::present_identity::surface_identity(state, mapping, width, height);
-    Some(crate::backend::vulkan::engine::resident_presentable(
-        &identity, width, height,
-    ))
-}
-
-#[cfg(not(feature = "backend-vulkan"))]
-fn present_resident_carries(
-    _state: &crate::model::DeviceState,
-    _mapping: u32,
-    _width: u32,
-    _height: u32,
-) -> Option<bool> {
-    None
-}
-
 /// Which channel an unbacked present belongs on: `true` is the failure channel.
 ///
 /// A separate function because the `None` arm is the whole content of the rule

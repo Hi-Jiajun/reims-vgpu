@@ -89,7 +89,7 @@ pub mod metal;
 #[cfg(feature = "backend-vulkan")]
 pub mod vulkan;
 
-use crate::model::{ComputeStorageResidencyKey, DeviceState};
+use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
 use crate::runtime::blit_exec::{BlitStatus, LinearTextureLevel, Type11Texture};
 use crate::runtime::compute_exec::{ComputeAccum, ComputeStatus};
 use crate::runtime::compute_session::ComputeSession;
@@ -332,6 +332,71 @@ pub(crate) trait Backend: Copy {
     /// either way. A rail with no resident registry records nothing rather than
     /// a "not ready" reading it would have to be told to discount.
     fn note_blit_t11_resident(&self, _state: &DeviceState, _mapping_id: u32) {}
+
+    // --- What the guest is told the GPU can do ------------------------------
+    //
+    // `CmdGetDeviceInfo` and `CmdGetComputeInfo` are asked **once** per boot and
+    // the guest keeps the answer for the life of that boot, so both of these
+    // describe the executing host GPU or they mislead the guest permanently.
+    // Neither has a default: "what can this GPU do" has no answer that is right
+    // for a rail that has not been asked, and a rail that inherited a neighbour's
+    // table would report a device it is not.
+
+    /// The device-info keys that describe the GPU rather than the protocol.
+    fn device_info_limits(&self) -> DeviceInfoLimits;
+
+    /// `(maxTotalThreadsPerThreadgroup, threadExecutionWidth)`.
+    ///
+    /// The two compute-info keys this device answers from the host GPU. The
+    /// third key it serves — static threadgroup memory — is a property of the
+    /// *pipeline* the guest named and not of the GPU, so it is not asked here.
+    fn compute_threadgroup_limits(&self) -> (u32, u32);
+
+    // --- What the rail's resident registry can say about a present ----------
+    //
+    // Both questions are about one surface identity, and both are answered by
+    // the pools a rail may not have. `None` / `false` are the honest readings
+    // for a rail with no registry, not degraded ones — see each method.
+
+    /// Would a resident carry the present this mapping names, at this geometry?
+    ///
+    /// `Some(true)` a presentable resident exists, `Some(false)` none does — so
+    /// a present with no guest-page frame behind it shows black — and `None` on
+    /// a rail with no target registry to ask, where the honest answer is that
+    /// this rail cannot tell. The caller fails closed on `None`
+    /// (`unbacked_present_is_a_loss`), so a rail that cannot answer never
+    /// demotes a possible black frame to a census.
+    fn present_resident_carries(
+        &self,
+        _state: &DeviceState,
+        _mapping: u32,
+        _width: u32,
+        _height: u32,
+    ) -> Option<bool> {
+        None
+    }
+
+    /// Fill `buf` from the mapping's GPU resident, without any guest-page
+    /// scatter.
+    ///
+    /// Returns whether the resident supplied the whole frame. On `true` `buf`
+    /// holds tight BGRA8; on `false` `buf` is untouched and the capture fails
+    /// (keep-prior) — there is no guest-page path left for the caller to take.
+    ///
+    /// A rail with no resident registry answers `false` for every present, so
+    /// its console holds its prior retain. That is a known gap in this pathway
+    /// rather than a rail-specific one, which is why it is spelled as this
+    /// method's default and not as a second capture vein.
+    fn try_capture_from_resident(
+        &self,
+        _state: &mut DeviceState,
+        _buf: &mut Vec<u8>,
+        _mapping_id: u32,
+        _width: u32,
+        _height: u32,
+    ) -> bool {
+        false
+    }
 }
 
 /// Whether a rail's outstanding guest-page writes can reach a set of pages.
@@ -610,6 +675,55 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.note_blit_t11_resident(state, mapping_id),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.note_blit_t11_resident(state, mapping_id),
+        }
+    }
+
+    fn device_info_limits(&self) -> DeviceInfoLimits {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.device_info_limits(),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.device_info_limits(),
+        }
+    }
+
+    fn compute_threadgroup_limits(&self) -> (u32, u32) {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.compute_threadgroup_limits(),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.compute_threadgroup_limits(),
+        }
+    }
+
+    fn present_resident_carries(
+        &self,
+        state: &DeviceState,
+        mapping: u32,
+        width: u32,
+        height: u32,
+    ) -> Option<bool> {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.present_resident_carries(state, mapping, width, height),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.present_resident_carries(state, mapping, width, height),
+        }
+    }
+
+    fn try_capture_from_resident(
+        &self,
+        state: &mut DeviceState,
+        buf: &mut Vec<u8>,
+        mapping_id: u32,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.try_capture_from_resident(state, buf, mapping_id, width, height),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.try_capture_from_resident(state, buf, mapping_id, width, height),
         }
     }
 }
