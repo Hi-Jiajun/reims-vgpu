@@ -237,7 +237,7 @@ impl MetalSession {
             execute_commands_in_buffer, execute_commands_in_buffer_indirect,
         };
         use crate::runtime::compute_exec::read_buffer_window;
-        use crate::runtime::icb::{
+        use crate::runtime::icb::metal::{
             export_icb_writeback_job, fill_icb_from_command_memory, resolve_metal_icb,
         };
         use metal::MTLResourceOptions;
@@ -420,7 +420,7 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
         nested_job_from_icb_resources, split_staged_textures, stage_buffer,
     };
     use crate::runtime::compute_exec::{load_compute_pipeline, stage_texture_raw};
-    use crate::runtime::icb::new_icb_compute_pso;
+    use crate::runtime::icb::metal::new_icb_compute_pso;
     use crate::runtime::mtlb::{load_mtlb, AirLoadRail};
     use crate::runtime::objects;
     use metal::{

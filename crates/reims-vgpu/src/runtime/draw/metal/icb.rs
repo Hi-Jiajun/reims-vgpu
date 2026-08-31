@@ -648,7 +648,9 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
         if let Some(ca) = pdesc.color_attachments().object_at(0) {
             ca.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
         }
-        match crate::runtime::icb::metal_vertex_descriptor_from_attrs(&pipeline.vertex_attributes) {
+        match crate::runtime::icb::metal::metal_vertex_descriptor_from_attrs(
+            &pipeline.vertex_attributes,
+        ) {
             Ok(Some(vd)) => pdesc.set_vertex_descriptor(Some(vd.as_ref())),
             Ok(None) if pipeline.vertex_attributes.is_empty() => {}
             Ok(None) => {
@@ -735,7 +737,7 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
 ) -> EncodeStatus {
     use crate::backend::metal::runtime::{system_device, thread_queue};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::icb::{fill_icb_from_command_memory, resolve_metal_icb};
+    use crate::runtime::icb::metal::{fill_icb_from_command_memory, resolve_metal_icb};
     use ::metal::*;
 
     if icb_ref == 0 {

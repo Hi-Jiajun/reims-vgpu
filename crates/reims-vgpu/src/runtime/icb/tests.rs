@@ -2,6 +2,11 @@ use super::*;
 // The Metal rail by name, not `backend::selected()`: an ICB is a Metal object
 // and every test here that opens a session is asserting what *that* rail does
 // with it. A binary carrying both rails may be running the other one.
+/// The Metal rail's half of this module, whose items every host-ICB test here
+/// names directly. Glob-imported like [`super`] itself so the split into
+/// `icb::metal` did not have to be spelled at four hundred call sites.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use super::metal::*;
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::backend::metal::MetalBackend;
 use crate::contract::endian::{st16, st32, st64};
@@ -960,7 +965,7 @@ fn a_flag_this_device_does_not_apply_is_counted_when_the_guest_asks_for_it() {
 fn materialize_and_execute_empty_range() {
     use crate::backend::metal::raw_metal::execute_commands_in_buffer;
     use crate::backend::metal::runtime::{system_device, thread_queue};
-    use metal::MTLDispatchType;
+    use ::metal::MTLDispatchType;
 
     let _guard = icb_test_guard();
     let (mut host, state) = icb_device();
