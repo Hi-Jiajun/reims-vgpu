@@ -399,6 +399,24 @@ pub(crate) trait Backend: Copy {
     /// guest packet arrives.
     fn flush_deferred_submissions(&self) {}
 
+    /// Submit the batch a guest-awaited completion stamp is parked in, and say
+    /// whether that submission was this call's doing.
+    ///
+    /// The targeted twin of [`Self::flush_deferred_submissions`]: the guest is
+    /// blocked on `stamp_index`, and the wait is unmet. If the word is still
+    /// inside a batch the rail has not handed to the GPU, then the guest is
+    /// waiting on *this device* rather than on the GPU, and submitting ends the
+    /// wait without changing any ordering. `false` means the rail had nothing
+    /// parked for that stamp — already in flight, never recorded, or a rail that
+    /// does not batch at all — and the caller holds the packet as it would have.
+    ///
+    /// The `bool` is the whole point of the method: it splits a held packet into
+    /// "a stall this device caused and just ended" and "a stall the GPU still
+    /// owns", and those read identically in every counter without it.
+    fn flush_batch_for_waiting_stamp(&self, _stamp_index: u32) -> bool {
+        false
+    }
+
     /// Count whether this rail already holds a type-11 surface's content.
     ///
     /// Census only: it changes no decision, and the caller copies the same bytes
@@ -1300,6 +1318,15 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.flush_deferred_submissions(),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.flush_deferred_submissions(),
+        }
+    }
+
+    fn flush_batch_for_waiting_stamp(&self, stamp_index: u32) -> bool {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.flush_batch_for_waiting_stamp(stamp_index),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.flush_batch_for_waiting_stamp(stamp_index),
         }
     }
 

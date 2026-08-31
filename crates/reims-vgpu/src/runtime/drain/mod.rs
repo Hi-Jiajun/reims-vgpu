@@ -1533,12 +1533,13 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
         // was registered against has not been made, because the batch carrying
         // it is still recording. Then the guest is blocked on this device
         // rather than on the GPU, and submitting ends it without changing any
-        // ordering. Counted both ways so the split stays visible: a flush that
-        // fires is a stall that was real.
-        #[cfg(feature = "backend-vulkan")]
+        // ordering. Asked of the running rail, because whether a stamp is
+        // parked in an unsubmitted batch is a fact about that rail's queue and
+        // not about which rails this binary compiled. Counted both ways so the
+        // split stays visible: a flush that fires is a stall that was real.
         if source == UnmetSource::Queued {
             note_store_route(
-                if crate::backend::vulkan::engine::submit_batch_for_waiting_stamp(index) {
+                if crate::backend::selected().flush_batch_for_waiting_stamp(index) {
                     "stamp_waiter_flushed_batch"
                 } else {
                     "stamp_waiter_already_in_flight"

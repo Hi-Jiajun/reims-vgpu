@@ -286,6 +286,10 @@ impl Backend for VulkanBackend {
         engine::flush_batched_draws();
     }
 
+    fn flush_batch_for_waiting_stamp(&self, stamp_index: u32) -> bool {
+        engine::submit_batch_for_waiting_stamp(stamp_index)
+    }
+
     fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
         &self,
         state: &mut DeviceState,
