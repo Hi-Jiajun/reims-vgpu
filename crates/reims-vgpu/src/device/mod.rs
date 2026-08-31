@@ -609,7 +609,6 @@ pub fn device_drain(id: u64) -> bool {
     // The bind registry's own levels, on that same cadence and read against the
     // `bb_retire_*` routes: what the retirements dropped, and what the survivors
     // look like.
-    #[cfg(feature = "backend-vulkan")]
     post_sweep(PostSweep::BindLevels, || {
         crate::runtime::bound_buffers::note_registry_levels(&device.state)
     });

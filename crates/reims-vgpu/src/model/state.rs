@@ -2489,7 +2489,14 @@ pub struct DeviceState {
     /// [`DeviceState::retire_bound_buffers_in_range`] from the packet handlers,
     /// so the retirement rules live in one place rather than at each opcode.
     /// See [`crate::runtime::bound_buffers`].
-    #[cfg(feature = "backend-vulkan")]
+    ///
+    /// Ungated. It holds nothing a rail owns — a bind window is a `GuestRun`
+    /// over this device's own import of guest RAM — and only one rail fills it
+    /// today, which is a fact about that rail rather than about the build. Gated
+    /// it needed a `not(feature)` arm at every retirement returning a fabricated
+    /// zero, and on a `--backend both` binary the Metal boot compiled the arm
+    /// that retires from a map that boot never filled. Empty on a rail that
+    /// resolves binds per encode, which is the same answer arrived at honestly.
     pub bound_buffers: crate::runtime::bound_buffers::BoundBuffers,
     /// When the guest last declared a write to each **buffer** object.
     ///
@@ -2798,7 +2805,6 @@ impl DeviceState {
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             #[cfg(feature = "backend-vulkan")]
             gather_witness: crate::runtime::gather_witness::GatherWitness::default(),
-            #[cfg(feature = "backend-vulkan")]
             bound_buffers: crate::runtime::bound_buffers::BoundBuffers::default(),
             buffer_write_gen: crate::runtime::buffer_write_gen::BufferWriteGens::default(),
             sampled_content_gen: 0,
@@ -3050,15 +3056,7 @@ impl DeviceState {
         // whatever backend is compiled in, and a stamp that outlived its task
         // would read as quiet for whatever the next task puts at that id.
         self.buffer_write_gen.retire_task(task_id);
-        #[cfg(feature = "backend-vulkan")]
-        {
-            self.bound_buffers.retire_task(task_id)
-        }
-        #[cfg(not(feature = "backend-vulkan"))]
-        {
-            let _ = task_id;
-            0
-        }
+        self.bound_buffers.retire_task(task_id)
     }
 
     /// Drop the held bind resolutions for `task_id` covering `[gva, gva+len)`.
@@ -3070,34 +3068,16 @@ impl DeviceState {
     /// [`crate::runtime::bound_buffers::BoundBuffers::retire_ref`] for why this
     /// is scoped to the reference rather than the task.
     pub fn retire_bound_buffers_for_ref(&mut self, task_id: u32, ref_: u32) -> usize {
-        #[cfg(feature = "backend-vulkan")]
-        {
-            self.bound_buffers.retire_ref(task_id, ref_)
-        }
-        #[cfg(not(feature = "backend-vulkan"))]
-        {
-            let _ = (task_id, ref_);
-            0
-        }
+        self.bound_buffers.retire_ref(task_id, ref_)
     }
 
-    /// [`Self::retire_bound_buffers_for_task`] for the gating.
     pub fn retire_bound_buffers_in_range(&mut self, task_id: u32, gva: u64, len: u64) -> usize {
-        #[cfg(feature = "backend-vulkan")]
-        {
-            self.bound_buffers.retire_range(task_id, gva, len)
-        }
-        #[cfg(not(feature = "backend-vulkan"))]
-        {
-            let _ = (task_id, gva, len);
-            0
-        }
+        self.bound_buffers.retire_range(task_id, gva, len)
     }
 
     pub fn reset(&mut self) {
         // Held bind resolutions name guest addresses under a device that is
         // going away; nothing about them survives a reset.
-        #[cfg(feature = "backend-vulkan")]
         self.bound_buffers.clear();
         // A translation hold that is still standing here never resolved. The
         // hold itself is control flow — the FIFO is parked until an AIR module

@@ -9,7 +9,10 @@ pub mod bind_phase;
 pub mod blit_exec;
 /// Draw-time buffer binds, resolved once per reference and held until the
 /// guest moves the addresses under them.
-#[cfg(feature = "backend-vulkan")]
+///
+/// Ungated: a bind window is a `GuestRun` over this device's own import of
+/// guest RAM and names nothing a rail owns. Which rail fills the registry is a
+/// fact about that rail, and it is answered by the registry being empty.
 pub mod bound_buffers;
 /// Guest-declared write generations for task-local GVA resources.
 pub mod buffer_write_gen;

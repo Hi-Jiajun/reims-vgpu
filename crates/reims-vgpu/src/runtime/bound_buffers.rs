@@ -99,7 +99,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::backend::vulkan::engine::GuestRun;
+use crate::runtime::guest_ram::GuestRun;
 use crate::runtime::guest_ram_map::GuestWindowRun;
 
 /// One task buffer reconstructed as a stable, contiguous host allocation.

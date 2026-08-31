@@ -5504,7 +5504,7 @@ fn guest_runs_decline_on_unstable_host_mappings() {
 
     // A task whose page table really does resolve `[gva, gva+16)` onto `data0`.
     let walkable = |stable: bool| -> Result<
-        Vec<crate::backend::vulkan::engine::GuestRun>,
+        Vec<crate::runtime::guest_ram::GuestRun>,
         super::vulkan::WindowRefusal,
     > {
         let mut host = FakeHost::new();
