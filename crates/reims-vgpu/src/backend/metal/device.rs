@@ -9,13 +9,15 @@
 //! two producers and the arm a reader landed on was arbitrary.
 
 use crate::backend::metal::runtime::system_device;
-use crate::backend::{Backend, CensusSite};
+use crate::backend::{Backend, CensusSite, MipmapGeneration};
+use crate::contract::mipmap::MetalMipmapError;
 use crate::model::{DeviceInfoLimits, DeviceState};
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus};
 use crate::runtime::compute_session::{self, ComputeSession};
 use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::draw::{self, DrawEncodeRequest, EncodeStatus};
 use crate::runtime::host::{HostMemory, HostOps};
+use crate::runtime::mipmap::MipmapStatus;
 
 /// The Metal rail's [`Backend`] handle.
 ///
@@ -158,6 +160,39 @@ impl Backend for MetalBackend {
         // for "an idle one".
         if site == CensusSite::Levels {
             crate::runtime::drain::census::metal::emit_object_cache_levels();
+        }
+    }
+
+    fn generate_mipmap_chain(
+        &self,
+        texture_ref: u32,
+        fmt: u16,
+        width: u32,
+        height: u32,
+        levels: u32,
+        level0: &[u8],
+    ) -> MipmapGeneration {
+        match super::mipmap::generate_mipmaps_filtered(fmt, width, height, levels, level0) {
+            Ok(chain) => MipmapGeneration::Chain(
+                chain
+                    .into_iter()
+                    .map(|level| (level.width, level.height, level.tight_bytes))
+                    .collect(),
+            ),
+            // Correct but slower: let the caller run the shared box filter, and
+            // make the missing device visible as a typed degradation. This is
+            // the *only* error that declines rather than refuses — every other
+            // one means the filtered path was available and rejected the work.
+            Err(error @ MetalMipmapError::NoDevice) => {
+                crate::observe::Emit::decline("mipmap_metal_fallback", &error)
+                    .field("texture", texture_ref)
+                    .field("format", format!("{fmt:#x}"))
+                    .field("width", width)
+                    .field("height", height)
+                    .off();
+                MipmapGeneration::Unfiltered
+            }
+            Err(error) => MipmapGeneration::Refused(MipmapStatus::Metal(error)),
         }
     }
 

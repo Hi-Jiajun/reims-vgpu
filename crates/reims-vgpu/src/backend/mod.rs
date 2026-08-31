@@ -524,6 +524,73 @@ pub(crate) trait Backend: Copy {
     ) -> Option<Vec<u8>> {
         None
     }
+
+    /// Filtered mip levels 0.. for one texture, generated on the GPU.
+    ///
+    /// `generateMipmaps` is a Metal blit-encoder operation and its result is
+    /// **filtered**, which a shared CPU box filter approximates rather than
+    /// reproduces. So the three answers are genuinely three, not two with a
+    /// flag: a rail with no filtered path here declines and the caller box
+    /// filters (same levels, slower — never a loss), while a rail that *has*
+    /// one and was refused by it must not be silently box-filtered, because the
+    /// guest would keep a texture whose upper levels came from a path the
+    /// refusal says was not lawful.
+    ///
+    /// `texture_ref` is here so a rail declining for a reason worth naming can
+    /// name the texture it declined for. Reporting the decline is the rail's,
+    /// since only the rail knows the reason.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "level 0's geometry, format and bytes are the operation's whole                   input; bundling them into a struct used at one call site would                   add a type without removing a field"
+    )]
+    fn generate_mipmap_chain(
+        &self,
+        _texture_ref: u32,
+        _fmt: u16,
+        _width: u32,
+        _height: u32,
+        _levels: u32,
+        _level0: &[u8],
+    ) -> MipmapGeneration {
+        MipmapGeneration::Unfiltered
+    }
+
+    /// Whether any of this submission's streams still needs work this rail must
+    /// finish before the packet may be consumed.
+    ///
+    /// `true` defers the whole packet: it is left unconsumed and retried, so a
+    /// replay cannot duplicate the clears, fences, dispatches or guest
+    /// writeback it contains. That makes this a **safety** answer rather than an
+    /// optimisation — a rail that answers `false` is promising the packet can be
+    /// executed to completion now.
+    ///
+    /// The default is `false` and is exactly that promise for a rail with
+    /// nothing to prepare: it compiles no shader ahead of the record that uses
+    /// one, so there is nothing a retry could find further along.
+    fn preflight_translations<M: HostMemory + HostOps>(
+        &self,
+        _state: &DeviceState,
+        _host: &M,
+        _task_id: u32,
+        _streams: &[Vec<u8>],
+    ) -> bool {
+        false
+    }
+}
+
+/// What a rail made of a `generateMipmaps` — the vocabulary of
+/// [`Backend::generate_mipmap_chain`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MipmapGeneration {
+    /// Level 0.., each `(width, height, tight native bytes)`.
+    Chain(Vec<(u32, u32, Vec<u8>)>),
+    /// This rail has no filtered path for this request. The caller runs the
+    /// shared CPU box filter, which lands the same levels more slowly.
+    Unfiltered,
+    /// This rail has a filtered path, tried it, and it refused. Distinguished
+    /// from [`Self::Unfiltered`] because the two want opposite handling: this
+    /// one must reach the guest as a refusal rather than as a quieter path.
+    Refused(crate::runtime::mipmap::MipmapStatus),
 }
 
 /// Which witness is asking, because two of them ask about the same plane rings
@@ -995,6 +1062,42 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.read_abandoned_chain_rgba(state, req),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.read_abandoned_chain_rgba(state, req),
+        }
+    }
+
+    fn generate_mipmap_chain(
+        &self,
+        texture_ref: u32,
+        fmt: u16,
+        width: u32,
+        height: u32,
+        levels: u32,
+        level0: &[u8],
+    ) -> MipmapGeneration {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => {
+                b.generate_mipmap_chain(texture_ref, fmt, width, height, levels, level0)
+            }
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => {
+                b.generate_mipmap_chain(texture_ref, fmt, width, height, levels, level0)
+            }
+        }
+    }
+
+    fn preflight_translations<M: HostMemory + HostOps>(
+        &self,
+        state: &DeviceState,
+        host: &M,
+        task_id: u32,
+        streams: &[Vec<u8>],
+    ) -> bool {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.preflight_translations(state, host, task_id, streams),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.preflight_translations(state, host, task_id, streams),
         }
     }
 }

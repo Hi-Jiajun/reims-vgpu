@@ -253,6 +253,16 @@ impl Backend for VulkanBackend {
         drain::vulkan::order_completion_stamp(state, host, index, value, site)
     }
 
+    fn preflight_translations<M: HostMemory + HostOps>(
+        &self,
+        state: &DeviceState,
+        host: &M,
+        task_id: u32,
+        streams: &[Vec<u8>],
+    ) -> bool {
+        crate::runtime::exec::vulkan::preflight_translations(state, host, task_id, streams)
+    }
+
     fn gva_load_seed_elidable<M: HostMemory + HostOps>(
         &self,
         state: &mut DeviceState,
