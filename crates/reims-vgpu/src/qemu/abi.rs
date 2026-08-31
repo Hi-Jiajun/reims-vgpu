@@ -44,6 +44,7 @@
     reason = "the shared QEMU C ABI safety contract is documented at module scope"
 )]
 
+use crate::backend::Backend as _;
 use crate::qemu::host_ops::ReimsVgpuHostOps;
 use crate::runtime::host::HostAction;
 use crate::{
@@ -490,13 +491,12 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_drain(handle: u64) -> c_int {
             if handle == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
             }
-            // Before the drain, so the first tranche's engine-lock acquires are
-            // already attributed to the worker. Entering this function is the
-            // only property that distinguishes the drain thread from a vCPU
-            // inside an MMIO store, and telling those apart is what makes a
-            // stalled guest attributable — see `EngineLockSite`.
-            #[cfg(feature = "backend-vulkan")]
-            crate::backend::vulkan::engine::mark_drain_thread();
+            // Before the drain, so the first tranche's lock acquires are already
+            // attributed to the worker. Entering this function is the only
+            // property that distinguishes the drain thread from a vCPU inside
+            // an MMIO store, and telling those apart is what makes a stalled
+            // guest attributable.
+            crate::backend::selected().note_drain_thread();
             if device_drain(handle) {
                 REIMS_VGPU_QEMU_OK
             } else {

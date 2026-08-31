@@ -24,20 +24,26 @@ backend-metal = []
 # Product Vulkan encode: self-contained ash engine + metal2vulkan
 # (native Vulkan on Linux, MoltenVK on macOS).
 # No vkcompute on any edge (product or dev) — engine is self-contained.
-backend-vulkan = ["dep:ash"]
-# Host-owned presentation window (kb host-window): Rust winit window +
-# VkSurfaceKHR/swapchain that replaces QEMU's UI. Off by default so the QEMU
-# staticlib link is unchanged until the window is proven. Pulls the windowing
-# stack; needs the Vulkan engine for the swapchain.
+backend-vulkan = ["dep:ash", "dep:ash-window", "dep:raw-window-handle"]
+# Host-owned presentation window (kb host-window): a Rust-owned winit window
+# that replaces QEMU's UI. Off by default so the QEMU staticlib link is
+# unchanged until the window is proven. Pulls the windowing stack and nothing
+# else.
+#
+# It names no backend. Which rail fills the window is a run-time answer
+# (`Backend::presents_host_window`), and every rail can: Vulkan drives a
+# swapchain on a `VkSurfaceKHR`, Metal drives a `CAMetalLayer` on the same
+# native view. The surface half each one needs travels with *that rail's*
+# feature — `ash-window` below with `backend-vulkan` — because Cargo cannot
+# express "this dependency when both features are on", and putting the Vulkan
+# half here is what would drag `ash` into a Metal-only build.
 host-window = [
     "dep:winit",
-    "dep:ash-window",
     "dep:raw-window-handle",
     "dep:wayland-client",
     "dep:wayland-backend",
     "dep:wayland-protocols",
     "dep:x11-dl",
-    "backend-vulkan",
 ]
 
 [dependencies]
@@ -85,6 +91,12 @@ x11-dl = { version = "2.21", optional = true }
 # Metal encode is macOS-only; `backend-metal` is rejected on any other host.
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.33"
+# `CGSize`, for the one CoreAnimation call that takes one — `CAMetalLayer`'s
+# `drawableSize`, which the host window's Metal presenter sets explicitly rather
+# than inheriting from the layer's bounds. Already in the graph as `metal`'s own
+# dependency at this version, so naming it adds no code to the build; it only
+# says that this crate calls it directly.
+core-graphics-types = { version = "0.2", default-features = false }
 objc = "0.2"
 block = "0.1"
 foreign-types = "0.5"

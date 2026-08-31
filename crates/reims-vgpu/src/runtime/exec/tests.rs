@@ -353,7 +353,7 @@ fn render_preflight_collects_content_pipelines_without_duplicates() {
     stream[4] = SEGMENT_TYPE_RENDER;
     stream.extend_from_slice(&records);
 
-    assert_eq!(render_pipeline_refs(&stream), vec![41, 77]);
+    assert_eq!(super::vulkan::render_pipeline_refs(&stream), vec![41, 77]);
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -389,7 +389,10 @@ fn compute_preflight_collects_pipeline_and_local_size_without_duplicates() {
     stream[4] = SEGMENT_TYPE_COMPUTE;
     stream.extend_from_slice(&records);
 
-    assert_eq!(compute_translation_inputs(&stream), vec![(20, [16, 16, 1])]);
+    assert_eq!(
+        super::vulkan::compute_translation_inputs(&stream),
+        vec![(20, [16, 16, 1])]
+    );
 }
 
 #[test]

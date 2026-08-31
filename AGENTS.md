@@ -63,6 +63,23 @@ only through the environment owner.
 | x86 macOS | Linux x86_64 KVM | x86_64 macOS | PCI | 12 | Vulkan |
 | arm64 macOS | Apple Silicon HVF | arm64 macOS | sysbus | 14 | Metal |
 | arm64 macOS | Apple Silicon HVF | arm64 macOS | sysbus | 14 | Vulkan/MoltenVK |
+| arm64 macOS | Apple Silicon HVF | arm64 macOS | sysbus | 14 | both, chosen at run time |
+
+The last row is one binary carrying both rails, built with
+`scripts/qemu-build/qemu-build.sh --backend both` and selected per run with `REIMS_VGPU_RAIL`.
+It exists so the same guest stream can be executed through native Metal and through MoltenVK
+without a rebuild, which is the only way to attribute a wrong frame to metal2vulkan rather than to
+this device. It is a measurement configuration, not a shipping one; the three rows above it are
+what ships.
+
+**A `cfg` may answer only "what did this build compile". It may never answer "which rail is
+running".** Those are different questions on the fourth row and the compiler cannot tell them
+apart: a `not(feature = "backend-vulkan")` block meaning "the Metal arm" disappears silently when
+both features are on, and a `feature = "backend-vulkan"` block meaning "the running rail" executes
+against Metal. Every decision the running rail makes goes through `backend::Backend`, whose
+implementation `backend::select` picks once per process. Tests obey the same rule: name the rail
+(`MetalBackend`, `VulkanBackend`) when the test is about one, and ask `selected().rail()` when the
+expected answer legitimately differs.
 
 Do not generalize observations between architectures, backends, memory topologies, host GPU
 classes, or guest rails. Vulkan 1.2 is the baseline; newer functionality requires a

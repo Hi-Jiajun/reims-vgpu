@@ -22,6 +22,13 @@
 //!   it (`hostPresentCount`). Freeze is at present (before stamp completion
 //!   lets the guest recycle the mid), not deferred to BH after stamp.
 
+// The Vulkan rail's answers about a present's resident, named rather than
+// re-exported flat — a capture reaches them only through `Backend`, so this
+// module's own code never mentions a rail.
+#[cfg(feature = "backend-vulkan")]
+pub mod vulkan;
+
+use crate::backend::Backend as _;
 use crate::contract::pixel_format::{
     self, convert_rgba8_to_row, convert_row_to_rgba8, MTL_FORMAT_BGRA8_UNORM,
     MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RGBA8_UNORM, RGBA8_BPP,
@@ -114,45 +121,6 @@ fn maybe_log_capture_sampling(state: &DeviceState) {
     if total != 0 && total.is_power_of_two() {
         crate::observe::off(format!("capture_sampling full={full} light={light}"));
     }
-}
-
-/// Fill `buf` from the mapping's GPU resident, without any guest-page scatter.
-///
-/// Returns whether the resident supplied the whole frame. On `true` `buf` holds
-/// tight BGRA8; on `false` `buf` is untouched and the capture fails
-/// (keep-prior) — there is no guest-page path left for the caller to take. A miss
-/// is an expected steady-state condition (cold mid / no resident yet), so it is
-/// counted in the `capture_source` census rather than logged per present.
-#[cfg(feature = "backend-vulkan")]
-fn try_capture_from_resident(
-    state: &mut crate::model::DeviceState,
-    buf: &mut Vec<u8>,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-) -> bool {
-    let need = buf.len();
-    let identity =
-        crate::runtime::present_identity::surface_identity(state, mapping_id, width, height);
-    let Some(bgra) = crate::backend::vulkan::engine::read_resident_bgra(&identity, need) else {
-        return false;
-    };
-    debug_assert_eq!(bgra.len(), need);
-    // Move (not copy) the readback in; the untouched scratch returns to the pool.
-    state.present.capture_scratch = std::mem::replace(buf, bgra);
-    true
-}
-
-/// Non-Vulkan backends have no resident registry; capture stays on guest pages.
-#[cfg(not(feature = "backend-vulkan"))]
-fn try_capture_from_resident(
-    _state: &mut crate::model::DeviceState,
-    _buf: &mut [u8],
-    _mapping_id: u32,
-    _width: u32,
-    _height: u32,
-) -> bool {
-    false
 }
 
 /// Snapshot the named mapping into the stable present frame.
@@ -308,10 +276,15 @@ pub fn capture_present_frame(
     // Live evidence for the delete: `capture_source resident=51 guest=0` across a
     // full boot (pre-convergence included), zero `present_capture FAIL`.
     //
-    // Consequence for the non-Vulkan backends: they have no resident registry, so
-    // capture fails there and the console holds its prior retain. That is the
-    // known arm/Metal breakage this pathway already carries.
-    if !from_host_cache && !try_capture_from_resident(state, &mut buf, mapping_id, width, height) {
+    // Consequence for a rail with no resident registry: capture fails there and
+    // the console holds its prior retain. That is the known arm/Metal breakage
+    // this pathway already carries, and it is spelled once as the
+    // `Backend::try_capture_from_resident` default rather than as a second vein
+    // here.
+    if !from_host_cache
+        && !crate::backend::selected()
+            .try_capture_from_resident(state, &mut buf, mapping_id, width, height)
+    {
         crate::observe::off(format!(
             "present_capture FAIL mid={mapping_id} {width}x{height} gen={generation} \
              reason=no_resident_content present_mapping={} frame_mapping={}",
@@ -323,7 +296,7 @@ pub fn capture_present_frame(
     }
     // Capture provenance, and there are only two sources to name: the type-4
     // surface_cache hit, or the resident. Reaching here with `!from_host_cache`
-    // means `try_capture_from_resident` returned true above, and it returns true
+    // means `Backend::try_capture_from_resident` returned true above, and it returns true
     // and there is no third source. This used to read a `last_paint_src`
     // provenance field through a five-arm match whose other four arms named
     // `paint_mapping` sub-paths — left over from when this function had a
@@ -1575,14 +1548,8 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
     // uniform result or a surface nothing drew into, and the ring is what
     // separates them. These layers are not the plane a present names, so the
     // present witness never drains their rings and nothing else does either.
-    #[cfg(feature = "backend-vulkan")]
-    let ring = crate::runtime::draw::read_plane_draw_ring(
-        crate::runtime::draw::PlaneDrawReader::PresentedPlane,
-        mapping_id,
-    )
-    .to_string();
-    #[cfg(not(feature = "backend-vulkan"))]
-    let ring = String::new();
+    let ring = crate::backend::selected()
+        .plane_draw_witness(crate::backend::PlaneDrawReader::PresentedPlane, mapping_id);
     crate::observe::off(format!(
         "sampled_surface_field mid={mapping_id} ref={texture_ref} {width}x{height} \
          fmt={format:#x} off={base_off:#x} bpr={bpr} route={route} patches=[{report}] \
@@ -1769,16 +1736,11 @@ pub fn note_present_field_witness<M: HostMemory>(
     // uniform field means the guest kept drawing and this device did not
     // publish it. Those have opposite repairs and no other record separates
     // them.
-    #[cfg(feature = "backend-vulkan")]
-    let ring = crate::runtime::draw::read_plane_draw_ring(
-        crate::runtime::draw::PlaneDrawReader::SampledLayer,
-        mapping_id,
-    )
-    .to_string();
-    // The ring is filled by the Vulkan draw encode; there is no such record on
-    // the Metal arm, so the field is simply absent there rather than empty.
-    #[cfg(not(feature = "backend-vulkan"))]
-    let ring = String::new();
+    // A rail that keeps no such record answers with an empty string, so the
+    // fields are absent rather than a `draws=0` that would read as a measurement
+    // — see `Backend::plane_draw_witness`.
+    let ring = crate::backend::selected()
+        .plane_draw_witness(crate::backend::PlaneDrawReader::SampledLayer, mapping_id);
     // What the outstanding-write ledger says about the very pages just read.
     //
     // This witness reads guest pages without settling, which is deliberate --
@@ -1800,13 +1762,15 @@ pub fn note_present_field_witness<M: HostMemory>(
     // Those three have different repairs, and no record on this rail separated
     // them: a plane that reads uniform white with 409 stores publishing into it
     // is consistent with all three.
-    #[cfg(feature = "backend-vulkan")]
+    //
+    // Asked of the running rail, and every rail answers: a rail whose Store has
+    // already executed when it returns has nothing outstanding, and `Disjoint`
+    // is that fact rather than a rail declining to say — which is precisely the
+    // reading this field is here to supply.
     let reach = format!(
         " write_reach={:?}",
-        crate::backend::vulkan::engine::guest_writes_reaching(&gpas)
+        crate::backend::selected().guest_writes_reaching(&gpas)
     );
-    #[cfg(not(feature = "backend-vulkan"))]
-    let reach = String::new();
     // The page span, so a store record naming its destination and this record
     // naming the presented plane can be compared without either having to know
     // about the other. First and last of the mapping's own order, not of the

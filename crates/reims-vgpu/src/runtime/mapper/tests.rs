@@ -1238,22 +1238,55 @@ fn stable_view_without_a_vulkan_import_unmaps_at_mapping_retirement() {
     assert_eq!(host.unmap_pages_calls, 1);
 }
 
+/// The rail's half: an alias is handed back once, and only after its terminal
+/// destruction is published.
+///
+/// Asked of `VulkanBackend` by name. It used to publish into that rail's engine
+/// and then drain through `backend::selected()`, which was the same rail only
+/// while a build could carry one — on a binary carrying both, the process may
+/// be running Metal and the published alias would sit unclaimed while the test
+/// asserted it had been unmapped.
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn vulkan_alias_unmaps_only_after_terminal_destruction_is_published() {
-    let mut host = crate::runtime::FakeHost::new();
+fn a_vulkan_alias_is_released_only_after_terminal_destruction_is_published() {
+    use crate::backend::vulkan::VulkanBackend;
+    use crate::backend::Backend as _;
 
-    assert_eq!(super::drain_deferred_unmaps(&mut host), 0);
-    assert_eq!(host.unmap_pages_calls, 0);
+    let rail = VulkanBackend::new();
+    assert!(rail.take_released_host_aliases().is_empty());
 
     crate::backend::vulkan::engine::publish_released_host_alias_for_test((0x1000, 0x2000));
-    assert_eq!(super::drain_deferred_unmaps(&mut host), 1);
-    assert_eq!(host.unmap_pages_calls, 1);
-    assert_eq!(super::drain_deferred_unmaps(&mut host), 0);
-    assert_eq!(
-        host.unmap_pages_calls, 1,
+    assert_eq!(rail.take_released_host_aliases(), vec![(0x1000, 0x2000)]);
+    assert!(
+        rail.take_released_host_aliases().is_empty(),
         "an alias is returned exactly once"
     );
+}
+
+/// The heartbeat's half: whatever the running rail hands back is unmapped, once
+/// each, and a rail holding no alias costs no host call.
+///
+/// Split from the rail's half above because they are two contracts with two
+/// owners, and the pair that used to test them together could only run on a
+/// build whose single compiled rail was the one being published into.
+#[test]
+fn the_heartbeat_unmaps_exactly_the_aliases_the_rail_hands_back() {
+    use crate::backend::Backend as _;
+
+    let mut host = crate::runtime::FakeHost::new();
+    let rail = crate::backend::selected();
+    // Drain anything an earlier test in this process left armed, so the counts
+    // below are this test's own.
+    let _ = super::drain_deferred_unmaps(&mut host);
+    host.unmap_pages_calls = 0;
+
+    let released = rail.take_released_host_aliases();
+    assert!(
+        released.is_empty(),
+        "nothing published: {released:?} was already owed"
+    );
+    assert_eq!(super::drain_deferred_unmaps(&mut host), 0);
+    assert_eq!(host.unmap_pages_calls, 0);
 }
 
 #[test]

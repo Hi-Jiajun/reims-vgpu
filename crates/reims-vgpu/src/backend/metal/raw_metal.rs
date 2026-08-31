@@ -735,20 +735,9 @@ pub fn new_compute_pso_with_function_reflection(
             error: &mut err
         ];
         if pso.is_null() {
-            let msg = if !err.is_null() {
-                let desc: *mut Object = msg_send![err, localizedDescription];
-                let cstr: *const i8 = msg_send![desc, UTF8String];
-                if cstr.is_null() {
-                    "(no detail)".to_string()
-                } else {
-                    std::ffi::CStr::from_ptr(cstr)
-                        .to_string_lossy()
-                        .into_owned()
-                }
-            } else {
-                "(no detail)".to_string()
-            };
-            return Err(MetalPipelineDecline { detail: msg });
+            return Err(MetalPipelineDecline {
+                detail: ns_error_detail(err),
+            });
         }
         if !reflection.is_null() {
             let _: *mut Object = msg_send![reflection, retain];
@@ -1132,24 +1121,139 @@ pub fn icb_draw_indexed_primitives(
     }
 }
 
-pub fn command_buffer_error_description(command_buffer: &metal::CommandBufferRef) -> String {
+/// What an `NSError` says, or [`NO_DETAIL`] when it says nothing this can read.
+///
+/// Every Metal call in this module that can fail hands back one of these, and
+/// each of them used to spell the same four nil checks — `err`, its
+/// `localizedDescription`, that string's `UTF8String`, and the empty case. A
+/// refusal reported as `detail=` is only worth the field if it survives all
+/// four, so the walk is written once.
+///
+/// # Safety
+///
+/// `err` is a `NSError *` or nil. Nothing else: the function sends
+/// `localizedDescription`, which any other object may not answer.
+pub unsafe fn ns_error_detail(err: *mut Object) -> String {
+    if err.is_null() {
+        return NO_DETAIL.to_string();
+    }
+    // SAFETY: the caller's contract — `err` is a live `NSError`.
     unsafe {
-        let err: *mut Object = msg_send![command_buffer, error];
-        if err.is_null() {
-            return "(no detail)".to_string();
-        }
         let desc: *mut Object = msg_send![err, localizedDescription];
         if desc.is_null() {
-            return "(no detail)".to_string();
+            return NO_DETAIL.to_string();
         }
         let cstr: *const i8 = msg_send![desc, UTF8String];
         if cstr.is_null() {
-            "(no detail)".to_string()
+            NO_DETAIL.to_string()
         } else {
             std::ffi::CStr::from_ptr(cstr)
                 .to_string_lossy()
                 .into_owned()
         }
+    }
+}
+
+/// What [`ns_error_detail`] reports when the error carries no readable text.
+///
+/// A value rather than an empty string: `detail=` with nothing after it reads
+/// as a truncated log line, and the reader has to go and check whether the
+/// field was dropped or the error was silent.
+pub const NO_DETAIL: &str = "(no detail)";
+
+pub fn command_buffer_error_description(command_buffer: &metal::CommandBufferRef) -> String {
+    // SAFETY: `error` on a command buffer is an `NSError *` or nil.
+    unsafe {
+        let err: *mut Object = msg_send![command_buffer, error];
+        ns_error_detail(err)
+    }
+}
+
+/// `newLibraryWithSource:options:error:` — runtime MSL compilation.
+///
+/// The checked replacement for `metal::Device::new_library_with_source`, which
+/// asserts on a nil library that arrived with a nil error. That assert is in a
+/// frame the host window's event loop calls, and a panic there unwinds into
+/// CoreFoundation and aborts the process; a refusal that says the compile
+/// produced nothing is the same information without the abort.
+///
+/// Uncached, and deliberately: the only source this compiles is the window
+/// presenter's own blit, built once when the presenter attaches. Guest shader
+/// blobs go through [`super::function::load_only_function`] and its content
+/// cache — putting an internal library in that keyspace would let a guest blob
+/// whose bytes happened to hash equal be served this one.
+pub fn new_library_with_source(device: &DeviceRef, source: &str) -> Result<metal::Library, String> {
+    let Ok(source) = std::ffi::CString::new(source) else {
+        // A NUL inside the source would truncate it at the ObjC boundary and
+        // compile a prefix, which fails somewhere unrelated to the real defect.
+        return Err("source contains an interior NUL".to_string());
+    };
+    // SAFETY: `stringWithUTF8String:` copies from a NUL-terminated buffer that
+    // outlives the call; the options object is freshly allocated; the library
+    // pointer is checked before it is given to `from_ptr`.
+    unsafe {
+        let ns_source: *mut Object =
+            msg_send![objc::class!(NSString), stringWithUTF8String: source.as_ptr()];
+        if ns_source.is_null() {
+            return Err("source is not valid UTF-8 for NSString".to_string());
+        }
+        let options = metal::CompileOptions::new();
+        let mut err: *mut Object = std::ptr::null_mut();
+        let library: *mut Object = msg_send![device,
+            newLibraryWithSource: ns_source
+            options: &*options
+            error: &mut err
+        ];
+        if library.is_null() {
+            return Err(ns_error_detail(err));
+        }
+        Ok(metal::Library::from_ptr(library as *mut _))
+    }
+}
+
+/// `newFunctionWithName:`, with the nil a name the library does not export
+/// returns.
+///
+/// The checked replacement for `metal::Library::get_function`, whose no-constants
+/// arm sends the selector and hands the result straight to `from_ptr` without
+/// looking at it — so a misspelled entry point is undefined behaviour rather
+/// than a miss.
+pub fn new_function(library: &metal::LibraryRef, name: &str) -> Option<metal::Function> {
+    let name = std::ffi::CString::new(name).ok()?;
+    // SAFETY: `stringWithUTF8String:` copies from a NUL-terminated buffer that
+    // outlives the call; the function pointer is checked before `from_ptr`.
+    unsafe {
+        let ns_name: *mut Object =
+            msg_send![objc::class!(NSString), stringWithUTF8String: name.as_ptr()];
+        if ns_name.is_null() {
+            return None;
+        }
+        let function: *mut Object = msg_send![library, newFunctionWithName: ns_name];
+        (!function.is_null()).then(|| metal::Function::from_ptr(function as *mut _))
+    }
+}
+
+/// `newRenderPipelineStateWithDescriptor:error:`, with the nil a rejected
+/// descriptor returns.
+///
+/// The checked replacement for `metal::Device::new_render_pipeline_state`,
+/// which reports the error object but then hands a possibly-nil pointer to
+/// `from_ptr` — the second half of the failure this module exists for.
+pub fn new_render_pipeline_state(
+    device: &DeviceRef,
+    descriptor: &RenderPipelineDescriptorRef,
+) -> Result<metal::RenderPipelineState, String> {
+    // SAFETY: the pipeline pointer is checked before `from_ptr` takes it.
+    unsafe {
+        let mut err: *mut Object = std::ptr::null_mut();
+        let pso: *mut Object = msg_send![device,
+            newRenderPipelineStateWithDescriptor: descriptor
+            error: &mut err
+        ];
+        if pso.is_null() {
+            return Err(ns_error_detail(err));
+        }
+        Ok(metal::RenderPipelineState::from_ptr(pso as *mut _))
     }
 }
 

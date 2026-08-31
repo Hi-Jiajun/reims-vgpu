@@ -5,6 +5,8 @@
 //! `MappingEntry.page_entries` and geometry from MappingInternal + device
 //! descriptor via guest KVA reads ([`HostOps::read_kva`]).
 
+// The backend the process executes on, reached only through the trait.
+use crate::backend::Backend as _;
 use crate::contract::iosurface_pages::{
     self, build_table_plan, decode_device_surface, decode_mapper_request_entry, guest_kernel_va,
     mapper_request_published_entry_offset, mapping_span_bound, read_internal_desc_ptr,
@@ -1483,30 +1485,21 @@ pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
     // The backend allocation aliases the host view, so revoke the GPU parent
     // first. Existing child images and recorded buffers hold it through their
     // fence-safe retirement; only then is the matching host view unmapped.
-    #[cfg(feature = "backend-vulkan")]
+    let backend = crate::backend::selected();
     let backend_owned: std::collections::HashSet<_> = state
         .retired_guest_imports
         .drain(..)
-        .filter_map(crate::backend::vulkan::engine::retire_guest_import)
+        .filter_map(|import| backend.retire_guest_import(import))
         .collect();
-    #[cfg(not(feature = "backend-vulkan"))]
-    state.retired_guest_imports.clear();
-
-    #[cfg(feature = "backend-vulkan")]
     let mut released: std::collections::HashSet<_> =
-        crate::backend::vulkan::engine::take_released_host_aliases()
-            .into_iter()
-            .collect();
+        backend.take_released_host_aliases().into_iter().collect();
     for (ptr, len) in state.retired_views.drain(..) {
-        #[cfg(feature = "backend-vulkan")]
         if backend_owned.contains(&(ptr, len)) {
             continue;
         }
-        #[cfg(feature = "backend-vulkan")]
         released.remove(&(ptr, len));
         host.unmap_pages(ptr, len);
     }
-    #[cfg(feature = "backend-vulkan")]
     for (ptr, len) in released {
         host.unmap_pages(ptr, len);
     }
@@ -1517,12 +1510,14 @@ pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
     }
 }
 
-/// Return Vulkan aliases whose terminal fence-safe destruction has completed
+/// Return backend aliases whose terminal fence-safe destruction has completed
 /// to the host. Called from the device heartbeat so release does not depend on
 /// another guest mapping event arriving.
-#[cfg(feature = "backend-vulkan")]
+///
+/// A rail that holds no alias of guest RAM releases none and this returns zero,
+/// which is what the heartbeat did on that arm before it was gated.
 pub fn drain_deferred_unmaps<H: HostOps>(host: &mut H) -> usize {
-    let released = crate::backend::vulkan::engine::take_released_host_aliases();
+    let released = crate::backend::selected().take_released_host_aliases();
     let count = released.len();
     for (ptr, len) in released {
         host.unmap_pages(ptr, len);

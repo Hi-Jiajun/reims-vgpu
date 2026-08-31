@@ -4,6 +4,10 @@
 )]
 
 use super::*;
+// Both rails' tests live here alongside the shared staging ones. Neither rail is
+// re-exported into `super`, so each is named where its arm compiles.
+#[cfg(feature = "backend-vulkan")]
+use super::vulkan::*;
 use crate::contract::endian::{st32, st64};
 use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
@@ -502,10 +506,10 @@ fn accum_stage_in_tg_imageblock_and_control_fail_closed() {
 #[test]
 fn vulkan_ignores_stage_input_regions_without_a_stage_input_descriptor() {
     let mut acc = ComputeAccum::default();
-    assert!(!super::linux_stage_input_or_imageblock_unsupported(
+    assert!(!super::vulkan::linux_stage_input_or_imageblock_unsupported(
         false, &acc
     ));
-    assert!(super::linux_stage_input_or_imageblock_unsupported(
+    assert!(super::vulkan::linux_stage_input_or_imageblock_unsupported(
         true, &acc
     ));
 
@@ -517,16 +521,16 @@ fn vulkan_ignores_stage_input_regions_without_a_stage_input_descriptor() {
         size_y: 1,
         size_z: 1,
     });
-    assert!(!super::linux_stage_input_or_imageblock_unsupported(
+    assert!(!super::vulkan::linux_stage_input_or_imageblock_unsupported(
         false, &acc
     ));
 
     acc.set_stage_in_region_indirect(3, 16);
     assert!(acc.stage_in_region.is_none());
-    assert!(!super::linux_stage_input_or_imageblock_unsupported(
+    assert!(!super::vulkan::linux_stage_input_or_imageblock_unsupported(
         false, &acc
     ));
-    assert!(super::linux_stage_input_or_imageblock_unsupported(
+    assert!(super::vulkan::linux_stage_input_or_imageblock_unsupported(
         true, &acc
     ));
 }
@@ -842,27 +846,35 @@ fn dispatch_missing_pipeline() {
     cmd.kind = Kind::DispatchThreadgroups;
     cmd.grid = compute::Size3 { x: 1, y: 1, z: 1 };
     cmd.threads_per_threadgroup = compute::Size3 { x: 1, y: 1, z: 1 };
-    let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
-    // The slug names *which* pipeline check refused, and it differs by
-    // backend: both arms open with `pipeline_ref == 0`, and before the
-    // status carried a reason the two were indistinguishable in the log.
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+    let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    // The slug names *which* pipeline check refused, and it differs by rail:
+    // both open with `pipeline_ref == 0`, and before the status carried a
+    // reason the two were indistinguishable in the log.
+    //
+    // Keyed on the rail that *ran*, not on the features that were compiled. A
+    // binary carrying both rails compiles both `cfg` arms, so a `cfg` here
+    // would assert one rail's slug against whichever rail `selected()` picked.
     assert_eq!(
         st,
-        ComputeStatus::MissingPipeline("compute_mtl_pipeline_ref_zero")
-    );
-    #[cfg(feature = "backend-vulkan")]
-    assert_eq!(
-        st,
-        ComputeStatus::MissingPipeline("compute_vk_pipeline_ref_zero")
+        ComputeStatus::MissingPipeline(match crate::backend::selected().rail() {
+            crate::backend::Rail::Metal => "compute_mtl_pipeline_ref_zero",
+            crate::backend::Rail::Vulkan => "compute_vk_pipeline_ref_zero",
+        })
     );
 }
 
-/// Linux without vulkan feature: dispatch is NoMetal (census). With
-/// backend-vulkan, missing pipeline is MissingPipeline (real encode path).
+/// The Vulkan rail attempts a real encode rather than answering `NoMetal`.
+///
+/// Asked of `VulkanBackend` by name, because that is what the test is about. It
+/// used to go through `backend::selected()`, which was the same thing only for
+/// as long as a build could carry one rail — on a binary carrying both, the
+/// process may be running Metal and this would assert the Vulkan contract
+/// against it.
 #[test]
 #[cfg(feature = "backend-vulkan")]
 fn dispatch_nometal_with_texture_binds() {
+    use crate::backend::vulkan::VulkanBackend;
+    use crate::backend::Backend as _;
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
@@ -887,7 +899,7 @@ fn dispatch_nometal_with_texture_binds() {
         z: 1,
     };
     cmd.threads_per_threadgroup = compute::Size3 { x: 32, y: 0, z: 1 };
-    let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let st = VulkanBackend::new().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
     assert!(
         matches!(
             st,
@@ -899,15 +911,25 @@ fn dispatch_nometal_with_texture_binds() {
         ),
         "vulkan path attempts encode, got {st:?}"
     );
-    // Nested short-circuit remains NoMetal on Linux (SPI not wired).
-    let mut session = crate::runtime::compute_session::ComputeSession { control_depth: 0 };
-    let st2 = execute_dispatch_nested(&mut state, &mut host, 1, &acc, &cmd, &mut session);
-    assert_eq!(st2, ComputeStatus::NoMetal("compute_nested_no_vulkan_path"));
+    // A nested dispatch needs an open session, and this rail cannot open one:
+    // `engine::execute_compute_request` is one-shot per dispatch. Asserted where
+    // the capability is decided rather than by building a session and calling
+    // through it — `ComputeSession` has no rail variant for this backend, so
+    // there is no such value to build.
+    assert_eq!(
+        VulkanBackend::new().open_compute_session(0).err(),
+        Some(ComputeStatus::NoMetal("compute_session_no_vulkan_path"))
+    );
 }
 
+/// Asked of `VulkanBackend` by name, for the reason
+/// [`dispatch_nometal_with_texture_binds`] gives.
 #[test]
 #[cfg(feature = "backend-vulkan")]
 fn dispatch_missing_pipeline_not_nometal() {
+    use crate::backend::vulkan::VulkanBackend;
+    use crate::backend::Backend as _;
+
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
@@ -917,7 +939,7 @@ fn dispatch_missing_pipeline_not_nometal() {
     cmd.kind = Kind::DispatchThreadgroups;
     cmd.grid = compute::Size3 { x: 1, y: 1, z: 1 };
     cmd.threads_per_threadgroup = compute::Size3 { x: 1, y: 1, z: 1 };
-    let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let st = VulkanBackend::new().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
     assert_eq!(
         st,
         ComputeStatus::MissingPipeline("compute_vk_pipeline_ref_zero")
@@ -935,7 +957,8 @@ fn dispatch_missing_pipeline_not_nometal() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn a_format_with_no_storage_selector_refuses_the_same_way_from_every_rail() {
-    use crate::runtime::compute_exec::{split_staged_textures, ComputeStatus, StagedTexture};
+    use crate::runtime::compute_exec::metal::split_staged_textures;
+    use crate::runtime::compute_exec::{ComputeStatus, StagedTexture};
 
     let mut no_selector = StagedTexture {
         binding: 33,
@@ -949,12 +972,22 @@ fn a_format_with_no_storage_selector_refuses_the_same_way_from_every_rail() {
         height: 4,
         bytes: vec![0; 64],
         is_storage: true,
+        // The Vulkan-gated half of the struct, kept complete because a build
+        // carrying both rails compiles these lines and nothing else checks
+        // them: this literal named a `seed_skipped: bool` and a
+        // `sample_resident` that were folded into one `serve` field, and both
+        // spellings survived because each single-arm build `cfg`s out exactly
+        // the arm that would have caught it.
+        #[cfg(feature = "backend-vulkan")]
+        array_element: 0,
+        #[cfg(feature = "backend-vulkan")]
+        descriptor_count: 1,
         #[cfg(feature = "backend-vulkan")]
         residency: None,
         #[cfg(feature = "backend-vulkan")]
-        seed_skipped: false,
+        serve: None,
         #[cfg(feature = "backend-vulkan")]
-        sample_resident: None,
+        multisample_target: None,
         writeback: TextureWriteback::None,
     };
 
@@ -1074,31 +1107,34 @@ fn dispatch_buffer_kernel_mul3add1() {
 
     let mut acc = ComputeAccum::default();
     acc.set_pipeline(6);
-    let bindings = vec![
-        BufferBinding {
-            ref_: 7,
-            offset: 0,
-            attribute_stride: 0,
-            has_attribute_stride: false,
-        },
-        #[cfg(feature = "backend-vulkan")]
-        BufferBinding {
-            // The kernel declares no buffer 1. Reflection must discard this
-            // extra encoder bind before object resolution; the nonexistent ref
-            // makes a pre-reflection staging pass fail as MissingBuffer.
+    let mut bindings = vec![BufferBinding {
+        ref_: 7,
+        offset: 0,
+        attribute_stride: 0,
+        has_attribute_stride: false,
+    }];
+    if crate::backend::selected().rail() == crate::backend::Rail::Vulkan {
+        // The kernel declares no buffer 1. Reflection must discard this extra
+        // encoder bind before object resolution; the nonexistent ref makes a
+        // pre-reflection staging pass fail as MissingBuffer.
+        //
+        // Conditioned on the rail that *runs*, not on the features compiled:
+        // this is a stimulus only the Vulkan rail's reflection is expected to
+        // survive, and a binary carrying both would otherwise hand it to Metal.
+        bindings.push(BufferBinding {
             ref_: 31,
             offset: 0,
             attribute_stride: 0,
             has_attribute_stride: false,
-        },
-    ];
+        });
+    }
     acc.bind_buffers(0, &bindings);
 
     let mut cmd = ComputeCommand::default();
     cmd.kind = Kind::DispatchThreadgroups;
     cmd.grid = compute::Size3 { x: 1, y: 1, z: 1 };
     cmd.threads_per_threadgroup = compute::Size3 { x: 4, y: 1, z: 1 };
-    let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
     assert!(
         matches!(
             st,
@@ -1143,7 +1179,7 @@ fn dispatch_missing_texture_fails() {
     cmd.threads_per_threadgroup = compute::Size3 { x: 1, y: 1, z: 1 };
     // Missing pipeline object → MissingPipeline before texture stage.
     // Non-Apple metal stubs short-circuit to NoMetal (Linux product).
-    let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
     assert!(matches!(
         st,
         ComputeStatus::MissingPipeline(_)
@@ -2759,10 +2795,11 @@ fn a_truncated_stage_input_is_not_the_same_as_an_absent_one() {
 #[test]
 #[cfg(feature = "backend-vulkan")]
 fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
-    use super::{
-        note_storage_residency_writeback, ComputeStorageResidencyCandidate, StagedTexture,
-        TextureWriteback, STORAGE_RESIDENCY_WINDOWS_PER_MAPPING,
+    use super::vulkan::{
+        note_storage_residency_writeback, ComputeStorageResidencyCandidate,
+        STORAGE_RESIDENCY_WINDOWS_PER_MAPPING,
     };
+    use super::{StagedTexture, TextureWriteback};
     use crate::model::ComputeStorageResidencyKey;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);

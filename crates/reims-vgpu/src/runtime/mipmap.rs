@@ -9,6 +9,7 @@
 //! no-device fallback for filterable unorm formats that convert through RGBA8.
 //! Single-level textures fail visibly (Metal rejects `mipmapLevelCount == 1`).
 
+use crate::backend::Backend as _;
 use crate::contract::pixel_format::{self, RGBA8_BPP};
 use crate::model::DeviceState;
 use crate::runtime::decode::resource::{
@@ -20,8 +21,6 @@ use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::objects;
 
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use crate::backend::metal::mipmap as metal_mip;
 // The refusal type is portable data and lives in `contract::mipmap` so its
 // checks can be executed on a host with no Apple linker. The import still
 // carries this gate, because only this arm can produce one.
@@ -366,22 +365,6 @@ fn store_level_tight_native<M: HostMemory + HostOps>(
     Ok(())
 }
 
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn generate_via_metal(
-    fmt: u16,
-    width: u32,
-    height: u32,
-    levels: u32,
-    level0: &[u8],
-) -> Result<Vec<(u32, u32, Vec<u8>)>, MetalMipmapError> {
-    metal_mip::generate_mipmaps_filtered(fmt, width, height, levels, level0).map(|chain| {
-        chain
-            .into_iter()
-            .map(|level| (level.width, level.height, level.tight_bytes))
-            .collect()
-    })
-}
-
 /// No-device fallback: RGBA8 box filter for formats with row conversion.
 fn generate_via_box_filter(
     fmt: u16,
@@ -476,31 +459,27 @@ pub fn generate_mipmaps_linear<M: HostMemory + HostOps>(
         Err(st) => return st,
     };
 
-    // Prefer Metal-filtered generation in the guest's native pixel format.
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    let chain = match generate_via_metal(fmt, l0_w, l0_h, levels as u32, &level0) {
-        Ok(chain) => chain,
-        Err(error @ MetalMipmapError::NoDevice) => {
-            // Correct but slower: retain the CPU box-filter fallback, and make
-            // the missing Metal device visible as a typed degradation.
-            crate::observe::Emit::decline("mipmap_metal_fallback", &error)
-                .field("texture", texture_ref)
-                .field("format", format!("{fmt:#x}"))
-                .field("width", l0_w)
-                .field("height", l0_h)
-                .off();
-            // Soft fallback only when no MTL device is available.
+    // Prefer the rail's own filtered generation, in the guest's native pixel
+    // format. `generateMipmaps` is filtered and the box filter below only
+    // approximates that, so a rail that declines costs quality-neutral time
+    // while a rail that *refuses* has to be reported — see
+    // `backend::MipmapGeneration`.
+    let chain = match crate::backend::selected().generate_mipmap_chain(
+        texture_ref,
+        fmt,
+        l0_w,
+        l0_h,
+        levels as u32,
+        &level0,
+    ) {
+        crate::backend::MipmapGeneration::Chain(chain) => chain,
+        crate::backend::MipmapGeneration::Unfiltered => {
             match generate_via_box_filter(fmt, l0_w, l0_h, levels, &level0) {
                 Ok(c) => c,
                 Err(st) => return st,
             }
         }
-        Err(error) => return MipmapStatus::Metal(error),
-    };
-    #[cfg(feature = "backend-vulkan")]
-    let chain = match generate_via_box_filter(fmt, l0_w, l0_h, levels, &level0) {
-        Ok(c) => c,
-        Err(st) => return st,
+        crate::backend::MipmapGeneration::Refused(status) => return status,
     };
 
     if chain.len() != levels {

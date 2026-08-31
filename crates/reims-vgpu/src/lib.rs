@@ -8,44 +8,57 @@
 //! | [`backend`] | Trait + self-contained [`backend::metal`] / [`backend::vulkan`] |
 //! | [`qemu`] | QEMU C ABI surface only |
 //!
-//! Features: exactly one of `backend-metal` (default) or `backend-vulkan`.
-//! Vulkan product path is self-contained `ash` ([`backend::vulkan::engine`]).
+//! Features: at least one of `backend-metal` (default) or `backend-vulkan`, and
+//! a build may carry **both**. Vulkan's product path is self-contained `ash`
+//! ([`backend::vulkan::engine`]).
 //!
-//! # The three supported arms
+//! # The supported arms
 //!
-//! A build is exactly one of these, and the guards below reject anything else:
-//!
-//! | Arm | `cfg` | Host GPU API |
+//! | Arm | Features | Host GPU API |
 //! | --- | --- | --- |
-//! | Metal | `all(feature = "backend-metal", target_os = "macos")` | native Metal |
-//! | Vulkan / MoltenVK | `all(feature = "backend-vulkan", target_os = "macos")` | MoltenVK |
-//! | Vulkan / native | `all(feature = "backend-vulkan", target_os = "linux")` | native ICD |
+//! | Metal | `backend-metal` | native Metal |
+//! | Vulkan / MoltenVK | `backend-vulkan` on macOS | MoltenVK |
+//! | Vulkan / native | `backend-vulkan` on linux | native ICD |
+//! | Both | `backend-metal,backend-vulkan` on macOS | either, chosen at run time |
 //!
 //! **Gate the host on `target_os` and nothing else.** `macos` and `linux` are
-//! the only two values this crate names, so the three arms differ in one term
-//! each and a reader greps one key to find every host gate.
+//! the only two values this crate names, so a reader greps one key to find
+//! every host gate.
 //!
 //! There is **no** host-stub Metal arm. `backend-metal` off macOS has no Metal
 //! to call, so it is a compile error rather than a binary that links and cannot
 //! draw.
 //!
-//! The consequence the rest of the crate relies on: **the Metal arm and the
-//! Vulkan arms partition every buildable configuration.** So the engine path is
-//! spelled positively as `feature = "backend-vulkan"` and the Metal path as
-//! `all(feature = "backend-metal", target_os = "macos")`, with no negation
-//! of one standing in for the other. Do not reintroduce
-//! `not(all(feature = "backend-metal", target_os = "macos"))` as a spelling
-//! of "the engine path" — it says what the build is *not*, which stops being
-//! equivalent the moment a fourth arm exists.
+//! # Why the fourth cell exists
+//!
+//! An Apple host can reach its GPU natively through Metal or through MoltenVK,
+//! and those two paths translate the guest's command stream by completely
+//! different means. When a frame is wrong, "is this a metal2vulkan defect or a
+//! defect in this device" is the first question and it was previously
+//! unanswerable without rebuilding — which changes the binary, the caches and
+//! the boot. A binary carrying both rails answers it by running the *same guest
+//! stream* twice with one variable changed.
+//!
+//! # What that costs the rest of the crate
+//!
+//! `cfg` may only ever answer **"what did this build compile"**. It may not
+//! answer "which rail is running", because on this fourth cell those are
+//! different questions and the compiler cannot tell them apart — a
+//! `not(feature = "backend-vulkan")` block meaning "the Metal arm" simply
+//! disappears, silently, the moment both features are on. Everything the
+//! running rail decides goes through [`backend::Backend`], whose implementation
+//! the process picks once in [`backend::select`]; the `cfg`s that remain are
+//! module declarations and the arms of that one selection.
+//!
+//! Do not reintroduce `not(feature = "backend-vulkan")` as a spelling of "the
+//! Metal arm". It says what the build is *not*, which stopped being equivalent
+//! the moment this cell existed.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(rust_2018_idioms)]
 
-#[cfg(all(feature = "backend-metal", feature = "backend-vulkan"))]
-compile_error!("select exactly one of backend-metal or backend-vulkan");
-
 #[cfg(not(any(feature = "backend-metal", feature = "backend-vulkan")))]
-compile_error!("select exactly one of backend-metal or backend-vulkan");
+compile_error!("select at least one of backend-metal or backend-vulkan");
 
 #[cfg(all(feature = "backend-metal", not(target_os = "macos")))]
 compile_error!(
@@ -93,9 +106,13 @@ pub mod runtime;
 pub mod backend;
 pub mod qemu;
 
-/// Host-owned presentation window (winit + VkSurfaceKHR) — see
-/// [[host-window]]. The `host-window` feature implies `backend-vulkan`, and is
-/// enabled for every verification command the x86 pathway is checked with.
+/// Host-owned presentation window — a Rust-owned `winit` window that replaces
+/// QEMU's UI. See [[host-window]].
+///
+/// The feature names no backend. Which rail fills the window is a run-time
+/// answer (`backend::Backend::presents_host_window`) and every rail can:
+/// Vulkan drives a swapchain on a `VkSurfaceKHR`, Metal a `CAMetalLayer` on the
+/// same native view. It is enabled on every product arm.
 #[cfg(feature = "host-window")]
 pub mod host_window;
 

@@ -219,33 +219,7 @@ pub(crate) fn classify_slate(
 ///
 /// So it is boot-scope, not dead: a reader who deletes it because steady-state
 /// traffic is zero blanks the window for the first several hundred frames.
-#[derive(Clone, Copy, Debug)]
-pub struct WindowCpuFrame<'a> {
-    pub bgra: &'a [u8],
-    pub width: u32,
-    pub height: u32,
-    /// Publish sequence of the frame these bytes came from. The staging image
-    /// keeps the last one it uploaded, so a forced redraw (resize, suboptimal
-    /// self-heal) re-blits without re-copying 8 MB that have not changed.
-    pub seq: u64,
-}
-
-/// Whether a published CPU frame holds every byte of the geometry it claims.
-///
-/// A short buffer is not a degraded frame, it is a torn one: the blit would
-/// read whatever the staging image held below the copied rows, which is the
-/// previous frame at whatever geometry it had. Kept out of the staging code so
-/// the rejection is a value test rather than a length check buried in an unsafe
-/// copy loop.
-fn cpu_frame_complete(frame: &WindowCpuFrame<'_>) -> bool {
-    if frame.width == 0 || frame.height == 0 {
-        return false;
-    }
-    let need = (frame.width as usize)
-        .saturating_mul(frame.height as usize)
-        .saturating_mul(4);
-    need != 0 && frame.bgra.len() >= need
-}
+pub(crate) use crate::backend::window::WindowCpuFrame;
 
 /// The staging image's persistent host mapping.
 ///
@@ -385,22 +359,7 @@ impl BlitSource {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WindowPresentOutcome {
-    Busy,
-    Presented {
-        direct: bool,
-        width: u32,
-        height: u32,
-        swapchain_images: usize,
-        /// The surface reported suboptimal at acquire or present, so a
-        /// recreation is armed. The window must schedule another redraw
-        /// promptly instead of waiting for the next guest frame — boot-era
-        /// presents can be seconds apart, which would leave a mismatched
-        /// drawable on screen for that long.
-        suboptimal: bool,
-    },
-}
+pub(crate) use crate::backend::window::WindowPresentOutcome;
 
 /// Result of the lock-held half of a display transaction.
 pub(crate) enum WindowPresentDispatch {
@@ -1236,7 +1195,7 @@ impl WindowPresenter {
             let want = source.map_or((0, 0), |s| (s.width, s.height));
             let reason = classify_slate(source.is_some(), want, state);
             let staged = cpu
-                .filter(cpu_frame_complete)
+                .filter(WindowCpuFrame::complete)
                 .and_then(|frame| self.stage_cpu_frame(ctx, frame));
             self.note_slate(reason, want, state, staged.is_some());
             staged
@@ -1325,7 +1284,7 @@ impl WindowPresenter {
                 // native resize normally makes this the full window within
                 // milliseconds). The window input path maps pointer positions
                 // through this same transform.
-                let vp = crate::host_window::viewport::aspect_fit(
+                let vp = crate::backend::window::viewport::aspect_fit(
                     (base_width, base_height),
                     (self.extent.width, self.extent.height),
                 );
@@ -1507,7 +1466,7 @@ impl WindowPresenter {
                         direct: finished.direct,
                         width: finished.width,
                         height: finished.height,
-                        swapchain_images: finished.swapchain_images,
+                        buffers: finished.swapchain_images,
                         suboptimal,
                     },
                 ))
@@ -2014,60 +1973,6 @@ mod tests {
         assert!(
             swapchain_recreated_line(from, to, "init", vk::PresentModeKHR::FIFO, 2)
                 .contains("present_mode=fifo images=2")
-        );
-    }
-
-    /// The staging upload copies `height` rows of `width * 4` bytes out of the
-    /// published buffer. A buffer short of that would read whatever the staging
-    /// image held below the copied rows — the previous frame, at whatever
-    /// geometry it had — and blit the result as though it were current.
-    ///
-    /// The short case is not hypothetical: every present the device elides the
-    /// readback for publishes an EMPTY buffer, because the resident is carrying
-    /// that frame. Those arrive here whenever the resident then turns out not to
-    /// be presentable, which is exactly when the fallback runs.
-    #[test]
-    fn a_cpu_frame_shorter_than_its_own_geometry_is_refused() {
-        let full = vec![0u8; 8 * 4 * 4];
-        assert!(cpu_frame_complete(&WindowCpuFrame {
-            bgra: &full,
-            width: 8,
-            height: 4,
-            seq: 1,
-        }));
-        // Slop is fine — the copy reads exactly what the geometry names.
-        assert!(cpu_frame_complete(&WindowCpuFrame {
-            bgra: &full,
-            width: 8,
-            height: 3,
-            seq: 1,
-        }));
-        assert!(
-            !cpu_frame_complete(&WindowCpuFrame {
-                bgra: &full[..full.len() - 1],
-                width: 8,
-                height: 4,
-                seq: 1,
-            }),
-            "one byte short is still a torn last row"
-        );
-        assert!(
-            !cpu_frame_complete(&WindowCpuFrame {
-                bgra: &[],
-                width: 8,
-                height: 4,
-                seq: 1,
-            }),
-            "the elided-readback publish carries no bytes at all"
-        );
-        assert!(
-            !cpu_frame_complete(&WindowCpuFrame {
-                bgra: &full,
-                width: 0,
-                height: 4,
-                seq: 1,
-            }),
-            "a zero dimension names no pixels and blits nothing"
         );
     }
 

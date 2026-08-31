@@ -1,7 +1,18 @@
 use super::*;
+// This file tests both rails, and neither is re-exported into `super`. The
+// Metal rail is named at each use (there are two), because the two rails
+// declare same-named entry points on purpose — `encode_draw_chain` is one — and
+// two globs make a build carrying both rails assert against whichever import
+// won rather than against the rail the test names.
+#[cfg(feature = "backend-vulkan")]
+use super::vulkan::*;
+#[cfg(feature = "backend-vulkan")]
+use crate::backend::vulkan::translate;
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 use crate::runtime::gva_mem::write_task_gva_arm64e;
 use crate::runtime::host::FakeHost;
+#[cfg(feature = "backend-vulkan")]
+use crate::runtime::mapper::{mapping_guest_write_verdict, GuestWriteVerdict};
 
 #[cfg(feature = "backend-vulkan")]
 #[test]
@@ -659,7 +670,7 @@ fn cpu_portability_store_publishes_composite() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn frag_unbound_scan_reports_only_missing_standard_kinds() {
-    use crate::runtime::draw::{FragUnbound, FragUnboundClass};
+    use crate::runtime::draw::vulkan::{FragUnbound, FragUnboundClass};
     use metal2vulkan::reflect::ResourceKind as K;
     let gap = |class, metal_index| FragUnbound { class, metal_index };
     let tex = |i| gap(FragUnboundClass::Texture, i);
@@ -1045,204 +1056,6 @@ fn encode_status_renders_its_check_beside_the_class_it_collapsed_to() {
     }
 }
 
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-#[test]
-fn explicit_metal_sampler_and_depth_binds_return_typed_missing_entry_declines() {
-    use crate::observe::Emit;
-
-    let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let host = FakeHost::new();
-
-    let sampler = load_sampler(&state, &host, 4, 77, 3)
-        .expect_err("a nonzero sampler ref in an empty object list must decline");
-    assert_eq!(
-        sampler,
-        MetalStateDecline::SamplerEntryMissing {
-            sampler_ref: 77,
-            index: 3,
-        }
-    );
-    assert_eq!(
-        Emit::decline("metal_draw_sampler_fallback", &sampler)
-            .field("task", 4)
-            .field("pipe", 19)
-            .field("stage", "fragment")
-            .render(),
-        "metal_draw_sampler_fallback reason=metal_sampler_entry_missing \
-             sampler_ref=77 index=3 task=4 pipe=19 stage=fragment"
-    );
-
-    let depth = load_depth_stencil_state(&state, &host, 4, 88)
-        .expect_err("a nonzero depth-stencil ref in an empty object list must decline");
-    assert_eq!(
-        depth,
-        MetalStateDecline::DepthStencilEntryMissing {
-            depth_stencil_ref: 88,
-        }
-    );
-    assert_eq!(
-        Emit::decline("metal_draw_depth_stencil_fallback", &depth)
-            .field("task", 4)
-            .field("pipe", 19)
-            .render(),
-        "metal_draw_depth_stencil_fallback reason=metal_depth_stencil_entry_missing \
-             depth_stencil_ref=88 task=4 pipe=19"
-    );
-}
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-#[test]
-fn metal_state_decode_declines_delegate_the_exact_resource_decoder_reason() {
-    use crate::observe::{Decline as _, Emit};
-
-    let sampler = MetalStateDecline::SamplerDecode {
-        sampler_ref: 41,
-        index: 6,
-        reason: DecodeStatus::ErrShort("res_sampler_short"),
-    };
-    assert_eq!(sampler.slug(), "res_sampler_short");
-    assert_eq!(
-        Emit::decline("metal_draw_sampler_fallback", &sampler).render(),
-        "metal_draw_sampler_fallback reason=res_sampler_short \
-             class=short sampler_ref=41 index=6"
-    );
-
-    let depth = MetalStateDecline::DepthStencilDecode {
-        depth_stencil_ref: 52,
-        reason: DecodeStatus::ErrShort("res_depth_stencil_short"),
-    };
-    assert_eq!(depth.slug(), "res_depth_stencil_short");
-    assert_eq!(
-        Emit::decline("metal_draw_depth_stencil_fallback", &depth).render(),
-        "metal_draw_depth_stencil_fallback reason=res_depth_stencil_short \
-             class=short depth_stencil_ref=52"
-    );
-}
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-#[test]
-fn every_metal_icb_inheritance_check_is_unique_namespaced_and_log_safe() {
-    use crate::observe::Decline as _;
-
-    let all = vec![
-        MetalIcbInheritanceDecline::CullModeUnsupported { value: 3 },
-        MetalIcbInheritanceDecline::FrontFacingUnsupported { value: 2 },
-        MetalIcbInheritanceDecline::BindSlotPastTable {
-            bind: PastTableBind {
-                class: BindTableClass::Buffer,
-                stage: crate::runtime::decode::render::Stage::Vertex,
-                index: MAX_BUFFER_BIND_SLOTS,
-                resource_ref: 1,
-            },
-        },
-        MetalIcbInheritanceDecline::VertexBufferMissing {
-            buffer_ref: 3,
-            index: 4,
-            offset: 5,
-        },
-        MetalIcbInheritanceDecline::FragmentBufferMissing {
-            buffer_ref: 6,
-            index: 7,
-            offset: 8,
-        },
-        MetalIcbInheritanceDecline::VertexTextureMissing {
-            texture_ref: 11,
-            index: 12,
-            detail: "no list entry".into(),
-        },
-        MetalIcbInheritanceDecline::FragmentTextureMissing {
-            texture_ref: 13,
-            index: 14,
-            detail: "guest\nread failed".into(),
-        },
-        MetalIcbInheritanceDecline::PipelineRefZero,
-        MetalIcbInheritanceDecline::PipelineMissing { pipeline_ref: 17 },
-        MetalIcbInheritanceDecline::VertexMtlbMissing { function_ref: 18 },
-        MetalIcbInheritanceDecline::FragmentMtlbMissing { function_ref: 19 },
-        MetalIcbInheritanceDecline::VertexLibraryLoad {
-            function_ref: 20,
-            detail: "Metal error".into(),
-        },
-        MetalIcbInheritanceDecline::FragmentLibraryLoad {
-            function_ref: 21,
-            detail: "Metal error".into(),
-        },
-        MetalIcbInheritanceDecline::VertexFunctionCount {
-            function_ref: 22,
-            count: 2,
-        },
-        MetalIcbInheritanceDecline::FragmentFunctionCount {
-            function_ref: 23,
-            count: 0,
-        },
-        MetalIcbInheritanceDecline::VertexFunctionGet {
-            function_ref: 24,
-            detail: "function missing".into(),
-        },
-        MetalIcbInheritanceDecline::FragmentFunctionGet {
-            function_ref: 25,
-            detail: "function missing".into(),
-        },
-        MetalIcbInheritanceDecline::VertexDescriptorMissing {
-            pipeline_ref: 26,
-            attribute_count: 3,
-        },
-        // The sibling of the entry above, and the pair is the point: an empty
-        // vertex block and a partial one are different refusals, and the
-        // builder used to report the second as a success.
-        MetalIcbInheritanceDecline::VertexAttributeUnencodable {
-            pipeline_ref: 26,
-            location: 3,
-            value: 99,
-        },
-        MetalIcbInheritanceDecline::RenderPipelineCreate {
-            pipeline_ref: 27,
-            detail: "pipeline failed".into(),
-        },
-        MetalIcbInheritanceDecline::AllocationFailed {
-            what: "inherited_texture",
-        },
-    ];
-
-    let mut slugs = all.iter().map(Decline::slug).collect::<Vec<_>>();
-    assert_eq!(slugs.len(), 26, "the fixture must cover every check");
-    for decline in &all {
-        assert!(decline.slug().starts_with("metal_icb_inherit_"));
-        for (key, value) in decline.fields() {
-            assert!(!key.is_empty());
-            assert!(
-                !value.chars().any(char::is_whitespace),
-                "{} rendered a non-token field {key}={value:?}",
-                decline.slug()
-            );
-        }
-    }
-    slugs.sort_unstable();
-    slugs.dedup();
-    assert_eq!(slugs.len(), all.len(), "two ICB checks share one reason");
-}
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-#[test]
-fn metal_icb_inheritance_line_keeps_pipeline_and_sanitized_driver_detail() {
-    use crate::observe::Emit;
-
-    let decline = MetalIcbInheritanceDecline::RenderPipelineCreate {
-        pipeline_ref: 71,
-        detail: "Error Domain=MTLLibrary Code=3".into(),
-    };
-    assert_eq!(
-        Emit::decline("metal_icb_inheritance", &decline)
-            .field("task", 2)
-            .field("pipe", 71)
-            .field("icb", 99)
-            .render(),
-        "metal_icb_inheritance reason=metal_icb_inherit_render_pipeline_create \
-             pipeline_ref=71 detail=Error_Domain=MTLLibrary_Code=3 \
-             task=2 pipe=71 icb=99"
-    );
-}
-
 /// A vertex reflection that trips the shader-pull coverage gate: writes
 /// Position, reads VertexIndex, binds a Buffer at each of `bindings`.
 #[cfg(feature = "backend-vulkan")]
@@ -1360,7 +1173,7 @@ fn reorder_rb_in_place_is_a_no_op_when_the_orders_already_agree() {
         let src: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
         for order in [false, true] {
             let mut same = src.clone();
-            crate::runtime::draw::reorder_rb_in_place(&mut same, order, order);
+            crate::runtime::draw::vulkan::reorder_rb_in_place(&mut same, order, order);
             assert_eq!(
                 same, src,
                 "len={len} order={order}: agreement must not copy"
@@ -1369,10 +1182,10 @@ fn reorder_rb_in_place_is_a_no_op_when_the_orders_already_agree() {
         // Disagreement in either direction is exactly the established swizzle,
         // tail included.
         let mut to_bgra = src.clone();
-        crate::runtime::draw::reorder_rb_in_place(&mut to_bgra, false, true);
+        crate::runtime::draw::vulkan::reorder_rb_in_place(&mut to_bgra, false, true);
         assert_eq!(to_bgra, swap_rb_channels(&src), "len={len} rgba->bgra");
         let mut to_rgba = src.clone();
-        crate::runtime::draw::reorder_rb_in_place(&mut to_rgba, true, false);
+        crate::runtime::draw::vulkan::reorder_rb_in_place(&mut to_rgba, true, false);
         assert_eq!(to_rgba, swap_rb_channels(&src), "len={len} bgra->rgba");
     }
 }
@@ -2456,7 +2269,12 @@ fn missing_pipeline_is_soft() {
     // used to pass *different* `force_full_store` values for the same call.
     // These are the arguments `exec` passes for a single-record draw that owns
     // its writeback.
-    let st = encode_draw_chain(&mut state, &mut host, &mut req, true, false).0;
+    // Through the seam, not a rail: this test is about what any rail answers
+    // for a pipeline it cannot resolve, and naming one would make a build
+    // carrying both assert against whichever glob import won.
+    let st = crate::backend::selected()
+        .encode_draw_chain(&mut state, &mut host, &mut req, true, false)
+        .0;
     assert!(matches!(
         st,
         EncodeStatus::MissingPipeline(_) | EncodeStatus::MissingMtlb(_) | EncodeStatus::NoMetal(_)
@@ -2680,7 +2498,7 @@ fn the_metal_draw_arm_refuses_a_bind_past_its_table() {
         .into(),
         ..Default::default()
     };
-    let st = encode_draw_chain(&mut state, &mut host, &mut req, false, false).0;
+    let st = super::metal::encode_draw_chain(&mut state, &mut host, &mut req, false, false).0;
     assert!(
         matches!(st, EncodeStatus::BadArgs("draw_mtl_bind_slot_past_table")),
         "expected a past-table refusal, got {st:?}"
@@ -3045,7 +2863,19 @@ fn mrt_draw_request_gets_attachment_samples_from_the_bound_pipeline_before_encod
 
     let req = single_rt_draw_request(&mut state, &mut host, 7, att)
         .expect("matching source and resolve geometry is representable");
-    assert_eq!(req.colors[0].sample_count, 4);
+    // Both halves of the policy, keyed on the rail that *ran*. Taking the
+    // pipeline's count is `Backend::pipeline_raster_sample_count` — a rail's
+    // answer, not a property of the build — and a rail that does not consult
+    // the pipeline keeps the resolved target's provisional 1. A `cfg` here
+    // would assert the consulting rail's 4 against a binary that carries both
+    // and happened to run the other one.
+    assert_eq!(
+        req.colors[0].sample_count,
+        match crate::backend::selected().rail() {
+            crate::backend::Rail::Vulkan => 4,
+            crate::backend::Rail::Metal => 1,
+        }
+    );
     assert_eq!(
         req.colors[0].texture_ref, 43,
         "the published resolve target"
@@ -5674,7 +5504,7 @@ fn guest_runs_decline_on_unstable_host_mappings() {
 
     // A task whose page table really does resolve `[gva, gva+16)` onto `data0`.
     let walkable = |stable: bool| -> Result<
-        Vec<crate::backend::vulkan::engine::GuestRun>,
+        Vec<crate::runtime::guest_ram::GuestRun>,
         super::vulkan::WindowRefusal,
     > {
         let mut host = FakeHost::new();
@@ -6455,7 +6285,7 @@ fn a_draw_skipped_after_an_engine_refusal_is_counted_with_the_vertices_it_cost()
     let vertices_before = store_route_count(VERTICES);
 
     let cap = crate::observe::FailCapture::start();
-    let st = encode_draw_chain(&mut state, &mut host, &mut req, true, false).0;
+    let st = super::vulkan::encode_draw_chain(&mut state, &mut host, &mut req, true, false).0;
     let lines = cap.lines();
     drop(cap);
 
@@ -7092,7 +6922,7 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
     let served = store_route_count("gvarung_resident");
 
     assert!(
-        super::try_gva_resident_sample(&mut state, &mut host, 1, 7, &tex).is_none(),
+        super::vulkan::try_gva_resident_sample(&mut state, &mut host, 1, 7, &tex).is_none(),
         "no Store has stamped this span, so nothing licenses serving a resident for it"
     );
     assert_eq!(
@@ -7121,7 +6951,7 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
     };
     note_store(&mut state, &mut host, orphan, &gpas);
     assert!(
-        super::try_gva_resident_sample(&mut state, &mut host, 1, 7, &tex).is_none(),
+        super::vulkan::try_gva_resident_sample(&mut state, &mut host, 1, 7, &tex).is_none(),
         "a stale page set stamped at this address must not answer for the one that replaced it"
     );
     assert_eq!(
@@ -7357,7 +7187,7 @@ fn a_retained_depth_stencil_state_is_served_without_reading_guest_memory() {
 
     // Nothing is published, so the only way to an answer is the registry.
     assert!(
-        super::load_depth_stencil_descriptor(&state, &host, 2, 7).is_err(),
+        super::vulkan::load_depth_stencil_descriptor(&state, &host, 2, 7).is_err(),
         "with no retained state and no guest bytes there is no answer to give"
     );
 
@@ -7372,14 +7202,14 @@ fn a_retained_depth_stencil_state_is_served_without_reading_guest_memory() {
         .register(2, 7, std::sync::Arc::new(retained.clone()));
 
     assert_eq!(
-        super::load_depth_stencil_descriptor(&state, &host, 2, 7).ok(),
+        super::vulkan::load_depth_stencil_descriptor(&state, &host, 2, 7).ok(),
         Some(retained),
         "the retained state answers with no guest read available at all"
     );
 
     assert!(state.task_depth_stencil_states.delete(2, 7));
     assert!(
-        super::load_depth_stencil_descriptor(&state, &host, 2, 7).is_err(),
+        super::vulkan::load_depth_stencil_descriptor(&state, &host, 2, 7).is_err(),
         "and the delete is a real invalidation, not a counter"
     );
 }
@@ -7584,7 +7414,10 @@ fn a_dontcare_colour_attachment_is_still_served_its_prior_contents() {
 ///
 /// Delta form, because the census map is process-global and the rest of the
 /// suite shares it.
-#[cfg(feature = "backend-vulkan")]
+///
+/// Runs on every arm. The record is decoded guest state and `observe` and
+/// nothing else, so gating it on the rail that happens to supply a pipeline
+/// count put a test of pure arithmetic on one arm for no reason.
 #[test]
 fn an_attachment_sample_count_taken_from_the_pipeline_names_where_the_samples_go() {
     use crate::runtime::decode::render::ColorAttachment;
@@ -7885,8 +7718,9 @@ fn a_span_can_be_named_without_asking_whether_its_guest_pages_are_current() {
     use crate::contract::endian::st32;
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::draw::vulkan::GvaResidentRefusal;
     use crate::runtime::draw::vulkan::{gva_resident_if_current, gva_span_identity};
-    use crate::runtime::draw::{GvaResidentRefusal, GvaSpan};
+    use crate::runtime::draw::GvaSpan;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
@@ -7970,6 +7804,7 @@ fn a_span_can_be_named_without_asking_whether_its_guest_pages_are_current() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_planes_drain_counts_every_arrival_even_past_the_ring_it_remembers() {
+    use crate::backend::PlaneDrawReader;
     // A mapping id no other test in this process shares, because the ring is
     // process-wide and keyed by it.
     let mapping_id = 0x0dda_1e01;

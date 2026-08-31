@@ -46,19 +46,14 @@ use crate::qemu::host_ops::{NullHost, QemuHost, ReimsVgpuHostOps};
 // The four names the two chapter modules below reach through `use super::*`,
 // and this module uses itself. They were the crate root's "convenience
 // re-exports used by qemu ABI and tests" and came with the registry.
+use crate::backend::Backend as _;
 use crate::model::{Device, DeviceId};
 use crate::runtime::{HostAction, HostOps};
-
-#[cfg(feature = "backend-metal")]
-type SelectedBackend = crate::backend::metal::MetalBackend;
-
-#[cfg(feature = "backend-vulkan")]
-type SelectedBackend = crate::backend::vulkan::VulkanBackend;
 
 /// Mutable protocol/backend state. The drain worker may hold this lock across
 /// shader translation and a GPU wait, so MMIO producers must never wait for it.
 struct DeviceInner {
-    device: Device<SelectedBackend>,
+    device: Device,
     /// Actions for the QEMU BH to apply after drain.
     actions: VecDeque<HostAction>,
 }
@@ -212,17 +207,6 @@ fn lock_for_drain(slot: &BoundDevice) -> parking_lot::MutexGuard<'_, DeviceInner
     inner
 }
 
-fn make_backend() -> SelectedBackend {
-    #[cfg(feature = "backend-metal")]
-    {
-        crate::backend::metal::MetalBackend::new()
-    }
-    #[cfg(feature = "backend-vulkan")]
-    {
-        crate::backend::vulkan::VulkanBackend::new()
-    }
-}
-
 /// Create a device. `ops` is the QEMU host-service table (nullable for tests).
 ///
 /// `page_shift` must be [`crate::model::PAGE_SHIFT_X86`] (12) or [`crate::model::PAGE_SHIFT_ARM64E`] (14).
@@ -236,8 +220,12 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
     let id = *id_guard;
     *id_guard = id.saturating_add(1);
     drop(id_guard);
-    let backend = make_backend();
-    let dev = Device::new(DeviceId(id), backend, page_shift);
+    // Resolve the process's backend here rather than at first draw: on the
+    // Metal rail this is what brings up the `MTLDevice`, and a host with none
+    // says so on the fail channel at create, in front of the guest work that
+    // would otherwise be the first to notice.
+    crate::observe::off(format!("backend_selected name={}", backend_name()));
+    let dev = Device::new(DeviceId(id), page_shift);
     let intr_disp = Arc::clone(&dev.state.gfx.interrupt_status_disp);
     let intr_gpu = Arc::clone(&dev.state.gfx.interrupt_status_gpu);
     let child_doorbell_rung = Arc::clone(&dev.state.gfx.child_doorbell_rung);
@@ -277,13 +265,13 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
         }),
     );
     // The completion thread's way back to the guest. Installed here rather than
-    // built into the engine because the engine must not know what a
-    // `BoundDevice` is, and looked up by id rather than captured by `Arc` so a
-    // stale hook cannot keep a torn-down device alive.
-    #[cfg(feature = "backend-vulkan")]
-    crate::backend::vulkan::engine::stamp_completion::install_announce(std::sync::Arc::new(
-        move |index: u32| announce_stamp_interrupt(id, index),
-    ));
+    // built into the rail because a rail must not know what a `BoundDevice` is,
+    // and looked up by id rather than captured by `Arc` so a stale hook cannot
+    // keep a torn-down device alive. Offered to whichever rail is running: one
+    // with no completion thread has nobody to announce from and drops it.
+    crate::backend::selected().install_stamp_announce(std::sync::Arc::new(move |index: u32| {
+        announce_stamp_interrupt(id, index)
+    }));
     Some(id)
 }
 
@@ -302,7 +290,6 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
 /// prompt rail call the thread-safe `notify_actions`. The stamp *word* is
 /// already in guest memory by construction: the submission that signalled this
 /// thread's timeline value wrote it.
-#[cfg(feature = "backend-vulkan")]
 fn announce_stamp_interrupt(id: u64, index: u32) {
     let Some(slot) = device_slot(id) else {
         // The device is gone, so there is no interrupt-status register to set
@@ -578,8 +565,7 @@ pub fn device_drain(id: u64) -> bool {
     // Submit any deferred draw batch before the worker sleeps: consumers
     // inside the tranche flush on their own (engine begin_entry), this bounds
     // only the idle-tail latency of the last same-target run.
-    #[cfg(feature = "backend-vulkan")]
-    crate::backend::vulkan::engine::flush_batched_draws();
+    crate::backend::selected().flush_deferred_submissions();
     let tail_us = tail_started.elapsed().as_micros() as u64;
     let boundary_started = std::time::Instant::now();
     publish_present_boundary(&slot, device.state.present.frame_flush_seen);
@@ -622,7 +608,6 @@ pub fn device_drain(id: u64) -> bool {
     // The bind registry's own levels, on that same cadence and read against the
     // `bb_retire_*` routes: what the retirements dropped, and what the survivors
     // look like.
-    #[cfg(feature = "backend-vulkan")]
     post_sweep(PostSweep::BindLevels, || {
         crate::runtime::bound_buffers::note_registry_levels(&device.state)
     });
@@ -715,11 +700,8 @@ pub fn device_poll(id: u64) -> bool {
     // the guest stops publishing. The wall clock returns already-dead resources
     // and free-pool memory; it has no authority over live residency, which is
     // governed by resource lifetime and allocation pressure.
-    #[cfg(feature = "backend-vulkan")]
-    {
-        crate::backend::vulkan::engine::maintain_resources(crate::observe::elapsed_ms() as u64);
-        crate::runtime::mapper::drain_deferred_unmaps(&mut host);
-    }
+    crate::backend::selected().maintain(crate::observe::elapsed_ms() as u64);
+    crate::runtime::mapper::drain_deferred_unmaps(&mut host);
     // Pre-boundary early-console → host window (headless-safe: the heartbeat
     // drives poll even under -display none). No-op post-boundary or with no
     // window attached.
@@ -806,15 +788,15 @@ pub fn device_pop_action(id: u64) -> Option<HostAction> {
     d.actions.pop_front()
 }
 
+/// What the process's backend calls itself, for QEMU's realize trace.
+///
+/// Asks the backend rather than restating the build's feature set. The two used
+/// to be the same claim written twice, and once a build can carry both arms they
+/// stop being: the feature set says what was compiled, and this says what is
+/// executing.
 pub fn backend_name() -> &'static str {
-    #[cfg(feature = "backend-metal")]
-    {
-        "metal"
-    }
-    #[cfg(feature = "backend-vulkan")]
-    {
-        "vulkan"
-    }
+    use crate::backend::Backend as _;
+    crate::backend::selected().name()
 }
 
 /// Run one C ABI entry body, turning a panic into `on_panic` rather than

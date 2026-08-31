@@ -47,6 +47,7 @@
 //! statement about the host rather than a loss, so it is reported once on the
 //! off channel rather than as a failure per reference.
 
+use crate::backend::Backend as _;
 use crate::runtime::guest_ram::{
     granularity, import_budget, import_span_max, GuestRamError, GuestRamImport, GuestRamRegion,
     GuestRef,
@@ -386,17 +387,14 @@ pub fn warm<H: HostOps + ?Sized>(host: &mut H) {
     if !already {
         with_map(host, |_| ());
     }
-    #[cfg(feature = "backend-vulkan")]
-    {
-        let imports = imports();
-        if !imports.is_empty() {
-            let (warmed, bytes) = crate::backend::vulkan::engine::warm_guest_ram_imports(&imports);
-            if warmed > 0 {
-                crate::observe::off(format!(
-                    "guest_ram_warm blocks={warmed} bytes={bytes} spans={}",
-                    imports.len()
-                ));
-            }
+    let imports = imports();
+    if !imports.is_empty() {
+        let (warmed, bytes) = crate::backend::selected().warm_guest_ram_imports(&imports);
+        if warmed > 0 {
+            crate::observe::off(format!(
+                "guest_ram_warm blocks={warmed} bytes={bytes} spans={}",
+                imports.len()
+            ));
         }
     }
 }

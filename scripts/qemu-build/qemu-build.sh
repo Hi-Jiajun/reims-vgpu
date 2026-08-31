@@ -7,8 +7,9 @@
 #
 # Targets:
 #   aarch64  — arm macOS guest rail for vm/boot-arm64.sh (macOS + HVF + Cocoa).
-#              Use --backend metal for host Metal or --backend vulkan for
-#              metal2vulkan through MoltenVK. Default target on Darwin.
+#              Use --backend metal for host Metal, --backend vulkan for
+#              metal2vulkan through MoltenVK, or --backend both for one binary
+#              carrying each. Default target on Darwin.
 #   x86_64   — x86 macOS guest rail for vm/boot-x86.sh. Use --backend vulkan
 #              for metal2vulkan on the Linux host. Default target on Linux.
 #
@@ -16,10 +17,19 @@
 # disabled) is committed IN the submodule, so this script does not clone or
 # patch: future device work commits directly in vendor/qemu.
 #
-# Product device reims-vgpu-mmio links crates/reims-vgpu (Cargo staticlib). Backend
-# is selected at configure/build time via --backend metal|vulkan and baked into
-# the binary — never a runtime env sniff inside the device.
+# Product device reims-vgpu-mmio links crates/reims-vgpu (Cargo staticlib). Which
+# backends are *linked in* is selected at configure/build time via
+# --backend metal|vulkan|both and baked into the binary.
 # Metal is Apple-only; non-Apple hosts use the Vulkan backend.
+#
+# `--backend both` links both and lets the device pick at run time through
+# REIMS_VGPU_RAIL. It exists for one measurement: running the same guest stream
+# through native Metal and through MoltenVK is how a metal2vulkan translation
+# defect is told apart from a defect in this device, and with one backend per
+# binary that comparison costs a rebuild — which changes the binary, the caches
+# and the boot alongside the thing being measured. Note this is still not a
+# runtime *sniff*: the set of rails is baked, and the variable can only narrow
+# it (see crates/reims-vgpu-env, REIMS_VGPU_RAIL).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -57,16 +67,23 @@ Build vendor/qemu (reims-vgpu-mmio + reims-vgpu for the selected target/backend)
 
   --target aarch64|x86_64  softmmu target (default: aarch64 on Darwin, x86_64
                            on Linux). Env: QEMU_TARGET.
-  --backend metal|vulkan   host GPU backend linked into reims-vgpu-mmio.
+  --backend metal|vulkan|both
+                           host GPU backend(s) linked into reims-vgpu-mmio.
                            Defaults by host OS. Baked at build time. Env: REIMS_VGPU_BACKEND.
-                           On non-Apple hosts, metal = Rust host stubs (linkable;
-                           encode Unsupported until filled in).
+                           `both` links Metal and Vulkan into one binary and
+                           picks between them at run time through REIMS_VGPU_RAIL;
+                           Apple hosts only, since backend-metal has no
+                           host-stub arm.
 
 Examples:
   scripts/qemu-build/qemu-build.sh
   scripts/qemu-build/qemu-build.sh --target aarch64 --backend metal
   scripts/qemu-build/qemu-build.sh --target aarch64 --backend vulkan
   scripts/qemu-build/qemu-build.sh --target x86_64 --backend vulkan
+  # One binary, two rails; run it twice and diff the fail logs:
+  scripts/qemu-build/qemu-build.sh --target aarch64 --backend both
+  REIMS_VGPU_RAIL=metal  vm/boot-arm64.sh ...
+  REIMS_VGPU_RAIL=vulkan vm/boot-arm64.sh ...
 EOF
       exit 0
       ;;
@@ -87,7 +104,7 @@ EOF
       shift
       REIMS_VGPU_BACKEND="${1:-}"
       if [ -z "$REIMS_VGPU_BACKEND" ]; then
-        echo "[qemu-build] ERROR: --backend needs metal|vulkan" >&2
+        echo "[qemu-build] ERROR: --backend needs metal|vulkan|both" >&2
         exit 1
       fi
       shift
@@ -124,21 +141,26 @@ case "$QEMU_TARGET" in
 esac
 
 case "$REIMS_VGPU_BACKEND" in
-  metal|vulkan) ;;
+  metal|vulkan|both) ;;
   *)
-    echo "[qemu-build] ERROR: unknown backend '$REIMS_VGPU_BACKEND' (metal | vulkan)" >&2
+    echo "[qemu-build] ERROR: unknown backend '$REIMS_VGPU_BACKEND' (metal | vulkan | both)" >&2
     exit 1
     ;;
 esac
 
-# Three supported arms: Metal on Apple, Vulkan/MoltenVK on Apple, Vulkan/native
-# on Linux. backend-metal off Apple has no Metal to call and is a compile_error!
-# in crates/reims-vgpu/src/lib.rs; catch it here so the message is about the build
-# choice rather than a rustc error inside meson.
-if [ "$REIMS_VGPU_BACKEND" = metal ] && [ "$(uname -s)" != Darwin ]; then
-  echo "[qemu-build] ERROR: --backend metal requires macOS (no host-stub Metal arm)" >&2
-  echo "[qemu-build]        use --backend vulkan on this host" >&2
-  exit 1
+# Metal on Apple, Vulkan/MoltenVK on Apple, Vulkan/native on Linux, and both on
+# Apple. backend-metal off Apple has no Metal to call and is a compile_error! in
+# crates/reims-vgpu/src/lib.rs; catch it here so the message is about the build
+# choice rather than a rustc error inside meson. `both` carries backend-metal
+# and so inherits the same host requirement.
+if [ "$(uname -s)" != Darwin ]; then
+  case "$REIMS_VGPU_BACKEND" in
+    metal|both)
+      echo "[qemu-build] ERROR: --backend $REIMS_VGPU_BACKEND requires macOS" >&2
+      echo "[qemu-build]        (no host-stub Metal arm); use --backend vulkan here" >&2
+      exit 1
+      ;;
+  esac
 fi
 
 export REIMS_VGPU_BACKEND

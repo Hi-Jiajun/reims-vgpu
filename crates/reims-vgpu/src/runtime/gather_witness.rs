@@ -659,10 +659,7 @@ impl GatherWitness {
 /// Every run's `host_ptr` must be a live mapping of at least `len` bytes — the
 /// same precondition the gather itself relies on, read at the same point in the
 /// draw.
-pub(crate) unsafe fn fold_runs(
-    runs: &[crate::backend::vulkan::engine::GuestRun],
-    span: u64,
-) -> u128 {
+pub(crate) unsafe fn fold_runs(runs: &[crate::runtime::guest_ram::GuestRun], span: u64) -> u128 {
     let mut a: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut b: u64 = 0xc2b2_ae3d_27d4_eb4f;
     let mut remaining = span;
@@ -780,22 +777,15 @@ impl PendingWrites {
     /// `settle_guest_writes_unless_disjoint` opens with — so a bind with nothing
     /// outstanding pays what it paid before.
     fn over(gpas: &[u64]) -> Self {
-        #[cfg(feature = "backend-vulkan")]
-        {
-            use crate::backend::vulkan::engine::GuestWriteReach as Reach;
-            if !crate::backend::vulkan::engine::guest_writes_outstanding() {
-                return Self::Disjoint;
-            }
-            match crate::backend::vulkan::engine::guest_writes_reaching(gpas) {
-                Reach::Disjoint => Self::Disjoint,
-                Reach::Overlap => Self::Overlap,
-                Reach::Unnamed => Self::Unnamed,
-            }
+        use crate::backend::{Backend as _, GuestWriteReach as Reach};
+        let backend = crate::backend::selected();
+        if !backend.guest_writes_outstanding() {
+            return Self::Disjoint;
         }
-        #[cfg(not(feature = "backend-vulkan"))]
-        {
-            let _ = gpas;
-            Self::Disjoint
+        match backend.guest_writes_reaching(gpas) {
+            Reach::Disjoint => Self::Disjoint,
+            Reach::Overlap => Self::Overlap,
+            Reach::Unnamed => Self::Unnamed,
         }
     }
 
@@ -825,7 +815,7 @@ pub struct GatherWindow<'a> {
     /// Page-aligned guest addresses the window covers, in window order.
     pub gpas: &'a [u64],
     /// Coalesced host spans the gather reads, covering `span` bytes in order.
-    pub runs: &'a [crate::backend::vulkan::engine::GuestRun],
+    pub runs: &'a [crate::runtime::guest_ram::GuestRun],
     /// Byte length of the window.
     pub span: u64,
     /// Guest page size the `gpas` are expressed in.
@@ -1539,7 +1529,7 @@ fn observe<M: crate::runtime::host::HostOps>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::vulkan::engine::GuestRun;
+    use crate::runtime::guest_ram::GuestRun;
 
     const KEY: GatherKey = GatherKey::Mapping {
         mid: 11,

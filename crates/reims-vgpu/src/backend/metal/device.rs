@@ -9,40 +9,277 @@
 //! two producers and the arm a reader landed on was arbitrary.
 
 use crate::backend::metal::runtime::system_device;
-use crate::backend::Backend;
+use crate::backend::{Backend, CensusSite, MipmapGeneration, Rail};
+use crate::contract::mipmap::MetalMipmapError;
+use crate::model::{DeviceInfoLimits, DeviceState};
+use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus};
+use crate::runtime::compute_session::{self, ComputeSession};
+use crate::runtime::decode::compute::Command as ComputeCommand;
+use crate::runtime::draw::{self, DrawEncodeRequest, EncodeStatus};
+use crate::runtime::host::{HostMemory, HostOps};
+use crate::runtime::mipmap::MipmapStatus;
 
-/// Device lifecycle handle; product encode is the C ABI in `ffi`.
+/// The Metal rail's [`Backend`] handle.
 ///
-/// `ready` and `name` have no caller outside this file's test, and `ready` is
-/// kept anyway because `new`'s `system_device()` call is the side effect that
-/// first creates the process-global `MTLDevice`. Dropping the field to quiet
-/// the lint would move when that happens.
-#[allow(dead_code)]
-#[derive(Debug, Default)]
-pub struct MetalBackend {
-    ready: bool,
-}
+/// Fieldless, because there is no per-device Metal state to hold: the
+/// `MTLDevice` is [`system_device`]'s process-global `OnceCell` and the command
+/// queues are thread-locals beside it. This carried a `ready: bool` that nothing
+/// read, kept only because constructing it was what first created that
+/// `MTLDevice` — a side effect hidden in a constructor, which is why the probe
+/// is now [`Self::probe`] and says so in its name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MetalBackend;
 
-#[allow(dead_code)] // `ready` and `name` — see the type's doc.
 impl MetalBackend {
-    pub fn new() -> Self {
-        Self {
-            ready: system_device().is_some(),
+    /// Bring up the process's `MTLDevice` and report whether the host has one.
+    ///
+    /// The probe is the structural capability a build carrying both rails
+    /// selects on — "this host can execute Metal" — and it is measured, never
+    /// inferred from a device name. On a Metal-only build the answer cannot
+    /// change what runs, so it is recorded and the handle is returned either
+    /// way; refusing here would replace "the draw found no Metal device" with a
+    /// failure at device create, which names the wrong thing.
+    pub fn probe() -> Self {
+        if system_device().is_none() {
+            crate::observe::fail(
+                "backend_probe reason=metal_no_system_device \
+                 (this host exposes no MTLDevice)",
+            );
         }
+        Self
     }
 
-    pub fn ready(&self) -> bool {
-        self.ready
-    }
-
-    pub fn name(&self) -> &'static str {
-        "metal"
+    /// Whether this host exposes an `MTLDevice` at all.
+    pub fn available() -> bool {
+        system_device().is_some()
     }
 }
 
 impl Backend for MetalBackend {
-    fn reset(&mut self) {
+    fn name(&self) -> &'static str {
+        Rail::Metal.name()
+    }
+
+    fn reset(&self) {
         crate::runtime::icb::clear_icb_cache();
+    }
+
+    fn encode_draw_chain<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        req: &mut DrawEncodeRequest,
+        writeback_guest: bool,
+        force_full_store: bool,
+    ) -> (EncodeStatus, Option<Vec<u8>>) {
+        draw::metal::encode_draw_chain(state, host, req, writeback_guest, force_full_store)
+    }
+
+    fn execute_dispatch<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        acc: &ComputeAccum,
+        cmd: &ComputeCommand,
+    ) -> ComputeStatus {
+        compute_exec::metal::execute_dispatch_metal(state, host, task_id, acc, cmd, None)
+    }
+
+    #[allow(clippy::result_large_err, reason = "see the `Backend` declaration")]
+    fn open_compute_session(&self, dispatch_type: u32) -> Result<ComputeSession, ComputeStatus> {
+        compute_session::metal::MetalSession::open(dispatch_type).map(ComputeSession::from_metal)
+    }
+
+    fn execute_dispatch_nested<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        acc: &ComputeAccum,
+        cmd: &ComputeCommand,
+        session: &mut ComputeSession,
+    ) -> ComputeStatus {
+        // `None` cannot happen: `backend::selected()` is latched, so every
+        // session in this process was opened by this rail. Named rather than
+        // unwrapped, because a panic must never cross the QEMU FFI boundary.
+        let Some(rail) = session.metal_mut() else {
+            return ComputeStatus::NoMetal("compute_nested_session_not_metal");
+        };
+        compute_exec::metal::execute_dispatch_metal(state, host, task_id, acc, cmd, Some(rail))
+    }
+
+    fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        req: &DrawEncodeRequest,
+        icb_ref: u32,
+        range_location: u64,
+        range_length: u64,
+    ) -> EncodeStatus {
+        draw::metal::encode_icb_execute_and_writeback(
+            state,
+            host,
+            req,
+            icb_ref,
+            range_location,
+            range_length,
+        )
+    }
+
+    /// This rail serves an Apple GPU to an Apple guest, so the table's own
+    /// values already describe the executing device and there is nothing to
+    /// reduce. Saturating rather than reflecting is deliberate: every one of
+    /// these keys bounds what the guest's *own* Metal will then ask this device
+    /// to run, and the guest's Metal is the same framework version running on
+    /// the same silicon, so a smaller number here would refuse work the host
+    /// can execute. The rail that has to reduce is the one whose host GPU is
+    /// not the guest's — see [`crate::backend::vulkan::VulkanBackend`].
+    fn device_info_limits(&self) -> DeviceInfoLimits {
+        DeviceInfoLimits {
+            max_sample_count: u32::MAX,
+            d24_stencil8: true,
+            max_threads_per_threadgroup: [u32::MAX; 3],
+            max_threadgroup_memory_bytes: u32::MAX,
+            native_fp16: true,
+        }
+    }
+
+    /// Apple GPUs report 1024 and 32 across every family the arm64 pathway
+    /// targets, and by the argument in [`Self::device_info_limits`] the GPU
+    /// behind this rail is one of them.
+    fn compute_threadgroup_limits(&self) -> (u32, u32) {
+        (1024, 32)
+    }
+
+    fn emit_census(&self, site: CensusSite) {
+        // One line, at one site. The other three are engine counters, phase
+        // windows and a mutex census that this rail has no counterpart for —
+        // absent rather than zeroed, so a reader cannot mistake "no such engine"
+        // for "an idle one".
+        if site == CensusSite::Levels {
+            crate::runtime::drain::census::metal::emit_object_cache_levels();
+        }
+    }
+
+    fn generate_mipmap_chain(
+        &self,
+        texture_ref: u32,
+        fmt: u16,
+        width: u32,
+        height: u32,
+        levels: u32,
+        level0: &[u8],
+    ) -> MipmapGeneration {
+        match super::mipmap::generate_mipmaps_filtered(fmt, width, height, levels, level0) {
+            Ok(chain) => MipmapGeneration::Chain(
+                chain
+                    .into_iter()
+                    .map(|level| (level.width, level.height, level.tight_bytes))
+                    .collect(),
+            ),
+            // Correct but slower: let the caller run the shared box filter, and
+            // make the missing device visible as a typed degradation. This is
+            // the *only* error that declines rather than refuses — every other
+            // one means the filtered path was available and rejected the work.
+            Err(error @ MetalMipmapError::NoDevice) => {
+                crate::observe::Emit::decline("mipmap_metal_fallback", &error)
+                    .field("texture", texture_ref)
+                    .field("format", format!("{fmt:#x}"))
+                    .field("width", width)
+                    .field("height", height)
+                    .off();
+                MipmapGeneration::Unfiltered
+            }
+            Err(error) => MipmapGeneration::Refused(MipmapStatus::Metal(error)),
+        }
+    }
+
+    #[cfg(feature = "host-window")]
+    fn presents_host_window(&self) -> bool {
+        // The drawable half of that window is `super::window`, so this rail can
+        // fill one. Whether this *build* compiled a window at all is a
+        // different question with a different owner — `device::window_publish`,
+        // where the `host-window` feature is asked.
+        true
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_attach(
+        &self,
+        surface: &crate::backend::window::WindowSurface,
+    ) -> Result<(), crate::backend::window::WindowDecline> {
+        super::window::attach(surface).map_err(window_decline)
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_attached(&self) -> bool {
+        super::window::attached()
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_present(
+        &self,
+        resident: Option<&crate::backend::window::WindowResident>,
+        cpu: Option<crate::backend::window::WindowCpuFrame<'_>>,
+    ) -> Result<crate::backend::window::WindowPresentOutcome, crate::backend::window::WindowDecline>
+    {
+        if resident.is_some() {
+            // Unreachable through the publish path — this rail's
+            // `window_resident` refuses, so nothing ever parks one for it — and
+            // typed rather than ignored because reaching it means the publisher
+            // and the presenter disagree about which rail is running, which is
+            // exactly the class of defect a `--backend both` binary exists to
+            // make visible.
+            return Err(crate::backend::window::WindowDecline::Refused(
+                crate::backend::window::WindowDeclineReason::ResidentFromOtherRail,
+            ));
+        }
+        super::window::present(cpu).map_err(window_decline)
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_resize(&self, width: u32, height: u32) {
+        super::window::resize(width, height);
+    }
+
+    #[cfg(feature = "host-window")]
+    fn window_detach(&self) {
+        super::window::detach();
+    }
+
+    // The rest of `Backend` takes the trait's defaults, and each default is the
+    // accurate statement for this rail rather than a stub:
+    //
+    // * The two blit fast paths, the resident census, and `window_resident` —
+    //   no resident registry to copy out of, to count, or to name a present
+    //   from, so the host window takes this rail's CPU frames.
+    // * The guest-memory group — this rail's Store is a host copy that has
+    //   already executed when it returns, so nothing is ever outstanding, it
+    //   holds no alias of guest RAM past the call, and it pins no linear
+    //   resident to release.
+    // * The cadence pair — nothing is batched or deferred, so there is nothing
+    //   for the heartbeat or the drain tail to flush.
+}
+
+/// Which disposition one of this rail's window refusals carries.
+///
+/// The window acts on exactly one distinction — a presenter that is *gone* gets
+/// rebuilt — and only this rail knows which of its refusals means that. Losing
+/// the presenter is losing the `CAMetalLayer`, and the layer is dropped in
+/// exactly one place: `window::detach`, from the window's own `exiting`. Every
+/// other refusal leaves a presenter standing and is named and dropped.
+#[cfg(feature = "host-window")]
+fn window_decline(
+    error: super::window::MetalWindowDecline,
+) -> crate::backend::window::WindowDecline {
+    let lost = matches!(error, super::window::MetalWindowDecline::NotAttached);
+    let reason = crate::backend::window::WindowDeclineReason::Metal(error);
+    if lost {
+        crate::backend::window::WindowDecline::PresenterLost(reason)
+    } else {
+        crate::backend::window::WindowDecline::Refused(reason)
     }
 }
 
@@ -57,6 +294,7 @@ mod tests {
     fn the_probe_finds_a_device_and_the_backend_reports_it_ready() {
         assert!(system_device().is_some());
         assert!(system_device_name().is_some());
-        assert!(MetalBackend::new().ready());
+        assert!(MetalBackend::available());
+        assert_eq!(MetalBackend::probe().name(), "metal");
     }
 }

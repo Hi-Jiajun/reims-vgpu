@@ -10,16 +10,6 @@ use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
 use crate::runtime::host::FakeHost;
 
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn a_store_recorded_by_its_draw_needs_no_second_engine_sync() {
-    assert!(!guest_store_needs_separate_sync(true));
-    assert!(
-        guest_store_needs_separate_sync(false),
-        "an older or fallback engine result must retain the synchronization transaction"
-    );
-}
-
 /// `mapping_geom_window` puts each measurement in the field of its own name.
 ///
 /// `SurfaceWindow`'s four fields are two `u64`s and two `u32`s, so
@@ -81,250 +71,6 @@ fn the_surface_window_names_which_measurement_is_which() {
         }
     )
     .is_none());
-}
-
-/// A tight full-page-aligned surface names exactly the pages its bytes
-/// occupy, and no more.
-///
-/// The last page is the one holding the last *texel*, not the one holding
-/// `bpr * height`. A plan that rounded up to the row pitch would hand the GPU
-/// write access to a page past the surface on every flush of a padded layout,
-/// and the guest owns whatever is in it.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn a_tight_window_names_the_pages_its_texels_occupy() {
-    // 1920x1080 BGRA8, tight, starting at offset 0 of a 4 KiB-page guest.
-    let (page, bpr) = (4096u64, 1920 * 4u32);
-    let span = u64::from(bpr) * 1080;
-    let plan = plan_guest_window(usize::MAX, page, 0, span, bpr, 1920, RGBA8_BPP)
-        .expect("a tight window plans");
-    assert_eq!(plan.first_page, 0);
-    assert_eq!(plan.last_page, ((span - 1) / page) as usize);
-    assert_eq!(plan.in_page, 0);
-    assert_eq!(plan.row_length_texels, 1920);
-    // Exactly the pages the bytes are in: 1920*4*1080 is a whole number of
-    // 4 KiB pages, so the last texel is the last byte of the last one.
-    assert_eq!(plan.pages() as u64, span / page);
-}
-
-/// A window starting part-way into a page reports that offset, and the page
-/// it starts in is the first the guest reference names.
-///
-/// This is the whole reason the plan exists. The reference starts at a page
-/// boundary and the sample window does not, so a copy that took the window's
-/// mapping offset as its `bufferOffset` would land the frame `first_page *
-/// page_size` bytes early — off the front of the reference entirely for any
-/// surface past the first page.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn a_window_starting_inside_a_page_carries_the_offset_and_not_the_mapping_one() {
-    let (page, bpr) = (4096u64, 256 * 4u32);
-    let base = 3 * page + 512;
-    let span = base + u64::from(bpr) * 8;
-    let plan = plan_guest_window(usize::MAX, page, base, span, bpr, 256, RGBA8_BPP).expect("plans");
-    assert_eq!(plan.first_page, 3);
-    assert_eq!(plan.in_page, 512);
-    // Not the mapping offset: that is the bug this asserts against.
-    assert_ne!(plan.in_page, base);
-}
-
-/// Page shift is explicit, so the same window plans differently on the two
-/// guests. A helper that assumed 4 KiB would name four times too many pages
-/// on arm64 and expose three quarters of a surface it was never asked for.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn the_same_window_spans_fewer_pages_on_a_sixteen_kilobyte_guest() {
-    let bpr = 1024 * 4u32;
-    let span = u64::from(bpr) * 64;
-    let x86 =
-        plan_guest_window(usize::MAX, 4096, 0, span, bpr, 1024, RGBA8_BPP).expect("plans on x86");
-    let arm = plan_guest_window(usize::MAX, 16384, 0, span, bpr, 1024, RGBA8_BPP)
-        .expect("plans on arm64");
-    assert_eq!(x86.pages(), arm.pages() * 4);
-}
-
-/// A padded guest pitch travels as texels, because that is what
-/// `bufferRowLength` is. The inter-row bytes are never named, so the guest's
-/// own content in the padding survives the flush — matching the copying
-/// rail, which writes row by row and skips it too.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn a_padded_pitch_becomes_a_row_length_in_texels() {
-    let bpr = 2048 * 4u32;
-    let plan = plan_guest_window(
-        usize::MAX,
-        4096,
-        0,
-        u64::from(bpr) * 4,
-        bpr,
-        1600,
-        RGBA8_BPP,
-    )
-    .expect("plans");
-    assert_eq!(plan.row_length_texels, 2048);
-}
-
-/// A plane's pitch is a count of **its own** texels, so a wider destination
-/// resolves the same byte pitch to fewer of them.
-///
-/// `bufferRowLength` is what this number becomes, and Vulkan multiplies it by
-/// the image's texel size to space the rows. Dividing a half-float plane's byte
-/// pitch by four reports twice as many texels as the row holds — a value that
-/// passes every validity rule and lands every row after the first at half its
-/// true spacing, so the frame arrives sheared into the top half of the window
-/// with no refusal anywhere. Both spellings are asserted from one byte pitch,
-/// because the defect is the *relation* between them and either one alone reads
-/// as correct.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn a_pitch_resolves_to_the_destinations_own_texels() {
-    use crate::contract::pixel_format::RGBA16F_BPP;
-    // One tightly-packed row of 256 half-float RGBA texels.
-    let bpr = 256 * RGBA16F_BPP;
-    let span = u64::from(bpr) * 4;
-    let wide = plan_guest_window(usize::MAX, 4096, 0, span, bpr, 256, RGBA16F_BPP)
-        .expect("a half-float plane plans");
-    assert_eq!(
-        wide.row_length_texels, 256,
-        "a tight row is exactly the frame's width in the destination's texels"
-    );
-    let narrow = plan_guest_window(usize::MAX, 4096, 0, span, bpr, 256, RGBA8_BPP)
-        .expect("the same bytes as an eight-bit plane plans");
-    assert_eq!(
-        narrow.row_length_texels,
-        wide.row_length_texels * 2,
-        "the same byte pitch is twice as many texels at half the width"
-    );
-    // And a pitch that is whole texels at four bytes but not at eight is
-    // refused for the wide destination rather than truncated into one.
-    assert_eq!(
-        plan_guest_window(usize::MAX, 4096, 0, span, bpr + RGBA8_BPP, 256, RGBA16F_BPP),
-        Err(GpuWritebackDecline::PitchNotTexels {
-            bpr: bpr + RGBA8_BPP
-        })
-    );
-}
-
-/// Every value a `VkBufferImageCopy` cannot express declines by name rather
-/// than being rounded into one it can.
-///
-/// `bufferOffset` must be a multiple of the texel block size and
-/// `bufferRowLength` is counted in texels; a copy submitted with either one
-/// wrong is undefined behaviour, not a misplaced frame, so neither may be
-/// silently repaired.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn a_geometry_the_copy_cannot_express_declines_by_name() {
-    // A row pitch that is not a whole number of texels.
-    assert_eq!(
-        plan_guest_window(usize::MAX, 4096, 0, 4096, 1023, 1, RGBA8_BPP),
-        Err(GpuWritebackDecline::PitchNotTexels { bpr: 1023 })
-    );
-    // A window starting on an odd byte inside its page.
-    assert_eq!(
-        plan_guest_window(usize::MAX, 4096, 2, 4096, 4, 1, RGBA8_BPP),
-        Err(GpuWritebackDecline::OffsetNotTexelAligned { in_page: 2 })
-    );
-    // A page list that stops before the window does. Writing anyway would
-    // export whatever the shorter list's tail happens to name.
-    assert_eq!(
-        plan_guest_window(2, 4096, 0, 3 * 4096, 4, 1, RGBA8_BPP),
-        Err(GpuWritebackDecline::PageListShort { need: 3, have: 2 })
-    );
-    // An empty or inverted window has no destination at all.
-    assert_eq!(
-        plan_guest_window(usize::MAX, 4096, 100, 100, 4, 1, RGBA8_BPP),
-        Err(GpuWritebackDecline::NotWritable)
-    );
-    // A pitch narrower than the frame. Vulkan requires `bufferRowLength` to
-    // be zero or at least the extent's width, so this is an invalid copy
-    // rather than a tight one — and a plan that let it through would submit
-    // it, because nothing else in the path re-derives the row length.
-    assert_eq!(
-        plan_guest_window(usize::MAX, 4096, 0, 4096, 4 * 8, 9, RGBA8_BPP),
-        Err(GpuWritebackDecline::PitchNotTexels { bpr: 32 })
-    );
-}
-
-/// "This host cannot import" and "these pages would not resolve" are different
-/// findings and must not share a name.
-///
-/// They did, twice, from opposite directions, and the fix for the first is
-/// what made the second reachable.
-///
-/// Originally both `granularity()` returning `None` and any refusal from
-/// `guest_ram_map` returned `NoGuestImport`, so a driven x86 boot printed
-/// twenty `gpuwb_no_guest_import` lines — one per 1080p mapping — on a host
-/// whose `vk_caps` said `host_pointer_import=supported`. The real cause was
-/// `Scattered`, reported by `guest_ram_map` exactly once for the whole boot
-/// because `report_once` latches on `first_sight`. Ranking the fail channel by
-/// `reason=`, the documented way to read that log, put the twenty at the top
-/// under a name that contradicted the capability line.
-///
-/// Splitting them fixed that and left two spellings of "this host cannot
-/// import" — a granularity read here and the resolution over in
-/// `guest_ram_map` — which is the divergence class in its own right. So the
-/// distinction now rides on `via=` rather than on the slug: one variant, one
-/// authority (`guest_ram_map::standing_refusal`), and the inner check named on
-/// every record.
-///
-/// The `assert_ne!`s are the regression. What must never come back is two
-/// records that a `reason=` ranking cannot tell apart — whichever field
-/// carries the difference.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn a_refused_page_list_does_not_report_itself_as_a_host_without_the_import() {
-    use crate::observe::Decline;
-    use crate::runtime::guest_ram_map::MapRefusal;
-
-    let via = |d: &GpuWritebackDecline| {
-        d.fields()
-            .into_iter()
-            .find(|(k, _)| *k == "via")
-            .map(|(_, v)| v)
-    };
-
-    let scattered = GpuWritebackDecline::GuestRefRefused {
-        refusal: MapRefusal::Scattered {
-            pages: 32,
-            runs: 9,
-            first: 0x39bb_6a000,
-        },
-    };
-    let no_import = GpuWritebackDecline::GuestRefRefused {
-        refusal: MapRefusal::NoBackendImport,
-    };
-    assert_ne!(
-        via(&scattered),
-        via(&no_import),
-        "a refused page list must not read as a host that cannot import"
-    );
-    assert_eq!(
-        via(&no_import).as_deref(),
-        Some("guest_ram_map_no_backend_import"),
-        "the host-wide statement still names itself, on the record rather than \
-         on one line elsewhere in the log"
-    );
-
-    // The check that refused, and its own numbers, on this record.
-    let fields = scattered.fields();
-    assert_eq!(via(&scattered).as_deref(), Some("guest_ram_map_scattered"));
-    assert_eq!(
-        fields
-            .iter()
-            .find(|(k, _)| *k == "pages")
-            .map(|(_, v)| v.as_str()),
-        Some("32")
-    );
-    // A host-wide fact has nothing per-record to carry beyond its own name.
-    assert_eq!(no_import.fields().len(), 1);
-
-    // A different inner check must reach the log differently, or carrying it
-    // buys nothing.
-    let not_in_import = GpuWritebackDecline::GuestRefRefused {
-        refusal: MapRefusal::GpaNotInAnyImport { gpa: 0x1000 },
-    };
-    assert_ne!(via(&not_in_import), via(&scattered));
 }
 
 /// The gap walk is what both writeback paths subtract their skipped ranges
@@ -669,72 +415,6 @@ fn a_writeback_refused_because_the_geometry_moved_says_so_by_name() {
     }
 }
 
-/// The type-11 licence judges the window it is given, not the surface's extent.
-///
-/// A render Store's destination *is* the surface, so that caller refuses a frame
-/// whose rect is not the mapping's latched geometry — the test above drives
-/// exactly that, and it stays where it belongs, in the caller. A compute
-/// dispatch's destination is not a scanout: writing a sub-rectangle of a surface
-/// is ordinary, and the licence resolving its own full-extent window refused
-/// every one of them. On a driven macos-13 boot that was 15 of the 19 remaining
-/// compute readbacks, all `GeometryMoved`, at extents like 44x26 of a 64x64
-/// surface and 128x512 of a 512x512 one.
-///
-/// So the assertion is that extent is no longer a *term*: a sub-rectangle and a
-/// whole-surface destination over the same mapping must reach the same decline,
-/// and it must not be `GeometryMoved`. `FakeHost` publishes no guest-RAM import,
-/// so both stop at the reference gate — which is downstream of every rule the
-/// licence still owns, and therefore says both got through all of them.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn a_type11_licence_judges_the_callers_window_and_not_the_surfaces_extent() {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::model::PAGE_SHIFT_X86;
-    const PAGE: u64 = 1 << PAGE_SHIFT_X86;
-
-    let mut state = DeviceState::new(DeviceId(9), PAGE_SHIFT_X86);
-    let mut host = FakeHost::new();
-    let base_pfn = 0x40u32;
-    host.map_range(
-        (base_pfn as u64) << PAGE_SHIFT_X86,
-        16 * PAGE as usize,
-        0x55,
-    );
-    state.map_surface(7);
-    state.attach_mapping_internal(7, 0);
-    let m = state.mappings.get_mut(&7).unwrap();
-    m.mapping_internal = 1;
-    m.page_entries = (0..16)
-        .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
-        .collect();
-    assert!(state.set_mapping_geom(7, 64, 64, MTL_FORMAT_BGRA8_UNORM));
-
-    let held = crate::backend::vulkan::translate::pixel::vk_texel_layout(
-        pixel_format::store_texel_order(MTL_FORMAT_BGRA8_UNORM).expect("BGRA8 has a linear texel"),
-    );
-    let dest = |width, height| Type11SurfaceDestination {
-        mapping_id: 7,
-        base_off: 0,
-        bpr: 64 * 4,
-        span_end: u64::from(height) * 64 * 4,
-        width,
-        height,
-        format: MTL_FORMAT_BGRA8_UNORM,
-    };
-
-    let whole = licence_type11_surface(&mut state, &mut host, held, &dest(64, 64));
-    let part = licence_type11_surface(&mut state, &mut host, held, &dest(44, 26));
-    for (what, got) in [("the whole surface", whole), ("a sub-rectangle", part)] {
-        match got {
-            Err(GpuWritebackDecline::GuestRefRefused { .. }) => {}
-            other => panic!(
-                "{what} must reach the reference gate, and only that gate; got {:?}",
-                other.err()
-            ),
-        }
-    }
-}
-
 #[test]
 fn writing_guest_pages_moves_the_host_write_record_and_reading_them_does_not() {
     use crate::model::PAGE_SHIFT_X86;
@@ -889,27 +569,37 @@ fn a_skipping_write_supersedes_the_debt_instead_of_paying_it_over_the_skip() {
 
     // The whole-frame writer is unchanged and still pays: it has no ranges to
     // protect, and a debt left standing there would be read straight past.
-    assert!(state
-        .pending_writebacks
-        .arm(
-            7,
-            crate::runtime::writeback_debt::test_resident_identity(
+    //
+    // Paying is the Vulkan rail: `writeback_debt::pay` lands the owed frame out
+    // of a resident the engine holds, and the arm with no engine has no such
+    // frame — its `pay` is the unreachable stub, because nothing on that arm
+    // arms the ledger in the first place. The supersede half above is the
+    // arm-independent claim and stays ungated; this half asserts a payment only
+    // the engine can make, so it is checked where the payer exists.
+    #[cfg(feature = "backend-vulkan")]
+    {
+        assert!(state
+            .pending_writebacks
+            .arm(
                 7,
+                crate::runtime::writeback_debt::test_resident_identity(
+                    7,
+                    W,
+                    H,
+                    u64::from(map_generation),
+                ),
                 W,
                 H,
-                u64::from(map_generation),
-            ),
-            W,
-            H,
-            map_generation,
-        )
-        .is_none());
-    assert!(write_bgra8(&mut state, &mut host, 7, &frame, W * 4, W, H));
-    assert_eq!(
-        count("wbdebt_paid_named"),
-        paid0 + 1,
-        "a write with nothing to skip must still discharge the debt by paying it"
-    );
+                map_generation,
+            )
+            .is_none());
+        assert!(write_bgra8(&mut state, &mut host, 7, &frame, W * 4, W, H));
+        assert_eq!(
+            count("wbdebt_paid_named"),
+            paid0 + 1,
+            "a write with nothing to skip must still discharge the debt by paying it"
+        );
+    }
 }
 
 #[test]

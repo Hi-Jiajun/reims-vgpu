@@ -112,6 +112,7 @@ Change the default rail with:  ln -sfn <rail> $RAILS_DIR/current
 Always builds reims-vgpu-efi and reims-vgpu before boot. In-tree QEMU is rebuilt
 unless QEMU_BIN is set to something other than the default path.
 Env: GUEST_DIR RAILS_DIR RAIL RUN_DIR QEMU_BIN AVPBOOTER RAM CPUS SSH_PORT REIMS_VGPU_BACKEND
+     REIMS_VGPU_RAIL (which GPU API runs, on a --backend both build: metal | vulkan)
      (vulkan default for reims-vgpu-mmio; metal default for apple-gfx-mmio)
      TESTING_TIMEOUT QMP_DUMP_TIMEOUT GUEST_MAC
      NET=user (SLIRP, default) | NET=none (no NIC — one-time offline Setup Assistant bootstrap)
@@ -339,9 +340,25 @@ ensure_rust_tools
 build_reims_vgpu_efi
 if [ -z "${REIMS_VGPU_BACKEND:-}" ]; then
   case "$GFX_DEVICE" in
-    reims-vgpu-mmio) REIMS_VGPU_BACKEND=vulkan ;;
+    # Asking for a rail at run time is asking for the build that can honour it.
+    # Without this, `REIMS_VGPU_RAIL=metal vm/boot-arm64.sh` would build the
+    # vulkan-only binary, the device would refuse the ask as `rail_not_compiled`
+    # and run Vulkan, and the operator would read the resulting log as a Metal
+    # boot. `both` is strictly more capable than either single rail on this
+    # host, so inferring it costs nothing but the link.
+    reims-vgpu-mmio) REIMS_VGPU_BACKEND="${REIMS_VGPU_RAIL:+both}" ;;
     *) REIMS_VGPU_BACKEND=metal ;;
   esac
+  : "${REIMS_VGPU_BACKEND:=vulkan}"
+fi
+# A rail this build cannot carry is refused by the device and reported there, so
+# the boot is not wrong — but it is not the boot that was asked for, and it is
+# cheaper to say so before the build than to find it in the fail log after.
+if [ -n "${REIMS_VGPU_RAIL:-}" ] &&
+  [ "$REIMS_VGPU_BACKEND" != both ] &&
+  [ "$REIMS_VGPU_RAIL" != "$REIMS_VGPU_BACKEND" ]; then
+  die "REIMS_VGPU_RAIL=$REIMS_VGPU_RAIL needs a binary carrying it; \
+this one is --backend $REIMS_VGPU_BACKEND (use REIMS_VGPU_BACKEND=both)"
 fi
 if [ "$QEMU_BIN" = "$QEMU_BIN_DEFAULT" ]; then
   echo "boot-arm64.sh: building in-tree QEMU (scripts/qemu-build --target aarch64 --backend $REIMS_VGPU_BACKEND) ..."
@@ -456,33 +473,60 @@ else
   QEMU_ARGS+=(-nic none)   # suppress QEMU's implicit default user-mode NIC
 fi
 
-# The Vulkan product build owns its AppKit window in Rust and therefore disables
-# QEMU's Cocoa display. The Apple reference and Metal-direct builds retain Cocoa.
-# The build stamp is authoritative configure-time state, not an env-gated device
-# path; fail closed rather than accidentally run two competing display windows.
+# Both product rails own their AppKit window in Rust and therefore disable QEMU's
+# Cocoa display: the Vulkan rail fills it through a VkSurfaceKHR swapchain, the
+# Metal rail through a CAMetalLayer on the same view. Only the Apple reference
+# device (apple-gfx-mmio), which is QEMU's own and has no Rust window, retains
+# Cocoa. The build stamp is authoritative configure-time state, not an env-gated
+# device path; fail closed rather than accidentally run two competing windows.
 DISPLAY_KIND="cocoa"
+BACKEND_RAIL=""
 if [ "$GFX_DEVICE" = "reims-vgpu-mmio" ]; then
   BACKEND_STAMP="$(dirname "$QEMU_BIN")/reims-vgpu-backend.stamp"
   [ -f "$BACKEND_STAMP" ] || die \
     "missing backend stamp: $BACKEND_STAMP (rebuild with scripts/qemu-build/qemu-build.sh)"
+  # Which rails the binary carries is the stamp's to say. Which one *runs* is
+  # the stamp's too for a single-rail build, and REIMS_VGPU_RAIL's for a `both`
+  # build — the same split the device itself makes. This has to agree with
+  # `backend::resolve_rail`, because the rail is also what the Vulkan loader
+  # environment below is set for. Metal is the device's default on an Apple
+  # host, so it is the default here.
   case "$(cat "$BACKEND_STAMP")" in
-    vulkan)
-      DISPLAY_KIND="reims-host-window"
-      VULKAN_LOADER_DIR="/opt/homebrew/opt/vulkan-loader/lib"
-      MOLTENVK_ICD="/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json"
-      [ -d "$VULKAN_LOADER_DIR" ] || die \
-        "Vulkan loader not found: $VULKAN_LOADER_DIR (install Homebrew vulkan-loader)"
-      [ -f "$MOLTENVK_ICD" ] || die \
-        "MoltenVK ICD not found: $MOLTENVK_ICD (install Homebrew molten-vk)"
-      export DYLD_FALLBACK_LIBRARY_PATH="$VULKAN_LOADER_DIR${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
-      export VK_ICD_FILENAMES="$MOLTENVK_ICD"
+    vulkan) BACKEND_RAIL="vulkan" ;;
+    metal) BACKEND_RAIL="metal" ;;
+    both)
+      BACKEND_RAIL="${REIMS_VGPU_RAIL:-metal}"
+      case "$BACKEND_RAIL" in
+        metal | vulkan) ;;
+        *) die "REIMS_VGPU_RAIL=$BACKEND_RAIL is not a rail (metal | vulkan)" ;;
+      esac
+      # Exported so the device reads the same value this script chose the
+      # display from. Unset, both take their own default and agree; set, they
+      # must not disagree, and one export is what makes that impossible.
+      export REIMS_VGPU_RAIL="$BACKEND_RAIL"
       ;;
-    metal) DISPLAY_KIND="cocoa" ;;
     *) die "invalid backend stamp: $BACKEND_STAMP" ;;
   esac
+  # Every rail this device carries presents into the Rust-owned window, so the
+  # window follows the *device* and not the rail; only the loader environment
+  # below is the Vulkan rail's.
+  DISPLAY_KIND="reims-host-window"
+  if [ "$BACKEND_RAIL" = vulkan ]; then
+    VULKAN_LOADER_DIR="/opt/homebrew/opt/vulkan-loader/lib"
+    MOLTENVK_ICD="/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json"
+    [ -d "$VULKAN_LOADER_DIR" ] || die \
+      "Vulkan loader not found: $VULKAN_LOADER_DIR (install Homebrew vulkan-loader)"
+    [ -f "$MOLTENVK_ICD" ] || die \
+      "MoltenVK ICD not found: $MOLTENVK_ICD (install Homebrew molten-vk)"
+    export DYLD_FALLBACK_LIBRARY_PATH="$VULKAN_LOADER_DIR${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
+    export VK_ICD_FILENAMES="$MOLTENVK_ICD"
+  fi
 fi
 
-echo "boot-arm64.sh: device=$GFX_DEVICE class=$BOOT_CLASS rail=$RAIL_NAME snapshot=$SNAPSHOT_NAME uuid=$UUID"
+# `rail=` is the guest snapshot rail; `backend_rail=` is the GPU API executing
+# this boot. Two different senses of one word, and both belong on the line — a
+# `both` build's log is unreadable without the second.
+echo "boot-arm64.sh: device=$GFX_DEVICE class=$BOOT_CLASS rail=$RAIL_NAME snapshot=$SNAPSHOT_NAME uuid=$UUID${BACKEND_RAIL:+ backend_rail=$BACKEND_RAIL}"
 echo "boot-arm64.sh: display=$DISPLAY_KIND"
 echo "boot-arm64.sh: ssh → localhost:$SSH_PORT   serial → $SERIAL_LOG   qmp → $QMP_SOCK"
 [ -n "$TRACE_LOG" ] && echo "boot-arm64.sh: trace → $TRACE_LOG ($TRACE_SPEC)"

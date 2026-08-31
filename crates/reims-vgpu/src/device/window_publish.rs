@@ -57,7 +57,7 @@ pub(crate) struct WindowLink {
     ///
     /// The window used to find frames by polling the slot every 2 ms, which on a
     /// driven boot asked for 494 redraws a second to serve 8.7 — see
-    /// `host_window::present::ENGINE_WINDOW_REDRAW_BACKSTOP`. The publisher is
+    /// `host_window::present::WINDOW_REDRAW_BACKSTOP`. The publisher is
     /// the only thing that knows a frame exists, so it is the only thing that
     /// can end the polling.
     wake: crate::host_window::present::WindowWakeHandle,
@@ -118,9 +118,27 @@ pub(crate) struct EarlyFb {
 /// [`publish_window_frame`], called by the drain. Idempotent; `true` on success.
 #[cfg(feature = "host-window")]
 pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
+    use crate::backend::Backend as _;
     use crate::host_window::present::{
         FrameSlot, InputSink, WindowConfig, WindowMode, WindowWaker,
     };
+    // Two questions, two owners. The `cfg` above answers "did this build
+    // compile a window"; the running rail answers "is there a swapchain to fill
+    // one", and only the second can tell a `--backend both` binary's Metal boot
+    // from its Vulkan boot. Asking the feature for both is what put a `winit`
+    // event loop — and its `NSApplication` delegate — inside a Cocoa boot; see
+    // `Backend::presents_host_window`.
+    let backend = crate::backend::selected();
+    if !backend.presents_host_window() {
+        // Expected, and the operator still has to be able to read which display
+        // owned the screen this boot, so it is offline analysis rather than a
+        // refusal: nothing was dropped and no guest work was declined.
+        crate::observe::off(format!(
+            "host_window_skipped id={id} rail={} display=qemu",
+            backend.rail().name()
+        ));
+        return false;
+    }
     let Some(slot) = device_slot(id) else {
         return false;
     };
@@ -296,42 +314,31 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     if need == 0 {
         return;
     }
-    let present_identity =
-        crate::runtime::present_identity::surface_identity(state, mapping, width, height);
-    // One engine operation keeps this resident alive across the idle sweep,
-    // reclaims aged peers, and returns the direct-present decision for this
-    // exact identity and geometry.
-    let resident_present = crate::backend::vulkan::engine::prepare_window_resident_present(
-        &present_identity,
-        width,
-        height,
-    );
-    // The window presenting from the engine's own device can take the resident
-    // as it stands, so the frame never crosses host memory. `display_from_resident`
+    // Asked whether or not the window takes it: a rail may fold resident
+    // maintenance into the same transaction that answers, so the question is
+    // also what keeps this resident alive across the idle sweep.
+    let backend = crate::backend::selected();
+    let resident = backend.window_resident(state, mapping, width, height);
+    // A window presenting from the rail's own device can take the resident as
+    // it stands, so the frame never crosses host memory. `display_from_resident`
     // is what tells the NEXT capture not to read it back, and it is only set
     // when a resident actually carried this one.
-    if crate::backend::vulkan::engine::window_present_attached() && resident_present.is_ok() {
-        let resident_source = crate::backend::vulkan::engine::WindowPresentSource {
-            width,
-            height,
-            identity: present_identity,
-        };
-        let published = window_write_frame(link, width, height, Vec::new(), Some(resident_source));
-        crate::runtime::census::present_proxy::host_window_publish::note(published);
-        if published {
-            link.last = key;
-            state.present.display_from_resident = true;
-        }
-        return;
-    }
-    // Say why the direct present was not taken, because the fallback below
-    // copies the whole framebuffer through host memory on every frame and the
+    // Say why a direct present was not taken, because the fallback below copies
+    // the whole framebuffer through host memory on every frame and the
     // difference between the two is the window's frame rate. Silence here is
     // what let `direct_frac` sit at 0.00 for a whole boot with no cause named.
-    if !crate::backend::vulkan::engine::window_present_attached() {
-        crate::runtime::drain::note_store_route("winpub_window_not_attached");
-    } else if let Err(route) = resident_present {
-        crate::runtime::drain::note_store_route(route);
+    match (backend.window_attached(), resident) {
+        (true, Ok(resident)) => {
+            let published = window_write_frame(link, width, height, Vec::new(), Some(resident));
+            crate::runtime::census::present_proxy::host_window_publish::note(published);
+            if published {
+                link.last = key;
+                state.present.display_from_resident = true;
+            }
+            return;
+        }
+        (true, Err(route)) => crate::runtime::drain::note_store_route(route),
+        (false, _) => crate::runtime::drain::note_store_route("winpub_window_not_attached"),
     }
     // No resident carries this present (firmware framebuffer, a mapping the
     // compositor cleared but never rendered into, the frames after a device
@@ -391,7 +398,7 @@ fn window_write_frame(
     width: u32,
     height: u32,
     bgra: Vec<u8>,
-    resident: Option<crate::backend::vulkan::engine::WindowPresentSource>,
+    resident: Option<crate::backend::window::WindowResident>,
 ) -> bool {
     link.seq = link.seq.wrapping_add(1);
     let frame = std::sync::Arc::new(crate::host_window::present::Frame {

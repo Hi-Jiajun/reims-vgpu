@@ -1431,19 +1431,11 @@ struct GuestWriteFootprint {
     allocations: Vec<crate::runtime::guest_ram::GuestPageFootprint>,
 }
 
-/// What the ledger can say about a reader's window.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum GuestWriteReach {
-    /// Nothing outstanding lands in any of the pages asked about. The caller may
-    /// read them without settling.
-    Disjoint,
-    /// An outstanding writeback lands in one of them.
-    Overlap,
-    /// The ledger cannot say, so the caller must settle. Distinguished from
-    /// [`Self::Overlap`] because the two want opposite fixes: an overlap is a
-    /// wait genuinely owed and this is precision the ledger failed to keep.
-    Unnamed,
-}
+/// Whether an outstanding guest-page write reaches a set of pages.
+///
+/// The trait's vocabulary, re-exported under the name this module's callers
+/// already write. See [`crate::backend::GuestWriteReach`].
+pub use crate::backend::GuestWriteReach;
 
 /// Record the guest pages a writeback about to be submitted will land in.
 ///

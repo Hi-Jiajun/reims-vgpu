@@ -2230,7 +2230,7 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         swizzle: Default::default(),
     });
     req.samplers.push(
-        reims_vgpu::runtime::draw::reflected_static_sampler_resource(
+        reims_vgpu::runtime::draw::vulkan::reflected_static_sampler_resource(
             "fragment",
             reims_vgpu::runtime::spirv_bind::reflected_sampler_binding(reflected, true)
                 .expect("reflected sampler maps into the executable variant"),
