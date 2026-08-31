@@ -49,16 +49,10 @@ use crate::qemu::host_ops::{NullHost, QemuHost, ReimsVgpuHostOps};
 use crate::model::{Device, DeviceId};
 use crate::runtime::{HostAction, HostOps};
 
-#[cfg(feature = "backend-metal")]
-type SelectedBackend = crate::backend::metal::MetalBackend;
-
-#[cfg(feature = "backend-vulkan")]
-type SelectedBackend = crate::backend::vulkan::VulkanBackend;
-
 /// Mutable protocol/backend state. The drain worker may hold this lock across
 /// shader translation and a GPU wait, so MMIO producers must never wait for it.
 struct DeviceInner {
-    device: Device<SelectedBackend>,
+    device: Device,
     /// Actions for the QEMU BH to apply after drain.
     actions: VecDeque<HostAction>,
 }
@@ -212,17 +206,6 @@ fn lock_for_drain(slot: &BoundDevice) -> parking_lot::MutexGuard<'_, DeviceInner
     inner
 }
 
-fn make_backend() -> SelectedBackend {
-    #[cfg(feature = "backend-metal")]
-    {
-        crate::backend::metal::MetalBackend::new()
-    }
-    #[cfg(feature = "backend-vulkan")]
-    {
-        crate::backend::vulkan::VulkanBackend::new()
-    }
-}
-
 /// Create a device. `ops` is the QEMU host-service table (nullable for tests).
 ///
 /// `page_shift` must be [`crate::model::PAGE_SHIFT_X86`] (12) or [`crate::model::PAGE_SHIFT_ARM64E`] (14).
@@ -236,8 +219,12 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
     let id = *id_guard;
     *id_guard = id.saturating_add(1);
     drop(id_guard);
-    let backend = make_backend();
-    let dev = Device::new(DeviceId(id), backend, page_shift);
+    // Resolve the process's backend here rather than at first draw: on the
+    // Metal rail this is what brings up the `MTLDevice`, and a host with none
+    // says so on the fail channel at create, in front of the guest work that
+    // would otherwise be the first to notice.
+    crate::observe::off(format!("backend_selected name={}", backend_name()));
+    let dev = Device::new(DeviceId(id), page_shift);
     let intr_disp = Arc::clone(&dev.state.gfx.interrupt_status_disp);
     let intr_gpu = Arc::clone(&dev.state.gfx.interrupt_status_gpu);
     let child_doorbell_rung = Arc::clone(&dev.state.gfx.child_doorbell_rung);
@@ -806,15 +793,15 @@ pub fn device_pop_action(id: u64) -> Option<HostAction> {
     d.actions.pop_front()
 }
 
+/// What the process's backend calls itself, for QEMU's realize trace.
+///
+/// Asks the backend rather than restating the build's feature set. The two used
+/// to be the same claim written twice, and once a build can carry both arms they
+/// stop being: the feature set says what was compiled, and this says what is
+/// executing.
 pub fn backend_name() -> &'static str {
-    #[cfg(feature = "backend-metal")]
-    {
-        "metal"
-    }
-    #[cfg(feature = "backend-vulkan")]
-    {
-        "vulkan"
-    }
+    use crate::backend::Backend as _;
+    crate::backend::selected().name()
 }
 
 /// Run one C ABI entry body, turning a panic into `on_panic` rather than

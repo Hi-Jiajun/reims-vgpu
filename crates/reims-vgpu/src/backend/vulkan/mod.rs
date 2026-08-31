@@ -23,26 +23,30 @@ pub mod translate;
 
 use crate::backend::Backend;
 
-/// Vulkan-rail backend handle.
+/// The Vulkan rail's [`Backend`] handle.
 ///
 /// Carries no state: the device and instance live in [`engine`]'s process-global
 /// context, which spins up lazily at the first real encode so off-VM protocol
-/// tests can construct this shell without a Vulkan ICD.
-#[derive(Debug, Default)]
+/// tests can construct this shell without a Vulkan ICD. That laziness is also
+/// why there is no `probe` beside [`crate::backend::metal::MetalBackend::probe`]
+/// — asking whether an ICD is present would be the very instance creation the
+/// engine defers, and doing it at device create would put a Vulkan loader call
+/// in front of every protocol test.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VulkanBackend;
 
 impl VulkanBackend {
     pub fn new() -> Self {
         Self
     }
-
-    pub fn name(&self) -> &'static str {
-        "vulkan"
-    }
 }
 
 impl Backend for VulkanBackend {
-    fn reset(&mut self) {
+    fn name(&self) -> &'static str {
+        "vulkan"
+    }
+
+    fn reset(&self) {
         engine::reset_guest_state();
     }
 }

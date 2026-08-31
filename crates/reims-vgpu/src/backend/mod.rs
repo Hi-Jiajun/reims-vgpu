@@ -89,24 +89,127 @@ pub mod metal;
 #[cfg(feature = "backend-vulkan")]
 pub mod vulkan;
 
-/// Guest-lifetime teardown, the one thing a backend owns that the runtime
-/// cannot do for it.
+/// What the device executes guest work through.
 ///
-/// The trait is this small on purpose. It once declared the whole
-/// Metal-semantic operation set — texture create/write/read, blit, compute,
-/// render, present — and nothing ever called any of it: the runtime drives the
-/// backends directly through their own seams, so every one of those methods
-/// returned a refusal or a bare `Ok` without touching a GPU.
-pub trait Backend {
+/// The trait names the operations the runtime cannot perform itself, and
+/// nothing else. It once declared the whole Metal-semantic operation set —
+/// texture create/write/read, blit, compute, render, present — and nothing
+/// called any of it, because the runtime reached the two backends through
+/// same-named free functions that a `cfg` chose between. What that cost is not
+/// tidiness: it made the two rails *unbuildable together*, so no run could
+/// answer "is this a metal2vulkan defect or a device defect" by executing the
+/// same guest stream both ways.
+///
+/// # Why a handle is `Copy` and its methods take `&self`
+///
+/// Neither backend owns its GPU. Metal's `MTLDevice` is a process-global
+/// `OnceCell` ([`metal::runtime::system_device`]) and Vulkan's context is a
+/// process-global `Lazy<Mutex<…>>` ([`vulkan::engine`]); a handle here is a
+/// *name* for one of those, not the thing itself. Saying so in the type is what
+/// lets a caller hold a backend while it mutably borrows the device state the
+/// backend is about to act on — which is every call site, because the runtime's
+/// unit of work is `(&mut DeviceState, &mut impl HostOps)`. A `&mut self`
+/// backend would have to be borrowed out of that same state and could not be.
+pub trait Backend: Copy {
+    /// What this backend calls itself on the fail channel and in QEMU's trace.
+    ///
+    /// One of the arm names `scripts/feature-matrix` builds, so a log line and
+    /// a build cell can be matched by eye.
+    fn name(&self) -> &'static str;
+
     /// Drop all state derived from the current guest lifetime.
     ///
     /// Immutable, content-keyed shader/pipeline caches may survive. Guest object
     /// identities, resident images, and aliases of guest memory must not.
-    fn reset(&mut self) {}
+    fn reset(&self);
 }
 
-/// Null backend for protocol/device tests without a GPU.
-#[derive(Default)]
-pub struct NullBackend;
+/// The backend a device executes through, resolved once per process.
+///
+/// A fieldless `Copy` enum rather than a boxed `dyn Backend`: [`Backend`]'s
+/// execution methods are generic over the host-memory type the whole runtime is
+/// generic over, so the trait is not object safe, and erasing that type would
+/// put a virtual call on the per-draw path this device is CPU-bound on. The
+/// variants are exactly the arms the build compiled, so a one-backend build
+/// dispatches through a match with one arm and the optimiser removes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectedBackend {
+    /// Native Metal on an Apple host. See [`metal`].
+    #[cfg(feature = "backend-metal")]
+    Metal(metal::MetalBackend),
+    /// Vulkan — a native ICD on Linux, MoltenVK on an Apple host. See
+    /// [`vulkan`].
+    #[cfg(feature = "backend-vulkan")]
+    Vulkan(vulkan::VulkanBackend),
+}
 
-impl Backend for NullBackend {}
+impl Backend for SelectedBackend {
+    fn name(&self) -> &'static str {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.name(),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.name(),
+        }
+    }
+
+    fn reset(&self) {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.reset(),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.reset(),
+        }
+    }
+}
+
+/// The backend this process runs on.
+///
+/// Latched, and read through this function everywhere. The choice is a property
+/// of the *process*, not of a device: both backends reach their GPU through a
+/// process-global singleton, so two devices in one QEMU could not run on
+/// different rails even if the selection were per-device. Latching also means a
+/// log covers one rail — a boot that changed its mind halfway would be two
+/// devices in one fail log, which is the reason
+/// [`crate::runtime::writeback_debt::lazy_writeback_enabled`] gives for latching
+/// its own switch.
+pub fn selected() -> SelectedBackend {
+    static SELECTED: std::sync::OnceLock<SelectedBackend> = std::sync::OnceLock::new();
+    *SELECTED.get_or_init(select)
+}
+
+/// Resolve the process's backend from what this build compiled.
+///
+/// With one arm compiled there is nothing to decide, and in particular a failed
+/// Metal probe is **not** a reason to refuse: a Metal build with no `MTLDevice`
+/// already runs today and reports the absence where a draw needs it, which
+/// names the missing device instead of the device create that came first.
+/// Probing is what a build carrying *both* arms will select on.
+fn select() -> SelectedBackend {
+    #[cfg(feature = "backend-metal")]
+    {
+        SelectedBackend::Metal(metal::MetalBackend::probe())
+    }
+    #[cfg(feature = "backend-vulkan")]
+    {
+        SelectedBackend::Vulkan(vulkan::VulkanBackend::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The process answers with one rail, the same one every time, and it is a
+    /// rail this build actually compiled.
+    #[test]
+    fn the_selected_backend_is_latched_and_names_a_compiled_arm() {
+        let first = selected();
+        assert_eq!(first, selected());
+        assert!(matches!(first.name(), "metal" | "vulkan"));
+        #[cfg(feature = "backend-metal")]
+        assert_eq!(first.name(), "metal");
+        #[cfg(feature = "backend-vulkan")]
+        assert_eq!(first.name(), "vulkan");
+    }
+}
