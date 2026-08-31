@@ -6999,6 +6999,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             for (_, use_) in &uses {
                 crate::runtime::drain::note_store_route(use_.slug());
             }
+            if let Some((gap, _)) = uses.iter().find(|(gap, use_)| {
+                gap.class == crate::runtime::draw::FragUnboundClass::Buffer
+                    && use_.is_violation()
+            }) {
+                return Err(DrawError::DrawPreparation(
+                    DrawPreparationDecline::UnboundStorageBuffer {
+                        index: gap.metal_index,
+                        binding: gap.metal_index + FRAG_BUFFER_BINDING_OFFSET,
+                    },
+                ));
+            }
             if !unbound.is_empty() {
                 // Cold path only: build the provided-index sets for the log detail.
                 let bufs: std::collections::BTreeSet<u32> =
@@ -7554,22 +7565,22 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // rather than papered over with a shape the shader did not
                 // declare — which would be a second violation wearing the
                 // repair's clothes.
-                crate::observe::fail(format!(
-                    "shader_resource_declared_unbound \
-                     reason=frag_neutral_texture_shape_unsupported \
-                     pipe={} idx={index} binding={img_bind} kind={kind:?}",
-                    req.pipeline_ref
+                return Err(DrawError::DrawPreparation(
+                    DrawPreparationDecline::UnboundTextureShapeUnsupported {
+                        index,
+                        binding: img_bind,
+                        kind: format!("{kind:?}"),
+                    },
                 ));
-                continue;
             };
             if shape.multisampled {
-                crate::observe::fail(format!(
-                    "shader_resource_declared_unbound \
-                     reason=frag_neutral_texture_multisample_unrepresentable \
-                     pipe={} idx={index} binding={img_bind} kind={kind:?}",
-                    req.pipeline_ref
+                return Err(DrawError::DrawPreparation(
+                    DrawPreparationDecline::UnboundTextureShapeUnsupported {
+                        index,
+                        binding: img_bind,
+                        kind: format!("{kind:?}"),
+                    },
                 ));
-                continue;
             }
             // A repair that succeeded, not a success: the shader samples a
             // texture whose contents this device invented, so it stays on the
@@ -9341,7 +9352,7 @@ fn type11_render_identity(
 }
 
 /// Stable shared allocation behind the type-11 primary attachment, if this
-/// host can retain the mapping view for the device lifetime.
+/// host can retain the mapping view until its explicit retirement.
 ///
 /// The mapping revalidation inside `ensure_contig_view` is part of the answer:
 /// it retires an alias when the guest has recycled any of its pages, and that

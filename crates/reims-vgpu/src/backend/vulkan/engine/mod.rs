@@ -310,6 +310,25 @@ impl EngineState {
 
 static ENGINE: Lazy<Mutex<EngineState>> = Lazy::new(|| Mutex::new(EngineState::new()));
 
+/// Host aliases whose Vulkan buffer and imported memory have both been
+/// destroyed. The QEMU callback stays outside the backend; the device heartbeat
+/// drains this queue through its own HostOps context.
+static RELEASED_HOST_ALIASES: Lazy<Mutex<Vec<(usize, usize)>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
+
+fn release_host_alias(alias: (usize, usize)) {
+    RELEASED_HOST_ALIASES.lock().push(alias);
+}
+
+pub fn take_released_host_aliases() -> Vec<(usize, usize)> {
+    std::mem::take(&mut *RELEASED_HOST_ALIASES.lock())
+}
+
+#[cfg(test)]
+pub(crate) fn publish_released_host_alias_for_test(alias: (usize, usize)) {
+    release_host_alias(alias);
+}
+
 /// Whether the current device owns a recorded batch that has not been
 /// submitted yet.
 ///
@@ -2385,12 +2404,16 @@ pub fn retire_resident_storage_content(identity: &crate::model::ComputeStorageRe
 /// allocation ends. Existing child images keep the import until their own
 /// fence-safe retirement; an allocation with no children enters the same
 /// graveyard immediately so already-recorded buffer accesses finish first.
-pub fn retire_guest_import(import_id: crate::runtime::guest_ram::ImportId) {
+pub fn retire_guest_import(
+    import_id: crate::runtime::guest_ram::ImportId,
+) -> Option<(usize, usize)> {
     let mut guard = lock_engine();
     let Some(device) = guard.owner.ctx.as_ref().map(|ctx| ctx.device.clone()) else {
-        return;
+        return None;
     };
+    let alias = guard.pools.host_ram_import_alias(import_id);
     unsafe { guard.pools.retire_guest_import(&device, import_id) };
+    alias
 }
 
 /// A synchronous compute writeback landed this resident's output in the guest's
@@ -4963,6 +4986,14 @@ pub fn maintain_resources(now_ms: u64) {
     let Some(ctx) = owner.ctx.as_ref() else {
         return;
     };
+    let result = unsafe { pools.advance_graveyard_maintenance(ctx, counters) };
+    if let Err(error) = result {
+        if matches!(error, DrawError::DeviceLost(_)) {
+            device_lost::note_device_lost_seen();
+        }
+        crate::observe::Emit::decline("vk_maintenance", &error).fail_once(0);
+        return;
+    }
     unsafe {
         pools.advance_registry_maintenance(ctx, counters, now_ms);
     }
@@ -5037,6 +5068,13 @@ pub fn counter_snapshot() -> CounterSnapshot {
     let (reg_peak, reg_peak_bytes) = eng.pools.registry_pressure_stats();
     snap.registry_non_pinned_peak = reg_peak;
     snap.registry_non_pinned_peak_bytes = reg_peak_bytes;
+    let levels = eng.pools.registry_levels();
+    snap.registry_current_count = levels.current.count as u64;
+    snap.registry_current_bytes = levels.current.bytes;
+    snap.registry_recoverable_count = levels.recoverable.count as u64;
+    snap.registry_recoverable_bytes = levels.recoverable.bytes;
+    snap.registry_pinned_count = levels.pinned.count as u64;
+    snap.registry_pinned_bytes = levels.pinned.bytes;
     let (sole_peak, sole_peak_bytes) = eng.pools.registry_sole_copy_stats();
     snap.registry_sole_copy_peak = sole_peak;
     snap.registry_sole_copy_peak_bytes = sole_peak_bytes;

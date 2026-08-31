@@ -3593,6 +3593,28 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         .reflection
         .local_size
         .expect("kernel cache admits only the requested reflected local size");
+    let threads_per_grid_push = match kernel_shader.reflection.kernel_dispatch {
+        Some(metal2vulkan::reflect::KernelDispatch::ThreadsPushConstant { offset }) => {
+            let exact = if dispatch_threads {
+                [grid_x, grid_y, grid_z]
+            } else {
+                let Some(x) = wg_x.checked_mul(tg_x) else {
+                    return ComputeStatus::BadGrid("compute_vk_grid_overflow");
+                };
+                let Some(y) = wg_y.checked_mul(tg_y) else {
+                    return ComputeStatus::BadGrid("compute_vk_grid_overflow");
+                };
+                let Some(z) = wg_z.checked_mul(tg_z) else {
+                    return ComputeStatus::BadGrid("compute_vk_grid_overflow");
+                };
+                [x, y, z]
+            };
+            Some((offset, exact))
+        }
+        Some(metal2vulkan::reflect::KernelDispatch::Workgroups)
+        | Some(metal2vulkan::reflect::KernelDispatch::ThreadsFixed { .. }) => None,
+        None => return ComputeStatus::Unsupported("compute_kernel_dispatch_missing"),
+    };
     let mut spirv = match spirv_words_le(&kernel_shader.spirv) {
         Ok(w) => w,
         Err(e) => {
@@ -4147,6 +4169,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         spirv,
         entry: "main".into(),
         grid: [wg_x, wg_y, wg_z],
+        threads_per_grid_push,
         storage_buffers,
         sampled_images,
         samplers,

@@ -764,6 +764,15 @@ engine_counters! {
     }
 
     pool_levels {
+        /// Current resident registry population and attachment bytes.
+        registry_current_count,
+        registry_current_bytes,
+        /// Current unpinned residents whose content is reproducible.
+        registry_recoverable_count,
+        registry_recoverable_bytes,
+        /// Current residents held by one or more deferred-work pins.
+        registry_pinned_count,
+        registry_pinned_bytes,
         /// High-water mark of the non-pinned resident population, in slots.
         ///
         /// The demand, with no ceiling to read it against: this population is

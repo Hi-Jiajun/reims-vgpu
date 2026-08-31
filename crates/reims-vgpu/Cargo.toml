@@ -51,7 +51,7 @@ reims-vgpu-wire = { path = "../reims-vgpu-wire" }
 reims-vgpu-paging = { path = "../reims-vgpu-paging" }
 ash = { version = "0.38", optional = true }
 # Always available for Linux MTLB→AIR→SPIR-V (encode path + probes).
-metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan.git", rev = "22358a143" }
+metal2vulkan = { git = "https://github.com/nkhaooat/metal2vulkan.git", rev = "ccd0e3a5efc3a00c1ba42d54d394f4316fbbf60a" }
 winit = { version = "0.30", optional = true }
 ash-window = { version = "0.13", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
