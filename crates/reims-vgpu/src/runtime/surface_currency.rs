@@ -81,15 +81,59 @@ pub enum SurfaceCurrency {
     WroteUnknown,
 }
 
+/// The evidence a consumer requires of the witness before it will serve a
+/// host-side copy.
+///
+/// Named at the ask rather than assumed, because the two standards are both
+/// correct and choosing wrongly is invisible: on a pathway where the witness
+/// never arms, every answer is
+/// [`GuestWriteVerdict::NoStamp`], and the two standards then mean "serve
+/// every time" and "serve never".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CurrencyStandard {
+    /// Absence of evidence to the contrary: serve unless the host actually
+    /// watched a write land in this window.
+    ///
+    /// For a consumer that has other corroboration, or whose miss costs
+    /// content the guest asked for. `NoStamp` says "nobody asked the host to
+    /// watch these pages", which is a statement about this device's arming and
+    /// not about the guest; on the boot that first measured the Vulkan sampled
+    /// ladder it was 14 092 of 14 396 cache binds, so refusing on it would turn
+    /// the rung off on the strength of a rail that was never armed.
+    NoContraryEvidence,
+    /// Positive evidence: the host watched these pages across the window and
+    /// saw nothing written.
+    ///
+    /// For a consumer whose only check this is. An attachment LOAD seed served
+    /// from a host-side copy has no rung under it to correct a stale serve —
+    /// the pass composites onto the seed and its Store publishes the composite
+    /// back over the guest's pages, so a wrong frame is *held*. Its miss costs
+    /// a guest re-read and nothing else, which is the trade
+    /// [`NoContraryEvidence`](Self::NoContraryEvidence) cannot make.
+    WatchedAndUnwritten,
+}
+
 impl SurfaceCurrency {
     /// Whether a host-side copy of this window may be served as the surface's
-    /// content.
+    /// content, under the evidence standard the consumer states.
     ///
-    /// [`Self::WroteElsewhere`] serves: the guest wrote the allocation and not
-    /// these pixels, and discarding the copy on that is the 17 Hz black desktop
-    /// the module doc records.
-    pub fn serves(&self) -> bool {
-        matches!(self, Self::Unwritten(_) | Self::WroteElsewhere)
+    /// [`Self::WroteElsewhere`] serves under both: the guest wrote the
+    /// allocation and not these pixels, and discarding the copy on that is the
+    /// 17 Hz black desktop the module doc records. The standards differ only on
+    /// the answers that are not about the guest at all — no mapping, no stamp,
+    /// an unreadable token — which
+    /// [`CurrencyStandard::NoContraryEvidence`] admits and
+    /// [`CurrencyStandard::WatchedAndUnwritten`] does not.
+    pub fn serves(&self, standard: CurrencyStandard) -> bool {
+        match standard {
+            CurrencyStandard::NoContraryEvidence => {
+                matches!(self, Self::Unwritten(_) | Self::WroteElsewhere)
+            }
+            CurrencyStandard::WatchedAndUnwritten => matches!(
+                self,
+                Self::Unwritten(GuestWriteVerdict::Clean) | Self::WroteElsewhere
+            ),
+        }
     }
 
     /// The coarse verdict this answer was reached under.
@@ -213,22 +257,57 @@ mod tests {
             GuestWriteVerdict::Unreadable,
         ] {
             assert!(
-                SurfaceCurrency::Unwritten(verdict).serves(),
+                SurfaceCurrency::Unwritten(verdict).serves(CurrencyStandard::NoContraryEvidence),
                 "{verdict:?} is not evidence of a guest write and must not refuse a copy"
             );
         }
-        assert!(
-            !SurfaceCurrency::WrotePixels(vec![(0, 4096)]).serves(),
-            "a copy of pixels the host watched the guest rewrite is not the surface"
-        );
-        assert!(
-            !SurfaceCurrency::WroteUnknown.serves(),
-            "an unnameable write fails closed"
-        );
-        assert!(
-            SurfaceCurrency::WroteElsewhere.serves(),
-            "a write outside the window leaves the window intact"
-        );
+        for state in [
+            SurfaceCurrency::WrotePixels(vec![(0, 4096)]),
+            SurfaceCurrency::WroteUnknown,
+        ] {
+            for standard in [
+                CurrencyStandard::NoContraryEvidence,
+                CurrencyStandard::WatchedAndUnwritten,
+            ] {
+                assert!(
+                    !state.serves(standard),
+                    "{state:?} is a write this device cannot rule out of the window"
+                );
+            }
+        }
+        for standard in [
+            CurrencyStandard::NoContraryEvidence,
+            CurrencyStandard::WatchedAndUnwritten,
+        ] {
+            assert!(
+                SurfaceCurrency::WroteElsewhere.serves(standard),
+                "a write outside the window leaves the window intact under {standard:?}"
+            );
+        }
+    }
+
+    /// The stricter standard admits only positive evidence, and the three
+    /// answers it drops are exactly the ones that are about this device's arming
+    /// rather than about the guest.
+    ///
+    /// This is the whole reason the standard is a parameter. A consumer whose
+    /// only check this is cannot spend `NoStamp` — on a pathway where the
+    /// hypervisor's witness never arms, every ask answers `NoStamp` and
+    /// `NoContraryEvidence` degenerates into "serve whatever the cache holds".
+    #[test]
+    fn the_strict_standard_spends_only_a_watched_clean_answer() {
+        assert!(SurfaceCurrency::Unwritten(GuestWriteVerdict::Clean)
+            .serves(CurrencyStandard::WatchedAndUnwritten));
+        for verdict in [
+            GuestWriteVerdict::NoMapping,
+            GuestWriteVerdict::NoStamp,
+            GuestWriteVerdict::Unreadable,
+        ] {
+            assert!(
+                !SurfaceCurrency::Unwritten(verdict).serves(CurrencyStandard::WatchedAndUnwritten),
+                "{verdict:?} is not a watched answer and must not satisfy the strict standard"
+            );
+        }
     }
 
     /// Only the variant that can name the guest's bytes offers a skip list. An

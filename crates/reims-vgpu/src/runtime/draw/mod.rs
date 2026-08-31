@@ -3234,6 +3234,27 @@ fn seed_color_load<M: HostMemory + HostOps>(
         if let Some(bgra) = cached {
             return Some(swap_rb_channels(bgra));
         }
+        // The third door, and the only one a target with no address of its own
+        // can reach. Both doors above are keyed on `target_gva`, so a rail whose
+        // colour attachments are mapper-ref-texture surfaces rather than GVA
+        // allocations — which is every colour target on the Metal rail — closed
+        // them by construction: one driven macos-13 Metal boot asked the ref
+        // door 201 times, was refused 201 times, and paid the full guest read
+        // for every colour LOAD in the boot. That read is the largest single
+        // cost on that rail's per-draw chain (`chain_phase`'s `seed_us`, 6.09 ms
+        // a draw over 831 draws, of which 99 % is this).
+        //
+        // Keyed on the mapping, which is the identity a mapper-ref-texture
+        // surface actually has. The entry is written by the neutral
+        // `mapping_write`, which both rails' writebacks go through and which
+        // stamps the guest-write witness in the same breath — so `Clean` here
+        // means "no guest store since this device published these pixels", and
+        // the copy is exactly the attachment's prior content.
+        if let Some(seed) =
+            seed_from_published_surface(state, host, task_id, texture_ref, width, height)
+        {
+            return Some(seed);
+        }
     }
     // normal-texture (or texture-view base) linear GVA → convert to RGBA8.
     //
@@ -3263,6 +3284,88 @@ fn seed_color_load<M: HostMemory + HostOps>(
         crate::runtime::render_writeback::SettleSite::LinearTextureSeed,
     )?;
     Some(rgba)
+}
+
+/// A colour LOAD seed taken from this device's own last publication of a
+/// mapper-ref-texture surface, when the hypervisor's witness says the guest has
+/// not repainted it since.
+///
+/// # Why this door takes the strict standard
+///
+/// A LOAD seed is the attachment's *prior content*: the pass composites onto it
+/// and the matching Store publishes the composite back over the surface's guest
+/// pages. So a stale serve is not a frame that the next rung corrects — it is a
+/// frame that becomes the surface, and the frame after loads what this one
+/// stored. There is no rung under this one that reads the entry again.
+///
+/// [`CurrencyStandard::WatchedAndUnwritten`] is what makes that safe on a
+/// pathway whose dirty-tracking witness may never arm. Under the permissive
+/// standard a rail that never stamps answers `NoStamp` to every ask, and this
+/// door would then serve whatever the cache holds, unconditionally — a
+/// compositing layer frozen on the last frame this device drew into it. Under
+/// the strict standard the same rail simply never serves, pays the guest read it
+/// pays today, and says so under `load_seed_color_surface_unwatched`.
+///
+/// The miss is cheap and the wrong serve is not, which is the whole asymmetry.
+///
+/// # What it does not cover
+///
+/// Only a *direct* mapper-ref-texture reference. A texture view onto a
+/// mapper-ref-texture base resolves through `load_sampled_rgba_static`'s view
+/// rung and is not asked about here, because the view's format override can
+/// reinterpret the storage and the cache entry records no such reinterpretation.
+///
+/// The order against `load_sampled_rgba_static`'s own first rung is safe by
+/// construction rather than by care: that rung takes `OBJECT_TYPE_TEXTURE_VIEW`
+/// and [`objects::resolve_mapper_ref_texture`] takes
+/// `OBJECT_TYPE_MAPPER_REF_TEXTURE`, and an object has one type.
+fn seed_from_published_surface<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    use crate::runtime::surface_currency::{surface_currency, CurrencyStandard, SurfaceCurrency};
+
+    if texture_ref == 0 {
+        return None;
+    }
+    let mapping_id = objects::resolve_mapper_ref_texture(state, host, task_id, texture_ref)?;
+    // The denominator. A door that served nothing because it was never reached
+    // and one that was reached and refused read identically at zero, and only
+    // the second says what the gate costs.
+    crate::runtime::drain::note_store_route("load_seed_color_surface_asked");
+    let currency = surface_currency(state, host, mapping_id, width, height);
+    if !currency.serves(CurrencyStandard::WatchedAndUnwritten) {
+        crate::runtime::drain::note_store_route(match currency {
+            // Split from the other refusals because it is the one that is not
+            // about the guest: it says this device's witness was never armed for
+            // these pages, and it is the counter that decides whether widening
+            // this door to the permissive standard is even a question.
+            SurfaceCurrency::Unwritten(_) => "load_seed_color_surface_unwatched",
+            SurfaceCurrency::WrotePixels(_) => "load_seed_color_surface_repainted",
+            SurfaceCurrency::WroteUnknown => "load_seed_color_surface_unknown",
+            // `serves` admits this under both standards, so reaching it here is
+            // a contradiction between the rule and this match rather than a
+            // guest behaviour.
+            SurfaceCurrency::WroteElsewhere => "load_seed_color_surface_impossible",
+        });
+        return None;
+    }
+    let Some(bgra) = crate::runtime::surface_cache::get_shared(state, mapping_id, width, height)
+    else {
+        // Current and empty: either this device has published nothing for the
+        // surface at this geometry yet, or the entry was ceded to a rail's
+        // resident and the frame lives there. Neither is a refusal of the
+        // witness, and naming it apart is what keeps the `unwatched` count
+        // readable.
+        crate::runtime::drain::note_store_route("load_seed_color_surface_empty");
+        return None;
+    };
+    crate::runtime::drain::note_store_route("load_seed_color_from_surface");
+    Some(swap_rb_channels(&bgra))
 }
 
 /// Resolve sampled texture RGBA without requiring Metal feature (color LOAD seed path).

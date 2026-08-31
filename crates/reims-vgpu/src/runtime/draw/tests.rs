@@ -4152,6 +4152,165 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
     assert_eq!(texture_seed, vec![0, 180, 0, 255, 0, 180, 0, 255]);
 }
 
+/// A colour LOAD seed for a mapper-ref-texture attachment is served from this
+/// device's own last publication of the surface, and only while the
+/// hypervisor's witness positively says the guest has not repainted it.
+///
+/// Both doors above this one key on `target_gva`, and a mapper-ref-texture
+/// attachment has no address of its own — so on the Metal rail, whose colour
+/// targets are all mapper-ref-texture surfaces, the cache was unreachable by
+/// construction. One driven macos-13 Metal boot asked the ref door 201 times,
+/// was refused 201 times, and paid a whole-frame guest read plus a scalar
+/// per-pixel format conversion for every colour LOAD in the boot.
+///
+/// The three legs are the whole contract, and the third is the one that keeps
+/// the first from being a hazard. A LOAD seed is the attachment's prior content
+/// and the matching Store publishes the composite back over the surface's guest
+/// pages, so there is no rung under this door to correct a stale serve: a wrong
+/// frame becomes the surface and the next frame loads what this one stored.
+/// [`CurrencyStandard::WatchedAndUnwritten`] is what makes it safe on a pathway
+/// whose dirty tracking may never arm — under the permissive standard a rail
+/// that never stamps answers `NoStamp` to every ask and this door would serve
+/// whatever the cache holds, forever.
+#[test]
+fn a_mapper_ref_texture_load_seed_serves_a_published_frame_only_on_a_watched_clean_witness() {
+    use crate::contract::endian::{st16, st32};
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_MAPPER_REF_TEXTURE,
+    };
+    use crate::runtime::gva_mem;
+    use crate::runtime::host::HostOps;
+
+    let (w, h) = (2u32, 2u32);
+    let mid = 71u32;
+    let texture_ref = 2u32;
+    let task_id = 1u32;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+
+    // A one-level page table for task 1, with three mapped leaf pages: the
+    // object list, the descriptor, and the surface's own storage.
+    let (dir_pfn, root_pfn) = (2u32, 3u32);
+    let (dir_gpa, root_gpa) = (
+        (dir_pfn as u64) << PAGE_SHIFT_X86,
+        (root_pfn as u64) << PAGE_SHIFT_X86,
+    );
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x1000, 0);
+    let mut dir = [0u8; 8];
+    st32(&mut dir[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+    st32(&mut dir[DIRECTORY_DEPTH as usize..], 1);
+    assert!(host.write_gpa(dir_gpa, &dir).is_ok());
+    for i in 0..3u32 {
+        let pfn = 4 + i;
+        host.map_range((pfn as u64) << PAGE_SHIFT_X86, 0x1000, 0);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, pfn);
+        assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
+    }
+    state.define_task(task_id, 0x1000, dir_pfn);
+    assert!(state.set_object_list(task_id, 0, 32));
+
+    // The mapper-ref-texture object: an IOSurface descriptor naming the mapping,
+    // its format and its geometry, published through the task's object list.
+    const DESC_LEN: usize = 0x20;
+    let desc_gva = 0x1000u64;
+    let mut desc = vec![0u8; DESC_LEN];
+    st32(&mut desc[0..], mid);
+    st16(&mut desc[0x16..], MTL_FORMAT_BGRA8_UNORM);
+    st32(&mut desc[0x18..], w);
+    st32(&mut desc[0x1c..], h);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[task_id],
+        desc_gva,
+        &desc,
+        PAGE_SHIFT_X86
+    )
+    .is_ok());
+    let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut list_entry,
+        u32::from(OBJECT_TYPE_MAPPER_REF_TEXTURE) | ((DESC_LEN as u32) << 8),
+    );
+    list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[task_id],
+        list_object_entry_offset(texture_ref, 32).unwrap(),
+        &list_entry,
+        PAGE_SHIFT_X86
+    )
+    .is_ok());
+
+    // The surface's own guest pages, painted a colour the cache does not hold —
+    // so "served from the cache" and "read from the guest" are distinguishable
+    // by value and not merely by a counter.
+    let page_gpa = 6u64 << PAGE_SHIFT_X86;
+    assert!(state.map_surface(mid));
+    {
+        let m = state.mappings.get_mut(&mid).expect("mapped above");
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![(6u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+    }
+    assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+    let guest_bgra = [0x11u8, 0x22, 0x33, 0xff].repeat((w * h) as usize);
+    assert!(host.write_gpa(page_gpa, &guest_bgra).is_ok());
+    const GUEST_RGBA: [u8; 4] = [0x33, 0x22, 0x11, 0xff];
+
+    // What this device last published for the surface, as `mapping_write` would
+    // have left it: BGRA in the host cache.
+    let published = [0xAAu8, 0xBB, 0xCC, 0xff].repeat((w * h) as usize);
+    crate::runtime::surface_cache::store(&mut state, mid, w, h, published);
+    const PUBLISHED_RGBA: [u8; 4] = [0xCC, 0xBB, 0xAA, 0xff];
+
+    // Leg 1 — unwatched. The cache holds the surface and the witness has not
+    // been armed, so the strict standard refuses and the guest's pages answer.
+    // This is the whole reason the standard is a parameter: the permissive one
+    // serves here, and a rail that never stamps would serve here every time.
+    let unwatched = seed_color_load(&mut state, &mut host, task_id, texture_ref, 0, w, h)
+        .expect("the guest's own pages are always a seed");
+    assert_eq!(
+        &unwatched[..4],
+        &GUEST_RGBA,
+        "an unstamped surface has no witness to spend, and the cache must not be served"
+    );
+
+    // Leg 2 — watched and clean. Arm the token and stamp it, which is what
+    // `mapping_write` does in the same breath as it fills the cache.
+    let token = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, mid)
+        .expect("FakeHost observes guest writes");
+    state
+        .mappings
+        .get_mut(&mid)
+        .expect("mapped above")
+        .guest_write_gen_at_store = host.guest_write_gen(token).expect("a live token has one");
+    let served = seed_color_load(&mut state, &mut host, task_id, texture_ref, 0, w, h)
+        .expect("a published frame under a clean witness is the attachment's prior content");
+    assert_eq!(
+        &served[..4],
+        &PUBLISHED_RGBA,
+        "with the witness clean the device's own publication is the surface, and \
+         re-reading the guest's pages is the cost this door exists to remove"
+    );
+
+    // Leg 3 — repainted. The guest CPU stores into the surface with no device
+    // operation at all, so this witness is the only thing that sees it.
+    host.guest_wrote_page(page_gpa);
+    let repainted = seed_color_load(&mut state, &mut host, task_id, texture_ref, 0, w, h)
+        .expect("a repainted surface still seeds, from its own pages");
+    assert_eq!(
+        &repainted[..4],
+        &GUEST_RGBA,
+        "the cache is a frame the guest has since painted over; serving it would \
+         composite this pass onto a stale layer and store the result back"
+    );
+}
+
 /// A draw whose colour0 LOAD seed was elided must leave the encode holding
 /// either a chain or a seed — never neither.
 ///

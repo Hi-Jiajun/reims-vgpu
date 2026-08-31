@@ -17,7 +17,7 @@ use crate::contract::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 use crate::runtime::census::srgb_census;
 use crate::runtime::decode::resource::TextureDescriptor;
 use crate::runtime::mapper::{mapping_guest_write_verdict, GuestWriteVerdict};
-use crate::runtime::surface_currency::{surface_currency, SurfaceCurrency};
+use crate::runtime::surface_currency::{surface_currency, CurrencyStandard, SurfaceCurrency};
 
 /// Vulkan image shape for a reflected Metal sampled-image dimensionality.
 ///
@@ -1403,7 +1403,10 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     crate::runtime::drain::note_store_route(route);
                 }
                 let guest_owned = currency.guest_owned_ranges();
-                let guest_replaced = !currency.serves();
+                // Every rung under this one reads the guest's own pages, so a
+                // serve this rung refuses is corrected below it rather than
+                // held: the ladder takes the permissive standard.
+                let guest_replaced = !currency.serves(CurrencyStandard::NoContraryEvidence);
 
                 // A ready resident target is authoritative after a product
                 // Store — but only while nothing has replaced the bytes it is a
@@ -2379,7 +2382,11 @@ fn resolve_mapper_ref_texture_load_seed<M: HostMemory + HostOps>(
     // them back over the guest's pages, which is the fixpoint this file's own
     // note above `mapper_ref_texture_load_currency_query` calls "renders correctly for a few
     // frames then stays corrupted".
-    let guest_replaced = !surface_currency(state, host, mapping_id, w, h).serves();
+    // The permissive standard, because this rung has one under it: rung 2 reads
+    // the surface's own guest pages, so a refusal here costs a copy and a serve
+    // this rung should not have made is the only outcome nothing corrects.
+    let guest_replaced = !surface_currency(state, host, mapping_id, w, h)
+        .serves(CurrencyStandard::NoContraryEvidence);
     if guest_replaced {
         crate::runtime::drain::note_store_route("t11seed_cache_refused_guest_wrote");
     }
