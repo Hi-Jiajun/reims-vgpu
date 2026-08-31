@@ -1450,20 +1450,24 @@ impl StagedTexture {
 /// names the resident key a sampled binding reads directly instead.
 ///
 /// Which variant a binding can receive is fixed by `is_storage`, not chosen:
-/// [`vulkan::resident_serve`]'s two arms are the two variants. That is why the
+/// [`Backend::resident_serve`]'s two arms are the two variants. That is why the
 /// consumers split the same way — the storage rail reads only the seed and the
 /// sampled rail only the source.
 ///
-/// Declared unconditionally although only the Vulkan backend can produce one,
-/// so the rails that carry the answer through a `backend-metal` build can still
-/// name its type. Each used to substitute its own loose tuple of the same
-/// fields under `cfg(not(backend-vulkan))`, spelled out once per rail.
-/// [`vulkan::resident_serve`] is the only producer and it is gated on the Vulkan
-/// backend, so on a `backend-metal` build both variants are constructed
-/// nowhere. The rails still read the type — `serve` is `None` there and their
-/// accessor calls compile unchanged — which is the whole point of declaring it
-/// unconditionally.
-#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+/// Neutral, because the question is neutral: every staging site asks the
+/// running rail what it already holds, and a rail that holds nothing answers
+/// `None` from the trait's default. The type is not a Vulkan detail leaking
+/// outward — it is the shape of the answer, and only the answer's *content*
+/// differs by rail.
+///
+/// [`Backend::resident_serve`]: crate::backend::Backend::resident_serve
+#[cfg_attr(
+    not(feature = "backend-vulkan"),
+    allow(
+        dead_code,
+        reason = "no rail this build compiled constructs one; every rail still reads the type"
+    )
+)]
 #[derive(Clone, Copy)]
 pub(crate) enum ResidentServe {
     Seed(u32),
@@ -2728,14 +2732,11 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         }
     };
     // Only the base can be resident: a resident is one window at one level.
-    #[cfg(feature = "backend-vulkan")]
     let window = level_window(&level_sources[0], &pyramid[0]);
     // Linear-window residency identity — mirrors the host_linear_textures
     // entry exactly. Absent when the stride overflows the key field (no live
     // class; such a window simply stays on the bytes path).
-    #[cfg(feature = "backend-vulkan")]
     let span = layout.row_stride.saturating_mul(h as u64);
-    #[cfg(feature = "backend-vulkan")]
     let linear_key = (layout.row_stride <= u32::MAX as u64).then(|| {
         crate::model::ComputeStorageResidencyKey::linear(
             task_id,
@@ -2749,19 +2750,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         )
     });
     let mut bytes = vec![0u8; pyramid_need];
-    #[cfg_attr(
-        not(feature = "backend-vulkan"),
-        allow(
-            unused_mut,
-            reason = "the Vulkan resident-window block below assigns it"
-        )
-    )]
-    let have_bytes = false;
     // Resident-authoritative window (deferred linear writeback): consume the
-    // engine resident without bytes when possible; otherwise flush it into the
+    // rail's resident without bytes when possible; otherwise flush it into the
     // entry first — falling through to the raw guest read would silently serve
     // the pre-chain seed pages.
-    #[cfg(feature = "backend-vulkan")]
     let resident = match (
         linear_key,
         crate::runtime::surface_cache::linear_texture_resident_gen(state, &window),
@@ -2778,17 +2770,11 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     // unwritten — which is exactly the defect the pyramid repairs — so a
     // multi-level binding reads its own bytes and the rail refuses the pair
     // outright as `vk_compute_exec_resident_sample_is_not_a_pyramid`.
-    #[cfg(feature = "backend-vulkan")]
     let serve = if level_sources.len() > 1 {
         None
     } else {
         resident.and_then(|(_, _, serve)| serve)
     };
-    // No `resident` to ask on this arm: `linear_texture_resident_gen` reads a
-    // deferred-writeback state only the engine rail arms, so there is no window
-    // to consult rather than a rail declining to answer about one.
-    #[cfg(not(feature = "backend-vulkan"))]
-    let serve: Option<ResidentServe> = None;
     if let Some(generation) = serve.and_then(ResidentServe::seed_generation) {
         crate::observe::off(format!(
             "compute_stage_linear_resident_seed task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={w}x{h} gen={generation}",
@@ -2800,8 +2786,8 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             stage_format
         ));
     }
-    if serve.is_some() || have_bytes {
-        // Engine resident serves this window; no cache/guest read.
+    if serve.is_some() {
+        // The rail's resident serves this window; no cache/guest read.
     } else {
         // Level 0 is the window built above; every level after it is the same
         // read against that level's own rows, so the cache is consulted per
