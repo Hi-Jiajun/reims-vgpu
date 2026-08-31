@@ -112,6 +112,9 @@ pub mod released_pages;
 /// Transfer a host-resident render frame into guest pages when synchronization
 /// or a guest-memory reader makes the bytes observable.
 pub mod render_writeback;
+/// A rail's own name for a resident render target, opaque to the layers that
+/// carry it. See the module doc for the ledger this exists for.
+pub mod resident_target;
 /// The guest's per-resource validity quad, from both of its producers.
 pub mod resource_validity;
 /// The split of [`chain_phase`]'s largest *undivided* column, `sampled_us`.

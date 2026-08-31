@@ -397,6 +397,38 @@ impl Backend for VulkanBackend {
         compute_exec::vulkan::resident_serve(key, mirror_generation, is_storage, pixel_format)
     }
 
+    /// This rail's targets are engine `TargetIdentity`s; a handle it did not
+    /// issue names no image it can read, and the frame is lost rather than
+    /// written from the wrong one.
+    fn pay_surface_writeback<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        mapping_id: u32,
+        target: &crate::runtime::resident_target::ResidentTarget,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        let Some(identity) = target.get::<engine::TargetIdentity>() else {
+            return false;
+        };
+        let paid = crate::runtime::render_writeback::vulkan::store_render_frame(
+            state, host, mapping_id, identity, width, height,
+        );
+        if !paid {
+            // The hold ends either way: a frame nothing will ask for again must
+            // not keep its image alive to the next device reset.
+            engine::note_resident_content_copied_out(identity);
+        }
+        paid
+    }
+
+    fn abandon_resident(&self, target: &crate::runtime::resident_target::ResidentTarget) {
+        if let Some(identity) = target.get::<engine::TargetIdentity>() {
+            engine::note_resident_content_copied_out(identity);
+        }
+    }
+
     fn preflight_translations<M: HostMemory + HostOps>(
         &self,
         state: &DeviceState,

@@ -122,6 +122,7 @@ use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::draw::{DrawEncodeRequest, EncodeStatus, GvaSpan};
 use crate::runtime::guest_ram::{GuestRamImport, ImportId};
 use crate::runtime::host::{HostMemory, HostOps};
+use crate::runtime::resident_target::ResidentTarget;
 use std::sync::Arc;
 
 /// How a rail's own completion thread announces a finished stamp back to the
@@ -906,6 +907,39 @@ pub(crate) trait Backend: Copy {
     ) -> Option<ResidentServe> {
         None
     }
+
+    /// Move the resident a writeback debt was armed against into one
+    /// mapper-ref-texture mapping's guest pages, and release this rail's hold on
+    /// that resident.
+    ///
+    /// The hold is released either way: a payment the rail cannot make still
+    /// ends the resident's `gpu_only_content` claim, because the alternative is
+    /// an image nothing will ever ask for again holding memory until the device
+    /// resets. `false` says the guest's pages did not get the pixels, so the
+    /// ledger can name the debt that was lost; the rail has already reported
+    /// *why* on the failure channel.
+    ///
+    /// A rail that arms no writeback debt never sees one, which is why the
+    /// default refuses rather than being unreachable: `ledger::pay` is neutral
+    /// and would rather report a lost frame than not compile.
+    fn pay_surface_writeback<M: HostMemory + HostOps>(
+        &self,
+        _state: &mut DeviceState,
+        _host: &mut M,
+        _mapping_id: u32,
+        _target: &ResidentTarget,
+        _width: u32,
+        _height: u32,
+    ) -> bool {
+        false
+    }
+
+    /// Release this rail's hold on a resident whose frame the guest superseded,
+    /// without writing it anywhere.
+    ///
+    /// The guest wrote the pages itself, so the frame is not owed any more; the
+    /// resident is only still alive because the debt was keeping it so.
+    fn abandon_resident(&self, _target: &ResidentTarget) {}
 }
 
 /// What a rail made of a `generateMipmaps` — the vocabulary of
@@ -1608,6 +1642,36 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.resident_serve(key, mirror_generation, is_storage, pixel_format),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.resident_serve(key, mirror_generation, is_storage, pixel_format),
+        }
+    }
+
+    fn pay_surface_writeback<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        mapping_id: u32,
+        target: &ResidentTarget,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        match self {
+            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+            Self::Metal(b) => {
+                b.pay_surface_writeback(state, host, mapping_id, target, width, height)
+            }
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => {
+                b.pay_surface_writeback(state, host, mapping_id, target, width, height)
+            }
+        }
+    }
+
+    fn abandon_resident(&self, target: &ResidentTarget) {
+        match self {
+            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+            Self::Metal(b) => b.abandon_resident(target),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.abandon_resident(target),
         }
     }
 }

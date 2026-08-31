@@ -46,8 +46,10 @@
 //! lifetime is explicit — resource discard/delete and task teardown — so an
 //! unrelated capacity limit must not invent an early synchronization point.
 
+use crate::backend::Backend as _;
 use crate::model::DeviceState;
 use crate::runtime::host::{HostMemory, HostOps};
+use crate::runtime::resident_target::ResidentTarget;
 
 /// Debts held at once, before an arm pays the oldest to make room.
 ///
@@ -57,38 +59,12 @@ use crate::runtime::host::{HostMemory, HostOps};
 /// cannot lose pixels. `wbdebt_evicted` reports when a workload reaches it.
 pub const MAX_DEBTS: usize = 32;
 
-/// The engine identity of the resident a debt's frame lives in.
-///
-/// This module is compiled on every backend arm and the ledger is backend-
-/// agnostic, but the identity of a resident is not: only the Vulkan engine has
-/// one. An alias rather than a `cfg` on the field, so [`WritebackDebt`] and
-/// [`PendingWritebacks::arm`] have **one** shape on every arm — two shapes is
-/// how a struct starts disagreeing with itself across a feature boundary, and
-/// nothing in the toolchain compares them.
-///
-/// Nothing arms a surface debt on a Metal build: the sole caller is
-/// `runtime::draw::vulkan`. The placeholder is what lets the ledger's own tests
-/// compile there anyway.
-#[cfg(feature = "backend-vulkan")]
-pub type ResidentIdentity = crate::backend::vulkan::engine::TargetIdentity;
-
-/// See the Vulkan spelling above. A named zero-sized type rather than `()`,
-/// because `()` as an argument is a clippy lint at every call site and a reader
-/// cannot tell a deliberate placeholder from a function that forgot to return.
-#[cfg(not(feature = "backend-vulkan"))]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NoResidentIdentity;
-
-/// See [`NoResidentIdentity`].
-#[cfg(not(feature = "backend-vulkan"))]
-pub type ResidentIdentity = NoResidentIdentity;
-
-/// A synthetic resident identity, for tests that arm a debt without a device.
+/// A synthetic resident target, for tests that arm a debt without a device.
 ///
 /// Here rather than in each test module because it is the one place that knows
-/// which arm [`ResidentIdentity`] is on — two spellings of it would be a
-/// divergence across a feature boundary, which is the thing the alias exists to
-/// prevent.
+/// which rail's identity a [`ResidentTarget`] is carrying on this build — two
+/// spellings of that would be a divergence across a feature boundary, which is
+/// what the ledger's own opaque handle exists to prevent.
 #[cfg(test)]
 #[cfg(feature = "backend-vulkan")]
 pub(crate) fn test_resident_identity(
@@ -96,39 +72,68 @@ pub(crate) fn test_resident_identity(
     width: u32,
     height: u32,
     generation: u64,
-) -> ResidentIdentity {
-    crate::backend::vulkan::engine::TargetIdentity::Surface {
+) -> ResidentTarget {
+    ResidentTarget::new(crate::backend::vulkan::engine::TargetIdentity::Surface {
         id,
         width,
         height,
         generation,
         format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+    })
+}
+
+/// The arm that compiles no rail keeping resident render targets.
+///
+/// It carries the same four integers so the ledger's own tests — supersede,
+/// eviction order, "the debt remembers what it was armed with" — mean the same
+/// thing there. They are about the ledger, not about a rail.
+#[cfg(test)]
+#[cfg(not(feature = "backend-vulkan"))]
+#[derive(Debug, PartialEq, Eq)]
+struct TestTarget {
+    id: u32,
+    width: u32,
+    height: u32,
+    generation: u64,
+}
+
+#[cfg(test)]
+#[cfg(not(feature = "backend-vulkan"))]
+impl crate::runtime::resident_target::RailTarget for TestTarget {
+    fn same_target(&self, other: &dyn crate::runtime::resident_target::RailTarget) -> bool {
+        other.as_any().downcast_ref::<Self>() == Some(self)
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
-/// The placeholder arm: every identity is the same value, which is exactly true
-/// — a Metal build arms no surface debt at all.
+/// See the Vulkan spelling above.
 #[cfg(test)]
 #[cfg(not(feature = "backend-vulkan"))]
 pub(crate) fn test_resident_identity(
-    _id: u32,
-    _width: u32,
-    _height: u32,
-    _generation: u64,
-) -> ResidentIdentity {
-    NoResidentIdentity
+    id: u32,
+    width: u32,
+    height: u32,
+    generation: u64,
+) -> ResidentTarget {
+    ResidentTarget::new(TestTarget {
+        id,
+        width,
+        height,
+        generation,
+    })
 }
 
 /// A frame owed to one mapper-ref-texture mapping's guest pages.
 ///
 /// Values only, and no memory. See the module doc: the rail this replaces held
 /// resolved host pointers and corrupted the guest's page tables with them. A
-/// [`crate::backend::vulkan::engine::TargetIdentity`] is `Copy` and every field
-/// of it is a scalar the protocol handed over, so holding one keeps that rule.
+/// [`ResidentTarget`] is the rail's own *name* for an image and holds no
+/// pointer into one, so carrying it keeps that rule.
 ///
-/// `Clone` and not `Copy`, which the identity's own doc explains: it is a value
-/// either way, and the debt is moved out of the ledger by `take` rather than
-/// copied out of it.
+/// `Clone` and not `Copy`: the target is a shared handle, and the debt is moved
+/// out of the ledger by `take` rather than copied out of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WritebackDebt {
     /// The resident the frame is *in*.
@@ -149,7 +154,7 @@ pub struct WritebackDebt {
     /// [`Self::map_generation`] beside it is a different question and both are
     /// needed: this says *which image the pixels are in*, that says *whether the
     /// pages are still the ones they were promised to*.
-    pub identity: ResidentIdentity,
+    pub target: ResidentTarget,
     /// Geometry the Store was taken at, and the geometry the payment writes.
     pub width: u32,
     pub height: u32,
@@ -328,7 +333,7 @@ impl PendingWritebacks {
     pub fn arm(
         &mut self,
         mapping_id: u32,
-        identity: ResidentIdentity,
+        target: ResidentTarget,
         width: u32,
         height: u32,
         map_generation: u32,
@@ -342,7 +347,7 @@ impl PendingWritebacks {
         let previous = self.debts.insert(
             mapping_id,
             WritebackDebt {
-                identity,
+                target,
                 width,
                 height,
                 map_generation,
@@ -1489,7 +1494,6 @@ pub fn submit_for_resources<M: HostMemory + HostOps>(
 ///   leaks per occurrence. `wbdebt_generation_moved` is how a boot says how many;
 ///   a reading above single digits is the signal to carry the arm's whole
 ///   identity rather than the four integers that re-derive it.
-#[cfg(feature = "backend-vulkan")]
 fn pay<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1507,32 +1511,31 @@ fn pay<M: HostMemory + HostOps>(
         return;
     }
     // The resident the draw registered, not the one a fresh derivation would
-    // name today. See `WritebackDebt::identity`.
-    let identity = debt.identity;
+    // name today. See `WritebackDebt::target`.
+    let rail = crate::backend::selected();
     if crate::runtime::resource_validity::licence_of(validity)
         == crate::runtime::resource_validity::WritebackLicence::Superseded
     {
         crate::runtime::drain::note_store_route("wbdebt_abandoned_guest_wrote");
-        crate::backend::vulkan::engine::note_resident_content_copied_out(&identity);
+        rail.abandon_resident(&debt.target);
         return;
     }
     crate::runtime::drain::note_store_route(route);
-    if !crate::runtime::render_writeback::vulkan::store_render_frame(
+    if !rail.pay_surface_writeback(
         state,
         host,
         mapping_id,
-        &identity,
+        &debt.target,
         debt.width,
         debt.height,
     ) {
-        // `store_render_frame` reports its own loss on the failure channel; this
-        // names the rail that owed it, because a debt paid late and refused is a
-        // different investigation from a Store refused where it was issued.
+        // The rail reports its own loss on the failure channel; this names the
+        // rail that owed it, because a debt paid late and refused is a different
+        // investigation from a Store refused where it was issued.
         crate::observe::fail(format!(
             "wbdebt_pay_lost mapping={mapping_id} {}x{} reason=store_refused",
             debt.width, debt.height
         ));
-        crate::backend::vulkan::engine::note_resident_content_copied_out(&identity);
     }
     crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
 }
@@ -1756,23 +1759,6 @@ fn pay_gva<M: HostMemory + HostOps>(
     true
 }
 
-/// [`pay`] on an arm with no Vulkan engine to owe a frame to.
-///
-/// Unreachable rather than merely unused: the only arm site is the mapper-ref-texture
-/// surface Store in `draw::vulkan`, so the ledger is empty on this arm and both
-/// callers return at their emptiness check before reaching here. It exists so
-/// the reader-side helpers can be one set of functions on both arms instead of
-/// two spellings the settle sites would have to choose between.
-#[cfg(not(feature = "backend-vulkan"))]
-fn pay<M: HostMemory + HostOps>(
-    _state: &mut DeviceState,
-    _host: &mut M,
-    _mapping_id: u32,
-    _debt: WritebackDebt,
-    _route: &'static str,
-) {
-}
-
 #[cfg(not(feature = "backend-vulkan"))]
 fn pay_gva<M: HostMemory + HostOps>(
     _state: &mut DeviceState,
@@ -1819,11 +1805,14 @@ mod tests {
         assert_eq!(pending.arm(7, resident.clone(), 1920, 1080, 9), None);
         let debt = pending.take(7).expect("the debt was armed");
         assert_eq!(
-            debt.identity, resident,
+            debt.target, resident,
             "the payment would read a resident the draw never wrote"
         );
         assert_eq!(
-            debt.identity.generation(),
+            debt.target
+                .get::<crate::backend::vulkan::engine::TargetIdentity>()
+                .expect("this rail issued the target")
+                .generation(),
             8,
             "the resident's generation, not the mapping's"
         );

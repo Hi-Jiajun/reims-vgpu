@@ -10957,10 +10957,13 @@ fn arm_surface_writeback_debt<M: HostMemory + HostOps>(
     crate::backend::vulkan::engine::stamp_resident_content_epoch(identity, epoch);
     // Armed before the eviction is paid, so the ledger never holds two debts for
     // one mapping and the payment below cannot be the one just armed.
-    let evicted =
-        state
-            .pending_writebacks
-            .arm(mapping_id, identity.clone(), width, height, map_generation);
+    let evicted = state.pending_writebacks.arm(
+        mapping_id,
+        crate::runtime::resident_target::ResidentTarget::new(identity.clone()),
+        width,
+        height,
+        map_generation,
+    );
     if let Some(evicted) = evicted {
         crate::runtime::drain::note_store_route("wbdebt_evicted");
         if !crate::runtime::writeback_debt::pay_key(state, host, evicted) {
@@ -12244,8 +12247,8 @@ mod vulkan_split_tests {
                 .pending_writebacks
                 .get(mid)
                 .expect("the deferred plan arms a debt")
-                .identity,
-            drawn,
+                .target,
+            crate::runtime::resident_target::ResidentTarget::new(drawn),
             "the ledger has to name the image the draw rendered into"
         );
     }
