@@ -89,7 +89,7 @@ fn copy_cmd(copy_kind: CopyKind, source: u32, destination: u32) -> Command {
 }
 
 /// Back `mapping_id` with one guest data page at `pfn` and mark it mapped.
-/// This is the surface state every type-11 / type-5 install needs before it
+/// This is the surface state every mapper-ref-texture / ref-texture install needs before it
 /// can attach geometry or a descriptor.
 fn map_one_page_surface(host: &mut FakeHost, state: &mut DeviceState, mapping_id: u32, pfn: u32) {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
@@ -118,7 +118,7 @@ fn write_list_entry(
     write_task_gva_arm64e(host, &state.tasks[1], off, &entry);
 }
 
-/// Install type-1 buffer: object-list at GVA 0, descriptor at GVA 0x100 + ref*0x20.
+/// Install buffer: object-list at GVA 0, descriptor at GVA 0x100 + ref*0x20.
 fn install_buffer(
     host: &mut FakeHost,
     state: &mut DeviceState,
@@ -513,7 +513,7 @@ fn copy_b2b_overlap_rejected() {
 }
 
 #[test]
-fn copy_buffer_to_type11_roundtrip() {
+fn copy_buffer_to_mapper_ref_texture_roundtrip() {
     let (mut host, mut state) = blit_device();
     // Buffer with 8 BGRA pixels (one row of 2 pixels for a 2x1 copy).
     install_buffer(&mut host, &mut state, 1, 1, 256);
@@ -521,9 +521,9 @@ fn copy_buffer_to_type11_roundtrip() {
     let src_gva = 1u64 << RESOURCE_PAGE_SHIFT;
     write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &pat);
 
-    // Type-11 object ref 3 → mapping 9, 2x2 BGRA.
+    // Mapper-ref-texture object ref 3 → mapping 9, 2x2 BGRA.
     let mapping_id = 9u32;
-    install_type11(&mut host, &mut state, 3, mapping_id, 0x20);
+    install_mapper_ref_texture(&mut host, &mut state, 3, mapping_id, 0x20);
 
     let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, 3);
     cmd.source_offset = 0;
@@ -558,12 +558,12 @@ fn copy_buffer_to_type11_roundtrip() {
     assert!(state.mappings[&mapping_id].content_generation > gen_before);
 }
 
-/// type-11→type-11 copy lands source bytes in dest pages (unified content).
+/// mapper-ref-texture→mapper-ref-texture copy lands source bytes in dest pages (unified content).
 #[test]
-fn copy_type11_to_type11_writes_dst_pages() {
+fn copy_mapper_ref_texture_to_mapper_ref_texture_writes_dst_pages() {
     let (mut host, mut state) = blit_device();
-    install_type11(&mut host, &mut state, 3, 3, 0x20);
-    install_type11(&mut host, &mut state, 4, 4, 0x21);
+    install_mapper_ref_texture(&mut host, &mut state, 3, 3, 0x20);
+    install_mapper_ref_texture(&mut host, &mut state, 4, 4, 0x21);
     // Seed source mid=3 pages with a known pattern.
     let src_pat = [9u8, 8, 7, 6, 5, 4, 3, 2, 1, 0, 11, 12, 13, 14, 15, 16];
     assert!(mapping_write::write_rect_raw(
@@ -617,8 +617,8 @@ fn copy_type11_to_type11_writes_dst_pages() {
 #[test]
 fn an_extent_past_the_edge_is_refused_like_an_origin_past_the_edge() {
     let (mut host, mut state) = blit_device();
-    install_type11(&mut host, &mut state, 3, 3, 0x20); // 2×2 BGRA, mid 3
-    install_type11(&mut host, &mut state, 4, 4, 0x21); // 2×2 BGRA, mid 4
+    install_mapper_ref_texture(&mut host, &mut state, 3, 3, 0x20); // 2×2 BGRA, mid 3
+    install_mapper_ref_texture(&mut host, &mut state, 4, 4, 0x21); // 2×2 BGRA, mid 4
     install_buffer(&mut host, &mut state, 5, 5, 4096);
 
     // Origin in range, extent past the edge: 3 wide out of a 2-wide texture.
@@ -673,8 +673,8 @@ fn an_extent_past_the_edge_is_refused_like_an_origin_past_the_edge() {
 #[test]
 fn copy_executor_reason_slugs_name_distinct_sites() {
     let (mut host, mut state) = blit_device();
-    install_type11(&mut host, &mut state, 3, 3, 0x20); // 2×2 BGRA, mid 3
-    install_type11(&mut host, &mut state, 4, 4, 0x21); // 2×2 BGRA, mid 4
+    install_mapper_ref_texture(&mut host, &mut state, 3, 3, 0x20); // 2×2 BGRA, mid 3
+    install_mapper_ref_texture(&mut host, &mut state, 4, 4, 0x21); // 2×2 BGRA, mid 4
     install_buffer(&mut host, &mut state, 5, 5, 4096);
 
     // texture→texture: destination origin past a 2×2 target → Bounds.
@@ -691,8 +691,8 @@ fn copy_executor_reason_slugs_name_distinct_sites() {
     );
     assert_eq!(blit_fail_reason(), "t2t_origin_oob");
 
-    // texture→texture: a type-11 endpoint with a non-zero z origin (type-11 is
-    // 2D) → Unsupported, a DIFFERENT reason under the same executor.
+    // texture→texture: a mapper-ref-texture endpoint with a non-zero z origin (mapper-ref-texture
+    // is 2D) → Unsupported, a DIFFERENT reason under the same executor.
     let mut cmd = copy_cmd(CopyKind::TextureToTexture, 3, 4);
     cmd.source_origin.z = 1;
     cmd.source_size = Size {
@@ -734,8 +734,8 @@ fn copy_executor_reason_slugs_name_distinct_sites() {
     );
     assert_eq!(blit_fail_reason(), "b2t_origin_oob");
 
-    // A full-target valid type-11→type-11 copy succeeds and resets the channel,
-    // so no stale slug leaks into the next command's dispatch line.
+    // A full-target valid mapper-ref-texture→mapper-ref-texture copy succeeds and resets the
+    // channel, so no stale slug leaks into the next command's dispatch line.
     let mut cmd = copy_cmd(CopyKind::TextureToTexture, 3, 4);
     cmd.source_size = Size {
         width: 2,
@@ -746,8 +746,8 @@ fn copy_executor_reason_slugs_name_distinct_sites() {
     assert_eq!(blit_fail_reason(), "");
 }
 
-/// Install type-11 object-list entry + mapping pages (2×2 BGRA).
-fn install_type11(
+/// Install mapper-ref-texture object-list entry + mapping pages (2×2 BGRA).
+fn install_mapper_ref_texture(
     host: &mut FakeHost,
     state: &mut DeviceState,
     obj_ref: u32,
@@ -756,7 +756,7 @@ fn install_type11(
 ) {
     map_one_page_surface(host, state, mapping_id, pfn);
     assert!(state.set_mapping_geom(mapping_id, 2, 2, MTL_FORMAT_BGRA8_UNORM));
-    install_type11_plane(
+    install_mapper_ref_texture_plane(
         host,
         state,
         obj_ref,
@@ -800,7 +800,7 @@ fn install_biplanar_mapping(
     // Surface-level geom is not the plane; leave has_geom false until texture latch.
 }
 
-fn install_type11_plane(
+fn install_mapper_ref_texture_plane(
     host: &mut FakeHost,
     state: &mut DeviceState,
     obj_ref: u32,
@@ -809,7 +809,7 @@ fn install_type11_plane(
     width: u32,
     height: u32,
 ) {
-    use crate::runtime::decode::resource::OBJECT_TYPE_IOSURFACE;
+    use crate::runtime::decode::resource::OBJECT_TYPE_MAPPER_REF_TEXTURE;
     // iosurface desc layout: surfaceID @0, format @0x16, width @0x18, height @0x1c.
     const DESC_LEN: usize = 0x20;
     assert!(state.set_object_list(1, 0, 16));
@@ -824,18 +824,18 @@ fn install_type11_plane(
         host,
         state,
         obj_ref,
-        OBJECT_TYPE_IOSURFACE as u32,
+        OBJECT_TYPE_MAPPER_REF_TEXTURE as u32,
         DESC_LEN as u32,
         desc_gva,
     );
 }
 
-/// Install a type-5 RefTexture (object_type=5) that names an IOSurface
+/// Install a ref-texture RefTexture (object_type=5) that names an IOSurface
 /// mapping via `surfaceID@+0` and a serialized 0x62 color-view record
 /// (fmt@+0x16, w@+0x18, h@+0x1c, depth@+0x20, plane@+0x34 — the live blit-
-/// source layout from `decode_type5_texture_view_live_0x62_color_window_view`).
+/// source layout from `decode_ref_texture_view_live_0x62_color_window_view`).
 /// Also installs a single-page mapping at `mapping_id` so the resolve lands.
-fn install_type5(
+fn install_ref_texture(
     host: &mut FakeHost,
     state: &mut DeviceState,
     obj_ref: u32,
@@ -848,9 +848,9 @@ fn install_type5(
     // Mapping (surfaceID == mapping_id): mapped, one data page, latched geom.
     map_one_page_surface(host, state, mapping_id, pfn);
     assert!(state.set_mapping_geom(mapping_id, width, height, format));
-    // Type-5 descriptor: 56-byte blob, 0x62 color-view record.
+    // Ref-texture descriptor: 56-byte blob, 0x62 color-view record.
     assert!(state.set_object_list(1, 0, 16));
-    let built = reims_vgpu_wire::device_desc::Type5Builder::new(
+    let built = reims_vgpu_wire::device_desc::RefTextureBuilder::new(
         mapping_id,
         0,
         obj_ref,
@@ -870,14 +870,14 @@ fn install_type5(
         desc_len as u32,
         desc_gva,
     );
-    let e = objects::lookup_list_entry(state, host, 1, obj_ref).expect("type5 entry");
+    let e = objects::lookup_list_entry(state, host, 1, obj_ref).expect("ref_texture entry");
     assert_eq!(e.object_type, objects::OBJECT_TYPE_REF_TEXTURE);
 }
 
 /// A blit source must read the plane the wire named, and the only shape that
 /// can prove it is two planes that share geometry and bytes-per-element.
 ///
-/// This branch resolved type-5 views through `type11_sample_window`, which
+/// This branch resolved ref-texture views through `mapper_ref_texture_sample_window`, which
 /// takes no plane index and picks a plane by matching width, height and bpe.
 /// On the v0a8 shape the live apple.com hero produces — Y and alpha both R8
 /// at the luma geometry — that scan matches *two* records, takes neither, and
@@ -889,7 +889,7 @@ fn install_type5(
 /// identical in geometry to plane 0 and differs only in offset, so an
 /// assertion on the offset is exactly the assertion that the index was used.
 #[test]
-fn a_type5_blit_source_reads_the_plane_the_wire_named() {
+fn a_ref_texture_blit_source_reads_the_plane_the_wire_named() {
     use crate::contract::endian::st64;
     use crate::contract::iosurface_pages::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT,
@@ -906,7 +906,7 @@ fn a_type5_blit_source_reads_the_plane_the_wire_named() {
     let (w, h) = (8u32, 4u32);
     // Plane 2 is the alpha plane: same 8x4 R8 as plane 0, different offset.
     const ALPHA_OFFSET: u32 = 128;
-    install_type5(
+    install_ref_texture(
         &mut host,
         &mut state,
         obj_ref,
@@ -916,7 +916,7 @@ fn a_type5_blit_source_reads_the_plane_the_wire_named() {
         w,
         h,
     );
-    set_type5_record_plane(&mut host, &state, obj_ref, 2);
+    set_ref_texture_record_plane(&mut host, &state, obj_ref, 2);
 
     let mut desc = vec![0u8; DEVICE_DESC_LEN];
     st32(&mut desc[DEVICE_DESC_ALLOC_SIZE..], 0x1000);
@@ -948,7 +948,7 @@ fn a_type5_blit_source_reads_the_plane_the_wire_named() {
     // it resolves nothing at all, which is what this test exists to exclude.
     let ambiguous = {
         let m = state.mappings.get(&mapping_id).unwrap();
-        mapping_write::type11_sample_window(m, w, h, MTL_FORMAT_R8_UNORM)
+        mapping_write::mapper_ref_texture_sample_window(m, w, h, MTL_FORMAT_R8_UNORM)
     };
     assert!(
         ambiguous.is_none(),
@@ -958,59 +958,64 @@ fn a_type5_blit_source_reads_the_plane_the_wire_named() {
     // planes 0 and 2 specifically and not a descriptor that resolves nothing.
     let uv = {
         let m = state.mappings.get(&mapping_id).unwrap();
-        mapping_write::type5_sample_window(m, 1, 4, 2, MTL_FORMAT_RG8_UNORM)
+        mapping_write::ref_texture_sample_window(m, 1, 4, 2, MTL_FORMAT_RG8_UNORM)
     };
     assert_eq!(uv.map(|(off, _, _)| off), Some(64));
 
     let backing = resolve_texture_backing(&mut state, &mut host, 1, obj_ref, 0, 0)
-        .expect("type-5 blit source must resolve");
+        .expect("ref-texture blit source must resolve");
     match backing {
-        TextureBacking::Type11(t) => assert_eq!(
+        TextureBacking::MapperRefTexture(t) => assert_eq!(
             t.surface_offset, ALPHA_OFFSET as u64,
             "the wire named plane 2, and only the wire index can reach it"
         ),
-        TextureBacking::Linear(_) => panic!("expected Type11 backing, got Linear"),
+        TextureBacking::Linear(_) => panic!("expected MapperRefTexture backing, got Linear"),
     }
 }
 
-/// Overwrite the plane index in an installed type-5 record.
+/// Overwrite the plane index in an installed ref-texture record.
 ///
-/// `install_type5` leaves it 0 (the field sits past the fields it writes and
+/// `install_ref_texture` leaves it 0 (the field sits past the fields it writes and
 /// the blob is zeroed), which is the one value that cannot distinguish a
 /// used index from a dropped one.
-fn set_type5_record_plane(host: &mut FakeHost, state: &DeviceState, obj_ref: u32, plane: u32) {
+fn set_ref_texture_record_plane(
+    host: &mut FakeHost,
+    state: &DeviceState,
+    obj_ref: u32,
+    plane: u32,
+) {
     let off = objects::TYPE5_ARG_RECORD + objects::TYPE5_RECORD_PLANE;
     let desc_gva = 0x180u64 + (obj_ref as u64) * 0x40;
     let mut word = [0u8; 4];
     st32(&mut word, plane);
     write_task_gva_arm64e(host, &state.tasks[1], desc_gva + off as u64, &word);
-    let entry = objects::lookup_list_entry(state, host, 1, obj_ref).expect("type5 entry");
-    let desc = objects::read_descriptor(state, host, 1, &entry).expect("type5 desc");
+    let entry = objects::lookup_list_entry(state, host, 1, obj_ref).expect("ref_texture entry");
+    let desc = objects::read_descriptor(state, host, 1, &entry).expect("ref_texture desc");
     assert_eq!(
-        objects::decode_type5_texture_view(&desc)
+        objects::decode_ref_texture_view(&desc)
             .expect("view")
             .plane_index,
         plane
     );
 }
 
-/// Regression guard for the type-5 RefTexture blit-source branch
-/// (`resolve_texture_backing_depth` ~588): a type-5 object whose 0x62 record
-/// names a BGRA8 view must resolve to a `Type11` backing carrying the VIEW
+/// Regression guard for the ref-texture RefTexture blit-source branch
+/// (`resolve_texture_backing_depth` ~588): a ref-texture object whose 0x62 record
+/// names a BGRA8 view must resolve to a `MapperRefTexture` backing carrying the VIEW
 /// geometry/format (not the base mapping's), so a blit copy from a media /
-/// window backing lands. Mirrors the type-11 install fixtures.
+/// window backing lands. Mirrors the mapper-ref-texture install fixtures.
 #[test]
-fn type5_ref_texture_resolves_as_type11_blit_backing() {
+fn ref_texture_resolves_as_mapper_ref_texture_blit_backing() {
     use crate::contract::pixel_format::bytes_per_pixel;
     let (mut host, mut state) = blit_device();
     let mapping_id = 34u32;
     let obj_ref = 12u32;
     let (w, h, fmt) = (2u32, 2u32, MTL_FORMAT_BGRA8_UNORM);
-    install_type5(&mut host, &mut state, obj_ref, mapping_id, 0x30, fmt, w, h);
+    install_ref_texture(&mut host, &mut state, obj_ref, mapping_id, 0x30, fmt, w, h);
     let backing = resolve_texture_backing(&mut state, &mut host, 1, obj_ref, 0, 0)
-        .expect("type-5 blit source must resolve");
+        .expect("ref-texture blit source must resolve");
     match backing {
-        TextureBacking::Type11(t) => {
+        TextureBacking::MapperRefTexture(t) => {
             assert_eq!(t.mapping_id, mapping_id, "backs the named surface");
             assert_eq!((t.width, t.height), (w, h), "view geometry, not base");
             assert_eq!(t.pixel_format, fmt);
@@ -1018,17 +1023,17 @@ fn type5_ref_texture_resolves_as_type11_blit_backing() {
             assert!(u64::from(t.row_stride) >= u64::from(w) * u64::from(t.bpp));
             assert!(t.span_end >= u64::from(t.row_stride) * u64::from(h));
         }
-        TextureBacking::Linear(_) => panic!("expected Type11 backing, got Linear"),
+        TextureBacking::Linear(_) => panic!("expected MapperRefTexture backing, got Linear"),
     }
 }
 
-/// A type-5 record whose tag is neither 0x42 nor 0x62 is unknown wire → the
+/// A ref-texture record whose tag is neither 0x42 nor 0x62 is unknown wire → the
 /// blit branch must fail closed (`t5_view_decode`), never invent geometry.
 #[test]
-fn type5_unknown_record_tag_fails_closed() {
+fn ref_texture_unknown_record_tag_fails_closed() {
     let (mut host, mut state) = blit_device();
     let (mapping_id, obj_ref) = (34u32, 12u32);
-    install_type5(
+    install_ref_texture(
         &mut host,
         &mut state,
         obj_ref,
@@ -1049,18 +1054,18 @@ fn type5_unknown_record_tag_fails_closed() {
     );
     match resolve_texture_backing(&mut state, &mut host, 1, obj_ref, 0, 0) {
         Err(st) => assert_eq!(st, BlitStatus::Unsupported),
-        Ok(_) => panic!("unknown type-5 record tag must fail closed"),
+        Ok(_) => panic!("unknown ref-texture record tag must fail closed"),
     }
 }
 
 #[test]
-fn biplanar_type11_y_and_uv_planes_distinct() {
+fn biplanar_mapper_ref_texture_y_and_uv_planes_distinct() {
     use crate::contract::pixel_format::{MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM};
     let (mut host, mut state) = blit_device();
     let mapping_id = 7u32;
     install_biplanar_mapping(&mut host, &mut state, mapping_id, 0x30);
     // Y plane texture ref 10, UV plane texture ref 11 — same mapping_id.
-    install_type11_plane(
+    install_mapper_ref_texture_plane(
         &mut host,
         &mut state,
         10,
@@ -1069,7 +1074,7 @@ fn biplanar_type11_y_and_uv_planes_distinct() {
         4,
         2,
     );
-    install_type11_plane(
+    install_mapper_ref_texture_plane(
         &mut host,
         &mut state,
         11,
@@ -1214,7 +1219,7 @@ fn biplanar_type11_y_and_uv_planes_distinct() {
     assert_eq!(row0, y_pat[0..4]);
 }
 
-fn install_type8_view(
+fn install_texture_view(
     host: &mut FakeHost,
     state: &mut DeviceState,
     view_ref: u32,
@@ -1265,17 +1270,17 @@ fn install_type8_view(
 }
 
 #[test]
-fn copy_buffer_to_type8_view_of_type11() {
+fn copy_buffer_to_texture_view_view_of_mapper_ref_texture() {
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 1, 1, 256);
     let mapping_id = 9u32;
-    install_type11(&mut host, &mut state, 3, mapping_id, 0x20);
+    install_mapper_ref_texture(&mut host, &mut state, 3, mapping_id, 0x20);
     // View ref 8 → base 3, level 0, BGRA identity.
-    install_type8_view(&mut host, &mut state, 8, 3, MTL_FORMAT_BGRA8_UNORM, 0, None);
+    install_texture_view(&mut host, &mut state, 8, 3, MTL_FORMAT_BGRA8_UNORM, 0, None);
     let pat = [0xaau8, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44];
     let src_gva = 1u64 << RESOURCE_PAGE_SHIFT;
     write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &pat);
-    let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, 8); // type-8 view
+    let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, 8); // texture-view
     cmd.source_offset = 0;
     cmd.source_bytes_per_row = 8;
     cmd.source_size = Size {
@@ -1303,12 +1308,12 @@ fn copy_buffer_to_type8_view_of_type11() {
 }
 
 #[test]
-fn type8_swizzled_view_rejected_for_blit() {
+fn texture_view_swizzled_view_rejected_for_blit() {
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 1, 1, 256);
-    install_type11(&mut host, &mut state, 3, 9, 0x20);
+    install_mapper_ref_texture(&mut host, &mut state, 3, 9, 0x20);
     // Non-identity swizzle BGRA order selectors.
-    install_type8_view(
+    install_texture_view(
         &mut host,
         &mut state,
         8,
@@ -1331,12 +1336,12 @@ fn type8_swizzled_view_rejected_for_blit() {
 }
 
 #[test]
-fn type8_level_base_on_type11_rejected() {
+fn texture_view_level_base_on_mapper_ref_texture_rejected() {
     // Metal forbids mipmapped IOSurfaces; view level_base=1 fail-closes.
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 1, 1, 256);
-    install_type11(&mut host, &mut state, 3, 9, 0x20);
-    install_type8_view(
+    install_mapper_ref_texture(&mut host, &mut state, 3, 9, 0x20);
+    install_texture_view(
         &mut host,
         &mut state,
         8,
@@ -1712,7 +1717,7 @@ fn derived_slice_stride_2d() {
     );
 }
 
-/// Multi-mip linear texture + multi-level type-8 view selecting L1.
+/// Multi-mip linear texture + multi-level texture-view selecting L1.
 #[test]
 fn copy_buffer_to_multilevel_view_l1() {
     use crate::runtime::decode::resource::{
@@ -1726,7 +1731,7 @@ fn copy_buffer_to_multilevel_view_l1() {
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 1, 1, 512);
 
-    // Type-2 texture handle=2, 2 mips: L0 4x2, L1 2x1, RGBA8 (bpp=4).
+    // Texture texture handle=2, 2 mips: L0 4x2, L1 2x1, RGBA8 (bpp=4).
     let handle = 2u32;
     let levels = 2u32;
     let body = TEXTURE_DESC_BASE_LEN + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
@@ -1758,7 +1763,7 @@ fn copy_buffer_to_multilevel_view_l1() {
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     // View: level_base=0, level_count=2 over texture ref 4.
-    install_type8_view(&mut host, &mut state, 8, 4, MTL_FORMAT_RGBA8_UNORM, 0, None);
+    install_texture_view(&mut host, &mut state, 8, 4, MTL_FORMAT_RGBA8_UNORM, 0, None);
     // Patch level_count to 2 on the installed view.
     {
         use crate::runtime::decode::resource::{
@@ -1809,9 +1814,9 @@ fn copy_buffer_to_multilevel_view_l1() {
 fn multilevel_view_relative_level_oob() {
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 1, 1, 64);
-    install_type11(&mut host, &mut state, 3, 9, 0x20);
-    // View over type-11 with level_count=1, level_base=0; command level 1 is OOB.
-    install_type8_view(&mut host, &mut state, 8, 3, MTL_FORMAT_BGRA8_UNORM, 0, None);
+    install_mapper_ref_texture(&mut host, &mut state, 3, 9, 0x20);
+    // View over mapper-ref-texture with level_count=1, level_base=0; command level 1 is OOB.
+    install_texture_view(&mut host, &mut state, 8, 3, MTL_FORMAT_BGRA8_UNORM, 0, None);
     let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, 8);
     cmd.destination_level = 1; // relative 1 >= count 1
     cmd.source_size = Size {
@@ -1890,7 +1895,7 @@ fn slice_level_zero_counts_are_noop() {
     );
 }
 
-/// Install a simple type-2 RGBA8 texture (single level, handle → GVA).
+/// Install a simple texture RGBA8 texture (single level, handle → GVA).
 fn install_linear_rgba(
     host: &mut FakeHost,
     state: &mut DeviceState,
@@ -2035,7 +2040,9 @@ fn a_last_array_slice_is_not_charged_for_its_trailing_row_padding() {
             assert!(t.texel_offset(3, 1, 0).unwrap() + 4 <= EXACT);
             t.slice_stride
         }
-        TextureBacking::Type11(_) => panic!("linear texture resolved as type-11"),
+        TextureBacking::MapperRefTexture(_) => {
+            panic!("linear texture resolved as mapper-ref-texture")
+        }
     };
 
     // The bound this replaced charged a second whole stride and refused this
@@ -2090,7 +2097,7 @@ fn whole_surface_0x13e_single_level_copy() {
     assert_eq!(&back[16..32], &pat[16..32]);
 }
 
-/// A type-11 whole-surface `0x13e` moves every row, in order.
+/// A mapper-ref-texture whole-surface `0x13e` moves every row, in order.
 ///
 /// This arm stages the slice whole rather than a row at a time, because a
 /// per-row call into the mapping rail re-pays that rail's per-*rect* costs —
@@ -2106,10 +2113,10 @@ fn whole_surface_0x13e_single_level_copy() {
 /// buffer entire — a whole-buffer compare of a uniform fill would pass on a
 /// copy that wrote row 0 twice.
 #[test]
-fn a_type11_whole_surface_copy_lands_every_row_in_order() {
+fn a_mapper_ref_texture_whole_surface_copy_lands_every_row_in_order() {
     let (mut host, mut state) = blit_device();
-    install_type11(&mut host, &mut state, 2, 20, 0x40);
-    install_type11(&mut host, &mut state, 3, 21, 0x50);
+    install_mapper_ref_texture(&mut host, &mut state, 2, 20, 0x40);
+    install_mapper_ref_texture(&mut host, &mut state, 3, 21, 0x50);
 
     // 2×2 BGRA: two rows of 8 bytes, each row its own byte value.
     let src_pixels: [u8; 16] = [
@@ -2136,7 +2143,7 @@ fn a_type11_whole_surface_copy_lands_every_row_in_order() {
     assert_eq!(
         execute_blit(&mut state, &mut host, 1, &cmd),
         BlitStatus::Ok,
-        "a type-11 to type-11 whole-surface copy must execute"
+        "a mapper-ref-texture to mapper-ref-texture whole-surface copy must execute"
     );
 
     let mut back = [0u8; 16];
@@ -2389,7 +2396,7 @@ fn whole_surface_0x13e_two_levels() {
     let _ = RESOURCE_PAGE_SHIFT;
 }
 
-/// Install type-2 RGBA8 volume (single level, depth>1) at `handle<<14`.
+/// Install texture RGBA8 volume (single level, depth>1) at `handle<<14`.
 fn install_linear_rgba_volume(
     host: &mut FakeHost,
     state: &mut DeviceState,
@@ -2487,7 +2494,9 @@ fn whole_surface_0x13e_volume_rejects_nonzero_slice() {
     install_linear_rgba_volume(&mut host, &mut state, 2, 2, 2, 2, 2, 8);
     install_linear_rgba_volume(&mut host, &mut state, 3, 3, 2, 2, 2, 8);
     let mut cmd = copy_cmd(CopyKind::TextureToTextureSliceLevel, 2, 3); // Non-zero slice on 3D whole-surface is fail-closed (Metal forbids).
-                                                                        // Status may be Bounds (slice packing) or Unsupported (3D rule).
+                                                                        // Status may be Bounds
+                                                                        // (slice packing) or
+                                                                        // Unsupported (3D rule).
     cmd.source_slice = 1;
     cmd.slice_count = 1;
     cmd.level_count = 1;
@@ -2741,7 +2750,7 @@ fn copy_region_io_enrichment_dedups_per_page_and_direction() {
     ));
 }
 
-/// The copy path and the draw/sample path follow a type-8 view chain exactly
+/// The copy path and the draw/sample path follow a texture-view chain exactly
 /// as deep as each other.
 ///
 /// Two arms consume this one wire form: `resolve_texture_backing_depth` here,
@@ -2757,7 +2766,7 @@ fn copy_region_io_enrichment_dedups_per_page_and_direction() {
 /// only pinned this arm at eight would pass again the moment the other one
 /// moved, which is the failure that produced the divergence in the first place.
 ///
-/// The chain runs `MAX_TEXTURE_VIEW_CHAIN` views down to a type-11 base, each
+/// The chain runs `MAX_TEXTURE_VIEW_CHAIN` views down to a mapper-ref-texture base, each
 /// view a plain identity hop, so the only thing that can refuse it is depth.
 #[test]
 fn a_copy_follows_a_view_chain_as_deep_as_a_sample_does() {
@@ -2766,10 +2775,10 @@ fn a_copy_follows_a_view_chain_as_deep_as_a_sample_does() {
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 1, 1, 256);
     let mapping_id = 9u32;
-    install_type11(&mut host, &mut state, 3, mapping_id, 0x20);
+    install_mapper_ref_texture(&mut host, &mut state, 3, mapping_id, 0x20);
 
     // Views live at refs `outermost` down to `base_view`, each viewing the next
-    // lower ref; the lowest views the type-11 at ref 3. The object list holds
+    // lower ref; the lowest views the mapper-ref-texture at ref 3. The object list holds
     // 16 entries, so the deepest legal chain has to fit under that.
     let base_view = 4u32;
     let outermost = base_view + MAX_TEXTURE_VIEW_CHAIN as u32 - 1;
@@ -2780,7 +2789,7 @@ fn a_copy_follows_a_view_chain_as_deep_as_a_sample_does() {
         } else {
             view_ref - 1
         };
-        install_type8_view(
+        install_texture_view(
             &mut host,
             &mut state,
             view_ref,
@@ -2796,7 +2805,7 @@ fn a_copy_follows_a_view_chain_as_deep_as_a_sample_does() {
         .expect("the sample arm follows the contract's deepest chain");
     assert_eq!(
         resolved.base_texture_ref, 3,
-        "the sample arm must land on the type-11 base, not stop inside the chain"
+        "the sample arm must land on the mapper-ref-texture base, not stop inside the chain"
     );
 
     // The copy arm must reach the same base, and land real pixels through it.
@@ -2853,7 +2862,7 @@ fn a_copy_refuses_a_view_chain_the_sample_arm_also_refuses() {
 
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 1, 1, 256);
-    install_type11(&mut host, &mut state, 3, 9, 0x20);
+    install_mapper_ref_texture(&mut host, &mut state, 3, 9, 0x20);
 
     let base_view = 4u32;
     let outermost = base_view + MAX_TEXTURE_VIEW_CHAIN as u32; // one view too many
@@ -2864,7 +2873,7 @@ fn a_copy_refuses_a_view_chain_the_sample_arm_also_refuses() {
         } else {
             view_ref - 1
         };
-        install_type8_view(
+        install_texture_view(
             &mut host,
             &mut state,
             view_ref,
@@ -2939,7 +2948,7 @@ fn the_gpu_whole_plane_arm_refuses_before_it_resolves_anything() {
 /// The GPU whole-plane arm's destination half, and specifically the plane check.
 ///
 /// `write_bgra8_from_resident_gpu` resolves the plane itself, from the mapping's
-/// declaration, and takes no plane index. A type-5 view carries one on the wire
+/// declaration, and takes no plane index. A ref-texture view carries one on the wire
 /// and can therefore name a plane at a `surface_offset` that scan does not reach.
 /// Landing a frame there is silent at every layer — the pixels appear in the next
 /// plane of the same IOSurface — so the disagreement has to refuse before the
@@ -2972,7 +2981,7 @@ fn the_gpu_whole_plane_arm_refuses_a_plane_the_rail_would_not_write() {
     );
     assert_eq!(
         gpu_whole_plane_destination(None, Some(window), src),
-        Err(DstNotType11),
+        Err(DstNotMapperRefTexture),
         "a linear allocation has no mapping for the rail to name"
     );
     assert_eq!(
@@ -2981,7 +2990,7 @@ fn the_gpu_whole_plane_arm_refuses_a_plane_the_rail_would_not_write() {
         "a mapping that declines the extent has no window to write"
     );
 
-    // The type-5 plane hazard: the guest's descriptor names the second plane of a
+    // The ref-texture plane hazard: the guest's descriptor names the second plane of a
     // biplanar surface, the mapping's own geometry scan resolves the first.
     let second_plane = GpuPlane {
         surface_offset: 0x8000,

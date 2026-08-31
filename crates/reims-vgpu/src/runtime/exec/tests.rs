@@ -308,7 +308,7 @@ fn an_unknown_segment_family_is_refused_and_the_type_5_envelope_is_not() {
         segment_disposition, SegmentDisposition, SEGMENT_TYPE_BLIT, SEGMENT_TYPE_PROTECTION_OPTIONS,
     };
     // `walk_stream` ended in `_ => {}`, which gave one silence to two very
-    // different things. Type 5 is a contract-correct skip; type 6 is wire
+    // different things. Ref-texture is a contract-correct skip; function is wire
     // format the host has never seen.
     assert_eq!(
         segment_disposition(SEGMENT_TYPE_PROTECTION_OPTIONS),
@@ -1082,10 +1082,10 @@ fn the_pass_extent_census_scores_a_fraction_and_clamps_it() {
 /// The extent census scores whichever resolve arm supplied the mapping id,
 /// and only for slot 0.
 ///
-/// This is the arm-parity test. The census used to hang off the type-11
+/// This is the arm-parity test. The census used to hang off the mapper-ref-texture
 /// resolve alone, so on the x86/Vulkan pathway — where the workload takes
-/// the type-4 arm — every band read zero, which is indistinguishable from a
-/// guest that never states an extent. A type-4 attachment *is* its own
+/// the backing arm — every band read zero, which is indistinguishable from a
+/// guest that never states an extent. A backing attachment *is* its own
 /// mapping id, so the only difference between the two call sites is which
 /// id they pass, and this pins that the scoring does not care which.
 #[test]
@@ -1745,12 +1745,11 @@ fn accepted_render_without_executor_is_fail_visible() {
     };
     let task_id = 0xfeed;
     let mut command = vec![0u8; OP_HEADER_LEN];
-    // An opcode inside the encoder's range that no arm claims, found rather
-    // than named. It used to be `wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE`, which stopped working
-    // the moment that bound was corrected to `0xa6` -- because `0xa6` is a
-    // record this rail now decodes. `0x99` was the replacement and lasted
-    // one commit, until `setVertexAmplificationMode:value:` turned out to be
-    // that number. The catch-all is what is under test, not any literal.
+    // An opcode inside the encoder's range that no arm claims, found rather than named. It used to
+    // be `wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE`, which stopped working the moment
+    // that bound was corrected to `0xa6` -- because `0xa6` is a record this rail now decodes.
+    // `0x99` was the replacement and lasted one commit, until `setVertexAmplificationMode:value:`
+    // turned out to be that number. The catch-all is what is under test, not any literal.
     let op = render::unclaimed_accepted_opcode();
     st32(&mut command[0..], op);
     st32(&mut command[4..], OP_HEADER_LEN as u32);
@@ -1946,14 +1945,14 @@ fn zero_ref_render_bind_unbinds_existing_slots() {
     assert_eq!(out.sampler_unbinds, 1);
 }
 
-/// x86 type-4 display mid: clear-only stream must Store solid BGRA into pages.
+/// x86 backing display mid: clear-only stream must Store solid BGRA into pages.
 #[test]
-fn clear_only_type4_surface_writes_guest_pages() {
+fn clear_only_backing_surface_writes_guest_pages() {
     use crate::contract::endian::{st32, st64};
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::decode::render::ColorAttachment;
-    use crate::runtime::objects::{self, OBJECT_TYPE_SURFACE};
+    use crate::runtime::objects::{self, OBJECT_TYPE_BACKING};
 
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -1981,11 +1980,11 @@ fn clear_only_type4_surface_writes_guest_pages() {
     let _ = host.write_gpa(root_gpa + 0x40 * 4, &d[..4]);
     state.define_task(1, 0x1000, 2);
     assert!(state.set_object_list(1, 0, 8));
-    // Type-4 at surface_id=5.
+    // Backing at surface_id=5.
     let mut entry = [0u8; 12];
     st32(
         &mut entry[0..],
-        (OBJECT_TYPE_SURFACE as u32) | (0x30u32 << 8),
+        (OBJECT_TYPE_BACKING as u32) | (0x30u32 << 8),
     );
     entry[4..12].copy_from_slice(&0x80u64.to_le_bytes());
     let _ = host.write_gpa(data_gpa + 5 * 12, &entry);
@@ -1999,7 +1998,7 @@ fn clear_only_type4_surface_writes_guest_pages() {
     st32(&mut desc[0x20..], 64);
     let _ = host.write_gpa(data_gpa + 0x80, &desc);
 
-    assert!(objects::resolve_type4_surface(&mut state, &host, 5));
+    assert!(objects::resolve_backing(&mut state, &host, 5));
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
     acc.clears.push(ColorAttachment {
@@ -2015,7 +2014,7 @@ fn clear_only_type4_surface_writes_guest_pages() {
     finish_stream(&mut state, &mut host, 1, &mut out, &acc);
     assert!(
         out.clears_applied >= 1,
-        "type-4 clear must apply, got {}",
+        "backing clear must apply, got {}",
         out.clears_applied
     );
     // Read first pixel from guest page (BGRA).
@@ -2057,7 +2056,7 @@ fn finish_stream_clear_only_branch_without_draws() {
 ///
 /// The GPU draw path already carries the clear as a typed union member. This
 /// exercises the other publication path: no draw exists, so `finish_stream`
-/// must materialize the result directly in the type-11 mapping's native texels.
+/// must materialize the result directly in the mapper-ref-texture mapping's native texels.
 #[test]
 fn clear_only_rg16uint_publishes_native_guest_texels() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
@@ -2082,13 +2081,13 @@ fn clear_only_rg16uint_publishes_native_guest_texels() {
         .texture_to_mapping
         .insert((task_id, texture_ref), mapping_id);
 
-    let (_, row_stride, _) = mapping_write::type11_sample_window(
+    let (_, row_stride, _) = mapping_write::mapper_ref_texture_sample_window(
         state.mappings.get(&mapping_id).expect("mapping"),
         2,
         2,
         MTL_FORMAT_RG16_UINT,
     )
-    .expect("the type-11 texture has a sample window");
+    .expect("the mapper-ref-texture has a sample window");
     assert!(row_stride >= 2 * RG16_BPP);
 
     let mut acc = StreamAccum::default();
@@ -2120,7 +2119,7 @@ fn clear_only_rg16uint_publishes_native_guest_texels() {
     }
 }
 
-/// The same clear representation reaches a linear type-2/3 target, including
+/// The same clear representation reaches a linear normal-texture target, including
 /// its guest-declared row pitch rather than a tightly packed substitute.
 #[test]
 fn clear_only_rg16uint_publishes_native_linear_gva_rows() {
@@ -2296,14 +2295,14 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
     );
 }
 
-/// Linux NoMetal: draws fail but CLEAR seed still Stores into type-4 pages.
+/// Linux NoMetal: draws fail but CLEAR seed still Stores into backing pages.
 #[test]
-fn nometal_draw_falls_back_to_type4_clear() {
+fn nometal_draw_falls_back_to_backing_clear() {
     use crate::contract::endian::{st32, st64};
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::draw::BufferBind;
-    use crate::runtime::objects::{self, OBJECT_TYPE_SURFACE};
+    use crate::runtime::objects::{self, OBJECT_TYPE_BACKING};
 
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -2330,7 +2329,7 @@ fn nometal_draw_falls_back_to_type4_clear() {
     let mut entry = [0u8; 12];
     st32(
         &mut entry[0..],
-        (OBJECT_TYPE_SURFACE as u32) | (0x30u32 << 8),
+        (OBJECT_TYPE_BACKING as u32) | (0x30u32 << 8),
     );
     entry[4..12].copy_from_slice(&0x80u64.to_le_bytes());
     let _ = host.write_gpa(data_gpa + 5 * 12, &entry);
@@ -2343,7 +2342,7 @@ fn nometal_draw_falls_back_to_type4_clear() {
     st32(&mut desc[0x1c..], 16);
     st32(&mut desc[0x20..], 64);
     let _ = host.write_gpa(data_gpa + 0x80, &desc);
-    assert!(objects::resolve_type4_surface(&mut state, &host, 5));
+    assert!(objects::resolve_backing(&mut state, &host, 5));
 
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
@@ -2404,7 +2403,7 @@ fn nometal_draw_falls_back_to_type4_clear() {
         out.render_attachment_resolves, 1,
         "one render stream resolves its fixed attachment set once"
     );
-    // Non-Apple: Linux encode Stores CLEAR load into type-4 (Ok) or
+    // Non-Apple: Linux encode Stores CLEAR load into backing (Ok) or
     // NoMetal clear fallback — either path must land green BGRA.
     #[cfg(feature = "backend-vulkan")]
     {
@@ -3547,7 +3546,7 @@ fn an_indirect_draw_takes_its_counts_from_the_guest_buffer() {
     };
     use crate::runtime::gva_mem::{self, write_task_gva_arm64e};
 
-    // A type-1 buffer at ref 7 holding `words`, resolvable through the task's
+    // A buffer at ref 7 holding `words`, resolvable through the task's
     // own page table — the shape `resolve_indirect_threadgroups_from_buffer`
     // uses on the compute rail.
     let build = |words: &[u32]| {
@@ -5008,7 +5007,7 @@ fn a_visibility_count_lands_at_the_guest_offset_the_pass_named() {
     state.define_task(1, 0x1000, dir_pfn);
     assert!(state.set_object_list(1, 0, 32));
 
-    // A type-1 buffer of one page at handle 5, named by object ref 7 — the
+    // A buffer of one page at handle 5, named by object ref 7 — the
     // `handle << page_shift` shape `resolve_buffer_span` decodes.
     const BUF_REF: u32 = 7;
     const BUF_HANDLE: u32 = 5;
@@ -5358,7 +5357,7 @@ fn clear_fallback_draw_accounting_is_scoped_to_one_render_stream() {
 ///
 /// # The contract
 ///
-/// On rail macos-15 the guest renders 300x300 tiles into type-2/3 linear
+/// On rail macos-15 the guest renders 300x300 tiles into normal-texture linear
 /// textures whose descriptors declare `sampleCount = 4`, and it sizes those
 /// allocations to match: the boot's `gva_view_fragmented ... pages=352` at two
 /// separate targets fixes `height * bpr` inside `(351, 352] * 4096`, which for

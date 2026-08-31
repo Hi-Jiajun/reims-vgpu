@@ -3199,9 +3199,9 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     state.present.present_mapping = mapping;
     state.present.host_mapping = mapping;
     state.present.valid = true;
-    // x86: present surface_id → type-4 object-list slot (heap index =
+    // x86: present surface_id → backing object-list slot (heap index =
     // IOSurface getSurfaceID). Arm: MappingInternal page-table resolve.
-    // Always attempt type-4 when pages empty; then iosfc/mapper path.
+    // Always attempt backing when pages empty; then iosfc/mapper path.
     let _ = crate::runtime::objects::ensure_surface_for_present(state, host, mapping);
     let force = state
         .mappings
@@ -3774,7 +3774,7 @@ fn apply_map_family<H: HostMemory + HostOps>(
         //   host_gva_surfaces for sample (wallpaper wipe class).
         // - Map notify: PTEs already live → flush host_gva encode into
         //   **new** PFNs (not invent PTEs; not invent geom). Discrete
-        //   type-2/3 content may live only in host_cache until this.
+        //   normal-texture content may live only in host_cache until this.
         // Samples still prefer host_cache GVA key on Load.
         //
         // HostOps **views** (gva_host_views) are the opposite of encode
@@ -4091,7 +4091,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
             apply_define_task2(state, host, &packet.payload, Some(channel_id));
         }
         // A short SET_OBJECT_LIST leaves the task's object list unbound — every
-        // type-11 texture/object resolve on it then fails
+        // mapper-ref-texture/object resolve on it then fails
         // (object_list_count==0). Never on a well-formed boot.
         CHILD_OP_SET_OBJECT_LIST => {
             apply_set_object_list(state, &packet.payload, Some(channel_id));
@@ -4153,7 +4153,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
         }
         /*
          * Scanout policy:
-         * - Early boot: front type-11 writebacks paint while !frame_flush_seen
+         * - Early boot: front mapper-ref-texture writebacks paint while !frame_flush_seen
          *   and job W×H matches established console (no mid-switch thrash).
          * - After first boundary: display presents paint (op8 DisplaySwap on
          *   arm ch4, **or** the op6/op7 transactions on x86 Ventura/Tahoe
@@ -4312,7 +4312,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
             } else {
                 // Process this channel's exec packet. Archive does not drain
                 // other child FIFOs here; surface RAW is render_wait_surface on
-                // the specific type-11/GVA key at sample/Load/swap sites.
+                // the specific mapper-ref-texture/GVA key at sample/Load/swap sites.
                 let result =
                     crate::runtime::exec::process_exec_indirect2(state, host, &packet.payload);
                 let channel_bit = 1u32.checked_shl(channel_id).unwrap_or(0);

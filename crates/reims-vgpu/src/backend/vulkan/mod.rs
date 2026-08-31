@@ -28,7 +28,7 @@ use crate::backend::{
     StampOrdering,
 };
 use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
-use crate::runtime::blit_exec::{self, BlitStatus, LinearTextureLevel, Type11Texture};
+use crate::runtime::blit_exec::{self, BlitStatus, LinearTextureLevel, MapperRefTexture};
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus, ResidentServe};
 use crate::runtime::compute_session::ComputeSession;
 use crate::runtime::decode::blit::Command as BlitCommand;
@@ -325,7 +325,7 @@ impl Backend for VulkanBackend {
         host: &mut M,
         task_id: u32,
         destination_ref: u32,
-        src: &Type11Texture,
+        src: &MapperRefTexture,
         dst: &LinearTextureLevel,
     ) -> Option<BlitStatus> {
         blit_exec::vulkan::try_copy_t11_plane_to_linear_on_gpu(

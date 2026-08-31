@@ -3,16 +3,16 @@
 //!
 //! # Why this exists
 //!
-//! A type-11 render Store publishes into a mapping, and the device can ask
+//! A mapper-ref-texture render Store publishes into a mapping, and the device can ask
 //! whether anything has written that mapping since — the token lives on
 //! [`crate::model::MappingEntry`] and
 //! [`crate::runtime::mapper::mapping_guest_write_verdict`] reads it. That
-//! witness is what licenses the type-11 attachment LOAD elision, which serves a
+//! witness is what licenses the mapper-ref-texture attachment LOAD elision, which serves a
 //! `MTLLoadActionLoad` straight out of the engine resident instead of reading a
 //! whole frame back out of guest memory: one driven boot elided **11 484** seeds
 //! against 94 uploaded.
 //!
-//! A **GVA** (type-2/3) render target has no mapping and so had no witness, and
+//! A **GVA** (normal-texture) render target has no mapping and so had no witness, and
 //! its LOAD reads the attachment's full span out of guest pages every time —
 //! `load_seed_ok_color` 4 949 per driven Safari-drag boot, blocking on a
 //! guest-write settle for 2 923 of them, because those are exactly the pages the
@@ -25,7 +25,7 @@
 //! * **The guest CPU** wrote the span. Only the hypervisor's dirty bitmap can
 //!   see this, through a token registered over the target's pages.
 //! * **This device** wrote the span through some other rail — a compute
-//!   writeback, a blit, a type-11 write whose pages alias it. The hypervisor
+//!   writeback, a blit, a mapper-ref-texture write whose pages alias it. The hypervisor
 //!   cannot see those; [`crate::runtime::host_writes`] is the record that can,
 //!   and aliasing across id namespaces is real rather than theoretical (see that
 //!   module's own doc).
@@ -37,7 +37,7 @@
 //! # Why the key is the whole identity
 //!
 //! A token registered over one page list says nothing about another, and the
-//! guest recycles GVAs. The type-11 twin handles this with an explicit
+//! guest recycles GVAs. The mapper-ref-texture twin handles this with an explicit
 //! `guest_write_token_gen != map_generation` check that a future writer has to
 //! remember. Here the page-set hash *is part of the key*
 //! (`draw::vulkan::gva_span_alloc_generation`, the same value the engine
@@ -328,7 +328,7 @@ pub fn retire_pages(state: &mut DeviceState, gone: &[u64]) {
 /// Every variant but [`GvaWriteReach::Quiet`] means "assume written". They are
 /// kept apart because "this rail never got started", "the guest rewrites this
 /// target every frame" and "the record aged out" are the same refusal and three
-/// completely different findings — the same reason the type-11 twin splits its
+/// completely different findings — the same reason the mapper-ref-texture twin splits its
 /// own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GvaWriteReach {

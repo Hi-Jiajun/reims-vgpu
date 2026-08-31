@@ -40,7 +40,7 @@
 //! # How the layout was derived
 //!
 //! Perturbation. The ranged form was captured twice with every field different
-//! — format 70/10, type 2/3, level base 3/1, level count 2/7, slice base 5/2,
+//! — format 70/10, normal-texture, level base 3/1, level count 2/7, slice base 5/2,
 //! slice count 4/6 — so no two fields hold the same value in either case and a
 //! view that swapped `levels` for `slices`, or a base for a count, reports a
 //! pair no case produced. The Objective-C encoding declares both ranges as

@@ -250,7 +250,7 @@ reaches it, and each named the guest action that would take it:
 
 | file | why it is zero | the guest action that takes it |
 |---|---|---|
-| `runtime/icb/mod.rs` | already priced, five boots behind it | indirect command buffers, type-7 tag `0x36` |
+| `runtime/icb/mod.rs` | already priced, five boots behind it | indirect command buffers, serializer-object tag `0x36` |
 | `runtime/heap_query.rs` | Vulkan host has no Metal device, so it answers `NoMetalDevice` | `CmdHeapTextureSizeAndAlign`, child-FIFO config op `0x40` — `[MTLDevice heapTextureSizeAndAlignForDescriptor:]` |
 | `runtime/mipmap.rs` | a window drag creates no multi-mip textures | blit opcode `0x133 generateMipmaps` |
 | `runtime/plan/event_sync.rs` | pure planning behind `fence_exec`; same reason | Metal events and encoder fences, segment type 3 and the blit/compute/render fence fields |

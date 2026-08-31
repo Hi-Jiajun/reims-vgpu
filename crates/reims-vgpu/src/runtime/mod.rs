@@ -37,7 +37,7 @@ pub mod decode;
 pub mod drain;
 /// The always-on log sink every decline and census writes to
 /// (`/tmp/reims-vgpu-fail.log`); `line()` is the `REIMS_VGPU_DRAW_LOG=1`-gated tier.
-/// CmdExecIndirect2 stream walk + type-11 resolve.
+/// CmdExecIndirect2 stream walk + mapper-ref-texture resolve.
 pub mod exec;
 /// Product-path event + encoder fence sync (event/blit/compute/render domains).
 pub mod fence_exec;
@@ -61,7 +61,7 @@ pub mod guest_ram_map;
 /// Task GVA → guest RAM reads.
 pub mod gva_mem;
 /// Gated with the `GuestWriteVerdict` it reuses and the `TargetIdentity` it
-/// keys on, both of which are Vulkan-side; the type-11 twin this mirrors
+/// keys on, both of which are Vulkan-side; the mapper-ref-texture twin this mirrors
 /// (`mapper::mapping_guest_write_verdict`) carries the same gate.
 #[cfg(feature = "backend-vulkan")]
 pub mod gva_store_witness;
@@ -73,7 +73,7 @@ pub mod host;
 /// Which guest pages this device has written, and when — the half of the
 /// guest-write witness the hypervisor's dirty bitmap cannot supply.
 pub mod host_writes;
-/// Type-7 ICB (0x36) materialization, host command fills, execute writeback.
+/// Serializer-object ICB (0x36) materialization, host command fills, execute writeback.
 pub mod icb;
 
 /// Metal draw encode + writeback when MTLBs resolve.
@@ -90,19 +90,19 @@ pub mod map_audit;
 pub mod mapper;
 /// Write host BGRA into guest mapping pages (render writeback).
 pub mod mapping_write;
-/// generateMipmaps for multi-mip type-2/3 linear textures.
+/// generateMipmaps for multi-mip normal-texture linear textures.
 pub mod mipmap;
 pub mod mmio;
 /// MTLB container → wrapped-AIR carve for metal2vulkan.
 pub mod mtlb;
 pub mod node_guard;
-/// Object-list lookup and type-11 registration.
+/// Object-list lookup and mapper-ref-texture registration.
 pub mod objects;
 /// A draw's pipeline and both its shaders, resolved once per pipeline object.
 #[cfg(feature = "backend-vulkan")]
 pub mod pipeline_resolve;
 pub mod plan;
-/// The resident identity a type-11 guest surface renders into.
+/// The resident identity a mapper-ref-texture guest surface renders into.
 #[cfg(feature = "backend-vulkan")]
 pub mod present_identity;
 /// Whether a range's page-table entries are in the state the guest's own next
@@ -127,7 +127,7 @@ pub mod spirv_vertex_input;
 pub mod surface_cache;
 /// The wire task word a command payload carries → a live task slot.
 pub mod task_slot;
-/// Texture / type-11 geometry registration.
+/// Texture / mapper-ref-texture geometry registration.
 pub mod texture;
 /// Track host-authoritative surface and GVA frames, and transfer them on demand.
 pub mod writeback_debt;

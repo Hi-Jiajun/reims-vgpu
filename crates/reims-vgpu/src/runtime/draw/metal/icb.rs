@@ -720,7 +720,7 @@ fn render_icb_declined(
     }
 }
 
-/// Materializes type-7 ICB `0x36`, optionally re-fills from bound command
+/// Materializes serializer-object ICB `0x36`, optionally re-fills from bound command
 /// memory (`0x1d1` / associate), then `executeCommandsInBuffer:withRange:`.
 /// Empty ranges are valid Metal (no-op). Color writeback mirrors draw path.
 ///
@@ -909,7 +909,7 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
         return EncodeStatus::MetalFailed("icb_exec_command_buffer_error");
     }
 
-    // Writeback each color RT (type-11 mapping or type-2/3 GVA).
+    // Writeback each color RT (mapper-ref-texture mapping or normal-texture GVA).
     // Same one derivation as the seed side above, so the two halves of this
     // function cannot disagree about the layout of the buffer they share.
     let Some((stride, need)) =

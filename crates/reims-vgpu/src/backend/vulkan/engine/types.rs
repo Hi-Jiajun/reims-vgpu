@@ -1205,7 +1205,7 @@ pub struct SampledImageResource {
     /// Optional identity fast path for [`SampledSource::Bytes`] (see
     /// [`SampledContentIdentity`]); `None` keeps the content-addressed path.
     pub identity: Option<SampledContentIdentity>,
-    /// Decoded type-8 view swizzle, applied as the image view's component
+    /// Decoded texture-view swizzle, applied as the image view's component
     /// mapping so the GPU performs it at sample time. Identity (the default)
     /// creates the same view as before. Doing this on the view rather than by
     /// rewriting texels is what lets a swizzled texture stay on whatever
@@ -1762,7 +1762,7 @@ pub struct ComputeBufferOutput {
 
 /// Storage image for compute. Formats mirror the live `simg_u32_to_vk_storage` map.
 ///
-/// Single-layer 2D only: a compute texture binding is staged from one type-11
+/// Single-layer 2D only: a compute texture binding is staged from one mapper-ref-texture
 /// plane window or one linear GVA level, both of which are a flat `width ×
 /// height` rectangle. There is no decoded slice or depth axis on this rail, so
 /// the engine builds `TYPE_2D` unconditionally.
@@ -1784,7 +1784,7 @@ pub struct ComputeStorageImageResource {
     pub bytes: Vec<u8>,
     /// Where the post-dispatch pixels go. See [`ComputeImageDestination`].
     pub destination: ComputeImageDestination,
-    /// Exact type-11 resource lifetime/view contract for persistent GPU
+    /// Exact mapper-ref-texture resource lifetime/view contract for persistent GPU
     /// storage. `None` keeps the conservative transient upload path.
     pub residency: Option<ComputeStorageResidency>,
     /// The caller skipped reading guest pages into `bytes` because the
@@ -2067,7 +2067,7 @@ impl StorageImageFormat {
 /// this rail's resolution outside this rail.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum TargetIdentity {
-    /// Type-4 mapping / surface id namespace.
+    /// Backing mapping / surface id namespace.
     Surface {
         id: u32,
         width: u32,
@@ -2076,7 +2076,7 @@ pub enum TargetIdentity {
         /// This target's resident image format, from the pixel format the
         /// mapping declares for its own plane.
         ///
-        /// A type-11 mapping is not BGRA8 by its contract, which is what this
+        /// A mapper-ref-texture mapping is not BGRA8 by its contract, which is what this
         /// namespace assumed for as long as it held no format: it declares a
         /// format, `mapping_write` reads that declaration to lay out the
         /// writeback, and macOS 26 declares `MTLPixelFormatRGBA16Float` for
@@ -2092,7 +2092,7 @@ pub enum TargetIdentity {
         /// its destination cannot disagree about what the guest asked for.
         format: vk::Format,
     },
-    /// Type-2/3 texture ref namespace.
+    /// normal texture ref namespace.
     Texture {
         ref_: u32,
         width: u32,
@@ -2337,7 +2337,7 @@ impl TargetIdentity {
     ///
     /// Each namespace answers it from what it knows:
     ///
-    /// * `Surface` backs a type-11 guest IOSurface, whose plane carries a
+    /// * `Surface` backs a mapper-ref-texture guest IOSurface, whose plane carries a
     ///   declared pixel format exactly as a GVA target does — usually guest
     ///   scanout order, and not always.
     /// * `Gva` is a render target the guest declared a pixel format for, and
@@ -2971,7 +2971,7 @@ mod tests {
     ///
     /// `Surface` answers from the format its mapping declared, and one
     /// constructed at the scanout format reports BGRA: every CPU consumer of a
-    /// type-11 composite Store is declared in guest scanout order, so an RGBA
+    /// mapper-ref-texture composite Store is declared in guest scanout order, so an RGBA
     /// resident under a scanout-declared mapping costs a whole-frame exchange
     /// per Store.
     ///

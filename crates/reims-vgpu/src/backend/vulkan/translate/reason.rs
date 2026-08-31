@@ -154,7 +154,7 @@ pub enum TranslateReason {
     UnknownSamplerAddressMode(u32),
     /// `MTLSamplerBorderColor` value outside the SDK enum.
     UnknownSamplerBorderColor(u32),
-    /// A type-8 view swizzle selector outside the decoded contract's range.
+    /// A texture-view swizzle selector outside the decoded contract's range.
     UnknownSwizzleSelector(u8),
     /// The device does not advertise the requested `VkFormat` as a vertex
     /// buffer format, and no portable substitute exists for it.

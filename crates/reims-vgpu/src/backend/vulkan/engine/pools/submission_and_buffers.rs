@@ -3860,7 +3860,7 @@ impl ResourcePools {
                 .image(image)
                 .view_type(view_type)
                 .format(vk_format)
-                // The decoded type-8 view swizzle, performed by the hardware at
+                // The decoded texture-view swizzle, performed by the hardware at
                 // sample time. Identity for every ordinary bind. The format
                 // contributes no mapping of its own: `translate::pixel`'s
                 // sampled rail admits only formats whose Metal channels sit

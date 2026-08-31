@@ -330,7 +330,7 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
 
 /// Apply a capture to the mapping named by the just-drained ring entry.
 pub fn apply_capture(state: &mut DeviceState, cap: &MapperCapture, mapping_id: u32) -> bool {
-    // Neither branch below releases a deferred writeback window. A type-11
+    // Neither branch below releases a deferred writeback window. A mapper-ref-texture
     // render Store writes guest pages on its own path, so an UNMAP (or a MAP
     // that re-backs the slot with a different MappingInternal, orphaning the
     // old identity) leaves no mapping-keyed render obligation behind, because a
@@ -505,7 +505,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         }
     }
 
-    // Texture-path geom (type-11 object dims) refines span for single-plane; for
+    // Texture-path geom (mapper-ref-texture object dims) refines span for single-plane; for
     // multi-plane, prefer alloc_size already latched from the device descriptor.
     if let Some(m) = state.mappings.get(&mapping_id) {
         if m.has_geom && m.width > 0 && m.height > 0 {
@@ -651,16 +651,16 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         if let Some((lo, hi)) = entry_gpa_span(&plan.entries, page_shift) {
             let key = span_first_sight_key(mapping_id, lo, hi, page_shift);
             if crate::observe::first_sight(SPAN_SEEN_MAPPER, key) {
-                // `src=mapper` against the type-4 adoption site's `src=type4`,
+                // `src=mapper` against the backing adoption site's `src=backing`,
                 // which says which path a surface's page list arrived through.
                 //
                 // Read that field with the latch in mind: until the two sites
                 // were given separate `first_sight` namespaces they shared one,
-                // and on identical keys, so the type-4 site claimed every
+                // and on identical keys, so the backing site claimed every
                 // footprint it reached first and this one was suppressed for
                 // that footprint permanently. Every `mapping_gpa_span` line in
-                // an x86 boot read `src=type4`, which was taken as evidence that
-                // the page list arrives at the type-4 site — but the latch could
+                // an x86 boot read `src=backing`, which was taken as evidence that
+                // the page list arrives at the backing site — but the latch could
                 // not have produced any other reading. Whether this site is
                 // genuinely quiet is now an open question again, and a driven
                 // boot is what answers it.
@@ -890,14 +890,14 @@ pub(crate) fn entry_gpa_span(entries: &[u32], page_shift: u32) -> Option<(u64, u
 ///
 /// That is not a harmless overlap, because the two lines are read against each
 /// other. `src=` exists to say which adoption path a surface's page list
-/// arrived through, and the type-4 site wins the race in practice, so the
+/// arrived through, and the backing site wins the race in practice, so the
 /// mapper's silence was manufactured by the latch rather than observed. Two
 /// namespaces make each site's silence its own evidence.
 pub(crate) const SPAN_SEEN_MAPPER: &str = "mapping_gpa_span_mapper";
 
-/// `first_sight` namespace for the type-4 adoption span line. See
+/// `first_sight` namespace for the backing adoption span line. See
 /// [`SPAN_SEEN_MAPPER`] for why the two are not one.
-pub(crate) const SPAN_SEEN_TYPE4: &str = "mapping_gpa_span_type4";
+pub(crate) const SPAN_SEEN_TYPE4: &str = "mapping_gpa_span_backing";
 
 /// Dedup discriminant for a `mapping_gpa_span` line: the footprint identity.
 ///
@@ -935,10 +935,10 @@ pub(crate) fn plan_adoption_decision(
     )
 }
 
-/// True when the cached page table covers the type-11 sample/write span for
+/// True when the cached page table covers the mapper-ref-texture sample/write span for
 /// the latched geom (archive table build uses the same min_size).
 ///
-/// Early resolve often runs before type-11 object dims land (`min_size` =
+/// Early resolve often runs before mapper-ref-texture object dims land (`min_size` =
 /// PAGE_SIZE only). Leaving a short `page_entries` while `has_geom` is true
 /// makes Store writeback and sample page walks fail-closed on tiles (Favourites
 /// 249² with ~16 pages vs ~63 required) while the Metal attachment still holds
@@ -969,7 +969,7 @@ pub fn pages_cover_geom(state: &DeviceState, mapping_id: u32) -> bool {
     covered >= span_end.max(page_size)
 }
 
-/// Ensure pages (and geom if possible) before scanout paint / type-11 Store.
+/// Ensure pages (and geom if possible) before scanout paint / mapper-ref-texture Store.
 ///
 /// Re-resolves when the table is empty, geom is missing, **or** the cached page
 /// count cannot cover the latched W×H sample window (stale early resolve).
@@ -1115,7 +1115,7 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
 /// Which of the two `true`s a bare "are these pages still ours" bool would
 /// have returned.
 ///
-/// [`type4_pages_witness`]'s contract says a caller must not read a bare
+/// [`backing_pages_witness`]'s contract says a caller must not read a bare
 /// "yes" as "these pages were verified", because four of its five exits check
 /// nothing at all. Every caller then collapsed both meanings into
 /// [`PagesVerdict::Ours`], and the counters built on it — `mapw_pages_vouched` 29 002 against
@@ -1127,9 +1127,9 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
 /// yields a token and still lets the write through, exactly as before. Nothing
 /// here changes policy; it changes what the boot can say about it.
 ///
-/// [`Unwitnessed`]: Type4Witness::Unwitnessed
+/// [`Unwitnessed`]: BackingWitness::Unwitnessed
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Type4Witness {
+pub enum BackingWitness {
     /// Every page of the cached list was re-walked and agreed. The only exit
     /// that is evidence the list still names the surface's memory.
     Verified,
@@ -1147,36 +1147,36 @@ pub enum Type4Witness {
 /// # Why the existing revalidation cannot answer this
 ///
 /// [`revalidate_mapping_reason`] re-resolves a mapping *only* when
-/// `mapping_internal != 0`. A type-4 surface has no MappingInternal, so that
+/// `mapping_internal != 0`. A backing record has no MappingInternal, so that
 /// function reaches its final `match` with `resolve_ran == false` and returns
 /// `None` — "resolvable" — on the strength of `mapped && !page_entries
 /// .is_empty()` alone. The list is accepted because it is non-empty, not
 /// because anything checked it. Its own doc records the scale: 2 280 render
 /// windows in one boot were armed on mappings with `mapping_internal == 0`.
 ///
-/// Nothing on the wire closes that gap. When the guest re-points a type-4
+/// Nothing on the wire closes that gap. When the guest re-points a backing
 /// surface's backing in its own page table there is no packet, so
 /// `map_generation` does not move and the cached entries stay trusted until the
-/// next type-4 command happens to re-resolve — which for an idle surface may be
-/// never. `resolve_type4_surface_ex` knows this and checks for it, but only
+/// next backing command happens to re-resolve — which for an idle surface may be
+/// never. `resolve_backing_ex` knows this and checks for it, but only
 /// there, and only on the first and last entry:
 ///
 /// ```text
-/// type4_pages_stale sid=49 task=0 n=256 gpa0=0x2e8cf6000 (task PT translation moved; rebuilding)
+/// backing_pages_stale sid=49 task=0 n=256 gpa0=0x2e8cf6000 (task PT translation moved; rebuilding)
 /// ```
 ///
 /// That line is from a live boot. The translations do move.
 ///
 /// # What this checks
 ///
-/// Every page, not two. [`crate::model::Type4Walk`] latched the task and GPU-VA
+/// Every page, not two. [`crate::model::BackingWalk`] latched the task and GPU-VA
 /// base the entries were walked from, so the walk repeats with no object search:
 /// page `i` is `(backing_pfn + i) << page_shift` translated through that task.
 /// Any page that translates differently — or no longer translates at all — means
 /// the list in hand names memory that is no longer the surface's.
 ///
-/// Answers [`Type4Witness::Unwitnessed`] when there is nothing to check
-/// (`type4_walk` absent, or latched at a superseded `map_generation`), because
+/// Answers [`BackingWitness::Unwitnessed`] when there is nothing to check
+/// (`backing_walk` absent, or latched at a superseded `map_generation`), because
 /// this is a *specific* witness and not a general one. That exit is the reason
 /// the return type is an enum rather than a bool: it is not evidence, and a
 /// caller must not read it as "these pages were verified".
@@ -1185,26 +1185,26 @@ pub enum Type4Witness {
 /// mapping-keyed rails write through.
 ///
 /// Re-walks the cached page list and reports which exit it took.
-pub fn type4_pages_witness<H: HostMemory>(
+pub fn backing_pages_witness<H: HostMemory>(
     state: &DeviceState,
     host: &H,
     mapping_id: u32,
-) -> Type4Witness {
+) -> BackingWitness {
     let Some(m) = state.mappings.get(&mapping_id) else {
-        return Type4Witness::Unwitnessed("no_mapping");
+        return BackingWitness::Unwitnessed("no_mapping");
     };
-    let Some(walk) = m.type4_walk else {
-        // No type-4 walk was ever latched for this mapping, so this witness has
-        // never had anything to say about it. The type-11 rail lives here.
-        return Type4Witness::Unwitnessed("no_walk");
+    let Some(walk) = m.backing_walk else {
+        // No backing walk was ever latched for this mapping, so this witness has
+        // never had anything to say about it. The mapper-ref-texture rail lives here.
+        return BackingWitness::Unwitnessed("no_walk");
     };
     if walk.map_generation != m.map_generation {
         // The list has been replaced since the walk was latched. The new list
         // may be perfectly good — it simply has no witness of its own yet.
-        return Type4Witness::Unwitnessed("walk_superseded");
+        return BackingWitness::Unwitnessed("walk_superseded");
     }
     if m.page_entries.is_empty() {
-        return Type4Witness::Unwitnessed("no_pages");
+        return BackingWitness::Unwitnessed("no_pages");
     }
     let page_shift = state.page_shift;
     let page_size = crate::contract::iosurface_pages::page_size_of(page_shift);
@@ -1221,7 +1221,7 @@ pub fn type4_pages_witness<H: HostMemory>(
             walk.task_id,
             m.page_entries.len()
         ));
-        return Type4Witness::Drifted;
+        return BackingWitness::Drifted;
     }
     // One walk over the whole run, not one per page.
     //
@@ -1264,7 +1264,7 @@ pub fn type4_pages_witness<H: HostMemory>(
             let Some(live) = walked else {
                 // No translation now. This used to answer the failed walk with
                 // the GVA, to match the identity fallback that produced the
-                // entry, and that mirror had to go with it: `apply_type4_backing`
+                // entry, and that mirror had to go with it: `apply_backing`
                 // no longer adopts a page at its own GVA, so the only entry this
                 // could still accept is one the control arm made.
                 //
@@ -1282,12 +1282,12 @@ pub fn type4_pages_witness<H: HostMemory>(
                     walk.task_id,
                     entries.len()
                 ));
-                verdict = Some(Type4Witness::Drifted);
+                verdict = Some(BackingWitness::Drifted);
                 return false;
             };
             if cached != Some(live) {
                 // Every entry in this list came from a walk that succeeded:
-                // `apply_type4_backing` refuses the whole surface on the first
+                // `apply_backing` refuses the whole surface on the first
                 // page it cannot walk, so it cannot leave a fabricated one
                 // behind. A disagreement here is therefore between two real
                 // translations taken at different times, which is the guest
@@ -1300,7 +1300,7 @@ pub fn type4_pages_witness<H: HostMemory>(
                     entries.len(),
                     Some(live)
                 ));
-                verdict = Some(Type4Witness::Drifted);
+                verdict = Some(BackingWitness::Drifted);
                 return false;
             }
             i += 1;
@@ -1323,9 +1323,9 @@ pub fn type4_pages_witness<H: HostMemory>(
             walk.task_id,
             entries.len()
         ));
-        return Type4Witness::Drifted;
+        return BackingWitness::Drifted;
     }
-    Type4Witness::Verified
+    BackingWitness::Verified
 }
 
 /// Proof that a mapping's cached page list named the guest memory it was walked
@@ -1334,7 +1334,7 @@ pub fn type4_pages_witness<H: HostMemory>(
 ///
 /// # Why a token and not a call
 ///
-/// [`type4_pages_witness`] existed for a release with exactly one caller — the
+/// [`backing_pages_witness`] existed for a release with exactly one caller — the
 /// render writeback — while every other write
 /// through `MappingEntry::page_entries` went unchecked. That is not an oversight
 /// that a second call site fixes: the check has to be *reachable only through*
@@ -1357,7 +1357,7 @@ pub fn type4_pages_witness<H: HostMemory>(
 /// records the generation it was taken at and [`PagesVouched::covers`] re-checks
 /// it at the point of use. A carried-over token is then unusable by
 /// construction rather than by every future writer remembering a second field —
-/// the same rule [`crate::model::Type4Walk`] states for its own latch.
+/// the same rule [`crate::model::BackingWalk`] states for its own latch.
 #[derive(Clone, Copy, Debug)]
 pub struct PagesVouched {
     mapping_id: u32,
@@ -1387,11 +1387,11 @@ impl PagesVouched {
 /// clears it, bumps `map_generation` and retires the contiguous view and the
 /// guest-write token with it. Every window still armed against the old
 /// incarnation then refuses on the `map_generation` check it already had, and
-/// the next type-4 bind re-resolves the surface from the object list.
+/// the next backing bind re-resolves the surface from the object list.
 ///
 /// Returning a token when there is nothing to check is deliberate and is why
-/// [`type4_pages_witness`] reports "nothing to check" separately rather than
-/// "verified": a mapping with no [`crate::model::Type4Walk`] latch has a page
+/// [`backing_pages_witness`] reports "nothing to check" separately rather than
+/// "verified": a mapping with no [`crate::model::BackingWalk`] latch has a page
 /// list this witness cannot speak about, and refusing every write to it would
 /// blank surfaces the device has no evidence against.
 /// The verdict is handed back alongside the token, not folded into it, because
@@ -1425,7 +1425,7 @@ pub enum PagesVerdict {
     /// The re-walk agreed with the cached list, every page of it.
     Ours,
     /// Nothing was checked; the payload is which of the four states it was, per
-    /// [`Type4Witness::Unwitnessed`]. **The write proceeds exactly as it does
+    /// [`BackingWitness::Unwitnessed`]. **The write proceeds exactly as it does
     /// for [`Self::Ours`]** — this variant changes no policy. It exists because
     /// `Ours` used to mean both "verified" and "unverifiable", so a boot
     /// reporting `mapw_pages_refused = 0` could not say whether its guard had
@@ -1450,12 +1450,12 @@ pub fn mapping_pages_verdict<H: HostMemory + HostOps>(
     host: &H,
     mapping_id: u32,
 ) -> PagesVerdict {
-    match type4_pages_witness(state, host, mapping_id) {
-        Type4Witness::Verified => return PagesVerdict::Ours,
+    match backing_pages_witness(state, host, mapping_id) {
+        BackingWitness::Verified => return PagesVerdict::Ours,
         // Same policy as `Verified` — the write goes through — and a different
         // counter, because only one of the two is evidence.
-        Type4Witness::Unwitnessed(why) => return PagesVerdict::Unwitnessed(why),
-        Type4Witness::Drifted => {}
+        BackingWitness::Unwitnessed(why) => return PagesVerdict::Unwitnessed(why),
+        BackingWitness::Drifted => {}
     }
     state.invalidate_mapping_pages(mapping_id);
     PagesVerdict::Drifted
@@ -1542,7 +1542,7 @@ pub fn drain_deferred_unmaps<H: HostOps>(host: &mut H) -> usize {
 /// What keys the token to the surface's *current* pages is
 /// [`crate::model::MappingEntry::map_generation`], not the eager retirement in
 /// the lifecycle mutators. Two writers replace `page_entries` in place without
-/// going near those mutators — the mapper's own plan adoption and the type-4
+/// going near those mutators — the mapper's own plan adoption and the backing
 /// page refresh — and both retired the contiguous view while leaving the token
 /// alone. Both do bump the generation exactly when the list changes, so
 /// checking it here makes a carried-over token unusable by construction instead
@@ -1566,7 +1566,7 @@ pub fn ensure_guest_write_token<H: HostOps>(
         //
         // Counted because retiring a token reopens its two-harvest arming
         // window, and everything downstream of an unarmed token falls back to
-        // the whole-surface answer: the type-11 LOAD elision refuses with
+        // the whole-surface answer: the mapper-ref-texture LOAD elision refuses with
         // `t11_gw_ref_no_stamp` and the draw pays a full-frame seed read plus a
         // full-frame staging upload. `t11_gw_unarmed` says the window was open;
         // this says whether it keeps being reopened, which separates "the token
@@ -1603,13 +1603,13 @@ pub fn ensure_guest_write_token<H: HostOps>(
 /// Record the host's guest-write generation for a mapping whose pixels a Store
 /// has just published, registering its pages for tracking the first time.
 ///
-/// Called from every rail that publishes a type-11 surface: the Vulkan Store
+/// Called from every rail that publishes a mapper-ref-texture surface: the Vulkan Store
 /// rails next to their `surface_content_epoch` stamp, and the CPU writer in
 /// [`crate::runtime::mapping_write`] next to the host-cache store it makes
 /// authoritative. Lives here rather than in the Vulkan draw path because
 /// `mapping_write` is backend-agnostic and the witness is not a backend concern.
 ///
-/// Historically only the Vulkan Store rails armed it, which is why the type-4
+/// Historically only the Vulkan Store rails armed it, which is why the backing
 /// sampled ladder's first census read `t11rung_host_cache_gw_no_stamp` 14 092
 /// against `gw_clean` 0: the copy that rung serves is written here, and nothing
 /// here had ever asked the host to watch the pages it is a copy of.
@@ -1658,7 +1658,7 @@ pub fn stamp_guest_write_gen<M: HostMemory + HostOps>(
     }
 }
 
-/// What the hypervisor's dirty bitmap can say about a type-4 surface's pages
+/// What the hypervisor's dirty bitmap can say about a backing record's pages
 /// since the Store that stamped them.
 ///
 /// Every variant but [`Self::Clean`] means "assume written". They are kept
@@ -1682,11 +1682,10 @@ pub enum GuestWriteVerdict {
 
 /// The verdict itself, with no counters attached.
 ///
-/// Split from the type-11 LOAD gate's `type11_guest_wrote_since_store` so more
-/// than one rail can ask
-/// the same question and report it under its own names. A shared counter would
-/// pool two rails' refusals into one number, and the number would then be
-/// unreadable for either.
+/// Split from the mapper-ref-texture LOAD gate's `mapper_ref_texture_guest_wrote_since_store` so
+/// more than one rail can ask the same question and report it under its own names. A shared counter
+/// would pool two rails' refusals into one number, and the number would then be unreadable for
+/// either.
 #[cfg(feature = "backend-vulkan")]
 pub(crate) fn mapping_guest_write_verdict<M: HostOps>(
     state: &DeviceState,

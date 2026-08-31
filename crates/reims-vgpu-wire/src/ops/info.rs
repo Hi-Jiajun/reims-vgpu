@@ -63,7 +63,7 @@ pub const QUERY_TOTAL_LEN: u32 = 24;
 ///
 /// `reims_vgpu::runtime::icb` decodes the `0x1d1` case at exactly these three
 /// offsets and this length — **and reads the last two as something else.** It
-/// calls them `buffer_ref` ("the type-1 object-list ref of the ICB command
+/// calls them `buffer_ref` ("the buffer object-list ref of the ICB command
 /// backing buffer") and `gpu_address` ("guest GPU/VA of the backing"), then
 /// binds them as the ICB's command memory. Agreeing on where a field is and
 /// disagreeing on what it means is the drift this crate exists to catch, and it

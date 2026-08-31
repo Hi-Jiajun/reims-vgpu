@@ -176,7 +176,7 @@ LOAD_OFF=$(stat -c %s "$FAILLOG")
 # with no trust to arrange. `drag-load.py` drives that, and keeps the resize and
 # second-app churn alongside it because those are a different stressor: surface
 # *reallocation*, which a window that only moves never does, and which a previous
-# session measured as the thing that moves `type4_pages_stale` off zero.
+# session measured as the thing that moves `backing_pages_stale` off zero.
 "$REPO_ROOT/scripts/vibrancy-latch-probe/drag-load.py" \
   --seconds "$LOAD_SECONDS" --guest "$GUEST" --app Safari --qmp "$QMP_SOCK" \
   >"$WORK/load.count" 2>"$WORK/load.err" &

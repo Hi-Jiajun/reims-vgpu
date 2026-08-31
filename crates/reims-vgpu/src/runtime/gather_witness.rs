@@ -1,7 +1,7 @@
 //! Which sampled windows the engine may bind without reading a byte of guest RAM.
 //!
 //! The three zero-copy sampled producers ([`super::draw::vulkan`]'s
-//! linear, type-11 and type-5 rails) hand the engine a
+//! linear, mapper-ref-texture and ref-texture rails) hand the engine a
 //! [`crate::backend::vulkan::engine::SampledSource::GuestRuns`], and the engine's
 //! only byte-moving arm gathers the whole window out of guest RAM into a staging
 //! buffer. That arm had no content cache — measured on a driven x86/PCI boot at
@@ -259,7 +259,7 @@
 //! page above the first non-RAM byte, and nothing unwound it short of a reboot.
 //!
 //! It is worth recognising from the other side too, because the same step drives
-//! `runtime::draw`'s type-11 sampled rung into
+//! `runtime::draw`'s mapper-ref-texture sampled rung into
 //! `t11rung_resident_refused`, whose merge skips every page the witness claims
 //! and so leaves a GPU-side composite reading blank. Twelve recorded boots
 //! separated on this counter with no overlap — 155-186 clean against
@@ -306,10 +306,10 @@ use crate::contract::fnv;
 pub enum GatherRail {
     /// Linear guest texture addressed through task GVA.
     Linear,
-    /// Type-11 mapping-backed sampled bind.
-    Type11,
-    /// Type-5 serialized IOSurface plane view (the video path).
-    Type5,
+    /// Mapper-ref-texture mapping-backed sampled bind.
+    MapperRefTexture,
+    /// Ref-texture serialized IOSurface plane view (the video path).
+    RefTexture,
 }
 
 impl GatherRail {
@@ -317,8 +317,8 @@ impl GatherRail {
     fn names(self) -> (&'static str, &'static str) {
         match self {
             Self::Linear => ("gw_rail_linear", "gw_rail_linear_kb"),
-            Self::Type11 => ("gw_rail_t11", "gw_rail_t11_kb"),
-            Self::Type5 => ("gw_rail_t5", "gw_rail_t5_kb"),
+            Self::MapperRefTexture => ("gw_rail_t11", "gw_rail_t11_kb"),
+            Self::RefTexture => ("gw_rail_t5", "gw_rail_t5_kb"),
         }
     }
 }
@@ -327,7 +327,7 @@ impl GatherRail {
 ///
 /// The two shapes are the two ways the producers name a window: a task-GVA span
 /// (the linear texture rail, which has no mapping) and a mapping-relative offset
-/// (the type-11 and type-5 rails). Those two rails can name the same
+/// (the mapper-ref-texture and ref-texture rails). Those two rails can name the same
 /// `(mid, base_off)` for a single-plane surface, and that is harmless — same
 /// mapping, same offset and same span is the same bytes.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]

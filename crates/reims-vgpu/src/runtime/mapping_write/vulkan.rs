@@ -1,5 +1,5 @@
 //! The Vulkan rail's half of the mapping write: a resident's pixels straight
-//! into a type-11 mapping's guest pages, with the frame never existing on the
+//! into a mapper-ref-texture mapping's guest pages, with the frame never existing on the
 //! host.
 //!
 //! [`super`] owns the neutral half — where a mapping's plane is, what geometry
@@ -9,7 +9,7 @@
 //!
 //! This half is the GPU copy, and it is Vulkan's alone because the thing being
 //! copied is: `write_bgra8_from_resident_gpu` takes a `TargetIdentity`, and
-//! `licence_type11_surface` hands back a
+//! `licence_mapper_ref_texture_surface` hands back a
 //! [`crate::backend::vulkan::engine::GuestPageTarget`] — a permission to write
 //! guest pages that only a rail holding an import of them can grant.
 //!
@@ -280,7 +280,7 @@ fn plan_guest_window(
 /// ([`DeviceState::note_host_wrote_mapping`]) and the page footprint: a rail that
 /// lands frames without recording that it did makes
 /// [`crate::runtime::gather_witness`] attribute its own writes to the guest, and
-/// the type-11 resident rung above it then refuses residents and gathers whole
+/// the mapper-ref-texture resident rung above it then refuses residents and gathers whole
 /// surfaces per bind. That failure is measured and it costs more than this rail
 /// saves.
 ///
@@ -300,7 +300,7 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     // This rail's own window, and the reason the licence does not resolve one:
     // a Store's destination *is* the surface, so a frame whose extent is not
     // the mapping's latched geometry is a frame for a mapping that has moved
-    // under it. That is a scanout rule and not a property of a type-11
+    // under it. That is a scanout rule and not a property of a mapper-ref-texture
     // destination — a compute dispatch writing a sub-rectangle is ordinary — so
     // it is asked here, by the caller it belongs to.
     if !scanout_extent_ok(width, height) {
@@ -321,18 +321,19 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
             frame_height: height,
         });
     }
-    let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
+    let Some((base_off, bpr, span_end)) = mapper_ref_texture_sample_window(m, mw, mh, format)
+    else {
         return Err(GpuWritebackDecline::WindowUnresolved {
             width: mw,
             height: mh,
             format,
         });
     };
-    let licence = licence_type11_surface(
+    let licence = licence_mapper_ref_texture_surface(
         state,
         host,
         identity.resident_format(),
-        &Type11SurfaceDestination {
+        &MapperRefTextureSurfaceDestination {
             mapping_id,
             base_off,
             bpr,
@@ -348,27 +349,27 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
         &licence.gpas,
     )
     .map_err(|inner| GpuWritebackDecline::Engine { inner })?;
-    note_type11_landed(state, mapping_id, licence.base_off, licence.span_end);
+    note_mapper_ref_texture_landed(state, mapping_id, licence.base_off, licence.span_end);
     Ok(licence.span_end - licence.base_off)
 }
 
-/// A window of a type-11 surface mapping the GPU is asked to write.
+/// A window of a mapper-ref-texture surface mapping the GPU is asked to write.
 ///
-/// The type-11 counterpart of
+/// The mapper-ref-texture counterpart of
 /// [`crate::runtime::render_writeback::vulkan::GvaPlaneDestination`], and it exists for
 /// the same reason: the licence must not resolve its own destination. Which
 /// window of which plane a copy lands in is the *caller's* knowledge, and the
 /// two callers here come by it differently — a render Store's destination is the
 /// whole surface, while a compute bind resolves a window at stage time, which
-/// may be a sub-rectangle and, for a type-5 view, names its IOSurface plane on
+/// may be a sub-rectangle and, for a ref-texture view, names its IOSurface plane on
 /// the wire.
 ///
 /// Resolving it inside the licence instead served the Store and silently
 /// mis-served everything else. It refused every sub-rectangle — 15 of the 19
 /// remaining compute readbacks on a driven macos-13 boot, all
 /// [`GpuWritebackDecline::GeometryMoved`] — and behind that refusal sat a worse
-/// failure it was hiding: [`type11_sample_window`] takes no plane index and
-/// matches by geometry, so a type-5 bind's frame would have landed in whichever
+/// failure it was hiding: [`mapper_ref_texture_sample_window`] takes no plane index and
+/// matches by geometry, so a ref-texture bind's frame would have landed in whichever
 /// plane happened to share its dimensions. [`resident_gpu_plane`]'s doc states
 /// the cost of exactly that disagreement, which is that there is no error — the
 /// frame lands in the wrong plane of the right surface and the symptom is the
@@ -377,7 +378,7 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
 /// `format` is what the guest will read these bytes back as, and must be the
 /// format the window was resolved against; the licence derives the bytes per
 /// texel from it rather than taking one, so there is no second answer to carry.
-pub(crate) struct Type11SurfaceDestination {
+pub(crate) struct MapperRefTextureSurfaceDestination {
     pub mapping_id: u32,
     /// Byte offset of the window's first texel within the mapping.
     pub base_off: u64,
@@ -390,9 +391,9 @@ pub(crate) struct Type11SurfaceDestination {
     pub format: u16,
 }
 
-/// A licensed direct-to-guest-pages destination over a type-11 surface mapping.
+/// A licensed direct-to-guest-pages destination over a mapper-ref-texture surface mapping.
 ///
-/// The type-11 counterpart of
+/// The mapper-ref-texture counterpart of
 /// [`crate::runtime::render_writeback::vulkan::GvaPlaneLicence`], and it exists for the
 /// same reason: the two rails that write a guest surface from the GPU — a render
 /// Store and a compute storage-image output — differ only in the image they copy
@@ -402,8 +403,8 @@ pub(crate) struct Type11SurfaceDestination {
 ///
 /// `base_off` and `span_end` are carried because the landing note needs them and
 /// deriving them a second time would be a second answer to a question the
-/// licence already asked. See [`note_type11_landed`].
-pub(crate) struct Type11SurfaceLicence {
+/// licence already asked. See [`note_mapper_ref_texture_landed`].
+pub(crate) struct MapperRefTextureSurfaceLicence {
     pub target: crate::backend::vulkan::engine::GuestPageTarget,
     /// The pages walked, in the surface's own order — what the copy is licensed
     /// over and what every witness on this path is armed against.
@@ -413,11 +414,11 @@ pub(crate) struct Type11SurfaceLicence {
     pub span_end: u64,
 }
 
-/// Licence a caller's type-11 surface window as a destination the GPU may copy
+/// Licence a caller's mapper-ref-texture surface window as a destination the GPU may copy
 /// into, or give the typed reason it may not.
 ///
 /// Takes the window rather than resolving one — see
-/// [`Type11SurfaceDestination`] for why that division is where it is. What is
+/// [`MapperRefTextureSurfaceDestination`] for why that division is where it is. What is
 /// shared between the two rails, and therefore lives here, is the format rule,
 /// the page-list plan, the page walk, the guest-RAM references and the two
 /// guest-write witnesses.
@@ -439,19 +440,19 @@ pub(crate) struct Type11SurfaceLicence {
 /// pages itself, so there is no second pair to compare and this is the only
 /// place the question can be asked. A storage image takes its format from the
 /// specialized SPIR-V texel format, which has no reason to match the format the
-/// bind staged its window against — banded at 3 of 35 type-11 windows on a
+/// bind staged its window against — banded at 3 of 35 mapper-ref-texture windows on a
 /// driven macos-13 boot — so on that rail it is not a healthy zero either.
 ///
 /// Asking it for both callers rather than for the one that needs it keeps the
 /// rule in the licence, where a third writer of a guest surface would meet it
 /// without knowing to look.
-pub(crate) fn licence_type11_surface<M: HostMemory + HostOps>(
+pub(crate) fn licence_mapper_ref_texture_surface<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     held: ash::vk::Format,
-    dst: &Type11SurfaceDestination,
-) -> Result<Type11SurfaceLicence, GpuWritebackDecline> {
-    let &Type11SurfaceDestination {
+    dst: &MapperRefTextureSurfaceDestination,
+) -> Result<MapperRefTextureSurfaceLicence, GpuWritebackDecline> {
+    let &MapperRefTextureSurfaceDestination {
         mapping_id,
         base_off,
         bpr,
@@ -542,7 +543,7 @@ pub(crate) fn licence_type11_surface<M: HostMemory + HostOps>(
     //
     // What used to stand here was the deferred rail's flush-on-access, whose
     // justification was that landing a pending window "can invalidate the
-    // mapping". There are no windows: a type-11 render Store lands its frame at
+    // mapping". There are no windows: a mapper-ref-texture render Store lands its frame at
     // the Store (see `render_writeback`'s module doc). Measured at **5 204
     // settles and 7.29 s blocked** on a driven Safari-drag boot — 42 % of every
     // wait in the device — for an ordering the queue already had.
@@ -650,7 +651,7 @@ pub(crate) fn licence_type11_surface<M: HostMemory + HostOps>(
         ReadbackPhase::Resolve,
         resolve_started.elapsed().as_micros() as u64,
     );
-    Ok(Type11SurfaceLicence {
+    Ok(MapperRefTextureSurfaceLicence {
         target,
         gpas,
         base_off,
@@ -658,7 +659,7 @@ pub(crate) fn licence_type11_surface<M: HostMemory + HostOps>(
     })
 }
 
-/// What a landed type-11 GPU write owes the rest of the device.
+/// What a landed mapper-ref-texture GPU write owes the rest of the device.
 ///
 /// Called once the copy is *issued*, not once it has completed, and by both
 /// rails that issue one — the render Store, which submits and waits, and the
@@ -670,8 +671,8 @@ pub(crate) fn licence_type11_surface<M: HostMemory + HostOps>(
 /// Every one of these errs in the same direction on purpose: a cache forgotten
 /// early costs a re-read of bytes that are about to change anyway, while one
 /// forgotten late hands out a stale frame as fresh. The same argument the
-/// witnesses in [`licence_type11_surface`] are armed on.
-pub(crate) fn note_type11_landed(
+/// witnesses in [`licence_mapper_ref_texture_surface`] are armed on.
+pub(crate) fn note_mapper_ref_texture_landed(
     state: &mut DeviceState,
     mapping_id: u32,
     base_off: u64,
@@ -720,7 +721,8 @@ pub fn synchronize_guest_backed_resident(
             frame_height: height,
         });
     }
-    let Some((base_off, _bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
+    let Some((base_off, _bpr, span_end)) = mapper_ref_texture_sample_window(m, mw, mh, format)
+    else {
         return Err(GpuWritebackDecline::WindowUnresolved {
             width: mw,
             height: mh,
@@ -1008,7 +1010,7 @@ mod tests {
         assert_ne!(via(&not_in_import), via(&scattered));
     }
 
-    /// The type-11 licence judges the window it is given, not the surface's extent.
+    /// The mapper-ref-texture licence judges the window it is given, not the surface's extent.
     ///
     /// A render Store's destination *is* the surface, so that caller refuses a frame
     /// whose rect is not the mapping's latched geometry — the test above drives
@@ -1025,7 +1027,7 @@ mod tests {
     /// so both stop at the reference gate — which is downstream of every rule the
     /// licence still owns, and therefore says both got through all of them.
     #[test]
-    fn a_type11_licence_judges_the_callers_window_and_not_the_surfaces_extent() {
+    fn a_mapper_ref_texture_licence_judges_the_callers_window_and_not_the_surfaces_extent() {
         use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         use crate::model::PAGE_SHIFT_X86;
         const PAGE: u64 = 1 << PAGE_SHIFT_X86;
@@ -1051,7 +1053,7 @@ mod tests {
             pixel_format::store_texel_order(MTL_FORMAT_BGRA8_UNORM)
                 .expect("BGRA8 has a linear texel"),
         );
-        let dest = |width, height| Type11SurfaceDestination {
+        let dest = |width, height| MapperRefTextureSurfaceDestination {
             mapping_id: 7,
             base_off: 0,
             bpr: 64 * 4,
@@ -1061,8 +1063,8 @@ mod tests {
             format: MTL_FORMAT_BGRA8_UNORM,
         };
 
-        let whole = licence_type11_surface(&mut state, &mut host, held, &dest(64, 64));
-        let part = licence_type11_surface(&mut state, &mut host, held, &dest(44, 26));
+        let whole = licence_mapper_ref_texture_surface(&mut state, &mut host, held, &dest(64, 64));
+        let part = licence_mapper_ref_texture_surface(&mut state, &mut host, held, &dest(44, 26));
         for (what, got) in [("the whole surface", whole), ("a sub-rectangle", part)] {
             match got {
                 Err(GpuWritebackDecline::GuestRefRefused { .. }) => {}

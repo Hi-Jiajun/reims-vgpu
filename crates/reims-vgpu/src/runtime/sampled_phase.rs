@@ -53,7 +53,7 @@
 //! |---|---|---|---|---|
 //! | `Resolve` | 15498 | 72.1 | the attachment-alias branch and `resolve_sampled_source`, per texture bind | the sampled content cache and the gather witness |
 //! | [`Part::Reflect`] | 2556 | 11.9 | the AIR constexpr static-sampler walk and, in this measurement, the residual SPIR-V sampler-interface scan | carrying the reflected interface with each `m2v_cache` variant |
-//! | [`Part::Lookup`] | 1526 | 7.1 | `lookup_list_entry` + `resolve_texture_view`, per texture bind | caching the guest object-list walk and the type-8 view descriptor read |
+//! | [`Part::Lookup`] | 1526 | 7.1 | `lookup_list_entry` + `resolve_texture_view`, per texture bind | caching the guest object-list walk and the texture-view descriptor read |
 //! | [`Part::Samplers`] | 1263 | 5.9 | `load_vulkan_sampler` over the record's own sampler binds | the task-scoped retained sampler registry |
 //!
 //! The sampler registry is now the contract rather than a prospective cache:
@@ -130,7 +130,7 @@ use crate::observe::phase_clock::{charge_ns, to_us};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Part {
     /// The per-bind guest reads: `objects::lookup_list_entry` for the texture's
-    /// object-list entry, and `resolve_texture_view` for a type-8 view's
+    /// object-list entry, and `resolve_texture_view` for a texture-view's
     /// channel remap.
     Lookup = 0,
     /// The fragment attachment-alias branch: the `req.colors` probe, plus
@@ -139,7 +139,7 @@ pub enum Part {
     /// `to_vec` of the prior record's seed for a Load one — so this is where a
     /// draw sampling the target it is drawing into pays for the copy.
     ResolveAlias = 1,
-    /// `resolve_sampled_source`: the type-11 rung ladder and the linear guest
+    /// `resolve_sampled_source`: the mapper-ref-texture rung ladder and the linear guest
     /// rungs, for every bind the alias branch above did not claim.
     ResolveSource = 2,
     /// `load_vulkan_sampler` over the record's vertex and fragment sampler

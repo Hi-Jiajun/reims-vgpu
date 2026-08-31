@@ -1,7 +1,7 @@
-//! Guest type-6 function objects: loading the MTLB container, and carving the
+//! Guest function objects: loading the MTLB container, and carving the
 //! wrapped AIR out of it.
 //!
-//! Each type-6 object's descriptor names an MTLB container in guest memory;
+//! Each function object's descriptor names an MTLB container in guest memory;
 //! metal2vulkan consumes the LLVM BitcodeWrapper (`0x0b17c0de`) record inside.
 //! [`load_mtlb`](crate::runtime::mtlb::load_mtlb) does the first half
 //! (object list → container bytes) and
@@ -126,7 +126,7 @@ impl AirLoadRail {
     }
 }
 
-/// Load a type-6 function object's MTLB container out of guest memory.
+/// Load a function object's MTLB container out of guest memory.
 ///
 /// `None` means the caller gets no shader; every reason for it but one is
 /// written to the fail log under [`AirLoadRail::event`], because the callers all
@@ -298,7 +298,7 @@ mod tests {
     fn both_rails_name_the_rung_that_refused_under_their_own_event() {
         let mut host = FakeHost::new();
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        // Object type 11 is an IOSurface, not the type-6 function this loads.
+        // Object mapper-ref-texture is an IOSurface, not the function this loads.
         task_with_one_object(&mut host, &mut state, 11, &[0u8; 0x20]);
 
         let cap = crate::observe::FailCapture::start();

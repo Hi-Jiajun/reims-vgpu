@@ -15,11 +15,11 @@ pub(crate) use regs::*;
 // `mod`, so this is the only path those links can name — and rustc's
 // unused-import lint cannot see a doc link, so it will call this dead.
 pub use state::{
-    ChannelRing, ComputeStorageResidencyKey, DeviceId, DeviceState, ExecFault, FailEvent, GfxRegs,
-    GuestLinearMemo, GvaBacking, GvaEvictionWitness, GvaHostView, HostLinearTexture, HostSurface,
-    MapperCapture, MappingEntry, PacketFault, PresentBacking, PresentState, RenderFlushWitness,
-    ResourceValidity, SurfaceWriteKind, TaskEntry, TaskResource, TaskResourceLifetimeRef,
-    TaskSamplerState, TaskTable, Type4Walk, UnimplementedCommand, FENCE_DOMAIN_BLIT,
+    BackingWalk, ChannelRing, ComputeStorageResidencyKey, DeviceId, DeviceState, ExecFault,
+    FailEvent, GfxRegs, GuestLinearMemo, GvaBacking, GvaEvictionWitness, GvaHostView,
+    HostLinearTexture, HostSurface, MapperCapture, MappingEntry, PacketFault, PresentBacking,
+    PresentState, RenderFlushWitness, ResourceValidity, SurfaceWriteKind, TaskEntry, TaskResource,
+    TaskResourceLifetimeRef, TaskSamplerState, TaskTable, UnimplementedCommand, FENCE_DOMAIN_BLIT,
     FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER, GVA_ENCODE_CACHE_BYTE_CAP,
     GVA_EVICTION_WITNESS_KEYS,
 };
@@ -61,7 +61,7 @@ impl Device {
 
     /// Reset after releasing every HostOps view owned by this guest lifetime.
     pub fn reset_with_host<H: HostOps>(&mut self, host: &mut H) -> usize {
-        // Backend aliases (notably Metal type-11 textures) must die before the
+        // Backend aliases (notably Metal mapper-ref-textures) must die before the
         // underlying contiguous guest-memory views are unmapped.
         self.backend().reset();
         let views = self.state.take_all_host_views();
@@ -107,7 +107,7 @@ impl Device {
 
     /// BH body: drain pending work.
     ///
-    /// `state.texture_to_mapping` is the authoritative type-11 ref → mapping
+    /// `state.texture_to_mapping` is the authoritative mapper-ref-texture ref → mapping
     /// table and is read directly by `runtime/draw`. This used to also
     /// copy it into the backend on every drain, into a map nothing ever read.
     pub fn drain<H: runtime::host::HostMemory + HostOps>(&mut self, host: &mut H) {

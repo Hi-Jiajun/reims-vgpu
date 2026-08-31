@@ -25,15 +25,17 @@ use crate::runtime::decode::resource::{
     ICB_DESC_MAX_FRAGMENT_BINDS, ICB_DESC_MAX_KERNEL_BINDS, ICB_DESC_MAX_VERTEX_BINDS,
     ICB_DESC_OPTIONS, ICB_FLAG_INHERIT_BUFFERS, ICB_LAYOUT_LEN,
     MTL_INDIRECT_CMD_CONCURRENT_DISPATCH, MTL_INDIRECT_CMD_DRAW, MTL_INDIRECT_CMD_DRAW_INDEXED,
-    OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, OBJECT_TYPE_TYPE7, PIPELINE_TAG_FRAGMENT_FUNC,
-    PIPELINE_TAG_VERTEX_FUNC, RESOURCE_PAGE_SHIFT, TYPE7_OBJECT_ICB, TYPE7_OBJECT_RENDER_PIPELINE,
+    OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, OBJECT_TYPE_SERIALIZER_OBJECT,
+    PIPELINE_TAG_FRAGMENT_FUNC, PIPELINE_TAG_VERTEX_FUNC, RESOURCE_PAGE_SHIFT,
+    SERIALIZER_OBJECT_ICB, SERIALIZER_OBJECT_RENDER_PIPELINE,
 };
 /// Compute-pipeline and function descriptor constants, used only by the
 /// Metal-arm execute tests below. Kept in their own gated `use` so the Vulkan arm
 /// does not carry unused imports.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::decode::resource::{
-    OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, TYPE7_FIRST_TLVS, TYPE7_OBJECT_COMPUTE_PIPELINE,
+    OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, SERIALIZER_OBJECT_COMPUTE_PIPELINE,
+    SERIALIZER_OBJECT_FIRST_TLVS,
 };
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::draw::metal::encode_icb_execute_and_writeback;
@@ -346,7 +348,7 @@ fn make_icb_desc_bytes_tg(
 ) -> Vec<u8> {
     use crate::runtime::decode::resource::{compute_icb_layout, ICB_DESC_MAX_KERNEL_TG_BINDS};
     let mut b = vec![0u8; ICB_DESC_LEN];
-    st32(&mut b[0..], TYPE7_OBJECT_ICB);
+    st32(&mut b[0..], SERIALIZER_OBJECT_ICB);
     st32(&mut b[4..], ICB_DESC_LEN as u32);
     st32(&mut b[8..], MTL_INDIRECT_CMD_CONCURRENT_DISPATCH);
     b[ICB_DESC_MAX_VERTEX_BINDS] = 0;
@@ -414,7 +416,7 @@ fn make_render_icb_desc_bytes_ex(
         ICB_FLAG_INHERIT_PIPELINE_STATE,
     };
     let mut b = vec![0u8; ICB_DESC_LEN];
-    st32(&mut b[0..], TYPE7_OBJECT_ICB);
+    st32(&mut b[0..], SERIALIZER_OBJECT_ICB);
     st32(&mut b[4..], ICB_DESC_LEN as u32);
     st32(&mut b[8..], command_types);
     b[ICB_DESC_MAX_VERTEX_BINDS] = max_vertex as u8;
@@ -457,22 +459,22 @@ fn load_stagein_mtlb() -> (Vec<u8>, Vec<u8>) {
     (vtx, frag)
 }
 
-/// Minimal compute pipeline type-7 descriptor: one first-TLV entry naming the
+/// Minimal compute pipeline serializer-object descriptor: one first-TLV entry naming the
 /// kernel function ref. Eight call sites built these same seven lines. Gated
 /// like its constants and all eight callers, which are Metal-arm execute tests.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn make_compute_pipeline_desc(kernel_ref: u32) -> Vec<u8> {
     let mut pdesc = vec![0u8; 32];
-    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut pdesc[0..], SERIALIZER_OBJECT_COMPUTE_PIPELINE);
     st32(&mut pdesc[4..], 32);
-    pdesc[TYPE7_FIRST_TLVS] = 1;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], kernel_ref);
+    pdesc[SERIALIZER_OBJECT_FIRST_TLVS] = 1;
+    pdesc[SERIALIZER_OBJECT_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
+    pdesc[SERIALIZER_OBJECT_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[SERIALIZER_OBJECT_FIRST_TLVS + 3..], kernel_ref);
     pdesc
 }
 
-/// Minimal render pipeline type-7 descriptor: a first-TLV block carrying only
+/// Minimal render pipeline serializer-object descriptor: a first-TLV block carrying only
 /// the vertex and fragment function refs — no vertex-input and no colour
 /// attachment, unlike [`make_stagein_render_pipeline_desc`]. Six call sites
 /// built these same twelve lines. Gated like its constants and all six callers,
@@ -481,20 +483,20 @@ fn make_compute_pipeline_desc(kernel_ref: u32) -> Vec<u8> {
 fn make_render_pipeline_desc(vert_ref: u32, frag_ref: u32) -> Vec<u8> {
     let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
     let blen = pdesc.len() as u32;
-    st32(&mut pdesc[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut pdesc[0..], SERIALIZER_OBJECT_RENDER_PIPELINE);
     st32(&mut pdesc[4..], blen);
     st32(&mut pdesc[8..], 6);
-    pdesc[TYPE7_FIRST_TLVS] = 2;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], vert_ref);
-    pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 8] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], frag_ref);
+    pdesc[SERIALIZER_OBJECT_FIRST_TLVS] = 2;
+    pdesc[SERIALIZER_OBJECT_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
+    pdesc[SERIALIZER_OBJECT_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[SERIALIZER_OBJECT_FIRST_TLVS + 3..], vert_ref);
+    pdesc[SERIALIZER_OBJECT_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
+    pdesc[SERIALIZER_OBJECT_FIRST_TLVS + 8] = 4;
+    st32(&mut pdesc[SERIALIZER_OBJECT_FIRST_TLVS + 9..], frag_ref);
     pdesc
 }
 
-/// Type-7 render pipeline with vertex-input block: Float4 attr0 @ buffer0 stride 16.
+/// Serializer-object render pipeline with vertex-input block: Float4 attr0 @ buffer0 stride 16.
 ///
 /// Layout matches `parse_vertex_block` / color-attachment section (offset from
 /// header end via tag `0x08`).
@@ -519,7 +521,7 @@ fn make_stagein_render_pipeline_desc(vert_ref: u32, frag_ref: u32) -> Vec<u8> {
     let color_off_from_header = (color_abs - 16) as u32; // 86
 
     let mut b = vec![0u8; 117];
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], 117);
     st32(&mut b[8..], 6); // object id
                           // First TLVs
@@ -585,7 +587,7 @@ fn make_stagein_render_pipeline_desc(vert_ref: u32, frag_ref: u32) -> Vec<u8> {
     b
 }
 
-/// Compact type-7 mesh pipeline (host SPI shape): tag `0x14` section offset
+/// Compact serializer-object mesh pipeline (host SPI shape): tag `0x14` section offset
 /// + optional object `0x01` + mesh `0x02` + fragment `0x03`.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn make_mesh_render_pipeline_desc(
@@ -595,7 +597,7 @@ fn make_mesh_render_pipeline_desc(
 ) -> Vec<u8> {
     use crate::runtime::decode::resource::{
         PIPELINE_TAG_MESH_FRAGMENT_FUNC, PIPELINE_TAG_MESH_FUNC, PIPELINE_TAG_MESH_SECTION_OFFSET,
-        PIPELINE_TAG_OBJECT_FUNC, TYPE7_OBJECT_RENDER_PIPELINE,
+        PIPELINE_TAG_OBJECT_FUNC, SERIALIZER_OBJECT_RENDER_PIPELINE,
     };
     let mut fields = Vec::new();
     // Section offset filled after we know field payload size (matches SPI:
@@ -611,7 +613,7 @@ fn make_mesh_render_pipeline_desc(
     let first_tlv_len = 1 + n * 6;
     let mut b = vec![0u8; 16 + first_tlv_len];
     let blen = b.len() as u32;
-    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[0..], SERIALIZER_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], blen);
     st32(&mut b[8..], 6);
     b[16] = n as u8;
@@ -628,13 +630,7 @@ fn make_mesh_render_pipeline_desc(
 }
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn put_type1_buffer(
-    host: &mut FakeHost,
-    state: &DeviceState,
-    obj_ref: u32,
-    handle: u32,
-    bytes: &[u8],
-) {
+fn put_buffer(host: &mut FakeHost, state: &DeviceState, obj_ref: u32, handle: u32, bytes: &[u8]) {
     let gva = (handle as u64) << RESOURCE_PAGE_SHIFT;
     gva_mem::write_task_gva_arm64e(host, &state.tasks[1], gva, bytes);
     let mut bdesc = vec![0u8; 16];
@@ -872,7 +868,14 @@ fn load_icb_from_object_list() {
     let (mut host, state) = icb_device();
     let desc = make_icb_desc_bytes(8, 4, true);
     let gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, gva, &desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        gva,
+        &desc,
+    );
     let icb = load_icb_descriptor(&state, &host, 1, 9).unwrap();
     assert_eq!(icb.max_command_count, 8);
     assert_eq!(icb.max_kernel_buffer_bind_count, 4);
@@ -908,7 +911,14 @@ fn a_flag_this_device_does_not_apply_is_counted_when_the_guest_asks_for_it() {
         let (mut host, state) = icb_device();
         let desc = make_icb_desc_bytes(8, 4, true);
         let gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, gva, &desc);
+        put_object(
+            &mut host,
+            &state,
+            9,
+            OBJECT_TYPE_SERIALIZER_OBJECT,
+            gva,
+            &desc,
+        );
         load_icb_descriptor(&state, &host, 1, 9).unwrap();
     }
     for (route, was) in routes.iter().zip(&before) {
@@ -943,7 +953,14 @@ fn a_flag_this_device_does_not_apply_is_counted_when_the_guest_asks_for_it() {
         let word = crate::contract::endian::ld16(&desc[ICB_DESC_FLAGS..]);
         st16(&mut desc[ICB_DESC_FLAGS..], word & !clear);
         let gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, gva, &desc);
+        put_object(
+            &mut host,
+            &state,
+            9,
+            OBJECT_TYPE_SERIALIZER_OBJECT,
+            gva,
+            &desc,
+        );
         let before_route = store_route_count(route);
         let before_other = store_route_count(other);
         load_icb_descriptor(&state, &host, 1, 9).unwrap();
@@ -971,7 +988,14 @@ fn materialize_and_execute_empty_range() {
     let (mut host, state) = icb_device();
     let desc = make_icb_desc_bytes(8, 4, true);
     let gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, gva, &desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        gva,
+        &desc,
+    );
     let (d, icb) = resolve_metal_icb(&state, &host, 1, 9).expect("materialize");
     assert_eq!(d.max_command_count, 8);
     assert_eq!(icb.size(), 8);
@@ -996,14 +1020,28 @@ fn fill_and_execute_mul3add1_writeback() {
     // ICB object ref 9: 1 command, maxKernel=1, no inherit (explicit fills).
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     // Function + pipeline + data buffer (mul3add1).
     put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
     let pdesc = make_compute_pipeline_desc(5);
     let pdesc_gva = 0x140u64;
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        pdesc_gva,
+        &pdesc,
+    );
 
     let data = [1u32, 2, 3, 4];
     let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -1300,7 +1338,14 @@ fn fill_render_draw_patches_tessellation_oracle() {
 
     let icb_desc = make_render_icb_desc_bytes(1, 1, 0, MTL_INDIRECT_CMD_DRAW_PATCHES);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
@@ -1308,7 +1353,14 @@ fn fill_render_draw_patches_tessellation_oracle() {
 
     // Vertex-input Float4 @ buffer0 stride 16 (step defaults to PerPatchControlPoint).
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &pdesc,
+    );
 
     // Full-screen clip-space triangle as 3 control points.
     let tri: [[f32; 4]; 3] = [
@@ -1320,7 +1372,7 @@ fn fill_render_draw_patches_tessellation_oracle() {
         .iter()
         .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
         .collect();
-    put_type1_buffer(&mut host, &state, 11, 4, &cp_bytes);
+    put_buffer(&mut host, &state, 11, 4, &cp_bytes);
 
     // MTLTriangleTessellationFactorsHalf: edge[3] + inside, half 1.0 = 0x3c00.
     let tess_bytes: [u8; 8] = [
@@ -1329,7 +1381,7 @@ fn fill_render_draw_patches_tessellation_oracle() {
         0x00, 0x3c, // edge2
         0x00, 0x3c, // inside
     ];
-    put_type1_buffer(&mut host, &state, 12, 5, &tess_bytes);
+    put_buffer(&mut host, &state, 12, 5, &tess_bytes);
 
     fill_render(
         &state,
@@ -1392,14 +1444,28 @@ fn fill_render_draw_indexed_patches_tessellation_oracle() {
 
     let icb_desc = make_render_icb_desc_bytes(1, 1, 0, MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &pdesc,
+    );
 
     // Control points: dummy at 0, real full-screen triangle at 1,2,3.
     let cps: [[f32; 4]; 4] = [
@@ -1412,15 +1478,15 @@ fn fill_render_draw_indexed_patches_tessellation_oracle() {
         .iter()
         .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
         .collect();
-    put_type1_buffer(&mut host, &state, 11, 4, &cp_bytes);
+    put_buffer(&mut host, &state, 11, 4, &cp_bytes);
 
     // UInt16 control-point indices [1,2,3].
     let indices: [u16; 3] = [1, 2, 3];
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 13, 5, &index_bytes);
+    put_buffer(&mut host, &state, 13, 5, &index_bytes);
 
     let tess_bytes: [u8; 8] = [0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c];
-    put_type1_buffer(&mut host, &state, 12, 6, &tess_bytes);
+    put_buffer(&mut host, &state, 12, 6, &tess_bytes);
 
     fill_render(
         &state,
@@ -1672,9 +1738,16 @@ fn fill_render_draw_mesh_threads_oracle() {
 
     let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADS);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
-    // Mesh function lives in the type-7 "vertex" function slot (no guest
+    // Mesh function lives in the serializer-object "vertex" function slot (no guest
     // mesh-pipeline descriptor yet — host-fill only path).
     put_function_object(&mut host, &state, 2, 0x200, 2, &mesh_mtlb);
 
@@ -1682,7 +1755,14 @@ fn fill_render_draw_mesh_threads_oracle() {
 
     // No vertex attributes needed for mesh; reuse stage-in desc helper with empty attrs.
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &pdesc,
+    );
 
     fill_render(
         &state,
@@ -1724,14 +1804,28 @@ fn fill_render_draw_mesh_threadgroups_oracle() {
 
     let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &mesh_mtlb);
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &pdesc,
+    );
 
     fill_render(
         &state,
@@ -1837,14 +1931,28 @@ fn fill_render_negative_base_vertex_stagein_oracle() {
 
     let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW_INDEXED);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &pdesc,
+    );
 
     // Clip-space full-cover triangle at vertex indices 0,1,2.
     let tri: [[f32; 4]; 3] = [
@@ -1856,18 +1964,18 @@ fn fill_render_negative_base_vertex_stagein_oracle() {
         .iter()
         .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
         .collect();
-    put_type1_buffer(&mut host, &state, 11, 4, &pos_bytes);
+    put_buffer(&mut host, &state, 11, 4, &pos_bytes);
 
     // indices [1,2,3] + baseVertex(-1) → vertex_id 0,1,2.
     let indices: [u16; 3] = [1, 2, 3];
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 12, 5, &index_bytes);
+    put_buffer(&mut host, &state, 12, 5, &index_bytes);
 
     let sid = 7u8;
     let r = (0x60u32 + sid as u32) as f32 / 255.0;
     let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 13, 6, &color_bytes);
+    put_buffer(&mut host, &state, 13, 6, &color_bytes);
 
     fill_render(
         &state,
@@ -1937,13 +2045,27 @@ fn buffer_backed_fill_execute_mul3add1() {
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let layout = compute_only_icb_layout(1);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
     let pdesc = make_compute_pipeline_desc(5);
     let pdesc_gva = 0x140u64;
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        pdesc_gva,
+        &pdesc,
+    );
 
     let data = [1u32, 2, 3, 4];
     let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -1955,7 +2077,7 @@ fn buffer_backed_fill_execute_mul3add1() {
     let bdesc_gva = 0x180u64;
     put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, bdesc_gva, &bdesc);
 
-    // Guest-style fill: command slot in a type-1 backing buffer (handle 4).
+    // Guest-style fill: command slot in a buffer backing buffer (handle 4).
     let slot = encode_compute_command_slot(
         &layout,
         &IcbComputeFill {
@@ -1984,7 +2106,7 @@ fn buffer_backed_fill_execute_mul3add1() {
         &cmd_bdesc,
     );
 
-    // Auto-bind via type-1 buffer_ref (sync path / 0x1d1 payload).
+    // Auto-bind via buffer_ref (sync path / 0x1d1 payload).
     let mem = associate_icb_backing_buffer_ref(&state, &host, 1, 9, 10).expect("associate");
     assert_eq!(mem.gva, cmd_mem_gva);
     assert_eq!(mem.byte_len, layout.command_size as u64);
@@ -2010,7 +2132,7 @@ fn buffer_backed_fill_execute_mul3add1() {
     assert_eq!(
         out,
         vec![4, 7, 10, 13],
-        "type-1 associated ICB fill+execute mul3add1"
+        "buffer associated ICB fill+execute mul3add1"
     );
 }
 
@@ -2041,12 +2163,12 @@ fn icb_host_resource_info_decode_and_apply() {
 /// The record names an ICB and a scratch `(buffer, offset)` pair for the two
 /// `u64`s the guest is waiting to be handed. This device used to read that pair
 /// as the ICB's command backing, so a guest whose stream allocator returned a
-/// resolvable type-1 ref would have had its own reply staging area bound as an
+/// resolvable buffer ref would have had its own reply staging area bound as an
 /// ICB's command slots — and the next `executeCommandsInBuffer:` would have
 /// decoded whatever sat there and run it as real work.
 ///
 /// The fixture is built to be exactly that trap: object 11 is a well-formed
-/// type-1 buffer whose pages hold a *valid* encoded command slot, so the old
+/// buffer whose pages hold a *valid* encoded command slot, so the old
 /// code path succeeds on it. Both halves are asserted, because the refusal
 /// alone would still pass if the bind happened first and the error came later:
 /// the call refuses, **and** the ICB still has no command memory afterwards.
@@ -2058,7 +2180,14 @@ fn a_0x1d1_query_is_refused_and_binds_nothing() {
     let layout = compute_only_icb_layout(1);
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
     // Record the create body, as `execute` would, so the decode below refuses
     // for want of command memory rather than for want of the ICB itself.
     resolve_icb_record(&state, &host, 1, 9).expect("record the ICB create body");
@@ -2118,7 +2247,14 @@ fn fill_render_draw_indexed_execute_oracle() {
     // ICB: DrawIndexed, maxFragment=1 for color constant at fragment buffer 0.
     let icb_desc = make_render_icb_desc_bytes(1, 0, 1, MTL_INDIRECT_CMD_DRAW_INDEXED);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     // Vertex function (ref 2) + fragment function (ref 3).
     // Descriptor GVAs stay past object-list region (32×12 = 0x180).
@@ -2126,22 +2262,29 @@ fn fill_render_draw_indexed_execute_oracle() {
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
-    // Render pipeline type-7 (ref 6): vertex=2, fragment=3.
+    // Render pipeline serializer-object (ref 6): vertex=2, fragment=3.
     let pdesc = make_render_pipeline_desc(2, 3);
     let pdesc_gva = 0x240u64;
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        pdesc_gva,
+        &pdesc,
+    );
 
     // Index buffer (ref 12, handle 4): UInt16 [0,1,2].
     let indices: [u16; 3] = [0, 1, 2];
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 12, 4, &index_bytes);
+    put_buffer(&mut host, &state, 12, 4, &index_bytes);
 
     // Fragment color buffer (ref 13, handle 5): RGBA float4 for sid=7.
     let sid = 7u8;
     let r = (0x60u32 + sid as u32) as f32 / 255.0;
     let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
+    put_buffer(&mut host, &state, 13, 5, &color_bytes);
 
     // Mapping for color writeback (4×4 BGRA).
     let mapping_id = map_draw_target(&mut host, &mut state, 0x30);
@@ -2189,7 +2332,14 @@ fn buffer_backed_render_draw_indexed_fill_execute() {
     let layout = render_icb_layout(max_v, max_f, MTL_INDIRECT_CMD_DRAW_INDEXED);
     let icb_desc = make_render_icb_desc_bytes(1, max_v, max_f, MTL_INDIRECT_CMD_DRAW_INDEXED);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
@@ -2197,17 +2347,24 @@ fn buffer_backed_render_draw_indexed_fill_execute() {
 
     let pdesc = make_render_pipeline_desc(2, 3);
     let pdesc_gva = 0x240u64;
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        pdesc_gva,
+        &pdesc,
+    );
 
     let indices: [u16; 3] = [0, 1, 2];
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 12, 4, &index_bytes);
+    put_buffer(&mut host, &state, 12, 4, &index_bytes);
 
     let sid = 7u8;
     let r = (0x60u32 + sid as u32) as f32 / 255.0;
     let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
+    put_buffer(&mut host, &state, 13, 5, &color_bytes);
 
     let slot = encode_render_command_slot(
         &layout,
@@ -2244,7 +2401,7 @@ fn buffer_backed_render_draw_indexed_fill_execute() {
 /// Wire-backed E2E: DrawPatches tessellation.
 ///
 /// Guest path only — no `fill_render_command` host API:
-/// encode slot → type-1 command memory → `0x1d1` associate → execute
+/// encode slot → buffer command memory → `0x1d1` associate → execute
 /// re-fills via `fill_icb_from_command_memory` → solid BGRA.
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
@@ -2263,14 +2420,28 @@ fn wire_backed_draw_patches_tessellation_e2e() {
     let layout = render_draw_patches_icb_layout(1);
     let icb_desc = make_render_icb_desc_bytes(1, 1, 0, MTL_INDIRECT_CMD_DRAW_PATCHES);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &pdesc,
+    );
 
     let tri: [[f32; 4]; 3] = [
         [-1.0, -1.0, 0.0, 1.0],
@@ -2281,10 +2452,10 @@ fn wire_backed_draw_patches_tessellation_e2e() {
         .iter()
         .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
         .collect();
-    put_type1_buffer(&mut host, &state, 11, 4, &cp_bytes);
+    put_buffer(&mut host, &state, 11, 4, &cp_bytes);
 
     let tess_bytes: [u8; 8] = [0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c];
-    put_type1_buffer(&mut host, &state, 12, 5, &tess_bytes);
+    put_buffer(&mut host, &state, 12, 5, &tess_bytes);
 
     // Absolute wire VAs for control-point bind + tess factor (base+0).
     let cp_wire = (4u64) << RESOURCE_PAGE_SHIFT;
@@ -2364,14 +2535,28 @@ fn wire_backed_draw_indexed_patches_tessellation_e2e() {
     let layout = render_draw_indexed_patches_icb_layout(1);
     let icb_desc = make_render_icb_desc_bytes(1, 1, 0, MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &pdesc,
+    );
 
     // Control points: dummy at 0, real triangle at 1,2,3.
     let cps: [[f32; 4]; 4] = [
@@ -2384,14 +2569,14 @@ fn wire_backed_draw_indexed_patches_tessellation_e2e() {
         .iter()
         .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
         .collect();
-    put_type1_buffer(&mut host, &state, 11, 4, &cp_bytes);
+    put_buffer(&mut host, &state, 11, 4, &cp_bytes);
 
     let indices: [u16; 3] = [1, 2, 3];
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 13, 5, &index_bytes);
+    put_buffer(&mut host, &state, 13, 5, &index_bytes);
 
     let tess_bytes: [u8; 8] = [0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c];
-    put_type1_buffer(&mut host, &state, 12, 6, &tess_bytes);
+    put_buffer(&mut host, &state, 12, 6, &tess_bytes);
 
     let cp_wire = (4u64) << RESOURCE_PAGE_SHIFT;
     let index_wire = (5u64) << RESOURCE_PAGE_SHIFT;
@@ -2458,7 +2643,7 @@ fn wire_backed_draw_indexed_patches_tessellation_e2e() {
     );
 }
 
-/// Object+mesh host fill: dual-function metallib (object type 8 + mesh type 7)
+/// Object+mesh host fill: dual-function metallib (object texture-view + mesh serializer-object)
 /// → drawMeshThreadgroups → solid BGRA (object sets mesh grid via payload).
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
@@ -2487,7 +2672,14 @@ fn fill_render_object_mesh_threadgroups_oracle() {
         b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
             .copy_from_slice(&encode_icb_command_layout(&layout));
         let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &b);
+        put_object(
+            &mut host,
+            &state,
+            9,
+            OBJECT_TYPE_SERIALIZER_OBJECT,
+            icb_gva,
+            &b,
+        );
     }
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &om_mtlb);
@@ -2495,7 +2687,14 @@ fn fill_render_object_mesh_threadgroups_oracle() {
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &pdesc,
+    );
 
     fill_render(
         &state,
@@ -2525,7 +2724,7 @@ fn fill_render_object_mesh_threadgroups_oracle() {
 }
 
 /// Dedicated wire-backed E2E: dual-export object+mesh metallib in classic
-/// type-7 vertex slot (no mesh SPI tag 0x14) through command memory.
+/// serializer-object vertex slot (no mesh SPI tag 0x14) through command memory.
 /// Not claimed via mesh SPI separate-ref E2E.
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
@@ -2545,14 +2744,21 @@ fn wire_backed_dual_export_object_mesh_e2e() {
     let layout = render_draw_mesh_threadgroups_icb_layout();
     let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     // Dual-export object+mesh in classic "vertex" function slot only.
     put_function_object(&mut host, &state, 2, 0x200, 2, &om_mtlb);
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
-    // Classic type-7 shape: tag 0x01/0x02 only (no mesh SPI 0x14).
+    // Classic serializer-object shape: tag 0x01/0x02 only (no mesh SPI 0x14).
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
     let decoded = decode_render_pipeline_descriptor(&pdesc).expect("classic pipeline");
     assert_eq!(decoded.vertex_func_ref, 2);
@@ -2562,7 +2768,14 @@ fn wire_backed_dual_export_object_mesh_e2e() {
     assert!(!decoded.has_color_attachment_offset || decoded.color_attachment_offset != 0);
     // Mesh SPI shape uses tag 0x14; classic stagein has tag 0x08.
     // object/mesh refs must stay zero so fill uses dual-export scan of vertex metallib.
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &pdesc,
+    );
 
     let fill = IcbRenderFill {
         command_index: 0,
@@ -2595,7 +2808,7 @@ fn wire_backed_dual_export_object_mesh_e2e() {
     );
 }
 
-/// Separate object + mesh + fragment function refs via mesh SPI type-7
+/// Separate object + mesh + fragment function refs via mesh SPI serializer-object
 /// tags 0x01 / 0x02 / 0x03 under section tag 0x14 (not dual-export).
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
@@ -2625,7 +2838,14 @@ fn fill_render_separate_object_mesh_func_refs_oracle() {
         b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
             .copy_from_slice(&encode_icb_command_layout(&layout));
         let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &b);
+        put_object(
+            &mut host,
+            &state,
+            9,
+            OBJECT_TYPE_SERIALIZER_OBJECT,
+            icb_gva,
+            &b,
+        );
     }
 
     // Object function ref 2, mesh ref 4, fragment ref 3 — three distinct objects.
@@ -2641,7 +2861,14 @@ fn fill_render_separate_object_mesh_func_refs_oracle() {
     assert_eq!(decoded.mesh_func_ref, 4);
     assert_eq!(decoded.fragment_func_ref, 3);
     assert_eq!(decoded.vertex_func_ref, 0);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x280, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x280,
+        &pdesc,
+    );
 
     fill_render(
         &state,
@@ -2695,7 +2922,14 @@ fn wire_backed_mesh_spi_pipeline_e2e() {
     let layout = render_draw_mesh_threadgroups_icb_layout();
     let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     // Three distinct function objects: object=2, frag=3, mesh=4.
     put_function_object(&mut host, &state, 2, 0x200, 2, &obj_mtlb);
@@ -2711,7 +2945,14 @@ fn wire_backed_mesh_spi_pipeline_e2e() {
     assert_eq!(decoded.fragment_func_ref, 3);
     assert_eq!(decoded.vertex_func_ref, 0);
     assert!(decoded.has_color_attachment_offset); // tag 0x14 shape
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x280, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x280,
+        &pdesc,
+    );
 
     let fill = IcbRenderFill {
         command_index: 0,
@@ -2761,18 +3002,32 @@ fn fill_render_mesh_buffer_bind_oracle() {
     let icb_desc =
         make_render_icb_desc_bytes_ex(1, 0, 0, 0, 1, MTL_INDIRECT_CMD_DRAW_MESH_THREADS, 0);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &mesh_mtlb);
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &pdesc,
+    );
 
     // scale = 1.0f LE (handle must be a setup_task-mapped page pfn).
     let scale_bytes = 1.0f32.to_le_bytes();
-    put_type1_buffer(&mut host, &state, 7, 4, &scale_bytes);
+    put_buffer(&mut host, &state, 7, 4, &scale_bytes);
 
     fill_render(
         &state,
@@ -2825,17 +3080,31 @@ fn fill_render_object_buffer_bind_oracle() {
     let icb_desc =
         make_render_icb_desc_bytes_ex(1, 0, 0, 1, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, 0);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &om_mtlb);
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &pdesc,
+    );
 
     let scale_bytes = 1.0f32.to_le_bytes();
-    put_type1_buffer(&mut host, &state, 7, 4, &scale_bytes);
+    put_buffer(&mut host, &state, 7, 4, &scale_bytes);
 
     fill_render(
         &state,
@@ -2894,17 +3163,31 @@ fn wire_backed_mesh_buffer_bind_e2e() {
     icb_desc[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
         .copy_from_slice(&encode_icb_command_layout(&layout));
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &mesh_mtlb);
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &pdesc,
+    );
 
     let scale_bytes = 1.0f32.to_le_bytes();
-    put_type1_buffer(&mut host, &state, 7, 4, &scale_bytes);
+    put_buffer(&mut host, &state, 7, 4, &scale_bytes);
     let scale_gva = 4u64 << RESOURCE_PAGE_SHIFT;
 
     let fill = IcbRenderFill {
@@ -2970,17 +3253,31 @@ fn wire_backed_object_buffer_bind_e2e() {
     icb_desc[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
         .copy_from_slice(&encode_icb_command_layout(&layout));
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &om_mtlb);
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &pdesc,
+    );
 
     let scale_bytes = 1.0f32.to_le_bytes();
-    put_type1_buffer(&mut host, &state, 7, 4, &scale_bytes);
+    put_buffer(&mut host, &state, 7, 4, &scale_bytes);
     let scale_gva = 4u64 << RESOURCE_PAGE_SHIFT;
 
     let fill = IcbRenderFill {
@@ -3101,7 +3398,14 @@ fn fill_render_object_tg_memory_bad_length_rejected() {
         b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
             .copy_from_slice(&encode_icb_command_layout(&layout));
         let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &b);
+        put_object(
+            &mut host,
+            &state,
+            9,
+            OBJECT_TYPE_SERIALIZER_OBJECT,
+            icb_gva,
+            &b,
+        );
     }
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &om_mtlb);
@@ -3109,7 +3413,14 @@ fn fill_render_object_tg_memory_bad_length_rejected() {
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &pdesc,
+    );
 
     let err = fill_render(
         &state,
@@ -3164,7 +3475,14 @@ fn fill_render_object_tg_memory_oracle() {
         b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
             .copy_from_slice(&encode_icb_command_layout(&layout));
         let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &b);
+        put_object(
+            &mut host,
+            &state,
+            9,
+            OBJECT_TYPE_SERIALIZER_OBJECT,
+            icb_gva,
+            &b,
+        );
     }
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &om_mtlb);
@@ -3172,7 +3490,14 @@ fn fill_render_object_tg_memory_oracle() {
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &pdesc,
+    );
 
     fill_render(
         &state,
@@ -3225,14 +3550,28 @@ fn wire_backed_object_tg_memory_e2e() {
     icb_desc[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
         .copy_from_slice(&encode_icb_command_layout(&layout));
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &om_mtlb);
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &pdesc,
+    );
 
     let fill = IcbRenderFill {
         command_index: 0,
@@ -3265,7 +3604,7 @@ fn wire_backed_object_tg_memory_e2e() {
 
 /// Wire-backed E2E: drawMeshThreads.
 ///
-/// Same guest path as patches: encode slot into type-1 command memory,
+/// Same guest path as patches: encode slot into buffer command memory,
 /// `0x1d1` bind, execute re-fills from wire (no host `fill_render_command`).
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
@@ -3284,14 +3623,28 @@ fn wire_backed_mesh_threads_e2e() {
     let layout = render_draw_mesh_threads_icb_layout(0);
     let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADS);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &mesh_mtlb);
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &pdesc,
+    );
 
     let slot = encode_render_command_slot(
         &layout,
@@ -3343,14 +3696,28 @@ fn wire_backed_mesh_threadgroups_e2e() {
     let layout = render_draw_mesh_threadgroups_icb_layout();
     let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &mesh_mtlb);
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &pdesc,
+    );
 
     let slot = encode_render_command_slot(
         &layout,
@@ -3405,7 +3772,14 @@ fn inherit_buffers_encoder_fragment_color() {
         ICB_FLAG_INHERIT_BUFFERS,
     );
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
@@ -3413,17 +3787,24 @@ fn inherit_buffers_encoder_fragment_color() {
 
     let pdesc = make_render_pipeline_desc(2, 3);
     let pdesc_gva = 0x240u64;
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        pdesc_gva,
+        &pdesc,
+    );
 
     let indices: [u16; 3] = [0, 1, 2];
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 12, 4, &index_bytes);
+    put_buffer(&mut host, &state, 12, 4, &index_bytes);
 
     let sid = 7u8;
     let r = (0x60u32 + sid as u32) as f32 / 255.0;
     let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
+    put_buffer(&mut host, &state, 13, 5, &color_bytes);
 
     // Fill: pipeline + draw only — no fragment buffer in the ICB slot.
     fill_render(
@@ -3491,7 +3872,14 @@ fn inherit_pipeline_encoder_fragment_color() {
         ICB_FLAG_INHERIT_PIPELINE_STATE,
     );
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
@@ -3499,17 +3887,24 @@ fn inherit_pipeline_encoder_fragment_color() {
 
     let pdesc = make_render_pipeline_desc(2, 3);
     let pdesc_gva = 0x240u64;
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        pdesc_gva,
+        &pdesc,
+    );
 
     let indices: [u16; 3] = [0, 1, 2];
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 12, 4, &index_bytes);
+    put_buffer(&mut host, &state, 12, 4, &index_bytes);
 
     let sid = 7u8;
     let r = (0x60u32 + sid as u32) as f32 / 255.0;
     let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
+    put_buffer(&mut host, &state, 13, 5, &color_bytes);
 
     // Fill: buffers + draw only — pipeline_ref 0 (inherited from parent).
     fill_render(
@@ -3576,7 +3971,14 @@ fn fill_render_stagein_draw_execute_oracle() {
     // Draw (not indexed): max_vertex=1 for position buffer bind.
     let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
@@ -3584,7 +3986,14 @@ fn fill_render_stagein_draw_execute_oracle() {
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
     let pdesc_gva = 0x240u64;
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        pdesc_gva,
+        &pdesc,
+    );
 
     // Fullscreen triangle positions (clip space), stride 16 Float4.
     let tri: [[f32; 4]; 3] = [
@@ -3596,13 +4005,13 @@ fn fill_render_stagein_draw_execute_oracle() {
         .iter()
         .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
         .collect();
-    put_type1_buffer(&mut host, &state, 11, 4, &pos_bytes);
+    put_buffer(&mut host, &state, 11, 4, &pos_bytes);
 
     let sid = 7u8;
     let r = (0x60u32 + sid as u32) as f32 / 255.0;
     let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
+    put_buffer(&mut host, &state, 13, 5, &color_bytes);
 
     fill_render(
         &state,
@@ -3650,14 +4059,28 @@ fn wire_backed_draw_primitives_stagein_e2e() {
     let layout = render_icb_layout(1, 1, MTL_INDIRECT_CMD_DRAW);
     let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &pdesc,
+    );
 
     let tri: [[f32; 4]; 3] = [
         [-1.0, -1.0, 0.0, 1.0],
@@ -3668,13 +4091,13 @@ fn wire_backed_draw_primitives_stagein_e2e() {
         .iter()
         .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
         .collect();
-    put_type1_buffer(&mut host, &state, 11, 4, &pos_bytes);
+    put_buffer(&mut host, &state, 11, 4, &pos_bytes);
 
     let sid = 7u8;
     let r = (0x60u32 + sid as u32) as f32 / 255.0;
     let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
+    put_buffer(&mut host, &state, 13, 5, &color_bytes);
 
     let pos_wire = (4u64) << RESOURCE_PAGE_SHIFT;
     let color_wire = (5u64) << RESOURCE_PAGE_SHIFT;
@@ -3838,14 +4261,28 @@ fn fill_render_attribute_stride_stagein_execute() {
 
     let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &pdesc,
+    );
 
     // Tight Float4 positions (stride 16) — attributeStride matches layout stride.
     let tri: [[f32; 4]; 3] = [
@@ -3857,13 +4294,13 @@ fn fill_render_attribute_stride_stagein_execute() {
         .iter()
         .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
         .collect();
-    put_type1_buffer(&mut host, &state, 11, 4, &pos_bytes);
+    put_buffer(&mut host, &state, 11, 4, &pos_bytes);
 
     let sid = 7u8;
     let r = (0x60u32 + sid as u32) as f32 / 255.0;
     let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
+    put_buffer(&mut host, &state, 13, 5, &color_bytes);
 
     fill_render(
         &state,
@@ -3930,14 +4367,28 @@ fn wire_backed_attribute_stride_stagein_e2e() {
     assert!(icb_layout_attribute_stride_slot_count(&layout) >= 1);
     let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &pdesc,
+    );
 
     let tri: [[f32; 4]; 3] = [
         [-1.0, -1.0, 0.0, 1.0],
@@ -3948,13 +4399,13 @@ fn wire_backed_attribute_stride_stagein_e2e() {
         .iter()
         .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
         .collect();
-    put_type1_buffer(&mut host, &state, 11, 4, &pos_bytes);
+    put_buffer(&mut host, &state, 11, 4, &pos_bytes);
 
     let sid = 7u8;
     let r = (0x60u32 + sid as u32) as f32 / 255.0;
     let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
+    put_buffer(&mut host, &state, 13, 5, &color_bytes);
 
     let pos_wire = (4u64) << RESOURCE_PAGE_SHIFT;
     let color_wire = (5u64) << RESOURCE_PAGE_SHIFT;
@@ -4073,12 +4524,26 @@ fn fill_compute_barrier_and_tg_memory_execute() {
 
     let icb_desc = make_icb_desc_bytes_tg(1, 1, 1, 0);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
     let pdesc = make_compute_pipeline_desc(5);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x140,
+        &pdesc,
+    );
 
     let data = [1u32, 2, 3, 4];
     let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -4140,12 +4605,26 @@ fn inherit_buffers_encoder_kernel_mul3add1() {
     // inheritBuffers; maxKernel still advertises encoder bind capacity.
     let icb_desc = make_icb_desc_bytes_tg(1, 1, 0, ICB_FLAG_INHERIT_BUFFERS);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
     let pdesc = make_compute_pipeline_desc(5);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x140,
+        &pdesc,
+    );
 
     let data = [1u32, 2, 3, 4];
     let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -4214,12 +4693,26 @@ fn inherit_pipeline_encoder_kernel_mul3add1() {
 
     let icb_desc = make_icb_desc_bytes_tg(1, 1, 0, ICB_FLAG_INHERIT_PIPELINE_STATE);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
     let pdesc = make_compute_pipeline_desc(5);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x140,
+        &pdesc,
+    );
 
     let data = [1u32, 2, 3, 4];
     let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -4268,11 +4761,11 @@ fn inherit_pipeline_encoder_kernel_mul3add1() {
     );
 }
 
-/// Install a type-2 linear texture (single level) and write seed texels.
+/// Install a texture linear texture (single level) and write seed texels.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 // A test fixture builder: object ref, handle, geometry and seed texels.
 #[allow(clippy::too_many_arguments)]
-fn put_type2_texture(
+fn put_texture(
     host: &mut FakeHost,
     state: &mut DeviceState,
     obj_ref: u32,
@@ -4310,12 +4803,17 @@ fn put_type2_texture(
     gva_mem::write_task_gva_arm64e(host, &state.tasks[1], data_gva, &page);
 }
 
-/// Minimal type-7 sampler (36 B): clamp-to-edge, nearest, normalized coords.
+/// Minimal serializer-object sampler (36 B): clamp-to-edge, nearest, normalized coords.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn put_type7_sampler(host: &mut FakeHost, state: &DeviceState, obj_ref: u32, normalized: bool) {
-    use crate::runtime::decode::resource::{sampler_desc as off, TYPE7_OBJECT_SAMPLER};
+fn put_serializer_object_sampler(
+    host: &mut FakeHost,
+    state: &DeviceState,
+    obj_ref: u32,
+    normalized: bool,
+) {
+    use crate::runtime::decode::resource::{sampler_desc as off, SERIALIZER_OBJECT_SAMPLER};
     let mut desc = vec![0u8; off::LEN];
-    st32(&mut desc[off::TAG..], TYPE7_OBJECT_SAMPLER);
+    st32(&mut desc[off::TAG..], SERIALIZER_OBJECT_SAMPLER);
     st32(&mut desc[off::DECLARED_LEN..], off::LEN as u32);
     st32(&mut desc[off::ID..], obj_ref);
     // Address modes ClampToEdge=0 at bits 8/12/16; filters nearest=0.
@@ -4329,7 +4827,14 @@ fn put_type7_sampler(host: &mut FakeHost, state: &DeviceState, obj_ref: u32, nor
     st32(&mut desc[off::LOD_MIN..], 0f32.to_bits());
     st32(&mut desc[off::LOD_MAX..], f32::MAX.to_bits());
     let desc_gva = 0x300u64 + (obj_ref as u64) * 0x40;
-    put_object(host, state, obj_ref, OBJECT_TYPE_TYPE7, desc_gva, &desc);
+    put_object(
+        host,
+        state,
+        obj_ref,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        desc_gva,
+        &desc,
+    );
 }
 
 /// Textures/samplers always bind on the parent compute encoder at ICB
@@ -4353,12 +4858,26 @@ fn icb_parent_encoder_texture_and_sampler_binds() {
 
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
     let pdesc = make_compute_pipeline_desc(5);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x140,
+        &pdesc,
+    );
 
     let data = [1u32, 2, 3, 4];
     let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -4372,7 +4891,7 @@ fn icb_parent_encoder_texture_and_sampler_binds() {
     const W: u32 = 2;
     const H: u32 = 2;
     let seed = vec![0xCDu8; (W * H * 4) as usize];
-    put_type2_texture(
+    put_texture(
         &mut host,
         &mut state,
         11,
@@ -4382,7 +4901,7 @@ fn icb_parent_encoder_texture_and_sampler_binds() {
         MTL_FORMAT_RGBA8_UNORM,
         &seed,
     );
-    put_type7_sampler(&mut host, &state, 14, true);
+    put_serializer_object_sampler(&mut host, &state, 14, true);
 
     fill_compute(
         &state,
@@ -4472,17 +4991,31 @@ fn icb_argument_buffer_storage_texture_xyplane() {
     // maxKernel=1 for the AB buffer slot; no inheritBuffers — AB recorded on ICB.
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
     let pdesc = make_compute_pipeline_desc(5);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x140,
+        &pdesc,
+    );
 
     const W: u32 = 4;
     const H: u32 = 4;
     let seed = vec![0x00u8; (W * H * 4) as usize];
-    put_type2_texture(
+    put_texture(
         &mut host,
         &mut state,
         11,
@@ -4568,12 +5101,26 @@ fn icb_argument_buffer_sample_and_write() {
 
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
     let pdesc = make_compute_pipeline_desc(5);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x140,
+        &pdesc,
+    );
 
     const W: u32 = 4;
     const H: u32 = 4;
@@ -4587,7 +5134,7 @@ fn icb_argument_buffer_sample_and_write() {
             input[i + 3] = 255;
         }
     }
-    put_type2_texture(
+    put_texture(
         &mut host,
         &mut state,
         11,
@@ -4598,7 +5145,7 @@ fn icb_argument_buffer_sample_and_write() {
         &input,
     );
     let out_seed = vec![0x11u8; (W * H * 4) as usize];
-    put_type2_texture(
+    put_texture(
         &mut host,
         &mut state,
         12,
@@ -4608,7 +5155,7 @@ fn icb_argument_buffer_sample_and_write() {
         MTL_FORMAT_RGBA8_UINT,
         &out_seed,
     );
-    put_type7_sampler(&mut host, &state, 14, true);
+    put_serializer_object_sampler(&mut host, &state, 14, true);
 
     fill_compute(
         &state,
@@ -4688,7 +5235,7 @@ fn resolve_bind_offset_from_wire_va() {
     let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
     bytes[16..32].copy_from_slice(&color_bytes);
-    put_type1_buffer(&mut host, &state, 13, 4, &bytes);
+    put_buffer(&mut host, &state, 13, 4, &bytes);
     let base = (4u64) << RESOURCE_PAGE_SHIFT;
     assert_eq!(
         offset_from_wire_va(&state, &host, 1, 13, base + 16).unwrap(),
@@ -4699,7 +5246,7 @@ fn resolve_bind_offset_from_wire_va() {
     assert!(offset_from_wire_va(&state, &host, 1, 13, base + 32).is_err());
 }
 
-/// Host fill with non-zero fragment bind offset into a padded type-1 buffer.
+/// Host fill with non-zero fragment bind offset into a padded buffer.
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_nonzero_bind_offset_oracle() {
@@ -4710,7 +5257,14 @@ fn fill_render_nonzero_bind_offset_oracle() {
 
     let icb_desc = make_render_icb_desc_bytes(1, 0, 1, MTL_INDIRECT_CMD_DRAW_INDEXED);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
@@ -4718,13 +5272,20 @@ fn fill_render_nonzero_bind_offset_oracle() {
 
     let pdesc = make_render_pipeline_desc(2, 3);
     let pdesc_gva = 0x240u64;
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        pdesc_gva,
+        &pdesc,
+    );
 
     let indices: [u16; 3] = [0, 1, 2];
     // Index buffer: 4 B pad + 6 B indices (offset 4).
     let mut index_bytes = vec![0u8; 4];
     index_bytes.extend(indices.iter().flat_map(|v| v.to_le_bytes()));
-    put_type1_buffer(&mut host, &state, 12, 4, &index_bytes);
+    put_buffer(&mut host, &state, 12, 4, &index_bytes);
     let index_base = (4u64) << RESOURCE_PAGE_SHIFT;
 
     let sid = 7u8;
@@ -4734,7 +5295,7 @@ fn fill_render_nonzero_bind_offset_oracle() {
     // Color buffer: 16 B pad + float4 (offset 16).
     let mut color_buf = vec![0xAAu8; 16];
     color_buf.extend_from_slice(&color_bytes);
-    put_type1_buffer(&mut host, &state, 13, 5, &color_buf);
+    put_buffer(&mut host, &state, 13, 5, &color_buf);
     let color_base = (5u64) << RESOURCE_PAGE_SHIFT;
 
     fill_render(
@@ -4787,7 +5348,7 @@ fn fill_render_nonzero_bind_offset_oracle() {
     let _ = (index_base, color_base);
 }
 
-/// Buffer-backed fill: wire VA = type-1 base+offset → resolve → execute.
+/// Buffer-backed fill: wire VA = buffer base+offset → resolve → execute.
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn buffer_backed_nonzero_wire_va_offset() {
@@ -4801,19 +5362,33 @@ fn buffer_backed_nonzero_wire_va_offset() {
     let layout = render_icb_layout(max_v, max_f, MTL_INDIRECT_CMD_DRAW_INDEXED);
     let icb_desc = make_render_icb_desc_bytes(1, max_v, max_f, MTL_INDIRECT_CMD_DRAW_INDEXED);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
+    put_object(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        icb_gva,
+        &icb_desc,
+    );
 
     put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_render_pipeline_desc(2, 3);
-    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
+    put_object(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        0x240,
+        &pdesc,
+    );
 
     let indices: [u16; 3] = [0, 1, 2];
     let mut index_bytes = vec![0u8; 8]; // pad 8
     index_bytes.extend(indices.iter().flat_map(|v| v.to_le_bytes()));
-    put_type1_buffer(&mut host, &state, 12, 4, &index_bytes);
+    put_buffer(&mut host, &state, 12, 4, &index_bytes);
     let index_wire = ((4u64) << RESOURCE_PAGE_SHIFT) + 8;
 
     let sid = 7u8;
@@ -4822,7 +5397,7 @@ fn buffer_backed_nonzero_wire_va_offset() {
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
     let mut color_buf = vec![0u8; 24]; // pad 24
     color_buf.extend_from_slice(&color_bytes);
-    put_type1_buffer(&mut host, &state, 13, 5, &color_buf);
+    put_buffer(&mut host, &state, 13, 5, &color_buf);
     let color_wire = ((5u64) << RESOURCE_PAGE_SHIFT) + 24;
 
     let slot = encode_render_command_slot(
@@ -4894,7 +5469,7 @@ fn buffer_backed_nonzero_wire_va_offset() {
 ///
 /// The four maxima are decoded separately and handed to Metal separately, so
 /// mapping them onto one bound would report the wrong table for three stages out
-/// of four — the failure mode `8ad945e` found on the type-1 buffer span.
+/// of four — the failure mode `8ad945e` found on the buffer span.
 #[test]
 fn a_render_icb_bind_is_bounded_by_the_count_its_own_stage_declared() {
     use crate::observe::Decline;

@@ -465,7 +465,7 @@ pub const SCATTER_SPLIT: &str = "REIMS_VGPU_SCATTER_SPLIT";
 /// ways in one binary.
 pub const COMPUTE_SCATTER: &str = "REIMS_VGPU_COMPUTE_SCATTER";
 
-/// `off` narrows a type-11 surface Store back to copying its frame into the
+/// `off` narrows a mapper-ref-texture surface Store back to copying its frame into the
 /// guest's pages at the Store, instead of holding it in the engine resident and
 /// copying when something reads those pages.
 ///
@@ -485,7 +485,7 @@ pub const COMPUTE_SCATTER: &str = "REIMS_VGPU_COMPUTE_SCATTER";
 /// copy the lazy rail would not eventually have made.
 ///
 /// Default on, because it is the measured winner and by a margin no other rail
-/// here has produced. Twelve interleaved driven macos-13 boots: 90 % of type-11
+/// here has produced. Twelve interleaved driven macos-13 boots: 90 % of mapper-ref-texture
 /// Stores superseded before anything read their pages, `draw_us` 14.62 against
 /// 26.52 a draw, and five of six on-arm boots presenting at 105.8-109.2 Hz
 /// against a 77.2-78.6 Hz baseline. `crate::runtime::writeback_debt` carries the

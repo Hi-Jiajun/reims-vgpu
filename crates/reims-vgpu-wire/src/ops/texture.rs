@@ -605,7 +605,7 @@ mod tests {
         b[4..8].copy_from_slice(&NEW_TEXTURE_WIDE_TOTAL_LEN.to_le_bytes());
         b[8..12].copy_from_slice(&3u32.to_le_bytes()); // object_ref
         let d = 12; // payload + object_ref
-        b[d] = 0x42; // type 2, GPU-optimized contents, bit 7 clear
+        b[d] = 0x42; // texture, GPU-optimized contents, bit 7 clear
         b[d + 1..d + 3].copy_from_slice(&80u16.to_le_bytes());
         b[d + 3..d + 7].copy_from_slice(&5u32.to_le_bytes());
         b[d + 7..d + 11].copy_from_slice(&0x1111u32.to_le_bytes());
@@ -685,7 +685,7 @@ mod tests {
 
     #[test]
     fn the_packed_word_splits_into_type_flags_usage_and_format() {
-        // 0x005005c2: type 2, GPU-optimized contents, flags 0b00, usage 5,
+        // 0x005005c2: texture, GPU-optimized contents, flags 0b00, usage 5,
         // format 80 — the shape the oracle's baseline produced. Bit 7 is set
         // here because `0xc2` is what a `0xAA`-filled arena produced; the view
         // must read the same fields whatever that bit holds, which is what the

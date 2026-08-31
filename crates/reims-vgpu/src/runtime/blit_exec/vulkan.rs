@@ -4,8 +4,8 @@
 //! endpoints and moves guest bytes, and every function it calls is
 //! backend-neutral. What this module adds is the two cases where the content is
 //! already on the GPU and copying it through guest memory would cross a frame
-//! twice — a whole-plane type-11 to type-11 copy out of a resident, and a
-//! whole-plane type-11 to guest-linear one.
+//! twice — a whole-plane mapper-ref-texture to mapper-ref-texture copy out of a resident, and a
+//! whole-plane mapper-ref-texture to guest-linear one.
 //!
 //! Both are **fall-throughs, never losses**: each returns `Option<BlitStatus>`,
 //! and `None` means the host loop runs unchanged and lands the same pixels. The
@@ -88,8 +88,8 @@ pub(crate) fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
             return None;
         }
     };
-    let TextureBacking::Type11(t) = &dst else {
-        note_store_route(GpuPlaneRefusal::DstNotType11.route());
+    let TextureBacking::MapperRefTexture(t) = &dst else {
+        note_store_route(GpuPlaneRefusal::DstNotMapperRefTexture.route());
         return None;
     };
     let plane = GpuPlane {
@@ -170,7 +170,7 @@ pub(crate) fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
     }
 }
 
-/// Why one whole-plane type-11 to guest-linear copy is not the GPU arm's, for
+/// Why one whole-plane mapper-ref-texture to guest-linear copy is not the GPU arm's, for
 /// the terms that can be decided from the two endpoints alone.
 ///
 /// Every variant is a **fall-through and not a loss**: the staging loop runs
@@ -214,7 +214,7 @@ impl T2tGvaRefusal {
     }
 }
 
-/// The destination plane a whole-plane type-11 to guest-linear copy would write,
+/// The destination plane a whole-plane mapper-ref-texture to guest-linear copy would write,
 /// and its span, or the typed reason there is none.
 ///
 /// Everything [`try_copy_t11_plane_to_linear_on_gpu`] can decide before it asks
@@ -223,7 +223,7 @@ impl T2tGvaRefusal {
 /// declared geometry and `None` when it has none.
 fn gpu_t2t_gva_plane(
     surface: Option<(u32, u32)>,
-    src: &Type11Texture,
+    src: &MapperRefTexture,
     dst: &LinearTextureLevel,
     destination_ref: u32,
 ) -> Result<
@@ -307,7 +307,7 @@ pub(crate) fn try_copy_t11_plane_to_linear_on_gpu<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     destination_ref: u32,
-    src: &Type11Texture,
+    src: &MapperRefTexture,
     dst: &LinearTextureLevel,
 ) -> Option<BlitStatus> {
     use crate::runtime::drain::note_store_route;
@@ -379,7 +379,7 @@ pub(crate) fn try_copy_t11_plane_to_linear_on_gpu<M: HostMemory + HostOps>(
     }
 }
 
-/// Whether this rail already holds a type-11 surface's content, as a counter.
+/// Whether this rail already holds a mapper-ref-texture surface's content, as a counter.
 ///
 /// A census and nothing else: it changes no decision, and every caller runs the
 /// same host copy afterwards either way. The Metal rail has no resident registry
@@ -431,7 +431,7 @@ pub(crate) fn note_blit_t11_resident(state: &DeviceState, mapping_id: u32) {
 mod tests {
     use super::*;
 
-    /// The GPU arm for a whole-plane type-11 source going to a guest-linear
+    /// The GPU arm for a whole-plane mapper-ref-texture source going to a guest-linear
     /// destination, decided from the two endpoints alone.
     ///
     /// The staging loop this stands in front of reads the source's *guest bytes*,
@@ -442,13 +442,13 @@ mod tests {
     /// about whether the resident and the destination plane are the two ends of one
     /// byte copy, and never about whether the guest's pages are readable.
     #[test]
-    fn a_whole_surface_type11_source_reaches_the_destinations_own_guest_plane() {
+    fn a_whole_surface_mapper_ref_texture_source_reaches_the_destinations_own_guest_plane() {
         use super::T2tGvaRefusal::*;
 
         const W: u32 = 64;
         const H: u32 = 32;
         const BPR: u64 = 256;
-        let src = Type11Texture {
+        let src = MapperRefTexture {
             mapping_id: 7,
             width: W,
             height: H,
@@ -504,7 +504,7 @@ mod tests {
         assert_eq!(
             gpu_t2t_gva_plane(
                 Some((W, H)),
-                &Type11Texture {
+                &MapperRefTexture {
                     surface_offset: 0x8000,
                     ..src
                 },

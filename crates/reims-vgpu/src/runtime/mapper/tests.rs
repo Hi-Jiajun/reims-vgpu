@@ -56,11 +56,11 @@ fn windows_may_be_queried_out_of_order() {
     assert_eq!(sel(Some(&ranges), 16, 24), vec![(16, 24)]);
 }
 
-/// A type-4 surface can be re-pointed by the guest with no packet at all,
+/// A backing record can be re-pointed by the guest with no packet at all,
 /// and this is the only thing that can see it.
 ///
 /// The gap is precise. `revalidate_mapping_reason` re-resolves only when
-/// `mapping_internal != 0`; a type-4 surface has none, so that function
+/// `mapping_internal != 0`; a backing record has none, so that function
 /// falls through to `mapped && !page_entries.is_empty()` and answers
 /// "resolvable" without checking anything. The guest then re-points the
 /// backing in its own page table — no MapMemory2, no UnmapMemory, no
@@ -78,7 +78,7 @@ fn windows_may_be_queried_out_of_order() {
 fn the_page_witness_sees_a_rewire_no_packet_announced() {
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::model::{DeviceId, Type4Walk, PAGE_SHIFT_X86};
+    use crate::model::{BackingWalk, DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::{FakeHost, HostMemory};
 
     let page = 1u64 << PAGE_SHIFT_X86;
@@ -108,14 +108,14 @@ fn the_page_witness_sees_a_rewire_no_packet_announced() {
         m.mapped = true;
         m.page_entries =
             vec![(((data0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
-        m.type4_walk = Some(Type4Walk {
+        m.backing_walk = Some(BackingWalk {
             task_id: 1,
             backing_pfn: 0,
             map_generation: m.map_generation,
         });
     }
     assert!(
-        super::type4_pages_witness(&state, &host, 6) == super::Type4Witness::Verified,
+        super::backing_pages_witness(&state, &host, 6) == super::BackingWitness::Verified,
         "the list was just walked from this page table"
     );
 
@@ -130,7 +130,7 @@ fn the_page_witness_sees_a_rewire_no_packet_announced() {
         "no packet arrived, so nothing bumped the incarnation"
     );
     assert!(
-        super::type4_pages_witness(&state, &host, 6) == super::Type4Witness::Drifted,
+        super::backing_pages_witness(&state, &host, 6) == super::BackingWitness::Drifted,
         "a fresh walk names a different page, and a writeback through the \
          cached one lands in whatever the guest gave it to"
     );
@@ -139,13 +139,13 @@ fn the_page_witness_sees_a_rewire_no_packet_announced() {
     // in hand, so it must not be read as drift.
     {
         let m = state.mappings.get_mut(&6).unwrap();
-        let mut walk = m.type4_walk.unwrap();
+        let mut walk = m.backing_walk.unwrap();
         walk.map_generation = m.map_generation.wrapping_sub(1);
-        m.type4_walk = Some(walk);
+        m.backing_walk = Some(walk);
     }
     assert!(
-        super::type4_pages_witness(&state, &host, 6)
-            == super::Type4Witness::Unwitnessed("walk_superseded"),
+        super::backing_pages_witness(&state, &host, 6)
+            == super::BackingWitness::Unwitnessed("walk_superseded"),
         "a stale latch says nothing about the current list — it must not refuse, \
          and it must not be counted as a verification either"
     );
@@ -155,14 +155,14 @@ fn the_page_witness_sees_a_rewire_no_packet_announced() {
     // would pass the assertion above and lose every frame in production.
     {
         let m = state.mappings.get_mut(&6).unwrap();
-        let mut walk = m.type4_walk.unwrap();
+        let mut walk = m.backing_walk.unwrap();
         walk.map_generation = m.map_generation;
-        m.type4_walk = Some(walk);
+        m.backing_walk = Some(walk);
     }
     st32(&mut pte, (data0 >> PAGE_SHIFT_X86) as u32);
     host.write_gpa(root_gpa, &pte).unwrap();
     assert!(
-        super::type4_pages_witness(&state, &host, 6) == super::Type4Witness::Verified,
+        super::backing_pages_witness(&state, &host, 6) == super::BackingWitness::Verified,
         "the translation is back where the list says it is"
     );
 }
@@ -193,12 +193,12 @@ fn a_mapping_with_nothing_to_check_is_not_counted_as_verified() {
         let m = state.mappings.get_mut(&6).unwrap();
         m.mapped = true;
         m.page_entries = vec![(4u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
-        // No `type4_walk`: nothing ever latched a walk for this mapping.
-        m.type4_walk = None;
+        // No `backing_walk`: nothing ever latched a walk for this mapping.
+        m.backing_walk = None;
     }
     assert_eq!(
-        super::type4_pages_witness(&state, &host, 6),
-        super::Type4Witness::Unwitnessed("no_walk"),
+        super::backing_pages_witness(&state, &host, 6),
+        super::BackingWitness::Unwitnessed("no_walk"),
         "a list nothing walked is unwitnessed, not verified"
     );
 
@@ -206,12 +206,12 @@ fn a_mapping_with_nothing_to_check_is_not_counted_as_verified() {
     // single slug would make four different gaps look like one.
     state.mappings.get_mut(&6).unwrap().page_entries.clear();
     assert_eq!(
-        super::type4_pages_witness(&state, &host, 6),
-        super::Type4Witness::Unwitnessed("no_walk"),
+        super::backing_pages_witness(&state, &host, 6),
+        super::BackingWitness::Unwitnessed("no_walk"),
     );
     assert_eq!(
-        super::type4_pages_witness(&state, &host, 999),
-        super::Type4Witness::Unwitnessed("no_mapping"),
+        super::backing_pages_witness(&state, &host, 999),
+        super::BackingWitness::Unwitnessed("no_mapping"),
     );
 
     // Policy is unchanged: the verdict still hands back a token, so the
@@ -243,7 +243,7 @@ fn a_mapping_with_nothing_to_check_is_not_counted_as_verified() {
 fn a_page_the_task_cannot_translate_is_not_reported_as_a_move() {
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::model::{DeviceId, Type4Walk, PAGE_SHIFT_X86};
+    use crate::model::{BackingWalk, DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::{FakeHost, HostMemory};
 
     crate::observe::redirect_logs_for_tests();
@@ -272,13 +272,13 @@ fn a_page_the_task_cannot_translate_is_not_reported_as_a_move() {
         m.mapped = true;
         m.page_entries =
             vec![(((data0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
-        m.type4_walk = Some(Type4Walk {
+        m.backing_walk = Some(BackingWalk {
             task_id: 1,
             backing_pfn: 0,
             map_generation: m.map_generation,
         });
     }
-    assert!(super::type4_pages_witness(&state, &host, 6) != super::Type4Witness::Drifted);
+    assert!(super::backing_pages_witness(&state, &host, 6) != super::BackingWitness::Drifted);
 
     // The translation goes away rather than moving: the PTE is cleared, so
     // the walk fails outright.
@@ -288,7 +288,7 @@ fn a_page_the_task_cannot_translate_is_not_reported_as_a_move() {
     st32(&mut pte, 0);
     host.write_gpa(root_gpa, &pte).unwrap();
     assert!(
-        super::type4_pages_witness(&state, &host, 6) == super::Type4Witness::Drifted,
+        super::backing_pages_witness(&state, &host, 6) == super::BackingWitness::Drifted,
         "a page the table cannot translate must not vouch for a write"
     );
     let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
@@ -323,7 +323,7 @@ fn a_page_the_task_cannot_translate_is_not_reported_as_a_move() {
 fn a_page_moved_in_the_middle_of_a_run_still_refuses_the_write() {
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::model::{DeviceId, Type4Walk, PAGE_SHIFT_X86};
+    use crate::model::{BackingWalk, DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::{FakeHost, HostMemory};
 
     crate::observe::redirect_logs_for_tests();
@@ -361,15 +361,15 @@ fn a_page_moved_in_the_middle_of_a_run_still_refuses_the_write() {
         m.page_entries = (0..PAGES)
             .map(|i| (data_pfn(i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
             .collect();
-        m.type4_walk = Some(Type4Walk {
+        m.backing_walk = Some(BackingWalk {
             task_id: 1,
             backing_pfn: 0,
             map_generation: m.map_generation,
         });
     }
     assert_eq!(
-        super::type4_pages_witness(&state, &host, 6),
-        super::Type4Witness::Verified,
+        super::backing_pages_witness(&state, &host, 6),
+        super::BackingWitness::Verified,
         "a run whose every page still translates where it was walked must vouch"
     );
 
@@ -380,8 +380,8 @@ fn a_page_moved_in_the_middle_of_a_run_still_refuses_the_write() {
         .len();
     write_pte(&mut host, 2, elsewhere_pfn);
     assert_eq!(
-        super::type4_pages_witness(&state, &host, 6),
-        super::Type4Witness::Drifted,
+        super::backing_pages_witness(&state, &host, 6),
+        super::BackingWitness::Drifted,
         "a page re-pointed in the middle of the run must refuse the write"
     );
     let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
@@ -410,7 +410,7 @@ fn a_page_moved_in_the_middle_of_a_run_still_refuses_the_write() {
 #[test]
 fn a_walk_that_visits_nothing_is_not_agreement() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::model::{DeviceId, Type4Walk, PAGE_SHIFT_X86};
+    use crate::model::{BackingWalk, DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
 
     crate::observe::redirect_logs_for_tests();
@@ -422,15 +422,15 @@ fn a_walk_that_visits_nothing_is_not_agreement() {
         let m = state.mappings.get_mut(&6).unwrap();
         m.mapped = true;
         m.page_entries = vec![(4u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID; 3];
-        m.type4_walk = Some(Type4Walk {
+        m.backing_walk = Some(BackingWalk {
             task_id: 1,
             backing_pfn: 0,
             map_generation: m.map_generation,
         });
     }
     assert_eq!(
-        super::type4_pages_witness(&state, &host, 6),
-        super::Type4Witness::Drifted,
+        super::backing_pages_witness(&state, &host, 6),
+        super::BackingWitness::Drifted,
         "a page list nothing walked must not vouch for a write"
     );
 }
@@ -814,22 +814,22 @@ fn resolve_builds_page_entries() {
     );
 }
 
-/// The type-4 adoption site must not be able to silence this one.
+/// The backing adoption site must not be able to silence this one.
 ///
 /// Both emitters print `mapping_gpa_span` and both dedup on
 /// [`span_first_sight_key`], which is built from the mapping id and the span
 /// alone — so for any footprint both sites reach, they compute the *same*
 /// key. While they also shared one `first_sight` namespace, whichever
 /// arrived first claimed that footprint and the other went permanently
-/// quiet for it. The type-4 site wins in practice, so `src=type4` on every
+/// quiet for it. The backing site wins in practice, so `src=backing` on every
 /// line in a boot was a property of the latch, not a finding about where
 /// page lists arrive.
 ///
-/// This claims the footprint under the type-4 namespace first and then
+/// This claims the footprint under the backing namespace first and then
 /// requires the mapper's line anyway. With one shared namespace the claim
 /// below swallows it and `cap.one("OFF")` finds nothing to return.
 #[test]
-fn the_type4_span_latch_does_not_suppress_the_mapper_span() {
+fn the_backing_span_latch_does_not_suppress_the_mapper_span() {
     let pfn = 0x2c4d1_u32;
     let (mut state, host, page_gpa) = span_fixture(pfn);
 
@@ -844,7 +844,7 @@ fn the_type4_span_latch_does_not_suppress_the_mapper_span() {
     let key = span_first_sight_key(3, page_gpa, page_gpa, state.page_shift);
     assert!(
         crate::observe::first_sight(SPAN_SEEN_TYPE4, key),
-        "the type-4 latch must be unclaimed at the start of this test"
+        "the backing latch must be unclaimed at the start of this test"
     );
 
     assert!(resolve_mapping_backing(&mut state, &host, 3));
@@ -852,7 +852,7 @@ fn the_type4_span_latch_does_not_suppress_the_mapper_span() {
     assert!(
         span.contains("mapping_gpa_span mid=3") && span.contains("src=mapper"),
         "the mapper's own adoption must report its footprint even after the \
-         type-4 site has claimed the same one, got {span:?}"
+         backing site has claimed the same one, got {span:?}"
     );
     assert!(
         span.contains(&format!("pn_lo={pfn:#x}")),

@@ -12,20 +12,20 @@
 //! | `OFF present_paint` | HostAction paint / Unchanged |
 //! | `OFF host_cache_store` | Discrete-GPU host surface cache write |
 //! | `OFF host_cache_evict` | Cache drop (unmap/delete) |
-//! | `OFF m2v_store` | metal2vulkan Store to type-11/type-4 mid (incl. is_front) |
-//! | `OFF m2v_store_gva` | metal2vulkan Store to type-2/3 GVA |
+//! | `OFF m2v_store` | metal2vulkan Store to mapper-ref-texture/backing mid (incl. is_front) |
+//! | `OFF m2v_store_gva` | metal2vulkan Store to normal-texture GVA |
 //! | `OFF m2v_load_seed` | Load seed path (host_cache vs missing) |
 //! | `OFF load_seed_black` | Deduplicated zero-RGB Load seed preserved by protocol provenance |
-//! | `OFF linear_sample` | Display-sized type-2/3 sample provenance + content census |
+//! | `OFF linear_sample` | Display-sized normal-texture sample provenance + content census |
 //! | `OFF sampled_branch_census` | Cumulative per-branch sampled-resolution counts:bytes, every 256 |
 //! | `OFF sample_alpha_mask` | Deduplicated zero-RGB/nonzero-alpha sample census; alpha is preserved |
-//! | `linear_sample_miss` | Display-sized type-2/3 sample failed, with descriptor identity |
+//! | `linear_sample_miss` | Display-sized normal-texture sample failed, with descriptor identity |
 //! | `OFF linear_coverage_gap` | Typed stage-in/shader-evaluated coverage check rejected full-display ownership |
 //! | `import_content` | Resident-to-guest Store census; display rows include exact changed/R↔B-swapped pixel counts |
 //! | `linux_m2v_resources` | Per-draw resource census; `fixed_gap=[...]` names decoded fixed state absent from the Vulkan request |
 //! | `linux_m2v_timing` | always-on stage µs: load/m2v/setup/engine/composite + total |
 //! | `OFF display_clear` | Clear-only stream Store into a display-sized mid |
-//! | `OFF rt_resolve` | Color RT lookup (type-4/5/11 → mapping_id) display-sized |
+//! | `OFF rt_resolve` | Color RT lookup (backing/5/11 → mapping_id) display-sized |
 //! | `OFF front_wb` | note_front_buffer_writeback latch / post-boundary skip |
 //! | `OFF blit` | Product blit path enter/result (buffer↔texture) |
 //!
@@ -182,7 +182,7 @@ fn emit(sink: Sink, msg: &str) {
 }
 
 /// Flood self-detector (regression guard). A per-event line wrongly routed to
-/// the always-on sink (the `type5_view_zc`/`InvalidateResources` class that
+/// the always-on sink (the `ref_texture_view_zc`/`InvalidateResources` class that
 /// buried the curated fail view under ~130k lines/boot) fires per bind/op — far
 /// above any legitimate always-on rate. This watches the **always-on** stream in
 /// the background writer thread (zero producer cost) and emits ONE
@@ -204,7 +204,7 @@ const FLOOD_THRESHOLD_PER_WINDOW: u64 = 1000;
 
 /// The flood-accounting key for an always-on line: its slug — the first
 /// whitespace token, skipping a leading `OFF ` marker. Groups a runaway line by
-/// kind (`type5_view_zc`, `map_family`, …) so the warning names the culprit.
+/// kind (`ref_texture_view_zc`, `map_family`, …) so the warning names the culprit.
 #[cfg(any(test, not(feature = "testing")))]
 fn flood_key(line: &str) -> &str {
     let slug = line.strip_prefix("OFF ").unwrap_or(line);
@@ -930,8 +930,8 @@ mod tests {
     #[test]
     fn flood_key_is_the_slug_skipping_the_off_marker() {
         assert_eq!(
-            flood_key("OFF type5_view_zc ref=355 sid=62 view=1920x1080 t=1"),
-            "type5_view_zc"
+            flood_key("OFF ref_texture_view_zc ref=355 sid=62 view=1920x1080 t=1"),
+            "ref_texture_view_zc"
         );
         assert_eq!(
             flood_key("map_family op=InvalidateResources ch=3 t=1"),

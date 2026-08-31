@@ -1,7 +1,7 @@
 //! The Metal rail's half of the indirect command buffer: the host
 //! `MTLIndirectCommandBuffer` its parent's decode describes.
 //!
-//! [`super`] owns the guest contract — the type-7 descriptor, the command
+//! [`super`] owns the guest contract — the serializer-object descriptor, the command
 //! layout, and the encode/decode of one command slot's bytes — and that half is
 //! rail-neutral by construction: it is the guest's own serialization and it
 //! reads the same whichever rail executes it. Everything here is the other
@@ -197,7 +197,7 @@ pub fn fill_icb_from_command_memory<M: HostMemory + HostOps>(
     Ok(())
 }
 
-/// An attribute of the guest's type-7 vertex-input block that this device could
+/// An attribute of the guest's serializer-object vertex-input block that this device could
 /// not encode, which refuses the pipeline that declared it.
 ///
 /// Carries what the [`DroppedVertexAttribute`] line reports, so the caller's
@@ -209,7 +209,7 @@ pub(crate) struct VertexAttributeUnencodable {
     pub value: u32,
 }
 
-/// Build an `MTLVertexDescriptor` from the type-7 pipeline vertex-input block.
+/// Build an `MTLVertexDescriptor` from the serializer-object pipeline vertex-input block.
 ///
 /// `Ok(None)` ⇒ the pipeline declares no vertex input at all (SSBO-only, or
 /// every entry undeclared); `Err` ⇒ an attribute the guest *did* declare could
@@ -220,7 +220,7 @@ pub(crate) fn metal_vertex_descriptor_from_attrs(
     metal_vertex_descriptor_from_attrs_for_draw(attrs, false)
 }
 
-/// Build `MTLVertexDescriptor` from type-7 vertex attributes.
+/// Build `MTLVertexDescriptor` from serializer-object vertex attributes.
 ///
 /// When `for_patches` is true and a layout lacks an explicit step function,
 /// use `PerPatchControlPoint` (SDK value 4) so post-tessellation vertex
@@ -261,7 +261,7 @@ pub(crate) fn metal_vertex_descriptor_from_attrs_for_draw(
             crate::runtime::drain::note_store_route("icb_vertex_attr_undeclared");
             continue;
         }
-        // Both words come straight off the guest's type-7 descriptor and had no
+        // Both words come straight off the guest's serializer-object descriptor and had no
         // check at all — they were reinterpreted as `MTLVertexFormat` and
         // `MTLVertexStepFunction` directly.
         let Some(format) = mtl_enum::vertex_format(a.format) else {
@@ -356,9 +356,9 @@ fn icb_primitive_type(
 
 /// Fill one **render** command slot on a cached host ICB (Metal IndirectRenderCommand).
 ///
-/// Builds an ICB-capable render PSO from the type-7 render pipeline's vertex/
+/// Builds an ICB-capable render PSO from the serializer-object render pipeline's vertex/
 /// fragment MTLBs (color0 = BGRA8Unorm, matching product mapping/scanout).
-/// When the type-7 body carries a vertex-input block, attaches an
+/// When the serializer-object body carries a vertex-input block, attaches an
 /// `MTLVertexDescriptor` so `[[stage_in]]` attributes bind correctly.
 pub fn fill_render_command<M: HostMemory + HostOps>(
     state: &DeviceState,
@@ -372,7 +372,7 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
     use crate::runtime::compute_exec::ComputeBufferBind;
     use crate::runtime::decode::resource::{
         decode_function_descriptor, decode_render_pipeline_descriptor, FunctionDescriptor,
-        OBJECT_TYPE_FUNCTION, OBJECT_TYPE_TYPE7,
+        OBJECT_TYPE_FUNCTION, OBJECT_TYPE_SERIALIZER_OBJECT,
     };
     use crate::runtime::gva_mem;
     use ::metal::{
@@ -414,7 +414,7 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
             host,
             task_id,
             fill.pipeline_ref,
-            &[OBJECT_TYPE_TYPE7],
+            &[OBJECT_TYPE_SERIALIZER_OBJECT],
         )
         .map_err(|rung| {
             let slug = crate::observe::ladder_slugs!("icb_frc_pipeline")(rung);
@@ -499,7 +499,7 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
             .map_err(|_| IcbStatus::MetalFailed("icb_frc_fragment_function_get"))?;
 
         // Mesh draws need MTLMeshRenderPipelineDescriptor + mesh descriptor factory.
-        // Prefer mesh SPI type-7 shape (tag 0x14; 0x01 object / 0x02 mesh / 0x03 frag);
+        // Prefer mesh SPI serializer-object shape (tag 0x14; 0x01 object / 0x02 mesh / 0x03 frag);
         // else dual-export or mesh-only metallib in classic `vertex_func_ref`.
         let built = if is_mesh {
             use crate::backend::metal::raw_metal::{
@@ -632,7 +632,7 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
             if is_patches {
                 let cp_index_ty = match fill.draw {
                     IcbRenderDraw::IndexedPatches { .. } => {
-                        // UInt16 control-point indices (product fill stages type-1 bytes).
+                        // UInt16 control-point indices (product fill stages buffer bytes).
                         crate::backend::metal::raw_metal::MTL_TESSELLATION_CONTROL_POINT_INDEX_UINT16
                     }
                     _ => {
@@ -645,7 +645,7 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
                     cp_index_ty,
                 );
             }
-            // Stage-in / control-point: type-7 vertex-input block → MTLVertexDescriptor.
+            // Stage-in / control-point: serializer-object vertex-input block → MTLVertexDescriptor.
             // Patch draws force PerPatchControlPoint when the layout does not already
             // carry a step function (host tessellation oracle fixture).
             // Three answers, and the two that are not `Ok(Some)` used to be one
@@ -698,9 +698,9 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
     }
 
     // Stage index / patch / tessellation factor buffers by object-list ref.
-    let stage_type1 = |buffer_ref: u32, offset: u64| -> Result<::metal::Buffer, IcbStatus> {
+    let stage_buffer = |buffer_ref: u32, offset: u64| -> Result<::metal::Buffer, IcbStatus> {
         if buffer_ref == 0 {
-            return Err(IcbStatus::Args("icb_frc_type1_ref_zero"));
+            return Err(IcbStatus::Args("icb_frc_buffer_ref_zero"));
         }
         let bind = ComputeBufferBind {
             index: 0,
@@ -710,9 +710,9 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
             has_attribute_stride: false,
         };
         let s = stage_buffer(state, host, task_id, &bind)
-            .map_err(|_| IcbStatus::Missing("icb_frc_type1_stage_buffer"))?;
+            .map_err(|_| IcbStatus::Missing("icb_frc_buffer_stage_buffer"))?;
         new_buffer_from_host(device, s.bytes.as_ptr(), s.bytes.len())
-            .ok_or(IcbStatus::MetalFailed("icb_frc_type1_host_buffer"))
+            .ok_or(IcbStatus::MetalFailed("icb_frc_buffer_host_buffer"))
     };
 
     let index_mtl = match fill.draw {
@@ -734,7 +734,7 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
             if need == 0 {
                 return Err(IcbStatus::Args("icb_frc_index_span_zero"));
             }
-            let mtl = stage_type1(index_buffer_ref, index_buffer_offset)?;
+            let mtl = stage_buffer(index_buffer_ref, index_buffer_offset)?;
             // Product stages the index window at offset 0 in the retained buffer.
             let _ = need;
             Some(mtl)
@@ -757,7 +757,7 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
             patch_index_buffer_ref,
             patch_index_buffer_offset,
             ..
-        } if patch_index_buffer_ref != 0 => Some(stage_type1(
+        } if patch_index_buffer_ref != 0 => Some(stage_buffer(
             patch_index_buffer_ref,
             patch_index_buffer_offset,
         )?),
@@ -769,7 +769,7 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
             control_point_index_buffer_ref,
             control_point_index_buffer_offset,
             ..
-        } => Some(stage_type1(
+        } => Some(stage_buffer(
             control_point_index_buffer_ref,
             control_point_index_buffer_offset,
         )?),
@@ -789,7 +789,7 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
             if tessellation_factor.buffer_ref == 0 {
                 return Err(IcbStatus::Args("icb_frc_tess_factor_ref_zero"));
             }
-            Some(stage_type1(
+            Some(stage_buffer(
                 tessellation_factor.buffer_ref,
                 tessellation_factor.offset,
             )?)
@@ -1113,7 +1113,7 @@ pub(crate) fn new_icb_compute_pso(
 /// Fill one compute command slot on a cached host ICB from guest object-list state.
 ///
 /// Mirrors Metal: `indirectComputeCommandAtIndex` → set PSO / kernel buffers /
-/// concurrent dispatch. Stages type-1 buffer contents into shared Metal buffers
+/// concurrent dispatch. Stages buffer contents into shared Metal buffers
 /// and records GVA writebacks for post-execute flush.
 ///
 /// When the ICB was created with `inheritPipelineState` / `inheritBuffers`, those

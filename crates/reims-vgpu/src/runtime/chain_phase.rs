@@ -162,7 +162,7 @@ pub enum Phase {
     /// span it used to hold is now charged to [`Self::Prep`].
     PrepPages = 13,
     /// The four target-identity rails: resident render chain, GVA deferred
-    /// store, type-11 surface resident, and the Load-from-target identity.
+    /// store, mapper-ref-texture surface resident, and the Load-from-target identity.
     ///
     /// # Why the assemble span is split at all
     ///

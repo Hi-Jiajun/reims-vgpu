@@ -10,18 +10,18 @@
 //!
 //! # The rungs, in the order the archive tries them
 //!
-//! 1. **Type-8 view → base.** A view resolves to the texture it wraps, and
+//! 1. **Texture-view view → base.** A view resolves to the texture it wraps, and
 //!    carries a format override and a mip level forward with it. A swizzled view
 //!    is refused rather than resolved.
-//! 2. **Type-11 IOSurface.** Geometry comes from the live mapping, never from a
+//! 2. **Mapper-ref-texture IOSurface.** Geometry comes from the live mapping, never from a
 //!    sticky latch — the latch exists only for the window where the object-list
 //!    entry is transiently missing, and preferring it has twice routed a
 //!    dual-mapping composite onto one mapping.
-//! 3. **Type-4 surface / type-5 `RefTextureHandle`.** The object-list index is
-//!    the surface id; type-5 wraps type-4 and is what product colour targets
+//! 3. **Backing surface / ref-texture `RefTextureHandle`.** The object-list index is
+//!    the surface id; ref-texture wraps backing and is what product colour targets
 //!    actually bind.
-//! 4. **Type-2/3 linear guest VA.** Wallpaper and background intermediates and
-//!    UI intermediate render targets live here, so a type-11-only resolve drops
+//! 4. **normal-texture linear guest VA.** Wallpaper and background intermediates and
+//!    UI intermediate render targets live here, so a mapper-ref-texture-only resolve drops
 //!    those passes entirely.
 //!
 //! The order is live-type-driven at every step: the object list is re-read and
@@ -47,8 +47,8 @@
 //! A zero over an unstated amount of work is not a measurement, so: on the same
 //! boot `mrt_draw_single` counted **179 123** single-attachment draws reaching
 //! the Vulkan encode, every one of which is a colour attachment this ladder had
-//! already resolved, and `rt_type5_view_same` counted **23 951** attachments
-//! that reached the *bottom* of the type-4/5 rung. Both counters predate the
+//! already resolved, and `rt_ref_texture_view_same` counted **23 951** attachments
+//! that reached the *bottom* of the backing/5 rung. Both counters predate the
 //! typed refusals and sit on the success side, which is what makes them usable
 //! as a denominator here.
 //!
@@ -58,10 +58,10 @@
 //! background noise.
 
 use super::*;
-/// The colour render target's base format for a **type-4** surface, or nothing.
+/// The colour render target's base format for a **backing** surface, or nothing.
 ///
 /// On this arm `m.format == 0` is not "unset", it is a decoded refusal:
-/// [`objects::apply_type4_backing`] is the only writer of it, and it stores 0 for
+/// [`objects::apply_backing`] is the only writer of it, and it stores 0 for
 /// a multi-plane surface and for a single-plane one whose FourCC it does not
 /// know, saying why — "stage/paint must not invent BGRA".
 /// [`objects::iosurface_pixel_format_to_mtl`] repeats it twice more, and the
@@ -84,12 +84,12 @@ use super::*;
 /// not "unreachable" — the first surface to take it will now be named and
 /// refused rather than named and rendered wrong.
 ///
-/// The **type-11** arm deliberately does not come through here. A type-11
+/// The **mapper-ref-texture** arm deliberately does not come through here. A mapper-ref-texture
 /// mapping's format has other writers, so its 0 can mean "not latched yet" rather
 /// than "refused", and BGRA8 is the display contract's stated default for that
 /// case ([`crate::runtime::compute_exec`]'s `or_bgra8` writes the same rule down).
 /// Those are different zeros and only this one is provably a refusal.
-fn rt_type4_base_format(format: u16, mapping_id: u32) -> Option<u16> {
+fn rt_backing_base_format(format: u16, mapping_id: u32) -> Option<u16> {
     if format != 0 {
         return Some(format);
     }
@@ -97,7 +97,7 @@ fn rt_type4_base_format(format: u16, mapping_id: u32) -> Option<u16> {
     if crate::observe::first_sight("rt_base_fmt_declined", mapping_id as u64) {
         crate::observe::fail(format!(
             "rt_base_fmt_declined mapping={mapping_id} \
-             (the mapping's format is the type-4 decoder's multi-plane / \
+             (the mapping's format is the backing decoder's multi-plane / \
              unknown-FourCC refusal, so this surface is not a single-format \
              colour attachment and no format is invented for it)"
         ));
@@ -105,19 +105,19 @@ fn rt_type4_base_format(format: u16, mapping_id: u32) -> Option<u16> {
     None
 }
 
-/// The format a type-4 colour attachment is **declared** in.
+/// The format a backing colour attachment is **declared** in.
 ///
-/// A type-5 object is a texture view over the surface allocation, and its format
+/// A ref-texture object is a texture view over the surface allocation, and its format
 /// is attachment state: the UNORM and sRGB spellings name identical stored bytes
 /// and differ only in the fixed-function conversion the hardware applies on
 /// render writes. The guest declared that view, so the view's format is the
 /// contract and the base mapping's is what a surface bound without one falls
-/// back to. A type-8 view is a further reinterpretation asked for on top, so it
-/// outranks the type-5 record when both are present.
+/// back to. A texture-view is a further reinterpretation asked for on top, so it
+/// outranks the ref-texture record when both are present.
 ///
 /// # Why this stopped answering the base mapping's format
 ///
-/// It used to answer `base_fmt` for every type-5 view, on the ground that
+/// It used to answer `base_fmt` for every ref-texture view, on the ground that
 /// honouring the view would fork the resident — the guest binds one surface
 /// through both spellings, and a second spelling that missed would retire the
 /// resident and recreate it empty, alternating two half-filled images frame to
@@ -127,59 +127,60 @@ fn rt_type4_base_format(format: u16, mapping_id: u32) -> Option<u16> {
 /// `allocation()` (which folds `_SRGB` onto `_UNORM`), the image is created
 /// `MUTABLE_FORMAT` in the allocation format, and the attachment gets its own
 /// view in `declared()`. One allocation, a view per interpretation — which is
-/// what Metal's contract describes. The type-2/3 linear GVA targets have been
+/// what Metal's contract describes. The normal-texture linear GVA targets have been
 /// attaching sRGB through that same machinery all along; only this resolve was
 /// still throwing the qualifier away, so a surface the guest declared sRGB was
 /// rendered into without the linear-to-sRGB encode on write.
 ///
 /// # The geometry half is deliberately not honoured
 ///
-/// A type-5 view is taken only where it agrees with the base *extent*, because
+/// A ref-texture view is taken only where it agrees with the base *extent*, because
 /// the resolve this feeds takes the base mapping's geometry. A view describing a
 /// different grid is one this device is not honouring at all, and lifting its
 /// format alone would attach a reinterpretation to a grid that is not its own —
 /// the row-byte-equivalent quarter-width `RGBA32Uint` view over the desktop
 /// target is exactly that shape. That population is
-/// `rt_type5_view_differs_geometry`; it has never been observed on any boot, and
+/// `rt_ref_texture_view_differs_geometry`; it has never been observed on any boot, and
 /// it still resolves through the base.
 ///
 /// A view format whose texel is a different *width* from the base's is not a
 /// reinterpretation of one allocation at all, so [`effective_view_sample_format`]
 /// refuses it and the base format stands.
-fn rt_type4_declared_format(
+fn rt_backing_declared_format(
     base_fmt: u16,
     base_extent: (u32, u32),
-    type5_view: Option<objects::Type5TextureView>,
+    ref_texture_view: Option<objects::RefTextureView>,
     view_fmt_override: Option<u16>,
 ) -> u16 {
     let (base_w, base_h) = base_extent;
-    let type5_declared = type5_view
+    let ref_texture_declared = ref_texture_view
         .filter(|view| view.width == base_w && view.height == base_h)
         .map(|view| view.pixel_format)
         .filter(|&fmt| fmt != 0);
-    effective_view_sample_format(base_fmt, view_fmt_override.or(type5_declared)).unwrap_or(base_fmt)
+    effective_view_sample_format(base_fmt, view_fmt_override.or(ref_texture_declared))
+        .unwrap_or(base_fmt)
 }
 
-/// Report a type-5 colour attachment whose view record disagrees with the base
+/// Report a ref-texture colour attachment whose view record disagrees with the base
 /// mapping it is resolved through.
 ///
-/// This resolve reads only `surfaceID@0` out of a type-5 descriptor and takes
-/// geometry and format from the mapping. [`objects::decode_type5_texture_view`]'s
+/// This resolve reads only `surfaceID@0` out of a ref-texture descriptor and takes
+/// geometry and format from the mapping. [`objects::decode_ref_texture_view`]'s
 /// own contract forbids that — "callers must not replace it with base mapping
 /// geometry merely because the surface itself is otherwise stageable" — and the
 /// live case it names is real: the BGRA8 desktop target is also exposed as a
-/// row-byte-equivalent quarter-width RGBA32Uint view. Every other type-5
+/// row-byte-equivalent quarter-width RGBA32Uint view. Every other ref-texture
 /// consumer binds the view's own geometry.
 ///
 /// It is harmless exactly while view == base, so the question is how often that
 /// holds for a *render target* specifically, which nothing has measured.
-/// `rt_type5_view_differs` against `rt_type5_view_same` answers it. Reported
+/// `rt_ref_texture_view_differs` against `rt_ref_texture_view_same` answers it. Reported
 /// rather than repaired: taking the view's geometry here changes what every
-/// type-5 colour attachment renders into, and that is not a change to make on an
+/// ref-texture colour attachment renders into, and that is not a change to make on an
 /// unmeasured population.
 ///
 /// **Read on two driven x86/Vulkan boots: `same` 20 273 and 24 360, `differs`
-/// 0, `undecoded` 0.** So on this workload every type-5 colour attachment's view
+/// 0, `undecoded` 0.** So on this workload every ref-texture colour attachment's view
 /// agrees with the base mapping in width, height and format, and resolving
 /// through the base loses nothing. The reinterpretation view the contract names
 /// is real traffic elsewhere — the compute staging path sees it — but it is not
@@ -238,7 +239,7 @@ fn rt_type4_declared_format(
 /// macos-13 boot reads `same` only, with `differs` absent entirely, and
 /// `runtime::census::srgb_census` emits nothing across its six sites. So the
 /// extra encode `bugs/bug-03` measures enters somewhere neither this rail nor
-/// that census watches, and the type-5 view divergence — real, and worth
+/// that census watches, and the ref-texture view divergence — real, and worth
 /// honouring on its own terms — is not its road.
 ///
 /// **`..._geometry` is still a live healthy zero and is still a loss.** It has
@@ -249,18 +250,18 @@ fn rt_type4_declared_format(
 /// surface bound both ways is what exercises the view swap, so a non-zero there
 /// is the reading that says the swap is being taken rather than merely
 /// available.
-fn note_rt_type5_view(
-    view: Option<objects::Type5TextureView>,
+fn note_rt_ref_texture_view(
+    view: Option<objects::RefTextureView>,
     surface_id: u32,
     base: (u32, u32, u16),
 ) {
     let Some(view) = view else {
-        crate::runtime::drain::note_store_route("rt_type5_view_undecoded");
+        crate::runtime::drain::note_store_route("rt_ref_texture_view_undecoded");
         return;
     };
     let (base_w, base_h, base_fmt) = base;
     if view.width == base_w && view.height == base_h && view.pixel_format == base_fmt {
-        crate::runtime::drain::note_store_route("rt_type5_view_same");
+        crate::runtime::drain::note_store_route("rt_ref_texture_view_same");
         if differed_before(surface_id) {
             // The reading that decides whether the format repair above is safe.
             // A surface resolved both ways is one this device would key two
@@ -268,31 +269,31 @@ fn note_rt_type5_view(
             // between two images is worse than a frame in the wrong colour
             // space. A boot reporting `differs_format_only` with this at zero is
             // the one that licenses the repair.
-            crate::runtime::drain::note_store_route("rt_type5_view_sid_both_ways");
+            crate::runtime::drain::note_store_route("rt_ref_texture_view_sid_both_ways");
         }
         return;
     }
-    crate::runtime::drain::note_store_route("rt_type5_view_differs");
+    crate::runtime::drain::note_store_route("rt_ref_texture_view_differs");
     // Which half diverged decides both the counter and what the fail line says
     // happened, so it is asked once. The two halves no longer have the same
     // answer — the format is honoured and the geometry is not — and a single
     // sentence covering both was accurate only while neither was.
     let (route, disposition) = if view.width == base_w && view.height == base_h {
         (
-            "rt_type5_view_differs_format_only",
+            "rt_ref_texture_view_differs_format_only",
             "the colour attachment is resolved in the view's format",
         )
     } else {
         (
-            "rt_type5_view_differs_geometry",
+            "rt_ref_texture_view_differs_geometry",
             "the colour attachment is resolved with the base mapping's geometry, not the view's",
         )
     };
     crate::runtime::drain::note_store_route(route);
     note_differed(surface_id);
-    if crate::observe::first_sight("rt_type5_view_differs", surface_id as u64) {
+    if crate::observe::first_sight("rt_ref_texture_view_differs", surface_id as u64) {
         crate::observe::fail(format!(
-            "rt_type5_view_differs sid={surface_id} view={}x{} fmt={:#x} plane={} \
+            "rt_ref_texture_view_differs sid={surface_id} view={}x{} fmt={:#x} plane={} \
              base={base_w}x{base_h} fmt={base_fmt:#x} ({disposition})",
             view.width, view.height, view.pixel_format, view.plane_index
         ));
@@ -300,14 +301,14 @@ fn note_rt_type5_view(
 }
 
 /// Surface ids this ladder has resolved a render target through a *differing*
-/// type-5 view for.
+/// ref-texture view for.
 ///
 /// Bounded, and the bound is the whole design: this exists to answer whether one
 /// surface is bound both ways in one boot, and the population it watches was one
 /// member on the boot that made it necessary. Past [`DIFFERED_MAX`] it stops
 /// admitting rather than growing or evicting — an evicting set would answer
 /// "not seen before" for a surface it had forgotten, which is the direction that
-/// reports the repair as safe when it is not. `rt_type5_view_differ_set_full`
+/// reports the repair as safe when it is not. `rt_ref_texture_view_differ_set_full`
 /// says the bound bit, and a boot that reports it has not answered the question.
 const DIFFERED_MAX: usize = 64;
 
@@ -317,7 +318,7 @@ static DIFFERED: std::sync::Mutex<std::collections::BTreeSet<u32>> =
 fn note_differed(surface_id: u32) {
     let mut set = DIFFERED.lock().unwrap_or_else(|e| e.into_inner());
     if set.len() >= DIFFERED_MAX && !set.contains(&surface_id) {
-        crate::runtime::drain::note_store_route("rt_type5_view_differ_set_full");
+        crate::runtime::drain::note_store_route("rt_ref_texture_view_differ_set_full");
         return;
     }
     set.insert(surface_id);
@@ -338,7 +339,7 @@ fn differed_before(surface_id: u32) -> bool {
 /// unnoticed: all three orders type-check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ResolvedRenderTarget {
-    /// Non-zero ⇒ a host mapping; `0` with `target_gva` non-zero ⇒ type-2/3
+    /// Non-zero ⇒ a host mapping; `0` with `target_gva` non-zero ⇒ normal-texture
     /// linear guest VA. The two are exclusive, the same way
     /// [`ColorRtRequest::target_gva`] documents.
     pub(super) mapping_id: u32,
@@ -350,7 +351,7 @@ pub(super) struct ResolvedRenderTarget {
     pub(super) format: u16,
     /// Attachment samples this target's own declaration asks for.
     ///
-    /// For a type-2/3 linear texture this is the descriptor's decoded sample
+    /// For a normal-texture linear texture this is the descriptor's decoded sample
     /// count — the texture says what it is, and on rail macos-15 four textures a
     /// boot say four. It was a hardcoded provisional `1` until that field was
     /// recovered, and the provisional was indistinguishable from a decoded one:
@@ -359,7 +360,7 @@ pub(super) struct ResolvedRenderTarget {
     /// invention.
     ///
     /// It stays `1` on the two paths whose target is a *mapping* rather than a
-    /// texture (type-11 and type-4 surfaces). Those carry no creation
+    /// texture (mapper-ref-texture and backing records). Those carry no creation
     /// descriptor, so nothing there declares a sample count and `1` is the
     /// display contract's own default rather than a stand-in for an unread
     /// field.
@@ -389,7 +390,7 @@ pub(super) struct ResolvedRenderTarget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct RenderTargetRefusal {
     /// The ref the ladder was working on: `texture_ref` itself, or the base a
-    /// type-8 view resolved to.
+    /// texture-view resolved to.
     ///
     /// Reported next to the attachment's own ref rather than instead of it,
     /// because they differ exactly when a view is in play — and a refusal
@@ -405,12 +406,12 @@ pub(super) struct RenderTargetRefusal {
 /// contract. Grouped by rung in the order [`lookup_render_target`] tries them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RenderTargetCause {
-    /// A type-8 view whose swizzle is not the identity. The archive's
+    /// A texture-view whose swizzle is not the identity. The archive's
     /// `resolve_texture` requires `!has_swizzle` for a linear resolve, so the
     /// channel order this view asks for cannot be honoured by rendering into
     /// the base.
     ViewSwizzled,
-    /// The type-8 view chain ended at ref 0 — the view names no base texture.
+    /// The texture-view chain ended at ref 0 — the view names no base texture.
     ViewBaseUnbound,
 
     /// The view's own level base plus the level the pass named does not fit a
@@ -422,55 +423,55 @@ pub(super) enum RenderTargetCause {
         view_level: u32,
         attachment_level: u32,
     },
-    /// A mip>0 view of an IOSurface. Type-11 sample windows carry planes, not
+    /// A mip>0 view of an IOSurface. Mapper-ref-texture sample windows carry planes, not
     /// mip levels, so this geometry has no contract behind it.
-    Type11MipView { level: u32 },
+    MapperRefTextureMipView { level: u32 },
     /// Neither the live descriptor nor the latch produced a mapping id.
-    Type11Unresolved,
+    MapperRefTextureUnresolved,
     /// The mapping id resolved and names no live mapping.
-    Type11NoMapping { mapping_id: u32 },
+    MapperRefTextureNoMapping { mapping_id: u32 },
     /// The mapping has no latched geometry, or a zero dimension.
-    Type11Geometry {
+    MapperRefTextureGeometry {
         mapping_id: u32,
         has_geom: bool,
         width: u32,
         height: u32,
     },
     /// The mapping's format is not one Metal can render into.
-    Type11Format { mapping_id: u32, fmt: u16 },
+    MapperRefTextureFormat { mapping_id: u32, fmt: u16 },
 
-    /// The type-5 entry's descriptor bytes could not be read.
-    Type5DescRead,
-    /// The bytes were read and are not a type-5 header.
-    Type5DescDecode { len: usize },
-    /// The type-5 header names surface 0, so it wraps nothing.
-    Type5SurfaceZero,
+    /// The ref-texture entry's descriptor bytes could not be read.
+    RefTextureDescRead,
+    /// The bytes were read and are not a ref-texture header.
+    RefTextureDescDecode { len: usize },
+    /// The ref-texture header names surface 0, so it wraps nothing.
+    RefTextureSurfaceZero,
 
-    /// A mip>0 view of a type-4 surface. Colour RT materialization is level 0
+    /// A mip>0 view of a backing record. Colour RT materialization is level 0
     /// only.
-    Type4MipView { surface_id: u32, level: u32 },
+    BackingMipView { surface_id: u32, level: u32 },
     /// The surface's backing could not be resolved.
-    Type4Unresolved {
+    BackingUnresolved {
         surface_id: u32,
         live_type: Option<u8>,
     },
     /// The surface resolved and left no mapping under its id.
-    Type4NoMapping { surface_id: u32 },
+    BackingNoMapping { surface_id: u32 },
     /// The surface's mapping has no geometry, a zero dimension, or no pages.
-    Type4Geometry {
+    BackingGeometry {
         surface_id: u32,
         has_geom: bool,
         width: u32,
         height: u32,
         pages: usize,
     },
-    /// The type-4 decoder refused this surface a format — multi-plane, or a
-    /// FourCC it has no contract for. [`rt_type4_base_format`] carries the
+    /// The backing decoder refused this surface a format — multi-plane, or a
+    /// FourCC it has no contract for. [`rt_backing_base_format`] carries the
     /// argument for why no format is invented here; this is the ladder
     /// recording that it stopped there.
-    Type4BaseFormat { surface_id: u32, raw_fmt: u16 },
+    BackingBaseFormat { surface_id: u32, raw_fmt: u16 },
     /// The surface's format is not one Metal can render into.
-    Type4Format { surface_id: u32, fmt: u16 },
+    BackingFormat { surface_id: u32, fmt: u16 },
 
     /// The guest has put nothing under this ref. Expected while a task's object
     /// list is still being populated, which is why it is reported and not
@@ -546,20 +547,22 @@ impl crate::observe::Decline for RenderTargetRefusal {
             C::ViewSwizzled => "rt_view_swizzled",
             C::ViewBaseUnbound => "rt_view_base_unbound",
             C::LevelOverflow { .. } => "rt_level_overflow",
-            C::Type11MipView { .. } => "rt_type11_mip_view",
-            C::Type11Unresolved => "rt_type11_unresolved",
-            C::Type11NoMapping { .. } => "rt_type11_no_mapping",
-            C::Type11Geometry { .. } => "rt_type11_geometry",
-            C::Type11Format { .. } => "rt_type11_format",
-            C::Type5DescRead => crate::observe::ladder_slug!("rt_type5", desc_read),
-            C::Type5DescDecode { .. } => crate::observe::ladder_slug!("rt_type5", desc_decode),
-            C::Type5SurfaceZero => "rt_type5_surface_zero",
-            C::Type4MipView { .. } => "rt_type4_mip_view",
-            C::Type4Unresolved { .. } => "rt_type4_unresolved",
-            C::Type4NoMapping { .. } => "rt_type4_no_mapping",
-            C::Type4Geometry { .. } => "rt_type4_geometry",
-            C::Type4BaseFormat { .. } => "rt_type4_base_format",
-            C::Type4Format { .. } => "rt_type4_format",
+            C::MapperRefTextureMipView { .. } => "rt_mapper_ref_texture_mip_view",
+            C::MapperRefTextureUnresolved => "rt_mapper_ref_texture_unresolved",
+            C::MapperRefTextureNoMapping { .. } => "rt_mapper_ref_texture_no_mapping",
+            C::MapperRefTextureGeometry { .. } => "rt_mapper_ref_texture_geometry",
+            C::MapperRefTextureFormat { .. } => "rt_mapper_ref_texture_format",
+            C::RefTextureDescRead => crate::observe::ladder_slug!("rt_ref_texture", desc_read),
+            C::RefTextureDescDecode { .. } => {
+                crate::observe::ladder_slug!("rt_ref_texture", desc_decode)
+            }
+            C::RefTextureSurfaceZero => "rt_ref_texture_surface_zero",
+            C::BackingMipView { .. } => "rt_backing_mip_view",
+            C::BackingUnresolved { .. } => "rt_backing_unresolved",
+            C::BackingNoMapping { .. } => "rt_backing_no_mapping",
+            C::BackingGeometry { .. } => "rt_backing_geometry",
+            C::BackingBaseFormat { .. } => "rt_backing_base_format",
+            C::BackingFormat { .. } => "rt_backing_format",
             C::NoListEntry => crate::observe::ladder_slug!("rt", no_list_entry),
             C::WrongType { .. } => crate::observe::ladder_slug!("rt", wrong_type),
             C::LinearDescRead => crate::observe::ladder_slug!("rt_linear", desc_read),
@@ -584,7 +587,7 @@ impl crate::observe::Decline for RenderTargetRefusal {
         use RenderTargetCause as C;
         let mut v = vec![("base", self.base_ref.to_string())];
         match self.cause {
-            C::Type11MipView { level } | C::LinearLevelGva { level } => {
+            C::MapperRefTextureMipView { level } | C::LinearLevelGva { level } => {
                 v.push(("level", level.to_string()))
             }
             C::LevelOverflow {
@@ -594,8 +597,8 @@ impl crate::observe::Decline for RenderTargetRefusal {
                 v.push(("view_level", view_level.to_string()));
                 v.push(("attachment_level", attachment_level.to_string()));
             }
-            C::Type11NoMapping { mapping_id } => v.push(("mid", mapping_id.to_string())),
-            C::Type11Geometry {
+            C::MapperRefTextureNoMapping { mapping_id } => v.push(("mid", mapping_id.to_string())),
+            C::MapperRefTextureGeometry {
                 mapping_id,
                 has_geom,
                 width,
@@ -605,16 +608,16 @@ impl crate::observe::Decline for RenderTargetRefusal {
                 v.push(("has_geom", has_geom.to_string()));
                 v.push(("dims", format!("{width}x{height}")));
             }
-            C::Type11Format { mapping_id, fmt } => {
+            C::MapperRefTextureFormat { mapping_id, fmt } => {
                 v.push(("mid", mapping_id.to_string()));
                 v.push(("fmt", format!("{fmt:#x}")));
             }
-            C::Type5DescDecode { len } => v.push(("desc_len", len.to_string())),
-            C::Type4MipView { surface_id, level } => {
+            C::RefTextureDescDecode { len } => v.push(("desc_len", len.to_string())),
+            C::BackingMipView { surface_id, level } => {
                 v.push(("sid", surface_id.to_string()));
                 v.push(("level", level.to_string()));
             }
-            C::Type4Unresolved {
+            C::BackingUnresolved {
                 surface_id,
                 live_type,
             } => {
@@ -624,8 +627,8 @@ impl crate::observe::Decline for RenderTargetRefusal {
                     live_type.map_or_else(|| "none".to_string(), |t| t.to_string()),
                 ));
             }
-            C::Type4NoMapping { surface_id } => v.push(("sid", surface_id.to_string())),
-            C::Type4Geometry {
+            C::BackingNoMapping { surface_id } => v.push(("sid", surface_id.to_string())),
+            C::BackingGeometry {
                 surface_id,
                 has_geom,
                 width,
@@ -637,14 +640,14 @@ impl crate::observe::Decline for RenderTargetRefusal {
                 v.push(("dims", format!("{width}x{height}")));
                 v.push(("pages", pages.to_string()));
             }
-            C::Type4BaseFormat {
+            C::BackingBaseFormat {
                 surface_id,
                 raw_fmt,
             } => {
                 v.push(("sid", surface_id.to_string()));
                 v.push(("raw_fmt", format!("{raw_fmt:#x}")));
             }
-            C::Type4Format { surface_id, fmt } => {
+            C::BackingFormat { surface_id, fmt } => {
                 v.push(("sid", surface_id.to_string()));
                 v.push(("fmt", format!("{fmt:#x}")));
             }
@@ -702,9 +705,9 @@ impl crate::observe::Decline for RenderTargetRefusal {
             C::ZeroExtent { width, height } => v.push(("dims", format!("{width}x{height}"))),
             C::ViewSwizzled
             | C::ViewBaseUnbound
-            | C::Type11Unresolved
-            | C::Type5DescRead
-            | C::Type5SurfaceZero
+            | C::MapperRefTextureUnresolved
+            | C::RefTextureDescRead
+            | C::RefTextureSurfaceZero
             | C::NoListEntry
             | C::LinearDescRead => {}
         }
@@ -712,18 +715,18 @@ impl crate::observe::Decline for RenderTargetRefusal {
     }
 }
 
-/// Archive `apple_pv_gpu_lookup_render_target`: type-11 first, else type-2/3 GVA.
+/// Archive `apple_pv_gpu_lookup_render_target`: mapper-ref-texture first, else normal-texture GVA.
 ///
-/// Wallpaper/background intermediates are type-2/3 guest-VA; type-11-only resolve
+/// Wallpaper/background intermediates are normal-texture guest-VA; mapper-ref-texture-only resolve
 /// drops those passes (black wallpaper). Color RT formats are the Metal color-
 /// renderable set admitted by [`pixel_format::render_target_bpp`] (RGBA8 family,
 /// BGRA8 family, RGBA16Float) — bring-up only listed compositor BGRA8/0x73.
 ///
-/// Type-8 texture views (archive `resource_resolve_texture` view chain): resolve
+/// Texture-view texture views (archive `resource_resolve_texture` view chain): resolve
 /// to the base texture. Swizzled views are rejected as RTs (archive
 /// `resolve_texture` requires `!has_swizzle`). Level 0 only for color RT
 /// materialization (mip RT not supported). Without this, UI passes that bind a
-/// type-8 view as color attachment fail MRT (`mrt_request fail slots=[211]`) and
+/// texture-view as color attachment fail MRT (`mrt_request fail slots=[211]`) and
 /// drop entire draws (blank App Store sidebar / missing chrome labels).
 ///
 /// # An unbound ref is not a refusal
@@ -774,7 +777,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
 ) -> Result<ResolvedRenderTarget, RenderTargetRefusal> {
     use RenderTargetCause as C;
     let texture_ref = att.texture_ref;
-    // Type-8 view → base (archive resource_resolve_texture view chain).
+    // Texture-view view → base (archive resource_resolve_texture view chain).
     let (resolved_ref, view_fmt_override, view_level) =
         if let Some(view) = resolve_texture_view(state, host, task_id, texture_ref) {
             // Archive resolve_texture rejects swizzled views for linear resolve.
@@ -790,7 +793,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     // The level the pass names is relative to the texture it names, so a pass
     // rendering into level 1 of a view whose own range starts at level 2 lands
     // on the base texture's level 3. Both halves reach every rung below as one
-    // number, which is what keeps the type-11 and type-4 rungs — neither of
+    // number, which is what keeps the mapper-ref-texture and backing rungs — neither of
     // which has a mip layout — refusing an attachment level as loudly as they
     // already refuse a view level.
     let level = view_level.checked_add(att.level).ok_or(
@@ -804,11 +807,11 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         return Err(C::ViewBaseUnbound.at(resolved_ref));
     }
     // Archive lookup order is by **live** object-list type + descriptor, not a
-    // sticky cache: type-11 first, else type-2/3. Guest reuses object refs;
+    // sticky cache: mapper-ref-texture first, else normal-texture. Guest reuses object refs;
     // two failure modes for a stale `texture_to_mapping` latch:
-    // 1) live type is now type-2/3 → must not force type-11 (live residual
+    // 1) live type is now normal-texture → must not force mapper-ref-texture (live residual
     //    mrt color RT resolve fail ref=199 type=2 fmt=0x73 480x64).
-    // 2) live type is still type-11 but descriptor mapping_id changed (or a
+    // 2) live type is still mapper-ref-texture but descriptor mapping_id changed (or a
     //    recycled ref now names a different mid) → must re-read the live
     //    descriptor, not prefer the latch. Preferring latch routed dual-mid
     //    full-screen desktop composites onto only one mid (mid=3 nz=6M vs
@@ -816,27 +819,27 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     let live = objects::lookup_list_entry(state, host, task_id, resolved_ref);
     let live_type = live.as_ref().map(|e| e.object_type);
     if let Some(ot) = live_type {
-        if ot != OBJECT_TYPE_IOSURFACE {
-            // Live list says not type-11 — drop any recycled-ref latch.
+        if ot != OBJECT_TYPE_MAPPER_REF_TEXTURE {
+            // Live list says not mapper-ref-texture — drop any recycled-ref latch.
             state.texture_to_mapping.remove(&(task_id, resolved_ref));
         }
     }
-    let try_type11 = live_type == Some(OBJECT_TYPE_IOSURFACE)
+    let try_mapper_ref_texture = live_type == Some(OBJECT_TYPE_MAPPER_REF_TEXTURE)
         || (live_type.is_none()
             && state
                 .texture_to_mapping
                 .contains_key(&(task_id, resolved_ref)));
-    if try_type11 {
-        // Type-11 sample windows carry planes, not mip levels — a mip>0 view
+    if try_mapper_ref_texture {
+        // Mapper-ref-texture sample windows carry planes, not mip levels — a mip>0 view
         // of an IOSurface has no contract-backed layout; fail visibly.
         if level != 0 {
-            return Err(C::Type11MipView { level }.at(resolved_ref));
+            return Err(C::MapperRefTextureMipView { level }.at(resolved_ref));
         }
-        // Live list is source of truth for mapping_id when the entry is type-11.
+        // Live list is source of truth for mapping_id when the entry is mapper-ref-texture.
         // Latch is only a fallback when the list entry is transiently missing
-        // (resolve_type11_ref refreshes the latch from the live descriptor).
-        let mapping_id = if live_type == Some(OBJECT_TYPE_IOSURFACE) {
-            objects::resolve_type11_ref(state, host, task_id, resolved_ref).or_else(|| {
+        // (resolve_mapper_ref_texture refreshes the latch from the live descriptor).
+        let mapping_id = if live_type == Some(OBJECT_TYPE_MAPPER_REF_TEXTURE) {
+            objects::resolve_mapper_ref_texture(state, host, task_id, resolved_ref).or_else(|| {
                 state
                     .texture_to_mapping
                     .get(&(task_id, resolved_ref))
@@ -847,23 +850,23 @@ fn resolve_render_target<M: HostMemory + HostOps>(
                 .texture_to_mapping
                 .get(&(task_id, resolved_ref))
                 .copied()
-                .or_else(|| objects::resolve_type11_ref(state, host, task_id, resolved_ref))
+                .or_else(|| objects::resolve_mapper_ref_texture(state, host, task_id, resolved_ref))
         }
-        .ok_or(C::Type11Unresolved.at(resolved_ref))?;
+        .ok_or(C::MapperRefTextureUnresolved.at(resolved_ref))?;
         let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
         // This rung is terminal either way, and both directions were already
-        // true before it said so. A live type-11 that fails geometry must not
-        // be decoded as type-2/3 — that is the sticky-latch bug above. And in
+        // true before it said so. A live mapper-ref-texture that fails geometry must not
+        // be decoded as normal-texture — that is the sticky-latch bug above. And in
         // the only other case that reaches here, `live_type` is `None`
-        // (`try_type11` admits nothing else), so every rung below ends at
+        // (`try_mapper_ref_texture` admits nothing else), so every rung below ends at
         // `NoListEntry`: falling through reported the ladder's least specific
-        // refusal for a failure the type-11 rung had already diagnosed.
+        // refusal for a failure the mapper-ref-texture rung had already diagnosed.
         let m = state
             .mappings
             .get(&mapping_id)
-            .ok_or(C::Type11NoMapping { mapping_id }.at(resolved_ref))?;
+            .ok_or(C::MapperRefTextureNoMapping { mapping_id }.at(resolved_ref))?;
         if !m.has_geom || m.width == 0 || m.height == 0 {
-            return Err(C::Type11Geometry {
+            return Err(C::MapperRefTextureGeometry {
                 mapping_id,
                 has_geom: m.has_geom,
                 width: m.width,
@@ -871,8 +874,8 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             }
             .at(resolved_ref));
         }
-        // Not `rt_type4_base_format`: a type-11 mapping's format has
-        // writers other than the type-4 decoder, so 0 here can mean "not
+        // Not `rt_backing_base_format`: a mapper-ref-texture mapping's format has
+        // writers other than the backing decoder, so 0 here can mean "not
         // latched yet" rather than "refused", and BGRA8 is the display
         // contract's default for that case. See that function.
         let base_fmt = if m.format != 0 {
@@ -882,7 +885,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         };
         let fmt = effective_view_sample_format(base_fmt, view_fmt_override).unwrap_or(base_fmt);
         if pixel_format::render_target_bpp(fmt).is_none() {
-            return Err(C::Type11Format { mapping_id, fmt }.at(resolved_ref));
+            return Err(C::MapperRefTextureFormat { mapping_id, fmt }.at(resolved_ref));
         }
         return Ok(ResolvedRenderTarget {
             mapping_id,
@@ -894,36 +897,36 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             sample_count: 1,
         });
     }
-    // x86 Ventura/Tahoe type-4 surface/backing (present IOSurface). Object-list
+    // x86 Ventura/Tahoe backing record/backing (present IOSurface). Object-list
     // index == surface_id (ResourceHeap addObject type=4 objectId=getSurfaceID).
     // Without this, clear-only streams and Store writebacks never touch display
     // mids — guest pages stay empty and dual-mid thrash paints black.
-    // Type-4: object-list index is surface_id. Type-5 RefTextureHandle: surfaceID@0
-    // (allocateRefTextureHandle) — product color RTs are type-5 wrapping type-4.
-    let mut type5_view: Option<objects::Type5TextureView> = None;
-    let type4_sid = match live.as_ref() {
-        Some(e) if e.object_type == objects::OBJECT_TYPE_SURFACE => Some(resolved_ref),
+    // Backing: object-list index is surface_id. Ref-texture RefTextureHandle: surfaceID@0
+    // (allocateRefTextureHandle) — product color RTs are ref-texture wrapping backing.
+    let mut ref_texture_view: Option<objects::RefTextureView> = None;
+    let backing_sid = match live.as_ref() {
+        Some(e) if e.object_type == objects::OBJECT_TYPE_BACKING => Some(resolved_ref),
         Some(e) if e.object_type == objects::OBJECT_TYPE_REF_TEXTURE => {
             let desc = objects::read_descriptor(state, host, task_id, e)
-                .ok_or(C::Type5DescRead.at(resolved_ref))?;
-            let sid = reims_vgpu_wire::device_desc::type5_header(&desc)
-                .map_err(|_| C::Type5DescDecode { len: desc.len() }.at(resolved_ref))?
+                .ok_or(C::RefTextureDescRead.at(resolved_ref))?;
+            let sid = reims_vgpu_wire::device_desc::ref_texture_header(&desc)
+                .map_err(|_| C::RefTextureDescDecode { len: desc.len() }.at(resolved_ref))?
                 .surface_id
                 .get();
             if sid == 0 {
-                return Err(C::Type5SurfaceZero.at(resolved_ref));
+                return Err(C::RefTextureSurfaceZero.at(resolved_ref));
             }
-            type5_view = objects::decode_type5_texture_view(&desc);
+            ref_texture_view = objects::decode_ref_texture_view(&desc);
             Some(sid)
         }
         _ => None,
     };
-    if let Some(surface_id) = type4_sid {
+    if let Some(surface_id) = backing_sid {
         if level != 0 {
-            return Err(C::Type4MipView { surface_id, level }.at(resolved_ref));
+            return Err(C::BackingMipView { surface_id, level }.at(resolved_ref));
         }
-        if !objects::resolve_type4_surface(state, host, surface_id) {
-            return Err(C::Type4Unresolved {
+        if !objects::resolve_backing(state, host, surface_id) {
+            return Err(C::BackingUnresolved {
                 surface_id,
                 live_type,
             }
@@ -932,9 +935,9 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         let m = state
             .mappings
             .get(&surface_id)
-            .ok_or(C::Type4NoMapping { surface_id }.at(resolved_ref))?;
+            .ok_or(C::BackingNoMapping { surface_id }.at(resolved_ref))?;
         if !m.has_geom || m.width == 0 || m.height == 0 || m.page_entries.is_empty() {
-            return Err(C::Type4Geometry {
+            return Err(C::BackingGeometry {
                 surface_id,
                 has_geom: m.has_geom,
                 width: m.width,
@@ -945,19 +948,23 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         }
         let (base_w, base_h, base_raw_fmt) = (m.width, m.height, m.format);
         if live_type == Some(objects::OBJECT_TYPE_REF_TEXTURE) {
-            note_rt_type5_view(type5_view, surface_id, (base_w, base_h, base_raw_fmt));
+            note_rt_ref_texture_view(ref_texture_view, surface_id, (base_w, base_h, base_raw_fmt));
         }
-        let base_fmt = rt_type4_base_format(base_raw_fmt, surface_id).ok_or(
-            C::Type4BaseFormat {
+        let base_fmt = rt_backing_base_format(base_raw_fmt, surface_id).ok_or(
+            C::BackingBaseFormat {
                 surface_id,
                 raw_fmt: base_raw_fmt,
             }
             .at(resolved_ref),
         )?;
-        let fmt =
-            rt_type4_declared_format(base_fmt, (base_w, base_h), type5_view, view_fmt_override);
+        let fmt = rt_backing_declared_format(
+            base_fmt,
+            (base_w, base_h),
+            ref_texture_view,
+            view_fmt_override,
+        );
         if pixel_format::render_target_bpp(fmt).is_none() {
-            return Err(C::Type4Format { surface_id, fmt }.at(resolved_ref));
+            return Err(C::BackingFormat { surface_id, fmt }.at(resolved_ref));
         }
         // mapping_id = surface_id; no linear GVA.
         return Ok(ResolvedRenderTarget {
@@ -970,9 +977,10 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             sample_count: 1,
         });
     }
-    // type-2/3 linear GVA (wallpaper/background layers, UI intermediate RTs).
+    // normal-texture linear GVA (wallpaper/background layers, UI intermediate RTs).
     let entry = live.ok_or(C::NoListEntry.at(resolved_ref))?;
-    if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
+    if entry.object_type != OBJECT_TYPE_TEXTURE
+        && entry.object_type != OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS
     {
         return Err(C::WrongType {
             object_type: entry.object_type,
@@ -1172,37 +1180,37 @@ mod tests {
         );
     }
 
-    /// A type-4 colour attachment whose mapping carries the decoder's format
+    /// A backing colour attachment whose mapping carries the decoder's format
     /// refusal must be declined, and every decline must be counted.
     ///
-    /// `m.format == 0` on a type-4 mapping has exactly one writer,
-    /// `apply_type4_backing`, and it means multi-plane or unknown FourCC — a surface
+    /// `m.format == 0` on a backing mapping has exactly one writer,
+    /// `apply_backing`, and it means multi-plane or unknown FourCC — a surface
     /// that is not a single-format colour attachment. Inventing BGRA8 from it
     /// describes the wrong stride over the wrong bytes and every downstream window
     /// is built from the answer. The counter has to fire on the refusal and only on
     /// it: one that also fired on ordinary formats would answer a different question
     /// and read identically.
     #[test]
-    fn a_type4_render_target_declines_the_decoders_format_refusal() {
+    fn a_backing_render_target_declines_the_decoders_format_refusal() {
         use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         use crate::runtime::drain::store_route_count;
 
         let before = store_route_count("rt_base_fmt_declined");
         // A format the decoder resolved is passed through untouched and uncounted.
         assert_eq!(
-            rt_type4_base_format(MTL_FORMAT_BGRA8_UNORM, 11),
+            rt_backing_base_format(MTL_FORMAT_BGRA8_UNORM, 11),
             Some(MTL_FORMAT_BGRA8_UNORM)
         );
         assert_eq!(store_route_count("rt_base_fmt_declined"), before);
         // The refusal declines, and is counted per occurrence — the fail line is
         // deduped per mapping, the counter is not.
-        assert_eq!(rt_type4_base_format(0, 11), None);
-        assert_eq!(rt_type4_base_format(0, 12), None);
-        assert_eq!(rt_type4_base_format(0, 11), None);
+        assert_eq!(rt_backing_base_format(0, 11), None);
+        assert_eq!(rt_backing_base_format(0, 12), None);
+        assert_eq!(rt_backing_base_format(0, 11), None);
         assert_eq!(store_route_count("rt_base_fmt_declined"), before + 3);
     }
 
-    /// A type-5 view's declared format reaches the colour attachment, so the
+    /// A ref-texture view's declared format reaches the colour attachment, so the
     /// hardware performs the linear-to-sRGB encode the guest asked for.
     ///
     /// This is the write half of the sRGB round trip. Metal stores `E(L)` into an
@@ -1214,15 +1222,15 @@ mod tests {
     /// The live shape is `view=300x300 fmt=0x51 base=300x300 fmt=0x50`, seen twice
     /// on a driven macos-13 boot at icon size.
     #[test]
-    fn a_type5_views_declared_format_is_what_the_colour_attachment_attaches() {
+    fn a_ref_texture_views_declared_format_is_what_the_colour_attachment_attaches() {
         use crate::contract::pixel_format::{
             MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_RGBA16_FLOAT,
         };
-        use crate::runtime::objects::Type5TextureView;
+        use crate::runtime::objects::RefTextureView;
 
         let extent = (300u32, 300u32);
         let view = |w, h, fmt| {
-            Some(Type5TextureView {
+            Some(RefTextureView {
                 pixel_format: fmt,
                 width: w,
                 height: h,
@@ -1233,7 +1241,7 @@ mod tests {
 
         // The defect: an sRGB view over a linear base must attach sRGB.
         assert_eq!(
-            rt_type4_declared_format(
+            rt_backing_declared_format(
                 MTL_FORMAT_BGRA8_UNORM,
                 extent,
                 view(300, 300, MTL_FORMAT_BGRA8_UNORM_SRGB),
@@ -1243,12 +1251,12 @@ mod tests {
         );
         // A surface bound without a view keeps the mapping's own format.
         assert_eq!(
-            rt_type4_declared_format(MTL_FORMAT_BGRA8_UNORM, extent, None, None),
+            rt_backing_declared_format(MTL_FORMAT_BGRA8_UNORM, extent, None, None),
             MTL_FORMAT_BGRA8_UNORM
         );
         // A view that agrees says nothing new.
         assert_eq!(
-            rt_type4_declared_format(
+            rt_backing_declared_format(
                 MTL_FORMAT_BGRA8_UNORM,
                 extent,
                 view(300, 300, MTL_FORMAT_BGRA8_UNORM),
@@ -1260,7 +1268,7 @@ mod tests {
         // takes the base mapping's geometry, so lifting the format alone would
         // attach a reinterpretation to a grid that is not its own.
         assert_eq!(
-            rt_type4_declared_format(
+            rt_backing_declared_format(
                 MTL_FORMAT_BGRA8_UNORM,
                 extent,
                 view(75, 300, MTL_FORMAT_RGBA16_FLOAT),
@@ -1271,7 +1279,7 @@ mod tests {
         // A same-extent view whose texel is a different width is not a
         // reinterpretation of one allocation, and the base format stands.
         assert_eq!(
-            rt_type4_declared_format(
+            rt_backing_declared_format(
                 MTL_FORMAT_BGRA8_UNORM,
                 extent,
                 view(300, 300, MTL_FORMAT_RGBA16_FLOAT),
@@ -1279,16 +1287,16 @@ mod tests {
             ),
             MTL_FORMAT_BGRA8_UNORM
         );
-        // A zero format is the type-5 decoder saying it has none, not a
+        // A zero format is the ref-texture decoder saying it has none, not a
         // declaration of format zero.
         assert_eq!(
-            rt_type4_declared_format(MTL_FORMAT_BGRA8_UNORM, extent, view(300, 300, 0), None),
+            rt_backing_declared_format(MTL_FORMAT_BGRA8_UNORM, extent, view(300, 300, 0), None),
             MTL_FORMAT_BGRA8_UNORM
         );
-        // A type-8 view is a further reinterpretation the guest asked for on top,
-        // so it outranks the type-5 record.
+        // A texture-view is a further reinterpretation the guest asked for on top,
+        // so it outranks the ref-texture record.
         assert_eq!(
-            rt_type4_declared_format(
+            rt_backing_declared_format(
                 MTL_FORMAT_BGRA8_UNORM,
                 extent,
                 view(300, 300, MTL_FORMAT_BGRA8_UNORM_SRGB),
@@ -1298,7 +1306,7 @@ mod tests {
         );
     }
 
-    /// A type-5 colour attachment must be scored on whether its view agrees with
+    /// A ref-texture colour attachment must be scored on whether its view agrees with
     /// the base mapping, and "no view decoded" must not read as agreement.
     ///
     /// The resolve takes geometry from the base mapping either way, so the counter
@@ -1306,13 +1314,13 @@ mod tests {
     /// undecoded record into `same` would report the ambiguous case as the healthy
     /// one, which is the failure mode that makes a census worthless.
     #[test]
-    fn a_type5_render_target_view_is_scored_against_the_base_it_resolves_through() {
+    fn a_ref_texture_render_target_view_is_scored_against_the_base_it_resolves_through() {
         use crate::runtime::drain::store_route_count;
-        use crate::runtime::objects::Type5TextureView;
+        use crate::runtime::objects::RefTextureView;
 
         let base = (64u32, 32u32, 0x50u16);
         let view = |w, h, fmt| {
-            Some(Type5TextureView {
+            Some(RefTextureView {
                 pixel_format: fmt,
                 width: w,
                 height: h,
@@ -1321,27 +1329,27 @@ mod tests {
             })
         };
         let (same0, diff0, und0) = (
-            store_route_count("rt_type5_view_same"),
-            store_route_count("rt_type5_view_differs"),
-            store_route_count("rt_type5_view_undecoded"),
+            store_route_count("rt_ref_texture_view_same"),
+            store_route_count("rt_ref_texture_view_differs"),
+            store_route_count("rt_ref_texture_view_undecoded"),
         );
 
-        note_rt_type5_view(view(64, 32, 0x50), 5, base);
-        assert_eq!(store_route_count("rt_type5_view_same"), same0 + 1);
+        note_rt_ref_texture_view(view(64, 32, 0x50), 5, base);
+        assert_eq!(store_route_count("rt_ref_texture_view_same"), same0 + 1);
 
         // The live case the contract names: a row-byte-equivalent reinterpretation
         // at a different width and format over the same bytes.
-        note_rt_type5_view(view(16, 32, 0x73), 6, base);
-        assert_eq!(store_route_count("rt_type5_view_differs"), diff0 + 1);
+        note_rt_ref_texture_view(view(16, 32, 0x73), 6, base);
+        assert_eq!(store_route_count("rt_ref_texture_view_differs"), diff0 + 1);
         // Geometry alone is not the test — a format-only view is still a different
         // view, and it is the one this resolve would silently render as BGRA8.
-        note_rt_type5_view(view(64, 32, 0x73), 7, base);
-        assert_eq!(store_route_count("rt_type5_view_differs"), diff0 + 2);
+        note_rt_ref_texture_view(view(64, 32, 0x73), 7, base);
+        assert_eq!(store_route_count("rt_ref_texture_view_differs"), diff0 + 2);
 
-        note_rt_type5_view(None, 8, base);
-        assert_eq!(store_route_count("rt_type5_view_undecoded"), und0 + 1);
+        note_rt_ref_texture_view(None, 8, base);
+        assert_eq!(store_route_count("rt_ref_texture_view_undecoded"), und0 + 1);
         assert_eq!(
-            store_route_count("rt_type5_view_same"),
+            store_route_count("rt_ref_texture_view_same"),
             same0 + 1,
             "an undecoded record must not be scored as agreement"
         );
@@ -1380,20 +1388,20 @@ mod tests {
         );
     }
 
-    /// A type-11 latch whose mapping has no geometry is reported as that, not
+    /// A mapper-ref-texture latch whose mapping has no geometry is reported as that, not
     /// as the missing object-list entry three rungs further down.
     ///
-    /// This is the terminal-rung property. The type-11 arm used to return only
+    /// This is the terminal-rung property. The mapper-ref-texture arm used to return only
     /// when the *live* list said IOSurface; a latch-only attempt that failed
-    /// geometry fell through to the type-4 and linear rungs instead. It could
+    /// geometry fell through to the backing and linear rungs instead. It could
     /// not resolve there — `live_type` is `None` in that arm by construction,
-    /// so `type4_sid` is `None` and the linear rung's first act is to unwrap
+    /// so `backing_sid` is `None` and the linear rung's first act is to unwrap
     /// the entry that is not there. The fall-through therefore changed nothing
     /// about the outcome and everything about the diagnosis: the ladder
     /// reported `no_list_entry` for a surface whose mapping it had already
     /// found and measured.
     #[test]
-    fn a_type11_latch_without_geometry_names_the_geometry_check() {
+    fn a_mapper_ref_texture_latch_without_geometry_names_the_geometry_check() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let host = FakeHost::new();
         let tex_ref = 0x5c2u32;
@@ -1407,7 +1415,7 @@ mod tests {
         assert!(lookup_render_target(&mut state, &host, 4, attach(tex_ref)).is_none());
         let line = cap.one("rt_resolve");
         assert!(
-            line.starts_with("rt_resolve reason=rt_type11_geometry "),
+            line.starts_with("rt_resolve reason=rt_mapper_ref_texture_geometry "),
             "the rung that found the mapping must be the one that reports: {line}"
         );
         assert!(
@@ -1430,7 +1438,7 @@ mod tests {
     ///
     /// The guest re-issues the same pass every frame, so this path is entered
     /// at draw rate. The two ad-hoc lines this ladder used to emit had no latch
-    /// at all — one of them on the type-4 rung, which a compositing workload
+    /// at all — one of them on the backing rung, which a compositing workload
     /// takes for every desktop surface.
     #[test]
     fn a_repeated_refusal_on_the_same_attachment_reports_once() {
@@ -1455,7 +1463,7 @@ mod tests {
     ///
     /// macOS 26's compositor renders a blur pyramid level by level, and until
     /// this the whole class was refused at decode as an unbindable subresource.
-    /// The rung it reaches was already here for a type-8 *view* that carries a
+    /// The rung it reaches was already here for a texture-view *view* that carries a
     /// level; what was missing was the pass's own `level` field reaching it.
     ///
     /// Every assertion names a number that differs between the two levels, so a

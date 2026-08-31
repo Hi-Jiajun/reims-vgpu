@@ -2,16 +2,15 @@
 //!
 //! Metal is handed a pointer to host memory for each aspect, seeded from the
 //! guest's CLEAR value or read back from its texture, and written back into the
-//! guest's type-11 mapping when the pass stores. That is one procedure over a
+//! guest's mapper-ref-texture mapping when the pass stores. That is one procedure over a
 //! buffer whose texel is four bytes for depth and one for stencil — and it used
 //! to be written out twice, once per aspect, in the caller.
 //!
-//! The two copies had already drifted. Both tested `level` and
-//! `resolve_texture_ref` and neither tested `slice` or `depth_plane`, while the
-//! owning rule they were copies of
+//! The two copies had already drifted. Both tested `level` and `resolve_texture_ref` and neither
+//! tested `slice` or `depth_plane`, while the owning rule they were copies of
 //! ([`attachment_subresource_is_bindable`](crate::runtime::decode::render::attachment_subresource_is_bindable))
-//! tests all four; and both refused in silence, so an attachment this rail
-//! could not carry vanished with nothing in the log.
+//! tests all four; and both refused in silence, so an attachment this rail could not carry vanished
+//! with nothing in the log.
 
 use super::{degrade_log_first, load_linear_raw, DeviceState, DrawEncodeRequest};
 use crate::contract::pass_action::{
@@ -119,7 +118,7 @@ impl From<StencilAttachment> for HostAttachment {
 /// where a STORE puts them back.
 pub(super) struct HostDepthStencil {
     pub(super) data: Vec<u8>,
-    /// Type-11 mapping behind the attachment's texture, or 0 when the texture
+    /// Mapper-ref-texture mapping behind the attachment's texture, or 0 when the texture
     /// resolved to none — a STORE has nowhere to go in that case.
     mapping_id: u32,
     store_action: u16,
@@ -210,7 +209,8 @@ pub(super) fn seed_host_depth_stencil<M: HostMemory + HostOps>(
     let row_bytes = width.saturating_mul(spec.bytes_per_texel);
     let mut data = vec![0u8; (row_bytes as usize).saturating_mul(height as usize)];
     let mapping_id =
-        objects::resolve_type11_ref(state, host, req.task_id, attach.texture_ref).unwrap_or(0);
+        objects::resolve_mapper_ref_texture(state, host, req.task_id, attach.texture_ref)
+            .unwrap_or(0);
     if mapping_id != 0 {
         let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
     }

@@ -173,7 +173,7 @@
 //! ## That repair was built, and it is the cache half that fails
 //!
 //! The paragraph this replaces said the gather path had no content cache at all
-//! and that it was *not* established whether the type-11 seed witness could
+//! and that it was *not* established whether the mapper-ref-texture seed witness could
 //! cover these run lists, "the first thing to check before building on this".
 //! Both are answered. [`crate::runtime::gather_witness`] covers them —
 //! `GatherWindow` carries the window's `gpas` alongside its `runs`, so the

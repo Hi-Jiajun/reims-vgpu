@@ -47,7 +47,7 @@ pub struct TextureDescriptor {
     pub resource_options: u16,
     pub protection_options: u64,
     /// `MTLTextureSwizzleChannels` as four raw `MTLTextureSwizzle` ordinals in
-    /// red, green, blue, alpha order — the same encoding the type-8 swizzle
+    /// red, green, blue, alpha order — the same encoding the texture-view swizzle
     /// view carries, so [`crate::contract::pixel_format::swizzle_plan`] reads
     /// both.
     ///

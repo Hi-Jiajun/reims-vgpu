@@ -514,7 +514,7 @@ fn replace_physical_drops_the_cached_page_list() {
         let m = state.mappings.get_mut(&7).unwrap();
         m.mapped = true;
         m.page_entries = vec![0x11, 0x22, 0x33];
-        m.type4_walk = Some(crate::model::Type4Walk {
+        m.backing_walk = Some(crate::model::BackingWalk {
             task_id: 0,
             backing_pfn: 0x20,
             map_generation: m.map_generation,
@@ -549,11 +549,11 @@ fn replace_physical_drops_the_cached_page_list() {
     assert_ne!(
         m.map_generation, generation_before,
         "dropping the list must bump the incarnation, which is what retires the \
-         type-4 walk latch and any state keyed on it"
+         backing walk latch and any state keyed on it"
     );
 }
 
-/// A re-point naming a type-11 resource reaches the mapping associated with its
+/// A re-point naming a mapper-ref-texture resource reaches the mapping associated with its
 /// task-local ref. This is the packet family the arm used to drop entirely —
 /// 57 % of the re-points on a driven boot found no mapping under `object_id` —
 /// and dropping it leaves the texture's page list trusted while it names pages
@@ -562,7 +562,7 @@ fn replace_physical_drops_the_cached_page_list() {
 fn replace_physical_routes_through_the_texture_ref_when_no_mapping_owns_the_id() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    // Mapping 41 backs a type-11 texture the guest registered at object-list
+    // Mapping 41 backs a mapper-ref-texture the guest registered at object-list
     // ref 12 of task 3. Nothing is mapped under id 12.
     state.map_surface(41);
     {
@@ -660,7 +660,7 @@ fn replace_physical_retires_only_the_named_resource() {
 
 /// A same-number mapping owned by another task must not capture a task-local
 /// resource re-point. The association names mapping 99; mapping 7 merely shares
-/// its integer and has independent type-4 provenance.
+/// its integer and has independent backing provenance.
 #[test]
 fn replace_physical_does_not_confuse_another_tasks_mapping_for_the_resource() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -670,7 +670,7 @@ fn replace_physical_does_not_confuse_another_tasks_mapping_for_the_resource() {
         let m = state.mappings.get_mut(&7).unwrap();
         m.mapped = true;
         m.page_entries = vec![0x77];
-        m.type4_walk = Some(crate::model::Type4Walk {
+        m.backing_walk = Some(crate::model::BackingWalk {
             task_id: 1,
             backing_pfn: 0x20,
             map_generation: m.map_generation,

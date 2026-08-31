@@ -20,7 +20,7 @@
 //! - **Five of the sites had no check at all.** The two vertex-descriptor
 //!   builders (`backend::metal::render::make_vertex_descriptor` and
 //!   `runtime::icb::metal_vertex_descriptor_from_attrs_for_draw`) transmuted a
-//!   type-7 pipeline descriptor's `format` and `step_function` words straight
+//!   serializer-object pipeline descriptor's `format` and `step_function` words straight
 //!   through, and those are guest bytes with no producer-side clamp anywhere.
 //!
 //! ## Where the variant lists come from

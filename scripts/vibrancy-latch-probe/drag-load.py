@@ -17,7 +17,7 @@ sequence of teleports.
 
 Both stressors run, because they are different ones. The drag is the reported
 trigger. The resize and the second app opening and closing are what a previous
-session measured as the thing that moves `type4_pages_stale` off zero — surface
+session measured as the thing that moves `backing_pages_stale` off zero — surface
 *reallocation*, which a window that only moves never does.
 
 Usage:

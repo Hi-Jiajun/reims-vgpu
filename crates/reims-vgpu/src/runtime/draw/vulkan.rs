@@ -172,13 +172,13 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Prep);
     // metal2vulkan path: load MTLB → AIR → SPIR-V → internal Vulkan engine offscreen.
     let mut draw_rgba: Option<Vec<u8>> = None;
-    // Physical order of `draw_rgba`. A type-11 composite Store renders into a
+    // Physical order of `draw_rgba`. A mapper-ref-texture composite Store renders into a
     // BGRA `Surface` resident, so its readback is already in guest scanout
     // order; the pooled and GVA targets stay RGBA. Carried instead of assumed —
     // which of those a record hit depends on whether an identity resolved, and
     // that is not a condition the Store block can re-derive.
     let mut draw_bgra = false;
-    // Type-11 composite Store: the frame was written into the mapping's guest
+    // Mapper-ref-texture composite Store: the frame was written into the mapping's guest
     // pages by `store_surface_resident`, so this encode owes the caller nothing
     // further.
     let mut surface_store_armed = false;
@@ -220,7 +220,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             }
             Ok(M2vDrawSpan::ResidentGvaStore { identity }) => {
                 let _store_span = StoreCostSpan::new("gva_store_us");
-                note_type11_store_route("gva_flush");
+                note_mapper_ref_texture_store_route("gva_flush");
                 // Metal Store preserves the attachment in host GPU memory. It
                 // does not synchronize that texture into guest backing; the
                 // resource-validity protocol asks for that separately. The
@@ -230,14 +230,14 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     crate::runtime::writeback_debt::arm_gva(state, host, req.task_id, c0, &identity)
                 });
                 if landed {
-                    note_type11_store_route("gva_resident_authoritative");
+                    note_mapper_ref_texture_store_route("gva_resident_authoritative");
                     gva_store_armed = true;
                 } else {
                     // The copying rail: read the resident the draw just
                     // rendered into and let the synchronous Store block below
                     // run exactly as it does for a Store that never skipped its
                     // readback. `read_resident_chain` fail-logs a lost resident.
-                    note_type11_store_route("gva_store_sync");
+                    note_mapper_ref_texture_store_route("gva_store_sync");
                     draw_rgba = read_resident_chain(req, &identity);
                     crate::observe::line(format!(
                         "linux_m2v_draw ok resident_gva_store pipe={} {}x{} gva={:#x} rgba={}",
@@ -271,7 +271,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     .unwrap_or(false);
                 match (stored, c0_store) {
                     (true, Some((mid, cw, ch, fmt))) => {
-                        note_type11_store_route("surface_resident");
+                        note_mapper_ref_texture_store_route("surface_resident");
                         // The same two publishes the `Owned` rail performs at arm
                         // time, for the same reason: `dense_frame_seq` gates
                         // `present_unbacked`, and a route that skipped it would
@@ -294,7 +294,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         // a Store that never skipped its readback. This pays the
                         // readback the rail exists to avoid, which is the point —
                         // the fallback is a cost, never a lost frame.
-                        note_type11_store_route("surface_resident_sync");
+                        note_mapper_ref_texture_store_route("surface_resident_sync");
                         draw_rgba = read_resident_chain(req, &identity);
                         crate::observe::line(format!(
                             "linux_m2v_draw ok resident_surface_store_sync_fallback pipe={} {}x{} mid={} rgba={}",
@@ -356,7 +356,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         return (EncodeStatus::Ok, None);
     }
 
-    // Deferred type-11 composite Store: the window names the pinned resident and
+    // Deferred mapper-ref-texture composite Store: the window names the pinned resident and
     // the guest write lands on first access. `None`, not the frame, for the same
     // reason the `Owned` route returns `None` — `writeback_guest` is granted only
     // to the last record of a packet, so there is no record N+1 to seed.
@@ -364,7 +364,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         return (EncodeStatus::Ok, None);
     }
 
-    // A type-11 composite Store reaches the guest only through the CPU writeback
+    // A mapper-ref-texture composite Store reaches the guest only through the CPU writeback
     // below. The DMA rail that used to short-circuit it here — a resident BGRA
     // target landed straight in the mapping's guest pages through an imported
     // host pointer — is gone, because a pointer the GPU can read is one it can
@@ -373,11 +373,11 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // Taken, not borrowed. Every exit from this block returns the frame, and
     // borrowing forced each of them to `rgba.clone()` a whole framebuffer — 8 MB
     // at 1080p, at the 28-111 Stores/s `store_routes` measures, on the drain
-    // worker `drain_duty` shows at duty 0.93-0.99. The deferred type-11 arm is
+    // worker `drain_duty` shows at duty 0.93-0.99. The deferred mapper-ref-texture arm is
     // the hot one and it cloned purely to hand back the buffer it already owned.
     if let Some(mut rgba) = draw_rgba.take() {
         // Intermediate multi-draw GVA records: return color0 for chaining without
-        // guest Store (archive store plan). Resident type-11 intermediates
+        // guest Store (archive store plan). Resident mapper-ref-texture intermediates
         // returned above without materializing CPU pixels.
         if !writeback_guest {
             // A chain value seeds the next record, and `DrawRequest` states a
@@ -391,7 +391,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             // and producing them is an O(w*h) pass over a whole framebuffer
             // readback — 2 073 600 pixels per Store at 1080p, at the 28-111
             // Stores/s `store_routes` measures under load. Computing it here
-            // paid that on every route, including the type-11 one whose only
+            // paid that on every route, including the mapper-ref-texture one whose only
             // consumer is a `observe::line` a normal boot discards. Each arm
             // now scans only when it is about to write a line.
             // A free function, not a closure over `rgba`: the deferred arm below
@@ -404,7 +404,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             }
             let ok = if c0.mapping_id != 0 {
                 // Unconditional. This used to be `if
-                // type11_cpu_store_fallback_allowed(import_allowed)`, where
+                // mapper_ref_texture_cpu_store_fallback_allowed(import_allowed)`, where
                 // `import_allowed` asked whether the device could import a host
                 // pointer over the mapping's guest pages; when it could, the
                 // draw took the import rail and landing here was a fail-closed
@@ -412,7 +412,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 // invariant. There is no invariant left to preserve, and the
                 // else arm was a refusal for a rail that cannot be chosen.
                 {
-                    // Brackets the whole type-11 arm, into the same per-second
+                    // Brackets the whole mapper-ref-texture arm, into the same per-second
                     // window it divides into. `draw_phase` stops at the engine
                     // boundary, so this arm — the cache publish, the window arm,
                     // the guest scatter — is the bulk of the ~245 ms/s (28 % of
@@ -430,7 +430,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         let _span = StoreCostSpan::new("t11_convert_us");
                         reorder_rb_in_place(&mut bgra, draw_bgra, true);
                     }
-                    note_type11_store_route("cpu_portability");
+                    note_mapper_ref_texture_store_route("cpu_portability");
                     // `write_bgra8`, not `write_rgba8_image_changed`: the frame is
                     // already in guest scanout order, and that entry point would
                     // have to exchange every row back to read it. Both share the
@@ -476,7 +476,13 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             );
                         }
                         if let Some(epoch) = sync_epoch {
-                            stamp_type11_resident(state, host, req, writeback_guest, epoch);
+                            stamp_mapper_ref_texture_resident(
+                                state,
+                                host,
+                                req,
+                                writeback_guest,
+                                epoch,
+                            );
                         }
                         crate::observe::when_verbose(|| {
                             // Order-independent: both fields reduce over the three
@@ -523,7 +529,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 }
             } else if c0.target_gva != 0 {
                 // What this Store would cost if it were served the way the
-                // type-11 surface Store is served.
+                // mapper-ref-texture surface Store is served.
                 //
                 // That rail lands its frame with `copy_target_to_guest_pages` —
                 // the GPU writes the guest's pages and no byte crosses host
@@ -576,7 +582,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     sync_store_pages.as_ref().map(|p| p.membership()),
                 )
                 .is_ok();
-                // Discrete-GPU rail: type-2/3 encode into **texture_ref** + **GVA**
+                // Discrete-GPU rail: normal-texture encode into **texture_ref** + **GVA**
                 // host caches (not surface_id mid map — list ids collide with
                 // present mids;). Sample prefers GVA key then
                 // texture_ref with live descriptor geom.
@@ -792,7 +798,7 @@ pub(super) enum SampledSourceRequest {
     /// view swizzle: this rail binds guest bytes untouched, so a format whose
     /// Metal channels do not sit identically on the Vulkan format carrying them
     /// needs that difference expressed on the image view. It is composed with
-    /// the type-8 view swizzle at the push site. Identity for every format but
+    /// the texture-view swizzle at the push site. Identity for every format but
     /// `A8Unorm`.
     GuestRuns(
         crate::backend::vulkan::engine::GuestRunSource,
@@ -819,9 +825,9 @@ pub(super) enum SampledSourceRequest {
 /// | bit 63 | bit 62 | producer | low bits |
 /// |---|---|---|---|
 /// | 0 | 0 | guest linear | the texture's authoritative GVA (`host_gva_surfaces`) |
-/// | 1 | 0 | type-5 view | `plane_index << 32 \| mapping_id` |
-/// | 0 | 1 | type-11 host cache | `mapping_id` (`host_surfaces`) |
-/// | 1 | 1 | type-11 guest memo | `mapping_id` (`type11_memo`) |
+/// | 1 | 0 | ref-texture view | `plane_index << 32 \| mapping_id` |
+/// | 0 | 1 | mapper-ref-texture host cache | `mapping_id` (`host_surfaces`) |
+/// | 1 | 1 | mapper-ref-texture guest memo | `mapping_id` (`mapper_ref_texture_memo`) |
 ///
 /// GVAs are well under 2^62, so the unflagged row cannot collide with a flagged
 /// one. `generation` comes from
@@ -850,7 +856,7 @@ impl From<crate::runtime::gather_witness::GatheredIdentity> for LinearSampleIden
     }
 }
 
-type LoadedType5View = (
+type LoadedRefTextureView = (
     u32,
     u32,
     std::sync::Arc<Vec<u8>>,
@@ -945,7 +951,7 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
 ///
 /// Four rails resolve a texture ref through the second rung of the object-list
 /// ladder — `mipmap`, `draw::texture_view` and `compute_exec` name
-/// `[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT]` to
+/// `[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS]` to
 /// [`objects::resolve_descriptor`], and `draw::render_target` writes the pair
 /// out — and the two sampled-path sites in this file did not. They went
 /// `lookup_list_entry` -> `read_descriptor` -> `decode_texture_descriptor`, so
@@ -975,8 +981,11 @@ pub(super) fn sampled_texture_descriptor<M: HostMemory>(
 )> {
     let resource = objects::resolve_resource(state, host, task_id, texture_ref).ok()?;
     let entry = resource.entry;
-    use crate::runtime::decode::resource::{OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT};
-    if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
+    use crate::runtime::decode::resource::{
+        OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS,
+    };
+    if entry.object_type != OBJECT_TYPE_TEXTURE
+        && entry.object_type != OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS
     {
         let slug = crate::observe::ladder_slug!("draw_sampled_texture", wrong_type);
         if degrade_log_first(texture_ref, slug) {
@@ -998,9 +1007,9 @@ pub(super) fn sampled_texture_descriptor<M: HostMemory>(
 /// resolver the engine draw path uses. Distinct from [`load_sampled_rgba`],
 /// which is the Metal-path resolver and always materializes RGBA8 bytes.
 ///
-/// # The type-11 ladder is measured, and every rung carries load
+/// # The mapper-ref-texture ladder is measured, and every rung carries load
 ///
-/// Four rungs offer the same type-11 surface, and the obvious reading is that
+/// Four rungs offer the same mapper-ref-texture surface, and the obvious reading is that
 /// three of them are redundant with the first. They are not. A DRIVEN x86/Vulkan
 /// session — four Safari page loads, each scrolled six pages and then dragged by
 /// its title bar — split as:
@@ -1114,7 +1123,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         return None;
     }
 
-    // Opcode-9 buffer-backed texture (type-8): the sampled bytes are an MTLBuffer's
+    // Opcode-9 buffer-backed texture (texture-view): the sampled bytes are an MTLBuffer's
     // guest storage, not a view over another texture. Resolve it directly before
     // the view/surface paths (which would mis-decode the opcode-9 descriptor).
     // `resource` (when supplied by the caller) serves every classification and
@@ -1144,73 +1153,73 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     // decided by the entry's `object_type`, and the cases below are distinct
     // values of that single u8 field, so they cannot both apply:
     //
-    //   type-5 RefTextureHandle — carries the type-4 surface id in its
+    //   ref-texture RefTextureHandle — carries the backing record id in its
     //                             descriptor, alongside the Metal texture view
-    //   type-4 Surface         — the ref *is* the surface id
-    //   type-11 IOSurface      — resolves to the mapping id it was created on
+    //   backing Surface         — the ref *is* the surface id
+    //   mapper-ref-texture IOSurface      — resolves to the mapping id it was created on
     //
-    // The retained resource already carries the total typed decode. Type 11 can
+    // The retained resource already carries the total typed decode. Mapper-ref-texture can
     // therefore fill the slot directly from that object rather than looking up
     // and decoding the same reference a second time. It returns `None` for every
     // other type, so it can only fill a slot the classification above left empty.
     // Hence an `Option`, not a list of candidates to choose between.
     let mut is_linear_tex = false;
-    let mut is_type5 = false;
-    let mut type5_view: Option<objects::Type5TextureView> = None;
+    let mut is_ref_texture = false;
+    let mut ref_texture_view: Option<objects::RefTextureView> = None;
     let mut surface: Option<u32> = None;
     let resolved_resource =
         resource.or_else(|| objects::resolve_resource(state, host, task_id, texture_ref).ok());
     if let Some(resource) = resolved_resource.as_ref() {
         let entry = resource.entry;
         if entry.object_type == objects::OBJECT_TYPE_REF_TEXTURE {
-            is_type5 = true;
+            is_ref_texture = true;
             let desc = &resource.descriptor;
-            if let Ok(t5) = reims_vgpu_wire::device_desc::type5_header(desc) {
+            if let Ok(t5) = reims_vgpu_wire::device_desc::ref_texture_header(desc) {
                 let sid = t5.surface_id.get();
                 if sid != 0 {
-                    type5_view = objects::decode_type5_texture_view(desc);
+                    ref_texture_view = objects::decode_ref_texture_view(desc);
                     surface = Some(sid);
                 }
             }
         }
-        if entry.object_type == objects::OBJECT_TYPE_SURFACE {
+        if entry.object_type == objects::OBJECT_TYPE_BACKING {
             surface = Some(texture_ref);
         }
         if entry.object_type == OBJECT_TYPE_TEXTURE
-            || entry.object_type == OBJECT_TYPE_TEXTURE_VARIANT
+            || entry.object_type == OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS
         {
             is_linear_tex = true;
         }
     }
-    if !is_type5 {
+    if !is_ref_texture {
         // Runs for the linear and unclassified types too, not only for the
-        // type-11 hit it can return: the resolve records the ref as live in the
+        // mapper-ref-texture hit it can return: the resolve records the ref as live in the
         // task's object set and reports a typed failure when the descriptor is
         // unreadable. Both are wanted for any ref a draw sampled.
         surface = surface.or_else(|| {
             resolved_resource.as_ref().and_then(|resource| {
-                objects::resolve_type11_resource(state, task_id, texture_ref, resource)
+                objects::resolve_mapper_ref_texture_resource(state, task_id, texture_ref, resource)
             })
         });
     }
 
     if let Some(mid) = surface {
-        // Ensure type-4 pages exist for this surface id.
+        // Ensure backing pages exist for this surface id.
         let _ = objects::ensure_surface_for_texture_bind(state, host, mid);
-        // A type-5 serialized record is the exact Metal texture view over the
+        // A ref-texture serialized record is the exact Metal texture view over the
         // IOSurface bytes. Materialize it only when it differs from (or cannot
         // be inferred from) the base mapping. Exact base views keep the fast
         // resident/cache path below; an unknown 2-B/texel base FourCC exposed
         // as RG8 must instead use the serialized view's native interpretation.
-        // `type5_view` is set only on the branch that also set `surface` to that
+        // `ref_texture_view` is set only on the branch that also set `surface` to that
         // view's own surface id, so reaching here with a view in hand already
         // means `mid` is the surface it describes.
-        if let Some(view) = type5_view {
+        if let Some(view) = ref_texture_view {
             let needs_materialization = state
                 .mappings
                 .get(&mid)
                 .map(|m| {
-                    type5_view_requires_materialization(
+                    ref_texture_view_requires_materialization(
                         m.has_geom, m.width, m.height, m.format, view,
                     )
                 })
@@ -1224,7 +1233,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 if let Some(bpp) = crate::contract::pixel_format::bytes_per_pixel(view.pixel_format)
                 {
                     if let Some((base_off, bpr, _)) = state.mappings.get(&mid).and_then(|m| {
-                        crate::runtime::mapping_write::type5_sample_window(
+                        crate::runtime::mapping_write::ref_texture_sample_window(
                             m,
                             view.plane_index,
                             view.width,
@@ -1237,7 +1246,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                             &*host,
                             mid,
                             texture_ref,
-                            "type5_view",
+                            "ref_texture_view",
                             crate::runtime::scanout::SampledFieldWindow {
                                 width: view.width,
                                 height: view.height,
@@ -1254,7 +1263,13 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // RGBA8). This bypasses the ~1.5 MB/plane/frame CPU read +
                 // upload the CPU loader below would pay every decoded frame.
                 if let Some(src) = resolved_resource.as_ref().and_then(|resource| {
-                    try_type5_sample_zero_copy(state, host, mid, view, resource.lifetime_ref())
+                    try_ref_texture_sample_zero_copy(
+                        state,
+                        host,
+                        mid,
+                        view,
+                        resource.lifetime_ref(),
+                    )
                 }) {
                     // Success path: a healthy video decodes ~2 planes/frame,
                     // so this fires per-bind (~99k lines/boot). The aggregate
@@ -1263,13 +1278,13 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     // for deep debugging behind REIMS_VGPU_DRAW_LOG (observe::line)
                     // rather than flooding the always-on fail sink.
                     crate::observe::line(format!(
-                        "type5_view_zc ref={texture_ref} sid={mid} view={}x{} fmt={:#x} plane={}",
+                        "ref_texture_view_zc ref={texture_ref} sid={mid} view={}x{} fmt={:#x} plane={}",
                         view.width, view.height, view.pixel_format, view.plane_index
                     ));
                     return Some((view.width, view.height, mid, src));
                 }
                 let (w, h, rgba, identity, byte_format) =
-                    load_type5_view_rgba(state, host, task_id, texture_ref, mid, view)?;
+                    load_ref_texture_view_rgba(state, host, task_id, texture_ref, mid, view)?;
                 return Some((
                     w,
                     h,
@@ -1380,11 +1395,11 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
 
                 // A ready resident target is authoritative after a product
                 // Store — but only while nothing has replaced the bytes it is a
-                // copy of. A type-11 surface's pages are plain guest RAM and the
+                // copy of. A mapper-ref-texture surface's pages are plain guest RAM and the
                 // guest CPU stores into them with no device operation, so a
                 // resident produced for one tenant of the surface keeps claiming
                 // to hold its pixels after the guest has painted different ones
-                // there. This is the same question `type11_guest_wrote_since_store`
+                // there. This is the same question `mapper_ref_texture_guest_wrote_since_store`
                 // asks before the attachment LOAD elision reuses a resident, and
                 // the same one the host-cache rung below asks before serving its
                 // copy. This rung asked neither, and it is the largest of the
@@ -1411,10 +1426,10 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // merge, so borrowing `_refused` would report a repaint that did
                 // not happen and run a merge for it.
                 if resident_ready && !guest_replaced && !may_bind_resident {
-                    note_type11_sample_rung("t11rung_resident_swizzled", guest_write);
+                    note_mapper_ref_texture_sample_rung("t11rung_resident_swizzled", guest_write);
                 } else if resident_ready {
                     if !guest_replaced {
-                        note_type11_sample_rung("t11rung_resident", guest_write);
+                        note_mapper_ref_texture_sample_rung("t11rung_resident", guest_write);
                         let format = resident_id.resident_format();
                         return Some((
                             w,
@@ -1423,7 +1438,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                             SampledSourceRequest::Target(resident_id, format),
                         ));
                     }
-                    note_type11_sample_rung("t11rung_resident_refused", guest_write);
+                    note_mapper_ref_texture_sample_rung("t11rung_resident_refused", guest_write);
                     match guest_owned {
                         Some(ranges) => {
                             // The merge is what makes falling through sound: it
@@ -1493,9 +1508,9 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // is nothing left to merge from — the image is destroyed — yet
                 // it takes this fall-through with no merge and no refusal.
                 //
-                // For most surfaces that is correct: a type-11 surface's pages
+                // For most surfaces that is correct: a mapper-ref-texture surface's pages
                 // are its content, the flush rails write them, and reading them
-                // back is what `resolve_type11_load_seed` already calls "a cache
+                // back is what `resolve_mapper_ref_texture_load_seed` already calls "a cache
                 // miss is a reason to read them".
                 //
                 // # The unsound case this line was added to count is closed
@@ -1573,7 +1588,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     .flatten()
                 {
                     // Uploaded in the order the cache already holds. This rung's
-                    // bytes are BGRA8 by construction — it is a type-4 scanout
+                    // bytes are BGRA8 by construction — it is a backing scanout
                     // cache — and `B8G8R8A8_UNORM` is a Vulkan-mandatory sampled
                     // format with linear filtering, so declaring the layout costs
                     // nothing and the hardware reads the channels the guest
@@ -1605,8 +1620,8 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                         key: (1u64 << 62) | mid as u64,
                         generation: host_gen,
                     });
-                    note_type11_sample_rung("t11rung_host_cache", guest_write);
-                    // BGRA8 by construction — it is a type-4 scanout cache — but
+                    note_mapper_ref_texture_sample_rung("t11rung_host_cache", guest_write);
+                    // BGRA8 by construction — it is a backing scanout cache — but
                     // the *values* in it are the surface's, and this cache is
                     // filled from a writeback that reorders channels and decodes
                     // nothing. So the transfer function is the mapping's declared
@@ -1630,19 +1645,28 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // the guest has written over — so the gather always runs and the
                 // guest bytes are taken unconditionally. Declining the gather is
                 // expected control flow — the CPU byte loader below serves the
-                // same pixels — so it stays quiet, like the type-2/3 rail's.
+                // same pixels — so it stays quiet, like the normal-texture rail's.
                 if let Some(src) = resolved_resource.as_ref().and_then(|resource| {
-                    try_type11_sample_zero_copy(state, host, mid, w, h, resource.lifetime_ref())
+                    try_mapper_ref_texture_sample_zero_copy(
+                        state,
+                        host,
+                        mid,
+                        w,
+                        h,
+                        resource.lifetime_ref(),
+                    )
                 }) {
-                    note_type11_sample_rung("t11rung_zero_copy", guest_write);
+                    note_mapper_ref_texture_sample_rung("t11rung_zero_copy", guest_write);
                     return Some((w, h, mid, src));
                 }
                 // The memo skips the convert/alloc on unchanged content and
                 // returns a content identity so the engine skips re-hash+upload;
                 // its census (T11Memo hit / T11Guest fill) is emitted internally.
                 let memo_source = crate::runtime::draw::mapping_declared_format(state, mid, None);
-                if let Some((rgba, identity)) = load_type11_rgba_memoized(state, host, mid) {
-                    note_type11_sample_rung("t11rung_guest_memo", guest_write);
+                if let Some((rgba, identity)) =
+                    load_mapper_ref_texture_rgba_memoized(state, host, mid)
+                {
+                    note_mapper_ref_texture_sample_rung("t11rung_guest_memo", guest_write);
                     return Some((
                         w,
                         h,
@@ -1663,7 +1687,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     // (mid, geometry) so a steady repeat stays at one line.
                     use std::collections::HashSet;
                     use std::sync::Mutex;
-                    note_type11_sample_rung("t11rung_miss", guest_write);
+                    note_mapper_ref_texture_sample_rung("t11rung_miss", guest_write);
                     static SEEN: Mutex<Option<HashSet<(u32, u32, u32)>>> = Mutex::new(None);
                     let mut guard = SEEN.lock().unwrap_or_else(|e| e.into_inner());
                     if guard.get_or_insert_with(HashSet::new).insert((mid, w, h)) {
@@ -1677,7 +1701,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         }
     }
 
-    // Type-2/3: GVA-keyed encode, then texture_ref with **descriptor** geom match.
+    // normal-texture: GVA-keyed encode, then texture_ref with **descriptor** geom match.
     if is_linear_tex {
         // Zero-copy gather for large Vulkan-native linear textures: replaces
         // the CPU host-cache/memo byte paths below for eligible formats (the
@@ -1792,9 +1816,9 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
 fn resource_type_owns_surface_resident(object_type: u8) -> bool {
     matches!(
         object_type,
-        objects::OBJECT_TYPE_SURFACE
+        objects::OBJECT_TYPE_BACKING
             | objects::OBJECT_TYPE_REF_TEXTURE
-            | crate::runtime::decode::resource::OBJECT_TYPE_IOSURFACE
+            | crate::runtime::decode::resource::OBJECT_TYPE_MAPPER_REF_TEXTURE
     )
 }
 
@@ -1809,7 +1833,7 @@ fn resource_type_owns_gva_resident(object_type: u8) -> bool {
     matches!(
         object_type,
         crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE
-            | crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VARIANT
+            | crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS
     )
 }
 
@@ -1820,16 +1844,16 @@ mod resource_resident_ownership_tests {
     #[test]
     fn every_surface_texture_construction_form_owns_its_resident() {
         for object_type in [
-            objects::OBJECT_TYPE_SURFACE,
+            objects::OBJECT_TYPE_BACKING,
             objects::OBJECT_TYPE_REF_TEXTURE,
-            crate::runtime::decode::resource::OBJECT_TYPE_IOSURFACE,
+            crate::runtime::decode::resource::OBJECT_TYPE_MAPPER_REF_TEXTURE,
         ] {
             assert!(resource_type_owns_surface_resident(object_type));
         }
         for object_type in [
             crate::runtime::decode::resource::OBJECT_TYPE_BUFFER,
             crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE,
-            crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VARIANT,
+            crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS,
         ] {
             assert!(!resource_type_owns_surface_resident(object_type));
         }
@@ -1839,14 +1863,14 @@ mod resource_resident_ownership_tests {
     fn linear_texture_construction_forms_own_their_gva_resident() {
         for object_type in [
             crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE,
-            crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VARIANT,
+            crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS,
         ] {
             assert!(resource_type_owns_gva_resident(object_type));
         }
         for object_type in [
-            objects::OBJECT_TYPE_SURFACE,
+            objects::OBJECT_TYPE_BACKING,
             objects::OBJECT_TYPE_REF_TEXTURE,
-            crate::runtime::decode::resource::OBJECT_TYPE_IOSURFACE,
+            crate::runtime::decode::resource::OBJECT_TYPE_MAPPER_REF_TEXTURE,
             crate::runtime::decode::resource::OBJECT_TYPE_BUFFER,
         ] {
             assert!(!resource_type_owns_gva_resident(object_type));
@@ -1855,12 +1879,12 @@ mod resource_resident_ownership_tests {
 }
 
 #[inline]
-pub(super) fn type5_view_requires_materialization(
+pub(super) fn ref_texture_view_requires_materialization(
     base_has_geom: bool,
     base_width: u32,
     base_height: u32,
     base_format: u16,
-    view: objects::Type5TextureView,
+    view: objects::RefTextureView,
 ) -> bool {
     !base_has_geom
         || view.depth != 1
@@ -1874,20 +1898,20 @@ pub(super) fn type5_view_requires_materialization(
 /// for diagnosis: `(width, height, pixel_format, bytes_per_row, alloc_size)`.
 type SampleWindowDesc = (u32, u32, u32, u32, u32);
 
-/// Why the type-5 serialized-view loader refused to materialize a plane.
+/// Why the ref-texture serialized-view loader refused to materialize a plane.
 ///
-/// # Why these slugs are prefixed `type5_view_`
+/// # Why these slugs are prefixed `ref_texture_view_`
 ///
-/// The blit rail's `BlitStatus` already owns a `t5_*` vocabulary for the type-5
+/// The blit rail's `BlitStatus` already owns a `t5_*` vocabulary for the ref-texture
 /// *copy* path (`t5_no_mapping`, `t5_sample_window`, `t5_fmt_bpp`,
 /// `t5_unmapped`), and four of this loader's checks are conceptually the same
 /// words. A bare `no_mapping` was in fact one of three claimants — console
 /// capture, guest-page import and this loader — that the last present-rail
-/// migration recorded as still sharing the word. The `type5_view_` prefix keeps
-/// `grep reason=type5_view_…` answerable against the copy path that shares the
+/// migration recorded as still sharing the word. The `ref_texture_view_` prefix keeps
+/// `grep reason=ref_texture_view_…` answerable against the copy path that shares the
 /// surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Type5ViewDecline {
+pub(super) enum RefTextureViewDecline {
     /// The serialized view is volumetric; only `depth == 1` planes materialize.
     UnsupportedDepth { depth: u32 },
     /// The mapping's page table is not resident for scanout.
@@ -1935,21 +1959,21 @@ pub(super) enum Type5ViewDecline {
     Convert { row: usize, bpp: u32 },
 }
 
-impl crate::observe::Decline for Type5ViewDecline {
+impl crate::observe::Decline for RefTextureViewDecline {
     fn slug(&self) -> &'static str {
         match self {
-            Self::UnsupportedDepth { .. } => "type5_view_unsupported_depth",
-            Self::Unresolved => "type5_view_unresolved",
-            Self::FormatBpp => "type5_view_format_bpp",
-            Self::NoMapping => "type5_view_no_mapping",
-            Self::SampleWindow { .. } => "type5_view_sample_window",
-            Self::Span { .. } => "type5_view_span",
-            Self::TightOverflow { .. } => "type5_view_tight_overflow",
-            Self::NativeLen { .. } => "type5_view_native_len",
-            Self::Read { .. } => "type5_view_read",
-            Self::RgbaStride => "type5_view_rgba_stride",
-            Self::RgbaLen { .. } => "type5_view_rgba_len",
-            Self::Convert { .. } => "type5_view_convert",
+            Self::UnsupportedDepth { .. } => "ref_texture_view_unsupported_depth",
+            Self::Unresolved => "ref_texture_view_unresolved",
+            Self::FormatBpp => "ref_texture_view_format_bpp",
+            Self::NoMapping => "ref_texture_view_no_mapping",
+            Self::SampleWindow { .. } => "ref_texture_view_sample_window",
+            Self::Span { .. } => "ref_texture_view_span",
+            Self::TightOverflow { .. } => "ref_texture_view_tight_overflow",
+            Self::NativeLen { .. } => "ref_texture_view_native_len",
+            Self::Read { .. } => "ref_texture_view_read",
+            Self::RgbaStride => "ref_texture_view_rgba_stride",
+            Self::RgbaLen { .. } => "ref_texture_view_rgba_len",
+            Self::Convert { .. } => "ref_texture_view_convert",
         }
     }
 
@@ -2015,7 +2039,7 @@ impl crate::observe::Decline for Type5ViewDecline {
     }
 }
 
-/// Why a type-11 attachment `LOAD` could not be seeded with the surface's own
+/// Why a mapper-ref-texture attachment `LOAD` could not be seeded with the surface's own
 /// prior contents.
 ///
 /// This is not a degradation the caller absorbs. `exec` resolves the pass load
@@ -2034,7 +2058,7 @@ impl crate::observe::Decline for Type5ViewDecline {
 /// existed: **121 distinct (mapping, geometry) wipes** in ~170 s, four of them at
 /// the full 1920x1080 composite extent, against 0 in the idle phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Type11SeedDecline {
+enum MapperRefTextureSeedDecline {
     /// The cache holds no entry for this mapping id and the mapping's own pages
     /// could not be read at the requested extent either.
     ///
@@ -2053,7 +2077,7 @@ enum Type11SeedDecline {
     /// `NoEntry` would hide which one a future boot hit.
     GeomMismatch { have_w: u32, have_h: u32 },
     /// An entry exists at exactly this geometry but its bytes were ceded to the
-    /// pinned resident of a deferred type-11 Store that skipped its readback
+    /// pinned resident of a deferred mapper-ref-texture Store that skipped its readback
     /// (`surface_cache::cede_surface_to_resident`).
     ///
     /// Distinct from [`Self::GeomMismatch`] because the geometries *match* — folding
@@ -2066,12 +2090,12 @@ enum Type11SeedDecline {
     CededToResident,
 }
 
-impl crate::observe::Decline for Type11SeedDecline {
+impl crate::observe::Decline for MapperRefTextureSeedDecline {
     fn slug(&self) -> &'static str {
         match self {
-            Self::NoEntry => "type11_seed_cache_absent",
-            Self::GeomMismatch { .. } => "type11_seed_cache_geom",
-            Self::CededToResident => "type11_seed_cache_ceded",
+            Self::NoEntry => "mapper_ref_texture_seed_cache_absent",
+            Self::GeomMismatch { .. } => "mapper_ref_texture_seed_cache_geom",
+            Self::CededToResident => "mapper_ref_texture_seed_cache_ceded",
         }
     }
 
@@ -2083,19 +2107,19 @@ impl crate::observe::Decline for Type11SeedDecline {
     }
 }
 
-/// Which rung of the type-11 `LOAD` seed ladder produced the attachment's prior
+/// Which rung of the mapper-ref-texture `LOAD` seed ladder produced the attachment's prior
 /// contents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Type11SeedRung {
+enum MapperRefTextureSeedRung {
     /// The host render cache held this mapping at exactly this geometry.
     Cache,
     /// The cache missed and the surface's own guest IOSurface pages were read.
     GuestPages,
 }
 
-/// A type-11 attachment's prior contents, kept in the representation of the
+/// A mapper-ref-texture attachment's prior contents, kept in the representation of the
 /// freshest rung that supplied them.
-enum Type11LoadSeed {
+enum MapperRefTextureLoadSeed {
     /// Host-owned bytes from the render cache, or the universal converted
     /// fallback when the native guest-page view cannot be described.
     Host(
@@ -2107,7 +2131,7 @@ enum Type11LoadSeed {
     Guest(crate::backend::vulkan::engine::GuestTargetSeed),
 }
 
-impl Type11SeedRung {
+impl MapperRefTextureSeedRung {
     fn name(self) -> &'static str {
         match self {
             Self::Cache => "cache_hit",
@@ -2116,7 +2140,7 @@ impl Type11SeedRung {
     }
 }
 
-/// Report which way the type-11 `LOAD` seed branch went, once per
+/// Report which way the mapper-ref-texture `LOAD` seed branch went, once per
 /// `(mapping, requested geometry, outcome)`.
 ///
 /// Every outcome reports, because a zero on the miss arm has to be readable. A
@@ -2134,12 +2158,12 @@ impl Type11SeedRung {
 /// The mapping's own latched geometry and generation ride along on every arm:
 /// `want == mapgeom` is the condition under which the guest-pages rung can serve
 /// at all, so the pair says whether a miss was recoverable.
-fn note_type11_load_seed(
+fn note_mapper_ref_texture_load_seed(
     state: &DeviceState,
     mapping_id: u32,
     w: u32,
     h: u32,
-    served: Option<Type11SeedRung>,
+    served: Option<MapperRefTextureSeedRung>,
 ) {
     let (map_w, map_h, map_gen) = state
         .mappings
@@ -2153,17 +2177,17 @@ fn note_type11_load_seed(
     // sits on a branch the census measures at 28-111 entries a second.
     let outcome_bits = match served {
         None => 0u64,
-        Some(Type11SeedRung::Cache) => 1,
-        Some(Type11SeedRung::GuestPages) => 2,
+        Some(MapperRefTextureSeedRung::Cache) => 1,
+        Some(MapperRefTextureSeedRung::GuestPages) => 2,
     };
     let disc =
         (u64::from(mapping_id) << 40) | (u64::from(w) << 20) | u64::from(h) | (outcome_bits << 62);
     if let Some(rung) = served {
-        if !crate::observe::first_sight("type11_load_seed_served", disc) {
+        if !crate::observe::first_sight("mapper_ref_texture_load_seed_served", disc) {
             return;
         }
         crate::observe::off(format!(
-            "type11_load_seed outcome={} mid={mapping_id} want={w}x{h} \
+            "mapper_ref_texture_load_seed outcome={} mid={mapping_id} want={w}x{h} \
              mapgeom={map_w}x{map_h} mapgen={map_gen} hostgen={host_gen}",
             rung.name()
         ));
@@ -2175,15 +2199,15 @@ fn note_type11_load_seed(
                 state, mapping_id, w, h,
             ) =>
         {
-            Type11SeedDecline::CededToResident
+            MapperRefTextureSeedDecline::CededToResident
         }
-        Some((have_w, have_h)) => Type11SeedDecline::GeomMismatch { have_w, have_h },
-        None => Type11SeedDecline::NoEntry,
+        Some((have_w, have_h)) => MapperRefTextureSeedDecline::GeomMismatch { have_w, have_h },
+        None => MapperRefTextureSeedDecline::NoEntry,
     };
     if !crate::observe::first_sight(crate::observe::Decline::slug(&d), disc) {
         return;
     }
-    crate::observe::Emit::decline("type11_load_seed", &d)
+    crate::observe::Emit::decline("mapper_ref_texture_load_seed", &d)
         .field("mid", mapping_id)
         .field("want", format!("{w}x{h}"))
         .field("mapgeom", format!("{map_w}x{map_h}"))
@@ -2192,7 +2216,7 @@ fn note_type11_load_seed(
         .fail();
 }
 
-/// The prior contents of a type-11 attachment under `MTL_LOAD_ACTION_LOAD`,
+/// The prior contents of a mapper-ref-texture attachment under `MTL_LOAD_ACTION_LOAD`,
 /// with the byte order they are in.
 ///
 /// Two rungs, in freshness order:
@@ -2203,7 +2227,7 @@ fn note_type11_load_seed(
 ///    the R/B exchange rides the engine's single copy into mapped staging rather
 ///    than materializing a converted frame here.
 /// 2. **The surface's own guest IOSurface pages.** The cache is an accelerator,
-///    not the surface. What a type-11 attachment *contains* is its pages, so a
+///    not the surface. What a mapper-ref-texture attachment *contains* is its pages, so a
 ///    cache miss is a reason to read them — not a reason to drop the guest's
 ///    LOAD. Without this rung the pass began with `LoadOp::CLEAR` against the
 ///    hardcoded `[0,0,0,0]` primary clear and the matching Store published that
@@ -2217,12 +2241,12 @@ fn note_type11_load_seed(
 /// before recording the copy. Any writeback debt is paid before the page view is
 /// built, so it observes this device's latest Store rather than pre-Store bytes.
 ///
-/// The sibling Metal path already had rung 2: type-11 `seed_color_load` falls
+/// The sibling Metal path already had rung 2: mapper-ref-texture `seed_color_load` falls
 /// through to the same reader via `load_sampled_rgba_static`. Only the Vulkan arm
 /// stopped at the cache.
 ///
 /// `None` means the guest's LOAD could not be honoured at all, and
-/// [`note_type11_load_seed`] has already said which check refused.
+/// [`note_mapper_ref_texture_load_seed`] has already said which check refused.
 /// Band how long after pressure recovery the guest wanted the resident again.
 /// The fixed reference interval keeps existing census buckets comparable; it
 /// has no role in deciding whether the resident remains alive.
@@ -2259,7 +2283,7 @@ fn stage_uses_sampled_band(textures: &[TextureBind], samplers: &[SamplerBind]) -
     textures.iter().any(|t| t.texture_ref != 0) || samplers.iter().any(|s| s.sampler_ref != 0)
 }
 
-fn try_type11_target_guest_seed<M: HostMemory + HostOps>(
+fn try_mapper_ref_texture_target_guest_seed<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
@@ -2268,7 +2292,7 @@ fn try_type11_target_guest_seed<M: HostMemory + HostOps>(
     target_format: ash::vk::Format,
 ) -> Option<crate::backend::vulkan::engine::GuestTargetSeed> {
     use crate::backend::vulkan::engine::{GuestRunSource, GuestTargetSeed};
-    use crate::runtime::mapping_write::type11_sample_window;
+    use crate::runtime::mapping_write::mapper_ref_texture_sample_window;
 
     if w == 0 || h == 0 || !mapper::ensure_resolved_for_scanout(state, host, mapping_id) {
         return None;
@@ -2289,7 +2313,7 @@ fn try_type11_target_guest_seed<M: HostMemory + HostOps>(
             mapping.format
         };
         let layout = pixel_format::store_texel_order(format)?;
-        let (base_off, bpr, _) = type11_sample_window(mapping, w, h, format)?;
+        let (base_off, bpr, _) = mapper_ref_texture_sample_window(mapping, w, h, format)?;
         (base_off, u64::from(bpr), layout)
     };
     let source_format = translate::pixel::vk_texel_layout(layout);
@@ -2318,14 +2342,14 @@ fn try_type11_target_guest_seed<M: HostMemory + HostOps>(
     })
 }
 
-fn resolve_type11_load_seed<M: HostMemory + HostOps>(
+fn resolve_mapper_ref_texture_load_seed<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
     w: u32,
     h: u32,
     target_format: ash::vk::Format,
-) -> Option<Type11LoadSeed> {
+) -> Option<MapperRefTextureLoadSeed> {
     use crate::backend::vulkan::engine::SeedOrder;
     // The cache is the other host-side copy of these pages, and it sits above
     // the only rung that reads the pages themselves — so a stale hit here is
@@ -2336,12 +2360,12 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
     // it did is the page list walked to say whether it wrote the *pixels*.
     //
     // Without it this rung served exactly the frame the elision gate two frames
-    // up had just refused. The caller computes `type11_guest_wrote_since_store`
+    // up had just refused. The caller computes `mapper_ref_texture_guest_wrote_since_store`
     // to decide whether the resident may carry the chain, declines when it says
     // written, and then arrived here to be handed the same stale bytes out of
     // the host cache. The pass composites onto them and its Store publishes
     // them back over the guest's pages, which is the fixpoint this file's own
-    // note above `type11_load_currency_query` calls "renders correctly for a few
+    // note above `mapper_ref_texture_load_currency_query` calls "renders correctly for a few
     // frames then stays corrupted".
     let guest_write = mapping_guest_write_verdict(state, host, mapping_id);
     let site = guest_wrote_allocation(guest_write)
@@ -2355,48 +2379,56 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
         .flatten();
     let served = if let Some(bgra) = cached {
         Some((
-            Type11LoadSeed::Host(bgra, SeedOrder::Bgra8),
-            Type11SeedRung::Cache,
+            MapperRefTextureLoadSeed::Host(bgra, SeedOrder::Bgra8),
+            MapperRefTextureSeedRung::Cache,
         ))
     } else {
-        try_type11_target_guest_seed(state, host, mapping_id, w, h, target_format)
-            .map(|seed| (Type11LoadSeed::Guest(seed), Type11SeedRung::GuestPages))
+        try_mapper_ref_texture_target_guest_seed(state, host, mapping_id, w, h, target_format)
+            .map(|seed| {
+                (
+                    MapperRefTextureLoadSeed::Guest(seed),
+                    MapperRefTextureSeedRung::GuestPages,
+                )
+            })
             .or_else(|| {
-                load_type11_mapping_rgba(state, host, mapping_id, None)
+                load_mapper_ref_texture_mapping_rgba(state, host, mapping_id, None)
                     .map(|(_, _, r)| r)
                     .filter(|rgba| rgba.len() == (w as usize) * (h as usize) * 4)
                     .map(|rgba| {
                         (
-                            Type11LoadSeed::Host(std::sync::Arc::new(rgba), SeedOrder::Rgba8),
-                            Type11SeedRung::GuestPages,
+                            MapperRefTextureLoadSeed::Host(
+                                std::sync::Arc::new(rgba),
+                                SeedOrder::Rgba8,
+                            ),
+                            MapperRefTextureSeedRung::GuestPages,
                         )
                     })
             })
     };
-    note_type11_load_seed(state, mapping_id, w, h, served.as_ref().map(|s| s.1));
+    note_mapper_ref_texture_load_seed(state, mapping_id, w, h, served.as_ref().map(|s| s.1));
     served.map(|(seed, _)| seed)
 }
 
-/// Materialize the exact serialized Metal view carried by a type-5 object.
+/// Materialize the exact serialized Metal view carried by a ref-texture object.
 ///
-/// The underlying type-4 FourCC is allocation metadata, not necessarily the
+/// The underlying backing FourCC is allocation metadata, not necessarily the
 /// sampled Metal format. The view's format/geometry define the native row
-/// interpretation; the type-4 device descriptor supplies its base/BPR/span.
-/// Materialize a type-5 serialized texture view through the byte-exact
+/// interpretation; the backing device descriptor supplies its base/BPR/span.
+/// Materialize a ref-texture serialized texture view through the byte-exact
 /// revalidated memo (same contract as [`load_linear_guest_memoized`]): every
 /// bind re-reads the native plane window so a guest write is always observed;
 /// conversion, allocation, and — via the returned content identity — the
 /// engine upload are skipped when the bytes are unchanged.
-pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
+pub(super) fn load_ref_texture_view_rgba<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
     mapping_id: u32,
-    view: objects::Type5TextureView,
-) -> Option<LoadedType5View> {
-    let fail = |d: Type5ViewDecline| -> Option<LoadedType5View> {
-        crate::observe::Emit::decline("type5_draw_view", &d)
+    view: objects::RefTextureView,
+) -> Option<LoadedRefTextureView> {
+    let fail = |d: RefTextureViewDecline| -> Option<LoadedRefTextureView> {
+        crate::observe::Emit::decline("ref_texture_draw_view", &d)
             .field("task", task_id)
             .field("ref", texture_ref)
             .field("sid", mapping_id)
@@ -2407,19 +2439,19 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     };
 
     if view.depth != 1 {
-        return fail(Type5ViewDecline::UnsupportedDepth { depth: view.depth });
+        return fail(RefTextureViewDecline::UnsupportedDepth { depth: view.depth });
     }
     if !mapper::ensure_resolved_for_scanout(state, host, mapping_id) {
-        return fail(Type5ViewDecline::Unresolved);
+        return fail(RefTextureViewDecline::Unresolved);
     }
     let Some(bpp) = pixel_format::bytes_per_pixel(view.pixel_format) else {
-        return fail(Type5ViewDecline::FormatBpp);
+        return fail(RefTextureViewDecline::FormatBpp);
     };
     let (base_off, surface_bpr, span_end, pages_n, base_w, base_h, base_fmt, map_gen) = {
         let Some(m) = state.mappings.get(&mapping_id) else {
-            return fail(Type5ViewDecline::NoMapping);
+            return fail(RefTextureViewDecline::NoMapping);
         };
-        let Some((base_off, surface_bpr, span_end)) = mapping_write::type5_sample_window(
+        let Some((base_off, surface_bpr, span_end)) = mapping_write::ref_texture_sample_window(
             m,
             view.plane_index,
             view.width,
@@ -2436,7 +2468,7 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
                         d.alloc_size,
                     )
                 });
-            return fail(Type5ViewDecline::SampleWindow {
+            return fail(RefTextureViewDecline::SampleWindow {
                 base_w: m.width,
                 base_h: m.height,
                 base_fmt: m.format,
@@ -2456,7 +2488,7 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     };
     let page_bytes = (pages_n as u64).saturating_mul(1u64 << state.page_shift);
     if page_bytes < span_end {
-        return fail(Type5ViewDecline::Span {
+        return fail(RefTextureViewDecline::Span {
             pages: pages_n,
             page_bytes,
             span_end,
@@ -2464,13 +2496,13 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
         });
     }
     let Some(tight) = view.width.checked_mul(bpp) else {
-        return fail(Type5ViewDecline::TightOverflow { bpp });
+        return fail(RefTextureViewDecline::TightOverflow { bpp });
     };
     let Some(native_len) = (tight as u64)
         .checked_mul(view.height as u64)
         .and_then(host_alloc_len)
     else {
-        return fail(Type5ViewDecline::NativeLen { tight });
+        return fail(RefTextureViewDecline::NativeLen { tight });
     };
     let mut native = vec![0u8; native_len];
     if !mapping_write::read_rect_raw_at(
@@ -2492,7 +2524,7 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
         &mut native,
         tight,
     ) {
-        return fail(Type5ViewDecline::Read {
+        return fail(RefTextureViewDecline::Read {
             base_w,
             base_h,
             base_fmt,
@@ -2502,7 +2534,7 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
             pages: pages_n,
         });
     }
-    // Identity key namespace: bit 63 marks type-5 view content (guest linear
+    // Identity key namespace: bit 63 marks ref-texture view content (guest linear
     // identities use the raw sampled GVA as key). Every producer draws its
     // generation from `DeviceState::next_sampled_content_generation`, so a
     // (key, generation) pair cannot alias content even on a key collision.
@@ -2527,8 +2559,8 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     // The half-float colour pair is deliberately **not** here yet. It belongs
     // by the same argument the linear rails took — `texel_to_rgba8`'s arm for
     // it clamps to `[0, 1]` and quantizes to 256 levels — but nothing has ever
-    // measured a type-5 view arriving in one, and this rail is the video-plane
-    // rail. `type5_view_narrowed` below is the measurement; add the arm when it
+    // measured a ref-texture view arriving in one, and this rail is the video-plane
+    // rail. `ref_texture_view_narrowed` below is the measurement; add the arm when it
     // fires, not before.
     //
     // The packed 32-bit colour formats take the native rail for the same
@@ -2552,10 +2584,10 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
         view.pixel_format,
     );
     let ok_line = |generation_source: &str, rgba: &[u8]| {
-        // Per-draw success echo — fires on EVERY type-5 plane bind (thousands/sec
+        // Per-draw success echo — fires on EVERY ref-texture plane bind (thousands/sec
         // under video → ~36k lines/boot, 61% of the fail log), burying real
         // failures. The always-on health signal is the `sampled_branch_census`
-        // aggregate (Type5View / T5Memo, noted on both paths below), so this
+        // aggregate (RefTextureView / T5Memo, noted on both paths below), so this
         // per-bind detail — and its O(w*h) `rgba_rgb_stats` scan — is diagnostic
         // only: hand both to the sink so a normal boot stays uncluttered and
         // this path never holds the answer to whether the sink is open.
@@ -2563,14 +2595,14 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
             let s = crate::observe::rgba_rgb_stats(rgba);
             let (nz, max) = (s.rgb_nz, s.max_rgb);
             crate::observe::line(format!(
-            "type5_draw_view ok task={task_id} ref={texture_ref} sid={mapping_id} map_gen={map_gen} view={}x{} fmt={:#x} bpp={bpp} base={base_w}x{base_h} base_fmt={base_fmt:#x} off={base_off} bpr={surface_bpr} span_end={span_end} src={generation_source} rgb_nz={nz} max_rgb={max}",
+            "ref_texture_draw_view ok task={task_id} ref={texture_ref} sid={mapping_id} map_gen={map_gen} view={}x{} fmt={:#x} bpp={bpp} base={base_w}x{base_h} base_fmt={base_fmt:#x} off={base_off} bpr={surface_bpr} span_end={span_end} src={generation_source} rgb_nz={nz} max_rgb={max}",
             view.width,
             view.height,
             view.pixel_format,
         ));
         });
     };
-    if let Some(m) = state.type5_view_memo.get_touch(&memo_key) {
+    if let Some(m) = state.ref_texture_view_memo.get_touch(&memo_key) {
         // Vec equality is length + byte memcmp with early exit on change.
         if m.native == native {
             let rgba = m.rgba.clone();
@@ -2593,13 +2625,13 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     // memcmp key and the upload payload).
     let rgba: std::sync::Arc<Vec<u8>> = if byte_format.layout() == TexelLayout::Rgba8 {
         let Some(rgba_stride) = view.width.checked_mul(RGBA8_BPP) else {
-            return fail(Type5ViewDecline::RgbaStride);
+            return fail(RefTextureViewDecline::RgbaStride);
         };
         let Some(rgba_len) = (rgba_stride as u64)
             .checked_mul(view.height as u64)
             .and_then(host_alloc_len)
         else {
-            return fail(Type5ViewDecline::RgbaLen {
+            return fail(RefTextureViewDecline::RgbaLen {
                 stride: rgba_stride,
             });
         };
@@ -2607,9 +2639,9 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
         // The third CPU convert in this crate, and the third that said nothing
         // when it lost precision. `byte_format`'s table above names the video
         // plane formats natively and folds everything else here, so a half-float
-        // type-5 view is quantized on the same terms the linear rails were.
+        // ref-texture view is quantized on the same terms the linear rails were.
         crate::runtime::draw::note_sampled_narrowing(
-            "type5_view_narrowed",
+            "ref_texture_view_narrowed",
             texture_ref,
             view.pixel_format,
             view.width,
@@ -2624,7 +2656,7 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
                 view.width,
                 &mut rgba[dst_off..dst_off + rgba_stride as usize],
             ) {
-                return fail(Type5ViewDecline::Convert { row: y, bpp });
+                return fail(RefTextureViewDecline::Convert { row: y, bpp });
             }
         }
         std::sync::Arc::new(rgba)
@@ -2634,12 +2666,12 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     let generation = state.next_sampled_content_generation();
     ok_line("fill", &rgba);
     let entry_bytes = native.len() + rgba.len();
-    state.type5_view_memo.insert(
+    state.ref_texture_view_memo.insert(
         memo_key,
         crate::model::GuestLinearMemo {
             native,
             rgba: rgba.clone(),
-            // The type-5 view path re-derives this from the view's own pixel
+            // The ref-texture view path re-derives this from the view's own pixel
             // format on every call, hit or miss, so storing it is a statement of
             // what the bytes are rather than the source anything reads.
             layout: byte_format.layout(),
@@ -2664,7 +2696,7 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
 /// threshold only — never a correctness gate and never a gate on a direct
 /// buffer-backed image.
 ///
-/// Set to 64 KiB from a video-playback census: after the type-5 plane rail
+/// Set to 64 KiB from a video-playback census: after the ref-texture plane rail
 /// landed, the whole remaining CPU copy under video was `t11_guest`
 /// (~226 MB/session), and 100% of those declines were the floor —
 /// per-frame-changing composite surfaces clustered at ~236 KiB, just under the
@@ -2689,10 +2721,10 @@ pub(super) const SAMPLED_GATHER_MIN_BYTES: u64 = 64 * 1024;
 pub(super) enum SampledFloorRail {
     /// A linear texture addressed through task-local GVA space.
     Linear,
-    /// A type-11 surface plane addressed through a mapping.
-    Type11,
-    /// A serialized type-5 surface view addressed through a mapping.
-    Type5,
+    /// A mapper-ref-texture surface plane addressed through a mapping.
+    MapperRefTexture,
+    /// A serialized ref-texture surface view addressed through a mapping.
+    RefTexture,
 }
 
 /// The only application of [`SAMPLED_GATHER_MIN_BYTES`], for all three sampled
@@ -2707,7 +2739,7 @@ pub(super) enum SampledFloorRail {
 /// reaches the shader quantized.
 ///
 /// Written once here because it was written three times by hand and the three
-/// did not agree: the type-11 arm carried the span term alone, so every
+/// did not agree: the mapper-ref-texture arm carried the span term alone, so every
 /// half-float sampled surface under 64 KiB on that rail was declined onto the
 /// very loader `a_cost_floor_may_decline` was added to keep it away from. The
 /// two mapping rails also declined silently — no record at all — while the
@@ -2728,12 +2760,12 @@ pub(super) fn sampled_gather_floor_admits(
         (SampledFloorRail::Linear, s) if s < 4 * 1024 => "zc_lin_below_floor_lt4k",
         (SampledFloorRail::Linear, s) if s < 16 * 1024 => "zc_lin_below_floor_lt16k",
         (SampledFloorRail::Linear, _) => "zc_lin_below_floor_lt64k",
-        (SampledFloorRail::Type11, s) if s < 4 * 1024 => "zc_t11_below_floor_lt4k",
-        (SampledFloorRail::Type11, s) if s < 16 * 1024 => "zc_t11_below_floor_lt16k",
-        (SampledFloorRail::Type11, _) => "zc_t11_below_floor_lt64k",
-        (SampledFloorRail::Type5, s) if s < 4 * 1024 => "zc_t5_below_floor_lt4k",
-        (SampledFloorRail::Type5, s) if s < 16 * 1024 => "zc_t5_below_floor_lt16k",
-        (SampledFloorRail::Type5, _) => "zc_t5_below_floor_lt64k",
+        (SampledFloorRail::MapperRefTexture, s) if s < 4 * 1024 => "zc_t11_below_floor_lt4k",
+        (SampledFloorRail::MapperRefTexture, s) if s < 16 * 1024 => "zc_t11_below_floor_lt16k",
+        (SampledFloorRail::MapperRefTexture, _) => "zc_t11_below_floor_lt64k",
+        (SampledFloorRail::RefTexture, s) if s < 4 * 1024 => "zc_t5_below_floor_lt4k",
+        (SampledFloorRail::RefTexture, s) if s < 16 * 1024 => "zc_t5_below_floor_lt16k",
+        (SampledFloorRail::RefTexture, _) => "zc_t5_below_floor_lt64k",
     });
     false
 }
@@ -3423,7 +3455,7 @@ pub(super) fn strided_window_extent(w: u32, h: u32, bpp: u64, bpr: u64) -> Optio
 /// block width. An uncompressed block is 1x1, for which every expression below
 /// reduces to exactly what [`strided_window_extent`] computes; that helper
 /// keeps its texel spelling because its other callers are rails a compressed
-/// format cannot reach (type-11/type-5 surfaces, whose formats have a
+/// format cannot reach (mapper-ref-texture/ref-texture surfaces, whose formats have a
 /// bytes-per-texel by construction).
 ///
 /// This is the arithmetic that kept BC textures off the zero-copy gather:
@@ -3462,8 +3494,8 @@ pub(super) fn strided_level_extent(
 /// window's own page list beside the runs, for the same reason
 /// [`task_gva_guest_run_window`] does.
 ///
-/// Shared by the type-11 attachment seed and the type-11/type-5 sampled rails,
-/// which reach the same pages through different window math.
+/// Shared by the mapper-ref-texture attachment seed and the mapper-ref-texture/ref-texture sampled
+/// rails, which reach the same pages through different window math.
 ///
 /// # No settle, for the reason its linear twin already states
 ///
@@ -3502,7 +3534,7 @@ fn mapping_window_guest_runs<M: HostMemory + HostOps>(
     Some((window.to_vec(), runs))
 }
 
-/// Zero-copy draw-time buffer bind: resolve a type-1 buffer object's backing
+/// Zero-copy draw-time buffer bind: resolve a buffer object's backing
 /// span (from `offset`) to guest-RAM runs and hand the engine a
 /// [`engine::BufferContent::GuestRuns`] — the GPU gathers the bytes from
 /// imported guest RAM inside the draw's own CB. Replaces the per-draw CPU
@@ -4391,7 +4423,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // still lost, so the census records it rather than letting the fold be
     // silent.
     // **Every layout `sampled_pixels` returns is admitted**, which is the same
-    // rule `try_type5_sample_zero_copy` states and applies: that function is
+    // rule `try_ref_texture_sample_zero_copy` states and applies: that function is
     // the answer to "which guest bytes sample byte-identically through the
     // matching Vulkan image", and a layout it hands back has already passed
     // the identity-components test inside it. The engine creates the image
@@ -4400,7 +4432,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     //
     // This rail used to narrow that set again, to four-byte colour plus the
     // single-channel floats, on the stated grounds that "R8/Rg8 video planes
-    // keep their existing CPU/type-5 rails". The premise was that R8 and Rg8
+    // keep their existing CPU/ref-texture rails". The premise was that R8 and Rg8
     // only ever arrive as video; they do not. A Safari window drag with no
     // video playing produced 37 704 `Rg8` binds, 49 % of every linear sampled
     // bind in the boot, and each one fell to `load_linear_guest_memoized`'s
@@ -4423,7 +4455,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     //
     // The plan beside the layout is the format's own channel mapping — identity
     // for all but `A8Unorm`, whose byte rides in `R8_UNORM`. It is composed with
-    // the guest's type-8 view swizzle where the image view is built, so this
+    // the guest's texture-view swizzle where the image view is built, so this
     // rail no longer has to refuse a format for having one.
     let (native, sampled_vk_format, native_components) =
         match translate::pixel::sampled_pixels(declared_format) {
@@ -4511,7 +4543,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // writeback ahead of this gather, and a CPU fence wait buys an ordering that
     // holds without it.
     //
-    // `try_type11_sample_zero_copy` and `try_type5_sample_zero_copy` are the two
+    // `try_mapper_ref_texture_sample_zero_copy` and `try_ref_texture_sample_zero_copy` are the two
     // rails that were already written this way, and this one is now consistent
     // with them.
     //
@@ -4705,14 +4737,14 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     ))
 }
 
-/// Zero-copy rail for type-11 mapping-backed sampled binds. Eligible when
+/// Zero-copy rail for mapper-ref-texture mapping-backed sampled binds. Eligible when
 /// the mapping's raw bytes sample byte-identically through a native UNORM
 /// image (BGRA8/RGBA8 families — the CPU loader's `texel_to_rgba8` is a
 /// byte pass-through/swizzle for exactly these) and the caller established
 /// the resident is not authoritative. Mirrors `paint_mapping`'s window math
-/// (`type11_sample_window`) and its flush-on-access rule; any gate miss
+/// (`mapper_ref_texture_sample_window`) and its flush-on-access rule; any gate miss
 /// falls back to the CPU byte path.
-pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
+pub(super) fn try_mapper_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mid: u32,
@@ -4721,7 +4753,7 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     owner: crate::model::TaskResourceLifetimeRef,
 ) -> Option<SampledSourceRequest> {
     use crate::backend::vulkan::engine;
-    use crate::runtime::mapping_write::type11_sample_window;
+    use crate::runtime::mapping_write::mapper_ref_texture_sample_window;
     if w == 0 || h == 0 {
         return None;
     }
@@ -4751,10 +4783,10 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
             _ => return None,
         };
         let sampled_vk_format = translate::pixel::translate(format).ok()?.vk;
-        let (base_off, bpr_u32, _span_end) = type11_sample_window(m, w, h, format)?;
+        let (base_off, bpr_u32, _span_end) = mapper_ref_texture_sample_window(m, w, h, format)?;
         (native, sampled_vk_format, base_off, bpr_u32 as u64)
     };
-    // From the layout the translation chose, as the type-5 rail does, so the
+    // From the layout the translation chose, as the ref-texture rail does, so the
     // texel size cannot disagree with the image the engine creates. The
     // `is_four_byte_color` gate above already fixes it at four.
     let (span, row_length_texels) =
@@ -4803,7 +4835,7 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
             pixel_format::swizzle_identity(),
         ));
     }
-    if !sampled_gather_floor_admits(SampledFloorRail::Type11, native, span) {
+    if !sampled_gather_floor_admits(SampledFloorRail::MapperRefTexture, native, span) {
         return None;
     }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
@@ -4811,7 +4843,7 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     let seen = crate::runtime::gather_witness::note_gather(
         state,
         host,
-        crate::runtime::gather_witness::GatherRail::Type11,
+        crate::runtime::gather_witness::GatherRail::MapperRefTexture,
         crate::runtime::gather_witness::GatherKey::Mapping { mid, base_off },
         crate::runtime::gather_witness::GatherWindow {
             gpas: &gpas,
@@ -4840,24 +4872,24 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     ))
 }
 
-/// Zero-copy rail for a type-5 serialized IOSurface plane view — the video
+/// Zero-copy rail for a ref-texture serialized IOSurface plane view — the video
 /// hot path. VideoToolbox decodes to NV12 (Y = R8, CbCr = RG8; also
-/// BGRA8/RGBA8 surfaces), sampled through the type-5 view path whose CPU
-/// loader (`load_type5_view_rgba`) read + uploaded ~1.5 MB per plane per
+/// BGRA8/RGBA8 surfaces), sampled through the ref-texture view path whose CPU
+/// loader (`load_ref_texture_view_rgba`) read + uploaded ~1.5 MB per plane per
 /// decoded frame (census `t5_view`). This gathers the plane's guest pages
 /// directly in the draw CB so the decoded frame never materializes CPU bytes.
-/// Mirrors `try_type11_sample_zero_copy`'s page coalescing over the plane
-/// window from `type5_sample_window` (which carries the wire plane index +
+/// Mirrors `try_mapper_ref_texture_sample_zero_copy`'s page coalescing over the plane
+/// window from `ref_texture_sample_window` (which carries the wire plane index +
 /// biplanar offset); any gate miss falls back to the CPU byte path.
-pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
+pub(super) fn try_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mid: u32,
-    view: objects::Type5TextureView,
+    view: objects::RefTextureView,
     owner: crate::model::TaskResourceLifetimeRef,
 ) -> Option<SampledSourceRequest> {
     use crate::backend::vulkan::engine;
-    use crate::runtime::mapping_write::type5_sample_window;
+    use crate::runtime::mapping_write::ref_texture_sample_window;
     let (w, h) = (view.width, view.height);
     if w == 0 || h == 0 || view.depth != 1 {
         return None;
@@ -4878,7 +4910,7 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
         // never disagree with the image the engine creates.
         // A multiplanar view's planes are the video luma/chroma formats, all of
         // which sit identically on their Vulkan spellings. Required rather than
-        // assumed, for the reason the type-11 rail states.
+        // assumed, for the reason the mapper-ref-texture rail states.
         let (native, bpp) = match translate::pixel::sampled_pixels(view.pixel_format) {
             Ok((layout, _decline, components)) => {
                 if !pixel_format::swizzle_is_identity(&components) {
@@ -4890,16 +4922,16 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
             Err(_) => return None,
         };
         let (base_off, bpr_u32, _span_end) =
-            type5_sample_window(m, view.plane_index, w, h, view.pixel_format)?;
+            ref_texture_sample_window(m, view.plane_index, w, h, view.pixel_format)?;
         let sampled_vk_format = translate::pixel::translate(view.pixel_format).ok()?.vk;
         (native, sampled_vk_format, bpp, base_off, bpr_u32 as u64)
     };
     let (span, row_length_texels) = strided_window_extent(w, h, bpp as u64, bpr)?;
     // Same rule as the linear rail's floor: a cost threshold may only turn a
-    // plane away onto a CPU arm that produces the same pixels. The type-11 rail
+    // plane away onto a CPU arm that produces the same pixels. The mapper-ref-texture rail
     // needs no such qualifier because `is_four_byte_color` already fixes what
     // reaches its floor; this one admits every layout the translation names.
-    // The owed frame, for the reason `try_type11_sample_zero_copy` states: a
+    // The owed frame, for the reason `try_mapper_ref_texture_sample_zero_copy` states: a
     // debt is not a submitted writeback and queue order cannot order it.
     crate::runtime::writeback_debt::pay_for_mapping(state, host, mid);
     if let Some(source) = mapped_sampled_source(
@@ -4930,7 +4962,7 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
             pixel_format::swizzle_identity(),
         ));
     }
-    if !sampled_gather_floor_admits(SampledFloorRail::Type5, native, span) {
+    if !sampled_gather_floor_admits(SampledFloorRail::RefTexture, native, span) {
         return None;
     }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
@@ -4938,7 +4970,7 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     let seen = crate::runtime::gather_witness::note_gather(
         state,
         host,
-        crate::runtime::gather_witness::GatherRail::Type5,
+        crate::runtime::gather_witness::GatherRail::RefTexture,
         crate::runtime::gather_witness::GatherKey::Mapping { mid, base_off },
         crate::runtime::gather_witness::GatherWindow {
             gpas: &gpas,
@@ -5326,7 +5358,7 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 /// Report a sampled texture served entirely as zeroes out of the guest's pages
 /// while the host cache holds an entry for the same address.
 ///
-/// A type-2/3 texture's guest GVA pages are a *pageable alias* of a body this
+/// A normal texture's guest GVA pages are a *pageable alias* of a body this
 /// device owns (`surface_cache::store_linear_texture`), so a blank read here
 /// could mean the device rendered the span, cached it, and its own writeback
 /// never landed in the guest's pages — a silent loss, since the draw then
@@ -5582,7 +5614,7 @@ pub(super) fn sync_store_allowed_pages<M: HostMemory>(
     sync_store_target_pages(state, host, task_id, color0?)
 }
 
-/// How much surface a taken type-11 seed elision covered, in whole texels.
+/// How much surface a taken mapper-ref-texture seed elision covered, in whole texels.
 ///
 /// Measured to price the repair for an unsound witness: the epoch could not see
 /// a guest CPU write to the surface's own pages, and the obvious fix was the one
@@ -5606,8 +5638,8 @@ pub(super) fn sync_store_allowed_pages<M: HostMemory>(
 /// One driven boot, x86 / Vulkan, six Finder recomposites:
 ///
 /// ```text
-/// type11_seed_elided      41389      t11elide_le_64x64          5
-/// type11_seed_provided      242      t11elide_le_256x256        4
+/// mapper_ref_texture_seed_elided      41389      t11elide_le_64x64          5
+/// mapper_ref_texture_seed_provided      242      t11elide_le_256x256        4
 ///                                    t11elide_le_512x512      903
 ///                                    t11elide_le_1024x1024  15641
 ///                                    t11elide_display       24836
@@ -5619,7 +5651,7 @@ pub(super) fn sync_store_allowed_pages<M: HostMemory>(
 /// **An unconditional revalidation is not affordable.** At RGBA8 the elided
 /// extent is ~237 GB of guest reads per session. The rail is not a micro-
 /// optimisation to be traded away for correctness; it is carrying essentially
-/// all of the composite seed traffic, and `type11_seed_provided` at 242 against
+/// all of the composite seed traffic, and `mapper_ref_texture_seed_provided` at 242 against
 /// 41 389 says what the un-elided rate would be.
 ///
 /// **The latch is not on the icon target.** Nine elisions in the entire session
@@ -5634,12 +5666,11 @@ pub(super) fn sync_store_allowed_pages<M: HostMemory>(
 /// So the repair could not be "revalidate before trusting", and it could not be
 /// "drop the elision". What was missing was a witness for guest CPU writes that
 /// does not cost a read of the surface, and the hypervisor already had one.
-/// [`type11_guest_wrote_since_store`] is that witness, over
-/// `HostOps::guest_write_gen`: O(pages) at the harvest instead of O(bytes) at
-/// every LOAD, with the 237 GB left saved. One driven boot after it landed
-/// measured `type11_seed_elided` 283 against `type11_seed_provided` 23, so the
-/// reuse survived the soundness.
-fn note_type11_elision_extent(w: u32, h: u32) {
+/// [`mapper_ref_texture_guest_wrote_since_store`] is that witness, over
+/// `HostOps::guest_write_gen`: O(pages) at the harvest instead of O(bytes) at every LOAD, with the
+/// 237 GB left saved. One driven boot after it landed measured `mapper_ref_texture_seed_elided` 283
+/// against `mapper_ref_texture_seed_provided` 23, so the reuse survived the soundness.
+fn note_mapper_ref_texture_elision_extent(w: u32, h: u32) {
     let texels = (w as u64).saturating_mul(h as u64);
     crate::runtime::drain::note_store_route(match texels {
         0..=4_096 => "t11elide_le_64x64",
@@ -5702,7 +5733,7 @@ fn note_type11_elision_extent(w: u32, h: u32) {
 /// Scored per round across the break, no counter in this crate separates a
 /// corrupt round from a clean one — `lin_rung_guest_blank`,
 /// `lin_rung_blank_with_host_entry`, `lin_rung_guest_memo`, `gvac_suspect`,
-/// `type11_seed_elided` and `draw_partial_load_from_target` are all simply
+/// `mapper_ref_texture_seed_elided` and `draw_partial_load_from_target` are all simply
 /// proportional to round length, and the set of decline names is identical on
 /// both sides. A defect that is stable on screen for minutes and leaves no
 /// trace in a census this large will not be found by adding another counter to
@@ -5925,7 +5956,7 @@ fn note_draw_coverage(
             // device can have changed the surface since the resident was
             // published — and the one writer this device cannot see is the
             // guest's own CPU writing the surface's pages. A target with a
-            // type-11 mapping or a task GVA has such pages, and reusing its
+            // mapper-ref-texture mapping or a task GVA has such pages, and reusing its
             // resident without the currency query is the documented fixpoint
             // where "renders correctly for a few frames then stays corrupted"
             // comes from.
@@ -6245,7 +6276,7 @@ fn note_load_seed_outcome(
     }
 }
 
-/// Store type-2/3 encode into texture_ref + GVA host caches (BGRA).
+/// Store normal-texture encode into texture_ref + GVA host caches (BGRA).
 ///
 /// `task_id` is the task whose page table gives the GVA meaning; the store
 /// records the pages it resolves to so a later sample can tell whether the
@@ -6310,7 +6341,7 @@ enum M2vDrawSpan {
     None,
     /// CPU-side pixels (readback path), in the order the engine reports.
     ///
-    /// The order is carried rather than normalized because a type-11 composite
+    /// The order is carried rather than normalized because a mapper-ref-texture composite
     /// Store's consumers — `surface_cache`, the deferred window, the guest-page
     /// writeback — all want guest scanout order, and a BGRA resident hands them
     /// exactly that. Normalizing to RGBA here would restate a whole framebuffer
@@ -6331,7 +6362,7 @@ enum M2vDrawSpan {
     ResidentGvaStore {
         identity: crate::backend::vulkan::engine::TargetIdentity,
     },
-    /// Type-11 composite Store executed into its registry resident with
+    /// Mapper-ref-texture composite Store executed into its registry resident with
     /// `skip_readback`: the caller copies that image into the mapping's guest
     /// pages through [`crate::runtime::render_writeback`], which never brings
     /// the frame across host memory.
@@ -6346,7 +6377,7 @@ enum M2vDrawSpan {
     ///
     /// `identity` is the exact key this record handed `registry_ensure`, so the
     /// image the Store reads is the image the draw rendered into by
-    /// construction. The Store used to call `type11_store_identity` a second
+    /// construction. The Store used to call `mapper_ref_texture_store_identity` a second
     /// time instead, on the grounds that it is the same function that produced
     /// `DrawRequest::target_identity` — but it is not the same *value*. That
     /// identity carries `MappingEntry::map_generation`, the draw mutates
@@ -6421,7 +6452,7 @@ impl Drop for StoreCostSpan {
     }
 }
 
-/// Name which of the six routes a type-11 Store took: counted every time, and
+/// Name which of the six routes a mapper-ref-texture Store took: counted every time, and
 /// fail-logged once per route per process so a boot's route *set* is readable
 /// without the draw log.
 ///
@@ -6462,7 +6493,7 @@ impl Drop for StoreCostSpan {
 /// host GPU class to another, and this is exactly that boundary. Measuring these
 /// four needs a host whose quirk set turns deferral off, or one where the pin
 /// refuses — not another boot here.
-fn note_type11_store_route(route: &'static str) {
+fn note_mapper_ref_texture_store_route(route: &'static str) {
     use std::sync::Mutex;
     static SEEN: Mutex<Option<std::collections::BTreeSet<&'static str>>> = Mutex::new(None);
     crate::runtime::drain::note_store_route(route);
@@ -6472,7 +6503,7 @@ fn note_type11_store_route(route: &'static str) {
             return;
         }
     }
-    crate::observe::fail(format!("type11_store_route route={route}"));
+    crate::observe::fail(format!("mapper_ref_texture_store_route route={route}"));
 }
 
 /// Build the engine's secondary MRT attachments (slot 1..) from a draw's color
@@ -6578,8 +6609,8 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
             }
         };
         let format = attachment.vk;
-        // Identity mirrors the primary namespaces: type-2/3 linear GVA, else
-        // type-11 surface.
+        // Identity mirrors the primary namespaces: normal-texture linear GVA, else
+        // mapper-ref-texture surface.
         //
         // A secondary GVA is named by its own backing pages, exactly like color0
         // — the primary's generation describes a different address (a secondary
@@ -7555,7 +7586,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     let texture_resource = retained.cloned().or_else(|| {
                         objects::resolve_resource(state, host, req.task_id, texture_ref).ok()
                     });
-                    // A type-8 view's channel remap. Resolved here rather than in
+                    // A texture-view's channel remap. Resolved here rather than in
                     // the loaders because it describes how the bind READS the
                     // texture, not what the texture contains: the engine hands it
                     // to the image view as a component mapping and the hardware
@@ -7740,7 +7771,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 let mut byte_origin = crate::backend::vulkan::engine::SampledByteOrigin::Synthetic;
                 // Byte layout of a CPU-origin bind. Default RGBA8; a source that
                 // already holds its bytes in an uploadable order keeps them —
-                // BGRA8 from the type-4 scanout cache, a native single/dual-channel
+                // BGRA8 from the backing scanout cache, a native single/dual-channel
                 // video plane — and the host spelling is applied once, where the
                 // engine resource is built (`vk_texel_layout` below).
                 let sampled_vk_format;
@@ -8217,8 +8248,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // generation when the guest recycled a page, and the identity must
         // name that new generation rather than the one paired with the retired
         // alias.
-        let type11_guest_backing = type11_guest_target_backing(state, host, req);
-        let type11_resident_target = type11_store_identity(state, req, writeback_guest);
+        let mapper_ref_texture_guest_backing =
+            mapper_ref_texture_guest_target_backing(state, host, req);
+        let mapper_ref_texture_resident_target =
+            mapper_ref_texture_store_identity(state, req, writeback_guest);
         if req.chain_from_resident && render_chain_identity(state, req).is_some() {
             // The serialized chain names the resident it intends to load;
             // existence and readiness are engine state and are validated
@@ -8232,17 +8265,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // pages. Honour that here, or put the seed back.
         let mut gva_load_identity =
             honour_gva_load_elision(state, host, req, &mut chain_load_from_target);
-        // Type-11 composite Load. A retained guest-allocation target is the
+        // Mapper-ref-texture composite Load. A retained guest-allocation target is the
         // guest's texture resource itself, so its LOAD is authoritative without
         // comparing two copies. A device-allocation target is a mirror: only
         // when it was stamped with the mapping's current
         // `surface_content_epoch` does it hold exactly the bytes
-        // `resolve_type11_load_seed` would upload.
+        // `resolve_mapper_ref_texture_load_seed` would upload.
         //
         // The epoch is the witness. `mark_mapping_written` advances it and every
         // guest-page writer *in this crate* calls it, so a blit or a compute
         // writeback invalidates the stamp without knowing this rail exists. The
-        // deferred type-11 publish — the one writer that changes the pixels
+        // deferred mapper-ref-texture publish — the one writer that changes the pixels
         // without touching guest pages — advances it explicitly. Anything that
         // leaves the answer unknown (no slot, an evicted or recycled image, a
         // draw since the stamp, a `map_generation` rewire that renames the
@@ -8251,7 +8284,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // # The epoch cannot see the guest, so it is only half the test
         //
         // The epoch's closure does *not* include a guest CPU write, and cannot.
-        // A type-11 surface's pages are plain guest RAM; the guest writes them
+        // A mapper-ref-texture surface's pages are plain guest RAM; the guest writes them
         // with its own CPU and no device operation is involved, so nothing calls
         // `mark_mapping_written` and the epoch does not move. Every caller of it
         // is a device-side writer — `compute_exec`, `mapping_write`, `exec`,
@@ -8277,7 +8310,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // pixels that is not the resident, and the seed's only other source is
         // the surface's own guest pages, so the guest must be writing them.
         //
-        // `type11_guest_wrote_since_store` is the other half: the hypervisor's
+        // `mapper_ref_texture_guest_wrote_since_store` is the other half: the hypervisor's
         // dirty bitmap, the one witness for a write this device did not make.
         // Both halves must agree, and every unknown on either side reads as
         // "not current".
@@ -8312,12 +8345,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         //
         // Why not the sibling rail's shape — `load_linear_guest_memoized`
         // re-reads the guest's native rows on every call and byte-compares
-        // before reusing its `Arc`. Priced on one boot: `type11_seed_elided`
-        // 41 389 against `type11_seed_provided` 242, at a mean 1.43 M texels per
+        // before reusing its `Arc`. Priced on one boot: `mapper_ref_texture_seed_elided`
+        // 41 389 against `mapper_ref_texture_seed_provided` 242, at a mean 1.43 M texels per
         // elision, so revalidating by re-reading would move ~237 GB of guest
         // memory a session. The bitmap answers the same question in a word.
         if !chain_load_from_target {
-            if let Some((identity, mapping_epoch)) = type11_load_currency_query(state, req) {
+            if let Some((identity, mapping_epoch)) =
+                mapper_ref_texture_load_currency_query(state, req)
+            {
                 // Both arms counted, into the same one-second window as
                 // `drain_duty`. An elision count alone cannot tell "the seed was
                 // skipped" from "this record was never a candidate", and the
@@ -8333,35 +8368,40 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         .map(|resource| resource.resident_target_backing(&identity))
                 });
                 let (resident_current, guest_wrote) =
-                    type11_load_resident_is_current(backing, || {
+                    mapper_ref_texture_load_resident_is_current(backing, || {
                         let resident_epoch =
                             crate::backend::vulkan::engine::resident_content_epoch(&identity);
                         let mapping_id = req.colors.first().map(|c| c.mapping_id).unwrap_or(0);
-                        let guest_wrote = type11_guest_wrote_since_store(state, host, mapping_id);
+                        let guest_wrote =
+                            mapper_ref_texture_guest_wrote_since_store(state, host, mapping_id);
                         (
-                            type11_resident_is_current(mapping_epoch, resident_epoch)
+                            mapper_ref_texture_resident_is_current(mapping_epoch, resident_epoch)
                                 && !guest_wrote,
                             guest_wrote,
                         )
                     });
                 if resident_current {
                     chain_load_from_target = true;
-                    crate::runtime::drain::note_store_route("type11_seed_elided");
+                    crate::runtime::drain::note_store_route("mapper_ref_texture_seed_elided");
                     if backing
                         == Some(
                             crate::backend::vulkan::engine::ResidentContentBacking::GuestAllocation,
                         )
                     {
-                        crate::runtime::drain::note_store_route("type11_seed_guest_allocation");
+                        crate::runtime::drain::note_store_route(
+                            "mapper_ref_texture_seed_guest_allocation",
+                        );
                     }
-                    note_type11_elision_extent(w, h);
+                    note_mapper_ref_texture_elision_extent(w, h);
                 } else {
-                    crate::runtime::drain::note_store_route("type11_seed_provided");
+                    crate::runtime::drain::note_store_route("mapper_ref_texture_seed_provided");
                     // Separated from the epoch's refusal so a boot can say which
                     // half refused. The two answer different questions and a
                     // single counter would hide a rail that never fires.
                     if guest_wrote {
-                        crate::runtime::drain::note_store_route("type11_seed_guest_wrote");
+                        crate::runtime::drain::note_store_route(
+                            "mapper_ref_texture_seed_guest_wrote",
+                        );
                     }
                 }
             }
@@ -8455,11 +8495,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         // own the packet's final guest writeback. The Store-only
                         // identity below is deliberately narrower and would
                         // misclassify that record as a pooled RGBA target here.
-                        let target_format = type11_render_identity(state, req)
+                        let target_format = mapper_ref_texture_render_identity(state, req)
                             .as_ref()
                             .map(|identity| identity.resident_format())
                             .unwrap_or(translate::pixel::RESIDENT_RGBA_FORMAT);
-                        match resolve_type11_load_seed(
+                        match resolve_mapper_ref_texture_load_seed(
                             state,
                             host,
                             c0.mapping_id,
@@ -8467,11 +8507,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             h,
                             target_format,
                         ) {
-                            Some(Type11LoadSeed::Host(bytes, order)) => {
+                            Some(MapperRefTextureLoadSeed::Host(bytes, order)) => {
                                 target_rgba8 = Some(bytes);
                                 seed_order = order;
                             }
-                            Some(Type11LoadSeed::Guest(seed)) => target_guest_seed = Some(seed),
+                            Some(MapperRefTextureLoadSeed::Guest(seed)) => {
+                                target_guest_seed = Some(seed)
+                            }
                             None => {}
                         }
                     }
@@ -8502,7 +8544,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         // The widened arm's own instrument, and it is a counter
                         // rather than the latched line below it. DontCare now
                         // walks the same doors as a Load — a provenance seed
-                        // clone, or `resolve_type11_load_seed` reading the
+                        // clone, or `resolve_mapper_ref_texture_load_seed` reading the
                         // surface out of guest memory — and that work is new
                         // per pass, so both outcomes are counted or nothing
                         // says how often the widening pays or what it costs.
@@ -8676,7 +8718,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 req.colors.first().map(|c| c.load_action),
                 target_rgba8.is_some() || target_guest_seed.is_some(),
                 chain_load_from_target,
-                // Guest-visible backing is a type-11 mapping or a task GVA, and
+                // Guest-visible backing is a mapper-ref-texture mapping or a task GVA, and
                 // the two are exclusive — `ColorRtRequest::target_gva` documents
                 // that. Either one means the surface has pages the guest's own
                 // CPU can write without this device seeing it.
@@ -8811,7 +8853,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
             }
         }
-        // A type-11 composite Store renders into its registry resident, and skips
+        // A mapper-ref-texture composite Store renders into its registry resident, and skips
         // its readback when the deferred rail can name that resident as the
         // window's frame instead of owning a CPU copy of it.
         //
@@ -8833,7 +8875,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let mut surface_resident_store: Option<crate::backend::vulkan::engine::TargetIdentity> =
             None;
         if resources.target_identity.is_none() {
-            resources.target_identity = type11_resident_target.clone();
+            resources.target_identity = mapper_ref_texture_resident_target.clone();
         }
         // Whether the slot this record renders into is the one this rail would
         // pin, asked by comparing the two identities rather than by testing that
@@ -8843,14 +8885,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // `target_identity` already set when it is the last record of a resident
         // render-pass chain: the block above resolved `render_chain_identity` so
         // the record could take `LoadOp::LoadFromTarget`, and for `mapping_id != 0`
-        // that *is* the `surface_identity` `type11_store_identity` returns. An
+        // that *is* the `surface_identity` `mapper_ref_texture_store_identity` returns. An
         // `is_none()` test read that agreement as a conflict and kept the readback
         // for 100 % of the population. The GVA rail cannot collide — its identity
         // requires `mapping_id == 0` and this one requires `mapping_id != 0` — so a
         // genuine mismatch means another namespace owns the attachment and the
         // frame this rail would vouch for is not in the slot it would pin.
-        let renders_into_surface_identity =
-            type11_resident_target.is_some() && resources.target_identity == type11_resident_target;
+        let renders_into_surface_identity = mapper_ref_texture_resident_target.is_some()
+            && resources.target_identity == mapper_ref_texture_resident_target;
         // `!skip_readback` is implied — a set flag means one of the rails above
         // claimed this record, and each returns its own span before
         // `ResidentSurfaceStore` is reached, so a record that armed here as well
@@ -8862,13 +8904,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // this same value, and which is what `registry_ensure` will be
             // handed. Taken from here rather than unwrapped from the `Option`
             // above so the span cannot name a slot the draw did not register.
-            surface_resident_store = type11_resident_target.clone();
+            surface_resident_store = mapper_ref_texture_resident_target.clone();
         }
         resources.record_guest_store = surface_resident_store.is_some();
         // A first-failure classifier for a composite Store that still reads
         // back used to sit here. Its outer gate was never once true — none of
         // its four counters, nor its `else` arm, appears anywhere in the
-        // always-on log across every boot it holds. Every type-11 Store either
+        // always-on log across every boot it holds. Every mapper-ref-texture Store either
         // skips its readback or is not a writeback Store.
         // What the guest asked for, carried alongside what this device managed
         // to offer. The engine decides between clearing and beginning the pass
@@ -8904,15 +8946,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             resources.load_from_target = true;
             resources.target_rgba8 = None;
         }
-        // The backing belongs only to the type-11 surface identity it was
+        // The backing belongs only to the mapper-ref-texture surface identity it was
         // resolved from. A GVA or render-chain namespace may legitimately own
         // this draw's primary attachment instead, in which case handing it the
         // surface allocation would bind two unrelated resources together.
-        if resources.target_identity == type11_render_identity(state, req) {
-            resources.guest_target_memory = type11_guest_backing;
+        if resources.target_identity == mapper_ref_texture_render_identity(state, req) {
+            resources.guest_target_memory = mapper_ref_texture_guest_backing;
             resources.load_guest_target_backing = resources.guest_target_memory.is_some()
                 && req.colors.first().is_some_and(|color| {
-                    // Same admission as `type11_load_is_a_seed_candidate`, and
+                    // Same admission as `mapper_ref_texture_load_is_a_seed_candidate`, and
                     // for the same reason: a DontCare that this device can
                     // serve prior contents for must be served them, or the
                     // attachment starts at a colour nothing asked for.
@@ -8921,7 +8963,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         && color.target_seed_rgba.is_none()
                 });
         }
-        // Type-11 Load used to have a GPU rail here — ~170 lines of front-frame
+        // Mapper-ref-texture Load used to have a GPU rail here — ~170 lines of front-frame
         // retention policy resolving which resident image held the frame the
         // guest computes its damage against. It was reachable only under
         // `try_import`. A shared resident now keeps the guest allocation as
@@ -8932,7 +8974,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // previously left `resources.blend = None` → opaque replace for every
         // draw, so Load seeds (gray/wallpaper/logo bases) were wiped by sparse
         // dock/chrome layers that Metal would alpha-blend over the attachment.
-        // Contract: type-7 color attachment blend tags (decode/resource).
+        // Contract: serializer-object color attachment blend tags (decode/resource).
         // Outside the `blending_enabled` guard below, and deliberately: an
         // unblended attachment with a mask still leaves its unwritten channels
         // alone, so gating the mask on blending would drop it exactly where the
@@ -9567,8 +9609,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
 /// Engine-resident identity for a color0 render-pass chain.
 ///
 /// This identity lives only from the first serialized record through its final
-/// Store. Type-11 targets use their current protocol mapping identity; linear
-/// type-2/3 targets use the GVA identity below. Unlike deferred writeback, this
+/// Store. Mapper-ref-texture targets use their current protocol mapping identity; linear
+/// normal-texture targets use the GVA identity below. Unlike deferred writeback, this
 /// lifetime is safe on portability-subset devices because the final record
 /// materializes guest bytes before the packet completes.
 /// The registry resident this draw's **depth** attachment renders into, if the
@@ -9857,7 +9899,7 @@ pub(crate) fn render_chain_identity(
     gva_chain_identity(req)
 }
 
-/// The registry resident a type-11 composite Store renders into, if this record
+/// The registry resident a mapper-ref-texture composite Store renders into, if this record
 /// is one.
 ///
 /// Unlike the GVA rail this is **not** a `skip_readback` deferral: a composite
@@ -9885,7 +9927,7 @@ pub(crate) fn render_chain_identity(
 /// [`render_chain_identity`] — and the intermediates already render into that
 /// resident under `skip_readback` with `LoadOp::LoadFromTarget`. The last record
 /// differs only in what happens *after* the draw.
-pub(super) fn type11_store_identity(
+pub(super) fn mapper_ref_texture_store_identity(
     state: &DeviceState,
     req: &DrawEncodeRequest,
     writeback_guest: bool,
@@ -9893,11 +9935,11 @@ pub(super) fn type11_store_identity(
     if !writeback_guest {
         return None;
     }
-    type11_render_identity(state, req)
+    mapper_ref_texture_render_identity(state, req)
 }
 
-/// The registry resident this record renders its type-11 color0 *into*, whatever
-/// its role in the packet — the strict superset of [`type11_store_identity`],
+/// The registry resident this record renders its mapper-ref-texture color0 *into*, whatever
+/// its role in the packet — the strict superset of [`mapper_ref_texture_store_identity`],
 /// which is this same slot restricted to the record that also stores it for the
 /// guest.
 ///
@@ -9908,10 +9950,10 @@ pub(super) fn type11_store_identity(
 /// Conflating them cost the whole seed elision on multi-record packets: record 1
 /// of a chain has `writeback_guest == false`, so the currency check keyed on the
 /// Store identity never ran for it, and its LOAD fell through to
-/// `resolve_type11_load_seed` — which, with the host cache ceded to the resident
+/// `resolve_mapper_ref_texture_load_seed` — which, with the host cache ceded to the resident
 /// rail, reads the mapping's guest pages and therefore lands the very window the
 /// rail armed. One boot measured that loop directly: `surface_flush /
-/// surface_resident` = 1369/1373, one flush per arm, with `type11_load_seed`
+/// surface_resident` = 1369/1373, one flush per arm, with `mapper_ref_texture_load_seed`
 /// reporting `outcome=guest_pages` 110 times against 17 `cache_hit` and
 /// `hostgen=0` on every one.
 ///
@@ -9920,7 +9962,7 @@ pub(super) fn type11_store_identity(
 /// `!writeback_guest` intermediate, and the composite-Store rail claims it for the
 /// last record. So the condition here is the same one those blocks share, asked
 /// once.
-fn type11_render_identity(
+fn mapper_ref_texture_render_identity(
     state: &DeviceState,
     req: &DrawEncodeRequest,
 ) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
@@ -9933,15 +9975,15 @@ fn type11_render_identity(
     render_chain_identity(state, req)
 }
 
-/// Stable shared allocation behind the type-11 primary attachment, if this
+/// Stable shared allocation behind the mapper-ref-texture primary attachment, if this
 /// host can retain the mapping view until its explicit retirement.
 ///
 /// The mapping revalidation inside `ensure_contig_view` is part of the answer:
 /// it retires an alias when the guest has recycled any of its pages, and that
-/// advances the generation carried by `type11_render_identity`. The engine is
+/// advances the generation carried by `mapper_ref_texture_render_identity`. The engine is
 /// therefore handed a pointer and an identity derived from the same current
 /// page ownership, never a cached pointer paired with a newly rewired surface.
-fn type11_guest_target_backing<H: HostMemory + HostOps>(
+fn mapper_ref_texture_guest_target_backing<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     req: &DrawEncodeRequest,
@@ -9950,11 +9992,13 @@ fn type11_guest_target_backing<H: HostMemory + HostOps>(
         return None;
     }
     let c0 = req.colors.first()?;
-    type11_render_identity(state, req)?;
+    mapper_ref_texture_render_identity(state, req)?;
     let (plane_offset, row_pitch, span_end) = {
         let mapping = state.mappings.get(&c0.mapping_id)?;
         let format = crate::runtime::mapping_write::mapping_store_format(mapping);
-        crate::runtime::mapping_write::type11_sample_window(mapping, c0.width, c0.height, format)?
+        crate::runtime::mapping_write::mapper_ref_texture_sample_window(
+            mapping, c0.width, c0.height, format,
+        )?
     };
     let (import, footprint) =
         crate::runtime::mapper::ensure_contig_import_with_footprint(state, host, c0.mapping_id)?;
@@ -9983,13 +10027,13 @@ fn type11_guest_target_backing<H: HostMemory + HostOps>(
 /// [`crate::contract::pass_action::LoadAction::preserves_prior_contents`] for
 /// why undefined contents permit the prior ones, and why serving them is what
 /// keeps this arm agreeing with the Metal one.
-pub(super) fn type11_load_is_a_seed_candidate(c0: &ColorRtRequest) -> bool {
+pub(super) fn mapper_ref_texture_load_is_a_seed_candidate(c0: &ColorRtRequest) -> bool {
     crate::contract::pass_action::LoadAction::from_declared(c0.load_action)
         .preserves_prior_contents()
         && c0.target_seed_rgba.is_none()
 }
 
-/// The `(resident, mapping epoch)` pair a record's type-11 LOAD has to compare to
+/// The `(resident, mapping epoch)` pair a record's mapper-ref-texture LOAD has to compare to
 /// decide whether the image it is about to render into already holds the seed —
 /// or `None` when this record's LOAD is not one a resident could serve at all.
 ///
@@ -10003,15 +10047,15 @@ pub(super) fn type11_load_is_a_seed_candidate(c0: &ColorRtRequest) -> bool {
 /// a rescheduling with a GPU round trip added: `surface_flush / surface_resident`
 /// = 1369/1373 on one boot. Structure rather than a test, because a unit test on
 /// the resolver passes whatever the call site then decides to pass it.
-pub(super) fn type11_load_currency_query(
+pub(super) fn mapper_ref_texture_load_currency_query(
     state: &DeviceState,
     req: &DrawEncodeRequest,
 ) -> Option<(crate::backend::vulkan::engine::TargetIdentity, Option<u32>)> {
     let c0 = req.colors.first()?;
-    if !type11_load_is_a_seed_candidate(c0) {
+    if !mapper_ref_texture_load_is_a_seed_candidate(c0) {
         return None;
     }
-    let identity = type11_render_identity(state, req)?;
+    let identity = mapper_ref_texture_render_identity(state, req)?;
     let mapping_epoch = state
         .mappings
         .get(&c0.mapping_id)
@@ -10024,7 +10068,7 @@ pub(super) fn type11_load_currency_query(
 ///
 /// The device-side half of the currency test — the `surface_content_epoch`
 /// comparison one function up — can only witness writers inside this crate.
-/// A type-11 surface's pages are plain guest RAM, and the guest CPU stores
+/// A mapper-ref-texture surface's pages are plain guest RAM, and the guest CPU stores
 /// into them with no device operation, so the epoch does not move and the
 /// resident silently stops matching what the seed would upload. This is the
 /// only witness for that copied-allocation question, and it is the hypervisor's.
@@ -10051,7 +10095,7 @@ pub(super) fn type11_load_currency_query(
 /// surface it has just asked the GPU to render into, and — unlike the epoch-only
 /// rail this replaced — the very next guest write moves the generation again and
 /// clears it.
-pub(super) fn type11_guest_wrote_since_store<M: HostOps>(
+pub(super) fn mapper_ref_texture_guest_wrote_since_store<M: HostOps>(
     state: &DeviceState,
     host: &M,
     mapping_id: u32,
@@ -10078,7 +10122,7 @@ pub(super) fn type11_guest_wrote_since_store<M: HostOps>(
 }
 
 /// Whether the hypervisor watched the guest write anywhere in the allocation a
-/// type-4 surface's host-side copies were taken from.
+/// backing record's host-side copies were taken from.
 ///
 /// The first of two stages, and the coarse one: the tracking token covers the
 /// mapping's whole page list and its generation moves for a write to any page
@@ -10113,8 +10157,8 @@ enum GuestWriteSite {
 /// Narrow a `Wrote` verdict to the pixel window, so a write that misses it does
 /// not discard a resident that is still exactly the surface.
 ///
-/// The tracking token is per *page list*, and a type-4 allocation is more than
-/// its sampled plane: `type11_sample_window` reports a `base_off` precisely
+/// The tracking token is per *page list*, and a backing allocation is more than
+/// its sampled plane: `mapper_ref_texture_sample_window` reports a `base_off` precisely
 /// because the pixels do not start at offset 0, and an allocation can carry a
 /// second plane and end padding past `span_end`. A guest store into any of that
 /// moves the set-wide generation. Refusing on it discarded whole 1920x1080
@@ -10143,7 +10187,7 @@ fn guest_write_site<M: HostOps>(
         pixel_format::MTL_FORMAT_BGRA8_UNORM
     };
     let Some((base_off, _bpr, span_end)) =
-        crate::runtime::mapping_write::type11_sample_window(m, width, height, format)
+        crate::runtime::mapping_write::mapper_ref_texture_sample_window(m, width, height, format)
     else {
         return GuestWriteSite::Unknown;
     };
@@ -10258,7 +10302,7 @@ fn ranges_touch_window(ranges: &[(u64, u64)], base_off: u64, span_end: u64) -> b
         .any(|&(lo, hi)| lo < span_end && hi > base_off)
 }
 
-/// Census only: which rung of the type-4 sampled ladder served this bind, and,
+/// Census only: which rung of the backing sampled ladder served this bind, and,
 /// for the rungs that serve a host-side *copy* of guest memory, what the
 /// hypervisor said about those bytes when the rung was chosen.
 ///
@@ -10338,7 +10382,7 @@ fn ranges_touch_window(ranges: &[(u64, u64)], base_off: u64, span_end: u64) -> b
 /// `gw_wrote_elsewhere` on either rung. They are denominators, not dead code —
 /// their being empty is what says a served copy is never a copy the hypervisor
 /// actively contradicted.
-fn note_type11_sample_rung(rung: &'static str, guest_write: GuestWriteVerdict) {
+fn note_mapper_ref_texture_sample_rung(rung: &'static str, guest_write: GuestWriteVerdict) {
     crate::runtime::drain::note_store_route(rung);
     if let Some(gw) = sample_rung_gw_route(rung, guest_write) {
         crate::runtime::drain::note_store_route(gw);
@@ -10382,18 +10426,21 @@ fn sample_rung_gw_route(rung: &str, guest_write: GuestWriteVerdict) -> Option<&'
 /// mapping has no entry" and "this image was never stamped" as agreement and
 /// load undefined memory as though it were the guest's prior frame. That is
 /// precisely the black-layer class. Absence on either side is a refusal.
-fn type11_resident_is_current(mapping_epoch: Option<u32>, resident_epoch: Option<u32>) -> bool {
+fn mapper_ref_texture_resident_is_current(
+    mapping_epoch: Option<u32>,
+    resident_epoch: Option<u32>,
+) -> bool {
     mapping_epoch.is_some() && mapping_epoch == resident_epoch
 }
 
-/// Decide whether a type-11 LOAD can use its retained target.
+/// Decide whether a mapper-ref-texture LOAD can use its retained target.
 ///
 /// A guest allocation is the serialized texture's own storage, not a cached
 /// copy, so a host or guest write changes the allocation the next render pass
 /// loads. The copied-allocation currency query is supplied as a closure so the
 /// shared case cannot accidentally pay either engine lookup or guest-write
 /// lookup on a warm LOAD.
-fn type11_load_resident_is_current(
+fn mapper_ref_texture_load_resident_is_current(
     backing: Option<crate::backend::vulkan::engine::ResidentContentBacking>,
     copied_currency: impl FnOnce() -> (bool, bool),
 ) -> (bool, bool) {
@@ -10407,7 +10454,7 @@ fn type11_load_resident_is_current(
 /// Record that the resident this Store rendered into holds the mapping's
 /// content as of `epoch`, so the surface's next LOAD can skip its CPU seed.
 ///
-/// Keyed through [`type11_store_identity`] — the same call the draw's
+/// Keyed through [`mapper_ref_texture_store_identity`] — the same call the draw's
 /// `target_identity` came from — so the slot stamped is the slot rendered into.
 /// A miss is expected and silent: the identity resolves to `None` when this
 /// record never took the resident path, and `stamp_resident_content_epoch`
@@ -10421,14 +10468,14 @@ fn type11_load_resident_is_current(
 /// device operation. Registration happens here rather than at mapping resolve
 /// because this is the first moment the device has a host-side copy whose reuse
 /// would depend on the answer.
-fn stamp_type11_resident<M: HostMemory + HostOps>(
+fn stamp_mapper_ref_texture_resident<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     req: &DrawEncodeRequest,
     writeback_guest: bool,
     epoch: u32,
 ) {
-    if let Some(identity) = type11_store_identity(state, req, writeback_guest) {
+    if let Some(identity) = mapper_ref_texture_store_identity(state, req, writeback_guest) {
         crate::backend::vulkan::engine::stamp_resident_content_epoch(&identity, epoch);
         // Both callers reach here only on a route that has already put these
         // pixels outside the image — the synchronous one through `write_bgra8`
@@ -10537,7 +10584,7 @@ pub(crate) fn gva_span_alloc_generation<M: HostMemory + HostOps>(
     gva_page_set_hash(&pages)
 }
 
-/// Engine-resident identity for a GVA (type-2/3) color0 render target.
+/// Engine-resident identity for a GVA (normal-texture) color0 render target.
 ///
 /// Single source of truth for the resident GVA chain rail: the draw path,
 /// the alias-sample bind, and the abandon-path landing must all agree on the
@@ -10710,7 +10757,7 @@ pub(crate) fn read_resident_chain(
         }
     }
 }
-/// Land a type-11 render Store's frame in the guest's pages, from the resident
+/// Land a mapper-ref-texture render Store's frame in the guest's pages, from the resident
 /// the draw just rendered into.
 ///
 /// The Store never reads the frame back off the GPU: the copy's destination is
@@ -10727,7 +10774,7 @@ pub(crate) fn read_resident_chain(
 /// [`M2vDrawSpan::ResidentSurfaceStore`], so the image read here is the image
 /// the draw rendered into by construction.
 ///
-/// It used to be [`type11_store_identity`] called again here, on the argument
+/// It used to be [`mapper_ref_texture_store_identity`] called again here, on the argument
 /// that this is the same function that produced the draw's `target_identity`.
 /// The same function is not the same value: that identity carries
 /// `MappingEntry::map_generation`, and the draw mutates `DeviceState` between
@@ -10806,10 +10853,9 @@ fn store_surface_resident<M: HostMemory + HostOps>(
     ) {
         return false;
     }
-    // The guest half of the write witness, recorded here rather than by the
-    // caller because this rail returns straight out of `encode_draw` — it never
-    // reaches `stamp_type11_resident`, and it is where nearly all type-11 Stores
-    // go.
+    // The guest half of the write witness, recorded here rather than by the caller because this
+    // rail returns straight out of `encode_draw` — it never reaches
+    // `stamp_mapper_ref_texture_resident`, and it is where nearly all mapper-ref-texture Stores go.
     crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
     true
 }
@@ -10824,7 +10870,7 @@ fn store_surface_resident<M: HostMemory + HostOps>(
 /// # Why the resident is stamped here, where no copy has happened
 ///
 /// The stamp says the resident holds the mapping's content, and it is what
-/// licenses the type-11 attachment LOAD to seed from that image instead of
+/// licenses the mapper-ref-texture attachment LOAD to seed from that image instead of
 /// reading a whole frame back out of guest memory — 802 elided against 36
 /// uploaded on a driven boot. `registry_mark_ready` clears it on every draw that
 /// renders into the resident, so a Store that did not re-stamp would hand the
@@ -10856,7 +10902,7 @@ fn arm_surface_writeback_debt<M: HostMemory + HostOps>(
     // and a cession says so — see [`surface_cache::cede_surface_to_resident`],
     // which was written for this call and had no caller.
     //
-    // Without it the type-11 sampled ladder's host-cache rung serves the
+    // Without it the mapper-ref-texture sampled ladder's host-cache rung serves the
     // *previous* frame for as long as the debt is outstanding: that rung is
     // gated on the guest-write witness alone, which by construction cannot see a
     // publish this device made itself, and it sits above both rungs that read
@@ -10892,7 +10938,9 @@ fn arm_surface_writeback_debt<M: HostMemory + HostOps>(
             pixel_format::MTL_FORMAT_BGRA8_UNORM
         };
         if let Some((base_off, _bpr, span_end)) =
-            crate::runtime::mapping_write::type11_sample_window(m, width, height, format)
+            crate::runtime::mapping_write::mapper_ref_texture_sample_window(
+                m, width, height, format,
+            )
         {
             state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
         }
@@ -11747,9 +11795,9 @@ mod vulkan_split_tests {
 
     #[test]
     fn an_unstamped_resident_never_matches_a_mapping_with_no_epoch() {
-        assert!(!type11_resident_is_current(None, None));
-        assert!(!type11_resident_is_current(None, Some(0)));
-        assert!(!type11_resident_is_current(Some(7), None));
+        assert!(!mapper_ref_texture_resident_is_current(None, None));
+        assert!(!mapper_ref_texture_resident_is_current(None, Some(0)));
+        assert!(!mapper_ref_texture_resident_is_current(Some(7), None));
     }
 
     #[test]
@@ -11757,7 +11805,7 @@ mod vulkan_split_tests {
         use crate::backend::vulkan::engine::ResidentContentBacking;
 
         assert_eq!(
-            type11_load_resident_is_current(
+            mapper_ref_texture_load_resident_is_current(
                 Some(ResidentContentBacking::GuestAllocation),
                 || panic!("one allocation has no second copy whose currency can be queried"),
             ),
@@ -11770,7 +11818,7 @@ mod vulkan_split_tests {
         ] {
             for copied_answer in [(false, true), (true, false)] {
                 assert_eq!(
-                    type11_load_resident_is_current(backing, || copied_answer),
+                    mapper_ref_texture_load_resident_is_current(backing, || copied_answer),
                     copied_answer,
                     "{backing:?} must retain the copied-allocation currency test"
                 );
@@ -11778,7 +11826,7 @@ mod vulkan_split_tests {
         }
     }
 
-    /// A sampled bind may only be served from a host-side copy of a type-4
+    /// A sampled bind may only be served from a host-side copy of a backing
     /// surface while the hypervisor has not watched the guest replace the pages
     /// that copy was taken from — and the GPU resident is bound by that rule
     /// exactly as the byte cache is.
@@ -11787,7 +11835,7 @@ mod vulkan_split_tests {
     /// `mapping_guest_write_verdict` before serving; `t11rung_resident`, which
     /// sits above it in the ladder and took 92 730 binds to the cache's 14 396
     /// on the boot that first measured them, asked nothing and returned
-    /// `SampledSourceRequest::Target` unconditionally. A type-11 surface's pages
+    /// `SampledSourceRequest::Target` unconditionally. A mapper-ref-texture surface's pages
     /// are plain guest RAM: the guest CPU repaints them with no device
     /// operation, so a resident produced for one tenant of a pooled IOSurface
     /// keeps claiming to hold its pixels after a different tenant has been
@@ -11820,7 +11868,7 @@ mod vulkan_split_tests {
     }
 
     /// The second stage, which is what keeps the first from being ruinous. A
-    /// type-4 allocation is bigger than the plane a bind samples — pixels start
+    /// backing allocation is bigger than the plane a bind samples — pixels start
     /// at `base_off` and padding follows `span_end` — and the tracking token's
     /// generation moves for a write to any page of it. Refusing on that alone
     /// discarded whole 1920x1080 compositor scanouts the GPU had rendered and
@@ -11892,8 +11940,8 @@ mod vulkan_split_tests {
     /// current against a resident explicitly stamped with 0.
     #[test]
     fn epoch_zero_is_current_only_against_an_explicit_stamp() {
-        assert!(type11_resident_is_current(Some(0), Some(0)));
-        assert!(!type11_resident_is_current(Some(0), None));
+        assert!(mapper_ref_texture_resident_is_current(Some(0), Some(0)));
+        assert!(!mapper_ref_texture_resident_is_current(Some(0), None));
     }
 
     /// The elision is exact equality, not "at least as new". A resident stamped
@@ -11902,9 +11950,9 @@ mod vulkan_split_tests {
     /// fall back to the CPU seed.
     #[test]
     fn any_epoch_movement_since_the_stamp_refuses_the_elision() {
-        assert!(type11_resident_is_current(Some(4), Some(4)));
-        assert!(!type11_resident_is_current(Some(5), Some(4)));
-        assert!(!type11_resident_is_current(Some(4), Some(5)));
+        assert!(mapper_ref_texture_resident_is_current(Some(4), Some(4)));
+        assert!(!mapper_ref_texture_resident_is_current(Some(5), Some(4)));
+        assert!(!mapper_ref_texture_resident_is_current(Some(4), Some(5)));
     }
 
     /// Every guest-page writer in this crate goes through
@@ -11927,7 +11975,7 @@ mod vulkan_split_tests {
         );
     }
 
-    /// The deferred type-11 publish writes only the host shadow — no guest
+    /// The deferred mapper-ref-texture publish writes only the host shadow — no guest
     /// page, so `mark_mapping_written` never runs — and it is the one writer
     /// that would otherwise change the mapping's pixels invisibly to the epoch.
     /// `surface_cache` holds one entry per mapping, so a sibling Store at
@@ -11976,10 +12024,10 @@ mod vulkan_split_tests {
             load_action: MTL_LOAD_ACTION_LOAD,
             ..Default::default()
         };
-        assert!(type11_load_is_a_seed_candidate(&c0));
+        assert!(mapper_ref_texture_load_is_a_seed_candidate(&c0));
 
         c0.target_seed_rgba = Some(vec![0u8; 4]);
-        assert!(!type11_load_is_a_seed_candidate(&c0));
+        assert!(!mapper_ref_texture_load_is_a_seed_candidate(&c0));
     }
 
     /// A CLEAR is not a LOAD. Eliding a seed there would replace the guest's
@@ -11990,10 +12038,10 @@ mod vulkan_split_tests {
             load_action: MTL_LOAD_ACTION_CLEAR,
             ..Default::default()
         };
-        assert!(!type11_load_is_a_seed_candidate(&c0));
+        assert!(!mapper_ref_texture_load_is_a_seed_candidate(&c0));
     }
 
-    /// A type-11 `LOAD` whose host cache misses seeds from the surface's own
+    /// A mapper-ref-texture `LOAD` whose host cache misses seeds from the surface's own
     /// guest pages, and only refuses when those cannot serve the extent.
     ///
     /// Without the guest-pages rung this returns `None`, `target_rgba8` stays
@@ -12007,13 +12055,13 @@ mod vulkan_split_tests {
     /// Every one of those 121 lines had `want == mapgeom` and `hostgen=0`: the
     /// cache had never held the surface and its pages were readable. That pair is
     /// what makes reading them the fix rather than a guess.
-    /// The lazy type-11 Store publishes a frame nothing has written down yet, so
+    /// The lazy mapper-ref-texture Store publishes a frame nothing has written down yet, so
     /// the host surface cache — the other host-side copy of the same mapping —
     /// must stop naming the frame before it.
     ///
     /// The eager Store's GPU-direct arm ends in `surface_cache::forget` and says
     /// why; the lazy arm published a strictly newer frame and left the entry
-    /// alone. The consumer that would read it is the type-11 sampled ladder's
+    /// alone. The consumer that would read it is the mapper-ref-texture sampled ladder's
     /// host-cache rung, gated on the guest-write witness alone — which cannot
     /// see a publish this device made itself — and sitting above both rungs that
     /// read the guest's pages, so nothing below it corrects the answer.
@@ -12070,13 +12118,14 @@ mod vulkan_split_tests {
         // The third host-side claim on the same window: a compute dispatch's
         // storage image, recorded as holding what the guest's pages hold. This
         // Store supersedes both halves of that claim.
-        let (base_off, bpr, span_end) = crate::runtime::mapping_write::type11_sample_window(
-            state.mappings.get(&mid).expect("mapped above"),
-            w,
-            h,
-            MTL_FORMAT_BGRA8_UNORM,
-        )
-        .expect("a latched geometry resolves its window");
+        let (base_off, bpr, span_end) =
+            crate::runtime::mapping_write::mapper_ref_texture_sample_window(
+                state.mappings.get(&mid).expect("mapped above"),
+                w,
+                h,
+                MTL_FORMAT_BGRA8_UNORM,
+            )
+            .expect("a latched geometry resolves its window");
         let residency = crate::model::ComputeStorageResidencyKey {
             mapping_id: mid,
             map_generation: state.mappings[&mid].map_generation,
@@ -12199,7 +12248,7 @@ mod vulkan_split_tests {
         );
     }
 
-    /// The type-11 zero-copy sampled rail hands the engine the surface's guest
+    /// The mapper-ref-texture zero-copy sampled rail hands the engine the surface's guest
     /// pages, so an owed frame has to be written into them first.
     ///
     /// The rail is exempt from the *settle* and its comment says why: a
@@ -12210,7 +12259,7 @@ mod vulkan_split_tests {
     /// written before the debt rail existed and silently took the payment with
     /// it.
     #[test]
-    fn the_type11_zero_copy_gather_pays_the_frame_those_pages_owe() {
+    fn the_mapper_ref_texture_zero_copy_gather_pays_the_frame_those_pages_owe() {
         use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
         use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
@@ -12223,7 +12272,7 @@ mod vulkan_split_tests {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut host = FakeHost::new();
         // The rail refuses a host whose page views are transient before it ever
-        // builds one — see `type11_zero_copy_declines_transient_host_mappings`.
+        // builds one — see `mapper_ref_texture_zero_copy_declines_transient_host_mappings`.
         host.stable_map_pages = true;
         let mid = 913u32;
         let first_pfn = 0x40u32;
@@ -12263,8 +12312,15 @@ mod vulkan_split_tests {
         );
 
         assert!(
-            try_type11_sample_zero_copy(&mut state, &mut host, mid, w, h, resource.lifetime_ref())
-                .is_some(),
+            try_mapper_ref_texture_sample_zero_copy(
+                &mut state,
+                &mut host,
+                mid,
+                w,
+                h,
+                resource.lifetime_ref()
+            )
+            .is_some(),
             "the rail has to take, or this test proves nothing about what it does"
         );
         assert!(
@@ -12323,7 +12379,7 @@ mod vulkan_split_tests {
     /// over the pages the guest just wrote. The guest's repaint is then gone
     /// from both copies and the next frame loads what this one stored.
     #[test]
-    fn the_type11_load_seed_cache_rung_refuses_a_surface_the_guest_rewrote() {
+    fn the_mapper_ref_texture_load_seed_cache_rung_refuses_a_surface_the_guest_rewrote() {
         use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
         use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         use crate::runtime::host::HostOps;
@@ -12375,7 +12431,7 @@ mod vulkan_split_tests {
             .get_mut(&mid)
             .expect("mapped above")
             .guest_write_gen_at_store = host.guest_write_gen(token).expect("a live token has one");
-        let Type11LoadSeed::Host(bytes, order) = resolve_type11_load_seed(
+        let MapperRefTextureLoadSeed::Host(bytes, order) = resolve_mapper_ref_texture_load_seed(
             &mut state,
             &mut host,
             mid,
@@ -12401,7 +12457,7 @@ mod vulkan_split_tests {
              test is being asked the wrong question"
         );
 
-        let Type11LoadSeed::Guest(seed) = resolve_type11_load_seed(
+        let MapperRefTextureLoadSeed::Guest(seed) = resolve_mapper_ref_texture_load_seed(
             &mut state,
             &mut host,
             mid,
@@ -12413,7 +12469,7 @@ mod vulkan_split_tests {
             panic!("a repainted surface must bypass the stale host cache");
         };
         assert_eq!(seed.format, ash::vk::Format::B8G8R8A8_UNORM);
-        let (_, bpr, _) = crate::runtime::mapping_write::type11_sample_window(
+        let (_, bpr, _) = crate::runtime::mapping_write::mapper_ref_texture_sample_window(
             &state.mappings[&mid],
             w,
             h,
@@ -12427,7 +12483,7 @@ mod vulkan_split_tests {
     }
 
     #[test]
-    fn a_type11_load_seed_falls_back_to_the_surfaces_own_guest_pages() {
+    fn a_mapper_ref_texture_load_seed_falls_back_to_the_surfaces_own_guest_pages() {
         use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
         use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         use crate::runtime::mapping_write::write_bgra8;
@@ -12471,7 +12527,7 @@ mod vulkan_split_tests {
         // refused rather than showing a bare `None`: every rung on this ladder
         // declines by name, and the panic message is where that is worth reading.
         let cap = crate::observe::sink::FailCapture::start();
-        let served = resolve_type11_load_seed(
+        let served = resolve_mapper_ref_texture_load_seed(
             &mut state,
             &mut host,
             mid,
@@ -12486,11 +12542,11 @@ mod vulkan_split_tests {
             )
         });
         drop(cap);
-        let Type11LoadSeed::Guest(seed) = seed else {
+        let MapperRefTextureLoadSeed::Guest(seed) = seed else {
             panic!("a cold cache should preserve the native guest-page source");
         };
         assert_eq!(seed.format, ash::vk::Format::B8G8R8A8_UNORM);
-        let (_, bpr, _) = crate::runtime::mapping_write::type11_sample_window(
+        let (_, bpr, _) = crate::runtime::mapping_write::mapper_ref_texture_sample_window(
             &state.mappings[&mid],
             w,
             h,
@@ -12513,7 +12569,7 @@ mod vulkan_split_tests {
             px.copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xFF]);
         }
         crate::runtime::surface_cache::store(&mut state, mid, w, h, cached);
-        let Type11LoadSeed::Host(bytes, order) = resolve_type11_load_seed(
+        let MapperRefTextureLoadSeed::Host(bytes, order) = resolve_mapper_ref_texture_load_seed(
             &mut state,
             &mut host,
             mid,
@@ -12531,7 +12587,7 @@ mod vulkan_split_tests {
         // and refusing is right: a seed of the wrong length is rejected by the
         // engine anyway, and the decline names both geometries.
         assert!(
-            resolve_type11_load_seed(
+            resolve_mapper_ref_texture_load_seed(
                 &mut state,
                 &mut host,
                 mid,
@@ -12544,7 +12600,7 @@ mod vulkan_split_tests {
         );
     }
 
-    /// The type-4 host-cache sample rung must not serve a surface the
+    /// The backing host-cache sample rung must not serve a surface the
     /// hypervisor has watched the guest rewrite.
     ///
     /// That rung sits above both rungs that read the guest's own pages
@@ -12611,7 +12667,7 @@ mod vulkan_split_tests {
         );
     }
 
-    /// The type-11 `LOAD` seed branch reports both ways, and the miss arm names
+    /// The mapper-ref-texture `LOAD` seed branch reports both ways, and the miss arm names
     /// the geometry the cache actually holds.
     ///
     /// The miss is a whole-layer loss, not a degradation: with no seed the engine
@@ -12628,7 +12684,7 @@ mod vulkan_split_tests {
     /// `first_sight` latches per `(reason, discriminant)` for the life of the
     /// process and never resets.
     #[test]
-    fn the_type11_load_seed_branch_reports_both_ways() {
+    fn the_mapper_ref_texture_load_seed_branch_reports_both_ways() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mid = 909u32;
         state.map_surface(mid);
@@ -12648,14 +12704,14 @@ mod vulkan_split_tests {
             let hits: Vec<String> = cap
                 .lines()
                 .into_iter()
-                .filter(|l| l.contains("type11_load_seed"))
+                .filter(|l| l.contains("mapper_ref_texture_load_seed"))
                 .collect();
             assert_eq!(hits.len(), 1, "expected exactly one line, got {hits:?}");
             hits.into_iter().next().unwrap_or_default()
         };
 
         let cap = crate::observe::sink::FailCapture::start();
-        note_type11_load_seed(&state, mid, 8, 4, Some(Type11SeedRung::Cache));
+        note_mapper_ref_texture_load_seed(&state, mid, 8, 4, Some(MapperRefTextureSeedRung::Cache));
         let hit = only(&cap);
         assert!(hit.contains("outcome=cache_hit"), "{hit}");
         assert!(hit.contains("mapgeom=8x4"), "{hit}");
@@ -12666,7 +12722,13 @@ mod vulkan_split_tests {
         // rate is the only thing that prices the guest-pages fallback, and fusing
         // it would make the fix unmeasurable the moment it worked.
         let cap = crate::observe::sink::FailCapture::resume();
-        note_type11_load_seed(&state, mid, 4, 4, Some(Type11SeedRung::GuestPages));
+        note_mapper_ref_texture_load_seed(
+            &state,
+            mid,
+            4,
+            4,
+            Some(MapperRefTextureSeedRung::GuestPages),
+        );
         let pages = only(&cap);
         assert!(pages.contains("outcome=guest_pages"), "{pages}");
         drop(cap);
@@ -12675,19 +12737,22 @@ mod vulkan_split_tests {
         // geometry is the load-bearing field, since it says a Store at another
         // extent orphaned every window still living at this one.
         let cap = crate::observe::sink::FailCapture::resume();
-        note_type11_load_seed(&state, mid, 8, 1, None);
+        note_mapper_ref_texture_load_seed(&state, mid, 8, 1, None);
         let geom = only(&cap);
-        assert!(geom.contains("reason=type11_seed_cache_geom"), "{geom}");
+        assert!(
+            geom.contains("reason=mapper_ref_texture_seed_cache_geom"),
+            "{geom}"
+        );
         assert!(geom.contains("have=8x4"), "{geom}");
         assert!(geom.contains("want=8x1"), "{geom}");
         drop(cap);
 
         // A mapping the cache has never held reports absence, not a geometry.
         let cap = crate::observe::sink::FailCapture::resume();
-        note_type11_load_seed(&state, 910, 8, 4, None);
+        note_mapper_ref_texture_load_seed(&state, 910, 8, 4, None);
         let absent = only(&cap);
         assert!(
-            absent.contains("reason=type11_seed_cache_absent"),
+            absent.contains("reason=mapper_ref_texture_seed_cache_absent"),
             "{absent}"
         );
         assert!(!absent.contains("have="), "{absent}");
@@ -12699,10 +12764,16 @@ mod vulkan_split_tests {
         // ones made are exactly what this last one asserts, and `start` would
         // clear them and see all four lines again.
         let cap = crate::observe::sink::FailCapture::resume();
-        note_type11_load_seed(&state, mid, 8, 4, Some(Type11SeedRung::Cache));
-        note_type11_load_seed(&state, mid, 4, 4, Some(Type11SeedRung::GuestPages));
-        note_type11_load_seed(&state, mid, 8, 1, None);
-        note_type11_load_seed(&state, 910, 8, 4, None);
+        note_mapper_ref_texture_load_seed(&state, mid, 8, 4, Some(MapperRefTextureSeedRung::Cache));
+        note_mapper_ref_texture_load_seed(
+            &state,
+            mid,
+            4,
+            4,
+            Some(MapperRefTextureSeedRung::GuestPages),
+        );
+        note_mapper_ref_texture_load_seed(&state, mid, 8, 1, None);
+        note_mapper_ref_texture_load_seed(&state, 910, 8, 4, None);
         assert!(
             cap.lines().is_empty(),
             "second sighting must be latched: {:?}",
@@ -12806,17 +12877,17 @@ mod vulkan_split_tests {
 
         // Routes distinct from every product route so this test cannot be
         // satisfied by a line some other case in this binary emitted.
-        note_type11_store_route("test_route_a");
-        note_type11_store_route("test_route_a");
-        note_type11_store_route("test_route_a");
-        note_type11_store_route("test_route_b");
+        note_mapper_ref_texture_store_route("test_route_a");
+        note_mapper_ref_texture_store_route("test_route_a");
+        note_mapper_ref_texture_store_route("test_route_a");
+        note_mapper_ref_texture_store_route("test_route_b");
 
         let whole = std::fs::read_to_string(path).expect("fail log");
         let appended = &whole[mark.min(whole.len())..];
         let count = |route: &str| {
             appended
                 .lines()
-                .filter(|l| l.contains(&format!("type11_store_route route={route}")))
+                .filter(|l| l.contains(&format!("mapper_ref_texture_store_route route={route}")))
                 .count()
         };
         assert_eq!(count("test_route_a"), 1, "three calls, one line");
@@ -13309,7 +13380,7 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
 /// a direction, because that is what makes the call sites auditable: a readback's
 /// order is a property of the attachment it came out of, so the caller states the
 /// fact it was told and the ordering logic lives here. Spelled as a direction
-/// ("swizzle if type-11") each site would re-derive the predicate, which is how
+/// ("swizzle if mapper-ref-texture") each site would re-derive the predicate, which is how
 /// the two halves of a conversion end up disagreeing.
 ///
 /// The exchange is an involution, so one routine serves both directions. Trailing
@@ -13549,10 +13620,10 @@ pub(super) fn depth_stencil_descriptor_is_trivial(
         && !d.back_stencil_enabled
 }
 
-/// Decode the type-7 depth-stencil descriptor a draw bound, on the Linux path
+/// Decode the serializer-object depth-stencil descriptor a draw bound, on the Linux path
 /// (the Metal `load_depth_stencil_state` is `backend-metal`-gated). Mirrors
 /// `load_render_pipeline`: object-list lookup → descriptor read → decode (which
-/// validates the type-7 depth-stencil tag). Returns the specific reason slug on
+/// validates the serializer-object depth-stencil tag). Returns the specific reason slug on
 /// failure so the caller — which only reaches this for a bound `ds_ref != 0`, i.e.
 /// a guest that explicitly asked for a depth-stencil state — can fail-visibly
 /// name why the state silently fell back to no-depth instead of dropping it into
@@ -13567,9 +13638,14 @@ pub(super) fn load_depth_stencil_descriptor<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("ds_state_held");
         return Ok((*state_).clone());
     }
-    let (_entry, desc) =
-        objects::resolve_descriptor(state, host, task_id, ds_ref, &[OBJECT_TYPE_TYPE7])
-            .map_err(crate::observe::ladder_slugs!("depth_stencil"))?;
+    let (_entry, desc) = objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        ds_ref,
+        &[OBJECT_TYPE_SERIALIZER_OBJECT],
+    )
+    .map_err(crate::observe::ladder_slugs!("depth_stencil"))?;
     let decoded = decode_depth_stencil_descriptor(&desc)
         .map_err(|_| crate::observe::ladder_slug!("depth_stencil", desc_decode))?;
     // Registered only after a successful decode, on the same terms as
@@ -14337,7 +14413,7 @@ impl std::fmt::Display for PlaneDrawDrain {
 ///
 /// Called from the draw encode's own entry, which every draw reaches. The
 /// latched census below sits at the colour-seed site instead, and that site is
-/// skipped whenever the type-11 seed is elided — which is the overwhelming
+/// skipped whenever the mapper-ref-texture seed is elided — which is the overwhelming
 /// majority of passes (about 1 000 elided against 50 provided on a boot), so a
 /// ring filled there recorded one pass out of a frame's worth and missed
 /// whichever one it was supposed to name.
@@ -14471,8 +14547,8 @@ fn prepare_memo_scratch(scratch: &mut Vec<u8>, span: usize, filled: usize) {
     scratch[filled..].fill(0);
 }
 
-/// Byte-exact revalidated memo for the type-11 mapping-backed guest-page sampled
-/// path. Same contract as [`load_linear_guest_memoized`] / the type-5 view memo:
+/// Byte-exact revalidated memo for the mapper-ref-texture mapping-backed guest-page sampled
+/// path. Same contract as [`load_linear_guest_memoized`] / the ref-texture view memo:
 /// re-read the native BGRA rect every bind (a guest CPU write is always
 /// observed — neither `map_generation` nor `content_generation` tracks in-place
 /// guest writes), memcmp against the memo, and on an unchanged hit return the
@@ -14481,7 +14557,7 @@ fn prepare_memo_scratch(scratch: &mut Vec<u8>, span: usize, filled: usize) {
 /// magnification burst re-binds the same static icons ~1000×, so this collapses
 /// the `t11_guest` CPU copies that saturate the serial drain worker (the
 /// dock-hover whole-VM freeze). Returns `(rgba, identity)`.
-fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
+fn load_mapper_ref_texture_rgba_memoized<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mid: u32,
@@ -14502,7 +14578,7 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
     // Coherence re-read: land any resident-authoritative writeback and read the
     // current native BGRA (read_mapping_bgra8 runs ensure_resolved_for_scanout +
     // flush internally). Reuse the scratch so a memo hit costs no allocation.
-    let mut scratch = std::mem::take(&mut state.type11_memo_scratch);
+    let mut scratch = std::mem::take(&mut state.mapper_ref_texture_memo_scratch);
     prepare_memo_scratch(
         &mut scratch,
         span,
@@ -14511,21 +14587,21 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
     if !{
         crate::runtime::scanout::read_mapping_bgra8(state, host, mid, &mut scratch, stride, w, h)
     } {
-        state.type11_memo_scratch = scratch;
+        state.mapper_ref_texture_memo_scratch = scratch;
         return None;
     }
-    // Identity key namespace: bits 63+62 mark type-11 memo content, distinct from
-    // raw-GVA keys (bit 63 clear) and type-5 view keys (bit 63 set, bit 62 clear).
+    // Identity key namespace: bits 63+62 mark mapper-ref-texture memo content, distinct from
+    // raw-GVA keys (bit 63 clear) and ref-texture view keys (bit 63 set, bit 62 clear).
     // Every producer draws its generation from
     // `DeviceState::next_sampled_content_generation`, so a (key, generation)
     // pair is unique device-wide and content can never alias on a collision.
     let identity_key = (1u64 << 63) | (1u64 << 62) | mid as u64;
     let key = (mid, w, h);
-    if let Some(m) = state.type11_memo.get_touch(&key) {
+    if let Some(m) = state.mapper_ref_texture_memo.get_touch(&key) {
         if m.native == scratch {
             let rgba = m.rgba.clone();
             let generation = m.generation;
-            state.type11_memo_scratch = scratch;
+            state.mapper_ref_texture_memo_scratch = scratch;
             return Some((
                 rgba,
                 LinearSampleIdentity {
@@ -14547,13 +14623,13 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
         )
     });
     if !converted {
-        state.type11_memo_scratch = scratch;
+        state.mapper_ref_texture_memo_scratch = scratch;
         return None;
     }
     let rgba = std::sync::Arc::new(rgba);
     let generation = state.next_sampled_content_generation();
     let entry_bytes = scratch.len() + rgba.len();
-    state.type11_memo.insert(
+    state.mapper_ref_texture_memo.insert(
         key,
         crate::model::GuestLinearMemo {
             native: scratch,

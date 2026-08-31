@@ -591,7 +591,7 @@ impl From<ColorAttachment> for AttachSubresource {
 /// second predicate. The colour rail materializes a level's own plane inside the
 /// guest allocation — `TextureDescriptor::level_gva` gives its address, stride
 /// and geometry, and `render_target`'s linear rung has rendered into one since
-/// type-8 mip views existed. The depth/stencil rail has no such rung: it would
+/// texture-view mip views existed. The depth/stencil rail has no such rung: it would
 /// bind level 0 and the guest would read a level it never wrote.
 ///
 /// Making it an enum rather than a `bool` is the point — an arm has to say which
@@ -606,10 +606,9 @@ pub enum LevelSupport {
 
 /// Whether this device can honour an attachment's subresource as decoded.
 ///
-/// Slice 0, plane 0, no multisample resolve for callers using this predicate,
-/// and a level the caller's rail can reach. `slice` and `depth_plane` joined the test when they became decodable:
-/// a depth buffer bound at slice 5 was previously read as slice 0 and silently
-/// accepted.
+/// Slice 0, plane 0, no multisample resolve for callers using this predicate, and a level the
+/// caller's rail can reach. `slice` and `depth_plane` joined the test when they became decodable: a
+/// depth buffer bound at slice 5 was previously read as slice 0 and silently accepted.
 ///
 /// It lives beside the structs it reads because four arms apply it — the stream
 /// decode that admits an attachment into a pass, once per aspect, and the Metal
@@ -824,13 +823,12 @@ pub struct Command {
 /// `reims_vgpu_wire`'s manifest rather than from observation.
 /// An opcode inside the accepted window that no decode arm claims.
 ///
-/// Two tests need one -- this module's catch-all test and `runtime::exec`'s
-/// fail-visible test -- and both used to hardcode it. Both went stale, twice:
-/// `wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE` stopped working when that bound was corrected to `0xa6`,
-/// and its replacement `0x99` lasted one commit until
-/// `setVertexAmplificationMode:value:` turned out to be exactly that number.
-/// Searching keeps them honest as arms are added, because what they test is
-/// that the catch-all exists and reports, not that any number is in it.
+/// Two tests need one -- this module's catch-all test and `runtime::exec`'s fail-visible test --
+/// and both used to hardcode it. Both went stale, twice:
+/// `wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE` stopped working when that bound was corrected to
+/// `0xa6`, and its replacement `0x99` lasted one commit until `setVertexAmplificationMode:value:`
+/// turned out to be exactly that number. Searching keeps them honest as arms are added, because
+/// what they test is that the catch-all exists and reports, not that any number is in it.
 #[cfg(test)]
 pub(crate) fn unclaimed_accepted_opcode() -> u32 {
     (0..=wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE)

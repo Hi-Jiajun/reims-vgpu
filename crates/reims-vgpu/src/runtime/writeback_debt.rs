@@ -9,7 +9,7 @@
 //!
 //! # A resource owns its transfer backing
 //!
-//! Type-11 debts carry a mapping id, geometry, and map generation. GVA debts
+//! Mapper-ref-texture debts carry a mapping id, geometry, and map generation. GVA debts
 //! carry the task-local texture reference, GVA declaration, geometry, format,
 //! and resource generation. The live GVA resource separately retains the
 //! ordered physical pages of its transfer backing. Ordinary task unmap changes
@@ -42,7 +42,7 @@
 //! invalidation, task retirement, and generation movement release the same
 //! ownership without inventing a guest write.
 //!
-//! [`MAX_DEBTS`] bounds only anonymous type-11 surface debts. GVA resource
+//! [`MAX_DEBTS`] bounds only anonymous mapper-ref-texture surface debts. GVA resource
 //! lifetime is explicit — resource discard/delete and task teardown — so an
 //! unrelated capacity limit must not invent an early synchronization point.
 
@@ -119,7 +119,7 @@ pub(crate) fn test_resident_identity(
     NoResidentIdentity
 }
 
-/// A frame owed to one type-11 mapping's guest pages.
+/// A frame owed to one mapper-ref-texture mapping's guest pages.
 ///
 /// Values only, and no memory. See the module doc: the rail this replaces held
 /// resolved host pointers and corrupted the guest's page tables with them. A
@@ -1758,7 +1758,7 @@ fn pay_gva<M: HostMemory + HostOps>(
 
 /// [`pay`] on an arm with no Vulkan engine to owe a frame to.
 ///
-/// Unreachable rather than merely unused: the only arm site is the type-11
+/// Unreachable rather than merely unused: the only arm site is the mapper-ref-texture
 /// surface Store in `draw::vulkan`, so the ledger is empty on this arm and both
 /// callers return at their emptiness check before reaching here. It exists so
 /// the reader-side helpers can be one set of functions on both arms instead of
