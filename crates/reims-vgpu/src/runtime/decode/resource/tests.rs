@@ -3502,3 +3502,300 @@ fn a_layout_table_past_u16_reports_its_real_length() {
         assert_eq!(icb_layout_table_len(tg_start, tg_start - 8, stride), 0);
     }
 }
+
+/// Build an [`OBJECT_TYPE_DUAL_PLANE_TEXTURE`] body the way the format itself
+/// says one is built, so nothing here restates an offset the decoder also
+/// holds.
+///
+/// One object header, then `planes.len()` dimension blocks of
+/// `TEXTURE_DIM_HEADER_LEN + levels * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN` bytes,
+/// then the one 44-byte trailer. `plane_levels` is written into each block's own
+/// leading `u16` with one of the two flag bits above it set, so the 14-bit mask
+/// is exercised rather than assumed away by a zero byte. A caller can give the
+/// two blocks different counts to build the pair the splitter has to refuse.
+pub(crate) fn dual_plane_body(
+    plane_levels: [u32; 2],
+    plane0: (u32, u32),
+    pixel_format: u16,
+) -> Vec<u8> {
+    use crate::contract::endian::{st16, st32, st64};
+    // Either bit above the 14-bit count will do. This is the one the game whose
+    // descriptors settled the count's width does *not* set, so these bodies
+    // cannot consume the `texture_desc_mip_field_undecoded` report that
+    // `the_mip_level_count_is_one_byte_and_its_neighbour_is_another_field`
+    // asserts on.
+    const DIM_FLAG: u16 = 0x4000;
+    let levels = plane_levels[0] as usize;
+    let block = TEXTURE_DIM_HEADER_LEN + levels * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    let trailer = TEXTURE_DIM_BASE + 2 * block;
+    let mut b = vec![0u8; trailer + (TEXTURE_DESC_BASE_LEN - TEXTURE_DESC_LEVEL_RECORDS)];
+    st64(&mut b[LINEAR_DESC_SIZE..], 0x40_0000);
+    st32(&mut b[LINEAR_DESC_HANDLE..], 0x51);
+
+    for (plane, base) in [TEXTURE_DIM_BASE, TEXTURE_DIM_BASE + block]
+        .into_iter()
+        .enumerate()
+    {
+        st16(&mut b[base..], (plane_levels[plane] as u16) | DIM_FLAG);
+        // A 4:2:0 chroma plane is half the luma plane in each axis.
+        let (w, h) = if plane == 0 {
+            plane0
+        } else {
+            (plane0.0 / 2, plane0.1 / 2)
+        };
+        for level in 0..levels {
+            let rec = base + TEXTURE_DIM_HEADER_LEN + level * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+            let (lw, lh) = ((w >> level).max(1), (h >> level).max(1));
+            let stride = u64::from(lw) * if plane == 0 { 1 } else { 2 };
+            st64(&mut b[rec + TEXTURE_LEVEL_SIZE..], stride * u64::from(lh));
+            st64(&mut b[rec + TEXTURE_LEVEL_ROW_STRIDE..], stride);
+            st32(&mut b[rec + TEXTURE_LEVEL_WIDTH..], lw);
+            st32(&mut b[rec + TEXTURE_LEVEL_HEIGHT..], lh);
+            st32(&mut b[rec + TEXTURE_LEVEL_DEPTH..], 1);
+        }
+    }
+
+    // The trailer sits at the same distance inside itself whatever precedes it.
+    let pf = trailer + (TEXTURE_DESC_PIXEL_FORMAT - TEXTURE_DESC_LEVEL_RECORDS);
+    st16(&mut b[pf..], pixel_format);
+    st32(
+        &mut b[pf + (TEXTURE_DESC_TRAILER_WIDTH - TEXTURE_DESC_PIXEL_FORMAT)..],
+        plane0.0,
+    );
+    st32(
+        &mut b[pf + (TEXTURE_DESC_TRAILER_HEIGHT - TEXTURE_DESC_PIXEL_FORMAT)..],
+        plane0.1,
+    );
+    st16(
+        &mut b[pf + (TEXTURE_DESC_SAMPLE_COUNT - TEXTURE_DESC_PIXEL_FORMAT)..],
+        1,
+    );
+    b
+}
+
+/// The two block constants and the level-record offset are one layout, so the
+/// third is derived from the first two rather than measured separately.
+#[test]
+fn the_dimension_block_geometry_derives_the_level_record_offset() {
+    // Level 0's record sits immediately after the block header; the decode loop
+    // starts one record later because the geometry prefix already read L0.
+    const _: () = assert!(
+        TEXTURE_DESC_LEVEL_RECORDS
+            == TEXTURE_DIM_BASE + TEXTURE_DIM_HEADER_LEN + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN
+    );
+    // And every absolute level-0 field is that record's field.
+    let rec0 = TEXTURE_DIM_BASE + TEXTURE_DIM_HEADER_LEN;
+    assert_eq!(TEXTURE_DESC_USED_SIZE, rec0 + TEXTURE_LEVEL_SIZE);
+    assert_eq!(TEXTURE_DESC_ROW_STRIDE, rec0 + TEXTURE_LEVEL_ROW_STRIDE);
+    assert_eq!(TEXTURE_DESC_WIDTH, rec0 + TEXTURE_LEVEL_WIDTH);
+    assert_eq!(TEXTURE_DESC_HEIGHT, rec0 + TEXTURE_LEVEL_HEIGHT);
+    assert_eq!(TEXTURE_DESC_DEPTH, rec0 + TEXTURE_LEVEL_DEPTH);
+}
+
+/// A single-mip dual-plane body is 176 bytes and both planes come back whole.
+///
+/// The lengths are the derivation: `12 + 2 * (24 + 36) + 44`. A single-plane
+/// body of the same shape is 116, and the 60 bytes between them are the second
+/// dimension block.
+#[test]
+fn a_dual_plane_descriptor_decodes_both_planes_and_the_shared_trailer() {
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    let b = dual_plane_body([1, 1], (1920, 1080), MTL_FORMAT_BGRA8_UNORM);
+    assert_eq!(b.len(), 176, "the length identity this test turns on");
+    assert_eq!(
+        b.len(),
+        TEXTURE_DESC_BASE_LEN + (TEXTURE_DIM_HEADER_LEN + 36)
+    );
+
+    let cap = crate::observe::FailCapture::start();
+    let d = decode_dual_plane_texture_descriptor(&b).expect("a well-formed body decodes");
+    assert_eq!(d.planes[0].extent(), Some((1920, 1080)), "luma plane");
+    assert_eq!(d.planes[1].extent(), Some((960, 540)), "chroma plane");
+    assert_eq!(d.planes[0].row_stride, 1920);
+    assert_eq!(d.planes[1].row_stride, 1920, "two channels at half width");
+    assert_eq!(d.planes[0].handle, 0x51, "both planes are one object...");
+    assert_eq!(d.planes[1].handle, 0x51);
+    assert_eq!(
+        d.pixel_format(),
+        MTL_FORMAT_BGRA8_UNORM,
+        "...with one format"
+    );
+    assert_eq!(d.planes[1].pixel_format, MTL_FORMAT_BGRA8_UNORM);
+    // The trailer repeats the *object's* extent, and plane 1 is corroborated
+    // against that rather than against its own half-size one.
+    assert_eq!(d.planes[0].sample_count, Some(1));
+    assert_eq!(
+        d.planes[1].sample_count,
+        Some(1),
+        "a chroma plane must not be read as a broken trailer"
+    );
+    let lines = cap.lines();
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("texture_desc_trailer_disagrees")),
+        "the layout is exactly right here; nothing may claim otherwise: {lines:?}"
+    );
+    // Decoded, and still refused for execution -- once, with the geometry on it.
+    let note = lines
+        .iter()
+        .find(|l| l.starts_with("dual_plane_texture_unexecutable"))
+        .expect("unsupported guest work must reach the failure channel");
+    assert!(
+        note.contains("plane0=1920x1080") && note.contains("plane1=960x540"),
+        "{note}"
+    );
+}
+
+/// The tag cannot be folded into the single-plane arm, and this is why.
+///
+/// Plane 1's dimension block begins at exactly the offset a single-plane body
+/// puts its format trailer. So the tag-2 decoder does not come up short on a
+/// dual-plane body -- it succeeds, and returns plane 1's flags-plus-count `u16`
+/// as the pixel format. A wrong texture rather than a missing one.
+#[test]
+fn the_single_plane_decoder_reads_plane_ones_header_as_the_format_trailer() {
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    let b = dual_plane_body([1, 1], (1920, 1080), MTL_FORMAT_BGRA8_UNORM);
+    let cap = crate::observe::FailCapture::start();
+    let wrong = decode_texture_descriptor(&b).expect("it does not fail, which is the problem");
+    assert_ne!(
+        wrong.pixel_format, MTL_FORMAT_BGRA8_UNORM,
+        "offset 86 is fourteen bytes into plane 1's dimension header here, not \
+         the format trailer, so whatever that field holds becomes the format"
+    );
+    // The one thing that does notice is the trailer's repeated extent, read out
+    // of plane 1's records and disagreeing with plane 0's. That guard is why
+    // this misread degrades to a refused bind rather than a wrong frame -- but
+    // it is a backstop, not a decode.
+    assert!(
+        cap.lines()
+            .iter()
+            .any(|l| l.starts_with("texture_desc_trailer_disagrees")),
+        "the single-plane read of a dual-plane body must not look well-formed"
+    );
+    // And the tag routes to the arm that does not do this.
+    let Ok(Descriptor::DualPlaneTexture(right)) =
+        decode_descriptor(OBJECT_TYPE_DUAL_PLANE_TEXTURE, &b)
+    else {
+        panic!("tag 12 must decode as a dual-plane texture");
+    };
+    assert_eq!(right.pixel_format(), MTL_FORMAT_BGRA8_UNORM);
+}
+
+/// Plane 0's level count is what sizes and splits both blocks, so a mip chain
+/// moves the second plane and the trailer together.
+#[test]
+fn a_mipmapped_dual_plane_body_splits_at_plane_zeros_level_count() {
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    const LEVELS: usize = 4;
+    let b = dual_plane_body(
+        [LEVELS as u32, LEVELS as u32],
+        (256, 256),
+        MTL_FORMAT_BGRA8_UNORM,
+    );
+    let block = TEXTURE_DIM_HEADER_LEN + LEVELS * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    assert_eq!(b.len(), TEXTURE_DIM_BASE + 2 * block + 44);
+
+    let d = decode_dual_plane_texture_descriptor(&b).expect("decodes");
+    assert_eq!(d.planes[0].levels.len(), LEVELS);
+    assert_eq!(d.planes[1].levels.len(), LEVELS);
+    assert_eq!(
+        d.planes[0].level(3).map(|l| (l.width, l.height)),
+        Some((32, 32))
+    );
+    assert_eq!(
+        d.planes[1].level(3).map(|l| (l.width, l.height)),
+        Some((16, 16))
+    );
+    assert_eq!(
+        d.pixel_format(),
+        MTL_FORMAT_BGRA8_UNORM,
+        "the trailer is past both mip chains, not past one"
+    );
+}
+
+/// A body that stops before the second plane is short by name, not decoded as
+/// a single-plane texture that happens to fit.
+///
+/// The bound is the two dimension blocks, not the whole body: the split is what
+/// needs them, and a truncated *trailer* is already the single-plane decoder's
+/// `texture_desc_format_unreachable` rather than a second way to say short.
+/// `TEXTURE_DESC_BASE_LEN` is in the list because a well-formed single-plane
+/// body is exactly the length this must not accept.
+#[test]
+fn a_dual_plane_body_short_of_its_second_plane_is_refused() {
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    let full = dual_plane_body([1, 1], (64, 64), MTL_FORMAT_BGRA8_UNORM);
+    let both_blocks =
+        TEXTURE_DIM_BASE + 2 * (TEXTURE_DIM_HEADER_LEN + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN);
+    let cap = crate::observe::FailCapture::start();
+    for len in [TEXTURE_DESC_BASE_LEN, both_blocks - 1] {
+        assert_eq!(
+            decode_dual_plane_texture_descriptor(&full[..len]),
+            Err(DecodeStatus::ErrShort("res_dual_plane_desc_short")),
+            "a {len}-byte body cannot carry two planes"
+        );
+    }
+    assert!(
+        cap.lines()
+            .iter()
+            .any(|l| l.starts_with("dual_plane_desc_short")),
+        "the drop must be on the record"
+    );
+}
+
+/// Two blocks declaring different level counts cannot both be true, and the
+/// host resolves the disagreement by ignoring plane 1's field entirely.
+///
+/// Following it here would put the trailer somewhere the host never reads;
+/// ignoring it would accept a descriptor whose own two statements conflict.
+/// Neither is a decode, so this refuses and says which counts disagreed.
+#[test]
+fn planes_declaring_different_level_counts_are_refused_not_mis_sliced() {
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    let mut b = dual_plane_body([2, 2], (64, 64), MTL_FORMAT_BGRA8_UNORM);
+    let plane1 = TEXTURE_DIM_BASE + TEXTURE_DIM_HEADER_LEN + 2 * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    crate::contract::endian::st16(&mut b[plane1..], 3 | 0x4000);
+
+    let cap = crate::observe::FailCapture::start();
+    assert_eq!(
+        decode_dual_plane_texture_descriptor(&b),
+        Err(DecodeStatus::ErrUnsupported(
+            "res_dual_plane_level_mismatch"
+        ))
+    );
+    let note = cap
+        .lines()
+        .into_iter()
+        .find(|l| l.starts_with("dual_plane_level_mismatch"))
+        .expect("reported by name");
+    assert!(
+        note.contains("plane0=2") && note.contains("plane1=3"),
+        "{note}"
+    );
+}
+
+/// The count that decides the split is bounded by the same corruption guard the
+/// level loop uses, and refuses rather than reporting a short body.
+#[test]
+fn an_absurd_level_count_refuses_as_a_bad_count_not_as_a_short_body() {
+    use crate::contract::endian::st16;
+    let mut b = vec![0u8; 4096];
+    st16(
+        &mut b[TEXTURE_DIM_BASE..],
+        TEXTURE_MAX_MIP_LEVELS as u16 + 1,
+    );
+    let cap = crate::observe::FailCapture::start();
+    assert_eq!(
+        decode_dual_plane_texture_descriptor(&b),
+        Err(DecodeStatus::ErrUnsupported(
+            "res_dual_plane_levels_over_cap"
+        )),
+        "the body is long enough; the count is what is wrong"
+    );
+    assert!(cap
+        .lines()
+        .iter()
+        .any(|l| l.starts_with("dual_plane_levels_over_cap")));
+}

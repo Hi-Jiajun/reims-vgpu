@@ -117,6 +117,34 @@ pub const OBJECT_TYPE_SERIALIZER_OBJECT: u8 = 7;
 pub const OBJECT_TYPE_TEXTURE_VIEW: u8 = 8;
 pub const OBJECT_TYPE_MAPPER_REF_TEXTURE: u8 = 11;
 
+/// A texture whose storage the guest describes as **two planes**.
+///
+/// Same object as tag 2 in every other respect — the guest assigns it in
+/// `allocateTextureHandle` and the host builds it in
+/// `PGResourceManager::createNormalTexture` — and the *only* thing the tag
+/// changes is how many `APVTextureDimension` blocks follow the object header.
+/// `createNormalTexture` reads the entry's type byte before it reads anything
+/// else and sets a plane count of 2 for this tag and 1 for every other, then
+/// sizes the dimension array as `planeCount * (24 + 36 * levels)`. See
+/// [`decode_dual_plane_texture_descriptor`] for what that means byte by byte.
+///
+/// Live on the arm rail only, and live *now*: the host gates the tag on the
+/// dual-plane device-info bit, which
+/// [`crate::model::regs::protocol_dual_plane_textures`] answers `true` for at
+/// [`crate::model::regs::PROTOCOL_VERSION_MAX`]. A guest told the feature is on
+/// builds every biplanar video texture this way, so refusing to decode the tag
+/// is not a way to avoid it.
+///
+/// **Decoded here, executed nowhere.** No rail lists this tag in the `want`
+/// slice it passes to `objects::resolve_descriptor`, so a bind of one still
+/// refuses with `WrongType { got: 12 }`. That is deliberate: one biplanar Metal
+/// texture fed from two guest plane regions is a backend feature, not a decode
+/// arm, and presenting plane 0 as if it were a whole texture would sample luma
+/// as colour — a wrong frame rather than a missing one. What decoding buys is
+/// that the refusal is now *informed*: the geometry and pixel format of the
+/// thing being refused are recovered and reported.
+pub const OBJECT_TYPE_DUAL_PLANE_TEXTURE: u8 = 12;
+
 /// Serializer-object first dword subtypes.
 ///
 /// A tag-7 entry carries no type of its own: the host reads the descriptor's
@@ -607,10 +635,23 @@ pub const TEXTURE_DESC_GEOMETRY_LEN: usize = 68;
 /// format, and the fragment bind refused with
 /// `draw_prepare_texture_resolve_missing`.
 pub const TEXTURE_DESC_MIPMAP_LEVEL_COUNT: usize = 12;
-/// The byte above the mip-level count: a field this device does not decode.
+/// The byte above the mip-level count: **two flag bits and the count's top six**.
 ///
 /// Named so the read site is not an unexplained `+ 1`. See
-/// [`TEXTURE_DESC_MIPMAP_LEVEL_COUNT`] for why the two are separate fields.
+/// [`TEXTURE_DESC_MIPMAP_LEVEL_COUNT`] for why the two are separate fields, and
+/// [`TEXTURE_DIM_HEADER_LEN`] for the guest ivar type encoding that says what
+/// this byte holds: the block opens `b14 b1 b1` in one `u16`, so bits 0..6 of
+/// this byte continue the level count and bits 6 and 7 are one flag each.
+///
+/// That settles the *shape* and not the *meaning*. Neither flag's effect is
+/// known, so the report below still fires on a non-zero value — but it is now a
+/// report about two bits rather than about eight, and the `0x80` four of a
+/// game's descriptors carried is the upper flag set on a count that fits in the
+/// low byte, not a wider count. The decoder keeps reading the count as that low
+/// byte: [`TEXTURE_MAX_MIP_LEVELS`] is 16, so the two readings cannot differ on
+/// anything it will accept, and the one place the full 14-bit field matters —
+/// where a dual-plane descriptor splits — masks it explicitly through
+/// [`TEXTURE_DIM_LEVEL_COUNT_MASK`].
 pub const TEXTURE_DESC_MIP_FIELD_UNDECODED: usize = TEXTURE_DESC_MIPMAP_LEVEL_COUNT + 1;
 pub const TEXTURE_DESC_DATA_OFFSET: usize = 16;
 pub const TEXTURE_DESC_BYTES_PER_ELEMENT: usize = 35;
@@ -620,6 +661,40 @@ pub const TEXTURE_DESC_WIDTH: usize = 60;
 pub const TEXTURE_DESC_HEIGHT: usize = 64;
 pub const TEXTURE_DESC_DEPTH: usize = 68;
 pub const TEXTURE_DESC_LEVEL_RECORDS: usize = 72;
+
+/// Where the first `APVTextureDimension` block starts: past the object header.
+///
+/// The host reads a texture descriptor as a cursor: one `APVObjectTexture`
+/// (allocation size at `LINEAR_DESC_SIZE`, handle at `LINEAR_DESC_HANDLE`,
+/// twelve bytes), then the dimension array, then the format trailer. Every
+/// absolute offset above is one of these two constants plus a field offset
+/// inside a block, and [`TEXTURE_DESC_LEVEL_RECORDS`] is exactly
+/// `TEXTURE_DIM_BASE + TEXTURE_DIM_HEADER_LEN + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN`
+/// — level 0's record sits at `TEXTURE_DIM_BASE + TEXTURE_DIM_HEADER_LEN` and
+/// the loop starts one record later because the geometry prefix already read
+/// it. `the_dimension_block_geometry_derives_the_level_record_offset` asserts
+/// that derivation, and every level-0 field against its record field.
+pub const TEXTURE_DIM_BASE: usize = 12;
+/// Bytes of `APVTextureDimension` ahead of its first level record.
+///
+/// The block is **packed**, which is why a 36-byte record and a 24-byte header
+/// are possible at all: the guest's own ivar type encoding for it is
+/// `{?=b14b1b1SQQCCCC[0{?=QQQIII}]}` — a 14-bit level count and two 1-bit flags
+/// in one `u16`, a `u16`, two `u64`, four `u8`, then the flexible array of
+/// `{u64,u64,u64,u32,u32,u32}`. Laid out packed that is 2+2+8+8+4 = 24 for the
+/// header and 8+8+8+4+4+4 = 36 per record; laid out with natural alignment it
+/// would be 32 and 40, and the host's own `24 + 36 * levels` sizing rules that
+/// out.
+pub const TEXTURE_DIM_HEADER_LEN: usize = 24;
+/// Level-count bits of the dimension block's leading `u16`.
+///
+/// The count is 14 bits wide and the two bits above it are flags, per the type
+/// encoding quoted on [`TEXTURE_DIM_HEADER_LEN`]. The single-plane decoder
+/// reads only the low byte, which agrees with this for every count it will
+/// accept ([`TEXTURE_MAX_MIP_LEVELS`] is 16); this mask is what the *host*
+/// applies, and the plane split has to divide the descriptor exactly where the
+/// host does.
+pub const TEXTURE_DIM_LEVEL_COUNT_MASK: u16 = 0x3fff;
 pub const TEXTURE_DESC_MIP_LEVEL_RECORD_LEN: usize = 36;
 pub const TEXTURE_LEVEL_OFFSET: usize = 0;
 pub const TEXTURE_LEVEL_SIZE: usize = 8;
@@ -1875,6 +1950,9 @@ impl IndirectCommandBufferDescriptor {
 pub enum Descriptor {
     Buffer(BufferDescriptor),
     Texture(TextureDescriptor),
+    /// Two planes of one texture. Deliberately not a `Texture`: see
+    /// [`DualPlaneTextureDescriptor`].
+    DualPlaneTexture(DualPlaneTextureDescriptor),
     Sampler(SamplerDescriptor),
     Function(FunctionDescriptor),
     RenderPipeline(RenderPipelineDescriptor),
@@ -1940,6 +2018,28 @@ pub fn decode_buffer_descriptor(bytes: &[u8]) -> Result<BufferDescriptor, Decode
 }
 
 pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, DecodeStatus> {
+    decode_texture_dimension_block(bytes, None)
+}
+
+/// One `APVTextureDimension` block plus the format trailer that follows it.
+///
+/// `corroborate` is the extent the trailer's repeated width/height are checked
+/// against — see [`decode_trailer_sample_count`] for why that check exists.
+/// `None` means "this block's own level-0 extent", which is the only answer a
+/// single-plane descriptor can give and the one every caller but the dual-plane
+/// splitter wants.
+///
+/// The exception is the second plane of an [`OBJECT_TYPE_DUAL_PLANE_TEXTURE`].
+/// **The trailer belongs to the object, not to a plane**: there is exactly one
+/// of it however many dimension blocks precede it, and the extent it repeats is
+/// the texture's, which is plane 0's. A 4:2:0 chroma plane is half that in each
+/// axis, so corroborating it against itself would make the check fire on every
+/// well-formed biplanar descriptor — reporting a layout error where the layout
+/// is exactly right, and withholding a sample count that was correctly read.
+fn decode_texture_dimension_block(
+    bytes: &[u8],
+    corroborate: Option<(u32, u32)>,
+) -> Result<TextureDescriptor, DecodeStatus> {
     if bytes.len() < TEXTURE_DESC_GEOMETRY_LEN {
         return Err(DecodeStatus::ErrShort("res_texture_desc_short"));
     }
@@ -2091,7 +2191,9 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
     let pf_off = TEXTURE_DESC_PIXEL_FORMAT + format_shift;
     if bytes.len() >= pf_off + 2 {
         out.pixel_format = ld16(&bytes[pf_off..]);
-        out.sample_count = decode_trailer_sample_count(bytes, format_shift, out.width, out.height);
+        let (corroborate_w, corroborate_h) = corroborate.unwrap_or((out.width, out.height));
+        out.sample_count =
+            decode_trailer_sample_count(bytes, format_shift, corroborate_w, corroborate_h);
     } else if crate::observe::first_sight("texture_desc_format_unreachable", levels as u64) {
         // No fallback to the unshifted offset. The fallback's own length test
         // was `TEXTURE_DESC_PIXEL_FORMAT + 2`, so for a single-mip body it
@@ -2106,6 +2208,176 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
             "texture_desc_format_unreachable levels={levels} pf_off={pf_off} len={} \
              (multi-mip body too short for its shifted format trailer)",
             bytes.len()
+        ));
+    }
+    Ok(out)
+}
+
+/// The 14-bit level count of the `APVTextureDimension` block at `base`.
+///
+/// `None` when the body does not reach the field. Zero is returned as one: the
+/// single-plane decoder already treats a declared zero as one level, and a
+/// block that claimed zero levels would otherwise divide the descriptor in a
+/// place the host's own `24 + 36 * levels` never puts a boundary.
+fn dimension_level_count(bytes: &[u8], base: usize) -> Option<u32> {
+    let field = bytes.get(base..base.checked_add(2)?)?;
+    Some(u32::from(ld16(field) & TEXTURE_DIM_LEVEL_COUNT_MASK).max(1))
+}
+
+/// A texture the guest describes as two planes, decoded one plane at a time.
+///
+/// Both planes are the same texture: they share the object header's allocation
+/// and handle and the one format trailer, and differ only in the geometry each
+/// dimension block states. Nothing here reduces the pair to a single
+/// `TextureDescriptor` — plane 0 of a 4:2:0 pair is a full-size single-channel
+/// image and plane 1 is a half-size two-channel one, so either alone is a
+/// truthful description of something the guest did not ask for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DualPlaneTextureDescriptor {
+    /// Plane 0 then plane 1, in the order the descriptor lays them out.
+    pub planes: [TextureDescriptor; 2],
+}
+
+impl DualPlaneTextureDescriptor {
+    /// The object's pixel format, from the trailer both planes share.
+    pub fn pixel_format(&self) -> u16 {
+        self.planes[0].pixel_format
+    }
+}
+
+/// Decode an [`OBJECT_TYPE_DUAL_PLANE_TEXTURE`] descriptor.
+///
+/// # The layout, and where it comes from
+///
+/// A dual-plane body is a single-plane body with a second dimension block
+/// spliced in between the first one and the format trailer:
+///
+/// ```text
+///  0        12                    12+B                  12+2B
+///  +--------+---------------------+---------------------+---------+
+///  | object | dimension, plane 0  | dimension, plane 1  | trailer |
+///  | header | 24 + 36*L bytes     | 24 + 36*L bytes     | 44 B    |
+///  +--------+---------------------+---------------------+---------+
+/// ```
+///
+/// `PGResourceManager::createNormalTexture` builds exactly that. It reads the
+/// object-list entry's type byte, sets a plane count of 2 when it is 12 and 1
+/// otherwise, reads one `APVObjectTexture` and one `APVTextureDimension` header
+/// off its cursor, then sizes the whole dimension array as
+/// `planeCount * (24 + 36 * (levels & 0x3fff))` and pulls the remainder in as
+/// raw bytes before reading the trailer. `-[PGDualPlaneBlitTextureResource
+/// initWithTask:objectType:pagingInfo:dimension:dimensionLength:texture:]`
+/// then splits that array at `dimension + 24 + 36 * levels`, allocates one
+/// `24 + 36 * levels` buffer per plane, and validates both with
+/// `planeCount: 2` and `generateMipmaps: NO`.
+///
+/// So for `L = 1` a single-plane body is 116 bytes and a dual-plane one is 176,
+/// and **plane 1 begins exactly where a single-plane descriptor's format
+/// trailer would begin**. That is why the tag has to be decoded rather than
+/// declined: run a dual-plane body through the single-plane decoder and it does
+/// not come up short, it reads plane 1's header as the trailer and hands back a
+/// pixel format that is really a level count.
+///
+/// # Why the level count is read once
+///
+/// `createNormalTexture` sizes *both* blocks from plane 0's count, and the
+/// resource init splits at plane 0's count and validates both planes with it.
+/// Plane 1's own count field is therefore not authoritative anywhere on the
+/// host, and a descriptor whose two counts disagree is one the host would
+/// silently mis-slice. This refuses it by name instead.
+pub fn decode_dual_plane_texture_descriptor(
+    bytes: &[u8],
+) -> Result<DualPlaneTextureDescriptor, DecodeStatus> {
+    let levels = dimension_level_count(bytes, TEXTURE_DIM_BASE)
+        .ok_or(DecodeStatus::ErrShort("res_dual_plane_desc_short"))?;
+    // Bounded by the same corruption guard the single-plane decoder uses, and
+    // for a stronger reason: here the count is not just how many records to
+    // read, it is where plane 1 starts. An absurd count would place the second
+    // plane past any body, which reads as "short" and hides the malformed
+    // field that caused it.
+    if levels as usize > TEXTURE_MAX_MIP_LEVELS {
+        if crate::observe::first_sight("dual_plane_levels_over_cap", u64::from(levels)) {
+            crate::observe::fail(format!(
+                "dual_plane_levels_over_cap declared={levels} cap={TEXTURE_MAX_MIP_LEVELS} \
+                 len={} (the plane split is derived from this count)",
+                bytes.len()
+            ));
+        }
+        return Err(DecodeStatus::ErrUnsupported(
+            "res_dual_plane_levels_over_cap",
+        ));
+    }
+    let block = TEXTURE_DIM_HEADER_LEN + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN * levels as usize;
+    let plane1 = TEXTURE_DIM_BASE + block;
+    let trailer = plane1 + block;
+    if bytes.len() < trailer {
+        if crate::observe::first_sight("dual_plane_desc_short", bytes.len() as u64) {
+            crate::observe::fail(format!(
+                "dual_plane_desc_short levels={levels} need={trailer} len={} \
+                 (body ends before the second plane's dimension block)",
+                bytes.len()
+            ));
+        }
+        return Err(DecodeStatus::ErrShort("res_dual_plane_desc_short"));
+    }
+    let plane1_levels = dimension_level_count(bytes, plane1)
+        .ok_or(DecodeStatus::ErrShort("res_dual_plane_desc_short"))?;
+    if plane1_levels != levels {
+        if crate::observe::first_sight(
+            "dual_plane_level_mismatch",
+            (u64::from(levels) << 32) | u64::from(plane1_levels),
+        ) {
+            crate::observe::fail(format!(
+                "dual_plane_level_mismatch plane0={levels} plane1={plane1_levels} len={} \
+                 (the host sizes and splits both planes from plane 0's count, so the two \
+                 fields disagreeing makes the plane 1 boundary unrecoverable)",
+                bytes.len()
+            ));
+        }
+        return Err(DecodeStatus::ErrUnsupported(
+            "res_dual_plane_level_mismatch",
+        ));
+    }
+
+    // Each plane is re-assembled into the canonical single-plane shape — object
+    // header, one dimension block, trailer — and handed to the one decoder that
+    // already knows that shape. Splicing rather than re-implementing the field
+    // reads at a movable base is the whole point: there is no second copy of
+    // the geometry offsets to drift, and every guard the single-plane path has
+    // earned applies to both planes unchanged.
+    let mut plane0_bytes = Vec::with_capacity(plane1 + (bytes.len() - trailer));
+    plane0_bytes.extend_from_slice(&bytes[..plane1]);
+    plane0_bytes.extend_from_slice(&bytes[trailer..]);
+    let mut plane1_bytes = Vec::with_capacity(TEXTURE_DIM_BASE + bytes.len() - plane1);
+    plane1_bytes.extend_from_slice(&bytes[..TEXTURE_DIM_BASE]);
+    plane1_bytes.extend_from_slice(&bytes[plane1..]);
+
+    let plane0 = decode_texture_descriptor(&plane0_bytes)?;
+    // Plane 0's extent is the object's, so it is what the one trailer repeats.
+    let extent = (plane0.width, plane0.height);
+    let out = DualPlaneTextureDescriptor {
+        planes: [
+            plane0,
+            decode_texture_dimension_block(&plane1_bytes, Some(extent))?,
+        ],
+    };
+    // Unsupported guest work, and the only place that knows what was asked for.
+    // The bind refuses later as `WrongType { got: 12 }`, which can say the tag
+    // and nothing else; this says the texture. Keyed so a video stream's worth
+    // of identically shaped planes costs one line.
+    let key = (u64::from(out.pixel_format()) << 48)
+        | (u64::from(out.planes[0].width & 0xff_ffff) << 24)
+        | u64::from(out.planes[0].height & 0xff_ffff);
+    if crate::observe::first_sight("dual_plane_texture_unexecutable", key) {
+        crate::observe::fail(format!(
+            "dual_plane_texture_unexecutable pf={:#x} plane0={}x{} plane1={}x{} levels={levels} \
+             (decoded; no rail binds a two-plane texture yet, so a bind of this object \
+             refuses at the type gate)",
+            out.pixel_format(),
+            out.planes[0].width,
+            out.planes[0].height,
+            out.planes[1].width,
+            out.planes[1].height,
         ));
     }
     Ok(out)
@@ -5017,10 +5289,15 @@ pub fn decode_descriptor(object_type: u8, bytes: &[u8]) -> Result<Descriptor, De
         OBJECT_TYPE_TEXTURE_VIEW => Ok(Descriptor::TextureView(decode_texture_view_descriptor(
             bytes,
         )?)),
+        OBJECT_TYPE_DUAL_PLANE_TEXTURE => Ok(Descriptor::DualPlaneTexture(
+            decode_dual_plane_texture_descriptor(bytes)?,
+        )),
         OBJECT_TYPE_MAPPER_REF_TEXTURE => decode_iosurface_texture_descriptor(bytes),
         _ => Err(DecodeStatus::ErrUnknownType("res_object_type_unknown")),
     }
 }
 
+// `pub(crate)` so `runtime::texture` can build a dual-plane body through the
+// one function that encodes that layout, rather than restating its offsets.
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
