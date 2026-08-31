@@ -26,6 +26,67 @@
 //! Reading it is how a caller notices an operator asked for something the host
 //! cannot give and says so, rather than ignoring the request in silence.
 
+/// Declare a switch variable so that its name, its documentation, and its
+/// membership in [`ALL`] are one act rather than three.
+///
+/// [`ALL`] used to be written out a second time below the constants, and
+/// nothing connected the two: a constant declared and read by the device but
+/// left off the list reported as `unset` on every boot line while the device
+/// obeyed it. That is the divergence this module exists to prevent, reproduced
+/// inside the module itself, and it had already happened three times.
+/// `COMPUTE_GATHER` was missing until 2026-08-11, which made the boot line
+/// silent about the arm of the one switch whose two arms are byte-identical
+/// implementations, so an A/B could not be told from a pair of default boots by
+/// reading the log afterwards — the "compare arms, not pins" trap with the
+/// evidence removed. `SAMPLED_IDENTITY` and `GATHER_AUDIT_ALL` were missing
+/// until 2026-08-12, and the first of those has two arms differing in what the
+/// guest *sees*, so a boot that could not say which arm it ran was a boot whose
+/// content evidence was unattributable. `PASS_EXIT_NARROW` was missing until
+/// this registry was derived.
+///
+/// Deriving the registry from the declarations makes the omission unspellable
+/// rather than merely discouraged.
+macro_rules! switches {
+    ($( $(#[$doc:meta])* pub const $ident:ident: &str = $name:literal; )*) => {
+        $( $(#[$doc])* pub const $ident: &str = $name; )*
+
+        /// Every variable this device reads as a [`Switch`], in declaration
+        /// order.
+        ///
+        /// The one place the set is enumerable. A boot line built from this
+        /// reports what an operator actually set, which is the difference
+        /// between a bug report that says "it is slow" and one that says "it is
+        /// slow with a rail switched off" — and an operator who mistyped a
+        /// value learns it from the same line, because [`Switch::Unrecognized`]
+        /// has its own spelling there.
+        ///
+        /// Derived from the declarations above, so a switch this device reads
+        /// cannot fail to be reported.
+        pub const ALL: [&str; switches!(@count $($ident)*)] = [$($ident),*];
+    };
+    (@count $($ident:ident)*) => { [$( switches!(@unit $ident) ),*].len() };
+    (@unit $ident:ident) => { () };
+}
+
+/// [`switches`] for the variables read through [`count`] instead.
+///
+/// A separate registry because [`report_line`] has to print these differently:
+/// a count has no on/off state to name, and running one through the switch
+/// parse would report `REIMS_VGPU_BATCH_DRAWS=4` as `unrecognized(4)` — a line
+/// saying the device rejected the very value it adopted.
+macro_rules! counts {
+    ($( $(#[$doc:meta])* pub const $ident:ident: &str = $name:literal; )*) => {
+        $( $(#[$doc])* pub const $ident: &str = $name; )*
+
+        /// Every variable read as a [`count`] rather than as a [`Switch`], in
+        /// declaration order. Derived exactly as [`ALL`] is.
+        pub const ALL_COUNTS: [&str; counts!(@count $($ident)*)] = [$($ident),*];
+    };
+    (@count $($ident:ident)*) => { [$( counts!(@unit $ident) ),*].len() };
+    (@unit $ident:ident) => { () };
+}
+
+switches! {
 /// Guest RAM reaches the GPU as a host-pointer import over whole RAMBlocks.
 /// Setting this off makes the device take the copying rails on a host that
 /// could have imported — see
@@ -1069,6 +1130,9 @@ pub const COLOR_GENERAL: &str = "REIMS_VGPU_COLOR_GENERAL";
 /// outcome a tiling compositor already produces. `host_window::present`'s
 /// `WindowMode` owns both halves.
 pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
+}
+
+counts! {
 
 /// **A count, not a switch.** How many draws one command buffer may carry,
 /// narrowing the active memory-topology batch policy. Read through [`count`],
@@ -1088,6 +1152,7 @@ pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
 /// [`crate::runtime::gpu_hang_trail`]'s ring covers every submission still in
 /// flight instead of the last half millisecond of a batch.
 pub const BATCH_DRAWS: &str = "REIMS_VGPU_BATCH_DRAWS";
+}
 
 /// What one variable says, including the two ways it says nothing usable.
 ///
@@ -1195,65 +1260,6 @@ pub fn read(name: &str) -> (Switch, Option<String>) {
 pub fn switch(name: &str) -> Switch {
     read(name).0
 }
-
-/// Every variable this device reads.
-///
-/// The one place the set is enumerable. A boot line built from this reports what
-/// an operator actually set, which is the difference between a bug report that
-/// says "it is slow" and one that says "it is slow with a rail switched off" —
-/// and an operator who mistyped a value learns it from the same line, because
-/// [`Switch::Unrecognized`] has its own spelling here.
-///
-/// Nothing enforces that a new `pub const` above is added to this list; the rule
-/// is stated and honestly unenforced. What keeps it small is that the list is
-/// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 27] = [
-    COLOR_GENERAL,
-    LAZY_WRITEBACK,
-    SLAB_RETAIN,
-    // Both absent until 2026-08-12, for the same reason `COMPUTE_GATHER` was:
-    // added next to their constants and not here. `SAMPLED_IDENTITY`'s two arms
-    // differ in what the guest *sees* rather than in how fast it sees it, so a
-    // boot that cannot say which arm it ran is a boot whose content evidence is
-    // unattributable.
-    SAMPLED_IDENTITY,
-    GATHER_AUDIT_ALL,
-    PIPELINE_MEMO,
-    GUEST_IMPORT,
-    PUSH_DESCRIPTORS,
-    DRAW_LOG,
-    AIR_CAPTURE,
-    GPU_STAMP,
-    PAGE_GUARDS,
-    RANGE_COVERAGE,
-    BUFFER_EXTENT,
-    BATCH_MIXED_TARGETS,
-    BATCH_DEPTH,
-    UNUSED_BINDS,
-    PRESENT_DEPTH,
-    STAMP_COALESCE,
-    SCATTER_SPLIT,
-    COMPUTE_SCATTER,
-    // Absent from this list until 2026-08-11, which made the boot line silent
-    // about the arm of the one switch here whose two arms are byte-identical
-    // implementations — so a `COMPUTE_GATHER` A/B could not be told from a pair of
-    // default boots by reading the log afterwards. That is the "compare arms, not
-    // pins" trap with the evidence removed.
-    COMPUTE_GATHER,
-    GPU_SPANS,
-    LAYOUT_CHURN,
-    PASS_CHURN,
-    SHARED_TARGET,
-    FULLSCREEN,
-];
-
-/// Every variable read as a [`count`] rather than as a [`Switch`].
-///
-/// A second list because [`report_line`] has to print these differently: a count
-/// has no on/off state to name, and running one through the switch parse would
-/// report `REIMS_VGPU_BATCH_DRAWS=4` as `unrecognized(4)` — a line saying the
-/// device rejected the very value it adopted.
-pub const ALL_COUNTS: [&str; 1] = [BATCH_DRAWS];
 
 /// The state of every variable in [`ALL`], for the one-shot boot line.
 ///
@@ -1376,7 +1382,7 @@ mod tests {
     /// [`report_line`] is the only record of which arm a boot ran, and a count
     /// pushed through [`read`] reports `4` as `unrecognized(4)` — a line saying
     /// the device rejected the value it had in fact adopted, which is exactly
-    /// the "compare arms, not pins" trap the [`ALL`] doc records.
+    /// the "compare arms, not pins" trap the [`switches`] doc records.
     #[test]
     fn a_count_is_reported_as_its_value_and_not_as_an_unrecognized_switch() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1469,6 +1475,32 @@ mod tests {
             for b in &names[i + 1..] {
                 assert_ne!(a, b, "two variables share a name");
             }
+        }
+    }
+
+    /// Every switch this device reads reaches the boot line.
+    ///
+    /// The names below are the ones that did not. Each was declared, read by a
+    /// product path, and left off the hand-written registry, so every boot
+    /// reported it `unset` while the device obeyed it — a run whose arm cannot
+    /// be recovered from its own log. They are written out here rather than
+    /// derived: deriving them from the same declaration the line is built from
+    /// would assert nothing.
+    #[test]
+    fn every_switch_the_device_reads_reaches_the_boot_line() {
+        let line = report_line();
+        for name in [
+            PASS_EXIT_NARROW,
+            COMPUTE_GATHER,
+            SAMPLED_IDENTITY,
+            GATHER_AUDIT_ALL,
+        ] {
+            assert!(ALL.contains(&name), "{name} is not in the registry");
+            let short = name
+                .strip_prefix("REIMS_VGPU_")
+                .expect("prefix")
+                .to_ascii_lowercase();
+            assert!(line.contains(&format!(" {short}=")), "{name}: {line}");
         }
     }
 
