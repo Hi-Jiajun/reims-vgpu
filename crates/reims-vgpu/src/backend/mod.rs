@@ -95,7 +95,7 @@ use crate::runtime::compute_exec::{ComputeAccum, ComputeStatus};
 use crate::runtime::compute_session::ComputeSession;
 use crate::runtime::decode::blit::Command as BlitCommand;
 use crate::runtime::decode::compute::Command as ComputeCommand;
-use crate::runtime::draw::{DrawEncodeRequest, EncodeStatus};
+use crate::runtime::draw::{DrawEncodeRequest, EncodeStatus, GvaSpan};
 use crate::runtime::guest_ram::ImportId;
 use crate::runtime::host::{HostMemory, HostOps};
 
@@ -478,6 +478,50 @@ pub(crate) trait Backend: Copy {
         _task_id: u32,
         _pipeline_ref: u32,
     ) -> Option<u32> {
+        None
+    }
+
+    // --- Pixels the rail may already hold -----------------------------------
+    //
+    // Two questions with one shape: this device is about to move a frame's
+    // bytes through guest memory, and a rail that still holds those bytes can
+    // supply them without the round trip. Both default to "no", and on a rail
+    // with no resident registry that is not a degraded answer — there is
+    // nothing held, so the caller does exactly the work it would have done.
+
+    /// Whether the rail already holds, current and unmodified, the pixels a
+    /// colour LOAD is about to gather out of `span`'s guest pages.
+    ///
+    /// `true` means the caller may skip building the seed entirely: the rail
+    /// will load from what it holds. The rail is answering about its **own**
+    /// state, and answering `true` binds it — the encode either honours the
+    /// elision or re-seeds — which is why this is one call rather than a query
+    /// the caller interprets.
+    ///
+    /// `&mut` on both state and host because the answer is measured, not looked
+    /// up: deciding it consults the guest-write witness for those pages.
+    fn gva_load_seed_elidable<M: HostMemory + HostOps>(
+        &self,
+        _state: &mut DeviceState,
+        _host: &mut M,
+        _task_id: u32,
+        _span: GvaSpan,
+    ) -> bool {
+        false
+    }
+
+    /// Colour 0 of a chain this device is abandoning, read back from the rail.
+    ///
+    /// The chain broke, so no span carries the key its last good record
+    /// registered and the rail has to name the target from the state it can
+    /// still see. That second derivation belongs to the rail rather than to the
+    /// caller: every *other* reader of a chain has the draw's own key, and a
+    /// shared re-derivation would silently give them this one's answer.
+    fn read_abandoned_chain_rgba(
+        &self,
+        _state: &DeviceState,
+        _req: &DrawEncodeRequest,
+    ) -> Option<Vec<u8>> {
         None
     }
 }
@@ -923,6 +967,34 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.pipeline_raster_sample_count(state, host, task_id, pipeline_ref),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.pipeline_raster_sample_count(state, host, task_id, pipeline_ref),
+        }
+    }
+
+    fn gva_load_seed_elidable<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        span: GvaSpan,
+    ) -> bool {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.gva_load_seed_elidable(state, host, task_id, span),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.gva_load_seed_elidable(state, host, task_id, span),
+        }
+    }
+
+    fn read_abandoned_chain_rgba(
+        &self,
+        state: &DeviceState,
+        req: &DrawEncodeRequest,
+    ) -> Option<Vec<u8>> {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.read_abandoned_chain_rgba(state, req),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.read_abandoned_chain_rgba(state, req),
         }
     }
 }

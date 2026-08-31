@@ -4016,25 +4016,6 @@ fn load_index_content_reason<M: HostMemory + HostOps>(
 /// UNSCOREABLE none** across six anchors with its reload and movement gates
 /// both satisfied. A second workload (page loads and scrolling) served 11 103
 /// binds off the rung with no loss on the fail channel.
-/// The guest bytes one GVA render target occupies, as the rails that ask about
-/// it name them.
-///
-/// One value rather than five parameters because the five only mean anything
-/// together — a stride belongs to a height, and a format decides the channel
-/// order the registry keys a resident on — and because two callers assembling
-/// the same five by hand is how they come to disagree about one of them.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct GvaSpan {
-    pub texture_ref: u32,
-    pub gva: u64,
-    pub row_stride: u32,
-    pub width: u32,
-    pub height: u32,
-    /// The guest's declared pixel format, not a host one:
-    /// [`gva_resident_format`] turns it into the `format` half of the key.
-    pub format: u16,
-}
-
 /// Why a GVA span's resident may not stand in for its guest pages.
 ///
 /// Kept apart from a bare `None` because the three have nothing in common: one
@@ -4312,7 +4293,7 @@ mod gva_resident_ownership_tests {
 /// seed built, none elided — with `gvaseed_elided` and `gvarung_resident` both
 /// absent and zero bound imports. That arm keeps the behaviour it had before
 /// either rung existed.
-pub(super) fn gva_load_seed_elidable<M: HostMemory + HostOps>(
+pub fn gva_load_seed_elidable<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,

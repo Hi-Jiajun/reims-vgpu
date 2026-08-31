@@ -29,7 +29,7 @@ use crate::runtime::compute_session::ComputeSession;
 use crate::runtime::decode::blit::Command as BlitCommand;
 use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::drain;
-use crate::runtime::draw::{self, DrawEncodeRequest, EncodeStatus};
+use crate::runtime::draw::{self, DrawEncodeRequest, EncodeStatus, GvaSpan};
 use crate::runtime::guest_ram::ImportId;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::render_writeback::SettleSite;
@@ -251,6 +251,25 @@ impl Backend for VulkanBackend {
         site: SettleSite,
     ) -> StampOrdering {
         drain::vulkan::order_completion_stamp(state, host, index, value, site)
+    }
+
+    fn gva_load_seed_elidable<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        span: GvaSpan,
+    ) -> bool {
+        draw::vulkan::gva_load_seed_elidable(state, host, task_id, span)
+    }
+
+    fn read_abandoned_chain_rgba(
+        &self,
+        state: &DeviceState,
+        req: &DrawEncodeRequest,
+    ) -> Option<Vec<u8>> {
+        let identity = draw::vulkan::render_chain_identity(state, req)?;
+        draw::vulkan::read_resident_chain(req, &identity)
     }
 
     fn pipeline_raster_sample_count<M: HostMemory + HostOps>(

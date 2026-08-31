@@ -4111,21 +4111,15 @@ fn land_chain_before_abandon<M: HostMemory + HostOps>(
     chain_rgba: &mut Option<Vec<u8>>,
     end: ChainEnd,
 ) {
-    // The one caller that has no identity to be handed. The chain broke, so no
-    // span carries the key its last good record registered, and the abandoning
-    // read has to name the resident from the state it can still see. That is a
-    // second derivation and it is spelled out here rather than hidden inside
-    // `read_resident_chain`, because every *other* caller has the draw's own
-    // key and a shared re-derivation would silently give them this one's answer
-    // — see `draw::M2vDrawSpan::ResidentSurfaceStore` for what that cost.
-    #[cfg(feature = "backend-vulkan")]
+    // The one caller that has no identity to be handed: the chain broke, so no
+    // span carries the key its last good record registered. Which is why the
+    // rail derives the target itself here — see
+    // `Backend::read_abandoned_chain_rgba`, and
+    // `draw::M2vDrawSpan::ResidentSurfaceStore` for what sharing that
+    // derivation with the callers that *do* hold a key once cost.
     if end.resident && chain_rgba.is_none() {
-        if let Some(identity) = draw::vulkan::render_chain_identity(state, req) {
-            *chain_rgba = draw::vulkan::read_resident_chain(req, &identity);
-        }
+        *chain_rgba = crate::backend::selected().read_abandoned_chain_rgba(state, req);
     }
-    #[cfg(not(feature = "backend-vulkan"))]
-    let _ = (req, end.resident);
     if let Some(rgba) = chain_rgba.take() {
         let _ =
             draw::writeback_chain_rgba(state, host, task_id, &acc.color_slots, &rgba, end.cause);

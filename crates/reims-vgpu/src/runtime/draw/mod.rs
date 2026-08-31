@@ -1845,6 +1845,26 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
     wrote
 }
 
+/// The guest bytes one GVA render target occupies, as the rails that ask about
+/// it name them.
+///
+/// One value rather than five parameters because the five only mean anything
+/// together — a stride belongs to a height, and a format decides the channel
+/// order the registry keys a resident on — and because two callers assembling
+/// the same five by hand is how they come to disagree about one of them.
+#[derive(Clone, Copy, Debug)]
+pub struct GvaSpan {
+    pub texture_ref: u32,
+    pub gva: u64,
+    pub row_stride: u32,
+    pub width: u32,
+    pub height: u32,
+    /// The guest's declared pixel format, not a host one:
+    /// the rail that keys a resident on it turns it into the `format` half of
+    /// that key.
+    pub format: u16,
+}
+
 // --- The record for a sample count taken from the pipeline -----------------
 //
 // Neutral, and here rather than in a rail, because every line of it is decoded
@@ -2343,12 +2363,11 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                 // block on that same Store's writeback — the device's largest
                 // remaining wait. See `draw::vulkan::gva_resident_if_current`;
                 // the encode side honours the flag or re-seeds.
-                #[cfg(feature = "backend-vulkan")]
-                let elided = vulkan::gva_load_seed_elidable(
+                let elided = crate::backend::selected().gva_load_seed_elidable(
                     state,
                     host,
                     task_id,
-                    vulkan::GvaSpan {
+                    GvaSpan {
                         texture_ref: att.texture_ref,
                         gva,
                         row_stride: bpr,
@@ -2357,8 +2376,6 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                         format: mfmt,
                     },
                 );
-                #[cfg(not(feature = "backend-vulkan"))]
-                let elided = false;
                 // Only colour0. `gva_chain_identity` names the first attachment
                 // and the chain rail carries that one, so a second slot whose
                 // seed was skipped would reach the pass with nothing to load.

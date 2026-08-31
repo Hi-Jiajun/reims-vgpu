@@ -7701,8 +7701,9 @@ fn a_span_can_be_named_without_asking_whether_its_guest_pages_are_current() {
     use crate::contract::endian::st32;
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::draw::vulkan::GvaResidentRefusal;
     use crate::runtime::draw::vulkan::{gva_resident_if_current, gva_span_identity};
-    use crate::runtime::draw::vulkan::{GvaResidentRefusal, GvaSpan};
+    use crate::runtime::draw::GvaSpan;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();

@@ -1760,7 +1760,7 @@ fn multisample_sampled_texture<M: HostMemory + HostOps>(
         c0.target_gva,
         c0.row_stride,
     );
-    let span = crate::runtime::draw::vulkan::GvaSpan {
+    let span = crate::runtime::draw::GvaSpan {
         texture_ref,
         gva: target_gva,
         row_stride,
