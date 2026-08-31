@@ -202,19 +202,14 @@ mod tests {
         // The sampled-cache witness arms tokens of its own against window page
         // sets that no `MappingEntry` names, so a sweep that only walked
         // mappings would miss this one.
-        #[cfg(feature = "backend-vulkan")]
         let witness_token = {
             let token = h.track_guest_writes(&[0x3000], page).unwrap();
             d.state.gather_witness.arm_token_for_test(token);
             token
         };
-        #[cfg(feature = "backend-vulkan")]
         assert_ne!(witness_token, mapping_token);
 
-        #[cfg(feature = "backend-vulkan")]
         assert_eq!(h.tracked_guest_write_sets(), 2);
-        #[cfg(not(feature = "backend-vulkan"))]
-        assert_eq!(h.tracked_guest_write_sets(), 1);
 
         assert_eq!(d.reset_with_host(&mut h), 0);
         assert_eq!(

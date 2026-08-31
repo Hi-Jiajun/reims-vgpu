@@ -883,7 +883,6 @@ pub type TaskRenderPipelineStates =
 /// one changed**. The guest publishes the state once and binds it; the delete
 /// command is the invalidation, which is why this needs no capacity and no
 /// generation.
-#[cfg(feature = "backend-vulkan")]
 pub type TaskDepthStencilStates =
     TaskReferenceStates<crate::runtime::decode::resource::DepthStencilDescriptor>;
 
@@ -2350,7 +2349,6 @@ pub struct DeviceState {
     /// Immutable sampler objects in the sampler API's separate ref space.
     pub task_sampler_states: TaskSamplerStates,
     /// Immutable depth-stencil objects in that API's separate ref space.
-    #[cfg(feature = "backend-vulkan")]
     pub task_depth_stencil_states: TaskDepthStencilStates,
     /// Immutable render pipeline states in the pipeline API's separate ref
     /// space. The guest binds these by reference after construction and ends
@@ -2430,7 +2428,6 @@ pub struct DeviceState {
     /// texels did not change" key for the zero-copy sampled gathers, measured
     /// against the bytes themselves. See
     /// [`crate::runtime::gather_witness`] — it selects no behaviour.
-    #[cfg(feature = "backend-vulkan")]
     pub gather_witness: crate::runtime::gather_witness::GatherWitness,
     /// The GVA render targets a Store has stamped, and what the two write
     /// witnesses said at the time. The GVA half of the mapper-ref-texture witness that
@@ -2715,7 +2712,6 @@ impl DeviceState {
             objects: std::collections::BTreeSet::new(),
             task_resources: TaskResources::default(),
             task_sampler_states: TaskSamplerStates::default(),
-            #[cfg(feature = "backend-vulkan")]
             task_depth_stencil_states: TaskDepthStencilStates::default(),
             #[cfg(feature = "backend-vulkan")]
             task_render_pipeline_states: TaskRenderPipelineStates::default(),
@@ -2755,7 +2751,6 @@ impl DeviceState {
             stamp_ledger: Default::default(),
             gva_resident_backing: std::collections::BTreeMap::new(),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
-            #[cfg(feature = "backend-vulkan")]
             gather_witness: crate::runtime::gather_witness::GatherWitness::default(),
             bound_buffers: crate::runtime::bound_buffers::BoundBuffers::default(),
             buffer_write_gen: crate::runtime::buffer_write_gen::BufferWriteGens::default(),
@@ -2828,7 +2823,6 @@ impl DeviceState {
         // sets, and they are not reachable from any `MappingEntry` — so the
         // loop above cannot see them and a reset that only walked mappings left
         // them armed on the host forever.
-        #[cfg(feature = "backend-vulkan")]
         tokens.extend(self.gather_witness.take_tokens());
         tokens.extend(self.gva_store_witness.take_tokens());
         // Back onto the retired list rather than out through the return value:
@@ -3141,7 +3135,6 @@ impl DeviceState {
         self.objects.retain(|&(t, _)| t != task_id);
         self.task_resources.delete_task(task_id);
         self.task_sampler_states.delete_task(task_id);
-        #[cfg(feature = "backend-vulkan")]
         crate::runtime::drain::note_store_route_n(
             "ds_state_task_deleted",
             self.task_depth_stencil_states.delete_task(task_id) as u64,
@@ -3199,7 +3192,6 @@ impl DeviceState {
         self.objects.retain(|&(t, _)| t != task_id);
         self.task_resources.delete_task(task_id);
         self.task_sampler_states.delete_task(task_id);
-        #[cfg(feature = "backend-vulkan")]
         crate::runtime::drain::note_store_route_n(
             "ds_state_task_deleted",
             self.task_depth_stencil_states.delete_task(task_id) as u64,

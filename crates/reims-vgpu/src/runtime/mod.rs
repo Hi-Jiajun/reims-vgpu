@@ -43,7 +43,6 @@ pub mod exec;
 pub mod fence_exec;
 /// Is the hypervisor's guest-write generation a sound cache key for the
 /// zero-copy sampled gathers? Measurement, not policy.
-#[cfg(feature = "backend-vulkan")]
 pub mod gather_witness;
 /// Guest-physical control-plane writes via HostOps map_pages.
 pub mod gpa_map;
