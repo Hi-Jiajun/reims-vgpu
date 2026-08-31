@@ -198,7 +198,7 @@ pub(super) fn direct_destination<M: HostMemory + HostOps>(
 /// The destination that *can* describe it already existed on the render rail,
 /// resolving the sample window, walking the mapping's page entries and building
 /// the same [`crate::backend::vulkan::engine::GuestPageTarget`] this rail wants.
-/// It is now [`crate::runtime::mapping_write::licence_type11_surface`] and both
+/// It is now [`crate::runtime::mapping_write::vulkan::licence_type11_surface`] and both
 /// rails ask it, so the surface geometry, the format rule, the page walk and the
 /// guest-RAM references have one spelling rather than two.
 ///
@@ -232,11 +232,11 @@ pub(super) fn type11_destination<M: HostMemory + HostOps>(
     // plane-correct for a type-5 view and already a sub-rectangle where the
     // dispatch writes one, and it is the same window the readback rail lands
     // through — so the two rails cannot name different bytes of one surface.
-    match crate::runtime::mapping_write::licence_type11_surface(
+    match crate::runtime::mapping_write::vulkan::licence_type11_surface(
         state,
         host,
         held,
-        &crate::runtime::mapping_write::Type11SurfaceDestination {
+        &crate::runtime::mapping_write::vulkan::Type11SurfaceDestination {
             mapping_id: *mapping_id,
             base_off: *surface_offset,
             bpr: *surface_bpr,
@@ -1316,7 +1316,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                         surface_offset,
                         span_end,
                         ..
-                    } => crate::runtime::mapping_write::note_type11_landed(
+                    } => crate::runtime::mapping_write::vulkan::note_type11_landed(
                         state,
                         *mapping_id,
                         *surface_offset,

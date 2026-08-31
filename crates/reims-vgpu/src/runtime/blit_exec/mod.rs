@@ -3643,7 +3643,7 @@ struct GpuPlane {
     pixel_format: u16,
 }
 
-/// The plane `mapping_write::write_bgra8_from_resident_gpu` will address, from
+/// The plane `mapping_write::vulkan::write_bgra8_from_resident_gpu` will address, from
 /// the destination mapping's own declaration rather than from the texture
 /// descriptor the blit named.
 ///

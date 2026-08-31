@@ -506,7 +506,7 @@
 //! read those three numbers as something a fresh log can confirm.
 //!
 //! What the rail did buy is real and is kept: the Store does not read the frame
-//! back off the GPU. [`crate::runtime::mapping_write::write_bgra8_from_resident_gpu`]
+//! back off the GPU. [`crate::runtime::mapping_write::vulkan::write_bgra8_from_resident_gpu`]
 //! makes the guest's own pages the destination of the copy the GPU was going to
 //! make anyway, so nothing crosses host memory on the arm that runs. Landing at
 //! the Store keeps that and drops the window.

@@ -707,7 +707,7 @@ pub enum ReadbackPhase {
     ///
     /// Reads zero on a window the GPU rail landed, because that rail's
     /// destination *is* the guest's pages and there is no second pass to time.
-    /// See `mapping_write::write_bgra8_from_resident_gpu`.
+    /// See `mapping_write::vulkan::write_bgra8_from_resident_gpu`.
     Write,
     /// Re-walk the mapping's page list against the guest's page table
     /// (`mapper::vouch_mapping_pages_verdict`), which is what licenses any write

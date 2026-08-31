@@ -38,7 +38,7 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
     // The GPU writes the guest's pages directly. Tried first because when it
     // works there is nothing left to do: no staging buffer is mapped and no
     // host pass over the frame happens at all.
-    match crate::runtime::mapping_write::write_bgra8_from_resident_gpu(
+    match crate::runtime::mapping_write::vulkan::write_bgra8_from_resident_gpu(
         state, host, mapping_id, identity, width, height,
     ) {
         Ok(bytes) => {
@@ -200,10 +200,10 @@ pub fn store_guest_backed_frame(
     height: u32,
     guest_store_recorded: bool,
     guest_store_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint>,
-) -> Result<(), crate::runtime::mapping_write::GpuWritebackDecline> {
+) -> Result<(), crate::runtime::mapping_write::vulkan::GpuWritebackDecline> {
     let started = std::time::Instant::now();
     crate::runtime::drain::note_store_route("surface_flush");
-    let bytes = crate::runtime::mapping_write::synchronize_guest_backed_resident(
+    let bytes = crate::runtime::mapping_write::vulkan::synchronize_guest_backed_resident(
         state,
         mapping_id,
         identity,
