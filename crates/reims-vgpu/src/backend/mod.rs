@@ -89,6 +89,10 @@ pub mod metal;
 #[cfg(feature = "backend-vulkan")]
 pub mod vulkan;
 
+use crate::model::DeviceState;
+use crate::runtime::draw::{DrawEncodeRequest, EncodeStatus};
+use crate::runtime::host::{HostMemory, HostOps};
+
 /// What the device executes guest work through.
 ///
 /// The trait names the operations the runtime cannot perform itself, and
@@ -122,6 +126,48 @@ pub trait Backend: Copy {
     /// Immutable, content-keyed shader/pipeline caches may survive. Guest object
     /// identities, resident images, and aliases of guest memory must not.
     fn reset(&self);
+
+    /// Execute one decoded draw chain, and land its colour target in guest
+    /// memory when `writeback_guest`.
+    ///
+    /// `req` is backend-neutral: every field is a decoded guest fact, and the
+    /// two rails read the same request. What differs is entirely below this
+    /// call — Metal encodes an `MTLRenderCommandEncoder`, Vulkan builds an
+    /// `engine::DrawRequest` — and the asymmetry that matters is *not* in the
+    /// arguments but in the Store: each rail owns when the frame reaches the
+    /// guest's pages, which is why the return carries the tight RGBA8 colour 0
+    /// rather than a promise that the write happened.
+    ///
+    /// `force_full_store` is a Metal term (its Store can be scissor-local); the
+    /// Vulkan rail ignores it. It is a parameter rather than a rail-specific
+    /// entry point because the *caller's* reason for setting it — an abandoned
+    /// chain whose partial target must not be published — is a device fact, not
+    /// a Metal one.
+    fn encode_draw_chain<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        req: &mut DrawEncodeRequest,
+        writeback_guest: bool,
+        force_full_store: bool,
+    ) -> (EncodeStatus, Option<Vec<u8>>);
+
+    /// Execute a range of an indirect command buffer the guest has filled.
+    ///
+    /// A backend may not have one: `executeCommandsInBuffer:` is a Metal
+    /// concept, and the Vulkan rail answers
+    /// [`EncodeStatus::NoMetal`] rather than pretending. That refusal is the
+    /// contract — the caller turns it into a latched `render_icb` refusal — so
+    /// this is not a method with a silent default.
+    fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        req: &DrawEncodeRequest,
+        icb_ref: u32,
+        range_location: u64,
+        range_length: u64,
+    ) -> EncodeStatus;
 }
 
 /// The backend a device executes through, resolved once per process.
@@ -159,6 +205,57 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.reset(),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.reset(),
+        }
+    }
+
+    fn encode_draw_chain<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        req: &mut DrawEncodeRequest,
+        writeback_guest: bool,
+        force_full_store: bool,
+    ) -> (EncodeStatus, Option<Vec<u8>>) {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => {
+                b.encode_draw_chain(state, host, req, writeback_guest, force_full_store)
+            }
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => {
+                b.encode_draw_chain(state, host, req, writeback_guest, force_full_store)
+            }
+        }
+    }
+
+    fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        req: &DrawEncodeRequest,
+        icb_ref: u32,
+        range_location: u64,
+        range_length: u64,
+    ) -> EncodeStatus {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.encode_icb_execute_and_writeback(
+                state,
+                host,
+                req,
+                icb_ref,
+                range_location,
+                range_length,
+            ),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.encode_icb_execute_and_writeback(
+                state,
+                host,
+                req,
+                icb_ref,
+                range_location,
+                range_length,
+            ),
         }
     }
 }

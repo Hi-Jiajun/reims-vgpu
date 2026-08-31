@@ -4,6 +4,9 @@
 //! Draws try Metal encode when pipeline MTLBs resolve; otherwise color targets
 //! are still marked dirty for DisplaySwap.
 
+// The backend the process executes on, reached only through the trait: this
+// module names no rail.
+use crate::backend::Backend as _;
 use crate::contract::draw::DrawArgs;
 use crate::contract::endian::{ld32, ld64};
 use crate::contract::pass_action::{
@@ -3304,7 +3307,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                         }
                     }
                 };
-                match draw::encode_icb_execute_and_writeback(
+                match crate::backend::selected().encode_icb_execute_and_writeback(
                     state,
                     host,
                     &req,
@@ -3474,8 +3477,13 @@ fn finish_stream<M: HostMemory + HostOps>(
                 }
                 let draw_started = std::time::Instant::now();
                 fin.enter(crate::runtime::drain::FinishPhase::Encode);
-                let encode =
-                    draw::encode_draw_chain(state, host, &mut req, do_writeback, force_full_store);
+                let encode = crate::backend::selected().encode_draw_chain(
+                    state,
+                    host,
+                    &mut req,
+                    do_writeback,
+                    force_full_store,
+                );
                 fin.enter(crate::runtime::drain::FinishPhase::Result);
                 // Read before the status is matched: a draw whose Store failed
                 // still ran its query, and the count is the guest's answer

@@ -5928,7 +5928,7 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
                 ))
             }
         };
-        reims_vgpu_samplers.push(crate::runtime::draw::sampler_record(
+        reims_vgpu_samplers.push(crate::runtime::draw::metal::sampler_record(
             REIMS_VGPU_BINDING_SAMPLER_BASE + s.index,
             &sampler.descriptor,
             s.has_lod_clamp.then_some((s.lod_min_bits, s.lod_max_bits)),

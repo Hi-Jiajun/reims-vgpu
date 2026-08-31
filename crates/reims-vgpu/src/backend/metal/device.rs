@@ -10,6 +10,9 @@
 
 use crate::backend::metal::runtime::system_device;
 use crate::backend::Backend;
+use crate::model::DeviceState;
+use crate::runtime::draw::{self, DrawEncodeRequest, EncodeStatus};
+use crate::runtime::host::{HostMemory, HostOps};
 
 /// The Metal rail's [`Backend`] handle.
 ///
@@ -54,6 +57,36 @@ impl Backend for MetalBackend {
 
     fn reset(&self) {
         crate::runtime::icb::clear_icb_cache();
+    }
+
+    fn encode_draw_chain<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        req: &mut DrawEncodeRequest,
+        writeback_guest: bool,
+        force_full_store: bool,
+    ) -> (EncodeStatus, Option<Vec<u8>>) {
+        draw::metal::encode_draw_chain(state, host, req, writeback_guest, force_full_store)
+    }
+
+    fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        req: &DrawEncodeRequest,
+        icb_ref: u32,
+        range_location: u64,
+        range_length: u64,
+    ) -> EncodeStatus {
+        draw::metal::encode_icb_execute_and_writeback(
+            state,
+            host,
+            req,
+            icb_ref,
+            range_location,
+            range_length,
+        )
     }
 }
 

@@ -13,10 +13,10 @@ use super::*;
 /// Retained Metal objects for the duration of one ICB execute command buffer.
 #[derive(Default)]
 struct IcbEncoderKeepAlive {
-    buffers: Vec<metal::Buffer>,
-    textures: Vec<metal::Texture>,
-    samplers: Vec<metal::SamplerState>,
-    pso: Option<metal::RenderPipelineState>,
+    buffers: Vec<::metal::Buffer>,
+    textures: Vec<::metal::Texture>,
+    samplers: Vec<::metal::SamplerState>,
+    pso: Option<::metal::RenderPipelineState>,
 }
 
 /// A parent-render-encoder state bind that cannot be inherited by a Metal ICB.
@@ -279,8 +279,8 @@ impl crate::observe::Decline for MetalIcbInheritanceDecline {
 fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
-    device: &metal::Device,
-    enc: &metal::RenderCommandEncoderRef,
+    device: &::metal::Device,
+    enc: &::metal::RenderCommandEncoderRef,
     req: &DrawEncodeRequest,
     icb_desc: &crate::runtime::decode::resource::IndirectCommandBufferDescriptor,
     pass_w: u32,
@@ -288,7 +288,7 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
     keep: &mut IcbEncoderKeepAlive,
 ) -> Result<(), MetalIcbInheritanceDecline> {
     use crate::backend::metal::samplers::{make_default_sampler, make_explicit_sampler};
-    use metal::*;
+    use ::metal::*;
     use std::os::raw::c_char;
 
     // One bound for all three classes and both stages, asked before any resource
@@ -373,7 +373,7 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
     // Shared buffer staging (copy into Metal so guest Vec can drop). A
     // successful `load_buffer_bytes` is nonempty by construction: its
     // `host_alloc_len(avail).filter(|n| n > 0)` rejects the zero-span case.
-    let stage_mtl_buf = |bytes: &[u8]| -> Result<metal::Buffer, MetalIcbInheritanceDecline> {
+    let stage_mtl_buf = |bytes: &[u8]| -> Result<::metal::Buffer, MetalIcbInheritanceDecline> {
         unsafe {
             crate::backend::metal::raw_metal::new_buffer_with_data(
                 device,
@@ -736,7 +736,7 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
     use crate::backend::metal::runtime::{system_device, thread_queue};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::icb::{fill_icb_from_command_memory, resolve_metal_icb};
-    use metal::*;
+    use ::metal::*;
 
     if icb_ref == 0 {
         return EncodeStatus::BadArgs("icb_exec_ref_zero");
