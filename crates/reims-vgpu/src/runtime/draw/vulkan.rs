@@ -3016,11 +3016,22 @@ fn coalesce_pages_to_runs<M: HostOps>(
     let stretches = reims_vgpu_paging::runs::coalesce_window(window, page, head_off, span)?;
     let mut runs: Vec<engine::GuestRun> = Vec::with_capacity(stretches.len());
     for s in stretches {
-        let base = host.map_pages(&window[s.pages], page as usize)? as u64;
-        runs.push(engine::GuestRun {
-            host_ptr: (base + s.start_offset) as usize,
-            len: s.len,
-        });
+        // The view covers exactly the pages handed to `map_pages`, so its
+        // length is the bound the stretch is cut against — and
+        // `coalesce_window` already guarantees `start_offset + len` fits it
+        // (`reims_vgpu_paging::runs`'s `a_stretch_stays_inside_the_pages_it_
+        // names`). Passing the bound anyway is what keeps the guarantee from
+        // being two crates apart from the arithmetic that relies on it; a
+        // refusal here takes the same `None` this function already returns when
+        // the host cannot map the window at all.
+        let pages = s.pages.len() as u64;
+        let base = host.map_pages(&window[s.pages], page as usize)?;
+        runs.push(engine::GuestRun::in_mapping(
+            base,
+            pages * page,
+            s.start_offset,
+            s.len,
+        )?);
     }
     Some(runs)
 }
@@ -3114,6 +3125,20 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
             return None;
         }
         let host_base = host.map_pages(&gpas, page as usize)?;
+        // Cut in the *view's* coordinates, and cut here rather than below,
+        // because `head` is about to be rebound. The RAMBlock arm below
+        // replaces it with an offset measured from the import's `gpa_base`,
+        // which for a chunk covering more than this window is a larger number
+        // naming the same byte in a different space. Adding that to this base
+        // named an address past the end of the view by the window's distance
+        // into the block, and `write_staging_from_runs` — `exec`'s "no import
+        // on this host, or an offset it will not bind at" arm — read it.
+        let run = crate::runtime::guest_ram::GuestRun::in_mapping(
+            host_base,
+            map_len,
+            head,
+            backing.size,
+        )?;
         // A packed view answers a **scatter**: Vulkan host-pointer memory takes
         // one contiguous host range, and a linear guest resource may name guest
         // pages that are not contiguous. When this window's pages *are* one run
@@ -3180,10 +3205,7 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
             head,
             import,
             gpas: std::sync::Arc::new(gpas),
-            runs: std::sync::Arc::new(vec![crate::backend::vulkan::engine::GuestRun {
-                host_ptr: host_base.checked_add(head as usize)?,
-                len: backing.size,
-            }]),
+            runs: std::sync::Arc::new(vec![run]),
             pages: std::sync::Arc::new(vec![crate::runtime::guest_ram_map::GuestWindowRun {
                 window_offset: 0,
                 guest,
@@ -3340,10 +3362,8 @@ fn mapped_sampled_source<M: HostMemory + HostOps>(
         origin,
     });
     Some(GuestRunSource {
-        runs: std::sync::Arc::new(vec![GuestRun {
-            host_ptr: import.host_base(),
-            len: import.len(),
-        }]),
+        // The whole import, which is the mapping and the window at once.
+        runs: std::sync::Arc::new(vec![GuestRun::whole(import.host_base(), import.len())?]),
         source_offset: base_off,
         total_len: span,
         row_length_texels,
@@ -4595,13 +4615,15 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             let witness_gpas = packed
                 .gpas
                 .get(first_page..first_page.checked_add(page_count)?)?;
-            let witness_runs = [engine::GuestRun {
-                host_ptr: packed
-                    .import
-                    .host_base()
-                    .checked_add(usize::try_from(packed_offset).ok()?)?,
-                len: span,
-            }];
+            // Import coordinates on both sides: `packed.head` is an offset
+            // from the import's own base, so the mapping this is cut from is
+            // the import and its bound is the import's length.
+            let witness_runs = [engine::GuestRun::in_mapping(
+                packed.import.host_base(),
+                packed.import.len(),
+                packed_offset,
+                span,
+            )?];
             let seen = crate::runtime::gather_witness::note_gather(
                 state,
                 host,
@@ -12489,7 +12511,7 @@ mod vulkan_split_tests {
         assert_eq!(seed.source.total_len, span);
         assert_eq!(seed.source.row_length_texels, row_length_texels);
         assert_eq!(
-            seed.source.runs.iter().map(|run| run.len).sum::<u64>(),
+            seed.source.runs.iter().map(|run| run.len()).sum::<u64>(),
             seed.source.total_len
         );
 

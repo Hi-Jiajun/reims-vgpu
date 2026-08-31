@@ -5757,6 +5757,93 @@ fn the_packed_alias_rail_refuses_on_a_host_whose_map_refused() {
     crate::runtime::guest_ram_map::reset();
 }
 
+/// A packed buffer's run names the window's own bytes, whichever rail resolved
+/// it.
+///
+/// `PackedBuffer::runs` is the host span the CPU gather walks when the direct
+/// import declines a bind — `exec`'s third arm, "no import on this host, or an
+/// offset it will not bind at". `HostOps::map_pages` returns a view over
+/// *exactly the pages it was given*, so the window's first byte sits at the
+/// in-page offset of `gva` inside that view. A `GuestRamImport`'s offsets are
+/// relative to the import's own `gpa_base`, which for a RAMBlock chunk is at or
+/// below the window. The two coordinates differ by the window's distance into
+/// the block, and adding one to the other's base names a host address outside
+/// the view — which the gather then reads.
+///
+/// The window here starts two pages into its RAM range, so the two offsets are
+/// not equal and the test can tell them apart. The expected address comes from
+/// the host's own region table, not from the resolution being checked.
+#[test]
+#[cfg(feature = "backend-vulkan")]
+fn a_packed_run_names_the_window_and_not_its_offset_into_the_block() {
+    crate::runtime::guest_ram_map::reset();
+    use crate::contract::endian::st32;
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+
+    let page_shift = PAGE_SHIFT_X86;
+    let page = 1u64 << page_shift;
+    let mut host = FakeHost::new();
+    host.stable_map_pages = true;
+    let (dir_gpa, root_gpa, data_gpa) = (2 * page, 3 * page, 6 * page);
+    host.map_range(dir_gpa, page as usize, 0);
+    host.map_range(root_gpa, page as usize, 0);
+    // The data range starts two pages *below* the window, so the import's
+    // `gpa_base` is below `gpas[0]` and the two offsets differ.
+    host.map_range(4 * page, (8 * page) as usize, 0);
+    let mut directory = [0u8; 8];
+    st32(&mut directory[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut directory[DIRECTORY_DEPTH as usize..], 1);
+    host.write_gpa(dir_gpa, &directory).unwrap();
+    let mut ptes = [0u8; 24];
+    for (i, pte) in ptes.chunks_exact_mut(4).enumerate() {
+        st32(pte, (data_gpa >> page_shift) as u32 + i as u32);
+    }
+    host.write_gpa(root_gpa, &ptes).unwrap();
+
+    crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
+    let mut state = DeviceState::new(DeviceId(1), page_shift);
+    state.define_task(1, page, 2);
+    let backing = super::BufferBacking {
+        gva: 0x800,
+        size: 0x1800,
+    };
+    let head = backing.gva & (page - 1);
+    let window_gpa = data_gpa;
+
+    // The host's own answer for where the window's first byte lives, taken
+    // before the resolution runs so it cannot be a restatement of it.
+    let region = host
+        .guest_ram_regions()
+        .expect("the fixture reports its ranges")
+        .into_iter()
+        .find(|r| r.gpa_base <= window_gpa && window_gpa - r.gpa_base < r.len)
+        .expect("the window is inside a reported range");
+    let expected = (region.host_va + (window_gpa - region.gpa_base) + head) as usize;
+
+    assert!(super::vulkan::ensure_packed_resource(
+        &mut state,
+        &mut host,
+        1,
+        7,
+        &backing,
+        super::vulkan::PackedResourceRail::Buffer,
+    ));
+    let packed = state
+        .bound_buffers
+        .packed_available(1, 7, backing.gva, backing.size)
+        .expect("the fully mapped allocation must pack");
+    assert_eq!(packed.runs.len(), 1, "a contiguous window is one run");
+    assert_eq!(
+        packed.runs[0].host_ptr(),
+        expected,
+        "the run must start at the window's first byte, not at the view base \
+         plus the window's offset into the whole block"
+    );
+    assert_eq!(packed.runs[0].len(), backing.size);
+    crate::runtime::guest_ram::forget_import_limits();
+    crate::runtime::guest_ram_map::reset();
+}
+
 /// One whole-buffer host allocation is made per task/reference and offset binds
 /// become slices of it. The second lookup must not ask the host to reconstruct
 /// the same virtual range again.

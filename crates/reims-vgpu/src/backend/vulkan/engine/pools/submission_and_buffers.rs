@@ -3100,20 +3100,20 @@ impl ResourcePools {
                 if off >= total {
                     break;
                 }
-                if skip >= run.len {
-                    skip -= run.len;
+                if skip >= run.len() {
+                    skip -= run.len();
                     continue;
                 }
                 let within = skip as usize;
                 skip = 0;
-                let available = (run.len as usize).saturating_sub(within);
+                let available = (run.len() as usize).saturating_sub(within);
                 let n = available.min(total - off);
                 // SAFETY: `host_ptr` is a stable RAMBlock alias from
                 // `HostOps::map_pages`, valid for the VM lifetime; `ptr` is the
                 // mapped staging span of `size >= total` bytes and `off + n <=
                 // total`, so the destination stays in bounds.
                 std::ptr::copy_nonoverlapping(
-                    (run.host_ptr as *const u8).add(within),
+                    (run.host_ptr() as *const u8).add(within),
                     ptr.add(off),
                     n,
                 );
