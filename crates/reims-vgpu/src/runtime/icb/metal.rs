@@ -128,7 +128,7 @@ fn icb_cache() -> &'static parking_lot::Mutex<HashMap<(u32, u32), HostIcbEntry>>
 /// registry beside it: one entry point clears both, because a registry entry
 /// outliving its host object would name a descriptor no
 /// `MTLIndirectCommandBuffer` was built from.
-pub(super) fn clear_host_icb_cache() {
+pub(crate) fn clear_host_icb_cache() {
     icb_cache().lock().clear();
 }
 

@@ -615,6 +615,10 @@ impl Backend for VulkanBackend {
         draw::vulkan::read_plane_draw_ring(reader, mapping_id).to_string()
     }
 
+    fn forget_plane_draws(&self, mapping_id: u32) {
+        draw::vulkan::forget_plane_draw_ring(mapping_id);
+    }
+
     fn emit_census(&self, site: CensusSite) {
         match site {
             CensusSite::Serialization { win_ms } => census::emit_engine_lock(win_ms),

@@ -14382,7 +14382,7 @@ pub(crate) fn read_plane_draw_ring(reader: PlaneDrawReader, mapping_id: u32) -> 
 /// Called where the guest releases the mapping, so the ring is bounded by the
 /// live compositor surfaces rather than by every id the boot has ever used, and
 /// so a recycled id cannot inherit its predecessor's passes.
-pub fn forget_plane_draw_ring(mapping_id: u32) {
+pub(crate) fn forget_plane_draw_ring(mapping_id: u32) {
     PLANE_DRAW_RING
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

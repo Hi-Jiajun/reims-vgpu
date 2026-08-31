@@ -762,6 +762,31 @@ pub(crate) trait Backend: Copy {
         String::new()
     }
 
+    /// Drop every host indirect-command buffer this rail built from a recorded
+    /// ICB descriptor.
+    ///
+    /// The rail half of [`crate::runtime::icb::clear_icb_cache`], which clears
+    /// the neutral registry in the same call. The two are one entry point on
+    /// purpose: a registry entry outliving its host object would name a
+    /// descriptor nothing was built from, and a host object outliving its
+    /// registry entry is host GPU memory nothing will ever ask for again.
+    ///
+    /// Free on a rail that builds no host ICB.
+    fn forget_host_icbs(&self) {}
+
+    /// Drop whatever this rail remembers about draws into one plane, because
+    /// the mapping that named it is gone.
+    ///
+    /// Called by the model from `forget_compositor_mapping`, at the one point
+    /// where a mapping id stops naming the surface it named. The record is
+    /// keyed by that id, so a rail that kept it and a recycled id would have
+    /// the next surface inherit its predecessor's passes — which is a wrong
+    /// reading of a live plane, not a stale counter.
+    ///
+    /// Free on a rail that keeps no such record, which is what
+    /// [`Self::plane_draw_witness`]'s empty string already says.
+    fn forget_plane_draws(&self, _mapping_id: u32) {}
+
     /// The raster sample count the bound pipeline declares, when this rail has
     /// to make the attachment match it.
     ///
@@ -1607,6 +1632,24 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.plane_draw_witness(reader, mapping_id),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.plane_draw_witness(reader, mapping_id),
+        }
+    }
+
+    fn forget_plane_draws(&self, mapping_id: u32) {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.forget_plane_draws(mapping_id),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.forget_plane_draws(mapping_id),
+        }
+    }
+
+    fn forget_host_icbs(&self) {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.forget_host_icbs(),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.forget_host_icbs(),
         }
     }
 

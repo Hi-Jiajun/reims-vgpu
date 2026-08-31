@@ -64,6 +64,10 @@ impl Backend for MetalBackend {
         crate::runtime::icb::clear_icb_cache();
     }
 
+    fn forget_host_icbs(&self) {
+        crate::runtime::icb::metal::clear_host_icb_cache();
+    }
+
     fn encode_draw_chain<M: HostMemory + HostOps>(
         &self,
         state: &mut DeviceState,
