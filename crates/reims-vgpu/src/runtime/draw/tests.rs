@@ -2863,7 +2863,19 @@ fn mrt_draw_request_gets_attachment_samples_from_the_bound_pipeline_before_encod
 
     let req = single_rt_draw_request(&mut state, &mut host, 7, att)
         .expect("matching source and resolve geometry is representable");
-    assert_eq!(req.colors[0].sample_count, 4);
+    // Both halves of the policy, keyed on the rail that *ran*. Taking the
+    // pipeline's count is `Backend::pipeline_raster_sample_count` — a rail's
+    // answer, not a property of the build — and a rail that does not consult
+    // the pipeline keeps the resolved target's provisional 1. A `cfg` here
+    // would assert the consulting rail's 4 against a binary that carries both
+    // and happened to run the other one.
+    assert_eq!(
+        req.colors[0].sample_count,
+        match crate::backend::selected().rail() {
+            crate::backend::Rail::Vulkan => 4,
+            crate::backend::Rail::Metal => 1,
+        }
+    );
     assert_eq!(
         req.colors[0].texture_ref, 43,
         "the published resolve target"

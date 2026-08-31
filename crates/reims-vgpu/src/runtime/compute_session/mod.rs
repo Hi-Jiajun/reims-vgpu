@@ -291,6 +291,11 @@ pub fn finish_session<M: HostMemory + HostOps>(
 mod tests {
 
     use super::*;
+    // The Metal rail by name, not `backend::selected()`: these tests open a
+    // Metal compute session and assert what it does with it, and a binary
+    // carrying both rails may be *running* the other one.
+    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+    use crate::backend::metal::MetalBackend;
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     use crate::contract::endian::{st32, st64};
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
@@ -354,9 +359,7 @@ mod tests {
             write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
         }
 
-        let mut session = crate::backend::selected()
-            .open_compute_session(0)
-            .expect("metal session");
+        let mut session = MetalBackend.open_compute_session(0).expect("metal session");
         let start = ComputeCommand {
             kind: Kind::ControlStartIf,
             condition_buffer_ref: 7,
@@ -487,9 +490,7 @@ mod tests {
 
         // Phase A: nested dispatch alone on a session (no control SPI).
         {
-            let mut session = crate::backend::selected()
-                .open_compute_session(0)
-                .expect("session");
+            let mut session = MetalBackend.open_compute_session(0).expect("session");
             let mut acc = ComputeAccum::default();
             acc.set_pipeline(6);
             acc.buffers.push(ComputeBufferBind {
@@ -506,7 +507,7 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                crate::backend::selected().execute_dispatch_nested(
+                MetalBackend.execute_dispatch_nested(
                     &mut state,
                     &mut host,
                     1,
@@ -542,9 +543,7 @@ mod tests {
         // Phase B: if wraps nested dispatch. Concurrent encoder is the intended
         // SPI host for encodeStartIf. Wire comparison is the Reims VGPU encoder's enum
         // (not MTLCompareFunction): Equal=0 for buffer==reference (probed).
-        let mut session = crate::backend::selected()
-            .open_compute_session(1)
-            .expect("session");
+        let mut session = MetalBackend.open_compute_session(1).expect("session");
         let start = ComputeCommand {
             kind: Kind::ControlStartIf,
             condition_buffer_ref: 8,
@@ -572,7 +571,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            crate::backend::selected().execute_dispatch_nested(
+            MetalBackend.execute_dispatch_nested(
                 &mut state,
                 &mut host,
                 1,

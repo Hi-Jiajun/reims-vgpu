@@ -699,6 +699,21 @@ pub enum SelectedBackend {
     Vulkan(vulkan::VulkanBackend),
 }
 
+impl SelectedBackend {
+    /// Which rail this is, by name only.
+    ///
+    /// The inverse of [`build`], and the form a report or a comparison wants: a
+    /// handle carries a live GPU context and a [`Rail`] carries the answer.
+    pub fn rail(self) -> Rail {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(_) => Rail::Metal,
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(_) => Rail::Vulkan,
+        }
+    }
+}
+
 impl Backend for SelectedBackend {
     fn name(&self) -> &'static str {
         match self {
@@ -1102,6 +1117,210 @@ impl Backend for SelectedBackend {
     }
 }
 
+/// A rail by name — what an operator may ask for and what this device reports.
+///
+/// Names only, because the decision that picks one is made *before* a handle
+/// exists: bringing a rail up is what measures it, and a table whose cells were
+/// live backends could not be evaluated without bringing both up. The spelling
+/// is the single source for the env value, the boot line and every refusal —
+/// [`Backend::name`] is derived from it, so a rail cannot be called one thing in
+/// a log and another in a variable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rail {
+    /// Native Metal on an Apple host.
+    Metal,
+    /// Vulkan — a native ICD on Linux, MoltenVK on an Apple host.
+    Vulkan,
+}
+
+impl Rail {
+    /// What this rail calls itself, everywhere.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Metal => "metal",
+            Self::Vulkan => "vulkan",
+        }
+    }
+
+    /// Every rail this crate can name, which is what [`crate::env::RAIL`] is
+    /// parsed against.
+    ///
+    /// Deliberately *not* narrowed to the rails a build compiled: an operator
+    /// who names a rail this binary does not carry has to be told that, and a
+    /// list that omitted it would report the ask as a misspelling instead.
+    pub const NAMES: [&'static str; 2] = [Self::Metal.name(), Self::Vulkan.name()];
+
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "metal" => Some(Self::Metal),
+            "vulkan" => Some(Self::Vulkan),
+            _ => None,
+        }
+    }
+
+    /// The other one. Used where a refusal has to fall back to something.
+    fn other(self) -> Self {
+        match self {
+            Self::Metal => Self::Vulkan,
+            Self::Vulkan => Self::Metal,
+        }
+    }
+}
+
+/// Which rails a build carries.
+///
+/// An enum rather than a pair of `bool`s because "neither" is not a build
+/// `lib.rs` permits, and two booleans would make that fourth state
+/// representable in the very table that decides what executes guest work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Compiled {
+    /// Only [`Rail::Metal`].
+    MetalOnly,
+    /// Only [`Rail::Vulkan`].
+    VulkanOnly,
+    /// Both, which is the configuration this whole seam exists for: one binary
+    /// that can run one guest stream two ways, so a defect can be attributed to
+    /// the translation or to this device.
+    Both,
+}
+
+/// What the operator asked for through [`crate::env::RAIL`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RailRequest {
+    /// Nothing set; the device takes its own default.
+    Unset,
+    /// A rail this crate can name. Not permission — see [`resolve_rail`].
+    Named(Rail),
+    /// Set to something that is not a rail name at all, carrying the raw text.
+    Unrecognized(String),
+}
+
+/// Why an operator's rail ask was not carried out.
+///
+/// Each variant is a *different operator mistake* with a different fix, which is
+/// why they are not one "bad value": one needs a different build, one needs a
+/// different host, and one needs a corrected spelling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RailRefusal {
+    /// Named a rail this build does not carry. The fix is a build, not a run.
+    NotCompiled(Rail),
+    /// Named a rail this host has no device for. **This is the narrowing rule
+    /// doing its job**: an override may turn a rail off and may never turn one
+    /// on, so an ask that would put guest work in front of an absent device is
+    /// refused rather than obeyed.
+    NotAvailable(Rail),
+    /// Not a rail name. Carries the raw text so the report quotes what the
+    /// operator typed.
+    Unrecognized(String),
+}
+
+impl RailRefusal {
+    /// The registered slug for the always-on failure channel.
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Self::NotCompiled(_) => "rail_not_compiled",
+            Self::NotAvailable(_) => "rail_not_available",
+            Self::Unrecognized(_) => "rail_unrecognized",
+        }
+    }
+}
+
+/// The rail this process runs on, and anything the operator has to be told.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RailChoice {
+    /// What runs.
+    pub rail: Rail,
+    /// `Some` when the ask could not be met. The device runs `rail` anyway —
+    /// refusing to start would turn a mistyped variable into a machine that
+    /// does not boot — but the refusal is on the always-on channel.
+    pub refusal: Option<RailRefusal>,
+}
+
+/// Decide the rail from what the build carries, what the host was measured able
+/// to run, and what the operator asked for — in that order of authority.
+///
+/// Pure and total, and compiled on **every** arm rather than only on the one
+/// that can exercise both branches. The rule being encoded is arithmetic over
+/// three inputs; needing two live GPUs present to check it would put its tests
+/// on no arm at all, which is exactly how the `not(backend-vulkan)` gates this
+/// seam replaced went stale unnoticed.
+///
+/// # `metal_available` is measured, and Vulkan's absence is not measurable here
+///
+/// Metal's probe is one `MTLCreateSystemDefaultDevice`, so "this host can run
+/// Metal" is a fact by the time this is called. Vulkan has no equivalent: its
+/// context is created lazily at the first real encode, precisely so protocol
+/// tests need no ICD, and asking whether an ICD exists *is* the instance
+/// creation that laziness defers. So a compiled Vulkan rail is treated as
+/// runnable, and a host with no ICD reports it where the first encode needs one.
+/// That asymmetry is real and is the reason Vulkan is the fallback rather than
+/// the preference.
+///
+/// # Why one compiled rail is chosen even when its device is absent
+///
+/// With a single rail there is nothing to fall back *to*, and a refusal here
+/// would replace "the draw found no Metal device" — which names the missing
+/// device at the point it was needed — with a failure at device create, which
+/// names the wrong thing. So `metal_available` only ever decides between two
+/// rails; it never disqualifies the only one.
+pub fn resolve_rail(
+    compiled: Compiled,
+    metal_available: bool,
+    requested: RailRequest,
+) -> RailChoice {
+    let carried = |rail: Rail| {
+        matches!(
+            (compiled, rail),
+            (Compiled::Both, _)
+                | (Compiled::MetalOnly, Rail::Metal)
+                | (Compiled::VulkanOnly, Rail::Vulkan)
+        )
+    };
+    // Unset on a both-rails build takes Metal when the host has one: it is the
+    // native rail on the only host that can carry both, and it is the reference
+    // the other is being compared against.
+    let default = match compiled {
+        Compiled::MetalOnly => Rail::Metal,
+        Compiled::VulkanOnly => Rail::Vulkan,
+        Compiled::Both if metal_available => Rail::Metal,
+        Compiled::Both => Rail::Vulkan,
+    };
+    let asked = match requested {
+        RailRequest::Unset => {
+            return RailChoice {
+                rail: default,
+                refusal: None,
+            }
+        }
+        RailRequest::Unrecognized(raw) => {
+            return RailChoice {
+                rail: default,
+                refusal: Some(RailRefusal::Unrecognized(raw)),
+            }
+        }
+        RailRequest::Named(rail) => rail,
+    };
+    if !carried(asked) {
+        return RailChoice {
+            rail: asked.other(),
+            refusal: Some(RailRefusal::NotCompiled(asked)),
+        };
+    }
+    // The narrowing rule. Only reachable on a both-rails build: with one rail
+    // carried, `carried` already sent the other ask away and this one is the
+    // only rail there is.
+    if asked == Rail::Metal && compiled == Compiled::Both && !metal_available {
+        return RailChoice {
+            rail: Rail::Vulkan,
+            refusal: Some(RailRefusal::NotAvailable(Rail::Metal)),
+        };
+    }
+    RailChoice {
+        rail: asked,
+        refusal: None,
+    }
+}
+
 /// The backend this process runs on.
 ///
 /// Latched, and read through this function everywhere. The choice is a property
@@ -1117,21 +1336,113 @@ pub fn selected() -> SelectedBackend {
     *SELECTED.get_or_init(select)
 }
 
-/// Resolve the process's backend from what this build compiled.
+/// What [`crate::env::RAIL`] says, in this module's vocabulary.
+fn requested_rail() -> RailRequest {
+    match crate::env::choice(crate::env::RAIL, &Rail::NAMES) {
+        crate::env::Choice::Unset => RailRequest::Unset,
+        crate::env::Choice::Named(name) => match Rail::from_name(name) {
+            Some(rail) => RailRequest::Named(rail),
+            // Unreachable while `Rail::NAMES` is what was parsed against, and
+            // spelled as a value rather than as a panic because nothing here
+            // may panic across the QEMU boundary.
+            None => RailRequest::Unrecognized(name.to_owned()),
+        },
+        crate::env::Choice::Refused(raw) => RailRequest::Unrecognized(raw),
+    }
+}
+
+/// Which rails this build carries.
 ///
-/// With one arm compiled there is nothing to decide, and in particular a failed
-/// Metal probe is **not** a reason to refuse: a Metal build with no `MTLDevice`
-/// already runs today and reports the absence where a draw needs it, which
-/// names the missing device instead of the device create that came first.
-/// Probing is what a build carrying *both* arms will select on.
-fn select() -> SelectedBackend {
+/// The one `cfg` in the selection, and the honest one: every other question
+/// here is about the *host* or the *operator*, and only this one is about the
+/// build. `lib.rs` rejects a build with neither rail, which is what makes these
+/// three arms total.
+const fn compiled() -> Compiled {
+    #[cfg(all(feature = "backend-metal", feature = "backend-vulkan"))]
+    {
+        Compiled::Both
+    }
+    #[cfg(all(feature = "backend-metal", not(feature = "backend-vulkan")))]
+    {
+        Compiled::MetalOnly
+    }
+    #[cfg(all(feature = "backend-vulkan", not(feature = "backend-metal")))]
+    {
+        Compiled::VulkanOnly
+    }
+}
+
+/// Whether this host exposes a Metal device, measured rather than assumed.
+///
+/// `false` on a build with no Metal rail, which is not a measurement and does
+/// not have to be: [`resolve_rail`] only consults it to choose *between* rails,
+/// and a build without the Metal rail has no such choice to make.
+fn metal_available() -> bool {
     #[cfg(feature = "backend-metal")]
     {
-        SelectedBackend::Metal(metal::MetalBackend::probe())
+        metal::MetalBackend::available()
     }
-    #[cfg(feature = "backend-vulkan")]
+    #[cfg(not(feature = "backend-metal"))]
     {
-        SelectedBackend::Vulkan(vulkan::VulkanBackend::new())
+        false
+    }
+}
+
+/// Bring up the chosen rail and report what was chosen.
+///
+/// The report is unconditional and on the census channel, because "which rail
+/// ran" is the one fact every other line in the log has to be read against —
+/// and on a binary carrying both, it is no longer answerable from the build.
+fn select() -> SelectedBackend {
+    let choice = resolve_rail(compiled(), metal_available(), requested_rail());
+    if let Some(refusal) = &choice.refusal {
+        crate::observe::fail(format!(
+            "rail_refused reason={} asked={} running={} compiled={:?} \
+             (an override may narrow what this device does and never widen it)",
+            refusal.slug(),
+            match refusal {
+                RailRefusal::NotCompiled(rail) | RailRefusal::NotAvailable(rail) => rail.name(),
+                RailRefusal::Unrecognized(raw) => raw.as_str(),
+            },
+            choice.rail.name(),
+            compiled(),
+        ));
+    }
+    crate::observe::off(format!(
+        "rail_selected rail={} compiled={:?} metal_available={}",
+        choice.rail.name(),
+        compiled(),
+        metal_available() as u8
+    ));
+    build(choice.rail)
+}
+
+/// Construct the handle for one rail.
+///
+/// Separate from [`select`] so the policy above is free of `cfg` and this is the
+/// only place a rail's handle is created. The arms a build did not compile
+/// cannot be asked for: [`resolve_rail`] is given [`compiled`] and never returns
+/// one — but a total `match` still has to say what it would do, and it says the
+/// same thing the selection already decided rather than panicking.
+fn build(rail: Rail) -> SelectedBackend {
+    #[cfg(feature = "backend-metal")]
+    let metal = SelectedBackend::Metal(metal::MetalBackend::probe());
+    #[cfg(feature = "backend-vulkan")]
+    let vulkan = SelectedBackend::Vulkan(vulkan::VulkanBackend::new());
+    #[cfg(all(feature = "backend-metal", feature = "backend-vulkan"))]
+    match rail {
+        Rail::Metal => metal,
+        Rail::Vulkan => vulkan,
+    }
+    #[cfg(all(feature = "backend-metal", not(feature = "backend-vulkan")))]
+    {
+        let _ = rail;
+        metal
+    }
+    #[cfg(all(feature = "backend-vulkan", not(feature = "backend-metal")))]
+    {
+        let _ = rail;
+        vulkan
     }
 }
 
@@ -1145,10 +1456,128 @@ mod tests {
     fn the_selected_backend_is_latched_and_names_a_compiled_arm() {
         let first = selected();
         assert_eq!(first, selected());
-        assert!(matches!(first.name(), "metal" | "vulkan"));
-        #[cfg(feature = "backend-metal")]
-        assert_eq!(first.name(), "metal");
-        #[cfg(feature = "backend-vulkan")]
-        assert_eq!(first.name(), "vulkan");
+        assert_eq!(first.name(), first.rail().name());
+        match compiled() {
+            Compiled::MetalOnly => assert_eq!(first.rail(), Rail::Metal),
+            Compiled::VulkanOnly => assert_eq!(first.rail(), Rail::Vulkan),
+            // Both compiled: either is legal and which one is the *host's*
+            // answer, so assert the property that holds on any host — that the
+            // latched rail is the one the table names for this host and this
+            // environment, rather than pinning a machine-specific outcome.
+            Compiled::Both => assert_eq!(
+                first.rail(),
+                resolve_rail(Compiled::Both, metal_available(), requested_rail()).rail
+            ),
+        }
+    }
+
+    /// With nothing asked for, a build takes the rail it has — and, carrying
+    /// both, the host's native one when the host has it.
+    ///
+    /// The `Both` rows are the reason this table exists: they are the only ones
+    /// where "what did the build compile" and "what is running" differ, and
+    /// before this seam they could not differ at all.
+    #[test]
+    fn an_unset_rail_takes_the_native_one_a_build_carries() {
+        let unset = |compiled, metal| resolve_rail(compiled, metal, RailRequest::Unset);
+        assert_eq!(unset(Compiled::MetalOnly, true).rail, Rail::Metal);
+        assert_eq!(unset(Compiled::VulkanOnly, false).rail, Rail::Vulkan);
+        assert_eq!(unset(Compiled::Both, true).rail, Rail::Metal);
+        assert_eq!(unset(Compiled::Both, false).rail, Rail::Vulkan);
+        // A single rail runs even with no device behind it: there is nothing to
+        // fall back to, and the missing device has to be named where a draw
+        // needs it rather than at device create.
+        assert_eq!(unset(Compiled::MetalOnly, false).rail, Rail::Metal);
+        for compiled in [Compiled::MetalOnly, Compiled::VulkanOnly, Compiled::Both] {
+            for metal in [true, false] {
+                assert_eq!(unset(compiled, metal).refusal, None);
+            }
+        }
+    }
+
+    /// An ask this build or this host cannot meet is refused, never obeyed.
+    ///
+    /// This is `AGENTS.md`'s narrowing rule at the one place it decides which
+    /// GPU API executes guest work. Obeying `rail=metal` on a host with no
+    /// `MTLDevice` would put every draw in front of an absent device; obeying it
+    /// on a binary that did not compile the rail could not even be spelled.
+    #[test]
+    fn a_rail_ask_may_narrow_what_a_build_carries_and_may_never_widen_it() {
+        // Not compiled: the fix is a build, and the device says so.
+        let ask_metal_on_vulkan_build =
+            resolve_rail(Compiled::VulkanOnly, false, RailRequest::Named(Rail::Metal));
+        assert_eq!(ask_metal_on_vulkan_build.rail, Rail::Vulkan);
+        assert_eq!(
+            ask_metal_on_vulkan_build.refusal,
+            Some(RailRefusal::NotCompiled(Rail::Metal))
+        );
+
+        // Not available: the fix is a host. Distinguished from the above
+        // because an operator who conflated them would rebuild for nothing.
+        let ask_metal_without_a_device =
+            resolve_rail(Compiled::Both, false, RailRequest::Named(Rail::Metal));
+        assert_eq!(ask_metal_without_a_device.rail, Rail::Vulkan);
+        assert_eq!(
+            ask_metal_without_a_device.refusal,
+            Some(RailRefusal::NotAvailable(Rail::Metal))
+        );
+
+        // Narrowing proper: both carried, both runnable, the operator picks.
+        for rail in [Rail::Metal, Rail::Vulkan] {
+            let chosen = resolve_rail(Compiled::Both, true, RailRequest::Named(rail));
+            assert_eq!(chosen.rail, rail);
+            assert_eq!(chosen.refusal, None);
+        }
+
+        // Asking for the only rail there is, is not a refusal.
+        let ask_the_only_rail =
+            resolve_rail(Compiled::MetalOnly, false, RailRequest::Named(Rail::Metal));
+        assert_eq!(ask_the_only_rail.rail, Rail::Metal);
+        assert_eq!(ask_the_only_rail.refusal, None);
+    }
+
+    /// A misspelling reports itself and runs the default, rather than reading as
+    /// the default in silence.
+    ///
+    /// The raw text rides along because "I set it and nothing changed" is the
+    /// symptom of a typo, and a refusal that does not quote what it rejected
+    /// cannot end that conversation.
+    #[test]
+    fn an_unrecognised_rail_name_is_reported_and_the_default_runs() {
+        let typo = resolve_rail(
+            Compiled::Both,
+            true,
+            RailRequest::Unrecognized("moltenvk".to_owned()),
+        );
+        assert_eq!(typo.rail, Rail::Metal);
+        assert_eq!(
+            typo.refusal,
+            Some(RailRefusal::Unrecognized("moltenvk".to_owned()))
+        );
+        assert_eq!(
+            typo.refusal.as_ref().map(RailRefusal::slug),
+            Some("rail_unrecognized")
+        );
+    }
+
+    /// One spelling of a rail's name, reachable from every direction it is
+    /// asked for.
+    ///
+    /// The env value, the boot line, the refusals and `Backend::name` all read
+    /// this, so a rail renamed in one place is renamed everywhere or fails here.
+    #[test]
+    fn a_rail_has_one_name_and_it_round_trips_through_the_env_spelling() {
+        for rail in [Rail::Metal, Rail::Vulkan] {
+            assert_eq!(Rail::from_name(rail.name()), Some(rail));
+            assert!(Rail::NAMES.contains(&rail.name()));
+            assert_ne!(rail.other(), rail);
+            assert_eq!(rail.other().other(), rail);
+        }
+        assert_eq!(Rail::NAMES.len(), 2);
+        assert_eq!(Rail::from_name("moltenvk"), None);
+        // `Rail::NAMES` is every rail this crate can name and not the subset a
+        // build carries: an operator naming an uncompiled rail has to reach
+        // `NotCompiled`, and a narrowed list would report it as a misspelling.
+        assert_eq!(Rail::NAMES, ["metal", "vulkan"]);
     }
 }

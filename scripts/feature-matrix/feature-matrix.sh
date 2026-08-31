@@ -37,14 +37,22 @@ a green run. Counting links the test binaries, which is slower than checking;
 pass --no-counts to skip it. The cross-compiled arm cannot be counted because
 its binaries do not run on this host.
 
-The three supported arms, one per host GPU API actually available:
+The supported arms:
 
   Metal              --features backend-metal                     Apple only
   Vulkan / MoltenVK  --no-default-features
                        --features backend-vulkan,host-window      Apple
   Vulkan / native    same feature set                             Linux
+  Metal + Vulkan     --features backend-metal,backend-vulkan,host-window
+                                                                  Apple only
 
-A fourth cell checks crates/reims-vgpu-efi, the PCI option ROM every x86 boot
+The last one is the reason this script has to keep growing cells. It carries
+both rails in one binary and picks between them at run time (REIMS_VGPU_RAIL),
+so it is the only cell where "which rail did this build compile" and "which rail
+is running" are different questions. A `cfg` that conflates them compiles
+cleanly on both single-rail cells and misroutes or silently drops work here.
+
+A further cell checks crates/reims-vgpu-efi, the PCI option ROM every x86 boot
 builds. It is a separate workspace targeting x86_64-unknown-uefi, so it is not
 a backend arm — but it ships, and nothing else in the repository checks it.
 
@@ -125,6 +133,9 @@ fi
 # Feature sets, verbatim from vendor/qemu/hw/display/meson.build.
 FEATURES_METAL="--features backend-metal"
 FEATURES_VULKAN="--no-default-features --features backend-vulkan,host-window"
+# Both rails in one binary, chosen at run time through REIMS_VGPU_RAIL. Apple
+# only, because backend-metal needs target_os = "macos".
+FEATURES_BOTH="--features backend-metal,backend-vulkan,host-window"
 
 FAILED=0
 RESULTS=()
@@ -277,6 +288,35 @@ esac
 run_cell "vulkan,host-window / $HOST_TRIPLE" "" "$FEATURES_VULKAN"
 count_cell "vulkan,host-window / $HOST_TRIPLE" "$FEATURES_VULKAN"
 
+# Arm 4 — both rails in one binary, which is the configuration an Apple host
+# uses to run one guest stream through Metal and through MoltenVK and tell a
+# metal2vulkan defect from a defect in this device.
+#
+# It is not a fourth flavour of the other three; it is the cell that catches a
+# `cfg` used to mean "which rail is running". Such a `cfg` compiles and passes on
+# both single-rail cells and then silently drops or misroutes work here — which
+# is exactly what `emit_object_cache_levels`, `mipmap` and `exec`'s preflight
+# each did before the `Backend` trait took those decisions over. Cross-checked
+# off Apple for the same reason arm 1 is: the target carries the cfgs.
+case "$HOST_TRIPLE" in
+  *-apple-*)
+    run_cell "metal+vulkan / $HOST_TRIPLE" "" "$FEATURES_BOTH"
+    count_cell "metal+vulkan / $HOST_TRIPLE" "$FEATURES_BOTH"
+    ;;
+  *)
+    if [ -n "${METAL_TARGET:-}" ]; then
+      run_cell "metal+vulkan / $METAL_TARGET" "$METAL_TARGET" "$FEATURES_BOTH"
+      if [ "$COUNT_TESTS" -eq 1 ]; then
+        COUNTS+=("$(printf '%-46s %s' "metal+vulkan / $METAL_TARGET" \
+          "(cross-compiled — cannot run here)")")
+      fi
+    else
+      RESULTS+=("$(printf '%-4s %-46s %s' "SKIP" "metal+vulkan / $HOST_TRIPLE" \
+        "(rustup target add aarch64-apple-darwin)")")
+    fi
+    ;;
+esac
+
 # The supporting crates, counted separately because they are counted at all.
 # `reims-vgpu`'s own count is the number this file has always printed, and a
 # drop in it is supposed to mean a cfg change emptied an arm. When a module
@@ -294,7 +334,7 @@ if [ "$CROSS_TARGET" != "$HOST_TRIPLE" ]; then
   fi
 fi
 
-# Arm 4 — the PCI option ROM. Not a backend arm and not a workspace member: it
+# Arm 5 — the PCI option ROM. Not a backend arm and not a workspace member: it
 # is its own workspace targeting x86_64-unknown-uefi, and `vm/boot-x86.sh`
 # rebuilds it before every x86 boot. It was invisible to this script and to
 # every command in AGENTS.md, which is the same gap that let the Metal arm rot

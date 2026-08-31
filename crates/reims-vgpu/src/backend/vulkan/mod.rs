@@ -21,7 +21,7 @@ pub mod caps;
 pub mod engine;
 pub mod translate;
 
-use crate::backend::{Backend, CensusSite, GuestWriteReach, PlaneDrawReader, StampOrdering};
+use crate::backend::{Backend, CensusSite, GuestWriteReach, PlaneDrawReader, Rail, StampOrdering};
 use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
 use crate::runtime::blit_exec::{self, BlitStatus, LinearTextureLevel, Type11Texture};
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus};
@@ -55,7 +55,7 @@ impl VulkanBackend {
 
 impl Backend for VulkanBackend {
     fn name(&self) -> &'static str {
-        "vulkan"
+        Rail::Vulkan.name()
     }
 
     fn reset(&self) {

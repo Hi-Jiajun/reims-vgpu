@@ -1,4 +1,9 @@
 use super::*;
+// The Metal rail by name, not `backend::selected()`: an ICB is a Metal object
+// and every test here that opens a session is asserting what *that* rail does
+// with it. A binary carrying both rails may be running the other one.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use crate::backend::metal::MetalBackend;
 use crate::contract::endian::{st16, st32, st64};
 use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 /// Page-entry bits for hand-mapping a draw target. Metal-arm only, same reason
@@ -1028,9 +1033,7 @@ fn fill_and_execute_mul3add1_writeback() {
     assert_eq!(icb_a.size(), 1);
 
     // Product execute 0xe4 range [0,1] on a compute session + writeback.
-    let mut session = crate::backend::selected()
-        .open_compute_session(0)
-        .expect("session");
+    let mut session = MetalBackend.open_compute_session(0).expect("session");
     let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(
@@ -1981,9 +1984,7 @@ fn buffer_backed_fill_execute_mul3add1() {
     assert_eq!(mem.gva, cmd_mem_gva);
     assert_eq!(mem.byte_len, layout.command_size as u64);
 
-    let mut session = crate::backend::selected()
-        .open_compute_session(0)
-        .expect("session");
+    let mut session = MetalBackend.open_compute_session(0).expect("session");
     let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(
@@ -4100,9 +4101,7 @@ fn fill_compute_barrier_and_tg_memory_execute() {
     )
     .expect("fill with barrier+tg");
 
-    let mut session = crate::backend::selected()
-        .open_compute_session(0)
-        .expect("session");
+    let mut session = MetalBackend.open_compute_session(0).expect("session");
     let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(
@@ -4177,9 +4176,7 @@ fn inherit_buffers_encoder_kernel_mul3add1() {
         has_attribute_stride: false,
     });
 
-    let mut session = crate::backend::selected()
-        .open_compute_session(0)
-        .expect("session");
+    let mut session = MetalBackend.open_compute_session(0).expect("session");
     let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
@@ -4246,9 +4243,7 @@ fn inherit_pipeline_encoder_kernel_mul3add1() {
     let mut acc = ComputeAccum::default();
     acc.set_pipeline(6);
 
-    let mut session = crate::backend::selected()
-        .open_compute_session(0)
-        .expect("session");
+    let mut session = MetalBackend.open_compute_session(0).expect("session");
     let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
@@ -4413,9 +4408,7 @@ fn icb_parent_encoder_texture_and_sampler_binds() {
         has_lod_clamp: false,
     });
 
-    let mut session = crate::backend::selected()
-        .open_compute_session(0)
-        .expect("session");
+    let mut session = MetalBackend.open_compute_session(0).expect("session");
     let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
@@ -4517,9 +4510,7 @@ fn icb_argument_buffer_storage_texture_xyplane() {
         texture_ref: 11,
     });
 
-    let mut session = crate::backend::selected()
-        .open_compute_session(0)
-        .expect("session");
+    let mut session = MetalBackend.open_compute_session(0).expect("session");
     let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
@@ -4647,9 +4638,7 @@ fn icb_argument_buffer_sample_and_write() {
         has_lod_clamp: false,
     });
 
-    let mut session = crate::backend::selected()
-        .open_compute_session(0)
-        .expect("session");
+    let mut session = MetalBackend.open_compute_session(0).expect("session");
     let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),

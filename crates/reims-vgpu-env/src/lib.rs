@@ -68,6 +68,25 @@ macro_rules! switches {
     (@unit $ident:ident) => { () };
 }
 
+/// [`switches`] for the variables read through [`choice`] instead.
+///
+/// A separate registry for the same reason [`counts`] is one: [`report_line`]
+/// has to print these differently. A choice has no on/off state to name, and
+/// running one through the switch parse would report `REIMS_VGPU_RAIL=metal` as
+/// `unrecognized(metal)` — a line saying the device rejected the very value it
+/// adopted.
+macro_rules! choices {
+    ($( $(#[$doc:meta])* pub const $ident:ident: &str = $name:literal; )*) => {
+        $( $(#[$doc])* pub const $ident: &str = $name; )*
+
+        /// Every variable read as a [`choice`] rather than as a [`Switch`] or a
+        /// [`count`], in declaration order. Derived exactly as [`ALL`] is.
+        pub const ALL_CHOICES: [&str; choices!(@count $($ident)*)] = [$($ident),*];
+    };
+    (@count $($ident:ident)*) => { [$( choices!(@unit $ident) ),*].len() };
+    (@unit $ident:ident) => { () };
+}
+
 /// [`switches`] for the variables read through [`count`] instead.
 ///
 /// A separate registry because [`report_line`] has to print these differently:
@@ -1154,6 +1173,40 @@ counts! {
 pub const BATCH_DRAWS: &str = "REIMS_VGPU_BATCH_DRAWS";
 }
 
+choices! {
+
+/// **A choice, not a switch.** Which execution rail this process runs guest work
+/// on, when the binary carries more than one.
+///
+/// Accepted values are the rail names themselves — `metal`, `vulkan` — which are
+/// the same strings the device reports on its own boot line and in every refusal,
+/// so an operator can copy one back.
+///
+/// It exists so an Apple host can run the *same guest stream* through native
+/// Metal and through MoltenVK without rebuilding. That is the only way to tell a
+/// metal2vulkan translation defect from a defect in this device: one binary, one
+/// guest, two rails, and the difference between the two runs is the rail.
+///
+/// **It narrows and never widens**, like everything here. It may pick among the
+/// rails this build compiled *and* this host was measured able to run; it cannot
+/// add a rail the binary does not carry, and it cannot name a rail the host has
+/// no device for. Either is refused on the failure channel and the device runs
+/// what it can, rather than obeying an ask that would reach a driver with no
+/// device behind it.
+///
+/// Unset on a binary carrying both rails selects the host's native rail — Metal
+/// on Apple — because that is the one whose behaviour is the reference the other
+/// is being compared against.
+///
+/// Distinct from the build-time `REIMS_VGPU_BACKEND` that `scripts/qemu-build`
+/// and the `vm/` harnesses read. That one decides which rails are *compiled in*;
+/// this one decides which of them *runs*. Two names because they have two
+/// owners and two lifetimes, and one name would make "I set it and nothing
+/// changed" ambiguous between "the build does not carry that rail" and "the
+/// device declined the ask".
+pub const RAIL: &str = "REIMS_VGPU_RAIL";
+}
+
 /// What one variable says, including the two ways it says nothing usable.
 ///
 /// Four states rather than a `bool` because "unset", "explicitly on" and
@@ -1217,6 +1270,50 @@ pub fn count(name: &str, ceiling: u64) -> Count {
     match trimmed.parse::<u64>() {
         Ok(n) if n >= 1 && n <= ceiling => Count::Narrowed(n),
         _ => Count::Refused(value),
+    }
+}
+
+/// Which of a fixed set of named alternatives the operator asked for, or why
+/// the value was not usable.
+///
+/// Separate from [`Switch`] and [`Count`] for the reason those are separate from
+/// each other: it answers a different question. A rail is not a boolean and not
+/// a bound, and folding it into either would make the caller reconstruct a name
+/// from a state that never carried one.
+///
+/// [`Self::Named`] is **not** permission. It says what was asked, and the caller
+/// still has to check the ask against what the build carries and the host can
+/// run — see this module's rule about narrowing. Nothing here can measure a
+/// host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Choice {
+    /// Nothing set. The caller takes its own default.
+    Unset,
+    /// One of the alternatives the caller offered, returned as the caller
+    /// spelled it so a refusal and a report quote one string.
+    Named(&'static str),
+    /// Set to something that is not one of the alternatives, carrying the raw
+    /// text so the refusal can quote what it rejected.
+    Refused(String),
+}
+
+/// Read `name` as a choice among `allowed`, ASCII-case-insensitively.
+///
+/// `allowed` is the caller's list because only the caller knows it: the set of
+/// rails a binary carries is a property of that binary, and a list kept here
+/// would be a second copy of it that nothing compares against the first.
+pub fn choice(name: &str, allowed: &[&'static str]) -> Choice {
+    let Some(raw) = std::env::var_os(name) else {
+        return Choice::Unset;
+    };
+    let value = raw.to_string_lossy().into_owned();
+    let folded = value.trim().to_ascii_lowercase();
+    if folded.is_empty() {
+        return Choice::Unset;
+    }
+    match allowed.iter().find(|a| a.eq_ignore_ascii_case(&folded)) {
+        Some(matched) => Choice::Named(matched),
+        None => Choice::Refused(value),
     }
 }
 
@@ -1292,6 +1389,18 @@ pub fn report_line() -> String {
             .unwrap_or_else(|| "unset".to_owned());
         out.push_str(&format!(" {}={raw}", short.to_ascii_lowercase()));
     }
+    // The raw text again, and for the same reason: the alternatives a choice is
+    // narrowed against belong to the module that carries them, and this line is
+    // written before any device exists to ask. What the device *did* with the
+    // ask is reported where it is adopted.
+    for name in ALL_CHOICES {
+        let short = name.strip_prefix("REIMS_VGPU_").unwrap_or(name);
+        let raw = std::env::var_os(name)
+            .map(|v| v.to_string_lossy().into_owned())
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "unset".to_owned());
+        out.push_str(&format!(" {}={raw}", short.to_ascii_lowercase()));
+    }
     out
 }
 
@@ -1328,6 +1437,64 @@ mod tests {
 
     fn probe_count(value: Option<&str>, ceiling: u64) -> Count {
         with_probe(value, || count("REIMS_VGPU_TEST_PROBE", ceiling))
+    }
+
+    fn probe_choice(value: Option<&str>, allowed: &[&'static str]) -> Choice {
+        with_probe(value, || choice("REIMS_VGPU_TEST_PROBE", allowed))
+    }
+
+    /// A choice answers with one of the caller's own strings, or with the raw
+    /// text it could not place — and never with a fourth thing.
+    ///
+    /// `Named` returns the *caller's* spelling rather than the operator's, so a
+    /// refusal, a report line and a comparison all quote one string. Case is
+    /// folded for the same reason the on/off spellings are: an operator should
+    /// not have to look up which case this program wanted.
+    #[test]
+    fn a_choice_places_a_value_among_the_callers_alternatives_or_hands_it_back() {
+        const RAILS: [&str; 2] = ["metal", "vulkan"];
+        assert_eq!(probe_choice(None, &RAILS), Choice::Unset);
+        assert_eq!(probe_choice(Some(""), &RAILS), Choice::Unset);
+        assert_eq!(probe_choice(Some("   "), &RAILS), Choice::Unset);
+        assert_eq!(probe_choice(Some("metal"), &RAILS), Choice::Named("metal"));
+        assert_eq!(
+            probe_choice(Some(" METAL "), &RAILS),
+            Choice::Named("metal")
+        );
+        assert_eq!(
+            probe_choice(Some("Vulkan"), &RAILS),
+            Choice::Named("vulkan")
+        );
+        // The raw text, not the folded one: an operator who typed `Moltenvk`
+        // has to see what was rejected, spelled the way they typed it.
+        assert_eq!(
+            probe_choice(Some("Moltenvk"), &RAILS),
+            Choice::Refused("Moltenvk".to_owned())
+        );
+        // An alternative the caller did not offer is not a choice, however
+        // plausible it looks. This is the narrowing rule in its smallest form:
+        // the caller's list is what a build carries, and nothing here may add
+        // to it.
+        assert_eq!(
+            probe_choice(Some("vulkan"), &["metal"]),
+            Choice::Refused("vulkan".to_owned())
+        );
+    }
+
+    /// Every choice variable is on the boot line, with the operator's own text.
+    #[test]
+    fn the_report_line_carries_every_choice_variable() {
+        let line = report_line();
+        for name in ALL_CHOICES {
+            let short = name
+                .strip_prefix("REIMS_VGPU_")
+                .unwrap_or(name)
+                .to_ascii_lowercase();
+            assert!(
+                line.contains(&format!(" {short}=")),
+                "{name} is read but absent from the boot line: {line}"
+            );
+        }
     }
 
     /// A count narrows its ceiling and never widens it.

@@ -847,26 +847,34 @@ fn dispatch_missing_pipeline() {
     cmd.grid = compute::Size3 { x: 1, y: 1, z: 1 };
     cmd.threads_per_threadgroup = compute::Size3 { x: 1, y: 1, z: 1 };
     let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
-    // The slug names *which* pipeline check refused, and it differs by
-    // backend: both arms open with `pipeline_ref == 0`, and before the
-    // status carried a reason the two were indistinguishable in the log.
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+    // The slug names *which* pipeline check refused, and it differs by rail:
+    // both open with `pipeline_ref == 0`, and before the status carried a
+    // reason the two were indistinguishable in the log.
+    //
+    // Keyed on the rail that *ran*, not on the features that were compiled. A
+    // binary carrying both rails compiles both `cfg` arms, so a `cfg` here
+    // would assert one rail's slug against whichever rail `selected()` picked.
     assert_eq!(
         st,
-        ComputeStatus::MissingPipeline("compute_mtl_pipeline_ref_zero")
-    );
-    #[cfg(feature = "backend-vulkan")]
-    assert_eq!(
-        st,
-        ComputeStatus::MissingPipeline("compute_vk_pipeline_ref_zero")
+        ComputeStatus::MissingPipeline(match crate::backend::selected().rail() {
+            crate::backend::Rail::Metal => "compute_mtl_pipeline_ref_zero",
+            crate::backend::Rail::Vulkan => "compute_vk_pipeline_ref_zero",
+        })
     );
 }
 
-/// Linux without vulkan feature: dispatch is NoMetal (census). With
-/// backend-vulkan, missing pipeline is MissingPipeline (real encode path).
+/// The Vulkan rail attempts a real encode rather than answering `NoMetal`.
+///
+/// Asked of `VulkanBackend` by name, because that is what the test is about. It
+/// used to go through `backend::selected()`, which was the same thing only for
+/// as long as a build could carry one rail — on a binary carrying both, the
+/// process may be running Metal and this would assert the Vulkan contract
+/// against it.
 #[test]
 #[cfg(feature = "backend-vulkan")]
 fn dispatch_nometal_with_texture_binds() {
+    use crate::backend::vulkan::VulkanBackend;
+    use crate::backend::Backend as _;
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
@@ -891,7 +899,7 @@ fn dispatch_nometal_with_texture_binds() {
         z: 1,
     };
     cmd.threads_per_threadgroup = compute::Size3 { x: 32, y: 0, z: 1 };
-    let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let st = VulkanBackend::new().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
     assert!(
         matches!(
             st,
@@ -909,14 +917,19 @@ fn dispatch_nometal_with_texture_binds() {
     // through it — `ComputeSession` has no rail variant for this backend, so
     // there is no such value to build.
     assert_eq!(
-        crate::backend::selected().open_compute_session(0).err(),
+        VulkanBackend::new().open_compute_session(0).err(),
         Some(ComputeStatus::NoMetal("compute_session_no_vulkan_path"))
     );
 }
 
+/// Asked of `VulkanBackend` by name, for the reason
+/// [`dispatch_nometal_with_texture_binds`] gives.
 #[test]
 #[cfg(feature = "backend-vulkan")]
 fn dispatch_missing_pipeline_not_nometal() {
+    use crate::backend::vulkan::VulkanBackend;
+    use crate::backend::Backend as _;
+
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
@@ -926,7 +939,7 @@ fn dispatch_missing_pipeline_not_nometal() {
     cmd.kind = Kind::DispatchThreadgroups;
     cmd.grid = compute::Size3 { x: 1, y: 1, z: 1 };
     cmd.threads_per_threadgroup = compute::Size3 { x: 1, y: 1, z: 1 };
-    let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let st = VulkanBackend::new().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
     assert_eq!(
         st,
         ComputeStatus::MissingPipeline("compute_vk_pipeline_ref_zero")
@@ -1094,24 +1107,27 @@ fn dispatch_buffer_kernel_mul3add1() {
 
     let mut acc = ComputeAccum::default();
     acc.set_pipeline(6);
-    let bindings = vec![
-        BufferBinding {
-            ref_: 7,
-            offset: 0,
-            attribute_stride: 0,
-            has_attribute_stride: false,
-        },
-        #[cfg(feature = "backend-vulkan")]
-        BufferBinding {
-            // The kernel declares no buffer 1. Reflection must discard this
-            // extra encoder bind before object resolution; the nonexistent ref
-            // makes a pre-reflection staging pass fail as MissingBuffer.
+    let mut bindings = vec![BufferBinding {
+        ref_: 7,
+        offset: 0,
+        attribute_stride: 0,
+        has_attribute_stride: false,
+    }];
+    if crate::backend::selected().rail() == crate::backend::Rail::Vulkan {
+        // The kernel declares no buffer 1. Reflection must discard this extra
+        // encoder bind before object resolution; the nonexistent ref makes a
+        // pre-reflection staging pass fail as MissingBuffer.
+        //
+        // Conditioned on the rail that *runs*, not on the features compiled:
+        // this is a stimulus only the Vulkan rail's reflection is expected to
+        // survive, and a binary carrying both would otherwise hand it to Metal.
+        bindings.push(BufferBinding {
             ref_: 31,
             offset: 0,
             attribute_stride: 0,
             has_attribute_stride: false,
-        },
-    ];
+        });
+    }
     acc.bind_buffers(0, &bindings);
 
     let mut cmd = ComputeCommand::default();

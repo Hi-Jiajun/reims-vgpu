@@ -9,7 +9,7 @@
 //! two producers and the arm a reader landed on was arbitrary.
 
 use crate::backend::metal::runtime::system_device;
-use crate::backend::{Backend, CensusSite, MipmapGeneration};
+use crate::backend::{Backend, CensusSite, MipmapGeneration, Rail};
 use crate::contract::mipmap::MetalMipmapError;
 use crate::model::{DeviceInfoLimits, DeviceState};
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus};
@@ -57,7 +57,7 @@ impl MetalBackend {
 
 impl Backend for MetalBackend {
     fn name(&self) -> &'static str {
-        "metal"
+        Rail::Metal.name()
     }
 
     fn reset(&self) {
