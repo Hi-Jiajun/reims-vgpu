@@ -109,6 +109,53 @@ mod tests {
         assert_eq!(m.format, 0x73);
     }
 
+    /// A dual-plane texture is not a broken mapper-ref texture, and no longer
+    /// says it is.
+    ///
+    /// `APVObjectType` 12 is a normal texture with two dimension blocks. This
+    /// function is called for every object type, so before the decoder had an
+    /// arm for the tag the body arrived here as `res_object_type_unknown`, the
+    /// headerless retry did not recover a mapping either, and the drop was
+    /// reported as `mapper_ref_texture_register obj_type=12` — naming the one
+    /// object it definitely was not, on the arm rail where tag 11 is real and
+    /// the confusion costs a session.
+    ///
+    /// The tag now decodes, so it reaches the `Ok(_)` arm and is as silent here
+    /// as a buffer or a function: this object carries no mapping geometry, and
+    /// that is the normal case rather than a refusal.
+    #[test]
+    fn a_dual_plane_texture_is_not_reported_as_a_failed_mapper_ref_registration() {
+        use crate::runtime::decode::resource::{
+            tests::dual_plane_body, OBJECT_TYPE_DUAL_PLANE_TEXTURE,
+        };
+        let mut s = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let desc = dual_plane_body([1, 1], (1920, 1080), 0x50);
+
+        // The same bytes under a tag with no decode arm, which is what tag 12
+        // was: the decline fires, and it names a mapper-ref texture.
+        let cap = crate::observe::FailCapture::start();
+        register_from_descriptor_bytes(&mut s, 200, &desc);
+        let undecodable = cap.lines();
+        assert!(
+            undecodable
+                .iter()
+                .any(|l| l.starts_with("mapper_ref_texture_register")
+                    && l.contains("res_object_type_unknown")),
+            "the contrast this test turns on has to be real: {undecodable:?}"
+        );
+
+        let cap = crate::observe::FailCapture::start();
+        register_from_descriptor_bytes(&mut s, OBJECT_TYPE_DUAL_PLANE_TEXTURE, &desc);
+        let lines = cap.lines();
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("mapper_ref_texture_register")),
+            "a decoded object that simply is not a mapper-ref texture must not be \
+             reported as a dropped registration: {lines:?}"
+        );
+    }
+
     /// A headerless blob one byte short of the record latches nothing, and does
     /// so through the decoder rather than through a length test above it.
     ///
