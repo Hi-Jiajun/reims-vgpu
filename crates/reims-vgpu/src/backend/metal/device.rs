@@ -12,6 +12,7 @@ use crate::backend::metal::runtime::system_device;
 use crate::backend::Backend;
 use crate::model::DeviceState;
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus};
+use crate::runtime::compute_session::{self, ComputeSession};
 use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::draw::{self, DrawEncodeRequest, EncodeStatus};
 use crate::runtime::host::{HostMemory, HostOps};
@@ -81,6 +82,29 @@ impl Backend for MetalBackend {
         cmd: &ComputeCommand,
     ) -> ComputeStatus {
         compute_exec::metal::execute_dispatch_metal(state, host, task_id, acc, cmd, None)
+    }
+
+    #[allow(clippy::result_large_err, reason = "see the `Backend` declaration")]
+    fn open_compute_session(&self, dispatch_type: u32) -> Result<ComputeSession, ComputeStatus> {
+        compute_session::metal::MetalSession::open(dispatch_type).map(ComputeSession::from_metal)
+    }
+
+    fn execute_dispatch_nested<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        acc: &ComputeAccum,
+        cmd: &ComputeCommand,
+        session: &mut ComputeSession,
+    ) -> ComputeStatus {
+        // `None` cannot happen: `backend::selected()` is latched, so every
+        // session in this process was opened by this rail. Named rather than
+        // unwrapped, because a panic must never cross the QEMU FFI boundary.
+        let Some(rail) = session.metal_mut() else {
+            return ComputeStatus::NoMetal("compute_nested_session_not_metal");
+        };
+        compute_exec::metal::execute_dispatch_metal(state, host, task_id, acc, cmd, Some(rail))
     }
 
     // The two blit fast paths and the resident census take the trait's

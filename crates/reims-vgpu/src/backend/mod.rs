@@ -92,6 +92,7 @@ pub mod vulkan;
 use crate::model::DeviceState;
 use crate::runtime::blit_exec::{BlitStatus, LinearTextureLevel, Type11Texture};
 use crate::runtime::compute_exec::{ComputeAccum, ComputeStatus};
+use crate::runtime::compute_session::ComputeSession;
 use crate::runtime::decode::blit::Command as BlitCommand;
 use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::draw::{DrawEncodeRequest, EncodeStatus};
@@ -231,6 +232,36 @@ pub(crate) trait Backend: Copy {
         task_id: u32,
         acc: &ComputeAccum,
         cmd: &ComputeCommand,
+    ) -> ComputeStatus;
+
+    /// Open a multi-record encoder for one compute segment.
+    ///
+    /// A rail that cannot hold anything open across records refuses here, and
+    /// that refusal is the whole contract: the segment latches a
+    /// `SequencingBlock` and every later control-flow or ICB record in it is
+    /// declined with the same reason. It is *one* refusal at the point the
+    /// capability is asked for, rather than one at each of the four entry
+    /// points a session would otherwise have to decline.
+    #[allow(
+        clippy::result_large_err,
+        reason = "ComputeStatus carries the Metal backend's 264-byte Status so a \
+                  refusal names the check that refused; see this module's note \
+                  on the same exemption for `backend::metal`"
+    )]
+    fn open_compute_session(&self, dispatch_type: u32) -> Result<ComputeSession, ComputeStatus>;
+
+    /// Execute a dispatch onto an already-open session's encoder.
+    ///
+    /// Only reachable through [`Self::open_compute_session`], so the session is
+    /// always this rail's own.
+    fn execute_dispatch_nested<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        acc: &ComputeAccum,
+        cmd: &ComputeCommand,
+        session: &mut ComputeSession,
     ) -> ComputeStatus;
 
     /// Count whether this rail already holds a type-11 surface's content.
@@ -389,6 +420,33 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.execute_dispatch(state, host, task_id, acc, cmd),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.execute_dispatch(state, host, task_id, acc, cmd),
+        }
+    }
+
+    #[allow(clippy::result_large_err, reason = "see the trait declaration")]
+    fn open_compute_session(&self, dispatch_type: u32) -> Result<ComputeSession, ComputeStatus> {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.open_compute_session(dispatch_type),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.open_compute_session(dispatch_type),
+        }
+    }
+
+    fn execute_dispatch_nested<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        acc: &ComputeAccum,
+        cmd: &ComputeCommand,
+        session: &mut ComputeSession,
+    ) -> ComputeStatus {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.execute_dispatch_nested(state, host, task_id, acc, cmd, session),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.execute_dispatch_nested(state, host, task_id, acc, cmd, session),
         }
     }
 

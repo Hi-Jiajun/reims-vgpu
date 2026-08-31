@@ -903,10 +903,15 @@ fn dispatch_nometal_with_texture_binds() {
         ),
         "vulkan path attempts encode, got {st:?}"
     );
-    // Nested short-circuit remains NoMetal on Linux (SPI not wired).
-    let mut session = crate::runtime::compute_session::ComputeSession { control_depth: 0 };
-    let st2 = execute_dispatch_nested(&mut state, &mut host, 1, &acc, &cmd, &mut session);
-    assert_eq!(st2, ComputeStatus::NoMetal("compute_nested_no_vulkan_path"));
+    // A nested dispatch needs an open session, and this rail cannot open one:
+    // `engine::execute_compute_request` is one-shot per dispatch. Asserted where
+    // the capability is decided rather than by building a session and calling
+    // through it — `ComputeSession` has no rail variant for this backend, so
+    // there is no such value to build.
+    assert_eq!(
+        crate::backend::selected().open_compute_session(0).err(),
+        Some(ComputeStatus::NoMetal("compute_session_no_vulkan_path"))
+    );
 }
 
 #[test]

@@ -25,6 +25,7 @@ use crate::backend::Backend;
 use crate::model::DeviceState;
 use crate::runtime::blit_exec::{self, BlitStatus, LinearTextureLevel, Type11Texture};
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus};
+use crate::runtime::compute_session::ComputeSession;
 use crate::runtime::decode::blit::Command as BlitCommand;
 use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::draw::{self, DrawEncodeRequest, EncodeStatus};
@@ -96,6 +97,29 @@ impl Backend for VulkanBackend {
         cmd: &ComputeCommand,
     ) -> ComputeStatus {
         compute_exec::vulkan::execute_dispatch_linux(state, host, task_id, acc, cmd)
+    }
+
+    #[allow(clippy::result_large_err, reason = "see the `Backend` declaration")]
+    fn open_compute_session(&self, _dispatch_type: u32) -> Result<ComputeSession, ComputeStatus> {
+        // One-shot per dispatch: there is no encoder to hold open across a
+        // segment's records, and no `SessionRail` variant for one.
+        Err(ComputeStatus::NoMetal("compute_session_no_vulkan_path"))
+    }
+
+    fn execute_dispatch_nested<M: HostMemory + HostOps>(
+        &self,
+        _state: &mut DeviceState,
+        _host: &mut M,
+        _task_id: u32,
+        _acc: &ComputeAccum,
+        _cmd: &ComputeCommand,
+        _session: &mut ComputeSession,
+    ) -> ComputeStatus {
+        // Unreachable while `open_compute_session` refuses: a nested dispatch
+        // needs a session, and this rail never has one. Fail-visible anyway —
+        // `exec::note_compute_refusal` names the slug for every non-`Ok`
+        // compute record.
+        ComputeStatus::NoMetal("compute_nested_no_vulkan_path")
     }
 
     fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(

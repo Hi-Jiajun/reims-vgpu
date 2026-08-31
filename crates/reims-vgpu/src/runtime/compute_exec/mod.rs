@@ -835,9 +835,10 @@ fn apply_record_inner<M: HostMemory + HostOps>(
             }
             // Open multi-record session (control-flow SPI): encode on that encoder.
             if let Some(sess) = seg.session.as_mut() {
-                return Some(execute_dispatch_nested(
-                    state, host, task_id, &seg.acc, cmd, sess,
-                ));
+                return Some(
+                    crate::backend::selected()
+                        .execute_dispatch_nested(state, host, task_id, &seg.acc, cmd, sess),
+                );
             }
             Some(crate::backend::selected().execute_dispatch(state, host, task_id, &seg.acc, cmd))
         }
@@ -3530,33 +3531,6 @@ fn u32_dim(v: u64) -> Result<u32, ComputeStatus> {
         Err(ComputeStatus::BadGrid("compute_grid_dim_range"))
     } else {
         Ok(v as u32)
-    }
-}
-
-/// Nested dispatch onto an open multi-record control-flow session encoder.
-pub(crate) fn execute_dispatch_nested<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    task_id: u32,
-    acc: &ComputeAccum,
-    cmd: &ComputeCommand,
-    session: &mut crate::runtime::compute_session::ComputeSession,
-) -> ComputeStatus {
-    // Not yet a `Backend` method, and the reason is `ComputeSession`: the two
-    // rails declare two different structs under that one name, so a trait
-    // signature naming it would mean two different signatures. Unifying the
-    // session is what lets this join `execute_dispatch` above.
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    {
-        metal::execute_dispatch_metal(state, host, task_id, acc, cmd, Some(session))
-    }
-    #[cfg(feature = "backend-vulkan")]
-    {
-        // Nested/control-flow SPI has no Linux compute path. Fail-visible via
-        // the returned status: `exec.rs::note_compute_refusal` names the slug
-        // at the rail boundary for every non-`Ok` compute record.
-        let _ = (state, host, task_id, acc, cmd, session);
-        ComputeStatus::NoMetal("compute_nested_no_vulkan_path")
     }
 }
 

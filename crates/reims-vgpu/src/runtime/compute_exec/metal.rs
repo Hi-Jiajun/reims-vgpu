@@ -259,7 +259,7 @@ pub(crate) fn execute_dispatch_metal<M: HostMemory + HostOps>(
     task_id: u32,
     acc: &ComputeAccum,
     cmd: &ComputeCommand,
-    session: Option<&mut crate::runtime::compute_session::ComputeSession>,
+    session: Option<&mut crate::runtime::compute_session::metal::MetalSession>,
 ) -> ComputeStatus {
     use crate::backend::metal::abi::texture_binds_as_storage;
     use crate::backend::metal::abi::{
