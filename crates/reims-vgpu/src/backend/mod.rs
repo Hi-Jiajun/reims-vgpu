@@ -442,6 +442,41 @@ pub(crate) trait Backend: Copy {
     /// as a zero: an absent `engine_delta` means no such engine, where
     /// `engine_delta …=0` would mean an idle one.
     fn emit_census(&self, _site: CensusSite) {}
+
+    /// What this rail remembers drawing into one plane since this witness last
+    /// asked, formatted as census fields.
+    ///
+    /// A rail that keeps no such record answers with the **empty string**, so
+    /// the fields are absent from the line rather than present and zero. That is
+    /// the whole reason this is not a count: `draws=0` is a reading — "the guest
+    /// stopped compositing into this plane" — and a rail with no ring has not
+    /// taken it.
+    fn plane_draw_witness(&self, _reader: PlaneDrawReader, _mapping_id: u32) -> String {
+        String::new()
+    }
+}
+
+/// Which witness is asking, because two of them ask about the same plane rings
+/// for different questions and neither may consume the other's window.
+///
+/// [`crate::runtime::scanout::note_present_field_witness`] asks about the plane
+/// a present names; `note_sampled_surface_field` asks about a full-screen layer
+/// a draw sampled, and on a rail where the compositor's presented planes are
+/// also sampled layers a single destructive drain gave whichever witness fired
+/// first the whole window and the other one `draws=0` — which is exactly the
+/// reading that separates "a pass produced this field" from "nothing drew into
+/// this surface", so the shared drain manufactured the more alarming of the two
+/// answers.
+///
+/// Neutral, and here rather than beside the ring, because it names the two
+/// *witnesses* — both of which are runtime census sites that exist on every
+/// rail — and not the ring, which only one rail keeps.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum PlaneDrawReader {
+    /// The plane a present named.
+    PresentedPlane,
+    /// A full-screen layer a draw sampled.
+    SampledLayer,
 }
 
 /// A point in the drain's per-second census window at which a rail may
@@ -838,6 +873,15 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.emit_census(site),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.emit_census(site),
+        }
+    }
+
+    fn plane_draw_witness(&self, reader: PlaneDrawReader, mapping_id: u32) -> String {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.plane_draw_witness(reader, mapping_id),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.plane_draw_witness(reader, mapping_id),
         }
     }
 }

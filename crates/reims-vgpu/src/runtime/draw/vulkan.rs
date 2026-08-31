@@ -12,6 +12,7 @@ use super::*;
 
 use crate::backend::vulkan::engine::{DrawError, DrawPreparationDecline};
 use crate::backend::vulkan::translate;
+use crate::backend::PlaneDrawReader;
 use crate::contract::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 use crate::runtime::census::srgb_census;
 use crate::runtime::decode::resource::TextureDescriptor;
@@ -14372,25 +14373,6 @@ pub(super) fn note_plane_store_published(mapping_id: u32) {
     if pending.remove(&mapping_id) {
         crate::runtime::drain::note_store_route("plane_multiquad_published");
     }
-}
-
-/// Which witness is asking, because two of them ask about the same plane rings
-/// for different questions and neither may consume the other's window.
-///
-/// [`crate::runtime::scanout::note_present_field_witness`] asks about the plane
-/// a present names; `note_sampled_surface_field` asks about a full-screen layer
-/// a draw sampled, and on this rail the compositor's presented planes are also
-/// sampled layers. A single destructive drain gave whichever witness fired
-/// first the whole window and the other one `draws=0` — which is exactly the
-/// reading that separates "a pass produced this field" from "nothing drew into
-/// this surface", so the shared drain manufactured the more alarming of the two
-/// answers.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum PlaneDrawReader {
-    /// The plane a present named.
-    PresentedPlane,
-    /// A full-screen layer a draw sampled.
-    SampledLayer,
 }
 
 /// Each reader's last-seen arrival count per plane, so every reader gets its own

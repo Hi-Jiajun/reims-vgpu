@@ -21,7 +21,7 @@ pub mod caps;
 pub mod engine;
 pub mod translate;
 
-use crate::backend::{Backend, CensusSite, GuestWriteReach, StampOrdering};
+use crate::backend::{Backend, CensusSite, GuestWriteReach, PlaneDrawReader, StampOrdering};
 use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
 use crate::runtime::blit_exec::{self, BlitStatus, LinearTextureLevel, Type11Texture};
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus};
@@ -251,6 +251,10 @@ impl Backend for VulkanBackend {
         site: SettleSite,
     ) -> StampOrdering {
         drain::vulkan::order_completion_stamp(state, host, index, value, site)
+    }
+
+    fn plane_draw_witness(&self, reader: PlaneDrawReader, mapping_id: u32) -> String {
+        draw::vulkan::read_plane_draw_ring(reader, mapping_id).to_string()
     }
 
     fn emit_census(&self, site: CensusSite) {

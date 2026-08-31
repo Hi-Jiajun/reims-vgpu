@@ -1548,14 +1548,8 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
     // uniform result or a surface nothing drew into, and the ring is what
     // separates them. These layers are not the plane a present names, so the
     // present witness never drains their rings and nothing else does either.
-    #[cfg(feature = "backend-vulkan")]
-    let ring = crate::runtime::draw::vulkan::read_plane_draw_ring(
-        crate::runtime::draw::vulkan::PlaneDrawReader::PresentedPlane,
-        mapping_id,
-    )
-    .to_string();
-    #[cfg(not(feature = "backend-vulkan"))]
-    let ring = String::new();
+    let ring = crate::backend::selected()
+        .plane_draw_witness(crate::backend::PlaneDrawReader::PresentedPlane, mapping_id);
     crate::observe::off(format!(
         "sampled_surface_field mid={mapping_id} ref={texture_ref} {width}x{height} \
          fmt={format:#x} off={base_off:#x} bpr={bpr} route={route} patches=[{report}] \
@@ -1742,16 +1736,11 @@ pub fn note_present_field_witness<M: HostMemory>(
     // uniform field means the guest kept drawing and this device did not
     // publish it. Those have opposite repairs and no other record separates
     // them.
-    #[cfg(feature = "backend-vulkan")]
-    let ring = crate::runtime::draw::vulkan::read_plane_draw_ring(
-        crate::runtime::draw::vulkan::PlaneDrawReader::SampledLayer,
-        mapping_id,
-    )
-    .to_string();
-    // The ring is filled by the Vulkan draw encode; there is no such record on
-    // the Metal arm, so the field is simply absent there rather than empty.
-    #[cfg(not(feature = "backend-vulkan"))]
-    let ring = String::new();
+    // A rail that keeps no such record answers with an empty string, so the
+    // fields are absent rather than a `draws=0` that would read as a measurement
+    // — see `Backend::plane_draw_witness`.
+    let ring = crate::backend::selected()
+        .plane_draw_witness(crate::backend::PlaneDrawReader::SampledLayer, mapping_id);
     // What the outstanding-write ledger says about the very pages just read.
     //
     // This witness reads guest pages without settling, which is deliberate --
@@ -1773,13 +1762,15 @@ pub fn note_present_field_witness<M: HostMemory>(
     // Those three have different repairs, and no record on this rail separated
     // them: a plane that reads uniform white with 409 stores publishing into it
     // is consistent with all three.
-    #[cfg(feature = "backend-vulkan")]
+    //
+    // Asked of the running rail, and every rail answers: a rail whose Store has
+    // already executed when it returns has nothing outstanding, and `Disjoint`
+    // is that fact rather than a rail declining to say — which is precisely the
+    // reading this field is here to supply.
     let reach = format!(
         " write_reach={:?}",
-        crate::backend::vulkan::engine::guest_writes_reaching(&gpas)
+        crate::backend::selected().guest_writes_reaching(&gpas)
     );
-    #[cfg(not(feature = "backend-vulkan"))]
-    let reach = String::new();
     // The page span, so a store record naming its destination and this record
     // naming the presented plane can be compared without either having to know
     // about the other. First and last of the mapping's own order, not of the

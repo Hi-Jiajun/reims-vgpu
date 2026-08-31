@@ -7785,6 +7785,7 @@ fn a_span_can_be_named_without_asking_whether_its_guest_pages_are_current() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_planes_drain_counts_every_arrival_even_past_the_ring_it_remembers() {
+    use crate::backend::PlaneDrawReader;
     // A mapping id no other test in this process shares, because the ring is
     // process-wide and keyed by it.
     let mapping_id = 0x0dda_1e01;
