@@ -68,14 +68,6 @@ pub(crate) fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
-/// Whether verbose draw logging (`REIMS_VGPU_DRAW_LOG=1`) is active. Lets always-on
-/// paths skip building expensive *diagnostic-only* detail (e.g. per-peer
-/// full-frame rescans for a log field) on a normal boot without losing the
-/// always-on line itself.
-pub(crate) fn draw_log_enabled() -> bool {
-    enabled()
-}
-
 /// Milliseconds since the first log line of this process. Appended as a
 /// trailing `t=<ms>` field so cross-boot phase timing (first present, desktop
 /// settle, tranche bursts) is measurable from the logs alone. Trailing — not a
@@ -538,6 +530,45 @@ pub fn line(msg: impl AsRef<str>) {
     emit(Sink::Draw, msg.as_ref());
 }
 
+/// A verbose line whose *text* is expensive to build.
+///
+/// [`line`] already drops its argument when verbose logging is off, but the
+/// caller has paid for the `format!` by the time it is called. A hot path that
+/// wants to skip that cost used to ask whether the sink was open and branch, which
+/// put a query about observability state inside a product path — the one shape
+/// `AGENTS.md` and this module both rule out, because a path that can read the
+/// log's state is a path that could come to depend on it.
+///
+/// Taking the text as a closure moves the question back inside the sink. The
+/// caller states what it would say; whether saying it is worth building is not
+/// its decision to make.
+pub fn verbose(build: impl FnOnce() -> String) {
+    if !enabled() {
+        return;
+    }
+    emit(Sink::Draw, &build());
+}
+
+/// Run a diagnostic-only block, and only when verbose logging is on.
+///
+/// [`verbose`] covers a line whose text is expensive. This covers the wider
+/// case: a block that scans a frame for its byte statistics, walks a guest page
+/// table to describe a mapping, or emits several lines at once. Those cost more
+/// than a `format!` and none of them may run on a normal boot.
+///
+/// The closure returns nothing, which is the whole point. A caller that asked
+/// [`enabled`] and branched held a `bool` it could store, thread into a
+/// decision, or read a second time — and observability that a product path can
+/// read is observability a product path can come to depend on. Handing the work
+/// *to* the sink instead lets nothing escape the block: whatever it computes is
+/// for the log and dies there.
+pub fn when_verbose(diagnose: impl FnOnce()) {
+    if !enabled() {
+        return;
+    }
+    diagnose();
+}
+
 /// Always-on fail-visible line (writeback / Metal / missing resource / offline OFF).
 pub fn fail(msg: impl AsRef<str>) {
     emit(Sink::Fail, msg.as_ref());
@@ -828,6 +859,59 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Force the sink open or closed for one test and put it back.
+    ///
+    /// `ENABLED` is read once per process from the environment, so a test that
+    /// wants the other arm has to set it directly. Serialized against itself:
+    /// the suite runs `--test-threads=1`, and this makes the pairing explicit
+    /// rather than relying on that.
+    fn with_sink<R>(open: bool, body: impl FnOnce() -> R) -> R {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        redirect_logs_for_tests();
+        let was_init = INIT.swap(true, Ordering::Relaxed);
+        let was_enabled = ENABLED.swap(open, Ordering::Relaxed);
+        let out = body();
+        ENABLED.store(was_enabled, Ordering::Relaxed);
+        INIT.store(was_init, Ordering::Relaxed);
+        out
+    }
+
+    /// A diagnostic block does not run while the sink is closed.
+    ///
+    /// This is the property every caller gave up by asking whether logging was
+    /// on and branching itself: the answer stayed on the product path's side of
+    /// the call, and the work it guarded — a frame-wide byte scan, a guest
+    /// page-table walk, a per-binding `format!` — stayed the product path's to
+    /// skip, or to forget to skip. Here the sink owns both halves, and a caller
+    /// has nothing to get wrong because it is never told the answer.
+    #[test]
+    fn a_diagnostic_block_does_not_run_while_the_sink_is_closed() {
+        with_sink(false, || {
+            let mut ran = 0u32;
+            when_verbose(|| ran += 1);
+            verbose(|| {
+                ran += 1;
+                "unreachable_line".to_owned()
+            });
+            assert_eq!(ran, 0, "a closed sink ran a diagnostic block");
+        });
+    }
+
+    /// And does run while it is open, so the gate is a gate and not a deletion.
+    #[test]
+    fn a_diagnostic_block_runs_while_the_sink_is_open() {
+        with_sink(true, || {
+            let mut ran = 0u32;
+            when_verbose(|| ran += 1);
+            verbose(|| {
+                ran += 1;
+                "verbose_probe_line".to_owned()
+            });
+            assert_eq!(ran, 2, "an open sink skipped a diagnostic block");
+        });
+    }
 
     #[test]
     fn flood_key_is_the_slug_skipping_the_off_marker() {

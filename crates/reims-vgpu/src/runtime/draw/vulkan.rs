@@ -469,7 +469,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         if let Some(epoch) = sync_epoch {
                             stamp_type11_resident(state, host, req, writeback_guest, epoch);
                         }
-                        if crate::observe::draw_log_enabled() {
+                        crate::observe::when_verbose(|| {
                             // Order-independent: both fields reduce over the three
                             // colour channels, so an R/B exchange cannot move them.
                             let (rgb_nz, max_rgb, mean_rgb) = rgb_stats(&bgra);
@@ -483,7 +483,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                                 max_rgb,
                                 mean_rgb
                             ));
-                        }
+                        });
                     } else {
                         let (rgb_nz, max_rgb, mean_rgb) = rgb_stats(&bgra);
                         crate::observe::fail(format!(
@@ -2548,18 +2548,18 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
         // failures. The always-on health signal is the `sampled_branch_census`
         // aggregate (Type5View / T5Memo, noted on both paths below), so this
         // per-bind detail — and its O(w*h) `rgba_rgb_stats` scan — is diagnostic
-        // only: gate both behind REIMS_VGPU_DRAW_LOG so a normal boot stays uncluttered.
-        if !crate::observe::draw_log_enabled() {
-            return;
-        }
-        let s = crate::observe::rgba_rgb_stats(rgba);
-        let (nz, max) = (s.rgb_nz, s.max_rgb);
-        crate::observe::line(format!(
+        // only: hand both to the sink so a normal boot stays uncluttered and
+        // this path never holds the answer to whether the sink is open.
+        crate::observe::when_verbose(|| {
+            let s = crate::observe::rgba_rgb_stats(rgba);
+            let (nz, max) = (s.rgb_nz, s.max_rgb);
+            crate::observe::line(format!(
             "type5_draw_view ok task={task_id} ref={texture_ref} sid={mapping_id} map_gen={map_gen} view={}x{} fmt={:#x} bpp={bpp} base={base_w}x{base_h} base_fmt={base_fmt:#x} off={base_off} bpr={surface_bpr} span_end={span_end} src={generation_source} rgb_nz={nz} max_rgb={max}",
             view.width,
             view.height,
             view.pixel_format,
         ));
+        });
     };
     if let Some(m) = state.type5_view_memo.get_touch(&memo_key) {
         // Vec equality is length + byte memcmp with early exit on change.
@@ -8960,11 +8960,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         }
         let vertex_count = req.vertex_count.max(1);
 
-        // Decide FIRST whether a census line will be emitted at all; the
-        // resource metas below (per-attr/ssbo format!, hex prefixes, 16-float
-        // matrix dump) cost real per-draw CPU and were previously computed
-        // unconditionally on every draw only to be dropped.
-        let census_verbose = crate::observe::draw_log_enabled();
+        // The resource metas below (per-attr/ssbo `format!`, hex prefixes,
+        // 16-float matrix dump) cost real per-draw CPU and were once computed
+        // unconditionally on every draw only to be dropped. Each census block
+        // now hands itself to `observe::when_verbose`, which decides whether to
+        // run it at all — so the cost is still skipped and this path never
+        // holds a bool saying whether the log is open.
         let fixed_state_gap = vulkan_fixed_state_gap(req);
         let fixed_gap_first = !fixed_state_gap.is_empty() && {
             use std::collections::HashSet;
@@ -9162,7 +9163,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // attribute declarations, storage-buffer bindings, sampler state, colour
         // targets. It is verbose-gated (REIMS_VGPU_DRAW_LOG →
         // /tmp/reims-vgpu-draw.log) because it costs a `format!` per binding.
-        if census_verbose {
+        crate::observe::when_verbose(|| {
             let attr_meta: String = resources
                 .vertex_attributes
                 .iter()
@@ -9224,7 +9225,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 ssbo_meta,
                 sampler_meta
             ));
-        }
+        });
 
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::AssembleTrail);
         // Asked of the module rather than of m2v's reflection, which is the
@@ -9479,7 +9480,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // and must not be read as "GPU drew black" (use import_content res_rgb_nz).
         // The scan is O(pixels) on the drain worker and the line it feeds is the
         // only consumer, so it runs only when that sink is open.
-        if census_verbose {
+        crate::observe::when_verbose(|| {
             if out.pixels.is_empty() {
                 crate::observe::line(format!(
                     "linux_m2v_pixels pipe={} {}x{} skip_readback=1 (no CPU pixels; see import_content)",
@@ -9510,7 +9511,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     out.pixels.get(3).copied().unwrap_or(0),
                 ));
             }
-        }
+        });
         // No content-gated CPU composites: premultiplied One/OneMinusSourceAlpha
         // is hardware Load+blend, and keep-seed / alpha0-hole compositing is not
         // something real Metal does. The blend state below is what makes that

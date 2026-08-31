@@ -2595,7 +2595,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                         // build the head-hex only when REIMS_VGPU_DRAW_LOG is on. A genuine
                         // ensure failure surfaces downstream as `MissingTexture` (the
                         // mapping lookup below misses), so no always-on line is lost.
-                        if crate::observe::draw_log_enabled() {
+                        crate::observe::when_verbose(|| {
                             // The owner task the view names. `note_type5_owner_task`
                             // is the always-on check on its value; this echo carries
                             // it beside the descriptor it came out of.
@@ -2618,7 +2618,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                                 ok as u8,
                                 desc.len(),
                             ));
-                        }
+                        });
                     }
                 }
             }

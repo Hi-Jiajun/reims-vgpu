@@ -90,9 +90,9 @@ pub(crate) use ladder::{ladder_slug, ladder_slugs};
 // want the machinery.
 pub use sink::{
     bgra_present_stats, bgra_rgb_stats, fail, line, nonzero_stats, off, redirect_logs_for_tests,
-    rgba_rgb_stats, RgbaRgbStats,
+    rgba_rgb_stats, verbose, when_verbose, RgbaRgbStats,
 };
-pub(crate) use sink::{draw_log_enabled, elapsed_ms, elapsed_us};
+pub(crate) use sink::{elapsed_ms, elapsed_us};
 
 // Path accessors and the line matcher exist so tests can assert against the
 // real sink rather than a mock; production never reads them back.
