@@ -99,10 +99,16 @@ pub(crate) fn fifo_has_unsubmitted_stamp(index: u32) -> bool {
 
 /// Raise the guest-visible interrupt for a completed stamp slot.
 ///
+/// The seam's own [`crate::backend::StampAnnounce`] under this module's name,
+/// not a second declaration of it: the device layer builds the hook against the
+/// neutral spelling and any rail with a completion thread receives that same
+/// value, so a rail-local `Arc<dyn Fn(u32)>` would be a type that merely
+/// happened to match.
+///
 /// Installed by the device layer, which owns the interrupt-status clone and the
 /// prompt action queue. Called from the completion thread with no lock of this
 /// crate's held, so an implementation must not reach for the device lock.
-pub type AnnounceStamp = Arc<dyn Fn(u32) + Send + Sync>;
+pub type AnnounceStamp = crate::backend::StampAnnounce;
 
 /// The installed announcement hook.
 ///

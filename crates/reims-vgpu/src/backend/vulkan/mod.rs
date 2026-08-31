@@ -278,6 +278,25 @@ impl Backend for VulkanBackend {
         }
     }
 
+    fn warm_guest_ram_imports(
+        &self,
+        imports: &[std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>],
+    ) -> (usize, u64) {
+        engine::warm_guest_ram_imports(imports)
+    }
+
+    fn note_plane_store_published(&self, mapping_id: u32) {
+        draw::vulkan::note_plane_store_published(mapping_id);
+    }
+
+    fn note_drain_thread(&self) {
+        engine::mark_drain_thread();
+    }
+
+    fn install_stamp_announce(&self, announce: crate::backend::StampAnnounce) {
+        engine::stamp_completion::install_announce(announce);
+    }
+
     fn maintain(&self, now_ms: u64) {
         engine::maintain_resources(now_ms);
     }

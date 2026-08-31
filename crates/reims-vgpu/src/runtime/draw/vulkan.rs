@@ -14233,10 +14233,11 @@ static PLANE_MULTIQUAD_PENDING: std::sync::LazyLock<
 /// Note that a Store published for `mapping_id`, closing any multi-quad draw
 /// waiting on it.
 ///
-/// Called from [`publish_surface_store`], which is the one place a Store
-/// becomes visible in the plane's guest pages -- `note_present_backing` advances
-/// there and it is what `present_unbacked` reads.
-pub(super) fn note_plane_store_published(mapping_id: u32) {
+/// Reached through [`crate::backend::Backend::note_plane_store_published`],
+/// whose one caller is `publish_surface_store` -- the one place a Store becomes
+/// visible in the plane's guest pages, where `note_present_backing` advances
+/// and which is what `present_unbacked` reads.
+pub(crate) fn note_plane_store_published(mapping_id: u32) {
     let mut pending = PLANE_MULTIQUAD_PENDING
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());

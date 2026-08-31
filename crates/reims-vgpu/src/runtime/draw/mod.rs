@@ -1709,8 +1709,7 @@ pub(crate) fn publish_surface_store<M: HostMemory + HostOps>(
     height: u32,
     format: u16,
 ) {
-    #[cfg(feature = "backend-vulkan")]
-    vulkan::note_plane_store_published(mapping_id);
+    crate::backend::selected().note_plane_store_published(mapping_id);
     state.note_surface_composite(mapping_id);
     state.note_dense_frame_published(mapping_id, width, height);
     crate::runtime::scanout::note_front_buffer_writeback(

@@ -265,13 +265,13 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
         }),
     );
     // The completion thread's way back to the guest. Installed here rather than
-    // built into the engine because the engine must not know what a
-    // `BoundDevice` is, and looked up by id rather than captured by `Arc` so a
-    // stale hook cannot keep a torn-down device alive.
-    #[cfg(feature = "backend-vulkan")]
-    crate::backend::vulkan::engine::stamp_completion::install_announce(std::sync::Arc::new(
-        move |index: u32| announce_stamp_interrupt(id, index),
-    ));
+    // built into the rail because a rail must not know what a `BoundDevice` is,
+    // and looked up by id rather than captured by `Arc` so a stale hook cannot
+    // keep a torn-down device alive. Offered to whichever rail is running: one
+    // with no completion thread has nobody to announce from and drops it.
+    crate::backend::selected().install_stamp_announce(std::sync::Arc::new(move |index: u32| {
+        announce_stamp_interrupt(id, index)
+    }));
     Some(id)
 }
 
@@ -290,7 +290,6 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
 /// prompt rail call the thread-safe `notify_actions`. The stamp *word* is
 /// already in guest memory by construction: the submission that signalled this
 /// thread's timeline value wrote it.
-#[cfg(feature = "backend-vulkan")]
 fn announce_stamp_interrupt(id: u64, index: u32) {
     let Some(slot) = device_slot(id) else {
         // The device is gone, so there is no interrupt-status register to set

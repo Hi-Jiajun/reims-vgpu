@@ -120,8 +120,20 @@ use crate::runtime::compute_session::ComputeSession;
 use crate::runtime::decode::blit::Command as BlitCommand;
 use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::draw::{DrawEncodeRequest, EncodeStatus, GvaSpan};
-use crate::runtime::guest_ram::ImportId;
+use crate::runtime::guest_ram::{GuestRamImport, ImportId};
 use crate::runtime::host::{HostMemory, HostOps};
+use std::sync::Arc;
+
+/// How a rail's own completion thread announces a finished stamp back to the
+/// device — the vocabulary of [`Backend::install_stamp_announce`].
+///
+/// One `u32`, the FIFO stamp index, and nothing else: the word itself is
+/// already in guest RAM by the time this runs, so the only thing left to carry
+/// is which interrupt to raise. `Arc<dyn Fn>` rather than a concrete type
+/// because the device layer owns the body and the rail owns the thread; making
+/// it generic would put the device's types into the rail's signature, which is
+/// exactly what this seam exists to prevent.
+pub type StampAnnounce = Arc<dyn Fn(u32) + Send + Sync>;
 
 /// What the device executes guest work through.
 ///
@@ -388,6 +400,23 @@ pub(crate) trait Backend: Copy {
     /// Release the rail's residents for linear cache entries the guest deleted.
     fn retire_linear_residents(&self, _keys: &[ComputeStorageResidencyKey]) {}
 
+    /// Take this rail's device-side handles on the host's guest-RAM mappings
+    /// now, and say how many blocks and bytes that cost.
+    ///
+    /// A rail that imports host pointers pays for the import once — on some
+    /// drivers that is a pin of every page of guest RAM, seconds proportional
+    /// to the VM's size — and the whole point of this call is to pay it during
+    /// the protocol handshake instead of inside the guest's first draw, which
+    /// sits in a transaction the guest abandons after a second.
+    ///
+    /// `(0, 0)` from a rail with no import path, which is the honest reading:
+    /// nothing was warmed because nothing needed warming. The caller reports a
+    /// nonzero count and stays quiet otherwise, so a rail that copies instead
+    /// of importing produces no line rather than an empty one.
+    fn warm_guest_ram_imports(&self, _imports: &[Arc<GuestRamImport>]) -> (usize, u64) {
+        (0, 0)
+    }
+
     // --- Cadence ----------------------------------------------------------
 
     /// Idle-time upkeep, on the device heartbeat.
@@ -423,6 +452,36 @@ pub(crate) trait Backend: Copy {
     /// either way. A rail with no resident registry records nothing rather than
     /// a "not ready" reading it would have to be told to discount.
     fn note_blit_t11_resident(&self, _state: &DeviceState, _mapping_id: u32) {}
+
+    /// Tell the rail a Store for `mapping_id` has landed in the guest's pages.
+    ///
+    /// The one moment a plane's content becomes guest-visible, whichever route
+    /// wrote it. Census only, and a rail that tracks nothing per plane does
+    /// nothing with it.
+    fn note_plane_store_published(&self, _mapping_id: u32) {}
+
+    // --- What the rail is told about this process --------------------------
+    //
+    // Neither of these carries guest work. They tell a rail something about the
+    // host process it could not have observed from inside its own call tree,
+    // and a rail with no use for the fact ignores it.
+
+    /// Mark the calling thread as the drain worker.
+    ///
+    /// Entering the drain is the only property that separates that thread from
+    /// a vCPU inside an MMIO store, so a rail that attributes lock waits has to
+    /// be told here or it cannot tell a stalled guest from a busy one.
+    fn note_drain_thread(&self) {}
+
+    /// Install the way a rail's own completion thread reaches back into the
+    /// guest, for a stamp whose word the GPU has already written.
+    ///
+    /// Passed in rather than built by the rail because a rail must not know
+    /// what a device is: the hook resolves its device by id each time it runs,
+    /// so one left behind by a torn-down device announces nothing. A rail whose
+    /// completions are already ordered on the caller's thread has nobody to
+    /// announce from and drops it.
+    fn install_stamp_announce(&self, _announce: StampAnnounce) {}
 
     // --- What the guest is told the GPU can do ------------------------------
     //
@@ -1303,6 +1362,15 @@ impl Backend for SelectedBackend {
         }
     }
 
+    fn warm_guest_ram_imports(&self, imports: &[Arc<GuestRamImport>]) -> (usize, u64) {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.warm_guest_ram_imports(imports),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.warm_guest_ram_imports(imports),
+        }
+    }
+
     fn maintain(&self, now_ms: u64) {
         match self {
             #[cfg(feature = "backend-metal")]
@@ -1336,6 +1404,33 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.note_blit_t11_resident(state, mapping_id),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.note_blit_t11_resident(state, mapping_id),
+        }
+    }
+
+    fn note_plane_store_published(&self, mapping_id: u32) {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.note_plane_store_published(mapping_id),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.note_plane_store_published(mapping_id),
+        }
+    }
+
+    fn note_drain_thread(&self) {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.note_drain_thread(),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.note_drain_thread(),
+        }
+    }
+
+    fn install_stamp_announce(&self, announce: StampAnnounce) {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.install_stamp_announce(announce),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.install_stamp_announce(announce),
         }
     }
 
