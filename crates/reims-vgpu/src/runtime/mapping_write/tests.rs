@@ -2128,6 +2128,158 @@ fn rgba8_image_changed_writes_only_diff_spans() {
     assert_eq!(&row[0..4], &[0, 0, 0, 0]);
 }
 
+/// Every writer of a mapping's guest pages leaves *no* host-side copy claiming
+/// to be them.
+///
+/// This is the rule the two rect writers and the raw-row writer used to break,
+/// and it is not a rule about caches — it is what makes the hypervisor's witness
+/// answerable. `mapping_guest_write_verdict` reports whether the *guest* wrote
+/// these pages, and this device's own writes go through a mapped host pointer
+/// that cannot set `DIRTY_MEMORY_VGA`, so the witness is structurally blind to
+/// them. Only the writer can retire the copy, and a writer that does not leaves
+/// a stale frame the witness will go on calling `Clean` forever.
+///
+/// The consequence was measured on the colour LOAD seed:
+/// `draw::seed_from_published_surface` serves that entry as the attachment's
+/// prior content, the pass composites onto it, and its Store publishes the
+/// result back over the guest's pages — so a partial store's pixels are lost and
+/// then *held*, which is the class the door's strict evidence standard exists to
+/// prevent and could not prevent alone.
+///
+/// Every writer in this file is asserted, including the ones that already
+/// published or forgot, because the value of the rule is that it has no
+/// exceptions to remember.
+#[test]
+fn no_writer_of_a_mappings_pages_leaves_a_host_copy_claiming_to_be_them() {
+    const W: u32 = 4;
+    const H: u32 = 2;
+
+    /// A one-page BGRA mapping with a stale host-cache frame already in it, and
+    /// a stamp saying nothing has written since — the state a full Store leaves
+    /// and every writer below then invalidates.
+    fn staged() -> (DeviceState, FakeHost) {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let pfn = 0x12u32;
+        host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+        state.map_surface(5);
+        let m = state.mappings.get_mut(&5).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        assert!(state.set_mapping_geom(5, W, H, MTL_FORMAT_BGRA8_UNORM));
+        crate::runtime::surface_cache::store(
+            &mut state,
+            5,
+            W,
+            H,
+            vec![0xCCu8; (W * H * 4) as usize],
+        );
+        crate::runtime::mapper::stamp_guest_write_gen(&mut state, &mut host, 5);
+        assert!(
+            crate::runtime::surface_cache::get(&state, 5, W, H).is_some(),
+            "the fixture must start with a host copy for the writer to retire"
+        );
+        (state, host)
+    }
+
+    fn assert_retired(state: &DeviceState, who: &str) {
+        assert!(
+            crate::runtime::surface_cache::get(state, 5, W, H).is_none(),
+            "{who} wrote the mapping's pages and left a host copy still claiming \
+             to be them; the hypervisor's witness cannot see this device's own \
+             writes, so nothing below would ever correct it"
+        );
+    }
+
+    // A sub-rect: the partial store the Metal draw rail takes for a
+    // single-scissor draw.
+    let (mut state, mut host) = staged();
+    let src = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    assert!(write_rect_raw(
+        &mut state,
+        &mut host,
+        5,
+        Rect {
+            origin_x: 1,
+            origin_y: 1,
+            width: 2,
+            height: 1
+        },
+        &src,
+        8
+    ));
+    assert_retired(&state, "write_rect_raw");
+
+    // The whole plane through the same writer, which is the blit arm — and the
+    // worse case, because it replaces every texel the stale entry claims.
+    let (mut state, mut host) = staged();
+    let full = vec![0x77u8; (W * H * 4) as usize];
+    assert!(write_rect_raw(
+        &mut state,
+        &mut host,
+        5,
+        Rect {
+            origin_x: 0,
+            origin_y: 0,
+            width: W,
+            height: H
+        },
+        &full,
+        W * 4
+    ));
+    assert_retired(&state, "write_rect_raw over the whole plane");
+
+    // Raw rows: depth and stencil, so the entry is not normally there at all —
+    // asserted because the rule has no exceptions to remember.
+    let (mut state, mut host) = staged();
+    assert!(write_raw_rows(
+        &mut state,
+        &mut host,
+        5,
+        &vec![0x99u8; (W * H * 4) as usize],
+        W * 4,
+        W * 4,
+        W,
+        H
+    ));
+    assert_retired(&state, "write_raw_rows");
+
+    // Native texels, which already carried the rule and is where the other two
+    // took it from.
+    let (mut state, mut host) = staged();
+    assert!(write_native_image(
+        &mut state,
+        &mut host,
+        5,
+        &vec![0x55u8; (W * H * 4) as usize],
+        W * 4,
+        W,
+        H,
+        MTL_FORMAT_BGRA8_UNORM
+    ));
+    assert_retired(&state, "write_native_image");
+
+    // The two that *publish* rather than retire satisfy the rule the other way:
+    // the copy they leave is the frame they just wrote, so it does claim to be
+    // the pages and is right to.
+    let (mut state, mut host) = staged();
+    assert!(write_bgra8(
+        &mut state,
+        &mut host,
+        5,
+        &vec![0x31u8; (W * H * 4) as usize],
+        W * 4,
+        W,
+        H
+    ));
+    assert_eq!(
+        crate::runtime::surface_cache::get(&state, 5, W, H).map(|f| f[0]),
+        Some(0x31),
+        "write_bgra8 publishes what it wrote, which is the other lawful outcome"
+    );
+}
+
 #[test]
 fn rect_raw_roundtrip_subregion() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);

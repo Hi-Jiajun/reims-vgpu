@@ -1628,6 +1628,14 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
     }
     state.invalidate_storage_residency_window(mapping_id, 0, span_end);
     let _ = state.mark_mapping_written(mapping_id);
+    // Depth and stencil rows, so there is usually no BGRA entry under this
+    // mapping at all and this is a no-op. Kept anyway, and not as a formality:
+    // a mapping's id is not typed by aspect, and the one thing that must never
+    // happen is a writer of a mapping's pages leaving a host-side copy behind
+    // that claims to be them. The rule belongs to every writer here or it is
+    // not a rule.
+    crate::runtime::surface_cache::forget(state, mapping_id);
+    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
     true
 }
 
@@ -2295,6 +2303,8 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
                 return false;
             }
             let _ = state.mark_mapping_written(mapping_id);
+            crate::runtime::surface_cache::forget(state, mapping_id);
+            crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
             return true;
         }
         let mut frame = vec![0u8; frame_len];
@@ -2349,6 +2359,33 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     }
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
+    // Guest pages are authoritative after this write and no host-side copy
+    // represents them, so an older cache entry must retire. The same two lines
+    // `write_native_image` carries, for the same reason and against a sharper
+    // consequence: unlike a native-texel write, this one leaves a *BGRA* entry
+    // of exactly this geometry behind, which is the shape every reader of the
+    // cache is looking for.
+    //
+    // # The defect these close
+    //
+    // This writer publishes nothing and used to stamp nothing, so a partial
+    // store landed composite pixels in the guest's pages while
+    // `host_surfaces[mapping_id]` kept the previous frame and
+    // `mapping_guest_write_verdict` kept answering `Clean` — the device's own
+    // writes go through a mapped host pointer and cannot set `DIRTY_MEMORY_VGA`
+    // (`reims-vgpu-dirty.c`), so the hypervisor's witness cannot see them and
+    // only the writer can. `draw::seed_from_published_surface` then served that
+    // stale frame as the attachment's prior content, the pass composited onto
+    // it, and its Store published the result back over the guest's pages: the
+    // rect's pixels lost, and *held*, which is the exact class that door's
+    // strict evidence standard exists to prevent.
+    //
+    // Retiring rather than repairing, because this writer holds rows in the
+    // mapping's native layout and the cache holds a tight BGRA frame; building
+    // the second from the first is the full-frame conversion the partial store
+    // exists to avoid. A miss costs the next LOAD a guest read.
+    crate::runtime::surface_cache::forget(state, mapping_id);
+    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
     true
 }
 
