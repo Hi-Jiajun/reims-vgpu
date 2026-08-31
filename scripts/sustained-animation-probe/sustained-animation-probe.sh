@@ -29,8 +29,14 @@
 # be A/B'd, and the rails have no reason to have working DNS.
 set -u
 OUT="${1:?outdir}"; SECS="${2:-40}"
-REPO=/home/aneesiqbal/Projects/steelbrain/reims-vgpu
-export QMP_SOCK="${QMP_SOCK:-$REPO/vm/disks/run/qmp.sock}"
+# Derived, not spelled: this probe used to name one checkout's absolute path, so
+# it could not run anywhere else — including on the Apple host, which is the only
+# host the Metal rail exists on.
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# `qmp.py` resolves whichever pathway is live (vm/guest/run for boot-arm64.sh,
+# vm/disks/run for boot-x86.sh). Naming one of them here pinned the x86 pathway
+# and made this probe unable to drive an arm64 boot at all.
+export QMP_SOCK="${QMP_SOCK:-$("$REPO/scripts/qmp/qmp.py" sock)}"
 Q="$REPO/scripts/qmp/qmp.py"
 FAILLOG=/tmp/reims-vgpu-fail.log
 # The guest reaches the host at the user-net gateway. Fixed port: the guest is

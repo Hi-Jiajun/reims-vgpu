@@ -84,7 +84,7 @@ FAILLOG="${REIMS_FAIL_LOG:-/tmp/reims-vgpu-fail.log}"
 # wide is not a slow second — it is the drain thread not returning.
 FREEZE_GAP_S="${FREEZE_GAP_S:-8}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && cd .. && pwd)"
-QMP_SOCK="${QMP_SOCK:-$REPO/vm/disks/run/qmp.sock}"
+QMP_SOCK="${QMP_SOCK:-$("$REPO/scripts/qmp/qmp.py" sock)}"
 
 while [ $# -gt 0 ]; do
   case "$1" in

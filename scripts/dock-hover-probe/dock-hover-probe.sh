@@ -81,7 +81,7 @@ FAILLOG="${REIMS_FAIL_LOG:-/tmp/reims-vgpu-fail.log}"
 # The x86 boot's stable per-boot symlink. qmp.py defaults to the arm64 path, so
 # this must be passed explicitly here — the same override vibrancy-latch-probe
 # makes, for the same reason.
-QMP_SOCK="${QMP_SOCK:-$REPO_ROOT/vm/disks/run/qmp.sock}"
+QMP_SOCK="${QMP_SOCK:-$("$REPO_ROOT/scripts/qmp/qmp.py" sock)}"
 
 while [ $# -gt 0 ]; do
   case "$1" in

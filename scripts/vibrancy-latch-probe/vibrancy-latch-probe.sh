@@ -56,7 +56,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SHOT="$REPO_ROOT/scripts/screenshot/screenshot.sh"
 # The x86 boot's stable per-boot symlink; the drag rides `input-send-event`
 # through it. See scripts/qmp/README.md — the arm64 default does not apply here.
-QMP_SOCK="${QMP_SOCK:-$REPO_ROOT/vm/disks/run/qmp.sock}"
+QMP_SOCK="${QMP_SOCK:-$("$REPO_ROOT/scripts/qmp/qmp.py" sock)}"
 
 while [ $# -gt 0 ]; do
   case "$1" in

@@ -81,7 +81,7 @@ GUEST_DISPLAY_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # pressed at all.
 guest_osa_consenting() {
   local guest="$1" what="$2" script="$3"
-  local qmp_sock="${QMP_SOCK:-$GUEST_DISPLAY_REPO_ROOT/vm/disks/run/qmp.sock}"
+  local qmp_sock="${QMP_SOCK:-$("$GUEST_DISPLAY_REPO_ROOT/scripts/qmp/qmp.py" sock)}"
   local secs="${GUEST_CONSENT_TIMEOUT:-15}"
   local attempts="${GUEST_CONSENT_ATTEMPTS:-3}"
   local i out

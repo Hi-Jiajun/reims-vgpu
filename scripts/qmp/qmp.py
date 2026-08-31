@@ -8,6 +8,7 @@ whichever of the two is currently live, so a driver script works on either
 pathway without being told which. Override with QMP_SOCK=/path/to.sock.
 
 Raw QMP:
+  scripts/qmp/qmp.py sock                      # path of the live pathway's socket
   scripts/qmp/qmp.py cmd query-status
   scripts/qmp/qmp.py cmd human-monitor-command '{"command-line":"info usb"}'
 
@@ -329,6 +330,15 @@ def main(argv: list[str]) -> int:
     if mode in ("shot", "screendump"):
         print(CAPTURE_DISABLED.format(mode=mode), file=sys.stderr)
         return 2
+
+    # Answered without connecting, because the question is which socket a driver
+    # script should use and the answer is useful before a boot as well as during
+    # one. This module already resolves the live pathway; a shell script that
+    # spelled `vm/disks/run/qmp.sock` itself was pinning the x86 pathway and
+    # could not drive an arm64 boot at all.
+    if mode == "sock":
+        print(SOCK)
+        return 0
 
     if mode == "cmd" and args and args[0] == "screendump":
         print(CAPTURE_DISABLED.format(mode="cmd screendump"), file=sys.stderr)

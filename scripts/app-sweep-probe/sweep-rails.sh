@@ -147,7 +147,7 @@ for rail in $RAILS; do
   esac
   sleep 8   # dock and wallpaper settle
 
-  QMP_SOCK="$REPO/vm/disks/run/qmp.sock" timeout 900 \
+  QMP_SOCK="$("$REPO/scripts/qmp/qmp.py" sock)" timeout 900 \
     "$REPO/scripts/app-sweep-probe/app-sweep-probe.sh" \
     --rail "$rail" --seconds "$SECONDS_PER_APP" --torture-seconds "$TORTURE" \
     --shots "$OUT/shots" --keep "$OUT/$rail-work" >"$OUT/$rail-probe.log" 2>&1

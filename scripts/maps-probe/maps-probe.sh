@@ -30,7 +30,7 @@
 set -u
 OUT="${1:?outdir}"; SECS="${2:-40}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-export QMP_SOCK="${QMP_SOCK:-$REPO/vm/disks/run/qmp.sock}"
+export QMP_SOCK="${QMP_SOCK:-$("$REPO/scripts/qmp/qmp.py" sock)}"
 Q="$REPO/scripts/qmp/qmp.py"
 SHOT="$REPO/scripts/screenshot/screenshot.sh"
 FAILLOG=/tmp/reims-vgpu-fail.log
