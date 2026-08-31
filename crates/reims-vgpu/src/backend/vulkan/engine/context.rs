@@ -790,7 +790,12 @@ impl DeviceContext {
                 ash::khr::xcb_surface::NAME,
                 ash::khr::wayland_surface::NAME,
             ];
-            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            // VK_KHR_win32_surface is the Windows host-window surface
+            // extension; one arm per OS keeps each list exactly what that
+            // loader can advertise.
+            #[cfg(target_os = "windows")]
+            let platform: &[&CStr] = &[ash::khr::win32_surface::NAME];
+            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
             let platform: &[&CStr] = &[];
             let available: Vec<&CStr> = platform
                 .iter()

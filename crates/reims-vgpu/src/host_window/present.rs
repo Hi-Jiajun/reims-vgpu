@@ -710,6 +710,14 @@ fn build_event_loop() -> Result<EventLoop<FramePublished>, WindowError> {
         EventLoopBuilderExtX11::with_any_thread(&mut builder, true);
         EventLoopBuilderExtWayland::with_any_thread(&mut builder, true);
     }
+    #[cfg(target_os = "windows")]
+    {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        // Windows refuses a non-main-thread event loop unless the application
+        // opts in explicitly; reims owns a dedicated window thread on every
+        // host, so this is the same opt-in the X11/Wayland arms make above.
+        EventLoopBuilderExtWindows::with_any_thread(&mut builder, true);
+    }
     builder
         .build()
         .map_err(|e| WindowError::EventLoopBuild(e.to_string()))
