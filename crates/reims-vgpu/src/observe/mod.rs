@@ -30,6 +30,8 @@
 //!   thread holds the device lock.
 //! - [`emit`] — the one builder that renders `reason=<slug> k=v …`, and cannot
 //!   produce a line without a reason.
+//! - [`crate::observe::slugs`] — the crate-wide record of which type claims each slug, and the
+//!   collision report when two do.
 //!
 //! # The obligation
 //!
@@ -49,14 +51,14 @@
 //! emitters, and the silence it produced had already been written up as a
 //! finding about the device before the collision was noticed.
 //!
-//! **Nothing checks this.** A source scan over every `slug()` and `refusal()`
-//! body used to, and it went with the rest of them; a `gate` module before that
-//! checked it alongside a 2 700-line restatement of the vocabulary and was
-//! removed whole in `db80389`. Two shapes are the defect, at different radii:
-//! one slug claimed by two impls, and one slug returned by two arms of the same
-//! impl. Prefix every slug with the rail that owns it — that is what makes a
-//! collision unlikely by construction, since the audit that would catch one is
-//! gone.
+//! [`crate::observe::slugs`] observes it. Every line [`crate::observe::emit::Emit`] renders claims its slug for the
+//! concrete type that spelled it, and a second type claiming a slug some other
+//! type already holds is reported by name on the always-on channel — and
+//! panics in a unit-test build, where one process renders thousands of declines
+//! across the whole suite. That proves a collision when both sides emit; it
+//! cannot prove their absence, and it does not see the narrower shape of one
+//! slug returned by two arms of the same impl. Prefix every slug with the rail
+//! that owns it, which is what makes a collision unlikely in the first place.
 //!
 //! The judgement no gate can make stays with the author: do **not** log
 //! speculative returns (a resolver legitimately answering "not ready yet" every
@@ -70,6 +72,7 @@ pub mod ladder;
 pub mod panic;
 pub mod phase_clock;
 pub mod sink;
+pub mod slugs;
 
 /// Re-exported so call sites write `crate::observe::decline_display!(..)`
 /// next to the trait it implements, rather than reaching into the submodule.

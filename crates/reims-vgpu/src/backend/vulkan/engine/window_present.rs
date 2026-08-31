@@ -135,6 +135,15 @@ impl crate::observe::Decline for StagingError {
         }
     }
 
+    /// Delegated arm for arm with `slug`; see
+    /// [`crate::observe::slugs`].
+    fn owner(&self) -> &'static str {
+        match self {
+            Self::Call(call) => call.owner(),
+            Self::NoUploadMemoryType { .. } => std::any::type_name::<Self>(),
+        }
+    }
+
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::Call(call) => call.fields(),

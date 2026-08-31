@@ -139,6 +139,32 @@ impl crate::observe::Decline for DrawError {
         }
     }
 
+    /// Delegated arm for arm with `slug`.
+    ///
+    /// A delegating decline that kept the default owner would claim every
+    /// inner type's slug under its own name, and
+    /// [`crate::observe::slugs`] would report a collision on a wrapper that
+    /// shares no check with anything. The claim has to name the type that
+    /// spelled the slug, not the one that passed it on.
+    fn owner(&self) -> &'static str {
+        match self {
+            Self::TargetRead(d) => d.owner(),
+            Self::GuestPageWrite(d) => d.owner(),
+            Self::Unsupported(r) => r.owner(),
+            Self::VkCall(c) => c.owner(),
+            Self::Slab(d) => d.owner(),
+            Self::FenceTimeout => std::any::type_name::<Self>(),
+            Self::Init(d) => d.owner(),
+            Self::Facade(d) => d.owner(),
+            Self::DrawPreparation(d) => d.owner(),
+            Self::DrawValidation(d) => d.owner(),
+            Self::DrawExecution(d) => d.owner(),
+            Self::ComputeValidation(d) => d.owner(),
+            Self::ComputeExecution(d) => d.owner(),
+            Self::DeviceLost(d) => d.owner(),
+        }
+    }
+
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::TargetRead(d) => d.fields(),

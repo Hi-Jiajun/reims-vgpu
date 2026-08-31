@@ -51,6 +51,7 @@ impl Emit {
     /// Start a line for `event`, taking the reason and its load-bearing fields
     /// from `decline`.
     pub fn decline(event: &'static str, decline: &dyn Decline) -> Self {
+        super::slugs::claim(decline.slug(), decline.owner());
         Self {
             event,
             reason: decline.slug(),
@@ -73,9 +74,11 @@ impl Emit {
     /// which reads as "log it if it refused" and cannot be written the other way
     /// round.
     pub fn refusal(event: &'static str, status: &dyn Refusal) -> Option<Self> {
+        let reason = status.refusal()?;
+        super::slugs::claim(reason, status.owner());
         Some(Self {
             event,
-            reason: status.refusal()?,
+            reason,
             fields: status.fields(),
         })
     }

@@ -21,9 +21,11 @@
 //! expensive. Both went in `db80389`.
 //!
 //! One property is genuinely crate-wide and not visible from any single impl:
-//! **no two checks share a slug**. A source scan over the `Decline`/`Refusal`
-//! impls used to check it and is gone, so it is now the author's obligation —
-//! prefix a slug with the rail that owns it and a collision stops being likely.
+//! **no two checks share a slug**. The source scan that used to check it is
+//! gone and is not coming back; [`crate::observe::slugs`] observes it instead, by having
+//! every rendered line claim its slug for the type that spelled it. That proves
+//! a collision when both sides emit and cannot prove their absence, so prefixing
+//! a slug with the rail that owns it stays the author's habit.
 //!
 //! # Adding a decline type
 //!
@@ -53,6 +55,19 @@ pub trait Decline {
     /// detector will report.
     fn fields(&self) -> Vec<(&'static str, String)> {
         Vec::new()
+    }
+
+    /// The type that spells this slug, for the crate-wide "no two checks share
+    /// a slug" claim in [`crate::observe::slugs`].
+    ///
+    /// The default is this type's own name, which is right for every impl that
+    /// returns its slugs from its own arms. A type that *delegates* — an outer
+    /// enum whose arm hands the question to an inner decline — must delegate
+    /// this too, or the outer and inner types read as two claimants for one
+    /// slug and the collision report fires on a wrapper that shares no check
+    /// with anything.
+    fn owner(&self) -> &'static str {
+        std::any::type_name::<Self>()
     }
 }
 
@@ -107,5 +122,18 @@ pub trait Refusal {
     /// the failing site adds the refs and sizes with [`super::Emit::field`].
     fn fields(&self) -> Vec<(&'static str, String)> {
         Vec::new()
+    }
+
+    /// The type that spells this slug, for the crate-wide "no two checks share
+    /// a slug" claim in [`crate::observe::slugs`].
+    ///
+    /// The default is this type's own name, which is right for every impl that
+    /// returns its slugs from its own arms. A type that *delegates* — an outer
+    /// enum whose arm hands the question to an inner decline — must delegate
+    /// this too, or the outer and inner types read as two claimants for one
+    /// slug and the collision report fires on a wrapper that shares no check
+    /// with anything.
+    fn owner(&self) -> &'static str {
+        std::any::type_name::<Self>()
     }
 }
