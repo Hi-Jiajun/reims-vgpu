@@ -11,6 +11,8 @@
 use crate::backend::metal::runtime::system_device;
 use crate::backend::Backend;
 use crate::model::DeviceState;
+use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus};
+use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::draw::{self, DrawEncodeRequest, EncodeStatus};
 use crate::runtime::host::{HostMemory, HostOps};
 
@@ -68,6 +70,17 @@ impl Backend for MetalBackend {
         force_full_store: bool,
     ) -> (EncodeStatus, Option<Vec<u8>>) {
         draw::metal::encode_draw_chain(state, host, req, writeback_guest, force_full_store)
+    }
+
+    fn execute_dispatch<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        acc: &ComputeAccum,
+        cmd: &ComputeCommand,
+    ) -> ComputeStatus {
+        compute_exec::metal::execute_dispatch_metal(state, host, task_id, acc, cmd, None)
     }
 
     // The two blit fast paths and the resident census take the trait's

@@ -91,7 +91,9 @@ pub mod vulkan;
 
 use crate::model::DeviceState;
 use crate::runtime::blit_exec::{BlitStatus, LinearTextureLevel, Type11Texture};
+use crate::runtime::compute_exec::{ComputeAccum, ComputeStatus};
 use crate::runtime::decode::blit::Command as BlitCommand;
+use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::draw::{DrawEncodeRequest, EncodeStatus};
 use crate::runtime::host::{HostMemory, HostOps};
 
@@ -213,6 +215,23 @@ pub(crate) trait Backend: Copy {
     ) -> Option<BlitStatus> {
         None
     }
+
+    /// Execute a direct or indirect compute dispatch.
+    ///
+    /// Like [`Self::encode_draw_chain`], the request the two rails read is the
+    /// same: `acc` is the accumulated bind state the guest declared and `cmd`
+    /// the decoded dispatch, both backend-neutral. Each rail stages the guest's
+    /// bytes for itself, because *what* has to be staged differs — the Vulkan
+    /// rail may skip a guest read entirely when the engine already holds the
+    /// window, and the Metal rail has no such mirror to skip against.
+    fn execute_dispatch<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        acc: &ComputeAccum,
+        cmd: &ComputeCommand,
+    ) -> ComputeStatus;
 
     /// Count whether this rail already holds a type-11 surface's content.
     ///
@@ -354,6 +373,22 @@ impl Backend for SelectedBackend {
                 src,
                 dst,
             ),
+        }
+    }
+
+    fn execute_dispatch<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        acc: &ComputeAccum,
+        cmd: &ComputeCommand,
+    ) -> ComputeStatus {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.execute_dispatch(state, host, task_id, acc, cmd),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.execute_dispatch(state, host, task_id, acc, cmd),
         }
     }
 

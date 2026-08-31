@@ -2266,7 +2266,8 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
     fill: &IcbRenderFill,
 ) -> Result<(), IcbStatus> {
     use crate::backend::metal::runtime::{new_buffer_from_host, system_device};
-    use crate::runtime::compute_exec::{stage_buffer, ComputeBufferBind};
+    use crate::runtime::compute_exec::metal::stage_buffer;
+    use crate::runtime::compute_exec::ComputeBufferBind;
     use crate::runtime::decode::resource::{
         decode_function_descriptor, decode_render_pipeline_descriptor, FunctionDescriptor,
         OBJECT_TYPE_FUNCTION, OBJECT_TYPE_TYPE7,
@@ -2968,8 +2969,9 @@ pub fn resolve_metal_icb<M: HostMemory + HostOps>(
 pub(crate) fn export_icb_writeback_job(
     task_id: u32,
     icb_ref: u32,
-) -> Option<crate::runtime::compute_exec::NestedDispatchJob> {
-    use crate::runtime::compute_exec::{nested_job_from_icb_buffers, StagedBuffer};
+) -> Option<crate::runtime::compute_exec::metal::NestedDispatchJob> {
+    use crate::runtime::compute_exec::metal::nested_job_from_icb_buffers;
+    use crate::runtime::compute_exec::StagedBuffer;
 
     let cache = icb_cache().lock();
     let entry = cache.get(&(task_id, icb_ref))?;
@@ -3038,7 +3040,8 @@ pub fn fill_compute_command<M: HostMemory + HostOps>(
 ) -> Result<(), IcbStatus> {
     use crate::backend::metal::raw_metal::mtl_size;
     use crate::backend::metal::runtime::{new_buffer_from_host, system_device};
-    use crate::runtime::compute_exec::{load_compute_pipeline, stage_buffer, ComputeBufferBind};
+    use crate::runtime::compute_exec::metal::stage_buffer;
+    use crate::runtime::compute_exec::{load_compute_pipeline, ComputeBufferBind};
     use crate::runtime::mtlb::{load_mtlb, AirLoadRail};
 
     if icb_ref == 0 {

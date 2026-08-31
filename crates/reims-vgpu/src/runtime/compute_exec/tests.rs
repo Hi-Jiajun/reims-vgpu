@@ -4,6 +4,10 @@
 )]
 
 use super::*;
+// Both rails' tests live here alongside the shared staging ones. Neither rail is
+// re-exported into `super`, so each is named where its arm compiles.
+#[cfg(feature = "backend-vulkan")]
+use super::vulkan::*;
 use crate::contract::endian::{st32, st64};
 use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
@@ -502,10 +506,10 @@ fn accum_stage_in_tg_imageblock_and_control_fail_closed() {
 #[test]
 fn vulkan_ignores_stage_input_regions_without_a_stage_input_descriptor() {
     let mut acc = ComputeAccum::default();
-    assert!(!super::linux_stage_input_or_imageblock_unsupported(
+    assert!(!super::vulkan::linux_stage_input_or_imageblock_unsupported(
         false, &acc
     ));
-    assert!(super::linux_stage_input_or_imageblock_unsupported(
+    assert!(super::vulkan::linux_stage_input_or_imageblock_unsupported(
         true, &acc
     ));
 
@@ -517,16 +521,16 @@ fn vulkan_ignores_stage_input_regions_without_a_stage_input_descriptor() {
         size_y: 1,
         size_z: 1,
     });
-    assert!(!super::linux_stage_input_or_imageblock_unsupported(
+    assert!(!super::vulkan::linux_stage_input_or_imageblock_unsupported(
         false, &acc
     ));
 
     acc.set_stage_in_region_indirect(3, 16);
     assert!(acc.stage_in_region.is_none());
-    assert!(!super::linux_stage_input_or_imageblock_unsupported(
+    assert!(!super::vulkan::linux_stage_input_or_imageblock_unsupported(
         false, &acc
     ));
-    assert!(super::linux_stage_input_or_imageblock_unsupported(
+    assert!(super::vulkan::linux_stage_input_or_imageblock_unsupported(
         true, &acc
     ));
 }
@@ -842,7 +846,7 @@ fn dispatch_missing_pipeline() {
     cmd.kind = Kind::DispatchThreadgroups;
     cmd.grid = compute::Size3 { x: 1, y: 1, z: 1 };
     cmd.threads_per_threadgroup = compute::Size3 { x: 1, y: 1, z: 1 };
-    let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
     // The slug names *which* pipeline check refused, and it differs by
     // backend: both arms open with `pipeline_ref == 0`, and before the
     // status carried a reason the two were indistinguishable in the log.
@@ -887,7 +891,7 @@ fn dispatch_nometal_with_texture_binds() {
         z: 1,
     };
     cmd.threads_per_threadgroup = compute::Size3 { x: 32, y: 0, z: 1 };
-    let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
     assert!(
         matches!(
             st,
@@ -917,7 +921,7 @@ fn dispatch_missing_pipeline_not_nometal() {
     cmd.kind = Kind::DispatchThreadgroups;
     cmd.grid = compute::Size3 { x: 1, y: 1, z: 1 };
     cmd.threads_per_threadgroup = compute::Size3 { x: 1, y: 1, z: 1 };
-    let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
     assert_eq!(
         st,
         ComputeStatus::MissingPipeline("compute_vk_pipeline_ref_zero")
@@ -935,7 +939,8 @@ fn dispatch_missing_pipeline_not_nometal() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn a_format_with_no_storage_selector_refuses_the_same_way_from_every_rail() {
-    use crate::runtime::compute_exec::{split_staged_textures, ComputeStatus, StagedTexture};
+    use crate::runtime::compute_exec::metal::split_staged_textures;
+    use crate::runtime::compute_exec::{ComputeStatus, StagedTexture};
 
     let mut no_selector = StagedTexture {
         binding: 33,
@@ -1098,7 +1103,7 @@ fn dispatch_buffer_kernel_mul3add1() {
     cmd.kind = Kind::DispatchThreadgroups;
     cmd.grid = compute::Size3 { x: 1, y: 1, z: 1 };
     cmd.threads_per_threadgroup = compute::Size3 { x: 4, y: 1, z: 1 };
-    let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
     assert!(
         matches!(
             st,
@@ -1143,7 +1148,7 @@ fn dispatch_missing_texture_fails() {
     cmd.threads_per_threadgroup = compute::Size3 { x: 1, y: 1, z: 1 };
     // Missing pipeline object → MissingPipeline before texture stage.
     // Non-Apple metal stubs short-circuit to NoMetal (Linux product).
-    let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
     assert!(matches!(
         st,
         ComputeStatus::MissingPipeline(_)
@@ -2759,10 +2764,11 @@ fn a_truncated_stage_input_is_not_the_same_as_an_absent_one() {
 #[test]
 #[cfg(feature = "backend-vulkan")]
 fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
-    use super::{
-        note_storage_residency_writeback, ComputeStorageResidencyCandidate, StagedTexture,
-        TextureWriteback, STORAGE_RESIDENCY_WINDOWS_PER_MAPPING,
+    use super::vulkan::{
+        note_storage_residency_writeback, ComputeStorageResidencyCandidate,
+        STORAGE_RESIDENCY_WINDOWS_PER_MAPPING,
     };
+    use super::{StagedTexture, TextureWriteback};
     use crate::model::ComputeStorageResidencyKey;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);

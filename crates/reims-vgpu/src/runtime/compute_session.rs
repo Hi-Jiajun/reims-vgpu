@@ -55,7 +55,7 @@ pub struct ComputeSession {
     /// Materialized ICBs kept alive until session commit.
     retained_icbs: Vec<metal::IndirectCommandBuffer>,
     /// Nested dispatches encoded on this session; flushed after GPU completion.
-    pub(crate) nested_jobs: Vec<compute_exec::NestedDispatchJob>,
+    pub(crate) nested_jobs: Vec<compute_exec::metal::NestedDispatchJob>,
     pub control_depth: i32,
     ended: bool,
 }
@@ -442,7 +442,7 @@ impl ComputeSession {
             if self.command_buffer.status() == MTLCommandBufferStatus::Error {
                 return ComputeStatus::MetalFailed("compute_session_command_buffer_error");
             }
-            compute_exec::flush_nested_jobs(state, host, task_id, &mut self.nested_jobs)
+            compute_exec::metal::flush_nested_jobs(state, host, task_id, &mut self.nested_jobs)
         }
     }
 }
@@ -559,7 +559,7 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
     icb: Option<&metal::IndirectCommandBufferRef>,
     range_location: u64,
     range_length: u64,
-) -> Result<Option<compute_exec::NestedDispatchJob>, ComputeStatus> {
+) -> Result<Option<compute_exec::metal::NestedDispatchJob>, ComputeStatus> {
     use crate::backend::metal::abi::{
         texture_binds_as_storage, ReimsVgpuSampler, REIMS_VGPU_BINDING_SAMPLER_BASE,
         REIMS_VGPU_BINDING_TEXTURE_BASE,
@@ -577,10 +577,10 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
     use crate::backend::metal::samplers::make_explicit_sampler;
     use crate::backend::metal::util::valid_buffer_binding;
     use crate::contract::extent::tight_image_bytes;
-    use crate::runtime::compute_exec::{
-        load_compute_pipeline, nested_job_from_icb_resources, split_staged_textures, stage_buffer,
-        stage_texture_raw,
+    use crate::runtime::compute_exec::metal::{
+        nested_job_from_icb_resources, split_staged_textures, stage_buffer,
     };
+    use crate::runtime::compute_exec::{load_compute_pipeline, stage_texture_raw};
     use crate::runtime::icb::new_icb_compute_pso;
     use crate::runtime::mtlb::{load_mtlb, AirLoadRail};
     use crate::runtime::objects;

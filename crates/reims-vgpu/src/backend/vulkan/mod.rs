@@ -24,7 +24,9 @@ pub mod translate;
 use crate::backend::Backend;
 use crate::model::DeviceState;
 use crate::runtime::blit_exec::{self, BlitStatus, LinearTextureLevel, Type11Texture};
+use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus};
 use crate::runtime::decode::blit::Command as BlitCommand;
+use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::draw::{self, DrawEncodeRequest, EncodeStatus};
 use crate::runtime::host::{HostMemory, HostOps};
 
@@ -83,6 +85,17 @@ impl Backend for VulkanBackend {
             range_location,
             range_length,
         )
+    }
+
+    fn execute_dispatch<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        acc: &ComputeAccum,
+        cmd: &ComputeCommand,
+    ) -> ComputeStatus {
+        compute_exec::vulkan::execute_dispatch_linux(state, host, task_id, acc, cmd)
     }
 
     fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
