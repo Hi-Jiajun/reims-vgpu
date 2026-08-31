@@ -89,13 +89,14 @@ pub mod metal;
 #[cfg(feature = "backend-vulkan")]
 pub mod vulkan;
 
-use crate::model::DeviceState;
+use crate::model::{ComputeStorageResidencyKey, DeviceState};
 use crate::runtime::blit_exec::{BlitStatus, LinearTextureLevel, Type11Texture};
 use crate::runtime::compute_exec::{ComputeAccum, ComputeStatus};
 use crate::runtime::compute_session::ComputeSession;
 use crate::runtime::decode::blit::Command as BlitCommand;
 use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::draw::{DrawEncodeRequest, EncodeStatus};
+use crate::runtime::guest_ram::ImportId;
 use crate::runtime::host::{HostMemory, HostOps};
 
 /// What the device executes guest work through.
@@ -264,12 +265,93 @@ pub(crate) trait Backend: Copy {
         session: &mut ComputeSession,
     ) -> ComputeStatus;
 
+    // --- Guest memory the rail also touches -------------------------------
+    //
+    // A rail may write guest pages from the GPU, and may hold an alias of guest
+    // RAM the host mapped for it. The device has to know when those writes have
+    // landed before it reads the same bytes on the CPU, and has to unmap the
+    // host view only after the rail has let go of it. A rail that does neither
+    // takes every default below, and the callers stay one shape.
+
+    /// Whether this rail has guest-page writes submitted but not yet executed.
+    ///
+    /// One relaxed load on the rail that has them, and the gate every settle
+    /// site opens with — a caller with nothing outstanding pays only this.
+    fn guest_writes_outstanding(&self) -> bool {
+        false
+    }
+
+    /// Block until they have.
+    fn quiesce_guest_writes(&self) {}
+
+    /// Whether anything outstanding lands in `pages`.
+    ///
+    /// A rail with no outstanding writes cannot reach anything, so the default
+    /// is [`GuestWriteReach::Disjoint`] rather than
+    /// [`GuestWriteReach::Unnamed`]: "nothing to wait for" is a fact, not a
+    /// failure to answer.
+    fn guest_writes_reaching(&self, _pages: &[u64]) -> GuestWriteReach {
+        GuestWriteReach::Disjoint
+    }
+
+    /// Give up the rail's alias of a retired guest import.
+    ///
+    /// Returns the `(ptr, len)` host view the rail released, if it held one.
+    /// The caller must not unmap a view the rail still owns, which is why this
+    /// answers with the view rather than with a bare success.
+    fn retire_guest_import(&self, _import: ImportId) -> Option<(usize, usize)> {
+        None
+    }
+
+    /// Host views whose fence-safe destruction has completed since the last ask.
+    ///
+    /// The other half of [`Self::retire_guest_import`]: a rail may hold a view
+    /// past the retirement that asked for it, and this is how the view gets
+    /// unmapped without waiting for another guest mapping event.
+    fn take_released_host_aliases(&self) -> Vec<(usize, usize)> {
+        Vec::new()
+    }
+
+    /// Release the rail's residents for linear cache entries the guest deleted.
+    fn retire_linear_residents(&self, _keys: &[ComputeStorageResidencyKey]) {}
+
+    // --- Cadence ----------------------------------------------------------
+
+    /// Idle-time upkeep, on the device heartbeat.
+    fn maintain(&self, _now_ms: u64) {}
+
+    /// Submit anything the rail has been holding back for batching.
+    ///
+    /// Called at the drain tail, so a deferred batch cannot sit until the next
+    /// guest packet arrives.
+    fn flush_deferred_submissions(&self) {}
+
     /// Count whether this rail already holds a type-11 surface's content.
     ///
     /// Census only: it changes no decision, and the caller copies the same bytes
     /// either way. A rail with no resident registry records nothing rather than
     /// a "not ready" reading it would have to be told to discount.
     fn note_blit_t11_resident(&self, _state: &DeviceState, _mapping_id: u32) {}
+}
+
+/// Whether a rail's outstanding guest-page writes can reach a set of pages.
+///
+/// The vocabulary of [`Backend::guest_writes_reaching`], and neutral because
+/// the question is: a host-side reader of guest bytes has to know whether a GPU
+/// write it did not order against is about to land in them, and that is true on
+/// any rail that writes guest memory. It lived in the Vulkan engine, and
+/// `gather_witness` kept a second enum with the same three cases beside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestWriteReach {
+    /// Nothing outstanding lands in any of the pages asked about. The caller may
+    /// read them without settling.
+    Disjoint,
+    /// An outstanding writeback lands in one of them.
+    Overlap,
+    /// The ledger cannot say, so the caller must settle. Distinguished from
+    /// [`Self::Overlap`] because the two want opposite fixes: an overlap is a
+    /// wait genuinely owed and this is precision the ledger failed to keep.
+    Unnamed,
 }
 
 /// The backend a device executes through, resolved once per process.
@@ -447,6 +529,78 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.execute_dispatch_nested(state, host, task_id, acc, cmd, session),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.execute_dispatch_nested(state, host, task_id, acc, cmd, session),
+        }
+    }
+
+    fn guest_writes_outstanding(&self) -> bool {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.guest_writes_outstanding(),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.guest_writes_outstanding(),
+        }
+    }
+
+    fn quiesce_guest_writes(&self) {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.quiesce_guest_writes(),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.quiesce_guest_writes(),
+        }
+    }
+
+    fn guest_writes_reaching(&self, pages: &[u64]) -> GuestWriteReach {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.guest_writes_reaching(pages),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.guest_writes_reaching(pages),
+        }
+    }
+
+    fn retire_guest_import(&self, import: ImportId) -> Option<(usize, usize)> {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.retire_guest_import(import),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.retire_guest_import(import),
+        }
+    }
+
+    fn take_released_host_aliases(&self) -> Vec<(usize, usize)> {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.take_released_host_aliases(),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.take_released_host_aliases(),
+        }
+    }
+
+    fn retire_linear_residents(&self, keys: &[ComputeStorageResidencyKey]) {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.retire_linear_residents(keys),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.retire_linear_residents(keys),
+        }
+    }
+
+    fn maintain(&self, now_ms: u64) {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.maintain(now_ms),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.maintain(now_ms),
+        }
+    }
+
+    fn flush_deferred_submissions(&self) {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.flush_deferred_submissions(),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.flush_deferred_submissions(),
         }
     }
 

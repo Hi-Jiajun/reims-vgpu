@@ -21,14 +21,15 @@ pub mod caps;
 pub mod engine;
 pub mod translate;
 
-use crate::backend::Backend;
-use crate::model::DeviceState;
+use crate::backend::{Backend, GuestWriteReach};
+use crate::model::{ComputeStorageResidencyKey, DeviceState};
 use crate::runtime::blit_exec::{self, BlitStatus, LinearTextureLevel, Type11Texture};
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus};
 use crate::runtime::compute_session::ComputeSession;
 use crate::runtime::decode::blit::Command as BlitCommand;
 use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::draw::{self, DrawEncodeRequest, EncodeStatus};
+use crate::runtime::guest_ram::ImportId;
 use crate::runtime::host::{HostMemory, HostOps};
 
 /// The Vulkan rail's [`Backend`] handle.
@@ -120,6 +121,55 @@ impl Backend for VulkanBackend {
         // `exec::note_compute_refusal` names the slug for every non-`Ok`
         // compute record.
         ComputeStatus::NoMetal("compute_nested_no_vulkan_path")
+    }
+
+    fn guest_writes_outstanding(&self) -> bool {
+        engine::guest_writes_outstanding()
+    }
+
+    fn quiesce_guest_writes(&self) {
+        engine::quiesce_guest_writes();
+    }
+
+    fn guest_writes_reaching(&self, pages: &[u64]) -> GuestWriteReach {
+        engine::guest_writes_reaching(pages)
+    }
+
+    fn retire_guest_import(&self, import: ImportId) -> Option<(usize, usize)> {
+        engine::retire_guest_import(import)
+    }
+
+    fn take_released_host_aliases(&self) -> Vec<(usize, usize)> {
+        engine::take_released_host_aliases()
+    }
+
+    fn retire_linear_residents(&self, keys: &[ComputeStorageResidencyKey]) {
+        // Two releases, and dropping either one is a leak in the opposite
+        // direction: an unpin alone leaves the image holding the only copy of
+        // content nothing may reclaim, and retiring the content alone leaves a
+        // pinned slot no reclaim path may take. Together they make the image
+        // ordinarily evictable.
+        for key in keys {
+            engine::unpin_resident_storage(key);
+            engine::retire_resident_storage_content(key);
+            crate::observe::off(format!(
+                "linear_resident_retired task={} ref={} gva={:#x} {}x{} fmt={:#x}",
+                key.map_generation,
+                key.texture_ref,
+                key.surface_offset,
+                key.width,
+                key.height,
+                key.pixel_format
+            ));
+        }
+    }
+
+    fn maintain(&self, now_ms: u64) {
+        engine::maintain_resources(now_ms);
+    }
+
+    fn flush_deferred_submissions(&self) {
+        engine::flush_batched_draws();
     }
 
     fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(

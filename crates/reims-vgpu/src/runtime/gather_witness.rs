@@ -780,22 +780,15 @@ impl PendingWrites {
     /// `settle_guest_writes_unless_disjoint` opens with — so a bind with nothing
     /// outstanding pays what it paid before.
     fn over(gpas: &[u64]) -> Self {
-        #[cfg(feature = "backend-vulkan")]
-        {
-            use crate::backend::vulkan::engine::GuestWriteReach as Reach;
-            if !crate::backend::vulkan::engine::guest_writes_outstanding() {
-                return Self::Disjoint;
-            }
-            match crate::backend::vulkan::engine::guest_writes_reaching(gpas) {
-                Reach::Disjoint => Self::Disjoint,
-                Reach::Overlap => Self::Overlap,
-                Reach::Unnamed => Self::Unnamed,
-            }
+        use crate::backend::{Backend as _, GuestWriteReach as Reach};
+        let backend = crate::backend::selected();
+        if !backend.guest_writes_outstanding() {
+            return Self::Disjoint;
         }
-        #[cfg(not(feature = "backend-vulkan"))]
-        {
-            let _ = gpas;
-            Self::Disjoint
+        match backend.guest_writes_reaching(gpas) {
+            Reach::Disjoint => Self::Disjoint,
+            Reach::Overlap => Self::Overlap,
+            Reach::Unnamed => Self::Unnamed,
         }
     }
 

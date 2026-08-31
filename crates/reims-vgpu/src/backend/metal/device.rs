@@ -107,9 +107,17 @@ impl Backend for MetalBackend {
         compute_exec::metal::execute_dispatch_metal(state, host, task_id, acc, cmd, Some(rail))
     }
 
-    // The two blit fast paths and the resident census take the trait's
-    // defaults: this rail keeps no resident registry to copy out of or to count,
-    // so it declines both optimisations and records no reading.
+    // The rest of `Backend` takes the trait's defaults, and each default is the
+    // accurate statement for this rail rather than a stub:
+    //
+    // * The two blit fast paths and the resident census — no resident registry
+    //   to copy out of or to count.
+    // * The guest-memory group — this rail's Store is a host copy that has
+    //   already executed when it returns, so nothing is ever outstanding, it
+    //   holds no alias of guest RAM past the call, and it pins no linear
+    //   resident to release.
+    // * The cadence pair — nothing is batched or deferred, so there is nothing
+    //   for the heartbeat or the drain tail to flush.
     fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
         &self,
         state: &mut DeviceState,

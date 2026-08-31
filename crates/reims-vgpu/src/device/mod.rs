@@ -46,6 +46,7 @@ use crate::qemu::host_ops::{NullHost, QemuHost, ReimsVgpuHostOps};
 // The four names the two chapter modules below reach through `use super::*`,
 // and this module uses itself. They were the crate root's "convenience
 // re-exports used by qemu ABI and tests" and came with the registry.
+use crate::backend::Backend as _;
 use crate::model::{Device, DeviceId};
 use crate::runtime::{HostAction, HostOps};
 
@@ -565,8 +566,7 @@ pub fn device_drain(id: u64) -> bool {
     // Submit any deferred draw batch before the worker sleeps: consumers
     // inside the tranche flush on their own (engine begin_entry), this bounds
     // only the idle-tail latency of the last same-target run.
-    #[cfg(feature = "backend-vulkan")]
-    crate::backend::vulkan::engine::flush_batched_draws();
+    crate::backend::selected().flush_deferred_submissions();
     let tail_us = tail_started.elapsed().as_micros() as u64;
     let boundary_started = std::time::Instant::now();
     publish_present_boundary(&slot, device.state.present.frame_flush_seen);
@@ -702,11 +702,8 @@ pub fn device_poll(id: u64) -> bool {
     // the guest stops publishing. The wall clock returns already-dead resources
     // and free-pool memory; it has no authority over live residency, which is
     // governed by resource lifetime and allocation pressure.
-    #[cfg(feature = "backend-vulkan")]
-    {
-        crate::backend::vulkan::engine::maintain_resources(crate::observe::elapsed_ms() as u64);
-        crate::runtime::mapper::drain_deferred_unmaps(&mut host);
-    }
+    crate::backend::selected().maintain(crate::observe::elapsed_ms() as u64);
+    crate::runtime::mapper::drain_deferred_unmaps(&mut host);
     // Pre-boundary early-console → host window (headless-safe: the heartbeat
     // drives poll even under -display none). No-op post-boundary or with no
     // window attached.

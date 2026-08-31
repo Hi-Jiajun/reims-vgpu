@@ -533,6 +533,8 @@
 //! submitted guest-page write settles before the stamp moves. See
 //! `backend::vulkan::engine::write_completion_stamp`.
 
+// The backend the process executes on, reached only through the trait.
+use crate::backend::Backend as _;
 use crate::model::DeviceState;
 #[cfg(feature = "backend-vulkan")]
 use crate::runtime::host::{HostMemory, HostOps};
@@ -718,27 +720,24 @@ settle_sites! {
 /// reads to find which caller pays for the waits that are not free; see
 /// [`SettleSite`].
 pub fn settle_guest_writes(site: SettleSite) {
-    #[cfg(feature = "backend-vulkan")]
-    {
-        // The flag read is one relaxed-acquire load and clear is the common
-        // answer, so the census below runs only on the calls that cost
-        // something. It can race a writeback armed on another thread between
-        // this load and the wait, which makes the site's count a lower bound by
-        // at most one per race — the engine re-reads the flag under its own
-        // lock and the ordering is unaffected.
-        if !crate::backend::vulkan::engine::guest_writes_outstanding() {
-            return;
-        }
-        let started = std::time::Instant::now();
-        crate::backend::vulkan::engine::quiesce_guest_writes();
-        crate::runtime::drain::note_store_route(site.route());
-        crate::runtime::drain::note_store_route_us(
-            site.route_us(),
-            started.elapsed().as_micros() as u64,
-        );
+    let backend = crate::backend::selected();
+    // The flag read is one relaxed-acquire load and clear is the common answer,
+    // so the census below runs only on the calls that cost something. It can
+    // race a writeback armed on another thread between this load and the wait,
+    // which makes the site's count a lower bound by at most one per race — the
+    // rail re-reads the flag under its own lock and the ordering is unaffected.
+    // A rail whose Store has already executed when it returns answers `false`
+    // here always, and every caller below is the same shape on it.
+    if !backend.guest_writes_outstanding() {
+        return;
     }
-    #[cfg(not(feature = "backend-vulkan"))]
-    let _ = site;
+    let started = std::time::Instant::now();
+    backend.quiesce_guest_writes();
+    crate::runtime::drain::note_store_route(site.route());
+    crate::runtime::drain::note_store_route_us(
+        site.route_us(),
+        started.elapsed().as_micros() as u64,
+    );
 }
 
 /// [`settle_guest_writes`], skipped when the outstanding writeback lands nowhere
@@ -765,32 +764,26 @@ pub fn settle_guest_writes_unless_disjoint(
     site: SettleSite,
     pages: impl FnOnce() -> Option<Vec<u64>>,
 ) {
-    #[cfg(feature = "backend-vulkan")]
-    {
-        if !crate::backend::vulkan::engine::guest_writes_outstanding() {
-            return;
-        }
-        use crate::backend::vulkan::engine::GuestWriteReach as Reach;
-        let reach = match pages() {
-            Some(p) => crate::backend::vulkan::engine::guest_writes_reaching(&p),
-            // The caller could not name its own window, which is the same
-            // undecidable as the ledger failing to name the writeback's.
-            None => Reach::Unnamed,
-        };
-        crate::runtime::drain::note_store_route(match reach {
-            Reach::Disjoint => site.route_disjoint(),
-            Reach::Overlap => site.route_overlap(),
-            Reach::Unnamed => site.route_unnamed(),
-        });
-        if reach == Reach::Disjoint {
-            return;
-        }
-        settle_guest_writes(site);
+    use crate::backend::GuestWriteReach as Reach;
+    let backend = crate::backend::selected();
+    if !backend.guest_writes_outstanding() {
+        return;
     }
-    #[cfg(not(feature = "backend-vulkan"))]
-    {
-        let _ = (site, pages);
+    let reach = match pages() {
+        Some(p) => backend.guest_writes_reaching(&p),
+        // The caller could not name its own window, which is the same
+        // undecidable as the ledger failing to name the writeback's.
+        None => Reach::Unnamed,
+    };
+    crate::runtime::drain::note_store_route(match reach {
+        Reach::Disjoint => site.route_disjoint(),
+        Reach::Overlap => site.route_overlap(),
+        Reach::Unnamed => site.route_unnamed(),
+    });
+    if reach == Reach::Disjoint {
+        return;
     }
+    settle_guest_writes(site);
 }
 
 /// Release the engine residents of linear cache entries whose task or object
@@ -808,25 +801,10 @@ pub fn retire_linear_residents(state: &mut DeviceState) {
         return;
     }
     let retired = std::mem::take(&mut state.retired_linear_residents);
-    // The engine that holds these pins is the Vulkan one; a `backend-metal`
-    // build arms nothing that could have pinned them, so taking the list is the
-    // whole of the work there.
-    #[cfg(feature = "backend-vulkan")]
-    for key in &retired {
-        crate::backend::vulkan::engine::unpin_resident_storage(key);
-        crate::backend::vulkan::engine::retire_resident_storage_content(key);
-        crate::observe::off(format!(
-            "linear_resident_retired task={} ref={} gva={:#x} {}x{} fmt={:#x}",
-            key.map_generation,
-            key.texture_ref,
-            key.surface_offset,
-            key.width,
-            key.height,
-            key.pixel_format
-        ));
-    }
-    #[cfg(not(feature = "backend-vulkan"))]
-    drop(retired);
+    // What a release means is the rail's; that the list is emptied here is the
+    // device's. A rail that pins nothing takes the whole list and does nothing
+    // with it, which is the same answer it always gave.
+    crate::backend::selected().retire_linear_residents(&retired);
 }
 
 /// Copy `identity`'s pixels into `mapping_id`'s guest pages.
