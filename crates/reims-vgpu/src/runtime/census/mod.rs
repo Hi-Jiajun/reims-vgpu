@@ -30,7 +30,7 @@
 //! |---|---|
 //! | [`present_proxy`] | `secondary_mrt_drop` — a multi-RT draw degraded to single-RT — plus `stale_online_pending` and [`present_proxy::host_window_publish`], the sole record that a captured frame never reached the host window |
 //! | [`srgb_census`] | which rails drop the sRGB transfer function |
-//! | [`view_swizzle_census`] | type-8 view swizzles dropped, or served by rewriting texels on the CPU |
+//! | [`view_swizzle_census`] | texture-view swizzles dropped, or served by rewriting texels on the CPU |
 //!
 //! # Adding one
 //!
@@ -55,14 +55,14 @@
 //! change is a guest that starts populating the tail, and that is now a typed
 //! decline raised at the record, not a counter nobody reads.
 //!
-//! `t11_decline` was the second: an eight-way reason enum over the type-11
+//! `t11_decline` was the second: an eight-way reason enum over the mapper-ref-texture
 //! sampled rail's zero-copy declines. Across every recorded boot, 1 051 sampled
 //! declines named `below_floor` and nothing else — the other seven variants
 //! never fired once, including the three that sat *after* the floor test and so
 //! were never shadowed by it. That answer set `SAMPLED_GATHER_MIN_BYTES`, whose
 //! scope and basis are recorded on the constant. The threshold now governs only
 //! the copied gather fallback; a directly-backed resource has no size
-//! crossover. The rail returns `Option` like its type-2/3 sibling: falling back
+//! crossover. The rail returns `Option` like its normal-texture sibling: falling back
 //! to the CPU byte loader is expected control flow that yields the same pixels,
 //! so it stays quiet.
 //!

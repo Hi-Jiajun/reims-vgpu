@@ -14,7 +14,7 @@
 //!
 //! ## ICB (`0xe4` / `0xe5`)
 //!
-//! Type-7 tag `0x36` materializes a host `MTLIndirectCommandBuffer` (cached per
+//! Serializer-object tag `0x36` materializes a host `MTLIndirectCommandBuffer` (cached per
 //! task/ref). Command fills use the host Metal fill API in
 //! [`crate::runtime::icb`] — the stream carries no fill opcodes. Execute
 //! applies **parent-encoder inheritance** from stream [`ComputeAccum`] (Metal:
@@ -401,8 +401,8 @@ mod tests {
         use crate::runtime::compute_exec::ComputeBufferBind;
         use crate::runtime::decode::compute::Size3;
         use crate::runtime::decode::resource::{
-            OBJECT_TYPE_FUNCTION, OBJECT_TYPE_TYPE7, PIPELINE_TAG_KERNEL_FUNC, TYPE7_FIRST_TLVS,
-            TYPE7_OBJECT_COMPUTE_PIPELINE,
+            OBJECT_TYPE_FUNCTION, OBJECT_TYPE_SERIALIZER_OBJECT, PIPELINE_TAG_KERNEL_FUNC,
+            SERIALIZER_OBJECT_COMPUTE_PIPELINE, SERIALIZER_OBJECT_FIRST_TLVS,
         };
         use std::path::PathBuf;
 
@@ -454,18 +454,18 @@ mod tests {
             write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
         }
         let mut pdesc = vec![0u8; 32];
-        st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
+        st32(&mut pdesc[0..], SERIALIZER_OBJECT_COMPUTE_PIPELINE);
         st32(&mut pdesc[4..], 32);
-        pdesc[TYPE7_FIRST_TLVS] = 1;
-        pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
-        pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-        st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
+        pdesc[SERIALIZER_OBJECT_FIRST_TLVS] = 1;
+        pdesc[SERIALIZER_OBJECT_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
+        pdesc[SERIALIZER_OBJECT_FIRST_TLVS + 2] = 4;
+        st32(&mut pdesc[SERIALIZER_OBJECT_FIRST_TLVS + 3..], 5);
         let pdesc_gva = 0x180u64;
         write_task_gva_arm64e(&mut host, &state.tasks[1], pdesc_gva, &pdesc);
         {
             let off = list_object_entry_offset(6, 32).unwrap();
             let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
-            let packed = (OBJECT_TYPE_TYPE7 as u32) | (32u32 << 8);
+            let packed = (OBJECT_TYPE_SERIALIZER_OBJECT as u32) | (32u32 << 8);
             st32(&mut le[0..], packed);
             le[4..12].copy_from_slice(&pdesc_gva.to_le_bytes());
             write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);

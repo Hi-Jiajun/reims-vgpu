@@ -237,7 +237,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         frag_storage.push(bytes);
     }
 
-    // Stage-in attrs: layout always comes from the type-7 pipeline vertex
+    // Stage-in attrs: layout always comes from the serializer-object pipeline vertex
     // block (ICB path already does this). Host bytes attach when the stream
     // bound that buffer index; otherwise Metal still needs the descriptor or
     // PSO create fails with "Vertex function has input attributes but no
@@ -332,7 +332,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         frag_bufs.push(ab);
     }
 
-    // Sampled textures: type-11 mapping pages, then type-2/3 linear GVA.
+    // Sampled textures: mapper-ref-texture mapping pages, then normal-texture linear GVA.
     struct TexItem {
         index: u32,
         w: u32,
@@ -424,7 +424,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         })
         .collect();
 
-    // Samplers: type-7 subtype 0x03 when present. A nonzero ref is an explicit
+    // Samplers: serializer-object subtype 0x03 when present. A nonzero ref is an explicit
     // guest bind; if it cannot be resolved, keep the correct fallback but make
     // the degradation visible with the exact resolver reason.
     let mut vtx_samps: Vec<ReimsVgpuSampler> = Vec::new();
@@ -562,7 +562,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     });
     let depth_bias_opt = depth_bias_state.as_ref();
 
-    // Type-7 depth-stencil object + optional stencil reference.
+    // Serializer-object depth-stencil object + optional stencil reference.
     let depth_stencil_state = if req.depth_stencil_ref != 0 {
         match load_depth_stencil_state(state, host, req.task_id, req.depth_stencil_ref) {
             Ok(depth_stencil) => Some(depth_stencil),
@@ -683,7 +683,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         req.vertex_count
     };
 
-    // Type-11 color targets render into a host RT and are written back by the
+    // Mapper-ref-texture color targets render into a host RT and are written back by the
     // CPU. The guest-backed attachment that used to sit here aliased the
     // mapping's `mach_vm_remap` view with `newBufferWithBytesNoCopy`, so Load
     // read and Store wrote guest pages in place; that is exactly the access the
@@ -855,8 +855,8 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         return (EncodeStatus::MetalBackend(st), None);
     }
 
-    // Convert each color RT RGBA8 → guest format and writeback (type-11 mapping
-    // or type-2/3 GVA — archive write_type11_rgba / write_gva_rgba).
+    // Convert each color RT RGBA8 → guest format and writeback (mapper-ref-texture mapping
+    // or normal-texture GVA — archive write_mapper_ref_texture_rgba / write_gva_rgba).
     // Multi-draw intermediate records skip guest store (archive one writeback).
     let mut any_write = false;
     if !writeback_guest {
@@ -868,7 +868,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             continue;
         }
         let out_rgba = &color_outs[i];
-        // Type-2/3 GVA keeps archive image_changed via store_seed_policy.
+        // normal-texture GVA keeps archive image_changed via store_seed_policy.
         let load_seed = color_seeds.get(i).and_then(|s| s.as_deref());
         let seed_for_store = store_seed_policy(force_full_store, c.load_action, load_seed);
         // The same coverage question the draw census asks, from the same
@@ -961,7 +961,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         };
         if wrote {
             any_write = true;
-            // Early-boot logo+pill: paint type-11 front before first DisplaySwap.
+            // Early-boot logo+pill: paint mapper-ref-texture front before first DisplaySwap.
             if c.mapping_id != 0 {
                 crate::runtime::scanout::note_front_buffer_writeback(
                     state,
@@ -990,7 +990,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         );
     }
 
-    // Optional depth/stencil store writeback into type-11 mappings.
+    // Optional depth/stencil store writeback into mapper-ref-texture mappings.
     for seeded in [depth_storage.as_ref(), stencil_storage.as_ref()]
         .into_iter()
         .flatten()
@@ -1001,7 +1001,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     (EncodeStatus::Ok, color0_rgba)
 }
 
-/// Type-2/3 linear GVA raw image read (tight dst rows of `row_bytes`).
+/// normal-texture linear GVA raw image read (tight dst rows of `row_bytes`).
 // A raw image read is addressed by texture, level, geometry and destination
 // stride; every one of those is a separate wire-decoded value.
 #[allow(clippy::too_many_arguments)]
@@ -1024,7 +1024,7 @@ fn load_linear_raw<M: HostMemory + HostOps>(
         host,
         task_id,
         texture_ref,
-        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT],
+        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS],
     ) else {
         return false;
     };
@@ -1289,7 +1289,7 @@ fn load_depth_stencil_state<M: HostMemory + HostOps>(
         host,
         task_id,
         ds_ref,
-        &[OBJECT_TYPE_TYPE7],
+        &[OBJECT_TYPE_SERIALIZER_OBJECT],
     )
     .map_err(|rung| match rung {
         objects::LadderRung::NoListEntry => MetalStateDecline::DepthStencilEntryMissing {
@@ -1387,7 +1387,7 @@ fn default_sampler(binding: u32) -> crate::backend::metal::abi::ReimsVgpuSampler
     }
 }
 
-/// The Metal sampler ABI record for a decoded type-7 sampler descriptor.
+/// The Metal sampler ABI record for a decoded serializer-object sampler descriptor.
 ///
 /// One constructor for every encoder that builds this record — the render path,
 /// the direct compute path, and both ICB-inherit paths. It is an eighteen-field
@@ -1402,7 +1402,7 @@ fn default_sampler(binding: u32) -> crate::backend::metal::abi::ReimsVgpuSampler
 ///   clamp; the binding is the later statement.
 /// - `argument_buffers` forces `support_argument_buffers` on for a sampler that
 ///   is resident in an argument buffer. That residency is a property of how the
-///   pipeline binds it, which the type-7 descriptor cannot state.
+///   pipeline binds it, which the serializer-object descriptor cannot state.
 ///
 /// `has_lod_clamp` is always 1: both clamp fields are filled on every path
 /// here, from the binding when it carried one and from the descriptor
@@ -1518,7 +1518,8 @@ mod sampler_record_tests {
     }
 }
 
-/// Load a sampled texture as tight RGBA8: type-11, type-8→base+mip+format+swizzle, or type-2/3.
+/// Load a sampled texture as tight RGBA8: mapper-ref-texture, texture-view→base+mip+format+swizzle,
+/// or normal-texture.
 fn load_sampled_rgba<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1528,23 +1529,23 @@ fn load_sampled_rgba<M: HostMemory + HostOps>(
     if texture_ref == 0 {
         return None;
     }
-    // Opcode-9 buffer-backed texture (type-8): sample the source buffer directly.
+    // Opcode-9 buffer-backed texture (texture-view): sample the source buffer directly.
     if let Some(bt) = buffer_texture_descriptor(state, host, task_id, texture_ref, None) {
         return load_buffer_texture_rgba(state, host, task_id, texture_ref, &bt);
     }
-    if let Some(v) = load_type11_rgba(state, host, task_id, texture_ref, None) {
+    if let Some(v) = load_mapper_ref_texture_rgba(state, host, task_id, texture_ref, None) {
         return Some(v);
     }
-    // Type-8 view → base texture + selected mip + format override + optional swizzle.
+    // Texture-view view → base texture + selected mip + format override + optional swizzle.
     if let Some(view) = resolve_texture_view(state, host, task_id, texture_ref) {
-        let mut loaded = if let Some(v) = load_type11_rgba(
+        let mut loaded = if let Some(v) = load_mapper_ref_texture_rgba(
             state,
             host,
             task_id,
             view.base_texture_ref,
             view.pixel_format,
         ) {
-            // Type-11 IOSurface textures are single-level only: Metal rejects
+            // Mapper-ref-texture IOSurface textures are single-level only: Metal rejects
             // mipmapped IOSurface descriptors. Non-zero view level_base fails.
             if view.level != 0 {
                 return None;
@@ -1566,20 +1567,20 @@ fn load_sampled_rgba<M: HostMemory + HostOps>(
     load_linear_texture_rgba_at_level(state, host, task_id, texture_ref, 0, None)
 }
 
-fn load_type11_rgba<M: HostMemory + HostOps>(
+fn load_mapper_ref_texture_rgba<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
     format_override: Option<u16>,
 ) -> Option<(u32, u32, Vec<u8>)> {
-    let mapping_id = objects::resolve_type11_ref(state, host, task_id, texture_ref)?;
-    load_type11_mapping_rgba(state, host, mapping_id, format_override)
+    let mapping_id = objects::resolve_mapper_ref_texture(state, host, task_id, texture_ref)?;
+    load_mapper_ref_texture_mapping_rgba(state, host, mapping_id, format_override)
 }
 
-/// Type-2/3 linear texture at mip `level`: strided guest rows → tight RGBA8.
+/// normal-texture linear texture at mip `level`: strided guest rows → tight RGBA8.
 ///
-/// `format_override` is the type-8 view pixel format when present. Base storage
+/// `format_override` is the texture-view pixel format when present. Base storage
 /// geometry (row_stride / level layout) stays on the base texture; the sample
 /// format must be bpp-compatible with the base (Metal texture-view contract).
 fn load_linear_texture_rgba_at_level<M: HostMemory + HostOps>(
@@ -1595,7 +1596,7 @@ fn load_linear_texture_rgba_at_level<M: HostMemory + HostOps>(
         host,
         task_id,
         texture_ref,
-        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT],
+        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS],
     )
     .ok()?;
     let tex = decode_texture_descriptor(&desc_bytes).ok()?;
@@ -1699,7 +1700,7 @@ fn load_sampler<M: HostMemory + HostOps>(
     ))
 }
 
-/// Store scissor rect of tight RGBA8 into a type-11 mapping (BGRA host → guest fmt).
+/// Store scissor rect of tight RGBA8 into a mapper-ref-texture mapping (BGRA host → guest fmt).
 // Source geometry, destination geometry and the scissor rect are three
 // independent rectangles and stay three: collapsing them into one struct would
 // invite exactly the mix-up the separate names prevent.

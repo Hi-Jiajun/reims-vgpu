@@ -114,7 +114,7 @@ pub mod metal;
 pub mod vulkan;
 
 use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
-use crate::runtime::blit_exec::{BlitStatus, LinearTextureLevel, Type11Texture};
+use crate::runtime::blit_exec::{BlitStatus, LinearTextureLevel, MapperRefTexture};
 use crate::runtime::compute_exec::{ComputeAccum, ComputeStatus, ResidentServe};
 use crate::runtime::compute_session::ComputeSession;
 use crate::runtime::decode::blit::Command as BlitCommand;
@@ -285,7 +285,7 @@ pub(crate) trait Backend: Copy {
         None
     }
 
-    /// [`Self::try_copy_whole_plane_on_gpu`] for a type-11 source landing in a
+    /// [`Self::try_copy_whole_plane_on_gpu`] for a mapper-ref-texture source landing in a
     /// guest-linear destination, which resolves its endpoints differently.
     #[allow(
         clippy::too_many_arguments,
@@ -297,7 +297,7 @@ pub(crate) trait Backend: Copy {
         _host: &mut M,
         _task_id: u32,
         _destination_ref: u32,
-        _src: &Type11Texture,
+        _src: &MapperRefTexture,
         _dst: &LinearTextureLevel,
     ) -> Option<BlitStatus> {
         None
@@ -446,7 +446,7 @@ pub(crate) trait Backend: Copy {
         false
     }
 
-    /// Count whether this rail already holds a type-11 surface's content.
+    /// Count whether this rail already holds a mapper-ref-texture surface's content.
     ///
     /// Census only: it changes no decision, and the caller copies the same bytes
     /// either way. A rail with no resident registry records nothing rather than
@@ -1135,7 +1135,7 @@ impl Backend for SelectedBackend {
         host: &mut M,
         task_id: u32,
         destination_ref: u32,
-        src: &Type11Texture,
+        src: &MapperRefTexture,
         dst: &LinearTextureLevel,
     ) -> Option<BlitStatus> {
         match self {

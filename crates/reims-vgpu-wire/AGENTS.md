@@ -372,7 +372,7 @@ device contract instead, and nothing here can be replayed in CI:
 
 - **The guest GPU page table** ([`crate::page_table`]) — the worked example.
 - **FIFO packet framing** (`decode/fifo.rs`) — rings, doorbells, completion stamps.
-- **Device-side descriptors reached by GVA** — the type-4/5/11 IOSurface descriptors and the
+- **Device-side descriptors reached by GVA** — the backing/5/11 IOSurface descriptors and the
   116-byte texture descriptor `decode_texture_descriptor` reads. That 116-byte record is a
   *different structure* from the 36-byte creation payload in [`crate::ops::texture`]; they are not
   two readings of one thing.
@@ -412,7 +412,7 @@ So several modules split rather than staying whole:
 |---|---|
 | x86 PTE format *and* the multi-level walk (`page_table`) | the translation cache, and mapping a walk failure to a typed refusal |
 | object-list entry: 12 bytes, `[type\|desc_len]` + `desc_gva` | which task's list to read, and the lifetime of what it names |
-| type-4 descriptor layout | the 256-task search for which list holds it |
+| backing descriptor layout | the 256-task search for which list holds it |
 | IOSurface page-table entry | `build_table_plan`'s `MappingInternal` field chase (arm64 only) |
 
 The rule for `GuestMemory` implementations is in its module doc and is worth repeating because this

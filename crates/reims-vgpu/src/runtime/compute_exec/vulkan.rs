@@ -94,10 +94,10 @@ impl crate::observe::Decline for NeutralSampledImage {
 ///
 /// Two conditions, and each names a contract term rather than an observation:
 ///
-/// - the writeback must be a **guest-linear plane**. A type-11 destination is a
+/// - the writeback must be a **guest-linear plane**. A mapper-ref-texture destination is a
 ///   tiled surface mapping, which [`crate::runtime::render_writeback::vulkan::GvaPlaneDestination`]
 ///   cannot describe and the licence therefore cannot walk. It is the largest
-///   class this arm does not reach, so [`note_type11_shape`] bands how much of
+///   class this arm does not reach, so [`note_mapper_ref_texture_shape`] bands how much of
 ///   it a raw copy could ever serve — see that function for why the route
 ///   counter alone does not say.
 /// - the licence must be granted. That is where the format, the complete page
@@ -135,7 +135,7 @@ pub(super) fn direct_destination<M: HostMemory + HostOps>(
         ..
     } = &tex.writeback
     else {
-        return type11_destination(state, host, tex, held);
+        return mapper_ref_texture_destination(state, host, tex, held);
     };
     let Ok(row_stride) = u32::try_from(*row_stride) else {
         crate::runtime::drain::note_store_route("compute_dst_host_stride_width");
@@ -187,7 +187,7 @@ pub(super) fn direct_destination<M: HostMemory + HostOps>(
     }
 }
 
-/// [`direct_destination`] for a type-11 surface mapping.
+/// [`direct_destination`] for a mapper-ref-texture surface mapping.
 ///
 /// A tiled surface mapping is not a guest-linear plane and the GVA licence
 /// cannot describe one — but it is not therefore unreachable, and treating it as
@@ -198,21 +198,21 @@ pub(super) fn direct_destination<M: HostMemory + HostOps>(
 /// The destination that *can* describe it already existed on the render rail,
 /// resolving the sample window, walking the mapping's page entries and building
 /// the same [`crate::backend::vulkan::engine::GuestPageTarget`] this rail wants.
-/// It is now [`crate::runtime::mapping_write::vulkan::licence_type11_surface`] and both
+/// It is now [`crate::runtime::mapping_write::vulkan::licence_mapper_ref_texture_surface`] and both
 /// rails ask it, so the surface geometry, the format rule, the page walk and the
 /// guest-RAM references have one spelling rather than two.
 ///
 /// Every decline is a routing answer on the `OFF` channel, not a loss: readback
 /// lands identical bytes, and on a host without the guest-RAM import it is the
 /// only rail there is.
-pub(super) fn type11_destination<M: HostMemory + HostOps>(
+pub(super) fn mapper_ref_texture_destination<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     tex: &StagedTexture,
     held: ash::vk::Format,
 ) -> crate::backend::vulkan::engine::ComputeImageDestination {
     use crate::backend::vulkan::engine::ComputeImageDestination;
-    let TextureWriteback::Type11 {
+    let TextureWriteback::MapperRefTexture {
         mapping_id,
         surface_offset,
         surface_bpr,
@@ -229,14 +229,14 @@ pub(super) fn type11_destination<M: HostMemory + HostOps>(
         return ComputeImageDestination::Host;
     };
     // The window this bind staged against, not one resolved here. It is already
-    // plane-correct for a type-5 view and already a sub-rectangle where the
+    // plane-correct for a ref-texture view and already a sub-rectangle where the
     // dispatch writes one, and it is the same window the readback rail lands
     // through — so the two rails cannot name different bytes of one surface.
-    match crate::runtime::mapping_write::vulkan::licence_type11_surface(
+    match crate::runtime::mapping_write::vulkan::licence_mapper_ref_texture_surface(
         state,
         host,
         held,
-        &crate::runtime::mapping_write::vulkan::Type11SurfaceDestination {
+        &crate::runtime::mapping_write::vulkan::MapperRefTextureSurfaceDestination {
             mapping_id: *mapping_id,
             base_off: *surface_offset,
             bpr: *surface_bpr,
@@ -249,9 +249,9 @@ pub(super) fn type11_destination<M: HostMemory + HostOps>(
         Ok(licence) => {
             crate::runtime::drain::note_store_route("compute_dst_guest_pages");
             crate::runtime::drain::note_store_route(if tex.residency.is_some() {
-                "compute_dst_guest_pages_type11_resident"
+                "compute_dst_guest_pages_mapper_ref_texture_resident"
             } else {
-                "compute_dst_guest_pages_type11_transient"
+                "compute_dst_guest_pages_mapper_ref_texture_transient"
             });
             ComputeImageDestination::GuestPages {
                 target: Box::new(licence.target),
@@ -266,10 +266,12 @@ pub(super) fn type11_destination<M: HostMemory + HostOps>(
             // nothing — and no copy can serve those, so a boot where it is most
             // of this counter is this arm working rather than failing.
             crate::observe::off(format!(
-                "compute_dst_type11 bind={} mid={mapping_id} dims={width}x{height} held={held:?} reason={decline:?}",
+                "compute_dst_mapper_ref_texture bind={} mid={mapping_id} dims={width}x{height} held={held:?} reason={decline:?}",
                 tex.binding
             ));
-            crate::runtime::drain::note_store_route("compute_dst_host_type11_unlicensed");
+            crate::runtime::drain::note_store_route(
+                "compute_dst_host_mapper_ref_texture_unlicensed",
+            );
             ComputeImageDestination::Host
         }
     }
@@ -422,7 +424,7 @@ pub(crate) fn resident_serve(
 /// Stages buffers/textures with device `page_shift`, translates the kernel AIR
 /// via [`crate::runtime::m2v_cache::translate_cached_kernel_reflected`], dispatches on the
 /// process-global [`crate::backend::vulkan::engine`] (shared GRAPHICS|COMPUTE
-/// device), then writebacks GVA / type-11.
+/// device), then writebacks GVA / mapper-ref-texture.
 ///
 /// Nested/ICB/stage-in stay Unsupported (engine surface is storage buffers +
 /// storage images only).
@@ -1308,15 +1310,15 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     // destination owes exactly the same set. Both call it.
                     //
                     // The offsets are the staged ones rather than the licence's,
-                    // and they are the same offsets: `licence_type11_surface`
-                    // resolves the window through `type11_sample_window`, which
+                    // and they are the same offsets: `licence_mapper_ref_texture_surface`
+                    // resolves the window through `mapper_ref_texture_sample_window`, which
                     // is where these came from when the texture was staged.
-                    TextureWriteback::Type11 {
+                    TextureWriteback::MapperRefTexture {
                         mapping_id,
                         surface_offset,
                         span_end,
                         ..
-                    } => crate::runtime::mapping_write::vulkan::note_type11_landed(
+                    } => crate::runtime::mapping_write::vulkan::note_mapper_ref_texture_landed(
                         state,
                         *mapping_id,
                         *surface_offset,

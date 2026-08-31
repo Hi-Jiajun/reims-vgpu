@@ -153,7 +153,7 @@ fn near(got: u8, want: u8) -> bool {
 ///
 /// The engine picks the attachment format from the resolved target — a
 /// `TargetIdentity::Surface` resident is the format its mapping declared, which
-/// is `SURFACE_TEST_FORMAT` for every identity in this file, so a type-11
+/// is `SURFACE_TEST_FORMAT` for every identity in this file, so a mapper-ref-texture
 /// composite Store's readback lands in guest scanout order with no CPU pass — and reports
 /// which it used in `DrawOutput::pixels_bgra`. These cases assert *colour*, not
 /// byte layout, so they normalize here from the reported order rather than
@@ -1193,7 +1193,7 @@ fn sampled_upload_happens_once_across_more_draws_than_the_ring_is_deep() {
     }
 }
 
-/// A resident type-11 sample stays on the GPU: no source readback, staging
+/// A resident mapper-ref-texture sample stays on the GPU: no source readback, staging
 /// upload, or temporary sampled image. The tracked layout must still permit a
 /// later LoadFromTarget draw on the source identity.
 #[test]
@@ -1796,7 +1796,7 @@ fn every_admitted_resident_survives_past_the_retired_slot_cap() {
 /// and reads back in it **without the caller asking**, and says so; a pooled
 /// target does not.
 ///
-/// This is the contract the type-11 composite Store rests on. That Store's
+/// This is the contract the mapper-ref-texture composite Store rests on. That Store's
 /// consumers are all defined in BGRA — `mapping_write::write_bgra8`,
 /// `surface_cache`, the deferred window the flush reads — so when the attachment
 /// is BGRA the readback lands ready to use, and when it is not the runtime pays a
@@ -2412,7 +2412,7 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
     );
 }
 
-/// **L3's proof.** A decoded type-8 view swizzle must be performed by the image
+/// **L3's proof.** A decoded texture-view swizzle must be performed by the image
 /// view's component mapping, on the GPU, at sample time — not by rewriting
 /// texels, which would force every swizzled texture onto the CPU upload path
 /// and cost it the zero-copy crossing.
@@ -2722,7 +2722,7 @@ fn an_alpha_only_write_mask_leaves_the_colour_channels_alone() {
 /// A `SeedOrder::Bgra8` seed must land the same semantic pixels as the
 /// equivalent `SeedOrder::Rgba8` seed.
 ///
-/// This is the type-11 composite Load. `surface_cache` holds guest scanout order
+/// This is the mapper-ref-texture composite Load. `surface_cache` holds guest scanout order
 /// while the pooled target is RGBA, so the runtime used to allocate, copy and
 /// swizzle a whole framebuffer per seeded draw purely to restate pixels it
 /// already had — at the 28-111 Stores/s `store_routes` measures. Naming the
@@ -2980,7 +2980,7 @@ fn chain_load_from_target_byte_parity_vs_cpu_seed() {
     );
 }
 
-/// The type-11 composite Store's shape: `LoadFromTarget` on a resident that the
+/// The mapper-ref-texture composite Store's shape: `LoadFromTarget` on a resident that the
 /// *previous* pass read back, rather than one it left GPU-only.
 ///
 /// Every other `LoadFromTarget` case in this suite sets `skip_readback = true`
@@ -3087,7 +3087,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     );
 }
 
-/// Resident GVA chain (type-2/3 rail): a 3-record chain keeps intermediate
+/// Resident GVA chain (normal-texture rail): a 3-record chain keeps intermediate
 /// content on the engine target — exactly one readback (the final contract
 /// Store), zero CPU seed uploads, two post-submit wait skips — and the final
 /// pixels byte-match the CPU round-trip chain (readback → LoadSeed re-upload

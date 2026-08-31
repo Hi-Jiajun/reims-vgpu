@@ -572,7 +572,7 @@ pub(crate) mod fixtures {
     ///
     /// **Nothing here carries `HOST_COHERENT` and `HOST_CACHED` together**, and
     /// that is the load-bearing property. The previous version of this fixture
-    /// gave type 1 both bits — invented, not measured — which made every
+    /// gave buffer both bits — invented, not measured — which made every
     /// `MemoryClass::Readback` selection test pass while the real device fell
     /// through to uncached type 0 on every allocation. A fixture more capable
     /// than the hardware it stands for cannot fail the way the hardware does.
@@ -931,7 +931,7 @@ mod tests {
     fn type_bits_mask_is_respected() {
         let props = apple_m3_max();
         let req = MemoryTopology::Unified.request(MemoryClass::Readback);
-        // Mask out type 1 (the only host-visible type) → no candidate at all.
+        // Mask out buffer (the only host-visible type) → no candidate at all.
         assert_eq!(pick_index(&props, 0b101, &req), None);
         // Allow it again and it is chosen.
         assert_eq!(pick_index(&props, 0b010, &req), Some(1));

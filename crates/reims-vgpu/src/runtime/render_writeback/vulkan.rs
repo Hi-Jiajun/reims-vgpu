@@ -10,7 +10,7 @@
 //! every entry point here takes a
 //! [`crate::backend::vulkan::engine::TargetIdentity`], and a rail that holds no
 //! residents has nothing to name. The three destinations are the three
-//! namespaces the guest renders into — a type-11 mapping, a guest-backed
+//! namespaces the guest renders into — a mapper-ref-texture mapping, a guest-backed
 //! surface, and a raw GVA plane — and each is reached only from that rail's own
 //! draw, blit or compute path.
 //!
@@ -614,7 +614,7 @@ fn land_gva_frame_bytes<M: HostMemory + HostOps>(
     Ok(extent)
 }
 
-/// Copy `identity`'s pixels into the guest pages behind a type-2/3 render
+/// Copy `identity`'s pixels into the guest pages behind a normal-texture render
 /// target's `target_gva`, with no host copy of the frame at any point.
 ///
 /// The GVA twin of [`store_render_frame`]'s first arm, and worth diffing
@@ -894,7 +894,7 @@ pub(crate) fn copy_resident_into_gva_plane<M: HostMemory + HostOps>(
     // `store_render_frame` performs in `finish`.
     crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
     // Arm the GVA write witness over the pages this Store just published, the
-    // twin of `mapper::stamp_guest_write_gen` on the type-11 rail. It is what
+    // twin of `mapper::stamp_guest_write_gen` on the mapper-ref-texture rail. It is what
     // lets a later reader ask whether these pages still hold this frame without
     // reading them — see `crate::runtime::gva_store_witness`.
     //

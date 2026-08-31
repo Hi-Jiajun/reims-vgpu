@@ -82,7 +82,7 @@ impl PacketFault {
 /// Which check refused to execute a decoded child-channel command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecFault {
-    /// A type-2 indirect exec packet shorter than its declared descriptor.
+    /// A texture indirect exec packet shorter than its declared descriptor.
     Indirect2Short,
 }
 
@@ -494,7 +494,7 @@ pub struct TaskEntry {
 /// for one of them to have branched on.
 ///
 /// The two full-range probes in `runtime::objects` are the visible win.
-/// `type4_claimant_tasks` walked all 256 ids and `type4_probe_order` chained
+/// `backing_claimant_tasks` walked all 256 ids and `backing_probe_order` chained
 /// `1..256`; both now walk the live ids, because the ids in between were
 /// refused by the liveness test at the probe and contributed nothing. Same
 /// answer, and the walk is the size of the guest's task set instead of a
@@ -580,11 +580,11 @@ pub struct TaskResource {
     /// total decoder refuses, and keep that refusal too so those consumers do
     /// not silently widen the total contract.
     decoded: OnceLock<Result<Descriptor, ResourceDecodeStatus>>,
-    /// Type-11 construction side effects, completed once for this resource
+    /// Mapper-ref-texture construction side effects, completed once for this resource
     /// lifetime. The mapping id is immutable construction state; physical
     /// backing replacement invalidates the mapping's pages without rebuilding
     /// the texture object.
-    type11_mapping: OnceLock<u32>,
+    mapper_ref_texture_mapping: OnceLock<u32>,
     /// Identity whose strong lifetime is exactly this serialized resource.
     /// Direct backend objects keep only a weak reference, so deletion—not an
     /// arbitrary idle timeout—makes them reclaimable.
@@ -610,7 +610,7 @@ impl TaskResource {
             entry,
             descriptor,
             decoded: OnceLock::new(),
-            type11_mapping: OnceLock::new(),
+            mapper_ref_texture_mapping: OnceLock::new(),
             lifetime: Arc::new(TaskResourceLifetime::new()),
             #[cfg(feature = "backend-vulkan")]
             resident_targets: Mutex::new(HashMap::new()),
@@ -634,12 +634,12 @@ impl TaskResource {
         }
     }
 
-    pub(crate) fn registered_type11_mapping(&self) -> Option<u32> {
-        self.type11_mapping.get().copied()
+    pub(crate) fn registered_mapper_ref_texture_mapping(&self) -> Option<u32> {
+        self.mapper_ref_texture_mapping.get().copied()
     }
 
-    pub(crate) fn register_type11_mapping(&self, mapping_id: u32) -> u32 {
-        *self.type11_mapping.get_or_init(|| mapping_id)
+    pub(crate) fn register_mapper_ref_texture_mapping(&self, mapping_id: u32) -> u32 {
+        *self.mapper_ref_texture_mapping.get_or_init(|| mapping_id)
     }
 
     /// Retain and classify the engine target named by this resource.
@@ -1007,7 +1007,7 @@ pub type TaskRenderPipelineStates =
 /// A depth-stencil state is an immutable object with its own explicit delete
 /// command (`OPCODE_DELETE_DEPTH_STENCIL_STATE`), exactly like a sampler state
 /// and a render pipeline state, so it belongs in this namespace and not in
-/// [`TaskResources`] — whose type mask deliberately excludes object type 7,
+/// [`TaskResources`] — whose type mask deliberately excludes object serializer-object,
 /// because that tag is also worn by mutable serializer descriptors and two
 /// reference spaces sharing one map would destroy each other's entries when
 /// their integers collide.
@@ -1231,12 +1231,12 @@ pub struct MapperCapture {
 }
 
 /// The guest page table and GPU-VA base a mapping's [`MappingEntry::
-/// page_entries`] were walked from, when the list came from a type-4 surface
+/// page_entries`] were walked from, when the list came from a backing record
 /// plan.
 ///
 /// Latched at the one site that assigns those entries so the two cannot drift
 /// apart. It exists so a later reader can *repeat* the walk without repeating
-/// the search: `resolve_type4_surface_ex` finds the surface object by probing up
+/// the search: `resolve_backing_ex` finds the surface object by probing up
 /// to 256 task object lists, and that cost is why the page list is cached rather
 /// than re-derived. The walk itself is cheap — one page-table translation per
 /// page — and it is the only thing that can say whether the cached list still
@@ -1248,7 +1248,7 @@ pub struct MapperCapture {
 /// remembering to retire a second field — the same rule
 /// [`MappingEntry::guest_write_token_gen`] states for the same reason.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Type4Walk {
+pub struct BackingWalk {
     /// Task whose page table translated the backing pages.
     pub task_id: u32,
     /// `getGPUVirtualAddress() >> page_shift` of the surface backing — page `i`
@@ -1413,14 +1413,14 @@ pub struct MappingEntry {
     /// The host framework carries the matching pair as `PGResource._hostValid` /
     /// `._guestValid`, set through `setIsHostValid:` / `setIsGuestValid:`.
     pub validity: ResourceValidity,
-    /// Epoch of this mapping's *surface content* in the sense a type-11 render
+    /// Epoch of this mapping's *surface content* in the sense a mapper-ref-texture render
     /// LOAD needs: it advances whenever the pixels that Load would seed from
     /// could have changed, wherever they live.
     ///
     /// Strictly coarser than [`Self::content_generation`], and deliberately so.
     /// `content_generation` counts writes to the mapping's *guest pages*, which
     /// misses the one publisher that writes only the host shadow: the deferred
-    /// type-11 Store stores into `surface_cache` and arms a window instead of
+    /// mapper-ref-texture Store stores into `surface_cache` and arms a window instead of
     /// scattering into guest pages. `surface_cache` holds exactly one entry per
     /// mapping, so a sibling Store at a *different* geometry replaces the entry
     /// an older geometry's resident is being compared against while
@@ -1431,7 +1431,7 @@ pub struct MappingEntry {
     /// currency nothing established.
     ///
     /// Compared against [`crate::backend::vulkan::engine::resident_content_epoch`]
-    /// to decide whether a type-11 LOAD may take `LoadOp::LoadFromTarget` and
+    /// to decide whether a mapper-ref-texture LOAD may take `LoadOp::LoadFromTarget` and
     /// skip its CPU seed entirely. Never read to decide *what* to present or
     /// draw — only whether a known-equal upload can be elided.
     pub surface_content_epoch: u32,
@@ -1503,7 +1503,7 @@ pub struct MappingEntry {
     ///
     /// The lifecycle mutators retire the token eagerly, but they are not the
     /// only writers of [`Self::page_entries`]: the mapper's plan adoption and
-    /// the type-4 page refresh both replace the list in place, and both retired
+    /// the backing page refresh both replace the list in place, and both retired
     /// the contiguous view while leaving the token behind — a token naming
     /// pages the surface no longer owns, which is the one thing it must never
     /// be. Rather than add a third and a fourth site to remember,
@@ -1516,7 +1516,7 @@ pub struct MappingEntry {
     /// [`crate::runtime::host::HostOps::guest_write_gen`] as it stood when this
     /// mapping's pixels were last published by a device Store.
     ///
-    /// The other half of the type-11 seed currency test.
+    /// The other half of the mapper-ref-texture seed currency test.
     /// [`Self::surface_content_epoch`] can only witness writers inside this
     /// crate — every caller of `mark_mapping_written` is one — and a surface's
     /// pages are plain guest RAM the guest CPU stores into with no device
@@ -1526,22 +1526,22 @@ pub struct MappingEntry {
     /// never compares equal to a live generation (the host's first readable
     /// generation is 1).
     pub guest_write_gen_at_store: u64,
-    /// Task id that last owned this surface as a type-4 `OBJECT_TYPE_SURFACE`
+    /// Task id that last owned this surface as a backing `OBJECT_TYPE_BACKING`
     /// object (0 = no non-trivial hint; task 0 is always probed first anyway).
-    /// `resolve_type4_surface_ex` probes this task right after task 0 so a
+    /// `resolve_backing_ex` probes this task right after task 0 so a
     /// per-bind present-path scan short-circuits instead of walking all 256
     /// task slots. Purely a search-order hint — a stale/wrong value only costs
     /// one extra probe before the full-table fallback re-finds the owner.
     pub owner_task_hint: u32,
-    /// How [`Self::page_entries`] were derived, when they came from a type-4
-    /// surface plan — see [`Type4Walk`]. `None` for every other source, and for
+    /// How [`Self::page_entries`] were derived, when they came from a backing
+    /// surface plan — see [`BackingWalk`]. `None` for every other source, and for
     /// a mapping whose list has been invalidated.
     ///
     /// Distinct from [`Self::owner_task_hint`], which is a *search* hint and is
     /// allowed to be wrong. This is a statement about the list that is in the
     /// entry right now: repeat this walk and you must get these entries back, or
     /// the guest has moved the surface underneath us without saying so.
-    pub type4_walk: Option<Type4Walk>,
+    pub backing_walk: Option<BackingWalk>,
 }
 
 impl MappingEntry {
@@ -1574,9 +1574,9 @@ impl MappingEntry {
 /// Three window kinds share this shape (`texture_ref` appended last so the
 /// `(mapping_id, …)` ordering prefix — and every mapping-keyed range scan —
 /// is unchanged):
-/// - **Surface window** (`mapping_id != 0`): a type-11 IOSurface view;
+/// - **Surface window** (`mapping_id != 0`): a mapper-ref-texture IOSurface view;
 ///   `texture_ref == 0`.
-/// - **Linear window** (`mapping_id == 0`): a type-2/3 raw task-GVA texture,
+/// - **Linear window** (`mapping_id == 0`): a normal-texture raw task-GVA texture,
 ///   identity-matched to its `host_linear_textures` cache entry —
 ///   `map_generation` holds the task id, `surface_offset` the level-0 GVA,
 ///   `surface_bpr` the row stride, `span_end` `row_stride * height`, and
@@ -1599,7 +1599,7 @@ pub struct ComputeStorageResidencyKey {
 }
 
 impl ComputeStorageResidencyKey {
-    /// Identity of a linear (type-2/3 raw task-GVA) texture window.
+    /// Identity of a linear (normal-texture raw task-GVA) texture window.
     #[allow(
         clippy::too_many_arguments,
         reason = "the key constructor names every wire-derived identity component"
@@ -1781,7 +1781,7 @@ pub struct HostSurface {
     /// only unique while the entry lives, and this map's entries are removed
     /// and re-created on the routine deferred-Store arm path.
     pub host_gen: u64,
-    /// Decoded object type that produced a GVA-keyed type-2/3 encode. Zero for
+    /// Decoded object type that produced a GVA-keyed normal-texture encode. Zero for
     /// surface/ref caches and for stores that did not record an owner.
     pub producer_object_type: u8,
     /// Recency stamp for the GVA cache's byte cap
@@ -1855,7 +1855,7 @@ pub struct HostSurface {
     // re-stamping on every write.
 }
 
-/// Raw type-2/3 texture content retained by the discrete backend.
+/// Raw normal texture content retained by the discrete backend.
 ///
 /// Unlike [`HostSurface`], bytes stay in the guest Metal pixel format and are
 /// tightly row-packed. The key is `(task_id, texture_ref)`; descriptor fields
@@ -1899,7 +1899,7 @@ pub struct PresentState {
     pub present_mapping: u32,
     pub host_mapping: u32,
     pub frame_flush_seen: bool,
-    /// Latest type-11 **Composite** writeback mid (logo/desktop content).
+    /// Latest mapper-ref-texture **Composite** writeback mid (logo/desktop content).
     /// Pre-boundary: sticky early feed for gfx_update when present_mapping is a
     /// ClearOnly flip buffer (dual-mid buffer-setup thrash class).
     /// Post-boundary: dual-mid *peer* tracker, read only by the failure/census
@@ -1967,7 +1967,7 @@ pub struct PresentState {
     /// different pixels", where `frame_generation` is "the guest's pages hold
     /// something different".
     ///
-    /// The two came apart when the lazy type-11 Store
+    /// The two came apart when the lazy mapper-ref-texture Store
     /// ([`crate::runtime::writeback_debt`]) started leaving a frame in the engine
     /// resident and owing the pages a copy: the pixels move every frame and the
     /// generation does not. Anything asking "is this a new frame to show" has to
@@ -2094,12 +2094,12 @@ pub struct PendingWork {
 }
 
 /// Byte cap for the guest-CPU-produced content memos (`guest_linear_memo`,
-/// `type5_view_memo`, `type11_memo`). A cap crossing evicts the coldest entries
+/// `ref_texture_view_memo`, `mapper_ref_texture_memo`). A cap crossing evicts the coldest entries
 /// down to a low-water mark — never a bulk clear — so the hot working set (and
 /// its avoided re-decode/re-convert cost) survives.
 pub const GUEST_LINEAR_MEMO_BYTE_CAP: usize = 128 << 20;
 
-/// Byte cap for the GVA-keyed type-2/3 encode cache
+/// Byte cap for the GVA-keyed normal-texture encode cache
 /// ([`DeviceState::host_gva_surfaces`]). Same basis and same value as
 /// [`GUEST_LINEAR_MEMO_BYTE_CAP`], which bounds the sibling cache holding the
 /// same class of content.
@@ -2403,22 +2403,22 @@ pub struct DeviceState {
     /// them with resource deletion or task teardown.
     #[cfg(feature = "backend-vulkan")]
     pub task_render_pipeline_states: TaskRenderPipelineStates,
-    /// Type-11 texture object ref → mapping_id: (task_id, ref) -> mapping_id.
+    /// Mapper-ref-texture object ref → mapping_id: (task_id, ref) -> mapping_id.
     pub texture_to_mapping: BTreeMap<(u32, u32), u32>,
     pub mappings: BTreeMap<u32, MappingEntry>,
     /// Host render-cache keyed by surface_id / mapping_id (Linux/Vulkan rail).
     /// See [`crate::runtime::surface_cache`] and kb tahoe-x86-host-reims_vgpu §8.5.
     /// **Surface_id namespace only** — never texture_ref (object list ids collide).
     pub host_surfaces: BTreeMap<u32, HostSurface>,
-    /// Discrete encode cache for type-2/3 GVA color targets, keyed by
+    /// Discrete encode cache for normal-texture GVA color targets, keyed by
     /// `(task_id, texture_ref)`.
     ///
     /// Object-list refs are local to a task. Separate from
-    /// [`Self::host_surfaces`] so list ids cannot clobber type-4 present mids,
+    /// [`Self::host_surfaces`] so list ids cannot clobber backing present mids,
     /// and task-qualified so one address space cannot replace or evict another
     /// task's same-numbered texture.
     pub host_texture_surfaces: BTreeMap<(u32, u32), HostSurface>,
-    /// Same type-2/3 encode content keyed by target GVA — survives texture_ref
+    /// Same normal-texture encode content keyed by target GVA — survives texture_ref
     /// rebinding / small-atlas overwrite of the ref slot.
     ///
     /// Bounded by [`GVA_ENCODE_CACHE_BYTE_CAP`] with least-recently-*used*
@@ -2458,7 +2458,7 @@ pub struct DeviceState {
     pub gva_cache_byte_cap: usize,
     /// What [`GVA_ENCODE_CACHE_BYTE_CAP`] cost, measured rather than assumed.
     pub gva_eviction_witness: GvaEvictionWitness,
-    /// Raw compute encode for type-2/3 textures. Retained across GVA unmap;
+    /// Raw compute encode for normal textures. Retained across GVA unmap;
     /// evicted on task/object lifetime end or descriptor mismatch.
     pub host_linear_textures: BTreeMap<(u32, u32), HostLinearTexture>,
     /// Perf memo for guest-CPU-produced linear textures (no host cache entry,
@@ -2479,7 +2479,7 @@ pub struct DeviceState {
     #[cfg(feature = "backend-vulkan")]
     pub gather_witness: crate::runtime::gather_witness::GatherWitness,
     /// The GVA render targets a Store has stamped, and what the two write
-    /// witnesses said at the time. The GVA half of the type-11 witness that
+    /// witnesses said at the time. The GVA half of the mapper-ref-texture witness that
     /// licenses the attachment LOAD elision — see
     /// [`crate::runtime::gva_store_witness`].
     #[cfg(feature = "backend-vulkan")]
@@ -2518,7 +2518,7 @@ pub struct DeviceState {
     /// lifetime, key space, or eviction policy.
     ///
     /// Each producer used to keep its own counter and the difference was
-    /// measured, not theorised. The guest-linear and type-5 memos shared this
+    /// measured, not theorised. The guest-linear and ref-texture memos shared this
     /// one and were sound; the GVA host cache incremented a *per-entry* field
     /// that restarted at 1 whenever the entry was re-created, and
     /// `evict_gva` re-creates it on every deferred GVA render Store arm. One
@@ -2538,16 +2538,16 @@ pub struct DeviceState {
     pub host_writes: crate::runtime::host_writes::HostWrites,
     /// Reusable native-row read buffer for the guest-linear memo path.
     pub guest_linear_scratch: Vec<u8>,
-    /// Byte-exact revalidated memo for type-5 serialized texture views
+    /// Byte-exact revalidated memo for ref-texture serialized texture views
     /// (media IOSurface planes). Same contract as
     /// [`Self::guest_linear_memo`]: every bind re-reads the native plane
     /// window; conversion + upload (via the returned content identity) are
     /// skipped on unchanged bytes. Keyed by
     /// (mapping_id, plane, width, height, view pixel format). Byte-bounded LRU
     /// ([`GUEST_LINEAR_MEMO_BYTE_CAP`]).
-    pub type5_view_memo: LruBytesMemo<(u32, u32, u32, u32, u16), GuestLinearMemo>,
-    /// Byte-exact revalidated memo for the type-11 mapping-backed sampled path
-    /// (`load_type11_mapping_rgba` — small IOSurface textures below the zero-copy
+    pub ref_texture_view_memo: LruBytesMemo<(u32, u32, u32, u32, u16), GuestLinearMemo>,
+    /// Byte-exact revalidated memo for the mapper-ref-texture mapping-backed sampled path
+    /// (`load_mapper_ref_texture_mapping_rgba` — small IOSurface textures below the zero-copy
     /// floor, e.g. dock icons under magnification). Same contract as
     /// [`Self::guest_linear_memo`]: every bind re-reads the native BGRA rect;
     /// the BGRA->RGBA convert + the two per-bind allocs + the engine's content
@@ -2556,9 +2556,9 @@ pub struct DeviceState {
     /// so this collapses the `t11_guest` CPU copies that otherwise saturate the
     /// serial drain worker (dock-hover freeze). Keyed by (mapping_id, w, h).
     /// Byte-bounded LRU ([`GUEST_LINEAR_MEMO_BYTE_CAP`]).
-    pub type11_memo: LruBytesMemo<(u32, u32, u32), GuestLinearMemo>,
-    /// Reusable native BGRA read buffer for the type-11 memo re-read.
-    pub type11_memo_scratch: Vec<u8>,
+    pub mapper_ref_texture_memo: LruBytesMemo<(u32, u32, u32), GuestLinearMemo>,
+    /// Reusable native BGRA read buffer for the mapper-ref-texture memo re-read.
+    pub mapper_ref_texture_memo_scratch: Vec<u8>,
     /// Last guest-visible generation produced by a compute storage-image
     /// writeback, keyed by the exact window it was produced for.
     ///
@@ -2810,9 +2810,9 @@ impl DeviceState {
             sampled_content_gen: 0,
             host_writes: crate::runtime::host_writes::HostWrites::new(page_shift),
             guest_linear_scratch: Vec::new(),
-            type5_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
-            type11_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
-            type11_memo_scratch: Vec::new(),
+            ref_texture_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
+            mapper_ref_texture_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
+            mapper_ref_texture_memo_scratch: Vec::new(),
             gva_host_views: Vec::new(),
             view_stale_reads: 0,
         }
@@ -3296,7 +3296,7 @@ impl DeviceState {
     /// This device carries two ways from a reference to a surface, because the
     /// guest has two: on some paths the reference *is* the mapping id, and on
     /// the rest [`Self::texture_to_mapping`] holds the per-task registration a
-    /// type-11 create recorded. A statement about the reference — a validity
+    /// mapper-ref-texture create recorded. A statement about the reference — a validity
     /// quad, an owed render frame — is a statement about every mapping it
     /// names, so the candidate set is one rule and lives here.
     ///
@@ -3437,7 +3437,7 @@ impl DeviceState {
         // page list that just stopped being this surface's.
         //
         // Retiring the guest-write token is what makes that reachable rather
-        // than theoretical. The type-4 sampled ladder's host-cache rung serves
+        // than theoretical. The backing sampled ladder's host-cache rung serves
         // its copy unless the witness reports `Wrote`, and a retired token
         // reports `NoStamp` — deliberately not evidence, because "nobody armed
         // this" is a statement about this device and not about the guest. The
@@ -3860,7 +3860,7 @@ impl DeviceState {
     ///
     /// Also advances [`MappingEntry::surface_content_epoch`], so every one of
     /// this crate's guest-page writers keeps that epoch closed for free — the
-    /// completeness property the type-11 `LoadFromTarget` gate rests on.
+    /// completeness property the mapper-ref-texture `LoadFromTarget` gate rests on.
     pub fn mark_mapping_written(&mut self, mapping_id: u32) -> u32 {
         let seq = self.next_validity_seq();
         let Some(m) = self.mappings.get_mut(&mapping_id) else {
@@ -3888,7 +3888,7 @@ impl DeviceState {
     }
 
     /// Advance a mapping's content stamps for a publish that changed its pixels
-    /// *without* writing its guest pages — the lazy type-11 Store of
+    /// *without* writing its guest pages — the lazy mapper-ref-texture Store of
     /// [`crate::runtime::writeback_debt`], which leaves the frame in the engine
     /// resident and owes the pages a copy.
     ///

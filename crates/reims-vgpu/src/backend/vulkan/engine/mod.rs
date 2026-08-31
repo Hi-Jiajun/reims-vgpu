@@ -1876,7 +1876,7 @@ pub fn execute_compute_request(req: &ComputeRequest) -> Result<ComputeOutput, Co
 
 /// Measure-only: does the target registry hold **content_ready** for this identity?
 ///
-/// Used by type-11 sample dig (`sample_src=… resident_ready=`) to detect the
+/// Used by mapper-ref-texture sample dig (`sample_src=… resident_ready=`) to detect the
 /// resident-vs-guest split without a full readback. Does not create devices or
 /// allocate; returns false if the engine is uninit or the key is absent.
 /// Whether the window presenter would take this resident for a present at
@@ -2121,7 +2121,7 @@ pub fn resident_absent_after_reclaim(
 /// `None` when the identity is absent, evicted, or has not been vouched for
 /// since its last draw.
 ///
-/// Compared by the type-11 LOAD against
+/// Compared by the mapper-ref-texture LOAD against
 /// [`crate::model::MappingEntry::surface_content_epoch`]: equal means the
 /// resident already holds exactly the bytes a CPU seed would upload, so the
 /// pass may load straight from the resident and skip the upload. Every way the
@@ -2593,7 +2593,7 @@ pub fn supports_block_compressed_sampled() -> bool {
 /// a fallback, it is the host window holding its previous retain until some
 /// later frame happens to be readable. That was survivable while every resident
 /// this could name was created in guest scanout order; it stopped being so once
-/// a type-11 mapping's resident follows the format the mapping declares, because
+/// a mapper-ref-texture mapping's resident follows the format the mapping declares, because
 /// a scanout plane declared at anything else would have frozen the window
 /// outright. So the readback's own reported order decides, and a resident that
 /// is not already BGRA8 pays one exchange — [`read_target`]'s rail has already

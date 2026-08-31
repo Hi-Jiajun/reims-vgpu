@@ -1,10 +1,10 @@
 //! Product-path compute bind/dispatch for `SEGMENT_TYPE_COMPUTE`.
 //!
 //! Executable surface:
-//! - `0xd0` set compute pipeline (type-7 → kernel function MTLB + optional stage-input)
+//! - `0xd0` set compute pipeline (serializer-object → kernel function MTLB + optional stage-input)
 //! - `0xcb` / `0xd9` set buffers (+ optional attribute stride for dynamic stage-input layouts)
 //! - `0xcf` / `0xda` set buffer offset (+ optional attribute stride)
-//! - `0xce` set textures (type-2/3 GVA + type-11; sample vs storage via reflection)
+//! - `0xce` set textures (normal-texture GVA + mapper-ref-texture; sample vs storage via reflection)
 //! - `0xcc` / `0xcd` set samplers (+ optional LOD clamp)
 //! - `0xd1` direct stage-in region / `0xd2` indirect stage-in region (guest buffer args)
 //! - `0xd3` threadgroup memory length
@@ -22,7 +22,7 @@
 //!
 //! One-shot encode uses [`crate::backend::metal::compute::compute_core`]; nested
 //! encode uses `compute_encode_on_encoder`. Buffer and storage-image writeback
-//! is GVA / type-11 staged.
+//! is GVA / mapper-ref-texture staged.
 
 // The backend the process executes on, reached only through the trait.
 use crate::backend::Backend as _;
@@ -33,10 +33,11 @@ use crate::runtime::decode::compute::{
     BufferBinding, Command as ComputeCommand, Kind, RefBinding, SamplerBinding,
 };
 use crate::runtime::decode::resource::{
-    decode_heap_texture, decode_texture_descriptor, decode_type7_descriptor, texture_type8_opcode,
-    ComputeStageInputDescriptor, Descriptor as ResourceDescriptor, HEAP_TEXTURE_OPCODE,
-    HEAP_TEXTURE_WIDE_OPCODE, OBJECT_TYPE_BUFFER, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
-    OBJECT_TYPE_TEXTURE_VIEW, OBJECT_TYPE_TYPE7, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
+    decode_heap_texture, decode_serializer_object_descriptor, decode_texture_descriptor,
+    texture_view_opcode, ComputeStageInputDescriptor, Descriptor as ResourceDescriptor,
+    HEAP_TEXTURE_OPCODE, HEAP_TEXTURE_WIDE_OPCODE, OBJECT_TYPE_BUFFER,
+    OBJECT_TYPE_SERIALIZER_OBJECT, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS,
+    OBJECT_TYPE_TEXTURE_VIEW, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
     TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
 };
 use crate::runtime::draw::{host_alloc_len, StoreTargetPages};
@@ -924,7 +925,7 @@ pub(crate) struct LoadedComputePipeline {
     pub stage_input: Option<ComputeStageInputDescriptor>,
 }
 
-/// What a type-7's stage-input block means for the pipeline carrying it.
+/// What a serializer-object's stage-input block means for the pipeline carrying it.
 ///
 /// Three outcomes, and the whole point of naming them is that two of them are
 /// not the same: [`Self::Absent`] is a kernel that declares no per-thread input,
@@ -972,16 +973,20 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
         report.reason(task_id, pipeline_ref, reason, &detail);
         None
     };
-    let (_entry, desc) =
-        match objects::resolve_descriptor(state, host, task_id, pipeline_ref, &[OBJECT_TYPE_TYPE7])
-        {
-            Ok(found) => found,
-            Err(rung) => {
-                report.rung(task_id, pipeline_ref, rung);
-                return None;
-            }
-        };
-    let Ok(decoded) = decode_type7_descriptor(&desc) else {
+    let (_entry, desc) = match objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        pipeline_ref,
+        &[OBJECT_TYPE_SERIALIZER_OBJECT],
+    ) {
+        Ok(found) => found,
+        Err(rung) => {
+            report.rung(task_id, pipeline_ref, rung);
+            return None;
+        }
+    };
+    let Ok(decoded) = decode_serializer_object_descriptor(&desc) else {
         return miss(
             crate::observe::ladder_slug!("", desc_decode),
             format!("desc_len={}", desc.len()),
@@ -1024,7 +1029,7 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
     }
 }
 
-/// Read `len` bytes from a type-1 buffer at `offset` (product + session helpers).
+/// Read `len` bytes from a buffer at `offset` (product + session helpers).
 pub(crate) fn read_buffer_window<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
@@ -1243,15 +1248,15 @@ enum TextureWriteback {
         /// index `i` as page `i` of the window. See [`staged_window_pages`].
         pages: StoreTargetPages,
     },
-    Type11 {
+    MapperRefTexture {
         mapping_id: u32,
         /// The window this bind was staged against — a byte offset into the
         /// mapping, the surface's row pitch, and one past the last byte the
         /// window may touch.
         ///
         /// Resolved once, at stage time, through the plane the bind actually
-        /// names: `type5_sample_window` when the wire carried a type-5 view's
-        /// plane index, `type11_sample_window` otherwise. Both the read that
+        /// names: `ref_texture_sample_window` when the wire carried a ref-texture view's
+        /// plane index, `mapper_ref_texture_sample_window` otherwise. Both the read that
         /// seeds the image and the write that lands it use exactly these three
         /// numbers, so the two cannot name different bytes of one surface.
         surface_offset: u64,
@@ -1373,7 +1378,7 @@ pub(crate) struct StagedTexture {
     /// How many mip levels `bytes` carries, base first, packed tightly by
     /// [`crate::contract::extent::tight_pyramid_spans`].
     ///
-    /// `1` on every rail but the type-2/3 linear one, and `1` there too for a
+    /// `1` on every rail but the normal-texture linear one, and `1` there too for a
     /// storage binding or a view that already names a level: a compute write
     /// names one level and a levelled view exposes one. Where it is greater,
     /// `width`/`height` remain level 0's extent and every other level's is
@@ -1496,7 +1501,7 @@ impl ResidentServe {
 }
 
 /// Stage an opcode-9 buffer-backed texture: tight raw texels read out of the
-/// type-1 buffer the guest named, at its declared offset and row pitch.
+/// buffer the guest named, at its declared offset and row pitch.
 ///
 /// The contract is `newTextureWithBuffer:descriptor:offset:bytesPerRow:` — the
 /// texels *are* the buffer's bytes, reinterpreted through the embedded texture
@@ -1588,7 +1593,7 @@ fn stage_buffer_texture<M: HostMemory + HostOps>(
         return Err(ComputeStatus::Unsupported("compute_buftex_span"));
     };
     // A buffer-backed texture is two contract references over one allocation —
-    // the type-8 texture the guest binds and the type-1 buffer that owns the
+    // the texture-view texture the guest binds and the buffer that owns the
     // storage — and a debt may be armed under either. The draw twin pays for
     // both; so does this.
     crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
@@ -1807,15 +1812,16 @@ fn multisample_sampled_texture<M: HostMemory + HostOps>(
     })
 }
 
-/// Load tight raw texels for a compute texture binding (type-2/3, type-5→surface, or type-11).
+/// Load tight raw texels for a compute texture binding (normal-texture, ref-texture→surface, or
+/// mapper-ref-texture).
 ///
-/// Type-5 (`RefTextureHandle`) is the live CI wallpaper path (`compute_stage_tex … ot=5`).
-/// RE (type-5 wire + `runtime::draw` sample path): surfaceID@0 is a type-4 object id (= mapping
-/// mid). Product draw samples call [`objects::ensure_surface_for_present`] on that id and
-/// stage from the **mapping registry**, never re-resolving the surface id through the
-/// compute task's object list (that list uses a separate texture-ref namespace — live
-/// ensure=1 then MissingTexture/GuestIo class when `resolve_type11_ref(task, sid)` hit a
-/// different type-11 slot).
+/// Ref-texture (`RefTextureHandle`) is the live CI wallpaper path (`compute_stage_tex … ot=5`). RE
+/// (ref-texture wire + `runtime::draw` sample path): surfaceID@0 is a backing object id (= mapping
+/// mid). Product draw samples call [`objects::ensure_surface_for_present`] on that id and stage
+/// from the **mapping registry**, never re-resolving the surface id through the compute task's
+/// object list (that list uses a separate texture-ref namespace — live ensure=1 then
+/// MissingTexture/GuestIo class when `resolve_mapper_ref_texture(task, sid)` hit a different
+/// mapper-ref-texture slot).
 pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1824,23 +1830,23 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     binding: u32,
     is_storage: bool,
 ) -> Result<StagedTexture, ComputeStatus> {
-    // Type-5 RefTextureHandle → surface_id (live CI binds ot5).
+    // Ref-texture RefTextureHandle → surface_id (live CI binds ot5).
     let mut stage_ref = texture_ref;
-    let mut from_type5 = false;
-    let mut from_type4_direct = false;
-    let mut type5_record: Option<objects::Type5TextureView> = None;
+    let mut from_ref_texture = false;
+    let mut from_backing_direct = false;
+    let mut ref_texture_record: Option<objects::RefTextureView> = None;
     let mut view_level = 0;
     let mut view_pixel_format = None;
     let mut heap_texture = None;
     let mut buffer_texture: Option<crate::runtime::decode::resource::BufferTextureDescriptor> =
         None;
-    // A linear texture object (type-2/3) must resolve through its own
+    // A linear texture object (normal-texture) must resolve through its own
     // descriptor, never through the mapping registry: its numeric ref shares
-    // the id space with type-4 surface mids, so the `mappings.contains(ref)`
+    // the id space with backing record mids, so the `mappings.contains(ref)`
     // fallback below would wrongly grab a same-numbered surface (live class:
-    // `ref=N ot=2` dragged into the type-11 path and failing silently against
-    // the biplanar wallpaper mid). Same collision the type-5 path documents.
-    // Resolve the object-list entry once: `ref_is_linear` and the type5/type4
+    // `ref=N ot=2` dragged into the mapper-ref-texture path and failing silently against
+    // the biplanar wallpaper mid). Same collision the ref-texture path documents.
+    // Resolve the object-list entry once: `ref_is_linear` and the ref_texture/backing
     // classification below both read it for the same ref, and the guest object
     // list is immutable for the life of the dispatch (the device never writes
     // those pages). `ListObjectEntry` is `Copy`, so one guest-DMA read+decode
@@ -1858,7 +1864,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                     desc_read
                 )));
             };
-            let opcode = texture_type8_opcode(&desc).unwrap_or(0);
+            let opcode = texture_view_opcode(&desc).unwrap_or(0);
             // Both opcodes are the same record: the wide one is what the guest's
             // serializer emits with `TextureDescriptor2` on. The length each
             // implies is `decode_heap_texture`'s to check — this site used to
@@ -2091,20 +2097,21 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     let stage_entry = objects::lookup_list_entry(state, host, task_id, stage_ref);
     let ref_is_linear = stage_entry
         .map(|e| {
-            e.object_type == OBJECT_TYPE_TEXTURE || e.object_type == OBJECT_TYPE_TEXTURE_VARIANT
+            e.object_type == OBJECT_TYPE_TEXTURE
+                || e.object_type == OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS
         })
         .unwrap_or(false);
     if let Some(entry) = stage_entry {
         if entry.object_type == objects::OBJECT_TYPE_REF_TEXTURE {
             if let Some(desc) = objects::read_descriptor(state, host, task_id, &entry) {
-                if let Ok(t5) = reims_vgpu_wire::device_desc::type5_header(&desc) {
+                if let Ok(t5) = reims_vgpu_wire::device_desc::ref_texture_header(&desc) {
                     let sid = t5.surface_id.get();
                     if sid != 0 {
                         stage_ref = sid;
-                        from_type5 = true;
-                        type5_record = objects::decode_type5_texture_view(&desc);
+                        from_ref_texture = true;
+                        ref_texture_record = objects::decode_ref_texture_view(&desc);
                         let ok = objects::ensure_surface_for_present(state, host, sid);
-                        // Per-bind type-5 descriptor RE census (args@+8 holds the
+                        // Per-bind ref-texture descriptor RE census (args@+8 holds the
                         // serialized plane texture; product stage uses mapping geom
                         // only today). This is measurement, not a failure — it fired
                         // ~600×/boot on the always-on sink (same descriptor re-dumped
@@ -2113,7 +2120,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                         // ensure failure surfaces downstream as `MissingTexture` (the
                         // mapping lookup below misses), so no always-on line is lost.
                         crate::observe::when_verbose(|| {
-                            // The owner task the view names. `note_type5_owner_task`
+                            // The owner task the view names. `note_ref_texture_owner_task`
                             // is the always-on check on its value; this echo carries
                             // it beside the descriptor it came out of.
                             let owner_task = t5.owner_task.get();
@@ -2131,7 +2138,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                                 }
                             }
                             crate::observe::line(format!(
-                                "compute_stage_tex type5 ref={texture_ref} sid={sid} ensure={} owner_task={owner_task} desc_len={} args_n={args_n} args_hex={args_hex}",
+                                "compute_stage_tex ref_texture ref={texture_ref} sid={sid} ensure={} owner_task={owner_task} desc_len={} args_n={args_n} args_hex={args_hex}",
                                 ok as u8,
                                 desc.len(),
                             ));
@@ -2139,16 +2146,16 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                     }
                 }
             }
-        } else if entry.object_type == objects::OBJECT_TYPE_SURFACE {
-            // Direct type-4 surface bind (same id space as present mids).
-            from_type4_direct = true;
+        } else if entry.object_type == objects::OBJECT_TYPE_BACKING {
+            // Direct backing record bind (same id space as present mids).
+            from_backing_direct = true;
             let _ = objects::ensure_surface_for_present(state, host, stage_ref);
         }
     }
 
-    // Type-5 / direct type-4: surface id **is** the mapping mid. Never call
-    // resolve_type11_ref(task, sid) — task object-list indices collide with texture refs.
-    let mapping_id_opt = if from_type5 || from_type4_direct {
+    // Ref-texture / direct backing: surface id **is** the mapping mid. Never call
+    // resolve_mapper_ref_texture(task, sid) — task object-list indices collide with texture refs.
+    let mapping_id_opt = if from_ref_texture || from_backing_direct {
         if stage_ref != 0 && state.mappings.contains_key(&stage_ref) {
             Some(stage_ref)
         } else {
@@ -2156,10 +2163,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         }
     } else if ref_is_linear {
         // Linear texture: never fall back to the mapping registry (id-space
-        // collision with type-4 surface mids). Force the type-2/3 path.
+        // collision with backing record mids). Force the normal-texture path.
         None
     } else {
-        objects::resolve_type11_ref(state, host, task_id, stage_ref).or_else(|| {
+        objects::resolve_mapper_ref_texture(state, host, task_id, stage_ref).or_else(|| {
             if stage_ref != 0 && state.mappings.contains_key(&stage_ref) {
                 Some(stage_ref)
             } else {
@@ -2167,29 +2174,31 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             }
         })
     };
-    if mapping_id_opt.is_none() && from_type5 {
+    if mapping_id_opt.is_none() && from_ref_texture {
         crate::observe::fail(format!(
-            "compute_stage_tex type5_no_map ref={texture_ref} sid={stage_ref}"
+            "compute_stage_tex ref_texture_no_map ref={texture_ref} sid={stage_ref}"
         ));
         return Err(ComputeStatus::MissingTexture(
-            "compute_stage_tex_type5_no_map",
+            "compute_stage_tex_ref_texture_no_map",
         ));
     }
     if let Some(mapping_id) = mapping_id_opt {
         let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
-        // Geom/format: a type-5 record is the exact Metal texture view over
+        // Geom/format: a ref-texture record is the exact Metal texture view over
         // the IOSurface bytes. It is authoritative even for a stageable
         // single-plane mapping: the live BGRA8 desktop target is exposed as a
-        // row-byte-equivalent, quarter-width RGBA32Uint view. Type-4 direct
-        // refs use base mapping geometry. Type-11 refs may prefer the
+        // row-byte-equivalent, quarter-width RGBA32Uint view. Backing direct
+        // refs use base mapping geometry. Mapper-ref-texture refs may prefer the
         // IOSurface descriptor on this task's object list.
         if view_level != 0 {
             crate::observe::fail(format!(
-                "compute_stage_tex view_fail reason=type11_mip ref={texture_ref} base={stage_ref} level={view_level} mapping={mapping_id}"
+                "compute_stage_tex view_fail reason=mapper_ref_texture_mip ref={texture_ref} base={stage_ref} level={view_level} mapping={mapping_id}"
             ));
-            return Err(ComputeStatus::Unsupported("compute_view_type11_mip"));
+            return Err(ComputeStatus::Unsupported(
+                "compute_view_mapper_ref_texture_mip",
+            ));
         }
-        let (width, height, format) = if from_type5 || from_type4_direct {
+        let (width, height, format) = if from_ref_texture || from_backing_direct {
             let m = state
                 .mappings
                 .get(&mapping_id)
@@ -2199,14 +2208,14 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             let multiplanar = objects::mapping_is_multiplanar(m);
             let mapping_stageable =
                 m.has_geom && m.width != 0 && m.height != 0 && m.format != 0 && !multiplanar;
-            if let Some(rec) = type5_record {
-                // `type11_sample_window` below matches actual plane records by
+            if let Some(rec) = ref_texture_record {
+                // `mapper_ref_texture_sample_window` below matches actual plane records by
                 // geometry+bpe and otherwise verifies a packed row-compatible
                 // view over the same bytes. Per-bind measurement (view vs base
                 // geom), not a failure — verbose-gated to keep the always-on sink
                 // for genuine failures.
                 crate::observe::line(format!(
-                    "compute_stage_tex type5_view mapping={mapping_id} view={}x{} fmt={:#x} base={}x{} fmt={:#x} multiplanar={}",
+                    "compute_stage_tex ref_texture_view mapping={mapping_id} view={}x{} fmt={:#x} base={}x{} fmt={:#x} multiplanar={}",
                     rec.width,
                     rec.height,
                     rec.pixel_format,
@@ -2219,18 +2228,18 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             } else if !mapping_stageable {
                 if !m.has_geom || m.width == 0 || m.height == 0 {
                     crate::observe::fail(format!(
-                        "compute_stage_tex type11_fail reason=no_geom mapping={mapping_id} pages={} has_geom={}",
+                        "compute_stage_tex mapper_ref_texture_fail reason=no_geom mapping={mapping_id} pages={} has_geom={}",
                         m.page_entries.len(),
                         m.has_geom as u8
                     ));
                     return Err(ComputeStatus::MissingTexture(
-                        "compute_stage_tex_type11_no_geom",
+                        "compute_stage_tex_mapper_ref_texture_no_geom",
                     ));
                 } else if multiplanar {
                     // Multi-plane IOSurface without a plane record: fail closed,
                     // do not invent BGRA sample of the whole surface.
                     crate::observe::fail(format!(
-                        "compute_stage_tex type11_fail reason=multiplane mapping={mapping_id} {}x{} fmt={:#x} pages={} (no type-5 plane record)",
+                        "compute_stage_tex mapper_ref_texture_fail reason=multiplane mapping={mapping_id} {}x{} fmt={:#x} pages={} (no ref-texture plane record)",
                         m.width,
                         m.height,
                         m.format,
@@ -2240,7 +2249,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 } else {
                     // Single-plane unknown format: fail closed (no BGRA invent).
                     crate::observe::fail(format!(
-                        "compute_stage_tex type11_fail reason=fmt_unknown mapping={mapping_id} {}x{} pages={}",
+                        "compute_stage_tex mapper_ref_texture_fail reason=fmt_unknown mapping={mapping_id} {}x{} pages={}",
                         m.width,
                         m.height,
                         m.page_entries.len()
@@ -2313,7 +2322,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             Some(v) => v,
             None => {
                 crate::observe::fail(format!(
-                    "compute_stage_tex type11_fail reason=fmt_bytes mapping={mapping_id} {width}x{height} fmt={format:#x}"
+                    "compute_stage_tex mapper_ref_texture_fail reason=fmt_bytes mapping={mapping_id} {width}x{height} fmt={format:#x}"
                 ));
                 return Err(ComputeStatus::Unsupported("stage_tex_fmt_bytes"));
             }
@@ -2321,7 +2330,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         let storage_selector = pixel_format::storage_selector(stage_fmt);
         if is_storage && storage_selector.is_none() {
             crate::observe::fail(format!(
-                "compute_stage_tex type11_fail reason=fmt_storage mapping={mapping_id} {width}x{height} fmt={format:#x}"
+                "compute_stage_tex mapper_ref_texture_fail reason=fmt_storage mapping={mapping_id} {width}x{height} fmt={format:#x}"
             ));
             return Err(ComputeStatus::Unsupported("stage_tex_fmt_storage"));
         }
@@ -2337,23 +2346,27 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         // once `serve` is known.
         let content_generation = m.content_generation;
         let pages_n = m.page_entries.len();
-        // Wire type-4 `length` (page-aligned getResidentSize), stashed as device_desc.alloc_size.
+        // Wire backing `length` (page-aligned getResidentSize), stashed as device_desc.alloc_size.
         // Independent of plane w/h and of MapMemory2 IOAccelMemory length — measure-only.
         let wire_len = crate::contract::iosurface_pages::decode_device_surface(&m.device_desc)
             .map(|s| s.alloc_size as u64)
             .unwrap_or(0);
-        // A type-5 record names its IOSurface plane on the wire (record `+0x20`,
+        // A ref-texture record names its IOSurface plane on the wire (record `+0x20`,
         // the `newTextureWithDescriptor:iosurface:plane:` argument), so the
-        // plane is decided, not inferred. Type-11 carries no such field and must
+        // plane is decided, not inferred. Mapper-ref-texture carries no such field and must
         // still match a plane record by geometry — which is ambiguous whenever
         // two planes share dims and bytes-per-element (v0a8 Y and alpha), and
-        // declines rather than picking one. The draw path already binds type-5
+        // declines rather than picking one. The draw path already binds ref-texture
         // views by index; this is the same resolution on the staging path.
-        let window = match type5_record {
-            Some(rec) => {
-                mapping_write::type5_sample_window(m, rec.plane_index, width, height, stage_fmt)
-            }
-            None => mapping_write::type11_sample_window(m, width, height, stage_fmt),
+        let window = match ref_texture_record {
+            Some(rec) => mapping_write::ref_texture_sample_window(
+                m,
+                rec.plane_index,
+                width,
+                height,
+                stage_fmt,
+            ),
+            None => mapping_write::mapper_ref_texture_sample_window(m, width, height, stage_fmt),
         };
         let (surface_offset, surface_bpr, span_end) = match window {
             Some(w) => w,
@@ -2373,10 +2386,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 )
                 .unwrap_or(0);
                 crate::observe::fail(format!(
-                    "compute_stage_tex type11_fail reason=window mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} pages={pages_n} wire_len={wire_len} desc={dw}x{dh} bpr={dbpr} alloc={dalloc} reach={reach}"
+                    "compute_stage_tex mapper_ref_texture_fail reason=window mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} pages={pages_n} wire_len={wire_len} desc={dw}x{dh} bpr={dbpr} alloc={dalloc} reach={reach}"
                 ));
                 return Err(ComputeStatus::MissingTexture(
-                    "compute_stage_tex_type11_window",
+                    "compute_stage_tex_mapper_ref_texture_window",
                 ));
             }
         };
@@ -2384,12 +2397,12 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             .checked_mul(bpp as u64)
             .ok_or(ComputeStatus::Unsupported("stage_tex_tight_bpr_overflow"))?
             as u32;
-        if from_type5 && type5_record.is_some() {
-            // Per-bind type-5 sample-window measurement, not a failure — verbose-gated
+        if from_ref_texture && ref_texture_record.is_some() {
+            // Per-bind ref-texture sample-window measurement, not a failure — verbose-gated
             // (was a per-bind always-on line). Genuine window failures above emit
-            // `type11_fail reason=window` always-on.
+            // `mapper_ref_texture_fail reason=window` always-on.
             crate::observe::line(format!(
-                "compute_stage_tex type5_view_window mapping={mapping_id} view={width}x{height} fmt={stage_fmt:#x} bpp={bpp} tight={tight} surface_off={surface_offset} surface_bpr={surface_bpr} span_end={span_end}"
+                "compute_stage_tex ref_texture_view_window mapping={mapping_id} view={width}x{height} fmt={stage_fmt:#x} bpp={bpp} tight={tight} surface_off={surface_offset} surface_bpr={surface_bpr} span_end={span_end}"
             ));
         }
         let need_u64 = (tight as u64)
@@ -2397,16 +2410,18 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             .ok_or(ComputeStatus::Unsupported("stage_tex_need_overflow"))?;
         let Some(need) = host_alloc_len(need_u64) else {
             crate::observe::fail(format!(
-                "compute_stage_tex type11_fail reason=host_len mapping={mapping_id} need={need_u64}"
+                "compute_stage_tex mapper_ref_texture_fail reason=host_len mapping={mapping_id} need={need_u64}"
             ));
             return Err(ComputeStatus::Unsupported("stage_tex_host_len"));
         };
         let page_bytes = (pages_n as u64).saturating_mul(1u64 << state.page_shift);
         if page_bytes < span_end {
             crate::observe::fail(format!(
-                "compute_stage_tex type11_fail reason=span mapping={mapping_id} {width}x{height} pages={pages_n} page_bytes={page_bytes} span_end={span_end} bpr={surface_bpr} wire_len={wire_len}"
+                "compute_stage_tex mapper_ref_texture_fail reason=span mapping={mapping_id} {width}x{height} pages={pages_n} page_bytes={page_bytes} span_end={span_end} bpr={surface_bpr} wire_len={wire_len}"
             ));
-            return Err(ComputeStatus::GuestIo("compute_stage_tex_type11_span"));
+            return Err(ComputeStatus::GuestIo(
+                "compute_stage_tex_mapper_ref_texture_span",
+            ));
         }
         let residency_key = crate::model::ComputeStorageResidencyKey {
             mapping_id,
@@ -2492,12 +2507,14 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             )
         {
             crate::observe::fail(format!(
-                "compute_stage_tex type11_fail reason=read mapping={mapping_id} {width}x{height} off={surface_offset} bpr={surface_bpr} span_end={span_end} pages={pages_n}"
+                "compute_stage_tex mapper_ref_texture_fail reason=read mapping={mapping_id} {width}x{height} off={surface_offset} bpr={surface_bpr} span_end={span_end} pages={pages_n}"
             ));
-            return Err(ComputeStatus::GuestIo("compute_stage_tex_type11_read"));
+            return Err(ComputeStatus::GuestIo(
+                "compute_stage_tex_mapper_ref_texture_read",
+            ));
         }
         let writeback = if is_storage {
-            TextureWriteback::Type11 {
+            TextureWriteback::MapperRefTexture {
                 mapping_id,
                 surface_offset,
                 surface_bpr,
@@ -2509,12 +2526,12 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         } else {
             TextureWriteback::None
         };
-        if from_type5 {
-            // Per-bind type-5 stage SUCCESS census — not a failure; verbose-gated
-            // (was always-on, ~300/boot). Genuine type-5 stage failures above emit
-            // `type11_fail reason=<slug>` always-on.
+        if from_ref_texture {
+            // Per-bind ref-texture stage SUCCESS census — not a failure; verbose-gated
+            // (was always-on, ~300/boot). Genuine ref-texture stage failures above emit
+            // `mapper_ref_texture_fail reason=<slug>` always-on.
             crate::observe::line(format!(
-                "compute_stage_tex type5_ok ref={texture_ref} sid={mapping_id} {width}x{height} fmt={stage_fmt:#x} pages={pages_n}"
+                "compute_stage_tex ref_texture_ok ref={texture_ref} sid={mapping_id} {width}x{height} fmt={stage_fmt:#x} pages={pages_n}"
             ));
         }
         return Ok(StagedTexture {
@@ -2548,7 +2565,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         });
     }
 
-    // Type-2/3 linear. Fail-visible: name which gate rejected (live class:
+    // normal-texture linear. Fail-visible: name which gate rejected (live class:
     // silent ot=2 MissingTexture, journal 2026-07-14 compute census).
     // The reason travels *in* the status now, so this line and the caller's
     // both name the registered slug rather than a local shorthand only this
@@ -2565,7 +2582,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         host,
         task_id,
         stage_ref,
-        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT],
+        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS],
     ) {
         Ok(found) => found,
         Err(rung) => {
@@ -2982,7 +2999,7 @@ struct LinearLevelSource {
     row_stride: u64,
 }
 
-/// Levels 1.. of a type-2/3 texture's declared mip chain, as far as the
+/// Levels 1.. of a normal texture's declared mip chain, as far as the
 /// descriptor actually places them.
 ///
 /// The prefix, not the set: a level that will not resolve makes every level
@@ -3173,18 +3190,18 @@ fn writeback_texture<M: HostMemory + HostOps>(
                 },
             );
         }
-        TextureWriteback::Type11 {
+        TextureWriteback::MapperRefTexture {
             width,
             format,
             surface_bpr,
             ..
         } => {
-            crate::runtime::drain::note_store_route("compute_wb_type11");
+            crate::runtime::drain::note_store_route("compute_wb_mapper_ref_texture");
             let tight = pixel_format::bytes_per_pixel(*format).map(|bpp| width.saturating_mul(bpp));
             crate::runtime::drain::note_store_route(if tight == Some(*surface_bpr) {
-                "compute_wb_type11_dense"
+                "compute_wb_mapper_ref_texture_dense"
             } else {
-                "compute_wb_type11_padded"
+                "compute_wb_mapper_ref_texture_padded"
             });
         }
     }
@@ -3297,7 +3314,7 @@ fn writeback_texture<M: HostMemory + HostOps>(
                 }
             }
         }
-        TextureWriteback::Type11 {
+        TextureWriteback::MapperRefTexture {
             mapping_id,
             surface_offset,
             surface_bpr,
@@ -3314,10 +3331,12 @@ fn writeback_texture<M: HostMemory + HostOps>(
             // rows at a width nothing declared.
             let Some(bpp) = pixel_format::bytes_per_pixel(*format) else {
                 crate::observe::fail(format!(
-                    "compute_writeback_tex fail reason=type11_format_unsized task={task_id} bind={} mid={mapping_id} fmt={format:#x}",
+                    "compute_writeback_tex fail reason=mapper_ref_texture_format_unsized task={task_id} bind={} mid={mapping_id} fmt={format:#x}",
                     tex.binding
                 ));
-                return Err(ComputeStatus::GuestIo("compute_wb_tex_type11_format"));
+                return Err(ComputeStatus::GuestIo(
+                    "compute_wb_tex_mapper_ref_texture_format",
+                ));
             };
             let tight = width.saturating_mul(bpp);
             if !mapping_write::write_full_rect_raw_at(
@@ -3334,7 +3353,7 @@ fn writeback_texture<M: HostMemory + HostOps>(
                 tight,
             ) {
                 crate::observe::fail(format!(
-                    "compute_writeback_tex fail reason=type11_mapping_write task={task_id} bind={} mid={} surface_offset={surface_offset:#x} surface_bpr={} span_end={span_end:#x} dims={}x{} bpp={} bytes={} tight={tight}",
+                    "compute_writeback_tex fail reason=mapper_ref_texture_mapping_write task={task_id} bind={} mid={} surface_offset={surface_offset:#x} surface_bpr={} span_end={span_end:#x} dims={}x{} bpp={} bytes={} tight={tight}",
                     tex.binding,
                     mapping_id,
                     surface_bpr,
@@ -3343,7 +3362,9 @@ fn writeback_texture<M: HostMemory + HostOps>(
                     bpp,
                     tex.bytes.len()
                 ));
-                return Err(ComputeStatus::GuestIo("compute_wb_tex_type11_write"));
+                return Err(ComputeStatus::GuestIo(
+                    "compute_wb_tex_mapper_ref_texture_write",
+                ));
             }
             Ok(())
         }
@@ -3486,7 +3507,7 @@ fn writeback_buffer<M: HostMemory + HostOps>(
     Ok(())
 }
 
-/// An absent IOSurface pixel format means BGRA8: a type-11 surface the guest
+/// An absent IOSurface pixel format means BGRA8: a mapper-ref-texture surface the guest
 /// mapped without a format word is scanout-ordered by the display contract, and
 /// this is the one place that default is written down.
 fn or_bgra8(pixel_format: u16) -> u16 {
@@ -3497,7 +3518,7 @@ fn or_bgra8(pixel_format: u16) -> u16 {
     }
 }
 
-/// Latched geometry and pixel format of a type-11 mapping, for a surface whose
+/// Latched geometry and pixel format of a mapper-ref-texture mapping, for a surface whose
 /// own IOSurface descriptor could not be read.
 ///
 /// Three separate descriptor failures share this fallback, and spelling it out at

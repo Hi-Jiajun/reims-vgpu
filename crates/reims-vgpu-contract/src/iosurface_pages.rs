@@ -6,9 +6,9 @@ use crate::{align_up_u64, checked_add_u64, checked_mul_u64};
 
 pub const U32_SIZE: usize = 4;
 
-/// Minimum typed type-11 object-list descriptor length (geometry prefix).
+/// Minimum typed mapper-ref-texture object-list descriptor length (geometry prefix).
 /// Live blobs are often longer (0x38/0x58) with an unused/constant tail.
-/// There is no multi-mip level-record layout on type-11: Metal rejects
+/// There is no multi-mip level-record layout on mapper-ref-texture: Metal rejects
 /// mipmapped IOSurface textures (`mipmapLevelCount > 1`).
 ///
 /// `TYPE11_` rather than `TEXTURE_DESC_`, which is what these were called.
@@ -456,12 +456,12 @@ pub fn sample_window_from_device_surface(
 ///
 /// Three ways a window is derived, in order:
 ///
-/// - **A wire-carried plane index** (type-5 record `+0x20`) names its plane
+/// - **A wire-carried plane index** (ref-texture record `+0x20`) names its plane
 ///   record directly. It is the only key that separates same-geometry planes:
 ///   a v0a8 surface's Y plane 0 and alpha plane 2 are both R8 at the luma
 ///   geometry, so the scan below matches two and takes neither.
 /// - **A single-plane surface** uses the surface-level base and pitch.
-/// - **A multi-plane surface with no wire index** (type-11) matches width,
+/// - **A multi-plane surface with no wire index** (mapper-ref-texture) matches width,
 ///   height and bytes-per-element, and takes the plane only when *exactly one*
 ///   matches.
 pub fn sample_window_from_device_desc(
@@ -534,7 +534,7 @@ pub fn sample_window_from_device_desc(
 /// The descriptor answers this exactly when it has arrived; otherwise
 /// [`packed_span_estimate`] gives a count that errs long. Either way the guest's
 /// own allocation bounds it: RE (`allocateBackingHandle`) writes the
-/// page-aligned allocation length at type-4 desc `+0`, independent of the plane
+/// page-aligned allocation length at backing desc `+0`, independent of the plane
 /// width/height/pitch filled from the per-plane getters, and we stash it as
 /// `device_desc.alloc_size`. A span past that is a span past the pages the guest
 /// allocated, so it is refused rather than clamped.
@@ -1209,7 +1209,7 @@ mod tests {
     }
 
     /// The page-sizing estimate must not reach past the wire `alloc_size`
-    /// (type-4 `length`). RE: allocateBackingHandle writes length@0
+    /// (backing `length`). RE: allocateBackingHandle writes length@0
     /// independently of plane dims.
     #[test]
     fn mapping_span_bound_rejects_a_span_past_alloc_size() {
@@ -1293,7 +1293,7 @@ mod tests {
 
     /// v0a8 (biplanar video + alpha) shape from the live apple.com hero: the
     /// Y and alpha planes share geometry and bpe, so the geometry scan is
-    /// ambiguous by construction — only an explicit wire plane index (type-5
+    /// ambiguous by construction — only an explicit wire plane index (ref-texture
     /// record `+0x20`) separates them.
     #[test]
     fn sample_window_plane_index_selects_among_same_geometry_planes() {

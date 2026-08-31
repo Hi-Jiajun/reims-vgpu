@@ -1235,7 +1235,7 @@ pub(crate) struct SampledSlot {
     /// descriptor types, so a recycled slot must never cross that boundary.
     pub one_dim: bool,
     pub format: ash::vk::Format,
-    /// The view's component mapping, from the decoded type-8 swizzle. Part of
+    /// The view's component mapping, from the decoded texture-view swizzle. Part of
     /// the pool key because it is baked into the `VkImageView`: a recycled slot
     /// whose view swizzles differently would silently remap a later bind's
     /// channels. Identity is the overwhelmingly common case and keeps its own
@@ -1478,9 +1478,9 @@ struct ResidentSampledSlot {
     last_touch_ms: u64,
 }
 
-/// Geometry+format key for storage-image pool free lists. Compute images are
-/// single-layer 2D by contract (see [`crate::backend::vulkan::engine::ComputeStorageImageResource`]),
-/// so geometry is exactly width × height.
+/// Geometry+format key for storage-image pool free lists. Compute images are single-layer 2D by
+/// contract (see [`crate::backend::vulkan::engine::ComputeStorageImageResource`]), so geometry is
+/// exactly width × height.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct StorageImageKey {
     pub width: u32,
@@ -1885,7 +1885,7 @@ pub(crate) struct ResidentTargetSlot {
     /// `None` is the fail-closed default and it is what every reset restores:
     /// slot creation, image recycle, and both `registry_mark_ready*` arms — so
     /// a draw that stores into this identity without going on to publish the
-    /// mapping's content leaves the slot unvouched, and the type-11 LOAD gate
+    /// mapping's content leaves the slot unvouched, and the mapper-ref-texture LOAD gate
     /// falls back to its CPU seed. An `Option` rather than a sentinel because
     /// epoch 0 ("nothing published since attach") is a legal *mapping* value
     /// and a bare `0 == 0` would match an image that was never stamped at all.

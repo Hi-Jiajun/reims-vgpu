@@ -1,14 +1,14 @@
 //! Host surface cache for Linux/Vulkan discrete-GPU present (kb tahoe-x86 §8.5).
 //!
 //! On Apple Metal hosts, GPU Stores land in guest IOSurface pages (unified
-//! memory). On this Linux product rail guest type-4 pages are **not** filled by
+//! memory). On this Linux product rail guest backing pages are **not** filled by
 //! the host GPU until encode writeback; historical product painted from a
 //! **host render-cache** keyed by surface_id. This module is that cache.
 //!
 //! Namespace split (2026-07-13 live x86):
-//! - [`store`] / [`get`] — **type-4 surface_id / mapping_id** only (`host_surfaces`)
-//! - [`store_texture`] / [`get_texture`] — type-2/3 color targets by task/object ref
-//! - [`store_gva_owned`] / [`get_gva`] — type-2/3 by target GVA (survives ref rebinding)
+//! - [`store`] / [`get`] — **backing record_id / mapping_id** only (`host_surfaces`)
+//! - [`store_texture`] / [`get_texture`] — normal-texture color targets by task/object ref
+//! - [`store_gva_owned`] / [`get_gva`] — normal-texture by target GVA (survives ref rebinding)
 //!
 //! Never put texture_ref into `host_surfaces`: list ids collide with mids and
 //! recycled refs return stale full-frame blacks as multi-bind samples.
@@ -83,12 +83,12 @@ fn get_from_with_gen<'a, K: Ord>(
     Some((&e.bgra[..need], e.host_gen))
 }
 
-/// Insert/replace host-cache pixels for `surface_id` (type-4 present id).
+/// Insert/replace host-cache pixels for `surface_id` (backing present id).
 pub fn store(state: &mut DeviceState, surface_id: u32, width: u32, height: u32, bgra: Vec<u8>) {
     store_shared(state, surface_id, width, height, std::sync::Arc::new(bgra));
 }
 
-/// [`store`] for a frame already held behind an `Arc` — the type-11 render Store
+/// [`store`] for a frame already held behind an `Arc` — the mapper-ref-texture render Store
 /// arms its deferred window with the same allocation, so the frame is stored
 /// once and referenced twice.
 pub fn store_shared(
@@ -200,7 +200,7 @@ pub fn get(state: &DeviceState, surface_id: u32, width: u32, height: u32) -> Opt
 /// `(surface_id, generation)` pair is a statement that the bytes have not moved,
 /// which is what lets the sampled cache skip re-hashing a frame it already holds.
 ///
-/// The caller is the type-11 sampled ladder's host-cache rung, which without
+/// The caller is the mapper-ref-texture sampled ladder's host-cache rung, which without
 /// this had no identity to offer and drove every bind through the content
 /// digest: 116 lookups a second over 201 MB, hashed twice each. It takes the
 /// frame as a handle rather than a slice because it hands the bytes to the
@@ -219,7 +219,7 @@ pub fn get_shared_with_gen(
     Some((get_shared(state, surface_id, width, height)?, host_gen))
 }
 
-/// Cede this mapping's cached frame to the engine resident a deferred type-11
+/// Cede this mapping's cached frame to the engine resident a deferred mapper-ref-texture
 /// render Store just pinned: the entry keeps its geometry and its `host_gen`
 /// lineage, and holds no bytes.
 ///
@@ -227,7 +227,7 @@ pub fn get_shared_with_gen(
 /// what enforces it — so every reader that goes through [`get`] or [`get_shared`]
 /// misses and falls through to the source that does hold the frame:
 /// [`crate::runtime::scanout::capture_present_frame`] to
-/// `try_capture_from_resident`, and the type-11 LOAD seed to the surface's own
+/// `try_capture_from_resident`, and the mapper-ref-texture LOAD seed to the surface's own
 /// guest pages, which lands this window first. Nothing has to be taught about a
 /// new state.
 ///
@@ -278,7 +278,7 @@ pub fn forget(state: &mut DeviceState, surface_id: u32) {
 /// [`cede_surface_to_resident`] leaves behind: present at exactly this geometry
 /// and carrying no bytes.
 ///
-/// Read by the type-11 LOAD seed's decline classifier so a ceded entry is named
+/// Read by the mapper-ref-texture LOAD seed's decline classifier so a ceded entry is named
 /// as such instead of being reported as a stale-geometry hit — `get`'s miss is
 /// the same either way, and the two have different fixes.
 pub fn surface_ceded_to_resident(
@@ -321,7 +321,7 @@ pub fn get_shared(
     })
 }
 
-/// Type-2/3 encode cache by task-local texture object ref (not surface_id).
+/// normal-texture encode cache by task-local texture object ref (not surface_id).
 ///
 /// `source_gva` is the address the producing Store rendered into, kept so
 /// [`texture_source_gva`] can tell a later serve whether this entry's pixels
@@ -474,7 +474,7 @@ impl LinearWindow {
     }
 }
 
-/// Store tight raw compute content for a type-2/3 texture object.
+/// Store tight raw compute content for a normal-texture object.
 ///
 /// This is the discrete GPU-private body. It deliberately survives
 /// MapMemory2/UnmapMemory; the guest GVA pages are only a pageable alias.
@@ -760,10 +760,10 @@ const fn page_mask(page_shift: u32) -> u64 {
     !((1u64 << page_shift) - 1)
 }
 
-/// Store a type-2/3 encode in the GVA-keyed cache, with the decoded object
+/// Store a normal-texture encode in the GVA-keyed cache, with the decoded object
 /// identity that produced it.
 ///
-/// Type-2/type-3 wrappers are the same linear texture storage family when the
+/// Texture/generate-mipmaps texture wrappers are the same linear texture storage family when the
 /// GVA and geometry match; unrelated nonzero object-type transitions still
 /// identify a different resource class.
 ///

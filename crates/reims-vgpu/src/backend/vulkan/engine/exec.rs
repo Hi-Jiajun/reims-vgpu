@@ -4002,10 +4002,10 @@ pub(crate) unsafe fn execute_draw_inner(
                         crate::runtime::drain::note_store_route(match direct.origin {
                             super::SampledByteOrigin::LinearTexture => "sampled_direct_linear",
                             super::SampledByteOrigin::SurfaceGuestFallback => {
-                                "sampled_direct_type11"
+                                "sampled_direct_mapper_ref_texture"
                             }
                             super::SampledByteOrigin::SerializedSurfaceView => {
-                                "sampled_direct_type5"
+                                "sampled_direct_ref_texture"
                             }
                             _ => "sampled_direct_other",
                         });
@@ -5781,7 +5781,7 @@ pub(crate) unsafe fn execute_draw_inner(
     //
     // That is a reading about the workload and **not** a licence to delete the
     // tail. `skip_readback` has to be decided before submit, and a Store that
-    // neither defer rail can take still has to land its pixels: a type-11 Store
+    // neither defer rail can take still has to land its pixels: a mapper-ref-texture Store
     // always defers (`draw::vulkan` records why), but a GVA Store whose
     // `row_stride` is short of the format's tight row bytes fails
     // `gva_store_defer_eligible` and keeps its readback. Delete this and that

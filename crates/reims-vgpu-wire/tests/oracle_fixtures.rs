@@ -1880,7 +1880,7 @@ const KNOWN_CAPABILITY_DELTAS: &[KnownDelta] = &[
                emits one record. `blit_begin_segment_protected` and `..._alt` \
                pin the burst, `..._flag_set` and `..._protection_zero` pin the \
                two single-record arms. `reims-vgpu`'s decode::stream already \
-               skipped type 5 correctly and its own doc's prediction was right.",
+               skipped ref-texture correctly and its own doc's prediction was right.",
     },
 ];
 

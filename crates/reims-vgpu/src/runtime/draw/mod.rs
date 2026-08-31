@@ -3,7 +3,7 @@
 //!
 //! Loads per-function MTLB containers from the object list, materializes stream
 //! binds (vertex/fragment buffers, optional index buffer, viewport/scissor),
-//! hands them to the backend, and writes the RGBA result into the type-11
+//! hands them to the backend, and writes the RGBA result into the mapper-ref-texture
 //! mapping via [`mapping_write`]. The encode call is
 //! [`crate::backend::metal::render::render_core_mrt`] on the Metal arm and
 //! `try_metal2vulkan_draw` into `backend::vulkan::engine` on the Vulkan one.
@@ -48,9 +48,10 @@ use crate::runtime::decode::render::{
 };
 use crate::runtime::decode::resource::{
     decode_buffer_texture_descriptor, decode_depth_stencil_descriptor,
-    decode_render_pipeline_descriptor, decode_texture_descriptor, texture_type8_opcode,
-    BufferTextureDescriptor, DecodeStatus, RenderPipelineDescriptor, OBJECT_TYPE_IOSURFACE,
-    OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT, OBJECT_TYPE_TEXTURE_VIEW, OBJECT_TYPE_TYPE7,
+    decode_render_pipeline_descriptor, decode_texture_descriptor, texture_view_opcode,
+    BufferTextureDescriptor, DecodeStatus, RenderPipelineDescriptor,
+    OBJECT_TYPE_MAPPER_REF_TEXTURE, OBJECT_TYPE_SERIALIZER_OBJECT, OBJECT_TYPE_TEXTURE,
+    OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS, OBJECT_TYPE_TEXTURE_VIEW,
     TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
 };
 use crate::runtime::gva_mem;
@@ -77,7 +78,7 @@ pub(crate) use vulkan::coverage_band_for_test;
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 pub mod metal;
 
-// Type-8 texture-view resolution and linear texture loads. Backend-independent,
+// Texture-view texture-view resolution and linear texture loads. Backend-independent,
 // so the module carries no gate of its own; the two items inside it that are
 // arm- or test-specific keep theirs.
 mod texture_view;
@@ -470,15 +471,15 @@ pub struct IndexedDrawInfo {
 
 /// One color RT for MRT encode/writeback.
 ///
-/// Archive `ApplePVGPURenderTarget`: either type-11 IOSurface (`mapping_id`) or
-/// type-2/3 guest-VA linear (`target_gva` + `row_stride`). Wallpaper/background
+/// Archive `ApplePVGPURenderTarget`: either mapper-ref-texture IOSurface (`mapping_id`) or
+/// normal-texture guest-VA linear (`target_gva` + `row_stride`). Wallpaper/background
 /// layers are the GVA form.
 #[derive(Clone, Debug, Default)]
 pub struct ColorRtRequest {
     pub slot: u32,
     pub texture_ref: u32,
     pub mapping_id: u32,
-    /// Non-zero ⇒ type-2/3 linear GVA target (mapping_id must be 0).
+    /// Non-zero ⇒ normal-texture linear GVA target (mapping_id must be 0).
     pub target_gva: u64,
     /// Bytes-per-row for GVA target (archive `bpr`).
     pub row_stride: u32,
@@ -834,23 +835,27 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
         return None;
     }
     let report = crate::observe::RungReport::new("draw_load_pipeline", "pipe_ref");
-    // Live object-list: render pipeline is type-7 with subtype 0x0e.
-    let (_entry, desc) =
-        match objects::resolve_descriptor(state, host, task_id, pipeline_ref, &[OBJECT_TYPE_TYPE7])
-        {
-            Ok(found) => found,
-            Err(rung) => {
-                report.rung(task_id, pipeline_ref, rung);
-                return None;
-            }
-        };
+    // Live object-list: render pipeline is serializer-object with subtype 0x0e.
+    let (_entry, desc) = match objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        pipeline_ref,
+        &[OBJECT_TYPE_SERIALIZER_OBJECT],
+    ) {
+        Ok(found) => found,
+        Err(rung) => {
+            report.rung(task_id, pipeline_ref, rung);
+            return None;
+        }
+    };
     let p = match decode_render_pipeline_descriptor(&desc) {
         Ok(p) => p,
         Err(status) => {
             // The decoder's own name for what it refused, carried through rather
             // than collapsed into `desc_decode`. Without it this line said only
             // that a 292-byte descriptor did not decode, and finding out *why*
-            // meant correlating its `t=` against an `OFF type7_pipeline_shape`
+            // meant correlating its `t=` against an `OFF serializer_object_pipeline_shape`
             // line in the same millisecond — which is how the alpha-test and
             // logic-op tags were found and is not a step the next reader should
             // have to repeat.
@@ -878,8 +883,8 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
     Some(p)
 }
 
-/// Resolve type-1 buffer object → guest bytes starting at `offset`.
-/// Where a type-1 buffer object's bytes live in the task GVA space. Both the
+/// Resolve buffer object → guest bytes starting at `offset`.
+/// Where a buffer object's bytes live in the task GVA space. Both the
 /// zero-copy gather and the CPU staging read need identical `(gva, size)`;
 /// resolving it once ([`resolve_buffer_backing`]) avoids walking the task page
 /// table twice for every sub-zero-copy-floor bind (the `buf_snap` population —
@@ -891,7 +896,7 @@ pub(super) struct BufferBacking {
     pub(super) size: u64,
 }
 
-/// The slug for each way a type-1 buffer ref fails to yield a span.
+/// The slug for each way a buffer ref fails to yield a span.
 ///
 /// Five refusals, one per condition, in the vocabulary `observe::ladder`
 /// declares — because the five lines this replaced carried **no `reason=` at
@@ -933,7 +938,7 @@ fn buffer_refusal_detail(refusal: objects::BufferSpanRefusal, page_shift: u32) -
     }
 }
 
-/// Resolve a type-1 buffer `ref` to its backing `(gva, size)` (object-list
+/// Resolve a buffer `ref` to its backing `(gva, size)` (object-list
 /// entry read + descriptor read + decode). Fail-visible per failing site —
 /// this is the single owner of the `load_buffer *` reason slugs; the ZC and CPU
 /// binds delegate to it so a failure logs exactly once, not once per attempt.
@@ -1092,10 +1097,10 @@ fn load_buffer_bytes<M: HostMemory + HostOps>(
     read_buffer_bytes_resolved(state, host, task_id, buffer_ref, &backing, offset, None)
 }
 
-/// If `texture_ref` is a type-8 object whose descriptor is a buffer-backed
+/// If `texture_ref` is a texture-view object whose descriptor is a buffer-backed
 /// texture (view_opcode 9, `newTextureWithDescriptor:offset:bytesPerRow:`, or
 /// its `TextureDescriptor2` form), return its decoded descriptor. `None` for a
-/// non-type-8 object or a real texture VIEW (opcode 7/8/0x1b) — those stay on
+/// non-texture-view object or a real texture VIEW (opcode 7/8/0x1b) — those stay on
 /// the view path silently.
 fn buffer_texture_descriptor<M: HostMemory + HostOps>(
     state: &DeviceState,
@@ -1117,7 +1122,7 @@ fn buffer_texture_descriptor<M: HostMemory + HostOps>(
     }
     let desc_bytes = &resource.descriptor;
     if !matches!(
-        texture_type8_opcode(desc_bytes),
+        texture_view_opcode(desc_bytes),
         Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE) | Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE)
     ) {
         return None;
@@ -1222,7 +1227,7 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
     }
     let span = bpr.checked_mul(h as u64)?;
     // A buffer-backed texture is two contract references over one allocation:
-    // the type-8 texture object the guest binds and samples, and the type-1
+    // the texture-view texture object the guest binds and samples, and the buffer
     // buffer that owns the storage. A synchronize names the former and a debt
     // may be armed under either, so both are paid. `load_buffer_bytes` below
     // pays for `bt.buffer_ref`; this is the sibling call every other sampled
@@ -1332,7 +1337,7 @@ fn load_index_bytes_reason<M: HostMemory + HostOps>(
     Ok(buf)
 }
 
-/// Guest Store seed for type-11 `image_changed` / GVA partial writeback.
+/// Guest Store seed for mapper-ref-texture `image_changed` / GVA partial writeback.
 ///
 /// Metal `storeAction=Store` writes the **whole** attachment after the pass.
 /// Diff-only writeback is Store-equivalent only when `loadAction=Load` and
@@ -1481,14 +1486,14 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
         objects::OBJECT_TYPE_REF_TEXTURE => {
             match objects::read_descriptor(state, host, task_id, &entry) {
                 None => format!("type=5 desc_len={desc_len} reason=no_desc"),
-                Some(d) if reims_vgpu_wire::device_desc::type5_header(&d).is_err() => {
+                Some(d) if reims_vgpu_wire::device_desc::ref_texture_header(&d).is_err() => {
                     format!("type=5 desc_len={desc_len} reason=short_desc")
                 }
                 Some(d) => {
-                    let sid = reims_vgpu_wire::device_desc::type5_header(&d)
+                    let sid = reims_vgpu_wire::device_desc::ref_texture_header(&d)
                         .map(|h| h.surface_id.get())
                         .unwrap_or(0);
-                    match objects::decode_type5_texture_view(&d) {
+                    match objects::decode_ref_texture_view(&d) {
                         Some(view) => format!(
                             "type=5 desc_len={desc_len} surface_id={sid} view={}x{} fmt={:#x} reason=ref_texture_view",
                             view.width, view.height, view.pixel_format
@@ -1499,14 +1504,15 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
                 }
             }
         }
-        OBJECT_TYPE_IOSURFACE => {
-            let Some(mid) = objects::resolve_type11_ref(state, host, task_id, texture_ref) else {
-                return format!("type=11 desc_len={desc_len} reason=type11_resolve");
+        OBJECT_TYPE_MAPPER_REF_TEXTURE => {
+            let Some(mid) = objects::resolve_mapper_ref_texture(state, host, task_id, texture_ref)
+            else {
+                return format!("type=11 desc_len={desc_len} reason=mapper_ref_texture_resolve");
             };
             match state.mappings.get(&mid) {
                 None => format!("type=11 mid={mid} desc_len={desc_len} reason=no_mapping"),
                 Some(m) => format!(
-                    "type=11 mid={mid} desc_len={desc_len} geom={} {}x{} fmt={:#x} mapped={} pages={} reason=type11_sample",
+                    "type=11 mid={mid} desc_len={desc_len} geom={} {}x{} fmt={:#x} mapped={} pages={} reason=mapper_ref_texture_sample",
                     m.has_geom as u8,
                     m.width,
                     m.height,
@@ -1516,7 +1522,7 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
                 )}
         }
         OBJECT_TYPE_TEXTURE_VIEW => {
-            // Opcode-9 buffer-backed textures share the type-8 tag but are not views.
+            // Opcode-9 buffer-backed textures share the texture-view tag but are not views.
             if let Some(bt) = buffer_texture_descriptor(state, host, task_id, texture_ref, None) {
                 return format!(
                     "type=8 desc_len={desc_len} buf={} off={} bpr={} {}x{} fmt={:#x} reason=buftex_load",
@@ -1546,7 +1552,7 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
                     view.pixel_format
                 )}
         }
-        OBJECT_TYPE_TEXTURE | OBJECT_TYPE_TEXTURE_VARIANT => {
+        OBJECT_TYPE_TEXTURE | OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS => {
             let Some(desc_bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
                 return format!("type={ot} desc_len={desc_len} reason=desc_read");
             };
@@ -1572,8 +1578,8 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
     }
 }
 
-/// What the guest says a type-11 mapping's texel **values** are, seen through an
-/// optional type-8 view format.
+/// What the guest says a mapper-ref-texture mapping's texel **values** are, seen through an
+/// optional texture-view format.
 ///
 /// Distinct from the byte *order* its loaders hand back, and that distinction is
 /// the whole point. `scanout::read_mapping_bgra8` normalises a mapping's channel
@@ -1616,7 +1622,7 @@ fn mapping_declared_format(
     }
 }
 
-/// Sample a type-11 mapping as tight RGBA8 from guest pages.
+/// Sample a mapper-ref-texture mapping as tight RGBA8 from guest pages.
 ///
 /// Guest pages ARE the surface content: the CPU writeback lands Stores in them
 /// and guest CPU writes are immediately visible. There is exactly one source;
@@ -1626,7 +1632,7 @@ fn mapping_declared_format(
 /// mapped with a live `MappingInternal` and no latched W×H yet; resolving first
 /// decodes the guest device-surface descriptor and latches the geometry, so the
 /// sample succeeds instead of bailing out on `!has_geom` and dropping the bind.
-fn load_type11_mapping_rgba<M: HostMemory + HostOps>(
+fn load_mapper_ref_texture_mapping_rgba<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
@@ -1691,7 +1697,7 @@ fn host_cache_store_rgba8(
     );
 }
 
-/// Advance the guest-visible publish milestones for a type-11 Store whose
+/// Advance the guest-visible publish milestones for a mapper-ref-texture Store whose
 /// pixels have landed in the mapping's guest pages.
 ///
 /// Route-independent: the synchronous `cpu_portability` Store calls it inline,
@@ -1830,7 +1836,7 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
     }
     // An abandoned portability chain must still preserve the last successful
     // record. This is an error recovery rail, not normal product behavior: land
-    // the resident readback into the type-11 mapping, publish the Composite
+    // the resident readback into the mapper-ref-texture mapping, publish the Composite
     // Store, and keep the degradation fail-visible.
     crate::observe::fail(format!(
         "writeback_chain_rgba reason=resident_chain_abandoned_cpu_recovery \
@@ -2346,7 +2352,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             //
             // GVA linear target: ephemeral host RT needs a CPU seed (archive
             // reims_vgpu_backend_metal; NULL seed → Metal Clear invent, still encode).
-            // Type-11 is seeded later instead, at the attachment site in
+            // Mapper-ref-texture is seeded later instead, at the attachment site in
             // `encode_draw` — the same place the guest-backed alias used to be
             // built, and the same seed it already took whenever the alias was
             // refused. Seeding here would need the mapping read twice.
@@ -3015,10 +3021,10 @@ pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
     true
 }
 
-/// Seed color RT LOAD from guest type-11 (BGRA→RGBA) or type-2/3/view linear RGBA.
+/// Seed color RT LOAD from guest mapper-ref-texture (BGRA→RGBA) or normal-texture/view linear RGBA.
 ///
 /// Every color RT is an ephemeral host RT now, so every `Load` needs this: the
-/// type-11 guest-memory alias that let Metal Load read the surface bytes in
+/// mapper-ref-texture guest-memory alias that let Metal Load read the surface bytes in
 /// place is deleted. This used to run only on the alias-reject fallback
 /// (unaligned offset or row stride, span out of range, no device), which is why
 /// it is already a complete path and not a new one.
@@ -3032,8 +3038,8 @@ fn seed_color_load<M: HostMemory + HostOps>(
     height: u32,
 ) -> Option<Vec<u8>> {
     // Discrete GPU: exact target GVA is the strongest identity across object-ref
-    // recycling. Fall back to the type-2/3 texture namespace, never the
-    // unrelated type-4 surface_id namespace. Guest memory is last.
+    // recycling. Fall back to the normal texture namespace, never the
+    // unrelated backing record_id namespace. Guest memory is last.
     if width > 0 && height > 0 {
         if target_gva != 0 {
             // Recency for the encode cache's byte cap; a Load seed served from
@@ -3047,8 +3053,8 @@ fn seed_color_load<M: HostMemory + HostOps>(
         // `.agents/repros/gva-seed-serve-census.sh`) served **1 558 colour LOAD
         // seeds from this lookup and missed 0**. `load_seed_ok_color` was 1 558
         // in the same window, so every colour LOAD seed the device produced came
-        // from here; the other 1 462 of `load_seed_ok` are type-11 and take
-        // `resolve_type11_load_seed`.
+        // from here; the other 1 462 of `load_seed_ok` are mapper-ref-texture and take
+        // `resolve_mapper_ref_texture_load_seed`.
         //
         // That is what a LOAD seed is worth: `MTLLoadActionLoad` says the guest
         // is drawing onto the content already in this attachment, so a seed that
@@ -3229,7 +3235,7 @@ fn seed_color_load<M: HostMemory + HostOps>(
             return Some(swap_rb_channels(bgra));
         }
     }
-    // Type-2/3 (or type-8 base) linear GVA → convert to RGBA8.
+    // normal-texture (or texture-view base) linear GVA → convert to RGBA8.
     //
     // No settle at this fork. It used to sit at the head of this function, above
     // every host-cache lookup, and blocked 5 023 times for 2.63 s on a driven
@@ -3240,7 +3246,7 @@ fn seed_color_load<M: HostMemory + HostOps>(
     //
     // So each leaf under `load_sampled_rgba_static` owns it, narrowed on what it
     // actually reads — `read_buffer_bytes_resolved` on the buffer's span,
-    // `scanout::paint_mapping` behind `load_type11_mapping_rgba`, and
+    // `scanout::paint_mapping` behind `load_mapper_ref_texture_mapping_rgba`, and
     // `draw::texture_view::load_linear_texture_impl` for the linear arm. The
     // buffer leaf had no settle at all before that, on any of its four callers.
     // The seed arm: this leaf is shared with the sampled resolve and the two
@@ -3261,7 +3267,7 @@ fn seed_color_load<M: HostMemory + HostOps>(
 
 /// Resolve sampled texture RGBA without requiring Metal feature (color LOAD seed path).
 ///
-/// Type-8 views with a non-identity swizzle are rejected here: RT materialization does not
+/// Texture-view views with a non-identity swizzle are rejected here: RT materialization does not
 /// rematerialize through a remapped view (contract: swizzled views fail for RT/blit).
 /// View `pixel_format` still overrides the base format when bpp-compatible.
 fn load_sampled_rgba_static<M: HostMemory + HostOps>(
@@ -3272,7 +3278,7 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
     native: NativeUploads,
     site: crate::runtime::render_writeback::SettleSite,
 ) -> Option<(Vec<u8>, SampledByteFormat)> {
-    // Opcode-9 buffer-backed texture (type-8): sample the source buffer directly.
+    // Opcode-9 buffer-backed texture (texture-view): sample the source buffer directly.
     if let Some(bt) = buffer_texture_descriptor(state, host, task_id, texture_ref, None) {
         let source = bt.desc.pixel_format;
         return load_buffer_texture_rgba(state, host, task_id, texture_ref, &bt).map(
@@ -3284,17 +3290,17 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
             },
         );
     }
-    // Type-11 path via resolve.
-    if let Some(mid) = objects::resolve_type11_ref(state, host, task_id, texture_ref) {
+    // Mapper-ref-texture path via resolve.
+    if let Some(mid) = objects::resolve_mapper_ref_texture(state, host, task_id, texture_ref) {
         let source = mapping_declared_format(state, mid, None);
-        return load_type11_mapping_rgba(state, host, mid, None).map(|(_, _, r)| {
+        return load_mapper_ref_texture_mapping_rgba(state, host, mid, None).map(|(_, _, r)| {
             (
                 r,
                 SampledByteFormat::from_source(TexelLayout::Rgba8, source),
             )
         });
     }
-    // Type-8 view → base texture + mip + format. The view's SWIZZLE is
+    // Texture-view view → base texture + mip + format. The view's SWIZZLE is
     // deliberately not consulted here: it is a property of the view, not of the
     // bytes, and the bind applies it as the image view's component mapping so
     // the GPU performs it at sample time. Refusing here (which this path used
@@ -3305,22 +3311,24 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
         } else {
             (texture_ref, 0, None)
         };
-    // Type-11 base through a view (format override may reinterpret BGRA storage).
-    if let Some(mid) = objects::resolve_type11_ref(state, host, task_id, tex_ref) {
+    // Mapper-ref-texture base through a view (format override may reinterpret BGRA storage).
+    if let Some(mid) = objects::resolve_mapper_ref_texture(state, host, task_id, tex_ref) {
         if level != 0 {
             return None;
         }
         let source = mapping_declared_format(state, mid, fmt_override);
-        return load_type11_mapping_rgba(state, host, mid, fmt_override).map(|(_, _, r)| {
-            (
-                r,
-                SampledByteFormat::from_source(TexelLayout::Rgba8, source),
-            )
-        });
+        return load_mapper_ref_texture_mapping_rgba(state, host, mid, fmt_override).map(
+            |(_, _, r)| {
+                (
+                    r,
+                    SampledByteFormat::from_source(TexelLayout::Rgba8, source),
+                )
+            },
+        );
     }
     // The only rung here that can answer in anything but RGBA8. The three above
     // convert unconditionally — `load_buffer_texture_rgba` and
-    // `load_type11_mapping_rgba` have no native arm — so they state the layout
+    // `load_mapper_ref_texture_mapping_rgba` have no native arm — so they state the layout
     // they always produced rather than being handed a choice they cannot make.
     // All four still name the guest format their values were read from, because
     // a convert to RGBA8 reorders channels and does not decode.

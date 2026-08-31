@@ -78,7 +78,7 @@
 /// Compose a ladder slug from a rail's role and one of the four rungs.
 ///
 /// The role is whatever the rail already used to say which of its resources
-/// failed (`"buf"`, `"tex"`, `"icb_type1"`, `"compute_stage_buf"`), and is kept
+/// failed (`"buf"`, `"tex"`, `"icb_buffer"`, `"compute_stage_buf"`), and is kept
 /// exactly as it was. Only the condition half is fixed, which is the half that
 /// had ten spellings.
 ///
@@ -236,7 +236,10 @@ mod tests {
     fn a_role_and_a_rung_compose_into_the_slug_the_rail_emits() {
         assert_eq!(ladder_slug!("buf", no_list_entry), "buf_no_list_entry");
         assert_eq!(ladder_slug!("tex", wrong_type), "tex_wrong_type");
-        assert_eq!(ladder_slug!("icb_type1", desc_read), "icb_type1_desc_read");
+        assert_eq!(
+            ladder_slug!("icb_buffer", desc_read),
+            "icb_buffer_desc_read"
+        );
         assert_eq!(
             ladder_slug!("compute_stage_buf", desc_decode),
             "compute_stage_buf_desc_decode"

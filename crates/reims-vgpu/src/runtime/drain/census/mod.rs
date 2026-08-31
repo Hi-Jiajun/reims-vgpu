@@ -2865,10 +2865,10 @@ pub fn note_drain_tranche(
             crate::observe::off(routes);
         }
         // Beside `store_routes` deliberately: the two are read against each
-        // other. `type4_backing_fail` lines equal `type4_backing_recovered +
-        // type4_backing_superseded` from that line plus this one's `n`, and a
+        // other. `backing_fail` lines equal `backing_recovered +
+        // backing_superseded` from that line plus this one's `n`, and a
         // refusal that never recovered is only visible as the residue.
-        if let Some(outstanding) = crate::runtime::objects::type4_backing_outstanding_census() {
+        if let Some(outstanding) = crate::runtime::objects::backing_outstanding_census() {
             crate::observe::off(outstanding);
         }
         // The same reason and the same place: `store_routes` counts the watches
@@ -3091,7 +3091,7 @@ pub fn note_readback_gpu_us(barrier_us: u64, copy_us: u64) {
 /// The routes are the attribution for `engine_delta`'s readback bytes: only
 /// `cpu_portability` reads a full frame back and CPU-copies it into the guest's
 /// pages, and only it is forced to — `gva_store_defer_eligible` refuses any
-/// target with a nonzero `mapping_id`, so a type-11 composite Store has no
+/// target with a nonzero `mapping_id`, so a mapper-ref-texture composite Store has no
 /// deferred rail to take. Whether that is 2 Stores a second or 20 decides
 /// whether building one is worth it, and the route's own first-appearance line
 /// is deduplicated per process and cannot say.
@@ -3125,14 +3125,14 @@ thread_local! {
 /// ```text
 /// AUC 0.75  surface_flush             permutation p = 0.021 raw
 /// AUC 0.73  load_seed_ok                            p = 0.914 Bonferroni
-/// AUC 0.72  type11_seed_uploaded      (43 columns tested)
-/// AUC 0.72  type11_seed_guest_wrote
+/// AUC 0.72  mapper_ref_texture_seed_uploaded      (43 columns tested)
+/// AUC 0.72  mapper_ref_texture_seed_guest_wrote
 /// AUC 0.71  t11_gw_ref_moved
 /// ```
 ///
 /// Corrected for having looked at 43 columns, nothing is distinguishable from
 /// noise. The leaders are also largely one quantity wearing different names — a
-/// type-11 seed upload is a `load_seed_ok_mapping` — so they are one weak
+/// mapper-ref-texture seed upload is a `load_seed_ok_mapping` — so they are one weak
 /// signal, not five.
 ///
 /// The reason is structural rather than a gap to be filled by adding counters.
@@ -3291,12 +3291,11 @@ mod drain_gap_tests {
         // divide the whole process lifetime into one tranche — so the window
         // under test has to be opened before anything is accumulated into it.
         assert!(c.note(0, 0, 1).is_none(), "the first call arms the window");
-        // Six entries on a fixed stride, each: 40 idle, 10 lock, 30 drain, 5
-        // publish, 16 post — 16 so the four-way sweep split divides it whole and
-        // the shortfall check below reads truncation as nothing. Times are microseconds on the crate clock. The
-        // first entry's idle is the one span that cannot be measured — there is
-        // no previous exit to measure it from — so it lies before `t0` and is
-        // not part of what has to tile.
+        // Six entries on a fixed stride, each: 40 idle, 10 lock, 30 drain, 5 publish, 16 post — 16
+        // so the four-way sweep split divides it whole and the shortfall check below reads
+        // truncation as nothing. Times are microseconds on the crate clock. The first entry's idle
+        // is the one span that cannot be measured — there is no previous exit to measure it from —
+        // so it lies before `t0` and is not part of what has to tile.
         let (idle, lock, drain, publish, post) = (40u64, 10u64, 30u64, 5u64, 16u64);
         let stride = idle + lock + drain + publish + post;
         let entries = 6u64;

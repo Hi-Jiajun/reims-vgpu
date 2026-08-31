@@ -468,7 +468,7 @@ fn make_vertex_descriptor(
             );
         }
         // The format and step-function words come straight off the guest's
-        // type-7 pipeline descriptor and nothing upstream clamps them, so both
+        // serializer-object pipeline descriptor and nothing upstream clamps them, so both
         // are converted before anything is encoded. Neither had any check at
         // all before; the location and buffer index above did.
         let Some(format) = mtl_enum::vertex_format(attr.format) else {
@@ -866,7 +866,7 @@ fn bind_storage_buffers(
             // this index is `MTLBufferLayoutStrideDynamic`, exactly as the
             // compute rail's `metal_compute_attribute_stride_without_dynamic_layout`
             // states for `MTLBufferLayoutDescriptor`. This rail's vertex
-            // descriptor is built from the type-7 attribute block and never
+            // descriptor is built from the serializer-object attribute block and never
             // declares a dynamic layout, so the selector would raise an
             // NSException — a process abort, not an error return.
             //

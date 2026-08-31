@@ -77,7 +77,7 @@ struct RenderIcbExecute {
 /// Archive `apple_pv_gpu_render_worker_run` executes **every** draw in order,
 /// seeding draw N from draw N-1's writeback. Product previously kept only
 /// `last_draw`, which dropped the logo when the pill was the final draw in the
-/// same stream (journal: logo RG8 168×206 + pill → one type-11 FB).
+/// same stream (journal: logo RG8 168×206 + pill → one mapper-ref-texture FB).
 #[derive(Clone, Debug, Default)]
 struct PendingDraw {
     pipeline_ref: u32,
@@ -520,7 +520,7 @@ pub struct ExecResult {
     /// The caller must keep this packet at the channel head and retry it.
     pub deferred: bool,
     pub texture_refs: Vec<u32>,
-    pub type11_mappings: Vec<u32>,
+    pub mapper_ref_texture_mappings: Vec<u32>,
     pub saw_draw: bool,
     pub clears_applied: u32,
     pub metal_draws_ok: u32,
@@ -776,7 +776,7 @@ fn note_exec_header(exec_started: std::time::Instant, measured_ns: u64) {
 ///
 /// `validity_unknown_object` is **not** by itself a defect either, and a reader
 /// scoring it needs to know why: `DeviceState::objects` is populated lazily, by
-/// `objects::resolve_type11_ref` and `resolve_type4_surface_ex` at the moment a
+/// `objects::resolve_mapper_ref_texture` and `resolve_backing_ex` at the moment a
 /// decoded command names a ref. A resource the guest has created in its own
 /// object list but has not yet named in an executed stream is absent from the
 /// set by construction. The table names the submission's whole residency list,
@@ -1027,7 +1027,7 @@ fn handle_info_record<M: HostMemory + HostOps>(
     if opcode == INFO_OP_ICB_HOST_RESOURCE {
         // `icb_backing_fail` was a counter with no reason beside it: an ICB
         // whose command memory never bound looked identical whether the payload
-        // was malformed, the type-1 buffer was short, or the pathway has no ICB
+        // was malformed, the buffer was short, or the pathway has no ICB
         // execution at all. Latched per ICB ref — the guest re-sends `0x1d1`
         // for the same ICB, so an unlatched line would be one per frame.
         //
@@ -1358,7 +1358,7 @@ fn handle_blit_record<M: HostMemory + HostOps>(
         // decides whether an executor is worth building.
         //
         // Not executed here on purpose. A texture fill needs the destination
-        // resolved through the type-4/5/11 rails, the region walked per row,
+        // resolved through the backing/5/11 rails, the region walked per row,
         // and — for the colour form — the clear colour converted into the
         // texture's pixel format, which is a converter this device does not
         // have. The count is what says whether to build one, and for which of
@@ -1624,15 +1624,16 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     if !out.texture_refs.contains(&texture_ref) {
                         out.texture_refs.push(texture_ref);
                     }
-                    if let Some(m) = objects::resolve_type11_ref(state, host, task_id, texture_ref)
+                    if let Some(m) =
+                        objects::resolve_mapper_ref_texture(state, host, task_id, texture_ref)
                     {
-                        if !out.type11_mappings.contains(&m) {
-                            out.type11_mappings.push(m);
+                        if !out.mapper_ref_texture_mappings.contains(&m) {
+                            out.mapper_ref_texture_mappings.push(m);
                         }
-                    } else if objects::resolve_type4_surface(state, host, texture_ref) {
-                        // x86 type-4: object ref is surface_id / mapping_id.
-                        if !out.type11_mappings.contains(&texture_ref) {
-                            out.type11_mappings.push(texture_ref);
+                    } else if objects::resolve_backing(state, host, texture_ref) {
+                        // x86 backing: object ref is surface_id / mapping_id.
+                        if !out.mapper_ref_texture_mappings.contains(&texture_ref) {
+                            out.mapper_ref_texture_mappings.push(texture_ref);
                         }
                     }
                     Some(TextureBind {
@@ -1869,19 +1870,19 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         out.texture_refs.push(att.resolve_texture_ref);
                     }
                     if let Some(m) =
-                        objects::resolve_type11_ref(state, host, task_id, published_ref)
+                        objects::resolve_mapper_ref_texture(state, host, task_id, published_ref)
                     {
                         note_pass_extent_for_slot(state, task_id, slot, m, &cmd);
-                        if !out.type11_mappings.contains(&m) {
-                            out.type11_mappings.push(m);
+                        if !out.mapper_ref_texture_mappings.contains(&m) {
+                            out.mapper_ref_texture_mappings.push(m);
                         }
-                    } else if objects::resolve_type4_surface(state, host, published_ref) {
-                        // A type-4 attachment is its own mapping id — the arm
-                        // below pushes `att.texture_ref` where the type-11 arm
+                    } else if objects::resolve_backing(state, host, published_ref) {
+                        // A backing attachment is its own mapping id — the arm
+                        // below pushes `att.texture_ref` where the mapper-ref-texture arm
                         // pushes the id it resolved to.
                         note_pass_extent_for_slot(state, task_id, slot, published_ref, &cmd);
-                        if !out.type11_mappings.contains(&published_ref) {
-                            out.type11_mappings.push(published_ref);
+                        if !out.mapper_ref_texture_mappings.contains(&published_ref) {
+                            out.mapper_ref_texture_mappings.push(published_ref);
                         }
                     }
                     // The load action decides this, and only the load action.
@@ -2800,7 +2801,7 @@ struct BindTables<'a, B> {
 ///
 /// `make` builds the bind for a live slot and returns `None` for the zero ref,
 /// which keeps the ref field's name — and any side registration, such as the
-/// texture arm's type-11 mapping list — with the caller. The clear count comes
+/// texture arm's mapper-ref-texture mapping list — with the caller. The clear count comes
 /// back as a return value rather than through an `&mut` counter so `make` can
 /// hold the rest of `ExecResult`.
 fn apply_binds<T: Copy, B: Clone>(
@@ -3223,7 +3224,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                 fill_draw_binds_from_pending(&mut req, pd);
                 (req.continues_render_pass, req.render_pass_continues) =
                     render_pass_chain_position(di, draw_list.len());
-                // A resident type-11 target carries attachment contents between
+                // A resident mapper-ref-texture target carries attachment contents between
                 // records without a CPU chain buffer. Like a native Metal render
                 // pass, only the final record performs the guest-visible Store;
                 // importing a full frame after every draw held DeviceInner for
@@ -3235,7 +3236,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                     .unwrap_or(false);
                 // Records 2+ of a chain composite over the prior record: force
                 // loadAction=Load on every color. Leaving the pass action alone
-                // on a type-11 target let a CLEAR re-run before each record,
+                // on a mapper-ref-texture target let a CLEAR re-run before each record,
                 // wiping the full composite drawn by record 1 (live poison=1:
                 // mid peak 10.9M native → 2.5M after later records).
                 if di > 0 {
@@ -3245,7 +3246,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                     // Chain from the engine resident when available; otherwise
                     // seed from the prior encode output (archive "thread each
                     // record's output as next initial content"). MoltenVK's
-                    // portability path returns CPU pixels for type-11 mappings,
+                    // portability path returns CPU pixels for mapper-ref-texture mappings,
                     // so `unified` does not imply that a resident exists.
                     // Moved, not cloned (multi-MiB).
                     match multi_draw_chain_source(resident_chain, chain_rgba.is_some()) {
@@ -3866,11 +3867,11 @@ fn dirty_color_targets<M: HostMemory + HostOps>(
     refs: &[u32],
 ) {
     for &tex_ref in refs {
-        if let Some(mid) = objects::resolve_type11_ref(state, host, task_id, tex_ref) {
-            // The guest pages are the only copy of a type-11 surface, so there
+        if let Some(mid) = objects::resolve_mapper_ref_texture(state, host, task_id, tex_ref) {
+            // The guest pages are the only copy of a mapper-ref-texture surface, so there
             // is no mirror to drop — only bump gen for scanout skips.
             let _ = state.mark_mapping_written(mid);
-        } else if objects::resolve_type4_surface(state, host, tex_ref) {
+        } else if objects::resolve_backing(state, host, tex_ref) {
             let _ = state.mark_mapping_written(tex_ref);
         }
     }
@@ -4032,7 +4033,7 @@ fn apply_clear<M: HostMemory + HostOps>(
             return false;
         }
     };
-    // Prefer full draw-path resolve (type-11 or type-2/3 GVA wallpaper targets).
+    // Prefer full draw-path resolve (mapper-ref-texture or normal-texture GVA wallpaper targets).
     let Some(req) =
         // A clear-only pass: no pipeline and no geometry, so every draw
         // argument including the base instance is zero by construction.

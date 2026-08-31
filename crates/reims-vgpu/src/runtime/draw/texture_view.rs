@@ -1,4 +1,4 @@
-//! Type-8 texture-view chain resolution and the CPU linear-texture loads that
+//! Texture-view texture-view chain resolution and the CPU linear-texture loads that
 //! consume it: swizzle application, native upload-format selection, and the
 //! tight-row RGBA/BGRA readers shared by the sample and seed paths.
 //!
@@ -10,7 +10,7 @@
 
 use super::*;
 
-/// Type-8 view resolution for sample/seed paths.
+/// Texture-view view resolution for sample/seed paths.
 #[derive(Clone, Debug)]
 pub(crate) struct ViewResolve {
     /// Non-view base texture ref after walking the view chain (archive
@@ -23,7 +23,7 @@ pub(crate) struct ViewResolve {
     pub(crate) pixel_format: Option<u16>,
 }
 
-/// A specific refusal while resolving one type-8 texture-view chain.
+/// A specific refusal while resolving one texture-view texture-view chain.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TextureViewDecline {
     HopEntryMissing {
@@ -171,13 +171,13 @@ crate::observe::decline_display!(TextureViewDecline);
 
 impl std::error::Error for TextureViewDecline {}
 
-/// Archive `REIMS_VGPU_RESOURCE_RESOLVE_MAX_VIEW_CHAIN` — nested type-8 views collapse
+/// Archive `REIMS_VGPU_RESOURCE_RESOLVE_MAX_VIEW_CHAIN` — nested texture-views collapse
 /// to a non-view base (`apple_pv_gpu_resource_resolve_texture` chain walk).
 ///
 /// This is the decoded contract's own bound, not a budget of ours: a chain that
 /// needs a ninth hop is one the guest's own resolver would not have followed
 /// either, so refusing it is fidelity rather than a shortfall. That makes it the
-/// number **every** arm that walks a type-8 chain must use, and it is `pub(crate)`
+/// number **every** arm that walks a texture-view chain must use, and it is `pub(crate)`
 /// for exactly that reason. Two arms walk one: this module's
 /// [`resolve_texture_view_reasoned`] for the draw/sample path, and
 /// `blit_exec::resolve_texture_backing_depth` for copies. They used to disagree —
@@ -194,7 +194,7 @@ pub(crate) const MAX_TEXTURE_VIEW_CHAIN: usize = 8;
 
 /// Report a slice range the render path decodes and does not apply.
 ///
-/// [`decode_texture_view_hop_reasoned`] resolves a type-8 view to four things —
+/// [`decode_texture_view_hop_reasoned`] resolves a texture-view to four things —
 /// base ref, mip level, swizzle and format override — and the ranged forms
 /// (opcodes `0x08` and `0x1b`) carry two more that nothing on this path reads:
 /// `slice_base` and `slice_count`. `blit_exec` consumes them; the draw and
@@ -246,7 +246,7 @@ fn note_view_slice_range_dropped(
     ));
 }
 
-/// Decode one type-8 hop (does not walk nested bases).
+/// Decode one texture-view hop (does not walk nested bases).
 ///
 /// The `Result` carries a specific failure slug for the always-on fail log. No
 /// wrapper collapses it at this level: the slug travels up through
@@ -259,7 +259,7 @@ fn decode_texture_view_hop_reasoned<M: HostMemory + HostOps>(
     texture_ref: u32,
 ) -> Result<(u32, u32, Option<pixel_format::SwizzlePlan>, Option<u16>), TextureViewDecline> {
     use crate::runtime::decode::resource::{
-        decode_texture_view_descriptor, texture_type8_header, OBJECT_TYPE_TEXTURE_VIEW,
+        decode_texture_view_descriptor, texture_view_header, OBJECT_TYPE_TEXTURE_VIEW,
     };
     let (_entry, desc) = objects::resolve_descriptor(
         state,
@@ -282,7 +282,7 @@ fn decode_texture_view_hop_reasoned<M: HostMemory + HostOps>(
         }
     })?;
     // Bytes visible before decode, for the len-mismatch / bad-opcode census.
-    let (opcode, declared) = texture_type8_header(&desc).unwrap_or((0, 0));
+    let (opcode, declared) = texture_view_header(&desc).unwrap_or((0, 0));
     let view = decode_texture_view_descriptor(&desc).map_err(|reason| {
         // Dump the full wire blob for an unknown texture-view opcode: this is the
         // only signal that reveals a new serializer variant (off the hot path —
@@ -332,11 +332,11 @@ fn decode_texture_view_hop_reasoned<M: HostMemory + HostOps>(
     Ok((view.base_texture_ref, level, swizzle, pixel_format))
 }
 
-/// Resolve type-8 view to non-view base + mip + format override + swizzle.
+/// Resolve texture-view to non-view base + mip + format override + swizzle.
 ///
 /// The `Result` carries a specific failure slug (`reason=view_resolve` sub-case)
 /// for the always-on fail log; [`resolve_texture_view`] collapses it to `Option`
-/// for the hot path. Walks nested type-8 bases up to [`MAX_TEXTURE_VIEW_CHAIN`]
+/// for the hot path. Walks nested texture-view bases up to [`MAX_TEXTURE_VIEW_CHAIN`]
 /// (archive `apple_pv_gpu_resource_resolve_texture` chain). Outer-most view
 /// supplies level / format / swizzle (inner hops only extend the base ref),
 /// matching the product RT path which materializes a single selected level.
@@ -351,7 +351,8 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
     let (mut base, level, swizzle, pixel_format) =
         decode_texture_view_hop_reasoned(state, host, task_id, texture_ref)?;
 
-    // Collapse nested type-8 bases to a non-view texture (type-11 / type-2/3).
+    // Collapse nested texture-view bases to a non-view texture (mapper-ref-texture /
+    // normal-texture).
     let mut depth = 0u32;
     for _ in 1..MAX_TEXTURE_VIEW_CHAIN {
         let Some(entry) = objects::lookup_list_entry(state, host, task_id, base) else {
@@ -370,7 +371,7 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
         base = next;
     }
 
-    // Final base must not still be a type-8 view past the chain cap.
+    // Final base must not still be a texture-view past the chain cap.
     if let Some(entry) = objects::lookup_list_entry(state, host, task_id, base) {
         if entry.object_type == OBJECT_TYPE_TEXTURE_VIEW {
             return Err(TextureViewDecline::ChainOverflow { base, depth });
@@ -385,9 +386,9 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
     })
 }
 
-/// Resolve type-8 view to non-view base + mip + format override + swizzle.
+/// Resolve texture-view to non-view base + mip + format override + swizzle.
 ///
-/// Returns `None` if the ref is not a type-8 view, a hop is short/unsupported,
+/// Returns `None` if the ref is not a texture-view, a hop is short/unsupported,
 /// the chain exceeds the max depth without a non-view base, a base ref is zero,
 /// or swizzle selectors are malformed. See [`resolve_texture_view_reasoned`] for
 /// the specific reason on the fail path.
@@ -473,7 +474,7 @@ impl std::fmt::Display for ViewSampleRefusal {
     }
 }
 
-/// Pick the sample format for a type-8 view over base storage.
+/// Pick the sample format for a texture-view over base storage.
 ///
 /// Metal texture views require the view format to be storage-compatible with the
 /// base. Compatibility is compared as a whole [`pixel_format::BlockGeometry`] —
@@ -525,7 +526,7 @@ pub(crate) fn effective_view_sample_format_reasoned(
     Ok(sample)
 }
 
-/// Apply a type-8 view swizzle by rewriting tight RGBA8 texels. Identity plans
+/// Apply a texture-view swizzle by rewriting tight RGBA8 texels. Identity plans
 /// are no-ops. Returns `None` only if the buffer length is not a multiple of 4
 /// (corrupt load).
 ///
@@ -584,7 +585,7 @@ pub(crate) enum LinearLoadRefusal {
     DescriptorUndecodable,
     /// The descriptor carries no pixel format, so nothing names its layout.
     NoPixelFormat,
-    /// A type-8 view format that is not the same bytes-per-pixel as the base,
+    /// A texture-view format that is not the same bytes-per-pixel as the base,
     /// which would reinterpret the allocation rather than re-read it.
     ViewFormatBppMismatch { base: u16, view: u16 },
     /// The requested mip level has no address/layout in the descriptor.
@@ -978,7 +979,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
         host,
         task_id,
         texture_ref,
-        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT],
+        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS],
     )
     .map_err(|rung| match rung {
         objects::LadderRung::NoListEntry => R::ObjectListMiss,

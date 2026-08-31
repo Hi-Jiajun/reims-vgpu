@@ -1,4 +1,4 @@
-//! The guest's indirect command buffer: its type-7 create body, its command
+//! The guest's indirect command buffer: its serializer-object create body, its command
 //! layout, and the encode/decode of one command slot's bytes.
 //!
 //! Rail-neutral, all of it — this is the guest's own serialization and it reads
@@ -10,7 +10,7 @@
 //!
 //! Guest create is serialized by
 //! `PGSerializer newIndirectCommandBufferWithDescriptor:layout:maxCommandCount:options:allocator:`
-//! into an 88-byte type-7 body (tag `0x36`) including a 52-byte command
+//! into an 88-byte serializer-object body (tag `0x36`) including a 52-byte command
 //! **layout** at `+0x1c`. Product materializes a host ICB and caches it per
 //! `(task_id, icb_ref)`.
 //!
@@ -33,7 +33,7 @@
 use crate::contract::endian::{ld32, ld64}; // ld64: 0x1d1 gpu_address + dispatch args
 use crate::model::DeviceState;
 use crate::runtime::decode::resource::{
-    decode_type7_descriptor, icb_layout_attribute_stride_slot_count,
+    decode_serializer_object_descriptor, icb_layout_attribute_stride_slot_count,
     icb_layout_kernel_tg_slot_count, icb_layout_table_len, Descriptor as ResourceDescriptor,
     IcbCommandLayout, IndirectCommandBufferDescriptor, ICB_ATTRIBUTE_STRIDE_ENTRY_SIZE,
     ICB_BUFFER_BIND_STRIDE, ICB_CMD_TYPE_CONCURRENT_DISPATCH_THREADGROUPS,
@@ -41,7 +41,7 @@ use crate::runtime::decode::resource::{
     ICB_CMD_TYPE_DRAW_INDEXED_PATCHES, ICB_CMD_TYPE_DRAW_MESH_THREADGROUPS,
     ICB_CMD_TYPE_DRAW_MESH_THREADS, ICB_CMD_TYPE_DRAW_PATCHES, ICB_CONCURRENT_DISPATCH_ARGS_LEN,
     ICB_DRAW_INDEXED_PATCHES_ARGS_LEN, ICB_DRAW_MESH_ARGS_LEN, ICB_DRAW_PATCHES_ARGS_LEN,
-    ICB_TESSELLATION_FACTOR_LEN, ICB_TG_MEMORY_STRIDE, OBJECT_TYPE_TYPE7,
+    ICB_TESSELLATION_FACTOR_LEN, ICB_TG_MEMORY_STRIDE, OBJECT_TYPE_SERIALIZER_OBJECT,
 }; // ICB_TG_MEMORY_STRIDE: object + kernel TG length tables
 #[cfg(test)]
 use crate::runtime::decode::resource::{
@@ -156,7 +156,7 @@ impl From<IcbStatus> for crate::runtime::compute_exec::ComputeStatus {
 pub struct IcbKernelBufferBind {
     pub index: u32,
     pub buffer_ref: u32,
-    /// Byte offset into the type-1 buffer (host fill API, or resolved from [`Self::wire_va`]).
+    /// Byte offset into the buffer (host fill API, or resolved from [`Self::wire_va`]).
     pub offset: u64,
     /// Absolute guest VA from bind record `va@+4` (PGSerializer: base+offset).
     /// `0` means host-only fill / ref-at-base. Resolved to [`Self::offset`] before stage.
@@ -202,7 +202,7 @@ pub struct IcbThreadgroupMemory {
 #[derive(Clone, Debug)]
 pub struct IcbComputeFill {
     pub command_index: u32,
-    /// Type-7 compute pipeline object-list ref (kernel function + optional stage-in).
+    /// Serializer-object compute pipeline object-list ref (kernel function + optional stage-in).
     pub pipeline_ref: u32,
     pub buffers: Vec<IcbKernelBufferBind>,
     /// `setThreadgroupMemoryLength:atIndex:` entries (wire: u64 lengths table).
@@ -232,7 +232,7 @@ impl IcbRenderBindStage {
     /// The bind count the create descriptor declared for this stage.
     ///
     /// Each stage is a separate Metal argument table with its own maximum, taken
-    /// at ICB create from the four sibling fields the type-7 body carries and
+    /// at ICB create from the four sibling fields the serializer-object body carries and
     /// pushed straight into the `MTLIndirectCommandBufferDescriptor` (see
     /// [`metal::materialize_metal_icb`]). They are decoded per stage, so they
     /// are compared per stage: a guest that overruns the vertex table and one
@@ -299,7 +299,7 @@ pub(crate) fn refuse_render_bind_past_declared_max(
 pub struct IcbRenderBufferBind {
     pub index: u32,
     pub buffer_ref: u32,
-    /// Byte offset into the type-1 buffer (host fill API, or resolved from [`Self::wire_va`]).
+    /// Byte offset into the buffer (host fill API, or resolved from [`Self::wire_va`]).
     pub offset: u64,
     /// Absolute guest VA from bind record `va@+4` (PGSerializer: base+offset).
     /// `0` means host-only fill / ref-at-base. Resolved to [`Self::offset`] before stage.
@@ -358,7 +358,7 @@ pub enum IcbRenderDraw {
         index_type: u16,
         index_buffer_ref: u32,
         index_count: u64,
-        /// Byte offset into the index type-1 buffer (host fill or resolved from wire VA).
+        /// Byte offset into the index buffer (host fill or resolved from wire VA).
         index_buffer_offset: u64,
         /// Absolute guest VA of the index range (`va@+0x10` in DrawIndexed args); `0` = base.
         index_wire_va: u64,
@@ -1201,7 +1201,7 @@ pub fn encode_compute_command_slot(
     Ok(slot)
 }
 
-/// Load and decode a type-7 ICB descriptor for `icb_ref` on the task object list.
+/// Load and decode a serializer-object ICB descriptor for `icb_ref` on the task object list.
 pub fn load_icb_descriptor<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
@@ -1212,22 +1212,26 @@ pub fn load_icb_descriptor<M: HostMemory + HostOps>(
         return Err(IcbStatus::Missing("icb_desc_ref_zero"));
     }
     // The two statuses this rail splits the ladder into, stated once: a tag that
-    // is not type-7 means the guest described something, wrongly, while a
+    // is not serializer-object means the guest described something, wrongly, while a
     // missing entry or unreadable bytes mean it described nothing this device
     // can see yet.
-    let (_entry, desc) =
-        objects::resolve_descriptor(state, host, task_id, icb_ref, &[OBJECT_TYPE_TYPE7]).map_err(
-            |rung| {
-                let slug = crate::observe::ladder_slugs!("icb")(rung);
-                match rung {
-                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
-                        IcbStatus::Missing(slug)
-                    }
-                    objects::LadderRung::WrongType { .. } => IcbStatus::BadDescriptor(slug),
-                }
-            },
-        )?;
-    match decode_type7_descriptor(&desc) {
+    let (_entry, desc) = objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        icb_ref,
+        &[OBJECT_TYPE_SERIALIZER_OBJECT],
+    )
+    .map_err(|rung| {
+        let slug = crate::observe::ladder_slugs!("icb")(rung);
+        match rung {
+            objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
+                IcbStatus::Missing(slug)
+            }
+            objects::LadderRung::WrongType { .. } => IcbStatus::BadDescriptor(slug),
+        }
+    })?;
+    match decode_serializer_object_descriptor(&desc) {
         Ok(ResourceDescriptor::IndirectCommandBuffer(icb)) => {
             note_unapplied_icb_flags(task_id, icb_ref, &icb);
             Ok(icb)
@@ -1542,11 +1546,11 @@ pub fn bind_icb_command_memory(
     Ok(())
 }
 
-/// Associate ICB command memory from a type-1 buffer object-list ref (sync path).
+/// Associate ICB command memory from a buffer object-list ref (sync path).
 ///
-/// Resolves buffer GVA/size via the type-1 descriptor (`handle << PAGE_SHIFT`).
+/// Resolves buffer GVA/size via the buffer descriptor (`handle << PAGE_SHIFT`).
 /// Byte length is min(buffer size, command_size × max_command_count) from the
-/// ICB create layout so oversize type-1 allocations are truncated to the ICB.
+/// ICB create layout so oversize buffer allocations are truncated to the ICB.
 pub fn associate_icb_backing_buffer_ref<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
@@ -1557,12 +1561,12 @@ pub fn associate_icb_backing_buffer_ref<M: HostMemory + HostOps>(
     if icb_ref == 0 || buffer_ref == 0 {
         return Err(IcbStatus::Args("icb_associate_ref_zero"));
     }
-    // Record the type-7 create layout if it is not already recorded. This used
+    // Record the serializer-object create layout if it is not already recorded. This used
     // to materialize the host `MTLIndirectCommandBuffer` as a side effect, which
     // is why associating a backing buffer refused outright on the Vulkan arm —
     // the association is guest bookkeeping and needs no host object at all.
     let desc = resolve_icb_record(state, host, task_id, icb_ref)?;
-    let (gva, buf_size) = type1_buffer_gva_size(state, host, task_id, buffer_ref)?;
+    let (gva, buf_size) = buffer_gva_size(state, host, task_id, buffer_ref)?;
     let need = (desc.layout.command_size as u64).saturating_mul(desc.max_command_count as u64);
     if need == 0 {
         return Err(IcbStatus::Args("icb_associate_zero_layout_span"));
@@ -1591,7 +1595,7 @@ pub fn associate_icb_backing_buffer_ref<M: HostMemory + HostOps>(
 /// was worse than refusing. `reply_buffer_ref` went to
 /// [`associate_icb_backing_buffer_ref`] as the ICB's command backing and
 /// `reply_offset` became a command-memory GVA — so a guest whose scratch
-/// allocator happened to return a resolvable type-1 ref would have had *its own
+/// allocator happened to return a resolvable buffer ref would have had *its own
 /// reply staging area* bound as an ICB's command slots, and the next
 /// `executeCommandsInBuffer:` would decode whatever sat there and run it as
 /// draws. A refusal loses the guest's query; that lost the query and then
@@ -1656,7 +1660,7 @@ fn write_attribute_stride(
     Ok(())
 }
 
-fn type1_buffer_gva_size<M: HostMemory + HostOps>(
+fn buffer_gva_size<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
@@ -1665,7 +1669,7 @@ fn type1_buffer_gva_size<M: HostMemory + HostOps>(
     objects::resolve_buffer_span(state, host, task_id, buffer_ref).map_err(
         |refusal| match refusal {
             objects::BufferSpanRefusal::Rung(rung) => {
-                let slug = crate::observe::ladder_slugs!("icb_type1")(rung);
+                let slug = crate::observe::ladder_slugs!("icb_buffer")(rung);
                 match rung {
                     objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
                         IcbStatus::Missing(slug)
@@ -1674,14 +1678,14 @@ fn type1_buffer_gva_size<M: HostMemory + HostOps>(
                 }
             }
             objects::BufferSpanRefusal::Decode => {
-                IcbStatus::BadDescriptor(crate::observe::ladder_slug!("icb_type1", desc_decode))
+                IcbStatus::BadDescriptor(crate::observe::ladder_slug!("icb_buffer", desc_decode))
             }
-            objects::BufferSpanRefusal::NoBacking => IcbStatus::Missing("icb_type1_no_backing"),
+            objects::BufferSpanRefusal::NoBacking => IcbStatus::Missing("icb_buffer_no_backing"),
         },
     )
 }
 
-/// Convert absolute bind VA → offset into type-1 allocation (`handle << page_shift`).
+/// Convert absolute bind VA → offset into buffer allocation (`handle << page_shift`).
 ///
 /// PGSerializer stores `base+offset` in the bind VA field (not a separate offset).
 /// `wire_va == 0` means base (offset 0). Fail-closed if VA is below base or past size.
@@ -1695,7 +1699,7 @@ fn offset_from_wire_va<M: HostMemory + HostOps>(
     if wire_va == 0 {
         return Ok(0);
     }
-    let (base, size) = type1_buffer_gva_size(state, host, task_id, buffer_ref)?;
+    let (base, size) = buffer_gva_size(state, host, task_id, buffer_ref)?;
     if wire_va < base {
         return Err(IcbStatus::Args("icb_wire_va_below_base"));
     }
@@ -1706,7 +1710,7 @@ fn offset_from_wire_va<M: HostMemory + HostOps>(
     Ok(off)
 }
 
-/// Resolve wire VAs on a compute fill into type-1 bind offsets (mutates in place).
+/// Resolve wire VAs on a compute fill into buffer bind offsets (mutates in place).
 pub fn resolve_compute_fill_offsets<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
@@ -1721,7 +1725,7 @@ pub fn resolve_compute_fill_offsets<M: HostMemory + HostOps>(
     Ok(())
 }
 
-/// Resolve wire VAs on a render fill into type-1 bind / index offsets (mutates in place).
+/// Resolve wire VAs on a render fill into buffer bind / index offsets (mutates in place).
 pub fn resolve_render_fill_offsets<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
@@ -1831,7 +1835,7 @@ pub enum IcbCommandFill {
 /// Decode guest command memory into host ICB fills for the given index range.
 ///
 /// Dispatches compute vs render fills from wire `commandTypes` / slot
-/// command-type tags, and resolves every wire VA into a type-1 bind offset, so
+/// command-type tags, and resolves every wire VA into a buffer bind offset, so
 /// the result names only refs and offsets. Nothing here touches a backend: this
 /// is the half of ICB execute that is the same on all three pathways, and it is
 /// portable so that the Vulkan arm has something to replay.

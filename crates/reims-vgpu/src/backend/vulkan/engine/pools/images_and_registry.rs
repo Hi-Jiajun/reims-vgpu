@@ -866,7 +866,7 @@ impl ResourcePools {
     ///   ago, so it carries no content stamp and no epoch; nothing has
     ///   transitioned it, so its layout is `UNDEFINED`; and no window holds it,
     ///   so it is unpinned. These are not defaults a creation site may pick —
-    ///   `registry_mark_ready_at` and the type-11 LOAD gate read them, and an arm
+    ///   `registry_mark_ready_at` and the mapper-ref-texture LOAD gate read them, and an arm
     ///   that guessed differently would be
     ///   answering a question the others think they already asked.
     /// - **The diagnostic clock belongs to the registry.** `last_touch_ms` comes
@@ -1942,12 +1942,11 @@ impl ResourcePools {
             .is_some_and(|slot| slot.content_ready)
     }
 
-    /// Pin/unpin a resident render target against LRU eviction (deferred
-    /// render Stores). Pins are counted, not boolean: a surface can have several
-    /// deferred windows armed at once and each holds one count, so the slot
-    /// stays protected until every holder unpins. Returns false when the identity is absent or (for pinning) its
-    /// content is not ready — callers must fall back to the synchronous
-    /// Store. Unpin saturates at zero (a spurious unpin never underflows).
+    /// Pin/unpin a resident render target against LRU eviction (deferred render Stores). Pins are
+    /// counted, not boolean: a surface can have several deferred windows armed at once and each
+    /// holds one count, so the slot stays protected until every holder unpins. Returns false when
+    /// the identity is absent or (for pinning) its content is not ready — callers must fall back to
+    /// the synchronous Store. Unpin saturates at zero (a spurious unpin never underflows).
     ///
     /// # An unpin at zero is reported, not absorbed
     ///
@@ -2817,7 +2816,7 @@ pub(super) mod pin_count_tests {
 
     /// A draw into this identity invalidates any stamp on it. The image's
     /// pixels just changed, and until something publishes them as the mapping's
-    /// content the type-11 LOAD gate must not treat them as current — otherwise
+    /// content the mapper-ref-texture LOAD gate must not treat them as current — otherwise
     /// an intermediate record's output is loaded as though it were the guest's
     /// prior frame.
     ///
@@ -3185,7 +3184,7 @@ pub(super) mod pin_count_tests {
     /// pixels, no layout transition behind it and no window holding it.
     ///
     /// Each of these four is read by a different rail — `registry_mark_ready`,
-    /// the type-11 LOAD gate's epoch check, the barrier tracker and the idle
+    /// the mapper-ref-texture LOAD gate's epoch check, the barrier tracker and the idle
     /// drain — so an arm that registered a slot with any of them set differently
     /// would be answering a question the other rails believe they already asked.
     #[test]
@@ -3593,7 +3592,8 @@ pub(super) mod pin_count_tests {
         let mut pools = ResourcePools::new();
         admit(&mut pools, surf(1), 10, 0); // aged, non-pinned  -> victim
         admit(&mut pools, surf(2), 10, 1); // aged but PINNED   -> kept
-                                           // now = 10 + AGE + 1 so slot 1's cutoff is crossed; a fresh slot is not.
+                                           // now = 10 + AGE + 1 so slot 1's cutoff is crossed; a
+                                           // fresh slot is not.
         let now = 10 + IDLE_MAINTENANCE_START_MS + 1;
         admit(&mut pools, surf(3), now, 0); // fresh            -> kept
         assert!(pools.plan_idle_maintenance(now), "maintenance pass is due");

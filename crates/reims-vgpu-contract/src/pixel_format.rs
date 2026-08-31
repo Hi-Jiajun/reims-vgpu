@@ -1285,7 +1285,7 @@ impl SwizzlePlan {
     /// identically on the host format carrying it *and* the guest asked for a
     /// view swizzle on top. `A8Unorm` is the standing case: its byte rides in
     /// `R8_UNORM`, so the format contributes "alpha is in red" and the guest's
-    /// type-8 view contributes whatever it asked for. Binding either alone
+    /// texture-view contributes whatever it asked for. Binding either alone
     /// gives the shader the wrong channels.
     ///
     /// A hardware component mapping takes one plan, not two, so they have to be
@@ -1884,7 +1884,7 @@ pub fn storage_selector(format: u16) -> Option<StorageImageSelector> {
 /// IOSurface — `kCVPixelFormatType_ARGB2101010LEPacked`, which
 /// `runtime::objects::iosurface_pixel_format_to_mtl` now names — and before
 /// either half of that change every draw of the frame was refused at
-/// `draw::render_target`'s `rt_type4_base_format` and the window was black:
+/// `draw::render_target`'s `rt_backing_base_format` and the window was black:
 /// 20 822 `draw_fail_clear_fallback` records and zero successful draws in one
 /// 100 s capture. Vulkan does not *mandate* `A2R10G10B10_UNORM_PACK32` as a
 /// colour attachment the way it does `R16_SFLOAT`, so unlike the two members
@@ -2042,7 +2042,7 @@ pub fn render_target_numeric_type(format: u16) -> Option<ColorNumericType> {
 /// resident's format; say `None` and the only route left is
 /// [`convert_rgba8_to_row`], which is a CPU pass over the frame.
 ///
-/// Named once because both writeback rails ask it — the type-11 mapping rail
+/// Named once because both writeback rails ask it — the mapper-ref-texture mapping rail
 /// wants `Bgra8` specifically and the GVA rail takes whichever layout its
 /// resident was built in — and a rail that re-lists the formats drifts the
 /// first time one is added.
@@ -4458,12 +4458,11 @@ mod tests {
         ));
         assert_eq!(bgra, [3, 2, 1, 4, 7, 6, 5, 8]);
 
-        // What this list may hold is not this test's to decide: a layout is
-        // seedable exactly when `render_target_bpp` admits the guest format it
-        // stands for, and
+        // What this list may hold is not this test's to decide: a layout is seedable exactly when
+        // `render_target_bpp` admits the guest format it stands for, and
         // `translate::pixel::…::the_renderable_set_is_one_answer_and_every_member_survives_both_rails`
-        // is what holds the two together. Removing a layout from here without
-        // that test agreeing means the two have drifted again.
+        // is what holds the two together. Removing a layout from here without that test agreeing
+        // means the two have drifted again.
         for layout in [
             TexelLayout::Rg8,
             TexelLayout::R32Float,

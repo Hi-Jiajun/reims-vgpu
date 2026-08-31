@@ -691,7 +691,7 @@ pub fn color_attachment(
 /// reads — so asking it was a render-target question about a destination that is
 /// not one, and the answer was `FormatNeedsConversion` for every 32-bit-per-
 /// channel plane. On a driven macos-13 boot that was all five remaining compute
-/// readbacks: four linear at `MTLPixelFormatRGBA32Float` and one type-11 at
+/// readbacks: four linear at `MTLPixelFormatRGBA32Float` and one mapper-ref-texture at
 /// `MTLPixelFormatRGBA32Uint` whose source image held `R32G32B32A32_UINT`, the
 /// very texel the guest had declared.
 ///
@@ -1034,7 +1034,7 @@ fn srgb_decline(f: &PixelFormat, mtl: u16) -> Option<TranslateReason> {
 /// it in hardware.
 ///
 /// The plan passed in is **already folded**: the caller composes the decoded
-/// type-8 view swizzle over the format's own channel remap with
+/// texture-view swizzle over the format's own channel remap with
 /// [`crate::contract::pixel_format::SwizzlePlan::after`], because a
 /// `VkComponentMapping` can express one plan and a bind may need both. This
 /// function does no composing of its own and must not start — it would then be
@@ -1079,7 +1079,7 @@ pub fn vk_component_mapping(plan: &SwizzlePlan) -> vk::ComponentMapping {
 /// non-identity format instead of admitting one it could not describe.
 ///
 /// The sampled rail relies on that: it takes the plan from [`sampled_pixels`]
-/// and folds it under the decoded type-8 swizzle (see [`vk_component_mapping`]),
+/// and folds it under the decoded texture-view swizzle (see [`vk_component_mapping`]),
 /// which it can only do because the plan travels with the layout instead of
 /// being re-derived downstream. This predicate is now a *reader* of the same
 /// fact rather than a gate on it, and a test holds the two in agreement.
@@ -2597,7 +2597,7 @@ mod tests {
                 // `'l10r'` IOSurface — `kCVPixelFormatType_ARGB2101010LEPacked`
                 // — is what Asphalt 8 renders into on a macos-13 x86/Vulkan
                 // boot, and every draw of it failed at
-                // `draw::render_target`'s `rt_type4_base_format` until the
+                // `draw::render_target`'s `rt_backing_base_format` until the
                 // FourCC and `render_target_bpp` both named it.
                 //
                 // Unlike every other member here this one is not a format
@@ -2818,7 +2818,7 @@ mod tests {
         assert_ne!(SCANOUT_FORMAT, RESIDENT_RGBA_FORMAT);
     }
 
-    /// A sampled bind's view mapping is the decoded type-8 swizzle and nothing
+    /// A sampled bind's view mapping is the decoded texture-view swizzle and nothing
     /// else. Identity in, identity out — otherwise every ordinary bind would
     /// pay for a feature almost none of them use.
     #[test]

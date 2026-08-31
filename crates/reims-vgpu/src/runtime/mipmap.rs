@@ -1,8 +1,8 @@
-//! `generateMipmaps` (blit opcode `0x133`) for multi-mip type-2/3 linear textures.
+//! `generateMipmaps` (blit opcode `0x133`) for multi-mip normal-texture linear textures.
 //!
-//! Type-11 IOSurface textures are out of scope: Metal forbids mipmapped
-//! IOSurface textures, so there is no legal multi-mip type-11 body to generate
-//! into. Non-type-2/3 refs fail as missing/unsupported at resolve.
+//! Mapper-ref-texture IOSurface textures are out of scope: Metal forbids mipmapped
+//! IOSurface textures, so there is no legal multi-mip mapper-ref-texture body to generate
+//! into. Non-normal-texture refs fail as missing/unsupported at resolve.
 //!
 //! Primary path: host Metal `generateMipmapsForTexture:` on a temporary Shared
 //! multi-level texture (native guest pixel format). CPU box-filter remains as a
@@ -13,7 +13,7 @@ use crate::backend::Backend as _;
 use crate::contract::pixel_format::{self, RGBA8_BPP};
 use crate::model::DeviceState;
 use crate::runtime::decode::resource::{
-    decode_texture_descriptor, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
+    decode_texture_descriptor, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS,
     TEXTURE_MAX_MIP_LEVELS,
 };
 use crate::runtime::draw::host_alloc_len;
@@ -182,7 +182,7 @@ fn resolve_multi_mip_texture<M: HostMemory + HostOps>(
         host,
         task_id,
         texture_ref,
-        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT],
+        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS],
     )
     .map_err(|rung| {
         crate::observe::RungReport::new("mipmap_resolve", "tex_ref").rung(
@@ -439,7 +439,7 @@ fn generate_via_box_filter(
     Ok(out)
 }
 
-/// Execute blit `0x133 generateMipmaps` for a type-2/3 multi-mip linear texture.
+/// Execute blit `0x133 generateMipmaps` for a normal-texture multi-mip linear texture.
 pub fn generate_mipmaps_linear<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,

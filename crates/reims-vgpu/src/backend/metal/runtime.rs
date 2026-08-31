@@ -13,7 +13,7 @@
 //! [`crate::runtime::guest_ram`], whose `GuestRamImport`/`GuestSlice` pair is
 //! the bound, sized to one RAMBlock with a single bounds-checking constructor.
 //!
-//! An earlier type-11 attachment cache did alias guest pages here
+//! An earlier mapper-ref-texture attachment cache did alias guest pages here
 //! (`mach_vm_remap` view → no-copy MTLBuffer → linear texture view) and was
 //! deleted. It is worth being exact about why, because the reason is not the
 //! aliasing: that cache retained a remap view per fragmented map until

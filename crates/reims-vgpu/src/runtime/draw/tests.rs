@@ -54,7 +54,7 @@ fn clear_black_attachment(texture_ref: u32) -> crate::runtime::decode::render::C
 }
 
 /// The triangle every target-resolution test in this file draws: three vertices
-/// of one instance, primitive type 3, from vertex 0.
+/// of one instance, primitive generate-mipmaps texture, from vertex 0.
 ///
 /// Named because it used to be spelled `3, 1, 3, 0, 0` at four call sites — five
 /// positional `u32`s with two `3`s among them, where a transposition compiles and
@@ -138,7 +138,7 @@ fn a_small_reflected_object_stays_on_the_gather_rail_and_moves_only_its_extent()
 
 /// The sampled gather floor is one rule, and all three rails get the same answer.
 ///
-/// It was three hand-written copies and they disagreed. The type-11 arm carried
+/// It was three hand-written copies and they disagreed. The mapper-ref-texture arm carried
 /// the span term alone, so a half-float sampled surface under 64 KiB — whose CPU
 /// loader arm exists and is lossy — was declined onto that loader on that rail
 /// and admitted on the other two. `a_cost_floor_may_decline` exists precisely to
@@ -154,8 +154,8 @@ fn the_sampled_gather_floor_gives_one_verdict_to_all_three_rails() {
 
     let rails = [
         SampledFloorRail::Linear,
-        SampledFloorRail::Type11,
-        SampledFloorRail::Type5,
+        SampledFloorRail::MapperRefTexture,
+        SampledFloorRail::RefTexture,
     ];
     let under = SAMPLED_GATHER_MIN_BYTES - 1;
     let over = SAMPLED_GATHER_MIN_BYTES;
@@ -331,7 +331,7 @@ fn strided_window_extent_measures_padded_rows_and_refuses_unrepresentable_stride
     assert_eq!(strided_window_extent(64, 32, 4, 258), None);
     // Zero height has no last row to measure to.
     assert_eq!(strided_window_extent(64, 0, 4, 256), None);
-    // Single-byte texels (the type-5 NV12 luma plane) take every stride.
+    // Single-byte texels (the ref-texture NV12 luma plane) take every stride.
     assert_eq!(strided_window_extent(64, 4, 1, 64), Some((256, 0)));
     // The block-aware level form, on the geometry the gather refused for a
     // whole session: a 64x64 BC3 level is 16 rows of 16 blocks. Tight rows
@@ -377,7 +377,7 @@ fn strided_window_extent_measures_padded_rows_and_refuses_unrepresentable_stride
 
 #[test]
 #[cfg(feature = "backend-vulkan")]
-fn type11_zero_copy_declines_transient_host_mappings() {
+fn mapper_ref_texture_zero_copy_declines_transient_host_mappings() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
@@ -402,7 +402,7 @@ fn type11_zero_copy_declines_transient_host_mappings() {
     assert!(state.set_mapping_geom(mid, width, height, MTL_FORMAT_BGRA8_UNORM));
 
     let resource = crate::model::TaskResource::new(Default::default(), std::sync::Arc::from([]));
-    assert!(try_type11_sample_zero_copy(
+    assert!(try_mapper_ref_texture_sample_zero_copy(
         &mut state,
         &mut host,
         mid,
@@ -453,81 +453,98 @@ fn mapping_sampled_planes_reuse_one_resource_owned_import() {
         crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB,
     ));
     crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
-    let type11_witnesses = crate::runtime::drain::store_route_count("gw_rail_t11");
-    let type5_witnesses = crate::runtime::drain::store_route_count("gw_rail_t5");
-    let type11_resource =
+    let mapper_ref_texture_witnesses = crate::runtime::drain::store_route_count("gw_rail_t11");
+    let ref_texture_witnesses = crate::runtime::drain::store_route_count("gw_rail_t5");
+    let mapper_ref_texture_resource =
         crate::model::TaskResource::new(Default::default(), std::sync::Arc::from([]));
-    let type5_resource =
+    let ref_texture_resource =
         crate::model::TaskResource::new(Default::default(), std::sync::Arc::from([]));
 
-    let type11 = try_type11_sample_zero_copy(
+    let mapper_ref_texture = try_mapper_ref_texture_sample_zero_copy(
         &mut state,
         &mut host,
         mid,
         128,
         128,
-        type11_resource.lifetime_ref(),
+        mapper_ref_texture_resource.lifetime_ref(),
     )
     .expect("the mapping's color plane is sampleable");
-    let SampledSourceRequest::GuestRuns(type11, _, type11_format, _, type11_identity, ..) = type11
+    let SampledSourceRequest::GuestRuns(
+        mapper_ref_texture,
+        _,
+        mapper_ref_texture_format,
+        _,
+        mapper_ref_texture_identity,
+        ..,
+    ) = mapper_ref_texture
     else {
         panic!("the mapping stays guest-backed")
     };
-    assert_eq!(type11_format, ash::vk::Format::B8G8R8A8_SRGB);
-    assert_eq!(type11_identity, None);
+    assert_eq!(mapper_ref_texture_format, ash::vk::Format::B8G8R8A8_SRGB);
+    assert_eq!(mapper_ref_texture_identity, None);
     assert_eq!(
         crate::runtime::drain::store_route_count("gw_rail_t11"),
-        type11_witnesses,
+        mapper_ref_texture_witnesses,
         "a direct resource has no copied image whose freshness needs witnessing"
     );
-    let type11_import = type11
+    let mapper_ref_texture_import = mapper_ref_texture
         .direct_image
         .expect("stable allocation binds directly")
         .import;
 
-    let type5 = try_type5_sample_zero_copy(
+    let ref_texture = try_ref_texture_sample_zero_copy(
         &mut state,
         &mut host,
         mid,
-        objects::Type5TextureView {
+        objects::RefTextureView {
             pixel_format: MTL_FORMAT_BGRA8_UNORM,
             width: 128,
             height: 128,
             depth: 1,
             plane_index: 0,
         },
-        type5_resource.lifetime_ref(),
+        ref_texture_resource.lifetime_ref(),
     )
     .expect("the serialized plane view is sampleable");
-    let SampledSourceRequest::GuestRuns(type5, _, type5_format, _, type5_identity, ..) = type5
+    let SampledSourceRequest::GuestRuns(
+        ref_texture,
+        _,
+        ref_texture_format,
+        _,
+        ref_texture_identity,
+        ..,
+    ) = ref_texture
     else {
         panic!("the plane view stays guest-backed")
     };
-    assert_eq!(type5_format, ash::vk::Format::B8G8R8A8_UNORM);
-    assert_eq!(type5_identity, None);
+    assert_eq!(ref_texture_format, ash::vk::Format::B8G8R8A8_UNORM);
+    assert_eq!(ref_texture_identity, None);
     assert_eq!(
         crate::runtime::drain::store_route_count("gw_rail_t5"),
-        type5_witnesses,
+        ref_texture_witnesses,
         "a direct plane has no copied image whose freshness needs witnessing"
     );
-    let type5_import = type5
+    let ref_texture_import = ref_texture
         .direct_image
         .expect("stable allocation binds directly")
         .import;
     crate::runtime::guest_ram::forget_import_limits();
 
     assert_eq!(
-        type11_import.id(),
-        type5_import.id(),
+        mapper_ref_texture_import.id(),
+        ref_texture_import.id(),
         "two views of one mapping must retain the mapping's one import"
     );
-    assert!(std::sync::Arc::ptr_eq(&type11_import, &type5_import));
+    assert!(std::sync::Arc::ptr_eq(
+        &mapper_ref_texture_import,
+        &ref_texture_import
+    ));
     assert_eq!(
         state.mappings[&mid]
             .contig_import
             .as_ref()
             .map(|import| import.id()),
-        Some(type11_import.id())
+        Some(mapper_ref_texture_import.id())
     );
 }
 
@@ -561,7 +578,7 @@ fn small_mapping_sampled_plane_uses_its_direct_resource() {
     crate::runtime::guest_ram::latch_import_limits(page, 1 << 30, 1 << 30);
     let resource = crate::model::TaskResource::new(Default::default(), std::sync::Arc::from([]));
 
-    let sampled = try_type11_sample_zero_copy(
+    let sampled = try_mapper_ref_texture_sample_zero_copy(
         &mut state,
         &mut host,
         mid,
@@ -1162,7 +1179,7 @@ fn swap_rb_channels_matches_two_pass_and_preserves_tail() {
 /// the order asked for, and match `swap_rb_channels` when it is not.
 ///
 /// The no-op half is the whole point of threading the order rather than
-/// normalizing: a type-11 composite Store's readback now arrives BGRA, so this is
+/// normalizing: a mapper-ref-texture composite Store's readback now arrives BGRA, so this is
 /// the call that used to be a 776 us whole-frame pass and is now a compare. A
 /// future edit that made it exchange unconditionally would restore that cost
 /// silently — the pixels would still be right.
@@ -1204,7 +1221,7 @@ fn stage_in_buffer_read_as_ssbo_is_bound_as_storage() {
 }
 
 /// Resident GVA chain wiring: the identity is built only for GVA color0
-/// (never type-11), and its extent is color0's declared geometry — the one
+/// (never mapper-ref-texture), and its extent is color0's declared geometry — the one
 /// place a draw states what it renders into.
 #[cfg(feature = "backend-vulkan")]
 #[test]
@@ -1243,7 +1260,7 @@ fn gva_chain_identity_rules() {
     assert_eq!(
         gva_chain_identity(&req),
         None,
-        "type-11 targets never take the GVA identity"
+        "mapper-ref-texture targets never take the GVA identity"
     );
     req.colors[0].mapping_id = 0;
     req.colors[0].target_gva = 0;
@@ -1252,7 +1269,7 @@ fn gva_chain_identity_rules() {
 
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn render_chain_identity_covers_type11_and_gva_targets() {
+fn render_chain_identity_covers_mapper_ref_texture_and_gva_targets() {
     use crate::backend::vulkan::engine::TargetIdentity;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -1318,7 +1335,7 @@ fn a_chained_composite_store_names_the_resident_it_loads_from() {
         ..Default::default()
     });
 
-    let unchained = type11_store_identity(&state, &req, true);
+    let unchained = mapper_ref_texture_store_identity(&state, &req, true);
     assert!(
         unchained.is_some(),
         "an unchained composite Store resolves its resident"
@@ -1326,13 +1343,13 @@ fn a_chained_composite_store_names_the_resident_it_loads_from() {
 
     req.chain_from_resident = true;
     assert_eq!(
-        type11_store_identity(&state, &req, true),
+        mapper_ref_texture_store_identity(&state, &req, true),
         unchained,
         "a chained Store must name the same resident an unchained one does — it is \
          the same attachment template, so the chain cannot move the slot"
     );
     assert_eq!(
-        type11_store_identity(&state, &req, true),
+        mapper_ref_texture_store_identity(&state, &req, true),
         render_chain_identity(&state, &req),
         "the Store identity and the LoadFromTarget identity must be one slot"
     );
@@ -1341,20 +1358,20 @@ fn a_chained_composite_store_names_the_resident_it_loads_from() {
     // separates the packet's last record from its intermediates, and an
     // intermediate has no guest Store to defer.
     assert_eq!(
-        type11_store_identity(&state, &req, false),
+        mapper_ref_texture_store_identity(&state, &req, false),
         None,
         "an intermediate record stores nothing guest-visible"
     );
     req.colors[0].store_action = crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
     assert_eq!(
-        type11_store_identity(&state, &req, true),
+        mapper_ref_texture_store_identity(&state, &req, true),
         None,
         "a record that discards its target has no frame to defer"
     );
     req.colors[0].store_action = MTL_STORE_ACTION_STORE;
     req.colors[0].mapping_id = 0;
     assert_eq!(
-        type11_store_identity(&state, &req, true),
+        mapper_ref_texture_store_identity(&state, &req, true),
         None,
         "a GVA target is the other rail's; this one requires a mapping"
     );
@@ -1392,8 +1409,9 @@ fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
     // The query the LOAD actually asks. It takes no `writeback_guest`, so an
     // intermediate and a final record get the same answer by construction — which
     // is the property, and it is structural rather than asserted.
-    let (identity, mapping_epoch) = type11_load_currency_query(&state, &req)
-        .expect("a LOAD into a mapped type-11 surface is a candidate the resident could serve");
+    let (identity, mapping_epoch) = mapper_ref_texture_load_currency_query(&state, &req).expect(
+        "a LOAD into a mapped mapper-ref-texture surface is a candidate the resident could serve",
+    );
     assert_eq!(
         Some(identity.clone()),
         render_chain_identity(&state, &req),
@@ -1401,18 +1419,18 @@ fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
     );
     assert_eq!(
         Some(identity),
-        type11_store_identity(&state, &req, true),
+        mapper_ref_texture_store_identity(&state, &req, true),
         "the Store identity is the same slot, restricted — not a different one"
     );
     assert_eq!(
         mapping_epoch,
         Some(0),
         "a freshly mapped surface has published nothing, and 0 is that value — the \
-         `is_some` guard in `type11_resident_is_current` is what keeps it from \
+         `is_some` guard in `mapper_ref_texture_resident_is_current` is what keeps it from \
          matching an unstamped slot"
     );
     assert_eq!(
-        type11_store_identity(&state, &req, false),
+        mapper_ref_texture_store_identity(&state, &req, false),
         None,
         "…while only the packet's last record may leave its frame on the resident"
     );
@@ -1421,30 +1439,30 @@ fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
     // all, or the counters below it would divide all draws instead of candidates.
     req.colors[0].load_action = crate::contract::pass_action::MTL_LOAD_ACTION_CLEAR;
     assert!(
-        type11_load_currency_query(&state, &req).is_none(),
+        mapper_ref_texture_load_currency_query(&state, &req).is_none(),
         "a CLEAR has no prior content to be current"
     );
     req.colors[0].load_action = MTL_LOAD_ACTION_LOAD;
     req.colors[0].target_seed_rgba = Some(vec![0u8; 128 * 64 * 4]);
     assert!(
-        type11_load_currency_query(&state, &req).is_none(),
+        mapper_ref_texture_load_currency_query(&state, &req).is_none(),
         "an explicit seed was already selected by RT provenance"
     );
     req.colors[0].target_seed_rgba = None;
     req.colors[0].store_action = crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
     assert!(
-        type11_load_currency_query(&state, &req).is_none(),
+        mapper_ref_texture_load_currency_query(&state, &req).is_none(),
         "a record that discards its target renders into no resident worth naming"
     );
     req.colors[0].store_action = MTL_STORE_ACTION_STORE;
     req.colors[0].mapping_id = 0;
     assert!(
-        type11_load_currency_query(&state, &req).is_none(),
+        mapper_ref_texture_load_currency_query(&state, &req).is_none(),
         "a GVA target is the other rail's"
     );
 }
 
-/// The guest half of the type-11 seed currency test.
+/// The guest half of the mapper-ref-texture seed currency test.
 ///
 /// `surface_content_epoch` witnesses only writers inside this crate — every
 /// caller of `mark_mapping_written` is one — and a surface's pages are plain
@@ -1477,11 +1495,11 @@ fn a_guest_write_since_the_store_refuses_the_resident() {
     }
 
     assert!(
-        type11_guest_wrote_since_store(&state, &host, 7),
+        mapper_ref_texture_guest_wrote_since_store(&state, &host, 7),
         "no Store has stamped this surface, so nothing vouches for any resident"
     );
     assert!(
-        type11_guest_wrote_since_store(&state, &host, 999),
+        mapper_ref_texture_guest_wrote_since_store(&state, &host, 999),
         "a mapping this device does not know cannot be declared unwritten"
     );
 
@@ -1495,7 +1513,7 @@ fn a_guest_write_since_the_store_refuses_the_resident() {
         .expect("mapped above")
         .guest_write_gen_at_store = stamped;
     assert!(
-        !type11_guest_wrote_since_store(&state, &host, 7),
+        !mapper_ref_texture_guest_wrote_since_store(&state, &host, 7),
         "nothing has written the pages since the Store, so the resident still holds them"
     );
 
@@ -1509,7 +1527,7 @@ fn a_guest_write_since_the_store_refuses_the_resident() {
          whole rail would be unnecessary"
     );
     assert!(
-        type11_guest_wrote_since_store(&state, &host, 7),
+        mapper_ref_texture_guest_wrote_since_store(&state, &host, 7),
         "the hypervisor saw the write, so the resident is stale"
     );
 
@@ -1517,7 +1535,7 @@ fn a_guest_write_since_the_store_refuses_the_resident() {
     // report would tell the first draw of the frame the surface is dirty and
     // every later draw that it is clean.
     assert!(
-        type11_guest_wrote_since_store(&state, &host, 7),
+        mapper_ref_texture_guest_wrote_since_store(&state, &host, 7),
         "the refusal must survive being read"
     );
 
@@ -1529,13 +1547,15 @@ fn a_guest_write_since_the_store_refuses_the_resident() {
         .get_mut(&7)
         .expect("mapped above")
         .guest_write_gen_at_store = restamped;
-    assert!(!type11_guest_wrote_since_store(&state, &host, 7));
+    assert!(!mapper_ref_texture_guest_wrote_since_store(
+        &state, &host, 7
+    ));
 
     // Retiring the page list retires the token with it: a generation recorded
     // against pages the surface no longer owns vouches for nothing.
     assert!(state.unmap_surface(7));
     assert!(
-        type11_guest_wrote_since_store(&state, &host, 7),
+        mapper_ref_texture_guest_wrote_since_store(&state, &host, 7),
         "a surface whose page list is gone has no vouched resident"
     );
     crate::runtime::mapper::flush_retired_views(&mut state, &mut host);
@@ -1548,7 +1568,7 @@ fn a_guest_write_since_the_store_refuses_the_resident() {
 
 /// The verdict must keep its refusals apart, because two rails now report it.
 ///
-/// [`type11_guest_wrote_since_store`] collapses everything that is not `Clean`
+/// [`mapper_ref_texture_guest_wrote_since_store`] collapses everything that is not `Clean`
 /// to `true`, which is the right answer for a gate and the wrong one for a
 /// census: "this rail was never stamped" and "the guest rewrites this surface
 /// every frame" produce the same refusal and mean opposite things. The sampled
@@ -1613,7 +1633,7 @@ fn the_guest_write_verdict_separates_its_refusals() {
 /// A page list replaced in place must not leave the token vouching for it.
 ///
 /// The lifecycle mutators retire the token eagerly, but they are not the only
-/// writers of `page_entries`: the mapper's plan adoption and the type-4 page
+/// writers of `page_entries`: the mapper's plan adoption and the backing page
 /// refresh both replace the list and bump `map_generation` without going near
 /// them, and both used to retire the contiguous view while leaving the token
 /// behind. A token that outlives its list watches pages the surface no longer
@@ -1646,9 +1666,11 @@ fn a_replaced_page_list_invalidates_the_token_it_was_built_for() {
         .get_mut(&7)
         .expect("mapped above")
         .guest_write_gen_at_store = stamped;
-    assert!(!type11_guest_wrote_since_store(&state, &host, 7));
+    assert!(!mapper_ref_texture_guest_wrote_since_store(
+        &state, &host, 7
+    ));
 
-    // Exactly what the mapper's adoption and the type-4 refresh do: swap the
+    // Exactly what the mapper's adoption and the backing refresh do: swap the
     // list and bump the generation, without touching the token.
     {
         let m = state.mappings.get_mut(&7).expect("mapped above");
@@ -1660,7 +1682,7 @@ fn a_replaced_page_list_invalidates_the_token_it_was_built_for() {
         "the point of the test is that nothing retired it"
     );
     assert!(
-        type11_guest_wrote_since_store(&state, &host, 7),
+        mapper_ref_texture_guest_wrote_since_store(&state, &host, 7),
         "a token built for the old pages cannot vouch for the new ones"
     );
 
@@ -1686,11 +1708,11 @@ fn a_replaced_page_list_invalidates_the_token_it_was_built_for() {
         .guest_write_gen_at_store = restamped;
     host.guest_wrote_page(0x40 * page);
     assert!(
-        !type11_guest_wrote_since_store(&state, &host, 7),
+        !mapper_ref_texture_guest_wrote_since_store(&state, &host, 7),
         "the surface no longer owns that page"
     );
     host.guest_wrote_page(0x88 * page);
-    assert!(type11_guest_wrote_since_store(&state, &host, 7));
+    assert!(mapper_ref_texture_guest_wrote_since_store(&state, &host, 7));
 }
 
 /// A host with no dirty bitmap must lose the elision, not gain a wrong frame.
@@ -1721,7 +1743,7 @@ fn a_host_that_cannot_observe_guest_writes_never_vouches() {
         "the refusal belongs at registration, not at every read"
     );
     assert!(
-        type11_guest_wrote_since_store(&state, &host, 7),
+        mapper_ref_texture_guest_wrote_since_store(&state, &host, 7),
         "with no witness the pages must read as written"
     );
 }
@@ -2100,7 +2122,7 @@ fn a_mappings_declared_format_answers_for_every_mapping() {
     assert!(pixel_format::is_srgb(mapping_declared_format(
         &state, 7, None
     )));
-    // A type-8 view's format is what the guest says it is reading, so it wins
+    // A texture-view's format is what the guest says it is reading, so it wins
     // over the mapping's own — including when it takes the sRGB back off.
     assert_eq!(
         mapping_declared_format(&state, 7, Some(MTL_FORMAT_BGRA8_UNORM)),
@@ -2758,7 +2780,7 @@ fn blend_state_maps_src_alpha_one_minus() {
     assert!(translate::blend::operation(9).is_err());
 }
 
-/// qemu-shim: guest Load with unresolvable type-11 pages still encodes
+/// qemu-shim: guest Load with unresolvable mapper-ref-texture pages still encodes
 /// (archive NULL seed / Metal Clear invent) — does not drop the pass.
 #[test]
 fn mrt_draw_request_load_seed_miss_still_encodes() {
@@ -2769,7 +2791,7 @@ fn mrt_draw_request_load_seed_miss_still_encodes() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     state.define_task(1, 0x1000, 2);
-    // Type-11 registered with geom but empty page table → seed read fails.
+    // Mapper-ref-texture registered with geom but empty page table → seed read fails.
     assert!(state.map_surface(9));
     assert!(state.set_mapping_geom(9, 8, 8, MTL_FORMAT_BGRA8_UNORM));
     // gen must be non-zero for Load path to attempt a snapshot (archive).
@@ -2914,11 +2936,11 @@ fn mrt_draw_request_refuses_a_resolve_destination_with_different_geometry() {
     }));
 }
 
-/// qemu-shim: type-8 view of type-11 is a valid color RT (archive
+/// qemu-shim: texture-view of mapper-ref-texture is a valid color RT (archive
 /// resource_resolve_texture view chain). Without this, App Store UI pipes
 /// that bind a view as color attachment drop the entire MRT pass.
 #[test]
-fn mrt_draw_request_type8_view_of_type11_as_color_rt() {
+fn mrt_draw_request_texture_view_view_of_mapper_ref_texture_as_color_rt() {
     use crate::contract::endian::{st16, st32, st64};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
@@ -2939,13 +2961,13 @@ fn mrt_draw_request_type8_view_of_type11_as_color_rt() {
     // Object list at GVA page 0; count covers live residual slot 211.
     assert!(state.set_object_list(1, 0, 256));
 
-    // Base type-11 mid 9 latched as texture ref 3.
+    // Base mapper-ref-texture mid 9 latched as texture ref 3.
     assert!(state.map_surface(9));
     assert!(state.set_mapping_geom(9, 64, 64, MTL_FORMAT_BGRA8_UNORM));
     state.mappings.get_mut(&9).unwrap().content_generation = 1;
     state.texture_to_mapping.insert((1, 3), 9);
 
-    // Type-8 view ref 211 → base 3 (identity, level 0) — live residual slot.
+    // Texture-view view ref 211 → base 3 (identity, level 0) — live residual slot.
     let view_ref = 211u32;
     let base_ref = 3u32;
     let len = TEXTURE_VIEW_MIN_RANGED;
@@ -2980,18 +3002,18 @@ fn mrt_draw_request_type8_view_of_type11_as_color_rt() {
 
     let att = clear_black_attachment(view_ref);
     let req = single_rt_draw_request(&mut state, &mut host, 12, att)
-        .expect("type-8 view of type-11 must resolve as color RT");
+        .expect("texture-view of mapper-ref-texture must resolve as color RT");
     assert_eq!(req.colors[0].mapping_id, 9);
     assert_eq!(req.colors[0].width, 64);
     assert_eq!(req.colors[0].height, 64);
     assert_eq!(req.colors[0].texture_ref, view_ref);
 }
 
-/// Archive `REIMS_VGPU_RESOURCE_RESOLVE_MAX_VIEW_CHAIN`: nested type-8 → type-8 →
-/// type-11 must collapse to the non-view base. One-hop resolve left the mid
-/// base as type-8 and dropped the MRT pass (`view_base_or_swizzle`).
+/// Archive `REIMS_VGPU_RESOURCE_RESOLVE_MAX_VIEW_CHAIN`: nested texture-view → texture-view →
+/// mapper-ref-texture must collapse to the non-view base. One-hop resolve left the mid
+/// base as texture-view and dropped the MRT pass (`view_base_or_swizzle`).
 #[test]
-fn mrt_draw_request_nested_type8_view_chain_to_type11() {
+fn mrt_draw_request_nested_texture_view_view_chain_to_mapper_ref_texture() {
     use crate::contract::endian::{st16, st32, st64};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
@@ -3004,7 +3026,7 @@ fn mrt_draw_request_nested_type8_view_chain_to_type11() {
     };
     use crate::runtime::host::FakeHost;
 
-    fn write_type8_view(
+    fn write_texture_view(
         host: &mut FakeHost,
         state: &DeviceState,
         view_ref: u32,
@@ -3046,19 +3068,19 @@ fn mrt_draw_request_nested_type8_view_chain_to_type11() {
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 256));
 
-    // type-11 mid 9 as texture ref 3.
+    // mapper-ref-texture mid 9 as texture ref 3.
     assert!(state.map_surface(9));
     assert!(state.set_mapping_geom(9, 64, 64, MTL_FORMAT_BGRA8_UNORM));
     state.mappings.get_mut(&9).unwrap().content_generation = 1;
     state.texture_to_mapping.insert((1, 3), 9);
 
-    // Inner view 8 → base 3 (type-11); outer view 211 → base 8 (type-8).
-    write_type8_view(&mut host, &state, 8, 3, 0x280);
-    write_type8_view(&mut host, &state, 211, 8, 0x300);
+    // Inner view 8 → base 3 (mapper-ref-texture); outer view 211 → base 8 (texture-view).
+    write_texture_view(&mut host, &state, 8, 3, 0x280);
+    write_texture_view(&mut host, &state, 211, 8, 0x300);
 
     let att = clear_black_attachment(211);
     let req = single_rt_draw_request(&mut state, &mut host, 12, att)
-        .expect("nested type-8→type-8→type-11 must resolve as color RT");
+        .expect("nested texture-view→texture-view→mapper-ref-texture must resolve as color RT");
     assert_eq!(req.colors[0].mapping_id, 9);
     assert_eq!(req.colors[0].width, 64);
     assert_eq!(req.colors[0].height, 64);
@@ -3067,7 +3089,7 @@ fn mrt_draw_request_nested_type8_view_chain_to_type11() {
 
 /// Archive resolve_texture rejects non-identity swizzle for RT resolve.
 #[test]
-fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
+fn mrt_draw_request_texture_view_swizzled_view_rejected_as_color_rt() {
     use crate::contract::endian::{st16, st32, st64};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
@@ -3133,7 +3155,7 @@ fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
             test_triangle()
         )
         .is_none(),
-        "swizzled type-8 must not resolve as color RT"
+        "swizzled texture-view must not resolve as color RT"
     );
 }
 
@@ -3315,11 +3337,11 @@ fn a_cube_texture_loads_six_faces_in_slice_order() {
     );
 }
 
-/// qemu-shim: type-2 linear RGBA16Float is a valid color RT. Stale
-/// `texture_to_mapping` from a prior type-11 at the same ref must not
+/// qemu-shim: texture linear RGBA16Float is a valid color RT. Stale
+/// `texture_to_mapping` from a prior mapper-ref-texture at the same ref must not
 /// fail-closed (live residual ref=199 type=2 fmt=0x73).
 #[test]
-fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_t11_latch() {
+fn mrt_draw_request_texture_rgba16f_as_color_rt_despite_stale_t11_latch() {
     use crate::contract::endian::{st16, st32, st64};
     use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT};
     use crate::runtime::decode::resource::{
@@ -3334,12 +3356,12 @@ fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_t11_latch() {
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 16);
     assert!(state.set_object_list(1, 0, 256));
 
-    // Stale type-11 latch at ref 199 (guest recycled the ref to type-2).
+    // Stale mapper-ref-texture latch at ref 199 (guest recycled the ref to texture).
     assert!(state.map_surface(99));
     assert!(state.set_mapping_geom(99, 64, 64, MTL_FORMAT_BGRA8_UNORM));
     state.texture_to_mapping.insert((1, 199), 99);
 
-    // Live type-2 RGBA16Float 480×64 bpr=3840 (live residual shape).
+    // Live texture RGBA16Float 480×64 bpr=3840 (live residual shape).
     let tex_ref = 199u32;
     let w = 480u32;
     let h = 64u32;
@@ -3367,7 +3389,7 @@ fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_t11_latch() {
 
     let att = clear_black_attachment(tex_ref);
     let req = single_rt_draw_request(&mut state, &mut host, 12, att)
-        .expect("type-2 RGBA16F RT must resolve despite stale type-11 latch");
+        .expect("texture RGBA16F RT must resolve despite stale mapper-ref-texture latch");
     assert_eq!(req.colors[0].mapping_id, 0);
     assert_eq!(req.colors[0].width, w);
     assert_eq!(req.colors[0].height, h);
@@ -3380,11 +3402,11 @@ fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_t11_latch() {
     assert!(!state.texture_to_mapping.contains_key(&(1, tex_ref)));
 }
 
-/// Live type-11 descriptor mapping_id wins over a stale texture_to_mapping
+/// Live mapper-ref-texture descriptor mapping_id wins over a stale texture_to_mapping
 /// latch (dual-mid recycled-ref residual: full desktop Store must land on
 /// the mid named by the live descriptor, not a prior latch).
 #[test]
-fn mrt_draw_request_type11_live_mapping_overrides_stale_latch() {
+fn mrt_draw_request_mapper_ref_texture_live_mapping_overrides_stale_latch() {
     use crate::contract::endian::{st16, st32};
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
@@ -3407,7 +3429,7 @@ fn mrt_draw_request_type11_live_mapping_overrides_stale_latch() {
     let _ = host.write_gpa(root_gpa, &d[..4]);
     state.define_task(1, 0x1000, 2);
     assert!(state.set_object_list(1, 0, 8));
-    // Live type-11 at ref=1 → mapping_id=4 (descriptor first u32).
+    // Live mapper-ref-texture at ref=1 → mapping_id=4 (descriptor first u32).
     let mut entry = [0u8; 12];
     st32(&mut entry[0..], 11u32 | (0x20u32 << 8));
     entry[4..12].copy_from_slice(&0x40u64.to_le_bytes());
@@ -3428,7 +3450,7 @@ fn mrt_draw_request_type11_live_mapping_overrides_stale_latch() {
 
     let att = clear_black_attachment(1);
     let req = single_rt_draw_request(&mut state, &mut host, 12, att)
-        .expect("live type-11 RT must resolve");
+        .expect("live mapper-ref-texture RT must resolve");
     assert_eq!(
         req.colors[0].mapping_id, 4,
         "live descriptor mapping_id=4 must beat stale latch mid=3"
@@ -3438,7 +3460,7 @@ fn mrt_draw_request_type11_live_mapping_overrides_stale_latch() {
 
 /// Color RT materialization does not rematerialize non-zero view mips.
 #[test]
-fn mrt_draw_request_type8_nonzero_level_rejected_as_color_rt() {
+fn mrt_draw_request_texture_view_nonzero_level_rejected_as_color_rt() {
     use crate::contract::endian::{st16, st32, st64};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
@@ -3502,16 +3524,16 @@ fn mrt_draw_request_type8_nonzero_level_rejected_as_color_rt() {
             test_triangle()
         )
         .is_none(),
-        "type-8 level_base!=0 must not resolve as color RT"
+        "texture-view level_base!=0 must not resolve as color RT"
     );
 }
 
-/// Archive collapses a type-8 view's mip level into linear geometry:
-/// a level-1 view of a type-2 texture is a color RT at that level's
+/// Archive collapses a texture-view's mip level into linear geometry:
+/// a level-1 view of a texture texture is a color RT at that level's
 /// plane (offset/dims/stride from the descriptor's level record) —
 /// compositor blur/backdrop pyramids render into successive mips.
 #[test]
-fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
+fn mrt_draw_request_texture_view_mip_level_view_of_linear_as_color_rt() {
     use crate::contract::endian::{st16, st32, st64};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
@@ -3534,7 +3556,7 @@ fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
 
-    // Type-2 base with 2 mips: L0 64x32 bpr 256; L1 at +0x2000, 32x16 bpr 128.
+    // Texture base with 2 mips: L0 64x32 bpr 256; L1 at +0x2000, 32x16 bpr 128.
     let base_ref = 5u32;
     let body = TEXTURE_DESC_BASE_LEN + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
     let mut b = vec![0u8; body];
@@ -3567,7 +3589,7 @@ fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
     le[4..12].copy_from_slice(&base_desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
 
-    // Type-8 view: level_base=1 over the type-2 base.
+    // Texture-view view: level_base=1 over the texture base.
     let view_ref = 8u32;
     let len = TEXTURE_VIEW_MIN_RANGED;
     let mut desc = vec![0u8; len];
@@ -3683,7 +3705,7 @@ fn view_format_reinterprets_bgra_storage_as_rgba() {
     assert_eq!(out, [10, 20, 30, 40]);
 }
 
-/// Regression: type-2/3 GVA Stores must walk with device page_shift (x86=12).
+/// Regression: normal-texture GVA Stores must walk with device page_shift (x86=12).
 /// Using the arm64e-default fallback made every `linux_m2v_store gva=… ok=0`
 /// on Ventura/Tahoe x86 product boots.
 #[test]
@@ -3750,11 +3772,11 @@ fn write_gva_rgba8_uses_device_page_shift_x86() {
     assert_eq!(&back[..4], &[30, 20, 10, 255]);
 }
 
-/// An encode Store of a type-2/3 GVA wallpaper layer lands in the texture_ref
+/// An encode Store of a normal-texture GVA wallpaper layer lands in the texture_ref
 /// and GVA caches and NOT in the surface_id map — three separate namespaces
 /// that happen to be keyed by the same integer.
 ///
-/// That a *sample* then reaches those bytes is `type3_sample_uses_type2_gva_cache`'s
+/// That a *sample* then reaches those bytes is `texture_gen_mips_sample_uses_texture_gva_cache`'s
 /// job: it builds the object-list entry and the descriptor the resolver needs.
 /// This fixture has neither, and the only rung that ever served it took its
 /// geometry from whichever cache entry was keyed by the ref rather than from a
@@ -4302,12 +4324,12 @@ fn a_gva_load_from_resident_draw_with_no_resident_puts_the_seed_back() {
     );
 }
 
-/// A type-5 ref is not itself a surface id. The descriptor's surface_id
+/// A ref-texture ref is not itself a surface id. The descriptor's surface_id
 /// remains authoritative even when the numeric ref collides with another
 /// live display mapping (live app-launch ref=2 -> sid=71 class).
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
+fn ref_texture_sample_uses_descriptor_surface_id_not_ref_collision() {
     use crate::contract::endian::st32;
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
@@ -4340,7 +4362,7 @@ fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
     let texture_ref = 2u32;
     let surface_id = 71u32;
     let desc_gva = 0x1000u64;
-    let built = reims_vgpu_wire::device_desc::Type5Builder::new(surface_id, 0, 0, 0)
+    let built = reims_vgpu_wire::device_desc::RefTextureBuilder::new(surface_id, 0, 0, 0)
         .with_len(objects::TYPE5_MIN_LEN);
     let desc = built.bytes();
     assert!(
@@ -4386,7 +4408,7 @@ fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
 
     let (width, height, sampled_mid, sampled) =
         resolve_sampled_source(&mut state, &mut host, 1, texture_ref, None, true)
-            .expect("type-5 descriptor surface must sample");
+            .expect("ref-texture descriptor surface must sample");
     assert_eq!((width, height, sampled_mid), (4, 3, surface_id));
     let SampledSourceRequest::Bytes(sampled, _, layout, _) = sampled else {
         panic!("cache-backed fixture unexpectedly resolved a resident target");
@@ -4405,7 +4427,7 @@ fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
     let threaded_resource = objects::resolve_resource(&state, &host, 1, texture_ref).ok();
     assert!(
         threaded_resource.is_some(),
-        "type-5 fixture must expose a resource to thread"
+        "ref-texture fixture must expose a resource to thread"
     );
     let (tw, th, tmid, tsrc) = resolve_sampled_source(
         &mut state,
@@ -4447,7 +4469,7 @@ fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
 /// `next_sampled_content_generation` in the same breath as it changes the bytes.
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn type11_host_cache_rung_identity_tracks_the_cached_frame() {
+fn mapper_ref_texture_host_cache_rung_identity_tracks_the_cached_frame() {
     use crate::contract::endian::st32;
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
@@ -4479,7 +4501,7 @@ fn type11_host_cache_rung_identity_tracks_the_cached_frame() {
     let texture_ref = 2u32;
     let surface_id = 71u32;
     let desc_gva = 0x1000u64;
-    let built = reims_vgpu_wire::device_desc::Type5Builder::new(surface_id, 0, 0, 0)
+    let built = reims_vgpu_wire::device_desc::RefTextureBuilder::new(surface_id, 0, 0, 0)
         .with_len(objects::TYPE5_MIN_LEN);
     let desc = built.bytes();
     assert!(
@@ -4559,7 +4581,7 @@ fn type11_host_cache_rung_identity_tracks_the_cached_frame() {
     assert_eq!(
         first_id.key,
         (1u64 << 62) | surface_id as u64,
-        "bit 62 alone is the type-11 host-cache namespace"
+        "bit 62 alone is the mapper-ref-texture host-cache namespace"
     );
     let stored_gen = crate::runtime::surface_cache::get_shared_with_gen(&state, surface_id, 4, 3)
         .expect("the frame just stored must be readable")
@@ -4606,13 +4628,13 @@ fn type11_host_cache_rung_identity_tracks_the_cached_frame() {
     );
 }
 
-/// Live Safari app-launch class: the type-4 base carries an unknown
-/// 2-byte IOSurface FourCC (`LA08`) while the type-5 descriptor carries
+/// Live Safari app-launch class: the backing base carries an unknown
+/// 2-byte IOSurface FourCC (`LA08`) while the ref-texture descriptor carries
 /// the exact RG8 Metal view. Defaulting the base to BGRA asks for a
 /// 632-byte row against the wire's 320-byte row and drops the draw.
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn type5_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
+fn ref_texture_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
     use crate::contract::endian::{st16, st32, st64};
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::iosurface_pages::{
@@ -4626,7 +4648,7 @@ fn type5_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
 
-    // One-level x86 GVA table for the object list and type-5 descriptor.
+    // One-level x86 GVA table for the object list and ref-texture descriptor.
     let dir_pfn = 2u32;
     let root_pfn = 3u32;
     let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_X86;
@@ -4653,7 +4675,7 @@ fn type5_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
     let height = 154u32;
     let surface_bpr = 320u32;
     let desc_gva = 0x1000u64;
-    let built = reims_vgpu_wire::device_desc::Type5Builder::new(
+    let built = reims_vgpu_wire::device_desc::RefTextureBuilder::new(
         surface_id,
         0,
         texture_ref,
@@ -4745,12 +4767,12 @@ fn type5_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
     );
 }
 
-/// The type-5 view memo: unchanged plane bytes reuse the converted Arc and
+/// The ref-texture view memo: unchanged plane bytes reuse the converted Arc and
 /// carry a stable content identity (engine upload skipped); a guest write
 /// to the plane is observed on the next bind and mints a new generation.
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn type5_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
+fn ref_texture_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
     use crate::contract::endian::{st16, st32, st64};
     use crate::contract::iosurface_pages::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BPE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS,
@@ -4802,7 +4824,7 @@ fn type5_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
     st32(&mut device_desc[DEVICE_DESC_BPR..], surface_bpr);
     st16(&mut device_desc[DEVICE_DESC_BPE..], 2);
     assert!(state.set_mapping_device_desc(surface_id, &device_desc));
-    let view = objects::Type5TextureView {
+    let view = objects::RefTextureView {
         pixel_format: MTL_FORMAT_RG8_UNORM,
         width,
         height,
@@ -4811,7 +4833,7 @@ fn type5_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
     };
 
     let (w1, h1, rgba1, id1, fmt1) =
-        load_type5_view_rgba(&mut state, &mut host, 1, 248, surface_id, view)
+        load_ref_texture_view_rgba(&mut state, &mut host, 1, 248, surface_id, view)
             .expect("first materialization");
     assert_eq!((w1, h1), (width, height));
     assert_eq!(
@@ -4828,11 +4850,11 @@ fn type5_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
     assert_eq!(
         id1.key,
         (1u64 << 63) | surface_id as u64,
-        "identity key namespaces type-5 content above GVA keys"
+        "identity key namespaces ref-texture content above GVA keys"
     );
 
     let (_, _, rgba2, id2, _) =
-        load_type5_view_rgba(&mut state, &mut host, 1, 248, surface_id, view)
+        load_ref_texture_view_rgba(&mut state, &mut host, 1, 248, surface_id, view)
             .expect("memo revalidation");
     assert!(
         std::sync::Arc::ptr_eq(&rgba1, &rgba2),
@@ -4843,7 +4865,7 @@ fn type5_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
     // Guest CPU writes one texel; the next bind must observe it.
     assert!(host.write_gpa(gpa0 + 6, &[0xAA, 0xBB]).is_ok());
     let (_, _, rgba3, id3, _) =
-        load_type5_view_rgba(&mut state, &mut host, 1, 248, surface_id, view)
+        load_ref_texture_view_rgba(&mut state, &mut host, 1, 248, surface_id, view)
             .expect("re-materialization after guest write");
     assert!(
         id3.generation > id2.generation,
@@ -4862,50 +4884,50 @@ fn type5_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
 
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn type5_view_materializes_only_when_base_identity_differs() {
+fn ref_texture_view_materializes_only_when_base_identity_differs() {
     use crate::contract::pixel_format::MTL_FORMAT_RG8_UNORM;
 
-    let exact = objects::Type5TextureView {
+    let exact = objects::RefTextureView {
         pixel_format: MTL_FORMAT_BGRA8_UNORM,
         width: 1920,
         height: 1080,
         depth: 1,
         plane_index: 0,
     };
-    assert!(!type5_view_requires_materialization(
+    assert!(!ref_texture_view_requires_materialization(
         true,
         1920,
         1080,
         MTL_FORMAT_BGRA8_UNORM,
         exact
     ));
-    assert!(type5_view_requires_materialization(
+    assert!(ref_texture_view_requires_materialization(
         true, 1920, 1080, 0, exact
     ));
 
-    let rg8_view = objects::Type5TextureView {
+    let rg8_view = objects::RefTextureView {
         pixel_format: MTL_FORMAT_RG8_UNORM,
         width: 158,
         height: 154,
         depth: 1,
         plane_index: 0,
     };
-    assert!(type5_view_requires_materialization(
+    assert!(ref_texture_view_requires_materialization(
         true,
         158,
         154,
         MTL_FORMAT_BGRA8_UNORM,
         rg8_view
     ));
-    assert!(type5_view_requires_materialization(
+    assert!(ref_texture_view_requires_materialization(
         false,
         158,
         154,
         MTL_FORMAT_RG8_UNORM,
         rg8_view
     ));
-    let volume = objects::Type5TextureView { depth: 2, ..exact };
-    assert!(type5_view_requires_materialization(
+    let volume = objects::RefTextureView { depth: 2, ..exact };
+    assert!(ref_texture_view_requires_materialization(
         true,
         1920,
         1080,
@@ -4993,34 +5015,34 @@ fn texture_view_decline_preserves_decode_leaf_and_chain_identity() {
     assert!(fields.contains(&("depth", "3".into())));
 }
 
-/// Every type-5 view refusal names its rail (`type5_view_`), renders
+/// Every ref-texture view refusal names its rail (`ref_texture_view_`), renders
 /// whitespace-free fields, and is distinct — the same discipline the
-/// capture and import rails took, so `grep reason=type5_view_…` stays
+/// capture and import rails took, so `grep reason=ref_texture_view_…` stays
 /// answerable against the blit rail's `t5_*` copy vocabulary next door.
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn every_type5_view_reason_is_namespaced_distinct_and_log_safe() {
+fn every_ref_texture_view_reason_is_namespaced_distinct_and_log_safe() {
     use crate::observe::Decline as _;
-    const ALL: &[Type5ViewDecline] = &[
-        Type5ViewDecline::UnsupportedDepth { depth: 0 },
-        Type5ViewDecline::Unresolved,
-        Type5ViewDecline::FormatBpp,
-        Type5ViewDecline::NoMapping,
-        Type5ViewDecline::SampleWindow {
+    const ALL: &[RefTextureViewDecline] = &[
+        RefTextureViewDecline::UnsupportedDepth { depth: 0 },
+        RefTextureViewDecline::Unresolved,
+        RefTextureViewDecline::FormatBpp,
+        RefTextureViewDecline::NoMapping,
+        RefTextureViewDecline::SampleWindow {
             base_w: 0,
             base_h: 0,
             base_fmt: 0,
             desc: None,
         },
-        Type5ViewDecline::Span {
+        RefTextureViewDecline::Span {
             pages: 0,
             page_bytes: 0,
             span_end: 0,
             bpr: 0,
         },
-        Type5ViewDecline::TightOverflow { bpp: 0 },
-        Type5ViewDecline::NativeLen { tight: 0 },
-        Type5ViewDecline::Read {
+        RefTextureViewDecline::TightOverflow { bpp: 0 },
+        RefTextureViewDecline::NativeLen { tight: 0 },
+        RefTextureViewDecline::Read {
             base_w: 0,
             base_h: 0,
             base_fmt: 0,
@@ -5029,15 +5051,15 @@ fn every_type5_view_reason_is_namespaced_distinct_and_log_safe() {
             span_end: 0,
             pages: 0,
         },
-        Type5ViewDecline::RgbaStride,
-        Type5ViewDecline::RgbaLen { stride: 0 },
-        Type5ViewDecline::Convert { row: 0, bpp: 0 },
+        RefTextureViewDecline::RgbaStride,
+        RefTextureViewDecline::RgbaLen { stride: 0 },
+        RefTextureViewDecline::Convert { row: 0, bpp: 0 },
     ];
     let mut slugs: Vec<&str> = Vec::new();
     for d in ALL {
         assert!(
-            d.slug().starts_with("type5_view_"),
-            "{} is not namespaced to the type-5 view rail",
+            d.slug().starts_with("ref_texture_view_"),
+            "{} is not namespaced to the ref-texture view rail",
             d.slug()
         );
         for (k, v) in d.fields() {
@@ -5048,7 +5070,7 @@ fn every_type5_view_reason_is_namespaced_distinct_and_log_safe() {
     slugs.sort_unstable();
     let before = slugs.len();
     slugs.dedup();
-    assert_eq!(before, slugs.len(), "duplicate Type5ViewDecline slug");
+    assert_eq!(before, slugs.len(), "duplicate RefTextureViewDecline slug");
 }
 
 /// `SampleWindow` is the only variant carrying transcribed field logic: the
@@ -5058,26 +5080,26 @@ fn every_type5_view_reason_is_namespaced_distinct_and_log_safe() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn sample_window_renders_the_descriptor_or_its_absence() {
-    let present = Type5ViewDecline::SampleWindow {
+    let present = RefTextureViewDecline::SampleWindow {
         base_w: 320,
         base_h: 240,
         base_fmt: 0x50,
         desc: Some((64, 64, 0x4c41_3038, 256, 4096)),
     };
     assert_eq!(
-            crate::observe::Emit::decline("type5_draw_view", &present).render(),
-            "type5_draw_view reason=type5_view_sample_window base=320x240 base_fmt=0x50 desc=64x64 desc_fmt=0x4c413038 bpr=256 alloc=4096"
+            crate::observe::Emit::decline("ref_texture_draw_view", &present).render(),
+            "ref_texture_draw_view reason=ref_texture_view_sample_window base=320x240 base_fmt=0x50 desc=64x64 desc_fmt=0x4c413038 bpr=256 alloc=4096"
         );
 
-    let missing = Type5ViewDecline::SampleWindow {
+    let missing = RefTextureViewDecline::SampleWindow {
         base_w: 320,
         base_h: 240,
         base_fmt: 0x50,
         desc: None,
     };
     assert_eq!(
-        crate::observe::Emit::decline("type5_draw_view", &missing).render(),
-        "type5_draw_view reason=type5_view_sample_window base=320x240 base_fmt=0x50 desc=missing"
+        crate::observe::Emit::decline("ref_texture_draw_view", &missing).render(),
+        "ref_texture_draw_view reason=ref_texture_view_sample_window base=320x240 base_fmt=0x50 desc=missing"
     );
 }
 
@@ -5478,7 +5500,7 @@ fn texture_ref_cache_geom_mismatch_does_not_hit_get_texture() {
     host_cache_store_rgba8(&mut state, 0, tex_ref, 1920, 1152, &full);
     // Exact geom hit
     assert!(crate::runtime::surface_cache::get_texture(&state, 0, tex_ref, 1920, 1152).is_some());
-    // Wrong geom (type-3 L0 recycle) miss
+    // Wrong geom (generate-mipmaps texture L0 recycle) miss
     assert!(crate::runtime::surface_cache::get_texture(&state, 0, tex_ref, 115, 16).is_none());
     // surface_id map must stay empty for texture_ref stores
     assert!(crate::runtime::surface_cache::get(&state, tex_ref, 1920, 1152).is_none());
@@ -6441,7 +6463,7 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
     }
 }
 
-/// A type-11 sample must resolve the mapping *before* it reads its geometry.
+/// A mapper-ref-texture sample must resolve the mapping *before* it reads its geometry.
 ///
 /// A mapped surface with a live `MappingInternal` can have no latched W×H yet:
 /// that geometry lives in the guest device-surface descriptor, and
@@ -6454,7 +6476,7 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
 /// `set_mapping_geom` — so this passes with the resolve first and fails with it
 /// after the geometry read.
 #[test]
-fn type11_sample_resolves_geometry_before_reading_it() {
+fn mapper_ref_texture_sample_resolves_geometry_before_reading_it() {
     use crate::contract::endian::{st32, st64};
     use crate::contract::iosurface_pages::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS, DEVICE_DESC_LEN,
@@ -6549,8 +6571,9 @@ fn type11_sample_resolves_geometry_before_reading_it() {
         );
     }
 
-    let (gw, gh, rgba) = load_type11_mapping_rgba(&mut state, &mut host, mid, None).expect(
-        "a mapped type-11 surface whose dims are still only in the device descriptor \
+    let (gw, gh, rgba) = load_mapper_ref_texture_mapping_rgba(&mut state, &mut host, mid, None)
+        .expect(
+        "a mapped mapper-ref-texture surface whose dims are still only in the device descriptor \
          must sample, not drop the bind",
     );
     assert_eq!((gw, gh), (w, h), "geometry must come from the resolve");
@@ -7274,8 +7297,8 @@ fn a_buffer_read_pays_the_frame_its_reference_owes_before_reading_the_pages() {
 
 /// The buffer-backed texture rail pays for its *texture* reference too.
 ///
-/// A type-8 buffer-backed texture is two contract references over one
-/// allocation — the texture object the guest binds and samples, and the type-1
+/// A texture-view buffer-backed texture is two contract references over one
+/// allocation — the texture object the guest binds and samples, and the buffer
 /// buffer that owns the storage — and a debt may be armed under either. The
 /// three sibling sampled rails all pay for the texture reference; this one made
 /// no payment at all, which is why a rendered icon or glyph atlas could stay in
@@ -7351,7 +7374,7 @@ fn a_dontcare_colour_attachment_is_still_served_its_prior_contents() {
     use crate::contract::pass_action::{
         MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_DONT_CARE, MTL_LOAD_ACTION_LOAD,
     };
-    use crate::runtime::draw::vulkan::type11_load_is_a_seed_candidate;
+    use crate::runtime::draw::vulkan::mapper_ref_texture_load_is_a_seed_candidate;
 
     let mut c0 = ColorRtRequest {
         load_action: MTL_LOAD_ACTION_LOAD,
@@ -7359,13 +7382,13 @@ fn a_dontcare_colour_attachment_is_still_served_its_prior_contents() {
         ..Default::default()
     };
     assert!(
-        type11_load_is_a_seed_candidate(&c0),
+        mapper_ref_texture_load_is_a_seed_candidate(&c0),
         "a LOAD has always been a candidate"
     );
 
     c0.load_action = MTL_LOAD_ACTION_DONT_CARE;
     assert!(
-        type11_load_is_a_seed_candidate(&c0),
+        mapper_ref_texture_load_is_a_seed_candidate(&c0),
         "DontCare declares the prior contents undefined, and undefined permits \
          the prior contents — the guest redraws only its damage rect and relies \
          on the rest surviving, which is what the Metal arm gives it"
@@ -7373,7 +7396,7 @@ fn a_dontcare_colour_attachment_is_still_served_its_prior_contents() {
 
     c0.load_action = MTL_LOAD_ACTION_CLEAR;
     assert!(
-        !type11_load_is_a_seed_candidate(&c0),
+        !mapper_ref_texture_load_is_a_seed_candidate(&c0),
         "a Clear must not be served a seed: resolving one would spell the pass \
          key LOAD and silently ignore the clear the guest asked for"
     );
@@ -7384,7 +7407,7 @@ fn a_dontcare_colour_attachment_is_still_served_its_prior_contents() {
     c0.load_action = MTL_LOAD_ACTION_DONT_CARE;
     c0.target_seed_rgba = Some(vec![0u8; 4]);
     assert!(
-        !type11_load_is_a_seed_candidate(&c0),
+        !mapper_ref_texture_load_is_a_seed_candidate(&c0),
         "an explicit provenance seed still excludes the resident candidate"
     );
 }

@@ -1,8 +1,8 @@
-//! Always-on declines for the type-8 view-swizzle bug class.
+//! Always-on declines for the texture-view-swizzle bug class.
 //!
 //! # The class
 //!
-//! A guest texture view (type-8, opcode `0x1b`) can remap which channel each
+//! A guest texture view (texture-view, opcode `0x1b`) can remap which channel each
 //! output component reads. Vulkan performs exactly that for free through the
 //! image view's `VkComponentMapping`. Doing it any other way is a defect with
 //! two shapes, and these declines tell them apart:

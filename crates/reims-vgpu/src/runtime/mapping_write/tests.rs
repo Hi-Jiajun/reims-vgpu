@@ -1,4 +1,4 @@
-//! Tests for the type-11 mapped-surface writers.
+//! Tests for the mapper-ref-texture mapped-surface writers.
 //!
 //! Out of line for the reason the sibling `runtime/` modules that already do
 //! this have: colocated, these 2,291 lines were 48% of `mapping_write.rs` — the
@@ -19,7 +19,7 @@ use crate::runtime::host::FakeHost;
 ///
 /// The row pitch is asserted by its relationships, not as a number: a
 /// 4-wide BGRA8 surface reports `bpr = 128` against a tight row of 16,
-/// because `type11_sample_window` aligns the pitch up. Hard-coding either
+/// because `mapper_ref_texture_sample_window` aligns the pitch up. Hard-coding either
 /// value would make this a test of that alignment rather than of which
 /// field holds what.
 #[test]
@@ -268,7 +268,7 @@ fn a_writeback_lands_every_row_at_its_own_offset() {
 /// whichever guest allocation happens to be scattered.
 ///
 /// Dropping the host cache at the tail is half the test: it would otherwise
-/// answer the type-11 LOAD seed with the very bytes the guest's stores were
+/// answer the mapper-ref-texture LOAD seed with the very bytes the guest's stores were
 /// preserved from.
 #[test]
 fn a_skipping_writeback_leaves_the_guest_its_own_pages() {
@@ -687,7 +687,7 @@ fn write_bumps_generation() {
 ///
 /// This function writes the guest pages and then stores the host render
 /// cache, so at this instant the two agree — the one moment the copy's
-/// currency can be pinned. Nothing else armed it: the type-4 sampled
+/// currency can be pinned. Nothing else armed it: the backing sampled
 /// ladder's first census read `t11rung_host_cache_gw_no_stamp` 14 092
 /// against `gw_clean` 0, because only the Vulkan Store rails ever stamped
 /// while the copy that rung serves is written here. Unstamped, the reader
@@ -778,7 +778,7 @@ fn mapping_write_invalidates_intersecting_residency_windows_only() {
     assert!(state.compute_storage_residency.contains_key(&survivor));
 }
 
-/// A direct type-11 writeback must not land in a page the guest re-pointed
+/// A direct mapper-ref-texture writeback must not land in a page the guest re-pointed
 /// away, and this asserts it in the currency of the bug: the bytes of the
 /// page the surface moved to.
 ///
@@ -799,7 +799,7 @@ fn mapping_write_invalidates_intersecting_residency_windows_only() {
 #[test]
 fn a_repointed_surface_refuses_the_write_and_leaves_the_new_owner_alone() {
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::model::{Type4Walk, PAGE_SHIFT_X86};
+    use crate::model::{BackingWalk, PAGE_SHIFT_X86};
 
     let page = 1u64 << PAGE_SHIFT_X86;
     let mut host = FakeHost::new();
@@ -830,7 +830,7 @@ fn a_repointed_surface_refuses_the_write_and_leaves_the_new_owner_alone() {
         m.mapped = true;
         m.page_entries =
             vec![(((data0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
-        m.type4_walk = Some(Type4Walk {
+        m.backing_walk = Some(BackingWalk {
             task_id: 1,
             backing_pfn: 0,
             map_generation: m.map_generation,
@@ -1296,7 +1296,7 @@ fn read_rect_raw_fragmented_pages_with_padded_rows() {
 /// A sub-rectangle of a padded plane over scattered guest pages reads through
 /// one page-table walk, not through a plane-sized window.
 ///
-/// This is the source half of every type-11 to linear blit. Before the
+/// This is the source half of every mapper-ref-texture to linear blit. Before the
 /// rectangle shape reached this rail the arm below materialised the *whole*
 /// sample window into a fresh zeroed `Vec` and then copied the wanted rows out
 /// of it, so a rectangle covering a fraction of the plane still paid for all of
@@ -1584,11 +1584,11 @@ fn an_ambiguous_descriptor_declines_where_an_absent_one_still_sizes_a_window() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     state.map_surface(8);
 
-    // No descriptor yet: geometry came from the type-11 texture object and
+    // No descriptor yet: geometry came from the mapper-ref-texture object and
     // the aligned row stands in for the pitch. 4 R8 texels align to 128.
     let m = state.mappings.get(&8).expect("mapping");
     assert_eq!(
-        type11_sample_window(m, 4, 2, MTL_FORMAT_R8_UNORM),
+        mapper_ref_texture_sample_window(m, 4, 2, MTL_FORMAT_R8_UNORM),
         Some((0, 128, 256)),
         "with nothing published there are no planes to confuse"
     );
@@ -1613,23 +1613,26 @@ fn an_ambiguous_descriptor_declines_where_an_absent_one_still_sizes_a_window() {
 
     let m = state.mappings.get(&8).expect("mapping");
     assert_eq!(
-        type11_sample_window(m, 4, 2, MTL_FORMAT_R8_UNORM),
+        mapper_ref_texture_sample_window(m, 4, 2, MTL_FORMAT_R8_UNORM),
         None,
         "two planes match and neither is the answer, so nothing is bound"
     );
     // The wire index is the only thing that separates them, and it reaches
     // each of the two directly.
     assert_eq!(
-        type5_sample_window(m, 0, 4, 2, MTL_FORMAT_R8_UNORM).map(|w| w.0),
+        ref_texture_sample_window(m, 0, 4, 2, MTL_FORMAT_R8_UNORM).map(|w| w.0),
         Some(512)
     );
     assert_eq!(
-        type5_sample_window(m, 2, 4, 2, MTL_FORMAT_R8_UNORM).map(|w| w.0),
+        ref_texture_sample_window(m, 2, 4, 2, MTL_FORMAT_R8_UNORM).map(|w| w.0),
         Some(1536)
     );
     // An index past the plane count resolves nothing rather than falling
     // back onto plane 0's bytes.
-    assert_eq!(type5_sample_window(m, 7, 4, 2, MTL_FORMAT_R8_UNORM), None);
+    assert_eq!(
+        ref_texture_sample_window(m, 7, 4, 2, MTL_FORMAT_R8_UNORM),
+        None
+    );
 }
 
 /// qemu-shim: guest page write IS the surface content (unified memory) —

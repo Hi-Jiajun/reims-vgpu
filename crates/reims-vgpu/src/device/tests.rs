@@ -98,7 +98,7 @@ fn window_publish_key_advances_for_in_place_present() {
     );
 }
 
-/// A lazy type-11 Store publishes new pixels without writing a guest page, so
+/// A lazy mapper-ref-texture Store publishes new pixels without writing a guest page, so
 /// the mapping's `content_generation` holds still across frames that genuinely
 /// differ — and the host window's publish key must move anyway.
 ///

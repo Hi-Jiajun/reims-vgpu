@@ -13,8 +13,8 @@ use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 use crate::runtime::decode::compute;
 use crate::runtime::decode::resource::{
-    list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, OBJECT_TYPE_IOSURFACE,
-    RESOURCE_PAGE_SHIFT,
+    list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER,
+    OBJECT_TYPE_MAPPER_REF_TEXTURE, RESOURCE_PAGE_SHIFT,
 };
 /// Compute-pipeline descriptor constants used by the backend execute test.
 #[cfg(any(
@@ -22,12 +22,13 @@ use crate::runtime::decode::resource::{
     all(feature = "backend-metal", target_os = "macos")
 ))]
 use crate::runtime::decode::resource::{
-    OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, TYPE7_FIRST_TLVS, TYPE7_OBJECT_COMPUTE_PIPELINE,
+    OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, SERIALIZER_OBJECT_COMPUTE_PIPELINE,
+    SERIALIZER_OBJECT_FIRST_TLVS,
 };
 use crate::runtime::gva_mem;
 use crate::runtime::gva_mem::write_task_gva_arm64e;
 use crate::runtime::host::FakeHost;
-use reims_vgpu_wire::device_desc::Type5Builder;
+use reims_vgpu_wire::device_desc::RefTextureBuilder;
 
 #[cfg(feature = "backend-vulkan")]
 #[test]
@@ -110,7 +111,7 @@ fn argument_buffer_reflection_decline_carries_the_owner_coordinate() {
     );
 }
 
-/// A type-5 view names its IOSurface plane on the wire (record `+0x20`, the
+/// A ref-texture view names its IOSurface plane on the wire (record `+0x20`, the
 /// `newTextureWithDescriptor:iosurface:plane:` argument). When two planes share
 /// geometry and bytes-per-element the geometry scan cannot separate them and
 /// falls back to inventing a packed window at offset 0 — which is the *first*
@@ -120,7 +121,7 @@ fn argument_buffer_reflection_decline_carries_the_owner_coordinate() {
 /// Shape is the live v0a8 (biplanar video + alpha) layout scaled down: plane 0
 /// and plane 2 are both R8 at identical dims, plane 1 is the RG8 chroma.
 #[test]
-fn stage_texture_type5_plane_index_beats_the_ambiguous_geometry_scan() {
+fn stage_texture_ref_texture_plane_index_beats_the_ambiguous_geometry_scan() {
     use crate::contract::endian::st16;
     use crate::contract::iosurface_pages::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT,
@@ -141,7 +142,7 @@ fn stage_texture_type5_plane_index_beats_the_ambiguous_geometry_scan() {
     assert!(state.set_object_list(1, 0, 32));
 
     let sid = 3u32;
-    let type5_ref = 10u32;
+    let ref_texture_ref = 10u32;
     let pfn = 0x20u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
     host.map_range(gpa, 0x4000, 0x5a);
@@ -176,28 +177,28 @@ fn stage_texture_type5_plane_index_beats_the_ambiguous_geometry_scan() {
     }
     assert!(state.set_mapping_device_desc(sid, &device_desc));
 
-    // 56-byte type-5 blob: 8-byte head, then kind/blob_len/own_ref and a 0x24
+    // 56-byte ref-texture blob: 8-byte head, then kind/blob_len/own_ref and a 0x24
     // record whose `+0x20` carries the plane index.
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
-    let type5_desc = Type5Builder::new(sid, 0, 10, 0x42)
+    let ref_texture_desc = RefTextureBuilder::new(sid, 0, 10, 0x42)
         .unknown(0x01)
         .geometry(MTL_FORMAT_R8_UNORM, 4, 4, 1)
         .trailer([1, 0, 1, 0, 1, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0])
         // IOSurface plane index = 2 (alpha)
         .plane_index(2);
-    let type5_desc = type5_desc.bytes();
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
-    let off = list_object_entry_offset(type5_ref, 32).unwrap();
+    let ref_texture_desc = ref_texture_desc.bytes();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, ref_texture_desc);
+    let off = list_object_entry_offset(ref_texture_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
-    let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((type5_desc.len() as u32) << 8);
+    let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((ref_texture_desc.len() as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 33, true)
-        .expect("a type-5 plane view over a mapped surface must stage");
+    let staged = stage_texture_raw(&mut state, &mut host, 1, ref_texture_ref, 33, true)
+        .expect("a ref-texture plane view over a mapped surface must stage");
     match staged.writeback {
-        TextureWriteback::Type11 {
+        TextureWriteback::MapperRefTexture {
             surface_offset,
             surface_bpr,
             ..
@@ -209,7 +210,9 @@ fn stage_texture_type5_plane_index_beats_the_ambiguous_geometry_scan() {
                  over plane 0 that the ambiguous geometry scan falls back to"
             );
         }
-        _ => panic!("a type-5 view over a surface mapping must write back as type-11"),
+        _ => panic!(
+            "a ref-texture view over a surface mapping must write back as mapper-ref-texture"
+        ),
     }
 }
 
@@ -701,8 +704,8 @@ fn a_compute_refusal_names_its_check_and_ok_names_nothing() {
         "an Ok must not be loggable — that is what keeps the sink clean"
     );
 
-    let st = ComputeStatus::MissingTexture("compute_stage_tex_type5_no_map");
-    assert_eq!(st.refusal(), Some("compute_stage_tex_type5_no_map"));
+    let st = ComputeStatus::MissingTexture("compute_stage_tex_ref_texture_no_map");
+    assert_eq!(st.refusal(), Some("compute_stage_tex_ref_texture_no_map"));
     assert_eq!(st.class(), "missing_texture");
     let line = Emit::refusal("compute_record", &st)
         .expect("a refusal renders a line")
@@ -710,7 +713,7 @@ fn a_compute_refusal_names_its_check_and_ok_names_nothing() {
         .render();
     assert_eq!(
         line,
-        "compute_record reason=compute_stage_tex_type5_no_map \
+        "compute_record reason=compute_stage_tex_ref_texture_no_map \
              class=missing_texture pipe=7"
     );
 
@@ -1070,18 +1073,18 @@ fn dispatch_buffer_kernel_mul3add1() {
     }
 
     let mut pdesc = vec![0u8; 32];
-    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut pdesc[0..], SERIALIZER_OBJECT_COMPUTE_PIPELINE);
     st32(&mut pdesc[4..], 32); // declared descriptor length
-    pdesc[TYPE7_FIRST_TLVS] = 1;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
+    pdesc[SERIALIZER_OBJECT_FIRST_TLVS] = 1;
+    pdesc[SERIALIZER_OBJECT_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
+    pdesc[SERIALIZER_OBJECT_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[SERIALIZER_OBJECT_FIRST_TLVS + 3..], 5);
     let pdesc_gva = 0x140u64;
     write_task_gva_arm64e(&mut host, &state.tasks[1], pdesc_gva, &pdesc);
     {
         let off = list_object_entry_offset(6, 32).unwrap();
         let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
-        let packed = (OBJECT_TYPE_TYPE7 as u32) | (32u32 << 8);
+        let packed = (OBJECT_TYPE_SERIALIZER_OBJECT as u32) | (32u32 << 8);
         st32(&mut le[0..], packed);
         le[4..12].copy_from_slice(&pdesc_gva.to_le_bytes());
         write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
@@ -1189,12 +1192,12 @@ fn dispatch_missing_texture_fails() {
     ));
 }
 
-/// Live CI wallpaper: type-5 RefTexture → type-4 surface_id must stage via
+/// Live CI wallpaper: ref-texture RefTexture → backing record_id must stage via
 /// ensure_surface + mapping (same order as the `runtime::draw` sample). Without
-/// ensure, stage fell through to type-2/3 with the type-5 ref → always
+/// ensure, stage fell through to normal-texture with the ref-texture ref → always
 /// MissingTexture (`compute_stage_tex … ot=5`).
 #[test]
-fn stage_texture_type5_ref_resolves_surface_mapping() {
+fn stage_texture_ref_texture_ref_resolves_surface_mapping() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
@@ -1205,8 +1208,8 @@ fn stage_texture_type5_ref_resolves_surface_mapping() {
     assert!(state.set_object_list(1, 0, 32));
 
     let sid = 3u32;
-    let type5_ref = 10u32;
-    // Pre-mapped type-4 surface (CI storage target) with one valid page.
+    let ref_texture_ref = 10u32;
+    // Pre-mapped backing record (CI storage target) with one valid page.
     let pfn = 0x20u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
     host.map_range(gpa, 0x4000, 0x5a);
@@ -1220,34 +1223,34 @@ fn stage_texture_type5_ref_resolves_surface_mapping() {
     }
     assert!(state.set_mapping_geom(sid, 4, 4, MTL_FORMAT_BGRA8_UNORM));
 
-    // Object-list: type-5 at ref 10 → surface_id=3 (mapping already seeded).
+    // Object-list: ref-texture at ref 10 → surface_id=3 (mapping already seeded).
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E; // data pfn base 4 + 2
-    let type5_desc = Type5Builder::new(sid, 0, 0, 0).with_len(16);
-    let type5_desc = type5_desc.bytes();
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
-    let off = list_object_entry_offset(type5_ref, 32).unwrap();
+    let ref_texture_desc = RefTextureBuilder::new(sid, 0, 0, 0).with_len(16);
+    let ref_texture_desc = ref_texture_desc.bytes();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, ref_texture_desc);
+    let off = list_object_entry_offset(ref_texture_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((16u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, true)
-        .expect("type-5→surface stage must succeed after ensure");
+    let staged = stage_texture_raw(&mut state, &mut host, 1, ref_texture_ref, 32, true)
+        .expect("ref-texture→surface stage must succeed after ensure");
     assert_eq!((staged.width, staged.height), (4, 4));
     assert_eq!(staged.bytes.len(), 4 * 4 * 4);
     assert!(matches!(
         staged.writeback,
-        TextureWriteback::Type11 { mapping_id: 3, .. }
+        TextureWriteback::MapperRefTexture { mapping_id: 3, .. }
     ));
 }
 
-/// A type-5 record is the exact Metal view, even when its single-plane
+/// A ref-texture record is the exact Metal view, even when its single-plane
 /// backing already has valid base geometry. Live pipe 5 exposes each row
 /// of a 1920-wide BGRA8 surface as a 480-wide RGBA32Uint view so one
 /// `uint4` image write stores four packed BGRA pixels.
 #[test]
-fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
+fn stage_texture_ref_texture_record_reshapes_stageable_single_plane_surface() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::contract::pixel_format::{
         StorageImageSelector, MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R32_UINT, MTL_FORMAT_RGBA32_UINT,
@@ -1260,7 +1263,7 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
     assert!(state.set_object_list(1, 0, 32));
 
     let sid = 3u32;
-    let type5_ref = 10u32;
+    let ref_texture_ref = 10u32;
     let pfn = 0x20u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
     host.map_range(gpa, 0x4000, 0x5a);
@@ -1276,21 +1279,21 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
 
     // Same 16 bytes per logical row: 4 BGRA8 texels = one RGBA32Uint texel.
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
-    let type5_desc = Type5Builder::new(sid, 0, 10, 0x42)
+    let ref_texture_desc = RefTextureBuilder::new(sid, 0, 10, 0x42)
         .unknown(0x02)
         .geometry(MTL_FORMAT_RGBA32_UINT, 1, 4, 1)
         .trailer([1, 0, 1, 0, 1, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    let type5_desc = type5_desc.bytes();
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
-    let off = list_object_entry_offset(type5_ref, 32).unwrap();
+    let ref_texture_desc = ref_texture_desc.bytes();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, ref_texture_desc);
+    let off = list_object_entry_offset(ref_texture_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
-    let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((type5_desc.len() as u32) << 8);
+    let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((ref_texture_desc.len() as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 33, true)
-        .expect("serialized type-5 view must override base surface geometry");
+    let staged = stage_texture_raw(&mut state, &mut host, 1, ref_texture_ref, 33, true)
+        .expect("serialized ref-texture view must override base surface geometry");
     assert_eq!((staged.width, staged.height), (1, 4));
     assert_eq!(
         staged.storage_selector,
@@ -1299,7 +1302,7 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
     assert_eq!(staged.bytes.len(), 4 * 16);
     assert!(staged.bytes.iter().all(|&b| b == 0x5a));
     match staged.writeback {
-        TextureWriteback::Type11 {
+        TextureWriteback::MapperRefTexture {
             mapping_id,
             surface_bpr,
             width,
@@ -1312,7 +1315,7 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
             assert_eq!((width, height), (1, 4));
             assert_eq!(pixel_format::bytes_per_pixel(format), Some(16));
         }
-        _ => panic!("expected Type11 writeback through the texture view"),
+        _ => panic!("expected MapperRefTexture writeback through the texture view"),
     }
 
     // A sampled R32Uint view retains its exact format/geometry. R32Uint is
@@ -1320,12 +1323,12 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
     // path), so `storage_selector` is populated — but it is inert here: this
     // view is staged sampled (`is_storage=false`, binding 32), and the
     // selector is only consulted on the storage-bind path.
-    let reshaped = Type5Builder::new(sid, 0, 10, 0x42)
+    let reshaped = RefTextureBuilder::new(sid, 0, 10, 0x42)
         .unknown(0x02)
         .geometry(MTL_FORMAT_R32_UINT, 4, 4, 1)
         .trailer([1, 0, 1, 0, 1, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, reshaped.bytes());
-    let sampled = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, false)
+    let sampled = stage_texture_raw(&mut state, &mut host, 1, ref_texture_ref, 32, false)
         .expect("sample-only R32Uint view must stage from the same IOSurface bytes");
     assert_eq!((sampled.width, sampled.height), (4, 4));
     assert_eq!(sampled.pixel_format, MTL_FORMAT_R32_UINT);
@@ -1337,12 +1340,12 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
     assert!(matches!(sampled.writeback, TextureWriteback::None));
 }
 
-/// Biplanar surface (device_desc plane_count=2) + type-5 args plane record:
+/// Biplanar surface (device_desc plane_count=2) + ref-texture args plane record:
 /// stage the named plane view (R8 Y) from the plane offset — live class
-/// `compute_dispatch st=Unsupported` / `type11_fail reason=multiplane`
+/// `compute_dispatch st=Unsupported` / `mapper_ref_texture_fail reason=multiplane`
 /// (wallpaper '420f', journal 2026-07-14 compute census).
 #[test]
-fn stage_texture_type5_record_stages_biplanar_y_plane() {
+fn stage_texture_ref_texture_record_stages_biplanar_y_plane() {
     use crate::contract::endian::{st16, st64};
     use crate::contract::iosurface_pages::{
         DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT,
@@ -1360,7 +1363,7 @@ fn stage_texture_type5_record_stages_biplanar_y_plane() {
     assert!(state.set_object_list(1, 0, 32));
 
     let sid = 3u32;
-    let type5_ref = 10u32;
+    let ref_texture_ref = 10u32;
     let pfn = 0x20u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
     host.map_range(gpa, 0x4000, 0x77);
@@ -1399,22 +1402,22 @@ fn stage_texture_type5_record_stages_biplanar_y_plane() {
         state.mappings.get(&sid).unwrap()
     ));
 
-    // Type-5 descriptor: sid + args blob carrying the R8 16×8 plane record.
+    // Ref-texture descriptor: sid + args blob carrying the R8 16×8 plane record.
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
     // tag, unk, fmt=R8
-    let type5_desc = Type5Builder::new(sid, 0, 10, 0x42)
+    let ref_texture_desc = RefTextureBuilder::new(sid, 0, 10, 0x42)
         .unknown(0x01)
         .geometry(0x0a, 16, 8, 1);
-    let type5_desc = type5_desc.bytes();
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
-    let off = list_object_entry_offset(type5_ref, 32).unwrap();
+    let ref_texture_desc = ref_texture_desc.bytes();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, ref_texture_desc);
+    let off = list_object_entry_offset(ref_texture_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
-    let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((type5_desc.len() as u32) << 8);
+    let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((ref_texture_desc.len() as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, true)
+    let staged = stage_texture_raw(&mut state, &mut host, 1, ref_texture_ref, 32, true)
         .expect("plane record must stage the Y plane of a biplanar surface");
     assert_eq!((staged.width, staged.height), (16, 8));
     assert_eq!(
@@ -1424,7 +1427,7 @@ fn stage_texture_type5_record_stages_biplanar_y_plane() {
     assert_eq!(staged.bytes.len(), 16 * 8);
     assert!(staged.bytes.iter().all(|&b| b == 0x77));
     match staged.writeback {
-        TextureWriteback::Type11 {
+        TextureWriteback::MapperRefTexture {
             mapping_id,
             surface_offset,
             surface_bpr,
@@ -1434,10 +1437,10 @@ fn stage_texture_type5_record_stages_biplanar_y_plane() {
             assert_eq!(surface_offset, 0);
             assert_eq!(surface_bpr, 64);
         }
-        _ => panic!("expected Type11 writeback"),
+        _ => panic!("expected MapperRefTexture writeback"),
     }
-    let sampled = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, false)
-        .expect("sampled type-5 plane must stage without writeback");
+    let sampled = stage_texture_raw(&mut state, &mut host, 1, ref_texture_ref, 32, false)
+        .expect("sampled ref-texture plane must stage without writeback");
     assert!(!sampled.is_storage);
     assert!(matches!(sampled.writeback, TextureWriteback::None));
     let _ = MTL_FORMAT_R8_UNORM;
@@ -1446,7 +1449,7 @@ fn stage_texture_type5_record_stages_biplanar_y_plane() {
 /// Biplanar surface **without** a plane record still fails closed
 /// (no BGRA invent over multi-plane bytes).
 #[test]
-fn stage_texture_type5_multiplanar_without_record_fails_closed() {
+fn stage_texture_ref_texture_multiplanar_without_record_fails_closed() {
     use crate::contract::iosurface_pages::{
         DEVICE_DESC_LEN, DEVICE_DESC_PLANE_COUNT, PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
     };
@@ -1458,7 +1461,7 @@ fn stage_texture_type5_multiplanar_without_record_fails_closed() {
     assert!(state.set_object_list(1, 0, 32));
 
     let sid = 3u32;
-    let type5_ref = 10u32;
+    let ref_texture_ref = 10u32;
     let pfn = 0x20u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
     host.map_range(gpa, 0x4000, 0x5a);
@@ -1478,19 +1481,19 @@ fn stage_texture_type5_multiplanar_without_record_fails_closed() {
         m.format = 0;
     }
 
-    // Type-5 descriptor with sid but NO args record.
+    // Ref-texture descriptor with sid but NO args record.
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
-    let type5_desc = Type5Builder::new(sid, 0, 0, 0).with_len(8);
-    let type5_desc = type5_desc.bytes();
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
-    let off = list_object_entry_offset(type5_ref, 32).unwrap();
+    let ref_texture_desc = RefTextureBuilder::new(sid, 0, 0, 0).with_len(8);
+    let ref_texture_desc = ref_texture_desc.bytes();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, ref_texture_desc);
+    let off = list_object_entry_offset(ref_texture_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
-    let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((type5_desc.len() as u32) << 8);
+    let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((ref_texture_desc.len() as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    match stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, true) {
+    match stage_texture_raw(&mut state, &mut host, 1, ref_texture_ref, 32, true) {
         Err(ComputeStatus::Unsupported(_)) => {}
         Err(other) => panic!("expected Unsupported, got {other:?}"),
         Ok(_) => panic!("multiplanar without plane record must fail closed"),
@@ -1619,7 +1622,7 @@ fn stage_heap_texture_uses_host_only_residency_identity() {
 
 #[cfg(feature = "backend-vulkan")]
 /// UnmapMemory removes the guest page-table alias, not the discrete
-/// type-2/3 texture body. Compute writeback must retain raw output, mirror
+/// normal texture body. Compute writeback must retain raw output, mirror
 /// normalized color for render sampling, and complete without attempting
 /// a fail-closed write into freed guest pages.
 #[test]
@@ -1704,12 +1707,12 @@ fn compute_stage_admits_full_screen_wide_gamut_without_cap() {
     );
 }
 
-/// Type-5 surface id must not be re-resolved through this task's object
+/// Ref-texture surface id must not be re-resolved through this task's object
 /// list: slot `sid` can be a different texture-ref object (id collision).
-/// Live class: ensure=1 then MissingTexture when resolve_type11_ref(task,sid)
+/// Live class: ensure=1 then MissingTexture when resolve_mapper_ref_texture(task,sid)
 /// returned the wrong mapping.
 #[test]
-fn stage_texture_type5_ignores_task_object_list_slot_collision() {
+fn stage_texture_ref_texture_ignores_task_object_list_slot_collision() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
@@ -1720,7 +1723,7 @@ fn stage_texture_type5_ignores_task_object_list_slot_collision() {
     assert!(state.set_object_list(1, 0, 32));
 
     let sid = 3u32;
-    let type5_ref = 10u32;
+    let ref_texture_ref = 10u32;
     let pfn = 0x21u32;
     let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
     host.map_range(gpa, 0x4000, 0xa5);
@@ -1734,45 +1737,45 @@ fn stage_texture_type5_ignores_task_object_list_slot_collision() {
     }
     assert!(state.set_mapping_geom(sid, 4, 4, MTL_FORMAT_BGRA8_UNORM));
 
-    // Poison: object-list slot `sid` is type-11 with mapping_id=99 (not mapped).
-    // Pre-fix path would resolve_type11_ref(task, sid) → 99 → MissingTexture.
+    // Poison: object-list slot `sid` is mapper-ref-texture with mapping_id=99 (not mapped).
+    // Pre-fix path would resolve_mapper_ref_texture(task, sid) → 99 → MissingTexture.
     let poison_desc_gva = (4u64 + 1) << PAGE_SHIFT_ARM64E;
     let mut iosurf = vec![0u8; 64];
     st32(&mut iosurf[0..], 99); // fake mapping_id
     write_task_gva_arm64e(&mut host, &state.tasks[1], poison_desc_gva, &iosurf);
     let off_sid = list_object_entry_offset(sid, 32).unwrap();
     let mut le_sid = [0u8; OBJECT_LIST_ENTRY_LEN];
-    // type-11 = OBJECT_TYPE_IOSURFACE
-    let packed_t11 = (OBJECT_TYPE_IOSURFACE as u32) | ((64u32) << 8);
+    // mapper-ref-texture = OBJECT_TYPE_MAPPER_REF_TEXTURE
+    let packed_t11 = (OBJECT_TYPE_MAPPER_REF_TEXTURE as u32) | ((64u32) << 8);
     st32(&mut le_sid[0..], packed_t11);
     le_sid[4..12].copy_from_slice(&poison_desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off_sid, &le_sid);
 
-    // type-5 at ref 10 → surface_id 3
+    // ref-texture at ref 10 → surface_id 3
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
-    let type5_desc = Type5Builder::new(sid, 0, 0, 0).with_len(16);
-    let type5_desc = type5_desc.bytes();
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
-    let off = list_object_entry_offset(type5_ref, 32).unwrap();
+    let ref_texture_desc = RefTextureBuilder::new(sid, 0, 0, 0).with_len(16);
+    let ref_texture_desc = ref_texture_desc.bytes();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, ref_texture_desc);
+    let off = list_object_entry_offset(ref_texture_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((16u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, true)
-        .expect("type-5 must stage mapping sid, not poisoned type-11 slot");
+    let staged = stage_texture_raw(&mut state, &mut host, 1, ref_texture_ref, 32, true)
+        .expect("ref-texture must stage mapping sid, not poisoned mapper-ref-texture slot");
     assert_eq!((staged.width, staged.height), (4, 4));
     assert!(matches!(
         staged.writeback,
-        TextureWriteback::Type11 { mapping_id: 3, .. }
+        TextureWriteback::MapperRefTexture { mapping_id: 3, .. }
     ));
 }
 
-/// Type-5 whose surface_id never maps must fail MissingTexture (not pretend
-/// type-2/3 success).
+/// Ref-texture whose surface_id never maps must fail MissingTexture (not pretend
+/// normal-texture success).
 #[test]
-fn stage_texture_type5_without_surface_is_missing() {
+fn stage_texture_ref_texture_without_surface_is_missing() {
     use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -1780,20 +1783,20 @@ fn stage_texture_type5_without_surface_is_missing() {
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
 
-    let type5_ref = 11u32;
+    let ref_texture_ref = 11u32;
     let sid = 99u32; // no mapping
     let desc_gva = (4u64 + 3) << PAGE_SHIFT_ARM64E;
-    let type5_desc = Type5Builder::new(sid, 0, 0, 0).with_len(16);
-    let type5_desc = type5_desc.bytes();
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
-    let off = list_object_entry_offset(type5_ref, 32).unwrap();
+    let ref_texture_desc = RefTextureBuilder::new(sid, 0, 0, 0).with_len(16);
+    let ref_texture_desc = ref_texture_desc.bytes();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, ref_texture_desc);
+    let off = list_object_entry_offset(ref_texture_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((16u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let st = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, false);
+    let st = stage_texture_raw(&mut state, &mut host, 1, ref_texture_ref, 32, false);
     assert!(matches!(st, Err(ComputeStatus::MissingTexture(_))));
 }
 
@@ -2320,7 +2323,7 @@ fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
 ///
 /// Both destination shapes have one, and the shapes differ only in which licence
 /// answers — a guest-linear plane goes to `licence_gva_plane` and a tiled surface
-/// mapping to `licence_type11_surface`. Residency is not a shape at all: a
+/// mapping to `licence_mapper_ref_texture_surface`. Residency is not a shape at all: a
 /// registered resident is a perfectly good source for a copy, and
 /// what holds it across a submitted-not-waited copy is the engine's pin, taken
 /// where the write debt is armed and released from the ring slot's cleanup.
@@ -2336,7 +2339,7 @@ fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
 /// identically to one an earlier gate caught. The census route is what
 /// distinguishes them, so each case is asserted on its own counter.
 ///
-/// The type-11 cases assert the thing that is easiest to regress back to. That
+/// The mapper-ref-texture cases assert the thing that is easiest to regress back to. That
 /// class was the largest this arm did not reach — 35 of the 51 storage
 /// destinations of a driven macos-13 boot — and the reason was a `return` on the
 /// destination's *shape*, before anything about the surface had been asked. A
@@ -2411,11 +2414,11 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
         "the licence refusal is the gate that caught it"
     );
 
-    // A type-11 destination is not a guest-linear plane at all. It is also the
+    // A mapper-ref-texture destination is not a guest-linear plane at all. It is also the
     // largest class this arm does not reach, so the same call must band whether
     // a raw copy could ever have served it — the route counter says how many
     // there are and the split says how many are reachable.
-    let type11 = |mapping_id, format| TextureWriteback::Type11 {
+    let mapper_ref_texture = |mapping_id, format| TextureWriteback::MapperRefTexture {
         mapping_id,
         surface_offset: 0,
         surface_bpr: 8,
@@ -2424,7 +2427,7 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
         height: 2,
         format,
     };
-    let unlicensed = || store_route_count("compute_dst_host_type11_unlicensed");
+    let unlicensed = || store_route_count("compute_dst_host_mapper_ref_texture_unlicensed");
     for mapping_id in [1, 2] {
         state.mappings.insert(
             mapping_id,
@@ -2442,7 +2445,7 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
     // serve it; mapping 2 is staged at a different one, and a copy converts
     // nothing, so no licence could land it however the pages resolve. The format
     // that decides is the bind's own, not the mapping's declaration — the bind
-    // may be a type-5 view reinterpreting the surface, and the staged format is
+    // may be a ref-texture view reinterpreting the surface, and the staged format is
     // the one both the seeding read and the landing write are arithmetic over.
     //
     // Mapping 3 is never registered, so there is nothing to write into.
@@ -2464,16 +2467,16 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
             is_host(&direct_destination(
                 &mut state,
                 &mut host,
-                &staged(type11(mapping_id, format), None),
+                &staged(mapper_ref_texture(mapping_id, format), None),
                 held,
             )),
-            "no guest-RAM import, so every type-11 licence is refused here"
+            "no guest-RAM import, so every mapper-ref-texture licence is refused here"
         );
     }
     assert_eq!(
         unlicensed(),
         before + 3,
-        "the type-11 licence is what refused, not the destination's shape"
+        "the mapper-ref-texture licence is what refused, not the destination's shape"
     );
     // A delta and not an absolute: these counters are process-global and this
     // suite runs serially in one binary, so a zero read absolutely would be
@@ -2481,7 +2484,7 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
     assert_eq!(
         store_route_count("compute_dst_host_not_linear"),
         not_linear,
-        "a type-11 destination is no longer turned away for not being linear"
+        "a mapper-ref-texture destination is no longer turned away for not being linear"
     );
 
     // And the case this test exists for: a resident window is routed on its
@@ -2957,7 +2960,7 @@ fn a_sampled_image_the_kernel_uses_and_the_guest_left_empty_gets_a_neutral_textu
 }
 
 /// A buffer-backed texture (opcode 9) bound to a compute *read* is staged from
-/// the type-1 buffer's own bytes, de-pitched to tight rows in its native
+/// the buffer's own bytes, de-pitched to tight rows in its native
 /// format.
 ///
 /// This arm refused the whole wire form until now, while `runtime::draw`
@@ -3002,7 +3005,7 @@ fn a_buffer_backed_texture_stages_its_texels_without_the_row_padding() {
     let buf_gva = 5u64 << RESOURCE_PAGE_SHIFT;
     write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &pixels);
 
-    // Type-1 buffer object naming that storage.
+    // Buffer buffer object naming that storage.
     let mut bdesc = vec![0u8; 16];
     st64(&mut bdesc[0..], (PITCH * H_ROWS) as u64);
     st32(&mut bdesc[8..], 5);
@@ -3016,7 +3019,7 @@ fn a_buffer_backed_texture_stages_its_texels_without_the_row_padding() {
         write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
     }
 
-    // Type-8 buffer-backed texture record over it.
+    // Texture-view buffer-backed texture record over it.
     let mut body = vec![0u8; crate::runtime::heap_query::WIDE_TEXTURE_BODY_LEN];
     body[std::mem::offset_of!(W, type_and_flags)] = 0x02; // 2D
     st16(
@@ -3158,7 +3161,7 @@ fn a_declared_mip_chain_stages_every_level_and_not_only_its_base() {
     let allocation_size = image.len() as u64;
     write_task_gva_arm64e(&mut host, &state.tasks[1], base_gva, &image);
 
-    // The type-2 descriptor that declares it: geometry prefix for level 0 and
+    // The texture descriptor that declares it: geometry prefix for level 0 and
     // one 36-byte record for each level after it.
     let desc_len =
         TEXTURE_DESC_BASE_LEN + (LEVELS as usize - 1) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;

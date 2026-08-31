@@ -212,7 +212,7 @@ fn refuse(mapping_id: u32, why: SurfaceWriteRefusal) -> bool {
 /// - **The mapping has published no descriptor.** `MappingInternal.descriptor`
 ///   reads zero until the guest fills it, which `mapper::resolve` documents as a
 ///   real state rather than a failure, and the geometry then comes from the
-///   type-11 texture object instead. There are no plane records to confuse here;
+///   mapper-ref-texture object instead. There are no plane records to confuse here;
 ///   the single unknown is the pitch, and [`packed_span_estimate`]'s aligned row
 ///   stands in for it over a surface starting at offset 0.
 /// - **The descriptor is published and resolves nothing.** Here the guest *has*
@@ -232,7 +232,7 @@ fn refuse(mapping_id: u32, why: SurfaceWriteRefusal) -> bool {
 /// because a capable host takes the import for every guest window and leaves the
 /// copying rails at zero. With the gate closed
 /// (`host_pointer_import=disabled_by_env`, nothing reporting a bound import) the
-/// copying rails carried the whole workload — every type-5 view, every type-11
+/// copying rails carried the whole workload — every ref-texture view, every mapper-ref-texture
 /// resident rung and every surface flush of the drag — and **no window failed to
 /// resolve**. Every bind came from a published descriptor, so the estimate above
 /// is the state before the guest fills one rather than a rung this device leans
@@ -253,13 +253,13 @@ fn sample_window(
     sample_window_from_device_desc(Some(desc), plane_index, format, width, height)
 }
 
-/// Resolve the sample window for a type-11 texture binding on a mapping.
+/// Resolve the sample window for a mapper-ref-texture binding on a mapping.
 ///
-/// Type-11 is the case with **no wire plane index**: nothing on the wire names
+/// Mapper-ref-texture is the case with **no wire plane index**: nothing on the wire names
 /// which plane the texture wants, so a multi-plane surface is resolved by
 /// matching width, height and bytes-per-element, and the plane is taken only
 /// when exactly one matches. See [`sample_window`] for what each outcome means.
-pub fn type11_sample_window(
+pub fn mapper_ref_texture_sample_window(
     m: &MappingEntry,
     width: u32,
     height: u32,
@@ -268,17 +268,17 @@ pub fn type11_sample_window(
     sample_window(m, None, width, height, format)
 }
 
-/// Resolve the sample window for a type-5 serialized view, which — unlike
-/// type-11 — carries the IOSurface plane index on the wire (type-5 record
+/// Resolve the sample window for a ref-texture serialized view, which — unlike
+/// mapper-ref-texture — carries the IOSurface plane index on the wire (ref-texture record
 /// `+0x20`).
 ///
-/// Every type-5 consumer must come through here rather than through
-/// [`type11_sample_window`], and the distinction is not cosmetic: the wire index
+/// Every ref-texture consumer must come through here rather than through
+/// [`mapper_ref_texture_sample_window`], and the distinction is not cosmetic: the wire index
 /// names the plane record directly, and it is the only key that separates
-/// same-geometry planes. Handing a type-5 view's geometry to the type-11 scan
+/// same-geometry planes. Handing a ref-texture view's geometry to the mapper-ref-texture scan
 /// drops that index, so a bind the wire said was alpha resolves against
 /// whichever same-geometry plane the scan happens to reach.
-pub fn type5_sample_window(
+pub fn ref_texture_sample_window(
     m: &MappingEntry,
     plane_index: u32,
     width: u32,
@@ -378,7 +378,7 @@ fn vouch_for_write<M: HostMemory + HostOps>(
 /// PFNs, cached on the mapping and returned again on every later call. Its own
 /// doc states the contract — "always revalidate first so a cached contig never
 /// aliases PFNs after ReplacePhysical / guest recycle" — but the revalidation it
-/// names cannot deliver that for a type-4 surface: with no `MappingInternal` it
+/// names cannot deliver that for a backing record: with no `MappingInternal` it
 /// re-resolves nothing and answers "resolvable" on a non-empty list alone. So a
 /// writer holding this pointer is holding whatever those PFNs became, and a
 /// full white frame poked through it is the `0xff`-filled freed guest heap the
@@ -652,7 +652,7 @@ pub fn write_bgra8_uncached<M: HostMemory + HostOps>(
 /// plane itself, from the mapping's own declaration, through the same two steps
 /// this function performs. A caller that already holds its own idea of the
 /// destination plane — the blit rail resolves one out of the guest's texture
-/// descriptor, and a type-5 view carries a **wire plane index** this rail has no
+/// descriptor, and a ref-texture view carries a **wire plane index** this rail has no
 /// parameter for — must compare the two before routing a copy here, because a
 /// disagreement is not an error anywhere: the frame lands, in the wrong plane of
 /// the right surface, and the only symptom is the next plane's pixels.
@@ -666,7 +666,7 @@ pub fn resident_gpu_plane(m: &MappingEntry, width: u32, height: u32) -> Option<(
     if mw != width || mh != height {
         return None;
     }
-    let (base_off, bpr, _span_end) = type11_sample_window(m, mw, mh, format)?;
+    let (base_off, bpr, _span_end) = mapper_ref_texture_sample_window(m, mw, mh, format)?;
     Some((base_off, bpr, format))
 }
 
@@ -688,7 +688,7 @@ fn mapping_write_geometry(m: &MappingEntry, width: u32, height: u32) -> (u32, u3
 /// The Metal pixel format a Store into this mapping's plane must land in.
 ///
 /// A mapping that has declared its own geometry owns this, and a zero format
-/// there means guest scanout order — the format every type-11 plane had before
+/// there means guest scanout order — the format every mapper-ref-texture plane had before
 /// any of them declared otherwise, so it is the contract's default and not a
 /// guess. A mapping that has declared no geometry has declared no format either.
 ///
@@ -760,7 +760,8 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             },
         );
     }
-    let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mw, mh, format) else {
+    let Some((base_off, bpr_u32, span_end)) = mapper_ref_texture_sample_window(m, mw, mh, format)
+    else {
         return refuse(
             mapping_id,
             SurfaceWriteRefusal::WindowUnresolved {
@@ -1056,7 +1057,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
         // complete copy of this surface and no host-side copy of `src` is its
         // content any more. Both of them have to be told so.
         //
-        // The byte cache would answer the type-11 LOAD seed, which prefers it
+        // The byte cache would answer the mapper-ref-texture LOAD seed, which prefers it
         // over the surface's own pages, and hand back exactly the bytes the
         // guest's stores were preserved *from*.
         crate::runtime::surface_cache::forget(state, mapping_id);
@@ -1125,7 +1126,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     );
     // This write just made the host copy and the guest pages agree, so it is the
     // moment the copy's currency can be pinned. Nothing else arms this mapping:
-    // the type-4 sampled ladder's first census read `gw_no_stamp` 14 092 against
+    // the backing sampled ladder's first census read `gw_no_stamp` 14 092 against
     // `gw_clean` 0 because only the Vulkan Store rails ever stamped, and the
     // copy that rung serves is written here. Unstamped, the reader cannot tell a
     // surface the guest has rewritten from one it has not, and must assume the
@@ -1134,9 +1135,9 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     true
 }
 
-/// Write a tight RGBA8 image into a type-11 mapping, optionally as changed-spans.
+/// Write a tight RGBA8 image into a mapper-ref-texture mapping, optionally as changed-spans.
 ///
-/// Archive `apple_pv_gpu_write_type11_image_changed`: when `seed_rgba` is present
+/// Archive `apple_pv_gpu_write_mapper_ref_texture_image_changed`: when `seed_rgba` is present
 /// (same layout as `rgba`), only contiguous native-format spans that differ from
 /// the seed are written. Equivalent to a full `storeAction=Store` when the seed
 /// was the Metal Load attachment content (unchanged texels match guest), without
@@ -1195,7 +1196,8 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
             },
         );
     }
-    let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mw, mh, format) else {
+    let Some((base_off, bpr_u32, span_end)) = mapper_ref_texture_sample_window(m, mw, mh, format)
+    else {
         return refuse(
             mapping_id,
             SurfaceWriteRefusal::WindowUnresolved {
@@ -1359,7 +1361,7 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     crate::runtime::surface_cache::store(state, mapping_id, mw, mh, cache);
     // This write just made the host copy and the guest pages agree, so it is the
     // moment the copy's currency can be pinned. Nothing else arms this mapping:
-    // the type-4 sampled ladder's first census read `gw_no_stamp` 14 092 against
+    // the backing sampled ladder's first census read `gw_no_stamp` 14 092 against
     // `gw_clean` 0 because only the Vulkan Store rails ever stamped, and the
     // copy that rung serves is written here. Unstamped, the reader cannot tell a
     // surface the guest has rewritten from one it has not, and must assume the
@@ -1385,7 +1387,7 @@ fn rgba8_row_to_native(format: u16, rgba_row: &[u8], width: u32, native: &mut [u
     convert_rgba8_to_row(format, rgba_row, width, native)
 }
 
-/// Write rows already encoded as a type-11 mapping's native pixel format.
+/// Write rows already encoded as a mapper-ref-texture mapping's native pixel format.
 ///
 /// Unlike [`write_raw_rows`], this resolves the texture's sample window inside
 /// an IOSurface allocation: its base offset and row pitch come from the mapping
@@ -1471,7 +1473,9 @@ pub fn write_native_image<M: HostMemory + HostOps>(
             },
         );
     }
-    let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, mapping_format) else {
+    let Some((base_off, bpr, span_end)) =
+        mapper_ref_texture_sample_window(m, mw, mh, mapping_format)
+    else {
         return refuse(
             mapping_id,
             SurfaceWriteRefusal::WindowUnresolved {
@@ -1702,11 +1706,11 @@ pub fn read_raw_rows<M: HostMemory + HostOps>(
 ///
 /// The resolution [`read_rect_raw`] and [`write_rect_raw`] share: the latched
 /// format (BGRA8 when the mapping never declared one), the plane window
-/// [`type11_sample_window`] decodes for it, and the texel size. Returns
+/// [`mapper_ref_texture_sample_window`] decodes for it, and the texel size. Returns
 /// `(base_offset, bytes_per_row, span_end, bytes_per_texel)`, or `None` when
 /// the mapping is gone, carries no latched geometry, has no decodable window,
 /// has an unknown format, or the rectangle leaves the surface.
-/// Where a mapped type-11 surface's texels sit, and how wide one is.
+/// Where a mapped mapper-ref-texture surface's texels sit, and how wide one is.
 ///
 /// `mapping_geom_window` used to return this as `Option<(u64, u32, u64, u32)>`,
 /// a shape whose meaning existed only in the destructuring patterns of the two
@@ -1754,7 +1758,7 @@ fn mapping_geom_window(state: &DeviceState, mapping_id: u32, rect: Rect) -> Opti
     } else {
         MTL_FORMAT_BGRA8_UNORM
     };
-    let (base_off, bpr, span_end) = type11_sample_window(m, m.width, m.height, format)?;
+    let (base_off, bpr, span_end) = mapper_ref_texture_sample_window(m, m.width, m.height, format)?;
     let bpp = pixel_format::bytes_per_pixel(format)?;
     if origin_x.saturating_add(width) > m.width || origin_y.saturating_add(height) > m.height {
         return None;
@@ -1767,7 +1771,7 @@ fn mapping_geom_window(state: &DeviceState, mapping_id: u32, rect: Rect) -> Opti
     })
 }
 
-/// Read a rectangular texel region from a mapped type-11 IOSurface.
+/// Read a rectangular texel region from a mapped mapper-ref-texture IOSurface.
 /// Contig HostOps view when possible; else multi-import.
 #[cfg(test)]
 pub fn read_rect_raw<M: HostMemory + HostOps>(
@@ -1822,10 +1826,10 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     // paths below was ever covered. The fragmented path ends in
     // `read_mapping_bytes`, which flushes; the `contig_for_span` path is a raw
     // `copy_nonoverlapping` out of the mapped span and flushes nothing — so
-    // whether a type-11 surface read observed the deferred Store depended on
+    // whether a mapper-ref-texture surface read observed the deferred Store depended on
     // whether its guest pages happened to be contiguous. Three callers read
-    // guest pages through here with no flush of their own: the type-5 view
-    // loader, a blit reading a type-11 texture backing, and the compute sample
+    // guest pages through here with no flush of their own: the ref-texture view
+    // loader, a blit reading a mapper-ref-texture backing, and the compute sample
     // stage.
     //
     // `flush_intersecting` returns immediately when nothing is armed, so this
@@ -1873,7 +1877,7 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     // arm was bounded anyway — which is true, but only by its own slice bounds:
     // that arm reads the window and then indexes rows into it, so an overrunning
     // rect came back as a bare `false` from a `get` that returned `None`. Both
-    // callers do name that (`rd_row_t11_io`, `Type5ViewDecline::Read`), so it was
+    // callers do name that (`rd_row_t11_io`, `RefTextureViewDecline::Read`), so it was
     // never a silent loss, but neither can say the rect left the window, and the
     // fragmented arm is the one a driven x86 boot actually takes. One check above
     // the split gives both arms the same refusal and the same line.
@@ -1989,9 +1993,9 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     true
 }
 
-/// Write a rectangular texel region into a mapped type-11 IOSurface.
+/// Write a rectangular texel region into a mapped mapper-ref-texture IOSurface.
 ///
-/// Uses latched mapping geom + [`type11_sample_window`]. Prefer
+/// Uses latched mapping geom + [`mapper_ref_texture_sample_window`]. Prefer
 /// [`write_rect_raw_at`] for an explicit plane window.
 #[allow(
     clippy::too_many_arguments,

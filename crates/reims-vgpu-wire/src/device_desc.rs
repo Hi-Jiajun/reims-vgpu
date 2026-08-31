@@ -1,5 +1,7 @@
-//! Device-side descriptors reached by GVA: the type-4 surface backing record
-//! and the type-5 reference-texture handle.
+//! Device-side descriptors reached by GVA: the backing record
+//! (`APVObjectType` 4) and the ref-texture handle (5). Both are x86-only —
+//! an arm64 guest reaches an IOSurface through the mapper-ref texture (11)
+//! instead. See `runtime::decode::resource` for the tag table.
 //!
 //! # Provenance
 //!
@@ -26,7 +28,7 @@
 //! Align-1 views with fallible constructors are worth as much on an unverified
 //! format as on a verified one: the bytes are guest-controlled either way.
 //!
-//! # Type-4 — surface backing (`allocateBackingHandle`)
+//! # Backing — surface backing (`allocateBackingHandle`)
 //!
 //! ```text
 //! +0x00  u64  length          byte length of the backing
@@ -44,10 +46,10 @@
 //! available; they are not *known* to be padding, which is why the device still
 //! reports the undecoded span rather than shrinking the record around it.
 //!
-//! # Type-5 — reference texture handle (`allocateRefTextureHandle`)
+//! # Ref-texture — reference texture handle (`allocateRefTextureHandle`)
 //!
 //! ```text
-//! +0x00  u32  surface_id      IOSurface::getSurfaceID() = the type-4 object id
+//! +0x00  u32  surface_id      IOSurface::getSurfaceID() = the backing object id
 //! +0x04  u32  owner_task      task whose object list holds that surface
 //! +0x08       args            serialized texture args, length desc_len - 8
 //! ```
@@ -57,7 +59,7 @@
 //! ```text
 //! +0x00  u32  kind            0x2f observed
 //! +0x04  u32  blob_len        == desc_len - 8
-//! +0x08  u32  own_ref         the type-5 object's own ref
+//! +0x08  u32  own_ref         the ref-texture object's own ref
 //! +0x0c       record          the serialized plane/view texture record
 //! ```
 //!
@@ -81,19 +83,19 @@
 use crate::le::{U16le, U32le, U64le};
 use crate::view::{view, view_at, Wire, WireError};
 
-/// Wire object type for surface / IOSurface backing.
-pub const OBJECT_TYPE_SURFACE: u8 = 4;
-/// Wire object type for a reference-texture handle.
+/// Wire object type for an IOSurface backing record (`APVObjectBacking`).
+pub const OBJECT_TYPE_BACKING: u8 = 4;
+/// Wire object type for a ref-texture handle (`APVObjectRefTexture`).
 pub const OBJECT_TYPE_REF_TEXTURE: u8 = 5;
 
-/// Header of a type-4 surface backing descriptor, up to the plane array.
+/// Header of a backing descriptor, up to the plane array.
 ///
 /// `plane_count` is `u8` on the wire and the three bytes after it are the
 /// undecoded interior the module doc describes — they are part of this struct
 /// so that `size_of` is the offset of plane 0 and the two cannot drift.
 #[repr(C)]
 #[derive(Debug)]
-pub struct Type4SurfaceHeader {
+pub struct BackingHeader {
     /// Byte length of the backing. Zero is not a surface this device accepts.
     pub length: U64le,
     /// First guest page frame of the backing. Zero is not a surface either;
@@ -115,28 +117,28 @@ pub struct Type4SurfaceHeader {
 }
 
 // SAFETY: align-1 `le` scalars plus `u8`, which is align-1 and all-bytes-valid.
-unsafe impl Wire for Type4SurfaceHeader {}
+unsafe impl Wire for BackingHeader {}
 
-/// One type-4 plane record.
+/// One backing plane record.
 #[repr(C)]
 #[derive(Debug)]
-pub struct Type4PlaneRecord {
+pub struct BackingPlaneRecord {
     /// Byte offset of the plane within the backing.
     pub offset: U32le,
     pub width: U32le,
     pub height: U32le,
     /// `getPlaneBytesPerRow` in the low 24 bits, `getPlaneBytesPerElement` in
     /// the high 8. Packed on the wire, so the two are read through
-    /// [`Type4PlaneRecord::bytes_per_row`] and
-    /// [`Type4PlaneRecord::bytes_per_element`] rather than by masking at each
+    /// [`BackingPlaneRecord::bytes_per_row`] and
+    /// [`BackingPlaneRecord::bytes_per_element`] rather than by masking at each
     /// call site.
     pub packed_bpr: U32le,
 }
 
 // SAFETY: four align-1 all-bytes-valid `le` scalars.
-unsafe impl Wire for Type4PlaneRecord {}
+unsafe impl Wire for BackingPlaneRecord {}
 
-impl Type4PlaneRecord {
+impl BackingPlaneRecord {
     /// Low 24 bits of `packed_bpr`.
     pub fn bytes_per_row(&self) -> u32 {
         self.packed_bpr.get() & 0x00ff_ffff
@@ -153,42 +155,42 @@ impl Type4PlaneRecord {
 /// cap. A descriptor declaring more is corrupt, not wider.
 pub const TYPE4_PLANE_CAP: usize = 8;
 
-/// Byte stride between type-4 plane records.
-pub const TYPE4_PLANE_STRIDE: usize = core::mem::size_of::<Type4PlaneRecord>();
+/// Byte stride between backing plane records.
+pub const TYPE4_PLANE_STRIDE: usize = core::mem::size_of::<BackingPlaneRecord>();
 
 /// Offset of plane 0, i.e. the length of the header before it.
-pub const TYPE4_PLANES: usize = core::mem::size_of::<Type4SurfaceHeader>();
+pub const TYPE4_PLANES: usize = core::mem::size_of::<BackingHeader>();
 
-/// Shortest type-4 descriptor that carries a header and one plane.
+/// Shortest backing descriptor that carries a header and one plane.
 pub const TYPE4_MIN_LEN: usize = TYPE4_PLANES + TYPE4_PLANE_STRIDE;
 
-/// Byte length of a type-4 descriptor declaring `plane_count` planes.
+/// Byte length of a backing descriptor declaring `plane_count` planes.
 ///
 /// The device's own census reads this as exact for every descriptor it has
 /// seen: `len` is the header plus the declared planes, with nothing after.
-pub const fn type4_len_for(plane_count: usize) -> usize {
+pub const fn backing_len_for(plane_count: usize) -> usize {
     TYPE4_PLANES + plane_count * TYPE4_PLANE_STRIDE
 }
 
-/// View the header of a type-4 surface descriptor.
-pub fn type4_header(desc: &[u8]) -> Result<&Type4SurfaceHeader, WireError> {
-    view::<Type4SurfaceHeader>(desc)
+/// View the header of a backing record descriptor.
+pub fn backing_header(desc: &[u8]) -> Result<&BackingHeader, WireError> {
+    view::<BackingHeader>(desc)
 }
 
-/// View plane `index` of a type-4 surface descriptor.
+/// View plane `index` of a backing record descriptor.
 ///
 /// Fails rather than truncating when the blob does not reach the record: a
 /// declared plane whose bytes are absent is a descriptor this device could not
 /// decode, not a plane of zero size.
-pub fn type4_plane(desc: &[u8], index: usize) -> Result<&Type4PlaneRecord, WireError> {
-    view_at::<Type4PlaneRecord>(desc, TYPE4_PLANES + index * TYPE4_PLANE_STRIDE)
+pub fn backing_plane(desc: &[u8], index: usize) -> Result<&BackingPlaneRecord, WireError> {
+    view_at::<BackingPlaneRecord>(desc, TYPE4_PLANES + index * TYPE4_PLANE_STRIDE)
 }
 
-/// Header of a type-5 reference-texture descriptor.
+/// Header of a ref-texture descriptor.
 #[repr(C)]
 #[derive(Debug)]
-pub struct Type5Header {
-    /// `IOSurface::getSurfaceID()` — the type-4 heap object id this handle
+pub struct RefTextureHeader {
+    /// `IOSurface::getSurfaceID()` — the backing heap object id this handle
     /// references.
     pub surface_id: U32le,
     /// The task whose object list holds that surface.
@@ -203,41 +205,41 @@ pub struct Type5Header {
 }
 
 // SAFETY: two align-1 all-bytes-valid `le` scalars.
-unsafe impl Wire for Type5Header {}
+unsafe impl Wire for RefTextureHeader {}
 
-/// Offset of `surface_id` within a type-5 descriptor.
+/// Offset of `surface_id` within a ref-texture descriptor.
 ///
 /// Derived from the view rather than stated, so a fixture carrying live wire
 /// bytes can name the field without restating the layout. Fixtures keep their
 /// literal bytes on purpose — they are what the guest emitted, and bytes
 /// assembled to satisfy the reader would agree with it whether or not it is
 /// right — but the *offsets they index by* must still come from one place.
-pub const TYPE5_SURFACE_ID: usize = core::mem::offset_of!(Type5Header, surface_id);
-/// Offset of `owner_task` within a type-5 descriptor. See
+pub const TYPE5_SURFACE_ID: usize = core::mem::offset_of!(RefTextureHeader, surface_id);
+/// Offset of `owner_task` within a ref-texture descriptor. See
 /// [`TYPE5_SURFACE_ID`].
-pub const TYPE5_OWNER_TASK: usize = core::mem::offset_of!(Type5Header, owner_task);
+pub const TYPE5_OWNER_TASK: usize = core::mem::offset_of!(RefTextureHeader, owner_task);
 
-/// Offset of the serialized args blob within a type-5 descriptor.
-pub const TYPE5_ARGS: usize = core::mem::size_of::<Type5Header>();
+/// Offset of the serialized args blob within a ref-texture descriptor.
+pub const TYPE5_ARGS: usize = core::mem::size_of::<RefTextureHeader>();
 
-/// Header of the type-5 args blob.
+/// Header of the ref-texture args blob.
 #[repr(C)]
 #[derive(Debug)]
-pub struct Type5ArgsHeader {
+pub struct RefTextureArgsHeader {
     /// Kind tag. `0x2f` observed.
     pub kind: U32le,
     /// Blob length, observed equal to `desc_len - TYPE5_ARGS`.
     pub blob_len: U32le,
-    /// The type-5 object's own ref, the same convention the type-11 texture
+    /// The ref-texture object's own ref, the same convention the mapper-ref-texture
     /// descriptor uses for its object-ref field.
     pub own_ref: U32le,
 }
 
 // SAFETY: three align-1 all-bytes-valid `le` scalars.
-unsafe impl Wire for Type5ArgsHeader {}
+unsafe impl Wire for RefTextureArgsHeader {}
 
-/// Offset of the serialized texture record within a type-5 descriptor.
-pub const TYPE5_ARG_RECORD: usize = TYPE5_ARGS + core::mem::size_of::<Type5ArgsHeader>();
+/// Offset of the serialized texture record within a ref-texture descriptor.
+pub const TYPE5_ARG_RECORD: usize = TYPE5_ARGS + core::mem::size_of::<RefTextureArgsHeader>();
 
 /// Record tag for an IOSurface plane view.
 pub const TYPE5_RECORD_TAG_PLANE: u8 = 0x42;
@@ -248,7 +250,7 @@ pub const TYPE5_RECORD_TAG_PLANE: u8 = 0x42;
 /// same view.
 pub const TYPE5_RECORD_TAG_COLOR_VIEW: u8 = 0x62;
 
-/// The serialized texture record inside a type-5 args blob, to the end of
+/// The serialized texture record inside a ref-texture args blob, to the end of
 /// `depth`.
 ///
 /// `plane_index` is deliberately not a field: it sits at
@@ -257,7 +259,7 @@ pub const TYPE5_RECORD_TAG_COLOR_VIEW: u8 = 0x62;
 /// it.
 #[repr(C)]
 #[derive(Debug)]
-pub struct Type5TextureRecord {
+pub struct RefTextureRecord {
     /// [`TYPE5_RECORD_TAG_PLANE`] or [`TYPE5_RECORD_TAG_COLOR_VIEW`]. Any other
     /// value is an unknown record: fail closed rather than invent geometry.
     pub tag: u8,
@@ -271,19 +273,19 @@ pub struct Type5TextureRecord {
 }
 
 // SAFETY: two `u8` and three align-1 `le` scalars, all bytes valid.
-unsafe impl Wire for Type5TextureRecord {}
+unsafe impl Wire for RefTextureRecord {}
 
-impl Type5TextureRecord {
+impl RefTextureRecord {
     /// Whether the tag is one of the two forms this device decodes.
     pub fn tag_is_known(&self) -> bool {
         self.tag == TYPE5_RECORD_TAG_PLANE || self.tag == TYPE5_RECORD_TAG_COLOR_VIEW
     }
 }
 
-/// Bytes of a type-5 texture record up to and including `depth`.
-pub const TYPE5_RECORD_MIN_LEN: usize = core::mem::size_of::<Type5TextureRecord>();
+/// Bytes of a ref-texture record up to and including `depth`.
+pub const TYPE5_RECORD_MIN_LEN: usize = core::mem::size_of::<RefTextureRecord>();
 
-/// Offset of the plane index within a type-5 texture record.
+/// Offset of the plane index within a ref-texture record.
 ///
 /// The `newTextureWithDescriptor:iosurface:plane:` plane argument. A live
 /// three-plane census settles it: Y blobs carry 0, the RG8 chroma blob carries
@@ -291,27 +293,27 @@ pub const TYPE5_RECORD_MIN_LEN: usize = core::mem::size_of::<Type5TextureRecord>
 /// tell Y from alpha, so this field is the only wire key for it.
 pub const TYPE5_RECORD_PLANE: usize = 0x20;
 
-/// View the header of a type-5 descriptor.
-pub fn type5_header(desc: &[u8]) -> Result<&Type5Header, WireError> {
-    view::<Type5Header>(desc)
+/// View the header of a ref-texture descriptor.
+pub fn ref_texture_header(desc: &[u8]) -> Result<&RefTextureHeader, WireError> {
+    view::<RefTextureHeader>(desc)
 }
 
-/// View the serialized texture record of a type-5 descriptor.
-pub fn type5_texture_record(desc: &[u8]) -> Result<&Type5TextureRecord, WireError> {
-    view_at::<Type5TextureRecord>(desc, TYPE5_ARG_RECORD)
+/// View the serialized texture record of a ref-texture descriptor.
+pub fn ref_texture_record(desc: &[u8]) -> Result<&RefTextureRecord, WireError> {
+    view_at::<RefTextureRecord>(desc, TYPE5_ARG_RECORD)
 }
 
-/// The plane index a type-5 descriptor's record names, when it carries one.
+/// The plane index a ref-texture descriptor's record names, when it carries one.
 ///
 /// `None` for a blob that stops before the field — pre-plane descriptors and
 /// test fixtures — which the caller reads as plane 0.
-pub fn type5_record_plane_index(desc: &[u8]) -> Option<u32> {
+pub fn ref_texture_record_plane_index(desc: &[u8]) -> Option<u32> {
     view_at::<U32le>(desc, TYPE5_ARG_RECORD + TYPE5_RECORD_PLANE)
         .ok()
         .map(|w| w.get())
 }
 
-/// Assemble a type-4 descriptor by the format's own rules, for tests.
+/// Assemble a backing descriptor by the format's own rules, for tests.
 ///
 /// The counterpart of [`crate::page_table::Builder`], and here for the same
 /// reason: a test that writes `st64(&mut desc[TYPE4_LEN..], ..)` is writing
@@ -322,16 +324,16 @@ pub fn type5_record_plane_index(desc: &[u8]) -> Option<u32> {
 /// It is deliberately not `cfg(test)`: `reims-vgpu`'s own tests are a different
 /// crate's, and they are the ones that were spelling the offsets.
 #[derive(Debug)]
-pub struct Type4Builder {
+pub struct BackingBuilder {
     bytes: [u8; TYPE4_BUILDER_CAP],
     len: usize,
 }
 
-/// Longest descriptor [`Type4Builder`] can assemble: header plus every plane
+/// Longest descriptor [`BackingBuilder`] can assemble: header plus every plane
 /// IOSurface can declare.
 pub const TYPE4_BUILDER_CAP: usize = TYPE4_PLANES + TYPE4_PLANE_CAP * TYPE4_PLANE_STRIDE;
 
-impl Type4Builder {
+impl BackingBuilder {
     /// A descriptor with a header and room for `planes` plane records.
     ///
     /// `plane_count` is written as given, including a value over
@@ -347,7 +349,7 @@ impl Type4Builder {
         bytes[0x10] = plane_count;
         Self {
             bytes,
-            len: type4_len_for(reserve),
+            len: backing_len_for(reserve),
         }
     }
 
@@ -388,26 +390,26 @@ impl Type4Builder {
     }
 }
 
-/// Assemble a type-5 descriptor by the format's own rules, for tests.
+/// Assemble a ref-texture descriptor by the format's own rules, for tests.
 ///
-/// Same purpose as [`Type4Builder`]: the descriptor's three nested headers were
+/// Same purpose as [`BackingBuilder`]: the descriptor's three nested headers were
 /// being written by hand at their offsets, which is the reader's own arithmetic
 /// spelled a second time.
 #[derive(Debug)]
-pub struct Type5Builder {
+pub struct RefTextureBuilder {
     bytes: [u8; TYPE5_BUILDER_CAP],
     len: usize,
 }
 
-/// Longest descriptor [`Type5Builder`] assembles: through the plane index.
+/// Longest descriptor [`RefTextureBuilder`] assembles: through the plane index.
 pub const TYPE5_BUILDER_CAP: usize = TYPE5_ARG_RECORD + TYPE5_RECORD_PLANE + 4;
 
-impl Type5Builder {
+impl RefTextureBuilder {
     /// A descriptor naming `surface_id`, owned by `owner_task`, whose args
     /// blob carries a texture record of `tag`.
     ///
     /// The blob length is written as the args bytes actually present, which is
-    /// what the live wire carries; use [`Type5Builder::with_len`] to produce a
+    /// what the live wire carries; use [`RefTextureBuilder::with_len`] to produce a
     /// descriptor that disagrees with itself.
     pub fn new(surface_id: u32, owner_task: u32, own_ref: u32, tag: u8) -> Self {
         let mut bytes = [0u8; TYPE5_BUILDER_CAP];
@@ -433,7 +435,7 @@ impl Type5Builder {
     }
 
     /// Write the record's undecoded byte at `+0x01`, for the same reason as
-    /// [`Type5Builder::trailer`].
+    /// [`RefTextureBuilder::trailer`].
     pub fn unknown(mut self, unknown: u8) -> Self {
         self.bytes[TYPE5_ARG_RECORD + 0x01] = unknown;
         self
@@ -479,16 +481,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn what_the_type5_builder_writes_is_what_the_views_read() {
-        let d = Type5Builder::new(77, 0, 4242, TYPE5_RECORD_TAG_COLOR_VIEW)
+    fn what_the_ref_texture_builder_writes_is_what_the_views_read() {
+        let d = RefTextureBuilder::new(77, 0, 4242, TYPE5_RECORD_TAG_COLOR_VIEW)
             .geometry(80, 1024, 768, 1)
             .plane_index(2);
         let desc = d.bytes();
 
-        let h = type5_header(desc).expect("header");
+        let h = ref_texture_header(desc).expect("header");
         assert_eq!((h.surface_id.get(), h.owner_task.get()), (77, 0));
 
-        let args = view_at::<Type5ArgsHeader>(desc, TYPE5_ARGS).expect("args header");
+        let args = view_at::<RefTextureArgsHeader>(desc, TYPE5_ARGS).expect("args header");
         assert_eq!(args.kind.get(), 0x2f);
         assert_eq!(args.own_ref.get(), 4242);
         assert_eq!(
@@ -497,7 +499,7 @@ mod tests {
             "the blob length is the args bytes present, which is what the wire carries"
         );
 
-        let rec = type5_texture_record(desc).expect("record");
+        let rec = ref_texture_record(desc).expect("record");
         assert!(rec.tag_is_known());
         assert_eq!(
             (
@@ -508,27 +510,27 @@ mod tests {
             ),
             (80, 1024, 768, 1)
         );
-        assert_eq!(type5_record_plane_index(desc), Some(2));
+        assert_eq!(ref_texture_record_plane_index(desc), Some(2));
     }
 
     /// The builder writes what the views read — the only thing that makes
     /// either of them worth anything.
     #[test]
     fn what_the_builder_writes_is_what_the_views_read() {
-        let d = Type4Builder::new(0x8000, 0x1234, 0x4247_5241, 2)
+        let d = BackingBuilder::new(0x8000, 0x1234, 0x4247_5241, 2)
             .plane(0, 0, 1920, 1080, 1920 * 4, 4)
             .plane(1, 0x1000, 960, 540, 960 * 2, 2);
         let desc = d.bytes();
-        assert_eq!(desc.len(), type4_len_for(2));
+        assert_eq!(desc.len(), backing_len_for(2));
 
-        let h = type4_header(desc).expect("header");
+        let h = backing_header(desc).expect("header");
         assert_eq!(h.length.get(), 0x8000);
         assert_eq!(h.backing_pfn.get(), 0x1234);
         assert_eq!(h.pixel_format.get(), 0x4247_5241);
         assert_eq!(h.plane_count, 2);
         assert_eq!(h.reserved, [0, 0, 0]);
 
-        let p0 = type4_plane(desc, 0).expect("plane 0");
+        let p0 = backing_plane(desc, 0).expect("plane 0");
         assert_eq!(
             (
                 p0.offset.get(),
@@ -539,7 +541,7 @@ mod tests {
             ),
             (0, 1920, 1080, 1920 * 4, 4)
         );
-        let p1 = type4_plane(desc, 1).expect("plane 1");
+        let p1 = backing_plane(desc, 1).expect("plane 1");
         assert_eq!(
             (
                 p1.offset.get(),
@@ -551,17 +553,17 @@ mod tests {
             (0x1000, 960, 540, 960 * 2, 2)
         );
         // Plane 2 was never reserved, so its record is off the end.
-        assert!(type4_plane(desc, 2).is_err());
+        assert!(backing_plane(desc, 2).is_err());
     }
 
     /// A plane count the guest could not honestly mean is written as given.
     #[test]
     fn the_builder_writes_an_over_cap_plane_count_without_clamping_it() {
-        let d = Type4Builder::new(0x1000, 0x100, 0x4247_5241, 12);
-        assert_eq!(type4_header(d.bytes()).expect("header").plane_count, 12);
+        let d = BackingBuilder::new(0x1000, 0x100, 0x4247_5241, 12);
+        assert_eq!(backing_header(d.bytes()).expect("header").plane_count, 12);
         assert_eq!(
             d.bytes().len(),
-            type4_len_for(TYPE4_PLANE_CAP),
+            backing_len_for(TYPE4_PLANE_CAP),
             "the bytes stop at the cap even when the count does not"
         );
     }
@@ -578,31 +580,31 @@ mod tests {
     fn the_layout_matches_the_offsets_the_device_contract_states() {
         use core::mem::offset_of;
 
-        assert_eq!(offset_of!(Type4SurfaceHeader, length), 0x00);
-        assert_eq!(offset_of!(Type4SurfaceHeader, backing_pfn), 0x08);
-        assert_eq!(offset_of!(Type4SurfaceHeader, pixel_format), 0x0c);
-        assert_eq!(offset_of!(Type4SurfaceHeader, plane_count), 0x10);
-        assert_eq!(offset_of!(Type4SurfaceHeader, reserved), 0x11);
+        assert_eq!(offset_of!(BackingHeader, length), 0x00);
+        assert_eq!(offset_of!(BackingHeader, backing_pfn), 0x08);
+        assert_eq!(offset_of!(BackingHeader, pixel_format), 0x0c);
+        assert_eq!(offset_of!(BackingHeader, plane_count), 0x10);
+        assert_eq!(offset_of!(BackingHeader, reserved), 0x11);
         assert_eq!(TYPE4_PLANES, 0x14);
         assert_eq!(TYPE4_PLANE_STRIDE, 0x10);
         assert_eq!(TYPE4_MIN_LEN, 0x24);
-        assert_eq!(offset_of!(Type4PlaneRecord, offset), 0x00);
-        assert_eq!(offset_of!(Type4PlaneRecord, width), 0x04);
-        assert_eq!(offset_of!(Type4PlaneRecord, height), 0x08);
-        assert_eq!(offset_of!(Type4PlaneRecord, packed_bpr), 0x0c);
+        assert_eq!(offset_of!(BackingPlaneRecord, offset), 0x00);
+        assert_eq!(offset_of!(BackingPlaneRecord, width), 0x04);
+        assert_eq!(offset_of!(BackingPlaneRecord, height), 0x08);
+        assert_eq!(offset_of!(BackingPlaneRecord, packed_bpr), 0x0c);
 
-        assert_eq!(offset_of!(Type5Header, surface_id), 0x00);
-        assert_eq!(offset_of!(Type5Header, owner_task), 0x04);
+        assert_eq!(offset_of!(RefTextureHeader, surface_id), 0x00);
+        assert_eq!(offset_of!(RefTextureHeader, owner_task), 0x04);
         assert_eq!(TYPE5_ARGS, 0x08);
-        assert_eq!(offset_of!(Type5ArgsHeader, kind), 0x00);
-        assert_eq!(offset_of!(Type5ArgsHeader, blob_len), 0x04);
-        assert_eq!(offset_of!(Type5ArgsHeader, own_ref), 0x08);
+        assert_eq!(offset_of!(RefTextureArgsHeader, kind), 0x00);
+        assert_eq!(offset_of!(RefTextureArgsHeader, blob_len), 0x04);
+        assert_eq!(offset_of!(RefTextureArgsHeader, own_ref), 0x08);
         assert_eq!(TYPE5_ARG_RECORD, 0x14);
-        assert_eq!(offset_of!(Type5TextureRecord, tag), 0x00);
-        assert_eq!(offset_of!(Type5TextureRecord, pixel_format), 0x02);
-        assert_eq!(offset_of!(Type5TextureRecord, width), 0x04);
-        assert_eq!(offset_of!(Type5TextureRecord, height), 0x08);
-        assert_eq!(offset_of!(Type5TextureRecord, depth), 0x0c);
+        assert_eq!(offset_of!(RefTextureRecord, tag), 0x00);
+        assert_eq!(offset_of!(RefTextureRecord, pixel_format), 0x02);
+        assert_eq!(offset_of!(RefTextureRecord, width), 0x04);
+        assert_eq!(offset_of!(RefTextureRecord, height), 0x08);
+        assert_eq!(offset_of!(RefTextureRecord, depth), 0x0c);
         assert_eq!(TYPE5_RECORD_MIN_LEN, 0x10);
     }
 
@@ -615,22 +617,22 @@ mod tests {
     #[test]
     fn a_short_descriptor_is_refused_rather_than_read_past() {
         let desc = [0u8; 0x40];
-        assert!(type4_header(&desc[..TYPE4_PLANES]).is_ok());
-        assert!(type4_header(&desc[..TYPE4_PLANES - 1]).is_err());
-        assert!(type4_plane(&desc[..TYPE4_MIN_LEN], 0).is_ok());
-        assert!(type4_plane(&desc[..TYPE4_MIN_LEN - 1], 0).is_err());
-        assert!(type4_plane(&desc, 1).is_ok());
-        assert!(type4_plane(&desc[..TYPE4_MIN_LEN], 1).is_err());
+        assert!(backing_header(&desc[..TYPE4_PLANES]).is_ok());
+        assert!(backing_header(&desc[..TYPE4_PLANES - 1]).is_err());
+        assert!(backing_plane(&desc[..TYPE4_MIN_LEN], 0).is_ok());
+        assert!(backing_plane(&desc[..TYPE4_MIN_LEN - 1], 0).is_err());
+        assert!(backing_plane(&desc, 1).is_ok());
+        assert!(backing_plane(&desc[..TYPE4_MIN_LEN], 1).is_err());
 
-        assert!(type5_header(&desc[..TYPE5_ARGS]).is_ok());
-        assert!(type5_header(&desc[..TYPE5_ARGS - 1]).is_err());
+        assert!(ref_texture_header(&desc[..TYPE5_ARGS]).is_ok());
+        assert!(ref_texture_header(&desc[..TYPE5_ARGS - 1]).is_err());
         let record_end = TYPE5_ARG_RECORD + TYPE5_RECORD_MIN_LEN;
-        assert!(type5_texture_record(&desc[..record_end]).is_ok());
-        assert!(type5_texture_record(&desc[..record_end - 1]).is_err());
+        assert!(ref_texture_record(&desc[..record_end]).is_ok());
+        assert!(ref_texture_record(&desc[..record_end - 1]).is_err());
 
         // The plane index sits past the record, so a blob that stops at the
         // record has no plane to report and must say `None` rather than 0.
-        assert_eq!(type5_record_plane_index(&desc[..record_end]), None);
+        assert_eq!(ref_texture_record_plane_index(&desc[..record_end]), None);
     }
 
     /// `bytes_per_row` and `bytes_per_element` share one wire word, and the
@@ -644,7 +646,7 @@ mod tests {
         let mut desc = [0u8; TYPE4_MIN_LEN];
         desc[TYPE4_PLANES + 0x0c..TYPE4_PLANES + 0x10]
             .copy_from_slice(&0xab_123456u32.to_le_bytes());
-        let plane = type4_plane(&desc, 0).expect("one plane fits");
+        let plane = backing_plane(&desc, 0).expect("one plane fits");
         assert_eq!(plane.bytes_per_row(), 0x123456);
         assert_eq!(plane.bytes_per_element(), 0xab);
     }
@@ -661,7 +663,7 @@ mod tests {
         ] {
             desc[TYPE5_ARG_RECORD] = tag;
             assert_eq!(
-                type5_texture_record(&desc)
+                ref_texture_record(&desc)
                     .expect("full record")
                     .tag_is_known(),
                 known,
@@ -670,16 +672,16 @@ mod tests {
         }
     }
 
-    /// The declared length of a type-4 descriptor is its header plus its
+    /// The declared length of a backing descriptor is its header plus its
     /// planes, and nothing checked that against the stride before.
     #[test]
     fn a_descriptors_length_is_its_header_plus_its_planes() {
-        assert_eq!(type4_len_for(0), TYPE4_PLANES);
-        assert_eq!(type4_len_for(1), TYPE4_MIN_LEN);
+        assert_eq!(backing_len_for(0), TYPE4_PLANES);
+        assert_eq!(backing_len_for(1), TYPE4_MIN_LEN);
         // The two shapes the live census produced: a single-plane 'BGRA'
         // surface at 36 bytes and a biplanar '420f' one at 52.
-        assert_eq!(type4_len_for(1), 36);
-        assert_eq!(type4_len_for(2), 52);
-        assert_eq!(type4_len_for(TYPE4_PLANE_CAP), TYPE4_PLANES + 8 * 0x10);
+        assert_eq!(backing_len_for(1), 36);
+        assert_eq!(backing_len_for(2), 52);
+        assert_eq!(backing_len_for(TYPE4_PLANE_CAP), TYPE4_PLANES + 8 * 0x10);
     }
 }

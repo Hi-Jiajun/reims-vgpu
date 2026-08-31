@@ -1,42 +1,42 @@
-use reims_vgpu_wire::device_desc::Type4Builder;
+use reims_vgpu_wire::device_desc::BackingBuilder;
 
 use super::*;
 use crate::contract::endian::{ld32, st16, st32, st64};
 use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 use crate::contract::iosurface_pages::DEVICE_DESC_PLANE_COUNT;
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
-use crate::runtime::decode::resource::TYPE7_OBJECT_SAMPLER;
+use crate::runtime::decode::resource::SERIALIZER_OBJECT_SAMPLER;
 use crate::runtime::host::FakeHost;
 
 #[test]
-fn type11_fail_latch_dedups_per_task_ref_and_rearms_on_clear() {
+fn mapper_ref_texture_fail_latch_dedups_per_task_ref_and_rearms_on_clear() {
     // Flood guard for the per-draw-per-ref resolve path: a genuinely-broken
-    // type-11 ref logs each reason once, isolates per (task,ref), and
+    // mapper-ref-texture ref logs each reason once, isolates per (task,ref), and
     // re-arms on resolve. Unique ids so this never races real refs across
     // the process-global latch.
     let (t, r, r2) = (0xAB01u32, 0xCD01u32, 0xCD02u32);
-    clear_type11_fail(t, r);
-    clear_type11_fail(t, r2);
+    clear_mapper_ref_texture_fail(t, r);
+    clear_mapper_ref_texture_fail(t, r2);
     let seen = |task: u32, rf: u32, reason: &'static str| {
-        type11_fail_latch()
+        mapper_ref_texture_fail_latch()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains(&(task, rf, reason))
     };
-    note_type11_fail(t, r, "type11_register", "x".into());
-    assert!(seen(t, r, "type11_register"));
+    note_mapper_ref_texture_fail(t, r, "mapper_ref_texture_register", "x".into());
+    assert!(seen(t, r, "mapper_ref_texture_register"));
     // Distinct reason on the same ref tracked independently.
-    note_type11_fail(t, r, "type11_desc_read", "x".into());
-    assert!(seen(t, r, "type11_desc_read"));
+    note_mapper_ref_texture_fail(t, r, "mapper_ref_texture_desc_read", "x".into());
+    assert!(seen(t, r, "mapper_ref_texture_desc_read"));
     // A different ref is untouched.
-    assert!(!seen(t, r2, "type11_register"));
-    note_type11_fail(t, r2, "type11_register", "x".into());
+    assert!(!seen(t, r2, "mapper_ref_texture_register"));
+    note_mapper_ref_texture_fail(t, r2, "mapper_ref_texture_register", "x".into());
     // Clearing r re-arms only r, leaves r2.
-    clear_type11_fail(t, r);
-    assert!(!seen(t, r, "type11_register"));
-    assert!(!seen(t, r, "type11_desc_read"));
-    assert!(seen(t, r2, "type11_register"));
-    clear_type11_fail(t, r2);
+    clear_mapper_ref_texture_fail(t, r);
+    assert!(!seen(t, r, "mapper_ref_texture_register"));
+    assert!(!seen(t, r, "mapper_ref_texture_desc_read"));
+    assert!(seen(t, r2, "mapper_ref_texture_register"));
+    clear_mapper_ref_texture_fail(t, r2);
 }
 
 fn setup_task_with_list(host: &mut FakeHost, state: &mut DeviceState) {
@@ -70,7 +70,7 @@ fn setup_task_with_list(host: &mut FakeHost, state: &mut DeviceState) {
 }
 
 #[test]
-fn resolve_type11_from_list() {
+fn resolve_mapper_ref_texture_from_list() {
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
@@ -78,27 +78,27 @@ fn resolve_type11_from_list() {
     let e = lookup_list_entry(&state, &host, 1, 1).expect("list entry");
     assert_eq!(e.object_type, 11);
     assert_eq!(e.descriptor_gva, 0x40);
-    let mid = resolve_type11_ref(&mut state, &host, 1, 1).expect("type11");
+    let mid = resolve_mapper_ref_texture(&mut state, &host, 1, 1).expect("mapper_ref_texture");
     assert_eq!(mid, 9);
     let m = state.mappings.get(&9).unwrap();
     assert!(m.has_geom);
     assert_eq!((m.width, m.height, m.format), (64, 32, 0x50));
 }
 
-/// Registering a type-11 texture is construction, not bind-time repair.
+/// Registering a mapper-ref-texture is construction, not bind-time repair.
 ///
 /// Once the task owns the texture object, later binds retrieve that object and
 /// must not replay its serialized descriptor over mutable mapping state. A new
 /// descriptor can take effect only after the resource lifetime ends.
 #[test]
-fn a_retained_type11_texture_runs_construction_side_effects_once() {
+fn a_retained_mapper_ref_texture_runs_construction_side_effects_once() {
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
     let resource = resolve_resource(&state, &host, 1, 1).expect("construction");
 
     assert_eq!(
-        resolve_type11_resource(&mut state, 1, 1, &resource),
+        resolve_mapper_ref_texture_resource(&mut state, 1, 1, &resource),
         Some(9)
     );
     {
@@ -109,7 +109,7 @@ fn a_retained_type11_texture_runs_construction_side_effects_once() {
     }
 
     assert_eq!(
-        resolve_type11_resource(&mut state, 1, 1, &resource),
+        resolve_mapper_ref_texture_resource(&mut state, 1, 1, &resource),
         Some(9)
     );
     let mapping = &state.mappings[&9];
@@ -182,7 +182,7 @@ fn resources_keep_construction_input_until_explicit_delete() {
         )
     ));
     assert_eq!(
-        resolve_type11_resource(&mut state, 1, 1, &retained),
+        resolve_mapper_ref_texture_resource(&mut state, 1, 1, &retained),
         Some(9),
         "the retained typed object resolves after its construction bytes become unreadable"
     );
@@ -195,7 +195,7 @@ fn resources_keep_construction_input_until_explicit_delete() {
     assert!(!Arc::ptr_eq(&first, &replacement));
     assert_eq!(ld32(&replacement.descriptor), 10);
     assert_eq!(
-        resolve_type11_resource(&mut state, 1, 1, &replacement),
+        resolve_mapper_ref_texture_resource(&mut state, 1, 1, &replacement),
         Some(10),
         "the replacement lifetime runs its own construction side effects"
     );
@@ -230,39 +230,42 @@ fn the_resource_registry_accepts_exactly_the_resource_constructor_types() {
 /// must not retain its descriptor and hide a later update.
 #[test]
 fn non_resource_descriptors_are_read_again() {
-    use crate::runtime::decode::resource::OBJECT_TYPE_TYPE7;
+    use crate::runtime::decode::resource::OBJECT_TYPE_SERIALIZER_OBJECT;
 
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
     let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
     let mut entry = [0u8; 12];
-    st32(&mut entry, u32::from(OBJECT_TYPE_TYPE7) | (4u32 << 8));
+    st32(
+        &mut entry,
+        u32::from(OBJECT_TYPE_SERIALIZER_OBJECT) | (4u32 << 8),
+    );
     entry[4..].copy_from_slice(&0x80u64.to_le_bytes());
     let _ = host.write_gpa(data_gpa + 24, &entry);
     let _ = host.write_gpa(data_gpa + 0x80, &1u32.to_le_bytes());
 
-    let (_, first) = resolve_descriptor(&state, &host, 1, 2, &[OBJECT_TYPE_TYPE7])
+    let (_, first) = resolve_descriptor(&state, &host, 1, 2, &[OBJECT_TYPE_SERIALIZER_OBJECT])
         .expect("first serializer descriptor");
     assert_eq!(ld32(&first), 1);
     assert!(state.task_resources.get(1, 2).is_none());
 
     let _ = host.write_gpa(data_gpa + 0x80, &2u32.to_le_bytes());
-    let (_, second) = resolve_descriptor(&state, &host, 1, 2, &[OBJECT_TYPE_TYPE7])
+    let (_, second) = resolve_descriptor(&state, &host, 1, 2, &[OBJECT_TYPE_SERIALIZER_OBJECT])
         .expect("updated serializer descriptor");
     assert_eq!(ld32(&second), 2);
     assert!(state.task_resources.get(1, 2).is_none());
 }
 
 fn put_sampler_object(host: &mut FakeHost, ref_: u32, descriptor_gva: u64, lod_min: f32) {
-    use crate::runtime::decode::resource::OBJECT_TYPE_TYPE7;
+    use crate::runtime::decode::resource::OBJECT_TYPE_SERIALIZER_OBJECT;
     use reims_vgpu_wire::ops::sampler::NEW_SAMPLER_TOTAL_LEN;
 
     let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
     let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     st32(
         &mut entry,
-        u32::from(OBJECT_TYPE_TYPE7) | (NEW_SAMPLER_TOTAL_LEN << 8),
+        u32::from(OBJECT_TYPE_SERIALIZER_OBJECT) | (NEW_SAMPLER_TOTAL_LEN << 8),
     );
     st64(&mut entry[4..], descriptor_gva);
     let _ = host.write_gpa(
@@ -271,7 +274,7 @@ fn put_sampler_object(host: &mut FakeHost, ref_: u32, descriptor_gva: u64, lod_m
     );
 
     let mut descriptor = vec![0u8; NEW_SAMPLER_TOTAL_LEN as usize];
-    st32(&mut descriptor, TYPE7_OBJECT_SAMPLER);
+    st32(&mut descriptor, SERIALIZER_OBJECT_SAMPLER);
     st32(&mut descriptor[4..], NEW_SAMPLER_TOTAL_LEN);
     st32(&mut descriptor[8..], ref_);
     st32(&mut descriptor[12..], 0x8400_0000);
@@ -307,17 +310,20 @@ fn sampler_construction_is_retained_until_its_own_explicit_delete() {
 
 #[test]
 fn failed_sampler_construction_is_not_retained_and_can_retry() {
-    use crate::runtime::decode::resource::OBJECT_TYPE_TYPE7;
+    use crate::runtime::decode::resource::OBJECT_TYPE_SERIALIZER_OBJECT;
 
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
     let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
     let mut short_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
-    st32(&mut short_entry, u32::from(OBJECT_TYPE_TYPE7) | (4 << 8));
+    st32(
+        &mut short_entry,
+        u32::from(OBJECT_TYPE_SERIALIZER_OBJECT) | (4 << 8),
+    );
     st64(&mut short_entry[4..], 0x80);
     let _ = host.write_gpa(data_gpa + 24, &short_entry);
-    let _ = host.write_gpa(data_gpa + 0x80, &TYPE7_OBJECT_SAMPLER.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 0x80, &SERIALIZER_OBJECT_SAMPLER.to_le_bytes());
 
     assert!(matches!(
         resolve_sampler_state(&state, &host, 1, 2),
@@ -343,7 +349,7 @@ fn task_teardown_retires_sampler_objects_without_touching_outstanding_owners() {
     assert_eq!(sampler.descriptor.lod_min_clamp, 2.0);
 }
 
-/// The type-4 decoder refuses a descriptor it cannot decode as declared, and
+/// The backing decoder refuses a descriptor it cannot decode as declared, and
 /// says which check refused.
 ///
 /// All three of these bounds are correct — IOSurface caps `getPlaneCount` at
@@ -357,22 +363,33 @@ fn task_teardown_retires_sampler_objects_without_touching_outstanding_owners() {
 /// the guest declared. Neither reads as a decode failure downstream — both are
 /// well-formed surfaces — so the loss appears as a layer that samples blank,
 /// which is what content that is genuinely empty also looks like. `None` reaches
-/// the caller's `type4_backing_fail reason=desc_decode`, which names the surface
+/// the caller's `backing_fail reason=desc_decode`, which names the surface
 /// id.
 ///
 /// Fails without the fix: both decodes return `Some`.
 #[test]
-fn the_type4_decoder_refuses_what_it_cannot_decode_and_reports_why() {
+fn the_backing_decoder_refuses_what_it_cannot_decode_and_reports_why() {
     // Twelve planes against IOSurface's own ceiling of eight.
-    let over_cap = Type4Builder::new(0x1000, 0x100, 0x4247_5241, 12).with_len(0x24); // 'BGRA'
-                                                                                     // A legal plane count whose records the blob does not reach: `with_len`
-                                                                                     // stops after plane 0, so planes 1..=3 are declared and unreachable.
-    let short_records = Type4Builder::new(0x1000, 0x100, 0x4247_5241, 4).with_len(0x24);
+    let over_cap = BackingBuilder::new(0x1000, 0x100, 0x4247_5241, 12).with_len(0x24); // 'BGRA'
+                                                                                       // A legal
+                                                                                       // plane count
+                                                                                       // whose
+                                                                                       // records the
+                                                                                       // blob does
+                                                                                       // not reach:
+                                                                                       // `with_len`
+                                                                                       // stops after
+                                                                                       // plane 0, so
+                                                                                       // planes 1..=3
+                                                                                       // are declared
+                                                                                       // and
+                                                                                       // unreachable.
+    let short_records = BackingBuilder::new(0x1000, 0x100, 0x4247_5241, 4).with_len(0x24);
 
-    reset_type4_decode_drops();
+    reset_backing_decode_drops();
     let cap = crate::observe::FailCapture::start();
     assert!(
-        decode_type4_surface(over_cap.bytes()).is_none(),
+        decode_backing(over_cap.bytes()).is_none(),
         "a plane count past IOSurface's own ceiling is a malformed descriptor, \
          and there is no correct prefix of it to publish"
     );
@@ -391,7 +408,7 @@ fn the_type4_decoder_refuses_what_it_cannot_decode_and_reports_why() {
     // every time; only the line is deduped.
     let cap2 = crate::observe::FailCapture::start();
     assert!(
-        decode_type4_surface(over_cap.bytes()).is_none(),
+        decode_backing(over_cap.bytes()).is_none(),
         "the latch must not turn the second refusal into an acceptance"
     );
     assert!(
@@ -403,10 +420,10 @@ fn the_type4_decoder_refuses_what_it_cannot_decode_and_reports_why() {
     );
 
     // A declared plane whose record the blob does not reach.
-    reset_type4_decode_drops();
+    reset_backing_decode_drops();
     let cap3 = crate::observe::FailCapture::start();
     assert!(
-        decode_type4_surface(short_records.bytes()).is_none(),
+        decode_backing(short_records.bytes()).is_none(),
         "a declared plane the blob does not reach must refuse the surface, \
          not publish a 0x0 plane in its slot"
     );
@@ -421,12 +438,12 @@ fn the_type4_decoder_refuses_what_it_cannot_decode_and_reports_why() {
     );
 
     // A surface larger than the 32-bit `allocSize` field can express.
-    reset_type4_decode_drops();
-    let big =
-        Type4Builder::new((u32::MAX as u64) + 1, 0x100, 0x4247_5241, 1).plane(0, 0, 64, 32, 256, 0);
-    let surf = decode_type4_surface(big.bytes()).expect("type4 decodes");
+    reset_backing_decode_drops();
+    let big = BackingBuilder::new((u32::MAX as u64) + 1, 0x100, 0x4247_5241, 1)
+        .plane(0, 0, 64, 32, 256, 0);
+    let surf = decode_backing(big.bytes()).expect("backing decodes");
     let cap4 = crate::observe::FailCapture::start();
-    let _ = synthesize_device_desc_from_type4(&surf);
+    let _ = synthesize_device_desc_from_backing(&surf);
     let sat = cap4
         .lines()
         .into_iter()
@@ -436,7 +453,7 @@ fn the_type4_decoder_refuses_what_it_cannot_decode_and_reports_why() {
 }
 
 #[test]
-fn decode_type4_plane0() {
+fn decode_backing_plane0() {
     let mut desc = vec![0u8; 0x30];
     st64(&mut desc[0..], 0x1000);
     st32(&mut desc[8..], 0x100); // backing pfn
@@ -446,13 +463,13 @@ fn decode_type4_plane0() {
     st32(&mut desc[0x18..], 64);
     st32(&mut desc[0x1c..], 32);
     st32(&mut desc[0x20..], 256); // bpr
-    let s = decode_type4_surface(&desc).expect("type4");
+    let s = decode_backing(&desc).expect("backing");
     assert_eq!(s.length, 0x1000);
     assert_eq!(s.backing_pfn, 0x100);
     assert_eq!((s.width, s.height, s.bytes_per_row), (64, 32, 256));
     assert_eq!(s.plane_count, 1);
     assert_eq!(s.planes[0].offset, 0);
-    assert!(!type4_is_multiplanar(&s));
+    assert!(!backing_is_multiplanar(&s));
     assert_eq!(
         iosurface_pixel_format_to_mtl(s.pixel_format),
         crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
@@ -464,7 +481,7 @@ fn decode_type4_plane0() {
 /// The bug class: a guest game creates its render surface as a single-plane
 /// `kCVPixelFormatType_ARGB2101010LEPacked` IOSurface, this table answered 0 for
 /// it, and 0 out of this table is `draw::render_target`'s
-/// `rt_type4_base_format` refusal — so every draw of every frame failed and the
+/// `rt_backing_base_format` refusal — so every draw of every frame failed and the
 /// window was black. Two tables had to answer for that to stop, and a test on
 /// either one alone would have passed while the window stayed black, so this
 /// walks the whole chain the resolve walks.
@@ -478,10 +495,11 @@ fn an_l10r_surface_resolves_as_a_packed_ten_bit_colour_attachment() {
     use crate::contract::pixel_format as pf;
 
     const FOURCC_L10R: u32 = 0x6c31_3072;
-    let built = Type4Builder::new(0x384000, 0x100, FOURCC_L10R, 1).plane(0, 0, 1280, 720, 5120, 0);
-    let surf = decode_type4_surface(built.bytes()).expect("type4 decodes");
+    let built =
+        BackingBuilder::new(0x384000, 0x100, FOURCC_L10R, 1).plane(0, 0, 1280, 720, 5120, 0);
+    let surf = decode_backing(built.bytes()).expect("backing decodes");
     assert!(
-        !type4_is_multiplanar(&surf),
+        !backing_is_multiplanar(&surf),
         "a packed single-plane colour surface must not read as biplanar"
     );
 
@@ -531,14 +549,14 @@ fn fourcc_420f_not_bgra_and_multiplanar() {
 ///
 /// The converter used to return `pixel_format as u16` for anything at or
 /// below 0x200, deciding which encoding the field was in from how big the
-/// number was. Every caller passes a type-4 `pixelFormat` (+0x0c), which is
+/// number was. Every caller passes a backing `pixelFormat` (+0x0c), which is
 /// an IOSurface OSType and therefore never below `'    '` (0x20202020), so
 /// a small value arriving here is a bad read — and passing it through
 /// published a format the guest never named. Fail closed instead, which is
 /// what this function already does for every FourCC it does not know.
 #[test]
 fn a_small_value_is_not_read_as_an_mtl_ordinal() {
-    // 0x50 is MTLPixelFormatBGRA8Unorm. As a type-4 OSType it is nonsense,
+    // 0x50 is MTLPixelFormatBGRA8Unorm. As a backing OSType it is nonsense,
     // and the old magnitude test would have handed it back as a format.
     assert_eq!(iosurface_pixel_format_to_mtl(0x50), 0);
     assert_eq!(iosurface_pixel_format_to_mtl(0x200), 0);
@@ -551,7 +569,7 @@ fn a_small_value_is_not_read_as_an_mtl_ordinal() {
 }
 
 #[test]
-fn decode_type4_biplanar_420f_planes() {
+fn decode_backing_biplanar_420f_planes() {
     // Wire: plane0 Y 1024×1024 bpr=1024 bpe=1; plane1 UV 512×512 bpr=1024 bpe=2.
     // Live boot: fmt='420f' len=0x180000 plane0 bpr=1024.
     let mut desc = vec![0u8; 0x14 + 2 * 0x10];
@@ -569,8 +587,8 @@ fn decode_type4_biplanar_420f_planes() {
     st32(&mut desc[0x28..], 512);
     st32(&mut desc[0x2c..], 512);
     st32(&mut desc[0x30..], 1024 | (2 << 24));
-    let s = decode_type4_surface(&desc).expect("type4 420f");
-    assert!(type4_is_multiplanar(&s));
+    let s = decode_backing(&desc).expect("backing 420f");
+    assert!(backing_is_multiplanar(&s));
     assert_eq!(s.plane_count, 2);
     assert_eq!(
         (
@@ -589,7 +607,7 @@ fn decode_type4_biplanar_420f_planes() {
         ),
         (512, 512, 2)
     );
-    let dev = synthesize_device_desc_from_type4(&s);
+    let dev = synthesize_device_desc_from_backing(&s);
     assert_eq!(dev[DEVICE_DESC_PLANE_COUNT], 2);
     use crate::contract::iosurface_pages::{
         decode_device_surface, mapping_span_bound, sample_window_from_device_desc,
@@ -602,7 +620,7 @@ fn decode_type4_biplanar_420f_planes() {
     let surf = decode_device_surface(&dev).expect("device");
     assert_eq!(surf.plane_count, 2);
     assert_eq!(surf.alloc_size, 0x180000);
-    // Type-11 Y plane: R8 1024×1024 matches plane0 (contract geometry key).
+    // Mapper-ref-texture Y plane: R8 1024×1024 matches plane0 (contract geometry key).
     let y = sample_window_from_device_desc(
         Some(&dev),
         None,
@@ -650,7 +668,7 @@ fn decode_type4_biplanar_420f_planes() {
 /// through. Here the walk cannot resolve the backing GVA and the identity
 /// candidate *is* mapped RAM, so the old path would have accepted it.
 #[test]
-fn resolve_type4_refuses_to_substitute_the_gva_when_the_walk_fails() {
+fn resolve_backing_refuses_to_substitute_the_gva_when_the_walk_fails() {
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     state.page_shift = PAGE_SHIFT_X86;
@@ -688,7 +706,7 @@ fn resolve_type4_refuses_to_substitute_the_gva_when_the_walk_fails() {
     let _ = host.write_gpa(data_gpa + 0x80, &desc);
 
     assert!(
-        !resolve_type4_surface(&mut state, &host, 3),
+        !resolve_backing(&mut state, &host, 3),
         "an untranslatable backing must not resolve"
     );
     // The refusal happens before any mutation, so no fabricated entry is
@@ -701,7 +719,7 @@ fn resolve_type4_refuses_to_substitute_the_gva_when_the_walk_fails() {
     assert!(!fabricated, "refusal must not cache a fabricated backing");
 }
 
-/// `resolve_type4_surface_ex` probes task 0 first and returns on the first
+/// `resolve_backing_ex` probes task 0 first and returns on the first
 /// task whose backing applies. The identity guess made task 0 succeed for
 /// surfaces it could not translate, so the search stopped there and the
 /// owning task was never tried — the surface was then backed by an address
@@ -768,7 +786,7 @@ fn the_task_search_reaches_the_owner_when_task_zero_cannot_translate() {
     let _ = host.write_gpa(data_gpa + 0x80, &desc);
 
     assert!(
-        resolve_type4_surface(&mut state, &host, 3),
+        resolve_backing(&mut state, &host, 3),
         "the owning task can translate the backing, so the resolve must succeed"
     );
     let m = state.mappings.get(&3).unwrap();
@@ -784,14 +802,14 @@ fn the_task_search_reaches_the_owner_when_task_zero_cannot_translate() {
 /// The search stops on the first task that can back a surface, so whether
 /// that choice was ever a choice is the thing to count. Nothing on the wire
 /// can verify a candidate — the object-list entry carries no identity and
-/// the type-4 descriptor is fully decoded — so the claimant count is the
+/// the backing descriptor is fully decoded — so the claimant count is the
 /// only available reading of the search's exposure, and it has to
 /// distinguish "one task lists this id" from "two do".
 #[test]
 fn a_surface_id_claimed_by_two_tasks_is_counted_as_two() {
     // Two tasks, each with its own directory and root, both listing eight
-    // object slots at GVA 0. Task 0's list page holds a type-4 surface at
-    // slot 3; task 1's holds a type-5 there until the second half of the
+    // object slots at GVA 0. Task 0's list page holds a backing record at
+    // slot 3; task 1's holds a ref-texture there until the second half of the
     // test rewrites it.
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -834,7 +852,7 @@ fn a_surface_id_claimed_by_two_tasks_is_counted_as_two() {
     // and length, which is what `lookup_list_entry` requires before the type
     // is even looked at.
     let mut entry = [0u8; 12];
-    st32(&mut entry[0..], OBJECT_TYPE_SURFACE as u32 | (0x30u32 << 8));
+    st32(&mut entry[0..], OBJECT_TYPE_BACKING as u32 | (0x30u32 << 8));
     entry[4..12].copy_from_slice(&0x80u64.to_le_bytes());
     let _ = host.write_gpa(list0_gpa + 3 * 12, &entry);
 
@@ -849,26 +867,26 @@ fn a_surface_id_claimed_by_two_tasks_is_counted_as_two() {
     let _ = host.write_gpa(list1_gpa + 3 * 12, &other);
 
     assert_eq!(
-        type4_claimant_tasks(&state, &host, 3),
+        backing_claimant_tasks(&state, &host, 3),
         vec![0],
         "a populated slot of another object type is not a claim on this id"
     );
 
-    // Now task 1 lists a type-4 surface at the same slot. The id spaces are
+    // Now task 1 lists a backing record at the same slot. The id spaces are
     // per task, so this is a second, unrelated surface wearing the same id —
     // and the search would have to break the tie by probe order alone.
     let _ = host.write_gpa(list1_gpa + 3 * 12, &entry);
     assert_eq!(
-        type4_claimant_tasks(&state, &host, 3),
+        backing_claimant_tasks(&state, &host, 3),
         vec![0, 1],
-        "both tasks list a type-4 surface at slot 3, so both are claimants"
+        "both tasks list a backing record at slot 3, so both are claimants"
     );
 
     // An inactive task cannot be the one the search stops on, so it is not
     // counted either.
     state.tasks[1].active = false;
     assert_eq!(
-        type4_claimant_tasks(&state, &host, 3),
+        backing_claimant_tasks(&state, &host, 3),
         vec![0],
         "an inactive task is not a claimant"
     );
@@ -878,7 +896,7 @@ fn a_surface_id_claimed_by_two_tasks_is_counted_as_two() {
 /// translation of the backing GVA moved (same surface id, same geometry,
 /// new physical pages — the early-boot FB vs WindowServer reallocation).
 #[test]
-fn resolve_type4_force_rebuilds_when_task_translation_moves() {
+fn resolve_backing_force_rebuilds_when_task_translation_moves() {
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     state.page_shift = PAGE_SHIFT_X86;
@@ -903,7 +921,7 @@ fn resolve_type4_force_rebuilds_when_task_translation_moves() {
     let _ = host.write_gpa(root_gpa + 4, &d[..4]);
     state.define_task(1, 0x1000, 2);
     assert!(state.set_object_list(1, 0, 8));
-    // Type-4 entry at surface_id=3, descriptor at GVA 0x80.
+    // Backing entry at surface_id=3, descriptor at GVA 0x80.
     let mut entry = [0u8; 12];
     st32(&mut entry[0..], 4u32 | (0x30u32 << 8));
     entry[4..12].copy_from_slice(&0x80u64.to_le_bytes());
@@ -918,7 +936,7 @@ fn resolve_type4_force_rebuilds_when_task_translation_moves() {
     st32(&mut desc[0x20..], 64);
     let _ = host.write_gpa(data_gpa + 0x80, &desc);
 
-    assert!(resolve_type4_surface(&mut state, &host, 3));
+    assert!(resolve_backing(&mut state, &host, 3));
     {
         let m = state.mappings.get(&3).unwrap();
         assert_eq!(m.page_entries.len(), 1);
@@ -931,7 +949,7 @@ fn resolve_type4_force_rebuilds_when_task_translation_moves() {
     // Guest remaps GVA page 1 onto a new physical page (same id/geometry).
     st32(&mut d[..4], 6);
     let _ = host.write_gpa(root_gpa + 4, &d[..4]);
-    assert!(resolve_type4_surface_force(&mut state, &host, 3));
+    assert!(resolve_backing_force(&mut state, &host, 3));
     {
         let m = state.mappings.get(&3).unwrap();
         assert_eq!(
@@ -942,7 +960,7 @@ fn resolve_type4_force_rebuilds_when_task_translation_moves() {
         assert_eq!(m.map_generation, 2, "page move bumps map_generation");
     }
     // Unchanged translation: force keeps the table without a rebuild.
-    assert!(resolve_type4_surface_force(&mut state, &host, 3));
+    assert!(resolve_backing_force(&mut state, &host, 3));
     let m = state.mappings.get(&3).unwrap();
     assert_eq!(m.map_generation, 2);
     assert_eq!(
@@ -955,35 +973,35 @@ fn resolve_type4_force_rebuilds_when_task_translation_moves() {
 /// whose page-backing construction fails) must be fail-visible with a
 /// `reason=` slug, deduped per `(surface_id, reason)`, and re-armed when the
 /// surface next backs cleanly — never a silent `return false` that paints
-/// stale/black with no log. Locks the type-4 backing blind-spot closure.
+/// stale/black with no log. Locks the backing blind-spot closure.
 #[test]
-fn apply_type4_backing_fail_latches_reason_and_rearms() {
+fn apply_backing_fail_latches_reason_and_rearms() {
     let host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     state.page_shift = PAGE_SHIFT_X86;
-    // A surface_id other type-4 tests do not touch (they use 3).
+    // A surface_id other backing tests do not touch (they use 3).
     let sid = 11u32;
-    clear_type4_fail(sid, 0x20u64 << PAGE_SHIFT_X86);
-    assert!(!type4_fail_latch()
+    clear_backing_fail(sid, 0x20u64 << PAGE_SHIFT_X86);
+    assert!(!backing_fail_latch()
         .lock()
         .unwrap()
         .contains_key(&(sid, "task_inactive")));
     // Small valid length (page_count = 1) so the alloc-guard passes, then an
     // undefined/inactive task_id hits the `task_inactive` site — the drain
     // race where a decoded surface's owning task died before backing landed.
-    let surf = Type4Surface {
+    let surf = BackingRecord {
         length: 0x1000,
         backing_pfn: 0x20,
         pixel_format: 0,
         plane_count: 1,
-        planes: [Type4Plane::default(); TYPE4_PLANE_CAP],
+        planes: [BackingPlane::default(); TYPE4_PLANE_CAP],
         width: 16,
         height: 16,
         bytes_per_row: 64,
     };
-    assert!(!apply_type4_backing(&mut state, &host, 5, sid, &surf));
+    assert!(!apply_backing(&mut state, &host, 5, sid, &surf));
     assert!(
-        !type4_fail_latch()
+        !backing_fail_latch()
             .lock()
             .unwrap()
             .contains_key(&(sid, "task_inactive")),
@@ -993,34 +1011,34 @@ fn apply_type4_backing_fail_latches_reason_and_rearms() {
     );
     // The search running out of tasks is what turns the probe's reason into
     // a reported failure.
-    flush_type4_fail(sid);
+    flush_backing_fail(sid);
     assert!(
-        type4_fail_latch()
+        backing_fail_latch()
             .lock()
             .unwrap()
             .contains_key(&(sid, "task_inactive")),
         "an exhausted search must report the first probe's reason slug"
     );
     // A clean backing on the same surface re-arms the latch.
-    clear_type4_fail(sid, 0x20u64 << PAGE_SHIFT_X86);
+    clear_backing_fail(sid, 0x20u64 << PAGE_SHIFT_X86);
     assert!(
-        !type4_fail_latch()
+        !backing_fail_latch()
             .lock()
             .unwrap()
             .contains_key(&(sid, "task_inactive")),
-        "clear_type4_fail must re-arm so a later failure logs again"
+        "clear_backing_fail must re-arm so a later failure logs again"
     );
 }
 
 /// A refusal that the next attach resolves is reported as the recovery it is,
 /// and only when the backing that landed is the one the refusal named.
 ///
-/// `type4_backing_fail reason=translate` reads as lost guest work and usually is
+/// `backing_fail reason=translate` reads as lost guest work and usually is
 /// not: `st=zero-pfn` means the guest had not finished mapping when the
 /// per-present path walked it, and the refusal exists so the device asks again
 /// rather than substituting a guess. Every one of the six on a driven boot
 /// recovered, within 1-21 ms, and nothing in the log said so — see
-/// [`super::clear_type4_fail`].
+/// [`super::clear_backing_fail`].
 ///
 /// The match is on the **backing address**, never on `surface_id`: ids recycle
 /// within a boot and across geometries, so a clean attach on a recycled id must
@@ -1029,10 +1047,10 @@ fn apply_type4_backing_fail_latches_reason_and_rearms() {
 /// A refusal leaves the latch three ways, and all three are now countable.
 ///
 /// Recovered, superseded, or still there. The third is the only one that can be
-/// lost guest work, and before `type4_backing_superseded` and
-/// `type4_backing_outstanding` it was indistinguishable from the second: a
-/// driven boot with five `type4_backing_fail` lines and four
-/// `type4_backing_recovered` lines gave a reader no way to tell a refusal the
+/// lost guest work, and before `backing_superseded` and
+/// `backing_outstanding` it was indistinguishable from the second: a
+/// driven boot with five `backing_fail` lines and four
+/// `backing_recovered` lines gave a reader no way to tell a refusal the
 /// guest walked away from apart from one that never came back, short of
 /// hand-matching backing GVAs across the log. That is how this gap was found.
 ///
@@ -1040,33 +1058,28 @@ fn apply_type4_backing_fail_latches_reason_and_rearms() {
 /// every refusal that leaves the latch is accounted for by exactly one of the
 /// three, and the residue is the census line's `n`.
 #[test]
-fn every_type4_refusal_leaves_the_latch_recovered_superseded_or_counted() {
+fn every_backing_refusal_leaves_the_latch_recovered_superseded_or_counted() {
     use crate::runtime::drain::store_route_count;
 
     // Ids no other test in this module uses; the latch is process-global.
     let sid = 0x4d2u32;
     let gva = 0x4222000u64;
-    clear_type4_fail(sid, gva);
+    clear_backing_fail(sid, gva);
 
     // Superseded: refused at `gva`, backed somewhere else. Not a recovery, and
     // it used to be the silent one.
-    let before = store_route_count("type4_backing_superseded");
-    let recovered_before = store_route_count("type4_backing_recovered");
-    defer_type4_fail(
-        sid,
-        "translate",
-        Some(gva),
-        "type4_backing_fail probe".into(),
-    );
-    flush_type4_fail(sid);
-    clear_type4_fail(sid, gva + 0x1000);
+    let before = store_route_count("backing_superseded");
+    let recovered_before = store_route_count("backing_recovered");
+    defer_backing_fail(sid, "translate", Some(gva), "backing_fail probe".into());
+    flush_backing_fail(sid);
+    clear_backing_fail(sid, gva + 0x1000);
     assert_eq!(
-        store_route_count("type4_backing_superseded"),
+        store_route_count("backing_superseded"),
         before + 1,
         "a refusal dropped because the surface backed elsewhere must be counted"
     );
     assert_eq!(
-        store_route_count("type4_backing_recovered"),
+        store_route_count("backing_recovered"),
         recovered_before,
         "and must not be claimed as a recovery"
     );
@@ -1074,23 +1087,18 @@ fn every_type4_refusal_leaves_the_latch_recovered_superseded_or_counted() {
     // Recovered: refused at `gva`, backed at `gva`. Counts on the other route
     // and leaves the superseded count alone — the two must not double-count one
     // refusal, which is what would make the identity stop holding.
-    let before = store_route_count("type4_backing_superseded");
-    let recovered_before = store_route_count("type4_backing_recovered");
-    defer_type4_fail(
-        sid,
-        "translate",
-        Some(gva),
-        "type4_backing_fail probe".into(),
-    );
-    flush_type4_fail(sid);
-    clear_type4_fail(sid, gva);
+    let before = store_route_count("backing_superseded");
+    let recovered_before = store_route_count("backing_recovered");
+    defer_backing_fail(sid, "translate", Some(gva), "backing_fail probe".into());
+    flush_backing_fail(sid);
+    clear_backing_fail(sid, gva);
     assert_eq!(
-        store_route_count("type4_backing_recovered"),
+        store_route_count("backing_recovered"),
         recovered_before + 1,
         "an attach on the backing the refusal named is a recovery"
     );
     assert_eq!(
-        store_route_count("type4_backing_superseded"),
+        store_route_count("backing_superseded"),
         before,
         "and is not also a supersede"
     );
@@ -1105,7 +1113,7 @@ fn every_type4_refusal_leaves_the_latch_recovered_superseded_or_counted() {
 fn the_outstanding_census_names_the_oldest_refusal_and_is_otherwise_silent() {
     let sid = 0x4d3u32;
     let gva = 0x4333000u64;
-    clear_type4_fail(sid, gva);
+    clear_backing_fail(sid, gva);
 
     // Other tests in this module share the latch, so assert about *this* sid
     // rather than about emptiness — a bare `is_none()` would be order-dependent.
@@ -1114,20 +1122,15 @@ fn the_outstanding_census_names_the_oldest_refusal_and_is_otherwise_silent() {
             .is_some_and(|l| l.contains(&format!("sid={sid}")))
     };
     assert!(
-        !mine(&type4_backing_outstanding_census()),
+        !mine(&backing_outstanding_census()),
         "nothing is latched for this surface yet"
     );
 
-    defer_type4_fail(
-        sid,
-        "translate",
-        Some(gva),
-        "type4_backing_fail probe".into(),
-    );
-    flush_type4_fail(sid);
-    let line = type4_backing_outstanding_census().expect("a latched refusal must be censused");
+    defer_backing_fail(sid, "translate", Some(gva), "backing_fail probe".into());
+    flush_backing_fail(sid);
+    let line = backing_outstanding_census().expect("a latched refusal must be censused");
     assert!(
-        line.starts_with("type4_backing_outstanding n=") && line.contains("oldest_ms="),
+        line.starts_with("backing_outstanding n=") && line.contains("oldest_ms="),
         "the line must carry both the count and the age: {line}"
     );
     assert!(
@@ -1136,9 +1139,9 @@ fn the_outstanding_census_names_the_oldest_refusal_and_is_otherwise_silent() {
     );
 
     // Retiring it removes it from the census, by either route.
-    clear_type4_fail(sid, gva);
+    clear_backing_fail(sid, gva);
     assert!(
-        !mine(&type4_backing_outstanding_census()),
+        !mine(&backing_outstanding_census()),
         "a recovered refusal is no longer outstanding"
     );
 }
@@ -1150,24 +1153,24 @@ fn the_outstanding_census_names_the_oldest_refusal_and_is_otherwise_silent() {
 /// frame is losing guest work; a surface it asked for once and never again is
 /// one the guest stopped presenting. Both sit in the latch as `n=1`.
 ///
-/// The trap this pins: `note_type4_fail` refreshes its timestamp on a repeat, so
+/// The trap this pins: `note_backing_fail` refreshes its timestamp on a repeat, so
 /// `oldest_ms` alone reads **backwards** — a live retry holds it near zero and
 /// an abandoned refusal lets it grow with the clock. `attempts` is what makes
 /// the line state which of the two it is without anyone re-deriving that.
 #[test]
-fn a_retried_type4_refusal_counts_its_attempts_and_an_abandoned_one_does_not() {
+fn a_retried_backing_refusal_counts_its_attempts_and_an_abandoned_one_does_not() {
     let sid = 0x4d3u32;
     let gva = 0x4188000u64;
-    clear_type4_fail(sid, gva);
+    clear_backing_fail(sid, gva);
     let is_mine = |line: &Option<String>| {
         line.as_ref()
             .is_some_and(|l| l.contains(&format!("sid={sid} ")))
     };
 
     // Asked once and refused.
-    defer_type4_fail(sid, "translate", Some(gva), "first refusal".into());
-    flush_type4_fail(sid);
-    let line = type4_backing_outstanding_census().expect("a latched refusal is censused");
+    defer_backing_fail(sid, "translate", Some(gva), "first refusal".into());
+    flush_backing_fail(sid);
+    let line = backing_outstanding_census().expect("a latched refusal is censused");
     if is_mine(&Some(line.clone())) {
         assert!(
             line.contains("attempts=1"),
@@ -1183,10 +1186,10 @@ fn a_retried_type4_refusal_counts_its_attempts_and_an_abandoned_one_does_not() {
     // quiet — this is the per-present path and one line a frame would flood it
     // — so the count is the only thing saying the device is still trying.
     for _ in 0..4 {
-        defer_type4_fail(sid, "translate", Some(gva), "retry refusal".into());
-        flush_type4_fail(sid);
+        defer_backing_fail(sid, "translate", Some(gva), "retry refusal".into());
+        flush_backing_fail(sid);
     }
-    let line = type4_backing_outstanding_census().expect("still latched");
+    let line = backing_outstanding_census().expect("still latched");
     if is_mine(&Some(line.clone())) {
         assert!(
             line.contains("attempts=5"),
@@ -1194,15 +1197,15 @@ fn a_retried_type4_refusal_counts_its_attempts_and_an_abandoned_one_does_not() {
         );
     }
 
-    clear_type4_fail(sid, gva);
+    clear_backing_fail(sid, gva);
     assert!(
-        !is_mine(&type4_backing_outstanding_census()),
+        !is_mine(&backing_outstanding_census()),
         "the latch re-arms once the surface backs"
     );
 }
 
 #[test]
-fn a_type4_refusal_the_next_attach_resolves_is_reported_as_recovered() {
+fn a_backing_refusal_the_next_attach_resolves_is_reported_as_recovered() {
     fn log_mark() -> usize {
         crate::observe::redirect_logs_for_tests();
         std::fs::read_to_string(crate::observe::fail_log_path())
@@ -1217,31 +1220,26 @@ fn a_type4_refusal_the_next_attach_resolves_is_reported_as_recovered() {
     // A surface id no other test in this module uses.
     let sid = 0x4d1u32;
     let gva = 0x4112000u64;
-    clear_type4_fail(sid, gva);
+    clear_backing_fail(sid, gva);
 
     // A reported refusal naming this backing...
     let mark = log_mark();
-    defer_type4_fail(
-        sid,
-        "translate",
-        Some(gva),
-        "type4_backing_fail probe".into(),
-    );
-    flush_type4_fail(sid);
+    defer_backing_fail(sid, "translate", Some(gva), "backing_fail probe".into());
+    flush_backing_fail(sid);
     assert!(
-        log_since(mark).contains("type4_backing_fail probe"),
+        log_since(mark).contains("backing_fail probe"),
         "the exhausted search must report the probe's reason"
     );
 
     // ...that a later attach on a *different* backing must not claim.
     let mark = log_mark();
-    clear_type4_fail(sid, gva + 0x1000);
+    clear_backing_fail(sid, gva + 0x1000);
     assert!(
-        !log_since(mark).contains("type4_backing_recovered"),
+        !log_since(mark).contains("backing_recovered"),
         "a recycled surface id is not evidence that the earlier backing landed"
     );
     assert!(
-        !type4_fail_latch()
+        !backing_fail_latch()
             .lock()
             .unwrap()
             .contains_key(&(sid, "translate")),
@@ -1250,17 +1248,12 @@ fn a_type4_refusal_the_next_attach_resolves_is_reported_as_recovered() {
 
     // The same refusal, then an attach on the backing it named, is a recovery.
     let mark = log_mark();
-    defer_type4_fail(
-        sid,
-        "translate",
-        Some(gva),
-        "type4_backing_fail probe".into(),
-    );
-    flush_type4_fail(sid);
-    clear_type4_fail(sid, gva);
+    defer_backing_fail(sid, "translate", Some(gva), "backing_fail probe".into());
+    flush_backing_fail(sid);
+    clear_backing_fail(sid, gva);
     let log = log_since(mark);
     assert!(
-        log.contains("type4_backing_recovered")
+        log.contains("backing_recovered")
             && log.contains(&format!("sid={sid}"))
             && log.contains("reason=translate")
             && log.contains(&format!("gva={gva:#x}")),
@@ -1282,7 +1275,7 @@ fn a_type4_refusal_the_next_attach_resolves_is_reported_as_recovered() {
 /// too is what keeps this from passing vacuously: a fixture in which every
 /// walk fails would satisfy the refusal assertions on its own.
 #[test]
-fn a_refused_type4_walk_names_the_check_that_refused() {
+fn a_refused_backing_walk_names_the_check_that_refused() {
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
@@ -1308,7 +1301,7 @@ fn a_refused_type4_walk_names_the_check_that_refused() {
         "the refusal must name where in the walk it stopped, got {walk:?}"
     );
 
-    let line = type4_translate_fail_detail(202, 1, 0, 640, gva, &walk);
+    let line = backing_translate_fail_detail(202, 1, 0, 640, gva, &walk);
     assert!(line.contains("reason=translate"), "{line}");
     assert!(line.contains("sid=202"), "{line}");
     assert!(line.contains("page=0/640"), "{line}");
@@ -1395,7 +1388,7 @@ fn a_task_with_no_object_list_resolves_nothing_not_its_neighbours_list() {
     let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     st32(
         &mut entry[0..],
-        (OBJECT_TYPE_SURFACE as u32) | (0x40u32 << 8),
+        (OBJECT_TYPE_BACKING as u32) | (0x40u32 << 8),
     );
     entry[4..12].copy_from_slice(&0xdead_0000u64.to_le_bytes());
     let _ = host.write_gpa(data_gpa, &entry);
@@ -1431,7 +1424,7 @@ fn a_task_with_no_object_list_resolves_nothing_not_its_neighbours_list() {
 /// miss is reportable differs.
 ///
 /// This is the half a regression would break. `probe_list_entry` exists because
-/// `type4_probe_order` walks every live task asking who owns a surface, so it
+/// `backing_probe_order` walks every live task asking who owns a surface, so it
 /// misses on every task before the owner — 18 `gva_read_refused` lines per
 /// driven boot, all of them the search working. Quietening that is only correct
 /// while it still *answers* identically; a probe that skipped the liveness test,
@@ -1461,7 +1454,7 @@ fn the_probe_and_the_named_lookup_answer_identically() {
     let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     st32(
         &mut entry[0..],
-        (OBJECT_TYPE_SURFACE as u32) | (0x40u32 << 8),
+        (OBJECT_TYPE_BACKING as u32) | (0x40u32 << 8),
     );
     entry[4..12].copy_from_slice(&0xdead_0000u64.to_le_bytes());
     let _ = host.write_gpa(data_gpa, &entry);
@@ -1492,7 +1485,7 @@ fn the_probe_and_the_named_lookup_answer_identically() {
     assert_eq!(probe_list_entry(&state, &host, 5, 0), None);
 }
 
-fn setup_type4_candidate(
+fn setup_backing_candidate(
     host: &mut FakeHost,
     state: &mut DeviceState,
     surface_id: u32,
@@ -1517,7 +1510,7 @@ fn setup_type4_candidate(
     let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     st32(
         &mut entry[0..],
-        (OBJECT_TYPE_SURFACE as u32) | (desc_len << 8),
+        (OBJECT_TYPE_BACKING as u32) | (desc_len << 8),
     );
     entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     let entry_gpa = data_gpa + surface_id as u64 * OBJECT_LIST_ENTRY_LEN as u64;
@@ -1525,56 +1518,56 @@ fn setup_type4_candidate(
     data_gpa
 }
 
-/// Once task-scan lookup finds an actual type-4 candidate, descriptor read
+/// Once task-scan lookup finds an actual backing candidate, descriptor read
 /// failure is no longer speculative: the surface has an owner but cannot get
 /// backing. It must be fail-visible with a stable reason slug.
 #[test]
-fn resolve_type4_candidate_logs_descriptor_read_failure() {
+fn resolve_backing_candidate_logs_descriptor_read_failure() {
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let sid = 17u32;
-    clear_type4_fail(sid, 0x20u64 << PAGE_SHIFT_X86);
-    let _ = setup_type4_candidate(&mut host, &mut state, sid, 0x3000, 0x30);
+    clear_backing_fail(sid, 0x20u64 << PAGE_SHIFT_X86);
+    let _ = setup_backing_candidate(&mut host, &mut state, sid, 0x3000, 0x30);
 
-    assert!(!resolve_type4_surface(&mut state, &host, sid));
+    assert!(!resolve_backing(&mut state, &host, sid));
     assert!(
-        type4_fail_latch()
+        backing_fail_latch()
             .lock()
             .unwrap()
             .contains_key(&(sid, "desc_read")),
         "surface-type candidate with unreadable descriptor must name desc_read"
     );
-    clear_type4_fail(sid, 0x20u64 << PAGE_SHIFT_X86);
+    clear_backing_fail(sid, 0x20u64 << PAGE_SHIFT_X86);
 }
 
-/// A readable but invalid type-4 descriptor used to fall through to the
+/// A readable but invalid backing descriptor used to fall through to the
 /// resolver tail with no site reason. Keep it fail-visible without logging
 /// absent/non-surface speculative probes.
 #[test]
-fn resolve_type4_candidate_logs_descriptor_decode_failure() {
+fn resolve_backing_candidate_logs_descriptor_decode_failure() {
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let sid = 18u32;
-    clear_type4_fail(sid, 0x20u64 << PAGE_SHIFT_X86);
-    let data_gpa = setup_type4_candidate(&mut host, &mut state, sid, 0x80, 0x30);
+    clear_backing_fail(sid, 0x20u64 << PAGE_SHIFT_X86);
+    let data_gpa = setup_backing_candidate(&mut host, &mut state, sid, 0x80, 0x30);
     let bad_desc = vec![0u8; 0x30];
     let _ = host.write_gpa(data_gpa + 0x80, &bad_desc);
 
-    assert!(!resolve_type4_surface(&mut state, &host, sid));
+    assert!(!resolve_backing(&mut state, &host, sid));
     assert!(
-        type4_fail_latch()
+        backing_fail_latch()
             .lock()
             .unwrap()
             .contains_key(&(sid, "desc_decode")),
         "surface-type candidate with invalid descriptor must name desc_decode"
     );
-    clear_type4_fail(sid, 0x20u64 << PAGE_SHIFT_X86);
+    clear_backing_fail(sid, 0x20u64 << PAGE_SHIFT_X86);
 }
 
-/// Live wire bytes (boot 093019 `compute_stage_tex type5 … args_hex`):
+/// Live wire bytes (boot 093019 `compute_stage_tex ref_texture … args_hex`):
 /// R8 1024×1024 = Y plane view of a biplanar 1024×1024 surface.
 #[test]
-fn decode_type5_texture_view_live_r8_y_plane() {
+fn decode_ref_texture_view_live_r8_y_plane() {
     let mut desc = vec![0u8; 8];
     st32(&mut desc[TYPE5_SURFACE_ID..], 8);
     // args blob: kind 0x2f, len 0x30, own_ref 0x15, record R8 1024×1024 d=1.
@@ -1587,7 +1580,7 @@ fn decode_type5_texture_view_live_r8_y_plane() {
         0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x10, 0x00, // trailer (unconsumed)
     ];
     desc.extend_from_slice(&args);
-    let rec = decode_type5_texture_view(&desc).expect("live R8 record decodes");
+    let rec = decode_ref_texture_view(&desc).expect("live R8 record decodes");
     assert_eq!(rec.pixel_format, 0x0a);
     assert_eq!((rec.width, rec.height, rec.depth), (1024, 1024, 1));
     // Short record (no +0x20 field) defaults to plane 0.
@@ -1600,7 +1593,7 @@ fn decode_type5_texture_view_live_r8_y_plane() {
 /// record tag `0x62`, not the biplanar `0x42`. Same field layout — must
 /// decode, or the blit path drops the copy.
 #[test]
-fn decode_type5_texture_view_live_0x62_color_window_view() {
+fn decode_ref_texture_view_live_0x62_color_window_view() {
     // Exact leading 40 bytes observed, zero-padded to the 56-byte desc_len.
     let head: [u8; 40] = [
         0x22, 0x00, 0x00, 0x00, // surface_id = 34
@@ -1616,7 +1609,7 @@ fn decode_type5_texture_view_live_0x62_color_window_view() {
     ];
     let mut desc = head.to_vec();
     desc.resize(56, 0); // plane field (+0x20 in record) reads 0
-    let rec = decode_type5_texture_view(&desc).expect("0x62 color view must decode");
+    let rec = decode_ref_texture_view(&desc).expect("0x62 color view must decode");
     assert_eq!(rec.pixel_format, 0x51);
     assert_eq!((rec.width, rec.height, rec.depth), (1024, 768, 1));
     assert_eq!(rec.plane_index, 0);
@@ -1627,7 +1620,7 @@ fn decode_type5_texture_view_live_0x62_color_window_view() {
 /// `+0x20` — Y views carry 0, the RG8 chroma view 1, the same-geometry
 /// alpha view 2. Geometry cannot separate Y from alpha; this field does.
 #[test]
-fn decode_type5_texture_view_live_v0a8_alpha_plane_index() {
+fn decode_ref_texture_view_live_v0a8_alpha_plane_index() {
     let mut desc = vec![0u8; 8];
     st32(&mut desc[TYPE5_SURFACE_ID..], 0x6d);
     let args = [
@@ -1641,7 +1634,7 @@ fn decode_type5_texture_view_live_v0a8_alpha_plane_index() {
         0x02, 0x00, 0x00, 0x00, // IOSurface plane index = 2 (alpha)
     ];
     desc.extend_from_slice(&args);
-    let rec = decode_type5_texture_view(&desc).expect("live v0a8 alpha record decodes");
+    let rec = decode_ref_texture_view(&desc).expect("live v0a8 alpha record decodes");
     assert_eq!(rec.pixel_format, 0x0a);
     assert_eq!((rec.width, rec.height, rec.depth), (946, 350, 1));
     assert_eq!(rec.plane_index, 2);
@@ -1656,7 +1649,7 @@ fn decode_type5_texture_view_live_v0a8_alpha_plane_index() {
 /// point of having it. Pinning the offset against a descriptor whose *other*
 /// leading dword is non-zero is what makes an off-by-four visible.
 #[test]
-fn the_type5_owner_task_is_read_from_its_own_dword() {
+fn the_ref_texture_owner_task_is_read_from_its_own_dword() {
     let mut desc = [0u8; TYPE5_MIN_LEN];
     st32(&mut desc[TYPE5_SURFACE_ID..], 0xabcd);
     assert_eq!(
@@ -1678,11 +1671,11 @@ fn the_type5_owner_task_is_read_from_its_own_dword() {
 }
 
 #[test]
-fn decode_type5_texture_view_fail_closed() {
+fn decode_ref_texture_view_fail_closed() {
     // Short descriptor (no record).
     let mut short = vec![0u8; 8];
     st32(&mut short[TYPE5_SURFACE_ID..], 8);
-    assert!(decode_type5_texture_view(&short).is_none());
+    assert!(decode_ref_texture_view(&short).is_none());
     // Wrong record tag.
     let mut bad_tag = vec![0u8; 8];
     st32(&mut bad_tag[TYPE5_SURFACE_ID..], 8);
@@ -1690,7 +1683,7 @@ fn decode_type5_texture_view_fail_closed() {
     bad_tag.extend_from_slice(&[
         0x41, 0x01, 0x0a, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x01, 0, 0, 0,
     ]);
-    assert!(decode_type5_texture_view(&bad_tag).is_none());
+    assert!(decode_ref_texture_view(&bad_tag).is_none());
     // Non-2D (depth != 1) fails closed.
     let mut vol = vec![0u8; 8];
     st32(&mut vol[TYPE5_SURFACE_ID..], 8);
@@ -1698,7 +1691,7 @@ fn decode_type5_texture_view_fail_closed() {
     vol.extend_from_slice(&[
         0x42, 0x07, 0x50, 0x00, 0x40, 0, 0, 0, 0x40, 0, 0, 0, 0x40, 0, 0, 0,
     ]);
-    assert!(decode_type5_texture_view(&vol).is_none());
+    assert!(decode_ref_texture_view(&vol).is_none());
     // Zero width fails closed.
     let mut zw = vec![0u8; 8];
     st32(&mut zw[TYPE5_SURFACE_ID..], 8);
@@ -1706,11 +1699,11 @@ fn decode_type5_texture_view_fail_closed() {
     zw.extend_from_slice(&[
         0x42, 0x01, 0x0a, 0x00, 0, 0, 0, 0, 0x00, 0x04, 0, 0, 0x01, 0, 0, 0,
     ]);
-    assert!(decode_type5_texture_view(&zw).is_none());
+    assert!(decode_ref_texture_view(&zw).is_none());
 }
 
 /// The probe's notion of "undecoded" must be exactly the bytes
-/// `decode_type4_surface` skips, and it must distinguish two surfaces on
+/// `decode_backing` skips, and it must distinguish two surfaces on
 /// those bytes alone.
 ///
 /// This is the measurement that blocks the largest deletion in the present
@@ -1718,12 +1711,12 @@ fn decode_type5_texture_view_fail_closed() {
 /// swapchain buffer from a same-geometry offscreen tile, so membership is
 /// reconstructed by half a dozen downstream mechanisms. If the guest is
 /// telling us in the undecoded span, the probe has to be able to see it.
-/// The two arms of the type-4 freshness test must accept exactly the same
+/// The two arms of the backing freshness test must accept exactly the same
 /// backings, because only one of them rebuilds when it says no.
 ///
-/// The force arm returns through `win_type4_search` **without** calling
-/// `apply_type4_backing`, so `set_mapping_geom` and
-/// `synthesize_device_desc_from_type4` are both skipped. It used to compare
+/// The force arm returns through `win_backing_search` **without** calling
+/// `apply_backing`, so `set_mapping_geom` and
+/// `synthesize_device_desc_from_backing` are both skipped. It used to compare
 /// width alone while the non-force arm compared width and height, and
 /// `ensure_surface_for_present` calls the force arm precisely to catch a
 /// wire geometry change — so a height change that stayed inside the same
@@ -1736,7 +1729,7 @@ fn decode_type5_texture_view_fail_closed() {
 #[test]
 fn a_latched_backing_is_stale_when_any_of_geometry_or_format_moved() {
     use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
-    let surf = |w: u32, h: u32, fourcc: u32| Type4Surface {
+    let surf = |w: u32, h: u32, fourcc: u32| BackingRecord {
         length: 0x1000,
         backing_pfn: 1,
         pixel_format: fourcc,
@@ -1786,7 +1779,7 @@ fn a_latched_backing_is_stale_when_any_of_geometry_or_format_moved() {
 /// the failure a shared `latched_mapping_format` exists to make impossible.
 #[test]
 fn a_multiplane_backing_compares_equal_to_the_zero_it_latched() {
-    let mut surf = Type4Surface {
+    let mut surf = BackingRecord {
         length: 0x1000,
         backing_pfn: 1,
         pixel_format: 0x4247_5241, // 'BGRA' — a format the converter knows
@@ -1819,8 +1812,8 @@ fn a_multiplane_backing_compares_equal_to_the_zero_it_latched() {
 /// A single-plane surface must publish plane 0's offset, because both its
 /// consumers fold it in and one of them is the other pathway.
 ///
-/// `decode_type4_plane` reads four fields; the surface-level convenience
-/// copies on `Type4Surface` take three, and the synthesizer's single-plane
+/// `decode_backing_plane` reads four fields; the surface-level convenience
+/// copies on `BackingRecord` take three, and the synthesizer's single-plane
 /// arm used to publish only those three. A surface whose pixels start past
 /// the base of its allocation was then read and written at 0 — the
 /// multi-plane arm has always published each plane's offset, and
@@ -1832,7 +1825,7 @@ fn a_single_plane_backing_publishes_the_offset_its_pixels_start_at() {
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     const BASE: u32 = 0x800;
     let (w, h, bpr) = (8u32, 4u32, 32u32);
-    let mut surf = Type4Surface {
+    let mut surf = BackingRecord {
         length: 0x4000,
         backing_pfn: 1,
         pixel_format: 0x4247_5241, // 'BGRA'
@@ -1842,7 +1835,7 @@ fn a_single_plane_backing_publishes_the_offset_its_pixels_start_at() {
         height: h,
         bytes_per_row: bpr,
     };
-    surf.planes[0] = Type4Plane {
+    surf.planes[0] = BackingPlane {
         offset: BASE,
         width: w,
         height: h,
@@ -1850,11 +1843,11 @@ fn a_single_plane_backing_publishes_the_offset_its_pixels_start_at() {
         bytes_per_element: 4,
     };
     assert!(
-        !type4_is_multiplanar(&surf),
+        !backing_is_multiplanar(&surf),
         "the single-plane arm is the one under test"
     );
 
-    let desc = synthesize_device_desc_from_type4(&surf);
+    let desc = synthesize_device_desc_from_backing(&surf);
     let decoded = decode_device_surface(&desc).expect("device descriptor");
     assert_eq!(
         decoded.plane_count, 0,
@@ -1876,7 +1869,7 @@ fn a_single_plane_backing_publishes_the_offset_its_pixels_start_at() {
 
     // Zero stays zero — the ordinary case must not gain an offset.
     surf.planes[0].offset = 0;
-    let zero = synthesize_device_desc_from_type4(&surf);
+    let zero = synthesize_device_desc_from_backing(&surf);
     assert_eq!(decode_device_surface(&zero).expect("desc").base_offset, 0);
 }
 
@@ -1930,7 +1923,7 @@ fn the_device_descriptor_format_word_survives_both_of_its_encodings() {
     assert_eq!(device_desc_format_to_mtl(0), 0);
 }
 
-/// The type-4 probe order must visit task 0 first, the hint next, and every
+/// The backing probe order must visit task 0 first, the hint next, and every
 /// **live** task exactly once.
 ///
 /// It is the thing that makes the search terminate on the first probe for
@@ -1946,7 +1939,7 @@ fn the_device_descriptor_format_word_survives_both_of_its_encodings() {
 /// and is why a length assertion against a number would silently stop meaning
 /// anything.
 #[test]
-fn the_type4_probe_order_visits_task_zero_first_and_every_live_task_once() {
+fn the_backing_probe_order_visits_task_zero_first_and_every_live_task_once() {
     use std::collections::HashSet;
 
     let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
@@ -1958,7 +1951,7 @@ fn the_type4_probe_order_visits_task_zero_first_and_every_live_task_once() {
     }
 
     for hint in [0u32, 1, 7, 70_000] {
-        let order = type4_probe_order(&state.tasks, hint);
+        let order = backing_probe_order(&state.tasks, hint);
         assert_eq!(order[0], 0, "task 0 leads for hint {hint}");
         if hint != 0 {
             assert_eq!(order[1], hint, "the hint is probed second");
@@ -1978,7 +1971,7 @@ fn the_type4_probe_order_visits_task_zero_first_and_every_live_task_once() {
     // A dead task is not probed. It never could be — the probe's own liveness
     // test refused it — so yielding it only ever cost a guest read's worth of
     // work per present.
-    let order = type4_probe_order(&state.tasks, 0);
+    let order = backing_probe_order(&state.tasks, 0);
     assert!(
         !order.contains(&9),
         "an id nothing defined must not be probed: {order:?}"
@@ -1986,27 +1979,27 @@ fn the_type4_probe_order_visits_task_zero_first_and_every_live_task_once() {
 
     // A hint naming no live task adds a probe that the liveness test at the
     // probe then refuses, and must not lose a live one or duplicate task 0.
-    let order = type4_probe_order(&state.tasks, u32::MAX);
+    let order = backing_probe_order(&state.tasks, u32::MAX);
     let seen: HashSet<u32> = order.iter().copied().collect();
     assert_eq!(seen.len(), order.len(), "{order:?}");
     assert!(live.iter().all(|t| seen.contains(t)), "{order:?}");
 }
 
 #[test]
-fn undecoded_type4_span_is_exactly_what_the_decoder_skips() {
+fn undecoded_backing_span_is_exactly_what_the_decoder_skips() {
     // One plane: the decoder consumes 0x14..0x24, so the tail starts there.
-    let built = Type4Builder::new(0x800000, 0x1234, 0x4247_5241, 1) // 'BGRA'
+    let built = BackingBuilder::new(0x800000, 0x1234, 0x4247_5241, 1) // 'BGRA'
         .plane(0, 0, 1920, 1080, 1920 * 4, 0)
         .with_len(0x40);
     let a = built.bytes().to_vec();
 
     // Every decoded field can change without moving the undecoded span.
-    let b = Type4Builder::new(0x900000, 0x9999, 0x4c31_3062, 1)
+    let b = BackingBuilder::new(0x900000, 0x9999, 0x4c31_3062, 1)
         .plane(0, 0, 1280, 720, 1280 * 4, 0)
         .with_len(0x40);
     assert_eq!(
-        undecoded_type4_surface_bytes(&a),
-        undecoded_type4_surface_bytes(b.bytes()),
+        undecoded_backing_bytes(&a),
+        undecoded_backing_bytes(b.bytes()),
         "changing only decoded fields must not look like a new shape"
     );
 
@@ -2016,8 +2009,8 @@ fn undecoded_type4_span_is_exactly_what_the_decoder_skips() {
         let mut c = a.clone();
         c[probe] ^= 0xff;
         assert_ne!(
-            undecoded_type4_surface_bytes(&a),
-            undecoded_type4_surface_bytes(&c),
+            undecoded_backing_bytes(&a),
+            undecoded_backing_bytes(&c),
             "byte {probe:#x} is undecoded and must be visible to the probe"
         );
     }
@@ -2030,25 +2023,25 @@ fn undecoded_type4_span_is_exactly_what_the_decoder_skips() {
         let mut c = a.clone();
         c[probe] ^= 0xff;
         assert_eq!(
-            undecoded_type4_surface_bytes(&a),
-            undecoded_type4_surface_bytes(&c),
+            undecoded_backing_bytes(&a),
+            undecoded_backing_bytes(&c),
             "byte {probe:#x} is decoded and must stay out of the span"
         );
     }
 
     // A second plane moves the boundary: 0x24..0x34 becomes decoded.
-    let two = Type4Builder::new(0x800000, 0x1234, 0x4247_5241, 2)
+    let two = BackingBuilder::new(0x800000, 0x1234, 0x4247_5241, 2)
         .plane(0, 0, 1920, 1080, 1920 * 4, 0)
         .with_len(0x40);
     assert_eq!(
-        undecoded_type4_surface_bytes(two.bytes()).len(),
-        undecoded_type4_surface_bytes(&a).len() - TYPE4_PLANE_STRIDE,
+        undecoded_backing_bytes(two.bytes()).len(),
+        undecoded_backing_bytes(&a).len() - TYPE4_PLANE_STRIDE,
         "the span shrinks by exactly one plane record"
     );
 
     // A record too short to decode reports nothing rather than a partial
     // span that would compare unequal against every real one.
-    assert!(undecoded_type4_surface_bytes(&a[..TYPE4_MIN_LEN - 1]).is_empty());
+    assert!(undecoded_backing_bytes(&a[..TYPE4_MIN_LEN - 1]).is_empty());
 }
 
 /// The shared ladder asks its three questions in the only order they can be
@@ -2062,16 +2055,16 @@ fn undecoded_type4_span_is_exactly_what_the_decoder_skips() {
 /// branches removes.
 #[test]
 fn the_shared_ladder_names_the_rung_that_refused() {
-    use crate::runtime::decode::resource::{OBJECT_TYPE_BUFFER, OBJECT_TYPE_IOSURFACE};
+    use crate::runtime::decode::resource::{OBJECT_TYPE_BUFFER, OBJECT_TYPE_MAPPER_REF_TEXTURE};
 
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
 
-    // Ref 1 is a type-11 entry whose descriptor is mapped: all three rungs pass.
-    let (entry, bytes) =
-        resolve_descriptor(&state, &host, 1, 1, &[OBJECT_TYPE_IOSURFACE]).expect("all rungs pass");
-    assert_eq!(entry.object_type, OBJECT_TYPE_IOSURFACE);
+    // Ref 1 is a mapper-ref-texture entry whose descriptor is mapped: all three rungs pass.
+    let (entry, bytes) = resolve_descriptor(&state, &host, 1, 1, &[OBJECT_TYPE_MAPPER_REF_TEXTURE])
+        .expect("all rungs pass");
+    assert_eq!(entry.object_type, OBJECT_TYPE_MAPPER_REF_TEXTURE);
     assert!(!bytes.is_empty(), "the descriptor bytes come back with it");
 
     // Same ref, asked for as a buffer: the tag it found travels with the
@@ -2080,7 +2073,7 @@ fn the_shared_ladder_names_the_rung_that_refused() {
     assert_eq!(
         resolve_descriptor(&state, &host, 1, 1, &[OBJECT_TYPE_BUFFER]),
         Err(LadderRung::WrongType {
-            got: OBJECT_TYPE_IOSURFACE
+            got: OBJECT_TYPE_MAPPER_REF_TEXTURE
         })
     );
 
@@ -2099,14 +2092,14 @@ fn the_shared_ladder_names_the_rung_that_refused() {
     let mut entry = [0u8; 12];
     st32(
         &mut entry[0..],
-        u32::from(OBJECT_TYPE_IOSURFACE) | (0x20u32 << 8),
+        u32::from(OBJECT_TYPE_MAPPER_REF_TEXTURE) | (0x20u32 << 8),
     );
     entry[4..12].copy_from_slice(&0xdead_0000u64.to_le_bytes());
     let _ = host.write_gpa(data_gpa + 24, &entry);
     // The declared length travels with the rung: the entry above says 0x20
     // bytes, and by the time a rail reports this the entry is gone.
     assert_eq!(
-        resolve_descriptor(&state, &host, 1, 2, &[OBJECT_TYPE_IOSURFACE]),
+        resolve_descriptor(&state, &host, 1, 2, &[OBJECT_TYPE_MAPPER_REF_TEXTURE]),
         Err(LadderRung::DescRead { declared_len: 0x20 })
     );
 }
@@ -2198,8 +2191,8 @@ fn a_repoint_drops_the_ref_keyed_host_copies_of_the_object() {
 /// mapping id is a different namespace even when the integers happen to be
 /// equal.
 ///
-/// This is the compositor failure class: task 0 owns type-4 surface 1 while
-/// task 1 owns type-11 resource 1, which resolves to mapping 9. Re-pointing the
+/// This is the compositor failure class: task 0 owns backing record 1 while
+/// task 1 owns mapper-ref-texture resource 1, which resolves to mapping 9. Re-pointing the
 /// latter must retire mapping 9 and leave task 0's surface intact. The old
 /// global-id-first route did the opposite.
 #[test]
@@ -2208,21 +2201,24 @@ fn a_repoint_resolves_the_resource_in_its_task_before_touching_a_mapping() {
     let mut host = FakeHost::new();
     setup_task_with_list(&mut host, &mut state);
 
-    assert_eq!(resolve_type11_ref(&mut state, &host, 1, 1), Some(9));
+    assert_eq!(resolve_mapper_ref_texture(&mut state, &host, 1, 1), Some(9));
 
     assert!(state.map_surface(1));
     {
         let surface = state.mappings.get_mut(&1).expect("surface mapping");
         surface.mapped = true;
         surface.page_entries = vec![0x1234_5001];
-        surface.type4_walk = Some(crate::model::Type4Walk {
+        surface.backing_walk = Some(crate::model::BackingWalk {
             task_id: 0,
             backing_pfn: 0x20,
             map_generation: surface.map_generation,
         });
     }
     {
-        let resource = state.mappings.get_mut(&9).expect("type-11 mapping");
+        let resource = state
+            .mappings
+            .get_mut(&9)
+            .expect("mapper-ref-texture mapping");
         resource.mapped = true;
         resource.page_entries = vec![0x6789_a001];
     }
@@ -2236,15 +2232,15 @@ fn a_repoint_resolves_the_resource_in_its_task_before_touching_a_mapping() {
     );
     assert!(
         state.mappings[&9].page_entries.is_empty(),
-        "the task-local type-11 association names the mapping to invalidate"
+        "the task-local mapper-ref-texture association names the mapping to invalidate"
     );
 }
 
-/// A direct type-4 resource is routed by the task provenance latched with its
+/// A direct backing resource is routed by the task provenance latched with its
 /// page walk, so tightening the namespace must not suppress genuine surface
 /// re-points.
 #[test]
-fn a_repoint_retires_a_type4_mapping_owned_by_the_packet_task() {
+fn a_repoint_retires_a_backing_mapping_owned_by_the_packet_task() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     assert!(state.map_surface(7));
@@ -2252,7 +2248,7 @@ fn a_repoint_retires_a_type4_mapping_owned_by_the_packet_task() {
         let surface = state.mappings.get_mut(&7).expect("surface mapping");
         surface.mapped = true;
         surface.page_entries = vec![0x1234_5001];
-        surface.type4_walk = Some(crate::model::Type4Walk {
+        surface.backing_walk = Some(crate::model::BackingWalk {
             task_id: 3,
             backing_pfn: 0x20,
             map_generation: surface.map_generation,
@@ -2266,7 +2262,7 @@ fn a_repoint_retires_a_type4_mapping_owned_by_the_packet_task() {
     assert_ne!(state.mappings[&7].map_generation, prior_generation);
     assert_ne!(
         state.mappings[&7]
-            .type4_walk
+            .backing_walk
             .expect("the old walk remains only as provenance")
             .map_generation,
         state.mappings[&7].map_generation,
