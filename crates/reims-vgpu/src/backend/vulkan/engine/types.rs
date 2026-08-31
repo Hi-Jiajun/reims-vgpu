@@ -2034,6 +2034,37 @@ impl StorageImageFormat {
 /// pointers and corrupted the guest's page tables with them. It is `Clone` and
 /// not `Copy` only because several hundred call sites spell the clone, and
 /// rewriting them would bury whatever change asked for it.
+///
+/// # Why it is still this rail's type, although neutral modules hold one
+///
+/// `writeback_debt`, `model::state` and `gva_store_witness` all name this type
+/// while owning nothing about Vulkan, which reads like a leak and has been
+/// attempted as one. It is not fixed by moving the type below the rail, because
+/// `format` is **not** a protocol scalar the way every other field is. It is
+/// what *this host* resolved the guest's declaration to:
+///
+/// * `Gva` takes `translate::pixel::color_attachment(guest_u16).vk`, which
+///   keeps the sRGB spelling the guest declared — a distinction
+///   `contract::pixel_format::TexelLayout` deliberately folds away, so a
+///   `TexelLayout` field would silently drop the transfer function.
+/// * `runtime::draw::vulkan::gva_resident_format` narrows that again by asking
+///   the *host* whether it renders to and blends the layout, falling back to
+///   [`translate::pixel::RESIDENT_RGBA_FORMAT`] when it does not.
+///
+/// Because this is the registry key, either substitution changes which draws
+/// share one `VkImage`: keying on the guest's declaration instead forks a
+/// resident per spelling, and keying on a folded layout fuses two that the host
+/// resolved apart. Both are the damage-history classes `storage_format` and
+/// `surface_identity` document, arrived at from opposite directions.
+///
+/// So a neutral spelling has to be lossless *for the resolved set*, which means
+/// a layout **and** its transfer function together — a contract type that does
+/// not exist yet. Until it does, the honest statement is that this key carries
+/// one rail-resolved component, and the neutral holders keep it opaque: none of
+/// them reads `format`. `gva_store_witness` reads [`Self::is_bgra`], which is a
+/// derived `bool` and stays derived for the reason its own field documents; a
+/// neutral holder that started matching on `format` itself would be spelling
+/// this rail's resolution outside this rail.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum TargetIdentity {
     /// Type-4 mapping / surface id namespace.
