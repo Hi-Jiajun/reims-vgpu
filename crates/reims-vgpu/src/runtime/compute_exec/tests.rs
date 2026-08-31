@@ -4,6 +4,26 @@
 )]
 
 use super::*;
+
+/// A rail payload for the tests below that are about what the neutral staging
+/// rails *produce* — geometry, format, bytes, writeback destination — rather
+/// than about what either rail keeps of it.
+///
+/// Naming a real rail here would have tied those tests to whichever arm the
+/// build carries, which is the coupling `StagedTexture`'s type parameter exists
+/// to remove. A test that is about one rail's half names that rail instead.
+#[derive(Debug, Default)]
+pub(super) struct NeutralStage;
+
+impl RailStage for NeutralStage {
+    fn stage(
+        _texture_ref: u32,
+        _residency: Option<ComputeStorageResidencyCandidate>,
+        _serve: Option<ResidentServe>,
+    ) -> Self {
+        Self
+    }
+}
 // Both rails' tests live here alongside the shared staging ones. Neither rail is
 // re-exported into `super`, so each is named where its arm compiles.
 #[cfg(feature = "backend-vulkan")]
@@ -195,8 +215,9 @@ fn stage_texture_ref_texture_plane_index_beats_the_ambiguous_geometry_scan() {
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged = stage_texture_raw(&mut state, &mut host, 1, ref_texture_ref, 33, true)
-        .expect("a ref-texture plane view over a mapped surface must stage");
+    let staged =
+        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, ref_texture_ref, 33, true)
+            .expect("a ref-texture plane view over a mapped surface must stage");
     match staged.writeback {
         TextureWriteback::MapperRefTexture {
             surface_offset,
@@ -960,12 +981,17 @@ fn dispatch_missing_pipeline_not_nometal() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn a_format_with_no_storage_selector_refuses_the_same_way_from_every_rail() {
-    use crate::runtime::compute_exec::metal::split_staged_textures;
+    use crate::runtime::compute_exec::metal::{split_staged_textures, MetalStage};
     use crate::runtime::compute_exec::{ComputeStatus, StagedTexture};
 
+    // This literal used to carry the *other* rail's half too, behind `cfg`s,
+    // because the struct did: it once named a `seed_skipped: bool` and a
+    // `sample_resident` that had been folded into one `serve` field, and both
+    // dead spellings survived because each single-arm build `cfg`d out exactly
+    // the arm that would have caught them. A Metal staged texture now carries
+    // `MetalStage` and there is no Vulkan field here to get wrong.
     let mut no_selector = StagedTexture {
         binding: 33,
-        texture_ref: 44,
         // A sample-only format: `contract::pixel_format::storage_selector` has
         // no entry for it by design, which is exactly the class this refuses.
         pixel_format: crate::contract::pixel_format::MTL_FORMAT_R32_FLOAT,
@@ -975,23 +1001,8 @@ fn a_format_with_no_storage_selector_refuses_the_same_way_from_every_rail() {
         height: 4,
         bytes: vec![0; 64],
         is_storage: true,
-        // The Vulkan-gated half of the struct, kept complete because a build
-        // carrying both rails compiles these lines and nothing else checks
-        // them: this literal named a `seed_skipped: bool` and a
-        // `sample_resident` that were folded into one `serve` field, and both
-        // spellings survived because each single-arm build `cfg`s out exactly
-        // the arm that would have caught it.
-        #[cfg(feature = "backend-vulkan")]
-        array_element: 0,
-        #[cfg(feature = "backend-vulkan")]
-        descriptor_count: 1,
-        #[cfg(feature = "backend-vulkan")]
-        residency: None,
-        #[cfg(feature = "backend-vulkan")]
-        serve: None,
-        #[cfg(feature = "backend-vulkan")]
-        multisample_target: None,
         writeback: TextureWriteback::None,
+        rail: MetalStage { texture_ref: 44 },
     };
 
     assert_eq!(
@@ -1235,8 +1246,9 @@ fn stage_texture_ref_texture_ref_resolves_surface_mapping() {
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged = stage_texture_raw(&mut state, &mut host, 1, ref_texture_ref, 32, true)
-        .expect("ref-texture→surface stage must succeed after ensure");
+    let staged =
+        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, ref_texture_ref, 32, true)
+            .expect("ref-texture→surface stage must succeed after ensure");
     assert_eq!((staged.width, staged.height), (4, 4));
     assert_eq!(staged.bytes.len(), 4 * 4 * 4);
     assert!(matches!(
@@ -1292,8 +1304,9 @@ fn stage_texture_ref_texture_record_reshapes_stageable_single_plane_surface() {
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged = stage_texture_raw(&mut state, &mut host, 1, ref_texture_ref, 33, true)
-        .expect("serialized ref-texture view must override base surface geometry");
+    let staged =
+        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, ref_texture_ref, 33, true)
+            .expect("serialized ref-texture view must override base surface geometry");
     assert_eq!((staged.width, staged.height), (1, 4));
     assert_eq!(
         staged.storage_selector,
@@ -1328,8 +1341,9 @@ fn stage_texture_ref_texture_record_reshapes_stageable_single_plane_surface() {
         .geometry(MTL_FORMAT_R32_UINT, 4, 4, 1)
         .trailer([1, 0, 1, 0, 1, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, reshaped.bytes());
-    let sampled = stage_texture_raw(&mut state, &mut host, 1, ref_texture_ref, 32, false)
-        .expect("sample-only R32Uint view must stage from the same IOSurface bytes");
+    let sampled =
+        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, ref_texture_ref, 32, false)
+            .expect("sample-only R32Uint view must stage from the same IOSurface bytes");
     assert_eq!((sampled.width, sampled.height), (4, 4));
     assert_eq!(sampled.pixel_format, MTL_FORMAT_R32_UINT);
     assert_eq!(
@@ -1417,8 +1431,9 @@ fn stage_texture_ref_texture_record_stages_biplanar_y_plane() {
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged = stage_texture_raw(&mut state, &mut host, 1, ref_texture_ref, 32, true)
-        .expect("plane record must stage the Y plane of a biplanar surface");
+    let staged =
+        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, ref_texture_ref, 32, true)
+            .expect("plane record must stage the Y plane of a biplanar surface");
     assert_eq!((staged.width, staged.height), (16, 8));
     assert_eq!(
         staged.storage_selector,
@@ -1439,8 +1454,9 @@ fn stage_texture_ref_texture_record_stages_biplanar_y_plane() {
         }
         _ => panic!("expected MapperRefTexture writeback"),
     }
-    let sampled = stage_texture_raw(&mut state, &mut host, 1, ref_texture_ref, 32, false)
-        .expect("sampled ref-texture plane must stage without writeback");
+    let sampled =
+        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, ref_texture_ref, 32, false)
+            .expect("sampled ref-texture plane must stage without writeback");
     assert!(!sampled.is_storage);
     assert!(matches!(sampled.writeback, TextureWriteback::None));
     let _ = MTL_FORMAT_R8_UNORM;
@@ -1493,7 +1509,8 @@ fn stage_texture_ref_texture_multiplanar_without_record_fails_closed() {
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    match stage_texture_raw(&mut state, &mut host, 1, ref_texture_ref, 32, true) {
+    match stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, ref_texture_ref, 32, true)
+    {
         Err(ComputeStatus::Unsupported(_)) => {}
         Err(other) => panic!("expected Unsupported, got {other:?}"),
         Ok(_) => panic!("multiplanar without plane record must fail closed"),
@@ -1543,7 +1560,9 @@ fn stage_texture_linear_ref_does_not_collide_with_surface_mid() {
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     // Must fail linear (bogus desc), NOT succeed against surface mid 7.
-    if let Ok(s) = stage_texture_raw(&mut state, &mut host, 1, colliding_mid, 32, true) {
+    if let Ok(s) =
+        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, colliding_mid, 32, true)
+    {
         panic!(
             "linear ref must not stage collided surface mid ({}x{})",
             s.width, s.height
@@ -1602,8 +1621,15 @@ fn stage_heap_texture_uses_host_only_residency_identity() {
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], entry_offset, &list_entry);
 
-    let staged = stage_texture_raw(&mut state, &mut host, 1, texture_ref, 33, true)
-        .expect("live opcode-0x15 heap texture must stage");
+    let staged = stage_texture_raw::<vulkan::VulkanStage, _>(
+        &mut state,
+        &mut host,
+        1,
+        texture_ref,
+        33,
+        true,
+    )
+    .expect("live opcode-0x15 heap texture must stage");
     assert_eq!((staged.width, staged.height), (180, 135));
     assert_eq!(staged.pixel_format, MTL_FORMAT_RGBA32_FLOAT);
     assert_eq!(
@@ -1612,7 +1638,10 @@ fn stage_heap_texture_uses_host_only_residency_identity() {
     );
     assert_eq!(staged.bytes.len(), 180 * 135 * 16);
     assert!(matches!(staged.writeback, TextureWriteback::None));
-    let residency = staged.residency.expect("heap texture needs GPU residency");
+    let residency = staged
+        .rail
+        .residency
+        .expect("heap texture needs GPU residency");
     assert!(residency.key.is_heap());
     assert!(!residency.key.is_linear());
     assert_eq!(residency.key.map_generation, 1);
@@ -1637,23 +1666,15 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
     let gva = 0x101000u64;
     let rgba = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
     let staged = StagedTexture {
-        multisample_target: None,
         mip_levels: 1,
         binding: 32,
-        #[cfg(feature = "backend-vulkan")]
-        array_element: 0,
-        #[cfg(feature = "backend-vulkan")]
-        descriptor_count: 1,
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        texture_ref: 44,
+        rail: vulkan::VulkanStage::default(),
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
         storage_selector: Some(pixel_format::StorageImageSelector::Rgba8Unorm),
         width: 2,
         height: 2,
         bytes: rgba.clone(),
         is_storage: true,
-        residency: None,
-        serve: None,
         writeback: TextureWriteback::Linear {
             pages: crate::runtime::draw::StoreTargetPages::empty(),
             texture_ref,
@@ -1763,8 +1784,9 @@ fn stage_texture_ref_texture_ignores_task_object_list_slot_collision() {
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let staged = stage_texture_raw(&mut state, &mut host, 1, ref_texture_ref, 32, true)
-        .expect("ref-texture must stage mapping sid, not poisoned mapper-ref-texture slot");
+    let staged =
+        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, ref_texture_ref, 32, true)
+            .expect("ref-texture must stage mapping sid, not poisoned mapper-ref-texture slot");
     assert_eq!((staged.width, staged.height), (4, 4));
     assert!(matches!(
         staged.writeback,
@@ -1796,7 +1818,8 @@ fn stage_texture_ref_texture_without_surface_is_missing() {
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let st = stage_texture_raw(&mut state, &mut host, 1, ref_texture_ref, 32, false);
+    let st =
+        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, ref_texture_ref, 32, false);
     assert!(matches!(st, Err(ComputeStatus::MissingTexture(_))));
 }
 
@@ -2371,24 +2394,19 @@ fn a_licence_and_not_the_destinations_shape_decides_the_direct_arm() {
         bpp: 4,
     };
     let staged = |writeback, residency| StagedTexture {
-        multisample_target: None,
         mip_levels: 1,
         binding: 32,
-        #[cfg(feature = "backend-vulkan")]
-        array_element: 0,
-        #[cfg(feature = "backend-vulkan")]
-        descriptor_count: 1,
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        texture_ref: 44,
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
         storage_selector: Some(pixel_format::StorageImageSelector::Rgba8Unorm),
         width: 2,
         height: 2,
         bytes: vec![0u8; 16],
         is_storage: true,
-        residency,
-        serve: None,
         writeback,
+        rail: vulkan::VulkanStage {
+            residency,
+            ..Default::default()
+        },
     };
     let is_host = |d: &ComputeImageDestination| matches!(d, ComputeImageDestination::Host);
 
@@ -2799,10 +2817,9 @@ fn a_truncated_stage_input_is_not_the_same_as_an_absent_one() {
 #[cfg(feature = "backend-vulkan")]
 fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
     use super::vulkan::{
-        note_storage_residency_writeback, ComputeStorageResidencyCandidate,
-        STORAGE_RESIDENCY_WINDOWS_PER_MAPPING,
+        note_storage_residency_writeback, VulkanStage, STORAGE_RESIDENCY_WINDOWS_PER_MAPPING,
     };
-    use super::{StagedTexture, TextureWriteback};
+    use super::{ComputeStorageResidencyCandidate, StagedTexture, TextureWriteback};
     use crate::model::ComputeStorageResidencyKey;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -2810,15 +2827,8 @@ fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
     const HEAP_TEXTURES: u32 = 4 * STORAGE_RESIDENCY_WINDOWS_PER_MAPPING as u32;
 
     let staged = |key: ComputeStorageResidencyKey| StagedTexture {
-        multisample_target: None,
         mip_levels: 1,
         binding: 33,
-        #[cfg(feature = "backend-vulkan")]
-        array_element: 0,
-        #[cfg(feature = "backend-vulkan")]
-        descriptor_count: 1,
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        texture_ref: key.texture_ref,
         pixel_format: key.pixel_format,
         storage_selector: Some(pixel_format::StorageImageSelector::Rgba8Uint),
         width: key.width,
@@ -2827,11 +2837,13 @@ fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
         // The mirror is only armed for a storage output, which is what makes a
         // heap texture's engine copy the sole content.
         is_storage: true,
-        residency: Some(ComputeStorageResidencyCandidate {
-            key,
-            seed_generation: 1,
-        }),
-        serve: None,
+        rail: VulkanStage {
+            residency: Some(ComputeStorageResidencyCandidate {
+                key,
+                seed_generation: 1,
+            }),
+            ..Default::default()
+        },
         writeback: TextureWriteback::None,
     };
 
@@ -3060,7 +3072,7 @@ fn a_buffer_backed_texture_stages_its_texels_without_the_row_padding() {
         write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
     }
 
-    let staged = stage_texture_raw(&mut state, &mut host, 1, 21, 0, false)
+    let staged = stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, 21, 0, false)
         .expect("a buffer-backed texture is a wire form this device decodes");
 
     assert_eq!(staged.width, W_TEXELS as u32);
@@ -3091,7 +3103,7 @@ fn a_buffer_backed_texture_stages_its_texels_without_the_row_padding() {
     // The destination half is a separate contract with no evidence behind it,
     // so a writable binding of the same record still refuses, under its own
     // name rather than the retired blanket one.
-    match stage_texture_raw(&mut state, &mut host, 1, 21, 0, true) {
+    match stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, 21, 0, true) {
         Err(ComputeStatus::Unsupported(slug)) => {
             assert_eq!(slug, "compute_buffer_texture_storage_unsupported")
         }
@@ -3209,7 +3221,7 @@ fn a_declared_mip_chain_stages_every_level_and_not_only_its_base() {
         write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
     }
 
-    let staged = stage_texture_raw(&mut state, &mut host, 1, 11, 0, false)
+    let staged = stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, 11, 0, false)
         .expect("a declared mip chain is a wire form this device decodes");
 
     assert_eq!(staged.width, BASE);
@@ -3243,7 +3255,7 @@ fn a_declared_mip_chain_stages_every_level_and_not_only_its_base() {
 
     // A storage binding of the same texture stays at the base: a compute write
     // names one level, and the writeback window describes one.
-    let written = stage_texture_raw(&mut state, &mut host, 1, 11, 0, true)
+    let written = stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, 11, 0, true)
         .expect("the same texture stages as a storage destination");
     assert_eq!(
         written.mip_levels, 1,

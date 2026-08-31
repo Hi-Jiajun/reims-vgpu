@@ -13,6 +13,60 @@
 
 use super::*;
 
+/// This rail's half of a staged compute texture. See [`RailStage`].
+///
+/// [`RailStage`]: crate::runtime::compute_exec::RailStage
+#[derive(Debug, Default)]
+pub(crate) struct MetalStage {
+    /// The guest ref this was staged from. Carried so a refusal downstream can
+    /// name the object the guest bound and not only the slot it bound it to.
+    /// Read by this rail's format refusal; the Vulkan rail reaches its images by
+    /// another route and never asks.
+    pub(crate) texture_ref: u32,
+}
+
+impl RailStage for MetalStage {
+    /// This rail keeps no residency mirror, so neither residency fact survives
+    /// staging — see `super::vulkan::resident_serve` for the rail that does.
+    fn stage(
+        texture_ref: u32,
+        _residency: Option<ComputeStorageResidencyCandidate>,
+        _serve: Option<ResidentServe>,
+    ) -> Self {
+        Self { texture_ref }
+    }
+}
+
+impl StagedTexture<MetalStage> {
+    /// The storage-image selector for this texture's guest pixel format,
+    /// or a named refusal.
+    ///
+    /// Sample-only formats such as `RGB9E5Float` have no selector by design, so
+    /// this is a real class rather than an internal error — a guest binding one
+    /// into a compute slot loses that bind, and the line has to say which
+    /// object at which slot in which format.
+    ///
+    /// Three sites asked this one question and each carried its own answer:
+    /// `reason=metal_selector_missing` twice and `reason=no_backend_selector`
+    /// once, under two event names, returning three different refusal slugs,
+    /// with one line carrying `ref`, another `storage` and the third neither.
+    /// A grep for any of the three names found a third of the occurrences.
+    pub(crate) fn storage_selector_or_refuse(
+        &self,
+        task_id: u32,
+        pipeline_ref: u32,
+    ) -> Result<pixel_format::StorageImageSelector, ComputeStatus> {
+        self.storage_selector.ok_or_else(|| {
+            crate::observe::fail(format!(
+                "compute_texture_format fail reason=no_backend_selector task={task_id} \
+                 pipe={pipeline_ref} bind={} ref={} fmt={:#x} storage={}",
+                self.binding, self.rail.texture_ref, self.pixel_format, self.is_storage as u8
+            ));
+            ComputeStatus::Unsupported("compute_no_backend_selector")
+        })
+    }
+}
+
 /// Conservative whole-allocation staging used by the Metal-direct callers,
 /// which do not translate the shader through the reflection-producing path.
 pub(crate) fn stage_buffer<M: HostMemory + HostOps>(
@@ -35,7 +89,7 @@ use crate::backend::metal::abi::{ReimsVgpuComputeSampledImage, ReimsVgpuStorageI
 /// above.
 #[allow(clippy::type_complexity)]
 pub(crate) fn split_staged_textures(
-    staged: &mut [StagedTexture],
+    staged: &mut [StagedTexture<MetalStage>],
     task_id: u32,
     pipeline_ref: u32,
 ) -> Result<
@@ -87,7 +141,7 @@ pub(crate) fn split_staged_textures(
 pub(crate) struct NestedDispatchJob {
     staged_bufs: Vec<StagedBuffer>,
     /// Storage textures only (sampled need no writeback).
-    storage_tex: Vec<StagedTexture>,
+    storage_tex: Vec<StagedTexture<MetalStage>>,
     mtl_buffers: Vec<::metal::Buffer>,
     mtl_storage: Vec<::metal::Texture>,
 }
@@ -128,7 +182,7 @@ fn abi_buffers(staged: &mut [StagedBuffer]) -> Vec<crate::backend::metal::abi::R
 pub(crate) fn nested_job_from_icb_resources(
     staged_bufs: Vec<StagedBuffer>,
     mtl_buffers: Vec<::metal::Buffer>,
-    storage_tex: Vec<StagedTexture>,
+    storage_tex: Vec<StagedTexture<MetalStage>>,
     mtl_storage: Vec<::metal::Texture>,
 ) -> NestedDispatchJob {
     NestedDispatchJob {
@@ -377,7 +431,7 @@ pub(crate) fn execute_dispatch_metal<M: HostMemory + HostOps>(
         }
     };
 
-    let mut staged_tex: Vec<StagedTexture> = Vec::new();
+    let mut staged_tex: Vec<StagedTexture<MetalStage>> = Vec::new();
     for t in &acc.textures {
         let binding = REIMS_VGPU_BINDING_TEXTURE_BASE + t.index;
         let is_storage = texture_binds_as_storage(&usages, binding);
@@ -462,7 +516,7 @@ pub(crate) fn execute_dispatch_metal<M: HostMemory + HostOps>(
             Err(st) => return ComputeStatus::MetalBackend(st),
         };
         // Split storage textures out of staged_tex for deferred writeback alignment.
-        let storage_tex: Vec<StagedTexture> =
+        let storage_tex: Vec<StagedTexture<MetalStage>> =
             staged_tex.into_iter().filter(|t| t.is_storage).collect();
         if storage_tex.len() != retain.images.len() {
             return ComputeStatus::MetalFailed("compute_mtl_retain_image_count");

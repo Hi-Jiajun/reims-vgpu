@@ -1325,9 +1325,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     .filter(|resource| {
                         resource_type_owns_surface_resident(resource.entry.object_type)
                     })
-                    .map(|resource| {
-                        resource_lease::resident_target_backing(resource, &resident_id)
-                    })
+                    .map(|resource| resource_lease::resident_target_backing(resource, &resident_id))
                     // An unclassified ref has no resource object to own a
                     // lease. Keep its existing query path so compatibility
                     // traffic still reaches the copying rails.

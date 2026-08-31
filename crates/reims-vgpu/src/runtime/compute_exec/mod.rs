@@ -1348,18 +1348,61 @@ fn staged_span_pages<M: HostMemory>(
     pages
 }
 
-pub(crate) struct StagedTexture {
+/// What one rail additionally carries about a staged compute texture.
+///
+/// # Why a type parameter and not more fields
+///
+/// [`StagedTexture`] used to hold both rails' private per-binding state inline,
+/// each field behind a `#[cfg]`: five for Vulkan (the descriptor array slot and
+/// count, the storage-residency candidate, what a resident could already serve,
+/// and the multisample target a `texture2d_ms` read binds), one for Metal (the
+/// guest ref its format refusal names). Twelve `cfg` lines repeated across four
+/// construction sites, and on the both-rails build — where every one of those
+/// gates is *on* — a single struct carrying both rails' privates with nothing
+/// but convention keeping either out of the other's.
+///
+/// A type parameter says the same thing and makes it true: `StagedTexture<MetalStage>`
+/// has no Vulkan field to read, on any build, because the field is not in the
+/// type. It also collapses the construction sites, which now name one `rail`
+/// instead of repeating the gates.
+///
+/// The rail is handed the neutral facts and decides what to keep. Both facts
+/// are already neutral — the residency key is a model type and
+/// [`ResidentServe`] is what [`crate::backend::Backend::resident_serve`]
+/// answers — so this is the rail narrowing a neutral answer, not the neutral
+/// layer computing a rail's input.
+pub(crate) trait RailStage: Sized {
+    /// This rail's half of one staged binding, from the neutral facts of it.
+    ///
+    /// `texture_ref` is the guest object reference this binding was staged
+    /// from. `residency` is the storage-mirror window the staging corresponds
+    /// to, for a storage binding and `None` for anything else, and `serve` is
+    /// what the running rail said it could already serve for that window —
+    /// which is also why `bytes` may be a zero placeholder.
+    ///
+    /// Three arguments rather than one struct of them because a rail that keeps
+    /// no residency mirror ignores the last two, and an ignored *argument* is
+    /// ignored while an unread *field* is dead weight the compiler is right to
+    /// report on the build where no rail reads it.
+    fn stage(
+        texture_ref: u32,
+        residency: Option<ComputeStorageResidencyCandidate>,
+        serve: Option<ResidentServe>,
+    ) -> Self;
+}
+
+/// The storage-mirror window a staged binding corresponds to.
+///
+/// Both fields are neutral, which is why the staging rails below can produce it
+/// without naming a rail; only a rail that keeps a residency mirror stores it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ComputeStorageResidencyCandidate {
+    pub(crate) key: crate::model::ComputeStorageResidencyKey,
+    pub(crate) seed_generation: u32,
+}
+
+pub(crate) struct StagedTexture<R: RailStage> {
     pub binding: u32,
-    #[cfg(feature = "backend-vulkan")]
-    pub array_element: u32,
-    #[cfg(feature = "backend-vulkan")]
-    pub descriptor_count: u32,
-    /// The guest ref this was staged from. Carried so a refusal downstream can
-    /// name the object the guest bound and not only the slot it bound it to.
-    /// Read by the direct-Metal rail's format refusal; the Vulkan arm reaches
-    /// its images by another route and never asks.
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    pub texture_ref: u32,
     /// Raw Metal pixel format from the exact texture/view descriptor.
     pub pixel_format: u16,
     /// Product storage-selector ABI when this Metal format is storage-capable.
@@ -1387,65 +1430,9 @@ pub(crate) struct StagedTexture {
     pub mip_levels: u32,
     pub bytes: Vec<u8>,
     pub is_storage: bool,
-    #[cfg(feature = "backend-vulkan")]
-    residency: Option<vulkan::ComputeStorageResidencyCandidate>,
-    /// What the engine could already serve for this binding, so the stage-time
-    /// guest read was skipped and `bytes` is a zero placeholder.
-    ///
-    /// [`ResidentServe::Seed`] — a storage binding whose resident the engine
-    /// holds at a verified generation; it must never be seeded from the
-    /// placeholder. [`ResidentServe::Sample`] — a sampled input whose window is
-    /// a prior dispatch's storage output; the engine seeds the sampled image by
-    /// copy-on-sample from that resident, again never from the bytes.
-    ///
-    /// One field rather than the `bool` and `Option` pair it replaces: those
-    /// were the variant tag and the payload of this enum stored apart, so every
-    /// producer had to rebuild both halves and nothing made a producer that set
-    /// one without the other fail to compile.
-    #[cfg(feature = "backend-vulkan")]
-    serve: Option<ResidentServe>,
-    /// The retained multisample render target this binding is served from.
-    ///
-    /// Set only for a kernel-declared `texture2d_ms<T, access::read>`, and it is
-    /// exclusive with everything above it by construction: `bytes` is empty,
-    /// `serve` is `None`, and nothing is staged, because
-    /// `engine::types::SampledResource::multisampled` says linear bytes cannot
-    /// be uploaded into a multisample image at all. The engine binds this
-    /// target's own view.
-    #[cfg(feature = "backend-vulkan")]
-    multisample_target: Option<crate::backend::vulkan::engine::TargetIdentity>,
     writeback: TextureWriteback,
-}
-
-impl StagedTexture {
-    /// The Metal storage-image selector for this texture's guest pixel format,
-    /// or a named refusal.
-    ///
-    /// Sample-only formats such as `RGB9E5Float` have no selector by design, so
-    /// this is a real class rather than an internal error — a guest binding one
-    /// into a compute slot loses that bind, and the line has to say which
-    /// object at which slot in which format.
-    ///
-    /// Three sites asked this one question and each carried its own answer:
-    /// `reason=metal_selector_missing` twice and `reason=no_backend_selector`
-    /// once, under two event names, returning three different refusal slugs,
-    /// with one line carrying `ref`, another `storage` and the third neither.
-    /// A grep for any of the three names found a third of the occurrences.
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    pub(crate) fn storage_selector_or_refuse(
-        &self,
-        task_id: u32,
-        pipeline_ref: u32,
-    ) -> Result<pixel_format::StorageImageSelector, ComputeStatus> {
-        self.storage_selector.ok_or_else(|| {
-            crate::observe::fail(format!(
-                "compute_texture_format fail reason=no_backend_selector task={task_id} \
-                 pipe={pipeline_ref} bind={} ref={} fmt={:#x} storage={}",
-                self.binding, self.texture_ref, self.pixel_format, self.is_storage as u8
-            ));
-            ComputeStatus::Unsupported("compute_no_backend_selector")
-        })
-    }
+    /// The running rail's own half of this binding. See [`RailStage`].
+    pub rail: R,
 }
 
 /// What an engine-resident copy of a window can serve one staged binding.
@@ -1473,7 +1460,7 @@ impl StagedTexture {
         reason = "no rail this build compiled constructs one; every rail still reads the type"
     )
 )]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum ResidentServe {
     Seed(u32),
     Sample(crate::model::ComputeStorageResidencyKey, u32),
@@ -1520,7 +1507,7 @@ impl ResidentServe {
 /// guest may have written anything into, and folding it into the image is
 /// exactly the failure the conformance battery fills padding with a distinct
 /// pattern to catch.
-fn stage_buffer_texture<M: HostMemory + HostOps>(
+fn stage_buffer_texture<R: RailStage, M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
@@ -1528,7 +1515,7 @@ fn stage_buffer_texture<M: HostMemory + HostOps>(
     binding: u32,
     is_storage: bool,
     bt: &crate::runtime::decode::resource::BufferTextureDescriptor,
-) -> Result<StagedTexture, ComputeStatus> {
+) -> Result<StagedTexture<R>, ComputeStatus> {
     let (width, height) = (bt.desc.width, bt.desc.height);
     if width == 0 || height == 0 {
         crate::observe::fail(format!(
@@ -1611,17 +1598,7 @@ fn stage_buffer_texture<M: HostMemory + HostOps>(
         bt.buffer_ref, bt.offset
     ));
     Ok(StagedTexture {
-        // Every staging rail produces bytes; the multisample source is
-        // not staged and is set at the classification site instead.
-        #[cfg(feature = "backend-vulkan")]
-        multisample_target: None,
         binding,
-        #[cfg(feature = "backend-vulkan")]
-        array_element: 0,
-        #[cfg(feature = "backend-vulkan")]
-        descriptor_count: 1,
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        texture_ref,
         pixel_format: format,
         storage_selector: pixel_format::storage_selector(format),
         // A buffer-backed texture view is one level of one buffer.
@@ -1630,11 +1607,8 @@ fn stage_buffer_texture<M: HostMemory + HostOps>(
         height,
         bytes,
         is_storage,
-        #[cfg(feature = "backend-vulkan")]
-        residency: None,
-        #[cfg(feature = "backend-vulkan")]
-        serve: None,
         writeback: TextureWriteback::None,
+        rail: R::stage(texture_ref, None, None),
     })
 }
 
@@ -1698,7 +1672,7 @@ fn multisample_sampled_texture<M: HostMemory + HostOps>(
     texture_ref: u32,
     binding: u32,
     descriptor: crate::runtime::spirv_bind::ReflectedTextureDescriptor,
-) -> Result<StagedTexture, ComputeStatus> {
+) -> Result<StagedTexture<vulkan::VulkanStage>, ComputeStatus> {
     let refuse = |reason: &'static str, detail: String, status: ComputeStatus| {
         crate::observe::fail(format!(
             "compute_linux texture_multisample fail reason={reason} pipe={pipeline_ref} \
@@ -1789,10 +1763,6 @@ fn multisample_sampled_texture<M: HostMemory + HostOps>(
     crate::runtime::drain::note_store_route("compute_multisample_resident_bind");
     Ok(StagedTexture {
         binding,
-        array_element: descriptor.array_element,
-        descriptor_count: descriptor.descriptor_count,
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        texture_ref,
         pixel_format: format,
         // A multisample image is never a storage image on this rail, so it has
         // no storage selector to carry.
@@ -1803,12 +1773,16 @@ fn multisample_sampled_texture<M: HostMemory + HostOps>(
         mip_levels: 1,
         bytes: Vec::new(),
         is_storage: false,
-        residency: None,
-        serve: None,
-        multisample_target: Some(identity),
         // Read-only: the kernel declares `access::read` or this shape would
         // have been refused as `multisampled_storage` before reaching here.
         writeback: TextureWriteback::None,
+        rail: vulkan::VulkanStage {
+            array_element: descriptor.array_element,
+            descriptor_count: descriptor.descriptor_count,
+            residency: None,
+            serve: None,
+            multisample_target: Some(identity),
+        },
     })
 }
 
@@ -1822,14 +1796,14 @@ fn multisample_sampled_texture<M: HostMemory + HostOps>(
 /// object list (that list uses a separate texture-ref namespace — live ensure=1 then
 /// MissingTexture/GuestIo class when `resolve_mapper_ref_texture(task, sid)` hit a different
 /// mapper-ref-texture slot).
-pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
+pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
     binding: u32,
     is_storage: bool,
-) -> Result<StagedTexture, ComputeStatus> {
+) -> Result<StagedTexture<R>, ComputeStatus> {
     // Ref-texture RefTextureHandle → surface_id (live CI binds ot5).
     let mut stage_ref = texture_ref;
     let mut from_ref_texture = false;
@@ -2064,17 +2038,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             use_offset as u8
         ));
         return Ok(StagedTexture {
-            // Every staging rail produces bytes; the multisample source is
-            // not staged and is set at the classification site instead.
-            #[cfg(feature = "backend-vulkan")]
-            multisample_target: None,
             binding,
-            #[cfg(feature = "backend-vulkan")]
-            array_element: 0,
-            #[cfg(feature = "backend-vulkan")]
-            descriptor_count: 1,
-            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-            texture_ref,
             pixel_format: format,
             storage_selector,
             // The heap arm refuses a descriptor declaring more than one level
@@ -2084,14 +2048,15 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             height,
             bytes: vec![0; need],
             is_storage,
-            #[cfg(feature = "backend-vulkan")]
-            residency: is_storage.then_some(vulkan::ComputeStorageResidencyCandidate {
-                key,
-                seed_generation,
-            }),
-            #[cfg(feature = "backend-vulkan")]
-            serve,
             writeback: TextureWriteback::None,
+            rail: R::stage(
+                texture_ref,
+                is_storage.then_some(ComputeStorageResidencyCandidate {
+                    key,
+                    seed_generation,
+                }),
+                serve,
+            ),
         });
     }
     let stage_entry = objects::lookup_list_entry(state, host, task_id, stage_ref);
@@ -2535,17 +2500,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ));
         }
         return Ok(StagedTexture {
-            // Every staging rail produces bytes; the multisample source is
-            // not staged and is set at the classification site instead.
-            #[cfg(feature = "backend-vulkan")]
-            multisample_target: None,
             binding,
-            #[cfg(feature = "backend-vulkan")]
-            array_element: 0,
-            #[cfg(feature = "backend-vulkan")]
-            descriptor_count: 1,
-            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-            texture_ref,
             pixel_format: stage_fmt,
             storage_selector,
             // Metal forbids a mipmapped IOSurface texture.
@@ -2554,14 +2509,15 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             height,
             bytes,
             is_storage,
-            #[cfg(feature = "backend-vulkan")]
-            residency: is_storage.then_some(vulkan::ComputeStorageResidencyCandidate {
-                key: residency_key,
-                seed_generation,
-            }),
-            #[cfg(feature = "backend-vulkan")]
-            serve,
             writeback,
+            rail: R::stage(
+                texture_ref,
+                is_storage.then_some(ComputeStorageResidencyCandidate {
+                    key: residency_key,
+                    seed_generation,
+                }),
+                serve,
+            ),
         });
     }
 
@@ -2846,9 +2802,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     // mapped at writeback time (the sync path would have written guest
     // pages), the deferred-writeback arm records a flush obligation with a
     // defer-time page index so aliased raw-GVA readers land it first.
-    #[cfg(feature = "backend-vulkan")]
     let mut residency = None;
-    #[cfg(feature = "backend-vulkan")]
     if is_storage {
         if let Some(key) = linear_key {
             if !crate::runtime::surface_cache::linear_mirrorable(stage_format) {
@@ -2861,7 +2815,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                             .map(|e| e.host_gen)
                             .unwrap_or(0)
                     });
-                residency = Some(vulkan::ComputeStorageResidencyCandidate {
+                residency = Some(ComputeStorageResidencyCandidate {
                     key,
                     seed_generation: seed,
                 });
@@ -2869,17 +2823,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         }
     }
     Ok(StagedTexture {
-        // Every staging rail produces bytes; the multisample source is
-        // not staged and is set at the classification site instead.
-        #[cfg(feature = "backend-vulkan")]
-        multisample_target: None,
         binding,
-        #[cfg(feature = "backend-vulkan")]
-        array_element: 0,
-        #[cfg(feature = "backend-vulkan")]
-        descriptor_count: 1,
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        texture_ref,
         pixel_format: stage_format,
         storage_selector,
         // The levels actually placed, which is the declared count when the
@@ -2890,11 +2834,8 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         height: h,
         bytes,
         is_storage,
-        #[cfg(feature = "backend-vulkan")]
-        residency,
-        #[cfg(feature = "backend-vulkan")]
-        serve,
         writeback,
+        rail: R::stage(texture_ref, residency, serve),
     })
 }
 
@@ -3158,11 +3099,11 @@ fn write_linear_texture_bulk<M: HostMemory + HostOps>(
     true
 }
 
-fn writeback_texture<M: HostMemory + HostOps>(
+fn writeback_texture<R: RailStage, M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    tex: &StagedTexture,
+    tex: &StagedTexture<R>,
 ) -> Result<(), ComputeStatus> {
     // Which destination namespace a compute storage output lands in, and — on
     // the linear arm — whether its guest rows are dense. Both are properties of
