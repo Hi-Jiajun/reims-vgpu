@@ -121,8 +121,10 @@ use crate::runtime::decode::blit::Command as BlitCommand;
 use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::draw::{DrawEncodeRequest, EncodeStatus, GvaSpan};
 use crate::runtime::guest_ram::{GuestRamImport, ImportId};
+use crate::runtime::gva_store_witness::GvaTargetKey;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::resident_target::ResidentTarget;
+use crate::runtime::writeback_debt::GvaWritebackDebt;
 use std::sync::Arc;
 
 /// How a rail's own completion thread announces a finished stamp back to the
@@ -940,6 +942,63 @@ pub(crate) trait Backend: Copy {
     /// The guest wrote the pages itself, so the frame is not owed any more; the
     /// resident is only still alive because the debt was keeping it so.
     fn abandon_resident(&self, _target: &ResidentTarget) {}
+
+    /// This rail's name for the resident holding one deferred GVA frame.
+    ///
+    /// Derived rather than carried, unlike [`Backend::pay_surface_writeback`]'s
+    /// target — [`crate::runtime::writeback_debt::GvaWindow`] records why the
+    /// two differ and why the derivation is sound here.
+    ///
+    /// `None` from a rail that keeps no GVA resident. The ledger reads it as
+    /// "this debt cannot exist on this arm" rather than as a lost frame, which
+    /// is what it is: only a rail that answers here can arm one.
+    fn gva_resident(&self, _debt: &GvaWritebackDebt) -> Option<ResidentTarget> {
+        None
+    }
+
+    /// The guest-write witness key for one deferred GVA frame's resident.
+    ///
+    /// The key is guest coordinates plus the resident's channel order, and the
+    /// order is the rail's answer — which is the whole of why this is a trait
+    /// method and not arithmetic in the ledger. A second hand-written copy of
+    /// that resolution put an R/B-exchanged frame in guest memory once already.
+    ///
+    /// `None` withdraws the deferral: without a witness the ledger cannot say
+    /// what the guest CPU wrote into the plane afterwards, and a frame it
+    /// cannot merge is a frame it must not defer.
+    fn gva_witness_key(&self, _debt: &GvaWritebackDebt) -> Option<GvaTargetKey> {
+        None
+    }
+
+    /// Move a deferred GVA frame out of `target` and into the guest pages
+    /// `pages` names, and release this rail's hold on that resident.
+    ///
+    /// `skip` is the plane-relative bytes the guest CPU owns and this store may
+    /// not overwrite; a non-empty one costs the rail its GPU-direct arm. See
+    /// `writeback_debt::pay_gva`, which is the only caller and resolves it from
+    /// the hypervisor's per-page report.
+    ///
+    /// The hold is released either way, for [`Backend::pay_surface_writeback`]'s
+    /// reason: an image nothing will ask for again must not hold memory to the
+    /// next device reset. The rail reports *why* a payment was lost on the
+    /// failure channel, so there is nothing for the neutral ledger to add and
+    /// nothing for it to return.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the store's own parameters, plus the bytes its owner may not overwrite"
+    )]
+    fn pay_gva_writeback<M: HostMemory + HostOps>(
+        &self,
+        _state: &mut DeviceState,
+        _host: &mut M,
+        _task_id: u32,
+        _target: &ResidentTarget,
+        _c0: &crate::runtime::draw::ColorRtRequest,
+        _texture_ref: u32,
+        _pages: &crate::runtime::draw::StoreTargetPages,
+        _skip: crate::runtime::mapping_write::SkipRanges<'_>,
+    ) {
+    }
 }
 
 /// What a rail made of a `generateMipmaps` — the vocabulary of
@@ -1672,6 +1731,47 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.abandon_resident(target),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.abandon_resident(target),
+        }
+    }
+
+    fn gva_resident(&self, debt: &GvaWritebackDebt) -> Option<ResidentTarget> {
+        match self {
+            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+            Self::Metal(b) => b.gva_resident(debt),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.gva_resident(debt),
+        }
+    }
+
+    fn gva_witness_key(&self, debt: &GvaWritebackDebt) -> Option<GvaTargetKey> {
+        match self {
+            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+            Self::Metal(b) => b.gva_witness_key(debt),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.gva_witness_key(debt),
+        }
+    }
+
+    fn pay_gva_writeback<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        target: &ResidentTarget,
+        c0: &crate::runtime::draw::ColorRtRequest,
+        texture_ref: u32,
+        pages: &crate::runtime::draw::StoreTargetPages,
+        skip: crate::runtime::mapping_write::SkipRanges<'_>,
+    ) {
+        match self {
+            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+            Self::Metal(b) => {
+                b.pay_gva_writeback(state, host, task_id, target, c0, texture_ref, pages, skip)
+            }
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => {
+                b.pay_gva_writeback(state, host, task_id, target, c0, texture_ref, pages, skip)
+            }
         }
     }
 }

@@ -1664,7 +1664,6 @@ pub fn stamp_guest_write_gen<M: HostMemory + HostOps>(
 /// Every variant but [`Self::Clean`] means "assume written". They are kept
 /// apart because "this rail never got started" and "the guest rewrites this
 /// surface every frame" are the same refusal and completely different findings.
-#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GuestWriteVerdict {
     /// The host has observed no write to these pages since the stamp.

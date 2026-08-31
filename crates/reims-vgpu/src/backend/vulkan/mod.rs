@@ -36,9 +36,11 @@ use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::drain;
 use crate::runtime::draw::{self, DrawEncodeRequest, EncodeStatus, GvaSpan};
 use crate::runtime::guest_ram::ImportId;
+use crate::runtime::gva_store_witness::GvaTargetKey;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::render_writeback::SettleSite;
 use crate::runtime::scanout;
+use crate::runtime::writeback_debt::{GvaWindow, GvaWritebackDebt};
 
 /// The Vulkan rail's [`Backend`] handle.
 ///
@@ -55,6 +57,85 @@ pub struct VulkanBackend;
 impl VulkanBackend {
     pub fn new() -> Self {
         Self
+    }
+}
+
+/// This rail's name for the resident behind one deferred GVA frame.
+///
+/// The single derivation, and `pub(crate)` because a debt is not only something
+/// to pay: a reader that wants the *content* rather than the guest's copy of it
+/// — the blit rail's whole-plane GPU arm — needs exactly this identity, and a
+/// second one built from the same debt fields is how two spellings of one
+/// resident start disagreeing.
+///
+/// It matches `draw::vulkan::gva_chain_identity` field for field, which is what
+/// makes [`crate::runtime::writeback_debt::GvaWindow`]'s deferral sound: the
+/// draw registers its resident from the attachment request and the allocation
+/// generation, and both reach the ledger verbatim.
+pub(crate) fn gva_identity(
+    debt: &crate::runtime::writeback_debt::GvaWritebackDebt,
+) -> engine::TargetIdentity {
+    engine::TargetIdentity::Gva {
+        gva: debt.gva,
+        width: debt.width,
+        height: debt.height,
+        generation: debt.generation,
+        format: draw::vulkan::gva_resident_format(debt.format),
+    }
+}
+
+/// The guest-write witness key for one of this rail's GVA residents, or `None`
+/// for any other identity kind or an unusable generation.
+///
+/// The only constructor a product path may use, so the arm site and the payment
+/// site cannot drift into naming different targets.
+///
+/// The task is deliberately not in the key. Two tasks colliding here would need
+/// identical resolved page sets at the same address and extent, which is the
+/// same physical memory — the same target by every test this device applies to
+/// it.
+pub(crate) fn gva_witness_key(identity: &engine::TargetIdentity) -> Option<GvaTargetKey> {
+    match *identity {
+        engine::TargetIdentity::Gva {
+            gva,
+            width,
+            height,
+            generation,
+            format: _,
+        } if generation != 0 && gva != 0 => Some(GvaTargetKey {
+            gva,
+            generation,
+            width,
+            height,
+            // Asked of the identity rather than spelled here. A channel order
+            // is one question with one owner, and a second hand-written copy of
+            // it is the divergence that put an R/B-exchanged frame in guest
+            // memory once already — see `engine::ResidentReadSnapshot::bgra`.
+            // The pattern still names the field so a new one cannot be added
+            // without meeting it.
+            bgra: identity.is_bgra(),
+        }),
+        _ => None,
+    }
+}
+
+/// The guest coordinates one of this rail's GVA residents stands for, or `None`
+/// for an identity that names no guest span.
+pub(crate) fn gva_window(identity: &engine::TargetIdentity) -> Option<GvaWindow> {
+    match *identity {
+        engine::TargetIdentity::Gva {
+            gva,
+            width,
+            height,
+            generation,
+            format: _,
+        } => Some(GvaWindow {
+            gva,
+            width,
+            height,
+            generation,
+        }),
+        _ => None,
     }
 }
 
@@ -425,6 +506,60 @@ impl Backend for VulkanBackend {
 
     fn abandon_resident(&self, target: &crate::runtime::resident_target::ResidentTarget) {
         if let Some(identity) = target.get::<engine::TargetIdentity>() {
+            engine::note_resident_content_copied_out(identity);
+        }
+    }
+
+    fn gva_resident(
+        &self,
+        debt: &GvaWritebackDebt,
+    ) -> Option<crate::runtime::resident_target::ResidentTarget> {
+        Some(crate::runtime::resident_target::ResidentTarget::new(
+            gva_identity(debt),
+        ))
+    }
+
+    fn gva_witness_key(&self, debt: &GvaWritebackDebt) -> Option<GvaTargetKey> {
+        gva_witness_key(&gva_identity(debt))
+    }
+
+    /// A handle this rail did not issue names no image it can read, so the
+    /// frame is lost rather than written from the wrong one — the rule
+    /// [`Self::pay_surface_writeback`] states, applied to the GVA namespace.
+    fn pay_gva_writeback<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        target: &crate::runtime::resident_target::ResidentTarget,
+        c0: &crate::runtime::draw::ColorRtRequest,
+        texture_ref: u32,
+        pages: &crate::runtime::draw::StoreTargetPages,
+        skip: crate::runtime::mapping_write::SkipRanges<'_>,
+    ) {
+        let Some(identity) = target.get::<engine::TargetIdentity>() else {
+            return;
+        };
+        if let Err(reason) = crate::runtime::render_writeback::vulkan::store_gva_frame(
+            state,
+            host,
+            task_id,
+            identity,
+            c0,
+            texture_ref,
+            Some(pages),
+            skip,
+        ) {
+            // Through the builder rather than by interpolating the decline,
+            // which renders its own `reason=` and produced `reason=reason=<slug>`
+            // — a line the standard ranking grep drops. The builder also carries
+            // the decline's own fields, so the `via=` that says which check
+            // inside the store refused now reaches the log instead of being
+            // formatted away.
+            crate::observe::Emit::decline("gvadebt_pay_lost", &reason)
+                .field("task", task_id)
+                .field("texture", texture_ref)
+                .fail();
             engine::note_resident_content_copied_out(identity);
         }
     }

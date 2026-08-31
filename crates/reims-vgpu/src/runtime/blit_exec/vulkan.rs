@@ -142,7 +142,7 @@ pub(crate) fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
         }
         return None;
     }
-    let identity = crate::runtime::writeback_debt::gva_identity(debt);
+    let identity = crate::backend::vulkan::gva_identity(&debt);
     match mapping_write::vulkan::write_bgra8_from_resident_gpu(
         state,
         host,

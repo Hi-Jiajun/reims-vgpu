@@ -226,8 +226,17 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 // resource-validity protocol asks for that separately. The
                 // live resource retains its transfer backing until explicit
                 // discard or delete; the debt records only content ownership.
-                let landed = req.colors.first().is_some_and(|c0| {
-                    crate::runtime::writeback_debt::arm_gva(state, host, req.task_id, c0, &identity)
+                let landed = crate::backend::vulkan::gva_window(&identity).is_some_and(|window| {
+                    req.colors.first().is_some_and(|c0| {
+                        crate::runtime::writeback_debt::arm_gva(
+                            crate::backend::vulkan::VulkanBackend,
+                            state,
+                            host,
+                            req.task_id,
+                            c0,
+                            window,
+                        )
+                    })
                 });
                 if landed {
                     note_mapper_ref_texture_store_route("gva_resident_authoritative");
@@ -4192,7 +4201,7 @@ pub(crate) fn gva_resident_if_current<M: HostMemory + HostOps>(
     task_id: u32,
     span: GvaSpan,
 ) -> Result<crate::backend::vulkan::engine::TargetIdentity, GvaResidentRefusal> {
-    use crate::runtime::gva_store_witness::{reach, GvaTargetKey};
+    use crate::runtime::gva_store_witness::reach;
 
     let texture_ref = span.texture_ref;
     let identity =
@@ -4202,18 +4211,20 @@ pub(crate) fn gva_resident_if_current<M: HostMemory + HostOps>(
     // state: a Store was copied out and both locations still agree. Keeping
     // those states distinct prevents a skipped copy from masquerading as a
     // statement about bytes that were never written.
-    if crate::runtime::writeback_debt::gva_resident_authoritative(state, &identity) {
+    if crate::backend::vulkan::gva_window(&identity).is_some_and(|window| {
+        crate::runtime::writeback_debt::gva_resident_authoritative(state, window)
+    }) {
         return gva_resident_ready(state, task_id, texture_ref, &identity)
             .then_some(identity)
             .ok_or(GvaResidentRefusal::NoResident);
     }
-    // From the identity built just above, through the key's own constructor.
-    // `GvaTargetKey::of` is what builds this key on the other side of the
-    // witness, and the two must agree — a key written out by hand at one of the
-    // two sites is how they stop agreeing. It cannot decline here: it declines
-    // only for a zero gva or generation, which `gva_span_identity` has already
-    // refused to produce an identity for.
-    let Some(key) = GvaTargetKey::of(&identity) else {
+    // From the identity built just above, through this rail's own constructor.
+    // `backend::vulkan::gva_witness_key` is what builds this key on the other
+    // side of the witness, and the two must agree — a key written out by hand
+    // at one of the two sites is how they stop agreeing. It cannot decline
+    // here: it declines only for a zero gva or generation, which
+    // `gva_span_identity` has already refused to produce an identity for.
+    let Some(key) = crate::backend::vulkan::gva_witness_key(&identity) else {
         return Err(GvaResidentRefusal::NoGeneration);
     };
     let verdict = reach(state, host, key);

@@ -60,10 +60,10 @@ pub mod guest_ram_map;
 /// both backends and every test arm reach it.
 /// Task GVA → guest RAM reads.
 pub mod gva_mem;
-/// Gated with the `GuestWriteVerdict` it reuses and the `TargetIdentity` it
-/// keys on, both of which are Vulkan-side; the mapper-ref-texture twin this mirrors
-/// (`mapper::mapping_guest_write_verdict`) carries the same gate.
-#[cfg(feature = "backend-vulkan")]
+/// Which GVA render targets a Store has stamped, and what the two write
+/// witnesses said at the time. Neutral: it keys on the guest span a rail's
+/// resident stands for — see `Backend::gva_witness_key` — and not on the rail's
+/// own name for that resident.
 pub mod gva_store_witness;
 /// Task-GVA HostOps views (MapMemory2 / UnmapMemory lifecycle).
 pub mod gva_view;
