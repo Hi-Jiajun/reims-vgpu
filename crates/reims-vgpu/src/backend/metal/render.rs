@@ -1687,30 +1687,68 @@ mod attachment_decline_tests {
 /// `crate::backend::vulkan::engine::exec` — but that is one of the three gaps
 /// here and the smallest.
 ///
-/// Why this is stated as a gap and not fixed here: it is a claim about the arm64
-/// pathway and **this repository has no Apple host to boot**, so there is no
-/// number for it and nothing under `backend/metal/` is even test-executed on a
-/// Linux checkout (`AGENTS.md`, "Rust tests"). What can be said without a boot
-/// is only what the code shape guarantees, and it is worth saying because the
-/// three costs are not equally sized and a session with a Mac should attack them
-/// in this order:
+/// # The bar is divided now, and the ranking it had was wrong
 ///
-/// 1. **The `waitUntilCompleted`.** A round trip is microseconds of latency the
-///    CPU cannot fill, and it serialises the whole device: nothing else in this
+/// This paragraph used to say the three costs could not be sized because "this
+/// repository has no Apple host to boot", and ranked them by argument:
+/// `waitUntilCompleted` first, the per-draw command buffer second, the per-draw
+/// pass third. The six [`crate::runtime::chain_phase::CostSpan`]s below divide
+/// the bar, and on a driven macos-13 Metal boot (2 480 chains, pointer-driven at
+/// the login window) they read:
+///
+/// ```text
+/// engine_us                    5413 us/draw   (chain_phase)
+///   metal_rt_seed_us           1670 us/draw   31 %   replace_region, whole attachment
+///   metal_commit_us            1424 us/draw   26 %   commit + waitUntilCompleted
+///   metal_readback_us          1041 us/draw   19 %   getBytes, whole attachment
+///   metal_encode_us             769 us/draw   14 %   encoder open → endEncoding
+///   metal_pso_us                323 us/draw    6 %   both functions + PSO lookup
+///   metal_rt_alloc_us            72 us/draw    1 %   the fresh MTLTexture itself
+///   metal_pass_us                 5 us/draw    0 %
+/// ```
+///
+/// The six sum to 98 % of `engine_us`; the remainder is the argument validation
+/// above them and the depth/stencil readback below. Check that sum before
+/// believing any single bar.
+///
+/// **The round trip is not the largest cost — moving the attachment across the
+/// CPU/GPU boundary is.** `metal_rt_seed_us` + `metal_readback_us` +
+/// `metal_rt_alloc_us` is 2 783 us a draw, 51 % of the bar, and all three exist
+/// for one reason: the colour target is *fresh every draw*, so its prior
+/// contents must be uploaded into it and its result read back out. A resident
+/// target keyed on the attachment's identity removes all three at once, and it
+/// removes most of `store_us` (3 620 us a draw in the same boot) with them,
+/// because that is the CPU writeback of the same pixels. The seams for it are
+/// already cut: [`crate::backend::Backend`]'s `gva_resident`,
+/// `gva_witness_key`, `pay_gva_writeback`, `pay_surface_writeback` and
+/// `abandon_resident`, driven by the neutral
+/// [`crate::runtime::writeback_debt`] ledger, which the Vulkan rail already
+/// uses and this one does not implement.
+///
+/// So the order to attack them in is:
+///
+/// 1. **The fresh target.** Measured at 51 % of this bar plus most of the Store
+///    phase, and it is a change to what this rail *retains*, not to when it
+///    submits.
+/// 2. **The `waitUntilCompleted`.** 26 %. A round trip is latency the CPU
+///    cannot fill, and it serialises the whole device: nothing else in this
 ///    process is encoding while it blocks. Removing it means the callers that
 ///    read a result out of the pass — the visibility query below, and the
 ///    writeback [`crate::runtime::draw`] performs on the strength of this having
 ///    completed — need a completion handler or a fence instead of a return
-///    value, which is the real work.
-/// 2. **The per-draw command buffer.** Metal's own guidance is tens to hundreds
+///    value, which is the real work. Note that a resident target removes the
+///    readback that is *why* this wait exists, so item 1 is also what makes
+///    item 2 reachable.
+/// 3. **The per-draw command buffer.** Metal's own guidance is tens to hundreds
 ///    of encodes per buffer; one draw per buffer pays the driver's per-commit
-///    cost at draw rate.
-/// 3. **The per-draw pass.** Apple Silicon is a tile-based deferred renderer, so
-///    each pass loads the attachment into tile memory and stores it back out at
-///    `endEncoding` whatever the draw touched. That is the cost this pathway
-///    pays that a discrete immediate-mode GPU does not: `REIMS_VGPU_LAYOUT_CHURN`
-///    measured a full-attachment layout move as free on an NVIDIA host and that
-///    reading says nothing here.
+///    cost at draw rate. Part of `metal_commit_us` and part of
+///    `metal_encode_us`; the two are not separated because the fix is the same
+///    change.
+/// 4. **The per-draw pass.** `metal_pass_us` is 5 us a draw of *descriptor*
+///    work, which is not the cost — Apple Silicon is a tile-based deferred
+///    renderer, so each pass loads the attachment into tile memory and stores it
+///    back out at `endEncoding` whatever the draw touched, and that lands inside
+///    `metal_encode_us` and `metal_commit_us` rather than in a bar of its own.
 ///
 /// None of the three is a decode or contract change. The guest stream is the
 /// same; only when this device chooses to end an encoder and hand it to the GPU
@@ -1873,6 +1911,16 @@ pub fn render_core_mrt(
         return Status::execute("metal_render_device_unavailable");
     };
 
+    // The five spans below divide this rail's `engine_us`, which
+    // `chain_phase`'s own doc says is the bar whose contents `draw_phase`
+    // answers for on the Vulkan rail and which nothing answers for here. They
+    // are spans and not phases on purpose: a phase re-cut would change what
+    // `engine_us` means across boots, and this bar has a baseline.
+    //
+    // They are contiguous and non-overlapping, so their sum is `engine_us` less
+    // the argument validation above and the depth/stencil readback below.
+    // Checking that sum is the first thing to do with a reading.
+    let span_pso = crate::runtime::chain_phase::CostSpan::new("metal_pso_us");
     let vertex = match load_only_function(device, vert_mtlb, "vertex", err) {
         Ok(f) => f,
         Err(st) => return st,
@@ -1945,12 +1993,14 @@ pub fn render_core_mrt(
         Ok(v) => v,
         Err(st) => return st,
     };
+    drop(span_pso);
 
     let mut retained_tex: Vec<Texture> = Vec::new();
     // (slot, tex, bpp)
     let mut color_textures: Vec<(u32, Texture, usize)> = Vec::new();
     for (i, c) in colors.iter().enumerate() {
         let (slot, _fmt_u32, bpp, mtl_fmt) = color_meta[i];
+        let span_alloc = crate::runtime::chain_phase::CostSpan::new("metal_rt_alloc_us");
         let target_descriptor = TextureDescriptor::new();
         target_descriptor.set_texture_type(MTLTextureType::D2);
         target_descriptor.set_pixel_format(mtl_fmt);
@@ -1966,8 +2016,15 @@ pub fn render_core_mrt(
                 .field("width", width)
                 .field("height", height);
         };
+        drop(span_alloc);
         // Archive reims_vgpu_backend_metal: upload target_rgba8 before Load
         // (fresh RT every job; NULL seed → Clear invent below).
+        //
+        // The whole attachment, every draw, because the target is fresh every
+        // draw. This is the upload a resident colour target would remove
+        // outright, and it is charged apart from the allocation because the two
+        // have different fixes.
+        let _span_seed = crate::runtime::chain_phase::CostSpan::new("metal_rt_seed_us");
         if let Some(seed) = c.seed_rgba8 {
             let region = MTLRegion {
                 origin: MTLOrigin { x: 0, y: 0, z: 0 },
@@ -1989,6 +2046,7 @@ pub fn render_core_mrt(
     }
     let mut retained_buf: Vec<Buffer> = Vec::new();
 
+    let span_pass = crate::runtime::chain_phase::CostSpan::new("metal_pass_us");
     let pass = RenderPassDescriptor::new();
     for (i, c) in colors.iter().enumerate() {
         let (slot, target, _) = &color_textures[i];
@@ -2098,6 +2156,9 @@ pub fn render_core_mrt(
         pass.set_visibility_result_buffer(Some(buffer));
     }
 
+    drop(span_pass);
+
+    let span_encode = crate::runtime::chain_phase::CostSpan::new("metal_encode_us");
     let queue = thread_queue(device);
     let Some(command_buffer) = crate::backend::metal::raw_metal::new_command_buffer(&queue) else {
         return Status::execute("metal_render_command_buffer_unavailable");
@@ -2371,8 +2432,16 @@ pub fn render_core_mrt(
     }
 
     encoder.end_encoding();
+    drop(span_encode);
+
+    // One command buffer, one pass, one blocking round trip, per decoded draw.
+    // Item 1 of the ranking in this function's own doc, and the only one of the
+    // three whose cost is a latency the CPU cannot fill rather than work it
+    // could do faster.
+    let span_commit = crate::runtime::chain_phase::CostSpan::new("metal_commit_us");
     command_buffer.commit();
     command_buffer.wait_until_completed();
+    drop(span_commit);
     if command_buffer.status() == MTLCommandBufferStatus::Error {
         let detail = command_buffer_error_description(&command_buffer);
         set_err(err, format!("Metal command buffer failed: {detail}"));
@@ -2387,6 +2456,7 @@ pub fn render_core_mrt(
         query.samples = Some(unsafe { core::ptr::read_unaligned(buffer.contents() as *const u64) });
     }
 
+    let span_readback = crate::runtime::chain_phase::CostSpan::new("metal_readback_us");
     for (i, c) in colors.iter_mut().enumerate() {
         if let Some(out) = c.out_rgba8.as_mut() {
             if out.is_empty() {
@@ -2431,6 +2501,7 @@ pub fn render_core_mrt(
             }
         }
     }
+    drop(span_readback);
     color_textures.clear();
     if let Some(depth) = depth_attachment {
         if depth.store_action == REIMS_VGPU_MTL_STORE_ACTION_STORE {
